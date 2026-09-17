@@ -3,9 +3,20 @@
 //! The linked node is allocated before submission. Returning an error, unwinding,
 //! reentrant housekeeping, and thread exit never release an unresolved node.
 
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    mem::size_of,
+    rc::Rc,
+};
 
-use safemlx::{error::Exception, SubmissionScope};
+use safemlx::{error::Exception, SubmissionScope, SubmissionScopeBeginError};
+pub(crate) mod observed;
+pub(crate) mod native_role;
+pub(crate) mod prediction;
+pub(crate) mod prefill;
+mod prepared;
+pub(crate) mod retirement;
+pub(crate) use prepared::{PreparedRecovery, PreparedRecoveryError, RecoveryPreparationError};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Status {
@@ -17,10 +28,30 @@ pub(crate) struct Status {
 pub(crate) trait Probe: 'static {
     fn seal(&mut self);
     fn progress(&self) -> Status;
+
+    /// Release only this observed terminal owner's native records/wrappers.
+    /// Called under the same no-hooks runtime guard, outside list borrows.
+    /// Refusal retains the node. Ordinary probes need no additional pass.
+    fn retire_terminal(&self) -> bool {
+        true
+    }
+
+    /// Close thread-local capture bookkeeping after a callback panic. This may
+    /// not observe status, release resources, allocate, wait, or panic. It is
+    /// not a retry of an arbitrary provider callback. Native probes must supply
+    /// the equivalent of SubmissionScope's noexcept bookkeeping; test probes
+    /// without active thread bookkeeping need no action.
+    fn seal_after_callback_failure(&mut self) {}
 }
 
 impl Probe for SubmissionScope {
     fn seal(&mut self) {
+        SubmissionScope::seal(self);
+    }
+
+    fn seal_after_callback_failure(&mut self) {
+        // No runtime lock, status query or native ownership release. This
+        // removes only this handle from its thread's active capture chain.
         SubmissionScope::seal(self);
     }
 
@@ -36,6 +67,26 @@ impl Probe for SubmissionScope {
 
 pub(crate) trait Retention: 'static {
     fn observe(&self, status: Status);
+
+    /// Retire ordinary typed storage exactly as before. The observed wrapper
+    /// overrides this private engine seam to keep its SAME empty node alive
+    /// through a separately deferred payload's actual destruction.
+    fn retire_node<P: Probe>(node: Box<Node<Self, P>>)
+    where
+        Self: Sized,
+    {
+        retire_typed_node(node);
+    }
+
+    /// Default direct payload destruction; selected nested deferred owners move
+    /// cleanup into their already-prepared payload node after actual resources.
+    fn retire_original(self, cleanup: observed::OriginalRetirementCleanup)
+    where
+        Self: Sized,
+    {
+        drop(self);
+        drop(cleanup);
+    }
 }
 
 impl<T: Retention> Retention for Rc<T> {
@@ -48,13 +99,14 @@ impl Retention for Vec<safemlx::Array> {
     fn observe(&self, _: Status) {}
 }
 
-/// Work on detached token/input values has no session authority, but still
-/// retains its roots across errors and thread teardown.
-pub(crate) fn detached<T>(
-    roots: Vec<safemlx::Array>,
+/// Holds request admission independently of detached native prompt/sampler work.
+/// Unresolved native completion retains this owner after the caller returns.
+pub(crate) fn detached_retained<T, R: Retention>(
+    retention: R,
     operation: impl FnOnce() -> Result<T, crate::backend::error::Error>,
 ) -> Result<T, crate::backend::error::Error> {
-    detached_preparation(roots, operation, |error| error)
+    let recovery = Recovery::begin(retention)?;
+    detached_with_recovery(recovery, operation, |error| error)
 }
 
 /// Preserves caller-owned text/media errors alongside detached native recovery.
@@ -70,7 +122,7 @@ pub(crate) fn detached_preparation<T, E>(
     detached_with_recovery(recovery, operation, map_backend)
 }
 
-fn detached_with_recovery<T, E, R: Retention, P: Probe>(
+pub(crate) fn detached_with_recovery<T, E, R: Retention, P: Probe>(
     mut recovery: Recovery<R, P>,
     operation: impl FnOnce() -> Result<T, E>,
     map_backend: impl FnOnce(crate::backend::error::Error) -> E,
@@ -91,68 +143,256 @@ fn detached_with_recovery<T, E, R: Retention, P: Probe>(
     Ok(output)
 }
 
+// No raw owning erasure leaves this module. Every implementation is the same
+// concrete Node, including its move-only links and consuming retirement.
 trait Pending {
-    fn progress(&self) -> bool;
+    fn never_started(&self) -> bool;
+    fn progress(&self) -> Status;
     fn observe_pending(&self);
-    fn take_next(&mut self) -> Option<Box<dyn Pending>>;
-    fn set_next(&mut self, next: Option<Box<dyn Pending>>);
+    fn callback_failed(&self) -> bool;
+    fn retire_terminal(&self) -> bool;
+    fn take_next(&mut self) -> Option<PendingOwner>;
+    fn set_next(&mut self, next: Option<PendingOwner>);
+    fn retire(self: Box<Self>);
 }
 
-struct Node<T, P> {
+pub(crate) struct Node<T, P> {
+    probe: Option<P>,
+    next: Option<PendingOwner>,
+    seal_attempted: bool,
+    seal_finished: bool,
+    callback_failed: Cell<bool>,
+    // Original custody must outlive probe/native-handle destruction.
     retention: T,
-    probe: P,
-    next: Option<Box<dyn Pending>>,
+}
+
+struct CallbackHealth<'a> {
+    failed: &'a Cell<bool>,
+    already_unwinding: bool,
+}
+impl<'a> CallbackHealth<'a> {
+    fn new(failed: &'a Cell<bool>) -> Self {
+        Self {
+            failed,
+            already_unwinding: std::thread::panicking(),
+        }
+    }
+}
+impl Drop for CallbackHealth<'_> {
+    fn drop(&mut self) {
+        if !self.already_unwinding && std::thread::panicking() {
+            self.failed.set(true);
+        }
+    }
+}
+
+fn callback_blocked() -> Status {
+    // Local Rust callback unobservability, not a native failed/terminal result.
+    Status {
+        settled: false,
+        failed: false,
+        blocked: true,
+    }
+}
+
+impl<T: Retention, P: Probe> Node<T, P> {
+    fn seal(&mut self) {
+        let Some(probe) = self.probe.as_mut() else {
+            return;
+        };
+        if self.seal_finished {
+            return;
+        }
+        if self.callback_failed.get() || self.seal_attempted {
+            // The sole callback allowed after failure is the narrow, known
+            // thread-bookkeeping hook. Never retry seal/progress/observe.
+            self.seal_finished = true;
+            probe.seal_after_callback_failure();
+            return;
+        }
+        self.seal_attempted = true;
+        let _health = CallbackHealth::new(&self.callback_failed);
+        probe.seal();
+        self.seal_finished = true;
+    }
 }
 
 impl<T: Retention, P: Probe> Pending for Node<T, P> {
-    fn progress(&self) -> bool {
-        let status = self.probe.progress();
+    fn never_started(&self) -> bool {
+        self.probe.is_none()
+    }
+    fn progress(&self) -> Status {
+        let Some(probe) = self.probe.as_ref() else {
+            return callback_blocked();
+        };
+        if self.callback_failed.get() {
+            return callback_blocked();
+        }
+        let _health = CallbackHealth::new(&self.callback_failed);
+        let status = probe.progress();
         self.retention.observe(status);
-        status.settled
+        status
     }
 
     fn observe_pending(&self) {
+        let Some(probe) = self.probe.as_ref() else {
+            return;
+        };
+        if self.callback_failed.get() {
+            return;
+        }
+        let _health = CallbackHealth::new(&self.callback_failed);
         self.retention.observe(Status {
             settled: false,
-            ..self.probe.progress()
+            ..probe.progress()
         });
     }
 
-    fn take_next(&mut self) -> Option<Box<dyn Pending>> {
+    fn callback_failed(&self) -> bool {
+        self.callback_failed.get()
+    }
+
+    fn retire_terminal(&self) -> bool {
+        if self.callback_failed.get() {
+            return false;
+        }
+        let Some(probe) = &self.probe else {
+            return false;
+        };
+        let _health = CallbackHealth::new(&self.callback_failed);
+        probe.retire_terminal()
+    }
+
+    fn take_next(&mut self) -> Option<PendingOwner> {
         self.next.take()
     }
 
-    fn set_next(&mut self, next: Option<Box<dyn Pending>>) {
+    fn set_next(&mut self, next: Option<PendingOwner>) {
+        // Callers detach the old next before taking a list borrow. Only moves
+        // of the known empty slot occur here; no provider or destructor runs.
         self.next = next;
+    }
+
+    fn retire(self: Box<Self>) {
+        T::retire_node(self);
+    }
+}
+
+fn retire_typed_node<T, P>(node: Box<Node<T, P>>) {
+    let node = unbox_node(node);
+    #[cfg(test)]
+    UNBOXED.with(|count| count.set(count.get() + 1));
+    // Unchanged ordinary destruction: Box first, then P before T, while the
+    // caller's runtime guard remains held. Observed empty cleanup ends here too.
+    drop(node);
+}
+
+fn unbox_node<T, P>(node: Box<Node<T, P>>) -> Node<T, P> {
+    *node
+}
+
+struct NodeOwner<T: Retention, P: Probe>(Option<Box<Node<T, P>>>);
+impl<T: Retention, P: Probe> NodeOwner<T, P> {
+    fn into_pending(mut self) -> PendingOwner {
+        PendingOwner(Some(self.0.take().expect("live recovery node")))
+    }
+    fn node(&self) -> &Node<T, P> {
+        self.0.as_deref().expect("live recovery node")
+    }
+    fn node_mut(&mut self) -> &mut Node<T, P> {
+        self.0.as_deref_mut().expect("live recovery node")
+    }
+}
+impl<T: Retention, P: Probe> Drop for NodeOwner<T, P> {
+    fn drop(&mut self) {
+        if let Some(node) = self.0.as_deref_mut() {
+            if !node.seal_finished {
+                // A seal callback may have panicked. Do not retry it; close
+                // only the native probe's known noexcept thread bookkeeping.
+                node.seal_finished = true;
+                if let Some(probe) = node.probe.as_mut() {
+                    probe.seal_after_callback_failure();
+                }
+            }
+        }
+        if let Some(node) = self.0.take() {
+            quarantine_chain(Some(node));
+        }
+    }
+}
+
+struct PendingOwner(Option<Box<dyn Pending>>);
+impl PendingOwner {
+    fn node(&self) -> &dyn Pending {
+        self.0.as_deref().expect("live pending node")
+    }
+    fn take_next(&mut self) -> Option<Self> {
+        self.0
+            .as_deref_mut()
+            .expect("live pending node")
+            .take_next()
+    }
+    fn retire(mut self) {
+        self.0.take().expect("live pending node").retire();
+    }
+    fn retain_permanently(mut self) {
+        if let Some(node) = self.0.take() {
+            std::mem::forget(node);
+        }
+    }
+}
+impl Drop for PendingOwner {
+    fn drop(&mut self) {
+        quarantine_chain(self.0.take());
+    }
+}
+
+// The detached snapshot remains closed while any probe/callback is running.
+#[derive(Default)]
+struct PendingList(Option<PendingOwner>);
+impl PendingList {
+    fn pop(&mut self) -> Option<PendingOwner> {
+        let mut node = self.0.take()?;
+        self.0 = node.take_next();
+        Some(node)
     }
 }
 
 #[derive(Default)]
-struct Orphans(Option<Box<dyn Pending>>);
+struct Orphans(Option<PendingOwner>);
 
-fn retire(node: Box<dyn Pending>) -> Option<Box<dyn Pending>> {
+fn retire(node: PendingOwner) -> Option<PendingOwner> {
+    if node.node().callback_failed() || std::thread::panicking() {
+        return Some(node);
+    }
     let mut retained = Some(node);
     let observed = safemlx::try_with_submission_retirement(|| {
-        if retained.as_ref().expect("retained node").progress() {
-            // Keep the nonblocking runtime guard through native-handle Drop.
-            drop(retained.take());
+        let node = retained.as_ref().expect("retained node").node();
+        // A never-started prepared node submitted no scope. Its teardown is a
+        // guarded ownership release only: no probe/status/observe callback and
+        // no completion/certification inference for its independently held T.
+        if node.never_started() || (node.progress().settled && node.retire_terminal()) {
+            // The same guard covers Box deallocation, P and T destruction.
+            retained.take().expect("retained node").retire();
         }
     });
     if observed.is_none() {
-        retained.as_ref().expect("retained node").observe_pending();
+        retained
+            .as_ref()
+            .expect("retained node")
+            .node()
+            .observe_pending();
     }
     retained
 }
 
 impl Drop for Orphans {
     fn drop(&mut self) {
-        let mut next = self.0.take();
-        while let Some(mut node) = next {
-            next = node.take_next();
+        let mut pending = PendingList(self.0.take());
+        while let Some(node) = pending.pop() {
             if let Some(node) = retire(node) {
-                // Native work can outlive its submitting thread. There is no
-                // safe teardown proof, so retain it permanently at thread exit.
-                std::mem::forget(node);
+                // TLS exit has no independent completion proof for this node.
+                node.retain_permanently();
             }
         }
     }
@@ -160,25 +400,41 @@ impl Drop for Orphans {
 
 thread_local! {
     static ORPHANS: RefCell<Orphans> = RefCell::new(Orphans::default());
+    #[cfg(test)]
+    static UNBOXED: Cell<usize> = const { Cell::new(0) };
 }
 
-fn quarantine(node: Box<dyn Pending>) {
-    let mut pending = Some(node);
-    let _ = ORPHANS.try_with(|orphans| {
-        if let Ok(mut orphans) = orphans.try_borrow_mut() {
-            let mut node = pending.take().expect("one preallocated quarantine node");
-            node.set_next(orphans.0.take());
-            orphans.0 = Some(node);
+#[cfg(test)]
+pub(crate) fn test_node_unbox_count() -> usize {
+    UNBOXED.with(Cell::get)
+}
+
+// Detach links outside the queue borrow. Reentrant/TLS-unavailable insertion
+// retains each preallocated Box without callbacks or another allocation.
+fn quarantine_chain(mut pending: Option<Box<dyn Pending>>) {
+    while let Some(mut node) = pending {
+        let next = node.take_next();
+        let mut detached = Some(node);
+        let _ = ORPHANS.try_with(|orphans| {
+            if let Ok(mut orphans) = orphans.try_borrow_mut() {
+                let mut node = detached.take().expect("one detached node");
+                node.set_next(orphans.0.take());
+                orphans.0 = Some(PendingOwner(Some(node)));
+            }
+        });
+        if let Some(node) = detached {
+            std::mem::forget(node);
         }
-    });
-    if let Some(node) = pending {
-        std::mem::forget(node);
+        pending = next.and_then(|mut next| next.0.take());
     }
 }
 
 /// Advances old records without waiting or holding a reentrant list borrow.
 pub(crate) fn reap() {
-    let mut pending = ORPHANS
+    if std::thread::panicking() {
+        return;
+    }
+    let pending = ORPHANS
         .try_with(|orphans| {
             orphans
                 .try_borrow_mut()
@@ -187,16 +443,16 @@ pub(crate) fn reap() {
         })
         .ok()
         .flatten();
-    while let Some(mut node) = pending {
-        pending = node.take_next();
-        if let Some(node) = retire(node) {
-            quarantine(node);
-        }
+    let mut pending = PendingList(pending);
+    while let Some(node) = pending.pop() {
+        // Returned or unwinding ownership re-enters quarantine through its
+        // closed Drop; the remaining snapshot stays separately armed.
+        drop(retire(node));
     }
 }
 
 pub(crate) struct Recovery<T: Retention, P: Probe = SubmissionScope> {
-    node: Option<Box<Node<T, P>>>,
+    node: Option<NodeOwner<T, P>>,
 }
 
 impl<T: Retention, P: Probe> std::fmt::Debug for Recovery<T, P> {
@@ -205,7 +461,79 @@ impl<T: Retention, P: Probe> std::fmt::Debug for Recovery<T, P> {
     }
 }
 
+/// The unchanged supplied owner from a failed scope attempt.
+///
+/// This is no native scope or completion proof. Keeping the error preserves its
+/// resources; dropping it releases only this supplied owner, which must already
+/// have independent custody for any work predating the attempted scope.
+#[must_use = "the failed attempt still owns its supplied resources"]
+pub(crate) struct RecoveryBeginError<T: Retention> {
+    retention: T,
+    cause: SubmissionScopeBeginError,
+}
+
+impl<T: Retention> RecoveryBeginError<T> {
+    pub fn cause(&self) -> &SubmissionScopeBeginError {
+        &self.cause
+    }
+
+    pub fn retention(&self) -> &T {
+        &self.retention
+    }
+
+    pub fn into_parts(self) -> (T, SubmissionScopeBeginError) {
+        (self.retention, self.cause)
+    }
+}
+
+impl<T: Retention> std::fmt::Debug for RecoveryBeginError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecoveryBeginError")
+            .field("cause", &self.cause)
+            .finish_non_exhaustive()
+    }
+}
+impl<T: Retention> std::fmt::Display for RecoveryBeginError<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("native recovery scope could not be entered; supplied resources remain owned")
+    }
+}
+impl<T: Retention> std::error::Error for RecoveryBeginError<T> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.cause)
+    }
+}
+
 impl<T: Retention> Recovery<T> {
+    /// Configure the same accepted empty scope while its recovery is owned.
+    /// Refusal leaves the caller's recovery intact for normal terminal cleanup.
+    pub(crate) fn configure_scope<E>(
+        &mut self,
+        configure: impl FnOnce(&mut SubmissionScope) -> Result<(), E>,
+    ) -> Result<(), E> {
+        self.configure_scope_with_retention(|scope, _| configure(scope))
+    }
+
+    /// Borrow immutable retained source proof while configuring this same Scope.
+    pub(crate) fn configure_scope_with_retention<R, E>(
+        &mut self,
+        configure: impl FnOnce(&mut SubmissionScope, &T) -> Result<R, E>,
+    ) -> Result<R, E> {
+        let node = self.node.as_mut().expect("live recovery").node_mut();
+        configure(node.probe.as_mut().expect("accepted scope"), &node.retention)
+    }
+
+    /// Try once without housekeeping registration, reaping or native progress.
+    /// Failure returns the exact supplied owner by move. Success allocates the
+    /// ordinary quarantine node and uses its existing nonblocking Drop; callers
+    /// must arrange the existing explicit/ordinary reaper independently.
+    pub fn try_begin(retention: T) -> Result<Self, RecoveryBeginError<T>> {
+        match SubmissionScope::try_begin() {
+            Ok(scope) => Ok(Self::with_probe(retention, scope)),
+            Err(cause) => Err(RecoveryBeginError { retention, cause }),
+        }
+    }
+
     pub fn begin(retention: T) -> Result<Self, Exception> {
         // Registration may allocate, so do it before this scope accepts work.
         // Retirement itself neither registers hooks nor grows a container.
@@ -217,20 +545,33 @@ impl<T: Retention> Recovery<T> {
 
 impl<T: Retention, P: Probe> Recovery<T, P> {
     pub fn retention(&self) -> &T {
-        &self.node.as_ref().expect("live recovery scope").retention
+        &self
+            .node
+            .as_ref()
+            .expect("live recovery scope")
+            .node()
+            .retention
     }
 
     pub fn retention_mut(&mut self) -> &mut T {
-        &mut self.node.as_mut().expect("live recovery scope").retention
+        &mut self
+            .node
+            .as_mut()
+            .expect("live recovery scope")
+            .node_mut()
+            .retention
     }
 
     pub fn with_probe(retention: T, probe: P) -> Self {
         Self {
-            node: Some(Box::new(Node {
-                retention,
-                probe,
+            node: Some(NodeOwner(Some(Box::new(Node {
+                probe: Some(probe),
                 next: None,
-            })),
+                seal_attempted: false,
+                seal_finished: false,
+                callback_failed: Cell::new(false),
+                retention,
+            })))),
         }
     }
 
@@ -238,29 +579,85 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
         self.node
             .as_mut()
             .expect("live recovery scope")
-            .probe
+            .node_mut()
             .seal();
     }
 
+    /// Abandonment still closes native thread capture, but never retries a
+    /// failed callback or observes completion while the caller is unwinding.
+    pub(crate) fn observe_abandonment(&mut self) -> Option<Status> {
+        self.seal();
+        if std::thread::panicking()
+            || self
+                .node
+                .as_ref()
+                .expect("live recovery scope")
+                .node()
+                .callback_failed
+                .get()
+        {
+            None
+        } else {
+            Some(self.progress())
+        }
+    }
+
     pub fn progress(&self) -> Status {
-        let node = self.node.as_ref().expect("live recovery scope");
-        safemlx::try_with_submission_retirement(|| {
-            let status = node.probe.progress();
-            node.retention.observe(status);
-            status
-        })
-        .unwrap_or_else(|| {
-            // Native terminal evidence alone does not permit a potentially
-            // locking payload destructor while another thread owns the runtime.
+        let node = self.node.as_ref().expect("live recovery scope").node();
+        if node.callback_failed.get() {
+            return callback_blocked();
+        }
+        safemlx::try_with_submission_retirement(|| node.progress()).unwrap_or_else(|| {
+            let _health = CallbackHealth::new(&node.callback_failed);
             let status = Status {
                 settled: false,
-                ..node.probe.progress()
+                ..node
+                    .probe
+                    .as_ref()
+                    .expect("active recovery probe")
+                    .progress()
             };
-            // Failure remains observable while native destruction is deferred.
-            // A nonterminal observation must retain every native resource.
             node.retention.observe(status);
             status
         })
+    }
+
+    /// Checked per-node requested layout and named construction/retirement
+    /// controls. This is not a total original-account population bound and
+    /// excludes native Scope/record allocations and dynamic children of T/P.
+    pub(crate) fn node_control_bytes() -> Option<u64> {
+        let bytes = [
+            size_of::<Node<T, P>>(), // existing single Box payload
+            size_of::<Node<T, P>>(), // construction aggregate
+            size_of::<Node<T, P>>(), // Box::new argument
+            size_of::<Node<T, P>>(), // concrete unbox return
+            size_of::<Node<T, P>>(), // payload destruction argument
+            size_of::<T>(),
+            size_of::<P>(), // with_probe arguments
+            size_of::<Recovery<T, P>>(),
+            size_of::<Option<Recovery<T, P>>>(), // completion extraction return
+            size_of::<&RefCell<Option<Recovery<T, P>>>>(), // extraction argument
+            size_of::<NodeOwner<T, P>>(),
+            size_of::<Option<NodeOwner<T, P>>>(),
+            size_of::<Option<Box<Node<T, P>>>>(),
+            size_of::<Box<Node<T, P>>>(),
+            size_of::<PendingOwner>(),
+            size_of::<Option<PendingOwner>>(),
+            size_of::<Option<Box<dyn Pending>>>(),
+            size_of::<Box<dyn Pending>>(),
+            size_of::<PendingList>(),
+            size_of::<CallbackHealth<'_>>(),
+            size_of::<bool>(),         // exact-owner terminal retirement result
+            size_of::<&P>(),           // terminal retirement callback receiver
+            size_of::<&dyn Pending>(), // guarded pending retirement receiver
+            size_of::<Status>(),
+            size_of::<Option<Status>>(),
+            size_of::<&mut Option<PendingOwner>>(), // guarded-retire capture
+            size_of::<&Node<T, P>>(),               // guarded-progress capture
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)?;
+        u64::try_from(bytes).ok()
     }
 
     /// Waits for successful work to settle, returning immediately on failure.
@@ -280,9 +677,23 @@ impl<T: Retention, P: Probe> Recovery<T, P> {
     pub fn finish(mut self) -> Status {
         loop {
             let status = safemlx::try_with_submission_retirement(|| {
-                let status = self.progress();
+                let mut status = self.progress();
                 if status.settled {
-                    drop(self.node.take());
+                    if self
+                        .node
+                        .as_ref()
+                        .expect("live recovery scope")
+                        .node()
+                        .retire_terminal()
+                    {
+                        self.node
+                            .take()
+                            .expect("live recovery scope")
+                            .into_pending()
+                            .retire();
+                    } else {
+                        status.settled = false;
+                    }
                 }
                 status
             })
@@ -318,10 +729,10 @@ pub(crate) fn wait_for_retirement(mut complete: impl FnMut() -> bool) {
 impl<T: Retention, P: Probe> Drop for Recovery<T, P> {
     fn drop(&mut self) {
         if let Some(mut node) = self.node.take() {
-            node.probe.seal();
-            if let Some(node) = retire(node) {
-                quarantine(node);
-            }
+            // The typed owner is armed before sealing. Its Drop preserves the
+            // same Box if sealing panics before erasure or guard acquisition.
+            node.node_mut().seal();
+            drop(retire(node.into_pending()));
         }
     }
 }
@@ -593,3 +1004,13 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "submission_recovery/try_begin_tests.rs"]
+mod try_begin_tests;
+
+#[cfg(test)]
+#[path = "submission_recovery/owner_tests.rs"]
+mod owner_tests;
+
+pub(crate) mod addressable;

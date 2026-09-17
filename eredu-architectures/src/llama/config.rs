@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_core::cache::derive_prompt_cache_architecture_fingerprint;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_gguf::MetadataValue;
 use eredu_nn::RotarySpec;
@@ -110,6 +109,13 @@ impl ModelArgs {
         validate_model_args(self)
     }
 
+    pub(crate) fn validate_with_diagnostic<E>(
+        &self,
+        invalid: impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
+        validate_model_args_with(self, &invalid)
+    }
+
     /// Returns the model-wide checkpoint encoding, if packed.
     pub fn weight_quantization(&self) -> Option<WeightQuantization> {
         self.quantization
@@ -133,6 +139,77 @@ impl ModelArgs {
 }
 
 impl Config for ModelArgs {
+    fn weight_quantization_with_metadata(
+        &self,
+        name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<WeightQuantization>, eredu_nn::Error> {
+        Ok(self.weight_quantization_for(name))
+    }
+
+    fn linear_format_with_metadata(
+        &self,
+        name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        Ok(self.linear_format(name))
+    }
+
+    fn parameter_alias_with_metadata(
+        &self,
+        _name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn block_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn attention_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn feed_forward_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn rotary_spec_with_metadata(
+        &self,
+        dimensions: i32,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<RotarySpec, eredu_nn::Error> {
+        Ok(RotarySpec {
+            arithmetic: eredu_nn::RotaryArithmetic::Native,
+            dimensions,
+            base: self.rope_theta,
+            traditional: self.rope_traditional,
+            algorithm: crate::rotary::normalize_algorithm_with(
+                self.rope_scaling.as_ref(),
+                |args| context.metadata_error(args),
+            )?,
+        })
+    }
+
+    fn attention_value_format_with_metadata(
+        &self,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        crate::decoder::parameter_metadata::default_attention_value_format_with_metadata(
+            self, layer, context,
+        )
+    }
+
     fn model_family(&self) -> &'static str {
         "llama"
     }
@@ -142,8 +219,23 @@ impl Config for ModelArgs {
     fn architecture_fingerprint(&self) -> String {
         prompt_cache_architecture_fingerprint(self)
     }
+    fn architecture_fingerprint_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<String, eredu_nn::Error> {
+        prompt_cache_architecture_fingerprint_with_metadata(
+            self,
+            crate::decoder::identity::Metadata::new(Some(context)),
+        )
+    }
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
         self.validate().map_err(eredu_nn::Error::backend)
+    }
+    fn validate_config_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), eredu_nn::Error> {
+        self.validate_with_diagnostic(|text| context.metadata_error(text))
     }
     fn hidden_size(&self) -> i32 {
         self.hidden_size
@@ -473,8 +565,15 @@ fn normalize_hf_sliding_window(value: Option<Value>) -> Result<Option<u32>, Conf
 }
 
 fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
+    validate_model_args_with(args, &|text| invalid(text.to_string()))
+}
+
+fn validate_model_args_with<E>(
+    args: &ModelArgs,
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     if !matches!(args.model_type.as_str(), "llama" | "mistral") {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "unsupported model type {:?}",
             args.model_type
         )));
@@ -490,11 +589,13 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
         ("head_dim", args.head_dim),
     ] {
         if value <= 0 {
-            return Err(invalid(format!("{name} must be positive, got {value}")));
+            return Err(invalid(format_args!(
+                "{name} must be positive, got {value}"
+            )));
         }
     }
     if args.num_attention_heads % args.num_key_value_heads != 0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
             args.num_attention_heads, args.num_key_value_heads
         )));
@@ -504,106 +605,166 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
         ("key/value projection", args.num_key_value_heads),
     ] {
         heads.checked_mul(args.head_dim).ok_or_else(|| {
-            invalid(format!(
+            invalid(format_args!(
                 "{name} width overflows i32: {heads} heads x head_dim {}",
                 args.head_dim
             ))
         })?;
     }
     if args.attention_schedule.len() != args.num_hidden_layers as usize {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "Llama attention schedule has {} layers, expected {}",
             args.attention_schedule.len(),
             args.num_hidden_layers
         )));
     }
     if let Some(config) = &args.rope_scaling {
-        validate_rope_scaling(config)?;
+        validate_rope_scaling_with(config, invalid)?;
     }
     Ok(())
 }
 
-fn validate_rope_scaling(config: &HashMap<String, RopeValue>) -> Result<(), ConfigError> {
-    crate::rotary::normalize_algorithm(Some(config))
-        .map(|_| ())
-        .map_err(invalid)
+fn validate_rope_scaling_with<E>(
+    config: &HashMap<String, RopeValue>,
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
+    crate::rotary::normalize_algorithm_with(Some(config), invalid).map(|_| ())
 }
 
 /// Returns the stable cache-compatibility fingerprint for this configuration.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    let rope_scaling = args.rope_scaling.as_ref().map_or_else(
-        || "none".to_string(),
-        |config| {
-            let mut entries = config.iter().collect::<Vec<_>>();
+    prompt_cache_architecture_fingerprint_with_metadata(
+        args,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary fingerprint formatting is infallible")
+}
+
+fn prompt_cache_architecture_fingerprint_with_metadata(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    let rope_scaling = match &args.rope_scaling {
+        None => metadata.text("none")?,
+        Some(config) => {
+            let mut entries = metadata.vector(config.len())?;
+            entries.extend(config.iter());
             entries.sort_unstable_by_key(|(key, _)| key.as_str());
-            entries
-                .into_iter()
-                .map(|(key, value)| {
-                    let value = match value {
-                        RopeValue::Float(value) => format!("f32:{:08x}", value.to_bits()),
-                        RopeValue::String(value) => format!("string:{value}"),
-                        RopeValue::Bool(value) => format!("bool:{value}"),
-                    };
-                    format!("{key}={value}")
-                })
-                .collect::<Vec<_>>()
-                .join(";")
-        },
-    );
-    let mut quantized_weights = args
-        .quantized_weights
-        .as_ref()
-        .map(|weights| weights.iter().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
+            let mut values = metadata.vector(entries.len())?;
+            for (key, value) in entries {
+                values.push(match value {
+                    RopeValue::Float(value) => {
+                        metadata.format(format_args!("{key}=f32:{:08x}", value.to_bits()))?
+                    }
+                    RopeValue::String(value) => {
+                        metadata.format(format_args!("{key}=string:{value}"))?
+                    }
+                    RopeValue::Bool(value) => {
+                        metadata.format(format_args!("{key}=bool:{value}"))?
+                    }
+                });
+            }
+            metadata.join(&values, ";")?
+        }
+    };
+    let mut quantized_weights = metadata.vector(
+        args.quantized_weights
+            .as_ref()
+            .map_or(0, |weights| weights.len()),
+    )?;
+    if let Some(weights) = &args.quantized_weights {
+        quantized_weights.extend(weights.iter());
+    }
     quantized_weights.sort_unstable();
-    let mut quantized_weight_configs = args
-        .quantized_weight_configs
-        .as_ref()
-        .map(|configs| {
-            configs
-                .iter()
-                .map(|(name, config)| format!("{name}={config:?}"))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut quantized_weight_configs = metadata.vector(
+        args.quantized_weight_configs
+            .as_ref()
+            .map_or(0, |configs| configs.len()),
+    )?;
+    if let Some(configs) = &args.quantized_weight_configs {
+        for (name, config) in configs {
+            quantized_weight_configs.push(metadata.format(format_args!("{name}={config:?}"))?);
+        }
+    }
     quantized_weight_configs.sort_unstable();
-    derive_prompt_cache_architecture_fingerprint(
-        "llama",
-        [
-            ("model_type", args.model_type.clone()),
-            ("hidden_size", args.hidden_size.to_string()),
-            ("num_hidden_layers", args.num_hidden_layers.to_string()),
-            ("intermediate_size", args.intermediate_size.to_string()),
-            ("num_attention_heads", args.num_attention_heads.to_string()),
-            ("num_key_value_heads", args.num_key_value_heads.to_string()),
-            ("head_dim", args.head_dim.to_string()),
+    metadata.fingerprint("llama", || {
+        Ok([
+            ("model_type", metadata.text(&args.model_type)?),
+            (
+                "hidden_size",
+                metadata.format(format_args!("{}", args.hidden_size))?,
+            ),
+            (
+                "num_hidden_layers",
+                metadata.format(format_args!("{}", args.num_hidden_layers))?,
+            ),
+            (
+                "intermediate_size",
+                metadata.format(format_args!("{}", args.intermediate_size))?,
+            ),
+            (
+                "num_attention_heads",
+                metadata.format(format_args!("{}", args.num_attention_heads))?,
+            ),
+            (
+                "num_key_value_heads",
+                metadata.format(format_args!("{}", args.num_key_value_heads))?,
+            ),
+            (
+                "head_dim",
+                metadata.format(format_args!("{}", args.head_dim))?,
+            ),
             (
                 "rms_norm_eps",
-                format!("{:08x}", args.rms_norm_eps.to_bits()),
+                metadata.format(format_args!("{:08x}", args.rms_norm_eps.to_bits()))?,
             ),
-            ("vocab_size", args.vocab_size.to_string()),
+            (
+                "vocab_size",
+                metadata.format(format_args!("{}", args.vocab_size))?,
+            ),
             (
                 "max_position_embeddings",
-                args.max_position_embeddings.to_string(),
+                metadata.format(format_args!("{}", args.max_position_embeddings))?,
             ),
-            ("rope_theta", format!("{:08x}", args.rope_theta.to_bits())),
-            ("rope_traditional", args.rope_traditional.to_string()),
+            (
+                "rope_theta",
+                metadata.format(format_args!("{:08x}", args.rope_theta.to_bits()))?,
+            ),
+            (
+                "rope_traditional",
+                metadata.format(format_args!("{}", args.rope_traditional))?,
+            ),
             ("rope_scaling", rope_scaling),
             (
                 "attention_schedule",
-                args.attention_schedule.fingerprint_component(),
+                metadata.format(format_args!(
+                    "{}",
+                    args.attention_schedule.display_fingerprint_component()
+                ))?,
             ),
-            ("tie_word_embeddings", args.tie_word_embeddings.to_string()),
-            ("attention_bias", args.attention_bias.to_string()),
-            ("mlp_bias", args.mlp_bias.to_string()),
-            ("quantization", format!("{:?}", args.weight_quantization())),
-            ("quantized_weights", quantized_weights.join(";")),
+            (
+                "tie_word_embeddings",
+                metadata.format(format_args!("{}", args.tie_word_embeddings))?,
+            ),
+            (
+                "attention_bias",
+                metadata.format(format_args!("{}", args.attention_bias))?,
+            ),
+            (
+                "mlp_bias",
+                metadata.format(format_args!("{}", args.mlp_bias))?,
+            ),
+            (
+                "quantization",
+                metadata.format(format_args!("{:?}", args.weight_quantization()))?,
+            ),
+            ("quantized_weights", metadata.join(&quantized_weights, ";")?),
             (
                 "quantized_weight_configs",
-                quantized_weight_configs.join(";"),
+                metadata.join(&quantized_weight_configs, ";")?,
             ),
-        ],
-    )
+        ])
+    })
 }
 
 fn invalid(message: impl Into<String>) -> ConfigError {

@@ -1,27 +1,81 @@
 //! Per-unit ownership spanning eager execution and event publication.
 
 use super::*;
+use crate::backend::submission_recovery::observed::{
+    operation::OperationRecovery, FinishRetainingError, Observation, ObservedRecovery,
+};
 use crate::backend::{
     ordinary_retirement::OrdinaryRetirement,
     submission_recovery::{Probe, Recovery, Retention, Status},
 };
+use eredu_runtime::working_memory::OriginalOperationMetadataCustody;
 use std::cell::Cell;
+type UnitRecovery<U> = OperationRecovery<UnitRetention<U>, OriginalOperationMetadataCustody>;
 
 struct UnitResources<U> {
     unit: MlxModule<U>,
     _transfer: MlxUnitTransfer,
 }
 
+// The independently prepared payload node may outlive the native recovery node.
+// Its original custody therefore follows its actual module/manager resources.
+struct UnitResourcesSlot<U> {
+    value: Option<UnitResources<U>>,
+    // The same native recovery node retires only after actual resource Drop.
+    cleanup: Option<crate::backend::submission_recovery::observed::OriginalRetirementCleanup>,
+    _custody: Option<eredu_runtime::working_memory::OriginalOperationMetadataCustody>,
+}
+
 struct UnitRetention<U: 'static> {
-    resources: OrdinaryRetirement<UnitResources<U>>,
-    event: Option<Event>,
+    resources: Option<OrdinaryRetirement<UnitResourcesSlot<U>>>,
+    event: Option<OperationEvent>,
     failed: Cell<bool>,
 }
+
+impl<U: 'static> UnitRetention<U> {
+    fn resources(&self) -> &UnitResources<U> {
+        self.resources
+            .as_ref()
+            .expect("unit payload node")
+            .value
+            .as_ref()
+            .expect("populated unit payload")
+    }
+    fn resources_mut(&mut self) -> &mut UnitResources<U> {
+        self.resources
+            .as_mut()
+            .expect("unit payload node")
+            .value
+            .as_mut()
+            .expect("populated unit payload")
+    }
+}
+
+mod prepared;
+pub(crate) use prepared::PreparedUnit;
 
 impl<U: 'static> Retention for UnitRetention<U> {
     fn observe(&self, status: Status) {
         if status.failed || status.blocked {
             self.failed.set(true);
+        }
+    }
+
+    fn retire_original(
+        mut self,
+        cleanup: crate::backend::submission_recovery::observed::OriginalRetirementCleanup,
+    ) {
+        if let Some(mut resources) = self.resources.take() {
+            // Terminal native observation permits staging this exact payload.
+            // Its existing retirement Box still postpones manager/module Drop
+            // until an unlocked host boundary. Keep the SAME cleanup node in
+            // that payload through destruction and any native wrapper deferral.
+            debug_assert!(resources.cleanup.is_none());
+            resources.cleanup = Some(cleanup);
+            drop(resources);
+        } else {
+            drop(self);
+            drop(cleanup);
         }
     }
 }
@@ -32,31 +86,54 @@ impl<U: 'static> Retention for UnitRetention<U> {
 /// the unit and residency ownership until terminal evidence; final module and
 /// manager-lease destruction runs only at an ordinary unlocked host entry.
 pub struct MlxUnitLease<U: 'static> {
-    recovery: Recovery<UnitRetention<U>>,
+    recovery: UnitRecovery<U>,
 }
 
 impl<U: 'static> MlxUnitLease<U> {
     pub(super) fn new(unit: MlxModule<U>, transfer: MlxUnitTransfer) -> Result<Self, Error> {
         Ok(Self {
-            recovery: Recovery::begin(UnitRetention {
-                resources: OrdinaryRetirement::new(UnitResources {
-                    unit,
-                    _transfer: transfer,
-                }),
+            recovery: OperationRecovery::ordinary(Recovery::begin(UnitRetention {
+                resources: Some(OrdinaryRetirement::new(UnitResourcesSlot {
+                    value: Some(UnitResources {
+                        unit,
+                        _transfer: transfer,
+                    }),
+                    cleanup: None,
+                    _custody: None,
+                })),
                 event: None,
                 failed: Cell::new(false),
-            })?,
+            })?),
         })
     }
 
-    pub(super) fn submitted(&mut self, event: Event) -> Result<(), Error> {
+    /// The selected request bank supplies both final nodes and an observer
+    /// authenticated before unit construction. This constructor only moves.
+    pub(super) fn from_prepared(
+        prepared: PreparedUnit<U>,
+        unit: MlxModule<U>,
+        transfer: MlxUnitTransfer,
+        observer: safemlx::OriginalScopeObserver,
+    ) -> Self {
+        Self {
+            recovery: OperationRecovery::Original(prepared.activate(unit, transfer, observer)),
+        }
+    }
+
+    /// Borrows the retained original role for an explicit native producer.
+    /// An escaped lease cannot select an ordinary producer from current TLS.
+    pub(super) fn original_observer(&self) -> Option<&safemlx::OriginalScopeObserver> {
+        self.recovery.original_observer()
+    }
+
+    pub(super) fn submitted(&mut self, event: OperationEvent) -> Result<(), Error> {
         self.recovery.retention_mut().event = Some(event);
         self.recovery.seal();
         self.check_status().map(|_| ())
     }
 
     pub(super) fn population_parts(&mut self) -> (&mut MlxModule<U>, &ResidentUnitLease) {
-        let resources = &mut *self.recovery.retention_mut().resources;
+        let resources = self.recovery.retention_mut().resources_mut();
         let lease = match &resources._transfer {
             MlxUnitTransfer::Ordinary { _transfer } => &_transfer.leases()[0],
             MlxUnitTransfer::Dense { _transfer } => _transfer.lease(),
@@ -65,31 +142,158 @@ impl<U: 'static> MlxUnitLease<U> {
     }
 
     fn check_status(&self) -> Result<bool, Error> {
-        unit_status(&self.recovery)
+        match &self.recovery {
+            OperationRecovery::Ordinary(value) => unit_status(value),
+            OperationRecovery::Original(value) => original_unit_status(value, value.progress()?),
+        }
     }
 
     pub(super) fn is_complete(&self) -> Result<bool, Error> {
-        unit_is_complete(&self.recovery)
+        match &self.recovery {
+            OperationRecovery::Ordinary(value) => unit_is_complete(value),
+            OperationRecovery::Original(value) => safemlx::try_with_submission_retirement(|| {
+                let observed = value.progress()?;
+                if observed.outcome == safemlx::ScopedSubmissionProgress::Busy {
+                    return Ok(false);
+                }
+                if !original_unit_status(value, observed)? {
+                    return Ok(false);
+                }
+                value
+                    .retention()
+                    .event
+                    .as_ref()
+                    .expect("submitted original unit retains its event")
+                    .is_complete()
+                    .map_err(Into::into)
+            })
+            .unwrap_or(Ok(false)),
+        }
     }
 
     pub(super) fn wait(&self) -> Result<(), Error> {
-        wait_for_unit(&self.recovery)
+        match &self.recovery {
+            OperationRecovery::Ordinary(value) => wait_for_unit(value),
+            OperationRecovery::Original(value) => {
+                // Only observed pending native work is retried by wait. Fixed
+                // Busy/funded/unknown outcomes return with original custody held.
+                if !original_unit_status(value, value.wait()?)? {
+                    return Err(Error::PrefillScopeUnavailable);
+                }
+                value
+                    .retention()
+                    .event
+                    .as_ref()
+                    .expect("submitted original unit retains its event")
+                    .synchronize()
+                    .map_err(Into::into)
+            }
+        }
     }
 
-    pub(super) fn finish(mut self) -> Result<(), Error> {
+    /// Complete the actual borrowed unit under its retained original observer.
+    /// Failure leaves its existing recovery/payload node armed. A successful
+    /// callback still passes the common terminal-observation and unlocked
+    /// retirement path; no polling failure is interpreted as completion.
+    pub(super) fn complete_original(
+        mut self,
+        complete: impl FnOnce(&U, &safemlx::OriginalScopeObserver) -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let observer = self.recovery.original_observer()
+            .ok_or(Error::PrefillScopeUnavailable)?;
+        complete(&self.recovery.retention().resources().unit.inner, observer)?;
+        self.recovery.seal();
+        self.finish_retired()
+    }
+
+    pub(super) fn finish(self) -> Result<(), Error> {
         self.wait()?;
-        match &mut self.recovery.retention_mut().resources._transfer {
+        self.finish_retired()
+    }
+
+    fn finish_retired(mut self) -> Result<(), Error> {
+        match &mut self.recovery.retention_mut().resources_mut()._transfer {
             MlxUnitTransfer::Ordinary { _transfer } => _transfer.synchronize()?,
             MlxUnitTransfer::Dense { _transfer } => _transfer.synchronize()?,
         }
-        let status = self.recovery.finish();
-        if status.failed || status.blocked {
-            return Err(Error::ArchitectureModel(
-                "native execution-unit retirement failed".into(),
-            ));
+        match self.recovery {
+            OperationRecovery::Ordinary(value) => {
+                let status = value.finish();
+                if status.failed || status.blocked {
+                    return Err(Error::ArchitectureModel(
+                        "native execution-unit retirement failed".into(),
+                    ));
+                }
+                Ok(())
+            }
+            OperationRecovery::Original(value) => {
+                let completed = value.finish_retaining().map_err(finish_error)?;
+                completed
+                    .release_with(release_unit_payload::<U> as fn(&mut UnitRetention<U>))
+                    .map(|_| ())
+                    .map_err(|error| {
+                        let cause = finish_error(error.cause);
+                        // Abandoned handoff puts T back in the SAME node. Its
+                        // original retirement hook preserves the payload cleanup.
+                        drop(error.callback);
+                        drop(error.pending);
+                        cause
+                    })
+            }
         }
-        Ok(())
     }
+}
+
+fn release_unit_payload<U: 'static>(retention: &mut UnitRetention<U>) {
+    // release_with established an unlocked host boundary. Consume this exact
+    // final payload node now; no global queue pass or replacement allocation.
+    if let Some(resources) = retention.resources.take() {
+        let mut slot = resources.into_inner();
+        if let Some(UnitResources { unit, _transfer }) = slot.value.take() {
+            // Native completion was established before release_with. Drop the
+            // module first, then retire this transfer's exact application pins;
+            // a global ordinary queue sweep would also touch unrelated owners.
+            drop(unit);
+            match _transfer {
+                MlxUnitTransfer::Ordinary { _transfer } => {
+                    _transfer.retire_completed_original();
+                }
+                MlxUnitTransfer::Dense { _transfer } => {
+                    _transfer.retire_completed_original();
+                }
+            }
+        }
+        drop(slot);
+    }
+}
+
+fn finish_error(cause: FinishRetainingError<safemlx::error::Exception>) -> Error {
+    match cause {
+        FinishRetainingError::Native(cause) => cause.into(),
+        // Native observers translate fixed/retained causes before consumption.
+        // This fallback fences an unavailable observation without new strings.
+        FinishRetainingError::Observation(_) => Error::PrefillScopeUnavailable,
+    }
+}
+
+fn original_unit_status<U: 'static>(
+    recovery: &ObservedRecovery<UnitRetention<U>, OriginalOperationMetadataCustody>,
+    observed: Observation,
+) -> Result<bool, Error> {
+    if let Some(cause) = recovery.observer().observation_error(observed.outcome) {
+        return Err(cause.into());
+    }
+    if recovery.retention().failed.get() || observed.status.failed || observed.status.blocked {
+        if let Some(cause) = recovery.observer().retained_failure().or_else(|| {
+            recovery
+                .observer()
+                .observation_error(safemlx::ScopedSubmissionProgress::Unobservable)
+        }) {
+            return Err(cause.into());
+        }
+        return Err(Error::PrefillScopeUnavailable);
+    }
+    Ok(observed.status.settled)
 }
 
 fn unit_status<U: 'static, P: Probe>(
@@ -138,13 +342,13 @@ impl<U: 'static> std::ops::Deref for MlxUnitLease<U> {
     type Target = U;
 
     fn deref(&self) -> &Self::Target {
-        &self.recovery.retention().resources.unit.inner
+        &self.recovery.retention().resources().unit.inner
     }
 }
 
 impl<U: 'static> std::ops::DerefMut for MlxUnitLease<U> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.recovery.retention_mut().resources.unit.inner
+        &mut self.recovery.retention_mut().resources_mut().unit.inner
     }
 }
 
@@ -195,7 +399,11 @@ mod tests {
         let terminal = Arc::new(AtomicBool::new(false));
         let recovery = Recovery::with_probe(
             UnitRetention {
-                resources: OrdinaryRetirement::new(resources(&drops)),
+                resources: Some(OrdinaryRetirement::new(UnitResourcesSlot {
+                    value: Some(resources(&drops)),
+                    cleanup: None,
+                    _custody: None,
+                })),
                 event: None,
                 failed: Cell::new(false),
             },
@@ -239,7 +447,7 @@ mod tests {
         let array = safemlx::Array::from_slice(&[1.0f32], &[1])
             .square(&stream)
             .unwrap();
-        let event = async_eval_with_event([&array]).unwrap();
+        let event = async_eval_with_operation_event([&array]).unwrap();
         lease.submitted(event).unwrap();
         let (ready_tx, ready_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();

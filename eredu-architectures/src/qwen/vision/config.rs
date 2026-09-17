@@ -7,30 +7,78 @@ use eredu_core::attention::LayerSchedule;
 use eredu_gguf::{MetadataArray, MetadataValue};
 use serde::Deserialize;
 
+mod validation;
+
 /// Stable cache identity for the complete shared vision policy and parameter formats.
 pub fn prompt_cache_architecture_fingerprint(config: &VisionConfig) -> String {
-    eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
-        "qwen_vision",
-        [
-            ("mode", format!("{:?}", config.mode)),
-            ("schedule", config.layer_schedule_fingerprint()),
-            ("hidden", config.hidden_size.to_string()),
-            ("activation", config.hidden_act.clone()),
-            ("intermediate", config.intermediate_size.to_string()),
-            ("heads", config.num_heads.to_string()),
-            ("positions", config.num_position_embeddings.to_string()),
-            ("channels", config.in_channels.to_string()),
-            ("patch", config.patch_size.to_string()),
-            ("spatial_merge", config.spatial_merge_size.to_string()),
-            ("temporal_patch", config.temporal_patch_size.to_string()),
-            ("window", config.window_size.to_string()),
-            ("output", config.out_hidden_size.to_string()),
+    prompt_cache_architecture_fingerprint_with_metadata(
+        config,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary vision fingerprint formatting is infallible")
+}
+
+pub(crate) fn prompt_cache_architecture_fingerprint_with_metadata(
+    config: &VisionConfig,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    metadata.fingerprint("qwen_vision", || {
+        Ok([
+            ("mode", metadata.format(format_args!("{:?}", config.mode))?),
+            (
+                "schedule",
+                config.layer_schedule_fingerprint_with_metadata(metadata)?,
+            ),
+            (
+                "hidden",
+                metadata.format(format_args!("{}", config.hidden_size))?,
+            ),
+            ("activation", metadata.text(&config.hidden_act)?),
+            (
+                "intermediate",
+                metadata.format(format_args!("{}", config.intermediate_size))?,
+            ),
+            (
+                "heads",
+                metadata.format(format_args!("{}", config.num_heads))?,
+            ),
+            (
+                "positions",
+                metadata.format(format_args!("{}", config.num_position_embeddings))?,
+            ),
+            (
+                "channels",
+                metadata.format(format_args!("{}", config.in_channels))?,
+            ),
+            (
+                "patch",
+                metadata.format(format_args!("{}", config.patch_size))?,
+            ),
+            (
+                "spatial_merge",
+                metadata.format(format_args!("{}", config.spatial_merge_size))?,
+            ),
+            (
+                "temporal_patch",
+                metadata.format(format_args!("{}", config.temporal_patch_size))?,
+            ),
+            (
+                "window",
+                metadata.format(format_args!("{}", config.window_size))?,
+            ),
+            (
+                "output",
+                metadata.format(format_args!("{}", config.out_hidden_size))?,
+            ),
             (
                 "linear_formats",
-                crate::cache_identity::debug_map(Some(&config.linear_formats)),
+                crate::cache_identity::debug_map_with_metadata(
+                    Some(&config.linear_formats),
+                    metadata,
+                )?,
             ),
-        ],
-    )
+        ])
+    })
 }
 
 /// Attention topology for one vision transformer block.
@@ -137,36 +185,55 @@ impl VisionConfig {
 
     /// Stable execution identity used by diagnostics and prompt fingerprints.
     pub fn layer_schedule_fingerprint(&self) -> String {
+        self.layer_schedule_fingerprint_with_metadata(crate::decoder::identity::Metadata::new(None))
+            .expect("ordinary vision schedule formatting is infallible")
+    }
+
+    fn layer_schedule_fingerprint_with_metadata(
+        &self,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<String, eredu_nn::Error> {
+        metadata.controls::<(&Self, String, Vec<String>)>()?;
         let mode = match self.mode {
             VisionMode::DeepStack => "deepstack",
             VisionMode::WindowScheduled => "window_scheduled",
         };
-        let schedule = self
-            .layer_schedule
-            .iter()
-            .map(|policy| {
-                let attention = match policy.attention {
-                    VisionAttentionPolicy::Full => "f",
-                    VisionAttentionPolicy::Windowed => "w",
-                };
-                policy.deepstack_merger.map_or_else(
-                    || attention.to_owned(),
-                    |merger| format!("{attention}d{merger}"),
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        format!("{mode}:{schedule}")
+        let mut rows = metadata.vector(self.layer_schedule.len())?;
+        for policy in self.layer_schedule.iter() {
+            let attention = match policy.attention {
+                VisionAttentionPolicy::Full => "f",
+                VisionAttentionPolicy::Windowed => "w",
+            };
+            rows.push(match policy.deepstack_merger {
+                Some(merger) => metadata.format(format_args!("{attention}d{merger}"))?,
+                None => metadata.text(attention)?,
+            });
+        }
+        let schedule = metadata.join(&rows, ",")?;
+        metadata.format(format_args!("{mode}:{schedule}"))
     }
 
     /// Resolves one canonical parameter's complete linear format.
     pub fn linear_format(&self, name: &str) -> LinearFormat {
+        self.linear_format_with_metadata(name, crate::decoder::identity::Metadata::new(None))
+            .expect("ordinary format-name construction is infallible")
+    }
+
+    pub(crate) fn linear_format_with_metadata(
+        &self,
+        name: &str,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<LinearFormat, eredu_nn::Error> {
         let relative = name.strip_prefix("model.visual.").unwrap_or(name);
-        self.linear_formats
-            .get(relative)
-            .or_else(|| self.linear_formats.get(&format!("model.visual.{relative}")))
+        if let Some(format) = self.linear_formats.get(relative) {
+            return Ok(*format);
+        }
+        let full_name = metadata.format(format_args!("model.visual.{relative}"))?;
+        Ok(self
+            .linear_formats
+            .get(&full_name)
             .copied()
-            .unwrap_or(LinearFormat::Dense)
+            .unwrap_or(LinearFormat::Dense))
     }
 
     /// Applies an explicit in-memory quantization policy to aligned vision
@@ -208,109 +275,28 @@ impl VisionConfig {
 
     /// Validates exact shared geometry and mode-specific scheduling.
     pub fn validate(&self) -> Result<(), VisionConfigError> {
-        for (name, value) in [
-            ("hidden_size", self.hidden_size),
-            ("intermediate_size", self.intermediate_size),
-            ("num_heads", self.num_heads),
-            ("num_position_embeddings", self.num_position_embeddings),
-            ("in_channels", self.in_channels),
-            ("patch_size", self.patch_size),
-            ("spatial_merge_size", self.spatial_merge_size),
-            ("temporal_patch_size", self.temporal_patch_size),
-            ("out_hidden_size", self.out_hidden_size),
-        ] {
-            if value <= 0 {
-                return Err(VisionConfigError::Invalid(format!(
-                    "vision {name} must be positive, got {value}"
-                )));
-            }
-        }
-        if self.hidden_size % self.num_heads != 0 {
-            return Err(VisionConfigError::Invalid(format!(
-                "vision hidden_size {} is not divisible by num_heads {}",
-                self.hidden_size, self.num_heads
-            )));
-        }
-        if !matches!(
-            self.hidden_act.as_str(),
-            "silu" | "gelu" | "gelu_pytorch_tanh"
-        ) {
-            return Err(VisionConfigError::Invalid(format!(
-                "unsupported vision activation {:?}",
-                self.hidden_act
-            )));
-        }
-        let mut mergers = self
-            .layer_schedule
-            .iter()
-            .filter_map(|policy| policy.deepstack_merger)
-            .collect::<Vec<_>>();
-        mergers.sort_unstable();
-        let expected = (0..mergers.len())
-            .map(|index| index as u32)
-            .collect::<Vec<_>>();
-        if mergers != expected {
-            return Err(VisionConfigError::Invalid(format!(
-                "DeepStack merger banks must be unique and contiguous from zero, got {mergers:?}"
-            )));
-        }
-        if self.mode == VisionMode::DeepStack
-            && self
-                .layer_schedule
-                .iter()
-                .any(|policy| policy.attention != VisionAttentionPolicy::Full)
-        {
-            return Err(VisionConfigError::Invalid(
-                "DeepStack vision schedules require full attention in every block".into(),
-            ));
-        }
-        if self
-            .layer_schedule
-            .iter()
-            .any(|policy| policy.attention == VisionAttentionPolicy::Windowed)
-            && self.window_size <= 0
-        {
-            return Err(VisionConfigError::Invalid(
-                "windowed vision schedules require a positive window_size".into(),
-            ));
-        }
-        for (name, format) in &self.linear_formats {
-            if name.trim().is_empty() {
-                return Err(VisionConfigError::Invalid(
-                    "vision linear-format identity must not be empty".into(),
-                ));
-            }
-            let relative = name.strip_prefix("model.visual.").unwrap_or(name);
-            if self
-                .linear_formats
-                .get(relative)
-                .is_some_and(|alias| alias != format)
-                || self
-                    .linear_formats
-                    .get(&format!("model.visual.{relative}"))
-                    .is_some_and(|alias| alias != format)
-            {
-                return Err(VisionConfigError::Invalid(format!(
-                    "conflicting vision linear formats for {name}"
-                )));
-            }
-            format
-                .validate()
-                .map_err(|error| VisionConfigError::Invalid(error.to_string()))?;
-        }
-        Ok(())
+        validation::validate(self, &validation::Ordinary)
+    }
+
+    pub(crate) fn validate_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), eredu_nn::Error> {
+        validation::validate(self, &validation::Checked(context))
     }
 
     /// Validates this configuration for the consuming Qwen family without
     /// allowing the consumer to reinterpret its execution mode.
     pub fn validate_for(&self, expected: VisionMode) -> Result<(), VisionConfigError> {
-        if self.mode != expected {
-            return Err(VisionConfigError::Invalid(format!(
-                "vision mode {:?} does not match required {:?} semantics",
-                self.mode, expected
-            )));
-        }
-        self.validate()
+        validation::validate_for(self, expected, &validation::Ordinary)
+    }
+
+    pub(crate) fn validate_for_with_metadata(
+        &self,
+        expected: VisionMode,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), eredu_nn::Error> {
+        validation::validate_for(self, expected, &validation::Checked(context))
     }
 }
 

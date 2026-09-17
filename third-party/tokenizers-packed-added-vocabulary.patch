@@ -1,0 +1,2516 @@
+--- a/src/models/bpe/compile.rs
++++ b/src/models/bpe/compile.rs
+@@ -3,9 +3,9 @@
+     storage::{MergeEntry, Packed, Storage, VocabEntry},
+     BPE,
+ };
++use crate::utils::borrowed_json as json;
++use json::{Reader, Span, Text};
+ use std::{alloc::Layout, collections::TryReserveError, convert::TryFrom, fmt, mem::size_of};
+-mod json;
+-use json::{Reader, Span, Text};
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum BpeCompileErrorKind {
+@@ -40,6 +40,17 @@
+     }
+ }
+ impl std::error::Error for BpeCompileError {}
++impl From<json::Error> for BpeCompileError {
++    fn from(error: json::Error) -> Self {
++        Self {
++            kind: match error.kind {
++                json::Kind::InvalidJson => BpeCompileErrorKind::InvalidJson,
++                json::Kind::DepthLimit => BpeCompileErrorKind::DepthLimit,
++            },
++            offset: error.offset,
++        }
++    }
++}
+ type Error = BpeCompileError;
+ type Kind = BpeCompileErrorKind;
+ fn error(kind: Kind, offset: usize) -> Error {
+@@ -479,6 +490,11 @@
+     Source(Error),
+     Allocation(TryReserveError),
+ }
++impl From<json::Error> for Cause {
++    fn from(error: json::Error) -> Self {
++        Self::Source(error.into())
++    }
++}
+ impl From<Error> for Cause {
+     fn from(e: Error) -> Self {
+         Self::Source(e)
+@@ -577,6 +593,7 @@
+         size_of::<Storage>(),
+         size_of::<BPE>(),
+         size_of::<Reader<'_>>(),
++        size_of::<json::Error>(),
+         size_of::<json::Object<'_>>(),
+         size_of::<json::Array<'_>>(),
+         size_of::<json::Bytes<'_>>(),
+--- a/src/models/bpe/compile/json.rs
++++ /dev/null
+@@ -1,403 +0,0 @@
+-//! Fixed-stack validation and borrowed strings. No serde Value or owned key.
+-use super::{BpeCompileError as Error, BpeCompileErrorKind as Kind};
+-
+-pub(super) const DEPTH: usize = 128;
+-#[derive(Clone, Copy, Debug)]
+-pub(super) struct Span {
+-    pub start: usize,
+-    pub end: usize,
+-}
+-#[derive(Clone, Copy, Debug)]
+-pub(super) struct Text<'a> {
+-    pub raw: &'a str,
+-    pub offset: usize,
+-}
+-impl<'a> Text<'a> {
+-    pub fn bytes(self) -> Bytes<'a> {
+-        Bytes {
+-            chars: self.raw.chars(),
+-            buffer: [0; 4],
+-            at: 0,
+-            len: 0,
+-        }
+-    }
+-    pub fn is(self, expected: &str) -> bool {
+-        self.bytes().eq(expected.bytes())
+-    }
+-    pub fn len(self) -> usize {
+-        self.bytes().count()
+-    }
+-}
+-#[derive(Clone)]
+-pub(super) struct Bytes<'a> {
+-    chars: std::str::Chars<'a>,
+-    buffer: [u8; 4],
+-    at: usize,
+-    len: usize,
+-}
+-impl Iterator for Bytes<'_> {
+-    type Item = u8;
+-    fn next(&mut self) -> Option<u8> {
+-        if self.at < self.len {
+-            let b = self.buffer[self.at];
+-            self.at += 1;
+-            return Some(b);
+-        }
+-        let c = match self.chars.next()? {
+-            '\\' => match self.chars.next().expect("validated escape") {
+-                '"' => '"',
+-                '\\' => '\\',
+-                '/' => '/',
+-                'b' => '\u{8}',
+-                'f' => '\u{c}',
+-                'n' => '\n',
+-                'r' => '\r',
+-                't' => '\t',
+-                'u' => {
+-                    let mut read = || {
+-                        (0..4).fold(0, |n, _| {
+-                            n * 16 + self.chars.next().expect("hex").to_digit(16).expect("hex")
+-                        })
+-                    };
+-                    let high = read();
+-                    let scalar = if (0xd800..=0xdbff).contains(&high) {
+-                        self.chars.next();
+-                        self.chars.next();
+-                        let low = (0..4).fold(0, |n, _| {
+-                            n * 16 + self.chars.next().expect("hex").to_digit(16).expect("hex")
+-                        });
+-                        0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00)
+-                    } else {
+-                        high
+-                    };
+-                    char::from_u32(scalar).expect("validated scalar")
+-                }
+-                _ => unreachable!("validated escape"),
+-            },
+-            c => c,
+-        };
+-        self.len = c.encode_utf8(&mut self.buffer).len();
+-        self.at = 1;
+-        Some(self.buffer[0])
+-    }
+-}
+-
+-#[derive(Clone, Copy)]
+-enum Frame {
+-    ObjectFirst,
+-    ObjectKey,
+-    Colon,
+-    ObjectValue,
+-    ObjectComma,
+-    ArrayFirst,
+-    ArrayValue,
+-    ArrayComma,
+-}
+-pub(super) struct Reader<'a> {
+-    pub input: &'a str,
+-    pub pos: usize,
+-    end: usize,
+-}
+-impl<'a> Reader<'a> {
+-    pub fn new(input: &'a str, span: Span) -> Self {
+-        Self {
+-            input,
+-            pos: span.start,
+-            end: span.end,
+-        }
+-    }
+-    fn err(&self, kind: Kind) -> Error {
+-        Error {
+-            kind,
+-            offset: self.pos,
+-        }
+-    }
+-    fn peek(&self) -> Option<u8> {
+-        self.input
+-            .as_bytes()
+-            .get(self.pos)
+-            .copied()
+-            .filter(|_| self.pos < self.end)
+-    }
+-    pub fn ws(&mut self) {
+-        while matches!(self.peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
+-            self.pos += 1;
+-        }
+-    }
+-    pub fn byte(&mut self, b: u8) -> Result<(), Error> {
+-        self.ws();
+-        if self.peek() != Some(b) {
+-            return Err(self.err(Kind::InvalidJson));
+-        }
+-        self.pos += 1;
+-        Ok(())
+-    }
+-    pub fn finish(&mut self) -> Result<(), Error> {
+-        self.ws();
+-        if self.pos == self.end {
+-            Ok(())
+-        } else {
+-            Err(self.err(Kind::InvalidJson))
+-        }
+-    }
+-    fn hex(&mut self) -> Result<u32, Error> {
+-        let mut n = 0;
+-        for _ in 0..4 {
+-            let b = self.peek().ok_or_else(|| self.err(Kind::InvalidJson))?;
+-            let d = char::from(b)
+-                .to_digit(16)
+-                .ok_or_else(|| self.err(Kind::InvalidJson))?;
+-            n = n * 16 + d;
+-            self.pos += 1;
+-        }
+-        Ok(n)
+-    }
+-    pub fn string(&mut self) -> Result<Text<'a>, Error> {
+-        self.byte(b'"')?;
+-        let start = self.pos;
+-        loop {
+-            match self.peek().ok_or_else(|| self.err(Kind::InvalidJson))? {
+-                b'"' => {
+-                    let end = self.pos;
+-                    self.pos += 1;
+-                    return Ok(Text {
+-                        raw: &self.input[start..end],
+-                        offset: start,
+-                    });
+-                }
+-                0..=31 => return Err(self.err(Kind::InvalidJson)),
+-                b'\\' => {
+-                    self.pos += 1;
+-                    match self.peek().ok_or_else(|| self.err(Kind::InvalidJson))? {
+-                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => self.pos += 1,
+-                        b'u' => {
+-                            self.pos += 1;
+-                            let high = self.hex()?;
+-                            if (0xd800..=0xdbff).contains(&high) {
+-                                if self.peek() != Some(b'\\') {
+-                                    return Err(self.err(Kind::InvalidJson));
+-                                }
+-                                self.pos += 1;
+-                                if self.peek() != Some(b'u') {
+-                                    return Err(self.err(Kind::InvalidJson));
+-                                }
+-                                self.pos += 1;
+-                                if !(0xdc00..=0xdfff).contains(&self.hex()?) {
+-                                    return Err(self.err(Kind::InvalidJson));
+-                                }
+-                            } else if (0xdc00..=0xdfff).contains(&high) {
+-                                return Err(self.err(Kind::InvalidJson));
+-                            }
+-                        }
+-                        _ => return Err(self.err(Kind::InvalidJson)),
+-                    }
+-                }
+-                _ => self.pos += 1,
+-            }
+-        }
+-    }
+-    fn number(&mut self) -> Result<(), Error> {
+-        if self.peek() == Some(b'-') {
+-            self.pos += 1;
+-        }
+-        match self.peek() {
+-            Some(b'0') => self.pos += 1,
+-            Some(b'1'..=b'9') => {
+-                self.pos += 1;
+-                while matches!(self.peek(), Some(b'0'..=b'9')) {
+-                    self.pos += 1;
+-                }
+-            }
+-            _ => return Err(self.err(Kind::InvalidJson)),
+-        }
+-        if self.peek() == Some(b'.') {
+-            self.pos += 1;
+-            let start = self.pos;
+-            while matches!(self.peek(), Some(b'0'..=b'9')) {
+-                self.pos += 1;
+-            }
+-            if start == self.pos {
+-                return Err(self.err(Kind::InvalidJson));
+-            }
+-        }
+-        if matches!(self.peek(), Some(b'e' | b'E')) {
+-            self.pos += 1;
+-            if matches!(self.peek(), Some(b'+' | b'-')) {
+-                self.pos += 1;
+-            }
+-            let start = self.pos;
+-            while matches!(self.peek(), Some(b'0'..=b'9')) {
+-                self.pos += 1;
+-            }
+-            if start == self.pos {
+-                return Err(self.err(Kind::InvalidJson));
+-            }
+-        }
+-        Ok(())
+-    }
+-    fn atom(&mut self, stack: &mut [Frame; DEPTH], depth: &mut usize) -> Result<(), Error> {
+-        self.ws();
+-        match self.peek() {
+-            Some(b'{' | b'[') => {
+-                if *depth == DEPTH {
+-                    return Err(self.err(Kind::DepthLimit));
+-                }
+-                stack[*depth] = if self.peek() == Some(b'{') {
+-                    Frame::ObjectFirst
+-                } else {
+-                    Frame::ArrayFirst
+-                };
+-                *depth += 1;
+-                self.pos += 1;
+-            }
+-            Some(b'"') => {
+-                self.string()?;
+-            }
+-            Some(b'-' | b'0'..=b'9') => self.number()?,
+-            Some(b't' | b'f' | b'n') => {
+-                let expected = match self.peek() {
+-                    Some(b't') => "true",
+-                    Some(b'f') => "false",
+-                    _ => "null",
+-                };
+-                if !self.input.as_bytes()[self.pos..self.end].starts_with(expected.as_bytes()) {
+-                    return Err(self.err(Kind::InvalidJson));
+-                }
+-                self.pos += expected.len();
+-            }
+-            _ => return Err(self.err(Kind::InvalidJson)),
+-        }
+-        Ok(())
+-    }
+-    pub fn value(&mut self) -> Result<Span, Error> {
+-        self.ws();
+-        let start = self.pos;
+-        let mut stack = [Frame::ArrayFirst; DEPTH];
+-        let mut depth = 0;
+-        self.atom(&mut stack, &mut depth)?;
+-        while depth > 0 {
+-            self.ws();
+-            let i = depth - 1;
+-            match stack[i] {
+-                Frame::ObjectFirst if self.peek() == Some(b'}') => {
+-                    self.pos += 1;
+-                    depth -= 1;
+-                }
+-                Frame::ObjectFirst | Frame::ObjectKey => {
+-                    self.string()?;
+-                    stack[i] = Frame::Colon;
+-                }
+-                Frame::Colon => {
+-                    self.byte(b':')?;
+-                    stack[i] = Frame::ObjectValue;
+-                }
+-                Frame::ObjectValue => {
+-                    stack[i] = Frame::ObjectComma;
+-                    self.atom(&mut stack, &mut depth)?;
+-                }
+-                Frame::ObjectComma => {
+-                    if self.peek() == Some(b'}') {
+-                        self.pos += 1;
+-                        depth -= 1;
+-                    } else {
+-                        self.byte(b',')?;
+-                        stack[i] = Frame::ObjectKey;
+-                    }
+-                }
+-                Frame::ArrayFirst if self.peek() == Some(b']') => {
+-                    self.pos += 1;
+-                    depth -= 1;
+-                }
+-                Frame::ArrayFirst | Frame::ArrayValue => {
+-                    stack[i] = Frame::ArrayComma;
+-                    self.atom(&mut stack, &mut depth)?;
+-                }
+-                Frame::ArrayComma => {
+-                    if self.peek() == Some(b']') {
+-                        self.pos += 1;
+-                        depth -= 1;
+-                    } else {
+-                        self.byte(b',')?;
+-                        stack[i] = Frame::ArrayValue;
+-                    }
+-                }
+-            }
+-        }
+-        Ok(Span {
+-            start,
+-            end: self.pos,
+-        })
+-    }
+-    pub fn array(self) -> Result<Array<'a>, Error> {
+-        let mut reader = self;
+-        reader.byte(b'[')?;
+-        Ok(Array {
+-            reader,
+-            first: true,
+-            done: false,
+-        })
+-    }
+-    pub fn object(self) -> Result<Object<'a>, Error> {
+-        let mut reader = self;
+-        reader.byte(b'{')?;
+-        Ok(Object {
+-            reader,
+-            first: true,
+-            done: false,
+-        })
+-    }
+-}
+-pub(super) struct Array<'a> {
+-    reader: Reader<'a>,
+-    first: bool,
+-    done: bool,
+-}
+-impl Array<'_> {
+-    pub fn next(&mut self) -> Result<Option<Span>, Error> {
+-        if self.done {
+-            return Ok(None);
+-        }
+-        self.reader.ws();
+-        if self.reader.peek() == Some(b']') {
+-            self.reader.pos += 1;
+-            self.reader.finish()?;
+-            self.done = true;
+-            return Ok(None);
+-        }
+-        if !self.first {
+-            self.reader.byte(b',')?;
+-        }
+-        self.first = false;
+-        self.reader.value().map(Some)
+-    }
+-}
+-pub(super) struct Object<'a> {
+-    reader: Reader<'a>,
+-    first: bool,
+-    done: bool,
+-}
+-impl<'a> Object<'a> {
+-    pub fn next(&mut self) -> Result<Option<(Text<'a>, Span)>, Error> {
+-        if self.done {
+-            return Ok(None);
+-        }
+-        self.reader.ws();
+-        if self.reader.peek() == Some(b'}') {
+-            self.reader.pos += 1;
+-            self.reader.finish()?;
+-            self.done = true;
+-            return Ok(None);
+-        }
+-        if !self.first {
+-            self.reader.byte(b',')?;
+-        }
+-        self.first = false;
+-        let key = self.reader.string()?;
+-        self.reader.byte(b':')?;
+-        let value = self.reader.value()?;
+-        Ok(Some((key, value)))
+-    }
+-}
+-pub(super) fn stack_bytes() -> usize {
+-    std::mem::size_of::<[Frame; DEPTH]>()
+-}
+--- a/src/tokenizer/added_vocabulary.rs
++++ b/src/tokenizer/added_vocabulary.rs
+@@ -95,6 +95,153 @@
+ }
+ 
+ type MatchingSet = Option<DoubleArrayAhoCorasick<u32>>;
++mod access;
++mod packed;
++pub use access::AddedTokenRef;
++pub use packed::{
++    AddedVocabularyCompileError, AddedVocabularyCompileErrorKind, AddedVocabularyCompileFailure,
++    AddedVocabularyCompilePlan, AddedVocabularyCompileRequirements,
++};
++#[derive(Clone)]
++pub struct AddedVocabulary {
++    storage: Storage,
++}
++#[derive(Clone)]
++enum Storage {
++    Legacy(LegacyAddedVocabulary),
++    Packed(packed::Packed),
++}
++impl AddedVocabulary {
++    /// Find any AddedToken in the given sentence, using the provided MatchingSet.
++    /// This method returns a list "splits", each of them being a pair of Offsets
++    /// and an optional ID if it is an AddedToken.
++    /// The list of splits cover the entire input string.
++    fn find_matches(&self, sentence: &str, normalized: bool) -> Vec<(Option<u32>, Offsets)> {
++        if sentence.is_empty() {
++            return vec![(None, (0, 0))];
++        }
++
++        let mut start_offset = 0;
++        let mut splits = vec![];
++
++        for (id, (mut start, mut stop)) in self.raw_matches(sentence, normalized) {
++            let added_token = self.token_ref(id).expect("matched added token");
++
++            if self.get_encode_special_tokens() && self.is_special_token(added_token.content) {
++                continue;
++            }
++
++            if added_token.single_word {
++                let start_space = start == 0 || !ends_with_word(&sentence[..start]);
++                let stop_space = stop == sentence.len() || !starts_with_word(&sentence[stop..]);
++
++                if !stop_space || !start_space {
++                    // Discard not single word
++                    continue;
++                }
++            }
++            if added_token.lstrip {
++                // This will be strictly inferior to start and in correct sentence offset
++                let newstart = space_leftmost_at_end(&sentence[..start]);
++
++                // The previous match could have already matched those spaces
++                // Ignore them if it's already matched
++                start = std::cmp::max(newstart, start_offset);
++            }
++            if added_token.rstrip {
++                // This will starting a the stop+1 character, so we need
++                // to add the previous stop value
++                stop += space_rightmost_at_start(&sentence[stop..])
++            }
++            if start_offset < start {
++                splits.push((None, (start_offset, start)));
++            }
++            splits.push((Some(id), (start, stop)));
++            start_offset = stop;
++        }
++
++        let total_byte_len = sentence.len();
++        if start_offset != total_byte_len {
++            splits.push((None, (start_offset, total_byte_len)));
++        }
++
++        splits
++    }
++
++    /// Split the input sentence to extract anything we found from the `MatchingSet`, as well as
++    /// the list of corresponding IDs
++    /// The list of IDs have the exact same number of elements than the Iterator.
++    fn split_with_indices(
++        &self,
++        sentence: NormalizedString,
++        normalized: bool,
++    ) -> Vec<(NormalizedString, Option<Vec<Token>>)> {
++        self.find_matches(sentence.get(), normalized)
++            .into_iter()
++            .map(|(id, byte_offsets)| {
++                let slice = sentence
++                    .slice(Range::Normalized(byte_offsets.0..byte_offsets.1))
++                    .expect("AddedVocabulary bad split");
++                if let Some(id) = id {
++                    let value = slice.get().to_owned();
++                    let len = value.len();
++                    (slice, Some(vec![Token::new(id, value, (0, len))]))
++                } else {
++                    (slice, None)
++                }
++            })
++            .collect()
++    }
++
++    /// Extract the additional vocabulary from the given sentence, normalizing it along the way.
++    ///
++    /// Some tokens should match against their normalized representation, as well as the
++    /// non-normalized one. For example, when we expect to extract the token `yesterday` in the
++    /// input sentence `I read a book Yesterday`, if the normalizer is supposed to lowercase
++    /// everything, we expect a match.
++    pub fn extract_and_normalize<N: Normalizer>(
++        &self,
++        normalizer: Option<&N>,
++        sequence: &str,
++    ) -> PreTokenizedString {
++        let mut pretokenized: PreTokenizedString = sequence.into();
++
++        // 1. We extract all the non-normalized tokens from the non-normalized string
++        pretokenized
++            .split(|_, sequence| Ok(self.split_with_indices(sequence, false)))
++            .expect("AddedVocabulary bad split");
++
++        // <s> normalized = False
++        // "I read a book   <s>Hey" -> "I read a book", "   <s>", "Hey"
++
++        // </s> normalized = True -> "▁</s>"
++        // "I read a book</s>Hey" -> "I read a book</s>Hey"
++
++        // Day normalized = True -> "Day"
++        // "I read a book monday" -> "I read a book monday"
++
++        // [DAY] normalized = False -> "Day"
++        // "I read a [DAY] monday" -> "I read a " "[DAY]", "book monday"
++        //                                         320055
++        // 2. Then extract the normalized tokens from the normalized pieces of the string
++        pretokenized
++            .split(|_, mut sequence| {
++                normalizer.map(|n| n.normalize(&mut sequence));
++                Ok(self.split_with_indices(sequence, true))
++            })
++            .expect("AddedVocabulary bad split");
++
++        // ["I read a book", "   <s>", "Hey"] -> ["▁I read a book", "▁   <s>", "▁Hey"]
++        // ["▁I read a book", "▁   <s>", "▁Hey"] -> [.., "▁   ", "<s>", "▁Hey"]
++
++        // </s> normalized = True -> "▁</s>"
++        // "I read a book</s>Hey" -> ["▁I read a book", "<","/","s",">", "Hey"]
++
++        // "I read a " "[DAY]", "book monday" -> "i read a " "[day]", "book monday"
++
++        pretokenized
++    }
++}
+ 
+ static STARTS_WITH_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\w").unwrap());
+ static ENDS_WITH_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\w$").unwrap());
+@@ -139,7 +286,7 @@
+ /// exist as required.
+ ///
+ #[derive(Clone)]
+-pub struct AddedVocabulary {
++struct LegacyAddedVocabulary {
+     /// Contains the mapping from String (token content) to ID. This map contains both special
+     /// tokens and classic added tokens that were added to the this vocabulary.
+     added_tokens_map: AHashMap<String, u32>,
+@@ -166,7 +313,7 @@
+     encode_special_tokens: bool,
+ }
+ 
+-impl std::fmt::Debug for AddedVocabulary {
++impl std::fmt::Debug for LegacyAddedVocabulary {
+     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+         f.debug_struct("AddedVocabulary")
+             .field("added_tokens_map", &self.added_tokens_map)
+@@ -177,7 +324,7 @@
+     }
+ }
+ 
+-impl AddedVocabulary {
++impl LegacyAddedVocabulary {
+     pub fn new() -> Self {
+         Self {
+             added_tokens_map: AHashMap::new(),
+@@ -431,149 +578,9 @@
+ 
+         Ok(())
+     }
+-
+-    /// Find any AddedToken in the given sentence, using the provided MatchingSet.
+-    /// This method returns a list "splits", each of them being a pair of Offsets
+-    /// and an optional ID if it is an AddedToken.
+-    /// The list of splits cover the entire input string.
+-    fn find_matches(&self, sentence: &str, split_re: &MatchingSet) -> Vec<(Option<u32>, Offsets)> {
+-        if sentence.is_empty() {
+-            return vec![(None, (0, 0))];
+-        }
+-
+-        let mut start_offset = 0;
+-        let mut splits = vec![];
+-
+-        let trie = match split_re {
+-            Some(t) => t,
+-            None => {
+-                return vec![(None, (0, sentence.len()))];
+-            }
+-        };
+-        for mat in trie.leftmost_find_iter(sentence) {
+-            let mut start = mat.start();
+-            let mut stop = mat.end();
+-            let id = mat.value();
+-            let added_token = &self.added_tokens_map_r.get(&id).unwrap();
+-
+-            if self.encode_special_tokens && self.special_tokens_set.contains(&added_token.content)
+-            {
+-                continue;
+-            }
+-
+-            if added_token.single_word {
+-                let start_space = start == 0 || !ends_with_word(&sentence[..start]);
+-                let stop_space = stop == sentence.len() || !starts_with_word(&sentence[stop..]);
+-
+-                if !stop_space || !start_space {
+-                    // Discard not single word
+-                    continue;
+-                }
+-            }
+-            if added_token.lstrip {
+-                // This will be strictly inferior to start and in correct sentence offset
+-                let newstart = space_leftmost_at_end(&sentence[..start]);
+-
+-                // The previous match could have already matched those spaces
+-                // Ignore them if it's already matched
+-                start = std::cmp::max(newstart, start_offset);
+-            }
+-            if added_token.rstrip {
+-                // This will starting a the stop+1 character, so we need
+-                // to add the previous stop value
+-                stop += space_rightmost_at_start(&sentence[stop..])
+-            }
+-            if start_offset < start {
+-                splits.push((None, (start_offset, start)));
+-            }
+-            splits.push((Some(id), (start, stop)));
+-            start_offset = stop;
+-        }
+-
+-        let total_byte_len = sentence.len();
+-        if start_offset != total_byte_len {
+-            splits.push((None, (start_offset, total_byte_len)));
+-        }
+-
+-        splits
+-    }
+-
+-    /// Split the input sentence to extract anything we found from the `MatchingSet`, as well as
+-    /// the list of corresponding IDs
+-    /// The list of IDs have the exact same number of elements than the Iterator.
+-    fn split_with_indices(
+-        &self,
+-        sentence: NormalizedString,
+-        split_re: &MatchingSet,
+-    ) -> Vec<(NormalizedString, Option<Vec<Token>>)> {
+-        self.find_matches(sentence.get(), split_re)
+-            .into_iter()
+-            .map(|(id, byte_offsets)| {
+-                let slice = sentence
+-                    .slice(Range::Normalized(byte_offsets.0..byte_offsets.1))
+-                    .expect("AddedVocabulary bad split");
+-                if let Some(id) = id {
+-                    let value = slice.get().to_owned();
+-                    let len = value.len();
+-                    (slice, Some(vec![Token::new(id, value, (0, len))]))
+-                } else {
+-                    (slice, None)
+-                }
+-            })
+-            .collect()
+-    }
+-
+-    /// Extract the additional vocabulary from the given sentence, normalizing it along the way.
+-    ///
+-    /// Some tokens should match against their normalized representation, as well as the
+-    /// non-normalized one. For example, when we expect to extract the token `yesterday` in the
+-    /// input sentence `I read a book Yesterday`, if the normalizer is supposed to lowercase
+-    /// everything, we expect a match.
+-    pub fn extract_and_normalize<N: Normalizer>(
+-        &self,
+-        normalizer: Option<&N>,
+-        sequence: &str,
+-    ) -> PreTokenizedString {
+-        let mut pretokenized: PreTokenizedString = sequence.into();
+-
+-        // 1. We extract all the non-normalized tokens from the non-normalized string
+-        pretokenized
+-            .split(|_, sequence| Ok(self.split_with_indices(sequence, &self.split_trie)))
+-            .expect("AddedVocabulary bad split");
+-
+-        // <s> normalized = False
+-        // "I read a book   <s>Hey" -> "I read a book", "   <s>", "Hey"
+-
+-        // </s> normalized = True -> "▁</s>"
+-        // "I read a book</s>Hey" -> "I read a book</s>Hey"
+-
+-        // Day normalized = True -> "Day"
+-        // "I read a book monday" -> "I read a book monday"
+-
+-        // [DAY] normalized = False -> "Day"
+-        // "I read a [DAY] monday" -> "I read a " "[DAY]", "book monday"
+-        //                                         320055
+-        // 2. Then extract the normalized tokens from the normalized pieces of the string
+-        pretokenized
+-            .split(|_, mut sequence| {
+-                normalizer.map(|n| n.normalize(&mut sequence));
+-                Ok(self.split_with_indices(sequence, &self.split_normalized_trie))
+-            })
+-            .expect("AddedVocabulary bad split");
+-
+-        // ["I read a book", "   <s>", "Hey"] -> ["▁I read a book", "▁   <s>", "▁Hey"]
+-        // ["▁I read a book", "▁   <s>", "▁Hey"] -> [.., "▁   ", "<s>", "▁Hey"]
+-
+-        // </s> normalized = True -> "▁</s>"
+-        // "I read a book</s>Hey" -> ["▁I read a book", "<","/","s",">", "Hey"]
+-
+-        // "I read a " "[DAY]", "book monday" -> "i read a " "[day]", "book monday"
+-
+-        pretokenized
+-    }
+-}
+-
+-impl Default for AddedVocabulary {
++}
++
++impl Default for LegacyAddedVocabulary {
+     fn default() -> Self {
+         Self::new()
+     }
+@@ -588,7 +595,7 @@
+     pub token: AddedToken,
+ }
+ 
+-impl Serialize for AddedVocabulary {
++impl Serialize for LegacyAddedVocabulary {
+     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+     where
+         S: Serializer,
+@@ -808,8 +815,8 @@
+                 (3, AddedToken::from("added_token_2", true)),
+             ])
+         );
+-        assert!(vocab.added_tokens_map.contains_key("test"));
+-        assert!(vocab.added_tokens_map_r.contains_key(&0));
++        assert!(vocab.get_vocab().contains_key("test"));
++        assert!(vocab.get_added_tokens_decoder().contains_key(&0));
+ 
+         vocab
+             .add_tokens(
+@@ -944,7 +951,7 @@
+     #[test]
+     fn empty_matches() {
+         let vocab = AddedVocabulary::new();
+-        let matches = vocab.find_matches("", &vocab.split_trie);
++        let matches = vocab.find_matches("", false);
+         assert_eq!(matches, vec![(None, (0, 0))]);
+     }
+ 
+@@ -1132,8 +1139,8 @@
+         assert!(decoder.values().any(|t| t.content == "[CLS]"));
+ 
+         // "hello" (lowercased) is in the normalized cache — verify via simple_id_to_token
+-        let hello_id = vocab.added_tokens_map["Hello"];
+-        let cls_id = vocab.added_tokens_map["[CLS]"];
++        let hello_id = vocab.get_vocab()["Hello"];
++        let cls_id = vocab.get_vocab()["[CLS]"];
+         // normalized=true → decode returns cached form "hello"
+         assert_eq!(vocab.simple_id_to_token(hello_id).unwrap(), "hello");
+         // normalized=false → decode returns original content "[CLS]"
+@@ -1158,7 +1165,7 @@
+             .unwrap();
+ 
+         // Without a normalizer, simple_id_to_token returns the original content
+-        let hello_id = vocab.added_tokens_map["Hello"];
++        let hello_id = vocab.get_vocab()["Hello"];
+         assert_eq!(vocab.simple_id_to_token(hello_id).unwrap(), "Hello");
+ 
+         // Now attach a normalizer and refresh
+--- /dev/null
++++ b/src/tokenizer/added_vocabulary/access.rs
+@@ -0,0 +1,285 @@
++use super::*;
++use std::borrow::Cow;
++
++/// Borrowed properties of one actual added token; no owned String or map.
++#[derive(Clone, Copy, Debug, Serialize)]
++pub struct AddedTokenRef<'a> {
++    pub content: &'a str,
++    pub single_word: bool,
++    pub lstrip: bool,
++    pub rstrip: bool,
++    pub normalized: bool,
++    pub special: bool,
++}
++impl<'a> From<&'a AddedToken> for AddedTokenRef<'a> {
++    fn from(t: &'a AddedToken) -> Self {
++        Self {
++            content: &t.content,
++            single_word: t.single_word,
++            lstrip: t.lstrip,
++            rstrip: t.rstrip,
++            normalized: t.normalized,
++            special: t.special,
++        }
++    }
++}
++impl AddedTokenRef<'_> {
++    pub fn to_owned(self) -> AddedToken {
++        AddedToken {
++            content: self.content.to_owned(),
++            single_word: self.single_word,
++            lstrip: self.lstrip,
++            rstrip: self.rstrip,
++            normalized: self.normalized,
++            special: self.special,
++        }
++    }
++}
++impl AddedVocabulary {
++    /// Ordinary construction retains the legacy defaults and DAAC matcher.
++    pub fn new() -> Self {
++        Self {
++            storage: Storage::Legacy(LegacyAddedVocabulary::new()),
++        }
++    }
++    pub fn len(&self) -> usize {
++        match &self.storage {
++            Storage::Legacy(v) => v.len(),
++            Storage::Packed(v) => v.spellings.len(),
++        }
++    }
++    pub fn is_empty(&self) -> bool {
++        self.len() == 0
++    }
++    /// Borrowed canonical forward spellings and IDs for both storage modes.
++    pub fn vocabulary(&self) -> impl Iterator<Item = (&str, u32)> + '_ {
++        let legacy = match &self.storage {
++            Storage::Legacy(v) => Some(v.added_tokens_map.iter()),
++            _ => None,
++        };
++        let packed = match &self.storage {
++            Storage::Packed(v) => Some(v),
++            _ => None,
++        };
++        legacy
++            .into_iter()
++            .flatten()
++            .map(|(s, id)| (s.as_str(), *id))
++            .chain(packed.into_iter().flat_map(|v| {
++                v.spellings
++                    .iter()
++                    .map(move |&i| (v.content(i), v.entries[i].id))
++            }))
++    }
++    /// Borrowed canonical reverse population; ordering is unspecified.
++    pub fn tokens(&self) -> impl Iterator<Item = (u32, AddedTokenRef<'_>)> + '_ {
++        let legacy = match &self.storage {
++            Storage::Legacy(v) => Some(v.added_tokens_map_r.iter()),
++            _ => None,
++        };
++        let packed = match &self.storage {
++            Storage::Packed(v) => Some(v),
++            _ => None,
++        };
++        legacy
++            .into_iter()
++            .flatten()
++            .map(|(id, t)| (*id, t.into()))
++            .chain(
++                packed
++                    .into_iter()
++                    .flat_map(|v| v.ids.iter().map(move |&i| (v.entries[i].id, v.token(i)))),
++            )
++    }
++    pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
++        self.tokens().map(|(id, _)| id)
++    }
++    /// Legacy borrows its existing map; Packed explicitly materializes an unmanaged copy.
++    /// Use `vocabulary` for allocation-free access. The return is intentionally Cow,
++    /// since a concrete borrowed map cannot describe packed storage.
++    pub fn get_vocab(&self) -> Cow<'_, AHashMap<String, u32>> {
++        match &self.storage {
++            Storage::Legacy(v) => Cow::Borrowed(v.get_vocab()),
++            Storage::Packed(_) => Cow::Owned(
++                self.vocabulary()
++                    .map(|(s, id)| (s.to_owned(), id))
++                    .collect(),
++            ),
++        }
++    }
++    /// Explicit map compatibility; Packed copies strings into an unmanaged map.
++    pub fn get_added_tokens_decoder(&self) -> Cow<'_, AHashMap<u32, AddedToken>> {
++        match &self.storage {
++            Storage::Legacy(v) => Cow::Borrowed(v.get_added_tokens_decoder()),
++            Storage::Packed(_) => {
++                Cow::Owned(self.tokens().map(|(id, t)| (id, t.to_owned())).collect())
++            }
++        }
++    }
++    pub fn token_ref(&self, id: u32) -> Option<AddedTokenRef<'_>> {
++        match &self.storage {
++            Storage::Legacy(v) => v.added_tokens_map_r.get(&id).map(Into::into),
++            Storage::Packed(v) => v.id_index(id).map(|i| v.token(i)),
++        }
++    }
++    pub fn token_to_id(&self, token: &str, model: &impl Model) -> Option<u32> {
++        match &self.storage {
++            Storage::Legacy(v) => v.added_tokens_map.get(token).copied(),
++            Storage::Packed(v) => v.spelling_index(token).map(|i| v.entries[i].id),
++        }
++        .or_else(|| model.token_to_id(token))
++    }
++    #[deprecated(
++        since = "0.19.0",
++        note = "use simple_id_to_token followed by model.id_to_token"
++    )]
++    pub fn id_to_token(&self, id: u32, model: &impl Model) -> Option<String> {
++        self.simple_id_to_token(id)
++            .or_else(|| model.id_to_token(id))
++    }
++    pub(crate) fn decode_token_ref(&self, id: u32) -> Option<&str> {
++        match &self.storage {
++            Storage::Legacy(v) => v.decode_token_ref(id),
++            Storage::Packed(v) => v.id_index(id).map(|i| v.content(i)),
++        }
++    }
++    pub fn simple_id_to_token(&self, id: u32) -> Option<String> {
++        self.decode_token_ref(id).map(str::to_owned)
++    }
++    pub fn is_special_token(&self, token: &str) -> bool {
++        match &self.storage {
++            Storage::Legacy(v) => v.is_special_token(token),
++            Storage::Packed(v) => v
++                .spelling_index(token)
++                .is_some_and(|i| v.entries[i].special_seen),
++        }
++    }
++    pub fn set_encode_special_tokens(&mut self, value: bool) {
++        match &mut self.storage {
++            Storage::Legacy(v) => v.set_encode_special_tokens(value),
++            Storage::Packed(v) => v.encode_special_tokens = value,
++        }
++    }
++    pub fn get_encode_special_tokens(&self) -> bool {
++        match &self.storage {
++            Storage::Legacy(v) => v.get_encode_special_tokens(),
++            Storage::Packed(v) => v.encode_special_tokens,
++        }
++    }
++    /// Explicit unmanaged mutation materializes a complete legacy representation
++    /// before replacement. A matcher-construction error preserves the packed source.
++    fn legacy_mut(&mut self) -> Result<&mut LegacyAddedVocabulary> {
++        if let Storage::Packed(p) = &self.storage {
++            let mut v = LegacyAddedVocabulary {
++                added_tokens_map: self
++                    .vocabulary()
++                    .map(|(s, id)| (s.to_owned(), id))
++                    .collect(),
++                added_tokens_map_r: self.tokens().map(|(id, t)| (id, t.to_owned())).collect(),
++                special_tokens_set: p
++                    .spellings
++                    .iter()
++                    .filter(|&&i| p.entries[i].special_seen)
++                    .map(|&i| p.content(i).to_owned())
++                    .collect(),
++                normalized_cache: AHashMap::new(),
++                split_trie: None,
++                split_normalized_trie: None,
++                encode_special_tokens: p.encode_special_tokens,
++            };
++            v.refresh_added_tokens()?;
++            self.storage = Storage::Legacy(v);
++        }
++        match &mut self.storage {
++            Storage::Legacy(v) => Ok(v),
++            Storage::Packed(_) => unreachable!(),
++        }
++    }
++    pub fn add_tokens<N: Normalizer>(
++        &mut self,
++        tokens: impl IntoIterator<Item = AddedToken>,
++        model: &impl Model,
++        normalizer: Option<&N>,
++    ) -> Result<usize> {
++        self.legacy_mut()?.add_tokens(tokens, model, normalizer)
++    }
++    pub fn add_special_tokens<N: Normalizer>(
++        &mut self,
++        tokens: impl IntoIterator<Item = AddedToken>,
++        model: &impl Model,
++        normalizer: Option<&N>,
++    ) -> Result<usize> {
++        self.add_tokens(tokens, model, normalizer)
++    }
++    pub fn refresh_normalized_tokens<N: Normalizer>(
++        &mut self,
++        normalizer: Option<&N>,
++    ) -> Result<()> {
++        self.legacy_mut()?.refresh_normalized_tokens(normalizer)
++    }
++    pub(super) fn raw_matches<'a>(
++        &'a self,
++        sentence: &'a str,
++        normalized: bool,
++    ) -> impl Iterator<Item = (u32, Offsets)> + 'a {
++        let legacy = match &self.storage {
++            Storage::Legacy(v) => {
++                if normalized {
++                    v.split_normalized_trie.as_ref()
++                } else {
++                    v.split_trie.as_ref()
++                }
++            }
++            _ => None,
++        };
++        let packed = match &self.storage {
++            Storage::Packed(v) => Some(packed::Matches::new(v, sentence, normalized)),
++            _ => None,
++        };
++        legacy
++            .into_iter()
++            .flat_map(move |trie| trie.leftmost_find_iter(sentence))
++            .map(|m| (m.value(), (m.start(), m.end())))
++            .chain(packed.into_iter().flatten())
++    }
++}
++impl Default for AddedVocabulary {
++    fn default() -> Self {
++        Self::new()
++    }
++}
++impl std::fmt::Debug for AddedVocabulary {
++    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match &self.storage {
++            Storage::Legacy(v) => std::fmt::Debug::fmt(v, f),
++            Storage::Packed(v) => f
++                .debug_struct("PackedAddedVocabulary")
++                .field("tokens", &v.ids.len())
++                .field("encode_special_tokens", &v.encode_special_tokens)
++                .finish(),
++        }
++    }
++}
++impl Serialize for AddedVocabulary {
++    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
++        match &self.storage {
++            Storage::Legacy(v) => v.serialize(serializer),
++            Storage::Packed(v) => {
++                #[derive(Serialize)]
++                struct Entry<'a> {
++                    id: u32,
++                    #[serde(flatten)]
++                    token: AddedTokenRef<'a>,
++                }
++                let mut seq = serializer.serialize_seq(Some(v.ids.len()))?;
++                for &i in &v.ids {
++                    seq.serialize_element(&Entry {
++                        id: v.entries[i].id,
++                        token: v.token(i),
++                    })?;
++                }
++                seq.end()
++            }
++        }
++    }
++}
+--- /dev/null
++++ b/src/tokenizer/added_vocabulary/packed.rs
+@@ -0,0 +1,573 @@
++//! Checked source construction and literal search under the existing HF pipeline.
++use super::{AddedTokenRef, AddedVocabulary, Storage};
++use crate::{models::bpe::BPE, utils::borrowed_json as json, Model, NormalizerWrapper};
++use json::{Reader, Span, Text};
++use std::{alloc::Layout, collections::TryReserveError, convert::TryFrom, fmt, mem::size_of};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum AddedVocabularyCompileErrorKind {
++    InvalidUtf8,
++    InvalidJson,
++    DepthLimit,
++    MissingField,
++    DuplicateField,
++    UnsupportedField,
++    InvalidId,
++    NormalizationProfile,
++    WordOrStripProfile,
++    AmbiguousId,
++    Overflow,
++    CapacityExceeded,
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct AddedVocabularyCompileError {
++    pub kind: AddedVocabularyCompileErrorKind,
++    pub offset: usize,
++}
++type Error = AddedVocabularyCompileError;
++type Kind = AddedVocabularyCompileErrorKind;
++fn error(kind: Kind, offset: usize) -> Error {
++    Error { kind, offset }
++}
++impl From<json::Error> for Error {
++    fn from(e: json::Error) -> Self {
++        error(
++            match e.kind {
++                json::Kind::InvalidJson => Kind::InvalidJson,
++                json::Kind::DepthLimit => Kind::DepthLimit,
++            },
++            e.offset,
++        )
++    }
++}
++impl fmt::Display for Error {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(
++            f,
++            "added-vocabulary construction {:?} at byte {}",
++            self.kind, self.offset
++        )
++    }
++}
++impl std::error::Error for Error {}
++
++const SINGLE: u8 = 1;
++const LEFT: u8 = 2;
++const RIGHT: u8 = 4;
++const NORMALIZED: u8 = 8;
++const SPECIAL: u8 = 16;
++#[derive(Clone, Copy, Debug)]
++pub(super) struct Entry {
++    start: usize,
++    len: usize,
++    pub(super) id: u32,
++    flags: u8,
++    pub(super) special_seen: bool,
++    canonical: bool,
++}
++#[derive(Clone, Debug, Default)]
++pub(super) struct Packed {
++    pub(super) entries: Vec<Entry>,
++    bytes: Vec<u8>,
++    pub(super) spellings: Vec<usize>,
++    pub(super) ids: Vec<usize>,
++    pub(super) encode_special_tokens: bool,
++}
++impl Packed {
++    pub(super) fn content(&self, i: usize) -> &str {
++        let e = &self.entries[i];
++        std::str::from_utf8(&self.bytes[e.start..e.start + e.len]).expect("validated UTF-8")
++    }
++    pub(super) fn token(&self, i: usize) -> AddedTokenRef<'_> {
++        let e = &self.entries[i];
++        AddedTokenRef {
++            content: self.content(i),
++            single_word: e.flags & SINGLE != 0,
++            lstrip: e.flags & LEFT != 0,
++            rstrip: e.flags & RIGHT != 0,
++            normalized: e.flags & NORMALIZED != 0,
++            special: e.flags & SPECIAL != 0,
++        }
++    }
++    pub(super) fn spelling_index(&self, s: &str) -> Option<usize> {
++        self.spellings
++            .binary_search_by(|&i| self.content(i).cmp(s))
++            .ok()
++            .map(|i| self.spellings[i])
++    }
++    pub(super) fn id_index(&self, id: u32) -> Option<usize> {
++        self.ids
++            .binary_search_by_key(&id, |&i| self.entries[i].id)
++            .ok()
++            .map(|i| self.ids[i])
++    }
++    fn capacities(&self) -> [usize; 4] {
++        [
++            self.entries.capacity(),
++            self.bytes.capacity(),
++            self.spellings.capacity(),
++            self.ids.capacity(),
++        ]
++    }
++    fn buffer_bytes(&self) -> Option<usize> {
++        self.entries
++            .capacity()
++            .checked_mul(size_of::<Entry>())?
++            .checked_add(self.bytes.capacity())?
++            .checked_add(self.spellings.capacity().checked_mul(size_of::<usize>())?)?
++            .checked_add(self.ids.capacity().checked_mul(size_of::<usize>())?)
++    }
++}
++#[derive(Clone, Copy, Debug)]
++pub struct AddedVocabularyCompileRequirements {
++    slots: usize,
++    bytes: usize,
++    buffers: usize,
++    controls: usize,
++    total: usize,
++}
++impl AddedVocabularyCompileRequirements {
++    pub fn raw_slots(&self) -> usize {
++        self.slots
++    }
++    pub fn content_bytes(&self) -> usize {
++        self.bytes
++    }
++    pub fn buffer_bytes(&self) -> usize {
++        self.buffers
++    }
++    pub fn control_bytes(&self) -> usize {
++        self.controls
++    }
++    pub fn required_bytes(&self) -> usize {
++        self.total
++    }
++}
++/// One attempt, borrowing the actual immutable model and normalizer configuration.
++/// No identity boolean, caller byte fact, fresh model/normalizer argument at compile,
++/// tokenizer construction or funding authority is accepted.
++///
++/// ```compile_fail
++/// use tokenizers::AddedVocabularyCompilePlan;
++/// fn twice(plan:AddedVocabularyCompilePlan<'_>) {let _=plan.compile();let _=plan.compile();}
++/// ```
++/// ```compile_fail
++/// use tokenizers::{models::bpe::BPE, AddedVocabularyCompilePlan};
++/// fn replace(model:&mut BPE) {
++///   let plan=AddedVocabularyCompilePlan::prepare_json(b"[]",model,None).unwrap();
++///   model.dropout=Some(0.5);
++///   let _=plan.compile();
++/// }
++/// ```
++/// ```compile_fail
++/// use tokenizers::{AddedVocabularyCompilePlan, NormalizerWrapper, models::bpe::BPE};
++/// fn replace(model:&BPE, normalizer:&mut NormalizerWrapper) {
++///   let plan=AddedVocabularyCompilePlan::prepare_json(b"[]",model,Some(normalizer)).unwrap();
++///   *normalizer=tokenizers::normalizers::Lowercase.into();
++///   let _=plan.compile();
++/// }
++/// ```
++#[derive(Debug)]
++pub struct AddedVocabularyCompilePlan<'a> {
++    input: &'a str,
++    root: Span,
++    model: &'a BPE,
++    normalizer: Option<&'a NormalizerWrapper>,
++    requirements: AddedVocabularyCompileRequirements,
++    #[cfg(test)]
++    fail_at: Option<usize>,
++}
++impl<'a> AddedVocabularyCompilePlan<'a> {
++    /// The input is the exact added_tokens array. Nonempty normalized tokens
++    /// currently require the actual absence of a normalizer. Word/strip profiles
++    /// remain unfinished checked-construction coverage; Legacy is unchanged.
++    pub fn prepare_json(
++        input: &'a [u8],
++        model: &'a BPE,
++        normalizer: Option<&'a NormalizerWrapper>,
++    ) -> Result<Self, Error> {
++        let input =
++            std::str::from_utf8(input).map_err(|e| error(Kind::InvalidUtf8, e.valid_up_to()))?;
++        let mut r = Reader::new(
++            input,
++            Span {
++                start: 0,
++                end: input.len(),
++            },
++        );
++        let root = r.value()?;
++        r.finish()?;
++        let mut a = Reader::new(input, root).array()?;
++        let mut n = 0usize;
++        let mut b = 0usize;
++        while let Some(span) = a.next()? {
++            let token = token(input, span)?;
++            n = checked_add(n, 1)?;
++            b = checked_add(b, token.content.len())?;
++            if token.content.len() != 0 {
++                if token.flags & (SINGLE | LEFT | RIGHT) != 0 {
++                    return Err(error(Kind::WordOrStripProfile, span.start));
++                }
++                if token.flags & NORMALIZED != 0 && normalizer.is_some() {
++                    return Err(error(Kind::NormalizationProfile, span.start));
++                }
++            }
++        }
++        Ok(Self {
++            input,
++            root,
++            model,
++            normalizer,
++            requirements: requirements(n, b)?,
++            #[cfg(test)]
++            fail_at: None,
++        })
++    }
++    pub fn requirements(&self) -> AddedVocabularyCompileRequirements {
++        self.requirements
++    }
++    /// Consumes the same config/model-borrowing plan. Every partial allocation
++    /// remains in its actual failure, without retry or consuming extraction.
++    pub fn compile(self) -> Result<AddedVocabulary, AddedVocabularyCompileFailure> {
++        let mut partial = Packed::default();
++        if let Err(cause) = self.fill(&mut partial) {
++            return Err(AddedVocabularyCompileFailure { cause, partial });
++        }
++        let actual = partial.buffer_bytes();
++        if actual.is_none() || actual.is_some_and(|b| b > self.requirements.buffers) {
++            return Err(AddedVocabularyCompileFailure {
++                cause: error(
++                    if actual.is_none() {
++                        Kind::Overflow
++                    } else {
++                        Kind::CapacityExceeded
++                    },
++                    0,
++                )
++                .into(),
++                partial,
++            });
++        }
++        Ok(AddedVocabulary {
++            storage: Storage::Packed(partial),
++        })
++    }
++    #[cfg(test)]
++    fn fail_reservation(mut self, stage: usize) -> Self {
++        assert!(stage < 4);
++        self.fail_at = Some(stage);
++        self
++    }
++    fn requested_capacity(&self, stage: usize, requested: usize) -> usize {
++        #[cfg(test)]
++        if self.fail_at == Some(stage) {
++            return usize::MAX;
++        }
++        let _ = stage;
++        requested
++    }
++    fn fill(&self, p: &mut Packed) -> Result<(), Cause> {
++        let n = self.requirements.slots;
++        p.entries.try_reserve_exact(self.requested_capacity(0, n))?;
++        p.bytes
++            .try_reserve_exact(self.requested_capacity(1, self.requirements.bytes))?;
++        p.spellings
++            .try_reserve_exact(self.requested_capacity(2, n))?;
++        p.ids.try_reserve_exact(self.requested_capacity(3, n))?;
++        // The retained immutable borrow is the real normalizer; no manufactured
++        // identity claim or normalized cache construction intervenes.
++        let _normalizer = self.normalizer;
++        let mut a = Reader::new(self.input, self.root).array()?;
++        while let Some(span) = a.next()? {
++            let t = token(self.input, span)?;
++            let start = p.bytes.len();
++            p.bytes.extend(t.content.bytes());
++            p.entries.push(Entry {
++                start,
++                len: p.bytes.len() - start,
++                id: 0,
++                flags: t.flags,
++                special_seen: t.flags & SPECIAL != 0,
++                canonical: false,
++            });
++        }
++        let mut next_id =
++            u32::try_from(self.model.get_vocab_size()).map_err(|_| error(Kind::Overflow, 0))?;
++        for i in 0..p.entries.len() {
++            if p.entries[i].len == 0 {
++                continue;
++            }
++            if let Some(previous) =
++                (0..i).find(|&j| p.entries[j].canonical && p.content(j) == p.content(i))
++            {
++                // Same spelling keeps its first assigned ID; final properties
++                // replace earlier properties, and special membership is sticky.
++                let flags = p.entries[i].flags;
++                let special_seen = p.entries[i].special_seen;
++                p.entries[previous].flags = flags;
++                p.entries[previous].special_seen |= special_seen;
++                continue;
++            }
++            let id = match self.model.token_to_id(p.content(i)) {
++                Some(id) => id,
++                None => {
++                    let id = next_id;
++                    next_id = next_id
++                        .checked_add(1)
++                        .ok_or_else(|| error(Kind::Overflow, p.entries[i].start))?;
++                    id
++                }
++            };
++            p.entries[i].id = id;
++            p.entries[i].canonical = true;
++            p.spellings.push(i);
++            p.ids.push(i);
++        }
++        // Explicit disjoint references avoid whole-self closure capture in Rust2018.
++        let entries = &p.entries;
++        let bytes = &p.bytes;
++        p.spellings.sort_unstable_by(|&a, &b| {
++            let a = &entries[a];
++            let b = &entries[b];
++            bytes[a.start..a.start + a.len].cmp(&bytes[b.start..b.start + b.len])
++        });
++        p.ids.sort_unstable_by_key(|&i| entries[i].id);
++        if p.ids
++            .windows(2)
++            .any(|w| entries[w[0]].id == entries[w[1]].id)
++        {
++            return Err(error(Kind::AmbiguousId, 0).into());
++        }
++        Ok(())
++    }
++}
++#[derive(Clone, Copy)]
++struct Token<'a> {
++    content: Text<'a>,
++    flags: u8,
++}
++fn token(input: &str, span: Span) -> Result<Token<'_>, Error> {
++    const FIELDS: [&str; 7] = [
++        "id",
++        "content",
++        "single_word",
++        "lstrip",
++        "rstrip",
++        "normalized",
++        "special",
++    ];
++    let mut object = Reader::new(input, span).object()?;
++    let mut seen = 0u8;
++    let mut content = None;
++    let mut flags = 0;
++    while let Some((key, value)) = object.next()? {
++        let field = FIELDS
++            .iter()
++            .position(|name| key.is(name))
++            .ok_or_else(|| error(Kind::UnsupportedField, key.offset))?;
++        if seen & (1 << field) != 0 {
++            return Err(error(Kind::DuplicateField, key.offset));
++        }
++        seen |= 1 << field;
++        match field {
++            0 => {
++                let raw = &input[value.start..value.end];
++                if raw.is_empty()
++                    || !raw.bytes().all(|b| b.is_ascii_digit())
++                    || raw.parse::<u32>().is_err()
++                {
++                    return Err(error(Kind::InvalidId, value.start));
++                }
++            }
++            1 => {
++                let mut r = Reader::new(input, value);
++                content = Some(r.string()?);
++                r.finish()?;
++            }
++            _ => match &input[value.start..value.end] {
++                "true" => flags |= 1 << (field - 2),
++                "false" => {}
++                _ => return Err(error(Kind::InvalidJson, value.start)),
++            },
++        }
++    }
++    if seen != 127 {
++        return Err(error(Kind::MissingField, span.start));
++    }
++    Ok(Token {
++        content: content.expect("required content"),
++        flags,
++    })
++}
++fn checked_add(a: usize, b: usize) -> Result<usize, Error> {
++    a.checked_add(b).ok_or_else(|| error(Kind::Overflow, 0))
++}
++fn requirements(n: usize, b: usize) -> Result<AddedVocabularyCompileRequirements, Error> {
++    let entries = Layout::array::<Entry>(n)
++        .map_err(|_| error(Kind::Overflow, 0))?
++        .size();
++    let order = Layout::array::<usize>(n)
++        .map_err(|_| error(Kind::Overflow, 0))?
++        .size();
++    Layout::array::<u8>(b).map_err(|_| error(Kind::Overflow, 0))?;
++    let buffers = checked_add(checked_add(entries, b)?, checked_add(order, order)?)?;
++    let controls = [
++        size_of::<Packed>(),
++        size_of::<Entry>(),
++        size_of::<Token<'_>>(),
++        size_of::<Text<'_>>(),
++        size_of::<Span>(),
++        size_of::<Reader<'_>>(),
++        size_of::<json::Object<'_>>(),
++        size_of::<json::Array<'_>>(),
++        size_of::<json::Bytes<'_>>(),
++        json::stack_bytes(),
++        size_of::<json::Error>(),
++        size_of::<AddedVocabularyCompilePlan<'_>>(),
++        size_of::<Result<AddedVocabularyCompilePlan<'_>, Error>>(),
++        size_of::<AddedVocabularyCompileRequirements>(),
++        size_of::<Storage>(),
++        size_of::<AddedVocabulary>(),
++        size_of::<Cause>(),
++        size_of::<Error>(),
++        size_of::<AddedVocabularyCompileFailure>(),
++        size_of::<Result<AddedVocabulary, AddedVocabularyCompileFailure>>(),
++        size_of::<Result<(), Cause>>(),
++        size_of::<Result<(), TryReserveError>>(),
++        size_of::<Result<Token<'_>, Error>>(),
++        size_of::<&Vec<Entry>>(),
++        size_of::<&Vec<u8>>(),
++        size_of::<(&&Vec<Entry>, &&Vec<u8>)>(),
++        size_of::<&&Vec<Entry>>(),
++        size_of::<Option<&NormalizerWrapper>>(),
++    ]
++    .iter()
++    .try_fold(0usize, |a, &b| a.checked_add(b))
++    .ok_or_else(|| error(Kind::Overflow, 0))?;
++    Ok(AddedVocabularyCompileRequirements {
++        slots: n,
++        bytes: b,
++        buffers,
++        controls,
++        total: checked_add(buffers, controls)?,
++    })
++}
++#[derive(Debug)]
++enum Cause {
++    Source(Error),
++    Allocation(TryReserveError),
++}
++impl From<Error> for Cause {
++    fn from(e: Error) -> Self {
++        Self::Source(e)
++    }
++}
++impl From<json::Error> for Cause {
++    fn from(e: json::Error) -> Self {
++        Self::Source(e.into())
++    }
++}
++impl From<TryReserveError> for Cause {
++    fn from(e: TryReserveError) -> Self {
++        Self::Allocation(e)
++    }
++}
++/// Move-only actual partial destination and cause; no storage extraction or retry.
++#[derive(Debug)]
++pub struct AddedVocabularyCompileFailure {
++    cause: Cause,
++    partial: Packed,
++}
++impl AddedVocabularyCompileFailure {
++    pub fn source_error(&self) -> Option<&Error> {
++        match &self.cause {
++            Cause::Source(e) => Some(e),
++            _ => None,
++        }
++    }
++    pub fn allocation_error(&self) -> Option<&TryReserveError> {
++        match &self.cause {
++            Cause::Allocation(e) => Some(e),
++            _ => None,
++        }
++    }
++    pub fn buffer_capacities(&self) -> [usize; 4] {
++        self.partial.capacities()
++    }
++    pub fn allocated_bytes(&self) -> Option<usize> {
++        self.partial.buffer_bytes()
++    }
++}
++impl fmt::Display for AddedVocabularyCompileFailure {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match &self.cause {
++            Cause::Source(e) => fmt::Display::fmt(e, f),
++            Cause::Allocation(e) => fmt::Display::fmt(e, f),
++        }
++    }
++}
++impl std::error::Error for AddedVocabularyCompileFailure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match &self.cause {
++            Cause::Source(e) => Some(e),
++            Cause::Allocation(e) => Some(e),
++        }
++    }
++}
++
++/// Literal search has O(patterns × remaining-input search) work per yielded
++/// match, with constant iterator storage. It makes no DAAC throughput claim.
++pub(super) struct Matches<'a> {
++    packed: &'a Packed,
++    sentence: &'a str,
++    normalized: bool,
++    pos: usize,
++    done: bool,
++}
++impl<'a> Matches<'a> {
++    pub(super) fn new(packed: &'a Packed, sentence: &'a str, normalized: bool) -> Self {
++        Self {
++            packed,
++            sentence,
++            normalized,
++            pos: 0,
++            done: false,
++        }
++    }
++}
++impl Iterator for Matches<'_> {
++    type Item = (u32, (usize, usize));
++    fn next(&mut self) -> Option<Self::Item> {
++        if self.done {
++            return None;
++        }
++        let mut winner: Option<(u32, usize, usize)> = None;
++        for &i in &self.packed.spellings {
++            let e = &self.packed.entries[i];
++            if (e.flags & NORMALIZED != 0) != self.normalized {
++                continue;
++            }
++            if let Some(relative) = self.sentence[self.pos..].find(self.packed.content(i)) {
++                let start = self.pos + relative;
++                let end = start + e.len;
++                if winner.is_none_or(|(_, old_start, old_end)| {
++                    start < old_start || (start == old_start && end > old_end)
++                }) {
++                    winner = Some((e.id, start, end));
++                }
++            }
++        }
++        match winner {
++            Some((id, start, end)) => {
++                self.pos = end;
++                Some((id, (start, end)))
++            }
++            None => {
++                self.done = true;
++                None
++            }
++        }
++    }
++}
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/src/tokenizer/added_vocabulary/packed/tests.rs
+@@ -0,0 +1,322 @@
++use super::*;
++use crate::{AddedToken, NormalizerWrapper, OffsetReferential, OffsetType, Tokenizer};
++use serde_json::json;
++
++fn model() -> BPE {
++    crate::models::bpe::BpeCompilePlan::prepare_model_json(br#"{"vocab":{"h":0,"i":1,"hi":2," ":3,"a":4,"b":5,"c":6,"x":7,"y":8,"z":9,"e":10,"!":11,"\u00e9":12,"\ud83d\ude03":13},"merges":[["h","i"]]}"#).unwrap().compile().unwrap()
++}
++fn value(content: &str, normalized: bool, special: bool) -> serde_json::Value {
++    json!({"id":900,"content":content,"single_word":false,"lstrip":false,"rstrip":false,"normalized":normalized,"special":special})
++}
++fn source(values: Vec<serde_json::Value>) -> String {
++    serde_json::to_string(&values).unwrap()
++}
++fn legacy(input: &str, model: &BPE, normalizer: Option<&NormalizerWrapper>) -> AddedVocabulary {
++    let values: Vec<serde_json::Value> = serde_json::from_str(input).unwrap();
++    let tokens: Vec<AddedToken> = values
++        .into_iter()
++        .map(|v| serde_json::from_value(v).unwrap())
++        .collect();
++    let mut v = AddedVocabulary::new();
++    v.add_tokens(tokens, model, normalizer).unwrap();
++    v
++}
++fn packed(input: &str, model: &BPE, normalizer: Option<&NormalizerWrapper>) -> AddedVocabulary {
++    AddedVocabularyCompilePlan::prepare_json(input.as_bytes(), model, normalizer)
++        .unwrap()
++        .compile()
++        .unwrap()
++}
++fn extraction(
++    v: &AddedVocabulary,
++    normalizer: Option<&NormalizerWrapper>,
++    input: &str,
++) -> (
++    Vec<(String, (usize, usize), Vec<u32>)>,
++    Vec<(String, (usize, usize), Vec<u32>)>,
++) {
++    let p = v.extract_and_normalize(normalizer, input);
++    let collect = |kind| {
++        p.get_splits(kind, OffsetType::Byte)
++            .into_iter()
++            .map(|(s, o, t)| {
++                (
++                    s.to_owned(),
++                    o,
++                    t.as_ref()
++                        .map(|v| v.iter().map(|t| t.id).collect())
++                        .unwrap_or_default(),
++                )
++            })
++            .collect()
++    };
++    (
++        collect(OffsetReferential::Original),
++        collect(OffsetReferential::Normalized),
++    )
++}
++#[test]
++fn packed_nonzero_extraction_and_encoding_share_the_actual_pipeline() {
++    let model = model();
++    let input = source(vec![
++        value("<|end|>", false, true),
++        value("hi!", true, false),
++        value("😃", false, false),
++    ]);
++    let expected = legacy(&input, &model, None);
++    let actual = packed(&input, &model, None);
++    assert!(matches!(actual.storage, Storage::Packed(_)));
++    let mut first = Tokenizer::new(model.clone());
++    first.with_added_vocabulary(expected);
++    let mut second = Tokenizer::new(model);
++    second.with_added_vocabulary(actual);
++    for input in [
++        "hi hi! <|end|>😃 hi",
++        "<|end|><|end|>hi!",
++        "hé e\u{301} hi!",
++        "",
++        "xyz",
++    ] {
++        assert_eq!(
++            extraction(first.get_added_vocabulary(), None, input),
++            extraction(second.get_added_vocabulary(), None, input)
++        );
++        let a = first.encode(input, false).unwrap();
++        let b = second.encode(input, false).unwrap();
++        assert_eq!(a.get_ids(), b.get_ids());
++        assert_eq!(a.get_tokens(), b.get_tokens());
++        assert_eq!(a.get_offsets(), b.get_offsets());
++        if input == "hi hi! <|end|>😃 hi" {
++            assert!(b.get_ids().contains(&2));
++            assert!(b.get_ids().iter().any(|&id| id >= 14));
++        }
++    }
++}
++#[test]
++fn raw_longest_match_is_consumed_before_special_filtering() {
++    let model = model();
++    let input = source(vec![
++        value("ab", false, true),
++        value("a", false, false),
++        value("bc", false, false),
++    ]);
++    let mut expected = legacy(&input, &model, None);
++    let mut actual = packed(&input, &model, None);
++    let ab = actual.token_to_id("ab", &model).unwrap();
++    assert_eq!(
++        actual.raw_matches("abc", false).collect::<Vec<_>>(),
++        vec![(ab, (0, 2))]
++    );
++    expected.set_encode_special_tokens(true);
++    actual.set_encode_special_tokens(true);
++    assert_eq!(actual.find_matches("abc", false), vec![(None, (0, 3))]);
++    assert_eq!(
++        extraction(&expected, None, "abc ab a"),
++        extraction(&actual, None, "abc ab a")
++    );
++    // Neither shorter a at position 0 nor overlapping bc at position 1 is recovered.
++    actual.set_encode_special_tokens(false);
++    expected.set_encode_special_tokens(false);
++    assert_eq!(
++        extraction(&expected, None, "abc ab a"),
++        extraction(&actual, None, "abc ab a")
++    );
++}
++#[test]
++fn source_order_updates_keep_first_id_final_flags_and_sticky_special_membership() {
++    let model = model();
++    let input = source(vec![
++        value("", false, true),
++        value("hi", false, true),
++        value("new", false, false),
++        value("hi", true, false),
++        value("new", false, false),
++    ]);
++    let expected = legacy(&input, &model, None);
++    let actual = packed(&input, &model, None);
++    assert_eq!(actual.get_vocab(), expected.get_vocab());
++    assert_eq!(
++        actual.get_added_tokens_decoder(),
++        expected.get_added_tokens_decoder()
++    );
++    assert_eq!(actual.token_to_id("hi", &model), Some(2));
++    assert!(actual.is_special_token("hi"));
++    assert!(!actual.token_ref(2).unwrap().special);
++    assert!(actual.token_ref(2).unwrap().normalized);
++    assert_eq!(actual.len(), 2);
++    assert!(!actual.is_special_token(""));
++    assert_eq!(
++        extraction(&expected, None, "hi new hi"),
++        extraction(&actual, None, "hi new hi")
++    );
++}
++#[test]
++fn cardinality_assignment_and_added_first_model_shadowing_preserve_sparse_ids() {
++    let model = crate::models::bpe::BpeCompilePlan::prepare_model_json(
++        br#"{"vocab":{"a":0,"b":2},"merges":[]}"#,
++    )
++    .unwrap()
++    .compile()
++    .unwrap();
++    let input = source(vec![value("new", false, true)]);
++    let actual = packed(&input, &model, None);
++    let expected = legacy(&input, &model, None);
++    assert_eq!(actual.token_to_id("new", &model), Some(2));
++    assert_eq!(actual.decode_token_ref(2), Some("new"));
++    assert_eq!(actual.get_vocab(), expected.get_vocab());
++    let mut tokenizer = Tokenizer::new(model);
++    tokenizer.with_added_vocabulary(actual);
++    assert_eq!(tokenizer.decode_vocabulary().id_to_token(2), Some("new"));
++    assert_eq!(
++        tokenizer
++            .decode_vocabulary()
++            .ids()
++            .filter(|&id| id == 2)
++            .count(),
++        2
++    );
++}
++#[test]
++fn actual_normalizer_borrow_controls_profiles_and_nfc_unmatched_text() {
++    let model = model();
++    let normalizer: NormalizerWrapper = crate::normalizers::NFC.into();
++    let input = source(vec![value("hi", false, true)]);
++    let plan =
++        AddedVocabularyCompilePlan::prepare_json(input.as_bytes(), &model, Some(&normalizer))
++            .unwrap();
++    assert!(std::ptr::eq(plan.normalizer.unwrap(), &normalizer));
++    assert!(std::ptr::eq(plan.model, &model));
++    let actual = plan.compile().unwrap();
++    let expected = legacy(&input, &model, Some(&normalizer));
++    assert_eq!(
++        extraction(&expected, Some(&normalizer), "e\u{301} hi é"),
++        extraction(&actual, Some(&normalizer), "e\u{301} hi é")
++    );
++    let normalized = source(vec![value("hi", true, false)]);
++    assert_eq!(
++        AddedVocabularyCompilePlan::prepare_json(normalized.as_bytes(), &model, Some(&normalizer))
++            .unwrap_err()
++            .kind,
++        Kind::NormalizationProfile
++    );
++    let actual = packed(&normalized, &model, None);
++    assert_eq!(actual.decode_token_ref(2), Some("hi"));
++}
++#[test]
++fn four_real_capacity_frontiers_retain_every_allocated_prefix_after_input_drop() {
++    let model = model();
++    let mut previous = 0;
++    for stage in 0..4 {
++        let input = source(vec![
++            value("<first>", false, true),
++            value("😃hi", true, false),
++            value("last", false, false),
++        ]);
++        let plan = AddedVocabularyCompilePlan::prepare_json(input.as_bytes(), &model, None)
++            .unwrap()
++            .fail_reservation(stage);
++        let error = plan.compile().unwrap_err();
++        drop(input);
++        assert!(error.allocation_error().is_some());
++        assert!(error.source_error().is_none());
++        let capacities = error.buffer_capacities();
++        assert!(capacities[..stage].iter().all(|&c| c > 0));
++        assert!(capacities[stage..].iter().all(|&c| c == 0));
++        let bytes = error.allocated_bytes().unwrap();
++        assert_eq!(bytes == 0, stage == 0);
++        if stage > 0 {
++            assert!(bytes > previous);
++        }
++        previous = bytes;
++        assert!(std::error::Error::source(&error)
++            .unwrap()
++            .downcast_ref::<TryReserveError>()
++            .is_some());
++    }
++}
++#[test]
++fn late_reverse_id_collision_keeps_completed_raw_destination_without_retry() {
++    let model = crate::models::bpe::BpeCompilePlan::prepare_model_json(
++        br#"{"vocab":{"a":0,"b":2},"merges":[]}"#,
++    )
++    .unwrap()
++    .compile()
++    .unwrap();
++    let input = source(vec![value("new", false, true), value("b", false, false)]);
++    let plan = AddedVocabularyCompilePlan::prepare_json(input.as_bytes(), &model, None).unwrap();
++    let facts = plan.requirements();
++    let error = plan.compile().unwrap_err();
++    drop(input);
++    drop(model);
++    assert_eq!(error.source_error().unwrap().kind, Kind::AmbiguousId);
++    assert_eq!(error.allocated_bytes(), Some(facts.buffer_bytes()));
++    assert_eq!(error.partial.entries.len(), 2);
++    assert_eq!(error.partial.content(0), "new");
++    assert_eq!(error.partial.content(1), "b");
++}
++#[test]
++fn borrowed_and_explicit_map_compatibility_clone_serde_and_mutation_keep_values() {
++    let model = model();
++    let input = source(vec![value("HI", true, false), value("<s>", false, true)]);
++    let actual = packed(&input, &model, None);
++    assert!(matches!(actual.get_vocab(), std::borrow::Cow::Owned(_)));
++    let expected = legacy(&input, &model, None);
++    assert!(matches!(
++        expected.get_vocab(),
++        std::borrow::Cow::Borrowed(_)
++    ));
++    let alias = actual.clone();
++    let hi = actual.token_to_id("HI", &model).unwrap();
++    assert_eq!(actual.decode_token_ref(hi), Some("HI"));
++    assert_eq!(alias.get_vocab(), actual.get_vocab());
++    assert_eq!(
++        serde_json::to_value(&actual).unwrap(),
++        serde_json::to_value(&expected).unwrap()
++    );
++    let mut changed = actual;
++    let normalizer: NormalizerWrapper = crate::normalizers::Lowercase.into();
++    changed
++        .refresh_normalized_tokens(Some(&normalizer))
++        .unwrap();
++    assert!(matches!(changed.storage, Storage::Legacy(_)));
++    assert_eq!(changed.decode_token_ref(hi), Some("hi"));
++    assert_eq!(alias.decode_token_ref(hi), Some("HI"));
++    changed
++        .add_tokens([AddedToken::from("new", false)], &model, Some(&normalizer))
++        .unwrap();
++    assert!(changed.token_to_id("new", &model).is_some());
++    assert_eq!(alias.token_to_id("new", &model), None);
++}
++#[test]
++fn escaped_content_empty_input_and_complete_schema_validation_precede_reserves() {
++    let model = model();
++    let input = r#"[{"id":88,"content":"\ud83d\ude03","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}]"#;
++    let actual = packed(input, &model, None);
++    assert_eq!(actual.token_to_id("😃", &model), Some(13));
++    assert_eq!(actual.find_matches("", false), vec![(None, (0, 0))]);
++    for key in ["single_word", "lstrip", "rstrip"] {
++        let mut t = value("x", false, false);
++        t[key] = json!(true);
++        let input = source(vec![t]);
++        assert_eq!(
++            AddedVocabularyCompilePlan::prepare_json(input.as_bytes(), &model, None)
++                .unwrap_err()
++                .kind,
++            Kind::WordOrStripProfile
++        );
++    }
++    for input in [b"[".as_slice(), b"[] true", b"[{}]", b"[null]", b"[\xff]"] {
++        assert!(AddedVocabularyCompilePlan::prepare_json(input, &model, None).is_err());
++    }
++    let empty = packed("[]", &model, None);
++    assert!(empty.is_empty());
++    assert_eq!(empty.find_matches("hi", false), vec![(None, (0, 2))]);
++    assert_eq!(
++        requirements(usize::MAX, 1).unwrap_err().kind,
++        Kind::Overflow
++    );
++    assert_eq!(
++        requirements(1, usize::MAX).unwrap_err().kind,
++        Kind::Overflow
++    );
++}
+--- a/src/tokenizer/mod.rs
++++ b/src/tokenizer/mod.rs
+@@ -467,17 +467,15 @@
+     /// model maps or packed tables directly; it allocates nothing and invokes
+     /// no user callback.
+     pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
+-        self.model
+-            .decode_ids()
+-            .chain(self.added.get_added_tokens_decoder().keys().copied())
++        self.model.decode_ids().chain(self.added.ids())
+     }
+ 
+     /// Visits exactly the ID population of model `get_vocab(false)` and added
+     /// reverse entries. The caller's callback may have its own side effects.
+     pub fn visit_ids(&self, visitor: &mut dyn FnMut(u32)) {
+         self.model.visit_decode_ids(visitor);
+-        for id in self.added.get_added_tokens_decoder().keys() {
+-            visitor(*id);
++        for id in self.added.ids() {
++            visitor(id);
+         }
+     }
+ 
+@@ -768,11 +766,11 @@
+         let mut final_vocab = self.model.get_vocab();
+ 
+         if with_added_tokens {
+-            let added_vocab = self.added_vocabulary.get_vocab();
++            let added_vocab = &self.added_vocabulary;
+             if !added_vocab.is_empty() {
+                 final_vocab.reserve(added_vocab.len());
+-                for (token, id) in added_vocab {
+-                    final_vocab.insert(token.clone(), *id);
++                for (token, id) in added_vocab.vocabulary() {
++                    final_vocab.insert(token.to_owned(), id);
+                 }
+             }
+         }
+@@ -782,17 +780,19 @@
+ 
+     /// Get the added tokens decoder
+     pub fn get_added_tokens_decoder(&self) -> AHashMap<u32, AddedToken> {
+-        self.added_vocabulary.get_added_tokens_decoder().clone()
++        self.added_vocabulary
++            .get_added_tokens_decoder()
++            .into_owned()
+     }
+ 
+     /// Get the size of the vocabulary
+     pub fn get_vocab_size(&self, with_added_tokens: bool) -> usize {
+         let base = self.model.get_vocab_size();
+         if with_added_tokens {
+-            let added = self.added_vocabulary.get_vocab();
++            let added = &self.added_vocabulary;
+             let overlapping = added
+-                .keys()
+-                .filter(|t| self.model.token_to_id(t).is_some())
++                .vocabulary()
++                .filter(|(t, _)| self.model.token_to_id(t).is_some())
+                 .count();
+             base + added.len() - overlapping
+         } else {
+--- /dev/null
++++ b/src/utils/borrowed_json.rs
+@@ -0,0 +1,412 @@
++//! Fixed-stack validation and borrowed strings. No serde Value or owned key.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Kind {
++    InvalidJson,
++    DepthLimit,
++}
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct Error {
++    pub kind: Kind,
++    pub offset: usize,
++}
++
++pub(crate) const DEPTH: usize = 128;
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct Span {
++    pub start: usize,
++    pub end: usize,
++}
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct Text<'a> {
++    pub raw: &'a str,
++    pub offset: usize,
++}
++impl<'a> Text<'a> {
++    pub fn bytes(self) -> Bytes<'a> {
++        Bytes {
++            chars: self.raw.chars(),
++            buffer: [0; 4],
++            at: 0,
++            len: 0,
++        }
++    }
++    pub fn is(self, expected: &str) -> bool {
++        self.bytes().eq(expected.bytes())
++    }
++    pub fn len(self) -> usize {
++        self.bytes().count()
++    }
++}
++#[derive(Clone)]
++pub(crate) struct Bytes<'a> {
++    chars: std::str::Chars<'a>,
++    buffer: [u8; 4],
++    at: usize,
++    len: usize,
++}
++impl Iterator for Bytes<'_> {
++    type Item = u8;
++    fn next(&mut self) -> Option<u8> {
++        if self.at < self.len {
++            let b = self.buffer[self.at];
++            self.at += 1;
++            return Some(b);
++        }
++        let c = match self.chars.next()? {
++            '\\' => match self.chars.next().expect("validated escape") {
++                '"' => '"',
++                '\\' => '\\',
++                '/' => '/',
++                'b' => '\u{8}',
++                'f' => '\u{c}',
++                'n' => '\n',
++                'r' => '\r',
++                't' => '\t',
++                'u' => {
++                    let mut read = || {
++                        (0..4).fold(0, |n, _| {
++                            n * 16 + self.chars.next().expect("hex").to_digit(16).expect("hex")
++                        })
++                    };
++                    let high = read();
++                    let scalar = if (0xd800..=0xdbff).contains(&high) {
++                        self.chars.next();
++                        self.chars.next();
++                        let low = (0..4).fold(0, |n, _| {
++                            n * 16 + self.chars.next().expect("hex").to_digit(16).expect("hex")
++                        });
++                        0x10000 + ((high - 0xd800) << 10) + (low - 0xdc00)
++                    } else {
++                        high
++                    };
++                    char::from_u32(scalar).expect("validated scalar")
++                }
++                _ => unreachable!("validated escape"),
++            },
++            c => c,
++        };
++        self.len = c.encode_utf8(&mut self.buffer).len();
++        self.at = 1;
++        Some(self.buffer[0])
++    }
++}
++
++#[derive(Clone, Copy)]
++enum Frame {
++    ObjectFirst,
++    ObjectKey,
++    Colon,
++    ObjectValue,
++    ObjectComma,
++    ArrayFirst,
++    ArrayValue,
++    ArrayComma,
++}
++pub(crate) struct Reader<'a> {
++    pub input: &'a str,
++    pub pos: usize,
++    end: usize,
++}
++impl<'a> Reader<'a> {
++    pub fn new(input: &'a str, span: Span) -> Self {
++        Self {
++            input,
++            pos: span.start,
++            end: span.end,
++        }
++    }
++    fn err(&self, kind: Kind) -> Error {
++        Error {
++            kind,
++            offset: self.pos,
++        }
++    }
++    fn peek(&self) -> Option<u8> {
++        self.input
++            .as_bytes()
++            .get(self.pos)
++            .copied()
++            .filter(|_| self.pos < self.end)
++    }
++    pub fn ws(&mut self) {
++        while matches!(self.peek(), Some(b' ' | b'\n' | b'\r' | b'\t')) {
++            self.pos += 1;
++        }
++    }
++    pub fn byte(&mut self, b: u8) -> Result<(), Error> {
++        self.ws();
++        if self.peek() != Some(b) {
++            return Err(self.err(Kind::InvalidJson));
++        }
++        self.pos += 1;
++        Ok(())
++    }
++    pub fn finish(&mut self) -> Result<(), Error> {
++        self.ws();
++        if self.pos == self.end {
++            Ok(())
++        } else {
++            Err(self.err(Kind::InvalidJson))
++        }
++    }
++    fn hex(&mut self) -> Result<u32, Error> {
++        let mut n = 0;
++        for _ in 0..4 {
++            let b = self.peek().ok_or_else(|| self.err(Kind::InvalidJson))?;
++            let d = char::from(b)
++                .to_digit(16)
++                .ok_or_else(|| self.err(Kind::InvalidJson))?;
++            n = n * 16 + d;
++            self.pos += 1;
++        }
++        Ok(n)
++    }
++    pub fn string(&mut self) -> Result<Text<'a>, Error> {
++        self.byte(b'"')?;
++        let start = self.pos;
++        loop {
++            match self.peek().ok_or_else(|| self.err(Kind::InvalidJson))? {
++                b'"' => {
++                    let end = self.pos;
++                    self.pos += 1;
++                    return Ok(Text {
++                        raw: &self.input[start..end],
++                        offset: start,
++                    });
++                }
++                0..=31 => return Err(self.err(Kind::InvalidJson)),
++                b'\\' => {
++                    self.pos += 1;
++                    match self.peek().ok_or_else(|| self.err(Kind::InvalidJson))? {
++                        b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't' => self.pos += 1,
++                        b'u' => {
++                            self.pos += 1;
++                            let high = self.hex()?;
++                            if (0xd800..=0xdbff).contains(&high) {
++                                if self.peek() != Some(b'\\') {
++                                    return Err(self.err(Kind::InvalidJson));
++                                }
++                                self.pos += 1;
++                                if self.peek() != Some(b'u') {
++                                    return Err(self.err(Kind::InvalidJson));
++                                }
++                                self.pos += 1;
++                                if !(0xdc00..=0xdfff).contains(&self.hex()?) {
++                                    return Err(self.err(Kind::InvalidJson));
++                                }
++                            } else if (0xdc00..=0xdfff).contains(&high) {
++                                return Err(self.err(Kind::InvalidJson));
++                            }
++                        }
++                        _ => return Err(self.err(Kind::InvalidJson)),
++                    }
++                }
++                _ => self.pos += 1,
++            }
++        }
++    }
++    fn number(&mut self) -> Result<(), Error> {
++        if self.peek() == Some(b'-') {
++            self.pos += 1;
++        }
++        match self.peek() {
++            Some(b'0') => self.pos += 1,
++            Some(b'1'..=b'9') => {
++                self.pos += 1;
++                while matches!(self.peek(), Some(b'0'..=b'9')) {
++                    self.pos += 1;
++                }
++            }
++            _ => return Err(self.err(Kind::InvalidJson)),
++        }
++        if self.peek() == Some(b'.') {
++            self.pos += 1;
++            let start = self.pos;
++            while matches!(self.peek(), Some(b'0'..=b'9')) {
++                self.pos += 1;
++            }
++            if start == self.pos {
++                return Err(self.err(Kind::InvalidJson));
++            }
++        }
++        if matches!(self.peek(), Some(b'e' | b'E')) {
++            self.pos += 1;
++            if matches!(self.peek(), Some(b'+' | b'-')) {
++                self.pos += 1;
++            }
++            let start = self.pos;
++            while matches!(self.peek(), Some(b'0'..=b'9')) {
++                self.pos += 1;
++            }
++            if start == self.pos {
++                return Err(self.err(Kind::InvalidJson));
++            }
++        }
++        Ok(())
++    }
++    fn atom(&mut self, stack: &mut [Frame; DEPTH], depth: &mut usize) -> Result<(), Error> {
++        self.ws();
++        match self.peek() {
++            Some(b'{' | b'[') => {
++                if *depth == DEPTH {
++                    return Err(self.err(Kind::DepthLimit));
++                }
++                stack[*depth] = if self.peek() == Some(b'{') {
++                    Frame::ObjectFirst
++                } else {
++                    Frame::ArrayFirst
++                };
++                *depth += 1;
++                self.pos += 1;
++            }
++            Some(b'"') => {
++                self.string()?;
++            }
++            Some(b'-' | b'0'..=b'9') => self.number()?,
++            Some(b't' | b'f' | b'n') => {
++                let expected = match self.peek() {
++                    Some(b't') => "true",
++                    Some(b'f') => "false",
++                    _ => "null",
++                };
++                if !self.input.as_bytes()[self.pos..self.end].starts_with(expected.as_bytes()) {
++                    return Err(self.err(Kind::InvalidJson));
++                }
++                self.pos += expected.len();
++            }
++            _ => return Err(self.err(Kind::InvalidJson)),
++        }
++        Ok(())
++    }
++    pub fn value(&mut self) -> Result<Span, Error> {
++        self.ws();
++        let start = self.pos;
++        let mut stack = [Frame::ArrayFirst; DEPTH];
++        let mut depth = 0;
++        self.atom(&mut stack, &mut depth)?;
++        while depth > 0 {
++            self.ws();
++            let i = depth - 1;
++            match stack[i] {
++                Frame::ObjectFirst if self.peek() == Some(b'}') => {
++                    self.pos += 1;
++                    depth -= 1;
++                }
++                Frame::ObjectFirst | Frame::ObjectKey => {
++                    self.string()?;
++                    stack[i] = Frame::Colon;
++                }
++                Frame::Colon => {
++                    self.byte(b':')?;
++                    stack[i] = Frame::ObjectValue;
++                }
++                Frame::ObjectValue => {
++                    stack[i] = Frame::ObjectComma;
++                    self.atom(&mut stack, &mut depth)?;
++                }
++                Frame::ObjectComma => {
++                    if self.peek() == Some(b'}') {
++                        self.pos += 1;
++                        depth -= 1;
++                    } else {
++                        self.byte(b',')?;
++                        stack[i] = Frame::ObjectKey;
++                    }
++                }
++                Frame::ArrayFirst if self.peek() == Some(b']') => {
++                    self.pos += 1;
++                    depth -= 1;
++                }
++                Frame::ArrayFirst | Frame::ArrayValue => {
++                    stack[i] = Frame::ArrayComma;
++                    self.atom(&mut stack, &mut depth)?;
++                }
++                Frame::ArrayComma => {
++                    if self.peek() == Some(b']') {
++                        self.pos += 1;
++                        depth -= 1;
++                    } else {
++                        self.byte(b',')?;
++                        stack[i] = Frame::ArrayValue;
++                    }
++                }
++            }
++        }
++        Ok(Span {
++            start,
++            end: self.pos,
++        })
++    }
++    pub fn array(self) -> Result<Array<'a>, Error> {
++        let mut reader = self;
++        reader.byte(b'[')?;
++        Ok(Array {
++            reader,
++            first: true,
++            done: false,
++        })
++    }
++    pub fn object(self) -> Result<Object<'a>, Error> {
++        let mut reader = self;
++        reader.byte(b'{')?;
++        Ok(Object {
++            reader,
++            first: true,
++            done: false,
++        })
++    }
++}
++pub(crate) struct Array<'a> {
++    reader: Reader<'a>,
++    first: bool,
++    done: bool,
++}
++impl Array<'_> {
++    pub fn next(&mut self) -> Result<Option<Span>, Error> {
++        if self.done {
++            return Ok(None);
++        }
++        self.reader.ws();
++        if self.reader.peek() == Some(b']') {
++            self.reader.pos += 1;
++            self.reader.finish()?;
++            self.done = true;
++            return Ok(None);
++        }
++        if !self.first {
++            self.reader.byte(b',')?;
++        }
++        self.first = false;
++        self.reader.value().map(Some)
++    }
++}
++pub(crate) struct Object<'a> {
++    reader: Reader<'a>,
++    first: bool,
++    done: bool,
++}
++impl<'a> Object<'a> {
++    pub fn next(&mut self) -> Result<Option<(Text<'a>, Span)>, Error> {
++        if self.done {
++            return Ok(None);
++        }
++        self.reader.ws();
++        if self.reader.peek() == Some(b'}') {
++            self.reader.pos += 1;
++            self.reader.finish()?;
++            self.done = true;
++            return Ok(None);
++        }
++        if !self.first {
++            self.reader.byte(b',')?;
++        }
++        self.first = false;
++        let key = self.reader.string()?;
++        self.reader.byte(b':')?;
++        let value = self.reader.value()?;
++        Ok(Some((key, value)))
++    }
++}
++pub(crate) fn stack_bytes() -> usize {
++    std::mem::size_of::<[Frame; DEPTH]>()
++}
+--- a/src/utils/mod.rs
++++ b/src/utils/mod.rs
+@@ -1,3 +1,4 @@
++pub(crate) mod borrowed_json;
+ pub(crate) mod cache;
+ #[cfg(feature = "http")]
+ pub(crate) mod from_pretrained;

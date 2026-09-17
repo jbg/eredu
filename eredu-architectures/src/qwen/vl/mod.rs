@@ -4,24 +4,25 @@ mod checkpoint;
 mod config;
 mod model;
 mod parallel;
-mod positions;
+pub(crate) mod positions;
 
 pub use checkpoint::{
     load_time_quantization, normalize_text_weight_formats, projector_gguf_plan,
     rank_local_unit_recipes, safetensors_plan, static_recipes, translate_text_gguf_weight_name,
     translate_vision_gguf_weight_name, unit_recipes, with_checkpoint_formats,
 };
+pub(crate) use config::prompt_cache_architecture_fingerprint_with_metadata;
 pub use config::{
     model_args_from_config_value, model_args_from_gguf_parts,
-    prompt_cache_architecture_fingerprint, state_identity, state_layout,
+    prompt_cache_architecture_fingerprint, state_identity, state_identity_with_metadata, state_layout, state_layout_with_metadata,
     state_layout_with_key_value_heads, vision_config_from_gguf_catalog, GgufModelArgs, ModelArgs,
     VlConfigError,
 };
 pub use model::{
     prepare_input, vision_dependency_boundary_schema, vision_partition_boundary_schema,
-    ForwardContext, InputPart, LayeredModel, ModelInput, PipelineBoundary, PipelineBoundarySchema,
-    PipelinePartitionInput, PipelinePrepared, PipelineVisionState, PreparedInput, StaticModules,
-    Unit, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
+    ForwardContext, InputPart, LayeredModel, MediaPrefillPlan, ModelInput, PipelineBoundary,
+    PipelineBoundarySchema, PipelinePartitionInput, PipelinePrepared, PipelineVisionState,
+    PreparedInput, StaticModules, Unit, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
 pub use parallel::{
     local_geometry, partition_local_geometry, partition_local_routed_geometry, LocalGeometry,

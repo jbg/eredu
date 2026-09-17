@@ -21,14 +21,23 @@ pub struct CacheResidencyManager {
 
 #[path = "manager/transitions.rs"]
 mod transitions;
-use transitions::{eviction_candidate, HostDemotionProgress, PendingCacheOperation};
+use transitions::{HostDemotionProgress, PendingCacheOperation, eviction_candidate};
 
 #[path = "manager/lifecycle.rs"]
 mod lifecycle;
 
 #[path = "manager/reporting.rs"]
 mod reporting;
+#[path = "manager/source.rs"]
+mod source;
+#[path = "manager/storage.rs"]
+mod storage;
 pub(super) use reporting::update_report_totals;
+pub(crate) use source::{
+    CacheBlockSource, CacheBlockSourceLoan, CacheDiskSource, CacheSourceError, CacheSourceFailure,
+    CacheSourceFailureCause, IndependentCacheManagerPlan, PinnedCacheBlock, PinnedCacheBlockLease,
+    PinnedCacheSource, PreparedIndependentCacheManager,
+};
 
 #[path = "manager/acquisition.rs"]
 mod acquisition;
@@ -37,8 +46,8 @@ pub use acquisition::{CacheBlockLease, CacheBlockPrefetch};
 #[path = "manager/prompt_cache.rs"]
 mod prompt_cache;
 pub use prompt_cache::{
-    load_prompt_cache_state_tensors, open_prompt_cache, LoadedPromptCacheStateTensor,
-    PromptCacheStateArray,
+    LoadedPromptCacheStateTensor, PromptCacheStateArray, load_prompt_cache_state_tensors,
+    open_prompt_cache,
 };
 
 #[path = "manager/persistence.rs"]
@@ -75,3 +84,46 @@ fn sync_file(path: &Path) -> Result<(), CacheResidencyError> {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+pub(crate) use source::{CatalogInstallFailure, InstalledManagerCatalog, PreparedManagerCatalog};
+
+#[path = "manager/publication.rs"]
+mod publication;
+pub(crate) use publication::{CacheBlockMetadata, PreparedFloatingBlockMetadata};
+
+#[path = "manager/original_append.rs"]
+mod original_append;
+
+#[path = "manager/original_host.rs"]
+mod original_host;
+#[path = "manager/original_scan.rs"]
+mod original_scan;
+#[path = "manager/original_discard.rs"]
+mod original_discard;
+
+pub(crate) use source::{PagedArrayCopyLayout, PreparedPagedArrayCopy};
+
+pub(crate) use source::{PreparedCacheHostPromotion, PreparedCacheHostPromotionSlots};
+
+pub(crate) use source::{PreparedCacheHostDemotion, StoredCacheHostSource};
+
+pub(crate) use source::{
+    DiskWriteOccupancy, DiskWriteOperation, DiskWriteOperationFailure, PreparedDiskWrite,
+    PreparedDiskWriteOutput,
+};
+
+pub(crate) use source::{
+    CompletedDiskRead, DiskReadFinishFailure, DiskReadOccupancy, DiskReadOperation,
+    DiskReadOperationFailure, PreparedDiskRead, PreparedDiskReadOutput, PreparedDiskReadSource,
+};
+
+pub(crate) use source::PreparedDiskWriteDestination;
+
+pub(crate) use source::{InstalledDiskWorker, PreparedDiskWorker};
+
+pub(crate) use source::{DiskReadBinding, PreparedDiskReadDestination, disk_read_source_facts};
+
+pub(crate) use source::PreparedInitialDiskReturn;
+
+#[path = "manager/realtime_transaction.rs"]
+mod realtime_transaction;

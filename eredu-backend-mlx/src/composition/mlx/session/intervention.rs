@@ -3,43 +3,63 @@
 use super::bounded_capture::NativeCapture;
 use super::*;
 use eredu_core::{capture::*, intervention::*};
-use safemlx::ops::indexing::{ArrayIndex, IntoStrideBy, TryIndexMutOp};
 
 mod routed;
+mod static_activation;
+mod model;
+mod partition;
+pub(crate) use partition::PreparedPartitionModelIntervention;
+mod text;
+pub(crate) use model::PreparedModelInterventions;
+pub(crate) use text::{PreparedTextInterventions, PreparedTextInterventionsOwner};
+pub(in crate::composition::mlx) use text::TextInterventionQuote;
+pub(crate) use static_activation::{PreparedStaticActivation, StaticActivationPopulation, PreparedSparseActivation, SparseActivationFailure};
 #[cfg(test)]
 mod tests;
 
-pub(crate) fn mechanisms() -> InterventionMechanisms {
-    InterventionMechanisms {
-        routed_units: true,
-        operations: vec![
-            InterventionKind::Zero,
-            InterventionKind::Scale,
-            InterventionKind::Mask,
-            InterventionKind::MaskComponents,
-            InterventionKind::Replace,
-            InterventionKind::Add,
-            InterventionKind::MaskLogits,
-            InterventionKind::ExcludeExperts,
-            InterventionKind::ZeroExpertContribution,
-            InterventionKind::BiasRoutingScores,
-            InterventionKind::ForceExperts,
-        ],
-        dtypes: vec![
-            InterventionDtype::Float32,
-            InterventionDtype::Float16,
-            InterventionDtype::Bfloat16,
-        ],
-        score_stages: vec![
-            RoutingScoreStage::RawLogits,
-            RoutingScoreStage::TransformedScores,
-            RoutingScoreStage::RankingScores,
-        ],
-    }
+const OPERATIONS:&[InterventionKind]=&[
+    InterventionKind::Zero,InterventionKind::Scale,InterventionKind::Mask,
+    InterventionKind::MaskComponents,InterventionKind::Replace,InterventionKind::Add,
+    InterventionKind::MaskLogits,InterventionKind::ExcludeExperts,
+    InterventionKind::ZeroExpertContribution,InterventionKind::BiasRoutingScores,InterventionKind::ForceExperts,
+];
+const DTYPES:&[InterventionDtype]=&[InterventionDtype::Float32,InterventionDtype::Float16,InterventionDtype::Bfloat16];
+const SCORE_STAGES:&[RoutingScoreStage]=&[RoutingScoreStage::RawLogits,RoutingScoreStage::TransformedScores,RoutingScoreStage::RankingScores];
+pub(crate) fn mechanism_facts()->InterventionMechanismFacts<'static> {
+    InterventionMechanismFacts {routed_units:true,operations:OPERATIONS,dtypes:DTYPES,score_stages:SCORE_STAGES}
+}
+pub(crate) fn mechanisms()->InterventionMechanisms {
+    let facts=mechanism_facts();
+    InterventionMechanisms {routed_units:facts.routed_units,operations:facts.operations.to_vec(),
+        dtypes:facts.dtypes.to_vec(),score_stages:facts.score_stages.to_vec()}
 }
 
 /// Cold MLX bounds: the same estimator is used at admission and before execution.
 pub(crate) struct NativeInterventionEstimator;
+impl NativeInterventionEstimator {
+    /// Shared dense/sparse preflight controls and bounded diagnostic alternatives.
+    /// The virtual sparse expert axis is never a native allocation.
+    pub(crate) fn prepared_preflight_control_bytes()->Option<usize> {
+        use std::mem::{size_of,size_of_val};
+        let messages=["MLX intervention geometry exceeds signed 32-bit indexing",
+            "scalar activation edit", "MLX capture shape/index exceeds signed 32-bit indexing",
+            "selected score IDs exceed the runtime vocabulary or count limit",
+            "candidate count exceeds the runtime vocabulary", "histogram bin count",
+            "invalid sparse edit virtual shape", "MLX sparse edit indexing exceeds i32",
+            "sparse routing action", "sparse edit estimate includes record encoding"];
+        let frames=[size_of::<(&Self,&[u64],&ResolvedCaptureSlice,&InterventionAction)>(),
+            size_of::<(&[u64],&CaptureSelection,&[u64],&[u64])>(),
+            size_of::<[CaptureUsage;2]>(),size_of::<Result<CaptureUsage,CaptureError>>(),
+            // Four activation census values and eight dense capture census values.
+            size_of::<[u64;4]>(),size_of::<[u64;8]>(),size_of::<std::slice::Iter<'_,u64>>(),
+            size_of::<std::slice::Iter<'_,u32>>(),
+            size_of::<(RoutedUnitGeometry,&[u64],&ResolvedCaptureSlice,&InterventionAction)>(),
+            size_of::<(u64,u64,u64)>(),size_of::<Option<InterventionDtype>>()];
+        frames.into_iter().try_fold(size_of_val(&frames).checked_add(size_of_val(&messages))?,usize::checked_add)?
+            .checked_add(messages.iter().map(|text|text.len()).max().unwrap_or(0))
+    }
+}
+
 impl InterventionEstimator for NativeInterventionEstimator {
     fn partition_routed_unit_usage(
         &self,
@@ -101,6 +121,19 @@ impl InterventionEstimator for NativeInterventionEstimator {
             &slice.shape,
         )?;
         routed::usage(routes, geometry.units_per_expert, action)
+    }
+
+    fn window_routed_unit_usage(
+        &self,
+        geometry: RoutedUnitGeometry,
+        _logical_source: &[u64],
+        physical_source: &[u64],
+        slice: &ResolvedCaptureSlice,
+        action: &InterventionAction,
+    ) -> Result<CaptureUsage, CaptureError> {
+        // The existing worker counts native participating rows separately from
+        // validation of the immutable logical action payload.
+        self.routed_unit_usage(geometry, physical_source, slice, action)
     }
 
     fn validate_geometry(
@@ -212,25 +245,6 @@ impl InterventionEstimator for NativeInterventionEstimator {
     }
 }
 
-fn native_shape(shape: &[u64]) -> Result<Vec<i32>, Exception> {
-    shape
-        .iter()
-        .map(|n| i32::try_from(*n).map_err(|_| Exception::custom("intervention index exceeds i32")))
-        .collect()
-}
-fn indices(
-    slice: &ResolvedCaptureSlice,
-) -> Result<Vec<safemlx::ops::indexing::ArrayIndexOp<'static>>, Exception> {
-    let starts = native_shape(&slice.starts)?;
-    let ends = native_shape(&slice.ends)?;
-    let strides = native_shape(&slice.strides)?;
-    Ok(starts
-        .iter()
-        .zip(ends)
-        .zip(strides)
-        .map(|((start, end), stride)| (*start..end).stride_by(stride).index_op())
-        .collect())
-}
 fn native_dtype(dtype: InterventionDtype) -> Dtype {
     match dtype {
         InterventionDtype::Float32 => Dtype::Float32,
@@ -240,6 +254,11 @@ fn native_dtype(dtype: InterventionDtype) -> Dtype {
 }
 
 impl InterventionBackend for NativeCapture<'_> {
+    fn matches_intervention_shape(&self, tensor:&MlxTensor, expected:&[u64])->Result<bool,Error> {
+        Ok(tensor.shape().len()==expected.len()
+            && tensor.shape().iter().zip(expected).all(|(a,b)|u64::try_from(*a).ok()==Some(*b)))
+    }
+
     fn partition_routed_unit_locations(
         &mut self,
         source: &PartitionRoutedUnitCaptureSource<'_, MlxTensor>,
@@ -261,12 +280,8 @@ impl InterventionBackend for NativeCapture<'_> {
     ) -> Option<Result<MlxTensor, Error>> {
         Some((|| {
             let indices = routed::indices(indices)?;
-            Ok(MlxTensor::from_array(
-                source
-                    .as_array()
-                    .reshape(&[-1], self.stream)?
-                    .take(&indices, self.stream)?,
-            ))
+            let flat = source.as_array().reshape(&[-1], self.stream)?;
+            static_activation::ordinary(self.stream, |worker| worker.indexed_select(&flat, &indices))
         })())
     }
     fn update_elements(
@@ -277,11 +292,10 @@ impl InterventionBackend for NativeCapture<'_> {
     ) -> Option<Result<MlxTensor, Error>> {
         Some((|| {
             let indices = routed::indices(indices)?;
-            let mut flat = source.as_array().reshape(&[-1], self.stream)?;
-            flat.try_index_mut_device(indices, replacement.as_array(), self.stream)?;
-            Ok(MlxTensor::from_array(
-                flat.reshape(source.shape(), self.stream)?,
-            ))
+            let flat = source.as_array().reshape(&[-1], self.stream)?;
+            let output = static_activation::ordinary(self.stream, |worker|
+                worker.indexed_update(&flat, &indices, replacement.as_array()))?;
+            Ok(MlxTensor::from_array(output.as_array().reshape(source.shape(), self.stream)?))
         })())
     }
     fn intervention_dtype(&self, tensor: &MlxTensor) -> Result<InterventionDtype, Error> {
@@ -306,10 +320,7 @@ impl InterventionBackend for NativeCapture<'_> {
         tensor: &MlxTensor,
         slice: &ResolvedCaptureSlice,
     ) -> Result<MlxTensor, Error> {
-        Ok(MlxTensor::from_array(tensor.as_array().try_index_device(
-            indices(slice)?.as_slice(),
-            self.stream,
-        )?))
+        static_activation::ordinary(self.stream, |worker| worker.select_region(tensor.as_array(), slice))
     }
     fn update_region(
         &mut self,
@@ -317,26 +328,13 @@ impl InterventionBackend for NativeCapture<'_> {
         slice: &ResolvedCaptureSlice,
         replacement: &MlxTensor,
     ) -> Result<MlxTensor, Error> {
-        let mut output = tensor.as_array().clone();
-        output.try_index_mut_device(
-            indices(slice)?.as_slice(),
-            replacement.as_array(),
-            self.stream,
-        )?;
-        Ok(MlxTensor::from_array(output))
+        static_activation::ordinary(self.stream, |worker| worker.update_region(tensor.as_array(), slice, replacement.as_array()))
     }
     fn zeros(&mut self, shape: &[u64], dtype: InterventionDtype) -> Result<MlxTensor, Error> {
-        Ok(MlxTensor::from_array(safemlx::ops::zeros_dtype(
-            &native_shape(shape)?,
-            native_dtype(dtype),
-            self.stream,
-        )?))
+        static_activation::ordinary(self.stream, |worker| worker.zeros(shape, dtype))
     }
     fn scale(&mut self, value: &MlxTensor, factor: f32) -> Result<MlxTensor, Error> {
-        Ok(MlxTensor::from_array(value.as_array().multiply(
-            Array::from(factor).as_dtype(value.as_array().dtype(), self.stream)?,
-            self.stream,
-        )?))
+        static_activation::ordinary(self.stream, |worker| worker.scale(value.as_array(), factor))
     }
     fn fill_masked(
         &mut self,
@@ -344,13 +342,7 @@ impl InterventionBackend for NativeCapture<'_> {
         keep: &[bool],
         fill: f32,
     ) -> Result<MlxTensor, Error> {
-        let mask = Array::from_slice(keep, value.shape());
-        Ok(MlxTensor::from_array(safemlx::ops::r#where(
-            mask,
-            value.as_array(),
-            Array::from(fill).as_dtype(value.as_array().dtype(), self.stream)?,
-            self.stream,
-        )?))
+        static_activation::ordinary(self.stream, |worker| worker.fill_masked(value.as_array(), keep, fill))
     }
     fn mask_components(
         &mut self,
@@ -358,53 +350,13 @@ impl InterventionBackend for NativeCapture<'_> {
         ids: &[u32],
         keep_selected: bool,
     ) -> Result<MlxTensor, Error> {
-        let width = *value
-            .shape()
-            .last()
-            .ok_or_else(|| Exception::custom("component mask needs a final axis"))?;
-        let mut keep = vec![!keep_selected; width as usize];
-        for id in ids {
-            keep[*id as usize] = keep_selected;
-        }
-        let mask = safemlx::ops::broadcast_to(
-            Array::from_slice(&keep, &[width]),
-            value.shape(),
-            self.stream,
-        )?;
-        Ok(MlxTensor::from_array(safemlx::ops::r#where(
-            mask,
-            value.as_array(),
-            Array::from(0.0f32).as_dtype(value.as_array().dtype(), self.stream)?,
-            self.stream,
-        )?))
+        static_activation::ordinary(self.stream, |worker| worker.mask_components(value.as_array(), ids, keep_selected))
     }
     fn realize_tensor(&mut self, tensor: &InterventionTensor) -> Result<MlxTensor, Error> {
-        let shape = native_shape(&tensor.shape)?;
-        let array = match &tensor.values {
-            InterventionValues::Float32(values) => Array::from_slice(values, &shape),
-            InterventionValues::Float16(bits) => Array::from_slice(
-                &bits
-                    .iter()
-                    .copied()
-                    .map(half::f16::from_bits)
-                    .collect::<Vec<_>>(),
-                &shape,
-            ),
-            InterventionValues::Bfloat16(bits) => Array::from_slice(
-                &bits
-                    .iter()
-                    .copied()
-                    .map(half::bf16::from_bits)
-                    .collect::<Vec<_>>(),
-                &shape,
-            ),
-        };
-        Ok(MlxTensor::from_array(array))
+        static_activation::ordinary(self.stream, |worker| worker.realize_tensor(tensor))
     }
     fn add(&mut self, left: &MlxTensor, right: &MlxTensor) -> Result<MlxTensor, Error> {
-        Ok(MlxTensor::from_array(
-            left.as_array().add(right.as_array(), self.stream)?,
-        ))
+        static_activation::ordinary(self.stream, |worker| worker.add(left.as_array(), right.as_array()))
     }
     fn fill_columns(
         &mut self,
@@ -412,24 +364,6 @@ impl InterventionBackend for NativeCapture<'_> {
         ids: &[u32],
         fill: f32,
     ) -> Result<MlxTensor, Error> {
-        let vocabulary = *value
-            .shape()
-            .last()
-            .ok_or_else(|| Exception::custom("column fill requires non-scalar value"))?;
-        let mut keep = vec![true; vocabulary as usize];
-        for id in ids {
-            keep[*id as usize] = false;
-        }
-        let mask = safemlx::ops::broadcast_to(
-            Array::from_slice(&keep, &[vocabulary]),
-            value.shape(),
-            self.stream,
-        )?;
-        Ok(MlxTensor::from_array(safemlx::ops::r#where(
-            mask,
-            value.as_array(),
-            Array::from(fill).as_dtype(value.as_array().dtype(), self.stream)?,
-            self.stream,
-        )?))
+        static_activation::ordinary(self.stream, |worker| worker.fill_columns(value.as_array(), ids, fill))
     }
 }

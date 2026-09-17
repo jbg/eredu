@@ -1,0 +1,338 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T13:57:56.556674+00:00",
+  "scope": "Source-derived packed model construction in the existing HF BPE engine",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-reset-source-custody-integration-2026-09-14.json",
+  "tests": {
+    "hf": {
+      "passed": 241,
+      "ignored": 0
+    },
+    "hf_docs": {
+      "passed": 1,
+      "ignored": 0
+    },
+    "text": {
+      "passed": 74,
+      "ignored": 3
+    },
+    "text_docs": {
+      "passed": 6,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 248,
+      "ignored": 2
+    },
+    "docs": {
+      "passed": 6,
+      "ignored": 1
+    },
+    "portable": {
+      "passed": 26,
+      "ignored": 1
+    },
+    "conformance": {
+      "passed": 110,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 712,
+  "new_tests": [
+    {
+      "check": "hf",
+      "name": "packed_model_uses_existing_nonzero_merge_engine_and_offsets",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "decoded_duplicate_spelling_is_last_wins_and_sparse_ids_remain_borrowed",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "repeated_merge_pair_keeps_last_rank_after_legacy_comments",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "prefixes_suffixes_unknown_fusion_fallback_and_ignore_merges_match_legacy",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "all_seven_capacity_overflow_frontiers_retain_actual_prior_destinations",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "post_allocation_semantic_failures_keep_the_complete_destination_population",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "planning_rejects_invalid_and_unfinished_profiles_without_constructing_a_model",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "escaped_strings_field_order_and_fixed_parser_depth_preserve_values",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "clones_serde_save_and_owned_vocab_remain_explicit_compatibility_paths",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "existing_trainer_replaces_packed_storage_as_one_legacy_table_set",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "parity_trainer_replaces_packed_storage_without_a_second_training_engine",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs"
+    },
+    {
+      "check": "hf_docs",
+      "name": "BpeCompilePlan (line 92) - compile fail",
+      "path": "third-party/tokenizers-0.23.2/src/models/bpe/compile.rs"
+    }
+  ],
+  "new_test_count": 12,
+  "checks": {
+    "hf": {
+      "command": "CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/tokenizers-0.23.2/Cargo.toml --locked --target-dir /Users/jbg/dev/eredu/target --no-default-features --features fancy-regex,parity-aware-bpe --lib",
+      "started_utc": "2026-09-14T13:54:03.177780+00:00",
+      "elapsed_seconds": 4.929,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-packed-bpe-construction-integration-hf.log",
+      "log_sha256": "75545d70284c1021057f9e217ab05e421dde0098e9d16166f8329803d07446b5"
+    },
+    "hf_docs": {
+      "command": "CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/tokenizers-0.23.2/Cargo.toml --locked --target-dir /Users/jbg/dev/eredu/target --no-default-features --features fancy-regex,parity-aware-bpe --doc BpeCompilePlan",
+      "started_utc": "2026-09-14T13:54:08.108401+00:00",
+      "elapsed_seconds": 3.051,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-packed-bpe-construction-integration-hf_docs.log",
+      "log_sha256": "ec195525afe94e6e38ccc288c3152d16dcdd85e2192816c761a16d2a1ad6d367"
+    },
+    "text": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-text --no-default-features --lib",
+      "started_utc": "2026-09-14T13:54:11.159876+00:00",
+      "elapsed_seconds": 5.135,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-packed-bpe-construction-integration-text.log",
+      "log_sha256": "6b09647176888aa7628cfd441de9357c78fa57380b57e451486dac302c0c4a24"
+    },
+    "text_docs": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-text --no-default-features --doc",
+      "started_utc": "2026-09-14T13:54:16.295026+00:00",
+      "elapsed_seconds": 0.984,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-packed-bpe-construction-integration-text_docs.log",
+      "log_sha256": "cdf38d958a25c02cc8c21674c308765ebfaa197273b24cebf4c0ae7278bd5d34"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib",
+      "started_utc": "2026-09-14T13:54:17.279616+00:00",
+      "elapsed_seconds": 40.694,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-packed-bpe-construction-integration-facade.log",
+      "log_sha256": "e0650a9677b542f0db21d437dfbdf75d2fe35c4d7678448cf62fcc0677f97d1d"
+    },
+    "docs": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --doc",
+      "started_utc": "2026-09-14T13:54:57.974049+00:00",
+      "elapsed_seconds": 2.184,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-packed-bpe-construction-integration-docs.log",
+      "log_sha256": "92e6599e219efb65a49976eb9abfc89e378684302b939984c25dd860112287c4"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade",
+      "started_utc": "2026-09-14T13:55:00.158670+00:00",
+      "elapsed_seconds": 13.488,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-packed-bpe-construction-integration-portable.log",
+      "log_sha256": "6afdf56f7a40d73575d0e74e6cdcb16b24a31a916d4b8f4c4654045b58990bf8"
+    },
+    "conformance": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test backend_conformance",
+      "started_utc": "2026-09-14T13:55:13.647407+00:00",
+      "elapsed_seconds": 5.46,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-packed-bpe-construction-integration-conformance.log",
+      "log_sha256": "52072bb1fa5070a346b00931938c7eaf9beb9946df07cb62ddcd4d4c2fbba256"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T13:55:19.108472+00:00",
+      "elapsed_seconds": 17.263,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-packed-bpe-construction-integration-minimal.log",
+      "log_sha256": "ba980716002c43b6223570dbccd7deec8b303c20dbef0d648c2a7492e3fb2794"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T13:55:36.371591+00:00",
+      "elapsed_seconds": 18.122,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-packed-bpe-construction-integration-features.log",
+      "log_sha256": "c736352dbd6953d163b29310a6689f20777c51671f9441c78e304bd7669f547b"
+    },
+    "artifacts": {
+      "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-packed-bpe-construction-integration-artifacts.py",
+      "started_utc": "2026-09-14T13:55:54.494124+00:00",
+      "elapsed_seconds": 71.909,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-packed-bpe-construction-integration-artifacts.log",
+      "log_sha256": "690b202f0fda1daf459d90fb8091e35e4bd18c266ec15cb58437b0761efe620d"
+    }
+  },
+  "source_sha256": {
+    "third-party/tokenizers-packed-bpe-compile-correction.patch": "1ae2a3d4da59600825bd080a9b30d98649e312806cca34ac1eb95ebb3ad81c81",
+    "third-party/tokenizers-0.23.2/src/tokenizer/mod.rs": "6eb4cc3992c991acc8b41f8846b7f4c05138195072993a470fbec7d5908d8afb",
+    "doc/bounded-inference.md": "8eb8ac511f18945db79d8a490bef40083122dc4f5c374b30bd3b33a3903d620f",
+    "third-party/tokenizers-0.23.2/src/models/bpe/model.rs": "ed9a11fdc995aa6c96c27bc8f725fce64544d88f7493f8619e3909f5776fbe7a",
+    "third-party/tokenizers-packed-bpe.patch": "5b170af52d3490b09ea898d9643307a6468a8579749dcc9006bb6f1a36f9c3f7",
+    "third-party/tokenizers-0.23.2/src/models/mod.rs": "8d9da233c970d890377336830eb196757c257ad5f2204cc2b527e722e8b2ccb0",
+    "third-party/tokenizers-0.23.2/src/models/bpe/mod.rs": "d4fa10e858034e709b672794d23b448a474d8bf09932557f5f3361c53d30b501",
+    "third-party/tokenizers-0.23.2/src/models/bpe/compile/json.rs": "effe13aa67509ebd39f3fc3f2612583eef550fa43321386cf7d442b08d8ad135",
+    "third-party/tokenizers-0.23.2/src/models/bpe/compile.rs": "2feb2d1c53f638995b84ac303208694a17813ec768b086e6bc6bdbe07db9152b",
+    "third-party/tokenizers-0.23.2/src/models/bpe/parity_trainer.rs": "5cfc4aaba1434f584a0b44198cadddab5a989fecb548c3dc3a9b0ee5dc3db245",
+    "third-party/tokenizers-packed-bpe-compile-correction.json": "7e1fe5f2521c37e16c7cfc36d6de9550d996635db9b6e5e45c33c2575aa29343",
+    "third-party/tokenizers-0.23.2/src/models/bpe/word.rs": "f98d19a708e42e7deec97edd7aef852a7297d31b6ee2af41c2ff6ec06b4dd5fb",
+    "third-party/tokenizers-0.23.2/src/models/bpe/compile/tests.rs": "f51587936112764cd1804ca75e5a02768d6d3f0a7a2d4e7ed710b1968cd52d2e",
+    "doc/backend-architecture.md": "a0b7a08158c9ebe80405211176eb294f3fa6c8060ead331f50c0aac044810cff",
+    "third-party/README.md": "8bf22e62374c8baf8d9d62a9af227d75eee6134b1d8f5ef5a8340b81bcd6b653",
+    "third-party/tokenizers-packed-bpe.json": "82d8a21e7df16ad71e3a87d464ba5ed70ff165f1d1ca35809576d2a221625e2f",
+    "third-party/tokenizers-0.23.2/src/models/bpe/serialization.rs": "06f2fd6baed3578ddbaa9f84196dc882a2ebebbbc8a175fa607fb014a9cf5767",
+    "third-party/tokenizers-0.23.2/src/models/bpe/storage.rs": "85796b3ac47393fbf88fddf6e86c9abf12ed780ed34c16e872f21b31d155a8df",
+    "third-party/tokenizers-0.23.2/src/models/bpe/trainer.rs": "83297f6aacd23ae734e78e60b37949c3baba076b598f065fcf2d98e695100710"
+  },
+  "source_snapshot": "/private/tmp/eredu-packed-bpe-construction-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-reset-source-custody-integration-2026-09-14.json": "a4e60f00cd4de04c3bc37d20add3722dccd1f199f2842a0d0d3dc417dd629ac0",
+    "/private/tmp/eredu-fold-applied-packed-bpe-correction.py": "e4be2e8745e2c59a8437b56c22d2f32d1f6496eaabf348394d9c4bfef4f8fd52",
+    "/private/tmp/eredu-packed-bpe-artifact-replay-root-review.json": "09547eedd0701ce2edbbd4402cbbdf55f8fa373322b546bcdb0dcc7917530313",
+    "/private/tmp/eredu-packed-bpe-artifact-replay-stage/FROZEN.json": "932ba201e1545dc6b6965a7bfd0d14a0ee555cb4cce314aaa13775b0c900a436",
+    "/private/tmp/eredu-packed-bpe-artifact-replay-stage/main.rs": "da1206f76b2f9e33a9cb6b7e6f8f444ffb07cd101acfa13a0a8ca81c13881080",
+    "/private/tmp/eredu-packed-bpe-artifact-replay-stage/prepare.py": "8de840761cfcda13eb8119fb371c5dda67d3a8b7ed447d1f437273ae44dc22a8",
+    "/private/tmp/eredu-packed-bpe-compile-correction-final-root-review.json": "ed86dfb040e9129dfdb8e9bc9058b10d34ae1d7237028b2bf61085d7d323ea45",
+    "/private/tmp/eredu-packed-bpe-compile-correction-integration-spec.json": "2e7e3c59131c0604a9dec50b8a732f6748b53da325417f08cd65ec14fbc1828d",
+    "/private/tmp/eredu-packed-bpe-compile-correction-stage/AUDIT.md": "d0cf9967f7dcfb37a6d9122c554ddad2418fbdb14b6964453a821f110e0b7202",
+    "/private/tmp/eredu-packed-bpe-compile-correction-stage/FROZEN.json": "e354d77346411da48f5129d77db46fb3016a9d4f1bc3c18d85ba752d97288763",
+    "/private/tmp/eredu-packed-bpe-compile-correction-stage/STATIC-CHECKS.json": "5c6310461d63f22960e06e16e6a0f67e29e3773e9ddb27b3c9553e3e2aa28620",
+    "/private/tmp/eredu-packed-bpe-compile-correction-stage/all-manifest.json": "a709e559606865054b7c2496129ff2742ad4e05cea9cfd876ddd8eb223613632",
+    "/private/tmp/eredu-packed-bpe-compile-correction-stage/base-origins.json": "c9410286075f722eff2717393373a29c62901663415ca6658b9f9b2d96be1bef",
+    "/private/tmp/eredu-packed-bpe-compile-correction-stage/change.patch": "eb0a96b1ea0710f1806c47ee924c43b6402a3a39c3dc1e8940d04f7a4572e129",
+    "/private/tmp/eredu-packed-bpe-compile-correction-stage/dependency-manifest.json": "2c2df11349120b4687614c7282e583d6dbb23a880b1179a95146c5dc24b6dceb",
+    "/private/tmp/eredu-packed-bpe-compile-correction-stage/final-hf-manifest.json": "1fa7514facc835c74b2be694f132e3022bcf36f9fd4ee27ce06de73c6b296d90",
+    "/private/tmp/eredu-packed-bpe-compile-correction-stage/manifest.json": "5327749d2e0c6c0619063e458d882cced82b876e9602cce43870da6417fe2733",
+    "/private/tmp/eredu-packed-bpe-compile-correction-stage/predecessor-hf-manifest.json": "aa1351a727745dd563b7b2a71965f23c11d636b8059fa9976232f1dcfc6f3a59",
+    "/private/tmp/eredu-packed-bpe-compile-correction-stage/replay.py": "adead182adbbee25c1b173c768c3d841827dd65be68f3acd3379d029ce55f851",
+    "/private/tmp/eredu-packed-bpe-construction-final-root-review.json": "8b3812afff5bf125e7c95c8cebada779e74ca4faa1972663b014d1ec12d68d26",
+    "/private/tmp/eredu-packed-bpe-construction-integration-applied.json": "6ec5a9054db6087b5bc4da6c45668b1b582ba2b9a6c6f8bb5016912b33774203",
+    "/private/tmp/eredu-packed-bpe-construction-integration-apply.py": "6a36c97de2737bd9c0e12e1d252965c5bf465b41908b3b7f1196e938b51f7175",
+    "/private/tmp/eredu-packed-bpe-construction-integration-artifact-root-assessment.json": "f100c168bbb7fb63d46e50d7165add6458607ad1df77f79dc3d9827a415828bd",
+    "/private/tmp/eredu-packed-bpe-construction-integration-artifacts.log": "690b202f0fda1daf459d90fb8091e35e4bd18c266ec15cb58437b0761efe620d",
+    "/private/tmp/eredu-packed-bpe-construction-integration-artifacts.py": "fb05abd139b9a3469f9c8a02723f68c3237e57e8e1176936ca98a5386a986f6d",
+    "/private/tmp/eredu-packed-bpe-construction-integration-checks.json": "0667f6e8ea3194c01ec7673a8b3584df7c0f1284ab8eaa8cda186165ab3cba1f",
+    "/private/tmp/eredu-packed-bpe-construction-integration-compile-correction-review.json": "0f4b490e7ce4b5e8404ba443b7244ebc225d283e24e8f3f8e6e5bbf33cb42cf4",
+    "/private/tmp/eredu-packed-bpe-construction-integration-conformance.log": "52072bb1fa5070a346b00931938c7eaf9beb9946df07cb62ddcd4d4c2fbba256",
+    "/private/tmp/eredu-packed-bpe-construction-integration-decoder-artifact-report.json": "c4785374d8107f667903d4d8bd1a156cf8418d52ef86d316f7b078d2f769863f",
+    "/private/tmp/eredu-packed-bpe-construction-integration-doc-applied.json": "036c3831e4e062cf38edeb20a99a482360b8ba7fd4b6d2ac6be9fc33abbf7e8b",
+    "/private/tmp/eredu-packed-bpe-construction-integration-docs.log": "92e6599e219efb65a49976eb9abfc89e378684302b939984c25dd860112287c4",
+    "/private/tmp/eredu-packed-bpe-construction-integration-facade.log": "e0650a9677b542f0db21d437dfbdf75d2fe35c4d7678448cf62fcc0677f97d1d",
+    "/private/tmp/eredu-packed-bpe-construction-integration-features.log": "c736352dbd6953d163b29310a6689f20777c51671f9441c78e304bd7669f547b",
+    "/private/tmp/eredu-packed-bpe-construction-integration-hf.log": "75545d70284c1021057f9e217ab05e421dde0098e9d16166f8329803d07446b5",
+    "/private/tmp/eredu-packed-bpe-construction-integration-hf.log.1789394043177585000.previous": "8f3d78b26537844f7944d7fed1ba7b02885f03fd7d84819c8c54d06905be0817",
+    "/private/tmp/eredu-packed-bpe-construction-integration-hf_docs.log": "ec195525afe94e6e38ccc288c3152d16dcdd85e2192816c761a16d2a1ad6d367",
+    "/private/tmp/eredu-packed-bpe-construction-integration-minimal.log": "ba980716002c43b6223570dbccd7deec8b303c20dbef0d648c2a7492e3fb2794",
+    "/private/tmp/eredu-packed-bpe-construction-integration-model-artifact-report.json": "0956ff9e014ee094fd73c743d5dfd4ebb524cdb82de3eb268faaae9b15152466",
+    "/private/tmp/eredu-packed-bpe-construction-integration-portable.log": "6afdf56f7a40d73575d0e74e6cdcb16b24a31a916d4b8f4c4654045b58990bf8",
+    "/private/tmp/eredu-packed-bpe-construction-integration-review.json": "3a5ef9f4fbb5ec8b077cc7754e1478d968a4a01041c94da34763ec2f699be5a0",
+    "/private/tmp/eredu-packed-bpe-construction-integration-root-review.json": "4b4677c6ac17d0feb1039f38beb65700d3ce4d98bbc44e3bd9f25ea8405903a1",
+    "/private/tmp/eredu-packed-bpe-construction-integration-spec.json": "83c22dffbdd5ceacf74a39c8502419ae3575e30c77c3fd39615cc029cc03de61",
+    "/private/tmp/eredu-packed-bpe-construction-integration-spec.pending.json": "d4b6698c61936db41b659d8f4848c16a9a10bddb0aae13619bea0b9290b67fa5",
+    "/private/tmp/eredu-packed-bpe-construction-integration-stage/all.patch": "9ce6af54b0c6a073ec179cb015aa74227af9736c9f509584956a2c585ee3aa71",
+    "/private/tmp/eredu-packed-bpe-construction-integration-stage/change.patch": "c49e3cd2278ab38845e4aef330d5705472e71f473686479f25c915c1d25e9317",
+    "/private/tmp/eredu-packed-bpe-construction-integration-stage/manifest.json": "6ec5a9054db6087b5bc4da6c45668b1b582ba2b9a6c6f8bb5016912b33774203",
+    "/private/tmp/eredu-packed-bpe-construction-integration-stage/staged-hashes.json": "3da4644e5ead63becb2209324d136be58105778e70fc17bf360b8324a5fb0177",
+    "/private/tmp/eredu-packed-bpe-construction-integration-text.log": "6b09647176888aa7628cfd441de9357c78fa57380b57e451486dac302c0c4a24",
+    "/private/tmp/eredu-packed-bpe-construction-integration-text_docs.log": "cdf38d958a25c02cc8c21674c308765ebfaa197273b24cebf4c0ae7278bd5d34",
+    "/private/tmp/eredu-packed-bpe-construction-integration-validate.py": "f492e9f4ca62e94fa3e30bdde50a4ea1d4912b0414a8dc34f4cf8a94a309a200",
+    "/private/tmp/eredu-packed-bpe-construction-integration-validation-config.json": "822663aa70a4950f117ad1f53b482a056207e6b72f64898059a33a60ee6470a4",
+    "/private/tmp/eredu-packed-bpe-construction-review-sha256.json": "fe932a1555e9d0e1266dfe24f9179ffcc089ba0556c6f04acabb92ae40378967",
+    "/private/tmp/eredu-packed-bpe-construction-review.md": "79cfd8064bedd0aff00f24261a6a71e09cf2ce922d405d98853b4f9cc92c5e68",
+    "/private/tmp/eredu-packed-bpe-construction-reviewed-stage/README.md": "b84b3c244d1c08c6e5c5094c26c99da00760e51a08d16f909a1adc1393ea253e",
+    "/private/tmp/eredu-packed-bpe-construction-reviewed-stage/doc-snippets.json": "cc580b029867eadc024fe397298075708d801fb169e528b75282d75fcf86d7c4",
+    "/private/tmp/eredu-packed-bpe-construction-reviewed-stage/manifest.json": "72054be2d1c5a61a60caf025e00f7d371abdd4d2f614257e72e9e3b8991699b2",
+    "/private/tmp/eredu-packed-bpe-construction-root-verification.json": "f085267d94abfd6e3f2b7b72478cc5bfbd178672d2efe5910e62fb540e21ea94",
+    "/private/tmp/eredu-packed-bpe-construction-source-root-review.json": "0af1bc7aba61b3a4f300919012a3b44d0965537e46574f1560846f0d8edfd80c",
+    "/private/tmp/eredu-packed-bpe-independent-review/checks.json": "5a289096b9692b21d31d49a4efa00ffdf2dd7141a9768fd73e7d967b28267c08",
+    "/private/tmp/eredu-packed-bpe-independent-review/references.json": "eba821227b7aae7a92d14441003f712f046b36d457ceb61bb30a0aa2c3b8866c",
+    "/private/tmp/eredu-prepare-reviewed-document-operations-with-patch-artifacts.py": "5cc858a44806cb87982e4d15077aef282a2bca9ee5ae12cc174bad2ffcabf4a1"
+  },
+  "review": {
+    "full_manifest_sha256": "3da4644e5ead63becb2209324d136be58105778e70fc17bf360b8324a5fb0177",
+    "full_patch_sha256": "9ce6af54b0c6a073ec179cb015aa74227af9736c9f509584956a2c585ee3aa71",
+    "patch_sha256": "c49e3cd2278ab38845e4aef330d5705472e71f473686479f25c915c1d25e9317",
+    "replay": "/private/tmp/eredu-packed-bpe-construction-integration-stage/replay",
+    "review": "Root all12 Rust/11behavior+CF/two docs/pricing/provenance review complete; independent clean review includes exact RawValue released-model harness. Complete101\u2192106\u2192110 HF reconstruction,14/16 replay,24 dependencies,40 source basis,six stdlib members and12 formatting checks verified. No model execution yet.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-reset-source-custody-integration-2026-09-14.json": "a4e60f00cd4de04c3bc37d20add3722dccd1f199f2842a0d0d3dc417dd629ac0",
+      "/private/tmp/eredu-fold-applied-packed-bpe-correction.py": "e4be2e8745e2c59a8437b56c22d2f32d1f6496eaabf348394d9c4bfef4f8fd52",
+      "/private/tmp/eredu-packed-bpe-artifact-replay-root-review.json": "09547eedd0701ce2edbbd4402cbbdf55f8fa373322b546bcdb0dcc7917530313",
+      "/private/tmp/eredu-packed-bpe-artifact-replay-stage/FROZEN.json": "932ba201e1545dc6b6965a7bfd0d14a0ee555cb4cce314aaa13775b0c900a436",
+      "/private/tmp/eredu-packed-bpe-artifact-replay-stage/main.rs": "da1206f76b2f9e33a9cb6b7e6f8f444ffb07cd101acfa13a0a8ca81c13881080",
+      "/private/tmp/eredu-packed-bpe-artifact-replay-stage/prepare.py": "8de840761cfcda13eb8119fb371c5dda67d3a8b7ed447d1f437273ae44dc22a8",
+      "/private/tmp/eredu-packed-bpe-compile-correction-final-root-review.json": "ed86dfb040e9129dfdb8e9bc9058b10d34ae1d7237028b2bf61085d7d323ea45",
+      "/private/tmp/eredu-packed-bpe-compile-correction-integration-spec.json": "2e7e3c59131c0604a9dec50b8a732f6748b53da325417f08cd65ec14fbc1828d",
+      "/private/tmp/eredu-packed-bpe-compile-correction-stage/AUDIT.md": "d0cf9967f7dcfb37a6d9122c554ddad2418fbdb14b6964453a821f110e0b7202",
+      "/private/tmp/eredu-packed-bpe-compile-correction-stage/FROZEN.json": "e354d77346411da48f5129d77db46fb3016a9d4f1bc3c18d85ba752d97288763",
+      "/private/tmp/eredu-packed-bpe-compile-correction-stage/STATIC-CHECKS.json": "5c6310461d63f22960e06e16e6a0f67e29e3773e9ddb27b3c9553e3e2aa28620",
+      "/private/tmp/eredu-packed-bpe-compile-correction-stage/all-manifest.json": "a709e559606865054b7c2496129ff2742ad4e05cea9cfd876ddd8eb223613632",
+      "/private/tmp/eredu-packed-bpe-compile-correction-stage/base-origins.json": "c9410286075f722eff2717393373a29c62901663415ca6658b9f9b2d96be1bef",
+      "/private/tmp/eredu-packed-bpe-compile-correction-stage/change.patch": "eb0a96b1ea0710f1806c47ee924c43b6402a3a39c3dc1e8940d04f7a4572e129",
+      "/private/tmp/eredu-packed-bpe-compile-correction-stage/dependency-manifest.json": "2c2df11349120b4687614c7282e583d6dbb23a880b1179a95146c5dc24b6dceb",
+      "/private/tmp/eredu-packed-bpe-compile-correction-stage/final-hf-manifest.json": "1fa7514facc835c74b2be694f132e3022bcf36f9fd4ee27ce06de73c6b296d90",
+      "/private/tmp/eredu-packed-bpe-compile-correction-stage/manifest.json": "5327749d2e0c6c0619063e458d882cced82b876e9602cce43870da6417fe2733",
+      "/private/tmp/eredu-packed-bpe-compile-correction-stage/predecessor-hf-manifest.json": "aa1351a727745dd563b7b2a71965f23c11d636b8059fa9976232f1dcfc6f3a59",
+      "/private/tmp/eredu-packed-bpe-compile-correction-stage/replay.py": "adead182adbbee25c1b173c768c3d841827dd65be68f3acd3379d029ce55f851",
+      "/private/tmp/eredu-packed-bpe-construction-final-root-review.json": "8b3812afff5bf125e7c95c8cebada779e74ca4faa1972663b014d1ec12d68d26",
+      "/private/tmp/eredu-packed-bpe-construction-integration-artifacts.py": "fb05abd139b9a3469f9c8a02723f68c3237e57e8e1176936ca98a5386a986f6d",
+      "/private/tmp/eredu-packed-bpe-construction-integration-compile-correction-review.json": "0f4b490e7ce4b5e8404ba443b7244ebc225d283e24e8f3f8e6e5bbf33cb42cf4",
+      "/private/tmp/eredu-packed-bpe-construction-integration-root-review.json": "4b4677c6ac17d0feb1039f38beb65700d3ce4d98bbc44e3bd9f25ea8405903a1",
+      "/private/tmp/eredu-packed-bpe-construction-integration-spec.json": "83c22dffbdd5ceacf74a39c8502419ae3575e30c77c3fd39615cc029cc03de61",
+      "/private/tmp/eredu-packed-bpe-construction-review-sha256.json": "fe932a1555e9d0e1266dfe24f9179ffcc089ba0556c6f04acabb92ae40378967",
+      "/private/tmp/eredu-packed-bpe-construction-review.md": "79cfd8064bedd0aff00f24261a6a71e09cf2ce922d405d98853b4f9cc92c5e68",
+      "/private/tmp/eredu-packed-bpe-construction-reviewed-stage/README.md": "b84b3c244d1c08c6e5c5094c26c99da00760e51a08d16f909a1adc1393ea253e",
+      "/private/tmp/eredu-packed-bpe-construction-reviewed-stage/doc-snippets.json": "cc580b029867eadc024fe397298075708d801fb169e528b75282d75fcf86d7c4",
+      "/private/tmp/eredu-packed-bpe-construction-reviewed-stage/manifest.json": "72054be2d1c5a61a60caf025e00f7d371abdd4d2f614257e72e9e3b8991699b2",
+      "/private/tmp/eredu-packed-bpe-construction-root-verification.json": "f085267d94abfd6e3f2b7b72478cc5bfbd178672d2efe5910e62fb540e21ea94",
+      "/private/tmp/eredu-packed-bpe-construction-source-root-review.json": "0af1bc7aba61b3a4f300919012a3b44d0965537e46574f1560846f0d8edfd80c",
+      "/private/tmp/eredu-packed-bpe-independent-review/checks.json": "5a289096b9692b21d31d49a4efa00ffdf2dd7141a9768fd73e7d967b28267c08",
+      "/private/tmp/eredu-packed-bpe-independent-review/references.json": "eba821227b7aae7a92d14441003f712f046b36d457ceb61bb30a0aa2c3b8866c",
+      "/private/tmp/eredu-prepare-reviewed-document-operations-with-patch-artifacts.py": "5cc858a44806cb87982e4d15077aef282a2bca9ee5ae12cc174bad2ffcabf4a1"
+    },
+    "source_manifest_sha256": "6ec5a9054db6087b5bc4da6c45668b1b582ba2b9a6c6f8bb5016912b33774203"
+  },
+  "behavior": [
+    "Borrowed fixed-depth model JSON derives exact vector/string capacities before construction; no cache or map conversion is used.",
+    "The existing merge loop consumes packed or legacy lookup storage; duplicate spellings/pairs, Unicode, sparse IDs and prefix/offset semantics retain their defined behavior.",
+    "All seven capacity-overflow frontiers and late semantic failures retain actual buffers; one consumed plan cannot retry.",
+    "Ordinary Clone/serde/save/owned vocabulary and both trainers remain compatible allocating paths.",
+    "A separate pinned model harness compares exact RawValue fragments, every vocabulary mapping and real tokens/spellings/offsets; every disposition is reported."
+  ],
+  "limits": [
+    "Model constructor only; enclosing tokenizer components, input custody, tokenization scratch and runtime original ownership remain unfinished.",
+    "Non-null dropout, ambiguous reverse IDs, unknown/duplicate fields and depth over128 remain explicit construction profile gaps.",
+    "Named payload/control facts exclude allocator metadata and arbitrary process/call-stack memory.",
+    "Artifact reports must be assessed per model; a harness minimum-match assertion does not establish all-ten constructor coverage."
+  ]
+}

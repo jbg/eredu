@@ -449,7 +449,8 @@ fn intervened_facade_keeps_outcomes_cancellation_failure_and_consumer_lifetimes(
             eos_token_ids: vec![eos],
             checkpoint_generation_config: None,
         },
-    );
+    )
+    .unwrap();
     let chat = model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user","content":"token1"})],

@@ -121,6 +121,66 @@ pub fn async_eval_with_event<'a>(outputs: impl IntoIterator<Item = &'a Array>) -
     })
 }
 
+/// Submit a selected residency operation through its actual original role when
+/// present; ordinary callers retain the existing event implementation.
+pub fn async_eval_with_operation_event<'a>(
+    outputs: impl IntoIterator<Item = &'a Array>,
+) -> Result<crate::OperationEvent> {
+    crate::operation_event::submit(outputs)
+}
+
+/// Submit through an explicitly retained original role. An ended/different
+/// current role refuses before native allocation; absent TLS never selects an
+/// ordinary producer. The caller retains its source/request bank separately.
+pub fn async_eval_with_original_operation_event<'a>(
+    outputs: impl IntoIterator<Item = &'a Array>,
+    observer: &crate::OriginalScopeObserver,
+) -> Result<crate::OperationEvent> {
+    crate::operation_event::submit_original(outputs, observer)
+}
+
+/// Submit the exact selected stream frontier under the retained original role.
+/// Even empty or already evaluated roots create a real scoped synchronizer on
+/// `stream`, so prior consumer waits on that stream can reach completion.
+/// This does not seal the role or globally flush other streams.
+pub fn async_eval_with_original_operation_event_on_stream<'a>(
+    outputs: impl IntoIterator<Item = &'a Array>,
+    observer: &crate::OriginalScopeObserver,
+    stream: &Stream,
+) -> Result<crate::OperationEvent> {
+    crate::operation_event::submit_original_on_stream(outputs, observer, stream)
+}
+
+/// Submit an already retained exact root slice on the selected original stream.
+/// The native root vector reserves once before copying roots; count, owner and
+/// selected stream are checked before native allocation. A failed reserve keeps
+/// its partial native wrapper owned through error creation and safe retirement.
+/// Empty/evaluated roots still submit a real frontier. This is not full DAG fit.
+pub fn async_eval_with_original_operation_event_on_stream_exact(
+    outputs: &[Array],
+    observer: &crate::OriginalScopeObserver,
+    stream: &Stream,
+) -> Result<crate::OperationEvent> {
+    crate::operation_event::submit_original_on_stream_exact(outputs, observer, stream)
+}
+
+/// Consume finite Record destinations through the shared selected evaluator.
+/// The retained caller must separately establish the plan's source populations,
+/// Graph/native fit and original role. Exhaustion never falls back to growing
+/// traversal storage; partial native work retains its real Record ownership.
+pub fn async_eval_with_original_prepared_traversal<'a, I>(
+    outputs: I,
+    observer: &crate::OriginalScopeObserver,
+    stream: &Stream,
+    traversal: &crate::OperationEvalTraversalLayout,
+) -> Result<crate::OperationEvent>
+where
+    I: IntoIterator<Item = &'a Array>,
+    I::IntoIter: ExactSizeIterator,
+{
+    crate::operation_event::submit_original_prepared_traversal(outputs, observer, stream, traversal)
+}
+
 /// Submit `outputs` asynchronously and measure their execution timeline.
 ///
 /// Unlike timing Rust graph construction, this function records a timestamp,

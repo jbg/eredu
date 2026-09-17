@@ -16,68 +16,113 @@ pub enum RopeValue {
     Bool(bool),
 }
 
+/// One already-decoded scalar borrowed by the shared normalization worker.
+#[derive(Clone, Copy)]
+pub(crate) enum RopeValueView<'a> {
+    Float(f32),
+    String(&'a str),
+    Bool(bool),
+}
+impl RopeValue {
+    fn view(&self) -> RopeValueView<'_> {
+        match self {
+            Self::Float(value) => RopeValueView::Float(*value),
+            Self::String(value) => RopeValueView::String(value),
+            Self::Bool(value) => RopeValueView::Bool(*value),
+        }
+    }
+}
+
 /// Converts an external configuration map into a complete rotary algorithm.
 pub(crate) fn normalize_algorithm(
     values: Option<&HashMap<String, RopeValue>>,
 ) -> Result<RotaryAlgorithm, String> {
+    normalize_algorithm_with(values, |args| args.to_string())
+}
+
+/// Shared borrowed parser with the caller's owning diagnostic destination.
+pub(crate) fn normalize_algorithm_with<E>(
+    values: Option<&HashMap<String, RopeValue>>,
+    invalid: impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<RotaryAlgorithm, E> {
+    normalize_algorithm_lookup(
+        values.map(|values| move |key: &str| values.get(key).map(RopeValue::view)),
+        invalid,
+    )
+}
+
+/// Runs the same parser over the actual normalized scalar lookup. A missing
+/// entry has the same semantics as an entry filtered by the owning converter.
+pub(crate) fn normalize_algorithm_lookup<'a, E>(
+    values: Option<impl Fn(&str) -> Option<RopeValueView<'a>>>,
+    invalid: impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<RotaryAlgorithm, E> {
     let Some(values) = values else {
         return Ok(RotaryAlgorithm::Default);
     };
-    let from_type = values.get("type");
-    let from_rope_type = values.get("rope_type");
-    let string = |value: &RopeValue| match value {
-        RopeValue::String(value) => Ok(value.clone()),
-        _ => Err("RoPE type or rope_type must be a string".to_string()),
-    };
+    let from_type = values("type");
+    let from_rope_type = values("rope_type");
+    fn string<'a, E>(
+        value: RopeValueView<'a>,
+        invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<&'a str, E> {
+        match value {
+            RopeValueView::String(value) => Ok(value),
+            _ => Err(invalid(format_args!(
+                "RoPE type or rope_type must be a string"
+            ))),
+        }
+    }
     let kind = match (from_type, from_rope_type) {
         (Some(left), Some(right)) => {
-            let left = string(left)?;
-            let right = string(right)?;
+            let left = string(left, &invalid)?;
+            let right = string(right, &invalid)?;
             if left != right {
-                return Err(format!(
+                return Err(invalid(format_args!(
                     "conflicting RoPE type {left:?} and rope_type {right:?}"
-                ));
+                )));
             }
             left
         }
-        (Some(value), None) | (None, Some(value)) => string(value)?,
-        (None, None) => "default".to_string(),
+        (Some(value), None) | (None, Some(value)) => string(value, &invalid)?,
+        (None, None) => "default",
     };
-    let number = |key: &str| -> Result<Option<f32>, String> {
-        match values.get(key) {
+    let number = |key: &str| -> Result<Option<f32>, E> {
+        match values(key) {
             None => Ok(None),
-            Some(RopeValue::Float(value)) if value.is_finite() => Ok(Some(*value)),
-            Some(RopeValue::String(value)) => value
+            Some(RopeValueView::Float(value)) if value.is_finite() => Ok(Some(value)),
+            Some(RopeValueView::String(value)) => value
                 .parse::<f32>()
                 .ok()
                 .filter(|value| value.is_finite())
                 .map(Some)
-                .ok_or_else(|| format!("RoPE {key} must be a finite number")),
-            Some(_) => Err(format!("RoPE {key} must be a finite number")),
+                .ok_or_else(|| invalid(format_args!("RoPE {key} must be a finite number"))),
+            Some(_) => Err(invalid(format_args!("RoPE {key} must be a finite number"))),
         }
     };
     let required_positive = |key: &str| {
-        number(key)?
-            .filter(|value| *value > 0.0)
-            .ok_or_else(|| format!("RoPE {key} must be provided as a finite positive number"))
+        number(key)?.filter(|value| *value > 0.0).ok_or_else(|| {
+            invalid(format_args!(
+                "RoPE {key} must be provided as a finite positive number"
+            ))
+        })
     };
-    let original_positions = || -> Result<i32, String> {
+    let original_positions = || -> Result<i32, E> {
         let value = required_positive("original_max_position_embeddings")?;
         if value.fract() != 0.0 || value >= i32::MAX as f32 {
-            return Err(
+            return Err(invalid(format_args!(
                 "RoPE original_max_position_embeddings must be an exact positive integer"
-                    .to_string(),
-            );
+            )));
         }
         Ok(value as i32)
     };
-    let boolean = |key: &str, default: bool| match values.get(key) {
+    let boolean = |key: &str, default: bool| match values(key) {
         None => Ok(default),
-        Some(RopeValue::Bool(value)) => Ok(*value),
-        Some(_) => Err(format!("RoPE {key} must be a boolean")),
+        Some(RopeValueView::Bool(value)) => Ok(value),
+        Some(_) => Err(invalid(format_args!("RoPE {key} must be a boolean"))),
     };
 
-    let algorithm = match kind.as_str() {
+    let algorithm = match kind {
         "none" | "default" => RotaryAlgorithm::Default,
         "linear" => RotaryAlgorithm::Linear {
             factor: required_positive("factor")?,
@@ -86,7 +131,9 @@ pub(crate) fn normalize_algorithm(
             let low_frequency_factor = required_positive("low_freq_factor")?;
             let high_frequency_factor = required_positive("high_freq_factor")?;
             if high_frequency_factor <= low_frequency_factor {
-                return Err("RoPE high_freq_factor must be greater than low_freq_factor".into());
+                return Err(invalid(format_args!(
+                    "RoPE high_freq_factor must be greater than low_freq_factor"
+                )));
             }
             RotaryAlgorithm::Llama3 {
                 factor: required_positive("factor")?,
@@ -99,10 +146,14 @@ pub(crate) fn normalize_algorithm(
             let rotary_fraction = number("partial_rotary_factor")?.unwrap_or(1.0);
             let factor = number("factor")?.unwrap_or(1.0);
             if !(0.0 < rotary_fraction && rotary_fraction <= 1.0) {
-                return Err("RoPE partial_rotary_factor must be in (0, 1]".into());
+                return Err(invalid(format_args!(
+                    "RoPE partial_rotary_factor must be in (0, 1]"
+                )));
             }
             if factor <= 0.0 {
-                return Err("RoPE factor must be a finite positive number".into());
+                return Err(invalid(format_args!(
+                    "RoPE factor must be a finite positive number"
+                )));
             }
             RotaryAlgorithm::Proportional {
                 factor,
@@ -129,7 +180,9 @@ pub(crate) fn normalize_algorithm(
                 || concentration <= 0.0
                 || attention_factor < 0.0
             {
-                return Err("RoPE YaRN scalar values are outside their valid ranges".into());
+                return Err(invalid(format_args!(
+                    "RoPE YaRN scalar values are outside their valid ranges"
+                )));
             }
             RotaryAlgorithm::Yarn {
                 factor,
@@ -141,13 +194,21 @@ pub(crate) fn normalize_algorithm(
             }
         }
         "longrope" => {
-            return Err(
-                "RoPE scaling type \"longrope\" is unsupported; LongRoPE is not implemented".into(),
-            );
+            return Err(invalid(format_args!(
+                "RoPE scaling type \"longrope\" is unsupported; LongRoPE is not implemented"
+            )));
         }
-        other => return Err(format!("RoPE scaling type {other:?} is unsupported")),
+        other => {
+            return Err(invalid(format_args!(
+                "RoPE scaling type {other:?} is unsupported"
+            )));
+        }
     };
-    algorithm.validate().map_err(|error| error.to_string())?;
+    algorithm.validate_fixed().map_err(|_| {
+        invalid(format_args!(
+            "invalid normalized rotary algorithm: {algorithm:?}"
+        ))
+    })?;
     Ok(algorithm)
 }
 

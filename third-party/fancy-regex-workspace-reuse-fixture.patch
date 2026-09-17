@@ -1,0 +1,34 @@
+--- a/src/vm/workspace/tests.rs
++++ b/src/vm/workspace/tests.rs
+@@ -204,7 +204,10 @@
+ #[test]
+ fn actual_runtime_limit_is_terminal_for_iterator_and_same_workspace_is_reusable() {
+     let mut builder = RegexBuilder::new(r"(?:a|aa)+(?!b)");
+-    builder.backtrack_limit(1);
++    // `aa ` needs three backtracks: try the second alternative, leave
++    // the greedy repeat, then succeed through the negative lookahead.
++    // The longer failing input needs another backtrack and still exceeds 3.
++    builder.backtrack_limit(3);
+     let source = builder.build_workspace_source().unwrap();
+     let ordinary = builder.build().unwrap();
+     let mut workspace = source.plan().unwrap().prepare().unwrap();
+@@ -224,7 +227,18 @@
+     assert!(iter.next().is_none());
+     drop(iter);
+     assert_eq!(storage_identity(&workspace), identity);
+-    assert_eq!(workspace.find("aa ").unwrap().unwrap().as_str(), "aa");
++    let expected = ordinary.find("aa ").unwrap().unwrap();
++    assert_eq!(
++        (expected.start(), expected.end(), expected.as_str()),
++        (0, 2, "aa")
++    );
++    let actual = workspace.find("aa ").unwrap().unwrap();
++    assert_eq!(
++        (actual.start(), actual.end()),
++        (expected.start(), expected.end())
++    );
++    assert_eq!(actual.as_str(), expected.as_str());
++    assert_eq!(storage_identity(&workspace), identity);
+ }
+ 
+ #[test]

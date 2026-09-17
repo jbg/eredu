@@ -103,24 +103,7 @@ impl CacheResidencyManager {
             CacheResidencyError::Runtime("live cache disk worker is unavailable".into())
         })?;
         let record = state.blocks.get(id).expect("host block exists");
-        let live_disk_bytes = state
-            .blocks
-            .values()
-            .filter(|record| record.disk().is_some_and(|location| !location.persistent))
-            .map(|record| record.bytes)
-            .sum::<u64>()
-            .saturating_add(
-                state
-                    .host_write_reservations
-                    .iter()
-                    .filter(|(key, _)| {
-                        !state.blocks.get(&key.id).is_some_and(|record| {
-                            record.disk().is_some_and(|location| !location.persistent)
-                        })
-                    })
-                    .map(|(_, reservation)| reservation.logical_bytes)
-                    .sum(),
-            );
+        let live_disk_bytes = live_disk_bytes(&state).unwrap_or(u64::MAX);
         let projected = live_disk_bytes.saturating_add(record.bytes);
         if projected > budget_bytes {
             state.telemetry.report.failures += 1;
@@ -159,6 +142,7 @@ impl CacheResidencyManager {
                     logical_bytes: record_bytes,
                     host_capacity,
                     ticket: ticket.clone(),
+                    prepared: None,
                 },
             );
         }
@@ -166,6 +150,7 @@ impl CacheResidencyManager {
         record.physical.begin_write(MlxCacheIoOperation {
             ticket: ticket.clone(),
             reserved_host_bytes: None,
+            prepared_read: None,
         })?;
         update_report_totals(&mut state);
         drop(pool_admission);
@@ -382,18 +367,17 @@ impl CacheResidencyManager {
                 )));
             }
             update_report_totals(&mut state);
-            let pool_report = state.pool.report()?;
-            let pool_device_over =
-                pool_report.current_device_bytes > pool_report.limits.device_bytes();
-            let local_device_over =
-                state.telemetry.report.current_device_bytes > self.options().device_budget_bytes();
+            let budget = budget_snapshot(&state, self.options())?;
+            let pool_report = budget.pool;
+            let pool_device_over = budget.pool_device_over;
+            let local_device_over = budget.local_device_over;
             if local_device_over || pool_device_over {
-                if let Some(ticket) = state
+                let pending_demotion = state
                     .blocks
                     .values()
                     .find_map(CacheBlockRecord::host_demotion_ticket)
-                    .cloned()
-                {
+                    .cloned();
+                if let Some(ticket) = pending_demotion {
                     drop(state);
                     self.finish_device_demotion(&ticket)?;
                     continue;
@@ -536,10 +520,10 @@ impl CacheResidencyManager {
                 continue;
             }
 
-            let pool_report = state.pool.report()?;
-            let pool_host_over = pool_report.current_host_bytes > pool_report.limits.host_bytes();
-            let local_host_over =
-                state.telemetry.report.current_host_bytes > self.options().host_budget_bytes();
+            let budget = budget_snapshot(&state, self.options())?;
+            let pool_report = budget.pool;
+            let pool_host_over = budget.pool_host_over;
+            let local_host_over = budget.local_host_over;
             if local_host_over || pool_host_over {
                 let candidate = eviction_candidate(
                     &state,
@@ -640,16 +624,17 @@ pub(super) fn eviction_candidate(
 ) -> Option<CacheBlockId> {
     let candidates = state
         .blocks
-        .values()
-        .filter(|record| {
+        .iter()
+        .filter(|(_, record)| {
             physical_state_is_tier_candidate(&record.physical, tier)
                 && record.pending_disk().is_none()
         })
-        .map(|record| record.physical.id().clone());
+        .map(|(_, record)| record.physical.id());
     state
         .lifecycle
-        .eviction_candidate(candidates, required, recent_per_layer, policy)
-        .expect("storage blocks have lifecycle state")
+        .eviction_candidate_borrowed(candidates, required, recent_per_layer, policy)
+        .expect("canonical storage blocks have lifecycle state")
+        .cloned()
 }
 
 fn physical_state_is_tier_candidate(physical: &MlxCacheBlockStorage, tier: CacheTier) -> bool {
@@ -662,4 +647,66 @@ fn physical_state_is_tier_candidate(physical: &MlxCacheBlockStorage, tier: Cache
             )
             | (CacheStoragePhase::DiskReady, CacheTier::Disk)
     )
+}
+
+/// Same actual local/pool comparisons for ordinary transitions and the admitted
+/// device-resident publication. This read grants no tier-transition permission.
+pub(super) struct BudgetSnapshot {
+    pub(super) pool: eredu_runtime::CachePoolReport,
+    pub(super) pool_device_over: bool,
+    pub(super) local_device_over: bool,
+    pub(super) pool_host_over: bool,
+    pub(super) local_host_over: bool,
+}
+pub(super) fn budget_snapshot(
+    state: &CacheManagerState,
+    options: &PagedCacheOptions,
+) -> Result<BudgetSnapshot, CachePoolError> {
+    let pool = state.pool.report()?;
+    Ok(BudgetSnapshot {
+        pool_device_over: pool.current_device_bytes > pool.limits.device_bytes(),
+        local_device_over: state.telemetry.report.current_device_bytes
+            > options.device_budget_bytes(),
+        pool_host_over: pool.current_host_bytes > pool.limits.host_bytes(),
+        local_host_over: state.telemetry.report.current_host_bytes > options.host_budget_bytes(),
+        pool,
+    })
+}
+
+/// Logical local-policy usage shared by ordinary and prepared Host writeback.
+/// Actual file allocation/reservation remains a separate physical pool charge.
+pub(super) fn live_disk_bytes(state: &CacheManagerState) -> Option<u64> {
+    let mut bytes = 0u64;
+    for (_, record) in state.blocks.iter() {
+        if record.disk().is_some_and(|location| !location.persistent) {
+            bytes = bytes.checked_add(record.bytes)?;
+        }
+    }
+    for (key, reservation) in state.host_write_reservations.iter() {
+        if !state
+            .blocks
+            .get(&key.id)
+            .is_some_and(|record| record.disk().is_some_and(|location| !location.persistent))
+        {
+            bytes = bytes.checked_add(reservation.logical_bytes)?;
+        }
+    }
+    Some(bytes)
+}
+pub(super) fn live_disk_query_control_bytes() -> Option<usize> {
+    use std::mem::{size_of, size_of_val};
+    let frames = [
+        size_of::<(&CacheManagerState, u64, Option<u64>)>(),
+        size_of::<eredu_runtime::cache::CacheRecordTableIter<'_, CacheBlockId, CacheBlockRecord>>(),
+        size_of::<
+            eredu_runtime::cache::CacheRecordTableIter<
+                '_,
+                CacheIoOperationKey,
+                HostWriteReservation,
+            >,
+        >(),
+    ];
+    frames
+        .into_iter()
+        .try_fold(size_of_val(&frames), usize::checked_add)
 }

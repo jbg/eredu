@@ -763,6 +763,22 @@ impl ArtifactArchitecturePlan {
         required
     }
 
+    /// Global number of text-score columns declared by the retained family.
+    ///
+    /// Reads normalized geometry without allocating, constructing an executable,
+    /// or reopening a checkpoint. This excludes input-only padding rows and
+    /// separate audio/codebook heads, and applies protocol vocabulary trimming.
+    /// A padded projection can still require a larger temporary score tensor.
+    /// This is the global output domain, before
+    /// tensor-parallel partitioning; workspace and native backing remain separate.
+    /// Nonpositive geometry or trimming beyond the projection has no declared width.
+    pub fn text_output_width(&self) -> Option<usize> {
+        match &self.family {
+            ArtifactFamilyPlan::Safetensors(plan) => plan.model().text_output_width(),
+            ArtifactFamilyPlan::Gguf(plan) => plan.model().text_output_width(),
+        }
+    }
+
     /// Returns the exact normalized GGUF architecture, when applicable.
     pub const fn gguf_architecture(&self) -> Option<GgufArchitecture> {
         match &self.family {
@@ -2692,3 +2708,6 @@ mod tests {
         assert_eq!(video.groups[1].boundary_text, "<|vid_end|>");
     }
 }
+
+#[path = "processor_plan/retained_storage.rs"]
+pub(crate) mod retained_storage;

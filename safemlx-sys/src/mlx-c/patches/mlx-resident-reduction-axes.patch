@@ -1,0 +1,1248 @@
+diff --git a/mlx/axis_view.h b/mlx/axis_view.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/axis_view.h
+@@ -0,0 +1,36 @@
++#pragma once
++#include "mlx/array.h"
++
++namespace mlx::core {
++// A synchronous read-only axis loan. Owners remain Shape/ordinary vector;
++// no view is stored in a primitive, callback or returned ReductionPlan.
++class AxisView {
++ public:
++  AxisView(const Shape& axes) noexcept
++      : data_(axes.data()), size_(axes.size()) {}
++  AxisView(const std::vector<int>& axes) noexcept
++      : data_(axes.data()), size_(axes.size()) {}
++  const int* begin() const noexcept {
++    return data_;
++  }
++  const int* end() const noexcept {
++    return size_ ? data_ + size_ : data_;
++  }
++  size_t size() const noexcept {
++    return size_;
++  }
++  bool empty() const noexcept {
++    return !size_;
++  }
++  int operator[](size_t i) const noexcept {
++    return data_[i];
++  }
++  int back() const noexcept {
++    return data_[size_ - 1];
++  }
++
++ private:
++  const int* data_;
++  size_t size_;
++};
++} // namespace mlx::core
+diff --git a/mlx/backend/common/reduce.cpp b/mlx/backend/common/reduce.cpp
+--- a/mlx/backend/common/reduce.cpp
++++ b/mlx/backend/common/reduce.cpp
+@@ -4,29 +4,27 @@
+ 
+ namespace mlx::core {
+ 
+-std::pair<Shape, Strides> shapes_without_reduction_axes(
+-    Shape shape,
+-    Strides strides,
+-    const std::vector<int>& axes) {
++std::pair<Shape, Strides>
++shapes_without_reduction_axes(Shape shape, Strides strides, AxisView axes) {
+   for (int i = axes.size() - 1; i >= 0; i--) {
+     int a = axes[i];
+     shape.erase(shape.begin() + a);
+     strides.erase(strides.begin() + a);
+   }
+ 
+-  return std::make_pair(shape, strides);
++  return std::make_pair(std::move(shape), std::move(strides));
+ }
+ 
+ std::pair<Shape, Strides> shapes_without_reduction_axes(
+     const array& x,
+-    const std::vector<int>& axes) {
++    AxisView axes) {
+   auto shape = x.shape();
+   auto strides = x.strides();
+   return shapes_without_reduction_axes(
+       std::move(shape), std::move(strides), axes);
+ }
+ 
+-ReductionPlan get_reduction_plan(const array& x, const std::vector<int>& axes) {
++ReductionPlan get_reduction_plan(const array& x, AxisView axes) {
+   // The data is all there and we are reducing over everything
+   if (x.size() == x.data_size() && axes.size() == x.ndim() &&
+       x.flags().contiguous) {
+@@ -38,6 +36,8 @@
+     // Merge consecutive axes
+     Shape shape = {x.shape(axes[0])};
+     Strides strides = {x.strides()[axes[0]]};
++    shape.reserve(axes.size());
++    strides.reserve(axes.size());
+     for (int i = 1; i < axes.size(); i++) {
+       if (axes[i] - 1 == axes[i - 1] && x.shape(axes[i]) > 1) {
+         shape.back() *= x.shape(axes[i]);
+@@ -57,9 +57,11 @@
+     }
+ 
+     if (strides.back() == 1) {
+-      return ReductionPlan(ContiguousReduce, shape, strides);
++      return ReductionPlan(
++          ContiguousReduce, std::move(shape), std::move(strides));
+     } else if (strides.back() > 1) {
+-      return ReductionPlan(ContiguousStridedReduce, shape, strides);
++      return ReductionPlan(
++          ContiguousStridedReduce, std::move(shape), std::move(strides));
+     }
+   }
+ 
+@@ -76,7 +78,10 @@
+ 
+   // Sort reduction axes by stride in order to merge them and figure out if we
+   // have a contiguous reduction.
+-  std::vector<std::pair<int, int64_t>> reductions;
++  using ReductionAxis = std::pair<int, int64_t>;
++  SmallVector<ReductionAxis, 10, submission::GraphAllocator<ReductionAxis>>
++      reductions;
++  reductions.reserve(axes.size());
+   for (auto a : axes) {
+     if (x.shape(a) > 1) {
+       reductions.push_back(std::make_pair(x.shape(a), x.strides()[a]));
+@@ -102,6 +107,8 @@
+ 
+   Shape shape;
+   Strides strides;
++  shape.reserve(reductions.size());
++  strides.reserve(reductions.size());
+   for (auto r : reductions) {
+     shape.push_back(r.first);
+     strides.push_back(r.second);
+@@ -110,7 +117,8 @@
+   // We can call the contiguous reduction op for every weird way the input is
+   // structured in the rest of the axes.
+   if (strides.back() == 1) {
+-    return ReductionPlan(GeneralContiguousReduce, shape, strides);
++    return ReductionPlan(
++        GeneralContiguousReduce, std::move(shape), std::move(strides));
+   }
+ 
+   // Delegate to the general strided reduction op if the axes after
+@@ -144,11 +152,28 @@
+     // contiguous size. The reason is that we can't easily know if the reduced
+     // axis is before or after an expanded dimension.
+     if (size > strides.back() || (size == strides.back() && !have_expand)) {
+-      return ReductionPlan(GeneralStridedReduce, shape, strides);
++      return ReductionPlan(
++          GeneralStridedReduce, std::move(shape), std::move(strides));
+     }
+   }
+ 
+-  return ReductionPlan(GeneralReduce, shape, strides);
++  return ReductionPlan(GeneralReduce, std::move(shape), std::move(strides));
++}
++
++ReductionPlan get_reduction_plan(const array& x, const std::vector<int>& axes) {
++  return get_reduction_plan(x, AxisView(axes));
++}
++std::pair<Shape, Strides> shapes_without_reduction_axes(
++    const array& x,
++    const std::vector<int>& axes) {
++  return shapes_without_reduction_axes(x, AxisView(axes));
++}
++std::pair<Shape, Strides> shapes_without_reduction_axes(
++    Shape shape,
++    Strides strides,
++    const std::vector<int>& axes) {
++  return shapes_without_reduction_axes(
++      std::move(shape), std::move(strides), AxisView(axes));
+ }
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/common/reduce.h b/mlx/backend/common/reduce.h
+--- a/mlx/backend/common/reduce.h
++++ b/mlx/backend/common/reduce.h
+@@ -2,6 +2,7 @@
+ 
+ #pragma once
+ 
++#include "mlx/axis_view.h"
+ #include "mlx/backend/common/utils.h"
+ 
+ namespace mlx::core {
+@@ -47,6 +48,7 @@
+ };
+ 
+ ReductionPlan get_reduction_plan(const array& x, const std::vector<int>& axes);
++ReductionPlan get_reduction_plan(const array& x, AxisView axes);
+ 
+ std::pair<Shape, Strides> shapes_without_reduction_axes(
+     const array& x,
+@@ -55,5 +57,10 @@
+     Shape shape,
+     Strides strides,
+     const std::vector<int>& axes);
++std::pair<Shape, Strides> shapes_without_reduction_axes(
++    const array& x,
++    AxisView axes);
++std::pair<Shape, Strides>
++shapes_without_reduction_axes(Shape shape, Strides strides, AxisView axes);
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/cpu/reduce.cpp b/mlx/backend/cpu/reduce.cpp
+--- a/mlx/backend/cpu/reduce.cpp
++++ b/mlx/backend/cpu/reduce.cpp
+@@ -207,11 +207,7 @@
+ }
+ 
+ template <typename T, typename U, typename Op>
+-void reduction_op(
+-    const array& x,
+-    array& out,
+-    const std::vector<int>& axes,
+-    U init) {
++void reduction_op(const array& x, array& out, AxisView axes, U init) {
+   ReductionPlan plan = get_reduction_plan(x, axes);
+ 
+   auto in_ptr = x.data<T>();
+@@ -473,7 +469,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType rtype,
+-    const std::vector<int>& axes) {
++    AxisView axes) {
+   if (rtype == Reduce::And) {
+     reduction_op<InT, bool, AndReduce>(in, out, axes, true);
+   } else {
+@@ -486,7 +482,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType rtype,
+-    const std::vector<int>& axes) {
++    AxisView axes) {
+   if (rtype == Reduce::Sum) {
+     if constexpr (std::is_integral_v<InT> && sizeof(InT) <= 4) {
+       reduction_op<InT, int32_t, SumReduce>(in, out, axes, 0);
+@@ -507,7 +503,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType rtype,
+-    const std::vector<int>& axes) {
++    AxisView axes) {
+   if (rtype == Reduce::Max) {
+     auto init = Limits<InT>::min;
+     reduction_op<InT, InT, MaxReduce>(in, out, axes, init);
+diff --git a/mlx/backend/cuda/reduce/col_reduce.cu b/mlx/backend/cuda/reduce/col_reduce.cu
+--- a/mlx/backend/cuda/reduce/col_reduce.cu
++++ b/mlx/backend/cuda/reduce/col_reduce.cu
+@@ -34,10 +34,7 @@
+   // The number of column we are reducing. Namely prod(reduce_shape).
+   size_t non_col_reductions;
+ 
+-  ColReduceArgs(
+-      const array& in,
+-      const ReductionPlan& plan,
+-      const std::vector<int>& axes) {
++  ColReduceArgs(const array& in, const ReductionPlan& plan, AxisView axes) {
+     using ShapeVector = decltype(plan.shape);
+     using StridesVector = decltype(plan.strides);
+ 
+@@ -267,7 +264,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType reduce_type,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const ReductionPlan& plan,
+     const cu::ColReduceArgs& args) {
+   // Allocate data for the output using in's layout to access them as
+@@ -308,7 +305,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType reduce_type,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const ReductionPlan& plan,
+     const cu::ColReduceArgs& args) {
+   // Allocate data for the output using in's layout to access them as
+@@ -344,7 +341,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType reduce_type,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const ReductionPlan& plan,
+     const cu::ColReduceArgs& args) {
+   // Allocate data for the output using in's layout to access them as
+@@ -451,7 +448,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType reduce_type,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const ReductionPlan& plan) {
+   // Current col reduce options
+   //
+diff --git a/mlx/backend/cuda/reduce/reduce.cuh b/mlx/backend/cuda/reduce/reduce.cuh
+--- a/mlx/backend/cuda/reduce/reduce.cuh
++++ b/mlx/backend/cuda/reduce/reduce.cuh
+@@ -51,7 +51,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType reduce_type,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const ReductionPlan& plan);
+ 
+ void col_reduce(
+@@ -59,7 +59,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType reduce_type,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const ReductionPlan& plan);
+ 
+ void init_reduce(
+diff --git a/mlx/backend/cuda/reduce/reduce_utils.cuh b/mlx/backend/cuda/reduce/reduce_utils.cuh
+--- a/mlx/backend/cuda/reduce/reduce_utils.cuh
++++ b/mlx/backend/cuda/reduce/reduce_utils.cuh
+@@ -4,6 +4,7 @@
+ 
+ #include <numeric>
+ 
++#include "mlx/axis_view.h"
+ #include "mlx/backend/common/utils.h"
+ #include "mlx/backend/cuda/device.h"
+ #include "mlx/backend/cuda/device/utils.cuh"
+@@ -93,7 +94,7 @@
+ inline void allocate_same_layout(
+     array& out,
+     const array& in,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     cu::CommandEncoder& encoder) {
+   if (in.flags().row_contiguous) {
+     out.set_data(cu::malloc_async(out.nbytes(), encoder));
+diff --git a/mlx/backend/cuda/reduce/row_reduce.cu b/mlx/backend/cuda/reduce/row_reduce.cu
+--- a/mlx/backend/cuda/reduce/row_reduce.cu
++++ b/mlx/backend/cuda/reduce/row_reduce.cu
+@@ -31,10 +31,7 @@
+   // The number of rows we are reducing. Namely prod(reduce_shape).
+   size_t non_row_reductions;
+ 
+-  RowReduceArgs(
+-      const array& in,
+-      const ReductionPlan& plan,
+-      const std::vector<int>& axes) {
++  RowReduceArgs(const array& in, const ReductionPlan& plan, AxisView axes) {
+     assert(!plan.shape.empty());
+     row_size = plan.shape.back();
+ 
+@@ -56,7 +53,7 @@
+   }
+ 
+   // Convert shape and strides as if in was contiguous
+-  void sort_access_pattern(const array& in, const std::vector<int>& axes) {
++  void sort_access_pattern(const array& in, AxisView axes) {
+     auto shape_vec = in.shape();
+     auto strides_vec = in.strides();
+     std::tie(shape_vec, strides_vec) =
+@@ -234,7 +231,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType reduce_type,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const ReductionPlan& plan) {
+   // Allocate data for the output using in's layout to avoid elem_to_loc in the
+   // kernel.
+@@ -286,7 +283,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType reduce_type,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const ReductionPlan& plan,
+     cu::RowReduceArgs args) {
+   // Allocate data for the output using in's layout to access them as
+@@ -330,7 +327,7 @@
+     const array& in,
+     array& out,
+     Reduce::ReduceType reduce_type,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const ReductionPlan& plan) {
+   // Current row reduction options
+   //
+diff --git a/mlx/backend/metal/reduce.cpp b/mlx/backend/metal/reduce.cpp
+--- a/mlx/backend/metal/reduce.cpp
++++ b/mlx/backend/metal/reduce.cpp
+@@ -33,10 +33,7 @@
+   // The size of the row.
+   size_t row_size;
+ 
+-  RowReduceArgs(
+-      const array& in,
+-      const ReductionPlan& plan,
+-      const std::vector<int>& axes) {
++  RowReduceArgs(const array& in, const ReductionPlan& plan, AxisView axes) {
+     row_size = plan.shape.back();
+ 
+     reduce_shape = plan.shape;
+@@ -104,10 +101,7 @@
+   size_t reduction_size;
+   int64_t reduction_stride;
+ 
+-  ColReduceArgs(
+-      const array& in,
+-      const ReductionPlan& plan,
+-      const std::vector<int>& axes) {
++  ColReduceArgs(const array& in, const ReductionPlan& plan, AxisView axes) {
+     reduction_size = plan.shape.back();
+     reduction_stride = plan.strides.back();
+ 
+@@ -541,7 +535,7 @@
+     array& out,
+     const std::string& op_name,
+     const ReductionPlan& plan,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     CommandEncoder& compute_encoder,
+     metal::Device& d,
+     const Stream& s) {
+@@ -921,7 +915,7 @@
+     array& out,
+     const std::string& op_name,
+     const ReductionPlan& plan,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     CommandEncoder& compute_encoder,
+     metal::Device& d,
+     const Stream& s) {
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -773,7 +773,7 @@
+       bsx_shape.back() = 1;
+       scores = concatenate({broadcast_to(sinks, bsx_shape, s), scores}, -1, s);
+     }
+-    scores = softmax(scores, std::vector<int>{-1}, true, s);
++    scores = softmax(scores, -1, true, s);
+     if (has_sinks) {
+       // Slice off scores
+       auto start = Shape(scores.ndim(), 0);
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -9,6 +9,7 @@
+ #include <set>
+ #include <sstream>
+ 
++#include "mlx/axis_view.h"
+ #include "mlx/backend/cuda/cuda.h"
+ #include "mlx/backend/metal/metal.h"
+ #include "mlx/fast_primitives.h"
+@@ -20,13 +21,26 @@
+ 
+ namespace mlx::core {
+ 
++static array
++number_of_elements_owned(const array&, Shape, bool, Dtype, StreamOrDevice);
++static array transpose_owned(const array&, Shape, StreamOrDevice);
++static array all_owned(const array&, AxisView, bool, StreamOrDevice);
++static array any_owned(const array&, AxisView, bool, StreamOrDevice);
++static array sum_owned(const array&, AxisView, bool, StreamOrDevice);
++static array prod_owned(const array&, AxisView, bool, StreamOrDevice);
++static array max_owned(const array&, AxisView, bool, StreamOrDevice);
++static array min_owned(const array&, AxisView, bool, StreamOrDevice);
++static array mean_owned(const array&, AxisView, bool, StreamOrDevice);
++
+ namespace {
+ 
+-std::tuple<Shape, std::vector<int>, bool> compute_reduce_shape(
+-    const std::vector<int>& axes,
++bool sort_unique_view_axes(Shape& axes);
++std::tuple<Shape, Shape, bool> compute_reduce_shape(
++    AxisView axes,
+     const Shape& shape) {
+   bool is_noop = true;
+-  std::set<int> axes_set;
++  Shape sorted_axes;
++  sorted_axes.reserve(axes.size());
+   auto ndim = shape.size();
+   for (auto ax : axes) {
+     int ax_ = (ax < 0) ? ax + ndim : ax;
+@@ -36,28 +50,26 @@
+           << " dimensions.";
+       throw std::out_of_range(msg.str());
+     }
+-    axes_set.insert(ax_);
+-  }
+-  if (axes_set.size() != axes.size()) {
++    sorted_axes.push_back(ax_);
++  }
++  if (!sort_unique_view_axes(sorted_axes)) {
+     throw std::invalid_argument("Duplicate axes detected in reduction.");
+   }
+   Shape out_shape;
++  out_shape.reserve(ndim);
++  size_t next = 0;
+   for (int i = 0; i < ndim; ++i) {
+-    if (axes_set.count(i) == 0) {
+-      out_shape.push_back(shape[i]);
+-    } else {
+-      out_shape.push_back(1);
+-    }
++    const bool reduced = next < sorted_axes.size() && sorted_axes[next] == i;
++    out_shape.push_back(reduced ? 1 : shape[i]);
++    if (reduced)
++      ++next;
+     is_noop &= (out_shape.back() == shape[i]);
+   }
+-  std::vector<int> sorted_axes(axes_set.begin(), axes_set.end());
+-  // Dimensions that are size 1 at trace time can be dynamic when compiling
+-  // shapeless, so the reduction cannot be elided from the graph. Reductions
+-  // over no axes stay no-ops since they are shape independent.
++  // Preserve dynamic-shape tracing's original non-elision rule.
+   if (is_noop && !sorted_axes.empty() && detail::in_dynamic_tracing()) {
+     is_noop = false;
+   }
+-  return {out_shape, sorted_axes, is_noop};
++  return {std::move(out_shape), std::move(sorted_axes), is_noop};
+ }
+ 
+ Dtype at_least_float(const Dtype& d) {
+@@ -1605,11 +1617,11 @@
+   if (source == destination) {
+     return a;
+   }
+-  std::vector<int> reorder(a.ndim());
++  Shape reorder(a.ndim());
+   std::iota(reorder.begin(), reorder.end(), 0);
+   reorder.erase(reorder.begin() + source);
+   reorder.insert(reorder.begin() + destination, source);
+-  return transpose(a, reorder, s);
++  return transpose_owned(a, std::move(reorder), s);
+ }
+ 
+ array swapaxes(
+@@ -1629,16 +1641,14 @@
+   };
+   axis1 = check_ax(axis1);
+   axis2 = check_ax(axis2);
+-  std::vector<int> reorder(a.ndim());
++  Shape reorder(a.ndim());
+   std::iota(reorder.begin(), reorder.end(), 0);
+   std::swap(reorder[axis1], reorder[axis2]);
+-  return transpose(a, std::move(reorder), s);
+-}
+-
+-array transpose(
+-    const array& a,
+-    std::vector<int> axes,
+-    StreamOrDevice s /* = {} */) {
++  return transpose_owned(a, std::move(reorder), s);
++}
++
++static array
++transpose_owned(const array& a, Shape axes, StreamOrDevice s /* = {} */) {
+   for (auto& ax : axes) {
+     ax = ax < 0 ? ax + a.ndim() : ax;
+   }
+@@ -1670,14 +1680,19 @@
+   return array(
+       std::move(shape),
+       a.dtype(),
+-      submission::make_graph_primitive<Transpose>(to_stream(s), std::move(axes)),
++      submission::make_graph_primitive<Transpose>(
++          to_stream(s), std::move(axes), std::in_place),
+       {a});
+ }
+ 
++array transpose(const array& a, std::vector<int> axes, StreamOrDevice s) {
++  return transpose_owned(a, Shape(axes.begin(), axes.end()), s);
++}
++
+ array transpose(const array& a, StreamOrDevice s /* = {} */) {
+-  std::vector<int> axes(a.ndim());
++  Shape axes(a.ndim());
+   std::iota(axes.rbegin(), axes.rend(), 0);
+-  return transpose(a, std::move(axes), to_stream(s));
++  return transpose_owned(a, std::move(axes), to_stream(s));
+ }
+ 
+ array broadcast_to(
+@@ -2056,14 +2071,14 @@
+ }
+ 
+ array all(const array& a, bool keepdims, StreamOrDevice s /* = {}*/) {
+-  std::vector<int> axes(a.ndim());
++  Shape axes(a.ndim());
+   std::iota(axes.begin(), axes.end(), 0);
+-  return all(a, axes, keepdims, s);
+-}
+-
+-array all(
+-    const array& a,
+-    const std::vector<int>& axes,
++  return all_owned(a, axes, keepdims, s);
++}
++
++static array all_owned(
++    const array& a,
++    AxisView axes,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {}*/) {
+   auto [out_shape, sorted_axes, is_noop] =
+@@ -2073,12 +2088,20 @@
+       : array(
+             std::move(out_shape),
+             bool_,
+-            submission::make_graph_primitive<Reduce>(to_stream(s), Reduce::And, sorted_axes),
++            submission::make_graph_primitive<Reduce>(
++                to_stream(s), Reduce::And, sorted_axes, std::in_place),
+             {a});
+-  if (!keepdims) {
+-    out = squeeze(out, sorted_axes, s);
++  if (!keepdims && !sorted_axes.empty()) {
++    out = squeeze_impl(out, std::move(sorted_axes), s);
+   }
+   return out;
++}
++array all(
++    const array& a,
++    const std::vector<int>& axes,
++    bool keepdims,
++    StreamOrDevice s) {
++  return all_owned(a, AxisView(axes), keepdims, s);
+ }
+ 
+ array all(
+@@ -2086,18 +2109,18 @@
+     int axis,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {} */) {
+-  return all(a, std::vector<int>{axis}, keepdims, s);
++  return all_owned(a, Shape{axis}, keepdims, s);
+ }
+ 
+ array any(const array& a, bool keepdims, StreamOrDevice s /* = {}*/) {
+-  std::vector<int> axes(a.ndim());
++  Shape axes(a.ndim());
+   std::iota(axes.begin(), axes.end(), 0);
+-  return any(a, axes, keepdims, s);
+-}
+-
+-array any(
+-    const array& a,
+-    const std::vector<int>& axes,
++  return any_owned(a, axes, keepdims, s);
++}
++
++static array any_owned(
++    const array& a,
++    AxisView axes,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {}*/) {
+   auto [out_shape, sorted_axes, is_noop] =
+@@ -2107,12 +2130,20 @@
+       : array(
+             std::move(out_shape),
+             bool_,
+-            submission::make_graph_primitive<Reduce>(to_stream(s), Reduce::Or, sorted_axes),
++            submission::make_graph_primitive<Reduce>(
++                to_stream(s), Reduce::Or, sorted_axes, std::in_place),
+             {a});
+-  if (!keepdims) {
+-    out = squeeze(out, sorted_axes, s);
++  if (!keepdims && !sorted_axes.empty()) {
++    out = squeeze_impl(out, std::move(sorted_axes), s);
+   }
+   return out;
++}
++array any(
++    const array& a,
++    const std::vector<int>& axes,
++    bool keepdims,
++    StreamOrDevice s) {
++  return any_owned(a, AxisView(axes), keepdims, s);
+ }
+ 
+ array any(
+@@ -2120,18 +2151,18 @@
+     int axis,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {} */) {
+-  return any(a, std::vector<int>{axis}, keepdims, s);
++  return any_owned(a, Shape{axis}, keepdims, s);
+ }
+ 
+ array sum(const array& a, bool keepdims, StreamOrDevice s /* = {}*/) {
+-  std::vector<int> axes(a.ndim());
++  Shape axes(a.ndim());
+   std::iota(axes.begin(), axes.end(), 0);
+-  return sum(a, axes, keepdims, s);
+-}
+-
+-array sum(
+-    const array& a,
+-    const std::vector<int>& axes,
++  return sum_owned(a, axes, keepdims, s);
++}
++
++static array sum_owned(
++    const array& a,
++    AxisView axes,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {}*/) {
+   if (axes.empty()) {
+@@ -2152,12 +2183,20 @@
+       : array(
+             std::move(out_shape),
+             out_type,
+-            submission::make_graph_primitive<Reduce>(to_stream(s), Reduce::Sum, sorted_axes),
++            submission::make_graph_primitive<Reduce>(
++                to_stream(s), Reduce::Sum, sorted_axes, std::in_place),
+             {a});
+-  if (!keepdims) {
+-    out = squeeze(out, sorted_axes, s);
++  if (!keepdims && !sorted_axes.empty()) {
++    out = squeeze_impl(out, std::move(sorted_axes), s);
+   }
+   return out;
++}
++array sum(
++    const array& a,
++    const std::vector<int>& axes,
++    bool keepdims,
++    StreamOrDevice s) {
++  return sum_owned(a, AxisView(axes), keepdims, s);
+ }
+ 
+ array sum(
+@@ -2165,7 +2204,7 @@
+     int axis,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {} */) {
+-  return sum(a, std::vector<int>{axis}, keepdims, s);
++  return sum_owned(a, Shape{axis}, keepdims, s);
+ }
+ 
+ array count_nonzero(
+@@ -2195,14 +2234,14 @@
+ }
+ 
+ array mean(const array& a, bool keepdims, StreamOrDevice s /* = {}*/) {
+-  std::vector<int> axes(a.ndim());
++  Shape axes(a.ndim());
+   std::iota(axes.begin(), axes.end(), 0);
+-  return mean(a, axes, keepdims, to_stream(s));
+-}
+-
+-array mean(
+-    const array& a,
+-    const std::vector<int>& axes,
++  return mean_owned(a, axes, keepdims, to_stream(s));
++}
++
++static array mean_owned(
++    const array& a,
++    AxisView axes,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {}*/) {
+   int ndim = a.ndim();
+@@ -2216,8 +2255,16 @@
+   }
+   auto dtype = at_least_float(a.dtype());
+   // Divide once: a rounded reciprocal introduces an extra FP32 rounding.
+-  auto count = number_of_elements(a, axes, false, dtype, s);
+-  return divide(sum(a, axes, keepdims, s), count, s);
++  auto count = number_of_elements_owned(
++      a, Shape(axes.begin(), axes.end()), false, dtype, s);
++  return divide(sum_owned(a, axes, keepdims, s), count, s);
++}
++array mean(
++    const array& a,
++    const std::vector<int>& axes,
++    bool keepdims,
++    StreamOrDevice s) {
++  return mean_owned(a, AxisView(axes), keepdims, s);
+ }
+ 
+ array mean(
+@@ -2225,7 +2272,7 @@
+     int axis,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {} */) {
+-  return mean(a, std::vector<int>{axis}, keepdims, to_stream(s));
++  return mean_owned(a, Shape{axis}, keepdims, to_stream(s));
+ }
+ 
+ array median(const array& a, bool keepdims, StreamOrDevice s /* = {}*/) {
+@@ -2384,14 +2431,14 @@
+ }
+ 
+ array prod(const array& a, bool keepdims, StreamOrDevice s /* = {}*/) {
+-  std::vector<int> axes(a.ndim());
++  Shape axes(a.ndim());
+   std::iota(axes.begin(), axes.end(), 0);
+-  return prod(a, axes, keepdims, s);
+-}
+-
+-array prod(
+-    const array& a,
+-    const std::vector<int>& axes,
++  return prod_owned(a, axes, keepdims, s);
++}
++
++static array prod_owned(
++    const array& a,
++    AxisView axes,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {}*/) {
+   if (axes.empty()) {
+@@ -2412,12 +2459,20 @@
+       : array(
+             std::move(out_shape),
+             out_type,
+-            submission::make_graph_primitive<Reduce>(to_stream(s), Reduce::Prod, sorted_axes),
++            submission::make_graph_primitive<Reduce>(
++                to_stream(s), Reduce::Prod, sorted_axes, std::in_place),
+             {a});
+-  if (!keepdims) {
+-    out = squeeze(out, sorted_axes, s);
++  if (!keepdims && !sorted_axes.empty()) {
++    out = squeeze_impl(out, std::move(sorted_axes), s);
+   }
+   return out;
++}
++array prod(
++    const array& a,
++    const std::vector<int>& axes,
++    bool keepdims,
++    StreamOrDevice s) {
++  return prod_owned(a, AxisView(axes), keepdims, s);
+ }
+ 
+ array prod(
+@@ -2425,18 +2480,18 @@
+     int axis,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {} */) {
+-  return prod(a, std::vector<int>{axis}, keepdims, s);
++  return prod_owned(a, Shape{axis}, keepdims, s);
+ }
+ 
+ array max(const array& a, bool keepdims, StreamOrDevice s /* = {}*/) {
+-  std::vector<int> axes(a.ndim());
++  Shape axes(a.ndim());
+   std::iota(axes.begin(), axes.end(), 0);
+-  return max(a, axes, keepdims, s);
+-}
+-
+-array max(
+-    const array& a,
+-    const std::vector<int>& axes,
++  return max_owned(a, axes, keepdims, s);
++}
++
++static array max_owned(
++    const array& a,
++    AxisView axes,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {}*/) {
+   if (a.size() == 0) {
+@@ -2449,12 +2504,20 @@
+       : array(
+             std::move(out_shape),
+             a.dtype(),
+-            submission::make_graph_primitive<Reduce>(to_stream(s), Reduce::Max, sorted_axes),
++            submission::make_graph_primitive<Reduce>(
++                to_stream(s), Reduce::Max, sorted_axes, std::in_place),
+             {a});
+-  if (!keepdims) {
+-    out = squeeze(out, sorted_axes, s);
++  if (!keepdims && !sorted_axes.empty()) {
++    out = squeeze_impl(out, std::move(sorted_axes), s);
+   }
+   return out;
++}
++array max(
++    const array& a,
++    const std::vector<int>& axes,
++    bool keepdims,
++    StreamOrDevice s) {
++  return max_owned(a, AxisView(axes), keepdims, s);
+ }
+ 
+ array max(
+@@ -2462,18 +2525,18 @@
+     int axis,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {} */) {
+-  return max(a, std::vector<int>{axis}, keepdims, s);
++  return max_owned(a, Shape{axis}, keepdims, s);
+ }
+ 
+ array min(const array& a, bool keepdims, StreamOrDevice s /* = {}*/) {
+-  std::vector<int> axes(a.ndim());
++  Shape axes(a.ndim());
+   std::iota(axes.begin(), axes.end(), 0);
+-  return min(a, axes, keepdims, s);
+-}
+-
+-array min(
+-    const array& a,
+-    const std::vector<int>& axes,
++  return min_owned(a, axes, keepdims, s);
++}
++
++static array min_owned(
++    const array& a,
++    AxisView axes,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {}*/) {
+   if (a.size() == 0) {
+@@ -2489,12 +2552,20 @@
+       : array(
+             std::move(out_shape),
+             a.dtype(),
+-            submission::make_graph_primitive<Reduce>(to_stream(s), Reduce::Min, sorted_axes),
++            submission::make_graph_primitive<Reduce>(
++                to_stream(s), Reduce::Min, sorted_axes, std::in_place),
+             {a});
+-  if (!keepdims) {
+-    out = squeeze(out, sorted_axes, s);
++  if (!keepdims && !sorted_axes.empty()) {
++    out = squeeze_impl(out, std::move(sorted_axes), s);
+   }
+   return out;
++}
++array min(
++    const array& a,
++    const std::vector<int>& axes,
++    bool keepdims,
++    StreamOrDevice s) {
++  return min_owned(a, AxisView(axes), keepdims, s);
+ }
+ 
+ array min(
+@@ -2502,7 +2573,7 @@
+     int axis,
+     bool keepdims /* = false */,
+     StreamOrDevice s /* = {} */) {
+-  return min(a, std::vector<int>{axis}, keepdims, s);
++  return min_owned(a, Shape{axis}, keepdims, s);
+ }
+ 
+ array argmin(const array& a, bool keepdims, StreamOrDevice s /* = {} */) {
+@@ -2527,7 +2598,7 @@
+         "[argmin] Cannot argmin reduce zero size array.");
+   }
+   auto [out_shape, sorted_axes, is_noop] =
+-      compute_reduce_shape({axis}, a.shape());
++      compute_reduce_shape(Shape{axis}, a.shape());
+   auto out = (is_noop)
+       ? zeros(out_shape, uint32, s)
+       : array(
+@@ -2564,7 +2635,7 @@
+         "[argmax] Cannot argmax reduce zero size array.");
+   }
+   auto [out_shape, sorted_axes, is_noop] =
+-      compute_reduce_shape({axis}, a.shape());
++      compute_reduce_shape(Shape{axis}, a.shape());
+   auto out = (is_noop)
+       ? zeros(out_shape, uint32, s)
+       : array(
+@@ -3935,9 +4006,9 @@
+       {astype(a, dtype, s)});
+ }
+ 
+-array softmax(
+-    const array& a,
+-    const std::vector<int>& axes,
++static array softmax_owned(
++    const array& a,
++    AxisView axes,
+     bool precise /* = false */,
+     StreamOrDevice s /* = {}*/) {
+   if (a.size() == 0) {
+@@ -3972,20 +4043,32 @@
+     if (precise && !is_complex) {
+       in = astype(a, float32, s);
+     }
+-    auto a_max = stop_gradient(max(in, axes, /*keepdims = */ true, s), s);
++    auto a_max = stop_gradient(max_owned(in, axes, /*keepdims = */ true, s), s);
+     auto ex = exp(subtract(in, a_max, s), s);
+     return astype(
+-        divide(ex, sum(ex, axes, /*keepdims = */ true, s), s), a.dtype(), s);
+-  }
++        divide(ex, sum_owned(ex, axes, /*keepdims = */ true, s), s),
++        a.dtype(),
++        s);
++  }
++}
++array softmax(
++    const array& a,
++    const std::vector<int>& axes,
++    bool precise,
++    StreamOrDevice s) {
++  return softmax_owned(a, AxisView(axes), precise, s);
++}
++array softmax(const array& a, int axis, bool precise, StreamOrDevice s) {
++  return softmax_owned(a, Shape{axis}, precise, s);
+ }
+ 
+ array softmax(
+     const array& a,
+     bool precise /* = false */,
+     StreamOrDevice s /* = {}*/) {
+-  std::vector<int> axes(a.ndim());
++  Shape axes(a.ndim());
+   std::iota(axes.begin(), axes.end(), 0);
+-  return softmax(a, axes, precise, s);
++  return softmax_owned(a, axes, precise, s);
+ }
+ 
+ array power(const array& a, const array& b, StreamOrDevice s /* = {} */) {
+@@ -6339,9 +6422,9 @@
+   return out;
+ }
+ 
+-array number_of_elements(
+-    const array& a,
+-    std::vector<int> axes,
++static array number_of_elements_owned(
++    const array& a,
++    Shape axes,
+     bool inverted,
+     Dtype dtype /* = int32 */,
+     StreamOrDevice s /* = {} */) {
+@@ -6367,8 +6450,20 @@
+       Shape{},
+       dtype,
+       submission::make_graph_primitive<NumberOfElements>(
+-          to_stream(s), std::move(axes), inverted, dtype),
++          to_stream(s),
++          std::vector<int>(axes.begin(), axes.end()),
++          inverted,
++          dtype),
+       {a}));
++}
++array number_of_elements(
++    const array& a,
++    std::vector<int> axes,
++    bool inverted,
++    Dtype dtype,
++    StreamOrDevice s) {
++  return number_of_elements_owned(
++      a, Shape(axes.begin(), axes.end()), inverted, dtype, s);
+ }
+ 
+ array conjugate(const array& a, StreamOrDevice s /* = {} */) {
+diff --git a/mlx/ops.h b/mlx/ops.h
+--- a/mlx/ops.h
++++ b/mlx/ops.h
+@@ -1344,10 +1344,8 @@
+ softmax(const array& a, bool precise = false, StreamOrDevice s = {});
+ 
+ /** Softmax of an array. */
+-inline array
+-softmax(const array& a, int axis, bool precise = false, StreamOrDevice s = {}) {
+-  return softmax(a, std::vector<int>{axis}, precise, s);
+-}
++MLX_API array
++softmax(const array& a, int axis, bool precise = false, StreamOrDevice s = {});
+ 
+ /** Raise elements of a to the power of b element-wise */
+ MLX_API array power(const array& a, const array& b, StreamOrDevice s = {});
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -4062,10 +4062,10 @@
+   } else if (reduce_type_ == Reduce::Min || reduce_type_ == Reduce::Max) {
+     auto out = outputs[0];
+     if (out.ndim() != in.ndim()) {
+-      out = expand_dims(out, axes_, stream());
++      out = expand_dims(out, state().second, stream());
+     }
+     auto mask = equal(in, out, stream());
+-    auto normalizer = sum(mask, axes_, true, stream());
++    auto normalizer = sum(mask, state().second, true, stream());
+     return {multiply(divide(cotan, normalizer, stream()), mask, stream())};
+   }
+ 
+@@ -4099,7 +4099,7 @@
+ 
+   auto tan = tangents[0];
+   if (reduce_type_ == Reduce::Sum) {
+-    return {sum(tan, axes_, true, s)};
++    return {sum(tan, state().second, true, s)};
+   } else {
+     if (axes_.size() > 1) {
+       std::vector<int> transpose_to;
+@@ -4123,7 +4123,7 @@
+       tan = flatten(transpose(tan, transpose_to, s), start_ax, -1, s);
+ 
+       auto grad = squeeze(grad_op(in, tan, -1), -1, s);
+-      return {expand_dims(grad, axes_, s)};
++      return {expand_dims(grad, state().second, s)};
+     } else {
+       return {grad_op(in, tan, axes_[0])};
+     }
+@@ -4134,7 +4134,7 @@
+     const ArrayVector& inputs,
+     const std::vector<int>& axes) {
+   auto ax = axes[0];
+-  auto reduce_axes = axes_;
++  auto reduce_axes = state().second;
+   if (ax >= 0) {
+     for (auto& rax : reduce_axes) {
+       if (rax >= ax) {
+@@ -6070,7 +6070,7 @@
+     const std::vector<int>& argnums) {
+   assert(primals.size() == 1);
+   assert(tangents.size() == 1);
+-  return {transpose(tangents[0], axes_, stream())};
++  return {transpose(tangents[0], state(), stream())};
+ }
+ 
+ std::pair<ArrayVector, std::vector<int>> Transpose::vmap(
+@@ -6087,7 +6087,7 @@
+     }
+     axes_.insert(axes_.begin() + vdim, vdim);
+   }
+-  return {{transpose(inputs[0], axes_, stream())}, {vdim}};
++  return {{transpose(inputs[0], state(), stream())}, {vdim}};
+ }
+ 
+ bool Transpose::is_equivalent(const Primitive& other) const {
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -1813,7 +1813,14 @@
+       Stream stream,
+       ReduceType reduce_type,
+       const std::vector<int>& axes)
+-      : UnaryPrimitive(stream), reduce_type_(reduce_type), axes_(axes) {}
++      : UnaryPrimitive(stream),
++        reduce_type_(reduce_type),
++        axes_(axes.begin(), axes.end()) {}
++
++  Reduce(Stream stream, ReduceType reduce_type, Shape axes, std::in_place_t)
++      : UnaryPrimitive(stream),
++        reduce_type_(reduce_type),
++        axes_(std::move(axes)) {}
+ 
+   void eval_cpu(const ArrayVector& inputs, array& out) override;
+   void eval_gpu(const ArrayVector& inputs, array& out) override;
+@@ -1843,12 +1850,12 @@
+ 
+   bool is_equivalent(const Primitive& other) const override;
+   std::pair<ReduceType, std::vector<int>> state() const {
+-    return {reduce_type_, axes_};
++    return {reduce_type_, std::vector<int>(axes_.begin(), axes_.end())};
+   };
+ 
+  private:
+   ReduceType reduce_type_;
+-  std::vector<int> axes_;
++  Shape axes_;
+ };
+ 
+ class Round : public UnaryPrimitive {
+@@ -2434,7 +2441,10 @@
+ class Transpose : public UnaryPrimitive {
+  public:
+   explicit Transpose(Stream stream, const std::vector<int>& axes)
+-      : UnaryPrimitive(stream), axes_(axes) {}
++      : UnaryPrimitive(stream), axes_(axes.begin(), axes.end()) {}
++
++  Transpose(Stream stream, Shape axes, std::in_place_t)
++      : UnaryPrimitive(stream), axes_(std::move(axes)) {}
+ 
+   void eval_cpu(const ArrayVector& inputs, array& out) override;
+   void eval_gpu(const ArrayVector& inputs, array& out) override;
+@@ -2445,11 +2455,11 @@
+   bool is_equivalent(const Primitive& other) const override;
+   std::vector<Shape> output_shapes(const ArrayVector& inputs) override;
+   std::vector<int> state() const {
+-    return axes_;
++    return std::vector<int>(axes_.begin(), axes_.end());
+   };
+ 
+  private:
+-  std::vector<int> axes_;
++  Shape axes_;
+ 
+   void eval(const ArrayVector& inputs, array& out);
+ };
+diff --git a/mlx/backend/metal/reduce.h b/mlx/backend/metal/reduce.h
+--- a/mlx/backend/metal/reduce.h
++++ b/mlx/backend/metal/reduce.h
+@@ -38,4 +38,25 @@
+     metal::Device& d,
+     const Stream& s);
+ 
++// Borrowed axis worker; the ordinary vector overloads remain callable.
++void row_reduce_general_dispatch(
++    const array& in,
++    array& out,
++    const std::string& op_name,
++    const ReductionPlan& plan,
++    AxisView axes,
++    CommandEncoder& compute_encoder,
++    metal::Device& d,
++    const Stream& s);
++
++void strided_reduce_general_dispatch(
++    const array& in,
++    array& out,
++    const std::string& op_name,
++    const ReductionPlan& plan,
++    AxisView axes,
++    CommandEncoder& compute_encoder,
++    metal::Device& d,
++    const Stream& s);
++
+ } // namespace mlx::core
+diff --git a/mlx/backend/metal/reduce.cpp b/mlx/backend/metal/reduce.cpp
+--- a/mlx/backend/metal/reduce.cpp
++++ b/mlx/backend/metal/reduce.cpp
+@@ -940,6 +940,32 @@
+   }
+ 
+   return strided_reduce_looped(in, out, op_name, args, compute_encoder, d, s);
++}
++
++void row_reduce_general_dispatch(
++    const array& in,
++    array& out,
++    const std::string& op_name,
++    const ReductionPlan& plan,
++    const std::vector<int>& axes,
++    CommandEncoder& compute_encoder,
++    metal::Device& d,
++    const Stream& s) {
++  row_reduce_general_dispatch(
++      in, out, op_name, plan, AxisView(axes), compute_encoder, d, s);
++}
++
++void strided_reduce_general_dispatch(
++    const array& in,
++    array& out,
++    const std::string& op_name,
++    const ReductionPlan& plan,
++    const std::vector<int>& axes,
++    CommandEncoder& compute_encoder,
++    metal::Device& d,
++    const Stream& s) {
++  strided_reduce_general_dispatch(
++      in, out, op_name, plan, AxisView(axes), compute_encoder, d, s);
+ }
+ 
+ void Reduce::eval_gpu(const ArrayVector& inputs, array& out) {

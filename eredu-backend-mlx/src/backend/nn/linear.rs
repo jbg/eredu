@@ -95,6 +95,15 @@ pub(crate) trait NativeProjectionInputObserver {
         source: &eredu_nn::GeneratedTensorSource,
         generate: &mut dyn FnMut() -> Result<Array, Exception>,
     ) -> Result<(), Exception>;
+    /// Forward the actual generated program and its caller-owned root retention.
+    fn observe_generated_retained(
+        &mut self,
+        prototype: &Array,
+        source: &eredu_nn::GeneratedTensorSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<Array, Exception>,
+    ) -> Result<(), Exception> {
+        self.observe_generated(prototype, source, &mut || factory.generate(&mut |_| Ok(())))
+    }
 }
 
 /// Backend-owned linear materialization for every neutral physical format.
@@ -272,6 +281,15 @@ impl PhysicalLinear {
         })
     }
 
+    /// Actual native producer selection shared by execution and its borrowed
+    /// observer error adapter; no family or checkpoint-name inference.
+    pub(crate) fn generates_projection_input(&self) -> bool {
+        !self.weight.as_ref().dtype().is_float()
+            && self.gguf.is_none()
+            && self.scales.as_ref().is_none()
+            && self.weight_scale_inv.as_ref().is_some()
+    }
+
     /// Applies the selected dense or packed projection without materializing
     /// weights on the host.
     pub fn forward(&mut self, input: &Array, stream: &Stream) -> Result<Array, Exception> {
@@ -284,11 +302,7 @@ impl PhysicalLinear {
         stream: &Stream,
         mut observer: Option<&mut dyn NativeProjectionInputObserver>,
     ) -> Result<Array, Exception> {
-        let floating = self.weight.as_ref().dtype().is_float();
-        let transforms_input = !floating
-            && self.gguf.is_none()
-            && self.scales.as_ref().is_none()
-            && self.weight_scale_inv.as_ref().is_some();
+        let transforms_input = self.generates_projection_input();
         if !transforms_input {
             if let Some(observer) = observer.as_mut() {
                 observer.observe(input)?;
@@ -364,12 +378,24 @@ impl PhysicalLinear {
         stream: &Stream,
         observer: Option<&mut dyn NativeProjectionInputObserver>,
     ) -> Result<Array, Exception> {
+        self.forward_row_parallel_with_reducer(input,stream,observer,
+            |partial,stream|crate::backend::runtime::distributed::all_sum(partial,group,stream),
+            |cause|cause)
+    }
+
+    /// One shared physical projection/bias worker; the parallel context supplies
+    /// its ordinary or source-bound reduction without changing equation order.
+    pub(crate) fn forward_row_parallel_with_reducer<E>(
+        &mut self,input:&Array,stream:&Stream,observer:Option<&mut dyn NativeProjectionInputObserver>,
+        reduce:impl FnOnce(&Array,&Stream)->Result<Array,E>,
+        native:impl Fn(Exception)->E,
+    )->Result<Array,E> {
         let bias = self.bias.value.take();
         let partial = self.forward_with_input_observer(input, stream, observer);
         self.bias.value = bias;
-        let output = crate::backend::runtime::distributed::all_sum(&partial?, group, stream)?;
+        let output = reduce(&partial.map_err(&native)?,stream)?;
         match self.bias.as_ref() {
-            Some(bias) => output.add(bias, stream),
+            Some(bias) => output.add(bias, stream).map_err(native),
             None => Ok(output),
         }
     }

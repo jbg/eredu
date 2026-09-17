@@ -20,9 +20,9 @@ pub use checkpoint::{
 };
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
-    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry, ConfigError,
-    LayerGeometry, LayerPolicy, ModelArgs, WeightDtype, PREDICTION_STATE_SEGMENT,
-    TARGET_STATE_SEGMENT,
+    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_metadata,
+    state_layout_with_geometry, ConfigError, LayerGeometry, LayerPolicy, ModelArgs, WeightDtype,
+    PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
 };
 pub use mamba::Mamba2;
 pub use mlp::{expert_bank_spec, localized_expert_bank_spec, DenseMlp, SparseMoe};
@@ -30,6 +30,7 @@ pub use model::{
     ForwardContext, LayeredModel, TargetBoundary, TargetBoundarySchema, TargetPartitionInput, Unit,
 };
 pub use mtp::{EmbeddedInput, ForwardMode, PredictionUnit, RetainedValues};
+pub(crate) use mtp::PredictionUnitSpec;
 pub use parallel::{
     layer_parallel_parameter_groups, local_block_geometry, local_geometry, local_state_geometry,
     partition_local_geometry, partition_local_routed_geometry, partitioned_state_layout,
@@ -236,26 +237,64 @@ pub fn state_identity(
     global_layer_start: usize,
     topology: eredu_core::cache::PromptCacheTopology,
 ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
-    let target = usize::try_from(args.num_hidden_layers).map_err(eredu_nn::Error::backend)?;
+    state_identity_with(
+        args,
+        layout,
+        global_layer_start,
+        topology,
+        crate::decoder::identity::Metadata::new(None),
+    )
+}
+
+pub(crate) fn state_identity_with_metadata(
+    args: &ModelArgs,
+    layout: &eredu_runtime::StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+    state_identity_with(
+        args,
+        layout,
+        global_layer_start,
+        topology,
+        crate::decoder::identity::Metadata::new(Some(context)),
+    )
+}
+fn state_identity_with(
+    args: &ModelArgs,
+    layout: &eredu_runtime::StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+    metadata.controls::<eredu_runtime::ModelStateIdentity>()?;
+
+    let target = usize::try_from(args.num_hidden_layers).map_err(|cause| metadata.source(cause))?;
     let total = target
-        .checked_add(args.mtp_policies().map_err(eredu_nn::Error::backend)?.len())
-        .ok_or_else(|| eredu_nn::Error::backend("Nemotron-H state layer count overflowed"))?;
+        .checked_add(
+            args.mtp_policy_count_with(|message| match metadata.format(message) {
+                Ok(message) => metadata.source(config::ConfigError::Invalid(message)),
+                Err(cause) => cause,
+            })?,
+        )
+        .ok_or_else(|| metadata.error(format_args!("Nemotron-H state layer count overflowed")))?;
     let global_layer_end = global_layer_start
         .checked_add(layout.len())
-        .ok_or_else(|| eredu_nn::Error::backend("Nemotron-H owned state range overflowed"))?;
+        .ok_or_else(|| metadata.error(format_args!("Nemotron-H owned state range overflowed")))?;
     if global_layer_end > total {
-        return Err(eredu_nn::Error::backend(format!(
+        return Err(metadata.error(format_args!(
             "Nemotron-H owns state layers {global_layer_start}..{global_layer_end}, outside {total} layers"
         )));
     }
-    eredu_runtime::ModelStateIdentity::new(
-        "nemotron_h",
-        args.model_type.clone(),
-        prompt_cache_architecture_fingerprint(args),
+    eredu_runtime::ModelStateIdentity::new_with_diagnostic(
+        metadata.text("nemotron_h")?,
+        metadata.text(&args.model_type)?,
+        config::prompt_cache_architecture_fingerprint_with_metadata(args, metadata)?,
         total,
         global_layer_start,
         0,
         topology,
+        |message| metadata.prompt_error(message),
     )
-    .map_err(eredu_nn::Error::backend)
 }

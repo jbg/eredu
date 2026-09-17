@@ -129,8 +129,40 @@ impl eredu_nn::Tensor for ReferenceTensor {
         }
         Ok(Self(shape))
     }
-    fn index(&self, _: &[Index], _: &()) -> Result<Self, Error> {
-        Ok(self.clone())
+    fn index(&self, indices: &[Index], _: &()) -> Result<Self, Error> {
+        if indices.len() > self.0.len() {
+            return Err(Error::backend("reference index exceeds rank"));
+        }
+        let mut shape = Vec::with_capacity(self.0.len());
+        for (axis, &extent) in self.0.iter().enumerate() {
+            let normalize = |value: i32| -> Result<i32, Error> {
+                if value < 0 {
+                    extent
+                        .checked_add(value)
+                        .ok_or_else(|| Error::backend("reference index overflow"))
+                } else {
+                    Ok(value)
+                }
+            };
+            match indices.get(axis).unwrap_or(&Index::Full) {
+                Index::Full => shape.push(extent),
+                Index::At(value) => {
+                    let value = normalize(*value)?;
+                    if value < 0 || value >= extent {
+                        return Err(Error::backend("reference index is out of bounds"));
+                    }
+                }
+                Index::Range(start, end) => {
+                    let start = normalize(*start)?;
+                    let end = normalize(*end)?;
+                    if start < 0 || end < start || end > extent {
+                        return Err(Error::backend("reference range is out of bounds"));
+                    }
+                    shape.push(end - start);
+                }
+            }
+        }
+        Ok(Self(shape))
     }
     fn take_axis(&self, _: &Self, _: i32, _: &()) -> Result<Self, Error> {
         Ok(self.clone())
@@ -267,6 +299,11 @@ struct ReferenceLinear {
 }
 
 impl Parameterized<ReferenceTensor> for ReferenceLinear {
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&ReferenceTensor)) -> bool {
+        eredu_nn::visit_parameter_values(self, visitor);
+        true
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, ReferenceTensor>,
@@ -402,6 +439,11 @@ struct ReferenceEmbedding {
 }
 
 impl Parameterized<ReferenceTensor> for ReferenceEmbedding {
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&ReferenceTensor)) -> bool {
+        eredu_nn::visit_parameter_values(self, visitor);
+        true
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, ReferenceTensor>,
@@ -452,6 +494,11 @@ struct ReferenceNorm {
 }
 
 impl Parameterized<ReferenceTensor> for ReferenceNorm {
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&ReferenceTensor)) -> bool {
+        eredu_nn::visit_parameter_values(self, visitor);
+        true
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, ReferenceTensor>,
@@ -479,6 +526,11 @@ impl NormalizationOperator<ReferenceTensor> for ReferenceNorm {
 struct ReferenceRotary;
 
 impl Parameterized<ReferenceTensor> for ReferenceRotary {
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&ReferenceTensor)) -> bool {
+        eredu_nn::visit_parameter_values(self, visitor);
+        true
+    }
+
     fn visit_parameters<'a, V>(&'a self, _: &mut V)
     where
         V: ParameterVisitor<'a, ReferenceTensor>,
@@ -522,6 +574,11 @@ struct ReferenceHyperHead {
 macro_rules! impl_reference_hyper_parameters {
     ($name:ty) => {
         impl Parameterized<ReferenceTensor> for $name {
+            fn visit_retained_values(&self, visitor: &mut dyn FnMut(&ReferenceTensor)) -> bool {
+                eredu_nn::visit_parameter_values(self, visitor);
+                true
+            }
+
             fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
             where
                 V: ParameterVisitor<'a, ReferenceTensor>,
@@ -921,7 +978,7 @@ impl eredu_nn::BlockwiseAttentionBackend for ReferenceBackend {
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "ReferenceTensor")]
 struct ReferenceLinearGroups {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     spec: eredu_nn::GroupedLinearSpec,
     projection: ReferenceLinear,
 }

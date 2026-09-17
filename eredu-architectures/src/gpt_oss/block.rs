@@ -20,7 +20,18 @@ impl<B> BlockFactory<B, ModelArgs> for GptOssBlockFactory
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
+    // Causal attention (including fixed learned sinks) and per-token routing
+    // preserve rows under the shared ordinary, intervention-free contract.
+    const CAUSAL_PREFILL_ROWS: bool = true;
+
     type FeedForward = RoutedMlp<B>;
+
+    fn validate_with_metadata(
+        _config: &ModelArgs,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
 
     fn build(
         args: &ModelArgs,

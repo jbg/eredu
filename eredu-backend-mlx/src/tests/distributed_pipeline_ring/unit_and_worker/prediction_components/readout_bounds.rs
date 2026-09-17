@@ -69,7 +69,7 @@ fn prediction_f32_tensor<'a>(
     step: &'a eredu_core::speculative::SpeculativeActivationCapture,
     path: &str,
 ) -> Option<&'a [f32]> {
-    step.captures.records.iter().find_map(|record| {
+    step.captures.as_step().records.iter().find_map(|record| {
         if record.path != path {
             return None;
         }
@@ -328,7 +328,7 @@ impl EditedReadoutEvidence {
             step: &'a eredu_core::speculative::SpeculativeActivationCapture,
             path: &str,
         ) -> Option<&'a [f32]> {
-            step.captures.records.iter().find_map(|record| {
+            step.captures.as_step().records.iter().find_map(|record| {
                 if record.path != path {
                     return None;
                 }
@@ -430,7 +430,7 @@ impl EditedRoutedEvidence {
             step: &'a eredu_core::speculative::SpeculativeActivationCapture,
             path: &str,
         ) -> Option<&'a RoutedUnitCapture> {
-            step.captures.records.iter().find_map(|record| {
+            step.captures.as_step().records.iter().find_map(|record| {
                 if record.path != path {
                     return None;
                 }
@@ -529,8 +529,7 @@ impl EditedFfnWriteEvidence {
         let reconstruct = |step: &eredu_core::speculative::SpeculativeActivationCapture| {
             let shared = prediction_f32_tensor(step, &self.shared.effective_activation).unwrap();
             let routed = step
-                .captures
-                .records
+                .captures.as_step().records
                 .iter()
                 .find_map(|record| {
                     if record.path != self.routed.effective_activation {

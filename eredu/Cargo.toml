@@ -46,6 +46,11 @@ path = "examples/component_sparse_probe.rs"
 required-features = ["mlx"]
 
 [[example]]
+name = "managed_plain_memory_probe"
+path = "examples/managed_plain_memory_probe.rs"
+required-features = ["mlx"]
+
+[[example]]
 name = "controlled_generate"
 path = "examples/controlled_generate.rs"
 required-features = ["mlx"]
@@ -124,7 +129,7 @@ features = ["mlx", "metal", "image", "audio"]
 [features]
 default = ["mlx", "metal", "onig", "esaxx_fast"]
 
-mlx = ["dep:eredu-backend-mlx"]
+mlx = ["dep:eredu-backend-mlx", "dep:safemlx"]
 metal = [
     "eredu-backend-mlx?/accelerate",
     "eredu-backend-mlx?/metal",
@@ -142,7 +147,12 @@ workspace = true
 [dependencies]
 # Local dependencies
 eredu-backend-mlx = { workspace = true, optional = true }
+# Canonical native types for integration fixtures; enabled only with mlx.
+safemlx = { workspace = true, optional = true }
 eredu-core.workspace = true
+# Neutral workspace funding retained by managed facade preparation.
+eredu-nn.workspace = true
+eredu-checkpoint.workspace = true
 eredu-text = { workspace = true, default-features = false }
 eredu-gguf.workspace = true
 eredu-runtime.workspace = true
@@ -150,14 +160,15 @@ eredu-architectures.workspace = true
 
 # External dependencies
 serde = { version = "1", features = ["derive"] }
-tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "=0.23.2", path = "../third-party/tokenizers-0.23.2", default-features = false, features = ["fancy-regex"] }
 thiserror = "2"
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 sha2.workspace = true
-llguidance = { version = "1.8.0", default-features = false, features = ["ahash", "lark"] }
+llguidance = { version = "=1.8.0", default-features = false, features = ["ahash", "lark"] }
 jsonschema = { version = "0.52.0", default-features = false }
 
 [dev-dependencies]
+half.workspace = true
+tempfile.workspace = true
 anyhow = "1"
-eredu-checkpoint.workspace = true
 eredu-evaluation.workspace = true

@@ -1,5 +1,11 @@
 //! Filesystem-backed artifact content fingerprinting.
 
+pub(crate) mod file;
+use file::FileVersion as StableFileMetadata;
+pub use file::{
+    ArtifactFileReadError, ArtifactFileReadFailure, ArtifactFileVersion, PreparedArtifactFileRead,
+};
+
 use sha2::{Digest as _, Sha256};
 use std::{
     fs::File,
@@ -168,62 +174,12 @@ fn fingerprint_open_file_with_hook(
     Ok(fingerprint)
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-struct StableFileMetadata {
-    length: u64,
-    modified: std::time::SystemTime,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    #[cfg(unix)]
-    change_time_seconds: i64,
-    #[cfg(unix)]
-    change_time_nanoseconds: i64,
-    #[cfg(not(unix))]
-    created: Option<std::time::SystemTime>,
-    #[cfg(windows)]
-    file_attributes: u32,
-    #[cfg(windows)]
-    creation_time: u64,
-}
-
 impl StableFileMetadata {
     fn read(path: &Path, file: &File) -> Result<Self, ArtifactFingerprintError> {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt as _;
-
         let metadata = file
             .metadata()
             .map_err(|source| io_error("inspect", path, source))?;
-        Ok(Self {
-            length: metadata.len(),
-            modified: metadata
-                .modified()
-                .map_err(|source| io_error("inspect", path, source))?,
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            change_time_seconds: metadata.ctime(),
-            #[cfg(unix)]
-            change_time_nanoseconds: metadata.ctime_nsec(),
-            // The portable Metadata API exposes no ctime/change counter on
-            // non-Unix targets. Creation time is retained when available.
-            #[cfg(not(unix))]
-            created: metadata.created().ok(),
-            #[cfg(windows)]
-            file_attributes: {
-                use std::os::windows::fs::MetadataExt as _;
-                metadata.file_attributes()
-            },
-            #[cfg(windows)]
-            creation_time: {
-                use std::os::windows::fs::MetadataExt as _;
-                metadata.creation_time()
-            },
-        })
+        Self::from_metadata(&metadata).map_err(|source| io_error("inspect", path, source))
     }
 }
 

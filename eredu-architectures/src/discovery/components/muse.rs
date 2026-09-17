@@ -41,21 +41,8 @@ pub(in crate::discovery) fn unit(g: &mut Builder, c: &DecoderConfig, layer: usiz
     let dim = c.head_dim as usize;
     g.attach_parameters(&attention, &ap);
     g.attach_parameters(&ffn, &fp);
-    // Generic composite topology already declares the mutable block boundaries.
-    // These now execute inside the block and also supply effective evidence.
-    for suffix in ["input", "output"] {
-        let mut point = g
-            .descriptor
-            .observations
-            .get(&format!("{path}.{suffix}"))
-            .unwrap()
-            .clone();
-        point.path.push_str(".effective");
-        point.position = ObservationPosition::AfterIntervention;
-        point.meaning = format!("Effective Muse block {suffix}");
-        g.get_mut(&block).observation_paths.push(point.path.clone());
-        g.descriptor.observations.points.push(point);
-    }
+    // Generic composite topology declares both original and effective boundaries.
+    // Muse emits that same pair inside its block, so no outer copy is declared.
     for (boundary, node, field, post) in [
         ("attention.input", &attention, "input_layernorm", false),
         (

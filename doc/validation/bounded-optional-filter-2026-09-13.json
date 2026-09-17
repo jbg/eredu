@@ -1,0 +1,272 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted optional filtering metadata, complete mixed sampling trace and retained score backing integration",
+  "source_sha256": {
+    "doc/backend-architecture.md": "4301019b1077c96eecc0bf25458f267970fda06608c1bc7ba340bfd038902ff3",
+    "doc/bounded-inference.md": "1c5e0ddd336553d85d413aa5ae2236dd17ca6d54c1d39bd4cf8eab4dd2036299",
+    "doc/execution-control.md": "3cfb390582b382165ed24528e64926ea9111a5be8feb59306684d1d7139f13a3",
+    "eredu-architectures/src/prepared_execution/workspace.rs": "a43b1b4ebdb582ae11aa753759f956e2d9bab2b6eddde9ef84a8823ab78afafe",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace.rs": "b8e11533d0e9c8caeb2d05332c93ca67afd2eb5cc06b75a84e4adfc7c5809180",
+    "eredu-backend-mlx/src/backend/nn/workspace/sampling.rs": "78df515322380246acf79dd9d3bde43f01e8aaee264cc484891b1793b1229508",
+    "eredu-backend-mlx/src/backend/nn/workspace/sampling/tests.rs": "69c344a4cf3043afee48f69fd8fdd096a0ed1c6c26261258f8c9fe97ee33ab95",
+    "eredu-backend-mlx/src/composition/mlx/model.rs": "8de23bd6da4e81390f9f17f2d247d7db9916a9d93161fa6e334ddea346e4f201",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "a1fca0600c3b0f5a05751f699635579c0f071bf6e78eda0d9af17040fe4bb3e1",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/optional_filter_tests.rs": "628d2dfab4c5ec279e80e05bfbc2f24f5485c1a53a3def24eaee35f5c5a6cd12",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/shared_controller_tests.rs": "973f9c9df8e0f841277ae2412f6192dbd3b8a5ff213f1a496e7b7b7ab4fbf119",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote.rs": "1d418981850ed7865ff7b165a51a87a2d3893674b5a28763e140dc9310d6e2c7",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_step.rs": "6bc4fefdc7e8be8d6c5ec96b9bac119f924bbe3b0d31a9f3fb9861854731f488",
+    "eredu-backend-mlx/src/tests/distributed_pipeline_ring/unit_and_worker/prepared_workspace.rs": "bd299d19be4de497a5bd9d080b38d73c8f9ed7ad12bcc0a3c574f0cd7cf1f8ff",
+    "eredu-cli/tests/k2_distributed_control.rs": "491f847baa2ced90294a47c0228678c4b7d8a370cbe8db47d9f9771f63c50757",
+    "eredu-core/src/backend.rs": "b1a30f75e6f5a29937a7b5c347a91d6b309f99b178bd9998384c583eb88a3ddb",
+    "eredu-core/src/backend/controller_workspace.rs": "d4a5d9ba311354194da38711d956aedaa55f3ba05b23abdcd88158c3f7fa3bbf",
+    "eredu-core/src/backend/controller_workspace/tests.rs": "483491ac0f573e06637f36a0fef2668e25f5ed65b78b68ba4d49c2ed2d56e52f",
+    "eredu-core/src/backend/preparation.rs": "97b4a03e31e6e8f6d41e3e08c3f7821994f29daf4e8d1804f97accf5118b13f0",
+    "eredu-core/src/backend/shared_filter.rs": "c36fb03fc8842ef92b288cd811c8eb4893f19d40735f73b322f0428974bc4bd0",
+    "eredu-core/src/backend/shared_filter/tests.rs": "3b3a2efa459f8d81c55ac7e44e8750f032eb0e4fa96deb947ae9acf0c1afb2a0",
+    "eredu-core/src/backend/text_step/tests.rs": "95bc3d66194e8fd1057f2679bf516dac1a3e10adc6d503bb4ee6d800f57469c4",
+    "eredu-core/src/inference.rs": "1f50b39618ae11ba8a243e0680dd4fa72293d6db741f8d81bb8df6fdf73801a6",
+    "eredu-core/src/inference/filter_workspace.rs": "9d8500664372a2705bbcd12b649c688be45fc167df0f693632e19d478e866615",
+    "eredu-core/src/lib.rs": "49c1251239a476c50dfaab439beef94b9908ef25d919906cd7852e537f933087",
+    "eredu-nn/src/workspace/sampling.rs": "38016a6054016981050a021811c550b023b6bde230124b4afe3cea4a0e1ecf33",
+    "eredu-runtime/src/execution_control/choice.rs": "3afff07cec9788913d51a1b78afacb61737a18a11efafe90c978cc262b5dbeb1",
+    "eredu-runtime/src/working_memory.rs": "51c5ae73d21c5918c7b17b6d860ca0290170c4e99a8fff44e3f116acd799dc84",
+    "eredu-runtime/src/working_memory/controller.rs": "77810e9587f5a75902074134de0046125127e3880e2efd58d75fd9a38a581026",
+    "eredu-runtime/src/working_memory/controller/tests.rs": "352e05453c9390c532bbe79a1a9d7fc9dc77b96d5570a1a7c8d42591e42beed7",
+    "eredu-runtime/src/working_memory/sampling.rs": "d27dc7a9a8419083f92db4087f97f9c3f5362288c7015406744e7820575d2765",
+    "eredu-runtime/src/working_memory/sampling/request.rs": "7d541de6eff7223ce69fab7183f8c84b1605dff57149018cb6d8dda51e61673c",
+    "eredu-runtime/src/working_memory/sampling/tests.rs": "024b38e074d8a52d27550239d1c2fdb6bbbcae0e2a0765cc9149d13af1c59b0f",
+    "eredu-runtime/src/working_memory/sampling/tests/optional.rs": "7f320e6df5bcc34ee877972f12a8ca21521bf546ab2b5b287cd1429bb61eacfb",
+    "eredu-runtime/tests/bounded_prefill/text_run.rs": "35c1880e303dfa06dc84a8e5fcc8e8fa18891769bed514c2abd49c609f28a809",
+    "eredu/src/api/loaded.rs": "d32b86145c7a6c551838510597efbea33da4289a723e042bdd622aa00b119f83",
+    "eredu/src/api/portable.rs": "7f62b5feb9fb2886e523a3cffc9e997ca54efbd98b03b1ab6cf6705cff25a616",
+    "eredu/src/api/request.rs": "f4bb9072c00914a51f06cd2b65d8c14d82c0e07aa992c1f0096cfa1bafd62485",
+    "eredu/src/api/tests.rs": "d3fa928161af518ed10ad937634393765e5e985a9e419590b586969592914e26",
+    "eredu/src/api/tests/sampler.rs": "de5351dab56c5d990cb8a248c2cfb53c1e3999f218b5e3601cf4dd82a9145151",
+    "eredu/src/runtime/chat/constraints.rs": "9e81be6620e7261a8130022c2247892f366a0b7ecd84822666dd01f56d5fae1d",
+    "eredu/tests/backend_conformance.rs": "84f3ce006f6d37d8a6db927b446cb8a91b978c5888304c5b73eacdacbf030908",
+    "eredu/tests/backend_conformance/control.rs": "b7d6e04622010ff57c431b45ee0839ce458d0b6b80d466d8f2709ef048e518f8",
+    "eredu/tests/backend_conformance/control/text.rs": "e5e15c87aa680407bb511ddba584281ba58eef31f6076a5be6badeee80966537",
+    "eredu/tests/backend_conformance/observed_mock.rs": "bb2f28e59216a132972d367d3f50673d1dfe2d104da40f2d3fb961ba4373a87e",
+    "eredu/tests/backend_conformance/text.rs": "e972c4531697b580707565694ea53aaa109b3bd7b205dcff2608f61a1dae376d",
+    "eredu/tests/portable_facade.rs": "f69bdc531b87053a9d74cd12dc5ab479d7e3e8b8b6d685c8a4865c38afdab552",
+    "eredu/tests/portable_facade/lifecycle.rs": "30af88ba38be2dd5d83593359f27fe0ddcd9880f79b87ee0af6fa8f14cdf997c",
+    "eredu/tests/portable_facade/nanbeige.rs": "36e5ad6efd2e6ea58901971a5993d4e32a75f7934e6c2dc137af1f88ceb9ec82"
+  },
+  "prior_record": "doc/validation/bounded-shared-controller-2026-09-13.json",
+  "coverage": {
+    "rust_tests": 1381,
+    "by_suite": {
+      "nn": 58,
+      "architecture-workspace": 13,
+      "runtime": 773,
+      "architecture-prepared": 8,
+      "facade": 26,
+      "portable": 112,
+      "features": 0,
+      "cli": 0,
+      "core": 295,
+      "minimal": 0,
+      "native-final": 96
+    },
+    "ignored": 1,
+    "generic_all_optional_forced_filtering": true,
+    "nested_optional_choice_bounds": true,
+    "fresh_actual_score_backing_for_escaped_aliases": true,
+    "post_admission_controller_mutation": false,
+    "full_family_path_goal_complete": false,
+    "new_peak_measurements": 0,
+    "new_released_checkpoint_comparisons": 0,
+    "new_native_distributed_runs": 0
+  },
+  "api_changes": [
+    "TextControllerWorkspace.filter is TextFilterWorkspace: Exact(&TokenFilter) or OptionalMask{max_mask_positions,mask_capacity_bytes}. From<&TokenFilter> preserves exact callers.",
+    "TextControllerContract explicitly distinguishes exact All, exact Allowed and optional filtering; uses_mask means may use, requires_mask means every decision requires a mask.",
+    "WorkspaceSamplingOperation::OptionalTokenFilter requires complete masked costs and the input-alias alternative.",
+    "quote_sampling_workspace accepts WorkspaceSamplingInput with logical layout and optional actual backing-capacity envelope. Bare layouts explicitly declare packed capacity; architecture passes actual score backing facts."
+  ],
+  "behavior": [
+    "Cold optional declarations validate mask geometry and host capacity without constructing bits. Decision checks preserve executable membership, final extent/capacity, original-mask overlap and shared provenance.",
+    "TokenChoiceController quotes All sources without callbacks or synthetic masks, preserves exact Allowed behavior and composes nested optional domain/capacity bounds with replacement overlap.",
+    "The existing configured sampler executes every quote step. Optional filtering preserves possible allocation and input alias roots, including all earlier delivered token/key roots across mixed schedules.",
+    "Optional mask payload and primitive costs occur only when outputs are possible; independent RNG initialization and existing controller payload remain. Missing required native or host facts stay unknown.",
+    "Architecture gathers the maximum complete reachable backing union of actual score rows. Sampling supplies distinct score identities per step so escaped earlier aliases retain real capacity. The envelope is conservative and grants no residual credit.",
+    "Actual MLX sampling execution is unchanged. Native facts reuse ordinary filter costs with both output-storage alternatives.",
+    "Pre-staged forced choices run then continue unfiltered under the same policy; post-preparation controller mutation still fails identity checks before further controller/native work."
+  ],
+  "verified_fixtures": {
+    "native": {
+      "architecture": "nonzero tiny Llama through normal artifact preparation",
+      "hardware": "Apple arm64 with Metal execution",
+      "prompt": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "pre_staged_forced_token": 11,
+      "outputs": 3,
+      "final_state_frontier": 7,
+      "ordinary_controlled_parity": true,
+      "unforced_suffix_reference": "fresh ordinary generation from prompt+[forced token]",
+      "forced_token_differs_from_unforced_initial_prediction": true,
+      "ordinary_initial_token": 5,
+      "admitted_output_tokens": [
+        11,
+        11,
+        11
+      ],
+      "request_charge_bytes": 215351,
+      "exact_domain_capacity_bytes": 258743,
+      "exact_domain_capacity_admits": true,
+      "one_byte_lower_rejects_before_work": true,
+      "post_preparation_mutation_rejects_before_work": true
+    },
+    "neutral": {
+      "configured_modes": [
+        "greedy",
+        "stochastic standard",
+        "Mirostat v2"
+      ],
+      "mask_capacity_and_length_validated_independently": true,
+      "mixed_schedules_retained_by_possible_alias_union": true,
+      "late_filter_mixed_peak_bytes": 6677,
+      "homogeneous_max_peak_bytes": 6158,
+      "optional_union_peak_bytes": 8213,
+      "padded_score_backing_bytes": 2048,
+      "packed_score_backing_bytes": 148,
+      "architecture_three_output_alias_padding_delta_bytes": 3800,
+      "unknown_backing_and_missing_mechanism_facts_preserved": true
+    }
+  },
+  "limits": [
+    "Shared masks are registered once but later requests still reserve the full additional source allowance; identity-bound incremental host credit and pins remain next.",
+    "Optional filtering does not complete post-admission dynamic controls, grammar storage or snapshot/reset/restore/fork/copy admission.",
+    "Quarantine cleanup, conservative historical ceilings, populated unquoted-state promotion and incomplete initial residual candidate retry remain outstanding.",
+    "Full media/speculation/host/disk/TP/PP/combined admission and arbitrary escaped raw-output/completion lifetime accounting remain unfinished.",
+    "No new released-checkpoint comparison, allocator/process peak or native distributed run. CLI distributed caller compilation is not execution; one external tokenizer fixture remains ignored."
+  ],
+  "validation_corrections": [
+    {
+      "log": "/private/tmp/eredu-optional-filter-architecture-prepared-initial.log",
+      "sha256": "377091a685a8886fee8c47f08c9bcf66ffbc4f0e18d2eb8eb7e9eadab3b7d443",
+      "result": "Initial architecture run passed seven and failed the new isolated alias assertion: default top-p/min-p added two sampler allocations. The fixture now explicitly disables those operations, so the assertion isolates two retained prior score backings. No production correction was needed."
+    }
+  ],
+  "checks": [
+    {
+      "name": "nn",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-nn --all-features --lib workspace -- --test-threads=1",
+      "log": "/private/tmp/eredu-optional-filter-nn.log",
+      "exit_code": 0,
+      "passed": 58,
+      "ignored": 0,
+      "sha256": "0bf4068ff0ba6e4907d1ffacab133abcf1f0ac157e766c69a32cba64faa4554f"
+    },
+    {
+      "name": "architecture-workspace",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test workspace_estimation -- --test-threads=1",
+      "log": "/private/tmp/eredu-optional-filter-architecture-workspace.log",
+      "exit_code": 0,
+      "passed": 13,
+      "ignored": 0,
+      "sha256": "e9ffc528c6aad8f9b7ed123a3ff2e160b3b89466ef289cff290743bcedfc5bfd"
+    },
+    {
+      "name": "runtime",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib --test bounded_prefill --test backend_independence -- --test-threads=1",
+      "log": "/private/tmp/eredu-optional-filter-runtime.log",
+      "exit_code": 0,
+      "passed": 773,
+      "ignored": 0,
+      "sha256": "b620eefbeef8225b80422b77ccf51633fad667602e1dc309596d3758e11b4fe8"
+    },
+    {
+      "name": "architecture-prepared",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric prepared_workspace -- --test-threads=1",
+      "log": "/private/tmp/eredu-optional-filter-architecture-prepared.log",
+      "exit_code": 0,
+      "passed": 8,
+      "ignored": 0,
+      "sha256": "0a4673a1026cdf248ed999c2a6493dd3ddf67ede9bbdf3bfbec2e5213d9e8ae7"
+    },
+    {
+      "name": "facade",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib api::tests::sampler -- --test-threads=1",
+      "log": "/private/tmp/eredu-optional-filter-facade.log",
+      "exit_code": 0,
+      "passed": 26,
+      "ignored": 0,
+      "sha256": "f2c665fdfe48fd43d4c63797539d4715b5b58c0a9d19eb4301a780f60c8321b0"
+    },
+    {
+      "name": "portable",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "log": "/private/tmp/eredu-optional-filter-portable.log",
+      "exit_code": 0,
+      "passed": 112,
+      "ignored": 1,
+      "sha256": "5563885a279038dd22b5e2620b6861214e943ce4d6ee63447cb2b9876ef98f3a"
+    },
+    {
+      "name": "features",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal,image,audio",
+      "log": "/private/tmp/eredu-optional-filter-features.log",
+      "exit_code": 0,
+      "passed": 0,
+      "ignored": 0,
+      "sha256": "4531055f06e073e9a27e78bae87f0a5dee9f052da98ee09a21c7895a630baab2"
+    },
+    {
+      "name": "cli",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-cli --test k2_distributed_control",
+      "log": "/private/tmp/eredu-optional-filter-cli.log",
+      "exit_code": 0,
+      "passed": 0,
+      "ignored": 0,
+      "sha256": "5ba29c98749fee16193faf017c7d285943a1ec37c1d35502c3dec8a0a083d66d"
+    },
+    {
+      "name": "core",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib -- --test-threads=1",
+      "log": "/private/tmp/eredu-optional-filter-core.log",
+      "exit_code": 0,
+      "passed": 295,
+      "ignored": 0,
+      "sha256": "13888e65ea63e0e98497e46af6797e49d98d952cd0f085152955feb638553141"
+    },
+    {
+      "name": "minimal",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "log": "/private/tmp/eredu-optional-filter-minimal.log",
+      "exit_code": 0,
+      "passed": 0,
+      "ignored": 0,
+      "sha256": "73df168efe0b7371f37662aed3da53912de008dac016d5138d096c22e2576a4f"
+    },
+    {
+      "name": "native-final",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1 --nocapture initial_publication_tests model_session::operation_ model_session::preparation_ model_session::output_retention_tests model_session::idle_storage model_session::managed_admission_tests model_session::text_step_tests model_session::text_quote model_session::text_reuse_tests model_session::shared_controller_tests adapter::tests::managed_memory observation::memory_tests admission::publication::tests prepared_speculative::memory_tests generation::token_retention_tests sampling_native_facts_cover_sort_growth_host_masks_and_retained_key_replacement frontier_tests composition::mlx::session::tests:: adapter::completion::retirement_tests model_session::optional_filter_tests optional_filter_facts",
+      "log": "/private/tmp/eredu-optional-filter-native-final.log",
+      "exit_code": 0,
+      "passed": 96,
+      "ignored": 0,
+      "sha256": "11735653c33b7e30c79c026b0d956304d32802b7c4954ad1d011e2007c80d4ee"
+    }
+  ],
+  "supplementary_checks": [
+    {
+      "command": "rustfmt --check --edition 2021 --config skip_children=true <recorded Rust files>",
+      "log": "/private/tmp/eredu-optional-filter-format.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exit_code": 0
+    },
+    {
+      "command": "git diff --check -- <recorded source/documentation files>",
+      "log": "/private/tmp/eredu-optional-filter-whitespace.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exit_code": 0
+    }
+  ]
+}

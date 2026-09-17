@@ -1,0 +1,125 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "Uncommitted shared workspace. File hashes identify this increment; prior milestone records retain their historical hashes.",
+  "source_sha256": {
+    "doc/backend-architecture.md": "43054125cc7107186406136bb975781a34cf99241640acc9618fa8cc104a7582",
+    "doc/bounded-inference.md": "831be2bcbedbceed8c2c7521abedaa6d3227349c9fdb0d189ca9ec0e5310c327",
+    "doc/execution-control.md": "d1b120447836a18554bd8069d22b0798cf912b9bd1592ab37ee32ada6f0dfd44",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote.rs": "226f54e6db4cbbd1bc6c72347d1da503cde063335d5da8f438a78f80af5a4a1a",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/candidates.rs": "ae824f058181181f4eea6416143585a3cc24baf51703b629765617fcfc7d5ce3",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/candidates/tests.rs": "23d92576f006ed6cba8e3e710cfc995b431561e9e5b0103c164359ecc9c6c01e",
+    "eredu-runtime/src/working_memory.rs": "3fc8cc74c5bcbe8d28ccd1eb02ffae764a7d2cd5ded74bc9dbdff3bbe50816c2",
+    "eredu-runtime/src/working_memory/inference.rs": "27dca3151eb366d6da5f26b969f82fcc9d835565c325cd51fcb4bc9214377985",
+    "eredu-runtime/src/working_memory/residual.rs": "21714a5989affb94c4dc828414f2d8e7f33c84eedd07baf2843411141f0f55f2",
+    "eredu-runtime/src/working_memory/residual/tests.rs": "b846f3f6423a0ae29b25dfae91b96f2be717e72a20d0b0caffc2e53ad2cd328a",
+    "eredu-runtime/src/working_memory/residual/tests/controller.rs": "d99de7b7aeacb44389f0755f790c02080dfbf91fbbf4fa84e1824477d2776e3e",
+    "eredu-runtime/src/working_memory/residual/tests/incomplete.rs": "02d5abf5876ef5d3ecfcb3c3deac2533a42fc6bbc4a29806bc1ddbb70ed18daa"
+  },
+  "prior_record": "bounded-host-layerwise-2026-09-13.json",
+  "coverage": {
+    "total_passed": 969,
+    "new_runtime_tests": 9,
+    "new_native_tests": 5,
+    "whole_goal_complete": false,
+    "native_distributed_executed": false,
+    "external_tokenizer_fixture_ignored": true
+  },
+  "behavior": [
+    "Opaque numerical IncompleteWorkspace outcome can only be constructed after geometry, state-span protocol, domain and exact borrowed-root association validation; its source remains UnknownBound and it holds no registered source pin.",
+    "Shared integer-descending candidate loop handles incomplete and over-budget candidates without a monotonicity assumption; all other quote errors remain fatal and the final typed cause is preserved.",
+    "Native initial diagnostics enter the same loop. Output width and controller contract remain bound across candidates and complete proofs are checked before reservation.",
+    "Complete foreign-pool identity is validated before application-budget policy, preventing a retryable budget error from hiding invalid identity.",
+    "Rejected candidates leave used/peak charges unchanged. Accepted proof custody transfers to reservation before host-source pins, funding and prompt/sampler preparation."
+  ],
+  "verified_fixtures": [
+    "Actual nonzero metadata operations with selected facts missing at larger extents: [4,3,2] attempts accept chunk two for full/controller and registered-decoder quotes.",
+    "Mixed incomplete and over-budget sequences preserve exact capacity, safety reserve, full diagnostics and final error; retained error does not prolong original source registrations.",
+    "Missing state-span protocol, lost borrowed association, wrong geometry/pool, known overflow, controller-contract/output-width drift and original native exception reject without subsequent work.",
+    "Existing real Metal resident and host depths one/two run ordinary/controlled generation, finite exact/-1 capacities, cached reuse, retirement and fault handling. Llama, Qwen3-MoE, Qwen3.5 and text-only Gemma4 remain covered."
+  ],
+  "limits": [
+    "No new primitive coverage or execution path is claimed by retry tests; dimension-dependent incomplete facts are explicit test mechanisms, not fabricated native kernel limitations.",
+    "No new released-checkpoint comparison, allocator/process peak or native distributed run.",
+    "Grammar/shared-vocabulary preparation, dynamic controls/capture, quoted snapshot/reset/restore/fork/copy, disk and other host policies, complete media/speculation/TP/PP/combined admission, quarantine/capacity-ceiling cleanup and arbitrary raw-output/completion retention remain unfinished."
+  ],
+  "checks": [
+    {
+      "name": "runtime",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib --test backend_independence --test bounded_prefill -- --test-threads=1",
+      "log": "/private/tmp/eredu-incomplete-candidates-runtime.log",
+      "exit_code": 0,
+      "passed": 806,
+      "ignored": 0,
+      "sha256": "383504d7f224ab445cf882bcd15189c51ab3c2313e83c24c354cbfdca3033a17"
+    },
+    {
+      "name": "native",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1 --nocapture model_session::text_quote model_session::managed_admission_tests model_session::text_reuse_tests model_session::controller_credit_tests model_session::host_layerwise_tests",
+      "log": "/private/tmp/eredu-incomplete-candidates-native.log",
+      "exit_code": 0,
+      "passed": 30,
+      "ignored": 0,
+      "sha256": "0c53d639acee716c9e9d4c6ec0eae288416b9e4ff442ac7f036c2d8f1ed54569"
+    },
+    {
+      "name": "architecture-workspace",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test workspace_estimation -- --test-threads=1",
+      "log": "/private/tmp/eredu-incomplete-candidates-architecture-workspace.log",
+      "exit_code": 0,
+      "passed": 13,
+      "ignored": 0,
+      "sha256": "0f12949b669197f654ad76b2eead0eedbf102ec7396fd1e8897fc8230561da3e"
+    },
+    {
+      "name": "architecture-numeric",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric prepared_workspace -- --test-threads=1",
+      "log": "/private/tmp/eredu-incomplete-candidates-architecture-numeric.log",
+      "exit_code": 0,
+      "passed": 8,
+      "ignored": 0,
+      "sha256": "03bf9e9209c89f8a4419001f28bd46cbefd231ca516fa0c060a6b684b0226bcd"
+    },
+    {
+      "name": "portable",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance -- --test-threads=1",
+      "log": "/private/tmp/eredu-incomplete-candidates-portable.log",
+      "exit_code": 0,
+      "passed": 112,
+      "ignored": 1,
+      "sha256": "4c1c0cde8246284aab6082d1c2ff4e50f4be093ce28b6317c2ff51e4c895f3bb"
+    },
+    {
+      "name": "minimal",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "log": "/private/tmp/eredu-incomplete-candidates-minimal.log",
+      "exit_code": 0,
+      "passed": 0,
+      "ignored": 0,
+      "sha256": "03e21234f61e0c472ed105a295b44b20f3438f1994ca02179dd46b64a54391b4"
+    },
+    {
+      "name": "features",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal,image,audio",
+      "log": "/private/tmp/eredu-incomplete-candidates-features.log",
+      "exit_code": 0,
+      "passed": 0,
+      "ignored": 0,
+      "sha256": "cd29b1b3125edcd23fae7c5b725b705982efb3d61b3c7a3d4b666f8878595b7f"
+    }
+  ],
+  "supplementary_checks": [
+    {
+      "name": "format",
+      "log": "/private/tmp/eredu-incomplete-candidates-format.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "name": "whitespace",
+      "log": "/private/tmp/eredu-incomplete-candidates-whitespace.log",
+      "exit_code": 0,
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    }
+  ]
+}

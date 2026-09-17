@@ -233,6 +233,11 @@ impl TopKGroupSelector {
             .transpose()
             .map_err(|error| Exception::custom(error.to_string()))?
             .unwrap_or(QuantizationMode::Affine);
+        if (config.top_k < config.group_count || config.topk_group < config.n_group)
+            && stream.device_type().ok() == Some(safemlx::DeviceType::Gpu)
+        {
+            crate::backend::managed_memory::router::prepare_before_native_construction();
+        }
         Ok(Self {
             top_k: config.top_k,
             group_count: config.group_count,
@@ -498,13 +503,13 @@ impl TopKGroupSelector {
             let mut denominator = routing_sum_last(&top_k_weights, stream)?;
             if self.normalization_epsilon != 0.0 {
                 denominator =
-                    denominator.add(Array::from_f32(self.normalization_epsilon), stream)?;
+                    denominator.add(Array::try_from_f32(self.normalization_epsilon)?, stream)?;
             }
             top_k_weights = top_k_weights.divide(denominator, stream)?;
         }
         if self.coefficient_scale != 1.0 {
             top_k_weights =
-                top_k_weights.multiply(Array::from_f32(self.coefficient_scale), stream)?;
+                top_k_weights.multiply(Array::try_from_f32(self.coefficient_scale)?, stream)?;
         }
         if let Some(scale) = self.learned_coefficient_scale.as_ref() {
             top_k_weights =
@@ -525,15 +530,22 @@ impl TopKGroupSelector {
         let epsilon = self
             .input_rms_epsilon
             .expect("selector input scale requires an RMS epsilon");
-        let variance = mean_axis(&flat.square(stream)?, -1, true, stream)?;
-        let normalized = flat.multiply(
-            rsqrt(variance.add(Array::from_f32(epsilon), stream)?, stream)?,
-            stream,
-        )?;
+        // MLX's empty reduction identity-copy path requires equal shapes,
+        // whereas reducing [0, width] produces [0, 1]. Skip that reduction
+        // while preserving the learned-scale arithmetic and dtype promotion.
+        let normalized = if flat.size() == 0 {
+            flat
+        } else {
+            let variance = mean_axis(&flat.square(stream)?, -1, true, stream)?;
+            flat.multiply(
+                rsqrt(variance.add(Array::try_from_f32(epsilon)?, stream)?, stream)?,
+                stream,
+            )?
+        };
         let scaled = normalized.multiply(scale, stream)?;
         if self.input_inverse_sqrt_dimensions {
             scaled.multiply(
-                Array::from_f32((self.input_dims as f32).sqrt().recip()),
+                Array::try_from_f32((self.input_dims as f32).sqrt().recip())?,
                 stream,
             )
         } else {
@@ -542,6 +554,13 @@ impl TopKGroupSelector {
     }
 
     fn topk_indices(&self, scores_for_choice: &Array, stream: &Stream) -> Result<Array, Exception> {
+        if scores_for_choice.size() == 0 {
+            return zeros_dtype(
+                &[scores_for_choice.dim(0), self.top_k],
+                Dtype::Uint32,
+                stream,
+            );
+        }
         if self.n_group == 1 && self.topk_group == 1 {
             return largest_indices(scores_for_choice, self.top_k, stream);
         }
@@ -569,7 +588,7 @@ impl TopKGroupSelector {
         let partition_ids: Vec<i32> = (0..self.group_count)
             .map(|group| group / entries_per_partition)
             .collect();
-        let partition_ids = Array::from_slice(&partition_ids, &[1, 1, self.group_count]);
+        let partition_ids = Array::try_from_slice(&partition_ids, &[1, 1, self.group_count])?;
         let selected_groups = group_idx.try_index_device((.., .., NewAxis), stream)?;
         let group_mask = selected_groups.eq(partition_ids, stream)?;
         let group_mask = sum_axis(
@@ -578,11 +597,11 @@ impl TopKGroupSelector {
             false,
             stream,
         )?
-        .gt(Array::from_int(0), stream)?;
+        .gt(Array::try_from_int(0)?, stream)?;
         let masked_scores = r#where(
             &group_mask,
             scores_for_choice,
-            Array::from_f32(f32::NEG_INFINITY),
+            Array::try_from_f32(f32::NEG_INFINITY)?,
             stream,
         )?;
         largest_indices(&masked_scores, self.top_k, stream)
@@ -592,10 +611,28 @@ impl TopKGroupSelector {
 /// Partition from the largest end directly. Selecting the upper suffix of an
 /// ascending partition has different cutoff behavior when routing scores tie.
 fn largest_indices(scores: &Array, count: i32, stream: &Stream) -> Result<Array, Exception> {
-    let descending = scores.multiply(Array::from_f32(-1.0), stream)?;
+    let original = safemlx::OriginalScopeObserver::try_current()?;
+    // Acquire the existing admitted fallback before constructing even the
+    // descending/GPU prefix. Ordinary calls do not touch this shared runtime.
+    let original_cpu = if let Some(observer) = original.as_ref() {
+        if count < scores.dim(-1) && stream.device_type()? == safemlx::DeviceType::Gpu {
+            Some(crate::backend::managed_memory::router::stream(observer)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let descending = scores.multiply(Array::try_from_f32(-1.0)?, stream)?;
     let indices = argpartition_axis(&descending, count - 1, -1, stream)?
         .try_index_device((.., ..count), stream)?;
-    if count < scores.dim(-1) && stream.get_device()?.get_type()? == safemlx::DeviceType::Gpu {
+    if count < scores.dim(-1)
+        && if original.is_some() {
+            original_cpu.is_some()
+        } else {
+            stream.get_device()?.get_type()? == safemlx::DeviceType::Gpu
+        }
+    {
         let selected = take_along_axis(scores, &indices, -1, stream)?;
         let cutoff = selected.min_axis(-1, true, stream)?;
         let all_ties = scores
@@ -606,11 +643,17 @@ fn largest_indices(scores: &Array, count: i32, stream: &Stream) -> Result<Array,
             .eq(&cutoff, stream)?
             .as_dtype(Dtype::Int32, stream)?
             .sum_axis(-1, false, stream)?;
-        if all_ties
-            .gt(selected_ties, stream)?
-            .any(None, stream)?
-            .try_item::<bool>(stream)?
-        {
+        let crossing_tie = all_ties.gt(selected_ties, stream)?.any(None, stream)?;
+        if let Some(cpu) = original_cpu {
+            // Both native workers keep their existing comparator/partition
+            // semantics. The same global predicate selects CPU for every row
+            // if any cutoff tie crosses, matching the original host branch.
+            // Slice on the GPU so only the partition itself executes on CPU.
+            let value_only = argpartition_axis(&descending, count - 1, -1, cpu)?
+                .try_index_device((.., ..count), stream)?;
+            return r#where(&crossing_tie, value_only, indices, stream);
+        }
+        if crossing_tie.try_item::<bool>(stream)? {
             // Native GPU partitions break cutoff ties by index. Share the
             // value-only partition when a tie crosses the cutoff. Only scores
             // and indices cross streams; expert tensors retain their storage.
@@ -634,6 +677,11 @@ pub(crate) fn weighted_group_sum(
     let weights = gather_selection_values(top_k_weights, plan, stream)?
         .try_index_device((.., NewAxis), stream)?;
     let weighted = current.multiply(weights, stream)?;
+    if num_tokens == 0 {
+        // Avoid MLX's shape-mismatched empty reduction identity copy. Keep the
+        // product above so coefficient promotion still determines result dtype.
+        return zeros_dtype(&[0, weighted.dim(-1)], weighted.dtype(), stream);
+    }
 
     // Each selection index is unique, so restore the group-major rows with a
     // collision-free scatter and reduce the original top-k slots in their
@@ -688,6 +736,13 @@ fn routing_dtype(precision: RoutingPrecision, input: Dtype, current: Dtype) -> D
 
 fn routing_sum_last(input: &Array, stream: &Stream) -> Result<Array, Exception> {
     let dtype = input.dtype();
+    if input.size() == 0 {
+        let mut shape = input.shape().to_vec();
+        *shape
+            .last_mut()
+            .expect("routing coefficients have a last axis") = 1;
+        return zeros_dtype(&shape, dtype, stream);
+    }
     // Reduced-precision normalization rounds the completed reduction, rather
     // than every internal addition. The following epsilon/division boundaries
     // still consume the architecture-selected score dtype.

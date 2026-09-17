@@ -1,4 +1,4 @@
-use crate::{Error, Result};
+use crate::{Error, Result, UnsupportedGgmlType};
 
 pub const DEFAULT_ALIGNMENT: u64 = 32;
 
@@ -366,6 +366,15 @@ impl GgmlType {
         }
     }
     pub fn block_and_bytes(self) -> Result<(u64, u64)> {
+        self.block_and_bytes_fixed()
+            .map_err(|error| Error::UnsupportedTensorType(error.code()))
+    }
+
+    /// Returns the canonical values and bytes per block with a fixed error.
+    ///
+    /// This is the same geometry worker used by [`Self::block_and_bytes`].
+    /// Neither success nor refusal allocates or formats an error message.
+    pub fn block_and_bytes_fixed(self) -> std::result::Result<(u64, u64), UnsupportedGgmlType> {
         match self {
             Self::F32 => Ok((1, 4)),
             Self::F16 | Self::Bf16 | Self::I16 => Ok((1, 2)),
@@ -393,9 +402,9 @@ impl GgmlType {
             Self::IQ1M => Ok((256, 56)),
             Self::MxFp4 => Ok((32, 17)),
             Self::RemovedIQ4NL4_4 | Self::RemovedIQ4NL4_8 | Self::RemovedIQ4NL8_8 => {
-                Err(Error::UnsupportedTensorType(self.code()))
+                Err(UnsupportedGgmlType { code: self.code() })
             }
-            Self::Unknown(v) => Err(Error::UnsupportedTensorType(v)),
+            Self::Unknown(code) => Err(UnsupportedGgmlType { code }),
         }
     }
 
@@ -438,16 +447,57 @@ pub struct TensorDescriptor {
     pub byte_len: u64,
 }
 
+/// Borrowed descriptor fields used by the shared fixed-storage workers.
+/// Every name/dimension reference is tied to its actual owning descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TensorDescriptorView<'a> {
+    pub name: &'a str,
+    pub dimensions: &'a [u64],
+    pub ggml_type: GgmlType,
+    pub relative_offset: u64,
+    pub data_offset: u64,
+    pub byte_len: u64,
+}
 impl TensorDescriptor {
+    /// Borrow exact fields without cloning name or dimensions.
+    pub fn view(&self) -> TensorDescriptorView<'_> {
+        TensorDescriptorView {
+            name: &self.name,
+            dimensions: &self.dimensions,
+            ggml_type: self.ggml_type,
+            relative_offset: self.relative_offset,
+            data_offset: self.data_offset,
+            byte_len: self.byte_len,
+        }
+    }
     pub fn element_count(&self) -> Result<u64> {
+        self.view().element_count()
+    }
+    /// Shape in row-major order.
+    pub fn row_major_shape(&self) -> Vec<u64> {
+        self.view().row_major_shape()
+    }
+}
+impl TensorDescriptorView<'_> {
+    /// Checked element count using the ordinary descriptor equation.
+    pub fn element_count(self) -> Result<u64> {
         self.dimensions.iter().try_fold(1u64, |a, &b| {
             a.checked_mul(b)
                 .ok_or(Error::Overflow("tensor element count"))
         })
     }
-    /// Shape in row-major order.
-    pub fn row_major_shape(&self) -> Vec<u64> {
+    pub(crate) fn row_major_shape(self) -> Vec<u64> {
         self.dimensions.iter().rev().copied().collect()
+    }
+    pub(crate) fn to_owned(self) -> TensorDescriptor {
+        TensorDescriptor {
+            name: self.name.to_owned(),
+            dimensions: self.dimensions.to_owned(),
+            ggml_type: self.ggml_type,
+            relative_offset: self.relative_offset,
+            data_offset: self.data_offset,
+            byte_len: self.byte_len,
+        }
     }
 }
 

@@ -7,6 +7,14 @@ use super::*;
 use eredu_core::component::ComponentCoordinateMap;
 use sha2::{Digest, Sha256};
 
+mod cost;
+pub use cost::{PartitionInterventionProjectionCost, PartitionInterventionColumnError, validate_partition_column_region, intervention_window_metadata};
+mod geometry_identity;
+mod original_source;
+pub use original_source::{PreparedPartitionInterventionProjection, PartitionInterventionProjectionSourceError, PartitionInterventionUpdate};
+mod payload;
+pub use payload::{PreparedWindowInterventionPayload, PreparedWindowInterventionPayloadError, WindowInterventionPayloadError};
+
 /// One actual invocation member, including nonexporting replicas and empty shards.
 pub struct PartitionActivationMember<'a> {
     /// World rank that executes this invocation.
@@ -169,20 +177,9 @@ impl<'a> PartitionActivationProjection<'a> {
                 "partition intervention axis or fragment bound is invalid",
             ));
         }
-        let column_mask = matches!(
-            action,
-            InterventionAction::MaskComponents { .. } | InterventionAction::MaskLogits { .. }
-        );
+        let column_mask = validate_partition_column_region(action, global_shape, &slice)
+            .map_err(|_| invalid("column intervention requires the complete global final axis"))?;
         let last = global_shape.len() - 1;
-        if column_mask
-            && (slice.starts[last] != 0
-                || slice.ends[last] != global_shape[last]
-                || slice.strides[last] != 1)
-        {
-            return Err(invalid(
-                "column intervention requires the complete global final axis",
-            ));
-        }
         let mut shape = global_shape.to_vec();
         shape[axis] = coordinates.local_count() as u64;
         let local_columns = column_mask && axis == last;
@@ -230,19 +227,11 @@ impl<'a> PartitionActivationProjection<'a> {
     /// occurs on each term, so equality with editing a reduced tensor is numerical,
     /// not bitwise. This does not add a native reduction or completion authority.
     pub fn as_sum_term(mut self, offset_owner: bool) -> Result<Self, CaptureError> {
-        if self.sum_offset_owner.is_some()
-            || self.coordinates.local_count() != self.coordinates.global_count()
-            || (0..self.coordinates.local_count())
-                .any(|index| self.coordinates.local_to_global(index) != Some(index))
-        {
-            return Err(invalid("an additive intervention term requires complete ordered coordinates and one projection"));
+        if self.sum_offset_owner.is_some() {
+            return Err(invalid("additive intervention term already has an offset owner"));
         }
         let action = &self.plan.plan().operations[self.operation].action;
-        if matches!(action, InterventionAction::MaskLogits { .. }) {
-            return Err(CaptureError::Unsupported(
-                "vocabulary sentinel masking is not an additive activation mask".into(),
-            ));
-        }
+        validate_sum_coordinates(self.coordinates, action)?;
         self.sum_offset_owner = Some(offset_owner);
         if !offset_owner && matches!(action, InterventionAction::Add { .. }) {
             // This rank still validates its source and participates in completion,
@@ -266,44 +255,11 @@ impl<'a> PartitionActivationProjection<'a> {
     /// ordered coordinates and local/global region correspondence, so equally
     /// sized permutations cannot substitute for the retained placement.
     pub fn geometry_identity(&self) -> [u8; 32] {
-        let mut digest = Sha256::new();
-        digest.update(b"eredu-partition-activation-geometry-v2\0");
-        digest.update(self.plan.intent_identity().as_bytes());
-        digest.update((self.operation as u64).to_le_bytes());
-        digest.update([u8::from(self.local_columns)]);
-        digest.update([match self.sum_offset_owner {
-            None => 0,
-            Some(false) => 1,
-            Some(true) => 2,
-        }]);
-        let vector = |digest: &mut Sha256, values: &[u64]| {
-            digest.update((values.len() as u64).to_le_bytes());
-            for value in values {
-                digest.update(value.to_le_bytes());
-            }
-        };
-        vector(&mut digest, &self.shape);
-        digest.update((self.coordinates.global_count() as u64).to_le_bytes());
-        digest.update((self.coordinates.local_count() as u64).to_le_bytes());
-        for local in 0..self.coordinates.local_count() {
-            digest.update(
-                (self
-                    .coordinates
-                    .local_to_global(local)
-                    .expect("retained coordinate") as u64)
-                    .to_le_bytes(),
-            );
-        }
-        digest.update((self.regions.len() as u64).to_le_bytes());
-        for region in &self.regions {
-            digest.update([u8::from(region.destination.is_some())]);
-            for slice in std::iter::once(&region.local).chain(region.destination.iter()) {
-                for values in [&slice.starts, &slice.ends, &slice.strides, &slice.shape] {
-                    vector(&mut digest, values);
-                }
-            }
-        }
-        digest.finalize().into()
+        geometry_identity::identity(self.plan, self.operation, self.local_columns, self.sum_offset_owner,
+            &self.shape, self.coordinates, self.regions.len(), |index| {
+                let region = &self.regions[index];
+                (&region.local, region.destination.as_ref())
+            })
     }
 
     /// Charges host projection before copying payloads, then charges the complete
@@ -325,47 +281,12 @@ impl<'a> PartitionActivationProjection<'a> {
         } else {
             original_action
         };
-        let mut host_bytes = add(
-            256,
-            add(
-                self.plan.identity().len() as u64,
-                add(
-                    self.plan.intent_identity().len() as u64,
-                    mul(self.shape.len() as u64, 8)?,
-                )?,
-            )?,
-        )?;
+        let mut cost = PartitionInterventionProjectionCost::new(self.plan, self.shape.len())?;
         for region in &self.regions {
             estimator.validate_geometry(&self.shape, &region.local)?;
-            let payload = match action {
-                InterventionAction::Replace { tensor } | InterventionAction::Add { tensor } => mul(
-                    elements(&region.local.shape)?,
-                    if tensor.values.dtype() == InterventionDtype::Float32 {
-                        4
-                    } else {
-                        2
-                    },
-                )?,
-                InterventionAction::Mask { .. } => elements(&region.local.shape)?,
-                // Local index storage plus bounded uniqueness-validation scratch.
-                InterventionAction::MaskComponents { indices, .. } => {
-                    mul(indices.len() as u64, 96)?
-                }
-                InterventionAction::MaskLogits { token_ids, .. } => {
-                    mul(token_ids.len() as u64, 96)?
-                }
-                _ => 0,
-            };
-            // Owned action/region envelopes and exact row-major payload storage.
-            host_bytes = add(
-                host_bytes,
-                add(256, add(mul(self.shape.len() as u64, 48)?, payload)?)?,
-            )?;
+            cost.include(action, &region.local.shape)?;
         }
-        let host = CaptureUsage {
-            host_bytes,
-            ..Default::default()
-        };
+        let host = cost.usage();
         let mut projected = reservation.reserve_quota(host)?;
         reserve_envelope(&mut projected, host)?;
         let mut updates = Vec::with_capacity(self.regions.len());
@@ -532,69 +453,7 @@ fn project_action(
     action: &InterventionAction,
     destination: &ResolvedCaptureSlice,
 ) -> Result<InterventionAction, CaptureError> {
-    Ok(match action {
-        InterventionAction::Mask { dtype, shape, keep } => InterventionAction::Mask {
-            dtype: *dtype,
-            shape: destination.shape.clone(),
-            keep: select_payload(keep, shape, destination)?,
-        },
-        InterventionAction::Replace { tensor } | InterventionAction::Add { tensor } => {
-            let values = match &tensor.values {
-                InterventionValues::Float32(values) => {
-                    InterventionValues::Float32(select_payload(values, &tensor.shape, destination)?)
-                }
-                InterventionValues::Float16(values) => {
-                    InterventionValues::Float16(select_payload(values, &tensor.shape, destination)?)
-                }
-                InterventionValues::Bfloat16(values) => InterventionValues::Bfloat16(
-                    select_payload(values, &tensor.shape, destination)?,
-                ),
-            };
-            let tensor = InterventionTensor {
-                shape: destination.shape.clone(),
-                values,
-            };
-            if matches!(action, InterventionAction::Replace { .. }) {
-                InterventionAction::Replace { tensor }
-            } else {
-                InterventionAction::Add { tensor }
-            }
-        }
-        action => action.clone(),
-    })
-}
-
-// Iterate only selected elements; no global-size index vector or F16/BF16 cast.
-fn select_payload<T: Copy>(
-    values: &[T],
-    shape: &[u64],
-    slice: &ResolvedCaptureSlice,
-) -> Result<Vec<T>, CaptureError> {
-    let count = elements(&slice.shape)?;
-    let mut output =
-        Vec::with_capacity(usize::try_from(count).map_err(|_| CaptureError::Overflow)?);
-    for ordinal in 0..count {
-        let mut remaining = ordinal;
-        let mut source = 0u64;
-        let mut stride = 1u64;
-        for axis in (0..shape.len()).rev() {
-            let coordinate = add(
-                slice.starts[axis],
-                mul(remaining % slice.shape[axis], slice.strides[axis])?,
-            )?;
-            remaining /= slice.shape[axis];
-            source = add(source, mul(coordinate, stride)?)?;
-            stride = mul(stride, shape[axis])?;
-        }
-        output.push(
-            *values
-                .get(usize::try_from(source).map_err(|_| CaptureError::Overflow)?)
-                .ok_or_else(|| {
-                    invalid("partition intervention payload destination is outside admission")
-                })?,
-        );
-    }
-    Ok(output)
+    Ok(payload::project(action, destination, &mut payload::Ordinary)?.unwrap_or_else(|| action.clone()))
 }
 
 fn invalid(message: &str) -> CaptureError {
@@ -686,4 +545,16 @@ mod tests {
             }
         }
     }
+}
+
+// Shared additive semantics for ordinary projection and original source copies.
+fn validate_sum_coordinates(coordinates: &ComponentCoordinateMap, action: &InterventionAction) -> Result<(), CaptureError> {
+    if coordinates.local_count() != coordinates.global_count()
+        || (0..coordinates.local_count()).any(|index| coordinates.local_to_global(index) != Some(index)) {
+        return Err(invalid("an additive intervention term requires complete ordered coordinates and one projection"));
+    }
+    if matches!(action, InterventionAction::MaskLogits { .. }) {
+        return Err(CaptureError::Unsupported("vocabulary sentinel masking is not an additive activation mask".into()));
+    }
+    Ok(())
 }

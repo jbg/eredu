@@ -1716,7 +1716,9 @@ fn pipeline_ring_worker() {
                     "rank {expected_rank} lost original preparation cause: {error}"
                 );
                 let after = runtime.text_preparation_usage().unwrap();
-                assert_eq!(after.attempts, before.attempts + 1);
+                // Admission succeeds before the lane Sampling agreement rejects.
+                // Neither cache Sampling nor Delivery is reached after rejection.
+                assert_eq!(after.attempts, before.attempts + 2);
                 assert!(after.retained_bytes > before.retained_bytes);
                 assert!(after.host_bytes > before.host_bytes);
                 // A failed broad native operation has no whole-run restoration

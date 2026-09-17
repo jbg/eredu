@@ -107,6 +107,29 @@ fn apply_activation_checked<B: InterventionBackend>(
 ) -> Result<B::Tensor, CaptureExecutionError<B::Error>> {
     use CaptureExecutionError::Backend;
     let source = backend.shape(input).map_err(Backend)?;
+    apply_activation_known_shape(backend, input, action, slice, &source, validate)
+}
+
+/// Executes the same validated activation recipe using caller-retained geometry.
+/// Exact native source shape is checked before any primitive runs; this grants
+/// no admission authority and preserves ordinary action dispatch and validation.
+pub fn apply_activation_with_source_shape<B: InterventionBackend>(
+    backend: &mut B, input: &B::Tensor, action: &InterventionAction,
+    slice: &ResolvedCaptureSlice, source: &[u64],
+) -> Result<B::Tensor, CaptureExecutionError<B::Error>> {
+    apply_activation_known_shape(backend, input, action, slice, source,
+        InterventionAction::validate_activation_region)
+}
+
+fn apply_activation_known_shape<B: InterventionBackend>(
+    backend: &mut B, input: &B::Tensor, action: &InterventionAction,
+    slice: &ResolvedCaptureSlice, source: &[u64],
+    validate: impl Fn(&InterventionAction, InterventionDtype, &[u64]) -> Result<(), CaptureError>,
+) -> Result<B::Tensor, CaptureExecutionError<B::Error>> {
+    use CaptureExecutionError::Backend;
+    if !backend.matches_intervention_shape(input, source).map_err(Backend)? {
+        return Err(CaptureError::Invalid("activation source shape mismatch".into()).into());
+    }
     let dtype = backend.intervention_dtype(input).map_err(Backend)?;
     let rank = source.len();
     if [&slice.starts, &slice.ends, &slice.strides, &slice.shape]
@@ -186,10 +209,9 @@ fn validate_value<B: InterventionBackend>(
     shape: &[u64],
     dtype: InterventionDtype,
 ) -> Result<(), CaptureExecutionError<B::Error>> {
-    if backend
-        .shape(value)
+    if !backend
+        .matches_intervention_shape(value, shape)
         .map_err(CaptureExecutionError::Backend)?
-        != shape
         || backend
             .intervention_dtype(value)
             .map_err(CaptureExecutionError::Backend)?

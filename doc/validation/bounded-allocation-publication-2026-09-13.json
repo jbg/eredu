@@ -1,0 +1,159 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted durable storage identity, independent registrations and loaded nonstate allocation publication",
+  "source_sha256": {
+    "doc/backend-architecture.md": "7861477363230b1aa8983740cd764eb6f8b173ecfbea9c90508d1b6eb392fbc6",
+    "doc/execution-control.md": "f0d39850a761af182545f09280c34bc6de79dc93b626d16f70c158602bf93d04",
+    "doc/bounded-inference.md": "154337e2868975bbf83a875ac3be4d5eafda9ec41c9ff4629df27295b110d7c2",
+    "eredu-checkpoint/src/store/storage.rs": "0ccd76a60d17c02d1aad039ce8bc8b37eb88bd201d2c63cf0152bf04056c892e",
+    "eredu-checkpoint/src/store/storage/tests.rs": "d4bc41344265e55500717d7da996a64c6e1677d6baaf7f66fa87479b41579055",
+    "eredu-runtime/src/working_memory/storage.rs": "bb192b151cc2141bb5f29d8ad115779a56cf6f1aee7fb914ecf043cf3cf39122",
+    "eredu-runtime/src/working_memory/storage/tests.rs": "55f661170ff5371a82c3ac3b0f6b214f2ca0df761a2027434f0fbd3a26ad1f02",
+    "eredu-runtime/tests/bounded_prefill/storage.rs": "2425cb68eb311282f7fff4ebaf3687625f549be4975677f040f74bb11e70ac68",
+    "safemlx-sys/README.md": "64249a97357ff6cfc9491e2494c64f8e8ac15b4dc44195c921f5da1408575013",
+    "safemlx-sys/src/bindings.rs": "74e1bdfc903f5866b08603b567b51b2c252a1c439fe324219f30d7838d4679ec",
+    "safemlx-sys/src/mlx-c/CMakeLists.txt": "14ddd2b7337eba199892ccb3e85b95a6d6a77ae375753e2b0d470d06ed16bc8e",
+    "safemlx-sys/src/mlx-c/mlx/c/array.h": "f0ac17b409cfe5e2d5bce264abbcd141c447a7362c7a4baecfffa2f830ffbd54",
+    "safemlx-sys/src/mlx-c/mlx/c/array.cpp": "a92a0917ec050f08d9ef2abfcac242cc63637df743d07c9863a4ba80a8b4001f",
+    "safemlx-sys/src/mlx-c/mlx/c/host_transfer.h": "5a3fe810f6d71b5d486f00ab160770a35f5c749c8fd486b20a56d3d8c37311b5",
+    "safemlx-sys/src/mlx-c/mlx/c/host_transfer.cpp": "e28f3726dccc899994bc753d730f4d7e9ad8db2a56d1033d537461de7db5d248",
+    "safemlx-sys/src/mlx-c/mlx/c/private/allocation_owner.h": "23a1055899bd16dbe4b9ae56abc280ba493da2192b138425f63b8e5cfd7c2481",
+    "safemlx-sys/src/mlx-c/patches/mlx-allocation-owner-retention.patch": "4867409908bcdb64fc38bccbdd4246e54514c028ea0d4054274c9076050f7c34",
+    "safemlx-sys/src/mlx-c/patches/mlx-allocation-lifetime-generations.patch": "86bf6d2866ff520a9ba9ad24521a1f365968fd2a1415de136f668a70a8f29aa0",
+    "safemlx-sys/src/mlx-c/tests/allocation_generations_test.cpp": "ead5c682274837d826c64c3491dc8cc9d2275a2a31bf3ebd6e7f1fddd052c8fb",
+    "safemlx/src/array/mod.rs": "55ece59ffbd7bc36c28a9caf8806c1d3a9206b04c1c39c5c94147851910dbdd3",
+    "safemlx/src/host_transfer.rs": "3137d32f9a6b2e59dc3f06d433235e128fc5d20eda77ab0f0847f276526c3c49",
+    "safemlx/src/allocation_retention.rs": "1ff1553eb77f6f8366c7eb3ed164fd69cd108b29ead847e146c026a37ae21cb1",
+    "safemlx/src/allocation_retention/tests.rs": "78588cd1f782f53bccb59309ee943778352ddb53737efd2b7653a96818c70719",
+    "eredu-backend-mlx/src/backend/managed_memory.rs": "78a4b4f1e84e6a223fde7848042622424cd76ae473a71b39f8dc243069f2cd8e",
+    "eredu-backend-mlx/src/backend/adapter/model.rs": "a40d41967f467aa754be8d2a3f158f6ad1e335d807a51f38042b866f20d9c681",
+    "eredu-backend-mlx/src/backend/adapter/provider.rs": "8281adc64d9cc0be133ebc4943e1868aa1e01b3c84c8a66fa3a5fa2e8fc8b31d",
+    "eredu-backend-mlx/src/backend/adapter/tests/managed_memory.rs": "c0ca8b977af132b115fbd86535044dde095b0fb2fbdafbb51434af8d97b4b183",
+    "eredu-backend-mlx/src/backend/nn/shared/submission.rs": "e6bc6074ff7293aa97e6dd992867a5b40d5e159bcf07ce32163cd6ca655e5546",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage.rs": "edb37e7cb5e2f25de3dce7dc02eb499bd0601b4e9f27aaf51341e96d279da256",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission.rs": "c6e9fd325c787661985c2056b783274e1096bfa5d50af671d533728b58c58840",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication.rs": "0fb58a3bd3c5071bce951bff094911886740e14c1b485c781128c1693c38ecac",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication/tests.rs": "7e2d6e4515e1fd86ec99f8cb769fe71bc8669e991bf15fa35009a89ddaf56f57",
+    "eredu-backend-mlx/src/composition/mlx/model.rs": "a2349b29264356985865b5950e105f4d21a943d0f3af6a5bb2a7d81974941b01"
+  },
+  "native_archive_sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+  "coverage": {
+    "unique_rust_tests": 681,
+    "native_wrapper_tests": 560,
+    "checkpoint_identity_tests": 6,
+    "runtime_storage_unit_tests": 5,
+    "bounded_prefill_tests": 44,
+    "backend_integration_tests": 66,
+    "standalone_native_test_groups": 3,
+    "deterministic_native_address_reuse_lifetimes": 64,
+    "exhaustion_contending_threads": 16,
+    "existing_ignored_wrapper_tests": 2,
+    "existing_ignored_backend_tests": 4,
+    "new_peak_measurements": 0
+  },
+  "behavior": [
+    "Non-reused runtime-local u64 native generations preserve alias, host-storage and donation identity after physical backing retires. Exhaustion remains permanently uncertifiable without leaking or damaging storage.",
+    "Host-only immutable transfer buffers accept allocation-lifetime ownership without constructing an Array. Safe wrappers preserve failed attachment ownership and defer Rust destruction to unlocked host reclamation.",
+    "SourceStorageIdentity and buffered-byte identity tokens pin their Arc allocation weakly. They remain comparable after strong payload destruction and prevent address reuse while accounting keys remain live.",
+    "Grouped and individual registration share atomic inventory validation and commit. Per-key charges deduplicate aliases without retaining unrelated allocation charges. Rejection preserves usage and peak.",
+    "Provider key destruction runs outside the accounting lock before releasing associated bytes. Reentrant registration may conservatively overlap a retiring charge; clone failures, poisoned accounting, overflow and destructor panic cannot cause an unearned refund.",
+    "Backend publication attaches payload-free charges to individual native backings and keeps source/buffer roots separately. Returned duplicate map keys are dropped before the corresponding charges can retire.",
+    "Complete loaded nonstate inventories publish known storage; missing inventories remain unquoted. Publication never clears the model guard, authorizes new allocation, or registers decoder-state bytes a second time.",
+    "CPU and Metal publication tests verify independent backing retirement, host/native alias deduplication, source teardown, atomic overcapacity rejection and unknown lazy storage rejection without evaluation."
+  ],
+  "limits": [
+    "Public strict managed budgets still reject UnknownBound. Exact storage publication is not complete model promotion or request admission.",
+    "Independent prompt/sampler preparation, snapshot/copy/reseed admission and lazy observer escapes remain incomplete. Supplied private request reservations do not certify the public shared domain.",
+    "Nonempty decoder state needs exact overlap handling with request traces, and completed requests need a checked transition into retained-state charges. No scalar subtraction or unchecked guard release was introduced.",
+    "Rank-coordinated capacity admission and complete paging/materialization, media, observation/capture and speculative paths remain outstanding.",
+    "Nine focused runtime integration tests also passed independently and are included once in the 44-test bounded-prefill suite.",
+    "No new pinned-checkpoint numerical comparison or allocator/process peak measurement. Prior Qwen records remain separate. Existing ignored tests and unused-helper/linker warnings remain."
+  ],
+  "corrected_validation_findings": [
+    "Publication wrapper required manual Debug forwarding through OrdinaryRetirement.",
+    "An existing retirement fixture assumed unquoted-owner retirement also meant all exact storage charges had retired. It now waits for both, covering nested ordinary-host cleanup without refunding known storage early."
+  ],
+  "checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-checkpoint --lib store::storage::tests",
+      "exit_code": 0,
+      "suites": [
+        6
+      ],
+      "passed": 6,
+      "log": "/private/tmp/eredu-source-storage-identity.log",
+      "sha256": "fc1c40790ddf2bccc5a1346227e0914d33f5c0cae7fe44d65ac535e324fba91b"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib working_memory::storage",
+      "exit_code": 0,
+      "suites": [
+        5
+      ],
+      "passed": 5,
+      "log": "/private/tmp/eredu-individual-storage-unit.log",
+      "sha256": "16d30c8bfc5e6ba6d382b0503370750597e5ea91c6040bf9d07e2a1217e8d85a"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test bounded_prefill",
+      "exit_code": 0,
+      "suites": [
+        44
+      ],
+      "passed": 44,
+      "log": "/private/tmp/eredu-allocation-publication-prefill.log",
+      "sha256": "464fc4a31f7572398c31b68f505ff61f55a0deac61ec05dcd31ca15b6f292904"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 DOCS_RS=1 cargo check -p safemlx --tests",
+      "exit_code": 0,
+      "suites": [],
+      "passed": null,
+      "log": "/private/tmp/eredu-allocation-generations-rust-check.log",
+      "sha256": "9f703dfedb7bdd667249496f978a2f9f9fcc7c607f1bae104f9578404c27e2d5"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p safemlx --lib -- --test-threads=1",
+      "exit_code": 0,
+      "suites": [
+        560
+      ],
+      "passed": 560,
+      "log": "/private/tmp/eredu-allocation-generations-safemlx-lib.log",
+      "sha256": "fc10ed2f540ba5ec2a101b8bee391485f76945bdeeb51e924a17b5a3651e32d5"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1 storage::admission managed_memory backend::tests:: native_preparation recovery_tests",
+      "exit_code": 0,
+      "suites": [
+        66
+      ],
+      "passed": 66,
+      "log": "/private/tmp/eredu-allocation-publication-backend-verified.log",
+      "sha256": "f5623a6e131deaf121b0ba3cad472460ac7c10b8594661ea7721bb3bd73bfec1"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal,image,audio",
+      "exit_code": 0,
+      "suites": [],
+      "passed": null,
+      "log": "/private/tmp/eredu-allocation-publication-features.log",
+      "sha256": "20f9efa79af61e5257cff4e8a7c34fbfe759e243e7f787c273f86c3e14b8cdcc"
+    },
+    {
+      "command": "cmake --build target/debug/build/safemlx-sys-b076ec71720aca9a/out/build --target mlx-allocation-generations-test --parallel 2",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-allocation-generations-native-test-build.log",
+      "sha256": "58470e5c0eb7d44fc6c0f3b56ffc9eb63fceb77eb9e75b0509ca749dc0f0d4da",
+      "evidence": "completed native agent execution; standalone assertions throw on failure"
+    },
+    {
+      "command": "target/debug/build/safemlx-sys-b076ec71720aca9a/out/build/mlx-allocation-generations-test",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-allocation-generations-native-test.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "evidence": "completed native agent execution; standalone assertions throw on failure"
+    }
+  ]
+}

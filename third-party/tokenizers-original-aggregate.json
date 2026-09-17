@@ -1,0 +1,55 @@
+{
+  "boundary": "External dependency remains excluded from workspace membership; upstream unsafe boundary and all workspace lint inheritance remain unchanged.",
+  "dependency": "external tokenizers 0.23.2",
+  "files": {
+    "Cargo.toml": {
+      "after": "396181975290258f4c220c9159a6657c36c17d14560ccf943fcf0612b1faf4ed",
+      "before": "144e5aa059c5ba03316b6406f688fcef55ce0970c2ab1c9904411da66211813b"
+    },
+    "Cargo.toml.orig": {
+      "after": "b404b1ca3b1d21866ddf143fe0c7fd20aff034ab8d37a11936e25d60221610e0",
+      "before": "ae03af84c9e8495750b7e975ac231d9e7eed656405a2761403c0354daae12af9"
+    },
+    "src/models/bpe/compile.rs": {
+      "after": "9bf4b33812eb38c7f3330a8d62ea5a5a4b7fc9627b0a8640440e98f3c2de6b4e",
+      "before": "ef15e3bac1fe20b381974705bd83c98d63636323e7484b73dd8b6cb9b5a60fe0"
+    },
+    "src/tokenizer/added_vocabulary.rs": {
+      "after": "e00696a53316abb58f4eeb92b83ccdca488db0c70b4539f5b74cf8fe0b3ec7df",
+      "before": "68a15f0b943a88d71645fdbe8477c4f3bc238faefb75b0283dc44371c83b221f"
+    },
+    "src/tokenizer/added_vocabulary/packed.rs": {
+      "after": "d1ce714c62ba0d359e294eaa9d5ad058903b9a83166d2c31839d2c94edae6332",
+      "before": "738257b14dd7858f91bdefc156f7e5a845fdfd2e580fe13bd278b43906574b56"
+    },
+    "src/tokenizer/compile.rs": {
+      "after": "1d3df5abb6f01d7c0df4ceeca4d513901b988216ea71129259a0308701ee2284",
+      "before": null
+    },
+    "src/tokenizer/compile/tests.rs": {
+      "after": "ff0bb2b5e1974a19b0c3eb395bd38a22d8920c2d9b04bc718686eb15027474b6",
+      "before": null
+    },
+    "src/tokenizer/mod.rs": {
+      "after": "7ea51a57e052233786a16fc3393dc51ffebb8c543486a134ab26d4760d788b6b",
+      "before": "27ccbede2de2cb43281cbe2f08a7fe941b3de4f2aee4f78e7b8dc8b15af30faa"
+    }
+  },
+  "final_complete_manifest_sha256": "eedf65238ad98fde8acdb9ed4305753a92d77809cf6a7078af27f65095e617ce",
+  "patch_sha256": "fe0ae8937cfc1b5627aa8f2da641c73416b5a999d2794dee3d117ef2651d92b7",
+  "preceding_patches": [
+    "tokenizers-borrowed-decode.patch",
+    "tokenizers-model-cache-policy.patch",
+    "tokenizers-static-alphabet.patch",
+    "tokenizers-packed-bpe.patch",
+    "tokenizers-packed-bpe-compile-correction.patch",
+    "tokenizers-bpe-residence.patch",
+    "tokenizers-packed-added-vocabulary.patch",
+    "tokenizers-packed-added-prefix-search.patch"
+  ],
+  "predecessor": "corrected packed-added and tested prefix-search HF114",
+  "predecessor_complete_manifest_sha256": "571dcd719fa2c9eb0c7ca79c32a0e94b0398e9a63a0ff13a740063d3230bae82",
+  "publication": "Consumed by existing relative path dependencies; vanilla crates.io 0.23.2 does not provide these APIs. Publication requires upstreaming or a published patched dependency.",
+  "scope": "Borrowed whole-root inline construction, fresh component assembly, borrowed decode-view lifetimes and default-disabled real target-reserve support. No Matches change, original-account API or public managed activation inside HF.",
+  "upstream_archive_sha256": "7afbf6e88718afcc138bad01d6ccc3051dbbc3b2ce9793d8b8a3aeb610969cfc"
+}

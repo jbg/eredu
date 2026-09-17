@@ -1,0 +1,12 @@
+diff --git a/mlx/backend/cpu/greedy_storage.cpp b/mlx/backend/cpu/greedy_storage.cpp
+--- a/mlx/backend/cpu/greedy_storage.cpp
++++ b/mlx/backend/cpu/greedy_storage.cpp
+@@ -63,7 +63,7 @@
+   }
+   const auto& axes=static_cast<const Squeeze&>(output.primitive()).axes_ref();
+   if(axes.empty()||axes.size()>rank||output.ndim()!=rank-axes.size()||input.dtype()!=output.dtype()||
+-      (input.dtype()!=bool_&&input.dtype()!=int32&&input.dtype()!=uint32&&input.dtype()!=float32&&input.dtype()!=bfloat16)||
++      (input.dtype()!=bool_&&input.dtype()!=int32&&input.dtype()!=uint32&&input.dtype()!=float32&&input.dtype()!=float16&&input.dtype()!=bfloat16)||
+       input.itemsize()!=output.itemsize()||input.size()!=output.size())return false;
+   size_t elements=0;if(!alias_input_geometry(input,elements))return false;
+   size_t selected=0,target=0;

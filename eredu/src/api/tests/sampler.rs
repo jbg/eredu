@@ -233,6 +233,7 @@ fn argmax(logits: &[f32]) -> Result<u32, String> {
 }
 
 impl SpeculativeSampler<TestSamplingBackend> for CountingPolicy {
+    type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
     fn process_logits(
         &mut self,
         logits: &Vec<f32>,
@@ -260,7 +261,7 @@ fn constrained_sampler<S>(
 ) -> Result<ConstrainedSampler<S, ConstraintController>, ConstraintError> {
     Ok(ConstrainedSampler::new(
         policy,
-        ConstraintController::from_generation_plan(plan)?,
+        ConstraintController::from_generation_plan_unregistered(plan)?,
     ))
 }
 
@@ -771,19 +772,21 @@ fn mirostat_v2_validates_configuration() {
 
 #[test]
 fn tokenizer_validity_intersects_grammar_for_sampling_forcing_and_speculation() {
+    use eredu_core::SharedTokenFilter;
     use eredu_core::TokenFilterController;
     use eredu_runtime::execution_control::{TokenChoiceController, TokenChoiceError};
-    use std::sync::Arc;
 
     let plan = synthetic_plan(ToolChoice::Required);
-    let mut grammar = ConstraintController::from_generation_plan(&plan).unwrap();
+    let mut grammar = ConstraintController::from_generation_plan_unregistered(&plan).unwrap();
     let grammar_filter = grammar.current_filter().unwrap();
     let valid = (0..256).find(|&id| grammar_filter.allows(id)).unwrap();
     let forbidden = (0..256).find(|&id| !grammar_filter.allows(id)).unwrap();
     let mut validity = vec![false; 256];
     validity[valid as usize] = true;
     validity[forbidden as usize] = true;
-    let controller = grammar.with_validity(Arc::new(TokenFilter::allowed(validity).unwrap()));
+    let controller = grammar.with_validity(SharedTokenFilter::new(
+        TokenFilter::allowed(validity).unwrap(),
+    ));
     let mut choices = TokenChoiceController::new(controller.clone(), TokenDomain::new(256));
     assert!(matches!(
         choices.force_next(300),
@@ -856,8 +859,9 @@ fn tokenizer_validity_intersects_grammar_for_sampling_forcing_and_speculation() 
 
     let mut only_forbidden = vec![false; 256];
     only_forbidden[forbidden as usize] = true;
-    let mut empty =
-        controller.with_validity(Arc::new(TokenFilter::allowed(only_forbidden).unwrap()));
+    let mut empty = controller.with_validity(SharedTokenFilter::new(
+        TokenFilter::allowed(only_forbidden).unwrap(),
+    ));
     assert!(empty
         .current_filter()
         .unwrap_err()
@@ -872,9 +876,11 @@ fn snapshot_forks_retain_validity_without_copying_or_loosening_it() {
     let plan = synthetic_plan(ToolChoice::None);
     let mut validity = vec![false; 256];
     validity[b'a' as usize] = true;
-    let mut parent = ConstraintController::from_generation_plan(&plan)
+    let mut parent = ConstraintController::from_generation_plan_unregistered(&plan)
         .unwrap()
-        .with_validity(std::sync::Arc::new(TokenFilter::allowed(validity).unwrap()));
+        .with_validity(eredu_core::SharedTokenFilter::new(
+            TokenFilter::allowed(validity).unwrap(),
+        ));
     let bytes = parent.snapshot_storage_bytes().unwrap();
     let mut child = parent.fork_snapshot().unwrap();
     assert_eq!(child.snapshot_storage_bytes(), Some(bytes));
@@ -892,7 +898,8 @@ fn snapshot_forks_retain_validity_without_copying_or_loosening_it() {
 fn text_controller_excludes_dominant_padding_before_sampling_and_after_snapshot() {
     use eredu_core::TokenFilterController;
     use eredu_runtime::execution_control::{SnapshotTokenController, TokenChoiceController};
-    let validity = std::sync::Arc::new(TokenFilter::allowed(vec![true, false, true]).unwrap());
+    let validity =
+        eredu_core::SharedTokenFilter::new(TokenFilter::allowed(vec![true, false, true]).unwrap());
     let mut controller = ConstraintController::text(validity);
     let before = controller.snapshot_storage_bytes().unwrap();
     assert!(!controller.is_complete().unwrap());
@@ -916,6 +923,183 @@ fn text_controller_excludes_dominant_padding_before_sampling_and_after_snapshot(
         controller.filter_at(&[0]).unwrap(),
         TokenFilter::allowed(vec![true, false, true]).unwrap()
     );
+}
+
+#[test]
+fn text_controller_clones_and_snapshots_retain_shared_accounting_custody() {
+    use eredu_core::{
+        SharedStorageDomain, SharedTokenFilter, TextControllerStorage, TokenFilterController,
+    };
+    use eredu_runtime::{
+        execution_control::SnapshotTokenController, working_memory::WorkingMemoryPool,
+    };
+
+    let mut mask = Vec::with_capacity(19);
+    mask.extend([true, false, true]);
+    let validity = SharedTokenFilter::new(TokenFilter::allowed(mask).unwrap());
+    let capacity = validity.capacity_bytes().unwrap();
+    let source = ConstraintController::text(validity.clone());
+    let mut cloned = source.clone();
+    let mut snapshot = source.fork_snapshot().unwrap();
+    let prepared = crate::api::request::PreparedChatSpeculativeConstraint::new(source.clone());
+    let pool = WorkingMemoryPool::new(capacity, 0).unwrap();
+    let domain = SharedStorageDomain::default();
+    validity
+        .try_attach(&domain, || {
+            pool.register_storage([(validity.identity().clone(), capacity)])
+                .map(|handle| Box::new(handle) as Box<dyn Send + Sync>)
+        })
+        .unwrap();
+
+    for controller in [&source, &cloned, &snapshot] {
+        let TextControllerStorage::RunOwnedWithSharedFilters(filters) =
+            controller.inference_storage()
+        else {
+            panic!("text controller must enumerate its shared validity");
+        };
+        assert_eq!(filters.len(), 1);
+        assert!(filters[0].same_storage(&validity));
+    }
+    let TextControllerStorage::RunOwnedWithSharedFilters(filters) = prepared.inference_storage()
+    else {
+        panic!("prepared wrapper must forward shared ownership");
+    };
+    assert!(filters[0].same_storage(&validity));
+    assert!(!source.inference_workspace_is_run_owned());
+    assert!(source.inference_workspace(2).is_some());
+    assert!(matches!(
+        cloned.current_decision().unwrap().controller_storage(),
+        Some(TextControllerStorage::RunOwnedWithSharedFilters(_))
+    ));
+    assert!(matches!(
+        eredu_core::SpeculativeTokenFilterController::decision_at(&snapshot, &[])
+            .unwrap()
+            .controller_storage(),
+        Some(TextControllerStorage::RunOwnedWithSharedFilters(_))
+    ));
+    cloned.commit_token(0).unwrap();
+    snapshot.commit_token(2).unwrap();
+    assert!(source.filter_at(&[]).is_ok());
+    assert!(cloned.filter_at(&[0]).is_ok());
+    assert!(snapshot.filter_at(&[2]).is_ok());
+    assert!(cloned
+        .current_decision()
+        .unwrap()
+        .shared_tokenizer_validity()
+        .unwrap()
+        .same_storage(&validity));
+    assert!(
+        eredu_core::SpeculativeTokenFilterController::decision_at(&snapshot, &[2])
+            .unwrap()
+            .shared_tokenizer_validity()
+            .unwrap()
+            .same_storage(&validity)
+    );
+
+    drop(validity);
+    drop(source);
+    drop(cloned);
+    drop(prepared);
+    assert_eq!(pool.used_bytes().unwrap(), capacity);
+    assert_eq!(
+        snapshot.current_filter().unwrap().allowed_mask(),
+        Some(&[true, false, true][..])
+    );
+    drop(snapshot);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+}
+
+#[test]
+fn text_controller_quoted_choices_cover_forced_overlap_and_preserve_sampling() {
+    use eredu_core::{
+        SharedTokenFilter, TextControllerContract, TextControllerStorage, TokenFilterController,
+    };
+    use eredu_runtime::execution_control::TokenChoiceController;
+
+    let mut mask = Vec::with_capacity(13);
+    mask.extend([true, false, true]);
+    let validity = SharedTokenFilter::new(TokenFilter::allowed(mask).unwrap());
+    let ordinary = ConstraintController::text(validity.clone());
+    let base = ordinary.inference_workspace(2).unwrap();
+    let mut choices = TokenChoiceController::new(ordinary.clone(), TokenDomain::new(3));
+    let workspace = choices.inference_workspace(2).unwrap();
+    assert_eq!(
+        workspace.additional_host_bytes,
+        base.additional_host_bytes + validity.capacity_bytes().unwrap()
+    );
+    let contract = TextControllerContract::from_workspace(workspace, 5).unwrap();
+    let TextControllerStorage::RunOwnedWithSharedFilters(filters) = choices.inference_storage()
+    else {
+        panic!("controlled text must preserve shared ownership");
+    };
+    assert!(filters[0].same_storage(&validity));
+    contract
+        .validate_decision(&choices.current_decision().unwrap())
+        .unwrap();
+    choices.force_next(0).unwrap();
+    let forced = choices.current_decision().unwrap();
+    contract.validate_decision(&forced).unwrap();
+    assert!(forced
+        .shared_tokenizer_validity()
+        .unwrap()
+        .same_storage(&validity));
+    assert!(forced.capture_domain().unwrap().filter.allows(2));
+    assert!(!forced.filter().allows(2));
+    drop(forced);
+
+    let logits = vec![1.0, 500.0, 2.0, 1000.0, 900.0];
+    let mut ordinary_sampler = ConstrainedSampler::new(GenerationSampler::new().top_k(1), ordinary);
+    let mut controlled_sampler = ConstrainedSampler::new(
+        GenerationSampler::new().top_k(1),
+        TokenChoiceController::new(ConstraintController::text(validity), TokenDomain::new(3)),
+    );
+    for _ in 0..2 {
+        let ordinary =
+            Sampler::<TestSamplingBackend>::sample(&mut ordinary_sampler, &logits, 0.0, None, &())
+                .unwrap();
+        let controlled = Sampler::<TestSamplingBackend>::sample(
+            &mut controlled_sampler,
+            &logits,
+            0.0,
+            None,
+            &(),
+        )
+        .unwrap();
+        assert_eq!((ordinary, controlled), (2, 2));
+    }
+    let mut forced_sampler = ConstrainedSampler::new(GenerationSampler::new().top_k(1), choices);
+    assert_eq!(
+        Sampler::<TestSamplingBackend>::sample(&mut forced_sampler, &logits, 0.0, None, &())
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        Sampler::<TestSamplingBackend>::sample(&mut forced_sampler, &logits, 0.0, None, &())
+            .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn grammar_controllers_keep_incomplete_storage_explicit_through_prepared_wrapper() {
+    use eredu_core::{TextControllerStorage, TokenFilterController};
+
+    for choice in [ToolChoice::None, ToolChoice::Auto, ToolChoice::Required] {
+        let controller =
+            ConstraintController::from_generation_plan_unregistered(&synthetic_plan(choice))
+                .unwrap();
+        assert!(controller.inference_workspace(2).is_none());
+        assert!(matches!(
+            controller.inference_storage(),
+            TextControllerStorage::Unknown
+        ));
+        let prepared = crate::api::request::PreparedChatSpeculativeConstraint::new(controller);
+        assert!(prepared.inference_workspace(2).is_none());
+        assert!(matches!(
+            prepared.inference_storage(),
+            TextControllerStorage::Unknown
+        ));
+    }
 }
 
 #[test]
@@ -968,7 +1152,8 @@ fn speculative_forcing_uses_the_shared_grammar_and_only_restricts_its_absolute_p
 
 #[test]
 fn speculative_capture_reuses_domain_before_forcing_and_preserves_processing() {
-    let validity = std::sync::Arc::new(TokenFilter::allowed(vec![true, false, true]).unwrap());
+    let validity =
+        eredu_core::SharedTokenFilter::new(TokenFilter::allowed(vec![true, false, true]).unwrap());
     let controller = ConstraintController::text(validity);
     let mut sampler = ConstrainedSampler::new(DefaultSampler, controller);
     SpeculativeSampler::<TestSamplingBackend>::control_force_next(

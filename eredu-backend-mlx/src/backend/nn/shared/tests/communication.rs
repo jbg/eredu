@@ -221,7 +221,7 @@ fn fine_grained_collectives_admit_i32_only_for_count_gather_and_variable_exchang
         &stream,
     )
     .expect_err("integer reduction is not advertised");
-    assert!(reduction_error.what().contains("does not advertise dtype"));
+    assert!(reduction_error.to_string().contains("does not advertise dtype"));
 
     let uneven_error = <MlxNeuralBackend as UnevenGatherBackend>::all_gather_uneven(
         MlxTensor::from_array(Array::from_slice(&[1_i32], &[1])),
@@ -231,7 +231,7 @@ fn fine_grained_collectives_admit_i32_only_for_count_gather_and_variable_exchang
         &stream,
     )
     .expect_err("integer uneven gather is not advertised");
-    assert!(uneven_error.what().contains("does not advertise dtype"));
+    assert!(uneven_error.to_string().contains("does not advertise dtype"));
 
     let counts = CommunicationPeerCounts::new(vec![1], vec![1], 1).unwrap();
     let exchanged = <MlxNeuralBackend as VariableAllToAllBackend>::variable_all_to_all(
@@ -264,7 +264,7 @@ fn fine_grained_collectives_admit_i32_only_for_count_gather_and_variable_exchang
         &stream,
     )
     .expect_err("unsigned count gather is outside the exact admitted set");
-    assert!(unsigned_error.what().contains("does not advertise dtype"));
+    assert!(unsigned_error.to_string().contains("does not advertise dtype"));
 
     let unsigned_exchange = <MlxNeuralBackend as VariableAllToAllBackend>::variable_all_to_all(
         MlxTensor::from_array(Array::from_slice(&[1_u32], &[1])),
@@ -275,6 +275,6 @@ fn fine_grained_collectives_admit_i32_only_for_count_gather_and_variable_exchang
     )
     .expect_err("unsigned variable exchange is outside the exact admitted set");
     assert!(unsigned_exchange
-        .what()
+        .to_string()
         .contains("does not advertise dtype"));
 }

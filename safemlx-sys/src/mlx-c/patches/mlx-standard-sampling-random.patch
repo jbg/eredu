@@ -1,0 +1,120 @@
+diff --git a/mlx/random.cpp b/mlx/random.cpp
+--- a/mlx/random.cpp
++++ b/mlx/random.cpp
+@@ -3,6 +3,7 @@
+ #include <cmath>
+ #include <sstream>
+ 
++#include "mlx/backend/metal/metal.h"
+ #include "mlx/linalg.h"
+ #include "mlx/ops.h"
+ #include "mlx/primitives.h"
+@@ -10,6 +11,31 @@
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core::random {
++
++size_t standard_sampling_control_bytes() noexcept {
++  const size_t gpu = metal::random_bits_control_bytes();
++  if (!gpu) return 0;
++  // Key: the real initializer-list seed and final source descriptor.
++  const size_t seed = sizeof(uint64_t) + 2 * sizeof(uint32_t) +
++      sizeof(std::initializer_list<uint32_t>) + sizeof(Shape) + sizeof(array);
++  // bits/split: explicit key copy, width/dtype lambda, shape and stream loans.
++  // The default KeySequence branch is unreachable with the supplied key.
++  const size_t bits = 2 * sizeof(array) + sizeof(std::optional<array>) +
++      sizeof(Shape) + 2 * sizeof(int) + sizeof(Dtype) + sizeof(StreamOrDevice) +
++      4 * sizeof(void*);
++  // uniform: lo/hi/range/upper/maxval/out, low/high source arguments and the
++  // minimum/cast plus multiply/add expression temporaries. Shapes are inline
++  // for this rank<=3 route; every owned array body is already in Graph/P.
++  const size_t uniform = 11 * sizeof(array) + sizeof(Shape) +
++      sizeof(Dtype) + sizeof(Stream) + sizeof(StreamOrDevice) +
++      sizeof(std::optional<array>) + 5 * sizeof(void*);
++  // Four nested Gumbel unary expressions plus uniform's result; outer
++  // categorical shape, gumbel_shape, g and add/argmax result temporaries.
++  const size_t categorical = 8 * sizeof(array) + 2 * sizeof(Shape) +
++      3 * sizeof(int) + sizeof(size_t) + 2 * sizeof(StreamOrDevice) +
++      2 * sizeof(std::optional<array>) + 6 * sizeof(void*);
++  return gpu + seed + bits + uniform + categorical + 5 * sizeof(size_t);
++}
+ 
+ KeySequence::KeySequence(uint64_t seed) : key_(key(seed)) {}
+ 
+diff --git a/mlx/random.h b/mlx/random.h
+--- a/mlx/random.h
++++ b/mlx/random.h
+@@ -11,6 +11,9 @@
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core::random {
++
++// Fixed controls for explicit-key Standard sampling; no source or payload grant.
++MLX_API size_t standard_sampling_control_bytes() noexcept;
+ 
+ class MLX_API KeySequence {
+  public:
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -431,6 +431,7 @@
+       resident_primitive_control<Scatter>(), resident_primitive_control<ArgSort>(),
+       resident_primitive_control<ScatterAxis>(), resident_primitive_control<Partition>(),
+       resident_primitive_control<Scan>(),
++      resident_primitive_control<RandomBits>(), resident_primitive_control<Log>(),
+       resident_primitive_control<GatherMM>(), resident_primitive_control<Reduce>(),
+       resident_primitive_control<Slice>(), resident_primitive_control<SliceUpdate>(),
+       resident_primitive_control<ArgReduce>(), resident_primitive_control<ArgPartition>(),
+diff --git a/mlx/backend/metal/primitives.cpp b/mlx/backend/metal/primitives.cpp
+--- a/mlx/backend/metal/primitives.cpp
++++ b/mlx/backend/metal/primitives.cpp
+@@ -10,6 +10,7 @@
+ #include "mlx/backend/gpu/slicing.h"
+ #include "mlx/backend/metal/device.h"
+ #include "mlx/backend/metal/kernels.h"
++#include "mlx/backend/metal/metal.h"
+ #include "mlx/backend/metal/utils.h"
+ #include "mlx/primitives.h"
+ #include "mlx/scheduler.h"
+@@ -156,6 +157,16 @@
+   throw std::runtime_error("[Load::eval_gpu] Not implemented.");
+ }
+ 
++size_t metal::random_bits_control_bytes() noexcept {
++  // kname remains SSO for rbits/rbitsc. Each native loan and scalar below is
++  // local to this worker; pipeline rows, Graph objects and output P are separate.
++  return sizeof(std::string) + 2 * sizeof(MTL::Size) + 5 * sizeof(size_t) +
++      sizeof(bool) + sizeof(int) + sizeof(const ArrayVector*) + sizeof(array*) +
++      sizeof(const array*) + sizeof(RandomBits*) + sizeof(const Stream*) +
++      sizeof(metal::Device*) + sizeof(MTL::ComputePipelineState*) +
++      sizeof(metal::CommandEncoder*);
++}
++
+ void RandomBits::eval_gpu(const ArrayVector& inputs, array& out) {
+   assert(inputs.size() == 1);
+ 
+diff --git a/mlx/backend/metal/metal.h b/mlx/backend/metal/metal.h
+--- a/mlx/backend/metal/metal.h
++++ b/mlx/backend/metal/metal.h
+@@ -12,6 +12,9 @@
+ #include "mlx/device_initialization.h"
+ 
+ namespace mlx::core::metal {
++
++// Fixed controls owned by the existing RandomBits Metal worker; zero if unavailable.
++MLX_API size_t random_bits_control_bytes() noexcept;
+ 
+ /* Check if the Metal backend is available. */
+ MLX_API bool is_available();
+diff --git a/mlx/backend/metal/no_metal.cpp b/mlx/backend/metal/no_metal.cpp
+--- a/mlx/backend/metal/no_metal.cpp
++++ b/mlx/backend/metal/no_metal.cpp
+@@ -7,6 +7,8 @@
+ namespace mlx::core {
+ 
+ namespace metal {
++
++size_t random_bits_control_bytes() noexcept { return 0; }
+ 
+ bool is_available() {
+   return false;

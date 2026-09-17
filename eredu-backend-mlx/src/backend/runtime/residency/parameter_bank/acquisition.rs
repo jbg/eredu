@@ -2,6 +2,9 @@
 
 use super::*;
 
+mod prepared;
+pub(crate) use prepared::PreparedAddressableSource;
+
 fn prepared_parameter_members(
     entries: &[ParameterBankEntry],
     targets: &BTreeMap<(ParameterBankKey, String), String>,
@@ -47,6 +50,7 @@ pub struct AddressableParameterBank {
     pub(super) parameter_members:
         Vec<eredu_runtime::parameter_operations::PreparedBankParameterMember>,
     pub(super) parameter_replacements: BTreeMap<String, MlxTensor>,
+    pub(super) parameter_revision: u64,
     pub(super) effective_member_bytes: BTreeMap<ParameterBankKey, u64>,
     pub(super) pool_id: u64,
     pub(super) manager: ResidencyManager,
@@ -60,7 +64,7 @@ pub struct AddressableParameterBank {
     pub(super) scratch_limit: u64,
     #[cfg(test)]
     pub(super) bulk_bank_target: u64,
-    pub(super) statistics: Mutex<BTreeMap<usize, ParameterBankStatistics>>,
+    pub(super) statistics: Mutex<ParameterBankStatisticsTable>,
     pub(super) weight_quantizations: Vec<WeightQuantization>,
     pub(super) placements:
         BTreeMap<ParameterBankKey, eredu_runtime::AddressableBankMemberPlacement>,
@@ -96,6 +100,31 @@ pub(super) fn preflight_selected_entry_bindings(
 }
 
 impl SharedAddressableParameterBank {
+    /// Inventories the entire shared physical pool, including replacement values.
+    /// A logical bank scope cannot discount other storage retained by the pool.
+    pub fn retained_storage(
+        &self,
+    ) -> Result<crate::backend::runtime::residency::storage::RetainedStorage, Error> {
+        let mut storage = crate::backend::runtime::residency::storage::RetainedStorage::default();
+        self.collect_retained_storage(&mut storage)?;
+        Ok(storage)
+    }
+
+    /// Fills caller-owned storage without allocating an intermediate inventory.
+    pub fn collect_retained_storage(
+        &self,
+        storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    ) -> Result<(), Error> {
+        let bank = self.inner.lock().map_err(|_| {
+            Error::ArchitectureModel("addressable parameter bank lock was poisoned".into())
+        })?;
+        bank.manager.collect_retained_storage(storage)?;
+        for value in bank.parameter_replacements.values() {
+            storage.include_array(value.as_array())?;
+        }
+        Ok(())
+    }
+
     /// Reads exact member destinations retained after lowering, without source work.
     pub fn prepared_parameter_members(
         &self,
@@ -162,14 +191,14 @@ impl AddressableParameterBank {
         S: eredu_checkpoint::store::CheckpointSource + 'static,
         O: Into<ParameterBankOptions>,
     {
-        let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = store;
+        let store: eredu_checkpoint::store::RetainedCheckpointSource = store.into();
         Self::new_shared(store, entries, options.into(), source_stream, device_stream)
     }
 
     /// Creates a cache from an already type-erased checkpoint store.
     #[cfg(test)]
     pub(crate) fn new_shared<O>(
-        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        store: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
         entries: impl IntoIterator<Item = ParameterBankEntry>,
         options: O,
         source_stream: Stream,
@@ -178,6 +207,7 @@ impl AddressableParameterBank {
     where
         O: Into<ParameterBankOptions>,
     {
+        let store = store.into();
         Self::new_shared_with_policy(
             store,
             entries,
@@ -192,144 +222,49 @@ impl AddressableParameterBank {
         )
     }
 
-    /// Creates a cache from exact per-binding selected transformation tasks.
+    /// Creates an ordinary cache from the exact selected transformation tasks.
     pub fn new_selected_shared<O>(
-        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        store: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
         selected: SelectedAddressableEntries,
         options: O,
         source_stream: Stream,
         device_stream: Stream,
     ) -> Result<Self, AddressableParameterBankError>
-    where
-        O: Into<ParameterBankOptions>,
-    {
+    where O: Into<ParameterBankOptions> {
+        Self::new_selected_shared_with_manager(store, selected, options, source_stream, device_stream, None)
+    }
+
+    /// Prepares the actual selected catalog and its original manager before
+    /// ordinary model ownership. Selected transforms execute once here; the
+    /// move-only result retains their exact store, recipes and source identity.
+    pub(crate) fn prepare_selected_manager(
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
+        selected: SelectedAddressableEntries,
+        options: impl Into<ParameterBankOptions>,
+        source_stream: &Stream,
+        device_stream: &Stream,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    ) -> Result<Option<PreparedAddressableSource>, AddressableParameterBankError> {
+        PreparedAddressableSource::prepare(store, selected, options.into(), source_stream, device_stream, pool)
+    }
+
+    /// Consumes a matching prepared catalog, or runs the same ordinary resolver.
+    pub(crate) fn new_selected_shared_with_manager<O>(
+        store: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
+        selected: SelectedAddressableEntries,
+        options: O,
+        source_stream: Stream,
+        device_stream: Stream,
+        prepared: Option<PreparedAddressableSource>,
+    ) -> Result<Self, AddressableParameterBankError>
+    where O: Into<ParameterBankOptions> {
+        let store = store.into();
         let options = options.into();
-        preflight_selected_entry_bindings(store.as_ref(), &selected.entries)?;
-        let selected_keys = selected
-            .entries
-            .iter()
-            .map(|entry| entry.identity)
-            .collect::<std::collections::BTreeSet<_>>();
-        if selected_keys
-            != selected
-                .placements
-                .keys()
-                .copied()
-                .collect::<std::collections::BTreeSet<_>>()
-        {
-            return Err(AddressableParameterBankError::Transformation {
-                source: Box::new(Error::ArchitectureModel(
-                    "selected addressable placements do not cover the exact entry keys".into(),
-                )),
-            });
-        }
-        for entry in &selected.entries {
-            let expected = selected
-                .expected_bytes
-                .get(&entry.identity)
-                .ok_or_else(|| AddressableParameterBankError::Transformation {
-                    source: Box::new(Error::ArchitectureModel(format!(
-                        "selected addressable entry {:?} has no neutral byte total",
-                        entry.identity
-                    ))),
-                })?;
-            let projected = entry
-                .unit
-                .bindings()
-                .iter()
-                .try_fold(0u64, |total, binding| {
-                    let bytes = if let Some(transform) = selected
-                        .transformations
-                        .get(&(entry.identity, binding.name().to_owned()))
-                    {
-                        let metadata = binding.source_recipe().infer(store.as_ref())?;
-                        packed_projection_bytes(
-                            metadata.shape(),
-                            transform.quantization,
-                            &transform.companion_dtype,
-                        )?
-                    } else {
-                        binding.expected_bytes()
-                    };
-                    total.checked_add(bytes).ok_or_else(|| {
-                        Error::ArchitectureModel(
-                            "selected addressable entry bytes overflowed".into(),
-                        )
-                    })
-                })
-                .map_err(|source| AddressableParameterBankError::Transformation {
-                    source: Box::new(source),
-                })?;
-            if projected != *expected {
-                return Err(AddressableParameterBankError::Transformation {
-                    source: Box::new(Error::ArchitectureModel(format!(
-                        "selected addressable entry {:?} bytes differ: expected {}, projected {}",
-                        entry.identity, expected, projected
-                    ))),
-                });
-            }
-        }
-        if selected.transformations.is_empty() {
-            let parameter_members = prepared_parameter_members(
-                &selected.entries,
-                &selected.parameter_targets,
-                store.as_ref(),
-            )?;
-            let mut bank = Self::new_shared_with_policy(
-                store,
-                selected.entries,
-                options,
-                ResidencyPolicy::Cacheable,
-                MemoryTier::Disk,
-                source_stream,
-                device_stream,
-                Vec::new(),
-                selected.placements,
-                None,
-            )?;
-            bank.parameter_members = parameter_members;
-            return Ok(bank);
-        }
-        let telemetry_formats = selected_transformation_formats(&selected.transformations);
-        let transformed = quantize_selected_entry_catalog(
-            store,
-            selected.entries,
-            selected.transformations,
-            options.compact_bank_scratch_bytes,
-            &source_stream,
-        )
-        .map_err(|source| AddressableParameterBankError::Transformation {
-            source: Box::new(source),
-        })?;
-        for entry in &transformed.entries {
-            if selected.expected_bytes.get(&entry.identity) != Some(&entry.bytes) {
-                return Err(AddressableParameterBankError::Transformation {
-                    source: Box::new(Error::ArchitectureModel(format!(
-                        "materialized addressable entry {:?} differs from its neutral selected bytes",
-                        entry.identity
-                    ))),
-                });
-            }
-        }
-        let parameter_members = prepared_parameter_members(
-            &transformed.entries,
-            &selected.parameter_targets,
-            transformed.store.as_ref(),
-        )?;
-        let mut bank = Self::new_shared_with_policy(
-            transformed.store,
-            transformed.entries,
-            options,
-            ResidencyPolicy::Cacheable,
-            MemoryTier::Disk,
-            source_stream,
-            device_stream,
-            telemetry_formats,
-            selected.placements,
-            Some(transformed.report),
-        )?;
-        bank.parameter_members = parameter_members;
-        Ok(bank)
+        let (resolved, manager) = match prepared {
+            Some(prepared) => prepared.into_selected(&store, &selected, options)?,
+            None => (prepared::resolve_selected(store, selected, options, &source_stream)?, None),
+        };
+        resolved.into_bank(options, source_stream, device_stream, manager)
     }
 
     /// Creates a fully resident store over exactly the supplied owned entries.
@@ -340,11 +275,12 @@ impl AddressableParameterBank {
     /// and never trigger checkpoint reads during a forward pass.
     #[cfg(test)]
     pub(crate) fn new_resident_shared(
-        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        store: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
         entries: impl IntoIterator<Item = ParameterBankEntry>,
         source_stream: Stream,
         device_stream: Stream,
     ) -> Result<Self, AddressableParameterBankError> {
+        let store = store.into();
         Self::new_shared_with_policy(
             store,
             entries,
@@ -361,7 +297,7 @@ impl AddressableParameterBank {
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new_shared_with_policy(
-        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
         entries: impl IntoIterator<Item = ParameterBankEntry>,
         options: ParameterBankOptions,
         policy: ResidencyPolicy,
@@ -371,6 +307,24 @@ impl AddressableParameterBank {
         weight_quantizations: Vec<WeightQuantization>,
         placements: BTreeMap<ParameterBankKey, eredu_runtime::AddressableBankMemberPlacement>,
         materialization: Option<WeightMaterializationReport>,
+    ) -> Result<Self, AddressableParameterBankError> {
+        Self::new_shared_with_prepared_policy(store, entries, options, policy, initial_tier,
+            source_stream, device_stream, weight_quantizations, placements, materialization, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_shared_with_prepared_policy(
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
+        entries: impl IntoIterator<Item = ParameterBankEntry>,
+        options: ParameterBankOptions,
+        policy: ResidencyPolicy,
+        initial_tier: MemoryTier,
+        source_stream: Stream,
+        device_stream: Stream,
+        weight_quantizations: Vec<WeightQuantization>,
+        placements: BTreeMap<ParameterBankKey, eredu_runtime::AddressableBankMemberPlacement>,
+        materialization: Option<WeightMaterializationReport>,
+        prepared_manager: Option<ResidencyManager>,
     ) -> Result<Self, AddressableParameterBankError> {
         options.validate()?;
         let mut catalog = BTreeMap::new();
@@ -411,13 +365,24 @@ impl AddressableParameterBank {
             return Err(AddressableParameterBankError::EmptyCatalog);
         }
         let plan = OffloadPlan::new(options.storage, specs)?;
-        let manager =
-            ResidencyManager::new_shared(store, plan, definitions, source_stream, device_stream)?;
-        manager.initialize()?;
+        let manager = match prepared_manager {
+            Some(manager) => {
+                manager.validate_original_layerwise_preparation(
+                    &store, &BTreeMap::new(), &plan, &definitions, &source_stream, &device_stream)?;
+                manager
+            }
+            None => {
+                let manager = ResidencyManager::new_shared(store, plan, definitions, source_stream, device_stream)?;
+                manager.initialize()?;
+                manager
+            }
+        };
+        let statistics=ParameterBankStatisticsTable::new(&catalog);
         static NEXT_POOL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Ok(Self {
             parameter_members: Vec::new(),
             parameter_replacements: BTreeMap::new(),
+            parameter_revision: 0,
             effective_member_bytes: catalog.clone(),
             pool_id: NEXT_POOL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             manager,
@@ -438,7 +403,7 @@ impl AddressableParameterBank {
             scratch_limit: options.compact_bank_scratch_bytes,
             #[cfg(test)]
             bulk_bank_target: options.bulk_compact_bank_target_bytes,
-            statistics: Mutex::new(BTreeMap::new()),
+            statistics: Mutex::new(statistics),
             weight_quantizations,
             placements,
             materialization,
@@ -622,7 +587,7 @@ impl AddressableParameterBank {
             .lock()
             .map_err(|_| AddressableParameterBankError::StatisticsPoisoned)?;
         if let Some(bank) = bank {
-            let stats = statistics.entry(bank).or_default().pass_mut(pass);
+            let stats = statistics.get_mut(bank)?.pass_mut(pass);
             let distinct = compact_ids.len() as u64;
             stats.requested_selections = stats.requested_selections.saturating_add(selection_count);
             stats.distinct_entries = stats.distinct_entries.saturating_add(distinct);
@@ -655,7 +620,7 @@ impl AddressableParameterBank {
             occupancy.entry(self.unit_banks[id]).or_default().1 += bytes;
         }
         for (bank, (host, device)) in occupancy {
-            let stats = statistics.entry(bank).or_default();
+            let stats = statistics.get_mut(bank)?;
             stats.peak_host_bytes = stats.peak_host_bytes.max(host);
             stats.peak_device_bytes = stats.peak_device_bytes.max(device);
         }
@@ -667,6 +632,7 @@ impl AddressableParameterBank {
             scratch_bytes,
             pass,
             transfer,
+            original: None,
         })
     }
 
@@ -719,7 +685,7 @@ impl AddressableParameterBank {
             .statistics
             .lock()
             .map_err(|_| AddressableParameterBankError::StatisticsPoisoned)?;
-        let stats = statistics.entry(bank).or_default().pass_mut(pass);
+        let stats = statistics.get_mut(bank)?.pass_mut(pass);
         stats.compact_banks = stats.compact_banks.saturating_add(1);
         stats.compact_bank_bytes = stats.compact_bank_bytes.saturating_add(bytes);
         stats.peak_compact_bank_bytes = stats.peak_compact_bank_bytes.max(bytes);
@@ -873,6 +839,8 @@ pub struct AcquiredParameterGroups {
     pub(super) scratch_bytes: u64,
     pub(super) pass: BankAccessClass,
     pub(super) transfer: ResidentTransfer,
+    // Transfer/payloads retire before their issuing demand and source custody.
+    pub(super) original: Option<super::movement::OriginalIndexedChunkSource>,
 }
 
 impl AcquiredParameterGroups {

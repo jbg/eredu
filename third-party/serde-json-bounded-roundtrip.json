@@ -1,0 +1,34 @@
+{
+  "archive_sha256": "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14",
+  "boundary": "Qualifies the actual float_roundtrip feature union. Shares ordinary Number deserialize/end, float conversion/rounding, exact iterative power multiplication and limb shift; prepares finite digit scratch and two derived Bigint backings. No feature disabled; arbitrary_precision retained strings remain separate.",
+  "dependency": "serde_json-1.0.151",
+  "files": {
+    "src/bounded_number.rs": {
+      "after": "cd9ecad6c1555f5520c68cab0b855b06197ac7338a2ff2f9f48725b9e496a1f8",
+      "before": "49d7b3df07274661bb4237c1e8dff4969b86a8c1a35ee5e7ecfc14b130a002a2"
+    },
+    "src/de.rs": {
+      "after": "b66c55003b9c38f0ef9a107e9c27f95bb3d6a9b93675cb54ac6caca763635c4f",
+      "before": "3d560de0f6d0f437a385c6e175a07b2fb8816cad546682a2e4758f5cf75ae0cb"
+    },
+    "src/lexical/bignum.rs": {
+      "after": "6a3ab46e32cf16acf76fc67c51bb5c33610e23f21c01a92097f9b72d79da3aca",
+      "before": "db688e8112389998d0f91906f6857e28f9b510a8b4065ad476c8e8be2f77becf"
+    },
+    "src/lexical/bounded.rs": {
+      "after": "0a5ef6b554cfde3eb273bcbc1765429450010332d8d69132933c1a9958fe7b94",
+      "before": null
+    },
+    "src/lexical/math.rs": {
+      "after": "a460a39b4bb50bf913619652c8e22e5c524ca6153f376d475cfa8c6fe7faca5b",
+      "before": "c5452d3ef9cc9ebd74a99f22dcabf74f4f062bbaeade46301260b79e4662d5df"
+    },
+    "src/lexical/mod.rs": {
+      "after": "fc6c2d92d7d13cdc028ae75f0db7617a2fb5f281fc5ec77222b17aa1dfdc19fd",
+      "before": "ace2ccea2cd541f019a84b9eeb3b9ecd88daf6bccbe9edf0eac00b62704f47c4"
+    }
+  },
+  "patch_sha256": "e8b919265072bb2bfb49dc1ed1dc07836df1c86cabf62bb541a15d1e9e2bfcda",
+  "predecessor": "serde-json-bounded-number.patch",
+  "predecessor_patch_sha256": "65bdfcdf41a9cfc6c4d70749f8f093d1d464c51b7e0ca8d2e4f984f427e2af03"
+}

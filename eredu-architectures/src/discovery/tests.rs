@@ -564,7 +564,9 @@ fn nanbeige_groups_physical_layers_and_passes_without_collapsing_execution_ident
                         node.observation_paths,
                         [
                             format!("model.layers.{logical}.input"),
+                            format!("model.layers.{logical}.input.effective"),
                             format!("model.layers.{logical}.output"),
+                            format!("model.layers.{logical}.output.effective"),
                         ]
                     );
                     for suffix in [
@@ -1321,6 +1323,102 @@ fn gemma4_components_declare_actual_publishers_branch_norms_and_residual_scales(
             assert_eq!(
                 graph,
                 serde_json::from_slice(&serde_json::to_vec(&graph).unwrap()).unwrap()
+            );
+        }
+    }
+}
+
+/// A real unit hook has one mutable input surface and one read-only result.
+fn assert_unit_boundary_pair(
+    graph: &ArchitectureDescriptor,
+    interventions: &[eredu_core::intervention::InterventionPoint],
+    path: &str,
+    expected_axes: &[TensorAxis],
+) {
+    let effective_path = format!("{path}.effective");
+    let original = graph
+        .observations
+        .get(path)
+        .expect("original unit boundary");
+    let effective = graph
+        .observations
+        .get(&effective_path)
+        .expect("effective unit boundary");
+    assert_eq!(original.position, ObservationPosition::BeforeIntervention);
+    assert_eq!(effective.position, ObservationPosition::AfterIntervention);
+    assert_eq!(original.axes.as_deref(), Some(expected_axes));
+    assert_eq!(effective.axes, original.axes);
+    assert_eq!(effective.dtype, original.dtype);
+    assert_eq!(effective.value_type, original.value_type);
+    assert_eq!(effective.node_id, original.node_id);
+    assert_eq!(effective.requirements, original.requirements);
+    assert_eq!(effective.prefill, original.prefill);
+    assert_eq!(effective.decode, original.decode);
+    assert_eq!(
+        original.requirements,
+        [ObservationRequirement::ActivationHooks]
+    );
+    assert!(original.prefill && original.decode);
+    for name in [path, effective_path.as_str()] {
+        assert_eq!(
+            graph
+                .observations
+                .points
+                .iter()
+                .filter(|p| p.path == name)
+                .count(),
+            1
+        );
+        assert_eq!(
+            graph
+                .node(&original.node_id)
+                .unwrap()
+                .observation_paths
+                .iter()
+                .filter(|p| p.as_str() == name)
+                .count(),
+            1
+        );
+    }
+    let mutable = interventions
+        .iter()
+        .filter(|p| p.path == path)
+        .collect::<Vec<_>>();
+    assert_eq!(mutable.len(), 1);
+    assert_eq!(mutable[0].axes.as_slice(), expected_axes);
+    assert!(!interventions.iter().any(|p| p.path == effective_path));
+    assert!(graph
+        .observations
+        .get(&format!("{effective_path}.effective"))
+        .is_none());
+}
+
+#[test]
+fn dense_unit_catalog_pairs_effective_values_without_an_extra_mutable_hook() {
+    let json = serde_json::json!({
+        "model_type":"llama", "hidden_size":16, "num_hidden_layers":2,
+        "intermediate_size":32, "num_attention_heads":4, "num_key_value_heads":2,
+        "head_dim":4, "rms_norm_eps":1e-6, "vocab_size":32,
+        "max_position_embeddings":128, "rope_theta":10000.0
+    });
+    let prepared = crate::configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(&json)
+        .unwrap();
+    let plan = prepared.architecture_plan();
+    let graph = plan.architecture_descriptor();
+    let interventions = plan.intervention_points();
+    validate(&graph);
+    assert_eq!(
+        graph.observations.completeness,
+        DescriptionCompleteness::Complete
+    );
+    for layer in 0..2 {
+        for boundary in ["input", "output"] {
+            assert_unit_boundary_pair(
+                &graph,
+                &interventions,
+                &format!("model.layers.{layer}.{boundary}"),
+                &axes(16),
             );
         }
     }

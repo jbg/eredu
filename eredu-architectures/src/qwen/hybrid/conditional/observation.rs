@@ -22,7 +22,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> ConditionalLa
         let mut instrumentation =
             crate::decoder::ComponentInstrumentation::new("readout", &mut borrowed);
         let hidden = instrumentation.apply("embedding", hidden.clone())?;
-        forward.embedded = hidden.clone();
+        forward.embedded = Some(hidden.clone());
         Ok(Some(hidden))
     }
 

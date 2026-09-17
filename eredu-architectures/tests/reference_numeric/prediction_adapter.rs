@@ -20,6 +20,11 @@ mod residency;
 #[path = "prediction_adapter/v3_components.rs"]
 mod v3_components;
 
+#[path = "prediction_adapter/retained_resources.rs"]
+mod retained_resources;
+#[path = "prediction_adapter/startup.rs"]
+mod startup;
+
 type State = DeviceState<NumericBackend, NumericHybridLayerState>;
 type Snapshots = Rc<RefCell<Vec<State>>>;
 
@@ -50,6 +55,12 @@ impl RuntimeState<NumericBackend> for PredictionState {
     fn layout(&self) -> &eredu_runtime::StateLayout {
         self.state.layout()
     }
+    fn visit_all_retained_values(
+        &self,
+        visitor: &mut dyn FnMut(&NumericTensor),
+    ) -> Result<(), StateError> {
+        self.state.visit_all_retained_values(visitor)
+    }
     fn retained_values(
         &self,
         ordinal: usize,
@@ -67,7 +78,7 @@ impl PredictionModelState<NumericBackend> for PredictionState {
 
 struct Materializer;
 struct Materialization<'a> {
-    source: SharedCheckpointSource,
+    source: RetainedCheckpointSource,
     context: &'a NumericContext,
     snapshots: Snapshots,
 }
@@ -78,6 +89,7 @@ impl PredictionExtensionMaterializer<NumericBackend> for Materializer {
     type SequentialState = NumericCompressedCache;
     type ModelState = PredictionState;
     type Context<'a> = Materialization<'a>;
+    type SnapshotContext<'a> = &'a NumericContext;
     fn complete_prediction_values<'a>(
         values: impl IntoIterator<Item = &'a NumericTensor>,
         _context: &<NumericTensor as eredu_nn::Tensor>::Context,
@@ -241,6 +253,9 @@ where
     O: eredu_runtime::PredictionTargetOperation<A, NumericBackend, State>,
 {
     type Output = O::Output;
+    fn preserves_architecture_declarations(&self) -> bool {
+        self.0.preserves_architecture_declarations()
+    }
     fn apply(
         self,
         architecture: &mut A,
@@ -312,7 +327,7 @@ impl ReplicatedPredictionTargetVisitor<NumericBackend, State, Materializer> for 
         self,
         prepared: PreparedReplicatedTextArchitecture<A>,
         extension: <A as MaterializedPredictionTarget<NumericBackend>>::Extension<Materializer>,
-        checkpoint: SharedCheckpointSource,
+        checkpoint: RetainedCheckpointSource,
     ) -> Result<Run, String>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<NumericBackend, State, Error = Error>
@@ -354,6 +369,13 @@ impl Visitor<'_> {
         D: Driver<A>,
         E: MaterializedPredictionExecutor<A, NumericBackend, Materializer>,
     {
+        let snapshots_before = self.snapshots.borrow().len();
+        retained_resources::verify::<A, E>(&mut extension, 1);
+        assert_eq!(
+            self.snapshots.borrow().len(),
+            snapshots_before,
+            "inspection never clones a state prototype"
+        );
         let tokens = NumericTensor::token_ids(&[1, 3, 2]);
         let (target, capture) = session
             .prefill_prediction_target(&tokens, None, self.context)
@@ -567,7 +589,7 @@ impl
         self,
         prepared: eredu_architectures::routed_text::PreparedRoutedTextArchitecture<A>,
         extension: <A as MaterializedPredictionTarget<NumericBackend>>::Extension<Materializer>,
-        checkpoint: SharedCheckpointSource,
+        checkpoint: RetainedCheckpointSource,
     ) -> Result<Run, String>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<NumericBackend, State, Error = Error>
@@ -601,7 +623,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, State> for Ordinary {
     fn visit<A>(
         self,
         _: PreparedReplicatedTextArchitecture<A>,
-        _: SharedCheckpointSource,
+        _: RetainedCheckpointSource,
     ) -> Result<Run, String>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<NumericBackend, State, Error = Error>
@@ -620,7 +642,7 @@ impl eredu_architectures::routed_text::RoutedTextArchitectureVisitor<NumericBack
     fn visit<A>(
         self,
         _: eredu_architectures::routed_text::PreparedRoutedTextArchitecture<A>,
-        _: SharedCheckpointSource,
+        _: RetainedCheckpointSource,
     ) -> Result<Run, String>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<NumericBackend, State, Error = Error>
@@ -638,7 +660,7 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<NumericBackend, Sta
     fn visit<A>(
         self,
         _: eredu_architectures::routed_text::PreparedRoutedTextArchitecture<A>,
-        _: SharedCheckpointSource,
+        _: RetainedCheckpointSource,
     ) -> Result<Run, String>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<NumericBackend, State, Error = Error>
@@ -804,7 +826,7 @@ fn execute_config(
     let materialize_snapshots = Rc::clone(&snapshots);
     reset_reference_stage_evidence("SafeTensors");
     let materialize = |prepared: PreparedPredictionExtension<NumericBackend>,
-                       source: SharedCheckpointSource| {
+                       source: RetainedCheckpointSource| {
         assert_eq!(
             source.source_keys().into_iter().collect::<BTreeSet<_>>(),
             extension_keys

@@ -1,6 +1,10 @@
 /* Copyright © 2023-2024 Apple Inc. */
 
 #include "mlx/c/error.h"
+#include "mlx/record_quota.h"
+#include "mlx/graph_quota.h"
+#include "mlx/submission.h"
+#include <exception>
 
 #include <memory>
 #include <vector>
@@ -16,6 +20,10 @@ static void mlx_error_handler_default_(const char* msg, void* data) {
 
 static std::shared_ptr<void> mlx_error_handler_data_ = nullptr;
 static mlx_error_handler_func mlx_error_handler_ = mlx_error_handler_default_;
+
+extern "C" size_t mlx_error_static_storage_bytes(void) {
+  return sizeof(mlx_error_handler_data_) + sizeof(mlx_error_handler_);
+}
 
 extern "C" void mlx_set_error_handler(
     mlx_error_handler_func handler,
@@ -33,8 +41,39 @@ extern "C" void mlx_set_error_handler(
   }
 }
 
+namespace {
+thread_local unsigned submission_tracking_failure = 0;
+thread_local unsigned graph_metadata_failure = 0;
+}
+extern "C" unsigned mlx_error_submission_tracking_failure(void) {
+  return submission_tracking_failure;
+}
+extern "C" unsigned mlx_error_graph_metadata_failure(void) {
+  return graph_metadata_failure;
+}
 extern "C" void
 _mlx_error(const char* file, const int line, const char* fmt, ...) {
+  // Original safe operations translate the returned status through their exact
+  // retained observer. Do not format an additional diagnostic or invoke the
+  // process-wide handler. The carrier explicitly records source_unavailable
+  // when a C error is reported outside a catch; it invents no native exception.
+  auto* scope = mlx::core::submission::current_scope();
+  if (scope && scope->original_controls_required()) {
+    if (auto* carrier = scope->failure_owner().get()) {
+      carrier->capture_current_exception();
+    }
+    return;
+  }
+  submission_tracking_failure = 0;
+  graph_metadata_failure = 0;
+  if (auto current = std::current_exception()) {
+    try { std::rethrow_exception(current); }
+    catch (const mlx::core::submission::RecordQuotaError& error) {
+      submission_tracking_failure = static_cast<unsigned>(error.cause());
+    } catch (const mlx::core::submission::GraphQuotaError& error) {
+      graph_metadata_failure = static_cast<unsigned>(error.cause());
+    } catch (...) {}
+  }
   va_list args, args_copy;
   va_start(args, fmt);
 

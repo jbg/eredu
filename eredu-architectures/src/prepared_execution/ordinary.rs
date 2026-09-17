@@ -45,7 +45,7 @@ where
             return Err(PreparedExecutionError::UnavailablePrediction);
         }
         dispatch_replicated_key_value_text_architecture::<B, S, V>(
-            branch.inspection.architecture_plan(),
+            &branch.inspection.sources,
             branch.selected,
             branch.target,
             self.context,
@@ -125,7 +125,7 @@ where
             );
         }
         dispatch_replicated_text_architecture::<B, _>(
-            branch.inspection.architecture_plan(),
+            &branch.inspection.sources,
             branch.selected,
             branch.target,
             self.context,
@@ -224,7 +224,7 @@ where
             .all(|bank| bank.plan().relu2().is_some())
         {
             return visit_relu2_routed_text_architecture::<B, S, _>(
-                &branch.inspection,
+                &branch.inspection.sources,
                 branch.selected,
                 branch.target,
                 self.context,
@@ -248,7 +248,7 @@ where
             });
         if pooling {
             visit_pooling_routed_text_architecture::<B, PS, _>(
-                &branch.inspection,
+                &branch.inspection.sources,
                 branch.selected,
                 branch.target,
                 self.context,
@@ -257,7 +257,7 @@ where
             .map_err(routed_error)
         } else {
             visit_routed_text_architecture::<B, S, _>(
-                &branch.inspection,
+                &branch.inspection.sources,
                 branch.selected,
                 branch.target,
                 self.context,
@@ -333,10 +333,8 @@ where
                 self.context,
             );
         }
-        let requirements = composite_text_requirements(&branch.inspection)
-            .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
-        visit_composite_text_architecture::<B, S, _>(
-            requirements,
+        visit_prepared_composite_text_architecture::<B, S, _>(
+            &branch.inspection.sources,
             branch.selected,
             branch.target,
             self.context,

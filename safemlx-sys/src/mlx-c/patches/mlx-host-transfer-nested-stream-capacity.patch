@@ -1,0 +1,26 @@
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -553,7 +553,10 @@
+     const auto bank = submission::GraphConstruction::suspend_nested(
+         *controls.graph, controls.scope_identity, 1, suspended);
+     if (bank != submission::GraphFailure{}) throw submission::GraphQuotaError(bank);
+-    if (suspended.limits().streams != 1)
++    // The enclosing model can retain CPU collective and GPU streams. This
++    // child uses the selected preflighted GPU stream and its fixed one-stream
++    // traversal below; the enclosing limit is capacity, not child cardinality.
++    if (suspended.limits().streams < 1)
+       throw ScopedEvaluationError(ScopedEvaluation::domain);
+     // Completed source + optional compaction + CopyToHostTransfer. The output
+     // Data aliases the paid host buffer; only compaction can allocate Device.
+@@ -645,7 +648,10 @@
+     const auto bank = submission::GraphConstruction::suspend_nested(
+         *controls.graph, controls.scope_identity, 1, suspended);
+     if (bank != submission::GraphFailure{}) throw submission::GraphQuotaError(bank);
+-    if (suspended.limits().streams != 1)
++    // The enclosing model can retain CPU collective and GPU streams. This
++    // child uses the selected preflighted GPU stream and its fixed one-stream
++    // traversal below; the enclosing limit is capacity, not child cardinality.
++    if (suspended.limits().streams < 1)
+       throw ScopedEvaluationError(ScopedEvaluation::domain);
+     CompletionEvalRecordLayout record;
+     if (!completion_eval_record_layout(2, 1, 2, record))

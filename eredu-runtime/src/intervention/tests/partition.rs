@@ -2,6 +2,7 @@ use super::*;
 use eredu_core::component::ComponentCoordinateMap;
 
 mod sum;
+mod original;
 
 fn admitted(action: InterventionAction, partial: bool) -> AdmittedInterventionPlan {
     admitted_at(action, partial, 1, 1)

@@ -1,0 +1,2731 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -51,6 +51,8 @@
+ ]
+ 
+ [features]
++# Development-only real reserve failure selection; disabled by default.
++development-closed-chat = []
+ adjacent_loop_items = []
+ builtins = []
+ custom_syntax = ["dep:aho-corasick"]
+--- /dev/null
++++ b/src/bounded/input.rs
+@@ -0,0 +1,100 @@
++use std::fmt;
++
++/// Borrowed text-only message; the caller retains both string allocations.
++#[derive(Clone, Copy, Debug)]
++pub struct TextMessage<'a> {
++    /// The exact role spelling used by the ordinary template.
++    pub role: &'a str,
++    /// The exact content, including empty strings, NUL and Unicode scalars.
++    pub content: &'a str,
++}
++
++/// Fixed rejection before constructing render storage or ordinary Value objects.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum InputError {
++    /// A message is not an object with exactly role and content string members.
++    MessageProfile,
++}
++impl fmt::Display for InputError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("chat messages require exact role/content string members")
++    }
++}
++impl std::error::Error for InputError {}
++
++#[derive(Clone, Copy, Debug)]
++enum Source<'a> {
++    Text(&'a [TextMessage<'a>]),
++    #[cfg(feature = "json")]
++    Json(&'a [serde_json::Value]),
++}
++
++/// Validated readonly access to the actual message slice through both renders.
++/// This view performs no allocation and supplies no callback or mutable accessor.
++#[derive(Clone, Copy, Debug)]
++pub struct Messages<'a> {
++    source: Source<'a>,
++}
++impl<'a> Messages<'a> {
++    /// Borrow caller-owned typed strings without creating an owned message list.
++    pub fn from_text(messages: &'a [TextMessage<'a>]) -> Self {
++        Self {
++            source: Source::Text(messages),
++        }
++    }
++
++    /// Validate and borrow the facade's actual JSON message representation.
++    /// No accepted field is ignored: tool history and other members remain an
++    /// unfinished profile and reject before render admission.
++    #[cfg(feature = "json")]
++    pub fn from_json(messages: &'a [serde_json::Value]) -> Result<Self, InputError> {
++        for message in messages {
++            json_message(message)?;
++        }
++        Ok(Self {
++            source: Source::Json(messages),
++        })
++    }
++
++    /// Number of messages read by the selected template loop.
++    pub fn len(self) -> usize {
++        match self.source {
++            Source::Text(messages) => messages.len(),
++            #[cfg(feature = "json")]
++            Source::Json(messages) => messages.len(),
++        }
++    }
++
++    /// Whether the actual message loop has no iterations.
++    pub fn is_empty(self) -> bool {
++        self.len() == 0
++    }
++
++    pub(super) fn get(self, index: usize) -> Option<TextMessage<'a>> {
++        match self.source {
++            Source::Text(messages) => messages.get(index).copied(),
++            #[cfg(feature = "json")]
++            Source::Json(messages) => messages
++                .get(index)
++                .map(|message| json_message(message).expect("validated immutable message")),
++        }
++    }
++}
++
++#[cfg(feature = "json")]
++fn json_message(value: &serde_json::Value) -> Result<TextMessage<'_>, InputError> {
++    let object = value.as_object().ok_or(InputError::MessageProfile)?;
++    if object.len() != 2 {
++        return Err(InputError::MessageProfile);
++    }
++    Ok(TextMessage {
++        role: object
++            .get("role")
++            .and_then(serde_json::Value::as_str)
++            .ok_or(InputError::MessageProfile)?,
++        content: object
++            .get("content")
++            .and_then(serde_json::Value::as_str)
++            .ok_or(InputError::MessageProfile)?,
++    })
++}
+--- /dev/null
++++ b/src/bounded/mod.rs
+@@ -0,0 +1,28 @@
++//! Source-bound construction and rendering of a checked ordinary compiler image.
++//!
++//! This API does not initialize an Environment or provide an allocation-account
++//! grant. Callers admit the returned concrete requirements before constructing.
++//! Ordinary constructors, Value semantics and rendering remain available.
++
++#![forbid(unsafe_code)]
++
++mod input;
++mod recipe;
++mod render;
++mod source;
++mod worker;
++
++pub use input::{InputError, Messages, TextMessage};
++
++pub use render::{
++    RenderBuffer, RenderCause, RenderError, RenderFailure, RenderPlan, RenderPlanError,
++    RenderRequirements, Rendered,
++};
++
++pub use source::{
++    supported_source, CompileCause, CompileError, CompilePlan, CompileRequirements,
++    PreparedTemplate, SourceBuffer, SourceError, TemplateName, TemplateSettings,
++};
++
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/src/bounded/recipe.rs
+@@ -0,0 +1,430 @@
++//! Generated only from the verified ordinary compiler image; no runtime compiler.
++//! Image SHA256: a32ee2ae7a7587492e4f7082f71b349d7e97f1fddbcadc114877813e2099adce
++use super::source::{Instruction, Location, Range, Span};
++
++pub(super) const SOURCE: &str = r###"{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system
++You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>
++' }}{% endif %}{{'<|im_start|>' + message['role'] + '
++' + message['content'] + '<|im_end|>' + '
++'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant
++' }}{% endif %}"###;
++pub(super) const BYTES: &str = r###"{% for message in messages %}{% if loop.first and messages[0]['role'] != 'system' %}{{ '<|im_start|>system
++You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>
++' }}{% endif %}{{'<|im_start|>' + message['role'] + '
++' + message['content'] + '<|im_end|>' + '
++'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant
++' }}{% endif %}messagesmessageloopfirstmessagesrolesystem<|im_start|>system
++You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>
++<|im_start|>messagerole
++messagecontent<|im_end|>
++add_generation_prompt<|im_start|>assistant
++"###;
++pub(super) const INSTRUCTIONS: [Instruction; 39] = [
++    Instruction::Lookup(Range::new(368, 8)),
++    Instruction::PushLoop(1),
++    Instruction::Iterate(34),
++    Instruction::StoreLocal(Range::new(376, 7)),
++    Instruction::Lookup(Range::new(383, 4)),
++    Instruction::GetAttr(Range::new(387, 5)),
++    Instruction::JumpIfFalseOrPop(14),
++    Instruction::Lookup(Range::new(392, 8)),
++    Instruction::Zero,
++    Instruction::GetItem,
++    Instruction::Literal(Range::new(400, 4)),
++    Instruction::GetItem,
++    Instruction::Literal(Range::new(404, 6)),
++    Instruction::Ne,
++    Instruction::JumpIfFalse(17),
++    Instruction::Literal(Range::new(410, 98)),
++    Instruction::Emit,
++    Instruction::Literal(Range::new(508, 12)),
++    Instruction::Lookup(Range::new(520, 7)),
++    Instruction::Literal(Range::new(527, 4)),
++    Instruction::GetItem,
++    Instruction::Add,
++    Instruction::Literal(Range::new(531, 1)),
++    Instruction::Add,
++    Instruction::Lookup(Range::new(532, 7)),
++    Instruction::Literal(Range::new(539, 7)),
++    Instruction::GetItem,
++    Instruction::Add,
++    Instruction::Literal(Range::new(546, 10)),
++    Instruction::Add,
++    Instruction::Literal(Range::new(556, 1)),
++    Instruction::Add,
++    Instruction::Emit,
++    Instruction::Jump(2),
++    Instruction::PopLoopFrame,
++    Instruction::Lookup(Range::new(557, 21)),
++    Instruction::JumpIfFalse(39),
++    Instruction::Literal(Range::new(578, 22)),
++    Instruction::Emit,
++];
++pub(super) const LOCATIONS: [Location; 39] = [
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 18,
++            start_offset: 18,
++            end_line: 1,
++            end_col: 26,
++            end_offset: 26,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 18,
++            start_offset: 18,
++            end_line: 1,
++            end_col: 26,
++            end_offset: 26,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 18,
++            start_offset: 18,
++            end_line: 1,
++            end_col: 26,
++            end_offset: 26,
++        }),
++    },
++    Location {
++        line: 1,
++        span: None,
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 35,
++            start_offset: 35,
++            end_line: 1,
++            end_col: 45,
++            end_offset: 45,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 35,
++            start_offset: 35,
++            end_line: 1,
++            end_col: 45,
++            end_offset: 45,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 35,
++            start_offset: 35,
++            end_line: 1,
++            end_col: 45,
++            end_offset: 45,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 50,
++            start_offset: 50,
++            end_line: 1,
++            end_col: 61,
++            end_offset: 61,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 50,
++            start_offset: 50,
++            end_line: 1,
++            end_col: 61,
++            end_offset: 61,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 50,
++            start_offset: 50,
++            end_line: 1,
++            end_col: 61,
++            end_offset: 61,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 58,
++            start_offset: 58,
++            end_line: 1,
++            end_col: 69,
++            end_offset: 69,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 58,
++            start_offset: 58,
++            end_line: 1,
++            end_col: 69,
++            end_offset: 69,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 46,
++            start_offset: 46,
++            end_line: 1,
++            end_col: 81,
++            end_offset: 81,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 46,
++            start_offset: 46,
++            end_line: 1,
++            end_col: 81,
++            end_offset: 81,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 35,
++            start_offset: 35,
++            end_line: 1,
++            end_col: 81,
++            end_offset: 81,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 87,
++            start_offset: 87,
++            end_line: 3,
++            end_col: 1,
++            end_offset: 187,
++        }),
++    },
++    Location {
++        line: 1,
++        span: Some(Span {
++            start_line: 1,
++            start_col: 87,
++            start_offset: 87,
++            end_line: 3,
++            end_col: 1,
++            end_offset: 187,
++        }),
++    },
++    Location {
++        line: 3,
++        span: Some(Span {
++            start_line: 3,
++            start_col: 17,
++            start_offset: 203,
++            end_line: 3,
++            end_col: 49,
++            end_offset: 235,
++        }),
++    },
++    Location {
++        line: 3,
++        span: Some(Span {
++            start_line: 3,
++            start_col: 34,
++            start_offset: 220,
++            end_line: 3,
++            end_col: 49,
++            end_offset: 235,
++        }),
++    },
++    Location {
++        line: 3,
++        span: Some(Span {
++            start_line: 3,
++            start_col: 34,
++            start_offset: 220,
++            end_line: 3,
++            end_col: 49,
++            end_offset: 235,
++        }),
++    },
++    Location {
++        line: 3,
++        span: Some(Span {
++            start_line: 3,
++            start_col: 34,
++            start_offset: 220,
++            end_line: 3,
++            end_col: 49,
++            end_offset: 235,
++        }),
++    },
++    Location {
++        line: 3,
++        span: Some(Span {
++            start_line: 3,
++            start_col: 17,
++            start_offset: 203,
++            end_line: 3,
++            end_col: 49,
++            end_offset: 235,
++        }),
++    },
++    Location {
++        line: 3,
++        span: Some(Span {
++            start_line: 3,
++            start_col: 17,
++            start_offset: 203,
++            end_line: 4,
++            end_col: 1,
++            end_offset: 241,
++        }),
++    },
++    Location {
++        line: 3,
++        span: Some(Span {
++            start_line: 3,
++            start_col: 17,
++            start_offset: 203,
++            end_line: 4,
++            end_col: 1,
++            end_offset: 241,
++        }),
++    },
++    Location {
++        line: 4,
++        span: Some(Span {
++            start_line: 4,
++            start_col: 4,
++            start_offset: 244,
++            end_line: 4,
++            end_col: 22,
++            end_offset: 262,
++        }),
++    },
++    Location {
++        line: 4,
++        span: Some(Span {
++            start_line: 4,
++            start_col: 4,
++            start_offset: 244,
++            end_line: 4,
++            end_col: 22,
++            end_offset: 262,
++        }),
++    },
++    Location {
++        line: 4,
++        span: Some(Span {
++            start_line: 4,
++            start_col: 4,
++            start_offset: 244,
++            end_line: 4,
++            end_col: 22,
++            end_offset: 262,
++        }),
++    },
++    Location {
++        line: 4,
++        span: None,
++    },
++    Location {
++        line: 4,
++        span: None,
++    },
++    Location {
++        line: 4,
++        span: None,
++    },
++    Location {
++        line: 4,
++        span: None,
++    },
++    Location {
++        line: 4,
++        span: None,
++    },
++    Location {
++        line: 4,
++        span: None,
++    },
++    Location {
++        line: 4,
++        span: None,
++    },
++    Location {
++        line: 4,
++        span: None,
++    },
++    Location {
++        line: 5,
++        span: Some(Span {
++            start_line: 5,
++            start_col: 21,
++            start_offset: 303,
++            end_line: 5,
++            end_col: 42,
++            end_offset: 324,
++        }),
++    },
++    Location {
++        line: 5,
++        span: Some(Span {
++            start_line: 5,
++            start_col: 21,
++            start_offset: 303,
++            end_line: 5,
++            end_col: 42,
++            end_offset: 324,
++        }),
++    },
++    Location {
++        line: 5,
++        span: Some(Span {
++            start_line: 5,
++            start_col: 48,
++            start_offset: 330,
++            end_line: 6,
++            end_col: 1,
++            end_offset: 354,
++        }),
++    },
++    Location {
++        line: 5,
++        span: Some(Span {
++            start_line: 5,
++            start_col: 48,
++            start_offset: 330,
++            end_line: 6,
++            end_col: 1,
++            end_offset: 354,
++        }),
++    },
++];
+--- /dev/null
++++ b/src/bounded/render.rs
+@@ -0,0 +1,385 @@
++use std::alloc::Layout;
++use std::collections::TryReserveError;
++use std::fmt;
++use std::mem::size_of;
++
++use super::input::Messages;
++use super::source::{PreparedTemplate, Range};
++use super::worker::{self, Atom, Counts, Frame, Slot, Workspace};
++
++/// Fixed planning rejection before any render destination is allocated.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RenderPlanError {
++    /// Checked counts or requested layouts exceed the addressable range.
++    Overflow,
++    /// The closed source/input state does not satisfy its checked geometry.
++    Geometry,
++    /// Shared-dispatch failure at its actual source instruction/location.
++    Execution(RenderFailure),
++}
++/// Fixed source location of a checked execution failure, copied from the
++/// actually emitted image without an allocated debug object.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct RenderFailure {
++    /// Program counter at which the shared instruction failed.
++    pub instruction: u32,
++    /// Actual emitted line when available.
++    pub line: Option<usize>,
++    /// Actual emitted start column when available.
++    pub column: Option<usize>,
++    /// Whether checked count arithmetic overflowed.
++    pub overflow: bool,
++}
++fn failure(source: &PreparedTemplate, error: worker::Failure) -> RenderPlanError {
++    let location = source.locations.get(error.instruction as usize);
++    RenderPlanError::Execution(RenderFailure {
++        instruction: error.instruction,
++        line: location.map(|location| location.line),
++        column: location.and_then(|location| location.span.map(|span| span.start_col)),
++        overflow: error.kind == worker::Error::Overflow,
++    })
++}
++impl fmt::Display for RenderPlanError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(match self {
++            Self::Overflow => "chat render layout overflow",
++            Self::Geometry => "invalid closed chat render geometry",
++            Self::Execution(_) => "closed chat instruction failed",
++        })
++    }
++}
++impl std::error::Error for RenderPlanError {}
++
++/// The six real render destinations, in reserve order.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum RenderBuffer {
++    /// Shared-dispatch operand stack.
++    Operands,
++    /// The one actual finite message-loop frame.
++    Frames,
++    /// The message local retained by that frame.
++    Locals,
++    /// Every retained concatenation prefix, reused between the two executions.
++    Concat,
++    /// Complete rendering without an assistant generation prompt.
++    WithoutPrompt,
++    /// Complete rendering with an assistant generation prompt.
++    WithPrompt,
++}
++fn index(buffer: RenderBuffer) -> usize {
++    match buffer {
++        RenderBuffer::Operands => 0,
++        RenderBuffer::Frames => 1,
++        RenderBuffer::Locals => 2,
++        RenderBuffer::Concat => 3,
++        RenderBuffer::WithoutPrompt => 4,
++        RenderBuffer::WithPrompt => 5,
++    }
++}
++fn layout<T>(count: usize) -> Result<usize, RenderPlanError> {
++    Layout::array::<T>(count)
++        .map(|l| l.size())
++        .map_err(|_| RenderPlanError::Overflow)
++}
++
++/// Source/input-derived requested layouts, with no caller-supplied byte grant.
++#[derive(Clone, Copy, Debug)]
++pub struct RenderRequirements {
++    capacities: [usize; 6],
++    buffers: usize,
++    required: usize,
++}
++impl RenderRequirements {
++    /// Number of elements reserved for the actual destination.
++    pub fn capacity(self, buffer: RenderBuffer) -> usize {
++        self.capacities[index(buffer)]
++    }
++    /// Sum of all six requested allocation layouts.
++    pub fn buffer_bytes(self) -> usize {
++        self.buffers
++    }
++    /// Requested layouts and concrete compiler/render/error controls, excluding
++    /// the consumer's own Arc/account/error wrappers, which it must price.
++    pub fn required_bytes(self) -> usize {
++        self.required
++    }
++}
++
++/// Borrows the genuine closed source and immutable messages through both runs.
++/// Measuring follows the shared VM dispatcher and uses fixed stack storage.
++#[derive(Debug)]
++pub struct RenderPlan<'a> {
++    source: &'a PreparedTemplate,
++    messages: Messages<'a>,
++    counts: [Counts; 2],
++    requirements: RenderRequirements,
++    #[cfg(feature = "development-closed-chat")]
++    fail: Option<RenderBuffer>,
++}
++impl<'a> RenderPlan<'a> {
++    /// Measure both actual generation-prompt settings without building ordinary
++    /// Values, iterators, a renderer Environment, or any heap storage.
++    pub fn prepare(
++        source: &'a PreparedTemplate,
++        messages: Messages<'a>,
++    ) -> Result<Self, RenderPlanError> {
++        if source.geometry.operands != 3
++            || source.geometry.frames != 1
++            || source.geometry.locals != 1
++        {
++            return Err(RenderPlanError::Geometry);
++        }
++        let mut operands = [Slot::Undefined; 3];
++        let mut frames = [Frame::default(); 1];
++        let mut locals = [Slot::Undefined; 1];
++        let mut counts = [Counts::default(); 2];
++        for (generation, count) in [false, true].into_iter().zip(&mut counts) {
++            *count = worker::run(
++                source,
++                messages,
++                generation,
++                Workspace {
++                    operands: &mut operands,
++                    frames: &mut frames,
++                    locals: &mut locals,
++                    concat: None,
++                    output: None,
++                },
++            )
++            .map_err(|error| failure(source, error))?;
++        }
++        let capacities = [
++            3,
++            1,
++            1,
++            counts[0].concat.max(counts[1].concat),
++            counts[0].output,
++            counts[1].output,
++        ];
++        let sizes = [
++            layout::<Slot>(capacities[0])?,
++            layout::<Frame>(capacities[1])?,
++            layout::<Slot>(capacities[2])?,
++            layout::<Atom>(capacities[3])?,
++            layout::<u8>(capacities[4])?,
++            layout::<u8>(capacities[5])?,
++        ];
++        let mut buffers = 0_usize;
++        for bytes in sizes {
++            buffers = buffers
++                .checked_add(bytes)
++                .ok_or(RenderPlanError::Overflow)?;
++        }
++        let controls = [
++            size_of::<Self>(),
++            size_of::<Rendered>(),
++            size_of::<RenderError>(),
++            size_of::<RenderCause>(),
++            size_of::<Result<Rendered, RenderError>>(),
++            size_of::<Result<(), TryReserveError>>(),
++            size_of::<[Counts; 2]>(),
++            size_of::<[usize; 6]>(), // actual capacity array
++            size_of::<[usize; 6]>(), // checked byte-layout array
++            size_of::<RenderRequirements>(),
++            size_of::<Range>(), // resulting suffix range
++            size_of::<Layout>(),
++            worker::control_bytes().ok_or(RenderPlanError::Overflow)?,
++        ]
++        .into_iter()
++        .try_fold(0usize, usize::checked_add)
++        .ok_or(RenderPlanError::Overflow)?;
++        let required = buffers
++            .checked_add(controls)
++            .ok_or(RenderPlanError::Overflow)?;
++        Ok(Self {
++            source,
++            messages,
++            counts,
++            requirements: RenderRequirements {
++                capacities,
++                buffers,
++                required,
++            },
++            #[cfg(feature = "development-closed-chat")]
++            fail: None,
++        })
++    }
++    /// Actual requested layout facts before construction.
++    pub fn requirements(&self) -> RenderRequirements {
++        self.requirements
++    }
++    /// Inject only a real overflow at one selected destination reserve.
++    #[cfg(feature = "development-closed-chat")]
++    pub fn fail_reservation(mut self, buffer: RenderBuffer) -> Self {
++        self.fail = Some(buffer);
++        self
++    }
++    fn requested(&self, buffer: RenderBuffer) -> usize {
++        #[cfg(feature = "development-closed-chat")]
++        if self.fail == Some(buffer) {
++            return usize::MAX;
++        }
++        self.requirements.capacity(buffer)
++    }
++    /// Reserve every destination once, then run the same finite dispatch twice.
++    /// All actual prefix allocations remain in the owning error on failure.
++    pub fn render(self) -> Result<Rendered, RenderError> {
++        let mut data = Rendered {
++            operands: Vec::new(),
++            frames: Vec::new(),
++            locals: Vec::new(),
++            concat: Vec::new(),
++            without: Vec::new(),
++            with: Vec::new(),
++            suffix: Range::new(0, 0),
++        };
++        macro_rules! reserve {
++            ($field:ident, $buffer:ident, $empty:expr) => {
++                if let Err(error) = data
++                    .$field
++                    .try_reserve_exact(self.requested(RenderBuffer::$buffer))
++                {
++                    return Err(RenderError {
++                        data,
++                        cause: RenderCause::Reserve(RenderBuffer::$buffer, error),
++                    });
++                }
++                data.$field
++                    .resize(self.requirements.capacity(RenderBuffer::$buffer), $empty);
++            };
++        }
++        reserve!(operands, Operands, Slot::Undefined);
++        reserve!(frames, Frames, Frame::default());
++        reserve!(locals, Locals, Slot::Undefined);
++        reserve!(concat, Concat, Atom::Source(Range::new(0, 0)));
++        reserve!(without, WithoutPrompt, 0);
++        reserve!(with, WithPrompt, 0);
++        for (index, generation) in [false, true].into_iter().enumerate() {
++            // The previous run has returned with empty stack and no loop frame.
++            // No slot alias survives to the next concat overwrite.
++            let output = if generation {
++                &mut data.with
++            } else {
++                &mut data.without
++            };
++            let result = worker::run(
++                self.source,
++                self.messages,
++                generation,
++                Workspace {
++                    operands: &mut data.operands,
++                    frames: &mut data.frames,
++                    locals: &mut data.locals,
++                    concat: Some(&mut data.concat),
++                    output: Some(output),
++                },
++            );
++            match result {
++                Ok(counts) if counts == self.counts[index] => {}
++                Ok(_) => {
++                    return Err(RenderError {
++                        data,
++                        cause: RenderCause::State(RenderPlanError::Geometry),
++                    })
++                }
++                Err(error) => {
++                    return Err(RenderError {
++                        data,
++                        cause: RenderCause::State(failure(self.source, error)),
++                    })
++                }
++            }
++        }
++        data.suffix = if data.with.starts_with(&data.without) {
++            Range::new(data.without.len(), data.with.len() - data.without.len())
++        } else {
++            Range::new(0, 0)
++        };
++        Ok(data)
++    }
++}
++
++/// Both completed UTF-8 renderings and all original destination capacities.
++/// No mutable, raw-Vec, serde, Clone or ordinary Value conversion is exposed.
++#[derive(Debug)]
++pub struct Rendered {
++    operands: Vec<Slot>,
++    frames: Vec<Frame>,
++    locals: Vec<Slot>,
++    concat: Vec<Atom>,
++    without: Vec<u8>,
++    with: Vec<u8>,
++    suffix: Range,
++}
++impl Rendered {
++    /// Exact selected rendering, borrowed from the retained output destination.
++    pub fn prompt(&self, generation_prompt: bool) -> &str {
++        std::str::from_utf8(if generation_prompt {
++            &self.with
++        } else {
++            &self.without
++        })
++        .expect("UTF-8 span copies")
++    }
++    /// Extra generation suffix only when the false rendering is a true prefix.
++    pub fn generation_suffix(&self) -> &str {
++        self.suffix.text(&self.with).expect("UTF-8 prefix suffix")
++    }
++    /// Actual capacities, including still-retained scratch and partial outputs.
++    pub fn retained_buffer_bytes(&self) -> usize {
++        self.operands.capacity() * size_of::<Slot>()
++            + self.frames.capacity() * size_of::<Frame>()
++            + self.locals.capacity() * size_of::<Slot>()
++            + self.concat.capacity() * size_of::<Atom>()
++            + self.without.capacity()
++            + self.with.capacity()
++    }
++}
++/// Actual reserve cause or a fixed checked shared-worker state failure.
++#[derive(Debug)]
++pub enum RenderCause {
++    /// The selected destination's own real TryReserveError.
++    Reserve(RenderBuffer, TryReserveError),
++    /// Checked execution state or arithmetic failed; the source stays borrowed
++    /// through return, and the consumer retains its original source owner.
++    State(RenderPlanError),
++}
++impl fmt::Display for RenderCause {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("closed chat render failed")
++    }
++}
++impl std::error::Error for RenderCause {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Reserve(_, error) => Some(error),
++            Self::State(error) => Some(error),
++        }
++    }
++}
++/// By-value failure retaining all completed real destination prefixes.
++#[derive(Debug)]
++pub struct RenderError {
++    data: Rendered,
++    cause: RenderCause,
++}
++impl RenderError {
++    /// Real failure without allocating an error wrapper.
++    pub fn cause(&self) -> &RenderCause {
++        &self.cause
++    }
++    /// Actual storage still retained by this owning error.
++    pub fn retained_buffer_bytes(&self) -> usize {
++        self.data.retained_buffer_bytes()
++    }
++}
++impl fmt::Display for RenderError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        fmt::Display::fmt(&self.cause, f)
++    }
++}
++impl std::error::Error for RenderError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        Some(&self.cause)
++    }
++}
+--- /dev/null
++++ b/src/bounded/source.rs
+@@ -0,0 +1,495 @@
++use std::alloc::Layout;
++use std::collections::TryReserveError;
++use std::fmt;
++use std::mem::size_of;
++
++use crate::{default_auto_escape_callback, AutoEscape, UndefinedBehavior};
++
++use super::recipe;
++
++/// Exact decoded source of the checked compiler image. This readonly static
++/// text is profile data, never an allocation grant or source-owner witness.
++/// Adapters for encoded input must retain and validate their genuine input
++/// borrow before using this equivalent decoded value for fresh construction.
++pub fn supported_source() -> &'static str {
++    recipe::SOURCE
++}
++
++/// Actual template/cache name selected by the text-only sidecar route.
++#[derive(Clone, Copy, Debug)]
++pub enum TemplateName<'a> {
++    /// An unqualified template uses this exact existing name.
++    Single(&'a str),
++    /// A selected named `default` entry uses the ordinary composed name.
++    Default(&'a str),
++}
++impl<'a> TemplateName<'a> {
++    fn parts(self) -> [&'a str; 2] {
++        match self {
++            Self::Single(name) => [name, ""],
++            Self::Default(name) => [name, "::chat_template::default"],
++        }
++    }
++    fn byte_len(self) -> Result<usize, SourceError> {
++        let parts = self.parts();
++        parts[0]
++            .len()
++            .checked_add(parts[1].len())
++            .ok_or(SourceError::Overflow)
++    }
++    fn escape(self) -> AutoEscape {
++        match self {
++            Self::Single(name) => default_auto_escape_callback(name),
++            // The actual composed name ends in ::chat_template::default, so
++            // none of the ordinary filename suffixes can select escaping.
++            Self::Default(_) => default_auto_escape_callback("::chat_template::default"),
++        }
++    }
++}
++
++/// The actual scalar ordinary settings represented by the emitted source.
++#[derive(Clone, Copy, Debug)]
++pub struct TemplateSettings {
++    /// Strip the first newline after a block.
++    pub trim_blocks: bool,
++    /// Strip leading block whitespace.
++    pub lstrip_blocks: bool,
++    /// Retain a trailing template newline.
++    pub keep_trailing_newline: bool,
++    /// Ordinary undefined-value policy.
++    pub undefined_behavior: UndefinedBehavior,
++}
++impl TemplateSettings {
++    /// The settings installed by the ordinary text chat environment.
++    pub const fn text_chat() -> Self {
++        Self {
++            trim_blocks: true,
++            lstrip_blocks: true,
++            keep_trailing_newline: false,
++            undefined_behavior: UndefinedBehavior::Lenient,
++        }
++    }
++    fn matches(self) -> bool {
++        self.trim_blocks
++            && self.lstrip_blocks
++            && !self.keep_trailing_newline
++            && self.undefined_behavior == UndefinedBehavior::Lenient
++    }
++}
++
++/// Fixed source rejection, requiring no allocated error string.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SourceError {
++    /// This exact decoded source has no checked image yet.
++    Profile,
++    /// Actual compilation settings or selected escaping differ.
++    Settings,
++    /// Checked destination arithmetic exceeded the addressable layout.
++    Overflow,
++    /// The sealed image did not satisfy its control-flow invariants.
++    Geometry,
++}
++impl fmt::Display for SourceError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(match self {
++            Self::Profile => "chat source construction profile is unfinished",
++            Self::Settings => "chat source settings differ from the compiled image",
++            Self::Overflow => "chat source layout overflow",
++            Self::Geometry => "invalid checked chat instruction geometry",
++        })
++    }
++}
++impl std::error::Error for SourceError {}
++
++/// The three actual source destinations, in construction order.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum SourceBuffer {
++    /// Pointer-free ordinary instruction records.
++    Instructions,
++    /// Copied source, literal/lookup strings and actual selected name.
++    Bytes,
++    /// One actual source location per emitted instruction.
++    Locations,
++}
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) struct Range {
++    pub start: usize,
++    pub len: usize,
++}
++impl Range {
++    pub const fn new(start: usize, len: usize) -> Self {
++        Self { start, len }
++    }
++    pub fn text(self, bytes: &[u8]) -> Option<&str> {
++        let end = self.start.checked_add(self.len)?;
++        std::str::from_utf8(bytes.get(self.start..end)?).ok()
++    }
++}
++
++#[derive(Clone, Copy, Debug)]
++pub(super) enum Instruction {
++    Lookup(Range),
++    StoreLocal(Range),
++    GetAttr(Range),
++    GetItem,
++    Literal(Range),
++    Zero,
++    Add,
++    Ne,
++    Emit,
++    PushLoop(u8),
++    Iterate(u32),
++    PopLoopFrame,
++    Jump(u32),
++    JumpIfFalse(u32),
++    JumpIfFalseOrPop(u32),
++}
++#[derive(Clone, Copy, Debug)]
++pub(super) struct Span {
++    pub start_line: usize,
++    pub start_col: usize,
++    pub start_offset: usize,
++    pub end_line: usize,
++    pub end_col: usize,
++    pub end_offset: usize,
++}
++#[derive(Clone, Copy, Debug)]
++pub(super) struct Location {
++    pub line: usize,
++    pub span: Option<Span>,
++}
++#[derive(Clone, Copy, Debug)]
++pub(super) struct Geometry {
++    pub operands: usize,
++    pub frames: usize,
++    pub locals: usize,
++}
++
++/// Checked requested layouts; no public constructor accepts a byte grant.
++#[derive(Clone, Copy, Debug)]
++pub struct CompileRequirements {
++    capacities: [usize; 3],
++    buffers: usize,
++    required: usize,
++}
++impl CompileRequirements {
++    /// Requested element count of one actual destination.
++    pub fn capacity(self, buffer: SourceBuffer) -> usize {
++        self.capacities[index(buffer)]
++    }
++    /// Sum of the three requested allocation layouts.
++    pub fn buffer_bytes(self) -> usize {
++        self.buffers
++    }
++    /// Buffer layouts and concrete plan/partial/return controls, excluding a
++    /// caller's future Arc/account wrapper, which it must price separately.
++    pub fn required_bytes(self) -> usize {
++        self.required
++    }
++}
++fn index(buffer: SourceBuffer) -> usize {
++    match buffer {
++        SourceBuffer::Instructions => 0,
++        SourceBuffer::Bytes => 1,
++        SourceBuffer::Locations => 2,
++    }
++}
++fn layout<T>(n: usize) -> Result<usize, SourceError> {
++    Layout::array::<T>(n)
++        .map(|l| l.size())
++        .map_err(|_| SourceError::Overflow)
++}
++
++/// A genuine borrowed source and name, retained until the one construction ends.
++/// It is neither Clone nor an owning compiled-template adoption API.
++#[derive(Debug)]
++pub struct CompilePlan<'a> {
++    source: &'a str,
++    name: TemplateName<'a>,
++    geometry: Geometry,
++    requirements: CompileRequirements,
++    #[cfg(feature = "development-closed-chat")]
++    fail: Option<SourceBuffer>,
++}
++impl<'a> CompilePlan<'a> {
++    /// Select an image by exact decoded source and actual scalar settings/name.
++    /// No Environment, parser, compiler cache or allocation is constructed.
++    pub fn prepare(
++        source: &'a str,
++        name: TemplateName<'a>,
++        settings: TemplateSettings,
++    ) -> Result<Self, SourceError> {
++        if source != recipe::SOURCE {
++            return Err(SourceError::Profile);
++        }
++        if !settings.matches() || name.escape() != AutoEscape::None {
++            return Err(SourceError::Settings);
++        }
++        let geometry = validate_image()?;
++        let bytes = recipe::BYTES
++            .len()
++            .checked_add(name.byte_len()?)
++            .ok_or(SourceError::Overflow)?;
++        let capacities = [recipe::INSTRUCTIONS.len(), bytes, recipe::LOCATIONS.len()];
++        let buffers = layout::<Instruction>(capacities[0])?
++            .checked_add(layout::<u8>(capacities[1])?)
++            .and_then(|n| n.checked_add(layout::<Location>(capacities[2]).ok()?))
++            .ok_or(SourceError::Overflow)?;
++        // Explicit fixed validation/constructor populations accompany the
++        // requested Vec layouts. This sum names Rust control representations;
++        // it is not a claim about generated machine-stack frame sizes.
++        let controls = [
++            size_of::<Self>(),
++            size_of::<PreparedTemplate>(),
++            size_of::<Result<PreparedTemplate, CompileError>>(),
++            size_of::<CompileError>(),
++            size_of::<CompileCause>(),
++            size_of::<Result<(), TryReserveError>>(),
++            size_of::<CompileRequirements>(),
++            size_of::<Geometry>(),
++            size_of::<Result<Geometry, SourceError>>(),
++            size_of::<[Option<usize>; 40]>(), // actual validate_image worklist
++            size_of::<[(usize, usize); 2]>(), // its two actual outgoing edges
++            size_of::<(usize, isize)>(),      // minimum/delta of the current opcode
++            size_of::<[usize; 6]>(),          // pc/depth/after/maximum/target/value
++            size_of::<bool>(),                // changed flag
++            size_of::<[usize; 3]>(),          // requested capacities
++            size_of::<[&str; 2]>(),           // selected name parts
++            size_of::<Layout>(),
++        ]
++        .into_iter()
++        .try_fold(0usize, usize::checked_add)
++        .ok_or(SourceError::Overflow)?;
++        let required = buffers.checked_add(controls).ok_or(SourceError::Overflow)?;
++        Ok(Self {
++            source,
++            name,
++            geometry,
++            requirements: CompileRequirements {
++                capacities,
++                buffers,
++                required,
++            },
++            #[cfg(feature = "development-closed-chat")]
++            fail: None,
++        })
++    }
++    /// Exact requirements before any construction reserve.
++    pub fn requirements(&self) -> CompileRequirements {
++        self.requirements
++    }
++    /// Development-only capacity overflow at the selected real reserve site.
++    #[cfg(feature = "development-closed-chat")]
++    pub fn fail_reservation(mut self, buffer: SourceBuffer) -> Self {
++        self.fail = Some(buffer);
++        self
++    }
++    fn requested(&self, buffer: SourceBuffer) -> usize {
++        #[cfg(feature = "development-closed-chat")]
++        if self.fail == Some(buffer) {
++            return usize::MAX;
++        }
++        self.requirements.capacity(buffer)
++    }
++    /// Attempt each real allocation once, retaining all completed prefixes on
++    /// failure. No shrink, recompile, retry, or accounting handoff follows.
++    pub fn compile(self) -> Result<PreparedTemplate, CompileError> {
++        let mut data = PreparedTemplate {
++            instructions: Vec::new(),
++            bytes: Vec::new(),
++            locations: Vec::new(),
++            name: Range::new(
++                recipe::BYTES.len(),
++                self.name.byte_len().expect("checked name"),
++            ),
++            geometry: self.geometry,
++        };
++        macro_rules! reserve {
++            ($field:ident, $buffer:ident) => {
++                if let Err(error) = data
++                    .$field
++                    .try_reserve_exact(self.requested(SourceBuffer::$buffer))
++                {
++                    return Err(CompileError {
++                        data,
++                        cause: CompileCause::Reserve(SourceBuffer::$buffer, error),
++                    });
++                }
++            };
++        }
++        reserve!(instructions, Instructions);
++        data.instructions.extend_from_slice(&recipe::INSTRUCTIONS);
++        reserve!(bytes, Bytes);
++        // Copy the actual borrow, then the already source-checked decoded image
++        // strings. Runtime addresses never enter instructions or identity.
++        data.bytes.extend_from_slice(self.source.as_bytes());
++        data.bytes
++            .extend_from_slice(&recipe::BYTES.as_bytes()[self.source.len()..]);
++        for part in self.name.parts() {
++            data.bytes.extend_from_slice(part.as_bytes());
++        }
++        reserve!(locations, Locations);
++        data.locations.extend_from_slice(&recipe::LOCATIONS);
++        Ok(data)
++    }
++}
++
++/// Fresh closed source storage, with readonly projections and no ordinary
++/// Environment/Value/compiled-template conversion, Clone or serde escape.
++#[derive(Debug)]
++pub struct PreparedTemplate {
++    pub(super) instructions: Vec<Instruction>,
++    pub(super) bytes: Vec<u8>,
++    pub(super) locations: Vec<Location>,
++    name: Range,
++    pub(super) geometry: Geometry,
++}
++impl PreparedTemplate {
++    /// Actual selected template name retained in source storage.
++    pub fn name(&self) -> &str {
++        self.name.text(&self.bytes).expect("constructed name")
++    }
++    /// Actual decoded, source-matched template text.
++    pub fn source(&self) -> &str {
++        Range::new(0, recipe::SOURCE.len())
++            .text(&self.bytes)
++            .expect("constructed source")
++    }
++    /// Number of emitted ordinary instructions.
++    pub fn instruction_count(&self) -> usize {
++        self.instructions.len()
++    }
++    /// Actual retained destination capacities, also meaningful for partial errors.
++    pub fn retained_buffer_bytes(&self) -> usize {
++        self.instructions.capacity() * size_of::<Instruction>()
++            + self.bytes.capacity()
++            + self.locations.capacity() * size_of::<Location>()
++    }
++}
++/// Actual reserve failure from its selected destination.
++#[derive(Debug)]
++pub enum CompileCause {
++    /// Source buffer and actual TryReserveError.
++    Reserve(SourceBuffer, TryReserveError),
++}
++impl fmt::Display for CompileCause {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str("chat source destination reserve failed")
++    }
++}
++impl std::error::Error for CompileCause {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Reserve(_, e) => Some(e),
++        }
++    }
++}
++/// Owns the exact real partial buffers until its final destruction.
++#[derive(Debug)]
++pub struct CompileError {
++    data: PreparedTemplate,
++    cause: CompileCause,
++}
++impl CompileError {
++    /// The real reserve cause, without allocating erasure.
++    pub fn cause(&self) -> &CompileCause {
++        &self.cause
++    }
++    /// Actual partial destination capacity still retained by this error.
++    pub fn retained_buffer_bytes(&self) -> usize {
++        self.data.retained_buffer_bytes()
++    }
++}
++impl fmt::Display for CompileError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        fmt::Display::fmt(&self.cause, f)
++    }
++}
++impl std::error::Error for CompileError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        Some(&self.cause)
++    }
++}
++
++fn validate_image() -> Result<Geometry, SourceError> {
++    let code = &recipe::INSTRUCTIONS;
++    if code.len() != recipe::LOCATIONS.len() {
++        return Err(SourceError::Geometry);
++    }
++    let mut depths = [None; 40];
++    depths[0] = Some(0usize);
++    let mut maximum = 0;
++    // Each newly reachable entry is installed once; no heap worklist exists.
++    for _ in 0..=code.len() {
++        let mut changed = false;
++        for (pc, instruction) in code.iter().enumerate() {
++            let Some(depth) = depths[pc] else { continue };
++            maximum = maximum.max(depth);
++            let (minimum, delta) = match instruction {
++                Instruction::Lookup(_) | Instruction::Literal(_) | Instruction::Zero => (0, 1isize),
++                Instruction::StoreLocal(_)
++                | Instruction::Emit
++                | Instruction::PushLoop(_)
++                | Instruction::JumpIfFalse(_) => (1, -1),
++                Instruction::GetAttr(_) | Instruction::JumpIfFalseOrPop(_) => (1, 0),
++                Instruction::GetItem | Instruction::Add | Instruction::Ne => (2, -1),
++                _ => (0, 0),
++            };
++            if depth < minimum {
++                return Err(SourceError::Geometry);
++            }
++            let after = depth
++                .checked_add_signed(delta)
++                .ok_or(SourceError::Geometry)?;
++            let mut edges = [(pc + 1, after), (usize::MAX, 0)];
++            match instruction {
++                Instruction::Jump(target) => edges[0] = (*target as usize, depth),
++                Instruction::Iterate(target) => {
++                    edges = [(pc + 1, depth + 1), (*target as usize, depth)]
++                }
++                Instruction::JumpIfFalse(target) => edges[1] = (*target as usize, after),
++                Instruction::JumpIfFalseOrPop(target) => {
++                    edges = [(pc + 1, depth - 1), (*target as usize, depth)]
++                }
++                _ => {}
++            }
++            for (target, value) in edges {
++                if target == usize::MAX {
++                    continue;
++                }
++                if target > code.len() || (target <= pc && (pc != 33 || target != 2)) {
++                    return Err(SourceError::Geometry);
++                }
++                if let Some(existing) = depths[target] {
++                    if existing != value {
++                        return Err(SourceError::Geometry);
++                    }
++                } else {
++                    depths[target] = Some(value);
++                    changed = true;
++                }
++            }
++        }
++        if !changed {
++            break;
++        }
++    }
++    if depths.iter().any(Option::is_none) || depths[39] != Some(0) || maximum != 3 {
++        return Err(SourceError::Geometry);
++    }
++    if !matches!(code[1], Instruction::PushLoop(1))
++        || !matches!(code[2], Instruction::Iterate(34))
++        || !matches!(code[3], Instruction::StoreLocal(_))
++        || !matches!(code[34], Instruction::PopLoopFrame)
++    {
++        return Err(SourceError::Geometry);
++    }
++    // These slots follow the one actual emitted message-loop frame/local; the
++    // root context lives inline in the closed execution control.
++    Ok(Geometry {
++        operands: maximum,
++        frames: 1,
++        locals: 1,
++    })
++}
+--- /dev/null
++++ b/src/bounded/tests.rs
+@@ -0,0 +1,295 @@
++use super::*;
++
++fn source() -> PreparedTemplate {
++    CompilePlan::prepare(
++        recipe::SOURCE,
++        TemplateName::Single("chat"),
++        TemplateSettings::text_chat(),
++    )
++    .unwrap()
++    .compile()
++    .unwrap()
++}
++
++#[test]
++fn exact_source_settings_name_and_real_source_reserve_prefixes() {
++    assert!(matches!(
++        CompilePlan::prepare(
++            "",
++            TemplateName::Single("chat"),
++            TemplateSettings::text_chat()
++        ),
++        Err(SourceError::Profile)
++    ));
++    assert!(matches!(
++        CompilePlan::prepare(
++            recipe::SOURCE,
++            TemplateName::Single("chat.html"),
++            TemplateSettings::text_chat()
++        ),
++        Err(SourceError::Settings)
++    ));
++    let mut settings = TemplateSettings::text_chat();
++    settings.lstrip_blocks = false;
++    assert!(matches!(
++        CompilePlan::prepare(recipe::SOURCE, TemplateName::Single("chat"), settings),
++        Err(SourceError::Settings)
++    ));
++    let source = CompilePlan::prepare(
++        recipe::SOURCE,
++        TemplateName::Default("chat.html"),
++        TemplateSettings::text_chat(),
++    )
++    .unwrap()
++    .compile()
++    .unwrap();
++    assert_eq!(source.name(), "chat.html::chat_template::default");
++    assert_eq!(source.source(), recipe::SOURCE);
++    assert_eq!(source.instruction_count(), 39);
++    #[cfg(feature = "development-closed-chat")]
++    for (index, buffer) in [
++        SourceBuffer::Instructions,
++        SourceBuffer::Bytes,
++        SourceBuffer::Locations,
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let plan = CompilePlan::prepare(
++            recipe::SOURCE,
++            TemplateName::Single("chat"),
++            TemplateSettings::text_chat(),
++        )
++        .unwrap();
++        let error = plan.fail_reservation(buffer).compile().unwrap_err();
++        assert!(matches!(error.cause(), CompileCause::Reserve(actual, _) if *actual==buffer));
++        assert_eq!(error.retained_buffer_bytes() > 0, index != 0);
++        if index == 2 {
++            assert!(error.retained_buffer_bytes() > recipe::BYTES.len());
++        }
++        assert!(std::error::Error::source(error.cause()).is_some());
++    }
++}
++
++#[cfg(feature = "json")]
++#[test]
++fn shared_dispatch_matches_ordinary_empty_system_unicode_and_generation_settings() {
++    let source = source();
++    let mut ordinary = crate::Environment::new();
++    ordinary.set_trim_blocks(true);
++    ordinary.set_lstrip_blocks(true);
++    ordinary.set_keep_trailing_newline(false);
++    ordinary.set_undefined_behavior(crate::UndefinedBehavior::Lenient);
++    ordinary.add_template("chat", recipe::SOURCE).unwrap();
++    let template = ordinary.get_template("chat").unwrap();
++    let cases = [
++        serde_json::json!([]),
++        serde_json::json!([{"role":"system","content":""}]),
++        serde_json::json!([{"role":"user","content":"Hello e\u{301}\0 世界\n<|im_end|>"}]),
++        serde_json::json!([{"role":"system","content":"Rules"},{"role":"user","content":"question"},{"role":"assistant","content":"answer"}]),
++        serde_json::json!([{"role":"","content":""},{"role":"assistant","content":"é"}]),
++    ];
++    for input in cases {
++        let messages = Messages::from_json(input.as_array().unwrap()).unwrap();
++        let plan = RenderPlan::prepare(&source, messages).unwrap();
++        let requirements = plan.requirements();
++        assert_eq!(
++            requirements.capacity(RenderBuffer::Concat),
++            20 * messages.len()
++        );
++        let rendered = plan.render().unwrap();
++        for generation in [false, true] {
++            let expected = template
++                .render(serde_json::json!({"messages":input,"add_generation_prompt":generation}))
++                .unwrap();
++            assert_eq!(rendered.prompt(generation), expected);
++            assert_eq!(
++                rendered.prompt(generation).len(),
++                requirements.capacity(if generation {
++                    RenderBuffer::WithPrompt
++                } else {
++                    RenderBuffer::WithoutPrompt
++                })
++            );
++        }
++        let expected_suffix = rendered
++            .prompt(true)
++            .strip_prefix(rendered.prompt(false))
++            .unwrap_or("");
++        assert_eq!(rendered.generation_suffix(), expected_suffix);
++        assert_eq!(
++            rendered.retained_buffer_bytes(),
++            requirements.buffer_bytes()
++        );
++    }
++}
++
++#[cfg(feature = "json")]
++#[test]
++fn actual_borrowed_json_and_typed_messages_reject_unread_fields_without_a_copy() {
++    let source = source();
++    let raw = serde_json::json!([{"role":"user","content":"héllo"}]);
++    let messages = Messages::from_json(raw.as_array().unwrap()).unwrap();
++    let typed = [TextMessage {
++        role: raw[0]["role"].as_str().unwrap(),
++        content: raw[0]["content"].as_str().unwrap(),
++    }];
++    let actual = RenderPlan::prepare(&source, messages)
++        .unwrap()
++        .render()
++        .unwrap();
++    let expected = RenderPlan::prepare(&source, Messages::from_text(&typed))
++        .unwrap()
++        .render()
++        .unwrap();
++    assert_eq!(actual.prompt(false), expected.prompt(false));
++    assert_eq!(actual.prompt(true), expected.prompt(true));
++    assert_eq!(
++        messages.get(0).unwrap().content.as_ptr(),
++        typed[0].content.as_ptr()
++    );
++    for invalid in [
++        serde_json::json!([{"role":"user","content":null}]),
++        serde_json::json!([{"role":"user","content":"x","tool_calls":[]}]),
++        serde_json::json!([{"role":"user"}]),
++        serde_json::json!(["user"]),
++    ] {
++        assert_eq!(
++            Messages::from_json(invalid.as_array().unwrap()).unwrap_err(),
++            InputError::MessageProfile
++        );
++    }
++}
++
++#[cfg(feature = "development-closed-chat")]
++#[test]
++fn every_real_render_reserve_keeps_completed_destination_prefixes() {
++    let source = source();
++    let raw = [TextMessage {
++        role: "user",
++        content: "nonempty",
++    }];
++    for (index, buffer) in [
++        RenderBuffer::Operands,
++        RenderBuffer::Frames,
++        RenderBuffer::Locals,
++        RenderBuffer::Concat,
++        RenderBuffer::WithoutPrompt,
++        RenderBuffer::WithPrompt,
++    ]
++    .into_iter()
++    .enumerate()
++    {
++        let plan = RenderPlan::prepare(&source, Messages::from_text(&raw)).unwrap();
++        let requirements = plan.requirements();
++        let error = plan.fail_reservation(buffer).render().unwrap_err();
++        assert!(matches!(error.cause(),RenderCause::Reserve(actual,_) if *actual==buffer));
++        assert_eq!(error.retained_buffer_bytes() > 0, index != 0);
++        assert!(error.retained_buffer_bytes() < requirements.buffer_bytes());
++        assert!(std::error::Error::source(error.cause()).is_some());
++        assert_eq!(source.source(), recipe::SOURCE);
++    }
++}
++
++#[cfg(feature = "json")]
++#[test]
++fn ordinary_recursive_loop_restores_parent_frames_through_shared_dispatch() {
++    let mut env = crate::Environment::new();
++    env.add_template(
++        "recursive",
++        "{% for node in nodes recursive %}{{ loop.depth }}:{{ node.name }}[{{ loop(node.children) }}]{% endfor %}",
++    )
++    .unwrap();
++    let nodes = serde_json::json!([
++        {"name":"A","children":[
++            {"name":"B","children":[]},
++            {"name":"C","children":[{"name":"D","children":[]}]}
++        ]},
++        {"name":"E","children":[]}
++    ]);
++    assert_eq!(
++        env.get_template("recursive")
++            .unwrap()
++            .render(serde_json::json!({"nodes":nodes}))
++            .unwrap(),
++        "1:A[2:B[]2:C[3:D[]]]1:E[]"
++    );
++}
++
++#[test]
++fn ordinary_formatter_and_strict_undefined_keep_original_emit_contract() {
++    use std::sync::{
++        atomic::{AtomicUsize, Ordering},
++        Arc,
++    };
++    let calls = Arc::new(AtomicUsize::new(0));
++    let observed = Arc::clone(&calls);
++    let mut env = crate::Environment::new();
++    env.set_formatter(move |out, state, value| {
++        observed.fetch_add(1, Ordering::SeqCst);
++        crate::escape_formatter(
++            out,
++            state,
++            &crate::value::Value::from(format!("[{}]", value)),
++        )
++    });
++    env.add_template("ordinary.html", "{{ payload }}|{{ 2+3 }}")
++        .unwrap();
++    assert_eq!(
++        env.get_template("ordinary.html")
++            .unwrap()
++            .render(crate::context!(payload => "<&>"))
++            .unwrap(),
++        "[&lt;&amp;&gt;]|[5]"
++    );
++    assert_eq!(calls.load(Ordering::SeqCst), 2);
++    env.set_undefined_behavior(crate::UndefinedBehavior::Strict);
++    env.add_template("strict", "\n{{ missing }}").unwrap();
++    let error = env.get_template("strict").unwrap().render(()).unwrap_err();
++    assert_eq!(error.kind(), crate::ErrorKind::UndefinedError);
++    assert_eq!(error.name(), Some("strict"));
++    assert_eq!(error.line(), Some(2));
++    // Strict validation precedes even the ordinary custom formatter callback.
++    assert_eq!(calls.load(Ordering::SeqCst), 2);
++}
++
++#[cfg(feature = "fuel")]
++#[test]
++fn ordinary_fuel_is_consumed_before_shared_instruction_dispatch() {
++    let mut env = crate::Environment::new();
++    env.set_fuel(Some(1));
++    env.add_template("fuel", "{{ payload }}").unwrap();
++    let error = env
++        .get_template("fuel")
++        .unwrap()
++        .render(crate::context!(payload => "nonempty"))
++        .unwrap_err();
++    assert_eq!(error.kind(), crate::ErrorKind::OutOfFuel);
++    assert_eq!(error.name(), Some("fuel"));
++    env.set_fuel(Some(100));
++    assert_eq!(
++        env.get_template("fuel")
++            .unwrap()
++            .render(crate::context!(payload => "nonempty"))
++            .unwrap(),
++        "nonempty"
++    );
++}
++
++#[cfg(feature = "loop_controls")]
++#[test]
++fn ordinary_break_continue_keep_shared_loop_frame_transitions() {
++    let mut env = crate::Environment::new();
++    env.add_template(
++        "controls",
++        "{% for n in values %}{% if n == 2 %}{% continue %}{% endif %}{% if n == 4 %}{% break %}{% endif %}{{ n }}{% endfor %}",
++    )
++    .unwrap();
++    assert_eq!(
++        env.get_template("controls")
++            .unwrap()
++            .render(crate::context!(values => [1, 2, 3, 4, 5]))
++            .unwrap(),
++        "13"
++    );
++}
+--- /dev/null
++++ b/src/bounded/worker.rs
+@@ -0,0 +1,485 @@
++//! Concrete storage for the same instruction dispatcher as the ordinary VM.
++use crate::vm::shared::{self, Next, Op, Storage};
++
++use super::input::Messages;
++use super::source::{Instruction, PreparedTemplate, Range};
++
++#[derive(Clone, Copy, Debug)]
++pub(super) enum Atom {
++    Source(Range),
++    Role(usize),
++    Content(usize),
++}
++#[derive(Clone, Copy, Debug)]
++pub(super) enum Text {
++    Atom(Atom),
++    Concat {
++        start: usize,
++        count: usize,
++        bytes: usize,
++    },
++}
++#[derive(Clone, Copy, Debug)]
++pub(super) enum Slot {
++    Undefined,
++    Bool(bool),
++    Zero,
++    Text(Text),
++    Messages,
++    Message(usize),
++    Loop,
++}
++#[derive(Clone, Copy, Debug, Default)]
++pub(super) struct Frame {
++    next: usize,
++    current: Option<usize>,
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(super) enum Error {
++    Geometry,
++    Overflow,
++}
++#[derive(Clone, Copy, Debug)]
++pub(super) struct Failure {
++    pub kind: Error,
++    pub instruction: u32,
++}
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub(super) struct Counts {
++    pub concat: usize,
++    pub output: usize,
++}
++
++pub(super) struct Workspace<'a> {
++    pub operands: &'a mut [Slot],
++    pub frames: &'a mut [Frame],
++    pub locals: &'a mut [Slot],
++    // Measurement counts the same append operations without allocating them.
++    pub concat: Option<&'a mut [Atom]>,
++    pub output: Option<&'a mut [u8]>,
++}
++struct Engine<'source, 'input, 'work> {
++    source: &'source PreparedTemplate,
++    messages: Messages<'input>,
++    generation: bool,
++    workspace: Workspace<'work>,
++    depth: usize,
++    in_loop: bool,
++    counts: Counts,
++    remaining_instructions: usize,
++}
++fn atom_text<'a>(
++    source: &'a PreparedTemplate,
++    messages: Messages<'a>,
++    atom: Atom,
++) -> Result<&'a str, Error> {
++    match atom {
++        Atom::Source(range) => range.text(&source.bytes).ok_or(Error::Geometry),
++        Atom::Role(index) => Ok(messages.get(index).ok_or(Error::Geometry)?.role),
++        Atom::Content(index) => Ok(messages.get(index).ok_or(Error::Geometry)?.content),
++    }
++}
++impl Engine<'_, '_, '_> {
++    fn parts(&self, text: Text) -> Result<(usize, usize), Error> {
++        match text {
++            Text::Atom(atom) => Ok((1, atom_text(self.source, self.messages, atom)?.len())),
++            Text::Concat { count, bytes, .. } => Ok((count, bytes)),
++        }
++    }
++    fn append(&mut self, text: Text) -> Result<(), Error> {
++        let count = self.parts(text)?.0;
++        let end = self
++            .counts
++            .concat
++            .checked_add(count)
++            .ok_or(Error::Overflow)?;
++        if let Some(storage) = self.workspace.concat.as_deref_mut() {
++            if end > storage.len() {
++                return Err(Error::Geometry);
++            }
++            match text {
++                Text::Atom(atom) => storage[self.counts.concat] = atom,
++                Text::Concat { start, count, .. } => {
++                    let previous_end = start.checked_add(count).ok_or(Error::Overflow)?;
++                    // Existing concat prefixes precede the new append; no
++                    // overwritten slot can still be read by the shared Add.
++                    if previous_end > self.counts.concat {
++                        return Err(Error::Geometry);
++                    }
++                    storage.copy_within(start..previous_end, self.counts.concat);
++                }
++            }
++        }
++        self.counts.concat = end;
++        Ok(())
++    }
++    fn emit_atom(&mut self, atom: Atom) -> Result<(), Error> {
++        let text = atom_text(self.source, self.messages, atom)?;
++        let end = self
++            .counts
++            .output
++            .checked_add(text.len())
++            .ok_or(Error::Overflow)?;
++        if let Some(output) = self.workspace.output.as_deref_mut() {
++            output
++                .get_mut(self.counts.output..end)
++                .ok_or(Error::Geometry)?
++                .copy_from_slice(text.as_bytes());
++        }
++        self.counts.output = end;
++        Ok(())
++    }
++}
++impl<'source> Storage<'source> for Engine<'source, '_, '_> {
++    type Value = Slot;
++    type Error = Error;
++    fn pop(&mut self) -> Result<Slot, Error> {
++        self.depth = self.depth.checked_sub(1).ok_or(Error::Geometry)?;
++        let slot = *self
++            .workspace
++            .operands
++            .get(self.depth)
++            .ok_or(Error::Geometry)?;
++        self.workspace.operands[self.depth] = Slot::Undefined;
++        Ok(slot)
++    }
++    fn peek(&self) -> Result<&Slot, Error> {
++        self.workspace
++            .operands
++            .get(self.depth.checked_sub(1).ok_or(Error::Geometry)?)
++            .ok_or(Error::Geometry)
++    }
++    fn push(&mut self, value: Slot) -> Result<(), Error> {
++        *self
++            .workspace
++            .operands
++            .get_mut(self.depth)
++            .ok_or(Error::Geometry)? = value;
++        self.depth = self.depth.checked_add(1).ok_or(Error::Overflow)?;
++        Ok(())
++    }
++    fn lookup(&mut self, name: &'source str) -> Result<Slot, Error> {
++        match name {
++            "messages" => Ok(Slot::Messages),
++            "add_generation_prompt" => Ok(Slot::Bool(self.generation)),
++            "loop" if self.in_loop => Ok(Slot::Loop),
++            "message" if self.in_loop => self
++                .workspace
++                .locals
++                .first()
++                .copied()
++                .ok_or(Error::Geometry),
++            _ => Err(Error::Geometry),
++        }
++    }
++    fn store(&mut self, name: &'source str, value: Slot) -> Result<(), Error> {
++        if name != "message" || !self.in_loop || !matches!(value, Slot::Message(_)) {
++            return Err(Error::Geometry);
++        }
++        *self.workspace.locals.first_mut().ok_or(Error::Geometry)? = value;
++        Ok(())
++    }
++    fn attr(&mut self, value: Slot, name: &str) -> Result<Slot, Error> {
++        if matches!(value, Slot::Loop) && name == "first" && self.in_loop {
++            return Ok(Slot::Bool(
++                self.workspace
++                    .frames
++                    .first()
++                    .ok_or(Error::Geometry)?
++                    .current
++                    == Some(0),
++            ));
++        }
++        Err(Error::Geometry)
++    }
++    fn item(&mut self, value: Slot, key: Slot) -> Result<Slot, Error> {
++        match (value, key) {
++            (Slot::Messages, Slot::Zero) => {
++                if self.messages.is_empty() {
++                    Ok(Slot::Undefined)
++                } else {
++                    Ok(Slot::Message(0))
++                }
++            }
++            (Slot::Message(index), Slot::Text(Text::Atom(atom))) => {
++                if self.messages.get(index).is_none() {
++                    return Err(Error::Geometry);
++                }
++                match atom_text(self.source, self.messages, atom)? {
++                    "role" => Ok(Slot::Text(Text::Atom(Atom::Role(index)))),
++                    "content" => Ok(Slot::Text(Text::Atom(Atom::Content(index)))),
++                    _ => Err(Error::Geometry),
++                }
++            }
++            _ => Err(Error::Geometry),
++        }
++    }
++    fn add(&mut self, left: Slot, right: Slot) -> Result<Slot, Error> {
++        let (Slot::Text(left), Slot::Text(right)) = (left, right) else {
++            return Err(Error::Geometry);
++        };
++        let (ln, lb) = self.parts(left)?;
++        let (rn, rb) = self.parts(right)?;
++        let count = ln.checked_add(rn).ok_or(Error::Overflow)?;
++        let bytes = lb.checked_add(rb).ok_or(Error::Overflow)?;
++        let start = self.counts.concat;
++        self.append(left)?;
++        self.append(right)?;
++        Ok(Slot::Text(Text::Concat {
++            start,
++            count,
++            bytes,
++        }))
++    }
++    fn ne(&mut self, left: Slot, right: Slot) -> Result<Slot, Error> {
++        let (Slot::Text(Text::Atom(left)), Slot::Text(Text::Atom(right))) = (left, right) else {
++            return Err(Error::Geometry);
++        };
++        Ok(Slot::Bool(
++            atom_text(self.source, self.messages, left)?
++                != atom_text(self.source, self.messages, right)?,
++        ))
++    }
++    fn truth(&self, value: &Slot) -> Result<bool, Error> {
++        match value {
++            Slot::Undefined | Slot::Zero => Ok(false),
++            Slot::Bool(value) => Ok(*value),
++            Slot::Text(text) => Ok(self.parts(*text)?.1 != 0),
++            Slot::Messages => Ok(!self.messages.is_empty()),
++            Slot::Message(_) | Slot::Loop => Ok(true),
++        }
++    }
++    fn emit(&mut self, value: Slot) -> Result<(), Error> {
++        let Slot::Text(text) = value else {
++            return Err(Error::Geometry);
++        };
++        match text {
++            Text::Atom(atom) => self.emit_atom(atom),
++            Text::Concat {
++                start,
++                count,
++                bytes,
++            } => {
++                if self.workspace.output.is_none() {
++                    self.counts.output = self
++                        .counts
++                        .output
++                        .checked_add(bytes)
++                        .ok_or(Error::Overflow)?;
++                    return Ok(());
++                }
++                let end = start.checked_add(count).ok_or(Error::Overflow)?;
++                if end > self.counts.concat {
++                    return Err(Error::Geometry);
++                }
++                for index in start..end {
++                    let atom = *self
++                        .workspace
++                        .concat
++                        .as_deref()
++                        .and_then(|v| v.get(index))
++                        .ok_or(Error::Geometry)?;
++                    self.emit_atom(atom)?;
++                }
++                Ok(())
++            }
++        }
++    }
++    fn push_loop(&mut self, value: Slot, flags: u8, _pc: u32) -> Result<(), Error> {
++        if !matches!(value, Slot::Messages) || flags != 1 || self.in_loop {
++            return Err(Error::Geometry);
++        }
++        *self.workspace.frames.first_mut().ok_or(Error::Geometry)? = Frame::default();
++        *self.workspace.locals.first_mut().ok_or(Error::Geometry)? = Slot::Undefined;
++        self.in_loop = true;
++        Ok(())
++    }
++    fn next(&mut self) -> Result<Option<Slot>, Error> {
++        if !self.in_loop {
++            return Err(Error::Geometry);
++        }
++        let frame = self.workspace.frames.first_mut().ok_or(Error::Geometry)?;
++        if frame.next == self.messages.len() {
++            return Ok(None);
++        }
++        if frame.next > self.messages.len() {
++            return Err(Error::Geometry);
++        }
++        let index = frame.next;
++        frame.next = frame.next.checked_add(1).ok_or(Error::Overflow)?;
++        frame.current = Some(index);
++        Ok(Some(Slot::Message(index)))
++    }
++    fn pop_loop(&mut self) -> Result<Option<u32>, Error> {
++        if !self.in_loop {
++            return Err(Error::Geometry);
++        }
++        *self.workspace.frames.first_mut().ok_or(Error::Geometry)? = Frame::default();
++        *self.workspace.locals.first_mut().ok_or(Error::Geometry)? = Slot::Undefined;
++        self.in_loop = false;
++        Ok(None)
++    }
++}
++
++pub(super) fn run(
++    source: &PreparedTemplate,
++    messages: Messages<'_>,
++    generation: bool,
++    workspace: Workspace<'_>,
++) -> Result<Counts, Failure> {
++    // The image validator admits one finite message-loop backedge and all
++    // other edges move forward. Each iteration and final traversal visits at
++    // most the actual source instruction count; check the aggregate before
++    // walking input, then enforce it in the same dispatcher loop.
++    let remaining_instructions = messages
++        .len()
++        .checked_add(1)
++        .and_then(|n| n.checked_mul(source.instructions.len()))
++        .ok_or(Failure {
++            kind: Error::Overflow,
++            instruction: 0,
++        })?;
++    let mut engine = Engine {
++        remaining_instructions,
++        source,
++        messages,
++        generation,
++        workspace,
++        depth: 0,
++        in_loop: false,
++        counts: Counts::default(),
++    };
++    engine.workspace.operands.fill(Slot::Undefined);
++    engine.workspace.frames.fill(Frame::default());
++    engine.workspace.locals.fill(Slot::Undefined);
++    let mut pc = 0_u32;
++    let result = (|| {
++        while let Some(instruction) = source.instructions.get(pc as usize) {
++            engine.remaining_instructions = engine
++                .remaining_instructions
++                .checked_sub(1)
++                .ok_or(Error::Geometry)?;
++            let op = match *instruction {
++                Instruction::Lookup(r) => Op::Lookup(r.text(&source.bytes).ok_or(Error::Geometry)?),
++                Instruction::StoreLocal(r) => {
++                    Op::StoreLocal(r.text(&source.bytes).ok_or(Error::Geometry)?)
++                }
++                Instruction::GetAttr(r) => {
++                    Op::GetAttr(r.text(&source.bytes).ok_or(Error::Geometry)?)
++                }
++                Instruction::GetItem => Op::GetItem,
++                Instruction::Literal(r) => Op::LoadConst(Slot::Text(Text::Atom(Atom::Source(r)))),
++                Instruction::Zero => Op::LoadConst(Slot::Zero),
++                Instruction::Add => Op::Add,
++                Instruction::Ne => Op::Ne,
++                Instruction::Emit => Op::Emit,
++                Instruction::PushLoop(flags) => Op::PushLoop(flags),
++                Instruction::Iterate(target) => Op::Iterate(target),
++                Instruction::PopLoopFrame => Op::PopLoopFrame,
++                Instruction::Jump(target) => Op::Jump(target),
++                Instruction::JumpIfFalse(target) => Op::JumpIfFalse(target),
++                Instruction::JumpIfFalseOrPop(target) => Op::JumpIfFalseOrPop(target),
++            };
++            pc = match shared::step(op, pc, &mut engine)? {
++                Next::Advance => pc.checked_add(1).ok_or(Error::Overflow)?,
++                Next::Jump(target) => target,
++            };
++        }
++        if pc as usize != source.instructions.len() || engine.depth != 0 || engine.in_loop {
++            return Err(Error::Geometry);
++        }
++        Ok(engine.counts)
++    })();
++    result.map_err(|kind| Failure {
++        kind,
++        instruction: pc,
++    })
++}
++
++/// Concrete transient controls in addition to the six paid destinations.
++pub(super) fn control_bytes() -> Option<usize> {
++    use std::mem::size_of;
++    size_of::<Engine<'_, '_, '_>>()
++        .checked_add(size_of::<Workspace<'_>>())?
++        .checked_add(size_of::<Op<'_, Slot>>())?
++        .checked_add(size_of::<Result<Next, Error>>())?
++        .checked_add(size_of::<Counts>())?
++        .checked_add(size_of::<Result<Counts, Failure>>())?
++        .checked_add(size_of::<[Slot; 3]>())?
++        .checked_add(size_of::<[Frame; 1]>())?
++        .checked_add(size_of::<[Slot; 1]>())
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::bounded::{
++        supported_source, CompilePlan, TemplateName, TemplateSettings, TextMessage,
++    };
++
++    #[test]
++    fn actual_concat_and_output_checked_frontiers_reject_before_writing() {
++        let source = CompilePlan::prepare(
++            supported_source(),
++            TemplateName::Single("frontier"),
++            TemplateSettings::text_chat(),
++        )
++        .unwrap()
++        .compile()
++        .unwrap();
++        let messages = [TextMessage {
++            role: "user",
++            content: "é",
++        }];
++        let mut operands = [Slot::Undefined; 3];
++        let mut frames = [Frame::default(); 1];
++        let mut locals = [Slot::Undefined; 1];
++        let mut concat = [Atom::Role(0); 2];
++        let mut output = [0xA5; 4];
++        let mut engine = Engine {
++            source: &source,
++            messages: Messages::from_text(&messages),
++            generation: false,
++            workspace: Workspace {
++                operands: &mut operands,
++                frames: &mut frames,
++                locals: &mut locals,
++                concat: Some(&mut concat),
++                output: Some(&mut output),
++            },
++            depth: 0,
++            in_loop: false,
++            counts: Counts {
++                concat: usize::MAX,
++                output: usize::MAX,
++            },
++            remaining_instructions: 1,
++        };
++        // Private unit setup targets the real checked accumulators. No public
++        // capacity, source/input length or successful fake profile is supplied.
++        assert_eq!(
++            engine.append(Text::Atom(Atom::Content(0))),
++            Err(Error::Overflow)
++        );
++        assert_eq!(engine.emit_atom(Atom::Content(0)), Err(Error::Overflow));
++        let huge = Slot::Text(Text::Concat {
++            start: 0,
++            count: 1,
++            bytes: usize::MAX,
++        });
++        assert!(matches!(
++            engine.add(huge, Slot::Text(Text::Atom(Atom::Role(0)))),
++            Err(Error::Overflow)
++        ));
++        assert_eq!(
++            engine.counts,
++            Counts {
++                concat: usize::MAX,
++                output: usize::MAX
++            }
++        );
++        drop(engine);
++        assert!(concat.iter().all(|atom| matches!(atom, Atom::Role(0))));
++        assert_eq!(output, [0xA5; 4]);
++    }
++}
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -220,6 +220,7 @@
+ mod vendor;
+ mod vm;
+ 
++pub mod bounded;
+ pub mod filters;
+ pub mod functions;
+ pub mod syntax;
+--- a/src/vm/mod.rs
++++ b/src/vm/mod.rs
+@@ -11,11 +11,9 @@
+ use crate::environment::Environment;
+ use crate::error::{Error, ErrorKind};
+ use crate::output::{CaptureMode, Output};
+-use crate::utils::{untrusted_size_hint, write_escaped, AutoEscape, UndefinedBehavior};
++use crate::utils::{untrusted_size_hint, AutoEscape, UndefinedBehavior};
+ use crate::value::namespace_object::Namespace;
+-use crate::value::{
+-    ops, value_map_with_capacity, Kwargs, ObjectRepr, UndefinedType, Value, ValueMap, ValueRepr,
+-};
++use crate::value::{ops, value_map_with_capacity, Kwargs, ObjectRepr, Value, ValueMap};
+ use crate::vm::context::{Frame, Stack};
+ use crate::vm::loop_object::{Loop, LoopState};
+ use crate::vm::state::BlockStack;
+@@ -36,6 +34,7 @@
+ mod macro_object;
+ #[cfg(feature = "multi_template")]
+ mod module_object;
++pub(crate) mod shared;
+ mod state;
+ 
+ // the cost of a single include against the stack limit.
+@@ -320,7 +319,44 @@
+                 ctx_ok!(tracker.track(instr));
+             }
+ 
++            // The selected instructions share operand ordering and transitions
++            // with the closed source-bound storage implementation.
++            if let Some(op) = shared::ordinary(instr) {
++                let result = shared::step(
++                    op,
++                    pc,
++                    &mut shared::ordinary::Ordinary {
++                        vm: self,
++                        state,
++                        stack: &mut stack,
++                        output: out,
++                        next_loop_recursion_jump: &mut next_loop_recursion_jump,
++                        undefined_behavior,
++                        strict_undefined,
++                    },
++                );
++                match ctx_ok!(result) {
++                    shared::Next::Advance => pc += 1,
++                    shared::Next::Jump(target) => pc = target,
++                }
++                continue;
++            }
++
+             match instr {
++                Instruction::Emit
++                | Instruction::StoreLocal(_)
++                | Instruction::Lookup(_)
++                | Instruction::GetAttr(_)
++                | Instruction::GetItem
++                | Instruction::LoadConst(_)
++                | Instruction::Add
++                | Instruction::Ne
++                | Instruction::PopLoopFrame
++                | Instruction::PushLoop(_)
++                | Instruction::Iterate(_)
++                | Instruction::Jump(_)
++                | Instruction::JumpIfFalse(_)
++                | Instruction::JumpIfFalseOrPop(_) => unreachable!("shared dispatch"),
+                 Instruction::Swap => {
+                     a = stack.pop();
+                     b = stack.pop();
+@@ -331,39 +367,6 @@
+                     // this only produces a format error, no need to attach
+                     // location information.
+                     ok!(out.write_str(val).map_err(Error::from));
+-                }
+-                Instruction::Emit => {
+-                    let value = stack.pop();
+-                    if self.env.is_default_formatter() {
+-                        if strict_undefined
+-                            && matches!(value.0, ValueRepr::Undefined(UndefinedType::Default))
+-                        {
+-                            bail!(Error::from(ErrorKind::UndefinedError));
+-                        }
+-                        ctx_ok!(write_escaped(out, state.auto_escape.get(), &value));
+-                    } else {
+-                        ctx_ok!(self.env.format(&value, state, out));
+-                    }
+-                }
+-                Instruction::StoreLocal(name) => {
+-                    state.ctx.store(name, stack.pop());
+-                }
+-                Instruction::Lookup(name) => {
+-                    stack.push(assert_valid!(state
+-                        .lookup(name)
+-                        .unwrap_or(Value::UNDEFINED)));
+-                }
+-                Instruction::GetAttr(name) => {
+-                    a = stack.pop();
+-                    // This is a common enough operation that it's interesting to consider a fast
+-                    // path here.  This is slightly faster than the regular attr lookup because we
+-                    // do not need to pass down the error object for the more common success case.
+-                    // Only when we cannot look up something, we start to consider the undefined
+-                    // special case.
+-                    stack.push(match a.get_attr_fast(name) {
+-                        Some(value) => assert_valid!(value),
+-                        None => ctx_ok!(undefined_behavior.handle_undefined(a.is_undefined())),
+-                    });
+                 }
+                 Instruction::SetAttr(name) => {
+                     b = stack.pop();
+@@ -377,14 +380,6 @@
+                         ));
+                     }
+                 }
+-                Instruction::GetItem => {
+-                    a = stack.pop();
+-                    b = stack.pop();
+-                    stack.push(match b.get_item_opt(&a) {
+-                        Some(value) => assert_valid!(value),
+-                        None => ctx_ok!(undefined_behavior.handle_undefined(b.is_undefined())),
+-                    });
+-                }
+                 Instruction::Slice => {
+                     let step = stack.pop();
+                     let stop = stack.pop();
+@@ -394,9 +389,6 @@
+                         bail!(Error::from(ErrorKind::UndefinedError));
+                     }
+                     stack.push(ctx_ok!(ops::slice(a, b, stop, step)));
+-                }
+-                Instruction::LoadConst(value) => {
+-                    stack.push(value.clone());
+                 }
+                 Instruction::BuildMap(pair_count) => {
+                     let mut map = value_map_with_capacity(*pair_count);
+@@ -446,7 +438,6 @@
+                     }
+                     stack.push(Value::from(len));
+                 }
+-                Instruction::Add => func_binop!(add),
+                 Instruction::Sub => func_binop!(sub),
+                 Instruction::Mul => func_binop!(mul),
+                 Instruction::Div => func_binop!(div),
+@@ -454,7 +445,6 @@
+                 Instruction::Rem => func_binop!(rem),
+                 Instruction::Pow => func_binop!(pow),
+                 Instruction::Eq => op_binop!(==),
+-                Instruction::Ne => op_binop!(!=),
+                 Instruction::Gt => op_binop!(>),
+                 Instruction::Gte => op_binop!(>=),
+                 Instruction::Lt => op_binop!(<),
+@@ -537,57 +527,15 @@
+                 Instruction::PopFrame => {
+                     state.ctx.pop_frame();
+                 }
+-                Instruction::PopLoopFrame => {
+-                    let mut l = state.ctx.pop_frame().current_loop.unwrap();
+-                    if let Some((target, end_capture)) = l.current_recursion_jump.take() {
+-                        pc = target;
+-                        if end_capture {
+-                            stack.push(out.end_capture(state.auto_escape.get()));
+-                        }
+-                        continue;
+-                    }
+-                }
+                 #[cfg(feature = "macros")]
+                 Instruction::IsUndefined => {
+                     a = stack.pop();
+                     stack.push(Value::from(a.is_undefined()));
+-                }
+-                Instruction::PushLoop(flags) => {
+-                    a = stack.pop();
+-                    ctx_ok!(self.push_loop(state, a, *flags, pc, next_loop_recursion_jump.take()));
+-                }
+-                Instruction::Iterate(jump_target) => {
+-                    match state.ctx.next_loop_item() {
+-                        Some(item) => stack.push(assert_valid!(item)),
+-                        None => {
+-                            pc = *jump_target;
+-                            continue;
+-                        }
+-                    };
+                 }
+                 Instruction::PushDidNotIterate => {
+                     stack.push(Value::from(
+                         state.ctx.current_loop().unwrap().did_not_iterate(),
+                     ));
+-                }
+-                Instruction::Jump(jump_target) => {
+-                    pc = *jump_target;
+-                    continue;
+-                }
+-                Instruction::JumpIfFalse(jump_target) => {
+-                    a = stack.pop();
+-                    if !ctx_ok!(undefined_behavior.is_true(&a)) {
+-                        pc = *jump_target;
+-                        continue;
+-                    }
+-                }
+-                Instruction::JumpIfFalseOrPop(jump_target) => {
+-                    if !ctx_ok!(undefined_behavior.is_true(stack.peek())) {
+-                        pc = *jump_target;
+-                        continue;
+-                    } else {
+-                        stack.pop();
+-                    }
+                 }
+                 Instruction::JumpIfTrueOrPop(jump_target) => {
+                     if ctx_ok!(undefined_behavior.is_true(stack.peek())) {
+--- /dev/null
++++ b/src/vm/shared.rs
+@@ -0,0 +1,147 @@
++//! Storage-parametric dispatch for the selected non-calling instructions.
++//!
++//! Ordinary evaluation and closed source-bound evaluation use this same operand
++//! ordering and control flow. Storage decides how a value is represented; it
++//! cannot replace this instruction dispatcher.
++
++#![forbid(unsafe_code)]
++
++use crate::compiler::instructions::Instruction;
++use crate::value::Value;
++
++pub(crate) enum Op<'source, V> {
++    Lookup(&'source str),
++    StoreLocal(&'source str),
++    GetAttr(&'source str),
++    GetItem,
++    LoadConst(V),
++    Add,
++    Ne,
++    Emit,
++    PushLoop(u8),
++    Iterate(u32),
++    PopLoopFrame,
++    Jump(u32),
++    JumpIfFalse(u32),
++    JumpIfFalseOrPop(u32),
++}
++
++/// No source/allocator callback is exposed by the closed public API. This is the
++/// private storage contract used by the existing ordinary VM as well.
++pub(crate) trait Storage<'source> {
++    type Value;
++    type Error;
++    fn pop(&mut self) -> Result<Self::Value, Self::Error>;
++    fn peek(&self) -> Result<&Self::Value, Self::Error>;
++    fn push(&mut self, value: Self::Value) -> Result<(), Self::Error>;
++    fn lookup(&mut self, name: &'source str) -> Result<Self::Value, Self::Error>;
++    fn store(&mut self, name: &'source str, value: Self::Value) -> Result<(), Self::Error>;
++    fn attr(&mut self, value: Self::Value, name: &str) -> Result<Self::Value, Self::Error>;
++    fn item(&mut self, value: Self::Value, key: Self::Value) -> Result<Self::Value, Self::Error>;
++    fn add(&mut self, left: Self::Value, right: Self::Value) -> Result<Self::Value, Self::Error>;
++    fn ne(&mut self, left: Self::Value, right: Self::Value) -> Result<Self::Value, Self::Error>;
++    fn truth(&self, value: &Self::Value) -> Result<bool, Self::Error>;
++    fn emit(&mut self, value: Self::Value) -> Result<(), Self::Error>;
++    fn push_loop(&mut self, value: Self::Value, flags: u8, pc: u32) -> Result<(), Self::Error>;
++    fn next(&mut self) -> Result<Option<Self::Value>, Self::Error>;
++    fn pop_loop(&mut self) -> Result<Option<u32>, Self::Error>;
++}
++
++pub(crate) enum Next {
++    Advance,
++    Jump(u32),
++}
++
++pub(crate) fn step<'source, S: Storage<'source>>(
++    op: Op<'source, S::Value>,
++    pc: u32,
++    storage: &mut S,
++) -> Result<Next, S::Error> {
++    match op {
++        Op::Lookup(name) => {
++            let value = storage.lookup(name)?;
++            storage.push(value)?;
++        }
++        Op::StoreLocal(name) => {
++            let value = storage.pop()?;
++            storage.store(name, value)?;
++        }
++        Op::GetAttr(name) => {
++            let value = storage.pop()?;
++            let value = storage.attr(value, name)?;
++            storage.push(value)?;
++        }
++        Op::GetItem => {
++            let key = storage.pop()?;
++            let value = storage.pop()?;
++            let value = storage.item(value, key)?;
++            storage.push(value)?;
++        }
++        Op::LoadConst(value) => storage.push(value)?,
++        Op::Add => {
++            let right = storage.pop()?;
++            let left = storage.pop()?;
++            let value = storage.add(left, right)?;
++            storage.push(value)?;
++        }
++        Op::Ne => {
++            let right = storage.pop()?;
++            let left = storage.pop()?;
++            let value = storage.ne(left, right)?;
++            storage.push(value)?;
++        }
++        Op::Emit => {
++            let value = storage.pop()?;
++            storage.emit(value)?;
++        }
++        Op::PushLoop(flags) => {
++            let value = storage.pop()?;
++            storage.push_loop(value, flags, pc)?;
++        }
++        Op::Iterate(target) => match storage.next()? {
++            Some(value) => storage.push(value)?,
++            None => return Ok(Next::Jump(target)),
++        },
++        Op::PopLoopFrame => {
++            if let Some(target) = storage.pop_loop()? {
++                return Ok(Next::Jump(target));
++            }
++        }
++        Op::Jump(target) => return Ok(Next::Jump(target)),
++        Op::JumpIfFalse(target) => {
++            let value = storage.pop()?;
++            if !storage.truth(&value)? {
++                return Ok(Next::Jump(target));
++            }
++        }
++        Op::JumpIfFalseOrPop(target) => {
++            if !storage.truth(storage.peek()?)? {
++                return Ok(Next::Jump(target));
++            }
++            storage.pop()?;
++        }
++    }
++    Ok(Next::Advance)
++}
++
++pub(super) fn ordinary<'source>(instruction: &Instruction<'source>) -> Option<Op<'source, Value>> {
++    Some(match instruction {
++        Instruction::Lookup(name) => Op::Lookup(name),
++        Instruction::StoreLocal(name) => Op::StoreLocal(name),
++        Instruction::GetAttr(name) => Op::GetAttr(name),
++        Instruction::GetItem => Op::GetItem,
++        Instruction::LoadConst(value) => Op::LoadConst(value.clone()),
++        Instruction::Add => Op::Add,
++        Instruction::Ne => Op::Ne,
++        Instruction::Emit => Op::Emit,
++        Instruction::PushLoop(flags) => Op::PushLoop(*flags),
++        Instruction::Iterate(target) => Op::Iterate(*target),
++        Instruction::PopLoopFrame => Op::PopLoopFrame,
++        Instruction::Jump(target) => Op::Jump(*target),
++        Instruction::JumpIfFalse(target) => Op::JumpIfFalse(*target),
++        Instruction::JumpIfFalseOrPop(target) => Op::JumpIfFalseOrPop(*target),
++        _ => return None,
++    })
++}
++
++pub(super) mod ordinary;
+--- /dev/null
++++ b/src/vm/shared/ordinary.rs
+@@ -0,0 +1,110 @@
++//! The ordinary storage adapter retains the existing Value/Object/Context paths.
++use super::Storage;
++use crate::error::{Error, ErrorKind};
++use crate::output::Output;
++use crate::utils::{write_escaped, UndefinedBehavior};
++use crate::value::{ops, UndefinedType, Value, ValueRepr};
++use crate::vm::{context::Stack, State, Vm};
++
++pub(in crate::vm) struct Ordinary<'borrow, 'template, 'env, 'output> {
++    pub vm: &'borrow Vm<'env>,
++    pub state: &'borrow mut State<'template, 'env>,
++    pub stack: &'borrow mut Stack,
++    pub output: &'borrow mut Output<'output>,
++    pub next_loop_recursion_jump: &'borrow mut Option<(u32, bool)>,
++    pub undefined_behavior: UndefinedBehavior,
++    pub strict_undefined: bool,
++}
++
++impl<'env> Storage<'env> for Ordinary<'_, '_, 'env, '_> {
++    type Value = Value;
++    type Error = Error;
++
++    fn pop(&mut self) -> Result<Value, Error> {
++        Ok(self.stack.pop())
++    }
++    fn peek(&self) -> Result<&Value, Error> {
++        Ok(self.stack.peek())
++    }
++    fn push(&mut self, value: Value) -> Result<(), Error> {
++        self.stack.push(value);
++        Ok(())
++    }
++    fn lookup(&mut self, name: &'env str) -> Result<Value, Error> {
++        self.state
++            .lookup(name)
++            .unwrap_or(Value::UNDEFINED)
++            .validate()
++    }
++    fn store(&mut self, name: &'env str, value: Value) -> Result<(), Error> {
++        self.state.ctx.store(name, value);
++        Ok(())
++    }
++    fn attr(&mut self, value: Value, name: &str) -> Result<Value, Error> {
++        match value.get_attr_fast(name) {
++            Some(value) => value.validate(),
++            None => self
++                .undefined_behavior
++                .handle_undefined(value.is_undefined()),
++        }
++    }
++    fn item(&mut self, value: Value, key: Value) -> Result<Value, Error> {
++        match value.get_item_opt(&key) {
++            Some(value) => value.validate(),
++            None => self
++                .undefined_behavior
++                .handle_undefined(value.is_undefined()),
++        }
++    }
++    fn add(&mut self, left: Value, right: Value) -> Result<Value, Error> {
++        ops::add(&left, &right)
++    }
++    fn ne(&mut self, left: Value, right: Value) -> Result<Value, Error> {
++        self.undefined_behavior.assert_value_not_undefined(&left)?;
++        self.undefined_behavior.assert_value_not_undefined(&right)?;
++        Ok(Value::from(left != right))
++    }
++    fn truth(&self, value: &Value) -> Result<bool, Error> {
++        self.undefined_behavior.is_true(value)
++    }
++    fn emit(&mut self, value: Value) -> Result<(), Error> {
++        if self.vm.env.is_default_formatter() {
++            if self.strict_undefined
++                && matches!(value.0, ValueRepr::Undefined(UndefinedType::Default))
++            {
++                return Err(Error::from(ErrorKind::UndefinedError));
++            }
++            write_escaped(self.output, self.state.auto_escape.get(), &value)
++        } else {
++            self.vm.env.format(&value, self.state, self.output)
++        }
++    }
++    fn push_loop(&mut self, value: Value, flags: u8, pc: u32) -> Result<(), Error> {
++        self.vm.push_loop(
++            self.state,
++            value,
++            flags,
++            pc,
++            self.next_loop_recursion_jump.take(),
++        )
++    }
++    fn next(&mut self) -> Result<Option<Value>, Error> {
++        self.state
++            .ctx
++            .next_loop_item()
++            .map(Value::validate)
++            .transpose()
++    }
++    fn pop_loop(&mut self) -> Result<Option<u32>, Error> {
++        let mut frame = self.state.ctx.pop_frame().current_loop.unwrap();
++        if let Some((target, end_capture)) = frame.current_recursion_jump.take() {
++            if end_capture {
++                self.stack
++                    .push(self.output.end_capture(self.state.auto_escape.get()));
++            }
++            Ok(Some(target))
++        } else {
++            Ok(None)
++        }
++    }
++}

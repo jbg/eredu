@@ -1,0 +1,2891 @@
+{
+  "date": "2026-09-16",
+  "scope": "Incremental public dense/hybrid, seeded Standard/Mirostat sampling, resident KV/hybrid reset and exact/source-compiled chat milestones; goal incomplete",
+  "source_git_head": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "dirty_workspace": true,
+  "public_native": {
+    "geometry": {
+      "prompt_tokens": 5,
+      "prefill_chunks": [
+        2,
+        2,
+        1
+      ],
+      "generated_tokens": 4,
+      "managed_capacity_bytes": 8589934592,
+      "component_capacities": "automatic"
+    },
+    "dense": {
+      "managed": {
+        "exit_code": 0,
+        "seconds": 85.7,
+        "one_passed": true,
+        "actual": {
+          "ids": [
+            8,
+            38,
+            26,
+            1
+          ],
+          "text": "iMAb"
+        },
+        "baseline_equal": true
+      },
+      "controlled": {
+        "family": "plain",
+        "mode": "controlled",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-706f95ca2890d253",
+          "--exact",
+          "managed_plain::native_managed_plain_matches_ordinary_and_controlled_generation",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "exit_code": 0,
+        "seconds": 0.56,
+        "one_passed": true,
+        "actual": {
+          "ids": [
+            8,
+            38,
+            26,
+            1
+          ],
+          "text": "iMAb"
+        }
+      },
+      "ordinary_reference": {
+        "ids": [
+          8,
+          38,
+          26,
+          1
+        ],
+        "text": "iMAb",
+        "source": "Earlier request-pipeline-cache ordinary baseline; not rerun"
+      }
+    },
+    "hybrid": {
+      "managed": {
+        "exit_code": 0,
+        "seconds": 62.66,
+        "one_passed": true,
+        "instrumentation_absent": true,
+        "actual": {
+          "ids": [
+            63,
+            32,
+            32,
+            32
+          ],
+          "text": "?GGG"
+        }
+      },
+      "parity": [
+        {
+          "mode": "ordinary",
+          "argv": [
+            "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-706f95ca2890d253",
+            "--exact",
+            "managed_plain::native_managed_hybrid_matches_ordinary_and_controlled_generation",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "exit_code": 0,
+          "seconds": 0.24,
+          "one_passed": true,
+          "actual": {
+            "ids": [
+              63,
+              32,
+              32,
+              32
+            ],
+            "text": "?GGG"
+          },
+          "matches_managed": true
+        },
+        {
+          "mode": "controlled",
+          "argv": [
+            "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-706f95ca2890d253",
+            "--exact",
+            "managed_plain::native_managed_hybrid_matches_ordinary_and_controlled_generation",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1"
+          ],
+          "exit_code": 0,
+          "seconds": 0.83,
+          "one_passed": true,
+          "actual": {
+            "ids": [
+              63,
+              32,
+              32,
+              32
+            ],
+            "text": "?GGG"
+          },
+          "matches_managed": true
+        }
+      ]
+    },
+    "standard_sampling": {
+      "temperature": 1.0,
+      "seed": 827,
+      "filters": "default TopK/TopP/MinP",
+      "results": [
+        {
+          "case": "managed_plain::native_managed_standard_sampling_matches_ordinary_and_controlled_generation",
+          "mode": "managed",
+          "exit_code": 0,
+          "seconds": 6.83,
+          "one_passed": true,
+          "actual": {
+            "ids": [
+              60,
+              41,
+              15,
+              12
+            ],
+            "text": "8Ppm"
+          },
+          "log": "standard-managed.log"
+        },
+        {
+          "case": "managed_plain::native_managed_standard_sampling_matches_ordinary_and_controlled_generation",
+          "mode": "ordinary",
+          "exit_code": 0,
+          "seconds": 0.23,
+          "one_passed": true,
+          "actual": {
+            "ids": [
+              60,
+              41,
+              15,
+              12
+            ],
+            "text": "8Ppm"
+          },
+          "log": "standard-ordinary.log",
+          "matches_managed": true
+        },
+        {
+          "case": "managed_plain::native_managed_standard_sampling_matches_ordinary_and_controlled_generation",
+          "mode": "controlled",
+          "exit_code": 0,
+          "seconds": 0.57,
+          "one_passed": true,
+          "actual": {
+            "ids": [
+              60,
+              41,
+              15,
+              12
+            ],
+            "text": "8Ppm"
+          },
+          "log": "standard-controlled.log",
+          "matches_managed": true
+        }
+      ]
+    },
+    "resident_kv_reset": {
+      "case": "managed_plain::lifecycle::native_managed_reset_reuses_model_without_refunding_retained_output",
+      "mode": null,
+      "exit_code": 0,
+      "one_passed": true,
+      "seconds": 0.93,
+      "actual": {
+        "ids": [
+          8,
+          38,
+          26,
+          1
+        ],
+        "text": "iMAb",
+        "retained_outputs": 2
+      },
+      "log": "kv-reset.log"
+    },
+    "chat": {
+      "template": "Exact existing SmolLM compiler image; synthetic 64-character tokenizer/dense checkpoint",
+      "prefill_chunk_positions": 8,
+      "prompt_tokens": 57,
+      "results": [
+        {
+          "case": "managed_plain::lifecycle::native_managed_chat_matches_rendered_ordinary_and_controlled_generation",
+          "mode": "managed",
+          "exit_code": 0,
+          "seconds": 7.28,
+          "one_passed": true,
+          "actual": {
+            "ids": [
+              38,
+              32,
+              26,
+              56
+            ],
+            "text": "MGA "
+          },
+          "log": "chat-supported-managed.log"
+        },
+        {
+          "case": "managed_plain::lifecycle::native_managed_chat_matches_rendered_ordinary_and_controlled_generation",
+          "mode": "ordinary",
+          "exit_code": 0,
+          "seconds": 0.23,
+          "one_passed": true,
+          "actual": {
+            "ids": [
+              38,
+              32,
+              26,
+              56
+            ],
+            "text": "MGA "
+          },
+          "log": "chat-supported-ordinary.log"
+        },
+        {
+          "case": "managed_plain::lifecycle::native_managed_chat_matches_rendered_ordinary_and_controlled_generation",
+          "mode": "controlled",
+          "exit_code": 0,
+          "seconds": 0.87,
+          "one_passed": true,
+          "actual": {
+            "ids": [
+              38,
+              32,
+              26,
+              56
+            ],
+            "text": "MGA "
+          },
+          "log": "chat-supported-controlled.log"
+        }
+      ],
+      "limitation": "This earlier record covers the exact released-template image; the separate source_chat record validates actual-source compilation."
+    },
+    "resident_hybrid_reset": {
+      "case": "managed_plain::lifecycle::native_managed_hybrid_reset_reuses_all_state_tables",
+      "mode": null,
+      "exit_code": 0,
+      "one_passed": true,
+      "seconds": 1.49,
+      "actual": {
+        "ids": [
+          63,
+          32,
+          32,
+          32
+        ],
+        "text": "?GGG",
+        "retained_outputs": 2
+      },
+      "log": "hybrid-reset.log"
+    },
+    "mirostat": {
+      "temperature": 1.0,
+      "seed": 827,
+      "tau": 5.0,
+      "eta": 0.1,
+      "results": [
+        {
+          "case": "managed_plain::native_managed_mirostat_matches_ordinary_and_controlled_generation",
+          "mode": "managed",
+          "exit_code": 0,
+          "one_passed": true,
+          "seconds": 6.84,
+          "actual": {
+            "ids": [
+              49,
+              41,
+              15,
+              14
+            ],
+            "text": "XPpo"
+          },
+          "log": "mirostat-managed.log"
+        },
+        {
+          "case": "managed_plain::native_managed_mirostat_matches_ordinary_and_controlled_generation",
+          "mode": "ordinary",
+          "exit_code": 0,
+          "one_passed": true,
+          "seconds": 0.23,
+          "actual": {
+            "ids": [
+              49,
+              41,
+              15,
+              14
+            ],
+            "text": "XPpo"
+          },
+          "log": "mirostat-ordinary.log",
+          "matches_managed": true
+        },
+        {
+          "case": "managed_plain::native_managed_mirostat_matches_ordinary_and_controlled_generation",
+          "mode": "controlled",
+          "exit_code": 0,
+          "one_passed": true,
+          "seconds": 0.59,
+          "actual": {
+            "ids": [
+              49,
+              41,
+              15,
+              14
+            ],
+            "text": "XPpo"
+          },
+          "log": "mirostat-controlled.log",
+          "matches_managed": true
+        }
+      ]
+    },
+    "source_chat": {
+      "template": "{% for turn in messages %}{{ turn.content }}{% endfor %}{% if add_generation_prompt %} assistant:{% endif %}",
+      "rendered_prompt": "abcde assistant:",
+      "prompt_tokens": 16,
+      "prefill_chunk_positions": 8,
+      "results": [
+        {
+          "case": "managed_plain::lifecycle::native_managed_source_chat_matches_ordinary_and_controlled_generation",
+          "mode": "managed",
+          "exit_code": 0,
+          "one_passed": true,
+          "seconds": 0.52,
+          "actual": {
+            "ids": [
+              45,
+              26,
+              56,
+              63
+            ],
+            "text": "TA 1"
+          },
+          "log": "source-chat-managed.log"
+        },
+        {
+          "case": "managed_plain::lifecycle::native_managed_source_chat_matches_ordinary_and_controlled_generation",
+          "mode": "ordinary",
+          "exit_code": 0,
+          "one_passed": true,
+          "seconds": 0.23,
+          "actual": {
+            "ids": [
+              45,
+              26,
+              56,
+              63
+            ],
+            "text": "TA 1"
+          },
+          "log": "source-chat-ordinary.log",
+          "matches_managed": true
+        },
+        {
+          "case": "managed_plain::lifecycle::native_managed_source_chat_matches_ordinary_and_controlled_generation",
+          "mode": "controlled",
+          "exit_code": 0,
+          "one_passed": true,
+          "seconds": 0.52,
+          "actual": {
+            "ids": [
+              45,
+              26,
+              56,
+              63
+            ],
+            "text": "TA 1"
+          },
+          "log": "source-chat-controlled.log",
+          "matches_managed": true
+        }
+      ],
+      "limitations": "Supported source syntax has text/message access, conditions and nonnested loops. Filters, macros, calls, nested loops and broader constraints remain unfinished."
+    },
+    "host_layerwise": {
+      "geometry": "Tiny nonzero F32 dense decoder, 2 units, depth1, host/device8MiB; request8GiB with automatic Graph/Record capacities; prompt5 split2/2/1, four outputs and three cached decodes",
+      "record": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/public-host-layerwise",
+      "build": {
+        "code": 0,
+        "seconds": 53.14132499997504
+      },
+      "modes": [
+        {
+          "mode": "managed",
+          "argv": [
+            "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-706f95ca2890d253",
+            "--exact",
+            "managed_plain::native_managed_host_layerwise_matches_ordinary_and_controlled_generation",
+            "--ignored",
+            "--nocapture"
+          ],
+          "code": 0,
+          "seconds": 6.990977458888665,
+          "result": {
+            "ids": [
+              8,
+              38,
+              26,
+              1
+            ],
+            "text": "iMAb"
+          },
+          "fixture_cleanup": []
+        },
+        {
+          "mode": "ordinary",
+          "argv": [
+            "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-706f95ca2890d253",
+            "--exact",
+            "managed_plain::native_managed_host_layerwise_matches_ordinary_and_controlled_generation",
+            "--ignored",
+            "--nocapture"
+          ],
+          "code": 0,
+          "seconds": 0.25977812497876585,
+          "result": {
+            "ids": [
+              8,
+              38,
+              26,
+              1
+            ],
+            "text": "iMAb"
+          },
+          "fixture_cleanup": []
+        },
+        {
+          "mode": "controlled",
+          "argv": [
+            "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-706f95ca2890d253",
+            "--exact",
+            "managed_plain::native_managed_host_layerwise_matches_ordinary_and_controlled_generation",
+            "--ignored",
+            "--nocapture"
+          ],
+          "code": 0,
+          "seconds": 0.7039078751113266,
+          "result": {
+            "ids": [
+              8,
+              38,
+              26,
+              1
+            ],
+            "text": "iMAb"
+          },
+          "fixture_cleanup": []
+        }
+      ],
+      "coverage": [
+        "ordinary/managed/controlled exact token and text parity",
+        "actual inter-layer host transfers and completed-unit eviction",
+        "pre-start cancellation",
+        "one-byte refusal before request execution",
+        "output remains usable after source/model retirement"
+      ],
+      "limit": "Selected dense ready-host fixture; no complete dtype/family/state/disk/parallel claim."
+    }
+  },
+  "portable_chat": {
+    "exit_code": 0,
+    "seconds": 9.62,
+    "one_passed": true
+  },
+  "focused_native_passes": [
+    {
+      "case": "allocation_retention::original_buffer::tests::original_metal_population_covers_independently_rounded_sources",
+      "exit_code": 0,
+      "seconds": 1.92,
+      "one_passed": true,
+      "log": "focused-3.log"
+    },
+    {
+      "case": "operation_event::tests::original_array::repeated_i32_input_fills_final_storage_and_retires_after_last_alias",
+      "exit_code": 0,
+      "seconds": 1.06,
+      "one_passed": true,
+      "log": "focused-4.log"
+    },
+    {
+      "case": "backend::nn::workspace::resident_recipe::sampling_filters::tests::default_filters_have_real_completion_and_preserve_missing_sampling_positions",
+      "exit_code": 0,
+      "seconds": 6.42,
+      "one_passed": true,
+      "log": "case-0.log"
+    },
+    {
+      "case": "backend::nn::workspace::resident_recipe::sampling_penalties::tests::actual_penalty_windows_join_complete_sampling_constructors",
+      "exit_code": 0,
+      "seconds": 0.18,
+      "one_passed": true,
+      "log": "case-1.log"
+    },
+    {
+      "case": "backend::nn::workspace::resident_recipe::attention_direct::tests::direct_attention_keeps_bf16_validation_and_actual_blockwise_boundary",
+      "exit_code": 0,
+      "seconds": 0.18,
+      "one_passed": true,
+      "log": "case-3.log"
+    },
+    {
+      "case": "backend::nn::attention::tests::score_softcap_precedes_boolean_and_additive_masks_and_preserves_sinks",
+      "exit_code": 0,
+      "seconds": 1.07,
+      "one_passed": true,
+      "log": "case-4.log"
+    },
+    {
+      "case": "backend::nn::workspace::resident_recipe::sampling_random::tests::standard_seeded_sampling_retains_eager_key_and_complete_step_recipes",
+      "exit_code": 0,
+      "one_passed": true,
+      "seconds": 0.18,
+      "log": "case-1.log"
+    },
+    {
+      "case": "backend::nn::workspace::resident_recipe::attention_tiled::tests::actual_attention_tiles_prepare_all_nested_output_banks",
+      "exit_code": 0,
+      "one_passed": true,
+      "seconds": 0.03,
+      "log": "case-2.log"
+    },
+    {
+      "case": "backend::nn::attention::tests::native_bf16_attention_query_tiles_match_independent_reference",
+      "exit_code": 0,
+      "one_passed": true,
+      "seconds": 1.2,
+      "log": "case-3.log"
+    },
+    {
+      "case": "backend::nn::attention::tests::sliding_prefill_matches_independent_scalar_softmax_reference",
+      "exit_code": 0,
+      "one_passed": true,
+      "seconds": 1.06,
+      "log": "case-4.log"
+    },
+    {
+      "case": "composition::mlx::session::model_session::text_quote::prefill_tests::original_lease_return_moves_prepared_ids_on_miss_and_warm_and_keeps_request_custody",
+      "exit_code": 0,
+      "one_passed": true,
+      "seconds": 6.78,
+      "log": "lease.log"
+    },
+    {
+      "case": "backend::nn::workspace::resident_recipe::sampling_mirostat::tests::mirostat_retains_one_graph_and_two_real_scalar_frontiers",
+      "exit_code": 0,
+      "one_passed": true,
+      "seconds": 0.21,
+      "log": "mirostat-cold.log"
+    },
+    {
+      "case": "composition::mlx::session::model_session::text_quote::prefill_tests::grouped_linear_tests::original_attention_key_blocks_match_full_reference_and_retire_each_pass",
+      "exit_code": 0,
+      "one_passed": true,
+      "seconds": 9.11,
+      "log": "keyblocks.log"
+    }
+  ],
+  "pending_check": "Complete managed snapshot capture/table/native-copy construction and restore/fork, background-prefetch source/thread lifetime, additional formats/transforms and applicable family/media/speculation/observation/parallel matrix; then final feature/reference/memory validation. Foreground disk parity and numeric float_roundtrip have passed their focused milestones.",
+  "reproduce": {
+    "public": "cargo test -p eredu --no-default-features --features mlx,eredu-backend-mlx/metal --test native_execution_control -- managed_plain::native_managed_plain_matches_ordinary_and_controlled_generation --exact --ignored --nocapture",
+    "hybrid": "cargo test -p eredu --no-default-features --features mlx,eredu-backend-mlx/metal --test native_execution_control -- managed_plain::native_managed_hybrid_matches_ordinary_and_controlled_generation --exact --ignored --nocapture",
+    "portable_chat": "cargo test -p eredu --no-default-features --lib -- api::portable::original_token_input::tests::original_chat::public_managed::public_managed_chat_shares_cursor_authenticates_templates_and_retains_early_budget --exact",
+    "notes": [
+      "Native cases require an accessible Metal device; child modes run in fresh processes.",
+      "Full portable/native feature matrix and pinned released-Qwen enforced-budget validation remain outstanding.",
+      "No claim of total process/system-memory enforcement."
+    ],
+    "standard_sampling": "cargo test -p eredu --no-default-features --features mlx,eredu-backend-mlx/metal --test native_execution_control -- managed_plain::native_managed_standard_sampling_matches_ordinary_and_controlled_generation --exact --ignored --nocapture",
+    "resident_reset": "cargo test -p eredu --no-default-features --features mlx,eredu-backend-mlx/metal --test native_execution_control -- managed_plain::lifecycle::native_managed_reset_reuses_model_without_refunding_retained_output --exact --ignored --nocapture",
+    "native_chat": "cargo test -p eredu --no-default-features --features mlx,eredu-backend-mlx/metal --test native_execution_control -- managed_plain::lifecycle::native_managed_chat_matches_rendered_ordinary_and_controlled_generation --exact --ignored --nocapture",
+    "resident_hybrid_reset": "cargo test -p eredu --no-default-features --features mlx,eredu-backend-mlx/metal --test native_execution_control -- managed_plain::lifecycle::native_managed_hybrid_reset_reuses_all_state_tables --exact --ignored --nocapture",
+    "mirostat": "cargo test -p eredu --no-default-features --features mlx,eredu-backend-mlx/metal --test native_execution_control -- managed_plain::native_managed_mirostat_matches_ordinary_and_controlled_generation --exact --ignored --nocapture",
+    "source_chat": "cargo test -p eredu --no-default-features --features mlx,eredu-backend-mlx/metal --test native_execution_control -- managed_plain::lifecycle::native_managed_source_chat_matches_ordinary_and_controlled_generation --exact --ignored --nocapture"
+  },
+  "portable_source_compiler": {
+    "build": {
+      "exit_code": 0,
+      "seconds": 22.25,
+      "binaries": {
+        "eredu_text": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_text-383b4aa6c90860a9",
+        "eredu_runtime": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-40e3ec9b28dd90f5"
+      }
+    },
+    "tests": [
+      {
+        "case": "chat_storage::tests::generic_source_compilation_matches_ordinary_selected_text_and_owns_decoded_source",
+        "exit_code": 0,
+        "one_passed": true,
+        "seconds": 0.66,
+        "log": "case-0.log"
+      },
+      {
+        "case": "chat_storage::tests::generic_source_reserve_failure_retains_its_real_decoded_and_output_prefix",
+        "exit_code": 0,
+        "one_passed": true,
+        "seconds": 0.01,
+        "log": "case-1.log"
+      },
+      {
+        "case": "working_memory::original_chat::tests::generic_chat_compiler_j_precedes_decode_and_retains_failed_prefix",
+        "exit_code": 0,
+        "one_passed": true,
+        "seconds": 1.02,
+        "log": "case-2.log"
+      },
+      {
+        "case": "chat_storage::tests::decoded_named_selection_and_invalid_metadata_follow_ordinary_contracts",
+        "exit_code": 0,
+        "one_passed": true,
+        "seconds": 0.01,
+        "log": "changed-selection.log"
+      }
+    ]
+  },
+  "original_key_blocks": {
+    "keys": 8193,
+    "queries": 1,
+    "heads": 1,
+    "dtype": "F32",
+    "mask": "nonuniform Bool",
+    "softcap": 1.75,
+    "sinks": [
+      0.2
+    ],
+    "nested_completions": 66,
+    "reference": "independent ordinary full-score softmax and value product",
+    "absolute_tolerance": 2e-05,
+    "capacity": "actual component trace joins automatic original P/Graph/Record/cache recipe; no arena overrides",
+    "result": {
+      "case": "composition::mlx::session::model_session::text_quote::prefill_tests::grouped_linear_tests::original_attention_key_blocks_match_full_reference_and_retire_each_pass",
+      "exit_code": 0,
+      "one_passed": true,
+      "seconds": 9.11,
+      "log": "keyblocks.log"
+    }
+  },
+  "cold_exact_binding": {
+    "exit_code": 0,
+    "seconds": 9.09,
+    "one_passed": true
+  },
+  "host_layerwise_implementation": {
+    "neutral_controller": "Finite constructor and canonical initial-tier closure integrated. New cross-tier/cyclic-unit closure case PASS, including caller scratch rejection and constructed-controller parity.",
+    "neural_completion": "Asynchronous nested neural completion and original Graph/Record joins integrated; selected public host-layerwise multiple cached decodes PASS.",
+    "cold_architecture_destinations": "Integrated and focused floating/packed geometry test passes without payload reads.",
+    "remaining": "Selected public dense host-layerwise ordinary/managed/controlled parity PASS. Broader family/quantization/state combinations and foreground/background disk/parallel paths remain.",
+    "loading_transport": "Move-only provider-to-policy handoff and producer exports integrated; prepared manager is consumed once before ordinary native owner acquisition.",
+    "encoded_reads": "Borrowed finite scratch and detached exact source ownership integrated. Detached owner test releases ordinary roots, preserves read semantics/independent diagnostics and keeps custody in an escaping changed-source failure; PASS.",
+    "native_copy": "Original GPU consumer waits submit their prepaid receipt. Transfer retains and retires its exact consumer node, then targeted application/lease-node teardown releases completed pins. Public host-layerwise parity PASS.",
+    "cached_snapshot": "Cached host identity and operation windows initialized once within the original manager source account; planning reuses their metadata without rebuilding payloads.",
+    "policy_catalog": "Full detached source catalog, primary authentication with all per-unit overrides, distinct-owner deduplication and closed generic source erasure integrated. Both source-retirement/catalog fidelity and changed-primary adoption cases PASS.",
+    "operation_windows": "Finite constructor and cached opaque window owner integrated and initialized under the original source account. Public ready-host admission authenticates exact cached source and window owners.",
+    "binding": "Finite row Vec, shared atomic neutral validation and direct native field traversal integrated; focused atomicity checks and public host-layerwise execution PASS."
+  },
+  "cold_architecture_destinations": {
+    "returncode": 0,
+    "seconds": 65.26720554195344,
+    "case": "prepared_workspace::destinations::cold_destinations_preserve_packed_geometry_and_companions_without_payload_reads",
+    "coverage": "Two canonical units; F32 and affine UInt32 packed slots with scales/biases; zero payload reads."
+  },
+  "finite_residency_constructor": [
+    {
+      "case": "recipe::finite_inference::tests::finite_inference_preserves_join_selection_and_invalid_permutation_results",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_checkpoint-c1ad5b3b4db58e48",
+        "recipe::finite_inference::tests::finite_inference_preserves_join_selection_and_invalid_permutation_results",
+        "--exact",
+        "--nocapture"
+      ],
+      "returncode": 0,
+      "one_test_passed": true,
+      "seconds": 0.547707541147247
+    },
+    {
+      "case": "residency::construction::tests::prepared_controller_borrows_recipe_metadata_and_preserves_alias_and_window_transitions",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-40e3ec9b28dd90f5",
+        "residency::construction::tests::prepared_controller_borrows_recipe_metadata_and_preserves_alias_and_window_transitions",
+        "--exact",
+        "--nocapture"
+      ],
+      "returncode": 0,
+      "one_test_passed": true,
+      "seconds": 1.0038832919672132
+    },
+    {
+      "case": "residency::tests::windows_are_group_scoped_and_protect_capacity",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_core-247a00927f21ddf8",
+        "residency::tests::windows_are_group_scoped_and_protect_capacity",
+        "--exact",
+        "--nocapture"
+      ],
+      "returncode": 0,
+      "one_test_passed": true,
+      "seconds": 0.5628050838131458
+    },
+    {
+      "case": "residency::tests::controller_resolves_aliases_across_independent_units",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-40e3ec9b28dd90f5",
+        "residency::tests::controller_resolves_aliases_across_independent_units",
+        "--exact",
+        "--nocapture"
+      ],
+      "returncode": 0,
+      "one_test_passed": true,
+      "seconds": 0.006220249924808741
+    }
+  ],
+  "borrowed_encoded_reads": [
+    {
+      "case": "store::bulk::tests::borrowed_reads_reuse_admission_and_preserve_failed_shard_prefix",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_checkpoint-3dbf87d6cd89e939",
+        "store::bulk::tests::borrowed_reads_reuse_admission_and_preserve_failed_shard_prefix",
+        "--exact",
+        "--nocapture"
+      ],
+      "returncode": 0,
+      "one_test_passed": true,
+      "seconds": 0.5430200409609824
+    },
+    {
+      "case": "store::bulk::tests::short_reads_and_interrupts_preserve_scatter_order_and_report_eof",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_checkpoint-3dbf87d6cd89e939",
+        "store::bulk::tests::short_reads_and_interrupts_preserve_scatter_order_and_report_eof",
+        "--exact",
+        "--nocapture"
+      ],
+      "returncode": 0,
+      "one_test_passed": true,
+      "seconds": 0.008436374831944704
+    },
+    {
+      "case": "store::bulk::tests::grouped_reads_retain_each_sources_admission_and_telemetry",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_checkpoint-3dbf87d6cd89e939",
+        "store::bulk::tests::grouped_reads_retain_each_sources_admission_and_telemetry",
+        "--exact",
+        "--nocapture"
+      ],
+      "returncode": 0,
+      "one_test_passed": true,
+      "seconds": 0.010335749946534634
+    }
+  ],
+  "detached_source_and_window": [
+    {
+      "case": "store::bulk::tests::detached_reads_release_ordinary_sources_and_keep_failure_custody",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_checkpoint-c1ad5b3b4db58e48",
+        "store::bulk::tests::detached_reads_release_ordinary_sources_and_keep_failure_custody",
+        "--exact",
+        "--nocapture"
+      ],
+      "code": 0,
+      "passed": true,
+      "seconds": 0.6216192918363959
+    },
+    {
+      "case": "working_memory::layerwise_window::tests::windows_preserve_group_boundaries_and_partial_tails",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-40e3ec9b28dd90f5",
+        "working_memory::layerwise_window::tests::windows_preserve_group_boundaries_and_partial_tails",
+        "--exact",
+        "--nocapture"
+      ],
+      "code": 0,
+      "passed": true,
+      "seconds": 1.07641304214485
+    },
+    {
+      "case": "working_memory::layerwise_window::tests::unknown_and_mismatched_physical_facts_cannot_become_complete",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-40e3ec9b28dd90f5",
+        "working_memory::layerwise_window::tests::unknown_and_mismatched_physical_facts_cannot_become_complete",
+        "--exact",
+        "--nocapture"
+      ],
+      "code": 0,
+      "passed": true,
+      "seconds": 0.012358083156868815
+    }
+  ],
+  "closed_source_and_adoption": [
+    {
+      "case": "store::retained_source::tests::closed_custom_source_retires_value_before_final_identity_custody",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_checkpoint-c1ad5b3b4db58e48",
+        "store::retained_source::tests::closed_custom_source_retires_value_before_final_identity_custody",
+        "--exact",
+        "--nocapture"
+      ],
+      "code": 0,
+      "passed": true,
+      "seconds": 0.5673801249358803
+    },
+    {
+      "case": "store::bulk::tests::detached_reads_release_ordinary_sources_and_keep_failure_custody",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_checkpoint-c1ad5b3b4db58e48",
+        "store::bulk::tests::detached_reads_release_ordinary_sources_and_keep_failure_custody",
+        "--exact",
+        "--nocapture"
+      ],
+      "code": 0,
+      "passed": true,
+      "seconds": 0.01666199997998774
+    },
+    {
+      "case": "residency::construction::tests::prepared_controller_borrows_recipe_metadata_and_preserves_alias_and_window_transitions",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-40e3ec9b28dd90f5",
+        "residency::construction::tests::prepared_controller_borrows_recipe_metadata_and_preserves_alias_and_window_transitions",
+        "--exact",
+        "--nocapture"
+      ],
+      "code": 0,
+      "passed": true,
+      "seconds": 1.0553309579845518
+    }
+  ],
+  "finite_binding_and_closure": {
+    "record": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/finite-binding-and-closure",
+    "build": {
+      "code": 0,
+      "seconds": 18.177903125062585
+    },
+    "cases": [
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-40e3ec9b28dd90f5",
+          "--exact",
+          "parameter::binding::tests::prepared_binding_validation_is_atomic_and_publishes_complete_rows",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 1.119059915887192
+      },
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-40e3ec9b28dd90f5",
+          "--exact",
+          "residency::construction::tests::prepared_initial_tier_closure_includes_cross_tier_canonical_owners",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.019164875149726868
+      },
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/backend_independence-59415a41a852d219",
+          "--exact",
+          "bind_validation_failure_is_atomic",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.5742389580700547
+      },
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/backend_independence-59415a41a852d219",
+          "--exact",
+          "immutable_and_mutable_traversal_disagreement_fails_before_binding",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.011319374898448586
+      }
+    ]
+  },
+  "native_host_source_build": {
+    "record": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/host-source-native",
+    "result": {
+      "code": 0,
+      "seconds": 2.2458608329761773
+    },
+    "scope": "safemlx native C++ and Rust compilation; no backend/public execution claim"
+  },
+  "host_layerwise_joined": {
+    "record": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/host-layerwise-joined",
+    "build": {
+      "code": 0,
+      "seconds": 76.13336420897394
+    },
+    "catalog_cases": [
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-9e6d635ac959bfaa",
+          "--exact",
+          "backend::runtime::residency::manager::construction::source::tests::detached_catalog_preserves_selected_keys_provenance_and_releases_source",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 6.446831332985312
+      },
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-9e6d635ac959bfaa",
+          "--exact",
+          "backend::runtime::residency::manager::construction::source::tests::primary_catalog_adoption_checks_metadata_and_provenance_with_all_units_overridden",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.014631042024120688
+      }
+    ],
+    "router": {
+      "code": 0,
+      "seconds": 6.8274002079851925
+    },
+    "router_limit": "PASS: tie and no-tie numerical behavior, no eager evaluation and exact request-owner retirement. The assertion uses the sole remaining raw custody observer instead of unrelated pool-baseline equality.",
+    "router_diagnostic": {
+      "first_expected": 382268711,
+      "first_final": 382268711,
+      "second_expected": 382137480,
+      "second_final": 382092294,
+      "graph_occupied": 0,
+      "record_occupied": 0
+    }
+  },
+  "host_layerwise_generation_forward_count": {
+    "code": 0,
+    "scope": "Actual prefill plus max_output_tokens-1 decode forwards while preserving conservative diagnostic rows",
+    "case": "working_memory::inference::tests::span_workspace::actual_schedule_retains_new_state_and_nonzero_operations_without_opening_credit"
+  },
+  "source_trim_and_disk_domain": {
+    "record": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/trim-and-disk-domain",
+    "build": {
+      "code": 0,
+      "seconds": 16.54367516702041
+    },
+    "cases": [
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_text-383b4aa6c90860a9",
+          "--exact",
+          "chat_storage::tests::source_trim_filter_matches_ordinary_unicode_and_concatenated_text",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.6497929159086198,
+        "one_passed": true
+      },
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_text-383b4aa6c90860a9",
+          "--exact",
+          "chat_storage::tests::shared_filter_dispatch_keeps_ordinary_registration_arguments_and_errors",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.008726333966478705,
+        "one_passed": true
+      },
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-40e3ec9b28dd90f5",
+          "--exact",
+          "residency::construction::tests::borrowed_unit_domain_preserves_constructor_error_priority",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 1.0208437079563737,
+        "one_passed": true
+      }
+    ],
+    "scope": "Shared ordinary/bounded filter dispatch, Unicode trim on borrowed atoms/concatenations and neutral disk descriptor unit-domain error parity; public disk activation still pending."
+  },
+  "foreground_disk_implementation": {
+    "descriptors": "Integrated exact detached read/catalog source producer, shared neutral unit-domain validation and typed constructor failures. Unit-domain focused case passes.",
+    "read_copy": "Integrated authenticated domain/reservation-first final source buffers, validated borrowed subset reads, complete named-destination preflight, and shared copy/transfer custody. New nonzero checkpoint subset/refusal/failure-custody case PASS.",
+    "remaining": "Compile the integrated bounded live source capacity and deferred read slots; run four focused source-lifetime/request-identity cases, then public foreground ordinary/managed/controlled parity. Background prefetch remains separate. Router and host-layerwise public parity have passed.",
+    "manager": "Integrated shared descriptor/catalog source and sparse canonical initial Host/Device buffers/static aliases, using move-only prepared provider handoff. Public selection remains closed until request/native/controller joins.",
+    "request_slots": "Integrated source-keyed two-attempt unit banks per selected window/forward; exact source-buffer and control totals, reservation validation before final allocation, consumed checkout retaining the same registered request.",
+    "dispatch": "Joined selected foreground read slots to the existing transfer worker without ordinary fallback on selected failure. Actual session memory pool reaches cold planning through private composition; allocator/source planning runs after native inspector loans end.",
+    "native_recipe": "Integrated same source-copy/aggregate/wait/Graph/Record populations and exact source+request/forward slot matching; fixed custody-preserving materialization failures and descriptor-identity preflight.",
+    "source_backing_frontier": "Eager per-window/forward buffers are not accepted as the final bounded disk design. Successor must reserve peak live-window backing and recycle only after actual native source release; generic deferred-custody queue is not completion evidence.",
+    "controller": "Integrated finite source-owned dense controller, shared neutral borrowed-ledger telemetry, exact declaration adoption, source-qualified original acquisition, and settled group completion. Ordinary per-policy mutable windows remain independently owned; zero-host-budget public source selection uses the shared constructor.",
+    "workspace": "Integrated source-accounted immutable ordinal workspace, exact manager/window/source identity, canonical direct/alias rows and persistent-owner retention. Already pinned Device sources retain exact physical row capacity but contribute no second fresh materialization charge.",
+    "live_source_capacity": "Integrated one request-owned live source allowance sized to its maximum canonical window, with all finite attempt controls separately charged. Native backing retirement refunds bytes before queued request-custody destruction; strict-decrease CAS retries tolerate concurrent refunds without accepting competing acquisitions."
+  },
+  "foreground_disk_subset": {
+    "record": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/foreground-subset",
+    "result": {
+      "code": 0,
+      "seconds": 3.943533416837454,
+      "one_passed": true
+    },
+    "case": "store::bulk::tests::detached_read_subset_uses_only_selected_files_and_retains_failure_custody"
+  },
+  "disk_source_joined": {
+    "build": {
+      "code": 0,
+      "seconds": 105.92603679210879
+    },
+    "scope": "Descriptor/manager/foreground reader integration and retained consumer completion; later request-slot/native/controller join is a newer unbuilt source state.",
+    "command": {
+      "argv": [
+        "/opt/homebrew/opt/rustup/bin/cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "eredu-backend-mlx",
+        "--no-default-features",
+        "--features",
+        "eredu-backend-mlx/metal",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "cwd": "/private/tmp/eredu-original-operation-rust-diagnostic/source",
+      "environment": {
+        "CARGO_BUILD_JOBS": "24",
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_TARGET_DIR": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "DEVICE": "cpu",
+        "EREDU_PUBLIC_MANAGED_HYBRID_MODE": null,
+        "EREDU_PUBLIC_MANAGED_PLAIN_MODE": null,
+        "EREDU_PUBLIC_MANAGED_STANDARD_MODE": null,
+        "EREDU_REQUIRE_CPU_WORKER_STARTUP_QUALIFICATION": "1",
+        "EREDU_REQUIRE_GPU_STREAM_QUALIFICATION": "1",
+        "EREDU_REQUIRE_IMMUTABLE_SOURCE_QUALIFICATION": "1",
+        "EREDU_REQUIRE_METAL_DEVICE_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_MUTABLE_PAIR_QUALIFICATION": "1",
+        "EREDU_REQUIRE_PREPAID_STREAM_COPY_QUALIFICATION": "1",
+        "EREDU_REQUIRE_QUALIFIED_BF16_PROJECTION": "1",
+        "EREDU_REQUIRE_QUALIFIED_CACHE_CONTEXT": "1",
+        "EREDU_REQUIRE_QUALIFIED_FIXED_KERNEL": "1",
+        "EREDU_REQUIRE_QUALIFIED_G4": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_CATALOG": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_COMPOSITE": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_SOURCE": "1",
+        "EREDU_REQUIRE_QUALIFIED_KERNEL_DEFINITION": "1",
+        "EREDU_REQUIRE_QUALIFIED_KERNEL_FAMILY": "1",
+        "EREDU_REQUIRE_QUALIFIED_NATIVE_COLLECTOR": "1",
+        "EREDU_REQUIRE_QUALIFIED_PIPELINE_CACHE": "1",
+        "EREDU_REQUIRE_QUALIFIED_PROMPT_INPUT": "1",
+        "EREDU_REQUIRE_QUALIFIED_RECORD_LAYOUT": "1",
+        "EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE": "1",
+        "EREDU_REQUIRE_QUALIFIED_ROW_FAMILY": "1",
+        "EREDU_REQUIRE_QUALIFIED_SAMPLING_FILTERS": "1",
+        "EREDU_REQUIRE_QUALIFIED_SAMPLING_PENALTIES": "1",
+        "EREDU_REQUIRE_QUALIFIED_STANDARD_RANDOM": "1",
+        "EREDU_REQUIRE_ROUTER_QUALIFICATION": "1",
+        "EREDU_REQUIRE_SCHEDULER_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_STATIC_BASELINE_QUALIFICATION": "1",
+        "EREDU_REQUIRE_STREAM_REGISTRATION_QUALIFICATION": "1",
+        "MLX_C_BUILD_PATCH_TESTS": "OFF",
+        "PATH": "/Library/Developer/CommandLineTools/usr/bin:/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "RUSTC": "rustc",
+        "RUST_TEST_THREADS": "1",
+        "SAFEMLX_NATIVE_BUILD_ROOT": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-native",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "EREDU_REQUIRE_QUALIFIED_MIROSTAT": "1"
+      }
+    },
+    "retained_consumer": {
+      "case": "backend::submission_recovery::observed::tests::retained_child_finishes_once_after_pending_busy_and_retirement_error",
+      "result": {
+        "code": 0,
+        "seconds": 6.334114625118673
+      },
+      "passed": 1,
+      "failed": 0
+    }
+  },
+  "disk_activation_joined": {
+    "build": {
+      "code": 0,
+      "seconds": 72.20148804108612
+    },
+    "command": {
+      "argv": [
+        "/opt/homebrew/opt/rustup/bin/cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "eredu-backend-mlx",
+        "-p",
+        "eredu-runtime",
+        "--no-default-features",
+        "--features",
+        "eredu-backend-mlx/metal",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "cwd": "/private/tmp/eredu-original-operation-rust-diagnostic/source",
+      "environment": {
+        "CARGO_BUILD_JOBS": "24",
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_TARGET_DIR": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "DEVICE": "cpu",
+        "EREDU_PUBLIC_MANAGED_HYBRID_MODE": null,
+        "EREDU_PUBLIC_MANAGED_PLAIN_MODE": null,
+        "EREDU_PUBLIC_MANAGED_STANDARD_MODE": null,
+        "EREDU_REQUIRE_CPU_WORKER_STARTUP_QUALIFICATION": "1",
+        "EREDU_REQUIRE_GPU_STREAM_QUALIFICATION": "1",
+        "EREDU_REQUIRE_IMMUTABLE_SOURCE_QUALIFICATION": "1",
+        "EREDU_REQUIRE_METAL_DEVICE_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_MUTABLE_PAIR_QUALIFICATION": "1",
+        "EREDU_REQUIRE_PREPAID_STREAM_COPY_QUALIFICATION": "1",
+        "EREDU_REQUIRE_QUALIFIED_BF16_PROJECTION": "1",
+        "EREDU_REQUIRE_QUALIFIED_CACHE_CONTEXT": "1",
+        "EREDU_REQUIRE_QUALIFIED_FIXED_KERNEL": "1",
+        "EREDU_REQUIRE_QUALIFIED_G4": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_CATALOG": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_COMPOSITE": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_SOURCE": "1",
+        "EREDU_REQUIRE_QUALIFIED_KERNEL_DEFINITION": "1",
+        "EREDU_REQUIRE_QUALIFIED_KERNEL_FAMILY": "1",
+        "EREDU_REQUIRE_QUALIFIED_NATIVE_COLLECTOR": "1",
+        "EREDU_REQUIRE_QUALIFIED_PIPELINE_CACHE": "1",
+        "EREDU_REQUIRE_QUALIFIED_PROMPT_INPUT": "1",
+        "EREDU_REQUIRE_QUALIFIED_RECORD_LAYOUT": "1",
+        "EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE": "1",
+        "EREDU_REQUIRE_QUALIFIED_ROW_FAMILY": "1",
+        "EREDU_REQUIRE_QUALIFIED_SAMPLING_FILTERS": "1",
+        "EREDU_REQUIRE_QUALIFIED_SAMPLING_PENALTIES": "1",
+        "EREDU_REQUIRE_QUALIFIED_STANDARD_RANDOM": "1",
+        "EREDU_REQUIRE_ROUTER_QUALIFICATION": "1",
+        "EREDU_REQUIRE_SCHEDULER_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_STATIC_BASELINE_QUALIFICATION": "1",
+        "EREDU_REQUIRE_STREAM_REGISTRATION_QUALIFICATION": "1",
+        "MLX_C_BUILD_PATCH_TESTS": "OFF",
+        "PATH": "/Library/Developer/CommandLineTools/usr/bin:/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "RUSTC": "rustc",
+        "RUST_TEST_THREADS": "1",
+        "SAFEMLX_NATIVE_BUILD_ROOT": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-native",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "EREDU_REQUIRE_QUALIFIED_MIROSTAT": "1"
+      }
+    },
+    "telemetry": [
+      {
+        "case": "dense::prepared::tests::prepared_telemetry_observes_the_same_ledger_without_report_ownership",
+        "code": 0,
+        "seconds": 1.1199938328936696,
+        "one_pass": true
+      },
+      {
+        "case": "dense::tests::telemetry_owns_forward_lifecycle_validation",
+        "code": 0,
+        "seconds": 0.013698749942705035,
+        "one_pass": true
+      },
+      {
+        "case": "dense::tests::pass_accumulation_preserves_maximum_peaks",
+        "code": 0,
+        "seconds": 0.009893250185996294,
+        "one_pass": true
+      }
+    ],
+    "first_attempt": {
+      "build": {
+        "code": 101,
+        "seconds": 46.677764291875064
+      },
+      "corrections": "Two fixture scope/field corrections; retain the existing SharedBackendFailure explicitly when moving runtime inspection work outside the loan."
+    },
+    "scope": "Controller, workspace, keyed read slots, shared native recipe and transfer dispatch compile. Source backing is still the eager precursor; bounded live capacity successor remains required before public foreground validation."
+  },
+  "disk_capacity_joined": {
+    "status": "Three native lifetime cases and corrected same-pool foreign-request rejection all pass.",
+    "first_attempt": {
+      "build": {
+        "code": 101,
+        "seconds": 7.61974212503992
+      },
+      "corrections": "Use borrowed EvaluatedArray for two native alias data assertions; document new public error and fields. Also integrated the independently reviewed strict-decrease refund-race correction."
+    },
+    "build": {
+      "code": 0,
+      "seconds": 90.36704166699201
+    },
+    "command": {
+      "argv": [
+        "/opt/homebrew/opt/rustup/bin/cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "eredu-backend-mlx",
+        "-p",
+        "safemlx",
+        "--no-default-features",
+        "--features",
+        "eredu-backend-mlx/metal",
+        "--lib",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "cwd": "/private/tmp/eredu-original-operation-rust-diagnostic/source",
+      "environment": {
+        "CARGO_BUILD_JOBS": "24",
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_TARGET_DIR": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "DEVICE": "cpu",
+        "EREDU_PUBLIC_MANAGED_HYBRID_MODE": null,
+        "EREDU_PUBLIC_MANAGED_PLAIN_MODE": null,
+        "EREDU_PUBLIC_MANAGED_STANDARD_MODE": null,
+        "EREDU_REQUIRE_CPU_WORKER_STARTUP_QUALIFICATION": "1",
+        "EREDU_REQUIRE_GPU_STREAM_QUALIFICATION": "1",
+        "EREDU_REQUIRE_IMMUTABLE_SOURCE_QUALIFICATION": "1",
+        "EREDU_REQUIRE_METAL_DEVICE_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_MUTABLE_PAIR_QUALIFICATION": "1",
+        "EREDU_REQUIRE_PREPAID_STREAM_COPY_QUALIFICATION": "1",
+        "EREDU_REQUIRE_QUALIFIED_BF16_PROJECTION": "1",
+        "EREDU_REQUIRE_QUALIFIED_CACHE_CONTEXT": "1",
+        "EREDU_REQUIRE_QUALIFIED_FIXED_KERNEL": "1",
+        "EREDU_REQUIRE_QUALIFIED_G4": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_CATALOG": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_COMPOSITE": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_SOURCE": "1",
+        "EREDU_REQUIRE_QUALIFIED_KERNEL_DEFINITION": "1",
+        "EREDU_REQUIRE_QUALIFIED_KERNEL_FAMILY": "1",
+        "EREDU_REQUIRE_QUALIFIED_NATIVE_COLLECTOR": "1",
+        "EREDU_REQUIRE_QUALIFIED_PIPELINE_CACHE": "1",
+        "EREDU_REQUIRE_QUALIFIED_PROMPT_INPUT": "1",
+        "EREDU_REQUIRE_QUALIFIED_RECORD_LAYOUT": "1",
+        "EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE": "1",
+        "EREDU_REQUIRE_QUALIFIED_ROW_FAMILY": "1",
+        "EREDU_REQUIRE_QUALIFIED_SAMPLING_FILTERS": "1",
+        "EREDU_REQUIRE_QUALIFIED_SAMPLING_PENALTIES": "1",
+        "EREDU_REQUIRE_QUALIFIED_STANDARD_RANDOM": "1",
+        "EREDU_REQUIRE_ROUTER_QUALIFICATION": "1",
+        "EREDU_REQUIRE_SCHEDULER_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_STATIC_BASELINE_QUALIFICATION": "1",
+        "EREDU_REQUIRE_STREAM_REGISTRATION_QUALIFICATION": "1",
+        "MLX_C_BUILD_PATCH_TESTS": "OFF",
+        "PATH": "/Library/Developer/CommandLineTools/usr/bin:/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "RUSTC": "rustc",
+        "RUST_TEST_THREADS": "1",
+        "SAFEMLX_NATIVE_BUILD_ROOT": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-native",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "EREDU_REQUIRE_QUALIFIED_MIROSTAT": "1"
+      }
+    },
+    "behavior_first_attempt": [
+      {
+        "case": "allocation_retention::graph_quota::retirement_capacity::tests::capacity_cancellation_and_rejected_native_constructor_refund_once",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/safemlx-058a7e3a7583df78",
+          "--exact",
+          "allocation_retention::graph_quota::retirement_capacity::tests::capacity_cancellation_and_rejected_native_constructor_refund_once",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 0.9748361660167575,
+        "positive_one_test": true
+      },
+      {
+        "case": "allocation_retention::graph_quota::retirement_capacity::tests::capacity_refunds_at_final_native_alias_before_arbitrary_owner_retirement",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/safemlx-058a7e3a7583df78",
+          "--exact",
+          "allocation_retention::graph_quota::retirement_capacity::tests::capacity_refunds_at_final_native_alias_before_arbitrary_owner_retirement",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 0.025183292105793953,
+        "positive_one_test": true
+      },
+      {
+        "case": "allocation_retention::graph_quota::retirement_capacity::tests::host_source_backing_recycles_before_queued_custody_without_double_refund",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/safemlx-058a7e3a7583df78",
+          "--exact",
+          "allocation_retention::graph_quota::retirement_capacity::tests::host_source_backing_recycles_before_queued_custody_without_double_refund",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 1.3075940839480609,
+        "positive_one_test": true
+      },
+      {
+        "case": "composition::mlx::session::model_session::text_quote::prefill_tests::foreground_source_capacity_tests::foreground_source_capacity_refuses_another_request_in_the_same_pool",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-0494e37a06f3f63e",
+          "--exact",
+          "composition::mlx::session::model_session::text_quote::prefill_tests::foreground_source_capacity_tests::foreground_source_capacity_refuses_another_request_in_the_same_pool",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 101,
+        "seconds": 7.544706416781992,
+        "positive_one_test": false
+      }
+    ],
+    "fixture_correction": "The new request-identity case selected the ordinary unregistered fixture, which now correctly refuses complete managed admission with UnknownBound. Select the existing registered source/domain fixture used by public managed execution; the target request-identity assertions remain unchanged."
+  },
+  "public_foreground_disk": {
+    "status": "PASS: managed attempt6 and ordinary/controlled attempt7 agree. Historical failed attempts below are retained to explain corrections; see public_foreground_disk_collector for current evidence.",
+    "first_attempt": {
+      "build": {
+        "code": 0,
+        "seconds": 82.36220624996349
+      },
+      "results": [
+        {
+          "mode": "managed",
+          "argv": [
+            "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-706f95ca2890d253",
+            "--exact",
+            "managed_plain::native_managed_foreground_disk_matches_ordinary_and_controlled_generation",
+            "--ignored",
+            "--nocapture"
+          ],
+          "code": 101,
+          "seconds": 7.108854457968846,
+          "result": null,
+          "fixture_cleanup": []
+        }
+      ],
+      "cause": "Existing admitted allocator borrow incorrectly required an empty submission context. Initialization keeps that restriction; identity-checked no-allocation borrowing now permits active roles, with its own measured per-call controls."
+    },
+    "second_attempt": [
+      {
+        "mode": "managed",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-6ce1db9d6a539b3c",
+          "--exact",
+          "managed_plain::native_managed_foreground_disk_matches_ordinary_and_controlled_generation",
+          "--ignored",
+          "--nocapture"
+        ],
+        "code": 101,
+        "seconds": 7.469115499872714,
+        "result": null,
+        "fixture_cleanup": []
+      }
+    ],
+    "third_attempt": [
+      {
+        "mode": "managed",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-f41a3f97689dd5d8",
+          "--exact",
+          "managed_plain::native_managed_foreground_disk_matches_ordinary_and_controlled_generation",
+          "--ignored",
+          "--nocapture"
+        ],
+        "code": 101,
+        "seconds": 7.642095833085477,
+        "result": null,
+        "fixture_cleanup": []
+      }
+    ],
+    "callback_attempt_4": {
+      "build": {
+        "code": 0,
+        "seconds": 17.56046941690147
+      },
+      "behavior": [
+        {
+          "mode": "managed",
+          "argv": [
+            "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-285d48634713c3e0",
+            "--exact",
+            "managed_plain::native_managed_foreground_disk_matches_ordinary_and_controlled_generation",
+            "--ignored",
+            "--nocapture"
+          ],
+          "code": 101,
+          "seconds": 7.140041916863993,
+          "result": null,
+          "fixture_cleanup": []
+        }
+      ],
+      "status": "Still generic ExecutionFenced after callback-retention fix; no ordinary or controlled mode ran."
+    }
+  },
+  "followon_implementation": {
+    "checkpoint_recipes": "Integrated metadata-proven byte-preserving views, identity casts and singleton-axis transposes in the neutral encoded read compiler. Full ordinary inference precedes eligibility proof, preserving error precedence.",
+    "chat_trim": "Integrated shared Unicode character-set trim for borrowed atom/literal arguments; no temporary character vector or new renderer.",
+    "saved_copy": "Integrated shared exact collector plan and post-admission construction for saved array/sampler/decoder copying; original reserve failures retain copy custody. Full managed snapshot gateway remains separate.",
+    "validation": "Joined build passed in112.08s; all five selected checkpoint/trim/request-identity/saved-copy cases pass.",
+    "numeric_chat": "Integrated exact existing serde_json1.0.151 scalar producer with private syntax-error layout query, borrowed numeric spans, post-admission parser invocation and source-custody failure handling. Build in progress; focused numeric tests pending."
+  },
+  "disk_followon_joined": {
+    "build": {
+      "code": 0,
+      "seconds": 112.07551450002939
+    },
+    "command": {
+      "argv": [
+        "/opt/homebrew/opt/rustup/bin/cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "eredu-backend-mlx",
+        "-p",
+        "eredu-checkpoint",
+        "-p",
+        "eredu-text",
+        "-p",
+        "eredu",
+        "--no-default-features",
+        "--features",
+        "eredu/mlx,eredu-backend-mlx/metal",
+        "--lib",
+        "--test",
+        "native_execution_control",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "cwd": "/private/tmp/eredu-original-operation-rust-diagnostic/source",
+      "environment": {
+        "CARGO_BUILD_JOBS": "24",
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_TARGET_DIR": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "DEVICE": "cpu",
+        "EREDU_PUBLIC_MANAGED_HYBRID_MODE": null,
+        "EREDU_PUBLIC_MANAGED_PLAIN_MODE": null,
+        "EREDU_PUBLIC_MANAGED_STANDARD_MODE": null,
+        "EREDU_REQUIRE_CPU_WORKER_STARTUP_QUALIFICATION": "1",
+        "EREDU_REQUIRE_GPU_STREAM_QUALIFICATION": "1",
+        "EREDU_REQUIRE_IMMUTABLE_SOURCE_QUALIFICATION": "1",
+        "EREDU_REQUIRE_METAL_DEVICE_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_MUTABLE_PAIR_QUALIFICATION": "1",
+        "EREDU_REQUIRE_PREPAID_STREAM_COPY_QUALIFICATION": "1",
+        "EREDU_REQUIRE_QUALIFIED_BF16_PROJECTION": "1",
+        "EREDU_REQUIRE_QUALIFIED_CACHE_CONTEXT": "1",
+        "EREDU_REQUIRE_QUALIFIED_FIXED_KERNEL": "1",
+        "EREDU_REQUIRE_QUALIFIED_G4": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_CATALOG": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_COMPOSITE": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_SOURCE": "1",
+        "EREDU_REQUIRE_QUALIFIED_KERNEL_DEFINITION": "1",
+        "EREDU_REQUIRE_QUALIFIED_KERNEL_FAMILY": "1",
+        "EREDU_REQUIRE_QUALIFIED_NATIVE_COLLECTOR": "1",
+        "EREDU_REQUIRE_QUALIFIED_PIPELINE_CACHE": "1",
+        "EREDU_REQUIRE_QUALIFIED_PROMPT_INPUT": "1",
+        "EREDU_REQUIRE_QUALIFIED_RECORD_LAYOUT": "1",
+        "EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE": "1",
+        "EREDU_REQUIRE_QUALIFIED_ROW_FAMILY": "1",
+        "EREDU_REQUIRE_QUALIFIED_SAMPLING_FILTERS": "1",
+        "EREDU_REQUIRE_QUALIFIED_SAMPLING_PENALTIES": "1",
+        "EREDU_REQUIRE_QUALIFIED_STANDARD_RANDOM": "1",
+        "EREDU_REQUIRE_ROUTER_QUALIFICATION": "1",
+        "EREDU_REQUIRE_SCHEDULER_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_STATIC_BASELINE_QUALIFICATION": "1",
+        "EREDU_REQUIRE_STREAM_REGISTRATION_QUALIFICATION": "1",
+        "MLX_C_BUILD_PATCH_TESTS": "OFF",
+        "PATH": "/Library/Developer/CommandLineTools/usr/bin:/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "RUSTC": "rustc",
+        "RUST_TEST_THREADS": "1",
+        "SAFEMLX_NATIVE_BUILD_ROOT": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-native",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "EREDU_REQUIRE_QUALIFIED_MIROSTAT": "1"
+      }
+    },
+    "behavior": [
+      {
+        "case": "store::bulk::tests::recipe_read_infers_nested_expert_layout_and_falls_back_for_transforms",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_checkpoint-1e1fce4be85dfb32",
+          "--exact",
+          "store::bulk::tests::recipe_read_infers_nested_expert_layout_and_falls_back_for_transforms",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 0.6866592499427497,
+        "positive_one_test": true
+      },
+      {
+        "case": "chat_storage::tests::source_trim_character_arguments_share_ordinary_set_semantics_and_bounds",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_text-9cb393b56e291d5f",
+          "--exact",
+          "chat_storage::tests::source_trim_character_arguments_share_ordinary_set_semantics_and_bounds",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 6.509455000050366,
+        "positive_one_test": true
+      },
+      {
+        "case": "composition::mlx::session::model_session::text_quote::prefill_tests::foreground_source_capacity_tests::foreground_source_capacity_refuses_another_request_in_the_same_pool",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-7b06ed9bac20ef3d",
+          "--exact",
+          "composition::mlx::session::model_session::text_quote::prefill_tests::foreground_source_capacity_tests::foreground_source_capacity_refuses_another_request_in_the_same_pool",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 6.608362666796893,
+        "positive_one_test": true
+      },
+      {
+        "case": "composition::mlx::session::model_session::saved_array_copy::tests::exact_saved_arrays_copy_rejects_short_limits_and_preserves_independent_values",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-7b06ed9bac20ef3d",
+          "--exact",
+          "composition::mlx::session::model_session::saved_array_copy::tests::exact_saved_arrays_copy_rejects_short_limits_and_preserves_independent_values",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 1.1575644158292562,
+        "positive_one_test": true
+      },
+      {
+        "case": "composition::mlx::session::model_session::saved_array_copy::decoder::tests::paired_copy_admits_exact_managed_account_and_rejects_short_before_copy",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-7b06ed9bac20ef3d",
+          "--exact",
+          "composition::mlx::session::model_session::saved_array_copy::decoder::tests::paired_copy_admits_exact_managed_account_and_rejects_short_before_copy",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 1.1350757079198956,
+        "positive_one_test": true
+      }
+    ],
+    "first_attempt": {
+      "build": {
+        "code": 101,
+        "seconds": 6.411061874823645
+      },
+      "correction": "Use the existing dyn CheckpointSource recipe catalog adapter in the competing-error regression oracle."
+    }
+  },
+  "disk_collector_joined": {
+    "build": {
+      "code": 0,
+      "seconds": 114.41589295887388
+    },
+    "command": {
+      "argv": [
+        "/opt/homebrew/opt/rustup/bin/cargo",
+        "test",
+        "--locked",
+        "--offline",
+        "-p",
+        "eredu-backend-mlx",
+        "-p",
+        "eredu-runtime",
+        "-p",
+        "eredu",
+        "--no-default-features",
+        "--features",
+        "eredu/mlx,eredu-backend-mlx/metal",
+        "--lib",
+        "--test",
+        "native_execution_control",
+        "--test",
+        "backend_conformance",
+        "--no-run",
+        "--message-format=json"
+      ],
+      "cwd": "/private/tmp/eredu-original-operation-rust-diagnostic/source",
+      "environment": {
+        "CARGO_BUILD_JOBS": "24",
+        "CARGO_INCREMENTAL": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_TARGET_DIR": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "DEVICE": "cpu",
+        "EREDU_PUBLIC_MANAGED_HYBRID_MODE": null,
+        "EREDU_PUBLIC_MANAGED_PLAIN_MODE": null,
+        "EREDU_PUBLIC_MANAGED_STANDARD_MODE": null,
+        "EREDU_REQUIRE_CPU_WORKER_STARTUP_QUALIFICATION": "1",
+        "EREDU_REQUIRE_GPU_STREAM_QUALIFICATION": "1",
+        "EREDU_REQUIRE_IMMUTABLE_SOURCE_QUALIFICATION": "1",
+        "EREDU_REQUIRE_METAL_DEVICE_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_MUTABLE_PAIR_QUALIFICATION": "1",
+        "EREDU_REQUIRE_PREPAID_STREAM_COPY_QUALIFICATION": "1",
+        "EREDU_REQUIRE_QUALIFIED_BF16_PROJECTION": "1",
+        "EREDU_REQUIRE_QUALIFIED_CACHE_CONTEXT": "1",
+        "EREDU_REQUIRE_QUALIFIED_FIXED_KERNEL": "1",
+        "EREDU_REQUIRE_QUALIFIED_G4": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_CATALOG": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_COMPOSITE": "1",
+        "EREDU_REQUIRE_QUALIFIED_GGUF_SOURCE": "1",
+        "EREDU_REQUIRE_QUALIFIED_KERNEL_DEFINITION": "1",
+        "EREDU_REQUIRE_QUALIFIED_KERNEL_FAMILY": "1",
+        "EREDU_REQUIRE_QUALIFIED_NATIVE_COLLECTOR": "1",
+        "EREDU_REQUIRE_QUALIFIED_PIPELINE_CACHE": "1",
+        "EREDU_REQUIRE_QUALIFIED_PROMPT_INPUT": "1",
+        "EREDU_REQUIRE_QUALIFIED_RECORD_LAYOUT": "1",
+        "EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE": "1",
+        "EREDU_REQUIRE_QUALIFIED_ROW_FAMILY": "1",
+        "EREDU_REQUIRE_QUALIFIED_SAMPLING_FILTERS": "1",
+        "EREDU_REQUIRE_QUALIFIED_SAMPLING_PENALTIES": "1",
+        "EREDU_REQUIRE_QUALIFIED_STANDARD_RANDOM": "1",
+        "EREDU_REQUIRE_ROUTER_QUALIFICATION": "1",
+        "EREDU_REQUIRE_SCHEDULER_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION": "1",
+        "EREDU_REQUIRE_STATIC_BASELINE_QUALIFICATION": "1",
+        "EREDU_REQUIRE_STREAM_REGISTRATION_QUALIFICATION": "1",
+        "MLX_C_BUILD_PATCH_TESTS": "OFF",
+        "PATH": "/Library/Developer/CommandLineTools/usr/bin:/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "RUSTC": "rustc",
+        "RUST_TEST_THREADS": "1",
+        "SAFEMLX_NATIVE_BUILD_ROOT": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-native",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "EREDU_REQUIRE_QUALIFIED_MIROSTAT": "1"
+      }
+    },
+    "behavior": [
+      {
+        "case": "prefetch::typed_tests::typed_failure_survives_demand_and_cancel_and_retires_outside_lock",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-6015b9aa8bdff667",
+          "--exact",
+          "prefetch::typed_tests::typed_failure_survives_demand_and_cancel_and_retires_outside_lock",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 1.1986102911178023,
+        "positive_one_test": true
+      },
+      {
+        "case": "control::snapshots::facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulative_budgets",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/backend_conformance-5522408c9635ffd0",
+          "--exact",
+          "control::snapshots::facade_complete_snapshots_restore_partial_unicode_terminal_state_and_cumulative_budgets",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 7.071813374990597,
+        "positive_one_test": true
+      },
+      {
+        "case": "control::snapshots::facade_restore_preserves_stop_lookbehind_across_a_saved_token_boundary",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/backend_conformance-5522408c9635ffd0",
+          "--exact",
+          "control::snapshots::facade_restore_preserves_stop_lookbehind_across_a_saved_token_boundary",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 0.08975408296100795,
+        "positive_one_test": true
+      },
+      {
+        "case": "control::snapshots::host_authority::zero_finite_reservation_rejects_snapshot_restore_and_fork_without_work_or_budget",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/backend_conformance-5522408c9635ffd0",
+          "--exact",
+          "control::snapshots::host_authority::zero_finite_reservation_rejects_snapshot_restore_and_fork_without_work_or_budget",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "code": 0,
+        "seconds": 0.09017916698940098,
+        "positive_one_test": true
+      }
+    ],
+    "scope": "Typed collector failure retention, used snapshot host transaction, typed prefetch failure transport. All four affected-path behavioral cases pass."
+  },
+  "disk_callback_numeric": {
+    "build": {
+      "code": 0,
+      "seconds": 115.00068587507121
+    },
+    "behavior": [
+      {
+        "case": "chat_storage::tests::numeric_config_uses_ordinary_scalar_semantics_after_source_planning",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_text-7445418303525af1",
+          "--exact",
+          "chat_storage::tests::numeric_config_uses_ordinary_scalar_semantics_after_source_planning",
+          "--nocapture"
+        ],
+        "code": 101,
+        "seconds": 0.6746873329393566
+      }
+    ],
+    "status": "Numeric config case fails at Features because the actual facade union enables serde_json float_roundtrip. Runtime numeric case not run after failure. Full roundtrip scratch qualification in progress; no feature disabling."
+  },
+  "disk_failure_diagnosis": {
+    "qualification": false,
+    "mirror_only": true,
+    "restored": {
+      "restored": true,
+      "files": 6,
+      "live_unchanged": true
+    },
+    "first_build": {
+      "code": 0,
+      "seconds": 32.67476808303036
+    },
+    "second_build": {
+      "code": 0,
+      "seconds": 19.495543208904564
+    },
+    "first_cause": "Native(OriginalBuffer(UncertifiedBacking)) in nonstate publication from final sampling ScopeRetention retirement",
+    "tensor": {
+      "shape": [
+        16
+      ],
+      "dtype": "Float32",
+      "logical_bytes": 64,
+      "allocation_kind": "host_transfer",
+      "allocation_bytes": 16384
+    },
+    "mechanism": "Completed request-born disk host aliases lack matching host source inventory; current native observations do not classify host transfer backing. Later decode masks the publication error after funding quarantine.",
+    "production_resolution": "Resolved: exact canonical host sources, prepaid source accounting and actual owning collector joined. Managed disk attempt6 and ordinary/controlled attempt7 pass."
+  },
+  "snapshot_retained_provider": {
+    "status": "Integrated; compilation and independent-copy budget/state/output lifetime case PASS.",
+    "files": 18,
+    "scope": "Actual token/EOS/terminal text, four decoder buffers/progress, stop state, consumer lifecycle and distinct destination PendingAccount custody.",
+    "remaining": "Native managed capture preparation and original source-pin integration, restore/fork and applicable pending-state paths."
+  },
+  "completion_publication_failure": {
+    "status": "Integrated; post-retirement model and sampled completion health checks now return first owned callback cause before caching success or submitting another decode.",
+    "validation": "Joined build PASS. Historical failure preserved the first uncertified-backing cause, enabling the collector correction. Public disk now passes; see public_foreground_disk_collector."
+  },
+  "numeric_snapshot_worker_joined": {
+    "build": {
+      "code": 0,
+      "seconds": 108.80779541702941
+    },
+    "behavior": [
+      {
+        "case": "chat_storage::tests::numeric_config_uses_ordinary_scalar_semantics_after_source_planning",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_text-7445418303525af1",
+          "--exact",
+          "chat_storage::tests::numeric_config_uses_ordinary_scalar_semantics_after_source_planning",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.6754417910706252,
+        "positive_one_test": true
+      },
+      {
+        "case": "working_memory::original_chat::tests::original_numeric_chat_parser_and_error_remain_under_source_custody",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+          "--exact",
+          "working_memory::original_chat::tests::original_numeric_chat_parser_and_error_remain_under_source_custody",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 1.0762327499687672,
+        "positive_one_test": true
+      },
+      {
+        "case": "working_memory::residual::tests::span_workspace::text_controls::sequence::consumer::retained_provider_copy_has_independent_budget_state_and_output_lifetime",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+          "--exact",
+          "working_memory::residual::tests::span_workspace::text_controls::sequence::consumer::retained_provider_copy_has_independent_budget_state_and_output_lifetime",
+          "--nocapture"
+        ],
+        "code": 101,
+        "seconds": 0.028138166991993785,
+        "positive_one_test": false
+      }
+    ],
+    "worker_behavior": [
+      {
+        "case": "prefetch::fixed_tests::selected_nonjoining_drop_retains_operation_until_active_work_retires",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+          "--exact",
+          "prefetch::fixed_tests::selected_nonjoining_drop_retains_operation_until_active_work_retires",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.012294500134885311,
+        "positive_one_test": true
+      },
+      {
+        "case": "prefetch::fixed_tests::selected_cancel_fences_active_error_and_never_executes_future_work",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+          "--exact",
+          "prefetch::fixed_tests::selected_cancel_fences_active_error_and_never_executes_future_work",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.006138499826192856,
+        "positive_one_test": true
+      },
+      {
+        "case": "prefetch::typed_tests::typed_failure_survives_demand_and_cancel_and_retires_outside_lock",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+          "--exact",
+          "prefetch::typed_tests::typed_failure_survives_demand_and_cancel_and_retires_outside_lock",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.006092916009947658,
+        "positive_one_test": true
+      }
+    ],
+    "status": "Numeric parser2 and worker3 PASS. New retained-provider copy case exposed fixture execution ceiling with no copy headroom; fixture now explicitly reserves headroom, rerun pending."
+  },
+  "snapshot_managed_gateway": {
+    "status": "Public resident dense managed snapshots PASS both before prefill and after one committed token. Fresh restore/fork, hybrid/wider family-state validation, media/capture/residency combinations remain."
+  },
+  "snapshot_finite_preparation_1": {
+    "build": {
+      "code": 0,
+      "seconds": 108.66350808390416
+    },
+    "behavior": [
+      {
+        "case": "working_memory::residual::tests::span_workspace::text_controls::sequence::consumer::retained_provider_copy_has_independent_budget_state_and_output_lifetime",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+          "--exact",
+          "working_memory::residual::tests::span_workspace::text_controls::sequence::consumer::retained_provider_copy_has_independent_budget_state_and_output_lifetime",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 1.241251999977976,
+        "positive_one_test": true
+      },
+      {
+        "case": "workspace::isolated_copy::tests::aliases_pin_one_source_but_copy_every_slot_and_keep_prior_destinations",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_nn-32a2348cbb48a994",
+          "--exact",
+          "workspace::isolated_copy::tests::aliases_pin_one_source_but_copy_every_slot_and_keep_prior_destinations",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.3868710829410702,
+        "positive_one_test": true
+      },
+      {
+        "case": "workspace::isolated_copy::tests::selection_must_match_exactly_including_zero_byte_identities_and_empty_plans",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_nn-32a2348cbb48a994",
+          "--exact",
+          "workspace::isolated_copy::tests::selection_must_match_exactly_including_zero_byte_identities_and_empty_plans",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.014324083924293518,
+        "positive_one_test": true
+      }
+    ],
+    "projection_behavior": [
+      {
+        "case": "backend::nn::workspace::projection::tests::native_storage_projection_preserves_capacity_aliases_and_unknown_lazy_state",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-1949d2de08c40228",
+          "--exact",
+          "backend::nn::workspace::projection::tests::native_storage_projection_preserves_capacity_aliases_and_unknown_lazy_state",
+          "--nocapture",
+          "--ignored"
+        ],
+        "code": 0,
+        "seconds": 1.1295183750335127,
+        "positive_one_test": true
+      }
+    ]
+  },
+  "source_carrier_joined": {
+    "status": "Build PASS after fixed Send error transport; two focused runtime cases PASS.",
+    "build": {
+      "code": 0,
+      "seconds": 85.12909674993716
+    },
+    "implementation": [
+      "Retained original source carrier and finite registration",
+      "Foreground source control/backing split and completed-buffer failure retirement"
+    ],
+    "runtime_cases": [
+      "working_memory::resident_reset::tests::original_source_witness_and_new_revision_retain_actual_account_without_registry_cycle",
+      "working_memory::residual::tests::finite_binding_consumes_counted_rows_and_keeps_exact_existing_only_pins"
+    ]
+  },
+  "public_foreground_disk_collector": {
+    "status": "Public foreground disk ordinary/managed/controlled parity PASS across the collector correction and ordinary detached-source routing fix.",
+    "build": {
+      "code": 0,
+      "seconds": 22.822380374884233
+    },
+    "attempt6": [
+      {
+        "mode": "managed",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-faa37cf61a7c0f14",
+          "--exact",
+          "managed_plain::native_managed_foreground_disk_matches_ordinary_and_controlled_generation",
+          "--ignored",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 7.625281624961644,
+        "result": {
+          "ids": [
+            8,
+            32,
+            26,
+            1
+          ],
+          "text": "iGAb"
+        },
+        "fixture_cleanup": []
+      },
+      {
+        "mode": "ordinary",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-faa37cf61a7c0f14",
+          "--exact",
+          "managed_plain::native_managed_foreground_disk_matches_ordinary_and_controlled_generation",
+          "--ignored",
+          "--nocapture"
+        ],
+        "code": 101,
+        "seconds": 0.27304724999703467,
+        "result": null,
+        "fixture_cleanup": []
+      }
+    ],
+    "fix": "Owning retained-storage collector now includes canonical host sources retained by device cells. Existing row budgets and positive source witnesses reused.",
+    "remaining": "Background prefetch/read ownership, additional source transforms and wider family/path matrix.",
+    "attempt7": [
+      {
+        "mode": "ordinary",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-faa37cf61a7c0f14",
+          "--exact",
+          "managed_plain::native_managed_foreground_disk_matches_ordinary_and_controlled_generation",
+          "--ignored",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 6.50861974991858,
+        "result": {
+          "ids": [
+            8,
+            32,
+            26,
+            1
+          ],
+          "text": "iGAb"
+        },
+        "fixture_cleanup": []
+      },
+      {
+        "mode": "controlled",
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-faa37cf61a7c0f14",
+          "--exact",
+          "managed_plain::native_managed_foreground_disk_matches_ordinary_and_controlled_generation",
+          "--ignored",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 1.3144338328856975,
+        "result": {
+          "ids": [
+            8,
+            32,
+            26,
+            1
+          ],
+          "text": "iGAb"
+        },
+        "fixture_cleanup": []
+      }
+    ],
+    "ordinary_fix_build": {
+      "code": 0,
+      "seconds": 80.15525279194117
+    },
+    "validation_limit": "Managed passed on collector build before the ordinary-only routing fix; ordinary and controlled passed on the corrected joined build. Managed was not rerun."
+  },
+  "snapshot_finite_components": {
+    "status": "Joined native/portable compilation PASS; new finite-copy behavioral case PASS. Full original native snapshot remains disabled pending constructor/native-copy completion.",
+    "build": {
+      "code": 0,
+      "seconds": 80.15525279194117
+    },
+    "finite_copy": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_nn-32a2348cbb48a994",
+        "--exact",
+        "workspace::isolated_copy::tests::finite::finite_copy_matches_ordinary_and_rejects_changed_layout_or_aliasing",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 0.4822879589628428,
+      "binary_source": "successful eredu_nn compiler artifact in ordinary-detached-disk; that joined build failed later in backend ordinary row conversion"
+    },
+    "components": [
+      "Complete retained decoder census",
+      "Source-count/rank projection and context construction",
+      "Finite moved-key source pinning and original-source carrier",
+      "Finite shared isolated-copy graph/report preparation"
+    ],
+    "assertions": [
+      "Same operation program, layouts and assumptions as ordinary preparation",
+      "Aliased source counted once while every slot copied; incremental128 retained48 transient80 state176 bytes",
+      "Changed layout and direct/possible deep-copy aliases reject",
+      "Unknown deep-copy facts stay unknown without ordinary fallback"
+    ]
+  },
+  "snapshot_construction_joined": {
+    "status": "Joined compilation PASS; new table custody and cold estimate admission-order cases PASS. Complete original native snapshot remains gated.",
+    "build": {
+      "code": 0,
+      "seconds": 78.47876533307135
+    },
+    "table_lifetime": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+        "--exact",
+        "host_metadata::slots::tests::prepared_table_metadata_and_identity_retain_host_custody_but_registry_key_does_not",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 1.2841182500123978,
+      "binary_source": "successful runtime compiler artifact from joined build; that build later failed in backend visitor/iterator code"
+    },
+    "cold_estimate": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/backend_conformance-55cd659d3512e2c1",
+        "--exact",
+        "control::snapshots::policy::cold_estimate::original_estimates_bypass_ordinary_hooks_and_keep_budget_admission_order",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 1.0484898341819644
+    },
+    "components": [
+      "Original snapshot logical estimates via fixed borrowed native facts",
+      "Fixed neutral native preparation error transport at facade and runtime boundaries",
+      "Prepared table/source binding, metadata/identity/PAL and group bookkeeping",
+      "Consumed source inventory/projection/registration/finite-copy metadata composition"
+    ],
+    "corrections": [
+      "Hybrid source visitation uses its concrete borrowed RuntimeState visitor; failed visits remain unknown",
+      "Iterator layout query drops the borrowed iterator before its empty source owner",
+      "Destination identity creation occurs before copy-account commit, so exhaustion creates no untouched quarantined scope"
+    ],
+    "remaining": [
+      "Native copy Graph/Record/eager constructor/completion/publication ownership",
+      "Copy account/execution identity/weak node constructor lifetime",
+      "Fixed cold source preparation and final table/account/native composition",
+      "Public managed snapshot activation and capture/restore/fork matrix"
+    ]
+  },
+  "snapshot_account_cold_joined": {
+    "status": "production compile and new lifetime regression passed; public managed snapshot remains gated",
+    "build": {
+      "code": 0,
+      "seconds": 102.32022824999876
+    },
+    "build_directory": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/snapshot-account-cold-joined",
+    "new_regression": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+        "--exact",
+        "working_memory::funding::accounts::tests::prepared_copy_final_owners_drain_host_account_without_an_external_pool",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 1.1729907921981066
+    },
+    "scope": "Same-account native retention; prepared copy account and identity controls; terminal ledger and host custody retirement; cold decoder/source validators; single prepared table binding; immutable admitted stream/allocator environment.",
+    "not_repeated": "Previously passed disk public parity, finite-copy, table custody and cold-estimate tests were not rerun.",
+    "remaining": "Consumed native Graph/Record/buffer/completion plan, finite canonical publication, saved-result wrapper ownership, complete aggregate and public gateway."
+  },
+  "snapshot_native_copy_joined": {
+    "status": "Production and test compilation passed; public gateway join remains in progress.",
+    "build": {
+      "code": 0,
+      "seconds": 79.3711651249323
+    },
+    "build_directory": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/snapshot-native-copy-joined-fixed",
+    "scope": [
+      "Scoped native eager deep copy, bounded graph/control construction and same-account native buffer custody",
+      "Returned decoder/component wrappers retaining host authority through final destruction",
+      "Fixed saved-copy completion status transport preserving unsettled source and submission custody"
+    ],
+    "new_completion_regression": {
+      "status": "Corrected blocked-or-failed probe passed through actual shared completion/retirement.",
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-1949d2de08c40228",
+        "--exact",
+        "composition::mlx::session::model_session::saved_copy_completion_tests::saved_copy_completion_failure_keeps_pending_source_and_submission_authority",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 6.19372275006026
+    },
+    "remaining": [
+      "Finite destination publication and complete driver join",
+      "Public managed snapshot capture and restore/fork matrix"
+    ],
+    "not_repeated": "Previously passed public disk parity and account/cold-estimate tests were not rerun."
+  },
+  "snapshot_publication_joined": {
+    "status": "Finite publication and complete caller/public hook integrated; backend build retry and first public capture pending.",
+    "first_build": {
+      "code": 101,
+      "seconds": 45.74095816584304
+    },
+    "compile_correction": "Narrow cache-state visibility for the immutable hybrid child count used by destination metadata census.",
+    "publication_regression": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+        "--exact",
+        "working_memory::funding::accounts::tests::finite_copy_publication_checks_exact_account_and_retires_last_output_host_custody",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 1.2063546248245984
+    },
+    "scope": "Same-copy-account finite output publication with host constructor custody, foreign same-pool scope refusal, atomic registration, and final namespace/registry/host retirement.",
+    "runtime_artifact_note": "Runtime compiled successfully; subsequent backend compilation failed only on the corrected visibility.",
+    "not_repeated": "Existing account and cold-estimate tests and public foreground parity were not rerun.",
+    "passing_joined_build": {
+      "code": 0,
+      "seconds": 78.18583379196934
+    },
+    "completion_regression": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-1949d2de08c40228",
+        "--exact",
+        "composition::mlx::session::model_session::saved_copy_completion_tests::saved_copy_completion_failure_keeps_pending_source_and_submission_authority",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 6.19372275006026
+    }
+  },
+  "snapshot_public_capture": {
+    "status": "PASS: actual public managed snapshot after one committed token, independent immutable saved lifetime, continued numerical output, budget refusal and nonrefundable cumulative copy.",
+    "attempts": [
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-faa37cf61a7c0f14",
+          "--exact",
+          "managed_plain::snapshot::native_managed_snapshot_captures_after_commit_with_independent_custody",
+          "--ignored",
+          "--nocapture"
+        ],
+        "code": 101,
+        "seconds": 12.3626578329131,
+        "positive_one_test": false,
+        "fixture_cleanup": []
+      },
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-faa37cf61a7c0f14",
+          "--exact",
+          "managed_plain::snapshot::native_managed_snapshot_captures_after_commit_with_independent_custody",
+          "--ignored",
+          "--nocapture"
+        ],
+        "code": 101,
+        "seconds": 6.7875796251464635,
+        "positive_one_test": false,
+        "fixture_cleanup": []
+      },
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-faa37cf61a7c0f14",
+          "--exact",
+          "managed_plain::snapshot::native_managed_snapshot_captures_after_commit_with_independent_custody",
+          "--ignored",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 6.8695339588448405,
+        "positive_one_test": true,
+        "fixture_cleanup": []
+      }
+    ],
+    "correction": "Complete paired copy retains accepted host preparation through source revalidation and requires extracted sequence bank; standalone component copying still rejects original sequence.",
+    "corrected_build": {
+      "code": 0,
+      "seconds": 55.4545438750647
+    },
+    "verified": {
+      "saved_token_ids": [
+        8
+      ],
+      "saved_next_prediction": 1,
+      "continued_output": [
+        8,
+        38,
+        26,
+        1
+      ],
+      "retained_past_model_drop": true,
+      "snapshot_count_refusal": true,
+      "one_byte_capacity_refusal": true,
+      "cumulative_copy_not_refunded": true
+    },
+    "pending_native_source_regression": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-1949d2de08c40228",
+        "--exact",
+        "backend::array_copy::pending_input::tests::scalar_and_backing_views_follow_the_same_copy_program_without_collector_growth",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 13.011413041967899
+    },
+    "remaining": "Dense pending-prefill and hybrid recurrent capture now pass. Fresh restore/fork and broader decoder-state/family/residency/capture/media paths remain."
+  },
+  "snapshot_pending_prefill": {
+    "status": "PASS: actual public snapshot before first advance with complete prepared plain-text matrix; live generation and independent saved lifetime preserved.",
+    "build": {
+      "code": 0,
+      "seconds": 54.35288987518288
+    },
+    "first_public_attempt": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-faa37cf61a7c0f14",
+        "--exact",
+        "managed_plain::snapshot::native_managed_snapshot_captures_pending_prefill_with_independent_custody",
+        "--ignored",
+        "--nocapture"
+      ],
+      "code": 101,
+      "seconds": 6.643747374881059,
+      "positive_one_test": false,
+      "fixture_cleanup": []
+    },
+    "finding": "After the true nested copy completion, Array::deep_clone invoked into_evaluated, and destination inspection invoked evaluated again. These extra scopes exceeded the source-derived one-frontier tracking bound for the single pending matrix.",
+    "correction": "Original copy now borrows completed_in_original_scope before eager deep clone and verifies destinations through the same read-only completed witness. Ordinary evaluation path is unchanged; no quota padding or arbitrary reserve added.",
+    "corrected_build": {
+      "code": 0,
+      "seconds": 26.413537374930456
+    },
+    "passing_public_attempt": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-faa37cf61a7c0f14",
+        "--exact",
+        "managed_plain::snapshot::native_managed_snapshot_captures_pending_prefill_with_independent_custody",
+        "--ignored",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 6.871648708824068,
+      "positive_one_test": true,
+      "fixture_cleanup": []
+    },
+    "verified": {
+      "saved_token_ids": [],
+      "saved_next_prediction": 0,
+      "continued_output": [
+        8,
+        38,
+        26,
+        1
+      ],
+      "retained_past_model_drop": true,
+      "snapshot_count_refusal": true,
+      "one_byte_capacity_refusal": true,
+      "cumulative_copy_not_refunded": true
+    }
+  },
+  "snapshot_hybrid_capture": {
+    "status": "PASS: public managed capture of the selected Qwen hybrid recurrent state after one committed token.",
+    "initial_fixture_selection_attempt": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-faa37cf61a7c0f14",
+        "--exact",
+        "managed_plain::snapshot::native_managed_hybrid_snapshot_captures_recurrent_state_with_independent_custody",
+        "--ignored",
+        "--nocapture"
+      ],
+      "code": 101,
+      "seconds": 6.729603333165869,
+      "positive_one_test": false,
+      "fixture_cleanup": []
+    },
+    "correction": "The existing fixture(bool) selects fragmentation, not model family. Select the actual qwen_35_fixture for the hybrid phase. The first attempt failed at the pre-capture token assertion.",
+    "passing_public_attempt": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-faa37cf61a7c0f14",
+        "--exact",
+        "managed_plain::snapshot::native_managed_hybrid_snapshot_captures_recurrent_state_with_independent_custody",
+        "--ignored",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 7.148526916047558,
+      "positive_one_test": true,
+      "fixture_cleanup": []
+    },
+    "verified": {
+      "saved_token_ids": [
+        63
+      ],
+      "saved_next_prediction": 1,
+      "continued_output": [
+        63,
+        32,
+        32,
+        32
+      ],
+      "retained_past_model_drop": true,
+      "snapshot_count_refusal": true,
+      "one_byte_capacity_refusal": true,
+      "cumulative_copy_not_refunded": true
+    },
+    "scope": "Selected resident recurrent capture only; no fresh resume, wider family or residency qualification inferred."
+  },
+  "snapshot_original_resume_transaction": {
+    "status": "Shared core/runtime/facade resume transaction implemented and compiled; native execution activation pending remaining producer joins.",
+    "build": {
+      "code": 0,
+      "seconds": 83.70773412496783
+    },
+    "logical_retention_case": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+        "--exact",
+        "working_memory::residual::tests::span_workspace::text_controls::sequence::consumer::retained_provider_copy_has_independent_budget_state_and_output_lifetime",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 6.018817665986717
+    },
+    "verified": "Logical snapshot reservation attaches to the actual copied provider account. Physical admission refusal retains cumulative copy consumption; provider and output aliases retain logical/physical charges through final owner retirement, including cross-thread last-output destruction.",
+    "not_claimed": "This case does not execute native resumed generation."
+  },
+  "snapshot_native_resume_admission": {
+    "status": "Fresh source-bound Q admission, exact saved-state source metadata and native population composition implemented; original execution activation still needs complete planning/storage joins.",
+    "first_build": {
+      "code": 101,
+      "seconds": 45.5488298330456
+    },
+    "compile_corrections": "Two missing storage identity imports, existing neutral/backend error conversions and sibling source census visibility.",
+    "corrected_build": {
+      "code": 0,
+      "seconds": 66.09793920791708
+    }
+  },
+  "snapshot_pending_text_program": {
+    "status": "Shared decode/prefill numerical program and pending input last-owner host storage implemented; build passed.",
+    "build": {
+      "code": 0,
+      "seconds": 96.65228666597977
+    },
+    "pending_host_lifetime": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+        "--exact",
+        "working_memory::pending_input::tests::exact_host_plan_constructs_one_nonclone_payload_and_aliases_keep_custody",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 1.1812377078458667
+    },
+    "finite_state_role_validation": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+        "--exact",
+        "working_memory::state::tests::projection::projected_state_rejects_foreign_geometry_roles_and_dtype_before_equations",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 0.2052089578937739
+    },
+    "first_matrix_attempt": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-1949d2de08c40228",
+        "--exact",
+        "backend::array_copy::pending_input::tests::pending_prefill_matrix_uses_complete_source_and_shared_copy_program",
+        "--nocapture"
+      ],
+      "code": 101,
+      "seconds": 7.346993624931201
+    },
+    "matrix_attempt_correction": "The ordinary compatibility path intentionally returns a lazy reshape/cast; the test now evaluates output before inspecting its allocation. Corrected nonzero signed/unsigned matrix case passes with full output equality and actual native allocation coverage.",
+    "remaining": "Actual fresh prefill resume requires the selected geometry/native recipe join and complete finite planning metadata.",
+    "passing_matrix_attempt": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-1949d2de08c40228",
+        "--exact",
+        "backend::array_copy::pending_input::tests::pending_prefill_matrix_uses_complete_source_and_shared_copy_program",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 7.9881676658988
+    },
+    "native_source_geometry": "Fresh resume census authenticates actual pending positions; cast requested bytes scale with source size, and native recipe binding validates the same input count. Immutable saved metadata selects decode versus prefill and retains cache identity. A fresh prompt may choose a smaller valid chunk."
+  },
+  "snapshot_dense_resume_tables": {
+    "status": "Finite dense destination identities, grouped table constructors and same-account publication implemented and compiled.",
+    "first_build": {
+      "code": 101,
+      "seconds": 28.574674166971818
+    },
+    "correction": "Cold query measures its actual inferred dense result and value with size_of_val, preserving private type visibility.",
+    "corrected_build": {
+      "code": 0,
+      "seconds": 58.085171749815345
+    },
+    "remaining": "Returned erased state owner and finite exchange producer are in progress; complete planning metadata is not yet qualified."
+  },
+  "snapshot_native_prefill_resume_build": {
+    "first_build": {
+      "result": "failed",
+      "seconds": 27.97,
+      "cause": "missing WorkingMemoryStorage and StorageIdentity imports in text_quote/resume"
+    },
+    "corrected_build": {
+      "result": "passed",
+      "seconds": 51.09,
+      "artifact": "snapshot-resume-native-prefill-fixed"
+    },
+    "scope": "Compilation of complete saved prompt geometry, immutable source copy and native original prompt resume; complete finite planning and public resume qualification remain outstanding."
+  },
+  "snapshot_neural_metadata_compile": {
+    "result": "failed",
+    "seconds": 4.09,
+    "artifact": "snapshot-nn-metadata",
+    "causes": [
+      "isolated-copy private context omitted new facts field",
+      "import construction needed explicit metadata error conversion"
+    ],
+    "tests_executed": false
+  },
+  "snapshot_joined_metadata": {
+    "scope": "Shared shape/fact/context and policy metadata, fixed and pooling checkpoints, state-layout/table construction, native source-root and pending-prompt operation visitors, and returned-state ownership. Complete source-envelope and initial cold planning admission remain outstanding.",
+    "builds": [
+      {
+        "artifact": "snapshot-joined-metadata",
+        "code": 101,
+        "seconds": 27.68,
+        "cause": "obsolete StateError equality assertion after retained source support"
+      },
+      {
+        "artifact": "snapshot-joined-metadata-fixed",
+        "code": 101,
+        "seconds": 48.64,
+        "cause": "returned state adapter accessed private model_session path; corrected by narrow session reexports"
+      },
+      {
+        "artifact": "snapshot-joined-metadata-visibility-fixed",
+        "code": 101,
+        "seconds": 1.44,
+        "cause": "rotary constructor parameter remained unnamed after counted diagnostic migration"
+      },
+      {
+        "artifact": "snapshot-joined-metadata-rotary-fixed",
+        "code": 0,
+        "seconds": 111.74
+      },
+      {
+        "artifact": "snapshot-runtime-checkpoint-fixture-fixed",
+        "scope": "runtime test target only",
+        "code": 0,
+        "seconds": 29.97
+      }
+    ],
+    "tests": [
+      {
+        "name": "pooling_workspace_tracks_partial_overlap_and_local_sentinel_through_uneven_chunks",
+        "code": 0,
+        "seconds": 0.4343306669
+      },
+      {
+        "name": "fixed_checkpoint_copy_is_charged_before_mutation_and_preserves_saved_slots",
+        "code": 101,
+        "seconds": 1.3502448751,
+        "cause": "fixture used unloaded parameter initialization, invoking deliberately absent mechanism facts; changed fixture to existing imported metadata",
+        "retry": {
+          "artifact": "snapshot-runtime-checkpoint-fixture-fixed",
+          "code": 0,
+          "seconds": 1.2040742091,
+          "fixture": "Imported tensor metadata; no parameter-initialization operation is required."
+        }
+      }
+    ]
+  },
+  "snapshot_prepared_geometry_joined": {
+    "build": {
+      "code": 0,
+      "seconds": 108.46169041609392
+    },
+    "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/snapshot-prepared-geometry-joined/command.json",
+    "scope": "Joined compile only; retained prepared geometry, state/source and participating metadata constructors; no execution or public fresh-resume qualification claimed."
+  },
+  "workspace_planning_account": {
+    "build": {
+      "code": 0,
+      "seconds": 21.161967874970287
+    },
+    "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/snapshot-planning-account/command.json",
+    "concurrent_producers": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-d4f0f709d1e5f8a0",
+        "--exact",
+        "working_memory::workspace_planning::tests::competing_planning_producers_reserve_before_allocation_and_keep_last_owner_charged",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 1.271384125109762
+    },
+    "scope": "Actual shared host-only planning account: competing preallocation debits, fixed shortage refusal, escaped owner lifetime, final refund. Native initial quote integration still in progress."
+  },
+  "initial_planning_joined": {
+    "builds": [
+      {
+        "code": 101,
+        "seconds": 27.56715325010009,
+        "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/initial-planning-joined/command.json"
+      },
+      {
+        "code": 101,
+        "seconds": 57.009174291975796,
+        "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/initial-planning-joined-import-fixed/command.json"
+      },
+      {
+        "code": 0,
+        "seconds": 113.38995549990796,
+        "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/initial-planning-reservation-joined/command.json"
+      }
+    ],
+    "integration_fixes": [
+      "Explicit CapabilityError test import",
+      "Three existing full_span test calls now pass ordinary report metadata"
+    ],
+    "checks": {
+      "funded-facts-refusal": {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_nn-32a2348cbb48a994",
+          "--exact",
+          "workspace::metadata_funding::tests::funded_facts_refuse_before_control_inspection_and_buffer_emission",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.5073308330029249
+      },
+      "controller-metadata-causes": {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+          "--exact",
+          "working_memory::controller::contribution::tests::unknown_lifetime_invalid_metadata_and_unpriced_sources_preserve_typed_causes",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 1.0626415410079062
+      },
+      "reservation-metadata-lifetime": {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+          "--exact",
+          "working_memory::residual::tests::reservation_metadata::planned_reservation_refuses_before_q_publication_and_retains_final_metadata_or_node",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 1.2411452918313444
+      }
+    },
+    "scope": "Joined neural/runtime/native/facade compile passed. Focused actual reservation test verifies refusal before Q publication and funding retention through last metadata/reservation-node owner. Later prepared-contract and source-control joins remain uncompiled; complete native original resume remains unqualified."
+  },
+  "prepared_contract_equation_joined": {
+    "builds": [
+      {
+        "code": 101,
+        "seconds": 51.76039120811038,
+        "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/prepared-contract-resume-logical-joined/command.json"
+      },
+      {
+        "code": 0,
+        "seconds": 85.06910854205489,
+        "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/prepared-contract-equation-joined/command.json"
+      }
+    ],
+    "integration_fixes": [
+      "PreparedResidentDenseCopy crate-private reexport",
+      "Removed obsolete saved-sampling recipe census argument"
+    ],
+    "checks": {
+      "borrowed-lowering-invalid-geometry": {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+          "--exact",
+          "replicated_text::tests::optional_linear_transform_preserves_unaligned_weights_without_hiding_invalid_requests",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 1.274076708825305
+      }
+    },
+    "scope": "Joined build of actual planning, prepared contract/task/lowering, logical resume hook, closed driver errors and equation metadata producers. Later identity, source-handoff and description work remains to compile. Original public resume preparation is still gated; no complete native resume qualification claimed."
+  },
+  "source_identity_origin_joined": {
+    "build": {
+      "code": 0,
+      "seconds": 111.25325420801528
+    },
+    "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/source-identity-origin-joined/command.json",
+    "checks": {
+      "saved-resume-logical-origin": {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-1949d2de08c40228",
+          "--exact",
+          "composition::mlx::session::model_session::saved_array_copy::decoder::resume_driver::tests::saved_resume_logical_estimate_uses_saved_origin_and_excludes_future_growth",
+          "--nocapture"
+        ],
+        "code": 101,
+        "seconds": 7.777020750101656
+      }
+    },
+    "fixture_correction": "The native regression tried to load its foreign model after creating an active saved inference reservation; loader correctly refused ReservedWorkActive. Both models are now loaded before the saved branch is produced; retry pending.",
+    "scope": "Joined compile passed. Logical resume regression awaiting fixture correction; full original public resume remains gated."
+  },
+  "shared_selection_identity_groups_joined": {
+    "builds": [
+      {
+        "name": "shared-selection-identity-groups-joined",
+        "code": 101,
+        "seconds": 16.786414499860257,
+        "note": "Typed shared-graph comparison needed dereferencing."
+      },
+      {
+        "name": "shared-selection-identity-groups-graph-fixed",
+        "code": 101,
+        "seconds": 20.264915874926373,
+        "note": "Gemma2 retained WeightQuantization import restored."
+      },
+      {
+        "name": "shared-selection-identity-groups-import-fixed",
+        "code": 0,
+        "seconds": 98.92735570902005,
+        "note": "Joined source selection, identity, parameter groups and corrected native fixture compile."
+      }
+    ],
+    "ownership_validation": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-5e5ca68b23f76220",
+        "--exact",
+        "partition::tests::parameter_description_rejects_missing_duplicate_and_out_of_range_ownership",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 1.2179566249251366
+    },
+    "saved_resume_logical_origin": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-1949d2de08c40228",
+        "--exact",
+        "composition::mlx::session::model_session::saved_array_copy::decoder::resume_driver::tests::saved_resume_logical_estimate_uses_saved_origin_and_excludes_future_growth",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 7.495621875161305
+    },
+    "scope": "Actual ownership validation and saved logical geometry/origin pass. Public fresh original resume preparation still unqualified; remaining construction producers are being integrated."
+  },
+  "prepared_construction_joined": {
+    "builds": [
+      {
+        "name": "source-config-geometry-projection-joined",
+        "code": 101,
+        "seconds": 19.375773540930822
+      },
+      {
+        "name": "source-config-geometry-projection-complete",
+        "code": 101,
+        "seconds": 14.440746624954045
+      },
+      {
+        "name": "state-construction-capability-owner-joined",
+        "code": 0,
+        "seconds": 107.85013012494892
+      },
+      {
+        "name": "completed-semantics-standard-modules-joined",
+        "code": 0,
+        "seconds": 106.39774679206312
+      }
+    ],
+    "production_changes": [
+      "Borrow actual retained configuration and selected requirements; validate actual geometry declarations without temporary graph/transport trees.",
+      "Fund actual state-layout and standard parameter constructors before allocation.",
+      "Move StateLayout schedules into capability accounting instead of copying them.",
+      "Share the completed capability report and effective configuration with prepared-source reconstruction; preserve owned consuming API semantics.",
+      "Reuse exact immutable prepared-store validation, and fund final static/module/plan identity construction through the same context."
+    ],
+    "verification_scope": "The shared-report and standard-module joined build passed, as did the actual saved-source geometry/origin regression. Subsequent static/fixed validation and plan/store integrations await the next joined build. The public fresh-resume hook remains gated until constructor audit fixes are integrated; no public restore/fork execution result yet.",
+    "saved_resume_logical_origin": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-1949d2de08c40228",
+        "--exact",
+        "composition::mlx::session::model_session::saved_array_copy::decoder::resume_driver::tests::saved_resume_logical_estimate_uses_saved_origin_and_excludes_future_growth",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 7.631454749964178
+    }
+  },
+  "public_managed_resume_joined": {
+    "builds": [
+      {
+        "name": "public-resume-construction-joined",
+        "code": 101,
+        "seconds": 25.43633033405058,
+        "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/public-resume-construction-joined/command.json"
+      },
+      {
+        "name": "public-resume-construction-fixed",
+        "code": 101,
+        "seconds": 44.05349724995904,
+        "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/public-resume-construction-fixed/command.json"
+      },
+      {
+        "name": "public-resume-construction-native-fixed",
+        "code": 0,
+        "seconds": 87.41788999992423,
+        "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/public-resume-construction-native-fixed/command.json"
+      },
+      {
+        "name": "public-resume-construction-span",
+        "code": 0,
+        "seconds": 21.652744667138904,
+        "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/public-resume-construction-span/command.json"
+      },
+      {
+        "name": "public-resume-retirement-boundary",
+        "code": 0,
+        "seconds": 5.9886113330721855,
+        "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/public-resume-retirement-boundary/command.json"
+      },
+      {
+        "name": "public-resume-pending-epoch",
+        "code": 0,
+        "seconds": 24.334489249857143,
+        "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/public-resume-pending-epoch/command.json"
+      }
+    ],
+    "capability_independence": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_architectures-f90ab38fa843ed9e",
+        "--exact",
+        "capability::tests::selected_partition_memory_uses_only_owned_layers_and_heads",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 1.0933535830117762
+    },
+    "dense_restore_fork": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-85ac8832168fb6dd",
+        "--exact",
+        "managed_plain::snapshot::native_managed_snapshot_restore_and_fork_match_uninterrupted_future",
+        "--nocapture",
+        "--ignored"
+      ],
+      "code": 101,
+      "seconds": 7.011053832946345
+    },
+    "production_changes": [
+      "Shared actual config, capability, and prepared-store validation owners avoid reconstruction copies.",
+      "Plain/fixed static, module, parameter, geometry and validation destinations pay on the same admitted planning account.",
+      "Native saved-resume host hook composes fixed source preparation before fresh admission."
+    ],
+    "verification_scope": "Four focused public cases pass: dense and hybrid, each at pending prefill and after the first committed token. Restore and fork match uninterrupted generation, retain immutable saved state, handle cancellation and one-byte refusal, preserve cumulative copy usage, and retire logical retention after explicit native cleanup. Selected tiny resident F32 fixtures only; broader family/residency/state/capture/media/speculation/distributed original admission and released-checkpoint enforced validation remain unfinished.",
+    "public_checks": {
+      "native-dense-managed-resume": {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-85ac8832168fb6dd",
+          "--exact",
+          "managed_plain::snapshot::native_managed_snapshot_restore_and_fork_match_uninterrupted_future",
+          "--nocapture",
+          "--ignored"
+        ],
+        "code": 0,
+        "seconds": 7.256483291974291
+      },
+      "native-hybrid-managed-resume": {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-85ac8832168fb6dd",
+          "--exact",
+          "managed_plain::snapshot::native_managed_hybrid_snapshot_restore_and_fork_match_uninterrupted_future",
+          "--nocapture",
+          "--ignored"
+        ],
+        "code": 0,
+        "seconds": 1.9236212079413235
+      },
+      "native-dense-pending-managed-resume": {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-85ac8832168fb6dd",
+          "--exact",
+          "managed_plain::snapshot::native_managed_pending_snapshot_restore_and_fork_match_uninterrupted_future",
+          "--nocapture",
+          "--ignored"
+        ],
+        "code": 0,
+        "seconds": 7.55630883295089
+      },
+      "native-hybrid-pending-managed-resume": {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-85ac8832168fb6dd",
+          "--exact",
+          "managed_plain::snapshot::native_managed_hybrid_pending_snapshot_restore_and_fork_match_uninterrupted_future",
+          "--nocapture",
+          "--ignored"
+        ],
+        "code": 0,
+        "seconds": 2.1560556669719517
+      }
+    },
+    "integration_findings": [
+      "Saved-copy planning must finish before a fresh model-construction span opens for parameter placeholders; cumulative funding never resets.",
+      "Final model drop queues native semantic payload destruction. Exact zero-retention assertions follow the existing explicit native retirement boundary.",
+      "Before prefill the live sampler has no epoch yet; saved copies now retain the exact epoch already authenticated by the capture source. Strict resume origin comparison is unchanged."
+    ]
+  }
+}

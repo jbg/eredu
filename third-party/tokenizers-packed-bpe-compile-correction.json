@@ -1,0 +1,17 @@
+{
+  "base": "exact packed BPE110 successor; original patch remains unchanged",
+  "files": {
+    "src/models/bpe/compile.rs": {
+      "after": "2feb2d1c53f638995b84ac303208694a17813ec768b086e6bc6bdbe07db9152b",
+      "before": "505e26e2e89f110a91dff7804696cdc23526a9e42fb3381c4d8af23607a38068"
+    },
+    "src/models/bpe/parity_trainer.rs": {
+      "after": "5cfc4aaba1434f584a0b44198cadddab5a989fecb548c3dc3a9b0ee5dc3db245",
+      "before": "c8b0fbd3d017bef51f26d3a08f15f750ef9c9bfe0076fe30ca67a1347691ce29"
+    }
+  },
+  "final_complete_manifest_sha256": "1fa7514facc835c74b2be694f132e3022bcf36f9fd4ee27ce06de73c6b296d90",
+  "patch_sha256": "1ae2a3d4da59600825bd080a9b30d98649e312806cca34ac1eb95ebb3ad81c81",
+  "predecessor_complete_manifest_sha256": "aa1351a727745dd563b7b2a71965f23c11d636b8059fa9976232f1dcfc6f3a59",
+  "scope": "three unchanged parity length assertions use Legacy-only accessor; split Rust2018 closure borrow plus two named reference controls; no allocation or algorithm change"
+}

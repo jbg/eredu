@@ -47,87 +47,69 @@ pub(crate) fn sample_and_synchronize_bounded<S: Sampler<MlxSamplingBackend>>(
     authority
         .ensure_active()
         .map_err(|error| Error::Parallel(error.to_string()))?;
-    if sampling_rank >= group.size() {
-        return Err(Error::Parallel(format!(
-            "sampling rank {sampling_rank} is outside distributed group size {}",
-            group.size()
-        )));
-    }
-    if batch_size <= 0 {
-        return Err(Error::Parallel(format!(
-            "distributed sampling batch size must be positive, got {batch_size}"
-        )));
-    }
-    let local_token = if group.rank() == sampling_rank {
-        let logits = logits.ok_or_else(|| {
-            Error::Parallel(format!(
-                "sampling rank {sampling_rank} requires complete logits"
-            ))
-        })?;
-        if logits.as_array().dim(0) != batch_size {
-            return Err(Error::Parallel(format!(
-                "sampling logits batch {} does not match declared batch {batch_size}",
-                logits.as_array().dim(0)
-            )));
-        }
-        let logits = if logits.as_array().ndim() == 3 {
-            MlxTensor::from_array(logits.as_array().try_index_device((.., -1, ..), stream)?)
-        } else {
-            logits.clone()
-        };
-        Sampler::<MlxSamplingBackend>::sample(sampler, &logits, temperature, prng_state, stream)?
-            .into_array()
-            .reshape(&[batch_size, 1], stream)?
-            .as_dtype(Dtype::Float32, stream)?
-    } else {
-        zeros::<f32>(&[batch_size, 1], stream)?
-    };
-    let phase = DistributedExecutionPhase::SamplingSynchronization;
-    let operation = eredu_runtime::CommunicationOperation::Broadcast;
-    let token_submission =
-        <crate::backend::nn::shared::MlxNeuralBackend as BroadcastBackend>::broadcast(
-            MlxTensor::from_array(local_token),
-            sampling_rank,
-            group,
-            stream,
-        )
-        .map_err(|error| authority.submission_failure(error, operation, phase, None))
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let token = authority
-        .wait(token_submission, operation, phase, None)
-        .map_err(|error| Error::Parallel(error.to_string()))?
-        .into_array()
-        .as_dtype(Dtype::Uint32, stream)?;
+    let plan=eredu_runtime::generation::SamplingSynchronizationPlan::new(
+        group.size(),group.rank(),sampling_rank,batch_size)
+        .map_err(|cause|Error::Parallel(cause.to_string()))?;
+    let output=eredu_runtime::generation::synchronize_sampling(plan,finished,&mut OrdinarySynchronization{
+        logits,sampler,temperature,prng_state,group,authority,stream,
+    })?;
+    Ok(SynchronizedToken{token:output.token,finished:output.finished})
+}
 
-    let local_finished = if group.rank() == sampling_rank && finished {
-        ones::<f32>(&[], stream)?
-    } else {
-        zeros::<f32>(&[], stream)?
-    };
-    let finished_submission =
-        <crate::backend::nn::shared::MlxNeuralBackend as BroadcastBackend>::broadcast(
-            MlxTensor::from_array(local_finished),
-            sampling_rank,
-            group,
-            stream,
-        )
-        .map_err(|error| authority.submission_failure(error, operation, phase, None))
-        .map_err(|error| Error::Parallel(error.to_string()))?;
-    let eredu_core::Submission { output, completion } = finished_submission;
-    let (finished, completion) = completion.with_f32_flag(output.into_array());
-    let finished = authority
-        .wait(
-            eredu_core::Submission {
-                output: finished,
-                completion,
-            },
-            operation,
-            phase,
-            None,
-        )
-        .map_err(|error| Error::Parallel(error.to_string()))?
-        .resolve()?;
-    Ok(SynchronizedToken { token, finished })
+struct OrdinarySynchronization<'a,S> {
+    logits:Option<&'a MlxTensor>,sampler:&'a mut S,temperature:f32,
+    prng_state:Option<&'a mut crate::backend::random::RandomState>,
+    group:&'a Group,authority:&'a PartitionCommunicationAuthority,stream:&'a Stream,
+}
+impl<S:Sampler<MlxSamplingBackend>> eredu_runtime::generation::SamplingSynchronizationDriver
+    for OrdinarySynchronization<'_,S> {
+    type LocalToken=Array;type Contribution=Array;type Token=Array;type Error=Error;
+    fn sample_local(&mut self,plan:eredu_runtime::generation::SamplingSynchronizationPlan)->Result<Array,Error>{
+        let logits=self.logits.ok_or_else(||Error::Parallel(format!(
+            "sampling rank {} requires complete logits",plan.sampling_rank())))?;
+        if logits.as_array().dim(0)!=plan.batch_size(){return Err(Error::Parallel(format!(
+            "sampling logits batch {} does not match declared batch {}",logits.as_array().dim(0),plan.batch_size())));}
+        let logits=if logits.as_array().ndim()==3 {
+            MlxTensor::from_array(logits.as_array().try_index_device((..,-1,..),self.stream)?)
+        }else{logits.clone()};
+        Sampler::<MlxSamplingBackend>::sample(self.sampler,&logits,self.temperature,self.prng_state.take(),self.stream)
+            .map(MlxTensor::into_array).map_err(Into::into)
+    }
+    fn token_contribution(&mut self,local:Option<Array>,plan:eredu_runtime::generation::SamplingSynchronizationPlan)
+        ->Result<Array,Error>{
+        match local{
+            Some(token)=>token.reshape(&[plan.batch_size(),1],self.stream)?.as_dtype(Dtype::Float32,self.stream).map_err(Into::into),
+            None=>zeros::<f32>(&[plan.batch_size(),1],self.stream).map_err(Into::into),
+        }
+    }
+    fn exchange_token(&mut self,value:Array,plan:eredu_runtime::generation::SamplingSynchronizationPlan)->Result<Array,Error>{
+        let phase=DistributedExecutionPhase::SamplingSynchronization;
+        let operation=eredu_runtime::CommunicationOperation::Broadcast;
+        let submission=<crate::backend::nn::shared::MlxNeuralBackend as BroadcastBackend>::broadcast(
+            MlxTensor::from_array(value),plan.sampling_rank(),self.group,self.stream)
+            .map_err(|error|self.authority.submission_failure(error,operation,phase,None))
+            .map_err(|error|Error::Parallel(error.to_string()))?;
+        self.authority.wait(submission,operation,phase,None).map(MlxTensor::into_array)
+            .map_err(|error|Error::Parallel(error.to_string()))
+    }
+    fn finish_token(&mut self,value:Array,_:eredu_runtime::generation::SamplingSynchronizationPlan)->Result<Array,Error>{
+        value.as_dtype(Dtype::Uint32,self.stream).map_err(Into::into)
+    }
+    fn finished_contribution(&mut self,finished:bool,_:eredu_runtime::generation::SamplingSynchronizationPlan)->Result<Array,Error>{
+        if finished{ones::<f32>(&[],self.stream).map_err(Into::into)}else{zeros::<f32>(&[],self.stream).map_err(Into::into)}
+    }
+    fn exchange_finished(&mut self,value:Array,plan:eredu_runtime::generation::SamplingSynchronizationPlan)->Result<bool,Error>{
+        let phase=DistributedExecutionPhase::SamplingSynchronization;
+        let operation=eredu_runtime::CommunicationOperation::Broadcast;
+        let submission=<crate::backend::nn::shared::MlxNeuralBackend as BroadcastBackend>::broadcast(
+            MlxTensor::from_array(value),plan.sampling_rank(),self.group,self.stream)
+            .map_err(|error|self.authority.submission_failure(error,operation,phase,None))
+            .map_err(|error|Error::Parallel(error.to_string()))?;
+        let eredu_core::Submission{output,completion}=submission;
+        let (finished,completion)=completion.with_f32_flag(output.into_array());
+        Ok(self.authority.wait(eredu_core::Submission{output:finished,completion},operation,phase,None)
+            .map_err(|error|Error::Parallel(error.to_string()))?.resolve()?)
+    }
 }
 
 #[cfg(test)]

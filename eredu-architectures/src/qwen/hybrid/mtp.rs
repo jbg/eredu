@@ -9,6 +9,8 @@ use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RuntimeStateCo
 use crate::decoder::ComponentInstrumentation;
 
 use super::{Block, HybridConfig};
+pub(crate) mod construction;
+pub(crate) use construction::{PredictionSharedSpec, PredictionUnitSpec};
 
 /// Concatenates decoder token identity for embedded prediction in request order.
 pub fn prompt_token_identity<T: Tensor>(tokens: &[T], context: &T::Context) -> Result<T, Error> {
@@ -92,18 +94,25 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Clone for Pre
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionShared<B> {
     /// Builds the canonical shared modules used by every configured depth.
-    pub fn new(
-        config: &HybridConfig,
+    pub fn new(config: &HybridConfig, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        PredictionSharedSpec::new(config.hidden_size, config.rms_norm_eps).instantiate::<B>(context)
+    }
+    pub(super) fn from_dimensions(
+        hidden_size: i32,
+        rms_norm_eps: f32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, NormalizationConstructionSpec, LinearSpec)>()?;
         let norm = |name: &str| {
+            metadata.controls::<NormalizationConstructionSpec>()?;
             B::normalization(
                 NormalizationConstructionSpec {
                     groups: None,
-                    dimensions: config.hidden_size,
-                    epsilon: config.rms_norm_eps,
+                    dimensions: hidden_size,
+                    epsilon: rms_norm_eps,
                     scale: NormalizationScale::LearnedOffset {
-                        weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
+                        weight: metadata.plain_parameter(name)?,
                         offset: 1.0,
                     },
                 },
@@ -115,14 +124,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionSha
             embedding_norm: norm("mtp.pre_fc_norm_embedding.weight")?,
             fusion: B::linear(
                 LinearSpec {
-                    input: config.hidden_size * 2,
-                    output: config.hidden_size,
-                    weight: ParameterSpec::trainable("mtp.fc.weight").map_err(Error::backend)?,
+                    input: hidden_size * 2,
+                    output: hidden_size,
+                    weight: metadata.plain_parameter("mtp.fc.weight")?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        "mtp.fc.weight",
-                        eredu_checkpoint::LinearFormat::Dense,
-                    )?,
+                    format: metadata.format("mtp.fc.weight", eredu_checkpoint::LinearFormat::Dense)?,
                 },
                 context,
             )?,
@@ -137,7 +143,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionSha
 pub struct PredictionUnit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Full-attention decoder block for this prediction depth.
     pub block: Block<B>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     experts: i32,
 }
 
@@ -148,16 +154,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
         depth: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let steps = usize::try_from(config.mtp_num_hidden_layers).map_err(Error::backend)?;
-        if depth >= steps {
-            return Err(Error::backend(format!(
-                "Qwen hybrid MTP depth {depth} is outside {steps} configured layers"
-            )));
-        }
-        Ok(Self {
-            block: Block::new_mtp(config, depth, context)?,
-            experts: config.num_experts,
-        })
+        super::block::construction::require_source_compiler::<B>(context)?;
+        PredictionUnitSpec::new(config, depth)?.instantiate::<B>(context)
     }
 
     pub(crate) fn observation_points(

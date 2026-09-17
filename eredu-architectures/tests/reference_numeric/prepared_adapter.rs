@@ -160,6 +160,22 @@ pub(super) fn replicated(
         tokens,
         construction_started: false,
     };
+    replicated_with_visitor(sources, context, visitor)
+}
+
+pub(super) fn replicated_with_visitor<V>(
+    sources: PreparedModelSources,
+    context: &NumericContext,
+    visitor: V,
+) -> Result<NumericReplicatedRun, String>
+where
+    V: ReplicatedTextArchitectureVisitor<
+        NumericBackend,
+        DeviceState<NumericBackend, NumericHybridLayerState>,
+        Output = NumericReplicatedRun,
+        Error = String,
+    >,
+{
     let routes =
         PreparedExecutionRoutes::new().with_replicated(ReplicatedRoute::<NumericBackend, _>::new(
             context,
@@ -200,6 +216,16 @@ pub(super) fn composite(
     input: &eredu_runtime::PreparedModelInput<NumericTensor>,
     observer: Option<std::rc::Rc<std::cell::RefCell<CompositeObservation>>>,
 ) -> Result<NumericReplicatedRun, String> {
+    composite_with_chunks(sources, context, input, observer, None)
+}
+
+pub(super) fn composite_with_chunks(
+    sources: PreparedModelSources,
+    context: &NumericContext,
+    input: &eredu_runtime::PreparedModelInput<NumericTensor>,
+    observer: Option<std::rc::Rc<std::cell::RefCell<CompositeObservation>>>,
+    prefill_chunks: Option<(u64, bool)>,
+) -> Result<NumericReplicatedRun, String> {
     type State = DeviceState<NumericBackend, NumericHybridLayerState>;
     let routes =
         PreparedExecutionRoutes::new().with_composite(
@@ -211,6 +237,7 @@ pub(super) fn composite(
                     input,
                     construction_started: false,
                     observer,
+                    prefill_chunks,
                 },
             ),
         );
@@ -219,6 +246,8 @@ pub(super) fn composite(
 }
 
 #[cfg(test)]
+include!("../support/numeric/tensor_file.rs");
+
 pub(super) type ParameterBits = BTreeMap<String, (Vec<i32>, Vec<u32>)>;
 
 #[cfg(test)]
@@ -239,13 +268,36 @@ pub(super) fn payload_fixture_config_with(
     head_scale: f32,
     custom: impl Fn(&str, &[i32]) -> Option<NumericTensor>,
 ) -> (tempfile::TempDir, ParameterBits) {
-    use safetensors::tensor::{serialize_to_file, TensorView};
     let root = tempfile::tempdir().unwrap();
     std::fs::write(
         root.path().join("config.json"),
         serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
+    let resolved = eredu_architectures::configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(config)
+        .unwrap();
+    let schema = resolved
+        .architecture_plan()
+        .safetensors_architecture()
+        .unwrap()
+        .checkpoint();
+    let integer_keys = schema
+        .common_tensors
+        .iter()
+        .chain(
+            schema
+                .layout_groups
+                .iter()
+                .flat_map(|group| group.variants.iter())
+                .flat_map(|variant| variant.tensors.iter()),
+        )
+        .filter(|tensor| {
+            tensor.dtype.accepts(&eredu_checkpoint::StoredDtype::I32)
+                && !tensor.dtype.accepts(&eredu_checkpoint::StoredDtype::F32)
+        })
+        .map(|tensor| tensor.key.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
     let tensors = required_safetensors_parameters(config)
         .into_iter()
         .map(|(name, dimensions)| {
@@ -261,54 +313,20 @@ pub(super) fn payload_fixture_config_with(
                     name.contains("norm") && config["model_type"] != "gemma2",
                 )
             });
+            if integer_keys.contains(name.as_str()) {
+                value = value.map(|v| (v as i32) as f32);
+            }
             if name == "lm_head.weight" {
                 value = value.map(|value| value * head_scale);
             }
             (name, value)
         })
         .collect::<BTreeMap<_, _>>();
-    let expected = tensors
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.clone(),
-                (
-                    value.shape.clone(),
-                    value.data.iter().map(|value| value.to_bits()).collect(),
-                ),
-            )
-        })
-        .collect();
-    let encoded = tensors
-        .into_iter()
-        .map(|(name, value)| {
-            (
-                name,
-                (
-                    value
-                        .shape
-                        .into_iter()
-                        .map(|x| x as usize)
-                        .collect::<Vec<_>>(),
-                    value
-                        .data
-                        .iter()
-                        .flat_map(|value| value.to_le_bytes())
-                        .collect::<Vec<_>>(),
-                ),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let views = encoded
-        .iter()
-        .map(|(name, (shape, bytes))| {
-            (
-                name.as_str(),
-                TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
-            )
-        })
-        .collect::<Vec<_>>();
-    serialize_to_file(views, None, &root.path().join("model.safetensors")).unwrap();
+    let expected = write_payload_tensors(
+        &root.path().join("model.safetensors"),
+        tensors,
+        &integer_keys,
+    );
     (root, expected)
 }
 

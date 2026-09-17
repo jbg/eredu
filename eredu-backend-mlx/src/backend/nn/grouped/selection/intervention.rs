@@ -74,12 +74,12 @@ struct NativeRouting<'a> {
 }
 
 impl NativeRouting<'_> {
-    fn keep(&self, ids: &[u32]) -> Array {
+    fn keep(&self, ids: &[u32]) -> Result<Array, Exception> {
         let mut keep = vec![true; self.selector.group_count as usize];
         for id in ids {
             keep[*id as usize] = false;
         }
-        Array::from_slice(&keep, &[self.selector.group_count])
+        Array::try_from_slice(&keep, &[self.selector.group_count])
     }
     fn gathered_keep(
         &self,
@@ -87,7 +87,7 @@ impl NativeRouting<'_> {
         ids: &[u32],
         rows: &NativeRows,
     ) -> Result<Array, Exception> {
-        self.keep(ids)
+        self.keep(ids)?
             .take_axis(indices, 0, self.stream)?
             .logical_or(rows.mask.logical_not(self.stream)?, self.stream)
     }
@@ -137,12 +137,15 @@ impl RoutingMechanism for NativeRouting<'_> {
         let rows = safemlx::ops::arange::<_, i32>(0, tokens, None, self.stream)?
             .reshape(&[tokens, 1], self.stream)?;
         let mask = rows
-            .ge(Array::from(first), self.stream)?
-            .logical_and(rows.lt(Array::from(end), self.stream)?, self.stream)?
+            .ge(Array::try_from_int(first)?, self.stream)?
             .logical_and(
-                rows.subtract(Array::from(first), self.stream)?
-                    .remainder(Array::from(stride), self.stream)?
-                    .eq(Array::from(0i32), self.stream)?,
+                rows.lt(Array::try_from_int(end)?, self.stream)?,
+                self.stream,
+            )?
+            .logical_and(
+                rows.subtract(Array::try_from_int(first)?, self.stream)?
+                    .remainder(Array::try_from_int(stride)?, self.stream)?
+                    .eq(Array::try_from_int(0i32)?, self.stream)?,
                 self.stream,
             )?;
         Ok(NativeRows {
@@ -204,7 +207,7 @@ impl RoutingMechanism for NativeRouting<'_> {
         for (id, value) in ids.iter().zip(values) {
             bias[*id as usize] = *value;
         }
-        let bias = Array::from_slice(&bias, &[1, self.selector.group_count])
+        let bias = Array::try_from_slice(&bias, &[1, self.selector.group_count])?
             .as_dtype(value.dtype(), self.stream)?;
         r#where(
             &rows.mask,
@@ -221,13 +224,13 @@ impl RoutingMechanism for NativeRouting<'_> {
         rows: &NativeRows,
     ) -> Result<Array, Exception> {
         let keep = self
-            .keep(ids)
+            .keep(ids)?
             .reshape(&[1, self.selector.group_count], self.stream)?
             .logical_or(rows.mask.logical_not(self.stream)?, self.stream)?;
         r#where(
             keep,
             value,
-            Array::from_f32(fill).as_dtype(value.dtype(), self.stream)?,
+            Array::try_from_f32(fill)?.as_dtype(value.dtype(), self.stream)?,
             self.stream,
         )
     }
@@ -238,7 +241,7 @@ impl RoutingMechanism for NativeRouting<'_> {
         rows: &NativeRows,
     ) -> Result<Array, Exception> {
         let mut output = indices.clone();
-        let forced = Array::from_slice(ids, &[rows.count, self.selector.top_k])
+        let forced = Array::try_from_slice(ids, &[rows.count, self.selector.top_k])?
             .as_dtype(indices.dtype(), self.stream)?;
         output.try_index_mut_device(
             ((rows.first..rows.end).stride_by(rows.stride), ..),
@@ -258,7 +261,7 @@ impl RoutingMechanism for NativeRouting<'_> {
         r#where(
             self.gathered_keep(indices, ids, rows)?,
             value,
-            Array::from_f32(fill).as_dtype(value.dtype(), self.stream)?,
+            Array::try_from_f32(fill)?.as_dtype(value.dtype(), self.stream)?,
             self.stream,
         )
     }
@@ -269,13 +272,13 @@ impl RoutingMechanism for NativeRouting<'_> {
         self.all(value.is_finite(self.stream)?)
     }
     fn nonnegative(&self, value: &Array) -> Result<bool, Exception> {
-        self.all(value.ge(Array::from_f32(0.0), self.stream)?)
+        self.all(value.ge(Array::try_from_f32(0.0)?, self.stream)?)
     }
     fn positive_row_sums(&self, value: &Array) -> Result<bool, Exception> {
         self.all(
             value
                 .sum_axis(-1, false, self.stream)?
-                .gt(Array::from_f32(0.0), self.stream)?,
+                .gt(Array::try_from_f32(0.0)?, self.stream)?,
         )
     }
 }

@@ -259,6 +259,21 @@ pub(crate) fn gemma_runs_the_inspected_materialized_scheduler_path() {
         .unwrap();
 }
 
+fn assert_prefill_completion_retired(evidence: &ReferenceCompletionEvidence) {
+    assert_eq!(
+        evidence.submissions, 1,
+        "the actual one-position prompt has one capture/seed completion"
+    );
+    assert_eq!(evidence.polls, 0);
+    assert_eq!(evidence.incomplete_polls, 0);
+    assert_eq!(evidence.waits, 1);
+    assert_eq!(evidence.failures, 0);
+    assert_eq!(evidence.quarantines, 0);
+    assert!(evidence.retained_at_wait > 0);
+    assert_eq!(evidence.drops, evidence.submissions);
+    assert_eq!(evidence.released_resources, evidence.retained_at_wait);
+}
+
 #[allow(
     dead_code,
     reason = "owned by the unified reference_conformance target"
@@ -269,7 +284,7 @@ pub(crate) fn exact_completion_retains_resources_and_failure_rolls_back_before_p
         .stack_size(32 * 1024 * 1024)
         .spawn(|| {
             let delayed_assistant = reference_gemma_assistant_artifact();
-            let (delayed, delayed_evidence) = with_reference_completion_control(
+            let (delayed, delayed_evidence, delayed_prefill) = with_reference_verification_completion_control(
                 ReferenceCompletionMode::Delayed {
                     incomplete_polls: 1,
                 },
@@ -280,6 +295,7 @@ pub(crate) fn exact_completion_retains_resources_and_failure_rolls_back_before_p
                     )
                 },
             );
+            assert_prefill_completion_retired(&delayed_prefill);
             let delayed = delayed.expect("delayed exact completion must eventually resolve");
             assert_construction_stages(&delayed);
             assert_eq!(delayed_evidence.submissions, 1);
@@ -300,7 +316,7 @@ pub(crate) fn exact_completion_retains_resources_and_failure_rolls_back_before_p
             assert_eq!(delayed_evidence.lifecycle, delayed.execution_stages);
 
             let failed_assistant = reference_gemma_assistant_artifact();
-            let (failed, failed_evidence) = with_reference_completion_control(
+            let (failed, failed_evidence, failed_prefill) = with_reference_verification_completion_control(
                 ReferenceCompletionMode::FailWait,
                 || {
                     run_reference_external_production(
@@ -309,6 +325,7 @@ pub(crate) fn exact_completion_retains_resources_and_failure_rolls_back_before_p
                     )
                 },
             );
+            assert_prefill_completion_retired(&failed_prefill);
             let error = failed.expect_err("failed exact completion must abort the production run");
             assert!(error.contains("injected reference exact-completion failure"));
             assert_eq!(failed_evidence.submissions, 1);
@@ -342,7 +359,7 @@ pub(crate) fn exact_completion_retains_resources_and_failure_rolls_back_before_p
             );
 
             let never_assistant = reference_gemma_assistant_artifact();
-            let (never, never_evidence) = with_reference_completion_control(
+            let (never, never_evidence, never_prefill) = with_reference_verification_completion_control(
                 ReferenceCompletionMode::Never,
                 || {
                     run_reference_external_production(
@@ -351,6 +368,7 @@ pub(crate) fn exact_completion_retains_resources_and_failure_rolls_back_before_p
                     )
                 },
             );
+            assert_prefill_completion_retired(&never_prefill);
             let error = never.expect_err("never-completing work must be quarantined");
             assert!(error.contains("completion deadline exceeded"));
             assert_eq!(never_evidence.submissions, 1);

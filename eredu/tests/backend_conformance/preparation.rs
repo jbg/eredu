@@ -6,6 +6,8 @@ use eredu_core::run_preparation::{
 };
 use std::{cell::RefCell, ops::ControlFlow};
 
+#[path = "preparation/admission.rs"]
+mod admission;
 #[path = "preparation/speculative.rs"]
 mod speculative;
 
@@ -37,6 +39,69 @@ struct Probe {
     actions: Vec<&'static str>,
     schedules: Vec<Vec<eredu_core::SpeculativeScheduleState>>,
     schedule_fault: ScheduleFault,
+    admissions: Vec<Option<(u64, u64)>>,
+    inference_settings: Vec<(eredu_core::TextInferencePolicy, Option<usize>)>,
+    charge: std::sync::Weak<PreparationCharge>,
+    lifecycle: Vec<&'static str>,
+    completion_charge: Vec<bool>,
+}
+
+pub(super) struct PreparationCharge;
+impl Drop for PreparationCharge {
+    fn drop(&mut self) {
+        PROBE.with(|probe| {
+            if let Some(probe) = probe.borrow_mut().as_mut() {
+                probe.lifecycle.push("release");
+            }
+        });
+    }
+}
+
+pub(super) fn admit(
+    input: &eredu_core::TextPreparationInput<'_, Vec<u32>>,
+    config: TextGenerationConfig,
+) -> Result<Option<std::sync::Arc<PreparationCharge>>, eredu_core::BackendFailure> {
+    PROBE.with(|probe| {
+        let mut slot = probe.borrow_mut();
+        let Some(probe) = slot.as_mut() else {
+            return Ok(None);
+        };
+        probe.lifecycle.push("admit");
+        probe
+            .inference_settings
+            .push((config.inference_policy(), config.sampling().max_new_tokens));
+        probe.admissions.push(match input {
+            eredu_core::TextPreparationInput::TokenIds {
+                positions,
+                capacity_bytes,
+            } => Some((*positions, *capacity_bytes)),
+            eredu_core::TextPreparationInput::Prepared(_) => None,
+            eredu_core::TextPreparationInput::OriginalPrepared(_) => {
+                return Err(eredu_core::PreparedRequestRejection::Unsupported.into_backend_failure())
+            }
+            eredu_core::TextPreparationInput::OriginalTokenIds(_) => {
+                unreachable!("legacy fixture default rejects original input before admission")
+            }
+        });
+        if probe.fault == Fault::Local(Stage::Admission) {
+            return Err(eredu_core::BackendFailure::from_error(MockError::Capture(
+                "original Admission preparation failure".into(),
+            )));
+        }
+        let charge = std::sync::Arc::new(PreparationCharge);
+        probe.charge = std::sync::Arc::downgrade(&charge);
+        Ok(Some(charge))
+    })
+}
+
+pub(super) fn completion() {
+    PROBE.with(|probe| {
+        if let Some(probe) = probe.borrow_mut().as_mut() {
+            probe
+                .completion_charge
+                .push(probe.charge.strong_count() != 0);
+        }
+    });
 }
 thread_local! { static PROBE: RefCell<Option<Probe>> = const { RefCell::new(None) }; }
 struct Guard;
@@ -58,6 +123,11 @@ fn probe(fault: Fault) -> Guard {
             actions: vec![],
             schedules: vec![],
             schedule_fault: ScheduleFault::None,
+            admissions: vec![],
+            inference_settings: vec![],
+            charge: std::sync::Weak::new(),
+            lifecycle: vec![],
+            completion_charge: vec![],
         });
     });
     Guard
@@ -69,6 +139,17 @@ pub(super) fn native(stage: Stage) -> Result<(), MockError> {
     PROBE.with(|probe| {
         if let Some(probe) = &mut *probe.borrow_mut() {
             probe.native.push(stage);
+            if !probe.admissions.is_empty() {
+                assert!(
+                    probe.charge.strong_count() > 0,
+                    "native preparation lost admission"
+                );
+                probe.lifecycle.push(match stage {
+                    Stage::Prompt => "prompt",
+                    Stage::Sampling => "sampling",
+                    _ => "instrumentation",
+                });
+            }
             if probe.fault == Fault::Local(stage) {
                 return Err(MockError::Capture(format!(
                     "original {stage:?} preparation failure"
@@ -259,7 +340,12 @@ fn has_source<T: std::error::Error + 'static>(
 #[test]
 fn public_local_preparation_failure_votes_before_return_and_retry_matches_baseline() {
     for controlled in [false, true] {
-        for stage in [Stage::Prompt, Stage::Sampling, Stage::Instrumentation] {
+        for stage in [
+            Stage::Admission,
+            Stage::Prompt,
+            Stage::Sampling,
+            Stage::Instrumentation,
+        ] {
             let (mut model, chat, settings) = setup();
             let baseline = run(&mut model, &chat, settings, controlled).unwrap();
             assert!(!baseline.is_empty());
@@ -269,7 +355,12 @@ fn public_local_preparation_failure_votes_before_return_and_retry_matches_baseli
             let actual = snapshot();
             assert_eq!(actual.forwards, 0);
             assert_eq!(actual.votes.last(), Some(&(stage, Status::Failed)));
-            assert_eq!(actual.native.last(), Some(&stage));
+            if stage == Stage::Admission {
+                assert!(actual.native.is_empty());
+            } else {
+                assert_eq!(actual.native.last(), Some(&stage));
+            }
+            assert_eq!(actual.charge.strong_count(), 0);
             if stage == Stage::Instrumentation {
                 // Local policy remains a typed public variant. Transparent
                 // wrappers need not add that variant to Error::source().
@@ -306,9 +397,12 @@ fn public_peer_rejection_stops_every_preparation_boundary_before_model_work() {
     for controlled in [false, true] {
         for stage in [
             Stage::Request,
+            Stage::Admission,
             Stage::Prompt,
             Stage::Sampling,
             Stage::Instrumentation,
+            Stage::Prediction,
+            Stage::Decision,
             Stage::Delivery,
         ] {
             let (mut model, chat, settings) = setup();
@@ -318,8 +412,33 @@ fn public_peer_rejection_stops_every_preparation_boundary_before_model_work() {
                 has_source::<eredu_core::run_preparation::TextPreparationRejected>(error.as_ref()),
                 "{error}"
             );
-            assert_eq!(snapshot().forwards, 0);
-            assert_eq!(snapshot().votes.last(), Some(&(stage, Status::Ready)));
+            let rejected = snapshot();
+            assert_eq!(rejected.forwards, 0);
+            let rejection = rejected
+                .votes
+                .iter()
+                .position(|vote| *vote == (stage, Status::Ready))
+                .expect("the selected boundary must vote before peer rejection");
+            // The borrowed ordinary cursor agrees its failed delivery. The
+            // detached controlled continuation is already fenced by advance's
+            // agreed failure, so delivery preserves that cause without starting
+            // another phase. Neither path may vote ready after rejection.
+            let cleanup: &[(Stage, Status)] = match (controlled, stage) {
+                (false, Stage::Prediction | Stage::Decision) => {
+                    &[(Stage::Delivery, Status::Failed)]
+                }
+                _ => &[],
+            };
+            assert_eq!(
+                &rejected.votes[rejection + 1..],
+                cleanup,
+                "unexpected votes after {stage:?} rejection (controlled={controlled})"
+            );
+            assert_eq!(
+                rejected.charge.strong_count(),
+                0,
+                "rejected preparation must release its unused owner"
+            );
         }
     }
 }
@@ -349,7 +468,7 @@ fn peer_initial_delivery_cancellation_stops_ordinary_and_controlled_runs() {
 
 #[test]
 fn asynchronous_public_token_generation_agrees_native_preparation() {
-    for stage in [Stage::Prompt, Stage::Sampling] {
+    for stage in [Stage::Admission, Stage::Prompt, Stage::Sampling] {
         let (mut model, _, _) = setup();
         let _guard = probe(Fault::Local(stage));
         let config = TextGenerationConfig::new(

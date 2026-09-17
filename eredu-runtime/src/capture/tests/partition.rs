@@ -1,4 +1,5 @@
 mod receipts;
+mod windows;
 use super::*;
 use crate::capture::partition::*;
 use eredu_core::component::ComponentCoordinateMap;

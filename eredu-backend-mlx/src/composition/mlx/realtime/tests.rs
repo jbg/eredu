@@ -375,6 +375,14 @@ pub(crate) fn write_tiny_native_artifact(
     directory: &Path,
     quantization: Option<WeightQuantization>,
 ) {
+    write_tiny_native_artifact_with_values(directory, quantization, false)
+}
+
+fn write_tiny_native_artifact_with_values(
+    directory: &Path,
+    quantization: Option<WeightQuantization>,
+    nonzero: bool,
+) {
     let mut config_json =
         serde_json::from_str::<serde_json::Value>(TINY_NATIVE_CONFIG).expect("tiny native JSON");
     if let Some(quantization) = quantization {
@@ -418,7 +426,11 @@ pub(crate) fn write_tiny_native_artifact(
                         };
                     (
                         SafeDtype::F32,
-                        std::iter::repeat_n(value, elements)
+                        (0..elements)
+                            .map(|index| if nonzero && value == 0.0 {
+                                let name = constraint.key.bytes().fold(0usize, |sum, byte| sum + byte as usize);
+                                ((index * 17 + name) % 97) as f32 * 0.003 - 0.144
+                            } else { value })
                             .flat_map(f32::to_le_bytes)
                             .collect::<Vec<_>>(),
                     )
@@ -741,28 +753,34 @@ fn moshi_mlx_scheduler_transaction_rollback_release_resume() {
 fn moshi_mlx_conformance_suite() {
     verify_tiny_native_hardware_matrix();
     const TESTS: &[&str] = &[
-        "backend::nn::shared::neutral_semantic_operator_tests::mlx_dense_fused_projection_equivalence",
-        "backend::nn::shared::neutral_semantic_operator_tests::mlx_affine_fused_projection_equivalence",
-        "backend::nn::shared::neutral_semantic_operator_tests::mlx_mxfp4_fused_projection_equivalence",
-        "backend::nn::shared::neutral_semantic_operator_tests::mlx_sentinel_embedding_validation",
-        "backend::nn::shared::neutral_semantic_operator_tests::mlx_multi_table_embedding_sum_is_ordered_and_sentinel_safe",
-        "backend::runtime::cache::state::semantic_transaction_tests::paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback",
-        "backend::runtime::cache::state::semantic_transaction_tests::mlx_realtime_transaction_paged_rollback_release_resume",
+        "backend::nn::shared::tests::mlx_dense_fused_projection_equivalence",
+        "backend::nn::shared::tests::mlx_affine_fused_projection_equivalence",
+        "backend::nn::shared::tests::mlx_mxfp4_fused_projection_equivalence",
+        "backend::nn::shared::tests::mlx_sentinel_embedding_validation",
+        "backend::nn::shared::tests::mlx_multi_table_embedding_sum_is_ordered_and_sentinel_safe",
+        "backend::runtime::cache::state::hybrid::semantic_transaction_tests::paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback",
+        "backend::runtime::cache::state::hybrid::semantic_transaction_tests::mlx_realtime_transaction_paged_rollback_release_resume",
         "backend::runtime::residency::manager::tests::cross_unit_alias_reacquisition_reuses_one_pinned_owner_read",
         "backend::runtime::generation::backend::tests::mlx_token_domain_validation_is_deferred_to_completion",
-        "composition::mlx::realtime::tests::mlx_realtime_input_domains_are_deferred_and_strict",
+        "composition::mlx::realtime::tests::portable_realtime_input_domains_are_strict_before_materialization",
     ];
     let executable = std::env::current_exe().expect("current unit-test executable");
     for test in TESTS {
-        let output = std::process::Command::new(&executable)
-            .args(["--exact", test, "--ignored", "--nocapture"])
-            .output()
-            .unwrap_or_else(|error| {
-                panic!("failed to launch MLX conformance test {test}: {error}")
-            });
+        let mut command = std::process::Command::new(&executable);
+        command.args(["--exact", test, "--nocapture"]);
+        if !test.ends_with("cross_unit_alias_reacquisition_reuses_one_pinned_owner_read")
+            && !test.ends_with("portable_realtime_input_domains_are_strict_before_materialization")
+        {
+            command.arg("--ignored");
+        }
+        let output = command.output().unwrap_or_else(|error| {
+            panic!("failed to launch MLX conformance test {test}: {error}")
+        });
         assert!(
-            output.status.success(),
-            "MLX conformance test {test} failed\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains(&format!("test {test} ... ok"))
+                && String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+            "MLX conformance test {test} did not execute one successful matching case\n--- stdout ---\n{}\n--- stderr ---\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -1128,3 +1146,6 @@ fn moshi_personaplex_fixture_session_hook() {
     let request = RequestId::new(94);
     let _scheduler = selected_scheduler(&scheduler_model, request, RealtimeSampling::greedy());
 }
+
+#[path = "tests/managed.rs"]
+mod managed;

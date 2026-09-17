@@ -13,7 +13,7 @@
     clippy::type_complexity
 )]
 
-#[cfg(all(feature = "metal", feature = "cuda"))]
+#[cfg(all(feature = "mlx", feature = "metal", feature = "cuda"))]
 compile_error!(
     "the `metal` and `cuda` MLX backend features are mutually exclusive; disable default features before enabling `cuda`"
 );

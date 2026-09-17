@@ -67,7 +67,7 @@ impl<T> VisionState<T> {
 struct CenteredLayerNorm<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     weight: Parameter<B::Tensor>,
     bias: Parameter<B::Tensor>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     epsilon: f32,
 }
 
@@ -112,7 +112,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> CenteredLayerNorm<B>
 struct PatchEmbedder<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     projection: B::Linear,
     position_table: B::Embedding,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     input_width: i32,
 }
 
@@ -186,11 +186,11 @@ struct VisionAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     key: B::Linear,
     value: B::Linear,
     output: B::Linear,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     scale: f32,
 }
 
@@ -403,7 +403,7 @@ pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     adapter_fc1: B::Linear,
     adapter_fc2: B::Linear,
     projection: B::Linear,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     config: VisionConfig,
 }
 
@@ -478,9 +478,33 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             self.patch_embedder
                 .forward(input.pixels, input.grid, &self.config, context)?;
         let hidden = self.pre_norm.forward(&hidden, context)?;
-        let full_chunks = attention_chunk_lengths(input.grid).map_err(Error::backend)?;
+        let (hidden, state) = self.placement_state(input.grid, Some(hidden), context)?;
+        Ok((
+            hidden.expect("ordinary vision supplies its hidden value"),
+            state,
+        ))
+    }
+
+    /// Reconstructs only placement state for an already permuted encoder boundary.
+    pub(crate) fn continuation_state(
+        &self,
+        grid: &[(i32, i32, i32)],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<VisionState<B::Tensor>, Error> {
+        validate_patch_grid(grid, self.config.merge_size, None).map_err(Error::backend)?;
+        self.placement_state(grid, None, context)
+            .map(|(_, state)| state)
+    }
+
+    fn placement_state(
+        &self,
+        grid: &[(i32, i32, i32)],
+        hidden: Option<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(Option<B::Tensor>, VisionState<B::Tensor>), Error> {
+        let full_chunks = attention_chunk_lengths(grid).map_err(Error::backend)?;
         let window = window_partition(
-            input.grid,
+            grid,
             1,
             self.config.position_height * self.config.patch_size,
             self.config.patch_size,
@@ -491,12 +515,14 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             &[window.permutation.len() as i32],
             context,
         )?;
-        let hidden = hidden.take_axis(&permutation, 0, context)?;
-        let (cosine, sine) = rotary_embeddings::<B::Tensor>(input.grid, &self.config, context)?;
+        let hidden = hidden
+            .map(|value| value.take_axis(&permutation, 0, context))
+            .transpose()?;
+        let (cosine, sine) = rotary_embeddings::<B::Tensor>(grid, &self.config, context)?;
         Ok((
             hidden,
             VisionState {
-                grid: input.grid.to_vec(),
+                grid: grid.to_vec(),
                 full_chunks,
                 window_chunks: window.chunk_lengths,
                 window_permutation: window.permutation,
@@ -533,7 +559,7 @@ pub struct VisionTower<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub static_modules: VisionStatic<B>,
     /// Independently streamable encoder blocks.
     pub blocks: Vec<VisionBlock<B>>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     schedule: Vec<VisionAttentionPolicy>,
 }
 

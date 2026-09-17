@@ -1,6 +1,10 @@
 //! Architecture-owned speculative lifecycle for a Muse-Glimmer DFlash assistant.
 
 use std::marker::PhantomData;
+mod prefill_spans;
+mod state;
+pub use state::SharedDFlashContext;
+use crate::{external_assistant::ExternalOperationResult,speculative_execution::{EmbeddedPredictionTensor,PreparedEmbeddedEvidence}};
 
 use eredu_core::{
     BoundedCompletion, SpeculativeCommit, SpeculativeExecutor, SpeculativePrefill, Submission,
@@ -37,6 +41,59 @@ where
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
+    fn driver_buffer_bytes<T>(capacity:usize)->Option<usize>{M::state_buffer_bytes::<T>(capacity)}
+    fn driver_buffer<T>(capacity:usize,context:Self::Context<'_>)->Result<eredu_core::SpeculativeBuffer<T>,Self::Error>{M::state_buffer(capacity,context)}
+    fn driver_host_metadata(bytes:Option<usize>,context:Self::Context<'_>)->Result<eredu_core::HostPreparationAuthority,Self::Error>{M::state_host_metadata(bytes,context)}
+    fn request_context<'a>(request:eredu_core::SpeculativeRequestId,context:Self::Context<'a>)->Result<Self::Context<'a>,Self::Error>{M::request_context(request,context)}
+    fn coordinate_speculative_buffer(
+        local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> { M::coordinate_speculative_buffer(local, context) }
+
+    fn driver_identity(context:Self::Context<'_>)->Result<eredu_core::SpeculativeRequestIdentity,Self::Error>{M::driver_identity(context)}
+    fn copy_sequence(source:eredu_core::SpeculativeSequenceRef<'_>,context:Self::Context<'_>)->Result<eredu_core::SpeculativeSequence,eredu_core::SpeculativeDriverError<Self::Error>>{M::copy_sequence(source,context)}
+    fn sequence_copy_bytes(source:&eredu_core::SpeculativeSequence)->Option<u64>{M::sequence_copy_bytes(source)}
+    fn take_retained_failure(error:Self::Error)->Result<eredu_core::BackendFailure,Self::Error>{M::take_retained_failure(error)}
+
+    fn requires_activation_origin() -> bool { M::requires_activation_origin() }
+    fn invocation_context<'a>(context: Self::Context<'a>,
+        origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>,
+    ) -> Result<Self::Context<'a>, Self::Error> { M::invocation_context(context, origin) }
+    fn prepare_control_continuation<'a>(committed: usize,
+        status: eredu_core::generation::SpeculativeRequestStatus, context: Self::Context<'a>,
+    ) -> Result<(), Self::Error> { M::prepare_control_continuation(committed, status, context) }
+
+
+    fn sequence_len_with_context(value:&Self::Tensor,context:Self::Context<'_>)->Result<usize,Self::Error>{M::state_dimension(value,1,context)}
+    fn invalid_output_with_context(_expected:usize,_logits:usize,_captures:&[usize],context:Self::Context<'_>)->Self::Error{M::state_refusal(context)}
+    fn control_copy_state(state:&ExternalTargetState<Self::Tensor>,context:Self::Context<'_>)->Result<ExternalTargetState<Self::Tensor>,Self::Error>{state::control_copy::<M>(state,context)}
+    fn transfer_packet(value:&EmbeddedPredictionTensor<Self::Tensor>,direction:ExternalAssistantTransfer,context:Self::Context<'_>)->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{M::transfer_with_source(value,direction,context)}
+    fn transfer_value(value:&Self::Tensor,evidence:Option<&PreparedEmbeddedEvidence>,direction:ExternalAssistantTransfer,context:Self::Context<'_>)->Result<ExternalOperationResult<Self::Tensor>,Self::Error>{M::transfer_tensor_with_source(value,evidence,direction,context)}
+    fn assemble_with_source(assistant:&mut Self::Assistant,states:&[Self::Tensor],evidence:Option<&PreparedEmbeddedEvidence>,context:Self::Context<'_>)->Result<ExternalOperationResult<Self::Tensor>,Self::Error>{state::assemble::<M>(assistant,states,evidence,context)}
+    fn suffix_with_source(value:&Self::Tensor,maximum:i32,evidence:Option<&PreparedEmbeddedEvidence>,context:Self::Context<'_>)->Result<ExternalOperationResult<Self::Tensor>,Self::Error>{
+        let length=M::state_dimension(value,1,context)?;let maximum=usize::try_from(maximum).map_err(|_|M::state_refusal(context))?;
+        M::tensor_range_with_source(value,1,length.saturating_sub(maximum),length,evidence,ExternalAssistantTensorPlacement::Target,context)
+    }
+    fn update_with_source(assistant:&mut Self::Assistant,previous:Option<&SharedDFlashContext<Self::Tensor>>,pending:&Self::Tensor,evidence:Option<&PreparedEmbeddedEvidence>,absolute_end:i32,context:Self::Context<'_>)->Result<SharedDFlashContext<Self::Tensor>,Self::Error>{state::update::<M>(assistant,previous,pending,evidence,absolute_end,context)}
+    fn embeddings_with_source(target:&mut Self::Target,ids:&[u32],context:Self::Context<'_>)->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{state::embeddings::<M>(target,ids,context)}
+    fn proposal_with_source(assistant:&mut Self::Assistant,embeddings:&Self::Tensor,evidence:Option<&PreparedEmbeddedEvidence>,committed:&SharedDFlashContext<Self::Tensor>,absolute_end:i32,context:Self::Context<'_>)->Result<ExternalOperationResult<Self::Tensor>,Self::Error>{state::proposal::<M>(assistant,embeddings,evidence,committed,absolute_end,context)}
+    fn target_logits_with_source(target:&mut Self::Target,states:&Self::Tensor,evidence:Option<&PreparedEmbeddedEvidence>,context:Self::Context<'_>)->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{state::logits::<M>(target,states,evidence,context)}
+    fn proposal_row_with_source(value:&Self::Tensor,row:usize,evidence:Option<&PreparedEmbeddedEvidence>,context:Self::Context<'_>)->Result<Self::Logits,Self::Error>{M::logits_row_with_source(value,row,evidence,ExternalAssistantTensorPlacement::Draft,context)}
+    fn tokens_with_source(ids:&[u32],context:Self::Context<'_>)->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{M::target_tokens_with_source(ids,context)}
+    fn prefix_with_source(value:&EmbeddedPredictionTensor<Self::Tensor>,end:usize,context:Self::Context<'_>)->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{M::token_prefix_with_source(value,end,context)}
+    fn verify_with_tokens(target:&mut Self::Target,assistant:&mut Self::Assistant,request:&Self::Capture,tokens:&EmbeddedPredictionTensor<Self::Tensor>,cache:&mut Self::Cache,context:Self::Context<'_>)->Result<ExternalTargetOutput<Self::Tensor>,Self::Error>{
+        let evidence=tokens.evidence();let source=M::source_context(context,evidence.as_slice())?;
+        Self::verify_target(target,assistant,request,tokens,cache,source)
+    }
+    fn complete_with_tokens(output:&ExternalTargetOutput<Self::Tensor>,inputs:&EmbeddedPredictionTensor<Self::Tensor>,context:Self::Context<'_>)->Result<Self::Completion,Self::Error>{
+        let mut proofs=M::state_buffer(2,context)?;
+        if let Some(proof)=&output.evidence{proofs.try_push(proof).map_err(|_|M::state_refusal(context))?;}
+        if let Some(proof)=inputs.evidence(){proofs.try_push(proof).map_err(|_|M::state_refusal(context))?;}
+        M::submit_completion_with_sources(std::iter::once(&output.logits).chain(output.target_states.iter()).chain(std::iter::once(&**inputs)),&proofs,context)
+    }
+    fn observe_output_in_context(assistant:&mut Self::Assistant,_request:&Self::Capture,output:&mut ExternalTargetOutput<Self::Tensor>,path:&str,context:Self::Context<'_>)->Result<(),Self::Error>{
+        output.logits=M::observe_borrowed_tensor(assistant,path,&output.logits,output.evidence.as_ref(),context)?;Ok(())
+    }
 
     fn max_proposals(assistant: &Self::Assistant) -> usize {
         M::config(assistant).block_size.saturating_sub(1).min(15)
@@ -103,6 +160,18 @@ where
         validate_output_capture::<M>(cache, output)
     }
 
+    fn bind_prepared_input_with_context(input:&Self::Input,cache:&mut Self::Cache,context:Self::Context<'_>)->Result<(),Self::Error>{
+        M::bind_prepared_input_with_context(input,cache,context)
+    }
+    fn checkpoint_with_context(cache:&Self::Cache,context:Self::Context<'_>)->Result<Self::CacheCheckpoint,Self::Error>{
+        let host=M::state_host_metadata(Some(std::mem::size_of::<(Self::CacheCheckpoint,Result<Self::CacheCheckpoint,Self::Error>)>()),context)?;
+        M::checkpoint_native_with_context(cache.native(),context).map(|native|cache.checkpoint_with_host(native,host))
+    }
+    fn validate_output_capture_with_context(cache:&Self::Cache,
+        output:&ExternalTargetOutput<Self::Tensor>,context:Self::Context<'_>)->Result<(),Self::Error>{
+        validate_output_capture_in_context::<M>(cache,output,context)
+    }
+
     fn bind_prepared_input(
         input: &Self::Input,
         cache: &mut Self::Cache,
@@ -110,6 +179,36 @@ where
         cache
             .bind_prepared_input_cache_identity(&M::prepared_input_cache_identity(input)?)
             .map_err(M::error)
+    }
+
+    fn uses_span_prefill(_input: &Self::Input) -> bool {
+        // Every ordinary and controlled external prefill shares demand selection
+        // and exact completion. An absent override selects runtime span policy.
+        true
+    }
+    fn prefill_spans<'a>(
+        target: &mut Self::Target,
+        assistant: &mut Self::Assistant,
+        request: &Self::Capture,
+        input: Self::Input,
+        cache: &mut Self::Cache,
+        cancellation: &eredu_core::GenerationCancellationToken,
+        context: Self::Context<'a>,
+    ) -> Result<
+        eredu_core::SpeculativePrefillOutcome<
+            SpeculativePrefill<ExternalTargetState<Self::Tensor>, Self::Logits>,
+        >,
+        Self::Error,
+    > {
+        prefill_spans::run::<M>(
+            target,
+            assistant,
+            request,
+            input,
+            cache,
+            cancellation,
+            context,
+        )
     }
 
     fn prefill_target<'a>(
@@ -120,13 +219,13 @@ where
         cache: &mut Self::Cache,
         context: Self::Context<'a>,
     ) -> Result<ExternalTargetOutput<Self::Tensor>, Self::Error> {
-        let (logits, mut capture) =
-            M::prefill_target_native(target, request, input, cache.native_mut(), context)?;
+        let crate::external_assistant::ExternalTargetResult { logits, capture: mut capture, evidence } =
+            M::prefill_target_with_evidence(target, request, input, cache.native_mut(), context)?;
         cache
             .advance_frontier(M::native_cache_len(cache.native())?)
             .map_err(M::error)?;
-        observe_capture::<M>(assistant, cache, &mut capture)?;
-        target_output::<M>(logits, capture)
+        observe_capture::<M>(assistant, cache, &mut capture,evidence.as_ref(),context)?;
+        target_output::<M>(logits, capture, evidence)
     }
 
     fn verify_target<'a>(
@@ -137,13 +236,13 @@ where
         cache: &mut Self::Cache,
         context: Self::Context<'a>,
     ) -> Result<ExternalTargetOutput<Self::Tensor>, Self::Error> {
-        let (logits, mut capture) =
-            M::verify_target_native(target, request, tokens, cache.native_mut(), context)?;
+        let crate::external_assistant::ExternalTargetResult { logits, capture: mut capture, evidence } =
+            M::verify_target_with_evidence(target, request, tokens, cache.native_mut(), context)?;
         cache
             .advance_frontier(M::native_cache_len(cache.native())?)
             .map_err(M::error)?;
-        observe_capture::<M>(assistant, cache, &mut capture)?;
-        target_output::<M>(logits, capture)
+        observe_capture::<M>(assistant, cache, &mut capture,evidence.as_ref(),context)?;
+        target_output::<M>(logits, capture, evidence)
     }
 
     fn control_cache_estimate(
@@ -170,7 +269,8 @@ where
         cache: &Self::Cache,
         context: Self::Context<'a>,
     ) -> Result<Self::CacheCheckpoint, Self::Error> {
-        M::control_checkpoint(cache.native(), context).map(|native| cache.checkpoint(native))
+        let host=M::state_host_metadata(Some(std::mem::size_of::<(Self::CacheCheckpoint,Result<Self::CacheCheckpoint,Self::Error>)>()),context)?;
+        M::control_checkpoint(cache.native(), context).map(|native| cache.checkpoint_with_host(native,host))
     }
     fn control_restore<'a>(
         cache: &mut Self::Cache,
@@ -221,6 +321,15 @@ where
             context,
         )
         .map(M::into_logits)
+    }
+
+    fn logits_row_with_source<'a>(
+        value: &Self::Tensor,
+        row: usize,
+        evidence: Option<&crate::speculative_execution::PreparedEmbeddedEvidence>,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Logits, Self::Error> {
+        M::logits_row_with_source(value, row, evidence, ExternalAssistantTensorPlacement::Target, context)
     }
 
     fn proposal_logits_row<'a>(
@@ -370,6 +479,7 @@ fn observe_capture<M>(
     assistant: &mut M::Assistant,
     cache: &ExternalAssistantCache<M::NativeCache>,
     capture: &mut ExternalPredictionTargetCapture<M::Tensor>,
+    evidence:Option<&PreparedEmbeddedEvidence>,context:M::Context<'_>,
 ) -> Result<(), M::Error>
 where
     M: ExternalAssistantExecutionMechanisms<MuseGlimmerAssistantArchitecture>,
@@ -379,7 +489,7 @@ where
             "Muse-Glimmer target returned a different assistant capture".into(),
         ));
     };
-    let paths = cache.capture_paths();
+    let paths = cache.capture_paths_iter();
     if paths.len() != target_states.len() {
         return Err(M::error(format!(
             "Muse-Glimmer target capture path count {} differs from state count {}",
@@ -388,7 +498,7 @@ where
         )));
     }
     for (path, state) in paths.into_iter().zip(target_states) {
-        *state = M::observe_tensor(assistant, path, state.clone())?;
+        *state = M::observe_borrowed_tensor(assistant,path,state,evidence,context)?;
     }
     Ok(())
 }
@@ -408,9 +518,23 @@ where
     cache.validate_capture_shapes(&shapes).map_err(M::error)
 }
 
+fn validate_output_capture_in_context<M>(
+    cache: &ExternalAssistantCache<M::NativeCache>,
+    output: &ExternalTargetOutput<M::Tensor>,
+    context:M::Context<'_>,
+) -> Result<(), M::Error>
+where
+    M: ExternalAssistantExecutionMechanisms<MuseGlimmerAssistantArchitecture>,
+{
+    cache.validate_capture_values::<MuseGlimmerAssistantArchitecture,M,_>(
+        ||output.target_states.iter(),context)
+
+}
+
 fn target_output<M>(
     logits: M::Tensor,
     capture: ExternalPredictionTargetCapture<M::Tensor>,
+    evidence: Option<crate::speculative_execution::PreparedEmbeddedEvidence>,
 ) -> Result<ExternalTargetOutput<M::Tensor>, M::Error>
 where
     M: ExternalAssistantExecutionMechanisms<MuseGlimmerAssistantArchitecture>,
@@ -421,6 +545,7 @@ where
         ));
     };
     Ok(ExternalTargetOutput {
+        evidence,
         logits,
         target_states,
     })
@@ -432,14 +557,17 @@ pub struct ExternalTargetOutput<T> {
     pub logits: T,
     /// Target layer states in the order proven by assistant compatibility.
     pub target_states: Vec<T>,
+    /// Actual completed source retained after this output's native values.
+    pub evidence:Option<PreparedEmbeddedEvidence>,
 }
 
 /// Committed target and DFlash context state.
 #[derive(Clone)]
 pub struct ExternalTargetState<T: Clone> {
     pending_context: Option<T>,
-    draft_context: Option<DFlashContext<T>>,
+    draft_context: Option<SharedDFlashContext<T>>,
     cache_len: i32,
+    evidence:Option<crate::speculative_execution::PreparedEmbeddedEvidence>,
 }
 
 impl<T: Clone> ExternalTargetState<T> {
@@ -470,13 +598,14 @@ impl<T: Clone> ExternalTargetState<T> {
                         .collect::<Result<_, E>>()?,
                     start: c.start,
                     end: c.end,
-                })
+                }.into())
             })
             .transpose()?;
         Ok(Self {
             pending_context,
             draft_context,
             cache_len: self.cache_len,
+            evidence:self.evidence.clone(),
         })
     }
     fn tensor_bytes(&self, mut f: impl FnMut(&T) -> Option<u64>) -> Option<u64> {
@@ -500,17 +629,17 @@ impl<T: Clone> ExternalTargetState<T> {
 /// Private fused DFlash proposal block.
 #[derive(Clone)]
 pub struct ExternalDraftState<T: Clone> {
-    logits: T,
+    logits: EmbeddedPredictionTensor<T>,
     cursor: usize,
     proposal_capacity: usize,
-    draft_context: DFlashContext<T>,
+    draft_context: SharedDFlashContext<T>,
     cache_len: i32,
 }
 
 /// Retained target verification and exact input tokens.
 pub struct ExternalVerification<T> {
     output: ExternalTargetOutput<T>,
-    inputs: T,
+    inputs: EmbeddedPredictionTensor<T>,
 }
 
 /// Backend mechanisms required by the architecture-owned DFlash lifecycle.
@@ -541,6 +670,87 @@ pub trait ExternalMechanisms: 'static {
     type Telemetry: eredu_core::SpeculativeTelemetry;
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Fixed descriptor query under the current source's metadata destination.
+    fn sequence_len_with_context(value:&Self::Tensor,context:Self::Context<'_>)->Result<usize,Self::Error>{let _=context;Self::sequence_len(value)}
+    /// Source-retained refusal for a mismatch in this invocation's output.
+    fn invalid_output_with_context(expected:usize,logits:usize,captures:&[usize],context:Self::Context<'_>)->Self::Error{let _=context;Self::invalid_output(expected,logits,captures)}
+    /// Copies the exact complete seed through the existing admitted tensor copier.
+    fn control_copy_state(state:&ExternalTargetState<Self::Tensor>,context:Self::Context<'_>)->Result<ExternalTargetState<Self::Tensor>,Self::Error>{state.map(|value,placement|Self::control_copy_tensor(value,placement,context))}
+    /// Transfers the exact source packet through the existing placement worker.
+    fn transfer_packet(value:&EmbeddedPredictionTensor<Self::Tensor>,direction:ExternalAssistantTransfer,context:Self::Context<'_>)->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
+        match direction{ExternalAssistantTransfer::TargetToDraft=>Self::target_to_draft(value,context),ExternalAssistantTransfer::DraftToTarget=>Self::draft_to_target(value,context)}.map(EmbeddedPredictionTensor::ordinary)
+    }
+    /// Transfers an immutable value while preserving its completed source.
+    fn transfer_value(value:&Self::Tensor,evidence:Option<&PreparedEmbeddedEvidence>,direction:ExternalAssistantTransfer,context:Self::Context<'_>)->Result<ExternalOperationResult<Self::Tensor>,Self::Error>{
+        let _=evidence;match direction{ExternalAssistantTransfer::TargetToDraft=>Self::target_to_draft(value,context),ExternalAssistantTransfer::DraftToTarget=>Self::draft_to_target(value,context)}.map(ExternalOperationResult::ordinary)
+    }
+    /// Assembles the same target context with its actual receipt.
+    fn assemble_with_source(assistant:&mut Self::Assistant,states:&[Self::Tensor],evidence:Option<&PreparedEmbeddedEvidence>,context:Self::Context<'_>)->Result<ExternalOperationResult<Self::Tensor>,Self::Error>{let _=evidence;Self::assemble_target_states(assistant,states,context).map(ExternalOperationResult::ordinary)}
+    /// Selects the same rolling suffix with its actual receipt.
+    fn suffix_with_source(value:&Self::Tensor,maximum:i32,evidence:Option<&PreparedEmbeddedEvidence>,context:Self::Context<'_>)->Result<ExternalOperationResult<Self::Tensor>,Self::Error>{let _=evidence;Self::sequence_suffix(value,maximum,context).map(ExternalOperationResult::ordinary)}
+    /// Encodes into a source-preserving immutable committed context.
+    fn update_with_source(assistant:&mut Self::Assistant,previous:Option<&SharedDFlashContext<Self::Tensor>>,pending:&Self::Tensor,evidence:Option<&PreparedEmbeddedEvidence>,absolute_end:i32,context:Self::Context<'_>)->Result<SharedDFlashContext<Self::Tensor>,Self::Error>{let _=evidence;Self::update_context(assistant,previous.map(|value|(**value).clone()),pending,absolute_end,context).map(Into::into)}
+    /// Target embeddings retain their exact input/output evidence.
+    fn embeddings_with_source(target:&mut Self::Target,ids:&[u32],context:Self::Context<'_>)->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{Self::target_embeddings(target,ids,context).map(EmbeddedPredictionTensor::ordinary)}
+    /// Runs the same fused proposal with both exact source inventories.
+    fn proposal_with_source(assistant:&mut Self::Assistant,embeddings:&Self::Tensor,evidence:Option<&PreparedEmbeddedEvidence>,committed:&SharedDFlashContext<Self::Tensor>,absolute_end:i32,context:Self::Context<'_>)->Result<ExternalOperationResult<Self::Tensor>,Self::Error>{let _=evidence;Self::proposal_states(assistant,embeddings,committed,absolute_end,context).map(ExternalOperationResult::ordinary)}
+    /// Projects target vocabulary scores with the completed state source.
+    fn target_logits_with_source(target:&mut Self::Target,states:&Self::Tensor,evidence:Option<&PreparedEmbeddedEvidence>,context:Self::Context<'_>)->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{let _=evidence;Self::target_logits(target,states,context).map(EmbeddedPredictionTensor::ordinary)}
+    /// Reads one completed fused score row on draft placement.
+    fn proposal_row_with_source(value:&Self::Tensor,row:usize,evidence:Option<&PreparedEmbeddedEvidence>,context:Self::Context<'_>)->Result<Self::Logits,Self::Error>{let _=evidence;Self::proposal_logits_row(value,row,context)}
+    /// Constructs the existing target token packet.
+    fn tokens_with_source(ids:&[u32],context:Self::Context<'_>)->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{Self::target_tokens(ids,context).map(EmbeddedPredictionTensor::ordinary)}
+    /// Selects a replay prefix with the existing token source.
+    fn prefix_with_source(value:&EmbeddedPredictionTensor<Self::Tensor>,end:usize,context:Self::Context<'_>)->Result<EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{Self::token_prefix(value,end,context).map(EmbeddedPredictionTensor::ordinary)}
+    /// Verification consumes the actual token packet source.
+    fn verify_with_tokens(target:&mut Self::Target,assistant:&mut Self::Assistant,request:&Self::Capture,tokens:&EmbeddedPredictionTensor<Self::Tensor>,cache:&mut Self::Cache,context:Self::Context<'_>)->Result<ExternalTargetOutput<Self::Tensor>,Self::Error>{Self::verify_target(target,assistant,request,tokens,cache,context)}
+    /// Completion keeps the exact target and token receipts.
+    fn complete_with_tokens(output:&ExternalTargetOutput<Self::Tensor>,inputs:&EmbeddedPredictionTensor<Self::Tensor>,context:Self::Context<'_>)->Result<Self::Completion,Self::Error>{Self::submit_verification(output,inputs,context)}
+    /// Observes the same output through its source-aware borrowed value hook.
+    fn observe_output_in_context(assistant:&mut Self::Assistant,request:&Self::Capture,output:&mut ExternalTargetOutput<Self::Tensor>,path:&str,context:Self::Context<'_>)->Result<(),Self::Error>{let _=context;Self::observe_output(assistant,request,output,path)}
+
+    /// Whether the actual mechanism needs the shared scheduler coordinate.
+    /// Exact query for the matching actual driver buffer constructor.
+    fn driver_buffer_bytes<T>(capacity:usize)->Option<usize>{eredu_core::SpeculativeBuffer::<T>::retained_control_bytes(capacity)}
+    /// Actual host buffer for the common driver, paid before construction.
+    fn driver_buffer<T>(capacity:usize,context:Self::Context<'_>)->Result<eredu_core::SpeculativeBuffer<T>,Self::Error>{let _=context;Ok(eredu_core::SpeculativeBuffer::with_capacity(capacity))}
+    /// Exact concrete payload and erasure metadata source.
+    fn driver_host_metadata(bytes:Option<usize>,context:Self::Context<'_>)->Result<eredu_core::HostPreparationAuthority,Self::Error>{let _=(bytes,context);Ok(eredu_core::HostPreparationAuthority::unmanaged())}
+    /// Copies only the actual request assignment; no new source is inferred.
+    fn request_context<'a>(request:eredu_core::SpeculativeRequestId,context:Self::Context<'a>)->Result<Self::Context<'a>,Self::Error>{let _=request;Ok(context)}
+    /// Coordinates the same host rows without discarding their original owner.
+    /// Legacy mechanisms accept ordinary buffers; a retained buffer needs an
+    /// explicit source-aware implementation.
+    fn coordinate_speculative_buffer(
+        local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        let _ = context;
+        match local.try_into_ordinary() {
+            Ok(local) => Ok(local.into()),
+            Err(_) => Err(eredu_core::HostMetadataFundingError::Unavailable.into()),
+        }
+    }
+
+    /// Retains the shared driver's original request identity.
+    fn driver_identity(context:Self::Context<'_>)->Result<eredu_core::SpeculativeRequestIdentity,Self::Error>{let _=context;Ok(eredu_core::SpeculativeRequestIdentity::new())}
+    /// Uses the existing canonical sequence-copy mechanism at checkpoint boundaries.
+    fn copy_sequence(source:eredu_core::SpeculativeSequenceRef<'_>,context:Self::Context<'_>)->Result<eredu_core::SpeculativeSequence,eredu_core::SpeculativeDriverError<Self::Error>>{let _=context;source.copy_ordinary().map_err(eredu_core::SpeculativeDriverError::Preparation)}
+    /// Exact storage query for the matching sequence-copy provider.
+    fn sequence_copy_bytes(source:&eredu_core::SpeculativeSequence)->Option<u64>{match source{eredu_core::SpeculativeSequence::Ordinary(_)=>source.snapshot_storage_bytes(),eredu_core::SpeculativeSequence::Retained(_)=>None}}
+    /// Transfers an already retained failure without another allocation.
+    fn take_retained_failure(error:Self::Error)->Result<eredu_core::BackendFailure,Self::Error>{Err(error)}
+    /// Whether the actual native source needs a scheduler coordinate.
+    fn requires_activation_origin() -> bool { false }
+    /// Lends the actual coordinate to one operation; ordinary contexts are unchanged.
+    fn invocation_context<'a>(context: Self::Context<'a>,
+        _origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>,
+    ) -> Result<Self::Context<'a>, Self::Error> { Ok(context) }
+    /// The request owns monotonic attempts outside all cache snapshots.
+    fn prepare_control_continuation<'a>(_committed: usize,
+        _status: eredu_core::generation::SpeculativeRequestStatus, _context: Self::Context<'a>,
+    ) -> Result<(), Self::Error> { Ok(()) }
 
     /// Known bound for an isolated reusable target-cache checkpoint.
     fn control_cache_estimate(
@@ -624,9 +834,41 @@ pub trait ExternalMechanisms: 'static {
         Ok(())
     }
 
+    /// Uses the same validation with the active source/account loan.
+    fn validate_output_capture_with_context(cache:&Self::Cache,
+        output:&ExternalTargetOutput<Self::Tensor>,_context:Self::Context<'_>)->Result<(),Self::Error>{
+        Self::validate_output_capture(cache,output)
+    }
+
     /// Binds the exact prepared-input identity before target execution.
+    /// Source-aware prepared identity; ordinary implementations keep their worker.
+    fn bind_prepared_input_with_context(input:&Self::Input,cache:&mut Self::Cache,_context:Self::Context<'_>)->Result<(),Self::Error>{Self::bind_prepared_input(input,cache)}
+    /// Source-aware rollback checkpoint under the same shared transaction.
+    fn checkpoint_with_context(cache:&Self::Cache,_context:Self::Context<'_>)->Result<Self::CacheCheckpoint,Self::Error>{Self::checkpoint(cache)}
     fn bind_prepared_input(input: &Self::Input, cache: &mut Self::Cache)
         -> Result<(), Self::Error>;
+
+    /// Selects only the already requested shared span mechanism.
+    fn uses_span_prefill(_input: &Self::Input) -> bool {
+        false
+    }
+    /// Compatibility mechanisms keep their existing whole-input method.
+    fn prefill_spans<'a>(
+        _target: &mut Self::Target,
+        _assistant: &mut Self::Assistant,
+        _request: &Self::Capture,
+        _input: Self::Input,
+        _cache: &mut Self::Cache,
+        _cancellation: &eredu_core::GenerationCancellationToken,
+        _context: Self::Context<'a>,
+    ) -> Result<
+        eredu_core::SpeculativePrefillOutcome<
+            SpeculativePrefill<ExternalTargetState<Self::Tensor>, Self::Logits>,
+        >,
+        Self::Error,
+    > {
+        Err(Self::empty_input())
+    }
 
     /// Runs target prefill and returns ordered captured states.
     fn prefill_target<'a>(
@@ -666,6 +908,17 @@ pub trait ExternalMechanisms: 'static {
         row: usize,
         context: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error>;
+    /// Reads a row from this exact completed target output when source evidence is present.
+    fn logits_row_with_source<'a>(
+        value: &Self::Tensor,
+        row: usize,
+        evidence: Option<&crate::speculative_execution::PreparedEmbeddedEvidence>,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Logits, Self::Error> {
+        let _ = evidence;
+        Self::logits_row(value, row, context)
+    }
+
     /// Selects one proposal-logits row on draft placement.
     fn proposal_logits_row<'a>(
         value: &Self::Tensor,
@@ -745,11 +998,17 @@ pub trait ExternalMechanisms: 'static {
 pub struct ExternalExecutor<'a, M: ExternalMechanisms> {
     target: &'a mut M::Target,
     assistant: &'a mut M::Assistant,
-    capture: M::Capture,
+    capture: crate::external_assistant::CaptureSource<'a,M::Capture>,
+    origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>,
     _mechanisms: PhantomData<fn() -> M>,
 }
 
 impl<'a, M: ExternalMechanisms> ExternalExecutor<'a, M> {
+    /// Lends the exact immutable capture declaration owned by the selected source.
+    pub const fn new_borrowed(target:&'a mut M::Target,assistant:&'a mut M::Assistant,capture:&'a M::Capture)->Self{
+        Self{target,assistant,capture:crate::external_assistant::CaptureSource::Borrowed(capture),origin:None,_mechanisms:PhantomData}
+    }
+
     /// Binds materialized target and assistant objects to the neutral lifecycle.
     pub const fn new(
         target: &'a mut M::Target,
@@ -759,7 +1018,8 @@ impl<'a, M: ExternalMechanisms> ExternalExecutor<'a, M> {
         Self {
             target,
             assistant,
-            capture,
+            capture:crate::external_assistant::CaptureSource::Owned(capture),
+            origin: None,
             _mechanisms: PhantomData,
         }
     }
@@ -767,32 +1027,28 @@ impl<'a, M: ExternalMechanisms> ExternalExecutor<'a, M> {
     fn target_state<'context>(
         &mut self,
         output: &ExternalTargetOutput<M::Tensor>,
-        draft_context: Option<DFlashContext<M::Tensor>>,
+        draft_context: Option<SharedDFlashContext<M::Tensor>>,
         cache_len: i32,
         context: M::Context<'context>,
     ) -> Result<ExternalTargetState<M::Tensor>, M::Error> {
-        let assembled = M::assemble_target_states(self.assistant, &output.target_states, context)?;
-        let pending = M::sequence_suffix(&assembled, M::sliding_window(self.assistant), context)?;
+        let assembled = M::assemble_with_source(self.assistant, &output.target_states,output.evidence.as_ref(), context)?;
+        let pending = M::suffix_with_source(&assembled.output, M::sliding_window(self.assistant),assembled.evidence.as_ref(), context)?;
         Ok(ExternalTargetState {
-            pending_context: Some(pending),
+            evidence:pending.evidence,
+            pending_context: Some(pending.output),
             draft_context,
             cache_len,
         })
     }
 
-    fn validate_output(
-        output: &ExternalTargetOutput<M::Tensor>,
-        expected: usize,
-    ) -> Result<(), M::Error> {
-        let logits = M::sequence_len(&output.logits)?;
-        let captures = output
-            .target_states
-            .iter()
-            .map(M::sequence_len)
-            .collect::<Result<Vec<_>, _>>()?;
-        if logits != expected || captures.iter().any(|&capture| capture != expected) {
-            return Err(M::invalid_output(expected, logits, &captures));
-        }
+    fn validate_output(output:&ExternalTargetOutput<M::Tensor>,expected:usize,context:M::Context<'_>)->Result<(),M::Error>{
+        let controls=[std::mem::size_of::<Result<(),M::Error>>(),std::mem::size_of::<eredu_core::SpeculativeBuffer<usize>>(),
+            std::mem::size_of::<std::slice::Iter<'_,M::Tensor>>(),std::mem::size_of::<(usize,usize)>()];
+        let _host=M::driver_host_metadata(controls.into_iter().try_fold(std::mem::size_of_val(&controls),usize::checked_add),context)?;
+        let logits=M::sequence_len_with_context(&output.logits,context)?;
+        let mut captures=M::driver_buffer(output.target_states.len(),context)?;
+        for value in &output.target_states{captures.try_push(M::sequence_len_with_context(value,context)?).map_err(|_|M::invalid_output_with_context(expected,logits,&captures,context))?;}
+        if logits!=expected||captures.iter().any(|count|*count!=expected){return Err(M::invalid_output_with_context(expected,logits,&captures,context));}
         Ok(())
     }
 }
@@ -809,6 +1065,18 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
     type Cache = M::Cache;
     type TargetState = ExternalTargetState<M::Tensor>;
     type DraftState = ExternalDraftState<M::Tensor>;
+
+    fn copy_draft_state<'a>(
+        &self,
+        state: &Self::DraftState,
+        context: Self::Context<'a>,
+    ) -> Result<Self::DraftState, Self::Error>
+    where
+        Self: 'a,
+    {
+        let _host=M::driver_host_metadata(Some(std::mem::size_of::<(Self::DraftState,Result<Self::DraftState,Self::Error>)>()),context)?;
+        Ok(state.clone())
+    }
     type CacheCheckpoint = M::CacheCheckpoint;
     type Verification = ExternalVerification<M::Tensor>;
     type Logits = M::Logits;
@@ -816,6 +1084,31 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
+    fn driver_buffer_bytes<T>(&self,capacity:usize)->Option<usize>{M::driver_buffer_bytes::<T>(capacity)}
+    fn driver_buffer<T>(&self,capacity:usize,context:Self::Context<'_>)->Result<eredu_core::SpeculativeBuffer<T>,Self::Error>{M::driver_buffer(capacity,context)}
+    fn driver_host_metadata(&self,bytes:Option<usize>,context:Self::Context<'_>)->Result<eredu_core::HostPreparationAuthority,Self::Error>{M::driver_host_metadata(bytes,context)}
+    fn request_context<'a>(&self,request:eredu_core::SpeculativeRequestId,context:Self::Context<'a>)->Result<Self::Context<'a>,Self::Error> where Self:'a {M::request_context(request,context)}
+    fn coordinate_speculative_buffer(
+        &mut self, local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> { M::coordinate_speculative_buffer(local, context) }
+
+    fn driver_identity(&self,context:Self::Context<'_>)->Result<eredu_core::SpeculativeRequestIdentity,Self::Error>{M::driver_identity(context)}
+    fn copy_sequence(&self,source:eredu_core::SpeculativeSequenceRef<'_>,context:Self::Context<'_>)->Result<eredu_core::SpeculativeSequence,eredu_core::SpeculativeDriverError<Self::Error>>{M::copy_sequence(source,context)}
+    fn sequence_copy_bytes(&self,source:&eredu_core::SpeculativeSequence)->Option<u64>{M::sequence_copy_bytes(source)}
+    fn take_retained_failure(error:Self::Error)->Result<eredu_core::BackendFailure,Self::Error>{M::take_retained_failure(error)}
+
+
+    fn requires_activation_origin(&self) -> bool { M::requires_activation_origin() }
+    fn set_activation_origin(&mut self, origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>) {
+        self.origin = origin;
+    }
+    fn prepare_control_continuation<'a>(&mut self, committed: usize,
+        status: eredu_core::generation::SpeculativeRequestStatus, context: Self::Context<'a>,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        M::prepare_control_continuation(committed, status, context)
+            .map_err(eredu_core::speculative::SpeculativeControlError::backend)
+    }
 
     fn control_snapshot_estimate(
         &self,
@@ -841,8 +1134,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         if self.control_snapshot_estimate(cache, state).is_none() {
             return Ok(None);
         }
-        let state = state
-            .map(|t, placement| M::control_copy_tensor(t, placement, context))
+        let state = M::control_copy_state(state,context)
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
         Ok(Some((
             M::control_checkpoint(cache, context)
@@ -857,8 +1149,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         state: &Self::TargetState,
         context: Self::Context<'a>,
     ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError> {
-        let state = state
-            .map(|t, placement| M::control_copy_tensor(t, placement, context))
+        let state = M::control_copy_state(state,context)
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
         M::control_restore(cache, saved, context)
             .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
@@ -869,14 +1160,61 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         M::max_proposals(self.assistant)
     }
 
+    fn prefill_cancellable<'context>(
+        &mut self,
+        input: Self::Input,
+        cache: &mut Self::Cache,
+        cancellation: &eredu_core::GenerationCancellationToken,
+        context: Self::Context<'context>,
+    ) -> Result<
+        eredu_core::SpeculativePrefillOutcome<SpeculativePrefill<Self::TargetState, Self::Logits>>,
+        Self::Error,
+    > {
+        let context = M::invocation_context(context, self.origin)?;
+        let context = M::invocation_context(context, self.origin)?;
+        if !M::uses_span_prefill(&input) {
+            return self
+                .prefill(input, cache, context)
+                .map(eredu_core::SpeculativePrefillOutcome::Complete);
+        }
+        M::bind_prepared_input_with_context(&input, cache, context)?;
+        let checkpoint = M::checkpoint_with_context(cache, context)?;
+        match M::prefill_spans(
+            self.target,
+            self.assistant,
+            &self.capture,
+            input,
+            cache,
+            cancellation,
+            context,
+        ) {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                M::restore_checkpoint(cache, &checkpoint, context)?;
+                Err(error)
+            }
+        }
+    }
+
     fn prefill<'context>(
         &mut self,
         input: Self::Input,
         cache: &mut Self::Cache,
         context: Self::Context<'context>,
     ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error> {
-        M::bind_prepared_input(&input, cache)?;
-        let checkpoint = M::checkpoint(cache)?;
+        if M::uses_span_prefill(&input) {
+            return match self.prefill_cancellable(
+                input,
+                cache,
+                &eredu_core::GenerationCancellationToken::new(),
+                context,
+            )? {
+                eredu_core::SpeculativePrefillOutcome::Complete(output) => Ok(output),
+                eredu_core::SpeculativePrefillOutcome::Cancelled { .. } => Err(M::empty_input()),
+            };
+        }
+        M::bind_prepared_input_with_context(&input, cache, context)?;
+        let checkpoint = M::checkpoint_with_context(cache, context)?;
         let result = (|| {
             let mut output = M::prefill_target(
                 self.target,
@@ -886,20 +1224,20 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
                 cache,
                 context,
             )?;
-            M::observe_output(
+            M::observe_output_in_context(
                 self.assistant,
                 &self.capture,
                 &mut output,
-                eredu_core::MODEL_LOGITS_OBSERVATION_PATH,
+                eredu_core::MODEL_LOGITS_OBSERVATION_PATH,context,
             )?;
-            M::validate_output_capture(cache, &output)?;
-            let sequence = M::sequence_len(&output.logits)?;
+            M::validate_output_capture_with_context(cache, &output, context)?;
+            let sequence = M::sequence_len_with_context(&output.logits,context)?;
             if sequence == 0 {
                 return Err(M::empty_input());
             }
-            Self::validate_output(&output, sequence)?;
+            Self::validate_output(&output, sequence,context)?;
             Ok(SpeculativePrefill::new(
-                M::logits_row(&output.logits, sequence - 1, context)?,
+                M::logits_row_with_source(&output.logits, sequence - 1, output.evidence.as_ref(), context)?,
                 self.target_state(&output, None, M::cache_len(cache)?, context)?,
                 sequence,
             ))
@@ -920,6 +1258,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         proposal_capacity: usize,
         context: M::Context<'_>,
     ) -> Result<Self::DraftState, Self::Error> {
+        let context = M::invocation_context(context, self.origin)?;
         let maximum = self.max_proposals();
         if proposal_capacity == 0 || proposal_capacity > maximum {
             return Err(M::invalid_capacity(maximum));
@@ -927,31 +1266,34 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         let pending = state
             .pending_context
             .as_ref()
-            .map(|pending| M::target_to_draft(pending, context))
+            .map(|pending| M::transfer_value(pending,state.evidence.as_ref(),ExternalAssistantTransfer::TargetToDraft,context))
             .transpose()?;
         let draft_context = match pending {
-            Some(pending) => M::update_context(
+            Some(pending) => M::update_with_source(
                 self.assistant,
-                state.draft_context.clone(),
-                &pending,
+                state.draft_context.as_ref(),
+                &pending.output,pending.evidence.as_ref(),
                 state.cache_len,
                 context,
             )?,
             None => state.draft_context.clone().ok_or_else(M::missing_context)?,
         };
-        let ids = block_token_ids(last_token, M::mask_token(self.assistant), proposal_capacity);
-        let embeddings = M::target_embeddings(self.target, &ids, context)?;
-        let embeddings = M::target_to_draft(&embeddings, context)?;
-        let states = M::proposal_states(
+        let count=proposal_capacity.checked_add(1).ok_or_else(M::state_mismatch)?;
+        let mut ids=M::driver_buffer(count,context)?;
+        ids.try_push(last_token).map_err(|_|M::state_mismatch())?;
+        for _ in 0..proposal_capacity{ids.try_push(M::mask_token(self.assistant)).map_err(|_|M::state_mismatch())?;}
+        let embeddings = M::embeddings_with_source(self.target, &ids, context)?;
+        let embeddings = M::transfer_packet(&embeddings,ExternalAssistantTransfer::TargetToDraft, context)?;
+        let states = M::proposal_with_source(
             self.assistant,
-            &embeddings,
+            &embeddings,embeddings.evidence(),
             &draft_context,
             state.cache_len,
             context,
         )?;
-        let states = M::draft_to_target(&states, context)?;
-        let logits = M::target_logits(self.target, &states, context)?;
-        let logits = M::target_to_draft(&logits, context)?;
+        let states = M::transfer_value(&states.output,states.evidence.as_ref(),ExternalAssistantTransfer::DraftToTarget,context)?;
+        let logits = M::target_logits_with_source(self.target, &states.output,states.evidence.as_ref(), context)?;
+        let logits = M::transfer_packet(&logits,ExternalAssistantTransfer::TargetToDraft, context)?;
         Ok(ExternalDraftState {
             logits,
             cursor: 0,
@@ -967,12 +1309,13 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         _last_token: u32,
         context: M::Context<'_>,
     ) -> Result<Self::Logits, Self::Error> {
+        let context = M::invocation_context(context, self.origin)?;
         if state.cursor >= state.proposal_capacity {
             return Err(M::block_exhausted());
         }
         let row = state.cursor;
         state.cursor += 1;
-        let logits = M::proposal_logits_row(&state.logits, row, context)?;
+        let logits = M::proposal_row_with_source(&state.logits, row,state.logits.evidence(), context)?;
         M::observe_logits(
             self.assistant,
             EXTERNAL_ASSISTANT_PROPOSAL_LOGITS_OBSERVATION_PATH,
@@ -980,6 +1323,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         )
     }
 
+    fn checkpoint_with_context<'c>(&self,cache:&Self::Cache,context:Self::Context<'c>)->Result<Self::CacheCheckpoint,Self::Error>{M::checkpoint_with_context(cache,context)}
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error> {
         M::checkpoint(cache)
     }
@@ -999,8 +1343,9 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         cache: &mut Self::Cache,
         context: M::Context<'_>,
     ) -> Result<Submission<Self::Verification, Self::Completion>, Self::Error> {
-        let inputs = M::target_tokens(input_tokens, context)?;
-        let mut output = M::verify_target(
+        let context = M::invocation_context(context, self.origin)?;
+        let inputs = M::tokens_with_source(input_tokens, context)?;
+        let mut output = M::verify_with_tokens(
             self.target,
             self.assistant,
             &self.capture,
@@ -1008,15 +1353,15 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
             cache,
             context,
         )?;
-        M::observe_output(
+        M::observe_output_in_context(
             self.assistant,
             &self.capture,
             &mut output,
-            EXTERNAL_ASSISTANT_VERIFICATION_LOGITS_OBSERVATION_PATH,
+            EXTERNAL_ASSISTANT_VERIFICATION_LOGITS_OBSERVATION_PATH,context,
         )?;
-        M::validate_output_capture(cache, &output)?;
-        Self::validate_output(&output, input_tokens.len())?;
-        let completion = M::submit_verification(&output, &inputs, context)?;
+        M::validate_output_capture_with_context(cache, &output, context)?;
+        Self::validate_output(&output, input_tokens.len(),context)?;
+        let completion = M::complete_with_tokens(&output, &inputs, context)?;
         Ok(Submission {
             output: ExternalVerification { output, inputs },
             completion,
@@ -1029,7 +1374,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         index: usize,
         context: Self::Context<'a>,
     ) -> Result<Self::Logits, Self::Error> {
-        M::logits_row(&output.output.logits, index, context)
+        M::logits_row_with_source(&output.output.logits, index, output.output.evidence.as_ref(), context)
     }
 
     fn commit_verification(
@@ -1041,7 +1386,8 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
         verified_inputs: usize,
         context: M::Context<'_>,
     ) -> Result<SpeculativeCommit<Self::TargetState>, Self::Error> {
-        let input_len = M::sequence_len(&output.inputs)?;
+        let context = M::invocation_context(context, self.origin)?;
+        let input_len = M::sequence_len_with_context(&output.inputs,context)?;
         let checkpoint_offset = M::checkpoint_len(checkpoint)?;
         if verified_inputs > input_len
             || draft_state.cache_len != checkpoint_offset
@@ -1053,6 +1399,7 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
             M::restore_checkpoint(cache, checkpoint, context)?;
             return Ok(SpeculativeCommit::new(
                 ExternalTargetState {
+                    evidence:None,
                     pending_context: None,
                     draft_context: Some(draft_state.draft_context),
                     cache_len: checkpoint_offset,
@@ -1064,8 +1411,8 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
             (output.output, 0)
         } else {
             M::restore_checkpoint(cache, checkpoint, context)?;
-            let inputs = M::token_prefix(&output.inputs, verified_inputs, context)?;
-            let mut replayed = M::verify_target(
+            let inputs = M::prefix_with_source(&output.inputs, verified_inputs, context)?;
+            let mut replayed = M::verify_with_tokens(
                 self.target,
                 self.assistant,
                 &self.capture,
@@ -1073,14 +1420,14 @@ impl<M: ExternalMechanisms> SpeculativeExecutor for ExternalExecutor<'_, M> {
                 cache,
                 context,
             )?;
-            M::observe_output(
+            M::observe_output_in_context(
                 self.assistant,
                 &self.capture,
                 &mut replayed,
-                EXTERNAL_ASSISTANT_VERIFICATION_LOGITS_OBSERVATION_PATH,
+                EXTERNAL_ASSISTANT_VERIFICATION_LOGITS_OBSERVATION_PATH,context,
             )?;
-            M::validate_output_capture(cache, &replayed)?;
-            Self::validate_output(&replayed, verified_inputs)?;
+            M::validate_output_capture_with_context(cache, &replayed, context)?;
+            Self::validate_output(&replayed, verified_inputs,context)?;
             (replayed, verified_inputs)
         };
         Ok(SpeculativeCommit::new(
@@ -1101,13 +1448,14 @@ mod tests {
     fn snapshot_seed_preserves_target_and_draft_tensor_placement() {
         use crate::external_assistant::ExternalAssistantTensorPlacement as Placement;
         let state = super::ExternalTargetState {
+            evidence:None,
             pending_context: Some(1u32),
             draft_context: Some(super::DFlashContext {
                 encoded: 2,
                 layers: vec![crate::muse_glimmer::DFlashLayerContext { keys: 3, values: 4 }],
                 start: 5,
                 end: 6,
-            }),
+            }.into()),
             cache_len: 6,
         };
         let copied = state
@@ -1199,6 +1547,7 @@ mod tests {
     impl Mechanisms {
         fn output(sequence: usize) -> ExternalTargetOutput<Tensor> {
             ExternalTargetOutput {
+                evidence: None,
                 logits: Tensor::new(sequence, 10),
                 target_states: vec![Tensor::new(sequence, 1), Tensor::new(sequence, 2)],
             }

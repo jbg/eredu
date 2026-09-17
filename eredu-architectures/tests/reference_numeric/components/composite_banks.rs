@@ -162,7 +162,10 @@ fn composite_independent_banks_preserve_media_writes_and_cached_decode() {
                         let workers = (0..topology.world_size()).map(|rank| {
                             let (inspection, parameters, inputs, plan, complete, provider_local) = (&inspection, &parameters, &inputs, &plan, &complete_writes, &provider_local);
                             let world = world.clone();
-                            scope.spawn(move || {
+                            std::thread::Builder::new()
+                                .name(format!("reference-composite-banks-{rank}"))
+                                .stack_size(32 * 1024 * 1024)
+                                .spawn_scoped(scope, move || {
                                 let sources = partitioned_adapter::prepare_plan_with_banks(
                                     inspection, plan, rank, std::time::Duration::from_secs(30),
                                     independent.then(|| ParameterBankLoadOptions::new(
@@ -188,7 +191,7 @@ fn composite_independent_banks_preserve_media_writes_and_cached_decode() {
                                     if tp == 1 && pp == 1 { assert!(evidence.bank_evictions > 0); }
                                 }
                                 (outputs, captures)
-                            })
+                            }).expect("spawn reference composite-banks rank worker")
                         }).collect::<Vec<_>>();
                         workers
                             .into_iter()

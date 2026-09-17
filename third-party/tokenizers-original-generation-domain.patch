@@ -1,0 +1,124 @@
+--- a/src/models/bpe/compile.rs
++++ b/src/models/bpe/compile.rs
+@@ -65,6 +65,7 @@
+ #[derive(Clone, Copy, Debug)]
+ pub struct BpeCompileRequirements {
+     slots: usize,
++    id_extent: u64,
+     bytes: usize,
+     merges: usize,
+     strings: [usize; 3],
+@@ -73,6 +74,11 @@
+     total: usize,
+ }
+ impl BpeCompileRequirements {
++    /// One beyond the largest declared model ID, or zero for an empty model.
++    /// This is a source observation, not an allocated dense vocabulary.
++    pub fn id_extent(&self) -> u64 {
++        self.id_extent
++    }
+     pub fn vocabulary_slots(&self) -> usize {
+         self.slots
+     }
+@@ -192,9 +198,10 @@
+         let merges = merges.ok_or_else(|| error(Kind::MissingField, root.start))?;
+         let mut n = 0;
+         let mut b = 0;
++        let mut id_extent = 0u64;
+         let mut entries = Reader::new(input, vocab).object()?;
+         while let Some((spelling, id)) = entries.next()? {
+-            parse_id(input, id)?;
++            id_extent = id_extent.max(u64::from(parse_id(input, id)?) + 1);
+             n = add(n, 1)?;
+             b = add(b, spelling.len())?;
+         }
+@@ -218,7 +225,7 @@
+             modern: format.unwrap_or(true),
+             strings,
+             flags,
+-            requirements: requirements(n, b, m, lengths)?,
++            requirements: requirements(n, b, m, lengths, id_extent)?,
+             #[cfg(any(test, feature = "packed-bpe-test-support"))]
+             fail_at: None,
+         })
+@@ -564,6 +571,7 @@
+     b: usize,
+     m: usize,
+     c: [usize; 3],
++    id_extent: u64,
+ ) -> Result<BpeCompileRequirements, Error> {
+     let layout = |n, layout: Result<Layout, _>| {
+         layout
+@@ -582,6 +590,7 @@
+         buffers = add(buffers, layout(bytes, Layout::array::<u8>(bytes))?)?;
+     }
+     let controls = [
++        size_of::<u64>(), // observed sparse ID extent during the borrowed scan
+         size_of::<BpeCompilePlan<'_>>(),
+         size_of::<Result<BpeCompilePlan<'_>, Error>>(),
+         size_of::<BpeCompileRequirements>(),
+@@ -615,6 +624,7 @@
+     .try_fold(0usize, add)?;
+     Ok(BpeCompileRequirements {
+         slots: n,
++        id_extent,
+         bytes: b,
+         merges: m,
+         strings: c,
+--- a/src/tokenizer/compile.rs
++++ b/src/tokenizer/compile.rs
+@@ -23,7 +23,10 @@
+     processors::{sequence::Sequence as PostSequence, PostProcessorWrapper},
+     utils::borrowed_json::{self as json, Reader, Span},
+ };
+-use std::{alloc::Layout, collections::TryReserveError, fmt, mem::size_of};
++use std::{
++    alloc::Layout, collections::TryReserveError, convert::TryFrom, fmt,
++    mem::size_of,
++};
+ 
+ /// Fixed source validation categories for the current aggregate constructor.
+ #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+@@ -358,8 +361,17 @@
+     total: usize,
+     decoder_ids: usize,
+     decoder_bytes: usize,
++    domain_extent: u64,
+ }
+ impl TokenizerCompileRequirements {
++    /// Dense ID-domain envelope derived from the actual fresh constructor.
++    /// Existing model IDs survive; new added IDs start at model population and
++    /// advance at most once per raw added entry. Declared added JSON IDs do not
++    /// control that assignment. Duplicate/empty/model-overlap entries may leave
++    /// an unused tail; this diagnostic allocates no dense storage.
++    pub fn domain_extent(&self) -> u64 {
++        self.domain_extent
++    }
+     /// Simultaneous model, added and pipeline destination capacities.
+     pub fn buffer_bytes(&self) -> usize {
+         self.buffers
+@@ -530,6 +542,10 @@
+             controls,
+             total: add(buffers, controls)?,
+             decoder_ids: add(m.vocabulary_slots(), a.raw_slots())?,
++            domain_extent: m.id_extent().max(
++                u64::try_from(add(m.vocabulary_slots(), a.raw_slots())?)
++                    .map_err(|_| err(K::Overflow, 0))?,
++            ),
+             decoder_bytes: add(
+                 m.spelling_bytes(),
+                 a.content_bytes()
+--- a/src/models/bpe/compile/tests.rs
++++ b/src/models/bpe/compile/tests.rs
+@@ -293,7 +293,10 @@
+         (0, 0, usize::MAX, [0; 3]),
+         (0, 0, 0, [usize::MAX, 0, 0]),
+     ] {
+-        assert_eq!(requirements(n, b, m, c).unwrap_err().kind, Kind::Overflow);
++        assert_eq!(
++            requirements(n, b, m, c, 0).unwrap_err().kind,
++            Kind::Overflow
++        );
+     }
+ }
+ 

@@ -1,0 +1,10 @@
+{
+  "boundary": "Numeric token ranges can only be projected from complete validated Document; no numeric conversion, JSON map, string decoding allocation or accounting grant.",
+  "dependency": "tokenizers-0.23.2",
+  "files": {
+    "src/utils/json_view.rs": {
+      "after": "30dac41ddded2abdff31bddb5b5c205c56d581b76d83a3323fae485065a200cc",
+      "before": "fc9e9b4529d77075ee99cce50fa13e24a3f27317e78a77fabdc4cbae2054a7ff"
+    }
+  }
+}

@@ -102,7 +102,7 @@ where
     } else {
         row_count.max(1)
     };
-    let mut movement = MlxIndexedMovement;
+    let mut movement = MlxIndexedMovement::default();
     let mut outputs = Vec::new();
     let mut execute_chunk = |hidden: &Array, selections: &Array, weights: &Array| {
         let indexed = MlxTensor::from_array(selections.clone());

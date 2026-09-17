@@ -17,7 +17,7 @@ use eredu_runtime::{
 };
 
 use crate::{
-    decoder::{LayeredInput, StaticModuleSpec, StaticModules, TARGET_EXECUTION_GROUP},
+    decoder::{LayeredInput, StaticModuleSpecView, StaticModules, TARGET_EXECUTION_GROUP},
     hybrid_decoder::HybridDecoder,
 };
 
@@ -30,15 +30,38 @@ pub(crate) trait FixedReplicatedFamily<B: NeuralBackend>: 'static {
     type Config: Clone;
     type Unit: Parameterized<B::Tensor>;
 
-    fn validate(config: &Self::Config) -> Result<(), Error>;
-    fn layer_count(config: &Self::Config) -> Result<usize, Error>;
-    fn static_spec(config: &Self::Config) -> StaticModuleSpec;
+    /// Family proof for the validated ordinary target configuration. Internal
+    /// hook availability is independent of causal row equivalence.
+    const CAUSAL_PREFILL_ROWS: bool = false;
+    const OBSERVATION_HOOKS: eredu_runtime::inspection::ObservationHookSupport =
+        eredu_runtime::inspection::ObservationHookSupport::internal(false, false, false);
+
+    fn validate(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<(), Error>;
+    fn layer_count(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<usize, Error>;
+    fn static_spec(config: &Self::Config) -> StaticModuleSpecView<'_>;
     fn state_layout(config: &Self::Config) -> Result<StateLayout, Error>;
+    fn state_layout_with_metadata(
+        config: &Self::Config,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<StateLayout, Error>;
     fn state_identity(
         config: &Self::Config,
         layout: &StateLayout,
         global_layer_start: usize,
         topology: PromptCacheTopology,
+    ) -> Result<ModelStateIdentity, Error>;
+    fn state_identity_with_metadata(
+        config: &Self::Config,
+        layout: &StateLayout,
+        global_layer_start: usize,
+        topology: PromptCacheTopology,
+        metadata: &eredu_nn::workspace::WorkspaceContext,
     ) -> Result<ModelStateIdentity, Error>;
     fn build_unit(
         config: &Self::Config,
@@ -77,15 +100,38 @@ pub(crate) trait CompressedReplicatedFamily<B: BlockwiseAttentionBackend>: 'stat
     type Config: Clone;
     type Unit: Parameterized<B::Tensor>;
 
-    fn validate(config: &Self::Config) -> Result<(), Error>;
-    fn layer_count(config: &Self::Config) -> Result<usize, Error>;
-    fn static_spec(config: &Self::Config) -> StaticModuleSpec;
+    /// Family proof for the validated ordinary target configuration. Internal
+    /// hook availability is independent of causal row equivalence.
+    const CAUSAL_PREFILL_ROWS: bool = false;
+    const OBSERVATION_HOOKS: eredu_runtime::inspection::ObservationHookSupport =
+        eredu_runtime::inspection::ObservationHookSupport::internal(false, false, false);
+
+    fn validate(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<(), Error>;
+    fn layer_count(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<usize, Error>;
+    fn static_spec(config: &Self::Config) -> StaticModuleSpecView<'_>;
     fn state_layout(config: &Self::Config) -> Result<StateLayout, Error>;
+    fn state_layout_with_metadata(
+        config: &Self::Config,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<StateLayout, Error>;
     fn state_identity(
         config: &Self::Config,
         layout: &StateLayout,
         global_layer_start: usize,
         topology: PromptCacheTopology,
+    ) -> Result<ModelStateIdentity, Error>;
+    fn state_identity_with_metadata(
+        config: &Self::Config,
+        layout: &StateLayout,
+        global_layer_start: usize,
+        topology: PromptCacheTopology,
+        metadata: &eredu_nn::workspace::WorkspaceContext,
     ) -> Result<ModelStateIdentity, Error>;
     fn build_unit(
         config: &Self::Config,
@@ -414,10 +460,11 @@ pub(crate) struct FixedReplicatedModel<
     F: FixedReplicatedFamily<B>,
     P = MixedState,
 > {
-    config: F::Config,
     decoder: HybridDecoder<B>,
     prediction_capture: bool,
     family: PhantomData<(F, P)>,
+    // The actual source outlives every module retained by this model.
+    config: crate::replicated_text::ConfigOwner<F::Config>,
 }
 
 pub(crate) struct CompressedReplicatedModel<
@@ -425,17 +472,33 @@ pub(crate) struct CompressedReplicatedModel<
     F: CompressedReplicatedFamily<B>,
     P = MixedCompressedState,
 > {
-    config: F::Config,
     decoder: HybridDecoder<B>,
     family: PhantomData<(F, P)>,
+    // The actual source outlives every module retained by this model.
+    config: crate::replicated_text::ConfigOwner<F::Config>,
 }
 
 impl<B: NeuralBackend, F: FixedReplicatedFamily<B>, P> FixedReplicatedModel<B, F, P> {
     pub fn new(config: F::Config, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        F::validate(&config)?;
-        let layers = F::layer_count(&config)?;
+        Self::new_with_config(config.into(), context)
+    }
+
+    pub(crate) fn new_with_config(
+        config: crate::replicated_text::ConfigOwner<F::Config>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        F::validate(&config, metadata)?;
+        let layers = F::layer_count(&config, metadata)?;
+        // The family returns its actual borrowed declarations before any owned
+        // names are constructed. The shared sink owns their checked copying.
+        let static_spec = F::static_spec(&config);
+        let static_spec = match B::construction_metadata(context) {
+            Some(metadata) => static_spec.to_owned_with_metadata(metadata)?,
+            None => static_spec.to_owned(),
+        };
         Ok(Self {
-            decoder: HybridDecoder::new(F::static_spec(&config), "model.layers", layers, context)?,
+            decoder: HybridDecoder::new(static_spec, "model.layers", layers, context)?,
             config,
             prediction_capture: false,
             family: PhantomData,
@@ -557,10 +620,25 @@ impl<B: BlockwiseAttentionBackend, F: CompressedReplicatedFamily<B>, P>
     CompressedReplicatedModel<B, F, P>
 {
     pub fn new(config: F::Config, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        F::validate(&config)?;
-        let layers = F::layer_count(&config)?;
+        Self::new_with_config(config.into(), context)
+    }
+
+    pub(crate) fn new_with_config(
+        config: crate::replicated_text::ConfigOwner<F::Config>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        F::validate(&config, metadata)?;
+        let layers = F::layer_count(&config, metadata)?;
+        // The family returns its actual borrowed declarations before any owned
+        // names are constructed. The shared sink owns their checked copying.
+        let static_spec = F::static_spec(&config);
+        let static_spec = match B::construction_metadata(context) {
+            Some(metadata) => static_spec.to_owned_with_metadata(metadata)?,
+            None => static_spec.to_owned(),
+        };
         Ok(Self {
-            decoder: HybridDecoder::new(F::static_spec(&config), "model.layers", layers, context)?,
+            decoder: HybridDecoder::new(static_spec, "model.layers", layers, context)?,
             config,
             family: PhantomData,
         })
@@ -571,81 +649,123 @@ fn parameter_description<B: NeuralBackend, U: Parameterized<B::Tensor>>(
     decoder: &HybridDecoder<B>,
     layers: usize,
     tied_head: bool,
+    context: &<B::Tensor as Tensor>::Context,
     mut build: impl FnMut(usize) -> Result<U, Error>,
 ) -> Result<ArchitectureParameterDescription, Error> {
-    let graph = decoder.execution_graph()?;
-    let layout = ExecutionUnitLayout::new(&graph, [layers]).map_err(Error::backend)?;
-    let mut expected = Vec::new();
-    let mut owned = Vec::new();
+    let metadata = B::construction_metadata(context).filter(|context| context.uses_checked_metadata());
+    crate::decoder::ModuleMetadata::new::<B>(context).controls::<(
+        ArchitectureParameterDescription, eredu_runtime::ExecutionGraph, ExecutionUnitLayout,
+        Vec<OwnedParameterGroupSpec>, ParameterGroupOwner, U, [usize; 1],
+        Option<&eredu_nn::workspace::WorkspaceContext>,
+    )>()?;
+    if let Some(metadata) = metadata {
+        metadata.charge_metadata(std::mem::size_of_val(&build))?;
+    }
+    let graph = match metadata {
+        Some(metadata) => decoder.execution_graph_with_metadata(metadata)?
+            .into_owned_with_metadata(metadata)?,
+        None => decoder.execution_graph()?,
+    };
+    let layout = match metadata {
+        Some(metadata) => ExecutionUnitLayout::new_with_metadata(&graph, &[layers], metadata)?,
+        None => ExecutionUnitLayout::new(&graph, [layers]).map_err(Error::backend)?,
+    };
     let modules = decoder.static_modules();
-    fn add_static<B: NeuralBackend, M: Parameterized<B::Tensor>>(
-        expected: &mut Vec<eredu_runtime::ParameterGroupSpec>,
-        owned: &mut Vec<OwnedParameterGroupSpec>,
-        name: &str,
-        role: &str,
-        parameter_role: ParameterRole,
+    let count = layers.checked_add(2 + usize::from(modules.lm_head.is_some()))
+        .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+    let mut owned = match metadata {
+        Some(metadata) => metadata.metadata_vec(count)?,
+        None => Vec::with_capacity(count),
+    };
+    fn group<B: NeuralBackend, M: Parameterized<B::Tensor>>(
+        name: std::fmt::Arguments<'_>,
+        role: ParameterRole,
         module: &M,
-        tied_head: bool,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<eredu_runtime::ParameterGroupSpec, Error> {
+        if let Some(metadata) = metadata {
+            metadata.charge_metadata(std::mem::size_of::<(
+                std::fmt::Arguments<'_>, ParameterRole, &M,
+                Result<eredu_runtime::ParameterGroupSpec, Error>,
+                Option<&eredu_nn::workspace::WorkspaceContext>,
+            )>())?;
+        }
+        match metadata {
+            Some(metadata) => eredu_runtime::module_parameter_group_with_metadata::<B::Tensor, _>(
+                name, role, module, metadata, |_, _| Ok(MemberSharding::Replicated),
+            ),
+            None => module_parameter_group::<B::Tensor, _>(
+                name.to_string(), role, module, |_, _| Ok(MemberSharding::Replicated),
+            ).map_err(Error::backend),
+        }
+    }
+    fn add_static<B: NeuralBackend, M: Parameterized<B::Tensor>>(
+        owned: &mut Vec<OwnedParameterGroupSpec>, name: &str, role: &str,
+        parameter_role: ParameterRole, module: &M, tied_head: bool,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
     ) -> Result<(), Error> {
-        let group = module_parameter_group::<B::Tensor, _>(name, parameter_role, module, |_, _| {
-            Ok(MemberSharding::Replicated)
-        })
-        .map_err(Error::backend)?;
-        expected.push(group.clone());
+        if let Some(metadata) = metadata {
+            metadata.charge_metadata(std::mem::size_of::<(
+                &mut Vec<OwnedParameterGroupSpec>, &str, &str, ParameterRole, &M, bool,
+                Option<&eredu_nn::workspace::WorkspaceContext>, eredu_runtime::ParameterGroupSpec,
+                ParameterGroupOwner, Vec<String>, Result<(), Error>,
+            )>())?;
+        }
+        let group = group::<B, M>(format_args!("{name}"), parameter_role, module, metadata)?;
         let owner = if tied_head && role == "embedding" {
-            ParameterGroupOwner::static_any_of(["embedding", "output"])
+            match metadata {
+                Some(metadata) => {
+                    let mut roles = metadata.metadata_vec(2)?;
+                    roles.push(metadata.metadata_string(format_args!("embedding"))?);
+                    roles.push(metadata.metadata_string(format_args!("output"))?);
+                    ParameterGroupOwner::StaticAnyOf(roles)
+                }
+                None => ParameterGroupOwner::static_any_of(["embedding", "output"]),
+            }
         } else {
-            ParameterGroupOwner::static_role(role)
+            match metadata {
+                Some(metadata) => ParameterGroupOwner::static_role(
+                    metadata.metadata_string(format_args!("{role}"))?,
+                ),
+                None => ParameterGroupOwner::static_role(role),
+            }
         };
         owned.push(OwnedParameterGroupSpec::new(owner, group));
         Ok(())
     }
-    add_static::<B, _>(
-        &mut expected,
-        &mut owned,
-        "embedding",
-        "embedding",
-        ParameterRole::Vocabulary,
-        &modules.embeddings,
-        tied_head,
-    )?;
-    add_static::<B, _>(
-        &mut expected,
-        &mut owned,
-        "norm",
-        "norm",
-        ParameterRole::Replicated,
-        &modules.norm,
-        tied_head,
-    )?;
+    add_static::<B, _>(&mut owned, "embedding", "embedding", ParameterRole::Vocabulary,
+        &modules.embeddings, tied_head, metadata)?;
+    add_static::<B, _>(&mut owned, "norm", "norm", ParameterRole::Replicated,
+        &modules.norm, tied_head, metadata)?;
     if let Some(head) = &modules.lm_head {
-        add_static::<B, _>(
-            &mut expected,
-            &mut owned,
-            "output",
-            "output",
-            ParameterRole::Vocabulary,
-            head,
-            tied_head,
-        )?;
+        add_static::<B, _>(&mut owned, "output", "output", ParameterRole::Vocabulary,
+            head, tied_head, metadata)?;
     }
-    let owner_group = layout.group_id(0).expect("replicated target group").clone();
+    let owner_group = layout.group_id(0).expect("replicated target group");
     for index in 0..layers {
         let unit = build(index)?;
-        let group = module_parameter_group::<B::Tensor, _>(
-            format!("model.layers.{index}"),
-            ParameterRole::Replicated,
-            &unit,
-            |_, _| Ok(MemberSharding::Replicated),
-        )
-        .map_err(Error::backend)?;
-        expected.push(group.clone());
+        let group = group::<B, _>(format_args!("model.layers.{index}"),
+            ParameterRole::Replicated, &unit, metadata)?;
+        let owner_group = match metadata {
+            Some(metadata) => eredu_runtime::ExecutionGroupId::new(
+                metadata.metadata_string(format_args!("{}", owner_group.as_str()))?,
+            ).map_err(|cause| metadata.metadata_source(cause))?,
+            None => owner_group.clone(),
+        };
         owned.push(OwnedParameterGroupSpec::new(
-            ParameterGroupOwner::execution_unit(owner_group.clone(), index),
-            group,
+            ParameterGroupOwner::execution_unit(owner_group, index), group,
         ));
     }
-    ArchitectureParameterDescription::new(&graph, &layout, expected, owned).map_err(Error::backend)
+    // The authoritative groups are these exact emitted groups. The shared
+    // consuming validator avoids deep-cloning every name and shape solely for
+    // duplicate expected/owned collections.
+    match metadata {
+        Some(metadata) => ArchitectureParameterDescription::from_owned_with_metadata(
+            graph, layout, owned, metadata,
+        ),
+        None => ArchitectureParameterDescription::from_owned(graph, layout, owned)
+            .map_err(Error::backend),
+    }
 }
 
 fn causal_mask<B: NeuralBackend>(
@@ -674,6 +794,13 @@ macro_rules! architecture_parameters {
                 F::state_layout(&self.config)
             }
 
+            fn state_layout_with_metadata(
+                &self,
+                context: &eredu_nn::workspace::WorkspaceContext,
+            ) -> Result<StateLayout, Error> {
+                F::state_layout_with_metadata(&self.config, context)
+            }
+
             fn state_identity(
                 &self,
                 state: &eredu_runtime::PartitionState,
@@ -687,15 +814,45 @@ macro_rules! architecture_parameters {
                 )
             }
 
+            fn state_identity_with_metadata(
+                &self,
+                state: &eredu_runtime::PartitionState,
+                topology: PromptCacheTopology,
+                metadata: &eredu_nn::workspace::WorkspaceContext,
+            ) -> Result<ModelStateIdentity, Error> {
+                F::state_identity_with_metadata(
+                    &self.config,
+                    state.layout(),
+                    state.global_layer_offset(),
+                    topology,
+                    metadata,
+                )
+            }
+
             fn parameter_description(
                 &self,
                 context: &<B::Tensor as Tensor>::Context,
             ) -> Result<ArchitectureParameterDescription, Error> {
                 parameter_description(
                     &self.decoder,
-                    F::layer_count(&self.config)?,
+                    F::layer_count(
+                        &self.config,
+                        crate::decoder::identity::Metadata::new(B::construction_metadata(context)),
+                    )?,
                     self.decoder.static_modules().lm_head.is_none(),
+                    context,
                     |index| F::build_unit(&self.config, index, context),
+                )
+            }
+
+            fn retained_static_value_slot_bound(&self) -> Option<usize> {
+                eredu_nn::Parameterized::retained_value_slot_bound(self.decoder.static_modules())
+            }
+
+            fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+                eredu_nn::Parameterized::visit_retained_values(
+                    self.decoder.static_modules(),
+                    visitor,
                 )
             }
 
@@ -735,10 +892,63 @@ architecture_parameters!(
     BlockwiseAttentionBackend
 );
 
+// Every fixed state profile uses the same target capture semantics. Selecting
+// a narrower cache representation must not remove the requested hidden output.
+macro_rules! fixed_prediction_target_methods {
+    () => {
+        fn complete_execution_group(
+            &mut self,
+            _group: usize,
+            hidden: &B::Tensor,
+            _state: &mut S,
+            forward: &mut Self::ForwardContext,
+            _context: &<B::Tensor as Tensor>::Context,
+        ) -> Result<B::Tensor, Error> {
+            if self.prediction_capture {
+                forward.prediction_capture = Some(hidden.clone());
+            }
+            Ok(hidden.clone())
+        }
+
+        fn retain_prediction_target_capture(&mut self) {
+            self.prediction_capture = true;
+        }
+
+        fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
+            forward.prediction_capture.as_ref()
+        }
+    };
+}
+
 macro_rules! common_layered_methods {
     () => {
+        fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
+            F::OBSERVATION_HOOKS
+        }
+        fn prefill_observation_declarations(
+            &self,
+        ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Error> {
+            if !F::CAUSAL_PREFILL_ROWS {
+                return Ok(Vec::new());
+            }
+            // These paths belong to this selected shell, including its actual
+            // state profile and checkpoint transformation. No direct family
+            // model is reconstructed to supply a different path owner.
+            let count = self.decoder.group_unit_count(0)?;
+            crate::decoder::ordinary_prefill_observation_declarations(
+                (0..count).map(|index| self.decoder.unit_path(0, index)),
+                true,
+            )
+        }
         fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
             crate::transport::decoder()
+        }
+        fn group_transport_matches(
+            &self,
+            _group: usize,
+            expected: &eredu_runtime::ArchitectureGroupTransport,
+        ) -> bool {
+            crate::transport::decoder_declaration().matches(expected)
         }
         fn primary_execution_group(&self) -> &str {
             TARGET_EXECUTION_GROUP
@@ -751,6 +961,19 @@ macro_rules! common_layered_methods {
         }
         fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
             self.decoder.execution_graph()
+        }
+        fn execution_graph_with_metadata(
+            &self,
+            context: &eredu_nn::workspace::WorkspaceContext,
+        ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
+            self.decoder.execution_graph_with_metadata(context)
+        }
+        fn group_unit_count_with_metadata(
+            &self,
+            group: usize,
+            context: &eredu_nn::workspace::WorkspaceContext,
+        ) -> Result<usize, Error> {
+            self.decoder.group_unit_count_with_metadata(group, context)
         }
         fn group_unit_count(&self, group: usize) -> Result<usize, Error> {
             self.decoder.group_unit_count(group)
@@ -792,6 +1015,16 @@ macro_rules! common_layered_methods {
         ) -> Result<B::Tensor, Error> {
             self.decoder.begin_group(group, initial, dependencies)
         }
+        fn select_readout_positions(
+            &self,
+            hidden: &B::Tensor,
+            _forward: &Self::ForwardContext,
+            demand: eredu_core::OutputDemand,
+            context: &<B::Tensor as Tensor>::Context,
+        ) -> Result<Option<B::Tensor>, Self::Error> {
+            crate::readout::select_readout_positions(hidden, demand, 1, context)
+        }
+
         fn finish_forward(
             &mut self,
             hidden: &B::Tensor,
@@ -841,6 +1074,11 @@ where
         = LayeredInput<'a, B::Tensor>
     where
         Self: 'a;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::token_shape(input.tokens).map(Some)
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;
@@ -852,24 +1090,8 @@ where
     type Error = Error;
 
     common_layered_methods!();
+    fixed_prediction_target_methods!();
 
-    fn complete_execution_group(
-        &mut self,
-        _group: usize,
-        hidden: &B::Tensor,
-        _state: &mut S,
-        forward: &mut Self::ForwardContext,
-        _context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<B::Tensor, Error> {
-        if self.prediction_capture {
-            forward.prediction_capture = Some(hidden.clone());
-        }
-        Ok(hidden.clone())
-    }
-
-    fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
-        forward.prediction_capture.as_ref()
-    }
 
     fn build_unit(
         &self,
@@ -986,6 +1208,11 @@ where
         = LayeredInput<'a, B::Tensor>
     where
         Self: 'a;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::token_shape(input.tokens).map(Some)
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;
@@ -997,6 +1224,7 @@ where
     type Error = Error;
 
     common_layered_methods!();
+    fixed_prediction_target_methods!();
 
     fn build_unit(
         &self,
@@ -1107,6 +1335,11 @@ where
         = LayeredInput<'a, B::Tensor>
     where
         Self: 'a;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::token_shape(input.tokens).map(Some)
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;
@@ -1118,6 +1351,7 @@ where
     type Error = Error;
 
     common_layered_methods!();
+    fixed_prediction_target_methods!();
 
     fn build_unit(
         &self,
@@ -1219,6 +1453,11 @@ where
         = LayeredInput<'a, B::Tensor>
     where
         Self: 'a;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::token_shape(input.tokens).map(Some)
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;
@@ -1230,6 +1469,7 @@ where
     type Error = Error;
 
     common_layered_methods!();
+    fixed_prediction_target_methods!();
 
     fn build_unit(
         &self,
@@ -1335,6 +1575,11 @@ where
         = LayeredInput<'a, B::Tensor>
     where
         Self: 'a;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::token_shape(input.tokens).map(Some)
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;
@@ -1463,6 +1708,11 @@ where
         = LayeredInput<'a, B::Tensor>
     where
         Self: 'a;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::token_shape(input.tokens).map(Some)
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = F::Unit;
     type ForwardContext = ReplicatedForwardContext<B::Tensor>;

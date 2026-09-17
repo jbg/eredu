@@ -32,6 +32,21 @@ impl Clone for Stream {
 }
 
 impl Stream {
+    /// Borrows MLX's default CPU execution stream through an owned handle.
+    /// MLX retains one default per host thread; acquiring another handle must
+    /// not register another native execution stream for every synchronous copy.
+    pub(crate) fn try_default_cpu() -> Result<Stream> {
+        crate::error::ensure_mlx_error_handler();
+        let _guard = runtime_lock::enter();
+        let c_stream = unsafe { safemlx_sys::mlx_default_cpu_stream_new() };
+        if c_stream.ctx.is_null() {
+            return Err(crate::error::get_and_clear_last_mlx_error()
+                .expect("MLX default CPU stream initialization failed but no error was set")
+                .into());
+        }
+        Ok(Stream { c_stream })
+    }
+
     /// Tries to create a new stream on the given device.
     #[track_caller]
     pub fn try_new_with_device(device: &Device) -> Result<Stream> {
@@ -83,6 +98,59 @@ impl Stream {
         <() as Guarded>::try_from_op(|_| unsafe {
             safemlx_sys::mlx_stream_wait_event(self.c_stream, event.c_event)
         })
+    }
+
+    /// Concrete parameter/result controls for the fixed native device comparison.
+    pub fn device_comparison_control_bytes() -> Option<usize> {
+        let native = unsafe { safemlx_sys::mlx_prepared_input_target_controls() };
+        [
+            std::mem::size_of::<&Self>(),
+            std::mem::size_of::<&Device>(),
+            std::mem::size_of::<bool>(),
+        ]
+        .into_iter()
+        .try_fold(native, usize::checked_add)
+    }
+
+    /// Compares the two existing immutable native device values without creating
+    /// a Device, entering housekeeping, or publishing an error. Nulls reject.
+    pub fn matches_device(&self, device: &Device) -> bool {
+        // SAFETY: both owned wrappers remain borrowed throughout the scalar
+        // native comparison; no pointer or mutable/native object escapes.
+        unsafe {
+            safemlx_sys::mlx_prepared_input_target_matches(self.c_stream, device.c_device) != 0
+        }
+    }
+
+    /// Read this existing stream's device kind without allocating a Device shell.
+    pub fn device_type(&self) -> Result<crate::DeviceType> {
+        match crate::StreamCopyPlan::<()>::capture(self) {
+            Ok(plan) => Ok(plan.device_type()),
+            Err(cause) => match crate::OriginalScopeObserver::try_current()? {
+                Some(observer) => Err(observer.error(2)),
+                None => Err(crate::error::Exception::from_source(cause)),
+            },
+        }
+    }
+
+    /// Concrete controls of the scalar device query; no Stream or Device owner.
+    pub fn device_type_control_bytes() -> Option<usize> {
+        let mut native = safemlx_sys::mlx_stream_copy_layout::default();
+        // SAFETY: the existing pure query writes this fixed local layout.
+        if unsafe { safemlx_sys::mlx_stream_copy_layout_for(&mut native) } != 0 {
+            return None;
+        }
+        [
+            std::mem::size_of::<crate::StreamCopyPlan<()>>(),
+            std::mem::size_of::<Result<crate::DeviceType>>(),
+            std::mem::size_of::<
+                std::result::Result<crate::StreamCopyPlan<()>, crate::StreamCopyCause>,
+            >(),
+            std::mem::size_of::<&Self>(),
+            crate::OriginalScopeObserver::control_bytes()?,
+        ]
+        .into_iter()
+        .try_fold(native.controls, usize::checked_add)
     }
 
     /// Get the device associated with the stream.
@@ -137,6 +205,21 @@ impl PartialEq for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_cpu_stream_handles_reuse_native_execution_stream() {
+        let initial = Stream::try_default_cpu().unwrap();
+        assert_eq!(
+            initial.get_device().unwrap().get_type().unwrap(),
+            crate::DeviceType::Cpu
+        );
+        for _ in 0..64 {
+            let stream = Stream::try_default_cpu().unwrap();
+            assert_eq!(stream.get_index().unwrap(), initial.get_index().unwrap());
+            let values = crate::Array::zeros::<f32>(&[3], &stream).unwrap();
+            assert_eq!(values.evaluated().unwrap().as_slice::<f32>(), &[0.0; 3]);
+        }
+    }
 
     #[test]
     fn test_stream_clone() {

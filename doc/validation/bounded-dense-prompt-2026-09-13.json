@@ -1,0 +1,224 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-13",
+  "created_utc": "2026-09-13T21:51:30.607810+00:00",
+  "scope": "Fresh request-bound dense decoder host construction and exact protected-hold to actual-table charge transfer",
+  "status": "Verified host construction prerequisite; full bounded inference and native funded resume remain incomplete",
+  "previous_increment": "bounded-stateless-dense-2026-09-13.json",
+  "tests": {
+    "runtime": {
+      "passed": 853,
+      "ignored": 0
+    },
+    "neutral": {
+      "passed": 81,
+      "ignored": 0
+    },
+    "sampling": {
+      "passed": 42,
+      "ignored": 0
+    },
+    "native": {
+      "passed": 17,
+      "ignored": 0
+    },
+    "cache": {
+      "passed": 154,
+      "ignored": 0
+    },
+    "storage": {
+      "passed": 28,
+      "ignored": 0
+    },
+    "layout": {
+      "passed": 3,
+      "ignored": 0
+    },
+    "cold": {
+      "passed": 2,
+      "ignored": 0
+    },
+    "snapshot": {
+      "passed": 6,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 127,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1313,
+  "new_tests": 13,
+  "new_test_ids": [
+    "working_memory::decoder_copy::dense_prompt::tests::exact_prompt_hold_and_transfer_preserve_account_pointer_and_ready_order",
+    "working_memory::decoder_copy::dense_prompt::tests::native_abandonment_remains_independent_before_and_after_host_publication",
+    "working_memory::decoder_copy::dense_prompt::tests::actual_funded_saved_source_survives_original_retirement_and_rechecks_health",
+    "working_memory::decoder_copy::dense_prompt::tests::failed_handoff_preserves_owner_and_hold_for_exact_recovery_or_retirement",
+    "working_memory::decoder_copy::dense_prompt::tests::comparison_panic_does_not_commit_transfer_or_destroy_keys_under_locks",
+    "working_memory::decoder_copy::dense_prompt::tests::nonempty_complete_source_checks_origin_health_and_survives_native_abandonment",
+    "working_memory::decoder_copy::dense_prompt::tests::registered_source_requires_exact_table_and_quarantine_is_rechecked_after_plan",
+    "working_memory::decoder_copy::dense_prompt::tests::panic_after_scope_commit_retains_full_source_pin_without_host_hold_leak",
+    "working_memory::decoder_copy::dense_prompt::tests::partial_recovery_keeps_source_claim_capacity_and_payload_before_hold",
+    "working_memory::decoder_copy::dense_prompt::tests::target_health_and_transfer_counter_failure_leave_full_hold_and_owned_table",
+    "working_memory::decoder_copy::dense_prompt::tests::zero_and_zst_tables_keep_logical_scope_and_registration_origin_lifetimes",
+    "working_memory::decoder_copy::dense_prompt::tests::wrong_stage_run_pool_and_source_inventory_reject_before_initializer",
+    "working_memory::decoder_copy::dense_prompt::tests::transfer_key_clone_and_rejection_drop_run_outside_both_table_and_pool_locks"
+  ],
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-13T21:48:10.069991+00:00",
+      "elapsed_seconds": 15.571,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-runtime.log",
+      "log_sha256": "b27ecf0fc807cbcfeed75642b6893c5721e1cdf67440a3a452aead24115cf0ac"
+    },
+    "neutral": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence",
+      "started_utc": "2026-09-13T21:48:25.641293+00:00",
+      "elapsed_seconds": 8.83,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-neutral.log",
+      "log_sha256": "0f9fa0d89790a3410080ad340742045c3118976312a8532ba5d169c69f5a902d"
+    },
+    "sampling": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib sampling -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T21:48:34.471631+00:00",
+      "elapsed_seconds": 89.885,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-sampling.log",
+      "log_sha256": "13391c4b75528bb391ca3bee2c80ae070e98f12cae7f527356fef91ee4c944a0"
+    },
+    "native": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib saved_array_copy -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T21:50:04.357670+00:00",
+      "elapsed_seconds": 0.695,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-native.log",
+      "log_sha256": "a318c354631903dede7564bc84bd93288d59535750c25dea778d81982a710422"
+    },
+    "cache": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::runtime::cache:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T21:50:05.053232+00:00",
+      "elapsed_seconds": 4.853,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-cache.log",
+      "log_sha256": "009103c38488aa06d4b85c10279c8dd26b6d8a3a6be6911f4087504348a52dd7"
+    },
+    "storage": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::runtime::residency::storage:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T21:50:09.906482+00:00",
+      "elapsed_seconds": 0.288,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-storage.log",
+      "log_sha256": "550cfdc3a22b124ec890e03da30801d52116b7b6c408190d49e262d011bf7627"
+    },
+    "layout": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib layout_publication_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T21:50:10.194764+00:00",
+      "elapsed_seconds": 0.32,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-layout.log",
+      "log_sha256": "4f8c09b3978b8f2202b815b511066feae275de5823fcc7539dbb9dabf76b453a"
+    },
+    "cold": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib resident_copy_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T21:50:10.515062+00:00",
+      "elapsed_seconds": 0.281,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-cold.log",
+      "log_sha256": "ed054e22bd217517d33273b700a797a02db5f9b47289067f255a29158b6a24a9"
+    },
+    "snapshot": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::text_snapshot:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T21:50:10.797063+00:00",
+      "elapsed_seconds": 0.321,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-snapshot.log",
+      "log_sha256": "e992fef8ef4e394e81f553da642cc328fe927702b4db8e9f8e330e70120a1ae1"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-13T21:50:11.118695+00:00",
+      "elapsed_seconds": 41.191,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-portable.log",
+      "log_sha256": "e3f89ee464c524e986d91009de30bdd2d29333e3ff07a53aa74c5d7b12923114"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-13T21:50:52.310765+00:00",
+      "elapsed_seconds": 14.305,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-minimal.log",
+      "log_sha256": "c77c949e299f07885a49784e9021d5ebc65bdabb5cb85189103d82845b009f9c"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-13T21:51:06.615760+00:00",
+      "elapsed_seconds": 15.192,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-dense-prompt-features.log",
+      "log_sha256": "f8d8047a04cb05d81ea0174e09a709886d25d7df1fe9b7c2cc4c3198a7c124ea"
+    }
+  },
+  "source_sha256": {
+    "eredu-runtime/src/host_metadata/slot_initialization/dense.rs": "ab283c5cfc7a8ff103d9fd37b283161ccb0aac0b8205bb04d53afbf105341047",
+    "eredu-runtime/src/working_memory.rs": "d35ecb8cefb8e8165034c802162e5194bc9c116a8ea8d96f9a1822a38bfb89c5",
+    "eredu-runtime/src/working_memory/decoder_copy.rs": "7848f87e1f305ead9fb7df48576c9d7e2f270a78073ae3837405b0b4f146e4db",
+    "eredu-runtime/src/working_memory/decoder_copy/dense_prompt.rs": "3c42ceaf02db4559cc30ff21881557e6f505fdaf2f06d697afb206d9d6f6e5e7",
+    "eredu-runtime/src/working_memory/decoder_copy/dense_prompt/tests.rs": "6cd1388c548325d2f9d40c232d03845ea5ef49867c7df9f4ded025320629f970",
+    "eredu-runtime/src/working_memory/funding.rs": "57c1c332fb0381c50d22a06e8e8b5fb39e5ef26c09b2deb45f66e9f95db182ad",
+    "eredu-runtime/src/working_memory/storage.rs": "ff7cbf37cef1a7b0cecfff0d36a3104e99576176d5d3ea1657948921db042176",
+    "eredu-runtime/src/working_memory/storage/host_transfer.rs": "fc0de8a9f72597ec07a0220d28ba729d8985b75e7eff44b21f9a9d3b7feede46",
+    "eredu-runtime/src/working_memory/text_preparation.rs": "0dfd3e3fd021dc28c5749dd06e76ef86e6dee778dc4a7f88fcb2250ebbd41518",
+    "doc/backend-architecture.md": "f52e7bd36611f3dbcb2a48cba9157e4b449f7a11fc95f7e306a078cfbe229665",
+    "doc/execution-control.md": "cb2fd5ae2acdd4ad04b30c5a40be3c3fda9ec3a98e2e5834eaff0be30beecf50",
+    "doc/bounded-inference.md": "32af5cfef8a908045ef77c9465e92bb33bcc926cab2aa7d7f38a1fce10213040"
+  },
+  "source_snapshot": "/private/tmp/eredu-dense-prompt-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-dense-prompt-validate.py": "0df0900af744bb829ac2f71da366a828587cf551b914f5f903ba3af4a679259f",
+    "/private/tmp/eredu-dense-prompt-format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/private/tmp/eredu-dense-prompt-frozen-rust.json": "a38041a8fac9d73197dbb4c8cbc4cda300579d6153853229d69dd215bcfe12c1",
+    "/private/tmp/eredu-dense-transfer-review.md": "cdff599b19eb88b2515a2768720292915aabc00a69f8fddfc41cc76603d52e67",
+    "/private/tmp/eredu-dense-prompt-doc-additions.json": "97dd4e6afc44ba1b89c2f81236360869258e890ae0fca1b9f75eb531a729edb2",
+    "/private/tmp/eredu-dense-table-transfer-stage/rust-insertion-basis.md": "96e7c355b470098df055e081246149a68f67de2af35d636b56d0366873ca3149",
+    "/private/tmp/eredu-dense-table-transfer-stage/rust-entry.rs": "7b312d09e6d1b8321c2c1e4273f8dcd095de7f2e39b1f8245d663bc3fc7dad79",
+    "/private/tmp/eredu-dense-table-transfer-stage/rust-node.rs": "2200ca0a4fe38592c314dc7f5f40bbb160e06b6f9e4abd1eb5bc40701540ab25",
+    "/private/tmp/eredu-dense-prompt-stage/README.md": "19e8b8796e8c9f6a1d13adf0f22e0c468cd645d31ee6d6c3ff128957b41f9406",
+    "/private/tmp/eredu-dense-prompt-stage/change.patch": "1cb28a873bd51f2d876340b57f710662c25ce7752afcfb29382d81733cefb4ec",
+    "/private/tmp/eredu-dense-prompt-stage/base-hashes.json": "7f8668e58b9914a2c724af1985b9b12fe52c9a01cf40ea6a2f5c3b53806aa565",
+    "/private/tmp/eredu-dense-prompt-stage/staged-hashes.json": "959322950e3c9b776825c2142a45d25beb9b66dd7d521e48299627b39bd1edb1",
+    "/private/tmp/eredu-dense-table-transfer-stage/README.md": "1bdfe88d1ff17fcea779adce52e55273fd24407106032520cd0ad19d9a6d88c0",
+    "/private/tmp/eredu-dense-table-transfer-stage/change.patch": "dc35fc8cc2dc0aa2b159f84bbc33e4d5aaa1abca41de89dd01a8954cbe925cf2",
+    "/private/tmp/eredu-dense-table-transfer-stage/base-hashes.json": "20225f397d76eddd11954cb0664e537a8c72d21f59a5aab9378e12c3eec357c3",
+    "/private/tmp/eredu-dense-table-transfer-stage/staged-hashes.json": "23d1f287aa17ff14724d71c304d0dd9ffcadd8ba6b9e903b417647205c40569f",
+    "/private/tmp/eredu-dense-prompt-tests-stage/README.md": "91282c9eded088aed6a05eedaaabcd4387c99885dd088d61964f41d936637bed",
+    "/private/tmp/eredu-dense-prompt-tests-stage/change.patch": "e0bb141e80b57e7db24ee4861e54515a5c110d6118383dce7935b618ddca5471",
+    "/private/tmp/eredu-dense-prompt-tests-stage/base-hashes.json": "97d4267c5d613099d7871660ead66aa6568736145b8737f2cc9ecb0fff682cfc",
+    "/private/tmp/eredu-dense-prompt-tests-stage/staged-hashes.json": "17cc4ec8e2abe9d4bc14e3403f0f782e94878b91a2972d7340b46c37d7efa3cc"
+  },
+  "behavior": [
+    "An actual registered or funded decoder source is consumed only through the original fresh prompt claim and exact request funding account; direct and complete source health are checked under the same lock as the protected host hold.",
+    "One dense buffer is filled without growth or conversion. Partial and completed errors retain source, original prompt claim and full host custody; native source pins and completion remain in a separate scope.",
+    "Exact publication attaches the actual table charge before exposure, shifts D from reserved and protected bytes into registered payload with the original funding origin, and preserves total usage and peak. P-D retires only afterward.",
+    "Shared and ordinary registry keys retain one K namespace without adding Sync to the existing ordinary Send-only APIs. Existing pin, register and funded adoption find the published key and do not charge it twice.",
+    "An externally retained shared key prevents final provider-key destruction while table/account locks unwind. Both entry search and checked arithmetic precede commit; the real second-comparison panic leaves transfer counters unchanged and preserves conservative poison.",
+    "Only exact publication creates the finish-only prompt remainder. Finishing then owned-input binding establish readiness through existing stages; no old request, receipt or quota is promoted."
+  ],
+  "review_findings": [
+    "The initial off-tree helper inserted an owned K after counter changes. Independent review identified provider comparison panic and key destruction under locks; that draft was never applied.",
+    "The revised helper uses a precommit vacant-entry search with an externally retained Arc and was independently reviewed. The pinned Rust entry/node source confirms vacant insertion does not repeat key comparison, including node splits.",
+    "Root tightened HostSlotStorageKey and publish documentation to require independent payload-free identity data, preventing a table-token-to-registration ownership cycle.",
+    "All 13 new tests and the production implementation passed on the first compilation/validation attempt; no source correction or rerun was required."
+  ],
+  "limits": [
+    "These are exact inline managed-host payload claims with existing descriptor, handle and allocator bookkeeping exclusions; they do not bound total process memory or arbitrary nested constructors.",
+    "Complete-source and direct registered/funded source behavior is covered. The new helper retains inherited residual-source pins by composition, but that branch has no dedicated new behavioral fixture.",
+    "Native arrays, RNG/pending input, executable origin binding, decoder installation, final controller and fresh step authority remain separate work. Funded generic restore/fork is not enabled.",
+    "Hybrid/paged state, whole-controller/facade/capture/ingress payloads and the full resident/host/disk/distributed/media/speculation matrix remain unfinished.",
+    "The new transfer panic guarantee does not broaden the pre-existing arbitrary-provider comparison contract of ordinary inventory insertion.",
+    "No new released-checkpoint, distributed hardware or total-process peak-memory measurements were performed."
+  ]
+}

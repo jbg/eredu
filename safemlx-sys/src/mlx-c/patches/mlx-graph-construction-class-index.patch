@@ -1,0 +1,74 @@
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -147,6 +147,9 @@
+   friend class GraphNestedEvaluation;
+   void resume_nested() noexcept;
+   struct Slot { void* pointer; size_t bytes; };
++  // Recipes allocate contiguous runs. Consumed slots never re-enter a run,
++  // even after their physical blocks retire.
++  struct SizeClass { size_t next{0}, end{0}, bytes{0}; };
+   static GraphFailure create_layout(GraphQuota&, uint64_t scope,
+       const Record* dispatch, const GraphConstructionLayout&, GraphConstruction*&, bool exclusive_host = false, bool resident_host = false) noexcept;
+   GraphConstruction(GraphQuota& quota, uint64_t scope, const Record* dispatch,
+@@ -159,6 +162,7 @@
+   const Record* dispatch_;
+   Slot* slots_{nullptr};
+   size_t count_;
++  SizeClass classes_[GraphConstructionLayout::classes]{};
+   bool exclusive_host_;
+   // Only create_resident supplies this tag; worker/pointwise banks cannot nest.
+   bool resident_host_;
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -377,7 +377,7 @@
+       !add(extents, slots_extent, value.allocation_extents)) return false;
+   value.named_control_bytes += sizeof(GraphConstruction*) + sizeof(GraphQuotaRef) +
+       sizeof(GraphConstructionContext) + sizeof(GraphQuota::Loan) +
+-      sizeof(size_t) * 8 + sizeof(GraphFailure);
++      sizeof(size_t) * 10 + sizeof(SizeClass*) + sizeof(GraphFailure);
+   return true;
+ }
+ GraphFailure GraphConstruction::create(GraphQuota& quota, uint64_t scope,
+@@ -619,6 +619,8 @@
+   }
+   size_t cursor = 0;
+   for (size_t i = 0; i < GraphConstructionLayout::classes; ++i) {
++    // complete_layout checked the total count, so this partial sum fits.
++    value->classes_[i] = {cursor, cursor + actual.request_counts[i], actual.request_bytes[i]};
+     for (size_t n = 0; n < actual.request_counts[i]; ++n) {
+       auto* block = quota.try_allocate(actual.request_bytes[i], actual.reserved_alignment);
+       if (!block) { value->destroy(); return GraphFailure::exhausted; }
+@@ -690,14 +692,16 @@
+ void* GraphConstruction::take(size_t bytes, size_t align) {
+   if (!align || (align & (align - 1)) || align > alignment)
+     throw GraphQuotaError(GraphFailure::construction_mismatch);
+-  Slot* best = nullptr;
+-  for (size_t i = 0; i < count_; ++i) {
+-    auto& slot = slots_[i];
+-    if (slot.pointer && slot.bytes >= bytes && (!best || slot.bytes < best->bytes)) best = &slot;
++  SizeClass* best = nullptr;
++  for (auto& candidate : classes_) {
++    if (candidate.next < candidate.end && candidate.bytes >= bytes &&
++        (!best || candidate.bytes < best->bytes)) best = &candidate;
+   }
+   if (!best) throw GraphQuotaError(GraphFailure::construction_mismatch);
+-  auto* value = best->pointer;
+-  best->pointer = nullptr;
++  // Strictly smaller replacement preserves first-slot ties across classes.
++  auto& slot = slots_[best->next++];
++  auto* value = slot.pointer;
++  slot.pointer = nullptr;
+   // Allocation already has its immutable physical reference. Deallocation
+   // uses its in-block offset, not the consumer's smaller byte request.
+   return value;
+@@ -705,7 +709,7 @@
+ size_t GraphConstruction::remaining() const noexcept {
+   const GraphQuota::Loan loan(*quota_);
+   size_t result = 0;
+-  for (size_t i = 0; i < count_; ++i) if (slots_[i].pointer) ++result;
++  for (const auto& entry : classes_) result += entry.end - entry.next;
+   return result;
+ }
+ void GraphConstruction::destroy() noexcept {

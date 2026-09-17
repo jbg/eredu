@@ -50,6 +50,7 @@ fn promoted_and_cancelled_writes_retain_host_reservations_until_release() {
                 logical_bytes: 16,
                 host_capacity,
                 ticket: ticket.clone(),
+                prepared: None,
             },
         );
         insert_test_record(
@@ -60,6 +61,8 @@ fn promoted_and_cancelled_writes_retain_host_reservations_until_release() {
                 shapes: [vec![1], vec![1]],
                 dtypes: ["Float32".into(), "Float32".into()],
                 imported: false,
+                original_discard: None,
+                _metadata_funding: None,
             },
             false,
             0,

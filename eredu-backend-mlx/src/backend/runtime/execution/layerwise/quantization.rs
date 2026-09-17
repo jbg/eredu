@@ -437,7 +437,7 @@ mod packed_weight_companion_tests;
 /// Builds a quantized checkpoint overlay from neutral parameter topologies.
 #[cfg(test)]
 fn quantize_parameterized_store<SM, U, SF, TF>(
-    store: SharedCheckpointSource,
+    store: RetainedCheckpointSource,
     source_static: &SM,
     target_static: &SM,
     mut source_unit: SF,
@@ -445,7 +445,7 @@ fn quantize_parameterized_store<SM, U, SF, TF>(
     unit_count: usize,
     quantization: WeightQuantization,
     stream: &Stream,
-) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
+) -> Result<(RetainedCheckpointSource, WeightMaterializationReport), Error>
 where
     SM: Clone + eredu_nn::Parameterized<crate::MlxTensor>,
     U: eredu_nn::Parameterized<crate::MlxTensor>,
@@ -507,19 +507,19 @@ where
         stream,
     )?);
     let report = transformed.report().clone();
-    let transformed: SharedCheckpointSource = transformed;
+    let transformed: RetainedCheckpointSource = transformed.into();
     Ok((transformed, report))
 }
 
 /// Builds a bounded packed overlay for one fully resident neutral module tree.
 #[cfg(test)]
 fn quantize_parameterized_module_store<M>(
-    store: SharedCheckpointSource,
+    store: RetainedCheckpointSource,
     source: &M,
     target: &M,
     quantization: WeightQuantization,
     stream: &Stream,
-) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
+) -> Result<(RetainedCheckpointSource, WeightMaterializationReport), Error>
 where
     M: Clone + eredu_nn::Parameterized<crate::MlxTensor>,
 {
@@ -545,7 +545,7 @@ where
 /// shared overlay.
 #[allow(clippy::too_many_arguments)]
 pub fn quantize_module_store_with_bindings<SM, U, SF, TF, SB, UB>(
-    store: SharedCheckpointSource,
+    store: RetainedCheckpointSource,
     source_static: &SM,
     target_static: &SM,
     mut source_unit: SF,
@@ -555,7 +555,7 @@ pub fn quantize_module_store_with_bindings<SM, U, SF, TF, SB, UB>(
     stream: &Stream,
     static_bindings: SB,
     mut unit_bindings: UB,
-) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
+) -> Result<(RetainedCheckpointSource, WeightMaterializationReport), Error>
 where
     SM: Parameterized<crate::MlxTensor>,
     U: Parameterized<crate::MlxTensor>,
@@ -624,7 +624,7 @@ where
         stream,
     )?);
     let report = transformed.report().clone();
-    let transformed: SharedCheckpointSource = transformed;
+    let transformed: RetainedCheckpointSource = transformed.into();
     Ok((transformed, report))
 }
 
@@ -636,7 +636,7 @@ where
 /// are never added to the materialization plan.
 #[allow(clippy::too_many_arguments)]
 pub fn quantize_exact_replicated_text_tasks<SM, U>(
-    store: SharedCheckpointSource,
+    store: RetainedCheckpointSource,
     source_static: &SM,
     target_static: &SM,
     source_units: &[U],
@@ -645,7 +645,7 @@ pub fn quantize_exact_replicated_text_tasks<SM, U>(
     quantization: WeightQuantization,
     tasks: &[&ReplicatedTextMaterializationTask],
     stream: &Stream,
-) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
+) -> Result<(RetainedCheckpointSource, WeightMaterializationReport), Error>
 where
     SM: Parameterized<crate::MlxTensor>,
     U: Parameterized<crate::MlxTensor>,
@@ -737,7 +737,7 @@ where
         stream,
     )?);
     let report = transformed.report().clone();
-    let transformed: SharedCheckpointSource = transformed;
+    let transformed: RetainedCheckpointSource = transformed.into();
     Ok((transformed, report))
 }
 
@@ -747,13 +747,13 @@ where
 /// contract. Target modules are inspected only to verify that those exact
 /// primary and companion handles exist with the native dtypes required by MLX.
 pub fn quantize_exact_realtime_tasks<SM, U>(
-    store: SharedCheckpointSource,
+    store: RetainedCheckpointSource,
     target_static: &SM,
     target_units: &[U],
     quantization: WeightQuantization,
     tasks: &[RealtimeMaterializationTask],
     stream: &Stream,
-) -> Result<(SharedCheckpointSource, WeightMaterializationReport), Error>
+) -> Result<(RetainedCheckpointSource, WeightMaterializationReport), Error>
 where
     SM: Parameterized<crate::MlxTensor>,
     U: Parameterized<crate::MlxTensor>,
@@ -865,7 +865,7 @@ where
         stream,
     )?);
     let report = transformed.report().clone();
-    let transformed: SharedCheckpointSource = transformed;
+    let transformed: RetainedCheckpointSource = transformed.into();
     Ok((transformed, report))
 }
 

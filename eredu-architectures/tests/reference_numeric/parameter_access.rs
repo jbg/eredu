@@ -1,11 +1,40 @@
 //! Real partition owners, source-backed loans and parameter-sensitive execution.
 use super::*;
 use eredu_core::{capture::*, parameters::*};
-use eredu_runtime::parameter_operations::PreparedParameterLocation;
+use eredu_runtime::parameter_operations::{LayeredParameterOwner, PreparedParameterLocation};
 use eredu_runtime::StaticParameterVisitorMut;
 use std::convert::Infallible;
 
 struct Budget(CaptureUsage);
+
+fn cold_retained_values(executable: &NumericPartitionExecutable) -> Vec<NumericTensor> {
+    let before = last_reference_stage_evidence();
+    let values = (executable.retained_parameter_values)().unwrap();
+    assert_eq!(
+        last_reference_stage_evidence(),
+        before,
+        "cold traversal must not read or materialize checkpoint data"
+    );
+    assert!(!values.is_empty());
+    assert!(values
+        .iter()
+        .any(|value| value.data.iter().any(|value| *value != 0.0)));
+    values
+}
+
+fn retained_bits(values: &[NumericTensor]) -> Vec<(Vec<i32>, Vec<u32>)> {
+    let mut values = values
+        .iter()
+        .map(|value| {
+            (
+                value.shape.clone(),
+                value.data.iter().map(|value| value.to_bits()).collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    values.sort();
+    values
+}
 impl CaptureReservation for Budget {
     fn reserve(&mut self, usage: CaptureUsage) -> Result<Option<CaptureSkipReason>, CaptureError> {
         self.0 = self.0.checked_add(usage)?;
@@ -89,6 +118,11 @@ fn ordinary(
     }
     let context = NumericContext::default();
     let args = llama::model_args_from_config_value(config).unwrap();
+    let address = decoder::dense_parameter_description(&args)
+        .unwrap()
+        .unit_layout()
+        .address(0)
+        .unwrap();
     let mut architecture = decoder::LayeredModel::<NumericBackend, _>::new(args, &context).unwrap();
     architecture
         .visit_static_parameters_mut(&mut Bind(values))
@@ -106,6 +140,31 @@ fn ordinary(
         })
         .collect();
     let mut runtime = LayerwiseRuntime::new(architecture, ResidentUnitWindow::new(units));
+    let mut retained = 0;
+    assert!(runtime.visit_retained_values(&mut |value| {
+        retained += value.data.len();
+    }));
+    assert!(retained > 0);
+    let loan = LayerwisePolicy::<NumericBackend, _>::acquire::<Error, _>(
+        runtime.policy_mut(),
+        0,
+        address,
+        |_| panic!("resident inspection cannot construct a unit"),
+        &context,
+    )
+    .unwrap();
+    let mut partial = 0;
+    assert!(!runtime.visit_retained_values(&mut |value| {
+        partial += value.data.len();
+    }));
+    assert!(partial > 0, "idle static and unloaned units remain visible");
+    assert!(partial < retained, "the active unit has no idle inventory");
+    LayerwisePolicy::<NumericBackend, _>::abort(
+        runtime.policy_mut(),
+        Some((0, address, loan)),
+        &context,
+    );
+    assert!(runtime.visit_retained_values(&mut |_| {}));
     inputs
         .iter()
         .map(|tokens| {
@@ -249,6 +308,7 @@ fn prepared_partition_parameter_loans_and_replacements_match_independent_executi
                             let mut context = NumericContext::with_partition(layout, rank, world);
                             context.bind_checkpoint_values = true;
                             let mut executable = partitioned_adapter::dense(sources, &context).unwrap();
+                            let retained_before = retained_bits(&cold_retained_values(&executable));
                             let mut original = BTreeMap::new(); let mut replacement = BTreeMap::new();
                             let mut locations = BTreeMap::new();
                             let mut budget = Budget(Default::default());
@@ -289,10 +349,15 @@ fn prepared_partition_parameter_loans_and_replacements_match_independent_executi
                             for (step, tokens) in inputs.iter().enumerate() { assert_tensor_close(&executable.forward(tokens, step == 0).unwrap(), &ordinary_baseline[step], "baseline after failed and successful parameter loans"); }
                             executable.reset().unwrap();
                             assert!((executable.publish_parameters)(&replacement, true).unwrap());
+                            let retained = cold_retained_values(&executable);
+                            for expected in replacement.values() {
+                                assert!(retained.iter().any(|value| value.shape == expected.shape && value.data == expected.data), "cold inventory must include current replacements or stored reload overrides");
+                            }
                             for (slot, expected) in &replacement { assert_tensor_exact(&(executable.parameters)(&locations[slot], false).unwrap()[slot], expected, "published values survive bounded reload"); }
                             for (step, tokens) in inputs.iter().enumerate() { assert_tensor_close(&executable.forward(tokens, step == 0).unwrap(), &ordinary_changed[step], "partition edits match independently edited ordinary model"); }
                             executable.reset().unwrap();
                             assert!((executable.publish_parameters)(&original, false).unwrap());
+                            assert_eq!(retained_bits(&cold_retained_values(&executable)), retained_before, "restoration removes override ownership and restores resident values");
                             for (step, tokens) in inputs.iter().enumerate() { assert_tensor_close(&executable.forward(tokens, step == 0).unwrap(), &ordinary_baseline[step], "restoration preserves baseline"); }
                         })
                     }).collect::<Vec<_>>();

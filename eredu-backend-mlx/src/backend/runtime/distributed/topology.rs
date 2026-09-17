@@ -49,6 +49,10 @@ pub(super) fn manifest_group_realizations() -> usize {
     MANIFEST_GROUP_REALIZATIONS.load(Ordering::Relaxed)
 }
 
+pub(crate) mod original_source;
+mod retention_copy;
+pub(crate) use original_source::{OriginalPreparationFrame, PreparedOriginalPreparationGather, OriginalCommunicationCompletedOperation, OriginalRankCollective, PreparedRankCollective, AcceptedRankCollective, AcceptedCommunicationSource, OriginalCommunicationOwner, OriginalCommunicationSource, OriginalCommunicatorInventory, OriginalCommunicationWorkers, OriginalCommunicationDispatch, OriginalCommunicationConstructor, OriginalCommunicationConstructed};
+
 /// Backend-owned handle for one opaque directed communication route.
 #[derive(Debug, Clone)]
 pub struct CommunicationRouteRealization {
@@ -56,6 +60,8 @@ pub struct CommunicationRouteRealization {
     group: Option<Group>,
     endpoint: Option<CommunicationRouteEndpoint>,
     peer_rank: Option<usize>,
+    // The exact checked source also survives routes with no local endpoint.
+    source: Option<eredu_runtime::RetainedCommunicationSource>,
 }
 
 /// This rank's role in one realized directed route.
@@ -110,6 +116,7 @@ impl CommunicationRouteRealization {
             group,
             endpoint,
             peer_rank,
+            source: world.retained_source().cloned(),
         })
     }
 
@@ -330,6 +337,7 @@ pub struct ParallelCommunicators {
     world_size: usize,
     global_rank: usize,
     session_identity: eredu_runtime::CommunicationSessionIdentity,
+    source: eredu_runtime::RetainedCommunicationSource,
     descriptors: Vec<CommunicationGroupDescriptor>,
     // Consensus-validated remote facts grant no local native participation.
     global_descriptors: std::sync::Arc<[CommunicationGroupDescriptor]>,
@@ -438,7 +446,11 @@ impl ParallelCommunicators {
     ) -> Result<Self, Error> {
         // Fence both manifest and uncontracted construction while any timed-out
         // work on this exact native communicator remains quarantined.
-        let owned_world = Group::uncontracted(world).with_completion_policy(completion);
+        let source = prepared.into_retained_source(session_identity)
+            .map_err(|cause| Error::Parallel(cause.to_string()))?;
+        let prepared = source.realization();
+        let owned_world = Group::uncontracted(world).with_completion_policy(completion)
+            .with_retained_source(source.clone());
         crate::backend::runtime::distributed::completion::ensure_group_available(&owned_world)?;
         let _setup = owned_world.begin_bounded_setup()?;
         let manifest = prepared.manifest();
@@ -454,6 +466,12 @@ impl ParallelCommunicators {
         // This unsplit handle is intentionally uncontracted: it is the control
         // plane from which exact manifest handles are realized.
         let world = owned_world;
+        // Setup already owns and synchronizes this actual communicator. Retain
+        // its selected transport once, before group clones share the field;
+        // request quotation must never initialize the lazy stream itself.
+        if world.size() > 1 {
+            world.initialize_transport_stream()?;
+        }
         let groups = prepared
             .try_create_groups(|descriptor, world_wave| {
                 let group =
@@ -475,6 +493,7 @@ impl ParallelCommunicators {
             global_rank: manifest.rank(),
             session_identity,
             descriptors: manifest.groups().to_vec(),
+            source,
             global_descriptors,
             control_world: world,
             groups,
@@ -519,6 +538,17 @@ impl ParallelCommunicators {
         })
     }
 
+    pub(crate) fn collect_retained_buffers(&self,storage:&mut crate::backend::runtime::residency::storage::RetainedStorage)
+        ->Result<(),Error> {
+        storage.include_group_buffer(self.control_world.retained_buffer())?;
+        for group in self.groups.values() {
+            if let Some(group)=&group.native {storage.include_group_buffer(group.retained_buffer())?;}
+        }
+        for route in self.routes.values() {
+            if let Some(group)=&route.group {storage.include_group_buffer(group.retained_buffer())?;}
+        }
+        Ok(())
+    }
     /// Instance identity established by the complete setup consensus.
     pub const fn session_identity(&self) -> eredu_runtime::CommunicationSessionIdentity {
         self.session_identity
@@ -551,6 +581,28 @@ impl ParallelCommunicators {
     }
 
     /// Consumes manifest-realized communicators into the neutral runtime's exact resource order.
+    /// Borrows the same exact initial resource table while retaining its source
+    /// for later original frame qualification. Only output vectors/handle aliases
+    /// are constructed; no map, descriptor, native group or route is recreated.
+    pub(crate) fn partition_resource_loans(&self,manifest:&CommunicationManifest)
+        ->Result<(Vec<eredu_runtime::RealizedCommunicationGroup<Group>>,
+            Vec<eredu_runtime::RealizedCommunicationRoute<CommunicationRouteRealization>>),Error> {
+        if self.groups.len()!=manifest.groups().len() || self.routes.len()!=manifest.routes().len() {
+            return Err(Error::Parallel("retained communication resources differ from selected manifest".into()));
+        }
+        let groups=manifest.groups().iter().map(|descriptor| {
+            let group=self.groups.get(&descriptor.id()).and_then(|value|value.native.as_ref())
+                .ok_or_else(||Error::Parallel("retained selected group is absent".into()))?;
+            Ok(eredu_runtime::RealizedCommunicationGroup::new(descriptor.id(),group.clone()))
+        }).collect::<Result<Vec<_>,Error>>()?;
+        let routes=manifest.routes().iter().map(|descriptor| {
+            let route=self.routes.get(&descriptor.id())
+                .ok_or_else(||Error::Parallel("retained selected route is absent".into()))?;
+            Ok(eredu_runtime::RealizedCommunicationRoute::new(descriptor.id(),route.clone()))
+        }).collect::<Result<Vec<_>,Error>>()?;
+        Ok((groups,routes))
+    }
+
     pub(crate) fn into_partition_resources(
         self,
         manifest: &CommunicationManifest,
@@ -565,6 +617,7 @@ impl ParallelCommunicators {
             world_size: _,
             global_rank: _,
             session_identity: _,
+            source: _,
             descriptors: _,
             global_descriptors: _,
             control_world: _,

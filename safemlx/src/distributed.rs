@@ -2,8 +2,10 @@
 //!
 //! MLX caches initialized backends process-wide. [`init`] preserves that
 //! behavior. With `strict == false`, failure to establish the requested
-//! backend returns a usable size-one group; collectives on that group return
+//! backend returns a usable size-one group; unless terminally fenced, collectives return
 //! their input unchanged. Point-to-point operations still reject a singleton.
+//! Terminal fencing applies to the cached native incarnation and all descendants;
+//! it does not cancel, settle or release already accepted work.
 //!
 //! Backend setup follows MLX 0.32:
 //!
@@ -110,11 +112,17 @@ impl std::fmt::Display for Backend {
     }
 }
 
+/// The exact native communicator incarnation rejects new submissions.
+/// This fixed preflight failure does not imply native completion or cancellation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("distributed communicator is terminal for new submissions")]
+pub struct TerminalGroup;
+
 /// An owned MLX distributed group.
 ///
-/// The final related group frees the native handle on drop. The type is
-/// intentionally neither `Clone`, `Send`, nor `Sync`: not every communication
-/// backend documents cross-thread group access.
+/// The final related group frees the native handle on drop. Clones share the same wrapper. The type is
+/// intentionally neither `Send` nor `Sync`: not every communication backend
+/// documents cross-thread group access.
 #[derive(Clone)]
 pub struct Group {
     native: Rc<NativeGroup>,
@@ -135,7 +143,40 @@ impl Drop for NativeGroup {
 }
 
 impl Group {
-    /// Returns whether two handles retain the same native communicator.
+    /// Irreversibly fence the canonical communicator, including cached wrappers
+    /// and split descendants. No allocation, runtime lock, error channel or work
+    /// occurs. Existing native submissions keep their original ownership.
+    pub fn mark_terminal_submission(&self) {
+        // SAFETY: this Rc retains an initialized immutable C++ Group wrapper.
+        // The shim only reads its immutable root link and stores a lock-free bit.
+        unsafe { safemlx_sys::mlx_distributed_group_mark_terminal_submission(self.native.c_group) }
+    }
+
+    /// Atomic-only query on that exact native incarnation. This proves no
+    /// completion, cancellation, reclaimable bytes or replacement authority.
+    pub fn terminal_submission(&self) -> bool {
+        // SAFETY: the retained wrapper and root are live; the shim only loads
+        // the canonical atomic bit and never uses the native error channel.
+        unsafe { safemlx_sys::mlx_distributed_group_terminal_submission(self.native.c_group) }
+    }
+
+    /// Allocation-free preflight before creating a status value or graph.
+    pub fn check_submission_available(&self) -> std::result::Result<(), TerminalGroup> {
+        if self.terminal_submission() {
+            Err(TerminalGroup)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_submission_available(&self) -> Result<()> {
+        self.check_submission_available()
+            .map_err(Exception::from_source)
+    }
+
+    /// Returns whether two handles retain the same owned native wrapper.
+    /// Repeated initialization may create distinct wrappers for one cached native
+    /// incarnation; terminal fencing follows that incarnation independently.
     pub fn shares_native_handle(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.native, &other.native)
     }
@@ -185,6 +226,7 @@ impl Group {
     /// This is independent of a model's compute stream. In particular, Ring
     /// selects CPU transport even when its inputs are produced by a GPU graph.
     pub fn communication_stream(&self) -> Result<Stream> {
+        self.ensure_submission_available()?;
         let _guard = runtime_lock::enter();
         Stream::try_from_op(|res| {
             // SAFETY: the output guard owns `res`; this group remains alive
@@ -201,6 +243,7 @@ impl Group {
     /// support varies: MLX 0.32 supports splitting with MPI and NCCL, while its
     /// singleton, Ring, and JACCL groups return an error.
     pub fn split(&self, color: i32, key: Option<i32>) -> Result<Self> {
+        self.ensure_submission_available()?;
         let _guard = runtime_lock::enter();
         Self::try_from_op(|res| {
             // SAFETY: `res` is an initialized output guard and `self.c_group`
@@ -260,6 +303,7 @@ fn collective(
         safemlx_sys::mlx_stream,
     ) -> i32,
 ) -> Result<Array> {
+    group.ensure_submission_available()?;
     let _guard = runtime_lock::enter();
     Array::try_from_op(|res| {
         // SAFETY: all borrowed handles remain alive for the call and `res` is
@@ -378,6 +422,7 @@ fn native_all_to_all_v(
     group: &Group,
     stream: &Stream,
 ) -> Result<Array> {
+    group.ensure_submission_available()?;
     let _guard = runtime_lock::enter();
     Array::try_from_op(|res| {
         // SAFETY: count slices and all borrowed MLX handles remain alive for
@@ -431,6 +476,7 @@ pub fn all_min(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> Resu
 ///
 /// Scalar inputs become a one-dimensional result for non-singleton groups.
 pub fn all_gather(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> Result<Array> {
+    group.ensure_submission_available()?;
     if group.size() > 1 {
         if let Some(&first_dim) = input.shape().first() {
             let group_size = i32::try_from(group.size())
@@ -464,6 +510,7 @@ pub fn all_to_all_v(
     group: &Group,
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
+    group.ensure_submission_available()?;
     let stream = stream.as_ref();
     let (send, recv, _) = validate_all_to_all_v(input, send_counts, recv_counts, group)?;
     if group.size() == 1 {
@@ -474,6 +521,7 @@ pub fn all_to_all_v(
 
 /// Sum across `group` and scatter equal axis-zero chunks to each rank.
 pub fn sum_scatter(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> Result<Array> {
+    group.ensure_submission_available()?;
     let group_size = group.size();
     if group_size > 1 {
         let first_dim = input
@@ -498,6 +546,7 @@ pub fn sum_scatter(input: &Array, group: &Group, stream: impl AsRef<Stream>) -> 
 }
 
 fn checked_peer(peer: usize, group: &Group, role: &str) -> Result<i32> {
+    group.ensure_submission_available()?;
     let size = group.size();
     if size == 1 {
         return Err(Exception::custom(format!(
@@ -524,6 +573,7 @@ pub fn send(
 ) -> Result<Array> {
     let destination = checked_peer(destination, group, "destination")?;
     let stream = stream.as_ref();
+    group.ensure_submission_available()?;
     let _guard = runtime_lock::enter();
     Array::try_from_op(|res| {
         // SAFETY: all input handles remain alive and `res` is an owned output
@@ -548,6 +598,7 @@ pub fn recv(
     group: &Group,
     stream: impl AsRef<Stream>,
 ) -> Result<Array> {
+    group.ensure_submission_available()?;
     if shape.iter().any(|dimension| *dimension < 0) {
         return Err(Exception::custom(
             "receive shape dimensions must be non-negative",
@@ -555,6 +606,7 @@ pub fn recv(
     }
     let source = checked_peer(source, group, "source")?;
     let stream = stream.as_ref();
+    group.ensure_submission_available()?;
     let _guard = runtime_lock::enter();
     Array::try_from_op(|res| {
         // SAFETY: `shape` and all borrowed handles remain alive for this call;
@@ -582,6 +634,7 @@ pub fn recv_like(
 ) -> Result<Array> {
     let source = checked_peer(source, group, "source")?;
     let stream = stream.as_ref();
+    group.ensure_submission_available()?;
     let _guard = runtime_lock::enter();
     Array::try_from_op(|res| {
         // SAFETY: all borrowed handles remain alive and `source` was checked.
@@ -729,3 +782,37 @@ mod tests {
         assert!(recv_like(&input, 0, &group, stream).is_err());
     }
 }
+
+#[cfg(test)]
+mod terminal_tests;
+
+mod inventory;
+pub use inventory::{GroupStorageDomain, GroupStorageInventory, GroupStorageKind, GroupStorageUnavailable};
+
+mod worker_storage;
+pub use worker_storage::{GroupWorkerOperation, GroupWorkerStorage};
+
+mod dispatch_storage;
+pub use dispatch_storage::GroupDispatchStorage;
+
+mod constructor_storage;
+pub use constructor_storage::GroupConstructorStorage;
+
+mod cpu_evaluation_storage;
+pub use cpu_evaluation_storage::{GroupCpuEvaluationStorage,GroupCpuStorageFacts};
+mod operation_storage;
+pub use operation_storage::{GroupCpuOperationStorage,GroupCpuBackingStorage};
+mod completion_storage;
+pub use completion_storage::{GroupCpuCompletionStorage,GroupCpuCompletionLayoutStorage,OwnedGroupCpuCompletionLayoutStorage};
+
+mod persistent_storage;
+pub use persistent_storage::{GroupPersistentStorage,GroupBufferIdentity,RetainedGroupBuffer};
+
+mod layout_storage;
+pub use layout_storage::{GroupCpuLayoutStorage,OwnedGroupCpuLayoutStorage};
+
+mod exchange_storage;
+pub use exchange_storage::{GroupCpuExchangeStorage,GroupCpuExchangeLayoutStorage,OwnedGroupCpuExchangeLayoutStorage};
+
+mod variable_storage;
+pub use variable_storage::GroupCpuVariableEnvelope;

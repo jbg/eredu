@@ -7,6 +7,39 @@ use super::*;
 use eredu_checkpoint::store::SafetensorsWeightStore;
 
 #[test]
+fn source_less_checkpoint_and_native_failures_remain_typed_causes() {
+    use std::error::Error as _;
+    let error = WeightRecipeError::CheckpointStore(
+        eredu_checkpoint::store::StoreError::AdmittedFileChanged {
+            path: std::path::PathBuf::from("admitted.safetensors"),
+        },
+    );
+    let WeightRecipeError::CheckpointStore(original) = &error else {
+        unreachable!()
+    };
+    assert!(std::ptr::eq(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<eredu_checkpoint::store::StoreError>()
+            .unwrap(),
+        original,
+    ));
+    let error = WeightRecipeError::Mlx(safemlx::error::Exception::custom("copy failed"));
+    let WeightRecipeError::Mlx(original) = &error else {
+        unreachable!()
+    };
+    assert!(std::ptr::eq(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<safemlx::error::Exception>()
+            .unwrap(),
+        original,
+    ));
+}
+
+#[test]
 fn subtract_one_preserves_inferred_dtype_and_residency_bytes() {
     let directory = tempfile::tempdir().unwrap();
     let values = [0.5_f32, 1.0, 2.0, 4.0];
@@ -68,7 +101,7 @@ fn subtract_one_preserves_inferred_dtype_and_residency_bytes() {
     }
 }
 
-fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
+pub(super) fn fixture() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
     let dir = tempfile::tempdir().unwrap();
     let left = [1i32, 2, 3, 4]
         .into_iter()

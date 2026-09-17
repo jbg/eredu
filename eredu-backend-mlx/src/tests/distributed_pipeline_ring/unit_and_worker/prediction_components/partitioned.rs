@@ -373,26 +373,26 @@ pub(super) fn verify_partitioned(
                 },
                 |session: &mut dyn ControlledSpeculativeSession| {
                     if replay {
-                        records.extend(session.step()?.unwrap().activations);
+                        records.extend(session.step()?.unwrap().activations.iter().cloned());
                         let saved = session.snapshot()?;
                         let sibling = session.fork(&saved)?;
                         let start = records.len();
                         while let Some(step) = session.step()? {
-                            records.extend(step.activations);
+                            records.extend(step.activations.iter().cloned());
                         }
                         let tokens = session.token_ids().to_vec();
                         let used = session.snapshot_usage().cumulative_copy_bytes;
                         session.restore(&saved)?;
                         let mut repeated = Vec::new();
                         while let Some(step) = session.step()? {
-                            repeated.extend(step.activations);
+                            repeated.extend(step.activations.iter().cloned());
                         }
                         assert_eq!(session.token_ids(), tokens);
                         assert_prediction_replay(&repeated, &records[start..]);
                         session.exchange(&sibling)?;
                         let mut branched = Vec::new();
                         while let Some(step) = session.step()? {
-                            branched.extend(step.activations);
+                            branched.extend(step.activations.iter().cloned());
                         }
                         assert_eq!(session.token_ids(), tokens);
                         assert_prediction_replay(&branched, &records[start..]);
@@ -403,7 +403,7 @@ pub(super) fn verify_partitioned(
                         session.release_snapshot(&saved)?;
                     } else {
                         while let Some(step) = session.step()? {
-                            records.extend(step.activations);
+                            records.extend(step.activations.iter().cloned());
                         }
                     }
                     Ok(())
@@ -430,16 +430,16 @@ pub(super) fn verify_partitioned(
                     .find(|r| r.phase == Phase::PredictionPrefill)
                     .unwrap();
                 assert_eq!(
-                    context.captures.invocation.unwrap().sequence,
+                    context.captures.as_step().invocation.unwrap().sequence,
                     tokens.len() as u64
                 );
                 let proposal = records
                     .iter()
                     .find(|r| r.phase == Phase::FusedProposal)
                     .unwrap();
-                assert_eq!(proposal.captures.invocation.unwrap().sequence, 2);
+                assert_eq!(proposal.captures.as_step().invocation.unwrap().sequence, 2);
                 for record in &records {
-                    for value in &record.captures.records {
+                    for value in &record.captures.as_step().records {
                         if value.path == "dspark.context.normalized" {
                             assert_eq!(
                                 value.outcome == CaptureOutcome::Captured,
@@ -473,7 +473,7 @@ pub(super) fn verify_partitioned(
     let logits = |records: &[SpeculativeActivationCapture]| {
         records
             .iter()
-            .flat_map(|record| &record.captures.records)
+            .flat_map(|record| &record.captures.as_step().records)
             .filter(|record| record.path == scope.readout.logits)
             .filter_map(|record| record.payload.clone())
             .collect::<Vec<_>>()
@@ -625,7 +625,7 @@ fn verify_fused_readout(
         .map(|r| {
             let source = prediction_trial_tensor(std::slice::from_ref(r), input);
             let expanded = prediction_trial_tensor(std::slice::from_ref(r), output);
-            let hidden = source.len() / r.captures.invocation.unwrap().sequence as usize;
+            let hidden = source.len() / r.captures.as_step().invocation.unwrap().sequence as usize;
             assert_eq!(expanded.len(), source.len() * streams);
             for (i, actual) in expanded.iter().enumerate() {
                 assert_eq!(
@@ -633,7 +633,7 @@ fn verify_fused_readout(
                     source[i / (streams * hidden) * hidden + i % hidden]
                 );
             }
-            r.captures.clone()
+            r.captures.as_step().clone()
         })
         .collect::<Vec<_>>();
     assert!(!steps.is_empty());
@@ -652,7 +652,7 @@ fn prediction_trial_payload<'a>(
                 Phase::PredictionPrefill | Phase::FusedProposal
             )
         })
-        .flat_map(|record| &record.captures.records)
+        .flat_map(|record| &record.captures.as_step().records)
         .filter(|record| record.path == path)
         .find_map(|record| record.payload.as_ref())
         .unwrap_or_else(|| panic!("first invoked prediction payload {path}"))
@@ -743,13 +743,12 @@ fn verify_prediction_mask_values(
                     matches!(
                         record.phase,
                         Phase::PredictionPrefill | Phase::FusedProposal
-                    ) && record.captures.records.iter().any(|capture| {
+                    ) && record.captures.as_step().records.iter().any(|capture| {
                         capture.path == group.activation && capture.payload.is_some()
                     })
                 })
                 .unwrap()
-                .captures
-                .invocation
+                .captures.as_step().invocation
                 .unwrap()
                 .sequence as usize;
             assert_eq!(sequence, expected_sequence);
@@ -808,14 +807,13 @@ fn assert_partitioned_prediction_result_with_readout(
     if std::env::var_os("EREDU_RING_DEEPSEEK_FP8").is_some() {
         for (left, right) in actual.1.iter().zip(&expected.1) {
             if !left
-                .captures
-                .partitions
+                .captures.as_step().partitions
                 .iter()
                 .any(|part| part.context.overlay_identity.is_some())
             {
                 continue;
             }
-            for (a, b) in left.captures.records.iter().zip(&right.captures.records) {
+            for (a, b) in left.captures.as_step().records.iter().zip(&right.captures.as_step().records) {
                 if !a.path.contains("readout") {
                     continue;
                 }
@@ -871,23 +869,22 @@ fn assert_partitioned_prediction_result_with_readout(
             }
         }
         assert_eq!(
-            (actual.phase, actual.origin, actual.captures.invocation),
+            (actual.phase, actual.origin, actual.captures.as_step().invocation),
             (
                 expected.phase,
                 expected.origin,
-                expected.captures.invocation
+                expected.captures.as_step().invocation
             )
         );
         assert_eq!(
-            actual.captures.records.len(),
-            expected.captures.records.len()
+            actual.captures.as_step().records.len(),
+            expected.captures.as_step().records.len()
         );
         let phase = actual.phase;
         for (actual, expected) in actual
-            .captures
-            .records
+            .captures.as_step().records
             .iter()
-            .zip(&expected.captures.records)
+            .zip(&expected.captures.as_step().records)
         {
             assert_eq!(actual.outcome, expected.outcome, "{}", actual.path);
             let path = &actual.path;
@@ -970,10 +967,9 @@ fn assert_partitioned_prediction_result_with_readout(
             }
         }
         assert!(
-            !actual.captures.partitions.is_empty()
+            !actual.captures.as_step().partitions.is_empty()
                 || actual
-                    .captures
-                    .records
+                    .captures.as_step().records
                     .iter()
                     .all(|record| record.payload.is_none())
         );
@@ -987,7 +983,7 @@ fn assert_prediction_replay(
     assert_eq!(actual.len(), expected.len());
     for (actual, expected) in actual.iter().zip(expected) {
         assert_eq!(actual.phase, expected.phase);
-        assert_eq!(actual.captures.records, expected.captures.records);
+        assert_eq!(actual.captures.as_step().records, expected.captures.as_step().records);
         assert_eq!(actual.admission_identity, expected.admission_identity);
         assert!(actual.completed);
     }

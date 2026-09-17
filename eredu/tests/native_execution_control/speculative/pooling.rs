@@ -81,7 +81,7 @@ fn records(
             (
                 capture.role,
                 capture.position,
-                capture.capture.records.clone(),
+                capture.capture.as_step().records.clone(),
             )
         })
         .collect()
@@ -188,27 +188,28 @@ fn verify(device: LocalDevice) {
             let mut baseline_captures = Vec::new();
             let baseline = model
                 .generate_observed_text_speculative(request(), options.clone(), |step| {
-                    baseline_captures.extend(step.captures);
+                    baseline_captures.extend(step.captures.iter().cloned());
                     ControlFlow::Continue(())
                 })
                 .unwrap();
             assert_eq!(baseline.token_ids().len(), 7);
-            assert!(baseline_captures
-                .iter()
-                .flat_map(|c| &c.capture.records)
-                .any(|record| {
-                    matches!(&record.payload, Some(CapturePayload::Candidates(values))
+            assert!(
+                baseline_captures
+                    .iter()
+                    .flat_map(|c| &c.capture.as_step().records)
+                    .any(|record| {
+                        matches!(&record.payload, Some(CapturePayload::Candidates(values))
                     if values.candidates.iter().any(|c| c.score != 0.0))
                 }));
             let mut observed = Vec::new();
             let output = model
                 .with_controlled_text_speculative(request(), options, |session| {
-                    observed.extend(session.step()?.unwrap().captures);
+                    observed.extend(session.step()?.unwrap().captures.iter().cloned());
                     assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
                     let saved = session.snapshot()?;
                     let start = observed.len();
                     while let Some(step) = session.step()? {
-                        observed.extend(step.captures);
+                        observed.extend(step.captures.iter().cloned());
                     }
                     let original = session.token_ids().to_vec();
                     let expected = records(&observed[start..]);
@@ -221,7 +222,7 @@ fn verify(device: LocalDevice) {
                         );
                         let mut replay = Vec::new();
                         while let Some(step) = session.step()? {
-                            replay.extend(step.captures);
+                            replay.extend(step.captures.iter().cloned());
                         }
                         assert_eq!(session.token_ids(), original);
                         compare_records(&records(&replay), &expected);
@@ -243,14 +244,14 @@ fn verify(device: LocalDevice) {
                     let changed = session.snapshot()?;
                     let mut suffix = Vec::new();
                     while let Some(step) = session.step()? {
-                        suffix.extend(step.captures);
+                        suffix.extend(step.captures.iter().cloned());
                     }
                     let changed_tokens = session.token_ids().to_vec();
                     assert_ne!(changed_tokens, original);
                     session.restore(&changed)?;
                     let mut replay = Vec::new();
                     while let Some(step) = session.step()? {
-                        replay.extend(step.captures);
+                        replay.extend(step.captures.iter().cloned());
                     }
                     assert_eq!(session.token_ids(), changed_tokens);
                     compare_records(&records(&replay), &records(&suffix));
@@ -259,7 +260,7 @@ fn verify(device: LocalDevice) {
                     session.exchange(&second)?;
                     let mut sibling = Vec::new();
                     while let Some(step) = session.step()? {
-                        sibling.extend(step.captures);
+                        sibling.extend(step.captures.iter().cloned());
                     }
                     assert_eq!(session.token_ids(), original);
                     compare_records(&records(&sibling), &expected);

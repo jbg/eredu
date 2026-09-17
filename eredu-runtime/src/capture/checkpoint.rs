@@ -11,10 +11,13 @@ use std::sync::Arc;
 /// establish native completion and save model, sampler, and semantic state.
 ///
 /// It contains no estimator or native handle. Admission proofs remain opaque and
-/// cannot be deserialized. Clones share only immutable host admission data.
+/// cannot be deserialized. Clones copy admitted plan payloads while sharing the
+/// source identity and host custody. Shared custody is not fresh destination
+/// admission or a finite copy-byte allowance. A checkpoint from a shared-source
+/// session also retains that existing physical source separately from its copied
+/// destination plan; source attachment never pays for this clone.
 #[derive(Clone)]
 pub struct CaptureCheckpoint {
-    owner: Arc<()>,
     artifact_identity: String,
     plan: AdmittedCapturePlan,
     intervention: Option<AdmittedInterventionPlan>,
@@ -23,6 +26,16 @@ pub struct CaptureCheckpoint {
     phase: CapturePhase,
     has_step: bool,
     usage: CaptureUsage,
+    // Existing source retention only: plan above is a distinct copied payload.
+    // Keep this after destination payload and before final preparation custody.
+    shared_source: Option<SharedCapturePlan>,
+    ordinary_prefill: Option<OrdinaryPrefillCapture>,
+    // Fresh only for each actual ordinary captured checkpoint. Clone preserves
+    // this immutable snapshot instance; the marker contains no payload/custody.
+    ordinary_identity: Option<Arc<()>>,
+    // Cloned plan/identity payloads retire before shared and immutable custody.
+    owner: Arc<CaptureHostOwner>,
+    ordinary_error_custody: Option<eredu_core::HostPreparationAuthority>,
 }
 
 /// Explicit admission inputs for a child capture run. The backend supplies the
@@ -70,11 +83,24 @@ impl PreparedCaptureRestore<'_> {
         self.run.capture_seconds = 0.0;
         self.run.transaction = None;
         self.run.invocation = None;
+        self.run.ordinary_progress = None;
         self.run.checkpoint_ready = true;
     }
 }
 
 impl CaptureSession {
+    // Shared ordinary/funded checkpoint boundary predicate. Native completion
+    // remains the enclosing saved-generation transaction's separate obligation.
+    pub(super) fn checkpoint_boundary_ready(&self) -> bool {
+        !self.window_reductions
+            && self.checkpoint_ready
+            && self.records.is_none()
+            && self.ordinary_frame.is_none()
+            && !self
+                .interventions
+                .as_ref()
+                .is_some_and(|run| run.records.is_some() || run.routing_pending.is_some())
+    }
     /// Known logical host storage for a copied portable checkpoint. Includes all
     /// admitted plan payloads and declarations, but no native estimator or handle.
     /// Callers reserve this before `checkpoint` clones the admission data.
@@ -88,7 +114,12 @@ impl CaptureSession {
             self.partition
                 .as_ref()
                 .map_or(Some(0), |run| run.identity_heap_bytes())?,
-        )
+        )?
+        .checked_add(if self.ordinary_prefill.is_some() {
+            2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>() as u64
+        } else {
+            0
+        })
     }
     /// Saves portable schedule position only after the current records have been
     /// delivered and all intervention finish checks succeeded. The initial run is
@@ -97,23 +128,26 @@ impl CaptureSession {
         &self,
         discovery: &CaptureDiscovery,
     ) -> Result<CaptureCheckpoint, CaptureError> {
-        if !self.checkpoint_ready
-            || self.records.is_some()
-            || self
-                .interventions
-                .as_ref()
-                .is_some_and(|run| run.records.is_some() || run.routing_pending.is_some())
-        {
+        let host = self.ordinary_error_custody.clone();
+        let result = self.checkpoint_unretained(discovery);
+        ordinary_error::retain_result(host, result)
+    }
+
+    fn checkpoint_unretained(
+        &self,
+        discovery: &CaptureDiscovery,
+    ) -> Result<CaptureCheckpoint, CaptureError> {
+        if !self.checkpoint_boundary_ready() {
             return Err(CaptureError::Invalid(
                 "capture checkpoint requires a successful, drained record boundary".into(),
             ));
         }
-        let checked = self.plan.readmit(discovery)?;
-        if checked.identity() != self.plan.identity()
-            || self
-                .partition
-                .as_ref()
-                .is_some_and(|run| !run.matches_artifact(&discovery.artifact_identity))
+        let _source_authority = self.owner.retained()?;
+        self.plan.revalidate(discovery)?;
+        if self
+            .partition
+            .as_ref()
+            .is_some_and(|run| !run.matches_artifact(&discovery.artifact_identity))
             || self
                 .interventions
                 .as_ref()
@@ -125,6 +159,7 @@ impl CaptureSession {
         }
         Ok(CaptureCheckpoint {
             owner: Arc::clone(&self.owner),
+            ordinary_error_custody: self.ordinary_error_custody.clone(),
             artifact_identity: discovery.artifact_identity.clone(),
             plan: self.plan.as_ref().clone(),
             intervention: self.interventions.as_ref().map(|run| run.plan.clone()),
@@ -133,12 +168,25 @@ impl CaptureSession {
             phase: self.phase,
             has_step: self.has_step,
             usage: self.ledger.total(),
+            shared_source: self.plan.shared().cloned(),
+            ordinary_prefill: self.ordinary_prefill.clone(),
+            ordinary_identity: self.ordinary_prefill.as_ref().map(|_| Arc::new(())),
         })
     }
 
     /// Checks a same-run restore before any native or portable mutation. Undelivered
     /// records must be consumed even when the previous operation failed.
     pub fn validate_restore(&self, checkpoint: &CaptureCheckpoint) -> Result<(), CaptureError> {
+        let host = self.ordinary_error_custody.clone();
+        let result = self.validate_restore_unretained(checkpoint);
+        ordinary_error::retain_result(host, result)
+    }
+
+    fn validate_restore_unretained(
+        &self,
+        checkpoint: &CaptureCheckpoint,
+    ) -> Result<(), CaptureError> {
+        let _source_authority = self.owner.retained()?;
         if !Arc::ptr_eq(&self.owner, &checkpoint.owner)
             || self.plan.identity() != checkpoint.plan.identity()
             || self.interventions.as_ref().map(|run| run.plan.identity())
@@ -152,6 +200,7 @@ impl CaptureSession {
             .transaction
             .is_some_and(|(_, status)| status == super::CaptureTransactionStatus::Pending)
             || self.records.is_some()
+            || self.ordinary_frame.is_some()
             || self
                 .interventions
                 .as_ref()
@@ -176,6 +225,15 @@ impl CaptureSession {
         &mut self,
         checkpoint: &CaptureCheckpoint,
     ) -> Result<PreparedCaptureRestore<'_>, CaptureError> {
+        let host = self.ordinary_error_custody.clone();
+        let result = self.prepare_restore_unretained(checkpoint);
+        ordinary_error::retain_result(host, result)
+    }
+
+    fn prepare_restore_unretained(
+        &mut self,
+        checkpoint: &CaptureCheckpoint,
+    ) -> Result<PreparedCaptureRestore<'_>, CaptureError> {
         self.validate_restore(checkpoint)?;
         Ok(PreparedCaptureRestore {
             run: self,
@@ -192,7 +250,86 @@ impl CaptureSession {
 }
 
 impl CaptureCheckpoint {
-    /// Logical storage of this immutable admission/schedule checkpoint.
+    /// Retains existing preparation custody across every checkpoint/run/partition
+    /// alias of this identity. The caller must acquire before copying; attachment
+    /// itself neither admits work nor turns logical sizes into physical bounds.
+    pub fn retain_host_preparation(
+        &self,
+        authority: &eredu_core::HostPreparationAuthority,
+    ) -> Result<(), CaptureError> {
+        let host = self.ordinary_error_custody.clone();
+        let result = self.retain_host_preparation_unretained(authority);
+        ordinary_error::retain_result(host, result)
+    }
+
+    fn retain_host_preparation_unretained(
+        &self,
+        authority: &eredu_core::HostPreparationAuthority,
+    ) -> Result<(), CaptureError> {
+        self.owner.retain(authority)
+    }
+
+    #[cfg(test)]
+    pub(in crate::capture) fn copied_plan_for_test(&self) -> &AdmittedCapturePlan {
+        &self.plan
+    }
+
+    /// Authenticate a pending-prefill restoration or a child actually produced
+    /// from this exact immutable checkpoint, including its saved frontier/usage.
+    /// The identity token contains no predecessor payload, allowance or backedge.
+    pub fn validate_pending_capture_destination(
+        &self,
+        destination: &CaptureSession,
+    ) -> Result<(), CaptureError> {
+        let host = self.ordinary_error_custody.clone();
+        let result = self.validate_pending_capture_destination_unretained(destination);
+        ordinary_error::retain_result(host, result)
+    }
+
+    fn validate_pending_capture_destination_unretained(
+        &self,
+        destination: &CaptureSession,
+    ) -> Result<(), CaptureError> {
+        if self.has_step || self.prediction != 0 || self.ordinary_identity.is_none() {
+            return Err(CaptureError::Invalid(
+                "saved checkpoint has no pending ordinary capture prompt".into(),
+            ));
+        }
+        if Arc::ptr_eq(&self.owner, &destination.owner) {
+            return destination.validate_restore(self);
+        }
+        if destination.ordinary_prefill.is_none()
+            || destination.prediction != self.prediction
+            || destination.phase != self.phase
+            || destination.has_step != self.has_step
+            || destination.ledger.total() != self.usage
+            || !self
+                .ordinary_identity
+                .as_ref()
+                .zip(destination.ordinary_prefill_parent.as_ref())
+                .is_some_and(|(saved, actual)| Arc::ptr_eq(saved, actual))
+        {
+            return Err(CaptureError::Invalid(
+                "pending capture destination is not this saved checkpoint's child".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Actual saved ordinary source binding; no copied-plan equality substitutes
+    /// for its physical identity when an independently copied prompt is rebound.
+    pub fn ordinary_prefill_source_binding(&self) -> Option<&OrdinaryPrefillCapture> {
+        self.ordinary_prefill.as_ref()
+    }
+    /// Existing shared source retained separately from the copied checkpoint
+    /// plan. It covers neither this copied destination nor child re-admission.
+    pub fn shared_plan_source(&self) -> Option<&SharedCapturePlan> {
+        self.shared_source.as_ref()
+    }
+
+    /// Logical storage of this immutable copied admission/schedule checkpoint.
+    /// Includes this owner's inline shared-source handle, but not the existing
+    /// source payload referenced by that handle; its capacity/charge is separate.
     pub fn logical_storage_bytes(&self) -> Option<u64> {
         checkpoint_storage_bytes(
             &self.plan,
@@ -203,7 +340,12 @@ impl CaptureCheckpoint {
             self.partition
                 .as_ref()
                 .map_or(Some(0), |identity| identity.heap_bytes())?,
-        )
+        )?
+        .checked_add(if self.ordinary_prefill.is_some() {
+            2 * std::mem::size_of::<std::sync::atomic::AtomicUsize>() as u64
+        } else {
+            0
+        })
     }
 
     /// Conservative logical host storage for shared child re-admission, measured
@@ -213,6 +355,11 @@ impl CaptureCheckpoint {
         let mut bytes = self
             .logical_storage_bytes()?
             .checked_add(u64::try_from(std::mem::size_of::<CaptureSession>()).ok()?)?;
+        if self.ordinary_prefill.is_some() {
+            bytes = bytes
+                .checked_add(SharedCapturePlan::new_owner_control_bytes()?)?
+                .checked_add(SharedCapturePlan::ordinary_host_control_bytes()?)?;
+        }
         for selection in &self.plan.plan().selections {
             let point = request
                 .discovery
@@ -286,11 +433,26 @@ impl CaptureCheckpoint {
             &ResolvedCaptureSlice,
         ) -> Result<CaptureUsage, CaptureError>,
     ) -> Result<CaptureSession, CaptureError> {
+        let host = self.ordinary_error_custody.clone();
+        let result = self.fork_unretained(request, estimate);
+        ordinary_error::retain_result(host, result)
+    }
+
+    fn fork_unretained(
+        &self,
+        request: CaptureForkRequest<'_>,
+        estimate: impl FnMut(
+            &[u64],
+            &CaptureSelection,
+            &ResolvedCaptureSlice,
+        ) -> Result<CaptureUsage, CaptureError>,
+    ) -> Result<CaptureSession, CaptureError> {
         if request.discovery.artifact_identity != self.artifact_identity {
             return Err(CaptureError::Invalid(
                 "child prepared source differs from checkpoint".into(),
             ));
         }
+        let source_authority = self.owner.retained()?;
         let mut geometry = self.plan.request();
         geometry.max_predictions = request.max_predictions;
         let mut plan = self.plan.plan().clone();
@@ -305,11 +467,12 @@ impl CaptureCheckpoint {
                     bounds,
                 )?
             }
-            None => plan.admit(
+            None => plan.admit_with_text_origin(
                 &request.discovery.catalog,
                 &request.discovery.support,
                 &request.discovery.support.capture,
                 geometry,
+                self.plan.text_origin().expect("ordinary capture origin"),
             )?,
         };
         super::validate_continuation(
@@ -358,13 +521,24 @@ impl CaptureCheckpoint {
             None if self.intervention.is_some() => {
                 return Err(CaptureError::Invalid(
                     "inherited interventions require child discovery and re-admission".into(),
-                ))
+                ));
             }
             None => None,
         };
         // Installation stays with the same shared owner. A fully empty child still
         // carries its inherited ledger, so removing controls cannot erase usage.
-        let mut child = CaptureSession::new(plan);
+        let mut child = if let Some(binding) = &self.ordinary_prefill {
+            CaptureSession::with_ordinary_prefill(
+                binding.rebind(SharedCapturePlan::new(plan))?,
+                &source_authority,
+            )?
+        } else {
+            CaptureSession::new(plan)
+        };
+        child.ordinary_prefill_parent = self.ordinary_identity.clone();
+        if self.ordinary_prefill.is_none() {
+            child.retain_host_preparation(&source_authority)?;
+        }
         if let Some(identity) = &self.partition {
             child.configure_partition_capture(identity.clone())?;
         }

@@ -101,8 +101,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 cache: Some(state.layer(state_ordinal).map_err(Error::backend)?),
                 allow_sliding_prefill: true,
                 rotary_position: Some(RotaryPosition::Embeddings {
-                    cosine: &forward.rotary.0,
-                    sine: &forward.rotary.1,
+                    cosine: &forward.rotary()?.0,
+                    sine: &forward.rotary()?.1,
                 }),
             },
             pass,
@@ -170,8 +170,8 @@ impl<B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeur
                 cache: Some(state.layer(state_ordinal).map_err(Error::backend)?),
                 allow_sliding_prefill: true,
                 rotary_position: Some(RotaryPosition::Embeddings {
-                    cosine: &forward.rotary.0,
-                    sine: &forward.rotary.1,
+                    cosine: &forward.rotary()?.0,
+                    sine: &forward.rotary()?.1,
                 }),
             },
             pass,

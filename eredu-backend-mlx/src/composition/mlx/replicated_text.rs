@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use eredu_checkpoint::{store::CheckpointSource, LinearFormat, SourceTensorEncoding, StoredDtype};
+use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype, store::CheckpointSource};
 use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
 };
@@ -23,8 +23,8 @@ use eredu_runtime::{
     WeightLoweringDescriptor, WeightResidencyMechanism,
 };
 use safemlx::{
-    error::Exception, ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Dtype,
-    Stream,
+    Array, Dtype, Stream, error::Exception, ops::indexing::TryIndexOp,
+    transforms::async_eval_with_event,
 };
 
 #[cfg(test)]
@@ -33,6 +33,7 @@ use eredu_runtime::PagedCacheOptions;
 use eredu_runtime::{StateComponentMechanism, StateMechanismCapabilities, WeightLoweringKind};
 
 use crate::{
+    MlxTensor,
     backend::{
         error::Error,
         nn::shared::MlxNeuralBackend,
@@ -40,7 +41,7 @@ use crate::{
         runtime::{
             cache::{
                 residency::{
-                    load_prompt_cache_state_tensors, open_prompt_cache, CacheResidencyManager,
+                    CacheResidencyManager, load_prompt_cache_state_tensors, open_prompt_cache,
                 },
                 state::{
                     MlxHybridState, MlxKeyValueState, MlxPoolingAttentionCache,
@@ -55,21 +56,19 @@ use crate::{
         },
     },
     native_quantization::NativeQuantizationFormat,
-    MlxTensor,
 };
 
-use crate::backend::runtime::execution::{
-    generic::prepare_layerwise_policy_with_supplementary_bindings,
-    layerwise::{quantize_exact_replicated_text_tasks, shard_addressable_member_bindings},
+use crate::backend::runtime::execution::layerwise::{
+    quantize_exact_replicated_text_tasks, shard_addressable_member_bindings,
 };
 use crate::backend::{
     nn::shared::neutral_parameter_refs,
     runtime::checkpoint::binding::build_mlx_exact_replicated_text_bindings,
 };
 
+use super::MlxModelInput;
 #[cfg(test)]
 use super::loading;
-use super::MlxModelInput;
 use crate::composition::mlx::{distributed, prepared_speculative};
 use eredu_architectures::composite_execution::{
     CompositeArchitecture, ExternalPredictionCaptureRequest, ExternalPredictionTargetCapture,
@@ -94,7 +93,13 @@ use partitioned::*;
 pub(super) use prediction::*;
 pub(super) use session::binding::*;
 use session::*;
+pub(crate) use state::PreparedDenseControlBindingError;
 pub(super) use state::*;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub(crate) use session::{
+    NativeOpeningRows, NativeOpeningRowsOwner, NativeOpeningRowsPlan, RetiredOpeningRow,
+    SealedOpeningRows,
+};

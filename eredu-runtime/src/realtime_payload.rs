@@ -1,11 +1,12 @@
 //! Backend-neutral payload retention for delayed realtime coordinates.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
 };
 
 use eredu_core::{RealtimeFrameSlot, RealtimeSlotCoordinate, RealtimeSpeechConfig};
+use eredu_core::realtime::RealtimeSlotTable;
+use eredu_core::{HostMetadataFunding,HostMetadataFundingError};
 
 use crate::generation::TokenDomain;
 
@@ -130,6 +131,11 @@ impl RealtimePayloadContract {
         }
     }
 
+    /// Exact owned schedule and contract shells used by the paid clone worker.
+    pub fn host_clone_bytes(&self)->Option<usize> {
+        self.schedule.host_clone_bytes()?.checked_add(std::mem::size_of::<Self>()
+            +std::mem::size_of::<Result<Self,HostMetadataFundingError>>())
+    }
     /// Validates another contract against every exact semantic identity field.
     pub fn validate(&self, contract: &Self) -> Result<(), RealtimePayloadContractError> {
         if self.schedule != contract.schedule {
@@ -273,14 +279,109 @@ pub enum RealtimePayloadContractError {
 }
 
 /// Payloads retained at exact text/audio coordinates for one speech schedule.
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct RealtimePayloadHistory<P> {
     schedule: RealtimeSpeechConfig,
     contract: Option<RealtimePayloadContract>,
-    payloads: BTreeMap<RealtimeSlotCoordinate, RealtimePayloadEnvelope<P>>,
+    payloads: RealtimeSlotTable<RealtimePayloadEnvelope<P>>,
+    // Retained after directory, envelope, and schedule storage.
+    host_funding: Option<HostMetadataFunding>,
+}
+impl<P:PartialEq> PartialEq for RealtimePayloadHistory<P> {
+    fn eq(&self,other:&Self)->bool {
+        self.schedule==other.schedule && self.contract==other.contract && self.payloads==other.payloads
+    }
+}
+impl<P:Eq> Eq for RealtimePayloadHistory<P> {}
+impl<P:Clone> Clone for RealtimePayloadHistory<P> {
+    fn clone(&self)->Self { self.try_clone().expect("funded history clone requires admitted host capacity") }
+}
+impl<P:Clone> RealtimePayloadHistory<P> {
+    /// Fallible counterpart used by every managed transaction/interpreter.
+    pub fn try_clone(&self)->Result<Self,HostMetadataFundingError> {
+        match &self.host_funding {
+            Some(funding)=>self.try_map_with(funding,&mut (clone_payload::<P> as fn(&P)->Result<P,HostMetadataFundingError>)),
+            None=>Ok(Self{schedule:self.schedule.clone(),contract:self.contract.clone(),
+                payloads:self.payloads.clone(),host_funding:None}),
+        }
+    }
 }
 
 impl<P> RealtimePayloadHistory<P> {
+    /// Account retained with the exact history and its transaction-local host work.
+    pub fn host_funding(&self)->Option<&HostMetadataFunding> {self.host_funding.as_ref()}
+
+    /// Exact history directory, schedule, and envelope-contract copies, using
+    /// the actual destination/error/mapper types. Payload copies remain a
+    /// separately supplied source and are not inferred from equal geometry.
+    pub fn map_host_bytes<'a,Q,E,F>(&'a self,_project:&F)->Option<usize>
+    where E:From<HostMetadataFundingError>,F:FnMut(&'a P)->Result<Q,E> {
+        let mapper=history_envelope_mapper::<P,Q,E,F>(None,None);
+        let mut bytes=Self::map_shell_bytes::<Q,E,F>()?.checked_add(self.schedule.host_clone_bytes()?)?
+            .checked_add(match self.contract.as_ref(){Some(value)=>value.host_clone_bytes()?,None=>0})?
+            .checked_add(self.payloads.map_control_bytes::<RealtimePayloadEnvelope<Q>,E,_>(0,&mapper)?)?;
+        for envelope in self.payloads.values(){bytes=bytes.checked_add(envelope.contract.host_clone_bytes()?)?;}
+        Some(bytes)
+    }
+    fn map_shell_bytes<Q,E,F>()->Option<usize> {
+        use std::mem::{size_of,size_of_val};
+        let frames=[size_of::<Self>(),size_of::<RealtimePayloadHistory<Q>>(),
+            size_of::<Result<RealtimePayloadHistory<Q>,E>>(),size_of::<&mut F>(),
+            size_of::<Option<RealtimePayloadContract>>(),size_of::<Option<HostMetadataFunding>>()];
+        frames.into_iter().try_fold(size_of_val(&frames),usize::checked_add)
+    }
+    /// Projects each retained payload using its actual coordinates, contract,
+    /// token domain and owner/history provenance. The supplied account pays the
+    /// real host destination before any callback can construct a payload.
+    pub fn try_map_with<'a,Q,E,F>(&'a self,funding:&HostMetadataFunding,project:&mut F)
+        ->Result<RealtimePayloadHistory<Q>,E>
+    where E:From<HostMetadataFundingError>,F:FnMut(&'a P)->Result<Q,E> {
+        funding.reserve_metadata(Self::map_shell_bytes::<Q,E,F>().ok_or(HostMetadataFundingError::Overflow)?)?;
+        let schedule=clone_schedule_source(&self.schedule,funding)?;
+        let contract=self.contract.as_ref().map(|value|clone_contract_source(value,funding)).transpose()?;
+        let payloads=self.payloads.try_map_with(0,funding,history_envelope_mapper::<P,Q,E,F>(Some(project),Some(funding)))?;
+        Ok(RealtimePayloadHistory{schedule,contract,payloads,host_funding:Some(funding.clone())})
+    }
+
+    fn cloned_contract(&self)->Result<RealtimePayloadContract,RealtimePayloadHistoryError> {
+        let contract=self.contract.as_ref().ok_or(RealtimePayloadHistoryError::UnboundContract)?;
+        Ok(match &self.host_funding {
+            Some(funding)=>clone_contract_source(contract,funding)?,
+            None=>contract.clone(),
+        })
+    }
+    fn source_vec<T>(&self,capacity:usize)->Result<Vec<T>,HostMetadataFundingError> {
+        if let Some(funding)=&self.host_funding {
+            let bytes=source_vec_bytes::<T>(capacity).ok_or(HostMetadataFundingError::Overflow)?;
+            funding.reserve_metadata(bytes)?;
+        }
+        let mut output=Vec::new();
+        output.try_reserve_exact(capacity).map_err(|_|HostMetadataFundingError::Unavailable)?;
+        Ok(output)
+    }
+    fn collect_source_values<T>(&self,values:impl IntoIterator<Item=T>)
+        ->Result<Vec<T>,HostMetadataFundingError> {
+        let values=values.into_iter();
+        if self.host_funding.is_none() {return Ok(values.collect());}
+        let maximum=values.size_hint().1.ok_or(HostMetadataFundingError::Unavailable)?;
+        let mut output=self.source_vec(maximum)?;
+        for value in values {
+            if output.len()==maximum {return Err(HostMetadataFundingError::Unavailable);}
+            output.push(value);
+        }
+        Ok(output)
+    }
+    fn extend_source_envelopes(&mut self,values:Vec<(RealtimeSlotCoordinate,RealtimePayloadEnvelope<P>)>)
+        ->Result<(),HostMetadataFundingError> {
+        if let Some(funding)=&self.host_funding {
+            self.payloads.reserve_prepared(values.len(),funding)?;
+            for (coordinate,envelope) in values {
+                self.payloads.insert_prepared(coordinate,envelope).map_err(|(cause,_)|cause)?;
+            }
+        } else {self.payloads.extend(values);}
+        Ok(())
+    }
+
     /// Creates an empty pre-first-frame history bound only to one exact schedule.
     ///
     /// A payload contract must be bound before any coordinate payload can be
@@ -290,7 +391,8 @@ impl<P> RealtimePayloadHistory<P> {
         Self {
             schedule,
             contract: None,
-            payloads: BTreeMap::new(),
+            payloads: RealtimeSlotTable::new(),
+            host_funding: None,
         }
     }
 
@@ -299,7 +401,8 @@ impl<P> RealtimePayloadHistory<P> {
         Self {
             schedule: contract.schedule().clone(),
             contract: Some(contract),
-            payloads: BTreeMap::new(),
+            payloads: RealtimeSlotTable::new(),
+            host_funding: None,
         }
     }
 
@@ -320,20 +423,29 @@ impl<P> RealtimePayloadHistory<P> {
         &mut self,
         contract: &RealtimePayloadContract,
     ) -> Result<(), RealtimePayloadHistoryError> {
+        self.validate_contract(contract)?;
+        if self.contract.is_none() {
+            debug_assert!(self.payloads.is_empty());
+            self.contract = Some(match &self.host_funding {
+                Some(funding)=>clone_contract_source(contract,funding)?,
+                None=>contract.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validates a prospective contract without cloning or binding its storage.
+    /// Frame admission may use this before any native input construction.
+    pub fn validate_contract(&self, contract:&RealtimePayloadContract)
+        ->Result<(),RealtimePayloadHistoryError> {
         if &self.schedule != contract.schedule() {
             return Err(RealtimePayloadHistoryError::PayloadContract(
-                RealtimePayloadContractError::ScheduleMismatch,
-            ));
+                RealtimePayloadContractError::ScheduleMismatch));
         }
-        if let Some(current) = &self.contract {
-            current
-                .validate(contract)
-                .map_err(RealtimePayloadHistoryError::PayloadContract)
-        } else {
-            debug_assert!(self.payloads.is_empty());
-            self.contract = Some(contract.clone());
-            Ok(())
+        if let Some(current)=&self.contract {
+            current.validate(contract).map_err(RealtimePayloadHistoryError::PayloadContract)?;
         }
+        Ok(())
     }
 
     /// Validates whether a branch history may replace this canonical history.
@@ -424,30 +536,27 @@ impl<P> RealtimePayloadHistory<P> {
         payloads: impl IntoIterator<Item = (RealtimeSlotCoordinate, P)>,
     ) -> Result<(), RealtimePayloadHistoryError> {
         self.validate_schedule(schedule)?;
-        let contract = self
-            .contract
-            .as_ref()
-            .ok_or(RealtimePayloadHistoryError::UnboundContract)?
-            .clone();
-        let payloads = payloads.into_iter().collect::<Vec<_>>();
-        let mut pending = BTreeSet::new();
-        for (coordinate, _) in &payloads {
+        let contract=self.cloned_contract()?;
+        let payloads=self.collect_source_values(payloads)?;
+        for (index, (coordinate, _)) in payloads.iter().enumerate() {
             self.validate_coordinate(*coordinate)?;
-            if self.payloads.contains_key(coordinate) || !pending.insert(*coordinate) {
+            if self.payloads.contains_key(coordinate) || payloads[..index].iter().any(|(prior,_)|prior==coordinate) {
                 return Err(RealtimePayloadHistoryError::DuplicatePayload {
                     coordinate: *coordinate,
                 });
             }
         }
-        let envelopes = payloads
-            .into_iter()
-            .map(|(coordinate, payload)| {
-                RealtimePayloadEnvelope::new(contract.clone(), coordinate, payload)
-                    .map(|envelope| (coordinate, envelope))
-                    .map_err(RealtimePayloadHistoryError::PayloadContract)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.payloads.extend(envelopes);
+        let mut envelopes=self.source_vec(payloads.len())?;
+        for (coordinate,payload) in payloads {
+            let copied=match &self.host_funding {
+                Some(funding)=>clone_contract_source(&contract,funding)?,
+                None=>contract.clone(),
+            };
+            let envelope=RealtimePayloadEnvelope::new(copied,coordinate,payload)
+                .map_err(RealtimePayloadHistoryError::PayloadContract)?;
+            envelopes.push((coordinate,envelope));
+        }
+        self.extend_source_envelopes(envelopes)?;
         Ok(())
     }
 
@@ -462,24 +571,22 @@ impl<P> RealtimePayloadHistory<P> {
         payloads: impl IntoIterator<Item = (RealtimeSlotCoordinate, P)>,
     ) -> Result<(), RealtimePayloadHistoryError> {
         self.validate_schedule(schedule)?;
-        let contract = self
-            .contract
-            .as_ref()
-            .ok_or(RealtimePayloadHistoryError::UnboundContract)?
-            .clone();
-        let payloads = payloads.into_iter().collect::<Vec<_>>();
+        let contract=self.cloned_contract()?;
+        let payloads=self.collect_source_values(payloads)?;
         for (coordinate, _) in &payloads {
             self.validate_coordinate(*coordinate)?;
         }
-        let envelopes = payloads
-            .into_iter()
-            .map(|(coordinate, payload)| {
-                RealtimePayloadEnvelope::new(contract.clone(), coordinate, payload)
-                    .map(|envelope| (coordinate, envelope))
-                    .map_err(RealtimePayloadHistoryError::PayloadContract)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        self.payloads.extend(envelopes);
+        let mut envelopes=self.source_vec(payloads.len())?;
+        for (coordinate,payload) in payloads {
+            let copied=match &self.host_funding {
+                Some(funding)=>clone_contract_source(&contract,funding)?,
+                None=>contract.clone(),
+            };
+            let envelope=RealtimePayloadEnvelope::new(copied,coordinate,payload)
+                .map_err(RealtimePayloadHistoryError::PayloadContract)?;
+            envelopes.push((coordinate,envelope));
+        }
+        self.extend_source_envelopes(envelopes)?;
         Ok(())
     }
 
@@ -525,10 +632,10 @@ impl<P> RealtimePayloadHistory<P> {
         coordinates: impl IntoIterator<Item = RealtimeSlotCoordinate>,
     ) -> Result<Vec<&P>, RealtimePayloadHistoryError> {
         self.validate_schedule(schedule)?;
-        coordinates
-            .into_iter()
-            .map(|coordinate| self.required(schedule, coordinate))
-            .collect()
+        let coordinates=self.collect_source_values(coordinates)?;
+        let mut output=self.source_vec(coordinates.len())?;
+        for coordinate in coordinates { output.push(self.required(schedule,coordinate)?); }
+        Ok(output)
     }
 
     /// Prunes coordinates older than the deterministic delayed-history window.
@@ -603,6 +710,9 @@ impl<P> RealtimePayloadHistory<P> {
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimePayloadHistoryError {
+    /// Actual admitted host constructor refused before mutation.
+    #[error(transparent)]
+    HostMetadata(#[from] HostMetadataFundingError),
     /// Coordinate payload operations require a complete exact contract.
     #[error("realtime payload history has no bound payload contract")]
     UnboundContract,
@@ -706,6 +816,48 @@ mod tests {
 
     fn payload_history<P>() -> RealtimePayloadHistory<P> {
         RealtimePayloadHistory::with_contract(exact_payload_contract())
+    }
+
+    #[test]
+    fn paid_history_projection_preserves_provenance_and_refuses_before_payload_work() {
+        use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+        #[derive(Debug)]
+        struct Account {spent:Arc<AtomicUsize>,limit:Arc<AtomicUsize>}
+        impl eredu_core::HostMetadataAccount for Account {
+            fn reserve_metadata(&self,bytes:usize)->Result<(),HostMetadataFundingError> {
+                let limit=self.limit.load(Ordering::SeqCst);
+                self.spent.fetch_update(Ordering::SeqCst,Ordering::SeqCst,|n|
+                    n.checked_add(bytes).filter(|next|*next<=limit))
+                    .map(|_|()).map_err(|spent|HostMetadataFundingError::Capacity {
+                        required:bytes as u64,available:limit.saturating_sub(spent) as u64})
+            }
+        }
+        let spent=Arc::new(AtomicUsize::new(0));
+        let limit=Arc::new(AtomicUsize::new(usize::MAX));
+        let funding=HostMetadataFunding::new(Account{spent:spent.clone(),limit:limit.clone()}).unwrap();
+        let mut history=payload_history::<usize>();
+        let key=coordinate(3,RealtimeFrameSlot::Text);
+        history.insert(&schedule(),key,7).unwrap();
+        let mut projected=history.try_map_with(&funding,&mut |value|Ok::<_,HostMetadataFundingError>(value*3)).unwrap();
+        assert_eq!(*projected.required(&schedule(),key).unwrap(),21);
+        assert_eq!(projected.envelope(&schedule(),key).unwrap().unwrap().contract(),
+            history.envelope(&schedule(),key).unwrap().unwrap().contract());
+        projected.overwrite_many(&schedule(),[(key,29)]).unwrap();
+        assert_eq!(*projected.required(&schedule(),key).unwrap(),29);
+        assert_eq!(*history.required(&schedule(),key).unwrap(),7);
+        let total=spent.load(Ordering::SeqCst);
+        limit.store(total,Ordering::SeqCst);
+        let calls=std::cell::Cell::new(0);
+        let refused=projected.try_map_with(&funding,&mut |value| {
+            calls.set(calls.get()+1);Ok::<_,HostMetadataFundingError>(*value)
+        });
+        assert!(matches!(refused,Err(HostMetadataFundingError::Capacity{..})));
+        assert_eq!(calls.get(),0);
+        assert!(matches!(projected.overwrite_many(&schedule(),[(key,31)]),
+            Err(RealtimePayloadHistoryError::HostMetadata(HostMetadataFundingError::Capacity{..}))));
+        assert_eq!(*projected.required(&schedule(),key).unwrap(),29);
+        drop(projected);
+        assert_eq!(spent.load(Ordering::SeqCst),total);
     }
 
     #[test]
@@ -1150,4 +1302,94 @@ mod tests {
             vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)]
         );
     }
+}
+
+fn clone_schedule_source(value:&RealtimeSpeechConfig,funding:&HostMetadataFunding)
+    ->Result<RealtimeSpeechConfig,HostMetadataFundingError> {
+    value.try_clone_with_host_source(funding)
+}
+fn clone_contract_source(value:&RealtimePayloadContract,funding:&HostMetadataFunding)
+    ->Result<RealtimePayloadContract,HostMetadataFundingError> {
+    let schedule=clone_schedule_source(&value.schedule,funding)?;
+    funding.reserve_metadata(std::mem::size_of::<RealtimePayloadContract>()
+        +std::mem::size_of::<Result<RealtimePayloadContract,HostMetadataFundingError>>())?;
+    Ok(RealtimePayloadContract{schedule,batch:value.batch,text_domain:value.text_domain,
+        audio_domain:value.audio_domain,generation:value.generation,owner:value.owner})
+}
+
+fn history_envelope_mapper<'source:'callback,'callback,P:'source,Q,E,F>(mut project:Option<&'callback mut F>,
+    funding:Option<&'callback HostMetadataFunding>)
+    ->impl FnMut(&'source RealtimePayloadEnvelope<P>)->Result<RealtimePayloadEnvelope<Q>,E>+'callback
+where E:From<HostMetadataFundingError>,F:FnMut(&'source P)->Result<Q,E> {
+    move |envelope| {
+        let funding=funding.ok_or(HostMetadataFundingError::Unavailable)?;
+        let contract=clone_contract_source(&envelope.contract,funding)?;
+        let payload=project.as_mut().ok_or(HostMetadataFundingError::Unavailable)?(&envelope.payload)?;
+        Ok(RealtimePayloadEnvelope{contract,coordinate:envelope.coordinate,domain:envelope.domain,payload})
+    }
+}
+
+fn clone_payload<P:Clone>(value:&P)->Result<P,HostMetadataFundingError> {Ok(value.clone())}
+pub(crate) fn source_vec_bytes<T>(capacity:usize)->Option<usize> {
+    std::alloc::Layout::array::<T>(capacity).ok()?.size()
+        .checked_add(std::mem::size_of::<Vec<T>>())?
+        .checked_add(std::mem::size_of::<Result<Vec<T>,HostMetadataFundingError>>())
+}
+/// Pure directory/contract facts; native payload widths are supplied by the consumer.
+#[derive(Clone,Copy,Debug)]
+pub(crate) struct HistoryHostSource {
+    pub(crate) rows:usize, schedule:usize, contract:usize, bound:bool,
+}
+impl<P> RealtimePayloadHistory<P> {
+    pub(crate) fn coordinator_host_source(&self,contract:&RealtimePayloadContract)
+        ->Result<HistoryHostSource,RealtimePayloadHistoryError> {
+        self.validate_contract(contract)?;
+        let schedule=self.schedule.host_clone_bytes().ok_or(HostMetadataFundingError::Overflow)?;
+        let bytes=contract.host_clone_bytes().ok_or(HostMetadataFundingError::Overflow)?;
+        for envelope in self.payloads.values() {envelope.contract.validate(contract)
+            .map_err(RealtimePayloadHistoryError::PayloadContract)?;}
+        Ok(HistoryHostSource{rows:self.len(),schedule,contract:bytes,bound:self.contract.is_some()})
+    }
+}
+impl HistoryHostSource {
+    pub(crate) fn bound(mut self)->Self {self.bound=true;self}
+    pub(crate) fn with_rows(mut self,rows:usize)->Self {self.rows=rows;self}
+    pub(crate) fn bind_bytes(&self)->usize {if self.bound {0}else{self.contract}}
+    pub(crate) fn clone_bytes<P:Clone>(&self)->Option<usize> {
+        mapped_history_bytes(self,&funded_payload_mapper::<P>(None,None))
+    }
+    pub(crate) fn overwrite_bytes<P>(&self,incoming:usize)->Option<usize> {
+        if !self.bound {return None;}
+        self.contract.checked_mul(incoming.checked_add(1)?)?
+            .checked_add(source_vec_bytes::<(RealtimeSlotCoordinate,P)>(incoming)?)?
+            .checked_add(source_vec_bytes::<(RealtimeSlotCoordinate,RealtimePayloadEnvelope<P>)>(incoming)?)?
+            .checked_add(RealtimeSlotTable::<RealtimePayloadEnvelope<P>>::construction_bytes(self.rows.checked_add(incoming)?)?)
+    }
+}
+
+fn funded_payload_mapper<'a,P:'a>(mut clone:Option<&'a mut dyn FnMut(&P,&HostMetadataFunding)
+    ->Result<P,eredu_core::BackendFailure>>,funding:Option<&'a HostMetadataFunding>)
+    ->impl FnMut(&P)->Result<P,eredu_core::BackendFailure>+'a {
+    move |value| clone.as_mut().ok_or(HostMetadataFundingError::Unavailable)?(
+        value,funding.ok_or(HostMetadataFundingError::Unavailable)?)
+}
+impl<P:Clone> RealtimePayloadHistory<P> {
+    pub(crate) fn clone_with_payload_source(&self,clone:&mut dyn FnMut(&P,&HostMetadataFunding)
+        ->Result<P,eredu_core::BackendFailure>)->Result<Self,eredu_core::BackendFailure> {
+        match self.host_funding.as_ref() {
+            Some(funding)=>self.try_map_with(funding,&mut funded_payload_mapper(Some(clone),Some(funding))),
+            None=>self.try_clone().map_err(Into::into),
+        }
+    }
+}
+fn mapped_history_bytes<P,F>(source:&HistoryHostSource,project:&F)->Option<usize>
+where F:FnMut(&P)->Result<P,eredu_core::BackendFailure> {
+    let _=project;
+    let mapper=history_envelope_mapper::<P,P,eredu_core::BackendFailure,F>(None,None);
+    RealtimePayloadHistory::<P>::map_shell_bytes::<P,eredu_core::BackendFailure,F>()?
+        .checked_add(source.schedule)?
+        .checked_add(if source.bound {source.contract}else{0})?
+        .checked_add(RealtimeSlotTable::<RealtimePayloadEnvelope<P>>::map_capacity_control_bytes::<
+            RealtimePayloadEnvelope<P>,eredu_core::BackendFailure,_>(source.rows,&mapper)?)?
+        .checked_add(source.rows.checked_mul(source.contract)?)
 }

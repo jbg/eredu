@@ -1,0 +1,142 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -45,6 +45,7 @@
+   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device_info.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/arg_reduce.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/greedy_storage.cpp
++  ${CMAKE_CURRENT_SOURCE_DIR}/reshape_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/binary_storage.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/slice_storage.cpp
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -16,6 +16,7 @@
+ #include "mlx/backend/cpu/slice_storage.h"
+ #include "mlx/backend/cpu/softmax_storage.h"
+ #include "mlx/backend/cpu/greedy_storage.h"
++#include "mlx/backend/cpu/reshape_storage.h"
+ 
+ namespace mlx::core::cpu {
+ 
+@@ -45,7 +46,8 @@
+   const bool fixed_slice = fixed && cpu::is_slice_eval_primitive(arr);
+   const bool fixed_softmax = fixed && cpu::is_softmax_eval_primitive(arr);
+   const bool fixed_greedy = fixed && cpu::is_greedy_eval_primitive(arr);
+-  const bool extended = fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool fixed_reshape = fixed && cpu::is_reshape_alias_eval_primitive(arr);
++  const bool extended = fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -53,7 +55,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_greedy
++    const auto failure = fixed_reshape
++        ? submission::GraphConstruction::create_cpu_reshape_alias_eval(*extended_prologue, extended_bank.value)
++        : fixed_greedy
+         ? submission::GraphConstruction::create_cpu_greedy_eval(*extended_prologue, extended_bank.value)
+         : fixed_softmax
+         ? submission::GraphConstruction::create_cpu_softmax_eval(*extended_prologue, extended_bank.value)
+diff --git a/mlx/backend/cpu/reshape_storage.cpp b/mlx/backend/cpu/reshape_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/reshape_storage.cpp
+@@ -0,0 +1,60 @@
++#include "mlx/backend/cpu/reshape_storage.h"
++#include "mlx/primitives.h"
++#include "mlx/submission.h"
++#include <typeinfo>
++namespace mlx::core::cpu {
++namespace {
++bool product(size_t a,size_t b,size_t& out) noexcept {
++  if(b&&a>size_t(PTRDIFF_MAX)/b)return false;out=a*b;return true;
++}
++}
++bool is_reshape_alias_eval_primitive(const array& out) noexcept {
++  return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
++      typeid(out.primitive())==typeid(Reshape);
++}
++bool reshape_alias_eval_layout(size_t rank,size_t output_rank,bool tracer,CopyEvalStorage& out) noexcept {
++  if(rank>4||output_rank>4)return false;
++  CopyEvalStorage value;
++  // Actual prepare_reshape takes the row-contiguous branch, copies at most
++  // four inline strides and delegates the same shared_buffer_reshape worker.
++  // No Data, output backing, copy task or collapse scratch is produced.
++  if(!copy_eval_layout(0,1,false,tracer,value))return false;
++  value.rank=rank;
++  const size_t controls=sizeof(value)+sizeof(rank)+sizeof(output_rank)+sizeof(tracer)+sizeof(out)+
++      sizeof(std::pair<bool,Strides>)+sizeof(Strides)*2+sizeof(array::Flags)+sizeof(Dtype)*2+
++      sizeof(const Shape*)+sizeof(const array*)*5+sizeof(const Reshape*)+sizeof(size_t)*8+
++      sizeof(int)*2+sizeof(bool)*3+sizeof(Shape::const_iterator)+
++      sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
++      sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
++  if(controls>SIZE_MAX-value.named_control_bytes)return false;
++  value.named_control_bytes+=controls;out=value;return true;
++}
++bool reshape_alias_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(!is_reshape_alias_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
++  const auto& input=output.inputs()[0];const auto& shape=static_cast<const Reshape&>(output.primitive()).shape_ref();
++  const size_t rank=input.ndim(),output_rank=output.ndim();
++  if(rank>4||output_rank>4||shape.size()!=output_rank||!input.flags().row_contiguous||
++      input.size()==0||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
++      !((input.dtype()==float32&&input.itemsize()==sizeof(float))||
++        (input.dtype()==uint32&&input.itemsize()==sizeof(uint32_t))))return false;
++  size_t input_elements=1,output_elements=1,bytes=0;
++  for(size_t i=0;i!=rank;++i)
++    if(input.shape(i)<=0||!product(input_elements,size_t(input.shape(i)),input_elements))return false;
++  for(size_t i=0;i!=output_rank;++i)
++    if(shape[i]<=0||shape[i]!=output.shape(i)||!product(output_elements,size_t(shape[i]),output_elements))return false;
++  if(input_elements!=input.size()||output_elements!=output.size()||input_elements!=output_elements||
++      !product(input_elements,size_t(input.itemsize()),bytes))return false;
++  return reshape_alias_eval_layout(rank,output_rank,output.is_tracer(),out);
++}
++}
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_reshape_alias_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record=guard.record();auto* graph=record.graph_quota();auto context=current_graph_construction_context();
++  if(out||!graph||!guard.cpu()||!context.scope||context.worker||context.dispatch!=&record||current_graph_quota()!=graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if(!cpu::reshape_alias_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
++}
++}
+diff --git a/mlx/backend/cpu/reshape_storage.h b/mlx/backend/cpu/reshape_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/reshape_storage.h
+@@ -0,0 +1,7 @@
++#pragma once
++#include "mlx/backend/cpu/copy_storage.h"
++namespace mlx::core::cpu {
++MLX_API bool reshape_alias_eval_layout(size_t rank,size_t output_rank,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool is_reshape_alias_eval_primitive(const array&) noexcept;
++MLX_API bool reshape_alias_eval_storage(const array&,CopyEvalStorage&) noexcept;
++}
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -165,6 +165,7 @@
+   static GraphFailure create_cpu_argpartition(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_greedy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_reshape_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_softmax_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_slice_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_copy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -1840,6 +1840,7 @@
+   DEFINE_GRADS()
+   DEFINE_NAME(Reshape)
+   bool is_equivalent(const Primitive& other) const override;
++  const Shape& shape_ref() const noexcept { return shape_; }
+   Shape state() const {
+     return shape_;
+   };

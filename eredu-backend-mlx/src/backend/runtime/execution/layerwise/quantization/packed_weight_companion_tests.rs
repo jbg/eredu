@@ -62,7 +62,7 @@ fn quantized_store_preserves_nonconventional_architecture_companion_names() {
         Some("encoder.blocks.3.quantization.zero-points")
     );
 
-    let store: SharedCheckpointSource = Arc::new(
+    let store: RetainedCheckpointSource = (Arc::new(
         MemoryWeightStore::from_safetensors([(
             weight_name.to_owned(),
             safetensors::Dtype::F32,
@@ -70,7 +70,8 @@ fn quantized_store_preserves_nonconventional_architecture_companion_names() {
             vec![0; 8 * 64 * size_of::<f32>()],
         )])
         .unwrap(),
-    );
+    ))
+    .into();
     let (quantized, _) = quantize_parameterized_module_store(
         store,
         &source,

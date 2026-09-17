@@ -16,7 +16,32 @@ fn complete_qwen3_vl_variants_accept_paged_cache() {
         );
         let model = load_model(&backend, checkpoint.path(), request).unwrap();
         assert_eq!(model.effective_model_type(), expected_effective_model_type);
-        let runtime = ModelRuntime::from_prepared(backend, model).unwrap();
+        let mut runtime = ModelRuntime::from_prepared(backend, model).unwrap();
+        {
+            let target = runtime
+                .session_mut()
+                .neutral_prediction_target_mut()
+                .unwrap();
+            let mut guard = safemlx::RuntimeCallDeadline::new(std::time::Duration::from_secs(5))
+                .unwrap()
+                .enter()
+                .unwrap();
+            let counts = target.count_parameter_owners(&mut guard).unwrap();
+            assert_ne!(
+                counts,
+                Default::default(),
+                "actual static aggregate is nonempty"
+            );
+            assert_eq!(
+                (
+                    counts.prediction_modules,
+                    counts.pooling_prototypes,
+                    counts.model_prototypes
+                ),
+                (0, 0, 0)
+            );
+        }
+
         assert_eq!(
             runtime.session().effective_model_type(),
             expected_effective_model_type
@@ -81,7 +106,18 @@ fn public_replicated_prediction_variants_install_only_the_neutral_extension() {
         assert!(has_selected_embedded_prediction(&mut session));
         let target = session.neutral_prediction_target_mut().unwrap();
         assert!(target.has_embedded_prediction());
-        let _ = expected_depth;
+        let mut guard = safemlx::RuntimeCallDeadline::new(std::time::Duration::from_secs(5))
+            .unwrap()
+            .enter()
+            .unwrap();
+        let counts = target.count_parameter_owners(&mut guard).unwrap();
+        assert!(counts.prediction_modules >= expected_depth);
+        assert_eq!(counts.prediction_ids_present, counts.prediction_modules);
+        assert_eq!(
+            counts.prediction_managers_installed,
+            counts.prediction_modules
+        );
+        assert_eq!(target.count_parameter_owners(&mut guard).unwrap(), counts);
     }
 
     let deepseek = tempfile::tempdir().unwrap();
@@ -635,7 +671,7 @@ fn execute_public_gemma_external_scheduler(
         })
         .collect::<Vec<_>>();
     let publications = Arc::new(AtomicUsize::new(0));
-    let lanes = prompts
+    let lanes: Vec<SpeculativeGenerationLane<'_, MlxBackend<'static>, AllowAllTokens>> = prompts
         .into_iter()
         .map(|prompt| {
             let publications = publications.clone();
@@ -1406,4 +1442,22 @@ fn ring_worker_output_drains_while_running() {
         .windows(256 << 10)
         .any(|bytes| bytes.iter().all(|byte| *byte == b'o')));
     assert_eq!(output.stderr, vec![b'e'; 256 << 10]);
+}
+
+impl eredu_runtime::ActivationObserver<MlxTensor, crate::backend::error::Error> for ExternalTensorObserver {
+    fn observe(&mut self, path: &str, value: &MlxTensor) -> Result<(), crate::backend::error::Error> {
+        <Self as eredu_runtime::ActivationObserver<MlxTensor, safemlx::error::Exception>>::observe(self, path, value).map_err(Into::into)
+    }
+    fn intervene(&mut self, path: &str, value: &MlxTensor) -> Result<Option<MlxTensor>, crate::backend::error::Error> {
+        <Self as eredu_runtime::ActivationObserver<MlxTensor, safemlx::error::Exception>>::intervene(self, path, value).map_err(Into::into)
+    }
+}
+
+impl eredu_runtime::ActivationObserver<Array, crate::backend::error::Error> for EmbeddedLogitsObserver {
+    fn observe(&mut self, path: &str, value: &Array) -> Result<(), crate::backend::error::Error> {
+        <Self as eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>>::observe(self, path, value).map_err(Into::into)
+    }
+    fn intervene(&mut self, path: &str, value: &Array) -> Result<Option<Array>, crate::backend::error::Error> {
+        <Self as eredu_runtime::ActivationObserver<Array, safemlx::error::Exception>>::intervene(self, path, value).map_err(Into::into)
+    }
 }

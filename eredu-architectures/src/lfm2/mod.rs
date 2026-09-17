@@ -22,8 +22,9 @@ pub use checkpoint::{
 
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
-    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry, ConfigError,
-    FeedForwardPolicy, LayerCacheGeometry, LayerPolicy, ModelArgs, OperatorPolicy, RopeConfig,
+    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_metadata,
+    state_layout_with_geometry, ConfigError, FeedForwardPolicy, LayerCacheGeometry, LayerPolicy,
+    ModelArgs, OperatorPolicy, RopeConfig,
 };
 pub use moe::{
     expert_realization_plan, replicated_expert_realization_plan, DenseSwiGlu, FeedForward,
@@ -57,6 +58,56 @@ use crate::{
 /// Architecture-owned values retained for one LFM2 forward pass.
 pub struct ForwardContext<T> {
     mask: Option<T>,
+}
+
+// This family has one target invocation segment. A sliced partition retains its
+// rebased segment; a stateless convolution cannot supply an attention offset.
+fn causal_mask_for_local_state<B, S>(
+    sequence: i32,
+    supplied: Option<&B::Tensor>,
+    state: &mut S,
+    expected: &StateLayout,
+    first_state_ordinal: usize,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<Option<B::Tensor>, Error>
+where
+    B: eredu_nn::NeuralBackend,
+    S: LayerRuntimeState<B>,
+    S::LayerState: RuntimeStateComponents<B>,
+{
+    if let Some(mask) = supplied {
+        return Ok(Some(mask.clone()));
+    }
+    if sequence <= 1 {
+        return Ok(None);
+    }
+    let range = expected
+        .segment_for_layer(first_state_ordinal)
+        .ok_or_else(|| Error::backend("LFM2 mask invocation has no local state segment"))?
+        .layers();
+    if range.start > first_state_ordinal
+        || first_state_ordinal >= range.end
+        || range.end > expected.len()
+    {
+        return Err(Error::backend(
+            "LFM2 mask invocation exceeds its local state layout",
+        ));
+    }
+    (first_state_ordinal..range.end)
+        .find(|&ordinal| {
+            expected
+                .layer(ordinal)
+                .is_some_and(|p| p.attention().is_some())
+        })
+        .map(|ordinal| {
+            B::causal_mask(
+                sequence,
+                state.layer(ordinal).map_err(Error::backend)?.position(),
+                None,
+                context,
+            )
+        })
+        .transpose()
 }
 
 /// Shared layered LFM2 lifecycle over a heterogeneous physical schedule.
@@ -93,6 +144,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
         self.parameter_description_impl(context)
+    }
+
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_nn::Parameterized::retained_value_slot_bound(self.decoder.static_modules())
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_nn::Parameterized::visit_retained_values(self.decoder.static_modules(), visitor)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -386,24 +445,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 state.layout()
             )));
         }
-        let sequence = hidden.dim(1);
-        let mask = if let Some(mask) = mask {
-            Some(mask.clone())
-        } else if sequence > 1
-            && self
-                .args
-                .layer_schedule
-                .iter()
-                .any(|policy| matches!(policy.operator, OperatorPolicy::SelfAttention(_)))
-        {
-            let position = state
-                .layer(first_state_ordinal)
-                .map_err(Error::backend)?
-                .position();
-            Some(B::causal_mask(sequence, position, None, context)?)
-        } else {
-            None
-        };
+        let mask = causal_mask_for_local_state::<B, S>(
+            hidden.dim(1),
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            context,
+        )?;
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext { mask },
@@ -564,6 +613,11 @@ where
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     type Input<'a> = LayeredInput<'a, B::Tensor>;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::token_shape(input.tokens).map(Some)
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = Block<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
@@ -616,6 +670,29 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error> {
         self.construct_unit(group, index, context)
+    }
+
+    fn prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        // Validated LFM2 schedules use causal short convolution with its exact
+        // carried history or full causal KV attention at fixed rotary positions.
+        // Dense and sigmoid top-k expert equations act independently per row.
+        // These declarations cover only the ordinary, intervention-free target
+        // invocation; the shared helper does not infer any internal hook proof.
+        let units = self.decoder.group_unit_count(0)?;
+        let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
+            (0..units).map(|index| self.decoder.unit_path(0, index)),
+            true,
+        )?;
+        // Same target bank invocation as observed execution; its expert equations are row-local.
+        for index in 0..units {
+            let path = self.decoder.unit_path(0, index)?;
+            if let Some(points) = self.args.routed_observation_points(&path, index) {
+                crate::decoder::append_routed_prefill_observations(&mut declarations, &points);
+            }
+        }
+        Ok(declarations)
     }
 
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
@@ -717,6 +794,16 @@ where
             context,
             observer,
         )
+    }
+
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        crate::readout::select_readout_positions(hidden, demand, 1, context)
     }
 
     fn finish_forward(
@@ -1242,23 +1329,57 @@ pub fn state_identity(
     global_layer_start: usize,
     topology: PromptCacheTopology,
 ) -> Result<ModelStateIdentity, Error> {
-    let layer_count = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    state_identity_with(
+        args,
+        layout,
+        global_layer_start,
+        topology,
+        crate::decoder::identity::Metadata::new(None),
+    )
+}
+
+pub(crate) fn state_identity_with_metadata(
+    args: &ModelArgs,
+    layout: &eredu_runtime::StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+    state_identity_with(
+        args,
+        layout,
+        global_layer_start,
+        topology,
+        crate::decoder::identity::Metadata::new(Some(context)),
+    )
+}
+fn state_identity_with(
+    args: &ModelArgs,
+    layout: &eredu_runtime::StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+    metadata.controls::<eredu_runtime::ModelStateIdentity>()?;
+
+    let layer_count =
+        usize::try_from(args.num_hidden_layers).map_err(|cause| metadata.source(cause))?;
     let global_layer_end = global_layer_start
         .checked_add(layout.len())
-        .ok_or_else(|| Error::backend("LFM2 owned layer range overflowed"))?;
+        .ok_or_else(|| metadata.error(format_args!("LFM2 owned layer range overflowed")))?;
     if global_layer_end > layer_count {
-        return Err(Error::backend(format!(
+        return Err(metadata.error(format_args!(
             "LFM2 owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    eredu_runtime::ModelStateIdentity::new(
-        "lfm2",
-        args.model_type.clone(),
-        prompt_cache_architecture_fingerprint(args),
+    eredu_runtime::ModelStateIdentity::new_with_diagnostic(
+        metadata.text("lfm2")?,
+        metadata.text(&args.model_type)?,
+        config::prompt_cache_architecture_fingerprint_with_metadata(args, metadata)?,
         layer_count,
         global_layer_start,
         0,
         topology,
+        |message| metadata.prompt_error(message),
     )
-    .map_err(Error::backend)
 }

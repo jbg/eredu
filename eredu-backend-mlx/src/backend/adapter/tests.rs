@@ -4,6 +4,9 @@ use crate::tests::support::path_instrumentation;
 use eredu_core::BackendProvider as _;
 use safemlx::{Device, DeviceType};
 
+#[path = "tests/managed_memory.rs"]
+mod managed_memory;
+
 #[test]
 fn materialization_reclaims_retired_owners_before_allocating_the_next_model() {
     use crate::backend::ordinary_retirement::OrdinaryRetirement;

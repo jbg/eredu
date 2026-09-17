@@ -12,6 +12,9 @@ use crate::{
     deepseek::{projection::ProjectionPolicy, V3Args},
 };
 
+mod construction;
+pub(crate) use construction::AttentionSpec;
+
 /// Direct or normalized low-rank query projection.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -45,17 +48,17 @@ impl<B: BlockwiseAttentionBackend> QueryProjection<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Attention<B: BlockwiseAttentionBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     nope: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     rope_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     value_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     latent_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     scale: f32,
     query: QueryProjection<B>,
     kv_a: B::Linear,
@@ -73,102 +76,10 @@ impl<B: BlockwiseAttentionBackend> Attention<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        args.validate().map_err(Error::backend)?;
-        let root = format!("model.layers.{layer}.self_attn");
-        let query_width = args
-            .num_attention_heads
-            .checked_mul(args.qk_nope_head_dim + args.qk_rope_head_dim)
-            .ok_or_else(|| Error::backend("V3 query width overflowed"))?;
-        let linear = |name: String, input, output| {
-            let format = args.linear_format_for(&name);
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: parameter(&name)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(&name, format)?,
-                },
-                context,
-            )
-        };
-        let query = if let Some(rank) = args.q_lora_rank {
-            QueryProjection::LowRank(
-                ProjectionPolicy {
-                    first_weight: Some(format!("{root}.q_a_proj.weight")),
-                    normalization_weight: format!("{root}.q_a_layernorm.weight"),
-                    second_weight: format!("{root}.q_b_proj.weight"),
-                    input_dimensions: args.hidden_size,
-                    rank,
-                    output_dimensions: query_width,
-                    epsilon: args.rms_norm_eps,
-                    first_format: args.linear_format_for(&format!("{root}.q_a_proj.weight")),
-                    second_format: args.linear_format_for(&format!("{root}.q_b_proj.weight")),
-                }
-                .build(context)?,
-            )
-        } else {
-            QueryProjection::Direct(linear(
-                format!("{root}.q_proj.weight"),
-                args.hidden_size,
-                query_width,
-            )?)
-        };
-        let rotary_algorithm = args
-            .rope_scaling
-            .as_ref()
-            .map_or(eredu_nn::RotaryAlgorithm::Default, |yarn| {
-                yarn.rotary_algorithm()
-            });
-        let scale = ((args.qk_nope_head_dim + args.qk_rope_head_dim) as f32)
-            .sqrt()
-            .recip()
-            * args
-                .rope_scaling
-                .as_ref()
-                .map_or(1.0, |yarn| yarn.attention_multiplier());
-        Ok(Self {
-            heads: args.num_attention_heads,
-            nope: args.qk_nope_head_dim,
-            rope_dimensions: args.qk_rope_head_dim,
-            value_dimensions: args.v_head_dim,
-            latent_dimensions: args.kv_lora_rank,
-            scale,
-            query,
-            kv_a: linear(
-                format!("{root}.kv_a_proj_with_mqa.weight"),
-                args.hidden_size,
-                args.kv_lora_rank + args.qk_rope_head_dim,
-            )?,
-            kv_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.kv_lora_rank,
-                    args.rms_norm_eps,
-                    parameter(format!("{root}.kv_a_layernorm.weight"))?,
-                ),
-                context,
-            )?,
-            kv_b: linear(
-                format!("{root}.kv_b_proj.weight"),
-                args.kv_lora_rank,
-                args.num_attention_heads * (args.qk_nope_head_dim + args.v_head_dim),
-            )?,
-            output: linear(
-                format!("{root}.o_proj.weight"),
-                args.num_attention_heads * args.v_head_dim,
-                args.hidden_size,
-            )?,
-            rotary: B::rotary(
-                RotarySpec {
-                    arithmetic: eredu_nn::RotaryArithmetic::Native,
-                    dimensions: args.qk_rope_head_dim,
-                    base: args.rope_theta,
-                    traditional: false,
-                    algorithm: rotary_algorithm,
-                },
-                context,
-            )?,
-        })
+        if B::construction_metadata(context).is_some_and(|metadata| metadata.uses_checked_metadata()) {
+            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+        }
+        AttentionSpec::new(args, layer)?.instantiate::<B>(context)
     }
 
     /// Runs MLA while retaining only head-independent latent and rotary state.

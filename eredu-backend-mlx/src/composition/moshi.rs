@@ -1,5 +1,6 @@
 //! Production MLX composition for the backend-neutral Moshi-family model.
 
+use eredu_runtime::parameter_operations::LayeredParameterOwner;
 use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
@@ -10,7 +11,7 @@ use std::{
 #[cfg(test)]
 use eredu_architectures::moshi::MoshiConfig;
 use eredu_architectures::moshi::{self};
-use eredu_checkpoint::store::{CheckpointSource, SharedCheckpointSource};
+use eredu_checkpoint::store::{CheckpointSource, RetainedCheckpointSource};
 use eredu_core::artifact::{ArtifactIdentity, DeferredArtifactIdentity};
 use eredu_nn::Parameterized;
 use eredu_runtime::{
@@ -31,7 +32,8 @@ use crate::backend::{
         cache::state::MlxKeyValueState,
         execution::{
             generic::{
-                prepare_layerwise_policy_with_bindings, MlxLayerwisePolicy, MlxResidentPolicy,
+                prepare_layerwise_policy_with_bindings, prepare_layerwise_policy_with_prepared_manager,
+                PreparedLayerwiseManager, MlxLayerwisePolicy, MlxResidentPolicy,
             },
             layerwise::{quantize_exact_realtime_tasks, shard_layer_bindings},
         },
@@ -39,6 +41,17 @@ use crate::backend::{
     },
     submission_recovery::{self, Recovery, Retention, Status},
 };
+mod workspace;
+mod bounded_source;
+mod model_source;
+mod operation_source;
+pub(crate) use operation_source::{RealtimeOperationPlan,RealtimeOperationRecipe};
+use operation_source::RealtimeOperationPolicy;
+mod original_frame;
+mod execution_failure;
+pub(crate) use original_frame::OriginalRealtimeModelLease;
+pub(crate) use workspace::RealtimeWorkspaceVisitor;
+
 type SelectedLayerwiseRuntime<A, P> = LayerwiseRuntime<A, MlxNeuralBackend, MlxKeyValueState, P>;
 type SelectedPartitionRuntime<A, P> = eredu_runtime::PartitionedTextRuntime<
     A,
@@ -58,6 +71,25 @@ type SelectedTraversalRuntime<A, P> = eredu_runtime::LayerwiseTraversalRuntime<
     Box<SelectedPartitionRuntime<A, P>>,
 >;
 trait ErasedRealtimeExecutionContract {
+    fn parallel_communication(&self)->Option<(&crate::backend::MlxDistributedSession,eredu_core::CollectiveGroupId)> {None}
+    fn collect_retained_module_storage(&self, storage: &mut crate::backend::runtime::residency::storage::RetainedStorage)
+        -> Result<(), Error>;
+    fn realtime_operation_plan(&self,stream:&Stream,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+        pool:&eredu_runtime::working_memory::WorkingMemoryPool,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<RealtimeOperationPlan,Error>;
+
+    fn with_workspace_frame(&self,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+        context:&eredu_nn::workspace::WorkspaceContext,visitor:&mut dyn RealtimeWorkspaceVisitor)
+        ->Result<(),Error>;
+
+    fn execute_original_decisions(&mut self,_state:&mut MlxKeyValueState,
+        _temporal:&[crate::MlxTensor],
+        _driver:&mut SequentialDecisionDriver<MlxSamplingBackend,eredu_runtime::GenerationSampler>,
+        _stream:&Stream,_parallel:&crate::backend::runtime::distributed::Group,
+        _funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
+        ->Result<(Option<crate::MlxTensor>,moshi::ForwardContext<crate::MlxTensor>),Error> {
+        Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))
+    }
     fn selected(&self) -> &SelectedRealtimeRealization;
     fn residency_report(&self) -> Result<ResidencyReport, Error>;
     fn dense_stream_report(&self) -> Result<Option<DenseDiskStreamReport>, Error>;
@@ -68,7 +100,14 @@ trait ErasedRealtimeExecutionContract {
         temporal: &[crate::MlxTensor],
         driver: &mut SequentialDecisionDriver<MlxSamplingBackend, eredu_runtime::GenerationSampler>,
         stream: &Stream,
-    ) -> Result<(crate::MlxTensor, moshi::ForwardContext<crate::MlxTensor>), Error>;
+        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+    ) -> Result<
+        (
+            Option<crate::MlxTensor>,
+            moshi::ForwardContext<crate::MlxTensor>,
+        ),
+        Error,
+    >;
 }
 
 struct DirectRealtimeExecution<A>
@@ -93,6 +132,8 @@ where
 {
     selected: SelectedRealtimeRealization,
     execution: SelectedTraversalRuntime<A, P>,
+    communication:crate::backend::MlxDistributedSession,
+    tensor_group:eredu_core::CollectiveGroupId,
 }
 
 impl<A> ErasedRealtimeExecutionContract for DirectRealtimeExecution<A>
@@ -102,6 +143,29 @@ where
         + 'static,
     A::Error: std::fmt::Display,
 {
+    fn collect_retained_module_storage(&self, storage: &mut crate::backend::runtime::residency::storage::RetainedStorage)
+        -> Result<(), Error> {
+        storage.include_retained_values(|visitor| Ok::<_, Error>(match self.execution.execution() {
+            RealtimeLayerwiseRuntime::Resident(runtime) => runtime.visit_retained_values(visitor),
+            RealtimeLayerwiseRuntime::Bounded(runtime) => runtime.visit_retained_values(visitor),
+        }))
+    }
+    fn realtime_operation_plan(&self,stream:&Stream,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+        pool:&eredu_runtime::working_memory::WorkingMemoryPool,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<RealtimeOperationPlan,Error> {
+        match self.execution.execution() {
+            RealtimeLayerwiseRuntime::Resident(runtime)=>runtime.policy().realtime_operation_plan(stream,allocation,pool,context),
+            RealtimeLayerwiseRuntime::Bounded(runtime)=>runtime.policy().realtime_operation_plan(stream,allocation,pool,context),
+        }
+    }
+    fn with_workspace_frame(&self,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+        context:&eredu_nn::workspace::WorkspaceContext,visitor:&mut dyn RealtimeWorkspaceVisitor)
+        ->Result<(),Error> {
+        match self.execution.execution() {
+            RealtimeLayerwiseRuntime::Resident(runtime)=>workspace::resident(runtime,context,visitor),
+            RealtimeLayerwiseRuntime::Bounded(runtime)=>workspace::layerwise(runtime,allocation,context,visitor),
+        }
+    }
     fn selected(&self) -> &SelectedRealtimeRealization {
         &self.selected
     }
@@ -137,15 +201,25 @@ where
         temporal: &[crate::MlxTensor],
         driver: &mut SequentialDecisionDriver<MlxSamplingBackend, eredu_runtime::GenerationSampler>,
         stream: &Stream,
-    ) -> Result<(crate::MlxTensor, moshi::ForwardContext<crate::MlxTensor>), Error> {
-        moshi::execute_detached_replicated_moshi_realtime(
+        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+    ) -> Result<
+        (
+            Option<crate::MlxTensor>,
+            moshi::ForwardContext<crate::MlxTensor>,
+        ),
+        Error,
+    > {
+        moshi::execute_detached_replicated_moshi_frame(
             &mut self.execution,
             state,
             temporal,
             driver,
             stream,
         )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        .map_err(|cause| match funding {
+            Some(funding)=>Error::Neural(funding.metadata_source(execution_failure::Source(cause))),
+            None=>Error::ArchitectureModel(cause.to_string()),
+        })
     }
 }
 
@@ -155,7 +229,7 @@ trait RealtimePolicyReports {
     fn execution_group_reports(&self) -> Result<Vec<ResidentLayerGroupReport>, Error>;
 }
 
-impl<U> RealtimePolicyReports for MlxResidentPolicy<U> {
+impl<U: 'static> RealtimePolicyReports for MlxResidentPolicy<U> {
     fn residency_report(&self) -> Result<ResidencyReport, Error> {
         self.residency_report()
     }
@@ -189,9 +263,72 @@ where
         + eredu_runtime::ParallelLayeredArchitecture<MlxNeuralBackend, MlxKeyValueState>
         + 'static,
     A::Error: std::fmt::Display,
-    P: eredu_runtime::LayerwisePolicy<MlxNeuralBackend, A::Unit> + RealtimePolicyReports + 'static,
+    P: eredu_runtime::LayerwisePolicy<MlxNeuralBackend, A::Unit,Error=Error> + RealtimePolicyReports + workspace::RealtimeWorkspacePolicy<A> + RealtimeOperationPolicy<A::Unit> + 'static,
     P::Error: std::fmt::Display,
 {
+    fn parallel_communication(&self)->Option<(&crate::backend::MlxDistributedSession,eredu_core::CollectiveGroupId)> {
+        Some((&self.communication,self.tensor_group))
+    }
+    fn collect_retained_module_storage(&self, storage: &mut crate::backend::runtime::residency::storage::RetainedStorage)
+        -> Result<(), Error> {
+        self.communication.collect_retained_buffers(storage)?;
+        storage.include_retained_values(|visitor| Ok::<_, Error>(match &self.execution {
+            eredu_runtime::LayerwiseTraversalRuntime::Direct(runtime) => runtime.visit_retained_values(visitor),
+            eredu_runtime::LayerwiseTraversalRuntime::Partitioned(runtime) => runtime.traversal_executor().runtime().visit_retained_values(visitor),
+        }))
+    }
+    fn realtime_operation_plan(&self,stream:&Stream,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+        pool:&eredu_runtime::working_memory::WorkingMemoryPool,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<RealtimeOperationPlan,Error> {
+        match &self.execution {
+            eredu_runtime::LayerwiseTraversalRuntime::Direct(runtime)=>runtime.policy().realtime_operation_plan(stream,allocation,pool,context),
+            eredu_runtime::LayerwiseTraversalRuntime::Partitioned(runtime)=>{
+                if !runtime.is_fully_local_traversal() {
+                    return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound));
+                }
+                runtime.traversal_executor().runtime().policy().realtime_operation_plan(stream,allocation,pool,context)
+            }
+        }
+    }
+    fn with_workspace_frame(&self,allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+        context:&eredu_nn::workspace::WorkspaceContext,visitor:&mut dyn RealtimeWorkspaceVisitor)
+        ->Result<(),Error> {
+        match &self.execution {
+            eredu_runtime::LayerwiseTraversalRuntime::Direct(runtime)=>P::with_workspace_frame(runtime,allocation,context,None,visitor),
+            eredu_runtime::LayerwiseTraversalRuntime::Partitioned(runtime)=>{
+                if !runtime.is_fully_local_traversal() {
+                    return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound));
+                }
+                let executor=runtime.traversal_executor();
+                let group=executor.parallel_context();
+                let parallel=eredu_nn::workspace::WorkspaceParallelContext::new(group.rank(),group.size())
+                    .map_err(Error::Neural)?;
+                P::with_workspace_frame(executor.runtime(),allocation,context,Some(parallel),visitor)
+            }
+        }
+    }
+    fn execute_original_decisions(&mut self,state:&mut MlxKeyValueState,
+        temporal:&[crate::MlxTensor],
+        driver:&mut SequentialDecisionDriver<MlxSamplingBackend,eredu_runtime::GenerationSampler>,
+        stream:&Stream,parallel:&crate::backend::runtime::distributed::Group,
+        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
+        ->Result<(Option<crate::MlxTensor>,moshi::ForwardContext<crate::MlxTensor>),Error> {
+        let eredu_runtime::LayerwiseTraversalRuntime::Partitioned(runtime)=&self.execution else {
+            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+        };
+        let expected=runtime.traversal_executor().parallel_context();
+        if !runtime.is_fully_local_traversal()
+            || !parallel.has_original_parallel()
+            || !parallel.native_group().shares_native_handle(expected.native_group())
+            || parallel.rank()!=expected.rank() || parallel.size()!=expected.size()
+            || !parallel.retained_source().zip(expected.retained_source())
+                .is_some_and(|(actual,expected)|actual.same_source(expected)) {
+            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch));
+        }
+        moshi::execute_detached_partitioned_moshi_frame_with_parallel(
+            &mut self.execution,state,temporal,driver,stream,parallel)
+            .map_err(|cause|Error::Neural(funding.metadata_source(execution_failure::Source(cause))))
+    }
     fn selected(&self) -> &SelectedRealtimeRealization {
         &self.selected
     }
@@ -214,37 +351,50 @@ where
         temporal: &[crate::MlxTensor],
         driver: &mut SequentialDecisionDriver<MlxSamplingBackend, eredu_runtime::GenerationSampler>,
         stream: &Stream,
-    ) -> Result<(crate::MlxTensor, moshi::ForwardContext<crate::MlxTensor>), Error> {
-        moshi::execute_detached_partitioned_moshi_realtime(
+        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+    ) -> Result<
+        (
+            Option<crate::MlxTensor>,
+            moshi::ForwardContext<crate::MlxTensor>,
+        ),
+        Error,
+    > {
+        moshi::execute_detached_partitioned_moshi_frame(
             &mut self.execution,
             state,
             temporal,
             driver,
             stream,
         )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))
+        .map_err(|cause| match funding {
+            Some(funding)=>Error::Neural(funding.metadata_source(execution_failure::Source(cause))),
+            None=>Error::ArchitectureModel(cause.to_string()),
+        })
     }
 }
 
 /// Generic MLX storage/materialization mechanisms used by the neutral constructor.
 pub struct MlxRealtimeConstructionMechanisms<U: 'static> {
-    store: SharedCheckpointSource,
+    store: RetainedCheckpointSource,
     residency: eredu_runtime::LayerWeightResidency,
     weights_stream: Stream,
     transform: Option<eredu_checkpoint::WeightQuantization>,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
     pending: Option<MlxLayerwisePolicy<U>>,
+    loaded_residency: Option<crate::backend::runtime::residency::manager::ResidencyManager>,
     metadata: Option<LayerwiseModelMetadata>,
     local_layout: Option<Arc<eredu_runtime::LocalModelLayout>>,
+    prepared_manager: Option<PreparedLayerwiseManager>,
 }
 
 impl<U: 'static> MlxRealtimeConstructionMechanisms<U> {
     fn new(
-        store: SharedCheckpointSource,
+        store: RetainedCheckpointSource,
         residency: eredu_runtime::LayerWeightResidency,
         transform: Option<eredu_checkpoint::WeightQuantization>,
         weights_stream: &Stream,
         local_layout: Option<eredu_runtime::LocalModelLayout>,
+        prepared_manager: Option<PreparedLayerwiseManager>,
     ) -> Self {
         Self {
             store,
@@ -253,8 +403,10 @@ impl<U: 'static> MlxRealtimeConstructionMechanisms<U> {
             transform,
             materialization: None,
             pending: None,
+            loaded_residency: None,
             metadata: None,
             local_layout: local_layout.map(Arc::new),
+            prepared_manager,
         }
     }
 
@@ -264,7 +416,7 @@ impl<U: 'static> MlxRealtimeConstructionMechanisms<U> {
     }
 }
 fn selected_task_bindings(
-    tasks: &[RealtimeMaterializationTask],
+    prepared: eredu_runtime::PreparedRealtimeTaskBindingPlan<'_>,
     store: &dyn CheckpointSource,
     local_layout: Option<&eredu_runtime::LocalModelLayout>,
 ) -> Result<
@@ -274,7 +426,8 @@ fn selected_task_bindings(
     ),
     Error,
 > {
-    let (mut pinned, mut units) = eredu_runtime::realtime_task_binding_plan(tasks, store)
+    let (mut pinned, mut units) = prepared
+        .materialized(store)
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?
         .into_parts();
     if let Some(layout) = local_layout {
@@ -309,7 +462,7 @@ where
         selected: &SelectedRealtimeRealization,
         context: &Stream,
     ) -> Result<(), Self::Error> {
-        eredu_runtime::preflight_realtime_materialization_tasks::<MlxNeuralBackend>(
+        let bindings = eredu_runtime::preflight_realtime_materialization_tasks::<MlxNeuralBackend>(
             tasks,
             self.store.as_ref(),
         )
@@ -322,7 +475,7 @@ where
                 )
             })?;
             let (store, report) = quantize_exact_realtime_tasks(
-                Arc::clone(&self.store),
+                self.store.clone(),
                 architecture.static_modules(),
                 units,
                 quantization,
@@ -337,10 +490,10 @@ where
             ));
         }
         let (static_bindings, mut unit_bindings) =
-            selected_task_bindings(tasks, self.store.as_ref(), self.local_layout.as_deref())?;
+            selected_task_bindings(bindings, self.store.as_ref(), self.local_layout.as_deref())?;
         let layout = selected.execution_units().clone();
         let (policy, metadata) = prepare_layerwise_policy_with_bindings(
-            Arc::clone(&self.store),
+            self.store.clone(),
             architecture,
             (),
             std::marker::PhantomData::<MlxKeyValueState>,
@@ -365,6 +518,7 @@ where
                     })
             },
         )?;
+        self.loaded_residency = Some(policy.residency_manager().clone());
         self.pending = Some(policy);
         let mut metadata = metadata;
         metadata.set_materialization(self.materialization.clone());
@@ -395,7 +549,7 @@ where
         selected: &SelectedRealtimeRealization,
         context: &Stream,
     ) -> Result<RealizedRealtimePolicy<Self::BoundedPolicy>, Self::Error> {
-        eredu_runtime::preflight_realtime_materialization_tasks::<MlxNeuralBackend>(
+        let bindings = eredu_runtime::preflight_realtime_materialization_tasks::<MlxNeuralBackend>(
             tasks,
             self.store.as_ref(),
         )
@@ -419,7 +573,7 @@ where
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let (store, report) = quantize_exact_realtime_tasks(
-                Arc::clone(&self.store),
+                self.store.clone(),
                 architecture.static_modules(),
                 &units,
                 quantization,
@@ -433,38 +587,19 @@ where
                 "selected MLX transform has no source-format architecture".into(),
             ));
         }
-        let (static_bindings, mut unit_bindings) =
-            selected_task_bindings(tasks, self.store.as_ref(), self.local_layout.as_deref())?;
+        let (static_bindings, unit_bindings) =
+            selected_task_bindings(bindings, self.store.as_ref(), self.local_layout.as_deref())?;
         let layout = selected.execution_units().clone();
-        let (policy, metadata) = prepare_layerwise_policy_with_bindings(
-            Arc::clone(&self.store),
-            architecture,
-            (),
-            std::marker::PhantomData::<MlxKeyValueState>,
-            self.residency,
-            context,
-            &self.weights_stream,
-            |_| false,
-            move |_modules, _store| Ok(static_bindings),
-            move |_ordinal, address, _path, _unit, _store, _stream| {
-                let group = layout
-                    .group_id(address.group())
-                    .ok_or_else(|| {
-                        Error::ArchitectureModel("selected unit group is missing".into())
-                    })?
-                    .clone();
-                unit_bindings
-                    .remove(&ParameterGroupOwner::execution_unit(group, address.index()))
-                    .ok_or_else(|| {
-                        Error::ArchitectureModel(format!(
-                            "selected unit bindings are missing for {address:?}"
-                        ))
-                    })
-            },
+        let ordered=bounded_source::ordered_units(&layout,unit_bindings)?;
+        let (policy, metadata) = prepare_layerwise_policy_with_prepared_manager(
+            self.store.clone(),architecture,(),std::marker::PhantomData::<MlxKeyValueState>,
+            self.residency,context,&self.weights_stream,|_|false,layout,static_bindings,ordered,
+            Vec::new(),self.prepared_manager.take(),
         )?;
         let mut metadata = metadata;
         metadata.set_materialization(self.materialization.clone());
         self.metadata = Some(metadata);
+        self.loaded_residency = Some(policy.residency_manager().clone());
         Ok(RealizedRealtimePolicy::new(policy, selected.residency()))
     }
 
@@ -546,21 +681,52 @@ pub(crate) struct SelectedRealtimeResources {
 }
 
 struct RealtimeResourcePayload {
-    _store: SharedCheckpointSource,
+    loaded: std::cell::OnceCell<model_source::LoadedRealtimeSource>,
+    execution_identity: eredu_runtime::working_memory::InferenceExecutionIdentity,
+    ingress: eredu_runtime::RealtimeIngressContract,
+    _store: RetainedCheckpointSource,
     world: Option<Arc<crate::backend::runtime::distributed::Group>>,
-    stream: Stream,
-    _weights_stream: Stream,
+    backend: Rc<crate::backend::MlxBackend<'static>>,
     poisoned: Rc<Cell<bool>>,
 }
 
 impl SelectedRealtimeResources {
+    /// Stable identity of this exact selected loaded owner, shared by its frame
+    /// sources and completions. A fresh model creates a distinct identity.
+    pub(crate) fn execution_identity(&self) -> &eredu_runtime::working_memory::InferenceExecutionIdentity {
+        &self.inner.execution_identity
+    }
+
+    /// Proves that these exact loaded resources completed their source
+    /// publication into this backend pool. This grants no frame allocation.
+    pub(crate) fn validate_loaded_source(&self) -> Result<(), Error> {
+        self.inner.loaded.get().ok_or(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound))?
+            .validate(self.execution_identity(), self.backend().memory_pool())
+    }
+
+    /// The architecture-validated schedule is constructed once at load time.
+    /// Managed frames only inspect this retained source.
+    pub(crate) fn ingress_contract(&self) -> &eredu_runtime::RealtimeIngressContract {
+        &self.inner.ingress
+    }
+
+    pub(crate) fn original_copy_environment(&self)
+        -> Result<crate::backend::OriginalCopyEnvironment<'_>, crate::backend::OriginalCopyEnvironmentError> {
+        self.inner.backend.original_copy_environment()
+    }
+
+    pub(crate) fn backend(&self) -> &crate::backend::MlxBackend<'static> {
+        &self.inner.backend
+    }
+
     pub(crate) fn poison(&self) {
         self.inner.poisoned.set(true);
     }
 
     fn validate_stream(&self, stream: &Stream) -> Result<(), Error> {
         crate::backend::validate_native_execution_target(
-            &self.inner.stream.get_device()?,
+            &self.inner.backend.stream().get_device()?,
             None,
             stream,
             None,
@@ -573,7 +739,7 @@ impl SelectedRealtimeResources {
         world: Option<&crate::backend::runtime::distributed::Group>,
     ) -> Result<(), Error> {
         crate::backend::validate_native_execution_target(
-            &self.inner.stream.get_device()?,
+            &self.inner.backend.stream().get_device()?,
             self.inner
                 .world
                 .as_deref()
@@ -627,6 +793,31 @@ impl MlxRealtimeExecution {
         result
     }
 
+    /// Borrows the selected immutable architecture and actual native parameter
+    /// owners for one cold frame trace. This does not acquire execution units,
+    /// mutate residency, evaluate tensors or grant native submission authority.
+    pub(crate) fn parallel_communication(&self)->Option<(&crate::backend::MlxDistributedSession,eredu_core::CollectiveGroupId)> {
+        self.payload.execution.parallel_communication()
+    }
+
+    pub(crate) fn with_workspace_frame(&self,
+        allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+        context:&eredu_nn::workspace::WorkspaceContext,visitor:&mut dyn RealtimeWorkspaceVisitor)
+        ->Result<(),Error> {
+        self.ensure_healthy()?;
+        self.payload.execution.with_workspace_frame(allocation,context,visitor)
+    }
+
+    /// Retains the selected policy's actual operation slot and stream source.
+    /// This descriptive plan grants no frame occurrence or native submission.
+    pub(crate) fn realtime_operation_plan(&self,stream:&Stream,
+        allocation:crate::backend::nn::workspace::MetalAllocationFacts,
+        pool:&eredu_runtime::working_memory::WorkingMemoryPool,context:&eredu_nn::workspace::WorkspaceContext)->Result<RealtimeOperationPlan,Error> {
+        self.ensure_healthy()?;
+        self.validate_stream(stream)?;
+        self.payload.execution.realtime_operation_plan(stream,allocation,pool,context)
+    }
+
     /// Parameter topology and residency metadata.
     pub fn metadata(&self) -> &LayerwiseModelMetadata {
         &self.metadata
@@ -664,18 +855,24 @@ impl MlxRealtimeExecution {
         temporal: &[crate::MlxTensor],
         driver: &mut SequentialDecisionDriver<MlxSamplingBackend, eredu_runtime::GenerationSampler>,
         stream: &Stream,
-    ) -> Result<(crate::MlxTensor, moshi::ForwardContext<crate::MlxTensor>), Error> {
+    ) -> Result<
+        (
+            Option<crate::MlxTensor>,
+            moshi::ForwardContext<crate::MlxTensor>,
+        ),
+        Error,
+    > {
         self.validate_stream(stream)?;
-        self.with_submission(|model| {
-            Rc::get_mut(&mut model.payload)
-                .ok_or_else(|| {
-                    Error::ArchitectureModel(
-                        "MLX realtime execution has unresolved native owners".into(),
-                    )
-                })?
-                .execution
-                .execute_decisions(state, temporal, driver, stream)
-        })
+        self.with_submission(|model| model.execute_realtime_body(state, temporal, driver, stream, None))
+    }
+
+    fn execute_realtime_body(&mut self,state:&mut MlxKeyValueState,
+        temporal:&[crate::MlxTensor],
+        driver:&mut SequentialDecisionDriver<MlxSamplingBackend,eredu_runtime::GenerationSampler>,
+        stream:&Stream,funding:Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
+        ->Result<(Option<crate::MlxTensor>,moshi::ForwardContext<crate::MlxTensor>),Error> {
+        Rc::get_mut(&mut self.payload).ok_or(Error::PrefillScopeUnavailable)?
+            .execution.execute_decisions(state,temporal,driver,stream,funding)
     }
 
     /// Creates request-local resident key/value state from the neutral layout.
@@ -687,7 +884,7 @@ impl MlxRealtimeExecution {
 
     /// Clones exact store, stream, and collective ownership into a completion.
     pub(crate) fn completion_resources(&self) -> Arc<SelectedRealtimeResources> {
-        Arc::clone(&self.payload.resources)
+        self.payload.resources.clone()
     }
 
     pub(crate) fn validate_stream(&self, stream: &Stream) -> Result<(), Error> {
@@ -715,6 +912,8 @@ struct SelectedMoshiRealtimeMechanismVisitor {
     weights_stream: Stream,
     distributed: Option<crate::backend::MlxDistributedSession>,
     resources: Arc<SelectedRealtimeResources>,
+    loading: crate::backend::managed_memory::NativeMemoryOwner,
+    prepared_manager: Option<PreparedLayerwiseManager>,
 }
 
 impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
@@ -726,7 +925,7 @@ impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
     fn visit<A>(
         self,
         mut prepared: moshi::PreparedMoshiRealtimeArchitecture<A>,
-        store: SharedCheckpointSource,
+        store: RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: moshi::MoshiRealtimeExecutionArchitecture<MlxNeuralBackend, MlxKeyValueState>
@@ -741,6 +940,7 @@ impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
             self.transform,
             &self.weights_stream,
             parallel.as_ref().map(|parallel| parallel.layout().clone()),
+            self.prepared_manager,
         );
         let constructed = construct_realtime_model::<A, MlxNeuralBackend, _>(
             prepared.take_architecture(),
@@ -750,7 +950,11 @@ impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
             &self.stream,
         )
         .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let (execution, _initial_state) = constructed.into_execution_and_state();
+        let (execution, initial_state) = constructed.into_execution_and_state();
+        // This construction scratch is not the later request-owned decoder.
+        drop(initial_state);
+        let loaded_residency = execution.mechanisms().loaded_residency.as_ref()
+            .ok_or(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::UnknownBound))?.clone();
         let mut metadata = execution.mechanisms().metadata().cloned().ok_or_else(|| {
             Error::ArchitectureModel("neutral MLX construction produced no metadata".into())
         })?;
@@ -776,15 +980,8 @@ impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
                             .into(),
                     )
                 })?;
-                let (partition_communication, parallel, _sampling, communication_executor) =
-                    distributed.into_partition_communication(
-                        communication.clone(),
-                        Some(tensor_group),
-                        tensor_group,
-                    )?;
-                let parallel = parallel.ok_or_else(|| {
-                    Error::Parallel("selected Moshi tensor group was not realized".into())
-                })?;
+                let (partition_communication,parallel,communication_executor)=
+                    distributed.retained_partition_communication(communication,tensor_group)?;
                 let (selected, runtime, _mechanisms) = execution.into_parts();
                 let residency = selected.residency().execution_residency();
                 match runtime {
@@ -793,7 +990,7 @@ impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
                             runtime, parallel,
                         );
                         Box::new(PartitionedRealtimeExecution {
-                            selected,
+                            selected,communication:distributed,tensor_group,
                             execution: eredu_runtime::LayerwiseTraversalRuntime::partitioned(
                                 Box::new(
                                     eredu_runtime::PartitionedTextRuntime::new(
@@ -817,7 +1014,7 @@ impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
                             runtime, parallel,
                         );
                         Box::new(PartitionedRealtimeExecution {
-                            selected,
+                            selected,communication:distributed,tensor_group,
                             execution: eredu_runtime::LayerwiseTraversalRuntime::partitioned(
                                 Box::new(
                                     eredu_runtime::PartitionedTextRuntime::new(
@@ -839,6 +1036,10 @@ impl moshi::MoshiRealtimeArchitectureVisitor<MlxNeuralBackend, MlxKeyValueState>
                 }
             }
         };
+        let loaded = model_source::LoadedRealtimeSource::publish(
+            execution.as_ref(), loaded_residency, &self.resources, &self.loading)?;
+        self.resources.inner.loaded.set(loaded).map_err(|_| Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::AlreadyStarted))?;
         Ok(MlxRealtimeExecution {
             artifact_identity: self.artifact_identity,
             metadata,
@@ -859,9 +1060,26 @@ pub fn materialize_selected(
     stream: &Stream,
     weights_stream: &Stream,
 ) -> Result<moshi::MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
+    materialize_selected_with_backend(prepared, world,
+        Rc::new(crate::backend::MlxBackend::new(stream, weights_stream)))
+}
+
+/// Shares the actual selected native owners with the returned model and every
+/// completion, including failure retirement after the public context is dropped.
+pub(crate) fn materialize_selected_with_backend(
+    prepared: moshi::PreparedMoshiRealtimeSource,
+    world: Option<Arc<crate::backend::runtime::distributed::Group>>,
+    backend: Rc<crate::backend::MlxBackend<'static>>,
+) -> Result<moshi::MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
     ordinary_retirement::reclaim();
+    let prepared_manager=bounded_source::prepare(&prepared,&backend)?;
+    let loading = crate::backend::managed_memory::NativeMemoryOwner::acquire(backend.memory_pool())?;
+    submission_recovery::detached_retained(loading.clone(), || {
+    let stream = backend.stream();
+    let weights_stream = backend.weights_stream();
     let execution_descriptor = prepared.selected().execution_descriptor();
     let target_config = prepared.selected().execution_config().clone();
+    let ingress = moshi::realtime_ingress_contract(&target_config).map_err(Error::ArchitectureModel)?;
     let selected = prepared.selected().selected().clone();
     let effective_model_type = target_config.effective_model_type().as_str().to_owned();
     let parallel_manifest = prepared
@@ -870,7 +1088,7 @@ pub fn materialize_selected(
         .map(|parallel| parallel.communication().clone());
     let artifact_identity = prepared.deferred_artifact_identity();
     let lowering = prepared.lowering();
-    let store = Arc::clone(prepared.source());
+    let store = prepared.source().clone();
     let transform = lowering.transform();
     let target_quantization = lowering.target();
     let distributed = parallel_manifest
@@ -890,10 +1108,12 @@ pub fn materialize_selected(
         .transpose()?;
     let resources = Arc::new(SelectedRealtimeResources {
         inner: OrdinaryRetirement::new(RealtimeResourcePayload {
-            _store: Arc::clone(&store),
+            loaded: std::cell::OnceCell::new(),
+            execution_identity: Default::default(),
+            ingress,
+            _store: store.clone(),
             world: parallel_manifest.as_ref().and(world.clone()),
-            stream: stream.clone(),
-            _weights_stream: weights_stream.clone(),
+            backend: Rc::clone(&backend),
             poisoned: Rc::new(Cell::new(false)),
         }),
     });
@@ -911,10 +1131,16 @@ pub fn materialize_selected(
                 weights_stream: weights_stream.clone(),
                 distributed,
                 resources,
+                loading: loading.clone(),
+                prepared_manager,
             },
         )
-        .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        .map_err(|error| match error {
+            moshi::MoshiRealtimeDispatchError::Mechanism(cause) => cause,
+            other => Error::ArchitectureModel(other.to_string()),
+        })?;
     Ok(execution_descriptor.bind(execution))
+    })
 }
 
 #[cfg(test)]

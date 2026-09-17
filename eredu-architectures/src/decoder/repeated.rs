@@ -32,16 +32,53 @@ pub fn attention_schedule(
 
 /// Maps a logical block parameter back to its shared physical checkpoint name.
 pub fn source_name(root: &str, physical_layers: usize, name: &str) -> String {
-    let prefix = format!("{root}.layers.");
-    if let Some((layer, suffix)) = name.strip_prefix(&prefix).and_then(|s| s.split_once('.')) {
-        if let Ok(layer) = layer.parse::<usize>() {
-            if suffix == "output_norm.weight" {
-                return format!("{root}.norm.weight");
-            }
-            return format!("{prefix}{}.{suffix}", layer % physical_layers);
+    source_name_view(root, physical_layers, name).to_string()
+}
+
+pub(crate) enum RepeatedParameterName<'a> {
+    Original(&'a str),
+    FinalNorm(&'a str),
+    Layer {
+        root: &'a str,
+        layer: usize,
+        suffix: &'a str,
+    },
+}
+impl std::fmt::Display for RepeatedParameterName<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Original(name) => f.write_str(name),
+            Self::FinalNorm(root) => write!(f, "{root}.norm.weight"),
+            Self::Layer {
+                root,
+                layer,
+                suffix,
+            } => write!(f, "{root}.layers.{layer}.{suffix}"),
         }
     }
-    name.to_owned()
+}
+pub(crate) fn source_name_view<'a>(
+    root: &'a str,
+    physical_layers: usize,
+    name: &'a str,
+) -> RepeatedParameterName<'a> {
+    if let Some((layer, suffix)) = name
+        .strip_prefix(root)
+        .and_then(|s| s.strip_prefix(".layers."))
+        .and_then(|s| s.split_once('.'))
+    {
+        if let Ok(layer) = layer.parse::<usize>() {
+            if suffix == "output_norm.weight" {
+                return RepeatedParameterName::FinalNorm(root);
+            }
+            return RepeatedParameterName::Layer {
+                root,
+                layer: layer % physical_layers,
+                suffix,
+            };
+        }
+    }
+    RepeatedParameterName::Original(name)
 }
 
 /// Exact aliases for every invocation, including the normalization between passes.

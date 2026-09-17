@@ -38,48 +38,23 @@ impl RealtimeHostTokenMaterializer for MlxRealtimeFrameTensorMechanisms<'_> {
 }
 
 impl RealtimeFrameTensorMechanisms for MlxRealtimeFrameTensorMechanisms<'_> {
-    type Tensor = MlxTensor;
-    type Error = Error;
-
-    fn column(
-        &mut self,
-        matrix: &Self::Tensor,
-        column: usize,
-    ) -> Result<Self::Tensor, Self::Error> {
-        let column = i32::try_from(column)
-            .map_err(|_| Error::Parallel("realtime tensor column exceeds i32".into()))?;
-        matrix
-            .as_array()
-            .try_index_device((.., column..column + 1), self.stream)
-            .map(MlxTensor::from_array)
-            .map_err(Into::into)
+    type Tensor=MlxTensor;
+    type Error=Error;
+    fn clone_with_host_source(&mut self,value:&Self::Tensor,funding:&eredu_core::HostMetadataFunding)
+        ->Result<Self::Tensor,eredu_core::BackendFailure> {
+        value.clone_with_host_source(funding)
     }
-
-    fn filled_column(&mut self, token: i32, batch: usize) -> Result<Self::Tensor, Self::Error> {
-        let batch = i32::try_from(batch)
-            .map_err(|_| Error::Parallel("realtime tensor batch exceeds i32".into()))?;
-        Array::full::<i32>(&[batch, 1], Array::from_int(token), self.stream)
-            .map(MlxTensor::from_array)
-            .map_err(Into::into)
+    fn column(&mut self,matrix:&MlxTensor,column:usize)->Result<MlxTensor,Error> {
+        eredu_runtime::NeuralRealtimeFrameTensorMechanisms::<MlxTensor>::new(self.stream)
+            .column(matrix,column).map_err(Error::Neural)
     }
-
-    fn stack_columns(
-        &mut self,
-        columns: &[Self::Tensor],
-        batch: usize,
-    ) -> Result<Self::Tensor, Self::Error> {
-        if columns.is_empty() {
-            let batch = i32::try_from(batch)
-                .map_err(|_| Error::Parallel("realtime tensor batch exceeds i32".into()))?;
-            return Array::zeros::<i32>(&[batch, 0], self.stream)
-                .map(MlxTensor::from_array)
-                .map_err(Into::into);
-        }
-        let columns = columns.iter().map(MlxTensor::as_array).collect::<Vec<_>>();
-        stack_axis(&columns, 1, self.stream)?
-            .squeeze_axes(&[-1], self.stream)
-            .map(MlxTensor::from_array)
-            .map_err(Into::into)
+    fn filled_column(&mut self,token:i32,batch:usize)->Result<MlxTensor,Error> {
+        eredu_runtime::NeuralRealtimeFrameTensorMechanisms::<MlxTensor>::new(self.stream)
+            .filled_column(token,batch).map_err(Error::Neural)
+    }
+    fn stack_columns(&mut self,columns:&[MlxTensor],batch:usize)->Result<MlxTensor,Error> {
+        eredu_runtime::NeuralRealtimeFrameTensorMechanisms::<MlxTensor>::new(self.stream)
+            .stack_columns(columns,batch).map_err(Error::Neural)
     }
 }
 
@@ -115,7 +90,7 @@ impl<T>
         MlxTensor,
         T,
         (
-            MlxTensor,
+            Option<MlxTensor>,
             eredu_architectures::moshi::ForwardContext<MlxTensor>,
         ),
     > for MlxRealtimeFrameCompletionMechanism
@@ -132,7 +107,7 @@ where
         model_state: &T,
         payload_history: &RealtimePayloadHistory<MlxTensor>,
         execution: Option<(
-            MlxTensor,
+            Option<MlxTensor>,
             eredu_architectures::moshi::ForwardContext<MlxTensor>,
         )>,
     ) -> Result<Self::Completion, RealtimeCompletionCreationError<Self::Completion, Self::Error>>
@@ -165,7 +140,7 @@ where
         );
         retained.extend(model_state.retained_arrays().into_iter().cloned());
         if let Some((text_logits, forward)) = execution {
-            retained.push(text_logits.into_array());
+            retained.extend(text_logits.map(MlxTensor::into_array));
             retained.extend(
                 forward
                     .temporal_mask()
@@ -210,7 +185,7 @@ impl
 {
     type Error = Error;
     type Retained = (
-        MlxTensor,
+        Option<MlxTensor>,
         eredu_architectures::moshi::ForwardContext<MlxTensor>,
     );
 
@@ -239,7 +214,7 @@ pub(super) fn submit_scheduled_realtime_frame(
     // This reuses the neutral contract; invalid user input does not poison a
     // model whose execution has not begun.
     ingress
-        .validate(frame)
+        .inspect(frame)
         .map_err(|error| Error::Parallel(error.to_string()))?;
     let payload_contract = branch
         .payload_contract(&ingress)

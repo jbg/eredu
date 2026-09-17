@@ -29,17 +29,48 @@ pub struct PromptCacheStateSegment {
     layers: Range<usize>,
 }
 
+/// Existing prompt-cache diagnostic classes used by allocation-aware constructors.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum PromptCacheDiagnosticKind {
+    /// Invalid serialized or supplied identity geometry.
+    Malformed,
+    /// Identity does not describe the selected model range.
+    Incompatible,
+    /// An individual cache policy violates its contract.
+    Policy,
+}
+impl PromptCacheDiagnosticKind {
+    /// Attaches already-owned diagnostic text without formatting or copying it.
+    pub fn into_error(self, text: String) -> PromptCacheError {
+        match self {
+            Self::Malformed => PromptCacheError::Malformed(text),
+            Self::Incompatible => PromptCacheError::Incompatible(text),
+            Self::Policy => PromptCacheError::Policy(CachePolicyError::Invalid(text)),
+        }
+    }
+}
+
 impl PromptCacheStateSegment {
     /// Creates a named non-empty local state range.
     pub fn new(id: impl Into<String>, layers: Range<usize>) -> Result<Self, PromptCacheError> {
-        let id = id.into();
+        Self::new_with_diagnostic(id.into(), layers, |text| {
+            PromptCacheError::Malformed(text.to_string())
+        })
+    }
+
+    /// Validates the same segment after its final name has been constructed.
+    pub fn new_with_diagnostic<E>(
+        id: String,
+        layers: Range<usize>,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         if id.trim().is_empty() {
-            return Err(PromptCacheError::Malformed(
-                "prompt-cache state segment identity must not be empty".into(),
-            ));
+            return Err(error(format_args!(
+                "prompt-cache state segment identity must not be empty"
+            )));
         }
         if layers.is_empty() {
-            return Err(PromptCacheError::Malformed(format!(
+            return Err(error(format_args!(
                 "prompt-cache state segment {id:?} has an empty range"
             )));
         }
@@ -333,10 +364,43 @@ impl PromptCacheModelIdentity {
         layer_prefix_offsets: Vec<i32>,
         state_segments: Vec<PromptCacheStateSegment>,
     ) -> Result<Self, PromptCacheError> {
+        Self::new_with_diagnostic(
+            model_family.into(),
+            effective_model_type.into(),
+            architecture_fingerprint.into(),
+            layer_count,
+            global_layer_start,
+            global_layer_end,
+            sink_tokens,
+            topology,
+            layer_layout,
+            layer_prefix_offsets,
+            state_segments,
+            |kind, text| kind.into_error(text.to_string()),
+        )
+    }
+
+    /// Consumes already-owned identity fields and validates them using the same
+    /// policy worker. The caller supplies any failure-text allocation destination.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_diagnostic<E>(
+        model_family: String,
+        effective_model_type: String,
+        architecture_fingerprint: String,
+        layer_count: usize,
+        global_layer_start: usize,
+        global_layer_end: usize,
+        sink_tokens: usize,
+        topology: PromptCacheTopology,
+        layer_layout: LayerSchedule<LayerCachePolicy>,
+        layer_prefix_offsets: Vec<i32>,
+        state_segments: Vec<PromptCacheStateSegment>,
+        mut error: impl FnMut(PromptCacheDiagnosticKind, std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         let identity = Self {
-            model_family: model_family.into(),
-            effective_model_type: effective_model_type.into(),
-            architecture_fingerprint: architecture_fingerprint.into(),
+            model_family,
+            effective_model_type,
+            architecture_fingerprint,
             layer_count,
             global_layer_start,
             global_layer_end,
@@ -352,12 +416,13 @@ impl PromptCacheModelIdentity {
             &identity.architecture_fingerprint,
         ] {
             if value.trim().is_empty() {
-                return Err(PromptCacheError::Malformed(
-                    "prompt-cache model identity strings must be non-empty".into(),
+                return Err(error(
+                    PromptCacheDiagnosticKind::Malformed,
+                    format_args!("prompt-cache model identity strings must be non-empty"),
                 ));
             }
         }
-        identity.validate()?;
+        identity.validate_with_diagnostic(error)?;
         Ok(identity)
     }
 
@@ -446,6 +511,13 @@ impl PromptCacheModelIdentity {
 
     /// Validates the owned layer range and every policy.
     pub fn validate(&self) -> Result<(), PromptCacheError> {
+        self.validate_with_diagnostic(|kind, text| kind.into_error(text.to_string()))
+    }
+
+    fn validate_with_diagnostic<E>(
+        &self,
+        error: impl FnMut(PromptCacheDiagnosticKind, std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
         IdentityLayout {
             layer_count: self.layer_count,
             global_layer_start: self.global_layer_start,
@@ -456,7 +528,7 @@ impl PromptCacheModelIdentity {
             state_segments: &self.state_segments,
             topology: &self.topology,
         }
-        .validate("loaded model")
+        .validate_with("loaded model", error)
     }
 
     /// Returns one architecture-declared state segment by stable identity.
@@ -529,11 +601,22 @@ struct IdentityLayout<'a> {
 
 impl IdentityLayout<'_> {
     fn validate(&self, subject: &str) -> Result<(), PromptCacheError> {
+        self.validate_with(subject, |kind, text| kind.into_error(text.to_string()))
+    }
+
+    fn validate_with<E>(
+        &self,
+        subject: &str,
+        mut error: impl FnMut(PromptCacheDiagnosticKind, std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
         let owned = self
             .global_layer_end
             .checked_sub(self.global_layer_start)
             .ok_or_else(|| {
-                PromptCacheError::Incompatible(format!("{subject} has an invalid layer range"))
+                error(
+                    PromptCacheDiagnosticKind::Incompatible,
+                    format_args!("{subject} has an invalid layer range"),
+                )
             })?;
         if self.layer_count == 0
             || self.global_layer_start >= self.global_layer_end
@@ -544,17 +627,26 @@ impl IdentityLayout<'_> {
             || self.layer_prefix_offsets.len() != owned
             || self.layer_prefix_offsets.iter().any(|offset| *offset > 0)
         {
-            return Err(PromptCacheError::Incompatible(format!(
-                "{subject} supplied {} cache layouts and {} layer prefix offsets for {owned} owned layers",
-                self.layer_layout.len(),
-                self.layer_prefix_offsets.len()
-            )));
+            return Err(error(
+                PromptCacheDiagnosticKind::Incompatible,
+                format_args!(
+                    "{subject} supplied {} cache layouts and {} layer prefix offsets for {owned} owned layers",
+                    self.layer_layout.len(),
+                    self.layer_prefix_offsets.len()
+                ),
+            ));
         }
-        self.topology.validate()?;
-        validate_state_segments(self.state_segments, owned)
-            .map_err(|error| PromptCacheError::Incompatible(format!("{subject} {error}")))?;
+        self.topology
+            .validate_with_diagnostic(|text| error(PromptCacheDiagnosticKind::Malformed, text))?;
+        validate_state_segments_with(self.state_segments, owned, |text| {
+            error(
+                PromptCacheDiagnosticKind::Incompatible,
+                format_args!("{subject} {text}"),
+            )
+        })?;
         for policy in self.layer_layout.iter() {
-            policy.validate()?;
+            policy
+                .validate_with_diagnostic(|text| error(PromptCacheDiagnosticKind::Policy, text))?;
         }
         Ok(())
     }
@@ -595,36 +687,46 @@ fn validate_state_segments(
     segments: &[PromptCacheStateSegment],
     owned: usize,
 ) -> Result<(), String> {
+    validate_state_segments_with(segments, owned, |text| text.to_string())
+}
+
+fn validate_state_segments_with<E>(
+    segments: &[PromptCacheStateSegment],
+    owned: usize,
+    mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     if segments.is_empty() {
-        return Err("has no named state segments".into());
+        return Err(error(format_args!("has no named state segments")));
     }
-    let mut ids = BTreeSet::new();
     let mut next = 0;
-    for segment in segments {
+    for (index, segment) in segments.iter().enumerate() {
         if segment.id.trim().is_empty() {
-            return Err("has an empty state segment identity".into());
+            return Err(error(format_args!("has an empty state segment identity")));
         }
-        if !ids.insert(segment.id.as_str()) {
-            return Err(format!(
+        if segments[..index]
+            .iter()
+            .any(|earlier| earlier.id == segment.id)
+        {
+            return Err(error(format_args!(
                 "has duplicate state segment identity {:?}",
                 segment.id
-            ));
+            )));
         }
         if segment.layers.start != next
             || segment.layers.end <= segment.layers.start
             || segment.layers.end > owned
         {
-            return Err(format!(
+            return Err(error(format_args!(
                 "state segment {:?} range {}..{} does not continue an exact partition of {owned} owned layers",
                 segment.id, segment.layers.start, segment.layers.end
-            ));
+            )));
         }
         next = segment.layers.end;
     }
     if next != owned {
-        return Err(format!(
+        return Err(error(format_args!(
             "state segments cover {next} of {owned} owned layers"
-        ));
+        )));
     }
     Ok(())
 }
@@ -693,15 +795,21 @@ impl PromptCacheTopology {
 
     /// Validates every optional world-size/rank pair.
     pub fn validate(&self) -> Result<(), PromptCacheError> {
+        self.validate_with_diagnostic(|text| PromptCacheError::Malformed(text.to_string()))
+    }
+
+    /// Validates placement through the same allocation-free diagnostic callback.
+    pub fn validate_with_diagnostic<E>(
+        &self,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
         for (name, axis) in [
             ("stage", self.stage),
             ("state shard", self.shard),
             ("addressable group", self.addressable),
         ] {
             if axis.is_some_and(|(size, rank)| size == 0 || rank >= size) {
-                return Err(PromptCacheError::Malformed(format!(
-                    "invalid {name} topology"
-                )));
+                return Err(error(format_args!("invalid {name} topology")));
             }
         }
         Ok(())
@@ -1263,15 +1371,49 @@ where
         .into_iter()
         .map(|(key, value)| (key.into(), value.into()))
         .collect::<Vec<_>>();
-    fields.sort_unstable();
-    let mut hasher = Sha256::new();
-    hash_component(&mut hasher, b"eredu-prompt-cache-architecture-v1");
-    hash_component(&mut hasher, model_family.as_bytes());
-    for (key, value) in fields {
-        hash_component(&mut hasher, key.as_bytes());
-        hash_component(&mut hasher, value.as_bytes());
+    PromptCacheArchitectureFingerprint::new(model_family, &mut fields).to_string()
+}
+
+/// Fixed digest of the exact sorted semantic fields used by prompt-cache identity.
+/// Constructing and displaying this value do not allocate.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct PromptCacheArchitectureFingerprint([u8; 32]);
+impl PromptCacheArchitectureFingerprint {
+    /// Fixed hashing and formatting controls, excluding caller-owned fields/output.
+    pub const fn construction_bytes() -> usize {
+        std::mem::size_of::<Sha256>()
+            + std::mem::size_of::<Self>()
+            + std::mem::size_of::<[u8; 32]>()
+            + std::mem::size_of::<[u8; 8]>()
+            + std::mem::size_of::<&str>()
+            + std::mem::size_of::<&mut Sha256>()
+            + std::mem::size_of::<u8>()
     }
-    format!("sha256:{}", hex(hasher.finalize()))
+    /// Hashes the same key-then-value ordering as the owned fingerprint helper.
+    /// The caller supplies all field storage; duplicate fields remain significant.
+    pub fn new<K: AsRef<str>, V: AsRef<str>>(model_family: &str, fields: &mut [(K, V)]) -> Self {
+        fields.sort_unstable_by(|(left_key, left_value), (right_key, right_value)| {
+            (left_key.as_ref(), left_value.as_ref())
+                .cmp(&(right_key.as_ref(), right_value.as_ref()))
+        });
+        let mut hasher = Sha256::new();
+        hash_component(&mut hasher, b"eredu-prompt-cache-architecture-v1");
+        hash_component(&mut hasher, model_family.as_bytes());
+        for (key, value) in fields {
+            hash_component(&mut hasher, key.as_ref().as_bytes());
+            hash_component(&mut hasher, value.as_ref().as_bytes());
+        }
+        Self(hasher.finalize().into())
+    }
+}
+impl std::fmt::Display for PromptCacheArchitectureFingerprint {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("sha256:")?;
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
 }
 
 /// Hashes exact prefix token IDs as little-endian `u32` values.
@@ -1501,9 +1643,11 @@ mod tests {
         manifest
             .validate_compatibility(&descriptor, &[7, 8])
             .unwrap();
-        assert!(manifest
-            .validate_compatibility(&descriptor, &[8, 7])
-            .is_err());
+        assert!(
+            manifest
+                .validate_compatibility(&descriptor, &[8, 7])
+                .is_err()
+        );
         let mut renamed = descriptor.clone();
         renamed.state_segments = vec![PromptCacheStateSegment::new("renamed", 0..1).unwrap()];
         assert!(matches!(

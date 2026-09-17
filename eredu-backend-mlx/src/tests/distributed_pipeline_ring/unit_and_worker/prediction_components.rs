@@ -9,7 +9,7 @@ mod prediction_components {
         speculative::SpeculativeActivationPhase as Phase, ModelConfigurationResolver,
     };
     use eredu_runtime::{inspection::SpeculativeActivationObserver, ActivationObserver};
-    use safemlx::error::Exception;
+    use crate::backend::error::Error as EmbeddedError;
 
     #[derive(Clone, Copy)]
     enum Mode {
@@ -33,8 +33,8 @@ mod prediction_components {
         mode: Mode,
         stream: Stream,
     }
-    impl ActivationObserver<MlxTensor, Exception> for Observer {
-        fn observe(&mut self, path: &str, value: &MlxTensor) -> Result<(), Exception> {
+    impl ActivationObserver<MlxTensor, EmbeddedError> for Observer {
+        fn observe(&mut self, path: &str, value: &MlxTensor) -> Result<(), EmbeddedError> {
             let mut trace = self.trace.lock().unwrap();
             let (phase, sequence) = trace.active.expect("internal hook requires an invocation");
             if self.paths.iter().any(|wanted| wanted == path) {
@@ -42,7 +42,7 @@ mod prediction_components {
                 trace.remaining = trace
                     .remaining
                     .checked_sub(bytes)
-                    .ok_or_else(|| Exception::custom("native phase fixture exhausted allowance"))?;
+                    .ok_or_else(|| EmbeddedError::InvalidOperation("native phase fixture exhausted allowance"))?;
                 let shape = value.as_array().shape().to_vec();
                 assert_eq!(
                     shape[1] as usize, sequence,
@@ -51,7 +51,7 @@ mod prediction_components {
                 let evaluated = value.as_array().evaluated()?;
                 let values = evaluated
                     .try_to_vec::<f32>()
-                    .map_err(|error| Exception::custom(error.to_string()))?;
+                    .map_err(|error| EmbeddedError::Exception(safemlx::error::Exception::custom(error.to_string())))?;
                 trace.values.push((phase, path.into(), shape, values));
             }
             if let Mode::Fail(failed) = self.mode {
@@ -60,7 +60,7 @@ mod prediction_components {
                         || (phase == Phase::TargetPrefill
                             && path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH))
                 {
-                    return Err(Exception::custom("injected native internal phase failure"));
+                    return Err(EmbeddedError::InvalidOperation("injected native internal phase failure"));
                 }
             }
             Ok(())
@@ -70,8 +70,8 @@ mod prediction_components {
             path: &str,
             _: &MlxTensor,
             _: &eredu_core::capture::GeneratedCaptureSource,
-            generate: &mut dyn FnMut() -> Result<MlxTensor, Exception>,
-        ) -> Result<(), Exception> {
+            generate: &mut dyn FnMut() -> Result<MlxTensor, EmbeddedError>,
+        ) -> Result<(), EmbeddedError> {
             // This fixture requests existing component values only. Unrequested
             // generated projections must not allocate native tensors.
             if self.paths.iter().any(|wanted| wanted == path) {
@@ -83,7 +83,7 @@ mod prediction_components {
             &mut self,
             path: &str,
             value: &MlxTensor,
-        ) -> Result<Option<MlxTensor>, Exception> {
+        ) -> Result<Option<MlxTensor>, EmbeddedError> {
             if !matches!(self.mode, Mode::Mask) || path != self.channel {
                 return Ok(None);
             }
@@ -100,18 +100,18 @@ mod prediction_components {
             )?)))
         }
     }
-    impl SpeculativeActivationObserver<MlxTensor, Exception> for Observer {
+    impl SpeculativeActivationObserver<MlxTensor, EmbeddedError> for Observer {
         fn begin_activation_invocation(
             &mut self,
             phase: Phase,
             sequence: usize,
-        ) -> Result<(), Exception> {
+        ) -> Result<(), EmbeddedError> {
             let mut trace = self.trace.lock().unwrap();
             assert!(trace.active.replace((phase, sequence)).is_none());
             trace.phases.push((phase, sequence));
             Ok(())
         }
-        fn complete_activation_invocation(&mut self) -> Result<(), Exception> {
+        fn complete_activation_invocation(&mut self) -> Result<(), EmbeddedError> {
             Ok(())
         }
         fn finish_activation_invocation(&mut self, success: bool) {

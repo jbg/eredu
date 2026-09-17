@@ -30,8 +30,8 @@ use safemlx::{
 };
 
 const WORKER_RANK: &str = "EREDU_MOSHI_RING_WORKER";
-const MODEL_WORKER_RANK: &str = "EREDU_MOSHI_RING_MODEL_WORKER";
-const MODEL_WORKER_FIXTURE: &str = "EREDU_MOSHI_RING_MODEL_FIXTURE";
+pub(crate) const MODEL_WORKER_RANK: &str = "EREDU_MOSHI_RING_MODEL_WORKER";
+pub(crate) const MODEL_WORKER_FIXTURE: &str = "EREDU_MOSHI_RING_MODEL_FIXTURE";
 const MODEL_WORKER_PROFILE: &str = "EREDU_MOSHI_RING_MODEL_PROFILE";
 const MODEL_WORKER_DISAGREE: &str = "EREDU_MOSHI_RING_MODEL_DISAGREE";
 const NATIVE_FIXTURE: &str = "EREDU_MOSHI_NATIVE_FIXTURE";
@@ -574,6 +574,14 @@ fn run_model_parity_fixture(fixture_variable: &str, profile: &str) {
 }
 
 fn run_model_parity_path(fixture: &Path, profile: &str, disagree: bool) {
+    run_model_parity_worker(fixture,profile,disagree,
+        "tests::distributed_realtime_ring::moshi_ring_model_parity_worker",false,Duration::from_secs(15*60));
+}
+
+/// Shared real two-process Ring harness. The caller supplies only the selected
+/// existing test entry; model execution remains inside its shared frame helper.
+pub(crate) fn run_model_parity_worker(fixture:&Path,profile:&str,disagree:bool,
+    worker:&str,ignored:bool,timeout:Duration) {
     assert!(
         distributed::is_available(Backend::Ring),
         "{profile} Ring parity requires the MLX Ring backend when this ignored test is explicitly enabled"
@@ -597,7 +605,7 @@ fn run_model_parity_path(fixture: &Path, profile: &str, disagree: bool) {
         command
             .args([
                 "--exact",
-                "tests::distributed_realtime_ring::moshi_ring_model_parity_worker",
+                worker,
                 "--nocapture",
             ])
             .env(MODEL_WORKER_RANK, rank.to_string())
@@ -608,13 +616,14 @@ fn run_model_parity_path(fixture: &Path, profile: &str, disagree: bool) {
             .env_remove("MLX_RING_VERBOSE")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if ignored {command.arg("--ignored");}
         if disagree {
             command.env(MODEL_WORKER_DISAGREE, "1");
         }
         children.0.push(command.spawn().unwrap());
     }
 
-    let deadline = Instant::now() + Duration::from_secs(15 * 60);
+    let deadline = Instant::now() + timeout;
     let mut timed_out = false;
     loop {
         let statuses = children

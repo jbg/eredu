@@ -9,6 +9,10 @@ use std::{
 };
 
 fn drafter(stream: &Stream) -> MlxDrafter {
+    drafter_with_backend(stream, None)
+}
+
+fn drafter_with_backend(stream: &Stream, backend: Option<crate::backend::MlxBackend<'static>>) -> MlxDrafter {
     use super::super::external_materialization_tests::{assistant_artifact, ASSISTANT_CONFIG};
 
     let assistant = assistant_artifact();
@@ -73,12 +77,11 @@ fn drafter(stream: &Stream) -> MlxDrafter {
         &speculative_mechanism_capabilities(),
     )
     .unwrap();
-    MlxDrafter::materialize(
-        eredu_architectures::PreparedExternalDraft::Assistant(prepared.preparation),
-        stream,
-        stream,
-    )
-    .unwrap()
+    let prepared = eredu_architectures::PreparedExternalDraft::Assistant(prepared.preparation);
+    match backend {
+        Some(backend) => MlxDrafter::materialize_with_backend(prepared, backend),
+        None => MlxDrafter::materialize(prepared, stream, stream),
+    }.unwrap()
 }
 
 struct CountVisit<'a>(&'a Cell<usize>);
@@ -98,7 +101,17 @@ impl MaterializedExternalAssistantVisitor<MlxAssistantPreparationVisitor> for Co
 #[test]
 fn terminal_retained_drafter_owner_rejects_mutation_until_exclusive_without_poisoning() {
     let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
-    let mut drafter = drafter(&stream);
+    let source_stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let backend = crate::backend::MlxBackend::new(&stream, &source_stream);
+    let mut drafter = drafter_with_backend(&stream, Some(backend));
+    let placement = drafter.payload.backend.as_ref().expect("selected placement retained");
+    assert_eq!(placement.stream(), &stream);
+    assert_eq!(placement.weights_stream(), &source_stream);
+    assert_ne!(placement.stream(), placement.weights_stream());
+    assert!(matches!(drafter.placement_environment(),
+        Err(crate::backend::OriginalCopyEnvironmentError::Memory(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound))));
+    drop(source_stream);
     let mut scope = SubmissionScope::begin().unwrap();
     let value = Array::from_slice(&[2.0_f32], &[1]).square(&stream).unwrap();
     eval([&value]).unwrap();
@@ -114,6 +127,7 @@ fn terminal_retained_drafter_owner_rejects_mutation_until_exclusive_without_pois
         DrafterRetention {
             _payload: Rc::new(RefCell::new(Some(Rc::clone(&drafter.payload)))),
             poisoned: Rc::clone(&drafter.poisoned),
+            backend: None,
         },
         scope,
     );

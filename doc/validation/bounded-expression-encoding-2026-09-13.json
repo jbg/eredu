@@ -1,0 +1,215 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-13",
+  "scope": "Prepared incremental hash-cons insertion and shared raw expression encoding",
+  "created_utc": "2026-09-13T18:55:07.765011+00:00",
+  "status": "verified_increment_full_goal_incomplete",
+  "tests": {
+    "derivre": {
+      "passed": 53,
+      "ignored": 0
+    },
+    "llguidance": {
+      "passed": 54,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 187,
+      "ignored": 2
+    },
+    "portable": {
+      "passed": 114,
+      "ignored": 1
+    },
+    "minimal": {
+      "passed": 53,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 461,
+  "new_tests": {
+    "incremental_writer": 10,
+    "expression_encoding": 9
+  },
+  "checks": {
+    "derivre": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p derivre --all-features -- --test-threads=1",
+      "started_utc": "2026-09-13T18:53:24.238292+00:00",
+      "elapsed_seconds": 5.828,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-expression-encoding-derivre.log",
+      "log_sha256": "3c114c25c78405f5487bc8627327139c2e786fd08478a85c45d2952db8a5e440"
+    },
+    "llguidance": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p llguidance --all-features -- --test-threads=1",
+      "started_utc": "2026-09-13T18:53:30.067151+00:00",
+      "elapsed_seconds": 4.347,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-expression-encoding-llguidance.log",
+      "log_sha256": "e4a07d845c72db389eeec234782f4810b72581f740b7bfd77c06c0f2e8a95667"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib -- --test-threads=1",
+      "started_utc": "2026-09-13T18:53:34.414530+00:00",
+      "elapsed_seconds": 18.826,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-expression-encoding-facade.log",
+      "log_sha256": "369e6f0fa31ed1f98bb2ddbaceec10e2b752abcd549f1ab2d76788d4a93cbe36"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-13T18:53:53.241741+00:00",
+      "elapsed_seconds": 16.696,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-expression-encoding-portable.log",
+      "log_sha256": "8a4442e527cb8340b1705c535b7337fc7c2bcfe70688f1d25b28ebd7f9641593"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p derivre --no-default-features -- --test-threads=1",
+      "started_utc": "2026-09-13T18:54:09.938984+00:00",
+      "elapsed_seconds": 6.145,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-expression-encoding-minimal.log",
+      "log_sha256": "00e29261bd9215952499f9231ff54a669382bb24721da0dca8bcab7f162ea752"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-13T18:54:16.084097+00:00",
+      "elapsed_seconds": 1.836,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-expression-encoding-features.log",
+      "log_sha256": "dfddfcf8d6a3e7644233dac587888ff87467ef41b045ef68c1e7e737c735856c"
+    }
+  },
+  "source_sha256": {
+    "AGENTS.md": "826ae12a972ccde6b79c78010cef422586655aa8bfbe2b0d01992bb9da1d92c0",
+    "Cargo.lock": "e3b9e2b92dcd2c672339f836df5d5ee34b9a5b936f483fd0b05493c3033969bb",
+    "Cargo.toml": "5640ce0048d6026ca6627320ea6925427a3a56f9363b1b83f77b4e73d01d22fc",
+    "doc/backend-architecture.md": "a1a24754935aa48bba9580d8aaa6535d3e614132408b347c94bf764c1cf70561",
+    "doc/bounded-inference.md": "2aacddd7976e7d96931e4401f242a6af0e87633ec600265248897c3eedffde93",
+    "doc/execution-control.md": "b5b558f9e58e4ee433cd33688bc0cfe950fb8207bbee6d12d43c7ad2bb5f1a65",
+    "eredu/Cargo.toml": "8b58b478a0f362e266ba8a2b9bba1c2f7bf14286e73b73ec012cdb28a64fe484",
+    "third-party/README.md": "afc4bd3cb3e4ce56b1ca58de8083d515bb56c154287f4342111d820f95784490",
+    "third-party/derivre-0.3.12/Cargo.toml": "6441fd7f0d65a6b999059ddeb64af5c8795b4a7bb5a942e162a426b6bc2cf7e1",
+    "third-party/derivre-0.3.12/src/ast.rs": "03dab229de0d10e9df652d54483dde1d524dd6f7229dddcb963a6c591add714a",
+    "third-party/derivre-0.3.12/src/ast/encoding_tests.rs": "600347fba0d73602a0c0996234a69f6d1b26c6f7e412b0e86a5939dba0dc769e",
+    "third-party/derivre-0.3.12/src/hashcons.rs": "012f84deeb07915360b8e1bd69439081cd1599b2dc9bbc2bf55af47f569b0a1e",
+    "third-party/derivre-0.3.12/src/hashcons/incremental_tests.rs": "02ed07121ca1ffdce475229131c51399a598e1ea3f844c2361b0f25e0ff543c1",
+    "third-party/derivre-0.3.12/src/hashcons/tests.rs": "4ec8b0e996cb93252b6768cb6da78de8edaa04d45813bf27de92e83d86713511",
+    "third-party/derivre-0.3.12/src/lib.rs": "db4b9f741f2102307a905196ccfebc9556c853f7768a048b0c38aaa127a50972",
+    "third-party/llguidance-1.8.0/Cargo.toml": "704853eb99a2f1eeb991b5fe58d98d10d290e00379f71f6b4142cc631e87a395",
+    "third-party/llguidance-1.8.0/src/api.rs": "d0efaeafc294bde481f1eed7c5c1901dc3c9ffb83a2081e64d2af72ca8180bac",
+    "third-party/llguidance-1.8.0/src/earley/lexer.rs": "fd8bf67f0af2483fb37c78fe2d819529e3f4421a9c84eb6d2add963316bc3711",
+    "third-party/llguidance-1.8.0/src/earley/lexer/construction_tests.rs": "000d1757976bd47ff300a60f16e141696831ee50ebf50b486c6038e55dd29429",
+    "third-party/llguidance-1.8.0/src/earley/lexerspec.rs": "65808538322912676b0f977c84c7f23aef7c3a4ac14a0f9e4f43ada4eeb84db0",
+    "third-party/llguidance-1.8.0/src/earley/parser.rs": "dfbbbf8ffc58ea1c0f277f90f034144372d8c1ea2ae4a3392aafec7670330631",
+    "third-party/llguidance-1.8.0/src/earley/parser/construction_tests.rs": "291c7ec03231b29d0841d0e9788c060e764817775e360f0dd4a148693071ffad",
+    "third-party/llguidance-1.8.0/src/earley/regexvec.rs": "eaa86564e1c2ce04a5d4a10444c95560c8ac204b16e3dcb0778f4bfc67b88846",
+    "third-party/llguidance-1.8.0/src/earley/regexvec/tests.rs": "d77cbcb09fed93e9f0867b14cec0dba0eea9b921a00cd7c56170451613dad3e5",
+    "third-party/llguidance-1.8.0/src/factory.rs": "8a31d8ec884bbabf8120e4de8729c53cbe6dd8c0ef2524028a7aacfca9a1353c",
+    "third-party/llguidance-1.8.0/src/lib.rs": "fddd5573bd72cc2731b8af8fd8deb90009ba419984cc306fbf7d5e8d9a89267d",
+    "third-party/llguidance-1.8.0/src/matcher.rs": "9e9934387c613a33e7e05607bfba1cd3b380d01d7b10a3a611971cf26821ecb8",
+    "third-party/llguidance-1.8.0/src/matcher/tests.rs": "7c8ad00f575dd71c33df7dad16f0a5c3e0fd3f335f8f39fe4b962f1816adfdc0",
+    "third-party/llguidance-1.8.0/tests/state_limits.rs": "7cd63f81f0c45189352e425c19ee7695e24b6c6dd2fcdb7cc0865c8c9800c01b",
+    "third-party/parser-upstream.json": "9aadf9010ece7de6935d0609a1584a49a243f2620889cfa3ece6878eed64ecac"
+  },
+  "artifacts": {
+    "/private/tmp/eredu-expression-encoding-format.log": {
+      "sha256": "2c0ef6ead6a0590305c0a7a4a6226becfb9a05dd1249f572a4d69c5fa86d4307"
+    },
+    "/private/tmp/eredu-expression-encoding-review.md": {
+      "sha256": "a8fbba2374dbb4c60e61599dc34ad64ac8cb28b01ce789eafceb28614d11679c"
+    },
+    "/private/tmp/eredu-expression-encoding-checks.py": {
+      "sha256": "aa4df7c21c5634f4287a8a2255c1a402c24468175589f0126fae4d5307896053"
+    }
+  },
+  "upstream_provenance": {
+    "manifest": "third-party/parser-upstream.json",
+    "verified_unchanged_archived_files": 88,
+    "changed_archived_files": {
+      "third-party/derivre-0.3.12/Cargo.toml": {
+        "upstream_sha256": "da90190df818e07e8f4c389476818027c26912934c48fe800377d1c7c9c84d58",
+        "local_sha256": "6441fd7f0d65a6b999059ddeb64af5c8795b4a7bb5a942e162a426b6bc2cf7e1"
+      },
+      "third-party/derivre-0.3.12/src/ast.rs": {
+        "upstream_sha256": "21e150da6784d6d6fe952e3305f0b69f5206d9d6af1086f06d0e5e7afe647a6d",
+        "local_sha256": "03dab229de0d10e9df652d54483dde1d524dd6f7229dddcb963a6c591add714a"
+      },
+      "third-party/derivre-0.3.12/src/hashcons.rs": {
+        "upstream_sha256": "83b45e1d9cea4946822a47eea170b19e14082b07f1ed5cbafe523fa16d9421fe",
+        "local_sha256": "012f84deeb07915360b8e1bd69439081cd1599b2dc9bbc2bf55af47f569b0a1e"
+      },
+      "third-party/derivre-0.3.12/src/lib.rs": {
+        "upstream_sha256": "218039c28fa1af4629cf14127991bdd8638f6f1905883fe7f1267fcfbdfe8472",
+        "local_sha256": "db4b9f741f2102307a905196ccfebc9556c853f7768a048b0c38aaa127a50972"
+      },
+      "third-party/llguidance-1.8.0/Cargo.toml": {
+        "upstream_sha256": "de28ec8cebb0a2203c60eb383a3ec59982b5956f32d59607a0cb648b2a11cc8f",
+        "local_sha256": "704853eb99a2f1eeb991b5fe58d98d10d290e00379f71f6b4142cc631e87a395"
+      },
+      "third-party/llguidance-1.8.0/src/api.rs": {
+        "upstream_sha256": "30ca50228809380292c1a757e67d5688aa96a95e177f58241d3fd541172ce929",
+        "local_sha256": "d0efaeafc294bde481f1eed7c5c1901dc3c9ffb83a2081e64d2af72ca8180bac"
+      },
+      "third-party/llguidance-1.8.0/src/earley/lexer.rs": {
+        "upstream_sha256": "c0547d669caa9a704333c3015c6804d777de6190bbde2965456b351a7926bb75",
+        "local_sha256": "fd8bf67f0af2483fb37c78fe2d819529e3f4421a9c84eb6d2add963316bc3711"
+      },
+      "third-party/llguidance-1.8.0/src/earley/lexerspec.rs": {
+        "upstream_sha256": "54f04ceb88cb11eea43991dad2fd2755a7e2170ffef6784819a864f7f7cfb824",
+        "local_sha256": "65808538322912676b0f977c84c7f23aef7c3a4ac14a0f9e4f43ada4eeb84db0"
+      },
+      "third-party/llguidance-1.8.0/src/earley/parser.rs": {
+        "upstream_sha256": "49bd10df88cc7a557b87bfe1bed42ba3f69be0d148e1fe8ddd29398befe3a766",
+        "local_sha256": "dfbbbf8ffc58ea1c0f277f90f034144372d8c1ea2ae4a3392aafec7670330631"
+      },
+      "third-party/llguidance-1.8.0/src/earley/regexvec.rs": {
+        "upstream_sha256": "b088aceeaa121ac7f32688e8136b6b2b14ff272b1b8bfc50cd7372b22ad61300",
+        "local_sha256": "eaa86564e1c2ce04a5d4a10444c95560c8ac204b16e3dcb0778f4bfc67b88846"
+      },
+      "third-party/llguidance-1.8.0/src/factory.rs": {
+        "upstream_sha256": "ef538f37f892fd720e6ea9ff0792492ca3c45605d35116580330983e91cfdb77",
+        "local_sha256": "8a31d8ec884bbabf8120e4de8729c53cbe6dd8c0ef2524028a7aacfca9a1353c"
+      },
+      "third-party/llguidance-1.8.0/src/lib.rs": {
+        "upstream_sha256": "ab2f9466286c11ffb57559769dc5fb261e3621d26c4492a9dad7ec007e83e8eb",
+        "local_sha256": "fddd5573bd72cc2731b8af8fd8deb90009ba419984cc306fbf7d5e8d9a89267d"
+      },
+      "third-party/llguidance-1.8.0/src/matcher.rs": {
+        "upstream_sha256": "509851a45af287a9e741d08fc05145ca0d16f3ba6d611d1ccca0be8edd041291",
+        "local_sha256": "9e9934387c613a33e7e05607bfba1cd3b380d01d7b10a3a611971cf26821ecb8"
+      }
+    },
+    "added_source_files": {
+      "third-party/derivre-0.3.12/src/ast/encoding_tests.rs": "600347fba0d73602a0c0996234a69f6d1b26c6f7e412b0e86a5939dba0dc769e",
+      "third-party/derivre-0.3.12/src/hashcons/incremental_tests.rs": "02ed07121ca1ffdce475229131c51399a598e1ea3f844c2361b0f25e0ff543c1",
+      "third-party/derivre-0.3.12/src/hashcons/tests.rs": "4ec8b0e996cb93252b6768cb6da78de8edaa04d45813bf27de92e83d86713511",
+      "third-party/llguidance-1.8.0/tests/state_limits.rs": "7cd63f81f0c45189352e425c19ee7695e24b6c6dd2fcdb7cc0865c8c9800c01b",
+      "third-party/llguidance-1.8.0/src/matcher/tests.rs": "7c8ad00f575dd71c33df7dad16f0a5c3e0fd3f335f8f39fe4b962f1816adfdc0",
+      "third-party/llguidance-1.8.0/src/earley/regexvec/tests.rs": "d77cbcb09fed93e9f0867b14cec0dba0eea9b921a00cd7c56170451613dad3e5",
+      "third-party/llguidance-1.8.0/src/earley/lexer/construction_tests.rs": "000d1757976bd47ff300a60f16e141696831ee50ebf50b486c6038e55dd29429",
+      "third-party/llguidance-1.8.0/src/earley/parser/construction_tests.rs": "291c7ec03231b29d0841d0e9788c060e764817775e360f0dd4a148693071ffad"
+    }
+  },
+  "previous_increment": "doc/validation/bounded-parser-construction-2026-09-13.json",
+  "behavior": [
+    "Explicit initialized scratch is included in exact retained capacity; begin_insert validates staged geometry before writing.",
+    "Incremental guards require exactly the declared word count. Overlong/failed writes are sticky and clear prior scratch; incomplete/drop/unwind/duplicate/rejected finishes clear staging without changing committed entries.",
+    "Completed encodings are hashed contiguously. Duplicate lookup precedes unique-entry allowance checks; successful new entries publish those same staged words without another payload copy.",
+    "Persistent owner active flag fences all subsequent mutations after mem::forget(guard); read-only committed lookup remains valid and no recovery/Clone/raw mutable escape is exposed.",
+    "One private expression encoder serves ordinary infallible arena insertion, checked nonallocating word counting and the fallible prepared writer.",
+    "Encoding preserves tags/flags/byte layout/padding and returns raw table-local u32 ids without implying reserved ExprSet ids, valid children or rebased references.",
+    "Typed ExprEncodingError retains storage error source; invalid ByteConcat length rejects before starting the writer."
+  ],
+  "initial_failures": [],
+  "limits": [
+    "Prepared allocation requires caller authority; requested word/entry counts are not byte admission proof. Fixed encoding does not constitute a fully bounded ExprSet.",
+    "Expression simplification, map traversal, weight/cache growth, derivative/relevance scratch, compiler/tokenizer/slicer roots and parser-copy peaks remain separate.",
+    "A deliberately forgotten writer is permanently fenced until owner destruction; abandoned staging remains owned, not reclaimed or treated as completion.",
+    "Raw encoding does not validate flags, alphabet widths, child references or semantic arena invariants.",
+    "Finite managed grammar admission remains Unknown; complete family/path goal is still incomplete.",
+    "All-feature/minimal derivre tests overlap and exercise different hashers; total counts executions. Three external checkpoint fixtures remain ignored.",
+    "No native endian/32-bit hardware campaign, allocator fault campaign, new released-checkpoint comparison, native distributed run or whole-process peak is claimed."
+  ]
+}

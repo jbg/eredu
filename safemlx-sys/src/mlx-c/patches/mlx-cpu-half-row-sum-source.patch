@@ -1,0 +1,94 @@
+diff --git a/mlx/backend/cpu/reduction_storage.h b/mlx/backend/cpu/reduction_storage.h
+--- a/mlx/backend/cpu/reduction_storage.h
++++ b/mlx/backend/cpu/reduction_storage.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows, Float32All, Uint32FlatSum, Float32FlatMaximum };
++enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows, Float32All, Uint32FlatSum, Float32FlatMaximum, Float16Rows, Bfloat16Rows };
+ MLX_API bool reduction_dispatch_storage(ReductionEvalKind,size_t rank,
+     EvalDispatchStorage&) noexcept;
+ MLX_API bool reduction_eval_layout(ReductionEvalKind,size_t rank,size_t width,
+diff --git a/mlx/backend/cpu/reduction_storage.cpp b/mlx/backend/cpu/reduction_storage.cpp
+--- a/mlx/backend/cpu/reduction_storage.cpp
++++ b/mlx/backend/cpu/reduction_storage.cpp
+@@ -25,6 +25,8 @@
+     case ReductionEvalKind::BooleanAll:case ReductionEvalKind::BooleanAny:
+       if(rows!=1)return false;break;
+     case ReductionEvalKind::Float32Rows:break;
++    case ReductionEvalKind::Float16Rows:case ReductionEvalKind::Bfloat16Rows:
++      if(width<=1)return false;break;
+     case ReductionEvalKind::Float32All:if(rank<2||rows!=1||width<=1)return false;break;
+     case ReductionEvalKind::Float32MinimumRows:if(width<=1)return false;break;
+     case ReductionEvalKind::Uint32FlatSum:case ReductionEvalKind::Float32FlatMaximum:
+@@ -74,6 +76,17 @@
+         axes.size()!=1||axes[0]!=0||output.shape(0)!=1||output.size()!=1||elements<=1||
+         !input.flags().contiguous||input.data_size()!=elements||span!=elements)return false;
+     selected=kind==Reduce::Sum?ReductionEvalKind::Uint32FlatSum:ReductionEvalKind::Float32FlatMaximum;
++  } else if(kind==Reduce::Sum&&(input.dtype()==float16||input.dtype()==bfloat16)) {
++    // The weightless normalization worker first squares in its input precision.
++    // That dense half array selects the ordinary typed contiguous SumReduce;
++    // never substitute the F32 cascade or its different rounding tree.
++    if(output.dtype()!=input.dtype()||input.itemsize()!=2||output.itemsize()!=2||
++        !input.flags().row_contiguous||axes.size()!=1||axes[0]!=int(rank)-1)return false;
++    width=size_t(input.shape(rank-1));rows=elements/width;
++    if(width<=1||input.strides()[rank-1]!=1||output.size()!=rows)return false;
++    for(size_t axis=0;axis!=rank;++axis)
++      if(output.shape(axis)!=(axis+1==rank?1:input.shape(axis)))return false;
++    selected=input.dtype()==float16?ReductionEvalKind::Float16Rows:ReductionEvalKind::Bfloat16Rows;
+   } else if(kind==Reduce::Sum&&rank>1&&axes.size()==rank) {
+     // This is the exact get_reduction_plan ContiguousAllReduce branch, not
+     // the last-axis cascade. Preserve the ordinary SIMD SumReduce order.
+diff --git a/mlx/backend/cpu/reduce.cpp b/mlx/backend/cpu/reduce.cpp
+--- a/mlx/backend/cpu/reduce.cpp
++++ b/mlx/backend/cpu/reduce.cpp
+@@ -657,6 +657,17 @@
+   }
+ };
+ namespace cpu {
++// Exact typed locals of the existing contiguous half SumReduce worker.
++// A complete last axis produces ContiguousAllReduce or a one-row
++// ContiguousReduce plan, so neither strided_reduce nor nd_loop is reachable.
++template <typename T>
++constexpr size_t half_row_sum_controls() noexcept {
++  constexpr int lanes=simd::max_size<T>;
++  return sizeof(ReductionPlan)*2+sizeof(Shape)*2+sizeof(Strides)*2+
++      sizeof(AxisView)*3+sizeof(SumReduce)*3+sizeof(simd::Simd<T,lanes>)*6+
++      sizeof(T)*6+sizeof(const T*)*3+sizeof(T*)*3+sizeof(int)*8+sizeof(size_t)*6+
++      sizeof(lanes);
++}
+ bool reduction_dispatch_storage(ReductionEvalKind kind,size_t rank,
+     EvalDispatchStorage& out) noexcept {
+   if(!rank||rank>4)return false;
+@@ -664,7 +675,8 @@
+     case ReductionEvalKind::BooleanAll:case ReductionEvalKind::BooleanAny:
+     case ReductionEvalKind::Float32Rows:case ReductionEvalKind::Float32MinimumRows:
+     case ReductionEvalKind::Float32All:case ReductionEvalKind::Uint32FlatSum:
+-    case ReductionEvalKind::Float32FlatMaximum:break;
++    case ReductionEvalKind::Float32FlatMaximum:
++    case ReductionEvalKind::Float16Rows:case ReductionEvalKind::Bfloat16Rows:break;
+     default:return false;
+   }
+   DispatchLayout task;WeakCopyStorage weak;
+@@ -712,8 +724,10 @@
+   const size_t maximum=sizeof(ReductionPlan)*2+sizeof(AxisView)*3+sizeof(MaxReduce)*3+
+       sizeof(simd::Simd<float,minimum_lanes>)*6+sizeof(simd::Simd<bool,minimum_lanes>)*2+
+       sizeof(float)*6+sizeof(const float*)*3+sizeof(float*)*3+sizeof(int)*4+sizeof(size_t)*3;
++  const size_t half_rows=kind==ReductionEvalKind::Float16Rows?half_row_sum_controls<float16_t>():
++      kind==ReductionEvalKind::Bfloat16Rows?half_row_sum_controls<bfloat16_t>():0;
+   const size_t controls[]={task.controls,weak.controls,weak.controls,
+-      kind==ReductionEvalKind::Float32Rows?std::max(cascade,sum_rows):
++      half_rows?half_rows:kind==ReductionEvalKind::Float32Rows?std::max(cascade,sum_rows):
+           kind==ReductionEvalKind::Float32MinimumRows?minimum:
+           kind==ReductionEvalKind::Float32All?sum_all:
+           kind==ReductionEvalKind::Uint32FlatSum?uint_sum:
+@@ -721,7 +735,7 @@
+       sizeof(value)+sizeof(out)+sizeof(kind)+sizeof(rank)+sizeof(task)+sizeof(weak)+
+       sizeof(ReductionTask)*2+sizeof(array)*3+sizeof(Shape)*2+sizeof(Strides)+
+       sizeof(Stream)+sizeof(CommandEncoder*)+sizeof(size_t)*7+sizeof(void*)*5+
+-      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)+sizeof(sum_all)+sizeof(sum_rows)+sizeof(uint_sum_lanes)+sizeof(uint_sum)+sizeof(maximum)};
++      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)+sizeof(sum_all)+sizeof(sum_rows)+sizeof(uint_sum_lanes)+sizeof(uint_sum)+sizeof(maximum)+sizeof(half_rows)};
+   value.controls=sizeof(controls);
+   for(size_t control:controls) {
+     if(control>SIZE_MAX-value.controls)return false;value.controls+=control;

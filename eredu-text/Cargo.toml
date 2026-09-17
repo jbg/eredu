@@ -15,10 +15,22 @@ readme = "README.md"
 no-default-features = true
 
 [features]
+# Development-only ordinary chat compiler image emission; no runtime authority.
+development-chat-recipe = ["minijinja/unstable_machinery_serde"]
+# Development-only aggregate constructor fault selection; disabled by default.
+tokenizer-compiler-test-support = ["tokenizers/tokenizer-compiler-test-support", "decode-compiler-test-support", "minijinja/development-closed-chat"]
+# Development-only original BPE constructor custody tests; never an allocator hook.
+packed-bpe-test-support = ["tokenizers/packed-bpe-test-support"]
 default = ["onig", "esaxx_fast"]
+
+# Development-only real capacity-overflow injection for original compiler custody tests.
+decode-compiler-test-support = []
 
 esaxx_fast = ["tokenizers/esaxx_fast"]
 onig = ["tokenizers/onig"]
+
+# Development-only real capacity-overflow injection at the two stop compiler reserves.
+stop-compiler-test-support = []
 
 [lints]
 workspace = true
@@ -26,11 +38,14 @@ workspace = true
 [dependencies]
 base64 = "0.23"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
-minijinja = { version = "2.24", features = ["json", "loader", "preserve_order"] }
+minijinja = { version = "2.24", path = "../third-party/minijinja-2.24.0", features = ["json", "loader", "preserve_order", "chat-clock"] }
 minijinja-contrib = { version = "2.24", features = ["pycompat"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2.workspace = true
 thiserror = "2"
-tokenizers = { version = "0.23", default-features = false, features = ["fancy-regex"] }
+tokenizers = { version = "=0.23.2", path = "../third-party/tokenizers-0.23.2", default-features = false, features = ["fancy-regex"] }
 eredu-gguf.workspace = true
+
+# Backend-neutral exact grammar vocabulary storage; shared ordinary constructor.
+toktrie = "=1.8.0"

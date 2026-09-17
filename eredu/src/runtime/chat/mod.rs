@@ -15,12 +15,7 @@ pub(crate) mod lfm2;
 mod tokenizer_env;
 pub(crate) mod tool_schema;
 
-use std::{
-    collections::{HashMap, HashSet},
-    fmt,
-    num::NonZeroUsize,
-    sync::Arc,
-};
+use std::{fmt, num::NonZeroUsize, sync::Arc};
 
 use eredu_text::tokenizer::{ChatTemplateIdentity, Tokenizer as ChatTokenizer};
 use serde_json::{Map, Value};
@@ -36,7 +31,7 @@ use crate::runtime::chat::dialect::{
 };
 use crate::runtime::generation::streaming::ToolRuntimeParser;
 use crate::{
-    runtime::chat::constraints::ConstraintBlueprint,
+    runtime::chat::constraints::{ConstraintBlueprint, recipe::ConstraintRecipe},
     runtime::chat::dialect::{DialectParameters, FormatDialect, GenerationPromptBehavior},
 };
 
@@ -132,64 +127,103 @@ impl Eq for GenerationConstraint {}
 pub(crate) struct SemanticRuntimePlan {
     dialect: &'static dyn FormatDialect,
     dialect_parameters: DialectParameters,
-    tools: Vec<Value>,
-    structural_tokens: Vec<ResolvedStructuralToken>,
-    profile_stop_sequences: Vec<String>,
+    recipe: ConstraintRecipe,
+    tool_schemas: Option<tool_schema::registered::Historical>,
 }
 
 impl SemanticRuntimePlan {
-    pub(crate) fn new(
-        dialect: &'static dyn FormatDialect,
-        dialect_parameters: DialectParameters,
-        tools: Vec<Value>,
-        structural_token_spellings: Vec<String>,
-        resolved_structural_token_ids: Vec<u32>,
-        profile_stop_sequences: Vec<String>,
-    ) -> Self {
-        debug_assert_eq!(
-            structural_token_spellings.len(),
-            resolved_structural_token_ids.len()
-        );
-        Self {
-            dialect,
-            dialect_parameters,
-            tools,
-            structural_tokens: structural_token_spellings
-                .into_iter()
-                .zip(resolved_structural_token_ids)
-                .map(|(spelling, token_id)| ResolvedStructuralToken { spelling, token_id })
-                .collect(),
-            profile_stop_sequences,
+    pub(crate) fn original_tool_validation(
+        &self, funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+    ) -> Result<Option<Arc<dyn eredu_runtime::working_memory::OriginalToolValidation>>, tool_schema::registered::PreparationFailure> {
+        self.tool_schemas.as_ref().map(|source| source.prepare(&self.recipe, funding)).transpose()
+    }
+
+    /// Borrows the actual selected parser program and compares the exact trigger
+    /// retained by the original forbidden source. This grants no output storage.
+    pub(crate) fn original_forbidden_channel_program(
+        &self,
+        source: &eredu_runtime::working_memory::OriginalForbiddenSource,
+    ) -> Result<&'static dialect::DeclarativeDialectSpec, dialect::DeclarationError> {
+        if self.recipe.trigger().map(str::as_bytes) != Some(source.inputs().trigger()) {
+            return Err(dialect::DeclarationError::Message(
+                "forbidden parser trigger source changed",
+            ));
         }
+        self.dialect
+            .original_channel_program(self.dialect_parameters)
     }
 
-    pub(crate) fn structural_tokens(&self) -> impl Iterator<Item = (u32, &str)> + '_ {
-        self.structural_tokens
-            .iter()
-            .map(|token| (token.token_id, token.spelling.as_str()))
+    /// Exact shared immutable recipe identity for an active grammar. The source
+    /// compiler independently authenticates that recipe, declaration and trie.
+    pub(crate) fn original_grammar_channel_program(
+        &self,
+        source: eredu_core::speculative::PreparedGrammarSource<'_>,
+    ) -> Result<&'static dialect::DeclarativeDialectSpec, dialect::DeclarationError> {
+        if !self.recipe.source().same_storage(source.recipe()) {
+            return Err(dialect::DeclarationError::Message("grammar parser recipe source changed"));
+        }
+        self.dialect.original_channel_program(self.dialect_parameters)
     }
 
+    /// Ordinary literal stop selection excludes exact structural spellings.
+    pub(crate) fn original_literal_stops(&self) -> impl Iterator<Item = &str> + '_ {
+        self.recipe.stop_sequences().filter(|stop| {
+            !self
+                .recipe
+                .structural_tokens()
+                .any(|(_, spelling)| spelling == *stop)
+        })
+    }
+
+    /// Exact retained recipe rows, including ordinary structural-stop membership.
+    pub(crate) fn original_structural_tokens(
+        &self,
+    ) -> impl ExactSizeIterator<Item = (u32, &str, bool)> + '_ {
+        self.recipe.structural_tokens().map(|(id, spelling)| {
+            (
+                id,
+                spelling,
+                self.recipe.stop_sequences().any(|stop| stop == spelling),
+            )
+        })
+    }
+
+    pub(crate) fn structural_tokens(&self) -> impl ExactSizeIterator<Item = (u32, &str)> + '_ {
+        self.recipe.structural_tokens()
+    }
+
+    #[cfg(test)]
     pub(crate) fn create_parser_with_stops<'a>(
         &self,
         caller_stops: impl IntoIterator<Item = &'a str>,
     ) -> Result<ToolRuntimeParser, String> {
+        self.create_parser_with_stops_under_authority(
+            caller_stops,
+            &eredu_core::HostPreparationAuthority::unmanaged(),
+        )
+    }
+
+    pub(crate) fn create_parser_with_stops_under_authority<'a>(
+        &self,
+        caller_stops: impl IntoIterator<Item = &'a str>,
+        authority: &eredu_core::HostPreparationAuthority,
+    ) -> Result<ToolRuntimeParser, String> {
+        let tools = self.recipe.tools()?;
         let parser = self
             .dialect
-            .incremental_parser_state_with_tools(self.dialect_parameters, &self.tools)?;
+            .incremental_parser_state_with_tools(self.dialect_parameters, &tools)?;
         ToolRuntimeParser::new_with_structural_stops(
             parser,
-            self.profile_stop_sequences.iter().map(String::as_str),
+            self.recipe.stop_sequences(),
             caller_stops,
-            self.profile_stop_sequences
-                .iter()
-                .filter(|stop| {
-                    self.structural_tokens
-                        .iter()
-                        .any(|token| token.spelling == stop.as_str())
-                })
-                .map(String::as_str),
+            self.recipe.stop_sequences().filter(|stop| {
+                self.recipe
+                    .structural_tokens()
+                    .any(|(_, spelling)| spelling == *stop)
+            }),
         )
-        .with_tool_schemas(&self.tools)
+        .with_host_preparation(authority.clone())
+        .with_tool_schemas_under_authority(&tools, authority)
     }
 }
 
@@ -197,8 +231,11 @@ impl fmt::Debug for SemanticRuntimePlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SemanticRuntimePlan")
-            .field("structural_token_count", &self.structural_tokens.len())
-            .field("profile_stop_count", &self.profile_stop_sequences.len())
+            .field(
+                "structural_token_count",
+                &self.recipe.structural_tokens().len(),
+            )
+            .field("profile_stop_count", &self.recipe.stop_sequences().len())
             .finish_non_exhaustive()
     }
 }
@@ -207,9 +244,7 @@ impl PartialEq for SemanticRuntimePlan {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self.dialect, other.dialect)
             && self.dialect_parameters.ptr_eq(other.dialect_parameters)
-            && self.tools == other.tools
-            && self.structural_tokens == other.structural_tokens
-            && self.profile_stop_sequences == other.profile_stop_sequences
+            && self.recipe.semantic_eq(&other.recipe)
     }
 }
 
@@ -226,7 +261,6 @@ pub(crate) struct GenerationRuntimePlan {
     tool_choice: ToolChoice,
     tool_surface: bool,
     generation_constraint: GenerationConstraint,
-    tool_call_trigger: Option<String>,
     semantic: SemanticRuntimePlan,
 }
 
@@ -234,36 +268,51 @@ pub(crate) struct GenerationRuntimePlanParts {
     pub(crate) tool_choice: ToolChoice,
     pub(crate) tool_surface: bool,
     pub(crate) generation_constraint: GenerationConstraint,
-    pub(crate) tool_call_trigger: Option<String>,
     pub(crate) dialect: &'static dyn FormatDialect,
     pub(crate) dialect_parameters: DialectParameters,
-    pub(crate) tools: Vec<Value>,
-    pub(crate) structural_token_spellings: Vec<String>,
-    pub(crate) resolved_structural_token_ids: Vec<u32>,
-    pub(crate) profile_stop_sequences: Vec<String>,
 }
 
 impl GenerationRuntimePlan {
     pub(crate) fn new(parts: GenerationRuntimePlanParts) -> Self {
-        debug_assert_eq!(
-            parts.structural_token_spellings.len(),
-            parts.resolved_structural_token_ids.len()
-        );
-        let semantic = SemanticRuntimePlan::new(
-            parts.dialect,
-            parts.dialect_parameters,
-            parts.tools,
-            parts.structural_token_spellings,
-            parts.resolved_structural_token_ids,
-            parts.profile_stop_sequences,
-        );
+        let semantic = SemanticRuntimePlan {
+            dialect: parts.dialect,
+            dialect_parameters: parts.dialect_parameters,
+            recipe: parts.generation_constraint.inner.recipe.clone(),
+            tool_schemas: None,
+        };
         Self {
             tool_choice: parts.tool_choice,
             tool_surface: parts.tool_surface,
             generation_constraint: parts.generation_constraint,
-            tool_call_trigger: parts.tool_call_trigger,
             semantic,
         }
+    }
+
+    pub(super) fn prepare_tool_schema_sources(
+        &mut self, tools: &[Value], authority: &eredu_core::HostPreparationAuthority,
+    ) -> Result<(), String> {
+        if !tools.is_empty() {
+            self.semantic.tool_schemas = Some(tool_schema::registered::Historical::compile(tools, &self.semantic.recipe, authority)?);
+        }
+        Ok(())
+    }
+    /// Replaces every local recipe alias with the source registered in the exact
+    /// runtime domain. Called while eager compiler temporaries remain guarded.
+    pub(crate) fn register_sources<B: eredu_core::TextGenerationBackend>(
+        &mut self,
+        runtime: &eredu_core::ModelRuntime<B>,
+    ) -> Result<(), eredu_core::BackendFailure> {
+        let recipe = self.semantic.recipe.register(runtime)?;
+        let blueprint = self
+            .generation_constraint
+            .inner
+            .with_registered_recipe(runtime, recipe.clone())?;
+        let tool_schemas = self.semantic.tool_schemas.as_ref()
+            .map(|source| source.register(runtime, &self.semantic.recipe, &recipe)).transpose()?;
+        self.generation_constraint.inner = Arc::new(blueprint);
+        self.semantic.recipe = recipe;
+        self.semantic.tool_schemas = tool_schemas;
+        Ok(())
     }
 
     pub(crate) fn semantic_plan(&self) -> &SemanticRuntimePlan {
@@ -276,12 +325,12 @@ impl GenerationRuntimePlan {
 
     pub(crate) fn auto_activation_trigger(&self) -> Option<&str> {
         (self.tool_choice == ToolChoice::Auto)
-            .then_some(self.tool_call_trigger.as_deref())
+            .then_some(self.tool_call_trigger())
             .flatten()
     }
 
     pub(crate) fn tool_call_trigger(&self) -> Option<&str> {
-        self.tool_call_trigger.as_deref()
+        self.semantic.recipe.trigger()
     }
 
     pub(crate) fn tool_choice(&self) -> ToolChoice {
@@ -294,10 +343,7 @@ impl GenerationRuntimePlan {
 
     #[cfg(test)]
     pub(crate) fn structural_token_ids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.semantic
-            .structural_tokens
-            .iter()
-            .map(|token| token.token_id)
+        self.semantic.structural_tokens().map(|(id, _)| id)
     }
 
     #[cfg(test)]
@@ -311,19 +357,17 @@ impl GenerationRuntimePlan {
     /// parser.
     #[cfg(test)]
     pub(crate) fn create_parser(&self) -> Result<ToolRuntimeParser, String> {
-        let parser = self.semantic.dialect.incremental_parser_state_with_tools(
-            self.semantic.dialect_parameters,
-            &self.semantic.tools,
-        )?;
+        let tools = self.semantic.recipe.tools()?;
+        let parser = self
+            .semantic
+            .dialect
+            .incremental_parser_state_with_tools(self.semantic.dialect_parameters, &tools)?;
         let mut parser = ToolRuntimeParser::new(
             parser,
-            self.semantic
-                .profile_stop_sequences
-                .iter()
-                .map(String::as_str),
+            self.semantic.recipe.stop_sequences(),
             std::iter::empty(),
         )
-        .with_tool_schemas(&self.semantic.tools)?;
+        .with_tool_schemas(&tools)?;
         if self.tool_choice == ToolChoice::None {
             parser.disable_tool_calls();
         }
@@ -359,18 +403,12 @@ impl PartialEq for GenerationRuntimePlan {
         self.tool_choice == other.tool_choice
             && self.tool_surface == other.tool_surface
             && self.generation_constraint == other.generation_constraint
-            && self.tool_call_trigger == other.tool_call_trigger
+            && self.tool_call_trigger() == other.tool_call_trigger()
             && self.semantic == other.semantic
     }
 }
 
 impl Eq for GenerationRuntimePlan {}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ResolvedStructuralToken {
-    spelling: String,
-    token_id: u32,
-}
 
 /// Whether the selected checkpoint template has registered native tool support.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -615,18 +653,34 @@ pub(crate) enum ReasoningTemplateControl {
 }
 
 impl ReasoningTemplateControl {
-    pub(crate) fn template_entry(self, enabled: bool) -> (&'static str, Value) {
+    pub(crate) fn borrowed_template_entry(
+        self,
+        enabled: bool,
+    ) -> eredu_text::chat_storage::ChatScalarBinding<'static> {
+        use eredu_text::chat_storage::{ChatScalarBinding, ChatScalarBindingValue};
         match self {
-            Self::Boolean(kwarg) => (kwarg, Value::Bool(enabled)),
+            Self::Boolean(kwarg) => ChatScalarBinding {
+                name: kwarg,
+                value: ChatScalarBindingValue::Bool(enabled),
+            },
             Self::NamedEffort {
                 kwarg,
                 enabled: enabled_value,
                 disabled,
-            } => (
-                kwarg,
-                Value::String(if enabled { enabled_value } else { disabled }.into()),
-            ),
+            } => ChatScalarBinding {
+                name: kwarg,
+                value: ChatScalarBindingValue::Text(if enabled { enabled_value } else { disabled }),
+            },
         }
+    }
+    pub(crate) fn template_entry(self, enabled: bool) -> (&'static str, Value) {
+        use eredu_text::chat_storage::ChatScalarBindingValue;
+        let binding = self.borrowed_template_entry(enabled);
+        let value = match binding.value {
+            ChatScalarBindingValue::Bool(value) => Value::Bool(value),
+            ChatScalarBindingValue::Text(value) => Value::String(value.into()),
+        };
+        (binding.name, value)
     }
 }
 
@@ -1054,57 +1108,52 @@ pub(crate) fn resolve_structural_tokens(
     tokenizer: &ChatTokenizer,
     required_tokens: &[String],
 ) -> Result<Vec<u32>, String> {
-    let mut seen_spellings = HashSet::new();
-    let mut seen_ids = HashMap::new();
-    let mut resolved = Vec::with_capacity(required_tokens.len());
-
-    for spelling in required_tokens {
-        if spelling.is_empty() {
-            return Err("required structural token spelling must be non-empty".into());
-        }
-        if !seen_spellings.insert(spelling.as_str()) {
-            return Err(format!(
-                "required structural token {spelling:?} is declared more than once"
-            ));
-        }
-        let token_id = tokenizer
-            .get_added_vocabulary()
-            .get_vocab()
-            .get(spelling)
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "required structural token {spelling:?} is not registered as an added token"
-                )
-            })?;
-        if tokenizer.token_to_id(spelling) != Some(token_id) {
-            return Err(format!(
-                "required structural token {spelling:?} does not resolve to its added-token ID {token_id}"
-            ));
-        }
-        if tokenizer.id_to_token(token_id).as_deref() != Some(spelling.as_str()) {
-            return Err(format!(
-                "required structural token {spelling:?} does not round-trip through tokenizer ID {token_id}"
-            ));
-        }
-        let encoding = tokenizer
-            .encode(spelling.as_str(), false)
-            .map_err(|error| {
-                format!("failed to encode required structural token {spelling:?}: {error}")
-            })?;
-        if encoding.get_ids() != [token_id] {
-            return Err(format!(
-                "required structural token {spelling:?} is not atomic with tokenizer ID {token_id}; encoded as {:?}",
-                encoding.get_ids()
-            ));
-        }
-        if let Some(previous) = seen_ids.insert(token_id, spelling.as_str()) {
-            return Err(format!(
-                "required structural tokens {previous:?} and {spelling:?} ambiguously resolve to tokenizer ID {token_id}"
-            ));
-        }
-        resolved.push(token_id);
-    }
+    use eredu_text::tokenizer::structural::{
+        OrdinaryStructuralTokens, StructuralTokenFailure as F, resolve_structural_with,
+    };
+    let mut resolved = vec![0; required_tokens.len()];
+    resolve_structural_with(
+        &mut OrdinaryStructuralTokens(tokenizer),
+        required_tokens,
+        &mut resolved,
+    )
+    .map_err(|failure| match failure {
+        F::Destination => "structural token result population differs from declaration".into(),
+        F::Empty { .. } => "required structural token spelling must be non-empty".into(),
+        F::Repeated { index } => format!(
+            "required structural token {:?} is declared more than once",
+            required_tokens[index]
+        ),
+        F::MissingAdded { index } => format!(
+            "required structural token {:?} is not registered as an added token",
+            required_tokens[index]
+        ),
+        F::Forward { index, id } => format!(
+            "required structural token {:?} does not resolve to its added-token ID {id}",
+            required_tokens[index]
+        ),
+        F::Reverse { index, id } => format!(
+            "required structural token {:?} does not round-trip through tokenizer ID {id}",
+            required_tokens[index]
+        ),
+        F::Encoding { index, cause } => format!(
+            "failed to encode required structural token {:?}: {cause}",
+            required_tokens[index]
+        ),
+        F::NonAtomic { index, id, encoded } => format!(
+            "required structural token {:?} is not atomic with tokenizer ID {id}; encoded as {:?}",
+            required_tokens[index],
+            encoded.get_ids()
+        ),
+        F::Ambiguous {
+            previous,
+            index,
+            id,
+        } => format!(
+            "required structural tokens {:?} and {:?} ambiguously resolve to tokenizer ID {id}",
+            required_tokens[previous], required_tokens[index]
+        ),
+    })?;
     Ok(resolved)
 }
 
@@ -1160,20 +1209,22 @@ pub(crate) fn prepare_format_profile(_template: &str) -> PreparedFormatProfile {
 mod tests {
     use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
     use tokenizers::{
-        models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace, AddedToken, Tokenizer,
+        AddedToken, Tokenizer, models::wordlevel::WordLevel, pre_tokenizers::whitespace::Whitespace,
     };
 
-    use super::{prepare_format_profile, resolve_structural_tokens, SYNTHETIC_TOOL_TEMPLATE};
+    use super::{SYNTHETIC_TOOL_TEMPLATE, prepare_format_profile, resolve_structural_tokens};
     #[test]
     fn registry_does_not_guess_unknown_templates() {
         let prepared = prepare_format_profile("unknown template");
 
         assert_eq!(prepared.identity, None);
         assert!(prepared.dialect.is_none());
-        assert!(prepared
-            .native_tool_unavailable_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("no behavioral format recognizer")));
+        assert!(
+            prepared
+                .native_tool_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no behavioral format recognizer"))
+        );
         assert!(prepared.required_structural_tokens.is_empty());
         assert!(prepared.stop_sequences.is_empty());
     }
@@ -1200,10 +1251,12 @@ mod tests {
         let prepared = prepare_format_profile(inkling_custom);
         assert_eq!(prepared.identity, None);
         assert!(prepared.dialect.is_none());
-        assert!(prepared
-            .native_tool_unavailable_reason
-            .as_deref()
-            .is_some_and(|reason| reason.contains("no behavioral format recognizer")));
+        assert!(
+            prepared
+                .native_tool_unavailable_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("no behavioral format recognizer"))
+        );
     }
 
     #[test]

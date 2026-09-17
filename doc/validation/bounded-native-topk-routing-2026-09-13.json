@@ -1,0 +1,115 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted native top-k selector workspace facts, shared intervention-cost execution and empty-routing reduction handling",
+  "source_sha256": {
+    "doc/backend-architecture.md": "7b4d993d8a12cfeead64688326a39e629b033d5a746237f4eed785be3a0ba66c",
+    "doc/execution-control.md": "9a3dea0608edf7e4c4a0a1a5fcac7a93586fff84fbab8c555c9728434e547795",
+    "doc/bounded-inference.md": "5b48693884bc9ca4ab8ca519b96e4789cf211b52505ee062192e0013078fe6e8",
+    "eredu-nn/src/lib.rs": "b453611a0584764ea5838e9459fb9ce51836e35c0937e83f4b26298ccc87fbc7",
+    "eredu-nn/src/workspace.rs": "40f7849b23d50f666d7ca862f4e99acde90dffc621e1907c62879efc457bbf9b",
+    "eredu-nn/src/workspace/backend/grouped.rs": "c8fd400b2238eb133eaef17232a1044e4b872d666e26faab070835d8aaf1cdd4",
+    "eredu-nn/src/routing_intervention.rs": "2265990b5254f21fdb21fdea184d9765d57a9424c5ba4a20e0494d140ccbf05f",
+    "eredu-nn/src/routing_intervention/execution.rs": "084ddb63ba99174fb7dfef3918f3f6975d5ee18d8c495cf62a89c44c17597f4a",
+    "eredu-backend-mlx/src/backend/nn/workspace.rs": "6c7ca61920b54bb39de1604ae3325072b214be2be666b3e929a583aa73cec578",
+    "eredu-backend-mlx/src/backend/nn/workspace/host.rs": "39741c0ca98066d3289b2624f50e682a03703c17c85411a44722b8dcd09fc2be",
+    "eredu-backend-mlx/src/backend/nn/workspace/routing.rs": "67cbf5bc89be7b257198ac90a47446fb7ca29e5c6b212c8e47cd123ffcb4c3ee",
+    "eredu-backend-mlx/src/backend/nn/workspace/routing/selector.rs": "80a6c541221392a0745ca136f671b1f584d936c94b66ba32f25e6ae23429fc28",
+    "eredu-backend-mlx/src/backend/nn/workspace/routing/selector/tests.rs": "4be6b769b865f86051eb6dfa82343c0cf97f7db589050c9d77d2b63917469397",
+    "eredu-backend-mlx/src/backend/nn/workspace/routing/selector/tests/native.rs": "6a98ea1d9a5b52aa094f8131e67f087b6c5d469c0bc46003f4c3d976ad0366ba",
+    "eredu-backend-mlx/src/backend/nn/workspace/matrix.rs": "3c1fb4d0e2bf5f477242d5869f2b0d88a3fadb6a3a7017a64de20413192d7d9f",
+    "eredu-backend-mlx/src/backend/nn/workspace/packed.rs": "89ffeee61780abc45be9678d587680ca5f3c2eda2370d864d2fc3bc847544783",
+    "eredu-backend-mlx/src/backend/nn/workspace/reduction.rs": "c14cc64516b55d14ffe9424b96a84f128a67e44baa27a51ccf6bb4b0fbd051a1",
+    "eredu-backend-mlx/src/backend/nn/workspace/sampling.rs": "52491319451979121a6b7eeecc107fb5d53eb988662c556ef34564b1eb0ebb9d",
+    "eredu-backend-mlx/src/backend/nn/grouped/selection.rs": "dcca39fd6af4c52567264d09127841b13830818b55a005b320c677ce19ac1358",
+    "eredu-backend-mlx/src/backend/nn/grouped/selection/intervention.rs": "2c0320f6c2488d2563f34f83f7a3484ca0c98801b62f3bce882eb10478b1f53c",
+    "eredu-backend-mlx/src/backend/nn/shared/extensions.rs": "6282d94573408bfcdcde47c0d42066e89a4220d52e7fc879d1ed78d90280e1e6",
+    "eredu-backend-mlx/src/backend/nn/shared/operators.rs": "fcf99b84e0f4a2e5460cfb3a9309e611383bcd80c8536d0aadb4e55ba970196b",
+    "eredu-backend-mlx/src/backend/nn/layers.rs": "103e1fdc703bb3d6e1310854ff1d84e7eba768fdad353b30aaf3c2f8f0d2f67b",
+    "eredu-backend-mlx/src/tests/distributed_pipeline_ring/unit_and_worker/prepared_workspace.rs": "6cd125ec066e23f94d8eacfbc882beaf249609a07803310318b15f69473be29a",
+    "safemlx-sys/src/mlx-c/CMakeLists.txt": "587feff147adb0ee2e61c79841c7dc87418d4b8692488f5ba748b0a2e1d399a6"
+  },
+  "native_source": {
+    "archive": "safemlx-sys/vendor/mlx-v0.32.0.tar.gz",
+    "sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+    "patch_set": "427f983b2956844066ee3c996df4dbc8789fa6652bf3fd43945986cc85e69a24",
+    "derivation_files_sha256": {
+      "mlx/ops.cpp": "725dd3f5021a2f3d5ccf32d91f860a651c036785c77dba9022c8631e165d0a92",
+      "mlx/backend/metal/indexing.cpp": "c9fa7383e3d490c1bd12081cf882fb1b60dccd10fee56be353046db50925e786",
+      "mlx/backend/metal/sort.cpp": "b2f2252cdb65ae18934665ba4659aca9df878cca610221c444b069c1c85fb94c",
+      "mlx/backend/cpu/sort.cpp": "2fd3a8cc4cc670aa1c285dea7a67e998e158a0a242c3abee5fdcf7173cc9d203",
+      "mlx/backend/metal/reduce.cpp": "74b57b0426dd3ee183a5e2f7b066707b4a3c60e9b6f9820e3a7b5689f05dc504",
+      "mlx/backend/metal/matmul.cpp": "775f1879cdebf383eba6ffe0efd3cb3b679162a4cd75ec08978c2c8fdea95927",
+      "mlx/backend/metal/allocator.cpp": "e0b94dd881aef4ef8fdb5aafad1f775be8476c3a5758db3d0a4efe16f34a7da0"
+    }
+  },
+  "coverage": {
+    "native_configurations": 552,
+    "cold_selector_configurations": 2592,
+    "cold_encodings": 36,
+    "neutral_tests": 88,
+    "focused_native_tests": 8,
+    "workspace_regressions": 45,
+    "unique_tests": 138,
+    "new_released_checkpoint_comparisons": 0
+  },
+  "behavior": [
+    "The top-k workspace fact composes the selected dense/packed projection with optional input RMS and learned scale, all four score transforms, grouped eligibility, complete GPU partition backing, cutoff-tie predicates and the possible second CPU partition. CPU argpartition writes shared native index storage using in-place nth_element and does not stage a host sort vector.",
+    "A cold RoutingMechanism executes the authoritative neutral execute_routing_intervention driver, preserving action/stage ordering without another backend-owned intervention engine. It covers bias at all three stages, exclusions, forced strided rows, zeroed contributions, validation predicates, original capture and final precision conversion.",
+    "Caller-supplied IDs retain their possible input storage root. Guaranteed score/coefficient aliases use AliasOutput and remain charged once; other dtype/normalization outcomes conservatively retain their possible separate buffers.",
+    "Managed host payload is the maximum live validation-count, partition-ID, correction or keep-mask vector. Existing control payloads are borrowed. Duplicate and forced-group validation no longer builds allocating ID sets.",
+    "Empty input RMS and selection bypass invalid MLX empty reductions. Empty coefficient sums construct the correctly shaped native zero result before ordinary normalization/scaling. Learned-scale arithmetic and dtype policy remain active.",
+    "2592 cold configurations cover 36 encodings (dense, MXFP4, six affine bit widths, and fourteen native GGML types in both byte orders), four scoring policies, three leading geometries, supplied IDs and all intervention actions/stages with and without original capture.",
+    "552 native configurations cover F32/F16/BF16, strided inputs/parameters, optional RMS and scales, mixed routing-stage precision, four scoring policies, multiple leading ranks, empty batches, all-group selection, 4097-way ties, single-entry and two-entry partitions, multiple selected partitions, supplied IDs, every intervention action/stage, and affine/MXFP4/Q8_0 projections.",
+    "Every measured active native allocation peak fits the corresponding cold bound. Independent F64 equations check projection, input normalization, score transforms, eligible partition/top-k cutoffs and gathered/scaled coefficients; force and zero actions are checked on selected strided rows and original captures are checked separately.",
+    "Prepared native cached traces now leave only grouped execution operations [54,201] for the DeepSeek fixture and [41,80] for Muse. The dense Inkling fixture remains bounded at 310956 bytes. These are operation-trace results, not complete public request-admission claims."
+  ],
+  "tolerances": {
+    "f32": {
+      "atol": 4e-05,
+      "rtol": 0.0004
+    },
+    "f16_bf16": {
+      "atol": 0.006,
+      "rtol": 0.06
+    },
+    "reference": "Native-rounded input/parameter values read after measurement, followed by independent F64 equations. Packed weights independently decoded from fixture bytes. Cutoff ties permit any unique eligible IDs."
+  },
+  "limits": [
+    "Grouped expert execution, addressable expert schedules, complete public quote/admission composition, paging/materialization/transfers, TP/PP, media, observations, active prediction lanes and independent-copy accounting remain unfinished.",
+    "Selector construction does not realize ordinary block-FP8 projection; the estimator keeps that descriptor unknown instead of inheriting another primitive capability. Other non-floating or unsupported native envelopes also remain unknown.",
+    "Bounds concern active managed payload through completion. Allocator cache, native shape/command metadata, driver/JIT and unrelated process/system memory are excluded. No new process-memory or released-checkpoint experiment was needed for this primitive increment.",
+    "Three cold selector tests overlap the focused and workspace suites, giving 138 unique tests. The workspace suite leaves 36 native measurements ignored; the new selector measurement is explicitly run by the focused suite.",
+    "Existing large-unwind linker and unused internal quote/helper warnings remain in logs."
+  ],
+  "checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-nn --all-features --lib",
+      "passed": 88,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-topk-routing-neutral.log",
+      "sha256": "6d935c3d2a9b9f276c25f9d3e5385207a9c57f998757556be51948699a314bdc"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib -- topk_routing_workspace_ native_routing_primitives_pass_shared_conformance prepared_workspace_native_routed routing_intervention_preserves_grouped_selected_softmax routing_stages_keep_input_projection --include-ignored --test-threads=1 --nocapture",
+      "passed": 8,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-topk-routing-native-final.log",
+      "sha256": "f26ea33197205eeeabc5f2e62d4f2f5e199659b40c4365e4c5f1030e580cf9f0"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib -- backend::nn::workspace:: --test-threads=1",
+      "passed": 45,
+      "ignored": 36,
+      "log": "/private/tmp/eredu-topk-routing-workspace-regression.log",
+      "sha256": "44e6dea150a83c38db62075fdcf32220f534543ccfe4e919f59d8934477f62e2"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "passed": null,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-topk-routing-check-final.log",
+      "sha256": "6d49561ca7ba20607648b47c2b634f380bbea7723909ac323b1640880c6a1982"
+    }
+  ]
+}

@@ -1,0 +1,5075 @@
+{
+  "hardware": {
+    "chip": "Apple M3 Ultra",
+    "cpu_cores": 32,
+    "unified_memory_bytes": 274877906944,
+    "gpu_architecture": "applegpu_g15d"
+  },
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted bounded inference implementation with native reduction/normalization facts and scalar backing allowance for empty pointwise broadcasts",
+  "native_versions": {
+    "native_runtime": {
+      "mlx": "0.32.0",
+      "vendored_archive_sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+      "patches": "safemlx-sys/src/mlx-c/patches at the recorded source revision",
+      "safemlx": "0.3.1"
+    }
+  },
+  "host_page_size": 16384,
+  "source_sha256": {
+    "eredu-backend-mlx/src/backend/nn/workspace.rs": "ab6e9808663c214c89c286d9a64fcf2723d85511cb719a49ea1b12ebea726394",
+    "eredu-backend-mlx/src/backend/nn/workspace/reduction.rs": "c14cc64516b55d14ffe9424b96a84f128a67e44baa27a51ccf6bb4b0fbd051a1",
+    "eredu-backend-mlx/src/backend/nn/workspace/reduction/tests.rs": "21aa9163baee9398aef7016d70b3b2f33c91afdfa34352ec0a19a085a4d71a5d",
+    "eredu-backend-mlx/src/backend/nn/workspace/normalization.rs": "78fe5b4626b06f521c930ed03e0b11bab8d7eb8b148461e3ffd72a34107a1b98",
+    "eredu-backend-mlx/src/backend/nn/workspace/normalization/tests.rs": "749c5e3622fe85f2841fcc1943c21e03c48f243ed367c202e0c45ca3a0f4259c",
+    "eredu-backend-mlx/src/backend/nn/workspace/basic.rs": "b6fad338aec19e8a25b089f36201a7d96e46ed1119dcce312e08a50be0a799f7",
+    "eredu-backend-mlx/src/backend/nn/workspace/basic/tests.rs": "eed788cbe4a62976c077af51c64e9ee6baf6159d5ad3c83e91672e8c4a1b770a",
+    "eredu-nn/src/workspace/tensor.rs": "bbc7015a7717ed3a49e133c8a3428ca7e2cbdfdd9282e1b4eeedc5ab32297fb0"
+  },
+  "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --lib --features metal,accelerate backend::nn::workspace -- --include-ignored --nocapture --test-threads=1",
+  "measurement": "Exclusive serial Metal test runner. Evaluate and retain original inputs and parameters, reset MLX peak immediately before each native equation, then read peak after output completion and subtract evaluated-input residency. Keep allocator cache populated between cases.",
+  "normalization_inputs": "Nonzero transposed tensors and stride-two scale vectors; widths 1,32,768,8193; F32,F16,BF16 and mixed F16/BF16 and BF16/F32 pairs. Fifteen raw/constructed normalization policies, including grouped scales, learned offsets and both gated orders.",
+  "reduction_inputs": "Exactly representable signed binary-fraction values, contiguous and transposed layouts, both axes, F32/F16/BF16. Includes a 32769-element reduction and a 16777217-element F32 all-reduce that exceeds the 2^26-byte native accumulator threshold.",
+  "reduction_oracle": {
+    "implementation": "independent host f64 sum in logical row/column order, then one division for mean",
+    "absolute_tolerance": 0.002,
+    "relative_tolerance": 0.01,
+    "comparison": "absolute difference <= absolute_tolerance + relative_tolerance * absolute(expected)"
+  },
+  "bound_derivation": [
+    "Metal reduction output minimum is four bytes. GeneralReduce can copy its input once.",
+    "Native partial-array dispatch thresholds are retained: two-pass column only above reduction extent 256 and below 32768 output elements; long-column starts at extent 1024 with 32 partials per output, increasing to 128 at 32768.",
+    "All-reduce above 4096 input elements uses 128 scalar partials up to 2^26 bytes, then 4096. At most one accumulator is allocated; take the maximum of possible stride-dependent branches.",
+    "Mean additionally charges its count scalar, division result and possible input casts.",
+    "Normalization prices actual fast/custom and fallback equations, taking the maximum of applicable dtype branches, including F32 widening, input/parameter copies, reshape, learned offsets and group/gating order.",
+    "Empty pointwise broadcasts keep a scalar allocation allowance even when logical element count is zero.",
+    "All buffers include host-page rounding and bounded oversized cache reuse; all temporaries are conservatively retained until completion."
+  ],
+  "limitations": [
+    "These operator facts do not establish complete native model workspace coverage or production request-budget admission.",
+    "Bounds cover active tensor-buffer capacity, excluding allocator-cache residency, Metal heap/driver/JIT storage and unrelated process memory.",
+    "Projection, attention and other required unpriced operations keep a full quote unknown; preparation, materialization and retained-resource bounds remain separately required."
+  ],
+  "summary": {
+    "unit_tests_passed": 15,
+    "native_measurements_passed": 888,
+    "normalization_cases_passed": 300,
+    "reduction_cases_passed": 122,
+    "empty_activation_cases_passed": 12,
+    "existing_basic_cases_passed": 435,
+    "existing_large_mask_cases_passed": 3,
+    "existing_recurrent_cases_passed": 16
+  },
+  "normalization_results": [
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 112
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 63
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 16,
+      "cold_bound_bytes": 77
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 112
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 63
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 16,
+      "cold_bound_bytes": 91
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 84
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 24,
+      "cold_bound_bytes": 119
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 40,
+      "cold_bound_bytes": 217
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 40,
+      "cold_bound_bytes": 217
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 3588,
+      "cold_bound_bytes": 11255
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 896,
+      "cold_bound_bytes": 14335
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 1824,
+      "cold_bound_bytes": 9292
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 904,
+      "cold_bound_bytes": 3596
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 900,
+      "cold_bound_bytes": 3844
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 900,
+      "cold_bound_bytes": 3844
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 896,
+      "cold_bound_bytes": 4092
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 3720,
+      "cold_bound_bytes": 11255
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 3720,
+      "cold_bound_bytes": 14335
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 896,
+      "cold_bound_bytes": 12544
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 3720,
+      "cold_bound_bytes": 19963
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 1082,
+      "cold_bound_bytes": 13316
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 3906,
+      "cold_bound_bytes": 20735
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 3906,
+      "cold_bound_bytes": 39632
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 3906,
+      "cold_bound_bytes": 39632
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 24580,
+      "cold_bound_bytes": 74382
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 6144,
+      "cold_bound_bytes": 98303
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 12664,
+      "cold_bound_bytes": 62043
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 6152,
+      "cold_bound_bytes": 24588
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 6148,
+      "cold_bound_bytes": 30724
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 6148,
+      "cold_bound_bytes": 30724
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 6144,
+      "cold_bound_bytes": 36860
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 24580,
+      "cold_bound_bytes": 74382
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 24580,
+      "cold_bound_bytes": 98303
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 6144,
+      "cold_bound_bytes": 86016
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 24580,
+      "cold_bound_bytes": 141307
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 10698,
+      "cold_bound_bytes": 104452
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 29134,
+      "cold_bound_bytes": 159743
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 24624,
+      "cold_bound_bytes": 258608
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 24624,
+      "cold_bound_bytes": 258608
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 458756,
+      "cold_bound_bytes": 885718
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 114688,
+      "cold_bound_bytes": 1179647
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 230120,
+      "cold_bound_bytes": 738187
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 114696,
+      "cold_bound_bytes": 294924
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 114692,
+      "cold_bound_bytes": 376836
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 114692,
+      "cold_bound_bytes": 376836
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 114688,
+      "cold_bound_bytes": 458748
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 458756,
+      "cold_bound_bytes": 885718
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 458756,
+      "cold_bound_bytes": 1179647
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 114688,
+      "cold_bound_bytes": 1032192
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 458756,
+      "cold_bound_bytes": 1703931
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 163844,
+      "cold_bound_bytes": 1277956
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 507912,
+      "cold_bound_bytes": 1949695
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 458800,
+      "cold_bound_bytes": 3099511
+    },
+    {
+      "input_dtype": "Float32",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 458800,
+      "cold_bound_bytes": 3099511
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 112
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 63
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 77
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 112
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 63
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 10,
+      "cold_bound_bytes": 91
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 84
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 18,
+      "cold_bound_bytes": 119
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 32,
+      "cold_bound_bytes": 217
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 38,
+      "cold_bound_bytes": 217
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 590,
+      "cold_bound_bytes": 11255
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 2776,
+      "cold_bound_bytes": 14335
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 140,
+      "cold_bound_bytes": 9292
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 452,
+      "cold_bound_bytes": 3596
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 450,
+      "cold_bound_bytes": 3844
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 450,
+      "cold_bound_bytes": 3844
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 448,
+      "cold_bound_bytes": 4092
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 870,
+      "cold_bound_bytes": 11255
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 2776,
+      "cold_bound_bytes": 14335
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 2776,
+      "cold_bound_bytes": 12544
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 2958,
+      "cold_bound_bytes": 19963
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 13316
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 2962,
+      "cold_bound_bytes": 20735
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 3990,
+      "cold_bound_bytes": 39632
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 4040,
+      "cold_bound_bytes": 39632
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 200,
+      "cold_bound_bytes": 74382
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 16842,
+      "cold_bound_bytes": 98303
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 62043
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 4554,
+      "cold_bound_bytes": 24588
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 4552,
+      "cold_bound_bytes": 30724
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 4552,
+      "cold_bound_bytes": 30724
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 4550,
+      "cold_bound_bytes": 36860
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 3156,
+      "cold_bound_bytes": 74382
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 16842,
+      "cold_bound_bytes": 98303
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 16842,
+      "cold_bound_bytes": 86016
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 21392,
+      "cold_bound_bytes": 141307
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 104452
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 21396,
+      "cold_bound_bytes": 159743
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 23030,
+      "cold_bound_bytes": 258608
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 27580,
+      "cold_bound_bytes": 258608
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 82308,
+      "cold_bound_bytes": 885718
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 425988,
+      "cold_bound_bytes": 1179647
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 386,
+      "cold_bound_bytes": 738187
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 294924
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 81922,
+      "cold_bound_bytes": 376836
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 81922,
+      "cold_bound_bytes": 376836
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 458748
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 82308,
+      "cold_bound_bytes": 885718
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 344068,
+      "cold_bound_bytes": 1179647
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 425988,
+      "cold_bound_bytes": 1032192
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 393220,
+      "cold_bound_bytes": 1703931
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 1277956
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 393224,
+      "cold_bound_bytes": 1949695
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 540720,
+      "cold_bound_bytes": 3099511
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Float16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 507952,
+      "cold_bound_bytes": 3099511
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 112
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 63
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 77
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 112
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 63
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 10,
+      "cold_bound_bytes": 91
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 84
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 18,
+      "cold_bound_bytes": 119
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 32,
+      "cold_bound_bytes": 217
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 38,
+      "cold_bound_bytes": 217
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 870,
+      "cold_bound_bytes": 11255
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 2776,
+      "cold_bound_bytes": 14335
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 140,
+      "cold_bound_bytes": 9292
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 452,
+      "cold_bound_bytes": 3596
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 450,
+      "cold_bound_bytes": 3844
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 450,
+      "cold_bound_bytes": 3844
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 448,
+      "cold_bound_bytes": 4092
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 870,
+      "cold_bound_bytes": 11255
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 2776,
+      "cold_bound_bytes": 14335
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 2776,
+      "cold_bound_bytes": 12544
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 2958,
+      "cold_bound_bytes": 19963
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 13316
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 2962,
+      "cold_bound_bytes": 20735
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 3858,
+      "cold_bound_bytes": 39632
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 4040,
+      "cold_bound_bytes": 39632
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 3156,
+      "cold_bound_bytes": 74382
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 16842,
+      "cold_bound_bytes": 98303
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 62043
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 4554,
+      "cold_bound_bytes": 24588
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 4552,
+      "cold_bound_bytes": 30724
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 4552,
+      "cold_bound_bytes": 30724
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 4550,
+      "cold_bound_bytes": 36860
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 3156,
+      "cold_bound_bytes": 74382
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 16842,
+      "cold_bound_bytes": 98303
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 16842,
+      "cold_bound_bytes": 86016
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 21392,
+      "cold_bound_bytes": 141307
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 104452
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 21396,
+      "cold_bound_bytes": 159743
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 23030,
+      "cold_bound_bytes": 258608
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 27580,
+      "cold_bound_bytes": 258608
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 82308,
+      "cold_bound_bytes": 885718
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 425988,
+      "cold_bound_bytes": 1179647
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 386,
+      "cold_bound_bytes": 738187
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 294924
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 81922,
+      "cold_bound_bytes": 376836
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 81922,
+      "cold_bound_bytes": 376836
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 458748
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 82308,
+      "cold_bound_bytes": 885718
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 344068,
+      "cold_bound_bytes": 1179647
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 425988,
+      "cold_bound_bytes": 1032192
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 393220,
+      "cold_bound_bytes": 1703931
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 1277956
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 393224,
+      "cold_bound_bytes": 1949695
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 540720,
+      "cold_bound_bytes": 3099511
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 507952,
+      "cold_bound_bytes": 3099511
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 112
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 63
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 77
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 112
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 63
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 10,
+      "cold_bound_bytes": 91
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 84
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 18,
+      "cold_bound_bytes": 119
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 42,
+      "cold_bound_bytes": 217
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 38,
+      "cold_bound_bytes": 217
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 870,
+      "cold_bound_bytes": 11255
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 266,
+      "cold_bound_bytes": 14335
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 140,
+      "cold_bound_bytes": 9292
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 452,
+      "cold_bound_bytes": 3596
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 86,
+      "cold_bound_bytes": 3844
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 186,
+      "cold_bound_bytes": 3844
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 4092
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 870,
+      "cold_bound_bytes": 11255
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 2776,
+      "cold_bound_bytes": 14335
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 12544
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 2958,
+      "cold_bound_bytes": 19963
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 13316
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 2962,
+      "cold_bound_bytes": 20735
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 5068,
+      "cold_bound_bytes": 39632
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 4040,
+      "cold_bound_bytes": 39632
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 3156,
+      "cold_bound_bytes": 74382
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 4550,
+      "cold_bound_bytes": 98303
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 62043
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 4554,
+      "cold_bound_bytes": 24588
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 30724
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 4554,
+      "cold_bound_bytes": 30724
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 4550,
+      "cold_bound_bytes": 36860
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 3156,
+      "cold_bound_bytes": 74382
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 16842,
+      "cold_bound_bytes": 98303
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 86016
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 21392,
+      "cold_bound_bytes": 141307
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 104452
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 21396,
+      "cold_bound_bytes": 159743
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 33724,
+      "cold_bound_bytes": 258608
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 27580,
+      "cold_bound_bytes": 258608
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 82308,
+      "cold_bound_bytes": 885718
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 1179647
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 386,
+      "cold_bound_bytes": 738187
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 294924
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 32770,
+      "cold_bound_bytes": 376836
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 376836
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 458748
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 82308,
+      "cold_bound_bytes": 885718
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 344068,
+      "cold_bound_bytes": 1179647
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 1032192
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 393220,
+      "cold_bound_bytes": 1703931
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 1277956
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 393224,
+      "cold_bound_bytes": 1949695
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 622640,
+      "cold_bound_bytes": 3099511
+    },
+    {
+      "input_dtype": "Float16",
+      "weight_dtype": "Bfloat16",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 507952,
+      "cold_bound_bytes": 3099511
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 20,
+      "cold_bound_bytes": 112
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 63
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 14,
+      "cold_bound_bytes": 77
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 20,
+      "cold_bound_bytes": 112
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 10,
+      "cold_bound_bytes": 63
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 14,
+      "cold_bound_bytes": 91
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 84
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 22,
+      "cold_bound_bytes": 119
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 46,
+      "cold_bound_bytes": 217
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 42,
+      "cold_bound_bytes": 217
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 1234,
+      "cold_bound_bytes": 11255
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 896,
+      "cold_bound_bytes": 14335
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 504,
+      "cold_bound_bytes": 9292
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 452,
+      "cold_bound_bytes": 3596
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 86,
+      "cold_bound_bytes": 3844
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 900,
+      "cold_bound_bytes": 3844
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 896,
+      "cold_bound_bytes": 4092
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 1234,
+      "cold_bound_bytes": 11255
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 3140,
+      "cold_bound_bytes": 14335
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 12544
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 3140,
+      "cold_bound_bytes": 19963
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 186,
+      "cold_bound_bytes": 13316
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 3326,
+      "cold_bound_bytes": 20735
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 5250,
+      "cold_bound_bytes": 39632
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        7,
+        32
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 4222,
+      "cold_bound_bytes": 39632
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 7822,
+      "cold_bound_bytes": 74382
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 6144,
+      "cold_bound_bytes": 98303
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 3270,
+      "cold_bound_bytes": 62043
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 3076,
+      "cold_bound_bytes": 24588
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 1538,
+      "cold_bound_bytes": 30724
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 6148,
+      "cold_bound_bytes": 30724
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 6144,
+      "cold_bound_bytes": 36860
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 7822,
+      "cold_bound_bytes": 74382
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 21508,
+      "cold_bound_bytes": 98303
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 86016
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 21508,
+      "cold_bound_bytes": 141307
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 3076,
+      "cold_bound_bytes": 104452
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 26062,
+      "cold_bound_bytes": 159743
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 33840,
+      "cold_bound_bytes": 258608
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        2,
+        768
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 27696,
+      "cold_bound_bytes": 258608
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Rms",
+      "incremental_peak_bytes": 164228,
+      "cold_bound_bytes": 885718
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "WeightedRms",
+      "incremental_peak_bytes": 114688,
+      "cold_bound_bytes": 1179647
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "L2",
+      "incremental_peak_bytes": 82306,
+      "cold_bound_bytes": 738187
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: false, bias: false }",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 294924
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: false, bias: true }",
+      "incremental_peak_bytes": 32770,
+      "cold_bound_bytes": 376836
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: true, bias: false }",
+      "incremental_peak_bytes": 114692,
+      "cold_bound_bytes": 376836
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Layer { weight: true, bias: true }",
+      "incremental_peak_bytes": 114688,
+      "cold_bound_bytes": 458748
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 0, grouped: false }",
+      "incremental_peak_bytes": 164228,
+      "cold_bound_bytes": 885718
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 0, grouped: true }",
+      "incremental_peak_bytes": 425988,
+      "cold_bound_bytes": 1179647
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 1, grouped: false }",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 1032192
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 1, grouped: true }",
+      "incremental_peak_bytes": 425988,
+      "cold_bound_bytes": 1703931
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 2, grouped: false }",
+      "incremental_peak_bytes": 49156,
+      "cold_bound_bytes": 1277956
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Constructed { scale: 2, grouped: true }",
+      "incremental_peak_bytes": 475144,
+      "cold_bound_bytes": 1949695
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Gated { after: false }",
+      "incremental_peak_bytes": 655408,
+      "cold_bound_bytes": 3099511
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "weight_dtype": "Float32",
+      "shape": [
+        3,
+        8193
+      ],
+      "equation": "Gated { after: true }",
+      "incremental_peak_bytes": 540720,
+      "cold_bound_bytes": 3099511
+    }
+  ],
+  "reduction_results": [
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 84,
+      "cold_bound_bytes": 830,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 88,
+      "cold_bound_bytes": 1146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 28,
+      "cold_bound_bytes": 782,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 32,
+      "cold_bound_bytes": 954,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 84,
+      "cold_bound_bytes": 830,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 88,
+      "cold_bound_bytes": 1146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 28,
+      "cold_bound_bytes": 782,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 32,
+      "cold_bound_bytes": 954,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 4732,
+      "cold_bound_bytes": 90629,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 4736,
+      "cold_bound_bytes": 91425,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 1028,
+      "cold_bound_bytes": 83974,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 1032,
+      "cold_bound_bytes": 90146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 90629,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 186,
+      "cold_bound_bytes": 91425,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 1028,
+      "cold_bound_bytes": 83974,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 1032,
+      "cold_bound_bytes": 90146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 1548,
+      "cold_bound_bytes": 445461,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 1552,
+      "cold_bound_bytes": 445537,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 147456,
+      "cold_bound_bytes": 622590,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 147460,
+      "cold_bound_bytes": 1163266,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 445461,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 16,
+      "cold_bound_bytes": 445537,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 147456,
+      "cold_bound_bytes": 622590,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 147460,
+      "cold_bound_bytes": 1163266,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 65535,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 32772,
+      "cold_bound_bytes": 262147,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 66565,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 66593,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 65535,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 32772,
+      "cold_bound_bytes": 262147,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 66565,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 66593,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        16777217
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 67190789,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        1,
+        16777217
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 67190817,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 28,
+      "cold_bound_bytes": 830,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 30,
+      "cold_bound_bytes": 1146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 24,
+      "cold_bound_bytes": 782,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 26,
+      "cold_bound_bytes": 954,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 28,
+      "cold_bound_bytes": 830,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 30,
+      "cold_bound_bytes": 1146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 24,
+      "cold_bound_bytes": 782,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 26,
+      "cold_bound_bytes": 954,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 3156,
+      "cold_bound_bytes": 90629,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 3158,
+      "cold_bound_bytes": 91425,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 728,
+      "cold_bound_bytes": 83974,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 730,
+      "cold_bound_bytes": 90146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 84,
+      "cold_bound_bytes": 90629,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 86,
+      "cold_bound_bytes": 91425,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 728,
+      "cold_bound_bytes": 83974,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 730,
+      "cold_bound_bytes": 90146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 445461,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 904,
+      "cold_bound_bytes": 445537,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 622590,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 81922,
+      "cold_bound_bytes": 1163266,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 445461,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 445537,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 622590,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 81922,
+      "cold_bound_bytes": 1163266,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 65535,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 8196,
+      "cold_bound_bytes": 262147,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 66565,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 66593,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 65535,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 8196,
+      "cold_bound_bytes": 262147,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 66565,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Float16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 66593,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 35,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 28,
+      "cold_bound_bytes": 830,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 30,
+      "cold_bound_bytes": 1146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 24,
+      "cold_bound_bytes": 782,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 26,
+      "cold_bound_bytes": 954,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 28,
+      "cold_bound_bytes": 830,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 30,
+      "cold_bound_bytes": 1146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 24,
+      "cold_bound_bytes": 782,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 26,
+      "cold_bound_bytes": 954,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 84,
+      "cold_bound_bytes": 90629,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 3158,
+      "cold_bound_bytes": 91425,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 728,
+      "cold_bound_bytes": 83974,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 730,
+      "cold_bound_bytes": 90146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 90629,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 86,
+      "cold_bound_bytes": 91425,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 728,
+      "cold_bound_bytes": 83974,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        257,
+        33
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 730,
+      "cold_bound_bytes": 90146,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 445461,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 904,
+      "cold_bound_bytes": 445537,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 622590,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 81922,
+      "cold_bound_bytes": 1163266,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 445461,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 445537,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 622590,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        32769,
+        3
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 81922,
+      "cold_bound_bytes": 1163266,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 65535,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 8196,
+      "cold_bound_bytes": 262147,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 66565,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": false,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 66593,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "sum",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 65535,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 0,
+      "operation": "mean",
+      "incremental_peak_bytes": 8196,
+      "cold_bound_bytes": 262147,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "sum",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 66565,
+      "host_oracle_match": true
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        1,
+        4097
+      ],
+      "strided": true,
+      "axis": 1,
+      "operation": "mean",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 66593,
+      "host_oracle_match": true
+    }
+  ],
+  "empty_activation_results": [
+    {
+      "dtype": "Float32",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 35
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 35
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 154
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 119
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 20,
+      "cold_bound_bytes": 210
+    },
+    {
+      "dtype": "Float32",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 56
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 35
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 35
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 154
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 119
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 22,
+      "cold_bound_bytes": 210
+    },
+    {
+      "dtype": "Bfloat16",
+      "shape": [
+        0,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 56
+    }
+  ]
+}

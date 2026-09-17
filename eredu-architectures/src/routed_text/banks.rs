@@ -228,6 +228,12 @@ where
             }
         })
     }
+    /// Borrows the exact generic movement selected for this provider.
+    pub fn indexed_movement(&self)->&Movement {
+        match self { Self::Gated(p)=>p.indexed_movement(),Self::Relu2(p)=>p.indexed_movement(),
+            Self::Linear(p)=>p.indexed_movement() }
+    }
+
     /// Borrows the retained generic storage owner.
     pub fn bank_storage(&self) -> &Bank {
         match self {
@@ -247,25 +253,32 @@ where
     }
 }
 
-impl<B> RoutedExpertProvider<B> for PlannedResidentBank
+impl<B> RoutedExpertProvider<B> for &PlannedResidentBank
 where
     B: GroupedNeuralBackend,
 {
     type Error = RoutedTextExecutionError;
+    // All variants validate the retained per-unit specification, then call the
+    // same grouped method on the supplied resident bank. No provider-owned
+    // compact bank, transfer or added tensor equation is introduced. Partition
+    // dispatch remains a distinct strategy with its own workspace qualification.
+    fn resident_unit_equations() -> bool {
+        true
+    }
     fn forward_grouped(
         &mut self,
         resident: &mut B::GatedProductGroups,
         request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        match self {
-            Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_grouped(p, resident, request, context)
+        match *self {
+            PlannedResidentBank::Gated(p) => {
+                RoutedExpertProvider::<B>::forward_grouped(&mut {p}, resident, request, context)
             }
-            Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_grouped(p, resident, request, context)
+            PlannedResidentBank::Relu2(p) => {
+                RoutedExpertProvider::<B>::forward_grouped(&mut {p}, resident, request, context)
             }
-            Self::Linear { .. } => Err(RoutedTextExecutionError::Contract(
+            PlannedResidentBank::Linear { .. } => Err(RoutedTextExecutionError::Contract(
                 "selected linear bank received a different grouped equation".into(),
             )),
         }
@@ -276,14 +289,14 @@ where
         request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        match self {
-            Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_compact_grouped(p, resident, request, context)
+        match *self {
+            PlannedResidentBank::Gated(p) => {
+                RoutedExpertProvider::<B>::forward_compact_grouped(&mut {p}, resident, request, context)
             }
-            Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_compact_grouped(p, resident, request, context)
+            PlannedResidentBank::Relu2(p) => {
+                RoutedExpertProvider::<B>::forward_compact_grouped(&mut {p}, resident, request, context)
             }
-            Self::Linear { .. } => Err(RoutedTextExecutionError::Contract(
+            PlannedResidentBank::Linear { .. } => Err(RoutedTextExecutionError::Contract(
                 "selected linear bank received a different grouped equation".into(),
             )),
         }
@@ -294,14 +307,14 @@ where
         request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        match self {
-            Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_relu2_routed(p, resident, request, context)
+        match *self {
+            PlannedResidentBank::Gated(p) => {
+                RoutedExpertProvider::<B>::forward_relu2_routed(&mut {p}, resident, request, context)
             }
-            Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_relu2_routed(p, resident, request, context)
+            PlannedResidentBank::Relu2(p) => {
+                RoutedExpertProvider::<B>::forward_relu2_routed(&mut {p}, resident, request, context)
             }
-            Self::Linear { .. } => Err(RoutedTextExecutionError::Contract(
+            PlannedResidentBank::Linear { .. } => Err(RoutedTextExecutionError::Contract(
                 "selected linear bank received a different grouped equation".into(),
             )),
         }
@@ -312,14 +325,14 @@ where
         request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        match self {
-            Self::Gated(p) => {
-                RoutedExpertProvider::<B>::forward_linear_routed(p, resident, request, context)
+        match *self {
+            PlannedResidentBank::Gated(p) => {
+                RoutedExpertProvider::<B>::forward_linear_routed(&mut {p}, resident, request, context)
             }
-            Self::Relu2(p) => {
-                RoutedExpertProvider::<B>::forward_linear_routed(p, resident, request, context)
+            PlannedResidentBank::Relu2(p) => {
+                RoutedExpertProvider::<B>::forward_linear_routed(&mut {p}, resident, request, context)
             }
-            Self::Linear {
+            PlannedResidentBank::Linear {
                 owner_group,
                 plan,
                 routes_by_unit,
@@ -352,6 +365,72 @@ where
                     .map_err(RoutedTextExecutionError::from_error)
             }
         }
+    }
+}
+
+impl<B> RoutedExpertProvider<B> for PlannedResidentBank
+where
+    B: GroupedNeuralBackend,
+{
+    type Error = RoutedTextExecutionError;
+    fn resident_unit_equations() -> bool {
+        <&Self as RoutedExpertProvider<B>>::resident_unit_equations()
+    }
+
+    fn forward_grouped(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if let Some(metadata) = B::construction_metadata(context).filter(|source| source.uses_checked_metadata()) {
+            let bytes = [std::mem::size_of::<(&mut Self, &Self)>(), std::mem::size_of_val(&resident), std::mem::size_of_val(&request), std::mem::size_of_val(&context), std::mem::size_of::<Result<B::Tensor, Self::Error>>()].into_iter().try_fold(0usize, usize::checked_add)
+                .ok_or_else(|| RoutedTextExecutionError::from_error(eredu_nn::workspace::WorkspaceMetadataError::Overflow))?;
+            metadata.charge_metadata(bytes).map_err(RoutedTextExecutionError::from_error)?;
+        }
+        RoutedExpertProvider::<B>::forward_grouped(&mut &*self, resident, request, context)
+    }
+
+    fn forward_compact_grouped(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if let Some(metadata) = B::construction_metadata(context).filter(|source| source.uses_checked_metadata()) {
+            let bytes = [std::mem::size_of::<(&mut Self, &Self)>(), std::mem::size_of_val(&resident), std::mem::size_of_val(&request), std::mem::size_of_val(&context), std::mem::size_of::<Result<B::Tensor, Self::Error>>()].into_iter().try_fold(0usize, usize::checked_add)
+                .ok_or_else(|| RoutedTextExecutionError::from_error(eredu_nn::workspace::WorkspaceMetadataError::Overflow))?;
+            metadata.charge_metadata(bytes).map_err(RoutedTextExecutionError::from_error)?;
+        }
+        RoutedExpertProvider::<B>::forward_compact_grouped(&mut &*self, resident, request, context)
+    }
+
+    fn forward_relu2_routed(
+        &mut self,
+        resident: &mut B::Relu2Groups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if let Some(metadata) = B::construction_metadata(context).filter(|source| source.uses_checked_metadata()) {
+            let bytes = [std::mem::size_of::<(&mut Self, &Self)>(), std::mem::size_of_val(&resident), std::mem::size_of_val(&request), std::mem::size_of_val(&context), std::mem::size_of::<Result<B::Tensor, Self::Error>>()].into_iter().try_fold(0usize, usize::checked_add)
+                .ok_or_else(|| RoutedTextExecutionError::from_error(eredu_nn::workspace::WorkspaceMetadataError::Overflow))?;
+            metadata.charge_metadata(bytes).map_err(RoutedTextExecutionError::from_error)?;
+        }
+        RoutedExpertProvider::<B>::forward_relu2_routed(&mut &*self, resident, request, context)
+    }
+
+    fn forward_linear_routed(
+        &mut self,
+        resident: &mut B::LinearGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        if let Some(metadata) = B::construction_metadata(context).filter(|source| source.uses_checked_metadata()) {
+            let bytes = [std::mem::size_of::<(&mut Self, &Self)>(), std::mem::size_of_val(&resident), std::mem::size_of_val(&request), std::mem::size_of_val(&context), std::mem::size_of::<Result<B::Tensor, Self::Error>>()].into_iter().try_fold(0usize, usize::checked_add)
+                .ok_or_else(|| RoutedTextExecutionError::from_error(eredu_nn::workspace::WorkspaceMetadataError::Overflow))?;
+            metadata.charge_metadata(bytes).map_err(RoutedTextExecutionError::from_error)?;
+        }
+        RoutedExpertProvider::<B>::forward_linear_routed(&mut &*self, resident, request, context)
     }
 }
 
@@ -655,6 +734,51 @@ impl RoutedTextRequirements {
     }
 }
 
+impl<B> eredu_runtime::TensorParallelRoutedExpertProvider<B> for &PlannedResidentBank
+where
+    B: eredu_nn::TensorParallelGroupedNeuralBackend,
+{
+    fn forward_grouped_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        match *self {
+            PlannedResidentBank::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(&mut {p}, resident, request, partitions, context),
+            PlannedResidentBank::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(&mut {p}, resident, request, partitions, context),
+            PlannedResidentBank::Linear { .. } => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
+        }
+    }
+    fn forward_compact_grouped_tensor_parallel(
+        &mut self,
+        resident: &mut B::GatedProductGroups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        match *self {
+            PlannedResidentBank::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_compact_grouped_tensor_parallel(&mut {p}, resident, request, partitions, context),
+            PlannedResidentBank::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_compact_grouped_tensor_parallel(&mut {p}, resident, request, partitions, context),
+            PlannedResidentBank::Linear { .. } => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
+        }
+    }
+    fn forward_relu2_routed_tensor_parallel(
+        &mut self,
+        resident: &mut B::Relu2Groups,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        partitions: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        match *self {
+            PlannedResidentBank::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_relu2_routed_tensor_parallel(&mut {p}, resident, request, partitions, context),
+            PlannedResidentBank::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_relu2_routed_tensor_parallel(&mut {p}, resident, request, partitions, context),
+            PlannedResidentBank::Linear { .. } => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
+        }
+    }
+}
+
 impl<B> eredu_runtime::TensorParallelRoutedExpertProvider<B> for PlannedResidentBank
 where
     B: eredu_nn::TensorParallelGroupedNeuralBackend,
@@ -666,12 +790,14 @@ where
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        match self {
-            Self::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(p, resident, request, partitions, context),
-            Self::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(p, resident, request, partitions, context),
-            Self::Linear { .. } => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
+        if let Some(metadata) = B::construction_metadata(context).filter(|source| source.uses_checked_metadata()) {
+            let bytes = [std::mem::size_of::<(&mut Self, &Self)>(), std::mem::size_of_val(&resident), std::mem::size_of_val(&request), std::mem::size_of_val(&partitions), std::mem::size_of_val(&context), std::mem::size_of::<Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error>>()].into_iter().try_fold(0usize, usize::checked_add)
+                .ok_or_else(|| RoutedTextExecutionError::from_error(eredu_nn::workspace::WorkspaceMetadataError::Overflow))?;
+            metadata.charge_metadata(bytes).map_err(RoutedTextExecutionError::from_error)?;
         }
+        eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_grouped_tensor_parallel(&mut &*self, resident, request, partitions, context)
     }
+
     fn forward_compact_grouped_tensor_parallel(
         &mut self,
         resident: &mut B::GatedProductGroups,
@@ -679,12 +805,14 @@ where
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        match self {
-            Self::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_compact_grouped_tensor_parallel(p, resident, request, partitions, context),
-            Self::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_compact_grouped_tensor_parallel(p, resident, request, partitions, context),
-            Self::Linear { .. } => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
+        if let Some(metadata) = B::construction_metadata(context).filter(|source| source.uses_checked_metadata()) {
+            let bytes = [std::mem::size_of::<(&mut Self, &Self)>(), std::mem::size_of_val(&resident), std::mem::size_of_val(&request), std::mem::size_of_val(&partitions), std::mem::size_of_val(&context), std::mem::size_of::<Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error>>()].into_iter().try_fold(0usize, usize::checked_add)
+                .ok_or_else(|| RoutedTextExecutionError::from_error(eredu_nn::workspace::WorkspaceMetadataError::Overflow))?;
+            metadata.charge_metadata(bytes).map_err(RoutedTextExecutionError::from_error)?;
         }
+        eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_compact_grouped_tensor_parallel(&mut &*self, resident, request, partitions, context)
     }
+
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident: &mut B::Relu2Groups,
@@ -692,11 +820,12 @@ where
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
-        match self {
-            Self::Gated(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_relu2_routed_tensor_parallel(p, resident, request, partitions, context),
-            Self::Relu2(p) => eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_relu2_routed_tensor_parallel(p, resident, request, partitions, context),
-            Self::Linear { .. } => Err(RoutedTextExecutionError::Contract("selected linear bank received a feed-forward partial invocation".into())),
+        if let Some(metadata) = B::construction_metadata(context).filter(|source| source.uses_checked_metadata()) {
+            let bytes = [std::mem::size_of::<(&mut Self, &Self)>(), std::mem::size_of_val(&resident), std::mem::size_of_val(&request), std::mem::size_of_val(&partitions), std::mem::size_of_val(&context), std::mem::size_of::<Result<eredu_runtime::RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error>>()].into_iter().try_fold(0usize, usize::checked_add)
+                .ok_or_else(|| RoutedTextExecutionError::from_error(eredu_nn::workspace::WorkspaceMetadataError::Overflow))?;
+            metadata.charge_metadata(bytes).map_err(RoutedTextExecutionError::from_error)?;
         }
+        eredu_runtime::TensorParallelRoutedExpertProvider::<B>::forward_relu2_routed_tensor_parallel(&mut &*self, resident, request, partitions, context)
     }
 }
 

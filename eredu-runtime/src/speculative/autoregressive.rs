@@ -4,7 +4,15 @@
 //! mechanism owns only proposal isolation, verification and accepted-prefix replay.
 use eredu_core::{
     execution_control::SnapshotEstimate, BoundedCompletion, SpeculativeCommit, SpeculativeExecutor,
-    SpeculativePrefill, Submission,
+    SpeculativePrefill, SpeculativePrefillOutcome, Submission,
+};
+
+mod occurrence;
+mod occurrence_owners;
+use occurrence_owners::OccurrenceOwners;
+pub use occurrence::{
+    AutoregressiveContinuation, AutoregressiveInvocation, AutoregressiveInvocationDomain, AutoregressiveOccurrenceClaim, AutoregressiveOccurrenceCursor,
+    AutoregressiveOccurrenceError, AutoregressiveScheduleIdentity, AutoregressiveSchedulePlan, AutoregressiveSource,
 };
 
 /// Attribution of a model invocation within an independent-draft transaction.
@@ -22,6 +30,16 @@ pub enum AutoregressivePass {
     TargetCommit,
     /// Canonical draft advancement to the accepted target frontier.
     DraftCommit,
+}
+
+/// Actual selected initial-prefill result. Target prefill returns its one
+/// sampling distribution; draft prefill has no scores. Verification retains the
+/// separate complete Output type and its existing sequence indexing.
+pub struct AutoregressivePrefill<L> {
+    /// Present only for target LastPosition demand.
+    pub logits: Option<L>,
+    /// Actual prompt positions consumed, independent of score row count.
+    pub evaluated_tokens: usize,
 }
 
 /// Ordinary model and state operations required by independent-model drafting.
@@ -49,20 +67,117 @@ pub trait AutoregressiveMechanisms {
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Projects a stable request ID through the existing batch assignment.
+    /// No allocation or new admission is permitted during this projection.
+    fn request_context<'a>(
+        _request: eredu_core::generation::SpeculativeRequestId,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Context<'a>, Self::Error>
+    where Self: 'a,
+    {
+        Ok(context)
+    }
+    /// Existing table insertion ID retained by a selected request context.
+    /// A finite occurrence table requires an ID; ordinary/single execution does
+    /// not. This is a read-only projection and creates no request authority.
+    fn occurrence_request(_context: Self::Context<'_>) -> Option<eredu_core::SpeculativeRequestId> {
+        None
+    }
+    /// Original host destination for shared proposal/history bookkeeping.
+    fn driver_buffer<T>(capacity: usize, _context: Self::Context<'_>)
+        -> Result<eredu_core::SpeculativeBuffer<T>, Self::Error>
+    {
+        Ok(eredu_core::SpeculativeBuffer::with_capacity(capacity))
+    }
+    /// Admits one concrete host metadata constructor. Managed mechanisms reject
+    /// unknown storage before allocation; ordinary construction is unchanged.
+    fn driver_host_metadata(_bytes: Option<usize>, _context: Self::Context<'_>)
+        -> Result<eredu_core::HostPreparationAuthority, Self::Error>
+    {
+        Ok(eredu_core::HostPreparationAuthority::unmanaged())
+    }
+    /// Exact query for the same actual host destination producer.
+    fn driver_buffer_bytes<T>(capacity: usize) -> Option<usize> {
+        eredu_core::SpeculativeBuffer::<T>::retained_control_bytes(capacity)
+    }
+    /// Creates an exact canonical request identity.
+    fn driver_identity(_context: Self::Context<'_>) -> Result<eredu_core::SpeculativeRequestIdentity, Self::Error> {
+        Ok(eredu_core::SpeculativeRequestIdentity::new())
+    }
+    /// Copies the actual canonical sequence before a shared transaction.
+    fn copy_sequence(source: eredu_core::SpeculativeSequenceRef<'_>, _context: Self::Context<'_>)
+        -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Self::Error>>
+    {
+        source.copy_ordinary().map_err(eredu_core::SpeculativeDriverError::Preparation)
+    }
+    /// Complete provider copy request for controlled snapshot estimation.
+    fn sequence_copy_bytes(source: &eredu_core::SpeculativeSequence) -> Option<u64> {
+        match source {
+            eredu_core::SpeculativeSequence::Ordinary(_) => source.snapshot_storage_bytes(),
+            eredu_core::SpeculativeSequence::Retained(_) => None,
+        }
+    }
+    /// Transfers an already retained neutral failure without allocating a new source.
+    /// Success must preserve its existing kind, operation and source identity;
+    /// it must not infer origin or reclassify an arbitrary error. Return
+    /// `Err(error)` with the identical unmodified owner when no retained
+    /// representation is available. The default preserves ordinary conversion.
+    /// This hook does not allocate storage, grant admission, or settle work.
+    fn take_retained_failure(
+        error: Self::Error,
+    ) -> Result<eredu_core::BackendFailure, Self::Error> {
+        Err(error)
+    }
+
+    /// Coordinates the existing preparation boundary; native implementations
+    /// delegate to the retained execution transport rather than checking locally.
+    fn agree_text_preparation(
+        _stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        use eredu_core::run_preparation::{
+            TextPreparationOutcome as O, TextPreparationStatus as S,
+        };
+        Ok(match status {
+            S::Ready => O::Ready,
+            S::Cancelled => O::Cancelled,
+            S::Failed => O::Rejected { rank: 0 },
+        })
+    }
+    /// Keeps later lane cancellation/completion scheduling in the same agreement.
+    /// Preserves an admitted scheduler destination through coordination.
+    fn coordinate_speculative_buffer(local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, context: Self::Context<'_>)
+        -> Result<eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        match local.try_into_ordinary() {
+            Ok(local) => Self::coordinate_speculative_step(local, context).map(Into::into),
+            Err(_) => Err(eredu_core::HostMetadataFundingError::Unavailable.into()),
+        }
+    }
+    fn coordinate_speculative_step(
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+        _context: Self::Context<'_>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        Ok(local)
+    }
+
     /// Realizes one empty ordinary state using the model's retained selection.
     fn empty(
         model: &mut Self::Model,
         pass: AutoregressivePass,
         context: Self::Context<'_>,
     ) -> Result<Self::State, Self::Error>;
-    /// Executes a prepared prompt and returns logits and evaluated token count.
+    /// Executes selected LastPosition (target) or StateOnly (draft) prefill.
+    /// Cancellation is returned only at an agreed, safely completed boundary.
     fn prefill(
         model: &mut Self::Model,
         input: &Self::Input,
         state: &mut Self::State,
         pass: AutoregressivePass,
+        cancellation: &eredu_core::GenerationCancellationToken,
         context: Self::Context<'_>,
-    ) -> Result<(Self::Output, usize), Self::Error>;
+    ) -> Result<SpeculativePrefillOutcome<AutoregressivePrefill<Self::Logits>>, Self::Error>;
     /// Executes supplied token IDs with the ordinary decoder.
     fn decode(
         model: &mut Self::Model,
@@ -71,6 +186,70 @@ pub trait AutoregressiveMechanisms {
         pass: AutoregressivePass,
         context: Self::Context<'_>,
     ) -> Result<Self::Output, Self::Error>;
+    /// Read-only actual state frontier for an installed occurrence contract.
+    /// Unknown state remains unqualified; ordinary execution does not call this.
+    fn invocation_frontier(_state: &Self::State) -> Result<Option<u64>, Self::Error> {
+        Ok(None)
+    }
+    /// Exact prepared plain-input length for a selected fresh-request contract.
+    /// No token encoding or model work may occur in this inspection.
+    fn invocation_input_positions(_input: &Self::Input) -> Result<Option<usize>, Self::Error> {
+        Ok(None)
+    }
+    /// Retains the fixed preflight failure in the mechanism's error domain.
+    fn occurrence_error(_cause: AutoregressiveOccurrenceError) -> Self::Error {
+        Self::invalid("independent speculative occurrence preflight refused")
+    }
+
+    /// Funds additional request slots for a restored canonical future. This is
+    /// separate from native role admission and never resets spent occurrences.
+    /// Ordinary mechanisms with no installed schedule do not call this hook.
+    fn prepare_continuation(
+        _continuation: &AutoregressiveContinuation,
+        _context: Self::Context<'_>,
+    ) -> Result<(), Self::Error> { Ok(()) }
+
+    /// Prepares the exact source/pass/width before the existing decoder can
+    /// allocate inputs or mutate state. An original implementation consumes its
+    /// same-request occurrence cursor and installs the corresponding role here.
+    /// Refusal prevents `decode`; a later decode error never refunds an attempt.
+    /// The default preserves the ordinary mechanism and grants no native fit.
+    fn before_invocation(
+        _model: &Self::Model,
+        _state: &Self::State,
+        _claim: AutoregressiveOccurrenceClaim<'_>,
+        _context: Self::Context<'_>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Keeps one source/role preparation alive around the actual shared worker.
+    /// A mechanism can retain exclusive source loans through preparation and
+    /// an unwind-safe role guard through `run`; refusal must occur before `run`.
+    /// The once-only callback prevents this hook from duplicating decoder work.
+    /// The ordinary uninstalled route does not call either invocation hook.
+    fn with_invocation<T>(
+        model: &mut Self::Model,
+        state: &mut Self::State,
+        _input: Option<&Self::Input>,
+        claim: AutoregressiveOccurrenceClaim<'_>,
+        context: Self::Context<'_>,
+        run: impl FnOnce(&mut Self::Model, &mut Self::State) -> Result<T, Self::Error>,
+    ) -> Result<T, Self::Error> {
+        Self::before_invocation(model, state, claim, context)?;
+        run(model, state)
+    }
+
+    /// Retains immutable verification inputs before decoding can mutate a cache.
+    /// An admitted implementation must fund its real storage and keep that
+    /// custody with every escaping token owner. The default is ordinary storage.
+    fn verification_tokens(
+        tokens: &[u32],
+        _context: Self::Context<'_>,
+    ) -> Result<eredu_core::GenerationTokenIds, Self::Error> {
+        Ok(tokens.to_vec().into())
+    }
+
     /// Captures complete state without permitting mutation through the checkpoint.
     fn checkpoint(state: &Self::State) -> Result<Self::Checkpoint, Self::Error>;
     /// Creates isolated state, settling any copies before publication.
@@ -120,7 +299,7 @@ pub struct AutoregressiveProposal<C> {
 /// Retained target outputs and their exact verification inputs.
 pub struct AutoregressiveVerification<O> {
     output: O,
-    tokens: Vec<u32>,
+    tokens: eredu_core::GenerationTokenIds,
 }
 
 /// Independent drafting through the shared ordinary and controlled drivers.
@@ -128,6 +307,7 @@ pub struct AutoregressiveExecutor<'a, M: AutoregressiveMechanisms> {
     target: &'a mut M::Model,
     draft: &'a mut M::Model,
     capacity: std::num::NonZeroUsize,
+    occurrences: OccurrenceOwners<'a>,
 }
 
 impl<'a, M: AutoregressiveMechanisms> AutoregressiveExecutor<'a, M> {
@@ -141,13 +321,78 @@ impl<'a, M: AutoregressiveMechanisms> AutoregressiveExecutor<'a, M> {
             target,
             draft,
             capacity,
+            occurrences: OccurrenceOwners::Uninstalled,
         }
     }
+    /// Borrows this exact selected independent-model execution to prepare its
+    /// finite fresh-request occurrence envelope. Selection is retained by loan;
+    /// neither an equation trace nor native admission is inferred from it.
+    pub fn schedule_plan<'s>(
+        &self,
+        selected: &'s crate::SelectedSpeculativeRealization,
+        input_positions: std::num::NonZeroU64,
+        context_positions: std::num::NonZeroU64,
+        config: &eredu_core::generation::SpeculativeConfig,
+        options: eredu_core::generation::SpeculativeSchedulerOptions,
+    ) -> Result<AutoregressiveSchedulePlan<'s>, AutoregressiveOccurrenceError> {
+        AutoregressiveSchedulePlan::new(
+            selected,
+            self.capacity,
+            input_positions,
+            context_positions,
+            config,
+            options,
+        )
+    }
+
+    /// Installs one fresh request's monotonic occurrence owner outside every
+    /// cache/checkpoint. This accepts no native grant and changes no scheduler.
+    /// A selected source-aware mechanism must supply actual frontier inspection.
+    pub fn with_schedule(
+        mut self,
+        plan: AutoregressiveSchedulePlan<'a>,
+    ) -> Result<Self, AutoregressiveOccurrenceError> {
+        if !matches!(self.occurrences, OccurrenceOwners::Uninstalled)
+            || plan
+                .selected()
+                .requirements()
+                .strategy()
+                .proposal_capacity()
+                != self.capacity
+        {
+            return Err(AutoregressiveOccurrenceError::Selection);
+        }
+        self.occurrences = OccurrenceOwners::Single(std::cell::RefCell::new(plan.into_cursor()));
+        Ok(self)
+    }
+
+    /// Installs the same monotonic cursor once for each actual batch request.
+    /// Plans arrive in shared-table insertion order. Their selected sources
+    /// remain borrowed; mutable cache copies never include this occurrence owner.
+    pub fn with_schedules(
+        mut self,
+        plans: eredu_core::SpeculativeBuffer<AutoregressiveSchedulePlan<'a>>,
+        context: M::Context<'_>,
+    ) -> Result<Self, M::Error> {
+        if !matches!(self.occurrences, OccurrenceOwners::Uninstalled) {
+            return Err(M::occurrence_error(AutoregressiveOccurrenceError::Selection));
+        }
+        self.occurrences = OccurrenceOwners::prepare::<M>(plans, self.capacity, context)?;
+        Ok(self)
+    }
+
     /// Realizes an isolated pair of ordinary lane caches.
     pub fn new_cache(
         &mut self,
         context: M::Context<'_>,
     ) -> Result<AutoregressiveCache<M::State>, M::Error> {
+        if let Some(cursor) = self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)? {
+            cursor
+                .try_borrow_mut()
+                .map_err(|_| M::occurrence_error(AutoregressiveOccurrenceError::Reentrant))?
+                .begin_cache()
+                .map_err(M::occurrence_error)?;
+        }
         Ok(AutoregressiveCache {
             target: M::empty(self.target, AutoregressivePass::TargetPrefill, context)?,
             draft: M::empty(self.draft, AutoregressivePass::DraftPrefill, context)?,
@@ -160,6 +405,17 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
     type Cache = AutoregressiveCache<M::State>;
     type TargetState = M::Checkpoint;
     type DraftState = AutoregressiveProposal<M::Checkpoint>;
+
+    fn copy_draft_state<'a>(
+        &self,
+        state: &Self::DraftState,
+        _context: Self::Context<'a>,
+    ) -> Result<Self::DraftState, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(state.clone())
+    }
     type CacheCheckpoint = AutoregressiveCheckpoint<M::Checkpoint>;
     type Verification = AutoregressiveVerification<M::Output>;
     type Logits = M::Logits;
@@ -167,6 +423,45 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
     type Completion = M::Completion;
     type Telemetry = M::Telemetry;
     type Error = M::Error;
+
+    fn take_retained_failure(
+        error: Self::Error,
+    ) -> Result<eredu_core::BackendFailure, Self::Error> {
+        M::take_retained_failure(error)
+    }
+
+    fn driver_buffer<T>(&self, capacity: usize, context: Self::Context<'_>)
+        -> Result<eredu_core::SpeculativeBuffer<T>, Self::Error>
+    {
+        M::driver_buffer(capacity, context)
+    }
+
+    fn driver_host_metadata(&self, bytes: Option<usize>, context: Self::Context<'_>)
+        -> Result<eredu_core::HostPreparationAuthority, Self::Error>
+    {
+        M::driver_host_metadata(bytes, context)
+    }
+    fn driver_buffer_bytes<T>(&self, capacity: usize) -> Option<usize> { M::driver_buffer_bytes::<T>(capacity) }
+    fn request_context<'a>(&self, request: eredu_core::generation::SpeculativeRequestId,
+        context: Self::Context<'a>) -> Result<Self::Context<'a>, Self::Error>
+    where Self: 'a,
+    {
+        M::request_context(request, context)
+    }
+    fn driver_identity(&self, context: Self::Context<'_>) -> Result<eredu_core::SpeculativeRequestIdentity, Self::Error> { M::driver_identity(context) }
+    fn coordinate_speculative_buffer<'a>(&mut self, local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, context: Self::Context<'a>)
+        -> Result<eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        M::coordinate_speculative_buffer(local, context)
+    }
+
+    fn copy_sequence(&self, source: eredu_core::SpeculativeSequenceRef<'_>, context: Self::Context<'_>)
+        -> Result<eredu_core::SpeculativeSequence, eredu_core::SpeculativeDriverError<Self::Error>>
+    {
+        M::copy_sequence(source, context)
+    }
+    fn sequence_copy_bytes(&self, source: &eredu_core::SpeculativeSequence) -> Option<u64> {
+        M::sequence_copy_bytes(source)
+    }
 
     fn max_proposals(&self) -> usize {
         self.capacity.get()
@@ -176,38 +471,101 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         true
     }
 
+    fn agree_text_preparation<'a>(
+        &mut self,
+        stage: eredu_core::run_preparation::TextPreparationStage,
+        status: eredu_core::run_preparation::TextPreparationStatus,
+        context: Self::Context<'a>,
+    ) -> Result<eredu_core::run_preparation::TextPreparationOutcome, eredu_core::BackendFailure>
+    {
+        M::agree_text_preparation(stage, status, context)
+    }
+    fn coordinate_speculative_step<'a>(
+        &mut self,
+        local: Vec<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'a>,
+    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        M::coordinate_speculative_step(local, context)
+    }
+
     fn prefill(
         &mut self,
         input: Self::Input,
         cache: &mut Self::Cache,
         context: Self::Context<'_>,
     ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error> {
-        let (output, count) = M::prefill(
+        match self.prefill_cancellable(
+            input,
+            cache,
+            &eredu_core::GenerationCancellationToken::new(),
+            context,
+        )? {
+            SpeculativePrefillOutcome::Complete(value) => Ok(value),
+            SpeculativePrefillOutcome::Cancelled { .. } => {
+                Err(M::invalid("uncancellable prefill joined cancellation"))
+            }
+        }
+    }
+
+    fn prefill_cancellable(
+        &mut self,
+        input: Self::Input,
+        cache: &mut Self::Cache,
+        cancellation: &eredu_core::GenerationCancellationToken,
+        context: Self::Context<'_>,
+    ) -> Result<
+        SpeculativePrefillOutcome<SpeculativePrefill<Self::TargetState, Self::Logits>>,
+        Self::Error,
+    > {
+        let target = match prefill_invocation::<M>(
+            self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
             self.target,
             &input,
             &mut cache.target,
             AutoregressivePass::TargetPrefill,
+            cancellation,
             context,
-        )?;
-        if count == 0 {
+        )? {
+            SpeculativePrefillOutcome::Complete(target) => target,
+            SpeculativePrefillOutcome::Cancelled { evaluated_tokens } => {
+                return Ok(SpeculativePrefillOutcome::Cancelled { evaluated_tokens })
+            }
+        };
+        if target.evaluated_tokens == 0 {
             return Err(M::invalid(
                 "independent drafting requires a nonempty prompt",
             ));
         }
-        let (_, draft_count) = M::prefill(
+        let logits = target
+            .logits
+            .ok_or_else(|| M::invalid("target prefill has no selected logits"))?;
+        let draft = match prefill_invocation::<M>(
+            self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
             self.draft,
             &input,
             &mut cache.draft,
             AutoregressivePass::DraftPrefill,
+            cancellation,
             context,
-        )?;
-        if draft_count != count {
-            return Err(M::invalid("draft and target prompt lengths differ"));
+        )? {
+            SpeculativePrefillOutcome::Complete(draft) => draft,
+            SpeculativePrefillOutcome::Cancelled { .. } => {
+                return Ok(SpeculativePrefillOutcome::Cancelled {
+                    evaluated_tokens: target.evaluated_tokens,
+                })
+            }
+        };
+        if draft.evaluated_tokens != target.evaluated_tokens || draft.logits.is_some() {
+            return Err(M::invalid(
+                "draft prefill does not match state-only prompt demand",
+            ));
         }
-        Ok(SpeculativePrefill::new(
-            M::logits(&output, count - 1, context)?,
-            M::checkpoint(&cache.draft)?,
-            count,
+        Ok(SpeculativePrefillOutcome::Complete(
+            SpeculativePrefill::new(
+                logits,
+                M::checkpoint(&cache.draft)?,
+                target.evaluated_tokens,
+            ),
         ))
     }
 
@@ -233,7 +591,8 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         context: Self::Context<'_>,
     ) -> Result<Self::Logits, Self::Error> {
         let mut state = M::restore(&proposal.saved, context)?;
-        let output = M::decode(
+        let output = decode_invocation::<M>(
+            self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
             self.draft,
             &[last_token],
             &mut state,
@@ -273,7 +632,10 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         if tokens.is_empty() || tokens.len() > self.capacity.get().saturating_add(1) {
             return Err(M::invalid("invalid independent draft verification width"));
         }
-        let output = M::decode(
+        // Refusal cannot follow a partially submitted verification transaction.
+        let retained_tokens = M::verification_tokens(tokens, context)?;
+        let output = decode_invocation::<M>(
+            self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
             self.target,
             tokens,
             &mut cache.target,
@@ -284,7 +646,7 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         Ok(Submission {
             output: AutoregressiveVerification {
                 output,
-                tokens: tokens.to_vec(),
+                tokens: retained_tokens,
             },
             completion,
         })
@@ -317,7 +679,8 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         let tokens = &output.tokens[..verified];
         let replayed = if verified < output.tokens.len() {
             let mut state = M::restore(&saved.target, context)?;
-            M::decode(
+            decode_invocation::<M>(
+                self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
                 self.target,
                 tokens,
                 &mut state,
@@ -330,7 +693,8 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
             0
         };
         let mut draft = M::restore(&saved.draft, context)?;
-        M::decode(
+        decode_invocation::<M>(
+            self.occurrences.select(M::occurrence_request(context)).map_err(M::occurrence_error)?,
             self.draft,
             tokens,
             &mut draft,
@@ -377,10 +741,34 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         eredu_core::speculative::SpeculativeControlError,
     > {
         Ok(Some((
-            self.checkpoint(cache)
-                .map_err(eredu_core::speculative::SpeculativeControlError::backend)?,
+            self.checkpoint(cache).map_err(|error| {
+                eredu_core::speculative::SpeculativeControlError::backend_with_retained(
+                    error,
+                    Self::take_retained_failure,
+                )
+            })?,
             state.clone(),
         )))
+    }
+
+    fn prepare_control_continuation(
+        &mut self,
+        committed: usize,
+        status: eredu_core::generation::SpeculativeRequestStatus,
+        context: Self::Context<'_>,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        let prepare = || -> Result<(), M::Error> {
+            let Some(cursor) = self.occurrences.select(M::occurrence_request(context))
+                .map_err(M::occurrence_error)? else { return Ok(()); };
+            let mut cursor = cursor.try_borrow_mut()
+                .map_err(|_| M::occurrence_error(AutoregressiveOccurrenceError::Reentrant))?;
+            let continuation = cursor.continuation(committed, status).map_err(M::occurrence_error)?;
+            M::prepare_continuation(&continuation, context)?;
+            cursor.install_continuation(continuation);
+            Ok(())
+        };
+        prepare().map_err(|cause| eredu_core::speculative::SpeculativeControlError::backend_with_retained(
+            cause, M::take_retained_failure))
     }
 
     fn restore_control_snapshot(
@@ -391,7 +779,69 @@ impl<M: AutoregressiveMechanisms> SpeculativeExecutor for AutoregressiveExecutor
         context: Self::Context<'_>,
     ) -> Result<Option<Self::TargetState>, eredu_core::speculative::SpeculativeControlError> {
         self.restore_checkpoint(cache, saved, context)
-            .map_err(eredu_core::speculative::SpeculativeControlError::backend)?;
+            .map_err(|error| {
+                eredu_core::speculative::SpeculativeControlError::backend_with_retained(
+                    error,
+                    Self::take_retained_failure,
+                )
+            })?;
         Ok(Some(state.clone()))
     }
+}
+
+// Single entry around the existing native/portable decoder worker. This is not
+// a second speculative driver: proposal, verification and commit still select
+// all tokens, passes, state and rollback in the methods above.
+fn decode_invocation<M: AutoregressiveMechanisms>(
+    occurrences: Option<&std::cell::RefCell<AutoregressiveOccurrenceCursor<'_>>>,
+    model: &mut M::Model,
+    tokens: &[u32],
+    state: &mut M::State,
+    pass: AutoregressivePass,
+    context: M::Context<'_>,
+) -> Result<M::Output, M::Error> {
+    if let Some(occurrences) = occurrences {
+        let invocation = AutoregressiveInvocation::decode(pass, tokens.len())
+            .ok_or_else(|| M::invalid("invalid independent draft invocation geometry"))?;
+        let claim = claim_invocation::<M>(occurrences, state, invocation)?;
+        return M::with_invocation(model, state, None, claim, context, |model, state| {
+            M::decode(model, tokens, state, pass, context)
+        });
+    }
+    M::decode(model, tokens, state, pass, context)
+}
+
+fn claim_invocation<'s, M: AutoregressiveMechanisms>(
+    cursor: &std::cell::RefCell<AutoregressiveOccurrenceCursor<'s>>,
+    state: &M::State,
+    invocation: AutoregressiveInvocation,
+) -> Result<AutoregressiveOccurrenceClaim<'s>, M::Error> {
+    let frontier = M::invocation_frontier(state)?
+        .ok_or_else(|| M::occurrence_error(AutoregressiveOccurrenceError::Geometry))?;
+    cursor
+        .try_borrow_mut()
+        .map_err(|_| M::occurrence_error(AutoregressiveOccurrenceError::Reentrant))?
+        .claim(frontier, invocation)
+        .map_err(M::occurrence_error)
+}
+fn prefill_invocation<M: AutoregressiveMechanisms>(
+    occurrences: Option<&std::cell::RefCell<AutoregressiveOccurrenceCursor<'_>>>,
+    model: &mut M::Model,
+    input: &M::Input,
+    state: &mut M::State,
+    pass: AutoregressivePass,
+    cancellation: &eredu_core::GenerationCancellationToken,
+    context: M::Context<'_>,
+) -> Result<SpeculativePrefillOutcome<AutoregressivePrefill<M::Logits>>, M::Error> {
+    if let Some(occurrences) = occurrences {
+        let positions = M::invocation_input_positions(input)?
+            .ok_or_else(|| M::occurrence_error(AutoregressiveOccurrenceError::Geometry))?;
+        let invocation = AutoregressiveInvocation::prefill(pass, positions)
+            .ok_or_else(|| M::occurrence_error(AutoregressiveOccurrenceError::Geometry))?;
+        let claim = claim_invocation::<M>(occurrences, state, invocation)?;
+        return M::with_invocation(model, state, Some(input), claim, context, |model, state| {
+            M::prefill(model, input, state, pass, cancellation, context)
+        });
+    }
+    M::prefill(model, input, state, pass, cancellation, context)
 }

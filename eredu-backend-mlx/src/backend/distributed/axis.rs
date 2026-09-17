@@ -247,25 +247,11 @@ pub fn all_to_all_v_axis(
         return distributed::all_to_all_v(input, send_counts, receive_counts, group, stream);
     }
 
-    let ndim = input.ndim();
-    let axis = i32::try_from(axis)
-        .map_err(|_| Exception::custom("variable all-to-all axis exceeds i32"))?;
-    let mut to_front = Vec::with_capacity(ndim);
-    to_front.push(axis);
-    for current in 0..ndim {
-        let current = i32::try_from(current)
-            .map_err(|_| Exception::custom("variable all-to-all rank exceeds i32"))?;
-        if current != axis {
-            to_front.push(current);
-        }
-    }
-    let transposed = input.transpose_axes(&to_front, stream)?;
-    let exchanged =
-        distributed::all_to_all_v(&transposed, send_counts, receive_counts, group, stream)?;
-    let mut restore = vec![0i32; ndim];
-    for (position, original_axis) in to_front.into_iter().enumerate() {
-        restore[original_axis as usize] = i32::try_from(position)
-            .map_err(|_| Exception::custom("variable all-to-all rank exceeds i32"))?;
-    }
-    exchanged.transpose_axes(&restore, stream)
+    use crate::backend::nn::logical_collective::{self, axis::AxisPlan};
+    let plan = AxisPlan::new(input.ndim(), axis)
+        .ok_or_else(|| Exception::custom("variable all-to-all axis/rank exceeds the selected permutation"))?;
+    let ops = logical_collective::Native(stream);
+    let transposed = logical_collective::axis::transpose(&ops, input, plan, false)?;
+    let exchanged = distributed::all_to_all_v(&transposed, send_counts, receive_counts, group, stream)?;
+    logical_collective::axis::transpose(&ops, &exchanged, plan, true)
 }

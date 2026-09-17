@@ -10,13 +10,47 @@ use sha2::{Digest, Sha256};
 
 #[cfg(test)]
 mod candidate_tests;
+mod delivery;
+pub use delivery::{CaptureDeliveryPending, CapturedStepDelivery};
 mod invocation;
+mod text_origin;
+pub use text_origin::CaptureTextOrigin;
 #[cfg(test)]
 mod prepared_geometry_tests;
-pub use invocation::{CaptureInvocationBounds, CaptureInvocationShape};
+pub use invocation::{
+    CaptureAxisError, CaptureInvocationBounds, CaptureInvocationShape, CaptureInvocationWindow,
+    CaptureWindowSourceError,
+};
+mod payload_wire;
+pub use payload_wire::CapturePayloadWire;
+mod record_wire;
+pub use record_wire::CaptureRecordWire;
+mod window_geometry;
+pub use window_geometry::{CaptureWindowError, CaptureWindowGeometry};
+mod prefill_transform;
+pub use prefill_transform::{CapturePrefillPartitionError, CapturePrefillTransformFragment, CapturePrefillTransformPlan};
+mod prefill_geometry;
+pub use prefill_geometry::{
+    CapturePrefillAxisSlice, CapturePrefillElement, CapturePrefillFragment,
+    CapturePrefillGeometryError, CapturePrefillRowAssembly,
+};
+mod retained_error;
 mod routed;
+pub use retained_error::RetainedCaptureError;
+mod intervention_evidence;
+pub(crate) mod plan_copy;
+pub use intervention_evidence::{
+    InterventionEvidenceCompanion, InterventionEvidenceDescriptor, InterventionEvidenceLayout,
+    InterventionEvidenceSide,
+};
+mod shared_plan;
+pub use plan_copy::{CapturePlanCopyError, PreparedCapturePlanCopy};
+pub(crate) mod retained_payload;
+mod shared_step;
 mod tensor_wire;
 pub use routed::*;
+pub use shared_plan::SharedCapturePlan;
+pub use shared_step::{PreparedCapturedStep, SharedCapturedStep, UnpublishedCapturedStep};
 
 use crate::{
     ObservationCatalog, ObservationPoint, ObservationSupportReport, ObservationSupportStatus,
@@ -30,7 +64,8 @@ pub const CAPTURE_SCHEMA_VERSION: u32 = 1;
 /// geometry only; it need not have the factory's actual element type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedCaptureSource {
-    /// Conservative native storage bound for creating the source and temporaries.
+    /// Conservative logical capture quota for creating the source and temporaries.
+    /// Physical native allocation bounds require the selected creation mechanism.
     pub creation_bytes: u64,
     /// Actual output type promised by the source mechanism, checked when generated.
     /// Unknown sources cannot supply empty raw captures without creating a value.
@@ -383,7 +418,29 @@ impl CapturePlan {
         capabilities: &CaptureCapabilities,
         request: CaptureRequestShape,
     ) -> Result<AdmittedCapturePlan, CaptureError> {
-        self.admit_geometry(catalog, support, capabilities, request, None)
+        self.admit_geometry(
+            catalog,
+            support,
+            capabilities,
+            request,
+            None,
+            CaptureTextOrigin::default(),
+        )
+    }
+
+    /// Admits ordinary text capture with an explicit cached opening prefix.
+    /// New prompt length and request-local prediction coordinates are unchanged.
+    /// The origin is geometry only; it grants no cache, execution or observation
+    /// authority. Zero origin preserves the existing ordinary admission identity.
+    pub fn admit_with_text_origin(
+        self,
+        catalog: &ObservationCatalog,
+        support: &ObservationSupportReport,
+        capabilities: &CaptureCapabilities,
+        request: CaptureRequestShape,
+        origin: CaptureTextOrigin,
+    ) -> Result<AdmittedCapturePlan, CaptureError> {
+        self.admit_geometry(catalog, support, capabilities, request, None, origin)
     }
 
     /// Admits independently shaped forwards under one cumulative capture budget.
@@ -402,6 +459,7 @@ impl CapturePlan {
             capabilities,
             bounds.request(),
             Some(bounds),
+            CaptureTextOrigin::default(),
         )
     }
 
@@ -412,25 +470,23 @@ impl CapturePlan {
         capabilities: &CaptureCapabilities,
         request: CaptureRequestShape,
         invocation_bounds: Option<CaptureInvocationBounds>,
+        text_origin: CaptureTextOrigin,
     ) -> Result<AdmittedCapturePlan, CaptureError> {
-        if self.schema_version != CAPTURE_SCHEMA_VERSION
-            || catalog.schema_version != crate::DISCOVERY_SCHEMA_VERSION
-            || support.schema_version != crate::DISCOVERY_SCHEMA_VERSION
-        {
-            return Err(CaptureError::Invalid("unsupported schema version".into()));
-        }
-        if self.limits.physical_native_bytes.is_some() && !capabilities.physical_native_limit {
-            return Err(CaptureError::Unsupported(
-                "physical native allocator/workspace bound".into(),
-            ));
-        }
+        revalidation::validate_schema(&self, catalog, support, capabilities)?;
         if request.batch == 0 || request.prompt_tokens == 0 || request.max_predictions == 0 {
             return Err(CaptureError::Invalid(
                 "batch, prompt, and prediction limits must be positive".into(),
             ));
         }
         if invocation_bounds.is_none() {
+            // Preserve the legacy zero-origin request check. The additional
+            // origin span uses the last actual prediction, not a phantom decode.
             add(request.prompt_tokens, request.max_predictions)?;
+            text_origin.validate_request(request)?;
+        } else if text_origin != CaptureTextOrigin::default() {
+            return Err(CaptureError::Invalid(
+                "ordinary text origin cannot replace invocation authority".into(),
+            ));
         }
         mul(request.batch, request.prompt_tokens)?;
         let mut ids = std::collections::BTreeSet::new();
@@ -456,15 +512,7 @@ impl CapturePlan {
             if let crate::ObservationValueType::RoutedUnits { geometry, .. } = &point.value_type {
                 geometry.components()?;
             }
-            if !capabilities
-                .transformations
-                .contains(&selection.transform.kind())
-            {
-                return Err(CaptureError::Unsupported(format!(
-                    "{:?}",
-                    selection.transform.kind()
-                )));
-            }
+            revalidation::validate_transform(selection, capabilities)?;
             if selection.schedule.every == 0
                 || selection
                     .schedule
@@ -473,30 +521,7 @@ impl CapturePlan {
             {
                 return Err(CaptureError::Invalid("invalid capture schedule".into()));
             }
-            let phase_support = support
-                .points
-                .iter()
-                .find(|p| p.path == selection.path)
-                .ok_or_else(|| {
-                    CaptureError::Unsupported(format!("no selected support for {}", selection.path))
-                })?;
-            for (enabled, status) in [
-                (selection.schedule.prefill, &phase_support.prefill),
-                (selection.schedule.decode, &phase_support.decode),
-            ] {
-                if enabled
-                    && !matches!(
-                        status,
-                        ObservationSupportStatus::Supported
-                            | ObservationSupportStatus::Conditional(_)
-                    )
-                {
-                    return Err(CaptureError::Unsupported(format!(
-                        "{}: {status:?}",
-                        selection.path
-                    )));
-                }
-            }
+            revalidation::validate_phase_support(selection, support)?;
             if matches!(selection.transform, CaptureTransform::Slice) && selection.slices.is_empty()
             {
                 return Err(CaptureError::Invalid(
@@ -504,18 +529,7 @@ impl CapturePlan {
                         .into(),
                 ));
             }
-            if let CaptureTransform::Histogram { edges } = &selection.transform {
-                if edges.len() < 2
-                    || (edges.len() - 1) as u64 > capabilities.max_histogram_bins
-                    || edges.iter().any(|edge| !edge.is_finite())
-                    || edges.windows(2).any(|w| w[0] >= w[1])
-                {
-                    return Err(CaptureError::Invalid(
-                        "histogram edges must be finite, increasing, and within the bin limit"
-                            .into(),
-                    ));
-                }
-            }
+            revalidation::validate_histogram(selection, capabilities)?;
             if let CaptureTransform::TopCandidates { count } = selection.transform {
                 if count == 0
                     || selection.path != crate::MODEL_LOGITS_OBSERVATION_PATH
@@ -612,7 +626,7 @@ impl CapturePlan {
                                 .expect("axis was validated");
                             let geometry = match invocation_bounds {
                                 Some(bounds) => bounds.maximum()?,
-                                None => request.invocation_shape(phase, prediction)?,
+                                None => text_origin.invocation_shape(request, phase, prediction)?,
                             };
                             if geometry
                                 .extent(&axis.dimension)?
@@ -626,7 +640,7 @@ impl CapturePlan {
                         }
                         let geometry = match invocation_bounds {
                             Some(bounds) => bounds.maximum()?,
-                            None => request.invocation_shape(phase, prediction)?,
+                            None => text_origin.invocation_shape(request, phase, prediction)?,
                         };
                         if let Some(shape) = geometry.resolve(point)? {
                             resolve_slice(point, selection, &shape)?;
@@ -639,7 +653,10 @@ impl CapturePlan {
         // Identity includes catalog semantics and request shape, not just caller labels.
         let bytes = match invocation_bounds {
             Some(bounds) => serde_json::to_vec(&("invocation", &self, &points, bounds)),
-            None => serde_json::to_vec(&(&self, &points, request)),
+            None if text_origin == CaptureTextOrigin::default() => {
+                serde_json::to_vec(&(&self, &points, request))
+            }
+            None => serde_json::to_vec(&("text_origin", &self, &points, request, text_origin)),
         }
         .map_err(|e| CaptureError::Invalid(e.to_string()))?;
         let identity = Sha256::digest(bytes)
@@ -651,6 +668,7 @@ impl CapturePlan {
             points,
             request,
             invocation_bounds,
+            text_origin,
             identity,
         })
     }
@@ -662,7 +680,7 @@ impl CapturePlan {
 pub struct CaptureRequestShape {
     /// Number of sequences in the request.
     pub batch: u64,
-    /// Number of prefill positions per sequence.
+    /// Number of new prefill positions per sequence, excluding any cached prefix.
     pub prompt_tokens: u64,
     /// Maximum number of generated predictions, including the prefill prediction.
     pub max_predictions: u64,
@@ -681,7 +699,9 @@ impl CaptureRequestShape {
         Ok(())
     }
 
-    /// Physical geometry of an ordinary prompt or single-row cached forward.
+    /// Zero-origin physical geometry of an ordinary prompt or cached forward.
+    /// For an admitted plan, use AdmittedCapturePlan::geometry_at so an explicit
+    /// cached opening prefix cannot be discarded.
     pub fn invocation_shape(
         self,
         phase: CapturePhase,
@@ -697,7 +717,8 @@ impl CaptureRequestShape {
             context: Some(add(self.prompt_tokens, prediction)?),
         })
     }
-    /// Checks every known or request-resolved axis, including partially known shapes.
+    /// Checks zero-origin request axes, including partially known shapes.
+    /// Admitted plans should validate their geometry_at result instead.
     pub fn validate_actual(
         self,
         point: &ObservationPoint,
@@ -708,7 +729,8 @@ impl CaptureRequestShape {
         self.invocation_shape(phase, prediction)?
             .validate_actual(point, shape)
     }
-    /// Resolves symbolic axes against ordinary request geometry.
+    /// Resolves zero-origin symbolic axes. For an admitted plan with a cached
+    /// prefix, use its estimate_shape or geometry_at result instead.
     pub fn resolve(
         self,
         point: &ObservationPoint,
@@ -726,11 +748,13 @@ pub struct AdmittedCapturePlan {
     points: Vec<ObservationPoint>,
     request: CaptureRequestShape,
     invocation_bounds: Option<CaptureInvocationBounds>,
+    text_origin: CaptureTextOrigin,
     identity: String,
 }
 
 impl AdmittedCapturePlan {
-    /// Stable digest of the plan, selected catalog semantics, and request shape.
+    /// Stable digest of the plan, selected catalog semantics, request shape and
+    /// explicit nonzero text origin (or the separate invocation authority).
     pub fn identity(&self) -> &str {
         &self.identity
     }
@@ -742,13 +766,19 @@ impl AdmittedCapturePlan {
     pub fn points(&self) -> &[ObservationPoint] {
         &self.points
     }
-    /// Returns admitted request geometry.
+    /// Returns new-input and local prediction limits. This deliberately omits
+    /// the separate cached origin; use geometry_at/estimate_shape for axes.
     pub fn request(&self) -> CaptureRequestShape {
         self.request
     }
     /// Explicit invocation bounds; absence retains ordinary prompt/decode geometry.
     pub fn invocation_bounds(&self) -> Option<CaptureInvocationBounds> {
         self.invocation_bounds
+    }
+    /// Ordinary text opening prefix. None means this plan instead requires
+    /// its separately admitted explicit invocation authority.
+    pub fn text_origin(&self) -> Option<CaptureTextOrigin> {
+        self.invocation_bounds.is_none().then_some(self.text_origin)
     }
     /// Resolves one forward's physical axes under this exact geometry authority.
     /// An invocation plan requires explicit axes; an ordinary request rejects them.
@@ -763,7 +793,9 @@ impl AdmittedCapturePlan {
                 bounds.validate(shape, prediction)?;
                 Ok(shape)
             }
-            (None, None) => self.request.invocation_shape(phase, prediction),
+            (None, None) => self
+                .text_origin
+                .invocation_shape(self.request, phase, prediction),
             _ => Err(CaptureError::Invalid(
                 "capture invocation authority/geometry mismatch".into(),
             )),
@@ -777,6 +809,7 @@ impl AdmittedCapturePlan {
             &discovery.support.capture,
             self.request,
             self.invocation_bounds,
+            self.text_origin,
         )
     }
     /// Static maximum shape for an enabled schedule, preserving ordinary identities.
@@ -788,7 +821,10 @@ impl AdmittedCapturePlan {
     ) -> Result<Option<Vec<u64>>, CaptureError> {
         match self.invocation_bounds {
             Some(bounds) => bounds.maximum()?.resolve(point),
-            None => self.request.resolve(point, phase, prediction),
+            None => self
+                .text_origin
+                .invocation_shape(self.request, phase, prediction)?
+                .resolve(point),
         }
     }
     /// Whether this plan captures no observation points.
@@ -798,12 +834,15 @@ impl AdmittedCapturePlan {
 }
 
 mod partition;
-pub use partition::{CaptureFragmentGeometry, CaptureSlicePartition};
+pub use partition::{
+    CaptureContiguousProjectionError, CaptureContiguousProjectionPlan, CaptureCoordinateProjectionPlan, CaptureFragmentGeometry, CaptureSlicePartition,
+};
 mod partition_wire;
 pub use partition_wire::{
-    PartitionCaptureCombination, PartitionCaptureContext, PartitionCaptureContributionRecord,
-    PartitionCaptureEvidence, PartitionCaptureFragmentRecord, PartitionCaptureProducerRecord,
-    PartitionCaptureRegion, PARTITION_CAPTURE_SCHEMA_VERSION,
+    PARTITION_CAPTURE_SCHEMA_VERSION, PartitionCaptureCombination, PartitionCaptureContext,
+    PartitionCaptureContributionRecord, PartitionCaptureEvidence, PartitionCaptureFragmentRecord,
+    PartitionCaptureProducerRecord, PartitionCaptureRegion,
+    BorrowedPartitionCaptureFragmentRecord, BorrowedPartitionCaptureProducerRecord,
 };
 
 /// Numeric axis slices resolved against an actual tensor before any retention/copy.
@@ -819,45 +858,31 @@ pub struct ResolvedCaptureSlice {
     pub shape: Vec<u64>,
 }
 
+mod slice_destination;
+pub use slice_destination::{CaptureSliceDestinationError, resolve_slice_into};
+
 /// Checks axis selection against actual extents without touching tensor payloads.
 pub fn resolve_slice(
     point: &ObservationPoint,
     selection: &CaptureSelection,
     shape: &[u64],
 ) -> Result<ResolvedCaptureSlice, CaptureError> {
-    if point
-        .axes
-        .as_ref()
-        .is_some_and(|axes| axes.len() != shape.len())
-    {
-        return Err(CaptureError::Invalid(
-            "runtime tensor rank differs from catalog".into(),
-        ));
-    }
     let mut output = ResolvedCaptureSlice {
         starts: vec![0; shape.len()],
         ends: shape.to_vec(),
         strides: vec![1; shape.len()],
         shape: shape.to_vec(),
     };
-    for slice in &selection.slices {
-        let axis = point
-            .axes
-            .as_ref()
-            .and_then(|axes| axes.iter().position(|axis| axis.name == slice.axis))
-            .ok_or_else(|| CaptureError::Invalid(format!("unknown axis {}", slice.axis)))?;
-        if slice.stride == 0 || slice.start > slice.end || slice.end > shape[axis] {
-            return Err(CaptureError::Invalid(format!(
-                "slice {} exceeds runtime extent",
-                slice.axis
-            )));
-        }
-        output.starts[axis] = slice.start;
-        output.ends[axis] = slice.end;
-        output.strides[axis] = slice.stride;
-        output.shape[axis] = (slice.end - slice.start).div_ceil(slice.stride);
-    }
-    elements(&output.shape)?;
+    resolve_slice_into(
+        point.axes.as_deref(),
+        &selection.slices,
+        shape,
+        &mut output.starts,
+        &mut output.ends,
+        &mut output.strides,
+        &mut output.shape,
+    )
+    .map_err(|cause| cause.legacy(&selection.slices))?;
     Ok(output)
 }
 
@@ -904,11 +929,19 @@ pub struct CaptureHistogram {
 }
 
 /// Bounded portable output from one native transformation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+///
+/// Raw and shared tensors with the same values compare equal; ownership and
+/// custody are not part of semantic equality. Floating NaNs retain their usual
+/// unequal behavior. Equality provides no storage identity or funding proof.
+#[derive(Debug, Clone)]
 pub enum CapturePayload {
-    /// Raw or sliced tensor values; integer identifiers retain exact precision.
-    Tensor(#[serde(with = "tensor_wire")] TensorObservation),
+    /// Raw or sliced caller-owned values; integer identifiers retain exact precision.
+    Tensor(TensorObservation),
+    /// Read-only aliases of an already owned tensor and its retained custody.
+    ///
+    /// Serializes as the same `kind: tensor` payload. Deserialization always
+    /// produces the raw `Tensor` variant and never reconstructs funding.
+    SharedTensor(crate::SharedTensorObservation),
     /// Finite/non-finite counts and finite-only statistics.
     Summary(CaptureSummary),
     /// Bounded fixed-edge histogram.
@@ -1004,12 +1037,44 @@ pub struct CandidateDomain {
     pub constrained: bool,
 }
 
+/// Closed pre-forcing predicate for sampling observation. This is descriptive
+/// semantic data, never an arbitrary callback or numerical source permission.
+#[derive(Debug, Clone, Copy)]
+pub enum CaptureTokenFilter<'a> {
+    /// An ordinary concrete filter, including an already intersected allow set.
+    Fixed(&'a crate::TokenFilter),
+    /// Actual borrowed packed semantic mask intersected with tokenizer validity.
+    Packed(crate::PackedTokenFilter<'a>),
+    /// The actual source-derived forbidden predicate at its provisional prefix.
+    Forbidden(crate::speculative::ForbiddenControllerDecision<'a>),
+}
+impl CaptureTokenFilter<'_> {
+    /// Exact allowed-ID predicate before prospective forcing or truncation.
+    pub fn allows(self, token: u32) -> bool {
+        match self {
+            Self::Fixed(filter) => filter.allows(token),
+            Self::Packed(filter) => filter.allows(token),
+            Self::Forbidden(decision) => decision.allows(token),
+        }
+    }
+}
+impl<'a> From<&'a crate::TokenFilter> for CaptureTokenFilter<'a> {
+    fn from(filter: &'a crate::TokenFilter) -> Self {
+        Self::Fixed(filter)
+    }
+}
+impl<'a> From<&'a crate::SharedTokenFilter> for CaptureTokenFilter<'a> {
+    fn from(filter: &'a crate::SharedTokenFilter) -> Self {
+        Self::Fixed(filter)
+    }
+}
+
 /// Borrowed exact filters for observation at one sampling decision.
 /// No grammar queries, native values or forced-token overrides are retained.
 #[derive(Debug, Clone, Copy)]
 pub struct CaptureTokenDomain<'a> {
     /// The exact intersection used for sampling before any forced-token override.
-    pub filter: &'a crate::TokenFilter,
+    pub filter: CaptureTokenFilter<'a>,
     /// The tokenizer-valid domain before semantic restrictions.
     pub tokenizer_validity: &'a crate::TokenFilter,
 }
@@ -1131,7 +1196,7 @@ pub enum CaptureSkipReason {
 
 /// One result linked back to a catalog point. The enclosing generation record owns
 /// run/session identity, prediction token, phase, positions, and timing.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct CaptureRecord {
     /// Wire schema version; unsupported versions are rejected.
     pub schema_version: u32,
@@ -1177,7 +1242,7 @@ pub trait CaptureReservation {
             Some(_) => {
                 return Err(CaptureError::Invalid(
                     "invalid quota reservation outcome".into(),
-                ))
+                ));
             }
         }
         Ok(CaptureQuota {
@@ -1301,8 +1366,11 @@ impl CaptureReservation for CaptureLedger {
 }
 
 /// Invalid, unsupported, or oversized capture requests.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum CaptureError {
+    /// Ordinary error and complete diagnostic storage retained independently of a frame.
+    #[error(transparent)]
+    Retained(RetainedCaptureError),
     /// Plan or runtime tensor constraints are inconsistent.
     #[error("invalid capture plan or tensor: {0}")]
     Invalid(String),
@@ -1349,6 +1417,65 @@ pub fn mul(a: u64, b: u64) -> Result<u64, CaptureError> {
 /// `transform` may run only after successful reservation. It must not retain the
 /// tensor beyond the call or fall back to copying an unsliced source to the host.
 pub trait CaptureBackend {
+    /// Validate the actual ordinary transform source without allocation/evaluation.
+    fn validate_capture_prefill_transform_source(
+        &self,
+        _tensor: &Self::Tensor,
+        _fragment: &CapturePrefillTransformFragment<'_, '_>,
+    ) -> Option<Result<crate::checkpoint::TensorDtype, Self::Error>> {
+        None
+    }
+    /// Cold logical allowance for one exact physical transform, including descriptors.
+    fn estimate_capture_prefill_transform(
+        &self,
+        _fragment: &CapturePrefillTransformFragment<'_, '_>,
+    ) -> Result<CaptureUsage, CaptureError> {
+        Err(CaptureError::Unsupported(
+            "ordinary prefill transform unavailable".into(),
+        ))
+    }
+    /// Produce only host payload after prepaid native work under existing recovery.
+    fn capture_prefill_transform(
+        &mut self,
+        _tensor: &Self::Tensor,
+        _fragment: &CapturePrefillTransformFragment<'_, '_>,
+    ) -> Option<Result<CapturePayload, Self::Error>> {
+        None
+    }
+    /// Cold logical allowance for the actual terminal-row candidate operation.
+    fn estimate_capture_prefill_candidates(
+        &self,
+        _geometry: &CaptureCandidateGeometry<'_>,
+    ) -> Result<CaptureUsage, CaptureError> {
+        Err(CaptureError::Unsupported(
+            "ordinary prefill candidates unavailable".into(),
+        ))
+    }
+    /// Validate and read the actual terminal source using the current sampler domain.
+    fn capture_prefill_candidates(
+        &mut self,
+        _tensor: &Self::Tensor,
+        _geometry: &CaptureCandidateGeometry<'_>,
+    ) -> Option<Result<CaptureCandidates, Self::Error>> {
+        None
+    }
+    /// Cold logical allowance for the actual terminal-row token-score operation.
+    fn estimate_capture_prefill_token_scores(
+        &self,
+        _geometry: &CaptureTokenScoreGeometry<'_>,
+    ) -> Result<CaptureUsage, CaptureError> {
+        Err(CaptureError::Unsupported(
+            "ordinary prefill token-scores unavailable".into(),
+        ))
+    }
+    /// Validate and read the actual terminal source using the current sampler domain.
+    fn capture_prefill_token_scores(
+        &mut self,
+        _tensor: &Self::Tensor,
+        _geometry: &CaptureTokenScoreGeometry<'_>,
+    ) -> Option<Result<CaptureTokenScores, Self::Error>> {
+        None
+    }
     /// Backend-native tensor type; never crosses the host-record boundary.
     type Tensor;
     /// Backend transformation error.
@@ -1392,6 +1519,34 @@ pub trait CaptureBackend {
         _geometry: RoutedUnitGeometry,
         _slice: &ResolvedCaptureSlice,
     ) -> Option<Result<RoutedUnitCapture, Self::Error>> {
+        None
+    }
+    /// Inspect an actual floating decoder source against a closed physical
+    /// prefill fragment. No native work, shape allocation or handle retention.
+    fn validate_capture_prefill_source(
+        &self,
+        _tensor: &Self::Tensor,
+        _fragment: &CapturePrefillFragment<'_, '_>,
+    ) -> Option<Result<crate::checkpoint::TensorDtype, Self::Error>> {
+        None
+    }
+    /// Existing logical native/host work quota for this exact physical fragment.
+    /// No result encoding or additional logical capture is implied.
+    fn estimate_capture_prefill_fragment(
+        &self,
+        _fragment: &CapturePrefillFragment<'_, '_>,
+    ) -> Result<CaptureUsage, CaptureError> {
+        Err(CaptureError::Unsupported(
+            "ordinary prefill fragments unavailable".into(),
+        ))
+    }
+    /// Eagerly copy only the prepaid physical selection; the caller retains the
+    /// ordinary native recovery and the final logical destination separately.
+    fn capture_prefill_fragment(
+        &mut self,
+        _tensor: &Self::Tensor,
+        _fragment: &CapturePrefillFragment<'_, '_>,
+    ) -> Option<Result<crate::TensorObservation, Self::Error>> {
         None
     }
     /// Reads tensor shape without evaluation, copying, or retaining the tensor.
@@ -1510,3 +1665,19 @@ pub struct CaptureDiscovery {
     /// Support for the execution actually realized by the session.
     pub support: ObservationSupportReport,
 }
+
+mod revalidation;
+pub use revalidation::CaptureRevalidationError;
+
+mod candidate_geometry;
+mod tensor_geometry;
+pub use candidate_geometry::CaptureCandidateGeometry;
+mod token_score_geometry;
+pub use tensor_geometry::{
+    CaptureHistogramGeometry, CaptureRoutedUnitsGeometry, CaptureRoutedPrefillPlan, CaptureRoutedPrefillFragment, CaptureRoutedTokenWindow, CaptureSummaryGeometry, CaptureTensorGeometry,
+    CaptureTensorGeometryError,
+};
+pub use token_score_geometry::CaptureTokenScoreGeometry;
+
+mod shared_tensor_wire;
+pub use shared_tensor_wire::CaptureTensorWire;

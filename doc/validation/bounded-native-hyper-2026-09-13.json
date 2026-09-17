@@ -1,0 +1,112 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted multi-stream native workspace facts, shared einsum allocation derivation and empty-span reduction handling",
+  "source_sha256": {
+    "doc/backend-architecture.md": "5cb508284ab6c9df2041e7445e2bf242987168d7c677275f8043a9e32cb2410c",
+    "doc/execution-control.md": "317bf6647d4cebbd58e3755e0b74d5b9455a99d5b361d9568fa259cd518fd27f",
+    "doc/bounded-inference.md": "059c156c4652f3f8e1972d433a441dd3cf3e3639112eb738fc5354a7272372b5",
+    "eredu-backend-mlx/src/backend/nn/workspace.rs": "0936dd5ceadecd7922ee47a15d5ad42de3e5a9ab9bed1594f499dd09cc85414d",
+    "eredu-backend-mlx/src/backend/nn/workspace/host.rs": "c4afdb414d91f601acba14202ce9454d61dadf712e982662eedffd9247efc1f0",
+    "eredu-backend-mlx/src/backend/nn/workspace/hyper.rs": "4fe388dd4dbf451cd816bde9a0fff79b65cc06b5d1005f9c8cbe8fd1e1b8a207",
+    "eredu-backend-mlx/src/backend/nn/workspace/hyper/tests.rs": "f862f8a559b3050ac200c63dd6c206390817e468c950e023217051746c8f6eec",
+    "eredu-backend-mlx/src/backend/nn/workspace/matrix.rs": "3c1fb4d0e2bf5f477242d5869f2b0d88a3fadb6a3a7017a64de20413192d7d9f",
+    "eredu-backend-mlx/src/backend/nn/workspace/pooling.rs": "7170516b791c4fb1f89701a9ad8a61aa209fdbe26f9d01d612fde0716ec476d8",
+    "eredu-backend-mlx/src/backend/nn/workspace/pooling/tests.rs": "f41643c53f91857c418943b86ed62d164aefab7bffc422a1d5b1a3f8a46db75a",
+    "eredu-backend-mlx/src/backend/nn/hyper_connections.rs": "ab8a4c55682381086c26e41f759e89db01b7acd545682c9bd254b9d20d1ab9b1",
+    "eredu-backend-mlx/src/backend/nn/hyper_connections/tests.rs": "cf81f3c20f937b6165d9fa97f274f58ab896a7793a730455afb49965ff9b4d95",
+    "eredu-nn/src/workspace/backend/hyper.rs": "f3843f34ef837328bc6b78622c220e0b215ccc7c7f52652d35b5838cac10bddb",
+    "eredu-nn/src/lib.rs": "344c6195a0efddb8b5f7e426ea9eb1c1ed2b55d5ff0b7c5d77924d80186821c3",
+    "eredu-backend-mlx/src/tests/distributed_pipeline_ring/unit_and_worker/prepared_workspace.rs": "6cd125ec066e23f94d8eacfbc882beaf249609a07803310318b15f69473be29a",
+    "safemlx-sys/src/mlx-c/CMakeLists.txt": "587feff147adb0ee2e61c79841c7dc87418d4b8692488f5ba748b0a2e1d399a6"
+  },
+  "native_source": {
+    "archive": "safemlx-sys/vendor/mlx-v0.32.0.tar.gz",
+    "sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+    "patch_set": "427f983b2956844066ee3c996df4dbc8789fa6652bf3fd43945986cc85e69a24",
+    "derivation_files_sha256": {
+      "mlx/ops.cpp": "725dd3f5021a2f3d5ccf32d91f860a651c036785c77dba9022c8631e165d0a92",
+      "mlx/einsum.cpp": "046db203cf41000e1ccf58159b6b07d4acd187fd3c37642bb4c2e3b35f9ffb3e",
+      "mlx/backend/gpu/copy.cpp": "9e6304129e8a2425aae4d913e8b9eefb2dac4bf8afac5c460cfc9331c6c48031",
+      "mlx/backend/metal/reduce.cpp": "74b57b0426dd3ee183a5e2f7b066707b4a3c60e9b6f9820e3a7b5689f05dc504",
+      "mlx/backend/metal/copy.cpp": "35570b10905afb07f59ea16bf7abf840d290435fedbf716ca83cc7c51691e5d8",
+      "mlx/backend/metal/unary.cpp": "35a7a35a9d14f5cac74e1535106093383aeb91c147a8a1a5f486913e74ccc521",
+      "mlx/backend/metal/binary.cpp": "51c0fdb82e377b0fac2b0046cd40362ce61334ed21173003bf328652b08a33ab",
+      "mlx/backend/metal/matmul.cpp": "775f1879cdebf383eba6ffe0efd3cb3b679162a4cd75ec08978c2c8fdea95927",
+      "mlx/backend/metal/allocator.cpp": "e0b94dd881aef4ef8fdb5aafad1f775be8476c3a5758db3d0a4efe16f34a7da0"
+    }
+  },
+  "coverage": {
+    "multi_stream_native_cases": 180,
+    "multi_stream_peak_measurements": 540,
+    "pooled_native_regression_cases": 648,
+    "focused_tests": 5,
+    "workspace_regressions": 40,
+    "pooled_regression_tests": 1,
+    "unique_tests": 44,
+    "cold_quote_trajectories": 15,
+    "cold_residual_cycles": 30,
+    "new_released_checkpoint_comparisons": 0
+  },
+  "behavior": [
+    "HyperCollapse, HyperExpand, HyperHeadCoefficients and HyperHeadSum compose selected native F32 preparation, weightless RMS reductions, learned products, sigmoid and softmax coefficients, batched contractions and weighted sums. All casts, native scalars and possible reshape copies remain in the completion envelope.",
+    "Sinkhorn pricing includes one initial column normalization and two passes per remaining iteration, each with reduction workspace, epsilon addition and matrix division. Large iteration counts are priced with checked closed-form arithmetic, not by executing or looping through native passes.",
+    "Collapsed values, pre/post vectors and mixing matrices retain their full individual output allowances across sublayers. The final-head coefficient observer precedes the separately priced weighted sum. Actual native output backing capacities fit those allowances.",
+    "The existing pooling einsum-to-batch-matmul derivation is shared with multi-stream contractions. Every underlying input/output reshape allowance and dense product workspace term is preserved.",
+    "180 native configurations cover five geometries, three iteration counts, F32/F16/BF16 activations, full/lower precision parameters and contiguous/strided storage. Independent F64 host equations validate all coefficients, matrices and outputs; 540 measured active native allocation peaks fit the cold bounds.",
+    "The empty-batch case exposed the vendored MLX Reduce identity-copy assertion when zero-sized input and output have different shapes. Native multi-stream RMS and Sinkhorn now bypass empty reductions; the final sum returns an empty output after invoking its ordinary coefficient observer.",
+    "Prepared initial and cached native routes still execute correctly. DeepSeek cached equation gaps decrease from twelve operations to four; Muse remains incomplete and Inkling retains its finite equation quote.",
+    "The 648-case pooled/indexed numerical and allocation matrix passes after the shared helper change."
+  ],
+  "tolerances": {
+    "f32": {
+      "atol": 5e-05,
+      "rtol": 0.0005
+    },
+    "f16_bf16_outputs": {
+      "atol": 0.003,
+      "rtol": 0.03
+    },
+    "coefficients": "always compared at F32 tolerance",
+    "input_reference": "actual native inputs converted to F32 after measurement; host equations use F64 arithmetic"
+  },
+  "limits": [
+    "This does not complete public request admission or full-family/path coverage. Grouped selection/execution, addressable expert schedules, materialization/transfers, paging, TP/PP, media, observation, active prediction and independent copies still need complete prices or composition.",
+    "These bounds cover the at-most-F32 floating metadata envelope. Other input domains remain explicitly unknown. A bounded primitive or resident equation quote is not a complete request budget.",
+    "The empty-reduction workaround is confined to native multi-stream mechanisms; this record does not claim to repair every empty reduction in the underlying MLX library.",
+    "Bounds cover active managed payload storage through completion, not allocator cache, native shape/command metadata, driver/JIT, total process or system memory. No new process-memory or released-checkpoint experiment was run.",
+    "Two cold tests occur in both suites, giving 44 unique tests. The workspace suite leaves 34 controlled native/allocator benchmarks ignored; the new multi-stream and existing pooling allocator matrices were explicitly run separately.",
+    "An initial compile required a checked-arithmetic propagation fix. The first native run aborted on an empty batch; diagnostic case 144 isolated the assertion, and the final recorded runs pass with empty handling.",
+    "Existing large-unwind linker and unused internal quote/helper warnings remain in logs."
+  ],
+  "checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib -- hyper_workspace_ metal_hyper_workspace prepared_workspace_native_routed preserves_arbitrary_leading_dimensions --include-ignored --test-threads=1 --nocapture",
+      "passed": 5,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-hyper-bounds-native-final.log",
+      "sha256": "f33630b24ab77b173c913a4232d506c843635d4ad0b6db36c4a39fffced8b097"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib -- backend::nn::workspace:: --test-threads=1",
+      "passed": 40,
+      "ignored": 34,
+      "log": "/private/tmp/eredu-hyper-bounds-workspace-regression.log",
+      "sha256": "a1e86ae34daa76127577b698bdb2e695b129f9fe8d1def0a82620777284c5c19"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib -- metal_pooled_mechanisms --include-ignored --test-threads=1 --nocapture",
+      "passed": 1,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-hyper-bounds-pooling-regression.log",
+      "sha256": "719d56f491821f308b28946bfddfb18857bcbe33d38037b3050688aa727684db"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "passed": null,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-hyper-bounds-check-final.log",
+      "sha256": "3bf8437975e23a75207344760287c54a9efdc3311bf042730a0a35957ecaed22"
+    }
+  ]
+}

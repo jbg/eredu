@@ -1,6 +1,7 @@
 //! Blockwise attention over ordered paged-cache blocks.
 
 use super::*;
+mod allowed;
 
 pub struct KeyValueAttentionBlock {
     pub start: i64,
@@ -46,6 +47,9 @@ pub struct BlockwiseAttentionAccumulator {
     running_max: Option<Array>,
     running_sum: Option<Array>,
     accumulator: Option<Array>,
+    // True only after the exact current recurrence roots completed below.
+    // This is local readiness, never permission for a source or another role.
+    recurrence_completed: bool,
 }
 
 impl BlockwiseAttentionAccumulator {
@@ -102,7 +106,17 @@ impl BlockwiseAttentionAccumulator {
             running_max: None,
             running_sum: None,
             accumulator: None,
+            recurrence_completed: false,
         })
+    }
+
+    /// Configures the existing worker from the neutral exact policy descriptor.
+    pub fn set_options(
+        &mut self,
+        options: eredu_nn::BlockwiseAttentionOptions,
+    ) -> Result<(), Exception> {
+        self.set_softcap(options.softcap)?;
+        self.set_arithmetic(options.arithmetic)
     }
 
     /// Sets the score transform used by every scanned block before masking.
@@ -171,10 +185,13 @@ impl BlockwiseAttentionAccumulator {
         self.accumulate_with_bias(block, None, stream)
     }
 
-    /// Submits the current recurrence before the next cache-block dependency
-    /// is inserted, allowing the dedicated transfer stream to prefetch the
-    /// following block while this block's attention executes.
+    /// Preserves the ordinary submission entry for an unsettled recurrence.
+    /// Successful accumulation already completed these exact roots, so it must
+    /// not create a second ordinary submission inside an original native role.
     pub fn submit(&self) -> Result<(), Exception> {
+        if self.recurrence_completed {
+            return Ok(());
+        }
         safemlx::transforms::async_eval(
             self.running_max
                 .iter()
@@ -184,6 +201,74 @@ impl BlockwiseAttentionAccumulator {
     }
 
     pub fn accumulate_with_bias(
+        &mut self,
+        block: &KeyValueAttentionBlock,
+        additive_bias: Option<&Array>,
+        stream: &Stream,
+    ) -> Result<(), Exception> {
+        // Even an early refusal revokes readiness of the attempted recurrence;
+        // failures cannot reuse a previous success to claim completed work.
+        self.recurrence_completed = false;
+        self.accumulate_settled(block, additive_bias, stream, None)?;
+        self.recurrence_completed = true;
+        Ok(())
+    }
+
+    pub(crate) fn has_completed_recurrence(&self) -> bool { self.recurrence_completed }
+    pub(crate) fn accumulate_original_paged(&mut self, source: &crate::backend::nn::workspace::OriginalPagedAttentionBlock<'_, '_>, stream: &Stream) -> Result<(), Exception> {
+        safemlx::OriginalScopeObserver::require_current()?;
+        self.recurrence_completed = false;
+        self.accumulate_settled(source.block(), None, stream, Some(source))?;
+        self.recurrence_completed = true;
+        Ok(())
+    }
+    fn accumulate_settled(
+        &mut self,
+        block: &KeyValueAttentionBlock,
+        additive_bias: Option<&Array>,
+        stream: &Stream,
+        paged: Option<&crate::backend::nn::workspace::OriginalPagedAttentionBlock<'_, '_>>,
+    ) -> Result<(), Exception> {
+        // Array readiness can precede Metal callback cleanup. Bound each step
+        // by waiting for the same exact native ownership frontier used by
+        // ordinary submissions, before another block may allocate scratch.
+        // On error, Recovery retains unresolved native work without waiting;
+        // the enclosing request continues to own its admission/session lease.
+        if let Some(observer) = safemlx::OriginalScopeObserver::try_current()? {
+            // The selected contiguous input-score worker supplies its explicit
+            // caller mask. Causal paged blocks retain their separate source
+            // producer; they cannot borrow this declared nested population.
+            if let Some(source) = paged {
+                source.validate([self.batch, self.query_heads, self.query_len, self.head_dim], self.query_start,
+                    self.sliding_window, self.prefix_tokens, self.causal,
+                    eredu_nn::BlockwiseAttentionOptions { arithmetic: self.arithmetic, softcap: self.softcap })?;
+            } else if self.causal
+                || additive_bias.is_some()
+                || self.arithmetic != eredu_nn::AttentionArithmetic::InputScores
+            {
+                return Err(observer.capacity_error());
+            }
+            safemlx::OperationEvent::validate_nested_completion(if self.value_pass {
+                1
+            } else {
+                3
+            })?;
+            return self.accumulate_equation_with_bias(block, additive_bias, stream);
+        }
+        let mut ownership =
+            crate::backend::submission_recovery::Recovery::begin(Vec::<Array>::new())?;
+        self.accumulate_equation_with_bias(block, additive_bias, stream)?;
+        ownership.seal();
+        let status = ownership.finish();
+        if status.failed || status.blocked || !status.settled {
+            return Err(Exception::custom(
+                "attention block native ownership did not complete successfully",
+            ));
+        }
+        Ok(())
+    }
+
+    fn accumulate_equation_with_bias(
         &mut self,
         block: &KeyValueAttentionBlock,
         additive_bias: Option<&Array>,
@@ -238,38 +323,28 @@ impl BlockwiseAttentionAccumulator {
             matmul(&self.queries, &keys.swap_axes(-1, -2, stream)?, stream)?
                 .as_dtype(self.output_dtype, stream)?
                 .as_dtype(Dtype::Float32, stream)?
-                .multiply(Array::from_f32(self.scale), stream)?
+                .multiply(Array::try_from_f32(self.scale)?, stream)?
                 .as_dtype(self.output_dtype, stream)?
         } else {
             matmul(
-                &self.queries.multiply(Array::from_f32(self.scale), stream)?,
+                &self
+                    .queries
+                    .multiply(Array::try_from_f32(self.scale)?, stream)?,
                 &keys.swap_axes(-1, -2, stream)?,
                 stream,
             )?
         };
         if let Some(cap) = self.softcap {
             scores = safemlx::ops::tanh(
-                &scores.multiply(Array::from_f32(cap.recip()), stream)?,
+                &scores.multiply(Array::try_from_f32(cap.recip())?, stream)?,
                 stream,
             )?
-            .multiply(Array::from_f32(cap), stream)?;
+            .multiply(Array::try_from_f32(cap)?, stream)?;
         }
         if let Some(bias) = additive_bias {
             scores = scores.add(bias.as_dtype(scores.dtype(), stream)?, stream)?;
         }
-        let allowed = if self.causal {
-            absolute_attention_mask(
-                self.query_start,
-                self.query_len,
-                block_start,
-                block_end,
-                self.sliding_window,
-                self.prefix_tokens,
-            )
-        } else {
-            vec![true; self.query_len as usize * key_len as usize]
-        };
-        let allowed = Array::from_slice(&allowed, &[self.query_len, key_len]);
+        let allowed = allowed::mask(self, block_start, block_end, stream)?;
         let effective_mask = if let Some(mask) = &self.explicit_mask {
             let relative_start = block_start - self.mask_origin;
             let relative_end = block_end - self.mask_origin;
@@ -278,23 +353,25 @@ impl BlockwiseAttentionAccumulator {
                     "paged attention mask does not cover every visible cache block",
                 ));
             }
-            let mask = mask.try_index_device(
-                (.., .., .., relative_start as i32..relative_end as i32),
+            let mask = mask.try_slice(
+                &[0, 0, 0, relative_start as i32],
+                &[mask.dim(0), mask.dim(1), mask.dim(2), relative_end as i32],
+                &[1; 4],
                 stream,
             )?;
             if mask.dtype() == Dtype::Bool {
                 let combined = allowed.logical_and(&mask, stream)?;
-                scores = r#where(&combined, scores, Array::from_f32(f32::MIN), stream)?;
+                scores = r#where(&combined, scores, Array::try_from_f32(f32::MIN)?, stream)?;
                 combined
             } else {
                 let combined =
                     allowed.logical_and(&mask.is_neg_inf(stream)?.logical_not(stream)?, stream)?;
                 scores = scores.add(mask.as_dtype(scores.dtype(), stream)?, stream)?;
-                scores = r#where(&combined, scores, Array::from_f32(f32::MIN), stream)?;
+                scores = r#where(&combined, scores, Array::try_from_f32(f32::MIN)?, stream)?;
                 combined
             }
         } else {
-            scores = r#where(&allowed, scores, Array::from_f32(f32::MIN), stream)?;
+            scores = r#where(&allowed, scores, Array::try_from_f32(f32::MIN)?, stream)?;
             allowed
         };
         let scores = scores.as_dtype(Dtype::Float32, stream)?;
@@ -308,9 +385,9 @@ impl BlockwiseAttentionAccumulator {
                 .as_ref()
                 .expect("normalization pass established denominators");
             let safe_sum = r#where(
-                &sum.gt(Array::from_f32(0.0), stream)?,
+                &sum.gt(Array::try_from_f32(0.0)?, stream)?,
                 sum,
-                Array::from_f32(1.0),
+                Array::try_from_f32(1.0)?,
                 stream,
             )?;
             let probabilities = scores
@@ -330,7 +407,14 @@ impl BlockwiseAttentionAccumulator {
                 Some(previous) => previous.add(&product, stream)?,
                 None => product,
             });
-            safemlx::transforms::eval(self.accumulator.iter())?;
+            if safemlx::OriginalScopeObserver::try_current()?.is_some() {
+                safemlx::OperationEvent::complete_nested(
+                    [self.accumulator.as_ref().expect("value-pass accumulator")],
+                    stream,
+                )?;
+            } else {
+                safemlx::transforms::eval(self.accumulator.iter())?;
+            }
             return Ok(());
         }
         let block_max = scores.max_axis(-1, true, stream)?;
@@ -391,7 +475,7 @@ impl BlockwiseAttentionAccumulator {
                 }
             }
         }
-        safemlx::transforms::eval([
+        let roots = [
             self.running_max
                 .as_ref()
                 .expect("blockwise attention initialized row maximum"),
@@ -401,13 +485,25 @@ impl BlockwiseAttentionAccumulator {
             self.accumulator
                 .as_ref()
                 .expect("blockwise attention initialized accumulator"),
-        ])?;
+        ];
+        if safemlx::OriginalScopeObserver::try_current()?.is_some() {
+            safemlx::OperationEvent::complete_nested(roots, stream)?;
+        } else {
+            safemlx::transforms::eval(roots)?;
+        }
         Ok(())
     }
 
     pub fn finish(self, stream: &Stream) -> Result<Array, Exception> {
+        self.finish_retained(stream)
+    }
+
+    /// Same output equation while an original caller retains the recurrence
+    /// through final output settlement or its enclosing failure retirement.
+    pub(crate) fn finish_retained(&self, stream: &Stream) -> Result<Array, Exception> {
         let accumulator = self
             .accumulator
+            .as_ref()
             .ok_or_else(|| Exception::custom("blockwise attention received no cache blocks"))?;
         if self.arithmetic == eredu_nn::AttentionArithmetic::InputScores {
             if !self.value_pass {
@@ -419,9 +515,10 @@ impl BlockwiseAttentionAccumulator {
         }
         let running_sum = self
             .running_sum
+            .as_ref()
             .ok_or_else(|| Exception::custom("blockwise attention normalization is empty"))?;
-        let nonzero = running_sum.gt(Array::from_f32(0.0), stream)?;
-        let safe_sum = r#where(&nonzero, &running_sum, Array::from_f32(1.0), stream)?;
+        let nonzero = running_sum.gt(Array::try_from_f32(0.0)?, stream)?;
+        let safe_sum = r#where(&nonzero, running_sum, Array::try_from_f32(1.0)?, stream)?;
         let output = accumulator.divide(safe_sum, stream)?;
         output.as_dtype(self.output_dtype, stream)
     }
@@ -446,3 +543,7 @@ pub(super) fn absolute_attention_mask(
     }
     mask
 }
+
+#[cfg(test)]
+#[path = "attention/submission_tests.rs"]
+mod submission_tests;

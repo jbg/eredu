@@ -13,6 +13,8 @@ use eredu_runtime::{
 use crate::linear_format::standard_expert_projection;
 
 use super::ModelArgs;
+mod construction;
+pub(crate) use construction::{DenseMlpSpec, SparseMoeSpec};
 
 /// Dense up/ReLU²/down projection pair.
 #[derive(Debug, Clone, Parameterized)]
@@ -32,30 +34,7 @@ impl<B: NeuralBackend> DenseMlp<B> {
         intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let linear = |field: &str, input, output| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: args
-                        .mlp_bias
-                        .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
-                        .transpose()
-                        .map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.weight_quantization_for(&weight).into(),
-                    )?,
-                },
-                context,
-            )
-        };
-        Ok(Self {
-            up_proj: linear("up_proj", args.hidden_size, intermediate)?,
-            down_proj: linear("down_proj", intermediate, args.hidden_size)?,
-        })
+        construction::DenseMlpSpec::new_with_metadata(args, prefix, intermediate, crate::decoder::ModuleMetadata::new::<B>(context))?.instantiate::<B>(context)
     }
 
     /// Executes replicated dense computation.
@@ -113,10 +92,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct SparseMoe<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     layer: usize,
-    #[parameter(skip)]
-    resident_unit_coordinates: Option<(eredu_core::component::ComponentCoordinateMap, bool)>,
+    #[parameter(skip, metadata)]
+    resident_unit_coordinates: Option<(std::sync::Arc<eredu_core::component::ComponentCoordinateMap>, bool)>,
     /// Grouped correction-bias router.
     pub gate: B::Selector,
     /// Packed routed experts.
@@ -170,42 +149,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
         shared_intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let gate_weight = format!("{prefix}.gate.weight");
-        let routing = TopKGroupSelectionSpec::new(
-            args.n_routed_experts,
-            args.num_experts_per_tok,
-            GroupScoring::Sigmoid,
-            args.norm_topk_prob,
-        )?
-        .with_groups(args.n_group, args.topk_group)?
-        .with_weight_policy(1e-20, args.routed_scaling_factor)?;
-        let selector = TopKGroupSelectorSpec::new(
-            args.hidden_size,
-            ParameterSpec::trainable(&gate_weight).map_err(Error::backend)?,
-            crate::linear_format::standard_linear_format(
-                &gate_weight,
-                args.weight_quantization_for(&gate_weight).into(),
-            )?,
-            routing,
-        )?
-        .with_correction_bias(
-            ParameterSpec::trainable(format!("{prefix}.gate.e_score_correction_bias"))
-                .map_err(Error::backend)?,
-        )?;
-        let gate = B::top_k_group_selector(selector, context)?;
-        let experts = B::grouped_relu2(spec, context)?;
-        Ok(Self {
-            layer,
-            resident_unit_coordinates: None,
-            gate,
-            experts,
-            shared_experts: DenseMlp::new(
-                args,
-                &format!("{prefix}.shared_experts"),
-                shared_intermediate,
-                context,
-            )?,
-        })
+        construction::SparseMoeSpec::with_experts(args, layer, prefix, spec, shared_intermediate)?
+            .instantiate::<B>(context)
     }
 
     /// Executes resident routed and shared experts.
@@ -288,8 +233,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
                 pass,
             },
             |request| {
-                eredu_runtime::with_resident_unit_coordinates(
-                    self.resident_unit_coordinates.as_ref(),
+                eredu_runtime::with_borrowed_resident_unit_coordinates(
+                    self.resident_unit_coordinates.as_ref().map(|(coordinates, partitioned)| (coordinates.as_ref(), *partitioned)),
                     request,
                     |request| provider.forward_relu2_routed(&mut self.experts, request, context),
                 )
@@ -350,8 +295,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
                 pass,
             },
             |request| {
-                eredu_runtime::with_resident_unit_coordinates(
-                    self.resident_unit_coordinates.as_ref(),
+                eredu_runtime::with_borrowed_resident_unit_coordinates(
+                    self.resident_unit_coordinates.as_ref().map(|(coordinates, partitioned)| (coordinates.as_ref(), *partitioned)),
                     request,
                     |request| {
                         provider.forward_relu2_routed_tensor_parallel(
@@ -388,6 +333,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMoe<B> 
     pub(crate) fn bind_resident_unit_coordinates(
         &mut self,
         coordinates: eredu_core::component::ComponentCoordinateMap,
+        partitioned: bool,
+    ) {
+        self.bind_shared_resident_unit_coordinates(std::sync::Arc::new(coordinates), partitioned);
+    }
+
+    pub(crate) fn bind_shared_resident_unit_coordinates(
+        &mut self,
+        coordinates: std::sync::Arc<eredu_core::component::ComponentCoordinateMap>,
         partitioned: bool,
     ) {
         self.resident_unit_coordinates = Some((coordinates, partitioned));

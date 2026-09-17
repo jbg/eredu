@@ -149,14 +149,17 @@ pub(crate) fn publish_bank_parameter_replacements(
                 replacements.insert(member.parameter.clone(), value.clone());
             }
         }
-        prepared.push((replacements, bytes));
+        let revision = bank.parameter_revision.checked_add(1).ok_or_else(||
+            Error::ArchitectureModel("bank parameter revision overflow".into()))?;
+        prepared.push((replacements, bytes, revision));
     }
     if !ordinary()? {
         return Ok(false);
     }
-    for (bank, (replacements, bytes)) in guards.iter_mut().zip(prepared) {
+    for (bank, (replacements, bytes, revision)) in guards.iter_mut().zip(prepared) {
         bank.parameter_replacements = replacements;
         bank.effective_member_bytes = bytes;
+        bank.parameter_revision = revision;
     }
     Ok(true)
 }

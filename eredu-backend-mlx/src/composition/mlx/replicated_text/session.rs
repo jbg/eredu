@@ -24,12 +24,24 @@ fn finish_prediction_state_operation<T>(
     operation: Result<T, Error>,
     recovery: Result<(), Error>,
 ) -> Result<T, Error> {
+    finish_prediction_state_operation_with_metadata(operation, recovery, None)
+}
+
+fn finish_prediction_state_operation_with_metadata<T>(
+    operation: Result<T, Error>,
+    recovery: Result<(), Error>,
+    funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+) -> Result<T, Error> {
     match (operation, recovery) {
         (Err(operation), Err(recovery)) => {
-            Err(Error::Other(Box::new(PredictionStateRecoveryFailure {
+            let failure = PredictionStateRecoveryFailure {
                 operation,
                 recovery,
-            })))
+            };
+            Err(match funding {
+                Some(funding) => Error::Neural(funding.metadata_source(failure)),
+                None => Error::Other(Box::new(failure)),
+            })
         }
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
         (Ok(output), Ok(())) => Ok(output),
@@ -50,9 +62,11 @@ mod recovery_tests {
                 .unwrap_err()
                 .model_state_preserved()
         );
-        assert!(!finish_prediction_state_operation(Ok(7), Err(recovery()))
-            .unwrap_err()
-            .model_state_preserved());
+        assert!(
+            !finish_prediction_state_operation(Ok(7), Err(recovery()))
+                .unwrap_err()
+                .model_state_preserved()
+        );
         let failure =
             finish_prediction_state_operation::<()>(Err(operation()), Err(recovery())).unwrap_err();
         assert!(!failure.model_state_preserved());
@@ -75,3 +89,53 @@ mod recovery_tests {
         assert!(found, "recovery failure must survive the portable boundary");
     }
 }
+
+/// Shared policy-only checks. Legacy logical estimates remain in the ordinary
+/// control-support path; the cold resident plan must not run native getters.
+fn native_control_policy_support(
+    partitioned: bool,
+    distributed_agreement: bool,
+    prediction_present: bool,
+) -> eredu_core::execution_control::ControlSupport {
+    use eredu_core::execution_control::ControlSupport;
+    match native_control_policy_rejection(partitioned, distributed_agreement, prediction_present) {
+        Some(reason) => ControlSupport::Unsupported {
+            reason: reason.into(),
+        },
+        None => ControlSupport::Supported,
+    }
+}
+
+// Borrowed policy facts for pre-grant inspection; ordinary diagnostics above
+// keep their exact text and allocation behavior at the existing public boundary.
+fn native_control_policy_rejection(
+    partitioned: bool,
+    distributed_agreement: bool,
+    prediction_present: bool,
+) -> Option<&'static str> {
+    if partitioned && !distributed_agreement {
+        return Some("partitioned state copies require bounded all-rank preparation agreement");
+    }
+    if prediction_present {
+        return Some("native text snapshots do not support selected speculative execution");
+    }
+    None
+}
+
+fn require_native_control_policy(
+    partitioned: bool,
+    distributed_agreement: bool,
+    prediction_present: bool,
+) -> Result<(), Error> {
+    match native_control_policy_support(partitioned, distributed_agreement, prediction_present) {
+        eredu_core::execution_control::ControlSupport::Supported => Ok(()),
+        eredu_core::execution_control::ControlSupport::Unsupported { reason } => {
+            Err(Error::ArchitectureModel(reason))
+        }
+    }
+}
+
+pub(crate) use mechanisms::{
+    NativeOpeningRows, NativeOpeningRowsOwner, NativeOpeningRowsPlan, RetiredOpeningRow,
+    SealedOpeningRows,
+};

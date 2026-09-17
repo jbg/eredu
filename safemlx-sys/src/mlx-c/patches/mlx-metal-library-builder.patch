@@ -1,0 +1,537 @@
+diff --git a/mlx/backend/metal/custom_kernel.cpp b/mlx/backend/metal/custom_kernel.cpp
+--- a/mlx/backend/metal/custom_kernel.cpp
++++ b/mlx/backend/metal/custom_kernel.cpp
+@@ -72,7 +72,7 @@
+     }
+   }
+ 
+-  auto lib = d.get_library(
++  auto lib = d.get_library_borrowed(
+       name_, compile_options_, [this] { return metal::utils() + source_; });
+   auto kernel = d.get_kernel(name_, lib);
+   auto& compute_encoder = metal::get_command_encoder(s);
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1321,6 +1321,20 @@
+     const std::string& name,
+     const CompileOptions& compile_options,
+     const std::function<std::string(void)>& builder) {
++  return get_library_with_builder(
++      name,
++      compile_options,
++      LibraryBuilder{
++          std::addressof(builder), [](const void* context) -> std::string {
++            return (*static_cast<const std::function<std::string(void)>*>(
++                context))();
++          }});
++}
++
++MTL::Library* Device::get_library_with_builder(
++    const std::string& name,
++    const CompileOptions& compile_options,
++    LibraryBuilder builder) {
+   {
+     std::shared_lock rlock(library_mtx_);
+     if (auto it = library_map_.find(name); it != library_map_.end()) {
+@@ -1333,7 +1347,8 @@
+     return it->second.get();
+   }
+ 
+-  auto mtl_lib = build_library_(builder(), compile_options);
++  auto mtl_lib =
++      build_library_(builder.invoke(builder.context), compile_options);
+   library_map_.insert({name, mtl_lib});
+   return mtl_lib.get();
+ }
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -6,9 +6,11 @@
+ 
+ #include <Metal/Metal.hpp>
+ #include <functional>
++#include <memory>
+ #include <mutex>
+ #include <shared_mutex>
+ #include <string>
++#include <type_traits>
+ #include <unordered_map>
+ #include <unordered_set>
+ 
+@@ -238,6 +240,22 @@
+ };
+ 
+ class MLX_API Device {
++  // Used only for the duration of get_library. The cache never stores this
++  // view, the callable, or references into the callable's captures.
++  struct LibraryBuilder {
++    const void* context;
++    std::string (*invoke)(const void*);
++  };
++
++  template <class Builder>
++  using BorrowableBuilder = std::enable_if_t<
++      std::is_object_v<Builder> &&
++          !std::is_same_v<
++              std::decay_t<Builder>,
++              std::function<std::string(void)>> &&
++          std::is_invocable_r_v<std::string, const Builder&>,
++      int>;
++
+  public:
+   Device();
+   Device(const Device&) = delete;
+@@ -271,6 +289,32 @@
+       const std::string& name,
+       const std::function<std::string(void)>& builder) {
+     return get_library(name, {}, builder);
++  }
++
++  // Explicit borrowed lambda/object calls avoid a temporary std::function
++  // allocation before a cache hit. The reference remains valid until this call
++  // returns, including exceptional exit. The unchanged get_library overloads
++  // retain the ordinary std::function adapter and its historical copy/ownership
++  // semantics.
++  template <class Builder, BorrowableBuilder<Builder> = 0>
++  MTL::Library* get_library_borrowed(
++      const std::string& name,
++      const CompileOptions& compile_options,
++      const Builder& builder) {
++    return get_library_with_builder(
++        name,
++        compile_options,
++        LibraryBuilder{
++            std::addressof(builder), [](const void* context) -> std::string {
++              return (*static_cast<const Builder*>(context))();
++            }});
++  }
++
++  template <class Builder, BorrowableBuilder<Builder> = 0>
++  MTL::Library* get_library_borrowed(
++      const std::string& name,
++      const Builder& builder) {
++    return get_library_borrowed(name, {}, builder);
+   }
+ 
+   void clear_library(const std::string& name);
+@@ -297,7 +341,16 @@
+       const DeviceInitializationLayout&, DeviceInitializationOwner, uint64_t&) noexcept;
+   Device(const EmbeddedMetallib&, const DeviceInitializationLayout&);
+   void set_architecture_policy(const char*, size_t, bool prepared);
+-  struct FreeBytes { void operator()(char* p) const noexcept { std::free(p); } };
++  struct FreeBytes {
++    void operator()(char* p) const noexcept {
++      std::free(p);
++    }
++  };
++  MTL::Library* get_library_with_builder(
++      const std::string& name,
++      const CompileOptions& compile_options,
++      LibraryBuilder builder);
++
+   NS::SharedPtr<MTL::Library> build_library_(
+       const std::string& source_string,
+       const CompileOptions& compile_options = {});
+diff --git a/mlx/backend/metal/indexing.cpp b/mlx/backend/metal/indexing.cpp
+--- a/mlx/backend/metal/indexing.cpp
++++ b/mlx/backend/metal/indexing.cpp
+@@ -97,7 +97,7 @@
+         work_per_thread);
+     std::string lib_name = kernel_name;
+ 
+-    auto lib = d.get_library(lib_name, [&]() {
++    auto lib = d.get_library_borrowed(lib_name, [&]() {
+       std::string kernel_source = metal::utils();
+       kernel_source += metal::gather_front();
+       kernel_source += get_template_definition(
+@@ -142,7 +142,7 @@
+       large ? "int64_t" : "int");
+   std::string lib_name = kernel_name;
+ 
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+     kernel_source += metal::gather();
+     std::string out_type_str = get_type_string(out.dtype());
+@@ -318,7 +318,7 @@
+       large ? "int64_t" : "int");
+   std::string lib_name = kernel_name;
+ 
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+     concatenate(kernel_source, metal::reduce_utils(), metal::scatter());
+ 
+@@ -462,7 +462,7 @@
+   kernel_name += src.flags().row_contiguous ? "c" : "nc";
+   kernel_name += idx.flags().row_contiguous ? "c" : "nc";
+ 
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+     kernel_source += metal::gather_axis();
+     std::string out_type_str = get_type_string(out.dtype());
+@@ -572,7 +572,7 @@
+   kernel_name += upd.flags().row_contiguous ? "c" : "nc";
+   kernel_name += idx.flags().row_contiguous ? "c" : "nc";
+ 
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+     kernel_source += metal::reduce_utils();
+     kernel_source += metal::scatter_axis();
+@@ -699,7 +699,7 @@
+   const std::string kernel_name =
+       fmt::format("{}_{}_{}", kBaseName, dtype_tag, contiguous);
+ 
+-  auto lib = d.get_library(kernel_name, [&]() {
++  auto lib = d.get_library_borrowed(kernel_name, [&]() {
+     std::string source = metal::utils();
+     source += metal::masked_scatter();
+     source +=
+@@ -826,7 +826,7 @@
+   auto& s = stream();
+   auto& d = metal::device(s.device);
+ 
+-  auto lib = d.get_library(kernel_name, [&]() {
++  auto lib = d.get_library_borrowed(kernel_name, [&]() {
+     std::string kernel_source = metal::utils();
+     concatenate(kernel_source, metal::reduce_utils(), metal::scatter());
+ 
+diff --git a/mlx/backend/metal/jit_kernels.cpp b/mlx/backend/metal/jit_kernels.cpp
+--- a/mlx/backend/metal/jit_kernels.cpp
++++ b/mlx/backend/metal/jit_kernels.cpp
+@@ -12,7 +12,7 @@
+     metal::Device& d,
+     const std::string& kernel_name,
+     const array& out) {
+-  auto lib = d.get_library(kernel_name, [&]() {
++  auto lib = d.get_library_borrowed(kernel_name, [&]() {
+     std::string kernel_source = metal::utils();
+     kernel_source += metal::arange();
+     kernel_source += get_template_definition(
+@@ -29,7 +29,7 @@
+     Dtype out_type,
+     const char* op) {
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     auto in_t = get_type_string(in_type);
+     auto out_t = get_type_string(out_type);
+     std::string kernel_source = metal::utils();
+@@ -108,7 +108,7 @@
+     Dtype out_type,
+     const char* op) {
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+     kernel_source = metal::utils();
+     concatenate(kernel_source, metal::binary_ops(), metal::binary());
+@@ -125,7 +125,7 @@
+     Dtype out_type,
+     const char* op) {
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+     concatenate(kernel_source, metal::binary_ops(), metal::binary_two());
+     append_binary_kernels(lib_name, in_type, out_type, op, kernel_source);
+@@ -140,7 +140,7 @@
+     Dtype type,
+     const char* op) {
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     auto t_str = get_type_string(type);
+     std::string kernel_source = metal::utils();
+     concatenate(kernel_source, metal::ternary_ops(), metal::ternary());
+@@ -197,7 +197,7 @@
+     const array& in,
+     const array& out) {
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+     kernel_source += metal::copy();
+     auto in_type = get_type_string(in.dtype());
+@@ -261,7 +261,7 @@
+     const array& in,
+     const array& out) {
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+     kernel_source += metal::copy();
+     auto in_type = get_type_string(in.dtype());
+@@ -293,7 +293,7 @@
+     bool precise,
+     const array& out) {
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+-  auto lib = d.get_library(lib_name, [&] {
++  auto lib = d.get_library_borrowed(lib_name, [&] {
+     std::string kernel_source = metal::utils();
+     auto in_type = get_type_string(out.dtype());
+     auto acc_type = get_type_string(precise ? float32 : out.dtype());
+@@ -312,7 +312,7 @@
+     const std::string& kernel_name,
+     const array& out) {
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+-  auto lib = d.get_library(lib_name, [&] {
++  auto lib = d.get_library_borrowed(lib_name, [&] {
+     auto t_str = get_type_string(out.dtype());
+     std::string kernel_source;
+     kernel_source = metal::utils();
+@@ -335,7 +335,7 @@
+     const array& in,
+     const array& out) {
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     auto out_type = get_type_string(out.dtype());
+     std::string op = "Cum" + reduce_type + "<" + out_type + ">";
+     op[3] = toupper(op[3]);
+@@ -369,7 +369,7 @@
+     int bn,
+     int tn) {
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     auto in_type = get_type_string(in.dtype());
+     auto out_type = get_type_string(out.dtype());
+@@ -407,7 +407,7 @@
+     int bn,
+     int tn) {
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::utils() << metal::sort();
+     std::array<std::pair<std::string, std::string>, 3> kernel_types = {
+@@ -435,7 +435,7 @@
+     const std::string& func_name,
+     const std::string& op_name,
+     const Dtype& out_type) {
+-  auto lib = d.get_library(kernel_name, [&]() {
++  auto lib = d.get_library_borrowed(kernel_name, [&]() {
+     std::string op_type = op_name;
+     op_type[0] = std::toupper(op_name[0]);
+     auto out_t = get_type_string(out_type);
+@@ -460,7 +460,7 @@
+     int ndim /* = -1 */,
+     int bm /* = -1 */,
+     int bn /* = -1 */) {
+-  auto lib = d.get_library(kernel_name, [&]() {
++  auto lib = d.get_library_borrowed(kernel_name, [&]() {
+     std::string op_type = op_name;
+     op_type[0] = std::toupper(op_name[0]);
+     auto in_t = get_type_string(in_type);
+@@ -498,7 +498,7 @@
+     int wm,
+     int wn) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::utils() << metal::gemm()
+                   << metal::steel_gemm_fused()
+@@ -533,7 +533,7 @@
+     bool mn_aligned,
+     bool k_aligned) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::utils() << metal::gemm()
+                   << metal::steel_gemm_splitk()
+@@ -563,7 +563,7 @@
+     const array& out,
+     bool axbpy) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::utils() << metal::gemm()
+                   << metal::steel_gemm_splitk()
+@@ -594,7 +594,7 @@
+     bool mn_aligned,
+     bool k_aligned) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     auto out_mask_type = mask_out.has_value()
+         ? get_type_string((*mask_out).dtype())
+@@ -638,7 +638,7 @@
+     int wn,
+     bool rhs) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+     concatenate(
+         kernel_source,
+@@ -675,7 +675,7 @@
+     int wm,
+     int wn) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+     concatenate(
+         kernel_source,
+@@ -712,7 +712,7 @@
+     bool nc,
+     bool axpby) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::gemv()
+                   << get_template_definition(
+@@ -744,7 +744,7 @@
+     int tm,
+     int tn) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::gemv()
+                   << get_template_definition(
+@@ -777,7 +777,7 @@
+     int tn,
+     bool contiguous) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     auto out_mask_type = mask_out.has_value()
+         ? get_type_string((*mask_out).dtype())
+@@ -815,7 +815,7 @@
+     int n_channel_specialization,
+     bool small_filter) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::utils() << metal::conv() << metal::steel_conv()
+                   << get_template_definition(
+@@ -845,7 +845,7 @@
+     int wn,
+     bool small_filter) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::utils() << metal::conv() << metal::steel_conv_3d()
+                   << get_template_definition(
+@@ -875,7 +875,7 @@
+     int wm,
+     int wn) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::utils() << metal::conv()
+                   << metal::steel_conv_general()
+@@ -900,7 +900,7 @@
+     const metal::MTLFCList& func_consts,
+     const std::string& template_def) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     std::string kernel_string;
+     kernel_source << metal::fft() << template_def;
+@@ -915,7 +915,7 @@
+     const std::string& template_def,
+     const std::string& mode) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+     concatenate(
+         kernel_source,
+@@ -945,7 +945,7 @@
+     int wn,
+     bool transpose) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+     concatenate(
+         kernel_source, metal::utils(), metal::quantized_utils(), metal::gemm());
+@@ -984,7 +984,7 @@
+     int wm,
+     int wn) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::utils() << metal::gemm_nax()
+                   << metal::steel_gemm_fused_nax()
+@@ -1019,7 +1019,7 @@
+     int wn,
+     bool rhs) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+     concatenate(
+         kernel_source,
+@@ -1056,7 +1056,7 @@
+     int wm,
+     int wn) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::utils() << metal::gemm_nax()
+                   << metal::steel_gemm_splitk_nax()
+@@ -1090,7 +1090,7 @@
+     int wm,
+     int wn) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+     kernel_source << metal::utils() << metal::gemm_nax()
+                   << metal::steel_gemm_segmented_nax()
+@@ -1116,7 +1116,7 @@
+     const std::string& template_def,
+     const std::string& mode) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+     concatenate(
+         kernel_source,
+@@ -1146,7 +1146,7 @@
+     int wn,
+     bool transpose) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+     concatenate(
+         kernel_source,
+@@ -1187,7 +1187,7 @@
+     int wn,
+     const array& m) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+     concatenate(
+         kernel_source,
+@@ -1221,7 +1221,7 @@
+     int wn,
+     const array& m) {
+   const auto& lib_name = kernel_name;
+-  auto lib = d.get_library(lib_name, [&]() {
++  auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+     concatenate(
+         kernel_source,

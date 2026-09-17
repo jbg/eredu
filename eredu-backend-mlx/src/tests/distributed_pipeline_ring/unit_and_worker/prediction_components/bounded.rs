@@ -213,6 +213,22 @@ fn prove_bounded(device: DeviceType) {
                 eos_token_ids: vec![],
             },
         );
+        // Failed execution keeps the actual session payload in nonblocking
+        // recovery. Drive that existing owner to retirement before borrowing
+        // host evidence; an error return alone is not completion authority.
+        if runtime.session().test_payload_owner_count() != 1 {
+            assert_eq!(
+                runtime
+                    .session_mut()
+                    .take_speculative_activation_capture()
+                    .unwrap_err()
+                    .kind(),
+                eredu_core::BackendFailureKind::Busy,
+            );
+        }
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            runtime.session().test_payload_owner_count() == 1
+        });
         let records: Vec<_> = std::iter::from_fn(|| {
             runtime
                 .session_mut()
@@ -239,14 +255,14 @@ fn prove_bounded(device: DeviceType) {
     assert_eq!(
         (
             records[0].phase,
-            records[0].captures.invocation.unwrap().sequence
+            records[0].captures.as_step().invocation.unwrap().sequence
         ),
         (Phase::TargetPrefill, 3)
     );
     assert_eq!(
         (
             records[1].phase,
-            records[1].captures.invocation.unwrap().sequence
+            records[1].captures.as_step().invocation.unwrap().sequence
         ),
         (Phase::PredictionPrefill, 2)
     );
@@ -255,13 +271,13 @@ fn prove_bounded(device: DeviceType) {
         assert!(record.completed);
         assert_eq!(record.origin.request.index(), 0);
         assert!(record.origin.prediction >= record.origin.committed_tokens);
-        assert!(!record.captures.records.iter().any(|r| matches!(
+        assert!(!record.captures.as_step().records.iter().any(|r| matches!(
             r.outcome,
             CaptureOutcome::Missing | CaptureOutcome::Failed { .. }
         )));
         assert!(
             serde_json::to_vec(record).unwrap().len() as u64
-                <= record.captures.step_usage.encoded_bytes
+                <= record.captures.as_step().step_usage.encoded_bytes
         );
     }
     let (masked, _, records, error, masked_logits) = run(true, true, 512);
@@ -282,7 +298,7 @@ fn prove_bounded(device: DeviceType) {
     };
     let mut applied = 0;
     for record in records {
-        for edit in record.captures.interventions {
+        for edit in &record.captures.as_step().interventions {
             if edit.evidence.iter().any(|r| r.payload.is_some()) {
                 let before = values(&edit.evidence[0]);
                 let after = values(&edit.evidence[1]);

@@ -40,7 +40,7 @@ fn inferred_expert_pass<T: Tensor>(input: &T) -> ExpertPass {
 #[parameterized(tensor = "B::Tensor")]
 pub struct RoutedGatedProduct<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Global decoder layer used for runtime expert identity.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub layer: usize,
     /// Learned top-k router.
     pub router: B::Selector,

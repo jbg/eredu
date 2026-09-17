@@ -1,0 +1,284 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -46,6 +46,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/arg_reduce.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/greedy_storage.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/reshape_storage.cpp
++  ${CMAKE_CURRENT_SOURCE_DIR}/random_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/binary_storage.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/slice_storage.cpp
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -67,8 +67,8 @@
+   return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
+       (exact_contiguous(output) || exact_cast(output) || is_completion_synchronizer(output));
+ }
+-bool single_output_eval_layout(size_t rank, size_t inputs, bool tracer,
+-    const EvalDispatchStorage* dispatch_source, SingleOutputEvalStorage& out) noexcept {
++static bool single_output_layout(size_t rank, size_t inputs, bool tracer,
++    const EvalDispatchStorage* dispatch_source, bool raw_task, SingleOutputEvalStorage& out) noexcept {
+   const bool copy = dispatch_source != nullptr;
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+@@ -93,12 +93,13 @@
+       sizeof(std::optional<submission::FixedEvalPrologueGuard>) +
+       sizeof(submission::GraphConstruction*) + sizeof(submission::GraphFailure) +
+       sizeof(submission::NativeControlBinding) + sizeof(detail::PreparedCleanup) +
+-      sizeof(CommandEncoder*) + sizeof(array*) + sizeof(scheduler::TaskContext) +
++      sizeof(CommandEncoder*) + sizeof(array*) + sizeof(scheduler::TaskContext) + sizeof(bool) +
++      sizeof(rank) + sizeof(inputs) + sizeof(tracer) + sizeof(dispatch_source) + sizeof(out) +
+       sizeof(scheduler::TaskOwner);
+   if (!add(value.named_control_bytes, cleanup.named_control_bytes)) return false;
+   if (copy) {
+     const auto& dispatch = *dispatch_source;
+-    const size_t weak_copies = inputs + 1;
++    const size_t weak_copies = raw_task ? 0 : inputs + 1;
+     WeakCopyStorage weak;
+     submission::OriginalBufferRoutingLayout routing;
+     size_t allocation_controls = 0;
+@@ -139,6 +140,14 @@
+   out = value; return true;
+ #endif
+ }
++bool single_output_eval_layout(size_t rank, size_t inputs, bool tracer,
++    const EvalDispatchStorage* dispatch_source, SingleOutputEvalStorage& out) noexcept {
++  return single_output_layout(rank,inputs,tracer,dispatch_source,false,out);
++}
++bool single_output_raw_task_layout(size_t rank, bool tracer,
++    const EvalDispatchStorage& dispatch_source, SingleOutputEvalStorage& out) noexcept {
++  return single_output_layout(rank,1,tracer,&dispatch_source,true,out);
++}
+ bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
+     CopyEvalStorage& out) noexcept {
+   if (copy && inputs != 1) return false;
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -17,6 +17,7 @@
+ #include "mlx/backend/cpu/softmax_storage.h"
+ #include "mlx/backend/cpu/greedy_storage.h"
+ #include "mlx/backend/cpu/reshape_storage.h"
++#include "mlx/backend/cpu/random_storage.h"
+ 
+ namespace mlx::core::cpu {
+ 
+@@ -47,7 +48,8 @@
+   const bool fixed_softmax = fixed && cpu::is_softmax_eval_primitive(arr);
+   const bool fixed_greedy = fixed && cpu::is_greedy_eval_primitive(arr);
+   const bool fixed_reshape = fixed && cpu::is_reshape_alias_eval_primitive(arr);
+-  const bool extended = fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool fixed_random = fixed && cpu::is_random_bits_eval_primitive(arr);
++  const bool extended = fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -55,7 +57,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_reshape
++    const auto failure = fixed_random
++        ? submission::GraphConstruction::create_cpu_random_bits_eval(*extended_prologue, extended_bank.value)
++        : fixed_reshape
+         ? submission::GraphConstruction::create_cpu_reshape_alias_eval(*extended_prologue, extended_bank.value)
+         : fixed_greedy
+         ? submission::GraphConstruction::create_cpu_greedy_eval(*extended_prologue, extended_bank.value)
+diff --git a/mlx/backend/cpu/eval_storage.h b/mlx/backend/cpu/eval_storage.h
+--- a/mlx/backend/cpu/eval_storage.h
++++ b/mlx/backend/cpu/eval_storage.h
+@@ -16,4 +16,8 @@
+ };
+ bool single_output_eval_layout(size_t rank, size_t inputs, bool tracer,
+     const EvalDispatchStorage*, SingleOutputEvalStorage&) noexcept;
++// One-input raw-pointer worker: the encoder/cleanup retains original arrays,
++// while the task owns no weak array descriptors. Output backing is still real.
++bool single_output_raw_task_layout(size_t rank, bool tracer,
++    const EvalDispatchStorage&, SingleOutputEvalStorage&) noexcept;
+ } // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/primitives.cpp b/mlx/backend/cpu/primitives.cpp
+--- a/mlx/backend/cpu/primitives.cpp
++++ b/mlx/backend/cpu/primitives.cpp
+@@ -12,6 +12,7 @@
+ #include "mlx/backend/cpu/arange.h"
+ #include "mlx/backend/cpu/copy.h"
+ #include "mlx/backend/cpu/encoder.h"
++#include "mlx/backend/cpu/random_storage.h"
+ #include "mlx/backend/cpu/threefry.h"
+ #include "mlx/primitives.h"
+ #include "mlx/utils.h"
+@@ -268,28 +269,14 @@
+   }
+ }
+ 
+-void RandomBits::eval_cpu(const ArrayVector& inputs, array& out) {
+-  assert(inputs.size() == 1);
+-  // keys has shape (N1, ..., NK, 2)
+-  // out has shape (N1, ..., NK, M1, M2, ...)
+-  auto& keys = inputs[0];
+-  size_t num_keys = keys.size() / 2;
+-
+-  size_t elems_per_key = out.size() / num_keys;
+-  size_t bytes_per_key = out.itemsize() * elems_per_key;
+-  out.allocate_data(out.nbytes());
+-
+-  auto kptr = inputs[0].data<uint32_t>();
+-  auto cptr = out.data<char>();
+-  auto& encoder = cpu::get_command_encoder(stream());
+-  encoder.set_input_array(inputs[0]);
+-  encoder.set_output_array(out);
+-  encoder.dispatch([kptr,
+-                    cptr,
+-                    bytes_per_key,
+-                    num_keys,
+-                    kshape = keys.shape(),
+-                    kstrides = keys.strides()]() mutable {
++namespace {
++struct RandomBitsTask {
++  const uint32_t* kptr;
++  char* cptr;
++  size_t bytes_per_key,num_keys;
++  Shape kshape;
++  Strides kstrides;
++  void operator()() {
+     auto copy_remaining = [&](char* cptr, size_t loc, uint32_t v) {
+       if (4 * loc + 4 <= bytes_per_key) {
+         reinterpret_cast<uint32_t*>(cptr)[loc] = v;
+@@ -328,7 +315,39 @@
+             cptr, half_size, random::threefry2x32_hash(key, count).first);
+       }
+     }
+-  });
++  }
++};
++}
++namespace cpu {
++bool random_bits_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  DispatchLayout task;
++  if(!CommandEncoder::dispatch_layout<RandomBitsTask>(task))return false;
++  const size_t controls=sizeof(EvalDispatchStorage)+sizeof(task)+sizeof(out)+sizeof(RandomBitsTask)*2+
++      sizeof(const uint32_t*)+sizeof(char*)+sizeof(size_t)*11+sizeof(int)*3+sizeof(bool)*2+
++      sizeof(Shape)+sizeof(Strides)+sizeof(std::pair<uint32_t,uint32_t>)*4+
++      sizeof(std::pair<uintptr_t,uintptr_t>)+sizeof(uint32_t[3])+sizeof(uint32_t)*3+sizeof(void*)*5;
++  if(controls>SIZE_MAX-task.controls)return false;
++  out={task.task_bytes,task.task_alignment,0,task.controls+controls};return true;
++}
++}
++
++void RandomBits::eval_cpu(const ArrayVector& inputs, array& out) {
++  assert(inputs.size() == 1);
++  // keys has shape (N1, ..., NK, 2)
++  // out has shape (N1, ..., NK, M1, M2, ...)
++  auto& keys = inputs[0];
++  size_t num_keys = keys.size() / 2;
++
++  size_t elems_per_key = out.size() / num_keys;
++  size_t bytes_per_key = out.itemsize() * elems_per_key;
++  out.allocate_data(out.nbytes());
++
++  auto kptr = inputs[0].data<uint32_t>();
++  auto cptr = out.data<char>();
++  auto& encoder = cpu::get_command_encoder(stream());
++  encoder.set_input_array(inputs[0]);
++  encoder.set_output_array(out);
++  encoder.dispatch(RandomBitsTask{kptr,cptr,bytes_per_key,num_keys,keys.shape(),keys.strides()});
+ }
+ 
+ void Reshape::eval_cpu(const ArrayVector& inputs, array& out) {
+diff --git a/mlx/backend/cpu/random_storage.cpp b/mlx/backend/cpu/random_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/random_storage.cpp
+@@ -0,0 +1,55 @@
++#include "mlx/backend/cpu/random_storage.h"
++#include "mlx/primitives.h"
++#include "mlx/submission.h"
++#include <typeinfo>
++namespace mlx::core::cpu {
++namespace {
++bool product(size_t a,size_t b,size_t& out) noexcept {
++  if(b&&a>size_t(PTRDIFF_MAX)/b)return false;out=a*b;return true;
++}
++}
++bool is_random_bits_eval_primitive(const array& out) noexcept {
++  return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
++      typeid(out.primitive())==typeid(RandomBits);
++}
++bool random_bits_eval_layout(size_t rank,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
++  size_t bytes=0;
++  if(rank<1||rank>4||!elements||elements>UINT32_MAX||!product(elements,sizeof(uint32_t),bytes))return false;
++  EvalDispatchStorage task;SingleOutputEvalStorage common;
++  if(!random_bits_dispatch_storage(task)||!single_output_raw_task_layout(rank,tracer,task,common))return false;
++  CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
++  const size_t controls=sizeof(value)+sizeof(task)+sizeof(common)+sizeof(rank)+sizeof(elements)+sizeof(tracer)+sizeof(out)+
++      sizeof(bytes)+sizeof(std::pair<const Shape&,int>)+sizeof(const array*)*3+sizeof(const RandomBits*)+
++      sizeof(size_t)*9+sizeof(int)*2+sizeof(bool)*2+sizeof(Shape)+sizeof(Strides)+
++      sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
++      sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
++  if(controls>SIZE_MAX-value.named_control_bytes)return false;
++  value.named_control_bytes+=controls;out=value;return true;
++}
++bool random_bits_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(!is_random_bits_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
++  const auto& keys=output.inputs()[0];const auto [shape,width]=static_cast<const RandomBits&>(output.primitive()).state_refs();
++  const size_t rank=output.ndim();
++  if(rank<1||rank>4||shape.size()!=rank||width!=4||output.dtype()!=uint32||output.itemsize()!=sizeof(uint32_t)||
++      keys.ndim()!=1||keys.shape(0)!=2||keys.size()!=2||keys.strides().size()!=1||keys.strides()[0]<0||
++      keys.dtype()!=uint32||keys.itemsize()!=sizeof(uint32_t))return false;
++  size_t elements=1,span=0,bytes=0;
++  for(size_t i=0;i!=rank;++i)
++    if(shape[i]<=0||shape[i]!=output.shape(i)||!product(elements,size_t(shape[i]),elements))return false;
++  if(!product(size_t(keys.strides()[0]),1,span)||span==size_t(PTRDIFF_MAX))return false;
++  ++span;
++  if(span>keys.data_size()||!product(span,sizeof(uint32_t),bytes)||elements!=output.size())return false;
++  return random_bits_eval_layout(rank,elements,output.is_tracer(),out);
++}
++}
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_random_bits_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record=guard.record();auto* graph=record.graph_quota();auto context=current_graph_construction_context();
++  if(out||!graph||!guard.cpu()||!context.scope||context.worker||context.dispatch!=&record||current_graph_quota()!=graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if(!cpu::random_bits_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
++}
++}
+diff --git a/mlx/backend/cpu/random_storage.h b/mlx/backend/cpu/random_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/random_storage.h
+@@ -0,0 +1,8 @@
++#pragma once
++#include "mlx/backend/cpu/copy_storage.h"
++namespace mlx::core::cpu {
++MLX_API bool random_bits_dispatch_storage(EvalDispatchStorage&) noexcept;
++MLX_API bool random_bits_eval_layout(size_t rank,size_t elements,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool is_random_bits_eval_primitive(const array&) noexcept;
++MLX_API bool random_bits_eval_storage(const array&,CopyEvalStorage&) noexcept;
++}
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -166,6 +166,7 @@
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_greedy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_reshape_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_random_bits_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_softmax_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_slice_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_copy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -1805,6 +1805,7 @@
+   DEFINE_VMAP()
+   DEFINE_NAME(RandomBits)
+   bool is_equivalent(const Primitive& other) const override;
++  std::pair<const Shape&,int> state_refs() const noexcept { return {shape_,width_}; }
+   std::pair<Shape, int> state() const {
+     return {shape_, width_};
+   };

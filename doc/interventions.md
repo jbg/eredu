@@ -510,3 +510,23 @@ invocation, while a shared fusion parameter overlay affects every consumer.
 Neutral dense/MoE fixtures verify exact unit selection, causal score changes and
 failed-observer replay; native TP/PP trials verify global masks and survivor
 recomputation through the public controlled path.
+
+## Original windowed execution scope
+
+The selected Qwen embedded dense-window intervention path passes ordinary,
+managed and controlled execution with the same ordered edits, cross-window
+Preview/Summary evidence, immutable source identity and cumulative lifetime
+accounting. The public case
+`native_original_qwen_window_intervention_evidence_matches_ordinary_and_controlled`
+records ordinary 0.453s, managed 0.620s and controlled 0.650s in the
+[bounded native evidence](validation/bounded-media-and-submission-2026-09-16.json).
+The original speculative outer checkpoint retains the collector and monotone
+invocation/ledger source; it is distinct from the plain capture checkpoint.
+
+Sparse internal/distributed interventions still need the original coordinate and
+lowering destinations, native source and shared callback join. Their current
+original admission rejects before those ordinary allocation/evaluation workers;
+the shared sparse intervention semantics remain applicable implementation work.
+The general plain managed request also still needs an intervention-source handoff
+alongside its existing capture option. These remaining joins do not reopen the
+validated dense-window scope.

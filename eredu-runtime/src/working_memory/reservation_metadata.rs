@@ -1,0 +1,162 @@
+//! Initial reservation metadata, paid by the already retained planning account.
+use super::*;
+use eredu_nn::workspace::{
+    WorkspaceMetadataError, WorkspaceMetadataFunding, WorkspaceMetadataFundingError,
+};
+use std::{
+    error::Error as StdError,
+    fmt,
+    mem::{size_of, size_of_val},
+};
+
+struct Failure {
+    cause: eredu_nn::Error,
+    // The closed outer Arc and exact cause retire before this account alias.
+    _funding: WorkspaceMetadataFunding,
+}
+
+/// An owning metadata-construction failure retaining the original typed cause.
+/// Clones share its closed owner without cloning or formatting that cause.
+/// Equality denotes the same retained failure, not diagnostic text equality.
+pub struct WorkspaceReservationMetadataError(Option<Arc<Failure>>);
+impl Clone for WorkspaceReservationMetadataError {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+impl PartialEq for WorkspaceReservationMetadataError {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(
+            self.0.as_ref().expect("live metadata failure"),
+            other.0.as_ref().expect("live metadata failure"),
+        )
+    }
+}
+impl Eq for WorkspaceReservationMetadataError {}
+impl Drop for WorkspaceReservationMetadataError {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.take() {
+            drop(Arc::into_inner(owner));
+        }
+    }
+}
+impl fmt::Debug for WorkspaceReservationMetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("WorkspaceReservationMetadataError")
+            .field(&self.0.as_ref().expect("live metadata failure").cause)
+            .finish()
+    }
+}
+impl fmt::Display for WorkspaceReservationMetadataError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0.as_ref().expect("live metadata failure").cause, f)
+    }
+}
+impl StdError for WorkspaceReservationMetadataError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.0.as_ref().expect("live metadata failure").cause)
+    }
+}
+
+pub(super) fn funding_error(cause: WorkspaceMetadataFundingError) -> WorkingMemoryError {
+    match cause {
+        WorkspaceMetadataFundingError::Capacity {
+            required,
+            available,
+        } => WorkingMemoryError::BudgetExceeded {
+            required_bytes: required,
+            available_bytes: available,
+        },
+        WorkspaceMetadataFundingError::Overflow => WorkingMemoryError::Overflow,
+        cause => WorkingMemoryError::MetadataConstruction(WorkspaceMetadataError::Funding(cause)),
+    }
+}
+
+pub(super) fn neural_error(
+    cause: eredu_nn::Error,
+    funding: &WorkspaceMetadataFunding,
+) -> WorkingMemoryError {
+    // Fixed admission errors own no source payload. Preserve the shared
+    // smaller-chunk classification without wrapping them into an owning error.
+    if let Some(fixed) = cause
+        .source()
+        .and_then(|source| source.downcast_ref::<WorkspaceMetadataError>())
+        .copied()
+    {
+        drop(cause);
+        return match fixed {
+            WorkspaceMetadataError::Funding(cause) => funding_error(cause),
+            WorkspaceMetadataError::Overflow => WorkingMemoryError::Overflow,
+            cause => WorkingMemoryError::MetadataConstruction(cause),
+        };
+    }
+    let failure = Failure {
+        cause,
+        _funding: funding.clone(),
+    };
+    let controls = [
+        size_of::<Failure>(),
+        size_of::<WorkspaceReservationMetadataError>(),
+        size_of::<Option<Arc<Failure>>>(),
+        size_of::<Option<Failure>>(),
+        size_of::<WorkingMemoryError>(),
+        size_of::<Result<(), WorkspaceMetadataFundingError>>(),
+    ];
+    let bytes = qualified_storage::shared_bytes::<Failure>()
+        .and_then(|value| usize::try_from(value).map_err(|_| WorkingMemoryError::Overflow))
+        .and_then(|value| {
+            value
+                .checked_add(size_of_val(&controls))
+                .ok_or(WorkingMemoryError::Overflow)
+        })
+        .and_then(|value| {
+            controls
+                .into_iter()
+                .try_fold(value, usize::checked_add)
+                .ok_or(WorkingMemoryError::Overflow)
+        });
+    let result = bytes.and_then(|bytes| funding.reserve_metadata(bytes).map_err(funding_error));
+    if let Err(cause) = result {
+        drop(failure);
+        return cause;
+    }
+    WorkingMemoryError::ReservationMetadata(WorkspaceReservationMetadataError(Some(Arc::new(
+        failure,
+    ))))
+}
+
+pub(super) fn constructor_bytes() -> Result<usize, WorkingMemoryError> {
+    control_mutex::require_known_layout()?;
+    let shared = usize::try_from(qualified_storage::shared_bytes::<Reservation>()?)
+        .map_err(|_| WorkingMemoryError::Overflow)?;
+    let controls = [
+        shared,
+        // Actual Box<AccountNode> and its by-value construction/commit states.
+        size_of::<funding::AccountNode>(),
+        size_of::<funding::AccountNode>(),
+        size_of::<Box<funding::AccountNode>>(),
+        size_of::<funding::FundingState>(),
+        size_of::<Reservation>(),
+        size_of::<ReservationOwner>(),
+        size_of::<WorkingMemoryReservation>(),
+        size_of::<Option<Reservation>>(),
+        size_of::<Result<WorkingMemoryReservation, WorkingMemoryError>>(),
+        size_of::<PreparedAccountCommit<'_>>(),
+        size_of::<Result<PreparedAccountCommit<'_>, WorkingMemoryError>>(),
+        size_of::<std::sync::MutexGuard<'_, Usage>>(),
+        size_of::<
+            Result<
+                std::sync::MutexGuard<'_, Usage>,
+                std::sync::PoisonError<std::sync::MutexGuard<'_, Usage>>,
+            >,
+        >(),
+        size_of::<WorkspaceReportMetadata<'_>>(),
+        size_of::<Option<WorkspaceMetadataFunding>>(),
+        size_of::<ControlMutex<text_preparation::RequestStart>>(),
+        size_of::<(u64, u64, u64, Option<u64>, InferenceGeometry)>(),
+    ];
+    controls
+        .into_iter()
+        .try_fold(size_of_val(&controls), usize::checked_add)
+        .ok_or(WorkingMemoryError::Overflow)
+}

@@ -3,11 +3,11 @@
 use std::{num::NonZeroU32, sync::Arc};
 
 use eredu_core::{
+    AttentionPolicy, LayerSchedule,
     cache::{
         LayerCachePolicy, MutableStateResidency, PoolingStateComponent, StateResidencyClass,
         StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
     },
-    AttentionPolicy, LayerSchedule,
 };
 use eredu_nn::{
     EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, GroupedGatedProductOperator,
@@ -23,17 +23,19 @@ use eredu_runtime::{
 };
 
 use eredu_checkpoint::LinearFormat;
+mod construction;
+pub(crate) use construction::{DsparkStaticSpec, V4PredictionUnitSpec};
 
 use crate::decoder::{
     SequentialPredictionGroups, StaticModuleSpec, StaticModules as TextStaticModules,
 };
 
 use super::{
+    DsparkConfig, V4Args, V4AttentionPolicy,
     block::V4Block,
     config::V4TargetCapturePolicy,
     moe::MoePolicy,
     mtp::{EmbeddedInput, ForwardMode, RetainedValues, V4PredictionLayer},
-    DsparkConfig, V4Args, V4AttentionPolicy,
 };
 
 fn capture_target_layer<T: Tensor>(
@@ -76,37 +78,43 @@ fn complete_target_capture<T: Tensor>(
 
 /// Declares V4 cache identity independently of concrete state storage.
 pub fn state_identity(
-    args: &V4Args,
-    layout: &StateLayout,
-    global_layer_start: usize,
+    args: &V4Args, layout: &StateLayout, global_layer_start: usize,
     topology: eredu_core::cache::PromptCacheTopology,
 ) -> Result<ModelStateIdentity, Error> {
-    args.validate().map_err(Error::backend)?;
-    topology.validate().map_err(Error::backend)?;
-    let layer_count = usize::try_from(
-        args.num_hidden_layers
-            .checked_add(args.num_nextn_predict_layers)
-            .ok_or_else(|| Error::backend("V4 state layer count overflowed"))?,
-    )
-    .map_err(Error::backend)?;
-    let global_layer_end = global_layer_start
-        .checked_add(layout.len())
-        .ok_or_else(|| Error::backend("V4 owned state range overflowed"))?;
+    state_identity_destination(args, layout, global_layer_start, topology,
+        crate::decoder::identity::Metadata::new(None))
+}
+pub(crate) fn state_identity_with_metadata(
+    args: &V4Args, layout: &StateLayout, global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<ModelStateIdentity, Error> {
+    state_identity_destination(args, layout, global_layer_start, topology,
+        crate::decoder::identity::Metadata::new(Some(context)))
+}
+fn state_identity_destination(
+    args: &V4Args, layout: &StateLayout, global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<ModelStateIdentity, Error> {
+    metadata.controls::<(ModelStateIdentity, usize, usize)>()?;
+    args.validate_with_diagnostic(|message| metadata.error(message))?;
+    topology.validate_with_diagnostic(|message| metadata.prompt_error(message))?;
+    let layer_count = usize::try_from(args.num_hidden_layers.checked_add(args.num_nextn_predict_layers)
+        .ok_or_else(|| metadata.error(format_args!("V4 state layer count overflowed")))?)
+        .map_err(|cause| metadata.source(cause))?;
+    let global_layer_end = global_layer_start.checked_add(layout.len())
+        .ok_or_else(|| metadata.error(format_args!("V4 owned state range overflowed")))?;
     if global_layer_end > layer_count {
-        return Err(Error::backend(format!(
-            "V4 owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
-        )));
+        return Err(metadata.error(format_args!(
+            "V4 owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers")));
     }
-    eredu_runtime::ModelStateIdentity::new(
-        "deepseek_v4",
-        args.model_type.clone(),
-        super::v4_architecture_fingerprint(args),
-        layer_count,
-        global_layer_start,
-        0,
-        topology,
+    eredu_runtime::ModelStateIdentity::new_with_diagnostic(
+        metadata.text("deepseek_v4")?, metadata.text(&args.model_type)?,
+        super::config::v4_architecture_fingerprint_with_metadata(args, metadata)?,
+        layer_count, global_layer_start, 0, topology,
+        |message| metadata.prompt_error(message),
     )
-    .map_err(Error::backend)
 }
 
 /// Pinned DSpark projections and heads shared by its ordinary draft blocks.
@@ -543,6 +551,25 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
         }
         Ok(values)
     }
+
+    fn wire_schema_with_metadata(&self,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<eredu_runtime::BoundaryWireSchema,Error>{
+        use eredu_runtime::{BoundaryTensorDimension as Dim,BoundaryTensorDtype as Dtype};
+        crate::boundary_metadata::schema(context,Self::IDENTITY,self.activation_hidden_size,
+            &[("tokens",&[Dim::Batch,Dim::Sequence],Dtype::Uint32)],
+            Some(("capture",self.capture_count,&[Dim::Batch,Dim::Sequence,Dim::Fixed(self.hidden_size)],Dtype::Activation)))
+    }
+    fn encode_with_metadata<T>(&self,boundary:Self::Boundary<T>,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Vec<eredu_runtime::ArchitectureBoundaryValue<T>>,Error>{
+        crate::boundary_metadata::encode(context,Self::IDENTITY,
+            [("tokens",boundary.input_ids)],boundary.captures,self.capture_count,"capture")
+    }
+    fn decode_with_metadata<T>(&self,tensors:Vec<T>,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Self::Boundary<T>,Error>{
+        let ([input_ids],captures)=crate::boundary_metadata::decode(context,Self::IDENTITY,tensors,self.capture_count)?;
+        Ok(TargetBoundary{input_ids,captures})
+    }
+
 }
 
 /// Typed V4 target context transported alongside the evolving activation.
@@ -629,12 +656,45 @@ pub struct Model<B>
 where
     B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
-    args: V4Args,
+    args: crate::replicated_text::config_source::ConfigOwner<V4Args>,
+    construction_parameters: Option<crate::routed_text::RetainedRoutedDescription>,
+    construction_units: Option<crate::routed_text::RetainedRoutedUnits>,
     static_modules: StaticModules<B>,
     groups: SequentialPredictionGroups,
     parallel_geometry: Option<Arc<super::parallel::V4LocalGeometry>>,
     expert_realization: Option<crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>,
     partition_target_start: usize,
+}
+
+impl<B> crate::routed_text::RoutedConstructionParameters<B> for Model<B>
+where
+    B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
+{
+    fn install_construction_parameters(&mut self, source: crate::routed_text::RetainedRoutedDescription) {
+        self.construction_parameters = Some(source);
+    }
+    fn prepare_construction_units(&self, banks: Option<&crate::routed_text::RetainedRoutedBanks>, context: &<B::Tensor as Tensor>::Context)
+        -> Result<Option<crate::routed_text::RetainedRoutedUnits>, Error> {
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        let count = self.groups.unit_count(0)?;
+        let selected = banks.map(|banks| banks.get(&eredu_runtime::RoutedBankId::new(0))
+            .and_then(|bank| bank.plan().gated())
+            .ok_or_else(|| Error::from(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)))
+            .transpose()?;
+        let mut specs = Vec::with_capacity(count);
+        for index in 0..count { specs.push(self.target_unit_source(index, selected)?); }
+        Ok(Some(crate::routed_text::RetainedRoutedUnits::v4_source(specs)))
+    }
+    fn install_construction_units(&mut self, source: Option<crate::routed_text::RetainedRoutedUnits>) -> Result<(), Error> {
+        if let Some(source) = &source {
+            if source.v4()?.len() != self.groups.unit_count(0)? {
+                return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+            }
+        }
+        self.construction_units = source;
+        Ok(())
+    }
+
 }
 
 impl<B> eredu_runtime::ArchitectureParameters<B> for Model<B>
@@ -645,6 +705,20 @@ where
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
         self.state_layout_impl()
+    }
+
+    fn state_layout_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<StateLayout, Self::DefinitionError> {
+        match &self.parallel_geometry {
+            Some(geometry) => geometry.state_layout().clone_workspace(context),
+            None => state_layout_with_metadata(&self.args, context),
+        }
+    }
+    fn state_identity_with_metadata(&self, state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<ModelStateIdentity, Self::DefinitionError> {
+        state_identity_with_metadata(&self.args, state.layout(), state.global_layer_offset(), topology, context)
     }
 
     fn state_identity(
@@ -665,6 +739,30 @@ where
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_runtime::ArchitectureParameterDescription, Self::DefinitionError> {
         super::parallel::v4_parameter_description(&self.args).map_err(Error::backend)
+    }
+
+    fn parameter_description_with_metadata(&self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>, Self::DefinitionError> {
+        match &self.construction_parameters {
+            Some(source) => {
+                crate::decoder::ModuleMetadata::new::<B>(context)
+                    .controls::<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>>()?;
+                Ok(std::borrow::Cow::Borrowed(source))
+            }
+            None if B::construction_metadata(context).is_some_and(|metadata| metadata.uses_checked_metadata()) => {
+                Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+            }
+            None => self.parameter_description(context).map(std::borrow::Cow::Owned),
+        }
+    }
+
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_nn::Parameterized::visit_retained_values(&self.static_modules, visitor)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -891,16 +989,27 @@ where
 
     /// Builds unloaded pinned V4 modules.
     pub fn new(args: V4Args, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
-            "DeepSeek-V4",
-            crate::operator_requirements::DEEPSEEK_V4,
-        )?;
-        args.validate().map_err(Error::backend)?;
-        let text = TextStaticModules::from_spec(text_static_spec(&args), context)?;
+        Self::new_with_config(args.into(),context)
+    }
+    pub(crate) fn new_with_config(args:crate::replicated_text::config_source::ConfigOwner<V4Args>,
+        context:&<B::Tensor as Tensor>::Context)->Result<Self,Error>{
+        let module_metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        module_metadata.controls::<Self>()?;
+        module_metadata.require::<B>("DeepSeek-V4", crate::operator_requirements::DEEPSEEK_V4)?;
+        args.validate_with_diagnostic(|message| metadata.error(message))?;
+        let spec = text_static_spec_view(&args);
+        let spec = match B::construction_metadata(context) {
+            Some(metadata) => spec.to_owned_with_metadata(metadata)?,
+            None => spec.to_owned(),
+        };
+        let text = TextStaticModules::from_spec(spec, context)?;
         Ok(Self {
-            groups: prediction_groups(&args)?,
+            groups: prediction_groups(&args, B::construction_metadata(context))?,
             static_modules: static_modules(&args, text, context)?,
             args,
+            construction_parameters: None,
+            construction_units: None,
             parallel_geometry: None,
             expert_realization: None,
             partition_target_start: 0,
@@ -927,9 +1036,11 @@ where
             context,
         )?;
         Ok(Self {
-            groups: prediction_groups(&args)?,
+            groups: prediction_groups(&args, B::construction_metadata(context))?,
             static_modules: static_modules(&args, text, context)?,
-            args,
+            args:args.into(),
+            construction_parameters: None,
+            construction_units: None,
             parallel_geometry: Some(Arc::new(geometry)),
             expert_realization: None,
             partition_target_start: 0,
@@ -954,6 +1065,9 @@ where
         &mut self,
         realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     ) {
+        // A new explicit realization invalidates the old immutable constructor loan.
+        self.construction_units = None;
+        self.construction_parameters = None;
         self.expert_realization = Some(realization);
     }
 
@@ -971,7 +1085,7 @@ where
     }
 
     /// Returns the normalized V4 arguments.
-    pub const fn args(&self) -> &V4Args {
+    pub fn args(&self) -> &V4Args {
         &self.args
     }
 
@@ -1004,6 +1118,17 @@ where
         &mut self.static_modules
     }
 
+    fn target_unit_source(&self, index: usize, selected_plan: Option<&crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>>) -> Result<super::block::V4BlockSpec, Error> {
+        self.groups.unit_count(0)?;
+        let args = self.parallel_geometry.as_ref().map_or(&*self.args, |geometry| geometry.args());
+        let realization = selected_plan.or(self.expert_realization.as_ref());
+        let selected = realization.and_then(|source| source.unit_spec("target", index)).cloned();
+        if realization.is_some() && selected.is_none() {
+            return Err(Error::backend(format!("V4 expert realization has no bank for target.{index}")));
+        }
+        super::block::V4BlockSpec::new(args, index, &format!("layers.{index}"), selected)
+    }
+
     /// Constructs one target, sequential MTP, or DSpark unit from this model's
     /// authoritative global or rank-local geometry.
     pub fn construct_unit(
@@ -1012,11 +1137,37 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
+        crate::decoder::ModuleMetadata::new::<B>(context).controls::<(
+            &Self, usize, usize, &<B::Tensor as Tensor>::Context, Result<Unit<B>, Error>,
+        )>()?;
+        if group == 0 {
+            if let Some(source) = &self.construction_units {
+                let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+                metadata.controls::<(&crate::routed_text::RetainedRoutedUnits, Unit<B>, usize)>()?;
+                let spec = source.v4()?.get(index).ok_or_else(|| metadata.error(format_args!(
+                    "target unit {index} is outside the retained source")))?;
+                return spec.instantiate::<B>(context).map(Unit::Target);
+            }
+        }
+
+        self.construct_ordinary_unit(group, index, context)
+    }
+
+    // The retained source route does not keep the ordinary target/MTP
+    // declaration temporaries live while recursively constructing its unit.
+    #[inline(never)]
+    fn construct_ordinary_unit(
+        &self,
+        group: usize,
+        index: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Unit<B>, Error> {
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
         self.groups.unit_count(group)?;
         let args = self
             .parallel_geometry
             .as_ref()
-            .map_or(&self.args, |geometry| geometry.args());
+            .map_or(&*self.args, |geometry| geometry.args());
         let owner_group = if group == 0 {
             "target".to_owned()
         } else {
@@ -1032,39 +1183,16 @@ where
                 "V4 expert realization has no bank for {owner_group}.{index}"
             )));
         }
-        let mut unit = if group == 0 {
+        let unit = if group == 0 {
             let block = match selected_spec.clone() {
                 Some(spec) => V4Block::new_with_expert_spec(args, index, spec, context)?,
                 None => V4Block::new(args, index, context)?,
             };
             Unit::Target(block)
-        } else if self.args.dspark.is_some() {
-            let global =
-                usize::try_from(self.args.num_hidden_layers).map_err(Error::backend)? + group - 1;
-            Unit::Dspark(V4Block::new_at(
-                args,
-                global,
-                &format!("mtp.{}", group - 1),
-                None,
-                context,
-            )?)
         } else {
-            Unit::Prediction(V4PredictionLayer::new(args, group - 1, context)?)
+            self.prediction_unit_spec(group - 1)?
+                .instantiate::<B>(context)?
         };
-        if group != 0 {
-            if let Some(realization) = &self.expert_realization {
-                let spec = realization.unit_spec(&owner_group, index).ok_or_else(|| {
-                    Error::backend(format!(
-                        "V4 expert realization has no bank for {owner_group}.{index}"
-                    ))
-                })?;
-                let feed_forward = match &mut unit {
-                    Unit::Target(block) | Unit::Dspark(block) => &mut block.feed_forward,
-                    Unit::Prediction(prediction) => &mut prediction.decoder.feed_forward,
-                };
-                feed_forward.experts = B::grouped_gated_product(spec.clone(), context)?;
-            }
-        }
         Ok(unit)
     }
 
@@ -1366,6 +1494,44 @@ where
                 "a non-sequential V4 unit cannot execute as an embedded predictor",
             )),
         }
+    }
+
+    /// Seeds the sequential prediction cache without constructing readout.
+    pub fn pipeline_seed_prediction<C>(
+        &mut self,
+        unit: &mut Unit<B>,
+        hidden: &B::Tensor,
+        tokens: &B::Tensor,
+        cache: &mut C,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(), Error>
+    where
+        C: PoolingAttentionCache<B::Tensor>,
+    {
+        let embedded = self.lookup_tokens(tokens, parallel, context)?;
+        let hidden = self.begin_partition_prediction_hidden(hidden, context)?;
+        let Unit::Prediction(unit) = unit else {
+            return Err(Error::backend("target unit cannot seed prediction state"));
+        };
+        unit.prefill_hidden_with_execution(
+            &hidden,
+            &embedded,
+            context,
+            &mut crate::decoder::ComponentInstrumentation::disabled(),
+            |decoder, fused, context, _| match parallel {
+                Some(parallel) => decoder.forward_parallel(
+                    fused,
+                    tokens,
+                    None,
+                    Some(cache),
+                    context,
+                    |value, context| B::sum_parallel(value, parallel, context),
+                ),
+                None => decoder.forward(fused, tokens, None, Some(cache), context),
+            },
+        )?;
+        Ok(())
     }
 
     /// Executes one sequential embedded-prediction unit with runtime-supplied
@@ -2799,11 +2965,14 @@ where
 }
 
 fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
-    StaticModuleSpec {
+    text_static_spec_view(args).to_owned()
+}
+fn text_static_spec_view(args: &V4Args) -> crate::decoder::StaticModuleSpecView<'_> {
+    crate::decoder::StaticModuleSpecView {
         normalization_groups: None,
-        embedding_weight: "embed.weight".into(),
-        normalization_weight: "norm.weight".into(),
-        head_weight: "head.weight".into(),
+        embedding_weight: "embed.weight",
+        normalization_weight: "norm.weight",
+        head_weight: "head.weight",
         vocabulary: args.vocab_size,
         hidden_size: args.hidden_size,
         normalization_epsilon: args.rms_norm_eps,
@@ -2814,13 +2983,13 @@ fn text_static_spec(args: &V4Args) -> StaticModuleSpec {
     }
 }
 
-fn prediction_groups(args: &V4Args) -> Result<SequentialPredictionGroups, Error> {
-    SequentialPredictionGroups::new(
-        "layers",
-        usize::try_from(args.num_hidden_layers).map_err(Error::backend)?,
-        (0..usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?)
-            .map(|depth| format!("mtp.{depth}")),
-    )
+fn prediction_groups(args: &V4Args, context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<SequentialPredictionGroups, Error> {
+    let metadata = crate::decoder::identity::Metadata::new(context);
+    metadata.controls::<(usize, usize, SequentialPredictionGroups)>()?;
+    let targets = usize::try_from(args.num_hidden_layers).map_err(|cause| metadata.source(cause))?;
+    let predictions = usize::try_from(args.num_nextn_predict_layers).map_err(|cause| metadata.source(cause))?;
+    SequentialPredictionGroups::new_indexed_with_metadata(
+        "layers", targets, "mtp", 0, predictions, 1, context)
 }
 
 fn static_modules<B>(
@@ -2831,15 +3000,17 @@ fn static_modules<B>(
 where
     B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend + GroupedNeuralBackend,
 {
+    let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+    metadata.controls::<(StaticModules<B>, HyperHeadSpec, Option<DsparkStatic<B>>)>()?;
     let hyper_head = HyperHead::new(
         HyperHeadSpec {
             streams: args.hc_mult,
             hidden_size: args.hidden_size,
             norm_epsilon: args.rms_norm_eps,
             epsilon: args.hc_eps,
-            function: parameter("hc_head_fn")?,
-            base: parameter("hc_head_base")?,
-            scale: parameter("hc_head_scale")?,
+            function: metadata.plain_parameter("hc_head_fn")?,
+            base: metadata.plain_parameter("hc_head_base")?,
+            scale: metadata.plain_parameter("hc_head_scale")?,
         },
         context,
     )?;
@@ -2861,73 +3032,8 @@ impl<B: HyperNeuralBackend + eredu_nn::DistributedNeuralBackend> DsparkStatic<B>
         config: &DsparkConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let last = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)? - 1;
-        let norm = |name: String| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    parameter(name)?,
-                ),
-                context,
-            )
-        };
-        Ok(Self {
-            main_projection: projection::<B>(
-                "mtp.0.main_proj.weight",
-                args.hidden_size
-                    * i32::try_from(
-                        args.target_capture_policy
-                            .as_ref()
-                            .expect("validated DSpark target capture policy")
-                            .len(),
-                    )
-                    .map_err(Error::backend)?,
-                args.hidden_size,
-                args.linear_format_for("mtp.0.main_proj.weight"),
-                context,
-            )?,
-            main_norm: norm("mtp.0.main_norm.weight".into())?,
-            output_norm: norm(format!("mtp.{last}.norm.weight"))?,
-            hyper_head: HyperHead::new(
-                HyperHeadSpec {
-                    streams: args.hc_mult,
-                    hidden_size: args.hidden_size,
-                    norm_epsilon: args.rms_norm_eps,
-                    epsilon: args.hc_eps,
-                    function: parameter(format!("mtp.{last}.hc_head_fn"))?,
-                    base: parameter(format!("mtp.{last}.hc_head_base"))?,
-                    scale: parameter(format!("mtp.{last}.hc_head_scale"))?,
-                },
-                context,
-            )?,
-            markov_embedding: B::embedding(
-                EmbeddingSpec {
-                    vocabulary: args.vocab_size,
-                    dimensions: config.markov_rank,
-                    weight: parameter(format!("mtp.{last}.markov_head.markov_w1.weight"))?,
-                    format: crate::linear_format::standard_linear_format(
-                        &format!("mtp.{last}.markov_head.markov_w1.weight"),
-                        LinearFormat::Dense,
-                    )?,
-                },
-                context,
-            )?,
-            markov_output: projection::<B>(
-                format!("mtp.{last}.markov_head.markov_w2.weight"),
-                config.markov_rank,
-                args.vocab_size,
-                args.linear_format_for(&format!("mtp.{last}.markov_head.markov_w2.weight")),
-                context,
-            )?,
-            confidence_head: projection::<B>(
-                format!("mtp.{last}.confidence_head.proj.weight"),
-                args.hidden_size + config.markov_rank,
-                1,
-                args.linear_format_for(&format!("mtp.{last}.confidence_head.proj.weight")),
-                context,
-            )?,
-        })
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        DsparkStaticSpec::new(args, config)?.instantiate::<B>(context)
     }
 }
 
@@ -2937,12 +3043,60 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: PoolingAttentionCache<B::Tensor>,
 {
+    fn prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        use eredu_runtime::layered::{
+            PrefillObservationDeclaration as Declaration, PrefillReadoutStage,
+        };
+        // Ordinary target execution uses causal local/pooled attention at the
+        // actual absolute cache offset. Complete pooling windows become visible
+        // only at their causal boundary; hyper connections and expert routing
+        // mix features/streams within each token, never across future rows.
+        // Prediction and bidirectional DSpark invocations retain their separate
+        // existing policy and receive no declarations from this target group.
+        let count = self.groups.unit_count(0)?;
+        let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
+            (0..count).map(|index| self.groups.unit_path(0, index)),
+            true,
+        )?;
+        // These are actual hooks of finish_target_instrumented, after the
+        // selected physical readout positions and before the final learned sum.
+        for path in [
+            "readout.streams",
+            "readout.streams.effective",
+            "readout.stream_coefficients",
+        ] {
+            declarations.push(Declaration::causal_ordinary_text(
+                path.into(),
+                1,
+                PrefillReadoutStage::ReadoutInput,
+            ));
+        }
+        // Same target bank invocation as observed execution; its expert equations are row-local.
+        for index in 0..count {
+            let path = self.groups.unit_path(0, index)?;
+            if self.args.n_routed_experts > 0 {
+                crate::decoder::append_routed_prefill_path(&mut declarations, &format!("{path}.feed_forward"));
+            }
+        }
+        Ok(declarations)
+    }
+
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         let complete = self.args.dspark.is_none();
         eredu_runtime::inspection::ObservationHookSupport::internal(complete, complete, complete)
     }
 
     type Input<'a> = EmbeddedInput<'a, B::Tensor>;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        match input {
+            EmbeddedInput::Target { tokens, .. } => crate::prefill::token_shape(*tokens).map(Some),
+            _ => Ok(None),
+        }
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = Unit<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
@@ -3008,6 +3162,14 @@ where
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
         self.groups.execution_graph()
+    }
+    fn execution_graph_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        self.groups.execution_graph_with_metadata(context)
+    }
+    fn group_unit_count_with_metadata(&self, group: usize, context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<usize, Self::Error> {
+        self.groups.unit_count_with_metadata(group, context)
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
@@ -3240,6 +3402,16 @@ where
             forward.draft_hidden = Some(hidden.clone());
         }
         Ok(hidden.clone())
+    }
+
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        crate::readout::select_readout_positions(hidden, demand, 1, context)
     }
 
     fn finish_forward(
@@ -3735,6 +3907,20 @@ where
         )
     }
 
+    fn partition_prediction_capture(
+        &self,
+        hidden: &B::Tensor,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        complete_target_capture(
+            self.args.target_capture_policy.as_ref(),
+            hidden,
+            &forward.captures,
+            context,
+        )
+    }
+
     fn finish_partition_observed<O>(
         &mut self,
         hidden: &B::Tensor,
@@ -3910,132 +4096,15 @@ pub(crate) fn moe_policy_at(args: &V4Args, layer: usize, root: &str) -> Result<M
 /// Declares bounded local keys and every append-only pooling component for V4
 /// target and prediction layers.
 pub fn state_layout(args: &V4Args) -> Result<StateLayout, Error> {
-    args.validate().map_err(Error::backend)?;
-    let layers = usize::try_from(
-        args.num_hidden_layers
-            .checked_add(args.num_nextn_predict_layers)
-            .ok_or_else(|| Error::backend("V4 total state layer count overflowed"))?,
-    )
-    .map_err(Error::backend)?;
-    let attention =
-        AttentionPolicy::sliding(u32::try_from(args.sliding_window).map_err(Error::backend)?)
-            .map_err(Error::backend)?;
-    let policies = (0..layers)
-        .map(|layer| {
-            let fixed = match args.attention_policy(layer) {
-                Some(V4AttentionPolicy::Local) => Vec::new(),
-                Some(V4AttentionPolicy::Compressed { ratio }) => {
-                    let mut tensors = pooling_stream(0, ratio, args.head_dim, ratio == 4)?;
-                    if ratio == 4 {
-                        tensors.extend(pooling_stream(1, ratio, args.index_head_dim, true)?);
-                    }
-                    tensors
-                }
-                None => return Err(Error::backend(format!("missing V4 layer policy {layer}"))),
-            };
-            if fixed.is_empty() {
-                LayerCachePolicy::key_only(attention, 1, args.head_dim).map_err(Error::backend)
-            } else {
-                LayerCachePolicy::key_only_with_fixed_state(attention, 1, args.head_dim, fixed)
-                    .map_err(Error::backend)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let target_layers = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
-    let mut segments = vec![StateSegmentSpec::new(
-        super::TARGET_STATE_SEGMENT,
-        0..target_layers,
-        StateSegmentLifetime::Persistent,
-        0,
-    )
-    .map_err(Error::backend)?];
-    if layers > target_layers {
-        segments.push(
-            StateSegmentSpec::new(
-                super::PREDICTION_STATE_SEGMENT,
-                target_layers..layers,
-                StateSegmentLifetime::Persistent,
-                if args.dspark.is_some() { 0 } else { -1 },
-            )
-            .map_err(Error::backend)?,
-        );
-    }
-    StateLayout::segmented(
-        LayerSchedule::new(layers, policies).map_err(Error::backend)?,
-        segments,
-    )
-    .map_err(Error::backend)
+    state_geometry::layout(args, &crate::state_geometry::Ordinary(Error::backend_message))
 }
-
-fn pooling_stream(
-    stream: u32,
-    ratio: i32,
-    pooled_width: i32,
-    overlapping: bool,
-) -> Result<Vec<StateTensorPolicy>, Error> {
-    let ratio = NonZeroU32::new(u32::try_from(ratio).map_err(Error::backend)?)
-        .ok_or_else(|| Error::backend("V4 pooling ratio must be positive"))?;
-    let source_width = if overlapping {
-        pooled_width
-            .checked_mul(2)
-            .ok_or_else(|| Error::backend("V4 pooling source width overflowed"))?
-    } else {
-        pooled_width
-    };
-    let role = |component| StateTensorRole::Pooling { stream, component };
-    let pending = |component| {
-        StateTensorPolicy::new(
-            role(component),
-            vec![
-                StateTensorDimension::Batch,
-                StateTensorDimension::PrefixTokensRem(ratio),
-                StateTensorDimension::fixed(source_width).map_err(Error::backend)?,
-            ],
-            StateTensorDtype::Floating,
-            MutableStateResidency::AlwaysDeviceMutable,
-        )
-        .map(|policy| policy.when_prefix_remainder_nonzero(ratio))
-        .map_err(Error::backend)
-    };
-    let mut tensors = vec![
-        pending(PoolingStateComponent::PendingValues)?,
-        pending(PoolingStateComponent::PendingGates)?,
-        StateTensorPolicy::new_with_residency(
-            role(PoolingStateComponent::Pooled),
-            vec![
-                StateTensorDimension::Batch,
-                StateTensorDimension::PrefixTokensDiv(ratio),
-                StateTensorDimension::fixed(pooled_width).map_err(Error::backend)?,
-            ],
-            StateTensorDtype::Floating,
-            StateResidencyClass::SealablePaged,
-        )
-        .map(|policy| policy.when_prefix_at_least(ratio))
-        .map_err(Error::backend)?,
-    ];
-    if overlapping {
-        for component in [
-            PoolingStateComponent::OverlapValues,
-            PoolingStateComponent::OverlapGates,
-        ] {
-            tensors.push(
-                StateTensorPolicy::new(
-                    role(component),
-                    vec![
-                        StateTensorDimension::Batch,
-                        StateTensorDimension::Fixed(ratio),
-                        StateTensorDimension::fixed(pooled_width).map_err(Error::backend)?,
-                    ],
-                    StateTensorDtype::Floating,
-                    MutableStateResidency::AlwaysDeviceMutable,
-                )
-                .map(|policy| policy.when_prefix_at_least(ratio))
-                .map_err(Error::backend)?,
-            );
-        }
-    }
-    Ok(tensors)
+/// Constructs the same V4 state policy through the caller's paid destination.
+pub fn state_layout_with_metadata(args: &V4Args, context: &eredu_nn::workspace::WorkspaceContext)
+    -> Result<StateLayout, Error> {
+    if !context.uses_checked_metadata() { return state_layout(args); }
+    state_geometry::layout(args, &crate::state_geometry::Counted::new(context, Error::backend_message))
 }
+mod state_geometry;
 
 fn parameter(name: impl Into<String>) -> Result<ParameterSpec, Error> {
     ParameterSpec::trainable(name).map_err(Error::backend)
@@ -4101,5 +4170,18 @@ mod boundary_tests {
             transport.last_owner_static_roles,
             ["norm", "output", "hyper_head"]
         );
+    }
+}
+
+#[cfg(test)]
+mod paid_boundary_metadata_tests {
+    use super::*;
+    #[test]
+    fn hyper_stream_boundary_preserves_capture_count_width_and_role_order(){
+        for count in [0,3]{
+            crate::boundary_metadata::tests::check(TargetBoundarySchema{
+                hidden_size:8,activation_hidden_size:32,capture_count:count},
+                (0..count+1).map(|n|17+n as i32*11).collect());
+        }
     }
 }

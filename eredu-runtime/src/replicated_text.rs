@@ -115,6 +115,65 @@ pub struct WeightLoweringDescriptor {
     packed_axis: Option<usize>,
 }
 
+/// Borrowed source/geometry used by contract inspection. It carries no source
+/// or execution authority and cannot outlive the exact admitted requirement.
+#[derive(Clone, Copy)]
+pub(crate) struct WeightLoweringDescriptorView<'a> {
+    source: &'a SourceTensorEncoding,
+    executable: LinearFormat,
+    physical_shape: &'a [usize],
+    logical_shape: &'a [usize],
+    packed_axis: Option<usize>,
+}
+impl WeightLoweringDescriptorView<'_> {
+    pub(crate) fn physical_shape(&self) -> &[usize] {
+        self.physical_shape
+    }
+    pub(crate) fn logical_shape(&self) -> &[usize] {
+        self.logical_shape
+    }
+    pub(crate) fn packed_axis(&self) -> Option<usize> {
+        self.packed_axis
+    }
+    fn into_owned(self) -> WeightLoweringDescriptor {
+        WeightLoweringDescriptor {
+            source: self.source.clone(),
+            executable: self.executable,
+            physical_shape: self.physical_shape.to_vec(),
+            logical_shape: self.logical_shape.to_vec(),
+            packed_axis: self.packed_axis,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+pub(crate) enum WeightLoweringViewError<'a> {
+    #[error("logical parameter {0:?} has no physical lowering source")]
+    MissingSource(&'a str),
+    #[error("logical parameter {0:?} has no physical source shape")]
+    MissingShape(&'a str),
+    #[error("weight lowering requires positive extents and equal physical and logical ranks")]
+    Geometry,
+    #[error("weight lowering packed axis is outside the logical shape")]
+    Axis,
+}
+fn validate_lowering_geometry(
+    physical_shape: &[usize],
+    logical_shape: &[usize],
+    packed_axis: Option<usize>,
+) -> Result<(), WeightLoweringViewError<'static>> {
+    if physical_shape.contains(&0)
+        || logical_shape.contains(&0)
+        || physical_shape.len() != logical_shape.len()
+    {
+        return Err(WeightLoweringViewError::Geometry);
+    }
+    if packed_axis.is_some_and(|axis| axis >= logical_shape.len()) {
+        return Err(WeightLoweringViewError::Axis);
+    }
+    Ok(())
+}
+
 impl WeightLoweringDescriptor {
     /// Creates a geometry-bearing lowering query.
     pub fn new(
@@ -124,19 +183,8 @@ impl WeightLoweringDescriptor {
         logical_shape: Vec<usize>,
         packed_axis: Option<usize>,
     ) -> Result<Self, ReplicatedTextContractError> {
-        if physical_shape.contains(&0)
-            || logical_shape.contains(&0)
-            || physical_shape.len() != logical_shape.len()
-        {
-            return Err(ReplicatedTextContractError::invalid(
-                "weight lowering requires positive extents and equal physical and logical ranks",
-            ));
-        }
-        if packed_axis.is_some_and(|axis| axis >= logical_shape.len()) {
-            return Err(ReplicatedTextContractError::invalid(
-                "weight lowering packed axis is outside the logical shape",
-            ));
-        }
+        validate_lowering_geometry(&physical_shape, &logical_shape, packed_axis)
+            .map_err(|cause| ReplicatedTextContractError::invalid(cause.to_string()))?;
         Ok(Self {
             source,
             executable,
@@ -1054,6 +1102,16 @@ impl ReplicatedTextParameterRequirement {
         &self,
         executable: LinearFormat,
     ) -> Result<WeightLoweringDescriptor, ReplicatedTextContractError> {
+        self.lowering_descriptor_view(executable)
+            .map(WeightLoweringDescriptorView::into_owned)
+            .map_err(|cause| ReplicatedTextContractError::invalid(cause.to_string()))
+    }
+
+    /// Borrows the same lowering query without cloning its source or shapes.
+    pub(crate) fn lowering_descriptor_view(
+        &self,
+        executable: LinearFormat,
+    ) -> Result<WeightLoweringDescriptorView<'_>, WeightLoweringViewError<'_>> {
         let packed_axis = match self.transform {
             ParameterTransformConstraint::None => None,
             ParameterTransformConstraint::Linear { packed_axis }
@@ -1102,23 +1160,18 @@ impl ReplicatedTextParameterRequirement {
         } else {
             &self.logical_shape
         };
-        WeightLoweringDescriptor::new(
-            self.source_encoding.clone().ok_or_else(|| {
-                ReplicatedTextContractError::invalid(format!(
-                    "logical parameter {:?} has no physical lowering source",
-                    self.name
-                ))
-            })?,
+        let source = self.source_encoding.as_ref()
+            .ok_or(WeightLoweringViewError::MissingSource(&self.name))?;
+        let physical_shape = self.physical_shape.as_deref()
+            .ok_or(WeightLoweringViewError::MissingShape(&self.name))?;
+        validate_lowering_geometry(physical_shape, lowering_shape, packed_axis)?;
+        Ok(WeightLoweringDescriptorView {
+            source,
             executable,
-            self.physical_shape.clone().ok_or_else(|| {
-                ReplicatedTextContractError::invalid(format!(
-                    "logical parameter {:?} has no physical source shape",
-                    self.name
-                ))
-            })?,
-            lowering_shape.clone(),
+            physical_shape,
+            logical_shape: lowering_shape,
             packed_axis,
-        )
+        })
     }
 }
 
@@ -2086,6 +2139,10 @@ pub struct ReplicatedTextOutputCompanion {
 }
 
 impl ReplicatedTextOutputCompanion {
+    pub(crate) fn valid_identity(name: &str, shape: &[usize]) -> bool {
+        !name.trim().is_empty() && !shape.is_empty() && !shape.contains(&0)
+    }
+
     /// Creates one exact output companion identity and semantic role.
     pub fn new(
         name: impl Into<String>,
@@ -2094,7 +2151,7 @@ impl ReplicatedTextOutputCompanion {
         owner: ParameterGroupOwner,
     ) -> Result<Self, ReplicatedTextContractError> {
         let name = name.into();
-        if name.trim().is_empty() || logical_shape.is_empty() || logical_shape.contains(&0) {
+        if !Self::valid_identity(&name, &logical_shape) {
             return Err(ReplicatedTextContractError::invalid(
                 "materialization output companion identity or geometry is invalid",
             ));
@@ -2698,22 +2755,12 @@ pub fn selected_materialization_task_bytes(
 pub fn replicated_text_materialization_tasks(
     selected: &SelectedReplicatedTextRealization,
 ) -> Result<Vec<ReplicatedTextMaterializationTask>, ReplicatedTextContractError> {
-    if selected.materialization_tasks.is_empty() && !selected.parameters.is_empty() {
+    if !selected.has_authoritative_materialization_tasks() {
         return Err(ReplicatedTextContractError::invalid(
             "selected realization omitted its authoritative materialization tasks",
         ));
     }
-    Ok(selected.materialization_tasks.clone())
-}
-
-fn build_replicated_text_materialization_tasks(
-    selected: &SelectedReplicatedTextRealization,
-) -> Result<Vec<ReplicatedTextMaterializationTask>, ReplicatedTextContractError> {
-    build_materialization_tasks(
-        selected.requirements(),
-        selected.requirements().parameters(),
-        selected.parameters(),
-    )
+    Ok(selected.materialization_tasks().to_vec())
 }
 
 fn build_materialization_tasks(
@@ -3395,6 +3442,12 @@ impl SelectedStateRealization {
 /// Authoritative realization selected before architecture or payload construction.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct SelectedReplicatedTextRealization {
+    // No raw Arc/Weak escapes. Clones retain the exact immutable cold selection.
+    shared: Option<std::sync::Arc<SelectedReplicatedTextRealizationData>>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SelectedReplicatedTextRealizationData {
     max_cached_shards: usize,
     requirements: ReplicatedTextRequirements,
     /// Exact selected execution topology.
@@ -3422,63 +3475,82 @@ pub struct SelectedReplicatedTextRealization {
     grouped_operations: Vec<GroupedOperationRequirement>,
 }
 
+impl Drop for SelectedReplicatedTextRealization {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.take() {
+            // Retire the shared shell before its selected metadata payload.
+            drop(std::sync::Arc::into_inner(shared));
+        }
+    }
+}
+
 impl SelectedReplicatedTextRealization {
+    fn data(&self) -> &SelectedReplicatedTextRealizationData {
+        self.shared
+            .as_deref()
+            .expect("selected realization is live")
+    }
+
+    pub(crate) fn has_authoritative_materialization_tasks(&self) -> bool {
+        !self.data().materialization_tasks.is_empty() || self.data().parameters.is_empty()
+    }
+
     /// Retained backend fact used before admitting an observer that requires
     /// completion even when ordinary execution did not request it.
-    pub const fn exact_completion_available(&self) -> bool {
-        self.exact_completion_available
+    pub fn exact_completion_available(&self) -> bool {
+        self.data().exact_completion_available
     }
     /// Returns the source reader-cache limit retained through selection.
-    pub const fn max_cached_shards(&self) -> usize {
-        self.max_cached_shards
+    pub fn max_cached_shards(&self) -> usize {
+        self.data().max_cached_shards
     }
     /// Returns the exact architecture/artifact requirements selected together.
-    pub const fn requirements(&self) -> &ReplicatedTextRequirements {
-        &self.requirements
+    pub fn requirements(&self) -> &ReplicatedTextRequirements {
+        &self.data().requirements
     }
     /// Returns the exact selected topology.
-    pub const fn topology(&self) -> ParallelTopology {
-        self.topology
+    pub fn topology(&self) -> ParallelTopology {
+        self.data().topology
     }
     /// Returns selected weight residency.
-    pub const fn residency(&self) -> LayerWeightResidency {
-        self.residency
+    pub fn residency(&self) -> LayerWeightResidency {
+        self.data().residency
     }
     /// Returns the authoritative selected mutable-state realization.
-    pub const fn state(&self) -> &SelectedStateRealization {
-        &self.state
+    pub fn state(&self) -> &SelectedStateRealization {
+        &self.data().state
     }
     /// Returns exact per-parameter realizations.
     pub fn parameters(&self) -> &[SelectedParameterRealization] {
-        &self.parameters
+        &self.data().parameters
     }
     /// Returns the authoritative exact materialization task sequence.
     pub fn materialization_tasks(&self) -> &[ReplicatedTextMaterializationTask] {
-        &self.materialization_tasks
+        &self.data().materialization_tasks
     }
     /// Returns exact additive auxiliary parameter selections.
     pub fn auxiliary_parameters(&self) -> &[SelectedParameterRealization] {
-        &self.auxiliary_parameters
+        &self.data().auxiliary_parameters
     }
     /// Returns exact additive auxiliary task/companion topology.
     pub fn auxiliary_materialization_tasks(&self) -> &[ReplicatedTextMaterializationTask] {
-        &self.auxiliary_materialization_tasks
+        &self.data().auxiliary_materialization_tasks
     }
     /// Returns selected session facilities.
-    pub const fn session(&self) -> SessionCapabilities {
-        self.session
+    pub fn session(&self) -> SessionCapabilities {
+        self.data().session
     }
     /// Returns whether prompt-cache persistence was selected.
-    pub const fn prompt_cache(&self) -> bool {
-        self.prompt_cache
+    pub fn prompt_cache(&self) -> bool {
+        self.data().prompt_cache
     }
     /// Returns whether exact completion ownership was selected.
-    pub const fn exact_completion(&self) -> bool {
-        self.exact_completion
+    pub fn exact_completion(&self) -> bool {
+        self.data().exact_completion
     }
     /// Returns selected grouped operation mechanisms.
     pub fn grouped_operations(&self) -> &[GroupedOperationRequirement] {
-        &self.grouped_operations
+        &self.data().grouped_operations
     }
 }
 
@@ -3731,7 +3803,7 @@ pub fn select_replicated_text_realization(
     if !issues.is_empty() {
         return Err(ReplicatedTextSelectionError { issues });
     }
-    let mut selected = SelectedReplicatedTextRealization {
+    let mut selected = SelectedReplicatedTextRealizationData {
         max_cached_shards: request.max_cached_shards,
         requirements: requirements.clone(),
         topology: request
@@ -3761,19 +3833,25 @@ pub fn select_replicated_text_realization(
         exact_completion_available: capabilities.exact_completion,
         grouped_operations: requirements.grouped_operations.clone(),
     };
-    selected.materialization_tasks = build_replicated_text_materialization_tasks(&selected)
-        .map_err(|error| ReplicatedTextSelectionError {
-            issues: vec![error.to_string()],
-        })?;
+    selected.materialization_tasks = build_materialization_tasks(
+        &selected.requirements,
+        selected.requirements.parameters(),
+        &selected.parameters,
+    )
+    .map_err(|error| ReplicatedTextSelectionError {
+        issues: vec![error.to_string()],
+    })?;
     selected.auxiliary_materialization_tasks = build_materialization_tasks(
-        selected.requirements(),
-        selected.requirements().auxiliary_parameters(),
+        &selected.requirements,
+        selected.requirements.auxiliary_parameters(),
         &selected.auxiliary_parameters,
     )
     .map_err(|error| ReplicatedTextSelectionError {
         issues: vec![error.to_string()],
     })?;
-    Ok(selected)
+    Ok(SelectedReplicatedTextRealization {
+        shared: Some(std::sync::Arc::new(selected)),
+    })
 }
 
 pub(crate) fn placement_is_compatible(
@@ -5311,5 +5389,32 @@ mod tests {
             .issues()
             .iter()
             .any(|issue| { issue.contains("GatedProductTensorParallelPartial") }));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn resident_reset_test_selection(layout: StateLayout) -> SelectedStateRealization {
+    let mut components = Vec::new();
+    for layer in 0..layout.len() {
+        for component in layout.components(layer).expect("fixture components") {
+            components.push(SelectedStateComponentRealization {
+                storage_dtype: StateStorageDtype::F32,
+                layer,
+                component: component.clone(),
+                placement: StateComponentPlacement::Device,
+            });
+        }
+    }
+    SelectedStateRealization {
+        floating_dtype: Some(StateStorageDtype::F32),
+        layout,
+        access: ReplicatedTextStateAccess::KeyValue,
+        policy: CacheResidencyPolicy::Device,
+        components,
+        checkpoint: true,
+        rollback: true,
+        reset: true,
+        prompt_cache: true,
+        observation_retention: true,
     }
 }

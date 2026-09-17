@@ -425,20 +425,31 @@ pub fn prepared_gguf_floating_state_dtype_source(
 pub fn prepared_floating_state_dtype_source(
     inspection: &eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
 ) -> Result<FloatingStateDtypeSource, PreparationCapabilityError> {
-    match inspection.format() {
+    prepared_floating_state_dtype_source_parts(
+        inspection.format(),
+        inspection.architecture_plan(),
+        inspection.tensors(),
+    )
+}
+
+/// Shared dtype selection from the retained target architecture and original catalog.
+pub(crate) fn prepared_floating_state_dtype_source_parts(
+    format: eredu_core::ArtifactFormat,
+    architecture: &crate::processor_plan::ArtifactArchitecturePlan,
+    tensors: &TensorCatalog,
+) -> Result<FloatingStateDtypeSource, PreparationCapabilityError> {
+    match format {
         eredu_core::ArtifactFormat::SafeTensors => {
-            let architecture = inspection
-                .architecture_plan()
+            let architecture = architecture
                 .safetensors_architecture()
                 .ok_or_else(|| invalid("SafeTensors inspection omitted its architecture plan"))?;
-            prepared_safetensors_floating_state_dtype_source(architecture, inspection.tensors())
+            prepared_safetensors_floating_state_dtype_source(architecture, tensors)
         }
         eredu_core::ArtifactFormat::Gguf => {
-            let architecture = inspection
-                .architecture_plan()
+            let architecture = architecture
                 .gguf_plan()
                 .ok_or_else(|| invalid("GGUF inspection omitted its architecture plan"))?;
-            prepared_gguf_floating_state_dtype_source(architecture, inspection.tensors())
+            prepared_gguf_floating_state_dtype_source(architecture, tensors)
         }
         _ => Err(invalid(
             "unsupported artifact format for floating-state dtype inspection",

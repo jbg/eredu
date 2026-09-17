@@ -2,6 +2,29 @@
 
 use crate::Error;
 
+/// Allocation-free failure of encoded projection row geometry.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+pub enum LinearRowError {
+    /// A partition declaration requested no partitions.
+    #[error("linear row partition count must be positive")]
+    PartitionCount,
+    /// Rows are empty or do not split into equal positive partitions.
+    #[error("linear rows do not form positive equal partitions")]
+    Rows,
+    /// The row-block width is zero.
+    #[error("linear row block width is zero")]
+    BlockWidth,
+    /// Total scale rows cannot be represented.
+    #[error("linear scale row count overflows")]
+    ScaleRowsOverflow,
+    /// A source boundary cuts an encoded block or lies outside the rows.
+    #[error("linear row boundary splits an encoded block")]
+    Boundary,
+    /// The corresponding scale boundary cannot be represented.
+    #[error("linear scale boundary overflows")]
+    ScaleBoundaryOverflow,
+}
+
 /// Independent block origins within a projection's output-row axis.
 /// Equal partitions retain their meaning when each partition is sliced to the
 /// same rank-local width, as with component-major fused gate/up projections.
@@ -17,6 +40,11 @@ pub enum LinearRowLayout {
 impl LinearRowLayout {
     /// Declares a positive count of independently blocked row partitions.
     pub fn equal_partitions(count: usize) -> Result<Self, Error> {
+        Self::equal_partitions_fixed(count).map_err(Error::backend)
+    }
+
+    /// Declares positive partitions without constructing an allocating diagnostic.
+    pub fn equal_partitions_fixed(count: usize) -> Result<Self, LinearRowError> {
         std::num::NonZeroUsize::new(count)
             .map(|count| {
                 if count.get() == 1 {
@@ -25,7 +53,7 @@ impl LinearRowLayout {
                     Self::EqualPartitions(count)
                 }
             })
-            .ok_or_else(|| Error::backend("linear row partition count must be positive"))
+            .ok_or(LinearRowError::PartitionCount)
     }
 
     /// Number of independent row partitions.
@@ -38,24 +66,32 @@ impl LinearRowLayout {
 
     /// Exact rows in each partition; rejects empty or unequal geometry.
     pub fn rows_per_partition(self, rows: usize) -> Result<usize, Error> {
+        self.rows_per_partition_fixed(rows).map_err(Error::backend)
+    }
+
+    /// Checks equal positive row geometry without allocating.
+    pub fn rows_per_partition_fixed(self, rows: usize) -> Result<usize, LinearRowError> {
         let parts = self.partitions();
         if rows == 0 || !rows.is_multiple_of(parts) {
-            return Err(Error::backend(
-                "linear rows do not form positive equal partitions",
-            ));
+            return Err(LinearRowError::Rows);
         }
         Ok(rows / parts)
     }
 
     /// Total stored scale rows, retaining the final partial block of each partition.
     pub fn scale_rows(self, rows: usize, block: usize) -> Result<usize, Error> {
+        self.scale_rows_fixed(rows, block).map_err(Error::backend)
+    }
+
+    /// Computes scale rows with the ordinary block-before-row validation order.
+    pub fn scale_rows_fixed(self, rows: usize, block: usize) -> Result<usize, LinearRowError> {
         if block == 0 {
-            return Err(Error::backend("linear row block width is zero"));
+            return Err(LinearRowError::BlockWidth);
         }
-        self.rows_per_partition(rows)?
+        self.rows_per_partition_fixed(rows)?
             .div_ceil(block)
             .checked_mul(self.partitions())
-            .ok_or_else(|| Error::backend("linear scale row count overflows"))
+            .ok_or(LinearRowError::ScaleRowsOverflow)
     }
 
     /// Maps a complete block or partition boundary to its scale coordinate.
@@ -65,16 +101,25 @@ impl LinearRowLayout {
         block: usize,
         boundary: usize,
     ) -> Result<usize, Error> {
-        let width = self.rows_per_partition(rows)?;
+        self.block_boundary_fixed(rows, block, boundary)
+            .map_err(Error::backend)
+    }
+
+    /// Maps a boundary with the ordinary row-before-block validation order.
+    pub fn block_boundary_fixed(
+        self,
+        rows: usize,
+        block: usize,
+        boundary: usize,
+    ) -> Result<usize, LinearRowError> {
+        let width = self.rows_per_partition_fixed(rows)?;
         if block == 0 || boundary > rows || !(boundary % width).is_multiple_of(block) {
-            return Err(Error::backend(
-                "linear row boundary splits an encoded block",
-            ));
+            return Err(LinearRowError::Boundary);
         }
         (boundary / width)
             .checked_mul(width.div_ceil(block))
             .and_then(|offset| offset.checked_add((boundary % width) / block))
-            .ok_or_else(|| Error::backend("linear scale boundary overflows"))
+            .ok_or(LinearRowError::ScaleBoundaryOverflow)
     }
 }
 

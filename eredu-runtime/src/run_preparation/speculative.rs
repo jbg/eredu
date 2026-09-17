@@ -16,12 +16,13 @@ impl TextPreparationCoordinator {
     /// packet. A count header and each request use the existing admitted fixed
     /// exchange bound; every exchange is charged and confirmed before returning.
     /// Returned facts preserve native completion ownership and request identity.
-    pub fn coordinate_speculative_step<T: TextPreparationTransport>(
+    pub fn coordinate_speculative_step<T: TextPreparationTransport, B>(
         &self,
         transport: &T,
-        mut local: Vec<SpeculativeScheduleState>,
-    ) -> Result<Vec<SpeculativeScheduleState>, TextPreparationAgreementError>
+        mut local: B,
+    ) -> Result<B, TextPreparationAgreementError>
     where
+        B: AsRef<[SpeculativeScheduleState]> + AsMut<[SpeculativeScheduleState]>,
         T::Error: Send + Sync + 'static,
         <T::Completion as Completion>::Error: Send + Sync + 'static,
     {
@@ -37,7 +38,7 @@ impl TextPreparationCoordinator {
             return Err(TextPreparationAgreementError::Fenced);
         }
         let result = (|| {
-            let count = u32::try_from(local.len()).ok();
+            let count = u32::try_from(local.as_ref().len()).ok();
             let header = self.schedule_frame(
                 transport,
                 &mut state,
@@ -51,7 +52,7 @@ impl TextPreparationCoordinator {
                 ));
             };
             header?;
-            for (index, request) in local.iter_mut().enumerate() {
+            for (index, request) in local.as_mut().iter_mut().enumerate() {
                 let flags = encode(*request);
                 let invalid = request.request.index() != index || flags.is_none();
                 let resolved = self.schedule_frame(

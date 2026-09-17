@@ -28,7 +28,8 @@ fn model() -> (LoadedModel<MockBackend>, Calls) {
                 eos_token_ids: vec![166101],
                 checkpoint_generation_config: None,
             },
-        ),
+        )
+        .unwrap(),
         calls,
     )
 }

@@ -16,7 +16,7 @@ use eredu_core::residency::{
     OffloadConfig, OffloadUnitSpec, ResidencyLedgerError, ResidencyPolicy,
 };
 
-fn cpu_stream() -> Stream {
+pub(super) fn cpu_stream() -> Stream {
     Stream::new_with_device(&Device::new(DeviceType::Cpu, 0))
 }
 
@@ -53,7 +53,7 @@ fn write_fixture(path: &std::path::Path) {
     .unwrap();
 }
 
-fn fixture_store() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
+pub(super) fn fixture_store() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
     let dir = tempfile::tempdir().unwrap();
     write_fixture(&dir.path().join("model.safetensors"));
     let store = Arc::new(SafetensorsWeightStore::open(dir.path()).unwrap());
@@ -93,19 +93,29 @@ fn cross_shard_store() -> (tempfile::TempDir, Arc<SafetensorsWeightStore>) {
     (dir, store)
 }
 
-fn id(value: &str) -> OffloadUnitId {
+pub(super) fn id(value: &str) -> OffloadUnitId {
     OffloadUnitId::new(value).unwrap()
 }
 
-fn binding(name: &str, key: &str, selection: TensorSelection, bytes: u64) -> WeightBinding {
+pub(super) fn binding(
+    name: &str,
+    key: &str,
+    selection: TensorSelection,
+    bytes: u64,
+) -> WeightBinding {
     WeightBinding::new(name, key, selection, bytes).unwrap()
 }
 
-fn unit(name: &str, bindings: impl IntoIterator<Item = WeightBinding>) -> OffloadUnit {
+pub(super) fn unit(name: &str, bindings: impl IntoIterator<Item = WeightBinding>) -> OffloadUnit {
     OffloadUnit::new(id(name), bindings).unwrap()
 }
 
-fn spec(name: &str, bytes: u64, policy: ResidencyPolicy, tier: MemoryTier) -> OffloadUnitSpec {
+pub(super) fn spec(
+    name: &str,
+    bytes: u64,
+    policy: ResidencyPolicy,
+    tier: MemoryTier,
+) -> OffloadUnitSpec {
     OffloadUnitSpec::new(id(name), bytes, policy, tier).unwrap()
 }
 
@@ -194,3 +204,19 @@ include!("tests/lifecycle.rs");
 include!("tests/transfer.rs");
 include!("tests/materialization.rs");
 include!("tests/accounting.rs");
+include!("tests/storage.rs");
+
+#[path = "tests/borrowed_storage.rs"]
+mod borrowed_storage;
+
+#[path = "tests/capacity.rs"]
+mod capacity;
+
+#[path = "tests/realtime_aliases.rs"]
+mod realtime_aliases;
+
+include!("tests/original_capacity_retry.rs");
+
+#[path = "tests/original_lease_return.rs"]
+mod original_lease_return;
+pub(crate) use original_lease_return::LeaseReturnFixture;

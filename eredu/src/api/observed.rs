@@ -21,20 +21,48 @@ use std::{
     time::Instant,
 };
 
+mod delivery;
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
 
+/// Scalar identity selection, allowing destination text to wait for admission.
+pub(super) struct PreparedIdentity<'a> {
+    kind: &'a str,
+    process: u32,
+    nanos: u128,
+    sequence: u64,
+}
+impl<'a> PreparedIdentity<'a> {
+    pub(super) fn new(kind: &'a str) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self {
+            kind,
+            process: std::process::id(),
+            nanos: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos()),
+            sequence: NEXT.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+    pub(super) fn bytes(&self) -> Option<u64> {
+        fn digits(n: u128) -> u64 {
+            n.checked_ilog10().map_or(1, |n| u64::from(n) + 1)
+        }
+        u64::try_from(self.kind.len()).ok()?
+            .checked_add(3)?
+            .checked_add(digits(u128::from(self.process)))?
+            .checked_add(digits(self.nanos))?
+            .checked_add(digits(u128::from(self.sequence)))
+    }
+    pub(super) fn render(self) -> String {
+        format!("{}-{}-{}-{}", self.kind, self.process, self.nanos, self.sequence)
+    }
+}
+
 pub(super) fn new_identity(kind: &str) -> String {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    format!(
-        "{kind}-{}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos()),
-        NEXT.fetch_add(1, Ordering::Relaxed)
-    )
+    PreparedIdentity::new(kind).render()
 }
 
 pub(super) use eredu_runtime::execution_control::TraceBudget;
@@ -160,6 +188,20 @@ pub enum ObservedGenerationEvent {
         /// Elapsed attempt time before failure.
         step_seconds: f64,
     },
+    /// Retained counterpart of `CaptureFailure` with the same wire representation.
+    /// Only the captured frame is shared; surrounding facade fields remain
+    /// ordinary caller-owned payload. Deserialization creates the legacy variant.
+    #[serde(rename = "capture_failure", skip_deserializing)]
+    SharedCaptureFailure {
+        /// Index of the unsuccessful prediction attempt.
+        prediction_index: u64,
+        /// Input positions used by the failed forward operation.
+        input_range: [u64; 2],
+        /// Completed host values and structured capture failures, with budgets.
+        captures: SharedCapturedStep,
+        /// Elapsed attempt time before failure.
+        step_seconds: f64,
+    },
     /// Prepared token alignment and resolved ordinary sampling settings.
     Started {
         /// Exact prefill token sequence.
@@ -187,6 +229,30 @@ pub enum ObservedGenerationEvent {
         rank: u32,
         /// Bounded records, absent when both capture and intervention plans are empty.
         captures: Option<CapturedStep>,
+        /// Submission, capture, sampling, token read and exact completion elapsed time.
+        step_seconds: f64,
+    },
+    /// Retained counterpart of `Token` with the same wire representation.
+    /// Only the captured frame is shared; surrounding facade fields remain
+    /// ordinary caller-owned payload. Deserialization creates the legacy variant.
+    #[serde(rename = "token", skip_deserializing)]
+    SharedToken {
+        /// Canonical token identifier, including special/EOS tokens.
+        token_id: u32,
+        /// This decision was restricted to one validated canonical token by
+        /// execution control. Ordinary callers always emit false.
+        #[serde(default, skip_serializing_if = "is_false")]
+        forced: bool,
+        /// Zero is predicted by prefill; later values are decode predictions.
+        prediction_index: u64,
+        /// Half-open input positions covered by this forward pass.
+        input_range: [u64; 2],
+        /// All current observed-generation outputs are committed, single-rank values.
+        committed: bool,
+        /// Rank owning these complete values. Partitioned capture is rejected.
+        rank: u32,
+        /// Actual shared frame and its original custody, without a raw owning export.
+        captures: SharedCapturedStep,
         /// Submission, capture, sampling, token read and exact completion elapsed time.
         step_seconds: f64,
     },
@@ -310,7 +376,9 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             .into());
         }
         let admitted =
-            intervention.admit(&discovery, prepared.plan.request(), &self.session_identity)?;
+            intervention.admit_with_text_origin(&discovery, prepared.plan.request(),
+                prepared.plan.text_origin().ok_or_else(|| CaptureError::Invalid("text intervention requires ordinary origin".into()))?,
+                &self.session_identity)?;
         B::validate_text_interventions(&self.runtime, &prepared.plan, &admitted)?;
         prepared.artifact_identity = Some(discovery.artifact_identity);
         prepared.intervention = Some(admitted);
@@ -536,26 +604,24 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             };
             let Some(token_id) = token_id else {
                 if let Some(captures) = captures {
-                    delivery.send(ObservedGenerationEvent::CaptureFailure {
-                        prediction_index: index,
+                    delivery.send(ObservedGenerationEvent::from_failed_delivery(
+                        index,
                         input_range,
                         captures,
                         step_seconds,
-                    });
+                    ));
                 }
                 return;
             };
             delivery.prediction += 1;
-            delivery.send(ObservedGenerationEvent::Token {
+            delivery.send(ObservedGenerationEvent::from_token_delivery(
                 token_id,
-                forced: false,
-                prediction_index: index,
+                false,
+                index,
                 input_range,
-                committed: true,
-                rank: 0,
                 captures,
                 step_seconds,
-            });
+            ));
         };
         let on_event = |event| {
             let mut delivery = delivery.borrow_mut();

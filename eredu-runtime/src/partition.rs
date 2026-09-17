@@ -1,5 +1,7 @@
 //! Backend-neutral ownership of one rank-local architecture partition.
 
+mod description;
+
 use std::ops::Deref;
 use std::{collections::BTreeMap, collections::BTreeSet, ops::Range};
 
@@ -84,67 +86,7 @@ impl ParameterGroupOwner {
         graph: &ExecutionGraph,
         layout: &ExecutionUnitLayout,
     ) -> Result<(), ArchitectureParameterError> {
-        match self {
-            ParameterGroupOwner::StaticRole(role) => {
-                if role.trim().is_empty() {
-                    return Err(ArchitectureParameterError::EmptyStaticRole);
-                }
-            }
-            ParameterGroupOwner::StaticAnyOf(roles) => {
-                if roles.is_empty() || roles.iter().any(|role| role.trim().is_empty()) {
-                    return Err(ArchitectureParameterError::EmptyStaticRole);
-                }
-                let unique = roles.iter().collect::<BTreeSet<_>>();
-                if unique.len() != roles.len() {
-                    return Err(ArchitectureParameterError::DuplicateStaticRole);
-                }
-            }
-            ParameterGroupOwner::StaticUnitConsumers { role, consumers } => {
-                if role.trim().is_empty() {
-                    return Err(ArchitectureParameterError::EmptyStaticRole);
-                }
-                if consumers.is_empty() {
-                    return Err(ArchitectureParameterError::EmptyStaticConsumers);
-                }
-                if consumers.iter().collect::<BTreeSet<_>>().len() != consumers.len() {
-                    return Err(ArchitectureParameterError::DuplicateStaticConsumer);
-                }
-            }
-            ParameterGroupOwner::ExecutionUnit { .. } => {}
-        }
-        let consumers = match self {
-            ParameterGroupOwner::StaticUnitConsumers { consumers, .. } => consumers
-                .iter()
-                .map(|(group, unit)| (group, unit))
-                .collect::<Vec<_>>(),
-            ParameterGroupOwner::ExecutionUnit { group, global_unit } => {
-                vec![(group, global_unit)]
-            }
-            _ => Vec::new(),
-        };
-        for (group, global_unit) in consumers {
-            let Some(group_index) = graph
-                .groups()
-                .iter()
-                .position(|candidate| candidate.id() == group.as_str())
-            else {
-                return Err(ArchitectureParameterError::UnknownExecutionGroup(
-                    group.as_str().to_owned(),
-                ));
-            };
-            let available = layout
-                .group_range(group_index)
-                .expect("validated canonical layout contains every group")
-                .len();
-            if *global_unit >= available {
-                return Err(ArchitectureParameterError::UnitOutOfRange {
-                    group: group.as_str().to_owned(),
-                    global_unit: *global_unit,
-                    available,
-                });
-            }
-        }
-        Ok(())
+        description::owner(self, graph, layout).map_err(description::Issue::into_owned)
     }
 
     fn is_local<G, A>(&self, partition: &ArchitecturePartition<G, A>) -> bool {
@@ -267,31 +209,13 @@ impl ArchitectureParameterDescription {
     ) -> Result<Self, ArchitectureParameterError> {
         validate_canonical_layout(graph, layout)
             .map_err(|error| ArchitectureParameterError::InvalidLayout(error.to_string()))?;
-        let expected = parameter_targets(expected)?;
+        let expected_groups = expected.into_iter().collect::<Vec<_>>();
+        let destination = description::Destination(None);
+        let expected = description::expected(expected_groups.iter(), destination)
+            .map_err(description::Failure::ordinary)?;
         let groups = groups.into_iter().collect::<Vec<_>>();
-        let mut actual = BTreeMap::new();
-        for tagged in &groups {
-            tagged.owner().validate(graph, layout)?;
-            for member in tagged.group().members() {
-                if let Some(previous) = actual.insert(member.target().to_owned(), tagged.owner()) {
-                    return Err(ArchitectureParameterError::DuplicateOwnership {
-                        target: member.target().to_owned(),
-                        first: previous.clone(),
-                        second: tagged.owner().clone(),
-                    });
-                }
-            }
-        }
-        let actual_targets = actual.keys().cloned().collect::<BTreeSet<_>>();
-        let expected_targets = expected.keys().cloned().collect::<BTreeSet<_>>();
-        if let Some(target) = expected_targets.difference(&actual_targets).next() {
-            return Err(ArchitectureParameterError::MissingOwnership(target.clone()));
-        }
-        if let Some(target) = actual_targets.difference(&expected_targets).next() {
-            return Err(ArchitectureParameterError::UnexpectedOwnership(
-                target.clone(),
-            ));
-        }
+        description::owned(graph, layout, &groups, &expected, destination)
+            .map_err(description::Failure::ordinary)?;
         Ok(Self {
             graph: graph.clone(),
             unit_layout: layout.clone(),
@@ -299,6 +223,53 @@ impl ArchitectureParameterDescription {
         })
     }
 
+    /// Consumes the complete groups emitted by one architecture constructor.
+    ///
+    /// The same expected-target and owner validation is used by `new`. Its
+    /// authoritative expected groups are the emitted groups themselves, avoiding
+    /// a deep duplicate of names, shapes, companions, and placement metadata.
+    /// Graph, layout, and groups are moved into the description.
+    pub fn from_owned(
+        graph: ExecutionGraph,
+        layout: ExecutionUnitLayout,
+        groups: Vec<OwnedParameterGroupSpec>,
+    ) -> Result<Self, ArchitectureParameterError> {
+        Self::from_owned_destination(graph, layout, groups, description::Destination(None))
+            .map_err(description::Failure::ordinary)
+    }
+
+    /// Consumes complete emitted groups using the caller's metadata destination.
+    ///
+    /// Uses the same validation and ownership transfer as `from_owned`. The
+    /// caller retains the Context's metadata custody while the returned
+    /// description is in use.
+    pub fn from_owned_with_metadata(
+        graph: ExecutionGraph,
+        layout: ExecutionUnitLayout,
+        groups: Vec<OwnedParameterGroupSpec>,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, eredu_nn::Error> {
+        Self::from_owned_destination(graph, layout, groups, description::Destination(Some(context)))
+            .map_err(description::Failure::metadata)
+    }
+
+    fn from_owned_destination(
+        graph: ExecutionGraph,
+        layout: ExecutionUnitLayout,
+        groups: Vec<OwnedParameterGroupSpec>,
+        destination: description::Destination<'_>,
+    ) -> Result<Self, description::Failure> {
+        destination.controls::<Self>()?;
+        description::canonical(&graph, &layout)
+            .map_err(|cause| destination.issue(description::Issue::Layout(cause)))?;
+        let expected = description::expected(
+            groups.iter().map(OwnedParameterGroupSpec::group),
+            destination,
+        )?;
+        description::owned(&graph, &layout, &groups, &expected, destination)?;
+        drop(expected);
+        Ok(Self { graph, unit_layout: layout, groups })
+    }
     /// Returns the canonical execution graph that owns these parameter groups.
     pub const fn graph(&self) -> &ExecutionGraph {
         &self.graph
@@ -378,26 +349,6 @@ impl ArchitectureParameterDescription {
             .into_iter()
             .collect()
     }
-}
-
-fn parameter_targets(
-    groups: impl IntoIterator<Item = ParameterGroupSpec>,
-) -> Result<BTreeMap<String, String>, ArchitectureParameterError> {
-    let mut targets = BTreeMap::new();
-    for group in groups {
-        for member in group.members() {
-            if let Some(previous) =
-                targets.insert(member.target().to_owned(), group.logical_name().to_owned())
-            {
-                return Err(ArchitectureParameterError::DuplicateExpectedTarget {
-                    target: member.target().to_owned(),
-                    first: previous,
-                    second: group.logical_name().to_owned(),
-                });
-            }
-        }
-    }
-    Ok(targets)
 }
 
 /// Invalid architecture-owned parameter ownership declaration.
@@ -544,6 +495,17 @@ impl BoundaryTensorSpec {
         }
     }
 
+    /// Copies a finite borrowed role and symbolic dimensions into counted storage.
+    pub fn new_with_metadata(role:&str,shape:&[BoundaryTensorDimension],dtype:BoundaryTensorDtype,
+        context:&eredu_nn::workspace::WorkspaceContext)->Result<Self,eredu_nn::Error>{
+        let destination=boundary_construction::Destination(Some(context));
+        destination.controls::<Self>().map_err(|cause|cause.metadata(context))?;
+        let role=destination.text(role).map_err(|cause|cause.metadata(context))?;
+        let mut copied=destination.vector(shape.len()).map_err(|cause|cause.metadata(context))?;
+        copied.extend_from_slice(shape);
+        Ok(Self {role,shape:copied,dtype})
+    }
+
     /// Declares the standard evolving batch/sequence/hidden activation.
     pub fn primary_activation(hidden_size: i32) -> Self {
         Self::new(
@@ -613,46 +575,22 @@ impl BoundaryWireSchema {
         primary: BoundaryTensorSpec,
         auxiliary: impl IntoIterator<Item = BoundaryTensorSpec>,
     ) -> Result<Self, ArchitectureBoundaryError> {
-        if identity.trim().is_empty() {
-            return Err(ArchitectureBoundaryError::EmptyIdentity);
+        if identity.trim().is_empty(){return Err(ArchitectureBoundaryError::EmptyIdentity);}
+        if primary.dtype!=BoundaryTensorDtype::Activation {
+            return Err(ArchitectureBoundaryError::InvalidPrimaryDtype{boundary:identity});
         }
-        if primary.dtype != BoundaryTensorDtype::Activation {
-            return Err(ArchitectureBoundaryError::InvalidPrimaryDtype { boundary: identity });
-        }
-        let auxiliary = auxiliary.into_iter().collect::<Vec<_>>();
-        let mut roles = BTreeSet::new();
-        for tensor in std::iter::once(&primary).chain(&auxiliary) {
-            if tensor.role.trim().is_empty() {
-                return Err(ArchitectureBoundaryError::EmptyTensorRole { boundary: identity });
-            }
-            if !roles.insert(tensor.role.as_str()) {
-                return Err(ArchitectureBoundaryError::DuplicateTensorRole {
-                    boundary: identity,
-                    role: tensor.role.clone(),
-                });
-            }
-            if tensor.shape.is_empty() {
-                return Err(ArchitectureBoundaryError::EmptyTensorShape {
-                    boundary: identity,
-                    role: tensor.role.clone(),
-                });
-            }
-            if tensor
-                .shape
-                .iter()
-                .any(|dimension| matches!(dimension, BoundaryTensorDimension::Fixed(value) if *value <= 0))
-            {
-                return Err(ArchitectureBoundaryError::InvalidTensorDimension {
-                    boundary: identity,
-                    role: tensor.role.clone(),
-                });
-            }
-        }
-        Ok(Self {
-            identity,
-            primary,
-            auxiliary,
-        })
+        boundary_construction::construct(identity, primary, auxiliary.into_iter().collect(),
+            boundary_construction::Destination(None)).map_err(boundary_construction::Failure::ordinary)
+    }
+
+    /// Moves declarations from their already paid producers and validates them
+    /// through the same worker as `new`. No source or native authority is minted.
+    pub fn from_owned_with_metadata(identity: &'static str, primary: BoundaryTensorSpec,
+        auxiliary: Vec<BoundaryTensorSpec>, context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<Self, eredu_nn::Error> {
+        boundary_construction::construct(identity, primary, auxiliary,
+            boundary_construction::Destination(Some(context)))
+            .map_err(|cause|cause.metadata(context))
     }
 
     /// Returns the stable schema identity.
@@ -694,51 +632,27 @@ impl BoundaryWireSchema {
         sequence_lengths: impl IntoIterator<Item = i32>,
     ) -> Result<ResolvedBoundaryWireSchema, ArchitectureBoundaryError> {
         let sequence_lengths = sequence_lengths.into_iter().collect::<Vec<_>>();
-        if sequence_lengths.len() != 1 + self.auxiliary.len() {
-            return Err(ArchitectureBoundaryError::TensorCount {
-                boundary: self.identity,
-                expected: 1 + self.auxiliary.len(),
-                actual: sequence_lengths.len(),
-            });
-        }
-        if batch_size <= 0 || sequence_lengths.iter().any(|sequence| *sequence <= 0) {
-            return Err(ArchitectureBoundaryError::InvalidInvocationGeometry {
-                boundary: self.identity,
-                batch_size,
-                sequence_length: sequence_lengths
-                    .into_iter()
-                    .find(|value| *value <= 0)
-                    .unwrap_or(0),
-            });
-        }
-        let resolve = |tensor: &BoundaryTensorSpec, sequence_length| ResolvedBoundaryTensorSpec {
-            role: tensor.role.clone(),
-            shape: tensor
-                .shape
-                .iter()
-                .map(|dimension| match dimension {
-                    BoundaryTensorDimension::Batch => batch_size,
-                    BoundaryTensorDimension::Sequence => sequence_length,
-                    BoundaryTensorDimension::Fixed(value) => *value,
-                })
-                .collect(),
-            dtype: tensor.dtype,
-        };
-        let mut sequences = sequence_lengths.into_iter();
-        Ok(ResolvedBoundaryWireSchema {
-            identity: self.identity,
-            primary: resolve(
-                &self.primary,
-                sequences.next().expect("validated primary sequence"),
-            ),
-            auxiliary: self
-                .auxiliary
-                .iter()
-                .zip(sequences)
-                .map(|(tensor, sequence)| resolve(tensor, sequence))
-                .collect(),
-        })
+        boundary_construction::resolve(self, batch_size, &sequence_lengths,
+            boundary_construction::Destination(None)).map_err(boundary_construction::Failure::ordinary)
     }
+
+    /// Resolves the same symbolic dimensions using counted role and shape destinations.
+    pub fn resolve_with_metadata(&self, batch_size:i32, sequence_length:i32,
+        context:&eredu_nn::workspace::WorkspaceContext)->Result<ResolvedBoundaryWireSchema,eredu_nn::Error>{
+        let count=self.auxiliary.len().checked_add(1)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+        let mut sequences=context.metadata_vec(count)?;
+        sequences.resize(count,sequence_length);
+        self.resolve_each_with_metadata(batch_size,&sequences,context)
+    }
+
+    /// Resolves an exact borrowed sequence extent per primary/auxiliary tensor.
+    pub fn resolve_each_with_metadata(&self,batch_size:i32,sequence_lengths:&[i32],
+        context:&eredu_nn::workspace::WorkspaceContext)->Result<ResolvedBoundaryWireSchema,eredu_nn::Error>{
+        boundary_construction::resolve(self,batch_size,sequence_lengths,
+            boundary_construction::Destination(Some(context))).map_err(|cause|cause.metadata(context))
+    }
+
 }
 
 /// One architecture boundary after invocation-dependent dimensions are resolved.
@@ -750,6 +664,23 @@ pub struct ResolvedBoundaryWireSchema {
 }
 
 impl ResolvedBoundaryWireSchema {
+    /// Copies this validated concrete schema into admitted metadata destinations.
+    pub fn clone_with_metadata(&self,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Self,eredu_nn::Error> {
+        context.charge_metadata(std::mem::size_of::<(Self,&Self,ResolvedBoundaryTensorSpec,
+            Vec<ResolvedBoundaryTensorSpec>,String,Vec<i32>)>())?;
+        let copy=|value:&ResolvedBoundaryTensorSpec|->Result<ResolvedBoundaryTensorSpec,eredu_nn::Error>{
+            let role=context.metadata_string(format_args!("{}",value.role))?;
+            let mut shape=context.metadata_vec(value.shape.len())?;shape.extend_from_slice(&value.shape);
+            Ok(ResolvedBoundaryTensorSpec{role,shape,dtype:value.dtype})
+        };
+        context.charge_metadata(std::mem::size_of_val(&copy))?;
+        let primary=copy(&self.primary)?;
+        let mut auxiliary=context.metadata_vec(self.auxiliary.len())?;
+        for value in &self.auxiliary {auxiliary.push(copy(value)?);}
+        Ok(Self{identity:self.identity,primary,auxiliary})
+    }
+
     /// Returns the stable schema identity.
     pub const fn identity(&self) -> &'static str {
         self.identity
@@ -798,6 +729,28 @@ pub trait ArchitectureBoundary: Sized {
     /// Reconstructs the typed value from transport-order tensors.
     fn decode<T>(&self, tensors: Vec<T>) -> Result<Self::Boundary<T>, ArchitectureBoundaryError>;
 
+    /// Produces this actual schema using the caller's metadata destination.
+    /// A custom schema must qualify its own finite producer before original execution.
+    fn wire_schema_with_metadata(&self, context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<BoundaryWireSchema,eredu_nn::Error>{
+        Err(context.metadata_source(eredu_nn::workspace::WorkspaceMetadataError::Unqualified))
+    }
+
+    /// Decomposes the same typed auxiliary value into paid role-tagged storage.
+    fn encode_with_metadata<T>(&self,boundary:Self::Boundary<T>,
+        context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Vec<ArchitectureBoundaryValue<T>>,eredu_nn::Error>{
+        let _=boundary;
+        Err(context.metadata_source(eredu_nn::workspace::WorkspaceMetadataError::Unqualified))
+    }
+
+    /// Reconstructs this exact typed auxiliary value using a qualified producer.
+    fn decode_with_metadata<T>(&self,tensors:Vec<T>,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Self::Boundary<T>,eredu_nn::Error>{
+        let _=tensors;
+        Err(context.metadata_source(eredu_nn::workspace::WorkspaceMetadataError::Unqualified))
+    }
+
     /// Returns the validated backend-neutral wire schema.
     fn wire_schema(&self) -> Result<BoundaryWireSchema, ArchitectureBoundaryError> {
         BoundaryWireSchema::new(
@@ -827,6 +780,15 @@ impl<T> ArchitectureBoundaryValue<T> {
             return Err(ArchitectureBoundaryError::EmptyTaggedTensorRole);
         }
         Ok(Self { role, tensor })
+    }
+
+    /// Copies an exact borrowed role through its paid destination, preserving
+    /// the same nonempty-role validation and moving the existing tensor owner.
+    pub fn new_with_metadata(role:&str,tensor:T,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Self,eredu_nn::Error>{
+        context.charge_metadata(std::mem::size_of::<(Self,Result<Self,eredu_nn::Error>)>())?;
+        let role=context.metadata_string(format_args!("{role}"))?;
+        Self::new(role,tensor).map_err(|cause|context.metadata_source(cause))
     }
 
     /// Architecture-owned semantic role.
@@ -871,6 +833,32 @@ impl ArchitectureBoundary for NoAuxiliaryBoundarySchema {
 
     const IDENTITY: &'static str = "none";
 
+    fn wire_schema_with_metadata(&self,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<BoundaryWireSchema,eredu_nn::Error>{
+        let primary=BoundaryTensorSpec::new_with_metadata("hidden",&[
+            BoundaryTensorDimension::Batch,BoundaryTensorDimension::Sequence,
+            BoundaryTensorDimension::Fixed(self.hidden_size)],BoundaryTensorDtype::Activation,context)?;
+        let auxiliary=context.metadata_vec(0)?;
+        BoundaryWireSchema::from_owned_with_metadata(Self::IDENTITY,primary,auxiliary,context)
+    }
+
+    fn encode_with_metadata<T>(&self,boundary:Self::Boundary<T>,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Vec<ArchitectureBoundaryValue<T>>,eredu_nn::Error>{
+        context.charge_metadata(std::mem::size_of::<(NoAuxiliaryBoundary,
+            Vec<ArchitectureBoundaryValue<T>>,Result<Vec<ArchitectureBoundaryValue<T>>,eredu_nn::Error>)>())?;
+        self.encode::<T>(boundary).map_err(|cause|context.metadata_source(cause))
+    }
+
+    fn decode_with_metadata<T>(&self,tensors:Vec<T>,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Self::Boundary<T>,eredu_nn::Error>{
+        context.charge_metadata(std::mem::size_of::<(Vec<T>,Result<NoAuxiliaryBoundary,eredu_nn::Error>)>())?;
+        // The same schema validation precedes cardinality on the ordinary path.
+        let schema=self.wire_schema_with_metadata(context)?;
+        boundary_construction::validate_count(Self::IDENTITY,schema.auxiliary.len(),tensors.len())
+            .map_err(|cause|context.metadata_source(cause))?;
+        Ok(NoAuxiliaryBoundary)
+    }
+
     fn primary_tensor_spec(&self) -> BoundaryTensorSpec {
         BoundaryTensorSpec::primary_activation(self.hidden_size)
     }
@@ -902,15 +890,7 @@ where
     B: ArchitectureBoundary,
 {
     let expected = boundary.wire_schema()?.auxiliary().len();
-    let actual = tensors.len();
-    if actual != expected {
-        return Err(ArchitectureBoundaryError::TensorCount {
-            boundary: B::IDENTITY,
-            expected,
-            actual,
-        });
-    }
-    Ok(())
+    boundary_construction::validate_count(B::IDENTITY, expected, tensors.len())
 }
 
 /// Invalid architecture-owned partition boundary declaration or payload.
@@ -1881,6 +1861,7 @@ impl LayeredPartitionDriver {
             parallel,
             context,
             None,
+            eredu_core::OutputDemand::Sequence,
         )
     }
 
@@ -1908,6 +1889,42 @@ impl LayeredPartitionDriver {
         M: PartitionedLayeredArchitecture<B, S>,
         O: crate::ActivationObserver<B::Tensor, M::Error> + ?Sized,
     {
+        self.finish_observed_with_readout(
+            architecture,
+            hidden,
+            state,
+            forward,
+            parallel,
+            context,
+            observer,
+            eredu_core::OutputDemand::Sequence,
+        )
+    }
+
+    /// Completes the same partition with explicit vocabulary demand.
+    pub fn finish_observed_with_readout<B, S, M, O>(
+        &self,
+        architecture: &mut M,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &mut M::ForwardContext,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut O,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<
+        LayeredPartitionOutput<
+            B::Tensor,
+            <M::Boundary as ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        M::Error,
+    >
+    where
+        B: eredu_nn::NeuralBackend,
+        S: RuntimeState<B>,
+        M: PartitionedLayeredArchitecture<B, S>,
+        O: crate::ActivationObserver<B::Tensor, M::Error> + ?Sized,
+    {
         let mut observer = crate::BorrowedActivationObserver(observer);
         self.finish_with_optional_observer(
             architecture,
@@ -1917,6 +1934,7 @@ impl LayeredPartitionDriver {
             parallel,
             context,
             Some(&mut observer),
+            demand,
         )
     }
 
@@ -1930,6 +1948,7 @@ impl LayeredPartitionDriver {
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
         observer: Option<&mut dyn crate::ActivationObserver<B::Tensor, M::Error>>,
+        demand: eredu_core::OutputDemand,
     ) -> Result<
         LayeredPartitionOutput<
             B::Tensor,
@@ -1945,7 +1964,7 @@ impl LayeredPartitionDriver {
         let hidden = architecture
             .leave_partition_group(self.group, hidden, state, forward, parallel, context)?;
         match observer {
-            Some(observer) => architecture.finish_partition_observed(
+            Some(observer) => architecture.finish_partition_with_readout(
                 &hidden,
                 state,
                 forward,
@@ -1953,14 +1972,17 @@ impl LayeredPartitionDriver {
                 parallel,
                 context,
                 observer,
+                demand,
             ),
-            None => architecture.finish_partition(
+            None => architecture.finish_partition_with_readout(
                 &hidden,
                 state,
                 forward,
                 self.owns_output,
                 parallel,
                 context,
+                &mut crate::NoopObserver,
+                demand,
             ),
         }
     }
@@ -2094,25 +2116,7 @@ fn validate_canonical_layout(
     graph: &ExecutionGraph,
     layout: &ExecutionUnitLayout,
 ) -> Result<(), ArchitecturePartitionError> {
-    if graph.groups().len() != layout.group_count() {
-        return Err(ArchitecturePartitionError::LayoutGroupCountMismatch {
-            graph: graph.groups().len(),
-            layout: layout.group_count(),
-        });
-    }
-    for (index, group) in graph.groups().iter().enumerate() {
-        let layout_group = layout
-            .group_id(index)
-            .expect("matching group counts provide every layout identity");
-        if layout_group.as_str() != group.id() {
-            return Err(ArchitecturePartitionError::LayoutGroupMismatch {
-                index,
-                graph: group.id().to_owned(),
-                layout: layout_group.as_str().to_owned(),
-            });
-        }
-    }
-    Ok(())
+    description::canonical(graph, layout).map_err(description::LayoutIssue::into_owned)
 }
 
 /// Invalid backend-neutral architecture partition declaration.
@@ -2541,10 +2545,9 @@ mod tests {
         assert!(!partition.ownership().owns_static_role("projector"));
         assert_eq!(description.select_owned(&partition).len(), 1);
         assert_eq!(description.select_static_roles(&partition), ["projector"]);
-        assert!(
-            owner.is_owned_by(partition.ownership(), |group, unit| partition
-                .owns_unit(group.as_str(), unit))
-        );
+        assert!(owner.is_owned_by(partition.ownership(), |group, unit| {
+            partition.owns_unit(group.as_str(), unit)
+        }));
         assert!(owner.refines_storage_owner(&ParameterGroupOwner::static_role("projector")));
         assert!(!owner.refines_storage_owner(&ParameterGroupOwner::static_role("embedding")));
         let replica = PartitionOwnership::new(false, false, Vec::<String>::new())
@@ -3175,3 +3178,6 @@ mod tests {
         ));
     }
 }
+
+#[path = "partition/boundary_construction.rs"]
+mod boundary_construction;

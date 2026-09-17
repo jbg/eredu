@@ -28,6 +28,7 @@ pub struct RealtimeGenerationState<M, S, R, C> {
     samplers: Vec<S>,
     random_state: Option<R>,
     completion: PhantomData<fn() -> C>,
+    host_funding: Option<eredu_core::HostMetadataFunding>,
 }
 
 /// Unpublished branch of every mutable component in one realtime transition.
@@ -39,6 +40,7 @@ pub struct RealtimeGenerationBranch<MB, S, R, C> {
     samplers: Vec<S>,
     random_state: Option<R>,
     completion: Option<C>,
+    host_funding: Option<eredu_core::HostMetadataFunding>,
 }
 
 /// Additive execution contract for architectures that consume realtime frames.
@@ -88,6 +90,9 @@ pub enum RealtimeCompletionAttachmentError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeGenerationTransactionError {
+    /// A paid state requires explicit model/sampler/random copy sources.
+    #[error("realtime generation requires its admitted branch source")]
+    HostSourceRequired,
     /// The model/cache transaction could not branch or publish.
     #[error("realtime model-state transaction failed: {0}")]
     Model(#[source] BackendFailure),
@@ -111,6 +116,13 @@ pub enum RealtimeGenerationTransactionError {
     /// Exact completion observation or successful waiting failed.
     #[error("realtime generation submission failed: {0}")]
     Completion(#[source] BackendFailure),
+}
+
+impl<M, S, R, C> RealtimeGenerationState<M, S, R, C> {
+    /// Borrows canonical delayed-frame state.
+    pub const fn schedule_state(&self) -> &RealtimeFrameScheduleState {
+        &self.schedule_state
+    }
 }
 
 impl<M, S, R, C> RealtimeGenerationState<M, S, R, C>
@@ -158,7 +170,51 @@ where
             samplers,
             random_state,
             completion: PhantomData,
+            host_funding:None,
         })
+    }
+
+    /// Exact branch shells, sampler directory and schedule copy. Individual
+    /// model, sampler and random copy callbacks retain their separate sources.
+    pub fn branch_host_bytes<F,G,H>(&self)->Option<usize> {
+        self.branch_shell_bytes::<F,G,H>()?.checked_add(self.schedule_state.host_clone_bytes()?)
+    }
+    fn branch_shell_bytes<F,G,H>(&self)->Option<usize> {
+        let parts=[std::mem::size_of::<F>(),std::mem::size_of::<G>(),std::mem::size_of::<H>(),
+            std::mem::size_of::<RealtimeGenerationBranch<M::Branch,S,R,C>>(),
+            std::mem::size_of::<Result<RealtimeGenerationBranch<M::Branch,S,R,C>,BackendFailure>>(),
+            std::mem::size_of::<Vec<S>>(),std::mem::size_of::<Option<R>>(),
+            std::mem::size_of::<Result<R,BackendFailure>>(),std::mem::size_of::<Result<S,BackendFailure>>(),
+            std::mem::size_of::<std::collections::TryReserveError>(),
+            eredu_core::HostMetadataFunding::reservation_control_bytes()];
+        let backing=std::alloc::Layout::array::<S>(self.samplers.len())
+            .ok()?.size();
+        parts.into_iter().try_fold(std::mem::size_of_val(&parts)
+            .checked_add(backing)?,usize::checked_add)
+
+    }
+
+    /// Constructs the actual unpublished branch under one retained host
+    /// account. Model, sampler and random copy sources remain explicit.
+    pub fn branch_with_host_source<F,G,H>(&self,funding:&eredu_core::HostMetadataFunding,
+        branch_model:F,mut clone_sampler:G,clone_random:H)
+        ->Result<RealtimeGenerationBranch<M::Branch,S,R,C>,BackendFailure>
+    where F:FnOnce(&M,&eredu_core::HostMetadataFunding)->Result<M::Branch,BackendFailure>,
+        G:FnMut(&S,&eredu_core::HostMetadataFunding)->Result<S,BackendFailure>,
+        H:FnOnce(&R,&eredu_core::HostMetadataFunding)->Result<R,BackendFailure> {
+        let bytes=self.branch_shell_bytes::<F,G,H>().ok_or(eredu_core::HostMetadataFundingError::Overflow)?;
+        funding.reserve_metadata(bytes)?;
+        let schedule_state=self.schedule_state.try_clone_with_host_source(funding)?;
+        let mut samplers=Vec::new();
+        samplers.try_reserve_exact(self.samplers.len()).map_err(|_|eredu_core::HostMetadataFundingError::Unavailable)?;
+        for sampler in &self.samplers {samplers.push(clone_sampler(sampler,funding)?);}
+        let random_state=match &self.random_state {
+            Some(value)=>Some(clone_random(value,funding)?),None=>None};
+        // No further fallible constructor follows model branching, so a
+        // portable host refusal cannot strand an unpublished model branch.
+        let model_state=branch_model(&self.model_state,funding)?;
+        Ok(RealtimeGenerationBranch{model_state,schedule_state,sampling:self.sampling,
+            samplers,random_state,completion:None,host_funding:Some(funding.clone())})
     }
 
     /// Borrows canonical model/cache state.
@@ -166,10 +222,6 @@ where
         &self.model_state
     }
 
-    /// Borrows canonical delayed-frame state.
-    pub const fn schedule_state(&self) -> &RealtimeFrameScheduleState {
-        &self.schedule_state
-    }
 
     /// Returns the exact portable sampling policy paired with sampler and RNG state.
     pub const fn sampling(&self) -> RealtimeSampling {
@@ -331,6 +383,9 @@ impl<MB, S, R, C> RealtimeGenerationBranch<MB, S, R, C> {
         S: Sampler<B> + Clone,
         R: Clone,
     {
+        if self.host_funding.is_some() {
+            return Err(SequentialDecisionPlanError::HostMetadata(eredu_core::HostMetadataFundingError::Unavailable));
+        }
         SequentialDecisionDriver::new(
             plan,
             self.samplers.clone(),
@@ -358,6 +413,18 @@ impl<MB, S, R, C> RealtimeGenerationBranch<MB, S, R, C> {
     }
 }
 
+impl<M,T,S,R,C> RealtimeGenerationBranch<crate::RealtimePayloadBranch<M,T>,S,R,C> {
+    // Borrow the actual unpublished owner. The coordinator stages updates in
+    // its own result; neither ordinary nor metadata execution needs a second
+    // generation branch merely to call the shared driver.
+    pub(crate) fn frame_parts_mut(&mut self)->(&mut M,&mut crate::RealtimePayloadHistory<T>,
+        &mut RealtimeFrameScheduleState,RealtimeSampling,&mut Vec<S>,&mut Option<R>,&mut Option<C>) {
+        let (model,history)=self.model_state.parts_mut();
+        (model,history,&mut self.schedule_state,self.sampling,&mut self.samplers,
+            &mut self.random_state,&mut self.completion)
+    }
+}
+
 impl<M, S, R, C> SemanticStateTransaction for RealtimeGenerationState<M, S, R, C>
 where
     M: SemanticStateTransaction,
@@ -370,6 +437,7 @@ where
     type Error = RealtimeGenerationTransactionError;
 
     fn branch(&self) -> Result<Self::Branch, Self::Error> {
+        if self.host_funding.is_some() {return Err(RealtimeGenerationTransactionError::HostSourceRequired);}
         Ok(RealtimeGenerationBranch {
             model_state: self
                 .model_state
@@ -380,10 +448,14 @@ where
             samplers: self.samplers.clone(),
             random_state: self.random_state.clone(),
             completion: None,
+            host_funding:self.host_funding.clone(),
         })
     }
 
-    fn commit_branch(&mut self, branch: Self::Branch) -> Result<(), Self::Error> {
+    fn commit_branch(&mut self, mut branch: Self::Branch) -> Result<(), Self::Error> {
+        // Declare first so every moved destination retires before this alias
+        // on all failure paths, including native completion errors.
+        let host_funding=branch.host_funding.take();
         let RealtimeGenerationBranch {
             model_state,
             schedule_state,
@@ -391,6 +463,7 @@ where
             samplers,
             random_state,
             completion,
+            host_funding:_,
         } = branch;
 
         let rollback = |model_state, error| match M::discard_branch(model_state) {
@@ -437,10 +510,12 @@ where
         self.sampling = sampling;
         self.samplers = samplers;
         self.random_state = random_state;
+        self.host_funding=host_funding;
         Ok(())
     }
 
-    fn discard_branch(branch: Self::Branch) -> Result<(), Self::Error> {
+    fn discard_branch(mut branch: Self::Branch) -> Result<(), Self::Error> {
+        let _host_funding=branch.host_funding.take();
         let RealtimeGenerationBranch {
             model_state,
             completion,
@@ -730,6 +805,66 @@ mod tests {
             Some(7),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn paid_schedule_and_branch_match_ordinary_and_refuse_before_model_copy() {
+        use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+        use eredu_core::{HostMetadataAccount,HostMetadataFunding,HostMetadataFundingError};
+        #[derive(Debug)]
+        struct Account {spent:Arc<AtomicUsize>,limit:Arc<AtomicUsize>}
+        impl HostMetadataAccount for Account {
+            fn reserve_metadata(&self,bytes:usize)->Result<(),HostMetadataFundingError> {
+                let limit=self.limit.load(Ordering::SeqCst);
+                self.spent.fetch_update(Ordering::SeqCst,Ordering::SeqCst,|old|
+                    old.checked_add(bytes).filter(|next|*next<=limit))
+                    .map(|_|()).map_err(|old|HostMetadataFundingError::Capacity {
+                        required:bytes as u64,available:limit.saturating_sub(old) as u64})
+            }
+        }
+        let spent=Arc::new(AtomicUsize::new(0));
+        let limit=Arc::new(AtomicUsize::new(usize::MAX));
+        let funding=HostMetadataFunding::new(Account{spent:spent.clone(),limit:limit.clone()}).unwrap();
+        for convention in [RealtimeFrameConvention::FeedbackAlignedHistory,RealtimeFrameConvention::AbsoluteDelayedSlots] {
+            let schedule=RealtimeSpeechConfig::new(3,1,2,3,100,64,convention,vec![1,0,2,1]).unwrap();
+            let mut ordinary=RealtimeFrameScheduleState::new(schedule.clone());
+            let mut paid=ordinary.try_clone_with_host_source(&funding).unwrap();
+            for frame in 0..8 {
+                let forcing=RealtimeFrameForcing::new(frame%2==0,vec![frame%3==0,frame%2==1]);
+                let expected=ordinary.advance(&schedule,&forcing).unwrap();
+                let actual=paid.advance_with_host_source(&schedule,&forcing,&funding).unwrap();
+                assert_eq!(actual,expected);
+                assert_eq!(paid,ordinary);
+            }
+            let before=paid.clone();
+            assert!(matches!(paid.branch(),Err(RealtimeScheduleError::HostSourceRequired)));
+            assert!(matches!(paid.advance(&schedule,&RealtimeFrameForcing::none(&schedule)),
+                Err(RealtimeScheduleError::HostSourceRequired)));
+            assert_eq!(paid,before);
+            limit.store(spent.load(Ordering::SeqCst),Ordering::SeqCst);
+            assert!(matches!(paid.advance_with_host_source(&schedule,&RealtimeFrameForcing::none(&schedule),&funding),
+                Err(RealtimeScheduleError::HostMetadata(HostMetadataFundingError::Capacity{..}))));
+            assert_eq!(paid,before);
+            limit.store(usize::MAX,Ordering::SeqCst);
+        }
+        let canonical=state();
+        let model_copies=Cell::new(0);
+        let mut branch=canonical.branch_with_host_source(&funding,
+            |model,_|{model_copies.set(model_copies.get()+1);Ok(model.clone())},
+            |sampler,_|Ok(sampler.clone()),|random,_|Ok(*random)).unwrap();
+        assert_eq!(branch.model_state(),canonical.model_state());
+        assert_eq!(branch.schedule_state(),canonical.schedule_state());
+        assert_eq!(branch.random_state(),canonical.random_state());
+        branch.model_state_mut().model_step=77;
+        assert_eq!(canonical.model_state().model_step,1);
+        let total=spent.load(Ordering::SeqCst);limit.store(total,Ordering::SeqCst);
+        let refused=canonical.branch_with_host_source(&funding,
+            |model,_|{model_copies.set(model_copies.get()+1);Ok(model.clone())},
+            |sampler,_|Ok(sampler.clone()),|random,_|Ok(*random));
+        assert!(refused.is_err());
+        assert_eq!(model_copies.get(),1);
+        drop(branch);
+        assert_eq!(spent.load(Ordering::SeqCst),total);
     }
 
     fn mutate_every_component(

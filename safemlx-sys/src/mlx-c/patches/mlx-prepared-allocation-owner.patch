@@ -1,0 +1,228 @@
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -196,10 +196,8 @@
+     throw std::runtime_error(
+         "Deferred allocation ownership requires certified owned backing.");
+   }
+-  for (const auto& retained : data->allocation_owners) {
+-    if (retained == owners) {
+-      return;
+-    }
++  if (data->allocation_owners.contains(owners)) {
++    return;
+   }
+   data->allocation_owners.push_back(owners);
+ }
+diff --git a/mlx/array.h b/mlx/array.h
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -9,6 +9,7 @@
+ #include <vector>
+
+ #include "mlx/allocator.h"
++#include "mlx/allocation_owners.h"
+ #include "mlx/api.h"
+ #include "mlx/dtype.h"
+ #include "mlx/event.h"
+@@ -262,7 +263,7 @@
+     // Opaque allocation owners do not replace the certified buffer/deleter.
+     // Mutation is serialized by the embedding runtime before exposing aliases.
+     // Members retire after the destructor frees native backing.
+-    std::vector<std::shared_ptr<void>> allocation_owners;
++    AllocationOwners allocation_owners;
+     // Physical-only submission pins never expose a logical array value. They
+     // preserve allocation lifetime without preventing ordered buffer donation.
+     std::atomic<size_t> recovery_pins{0};
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -92,12 +92,15 @@
+     return generation_;
+   }
+   void retain_allocation_owner(std::shared_ptr<void> owner) {
+-    for (const auto& retained : allocation_owners_) {
+-      if (retained == owner) {
+-        return;
+-      }
++    if (allocation_owners_.contains(owner)) {
++      return;
+     }
+     allocation_owners_.push_back(std::move(owner));
++  }
++
++  void retain_prepared_allocation_owner(AllocationOwners::Node* node,
++      void* payload, void (*release)(void*)) noexcept {
++    allocation_owners_.append_prepared(node, payload, release);
+   }
+
+   HostTransferStorage(const HostTransferStorage&) = delete;
+@@ -123,7 +126,7 @@
+   size_t capacity_;
+   uint64_t generation_;
+   // Released after free_host_transfer and the physical accounting update.
+-  std::vector<std::shared_ptr<void>> allocation_owners_;
++  AllocationOwners allocation_owners_;
+ };
+
+ namespace {
+@@ -170,6 +173,18 @@
+   return true;
+ }
+
++bool retain_prepared_host_transfer_allocation_owner(
++    const array& value, AllocationOwners::Node* node,
++    void* payload, void (*release)(void*)) {
++  if (!host_transfer_allocation_info(value)) {
++    return false;
++  }
++  const auto* retained =
++      value.data_shared_ptr()->d.target<HostTransferArrayDeleter>();
++  retained->owner->retain_prepared_allocation_owner(node, payload, release);
++  return true;
++}
++
+ bool retain_host_transfer_backing_owner(
+     const std::shared_ptr<array::Data>& data, std::shared_ptr<void> owner) {
+   if (!data) {
+@@ -187,6 +202,16 @@
+
+ uint64_t HostTransferBuffer::allocation_identity() const {
+   return storage_ ? storage_->allocation_generation() : 0;
++}
++
++bool HostTransferBuffer::retain_prepared_allocation_owner(
++    AllocationOwners::Node* node, void* payload,
++    void (*release)(void*)) const noexcept {
++  if (!storage_ || storage_->allocation_generation() == 0) {
++    return false;
++  }
++  storage_->retain_prepared_allocation_owner(node, payload, release);
++  return true;
+ }
+
+ bool HostTransferBuffer::retain_allocation_owner(std::shared_ptr<void> owner) const {
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -33,6 +33,12 @@
+  * Caller serializes attachment. Does not evaluate or alter the buffer/deleter. */
+ MLX_API bool retain_host_transfer_allocation_owner(
+     const array& value, std::shared_ptr<void> owner);
++
++/** Allocation-free handoff of one previously allocated opaque callback node.
++ * Does not consume node/payload when actual certified host backing is absent. */
++MLX_API bool retain_prepared_host_transfer_allocation_owner(
++    const array& value, AllocationOwners::Node* node,
++    void* payload, void (*release)(void*));
+
+ /** Internal publication while an output is being materialized. Certifies the
+  * shared host owner without depending on array status, evaluating or polling. */
+@@ -100,6 +106,8 @@
+   uint64_t allocation_identity() const;
+   /** Retain directly on shared host storage without constructing an array. */
+   bool retain_allocation_owner(std::shared_ptr<void> owner) const;
++  bool retain_prepared_allocation_owner(AllocationOwners::Node* node,
++      void* payload, void (*release)(void*)) const noexcept;
+   HostTransferPolicy policy() const;
+   HostTransferStorageKind storage_kind() const;
+
+diff --git a/mlx/allocation_owners.h b/mlx/allocation_owners.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/allocation_owners.h
+@@ -0,0 +1,94 @@
++#pragma once
++
++#include <memory>
++#include <utility>
++
++namespace mlx::core {
++
++// One canonical owner list for both existing shared owners and prepared opaque
++// callbacks. The embedding runtime serializes append; the physical owner keeps
++// the list alive through each append. No callback may retain this backing.
++class AllocationOwners {
++ public:
++  struct Node {
++    Node() noexcept = default;
++    explicit Node(std::shared_ptr<void> owner) noexcept
++        : shared(std::move(owner)), shared_entry(true) {}
++    ~Node() noexcept = default;
++    Node(const Node&) = delete;
++    Node& operator=(const Node&) = delete;
++
++   private:
++    friend class AllocationOwners;
++    Node* next{nullptr};
++    std::shared_ptr<void> shared;
++    void* payload{nullptr};
++    void (*release)(void*){nullptr};
++    bool shared_entry{false};
++  };
++
++  AllocationOwners() noexcept = default;
++  AllocationOwners(const AllocationOwners&) = delete;
++  AllocationOwners& operator=(const AllocationOwners&) = delete;
++  AllocationOwners(AllocationOwners&& other) noexcept
++      : first_(std::exchange(other.first_, nullptr)),
++        last_(std::exchange(other.last_, nullptr)) {}
++  // Data only needs move construction. Assignment could destroy live owners
++  // before a caller releases its backing, so it is deliberately unavailable.
++  AllocationOwners& operator=(AllocationOwners&&) = delete;
++  ~AllocationOwners() noexcept {
++    // The enclosing Data/HostTransferStorage destructor has freed backing first.
++    // Iteration avoids an unbounded recursive destructor chain.
++    while (first_) {
++      auto* node = first_;
++      first_ = node->next;
++      auto* payload = node->payload;
++      auto release = node->release;
++      // The Rust callback can publish to a queue reclaimed by another thread.
++      // Free this charged native node before making its accounting owner visible.
++      delete node;
++      if (payload) {
++        release(payload);
++      }
++    }
++  }
++
++  bool contains(const std::shared_ptr<void>& owner) const noexcept {
++    for (auto* node = first_; node; node = node->next) {
++      if (node->shared_entry && node->shared == owner) {
++        return true;
++      }
++    }
++    return false;
++  }
++
++  // Legacy publication still prepares its own shared_ptr payload. Allocation
++  // happens before append; failure cannot consume the caller's armed callback.
++  void push_back(std::shared_ptr<void> owner) {
++    auto node = std::make_unique<Node>(std::move(owner));
++    append(node.release());
++  }
++
++  // node is a unique, empty Node allocated before this operation. Callers have
++  // already certified the actual backing and keep it alive through this move.
++  // No allocation, comparison, destructor or callback follows arming.
++  void append_prepared(Node* node, void* payload, void (*release)(void*)) noexcept {
++    node->payload = payload;
++    node->release = release;
++    append(node);
++  }
++
++ private:
++  void append(Node* node) noexcept {
++    if (last_) {
++      last_->next = node;
++    } else {
++      first_ = node;
++    }
++    last_ = node;
++  }
++  Node* first_{nullptr};
++  Node* last_{nullptr};
++};
++
++} // namespace mlx::core

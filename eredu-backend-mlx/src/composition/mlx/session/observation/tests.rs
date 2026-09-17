@@ -3,6 +3,72 @@ use eredu_runtime::{
     with_routed_unit_invocation, RoutedUnitBatch, RoutedUnitInvocation, RoutedUnitObserver,
 };
 
+#[test]
+fn host_observation_preserves_logical_strides_for_all_supported_dtypes() {
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    for dtype in [
+        Dtype::Bool,
+        Dtype::Uint8,
+        Dtype::Uint16,
+        Dtype::Uint32,
+        Dtype::Uint64,
+        Dtype::Int8,
+        Dtype::Int16,
+        Dtype::Int32,
+        Dtype::Int64,
+        Dtype::Float16,
+        Dtype::Bfloat16,
+        Dtype::Float32,
+        Dtype::Float64,
+    ] {
+        let array = Array::from_slice(&[0_f32, 1., 2., 3., 4., 5.], &[2, 3])
+            .as_dtype(dtype, &stream)
+            .unwrap();
+        let reverse = array
+            .as_strided(&[2, 3][..], &[-3, -1][..], 5, &stream)
+            .unwrap();
+        let transposed = array.transpose_axes(&[1, 0], &stream).unwrap();
+        let row = array.try_index_device(..1, &stream).unwrap();
+        let broadcast = safemlx::ops::broadcast_to(&row, &[2, 3], &stream).unwrap();
+        let empty = array.try_index_device(..0, &stream).unwrap();
+        let scalar = array.try_index_device((0, 1), &stream).unwrap();
+        for (view, expected) in [
+            (reverse, vec![5_i64, 4, 3, 2, 1, 0]),
+            (transposed, vec![0, 3, 1, 4, 2, 5]),
+            (broadcast, vec![0, 1, 2, 0, 1, 2]),
+            (empty, vec![]),
+            (scalar, vec![1]),
+        ] {
+            let shape = view.shape().iter().map(|n| *n as usize).collect::<Vec<_>>();
+            let observed = observe_tensor(&MlxTensor::from_array(view), &stream).unwrap();
+            assert_eq!(observed.shape(), shape);
+            let expected = match dtype {
+                Dtype::Bool => {
+                    TensorObservationData::Bool(expected.iter().map(|n| *n != 0).collect())
+                }
+                Dtype::Uint8 | Dtype::Uint16 | Dtype::Uint32 | Dtype::Uint64 => {
+                    TensorObservationData::U64(expected.iter().map(|n| *n as u64).collect())
+                }
+                Dtype::Int8 | Dtype::Int16 | Dtype::Int32 | Dtype::Int64 => {
+                    TensorObservationData::I64(expected)
+                }
+                _ => TensorObservationData::F32(expected.iter().map(|n| *n as f32).collect()),
+            };
+            assert_eq!(observed.data(), &expected, "{dtype:?}");
+            let (length, capacity) = match observed.data() {
+                TensorObservationData::Bool(v) => (v.len(), v.capacity()),
+                TensorObservationData::U64(v) => (v.len(), v.capacity()),
+                TensorObservationData::I64(v) => (v.len(), v.capacity()),
+                TensorObservationData::F32(v) => (v.len(), v.capacity()),
+            };
+            assert_eq!(
+                length, capacity,
+                "{dtype:?} host capacity exceeds logical payload"
+            );
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("composed native observer failure")]
 struct Sentinel;
@@ -84,6 +150,7 @@ fn composed_array_and_neutral_adapters_preserve_routed_invocation_scope() {
             inner: &mut inner,
             routed_path: None,
             routed_invocation_active: false,
+            allocation_authority: None,
         };
         let mut neutral = crate::composition::NeutralActivationObserver::new(&mut arrays);
         let observer = neutral.routed_unit_observer("layer.0.units").unwrap();
@@ -118,5 +185,29 @@ fn composed_array_and_neutral_adapters_preserve_routed_invocation_scope() {
         } else {
             result.unwrap();
         }
+    }
+}
+
+#[test]
+fn composed_observer_adapters_preserve_readout_demand_without_native_allocation() {
+    struct SequenceObserver;
+    impl RuntimeActivationObserver<MlxTensor, Error> for SequenceObserver {
+        fn observe(&mut self, _: &str, _: &MlxTensor) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+    for sequence in [false, true] {
+        let mut noop = eredu_runtime::NoopObserver;
+        let mut capture = SequenceObserver;
+        let inner: &mut dyn RuntimeActivationObserver<MlxTensor, Error> =
+            if sequence { &mut capture } else { &mut noop };
+        let mut arrays = ArrayObserverAdapter {
+            inner,
+            routed_path: None,
+            routed_invocation_active: false,
+            allocation_authority: None,
+        };
+        let neutral = crate::composition::NeutralActivationObserver::new(&mut arrays);
+        assert_eq!(neutral.requires_sequence_readout(), sequence);
     }
 }

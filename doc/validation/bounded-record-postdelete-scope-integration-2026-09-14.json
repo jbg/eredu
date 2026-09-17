@@ -1,0 +1,129 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T10:33:35.541001+00:00",
+  "scope": "Retain native Scope custody through complete Record deallocation",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-original-preparation-scopes-integration-2026-09-14.json",
+  "tests": {
+    "patchtests": {
+      "passed": 65,
+      "ignored": 0
+    },
+    "scopeowners": {
+      "passed": 30,
+      "ignored": 0
+    },
+    "recovery": {
+      "passed": 22,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 117,
+  "new_tests": [
+    {
+      "check": "patchtests",
+      "name": "submission recovery owned scope custody survives the complete record allocation",
+      "path": "safemlx-sys/src/mlx-c/tests/submission_scope_owner_tests.cpp"
+    }
+  ],
+  "new_test_count": 1,
+  "checks": {
+    "patchtests": {
+      "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-record-postdelete-scope-integration-patchtests.py",
+      "started_utc": "2026-09-14T10:29:34.722819+00:00",
+      "elapsed_seconds": 116.346,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-record-postdelete-scope-integration-patchtests.log",
+      "log_sha256": "71a9c9a9468904a849a3709c901f5218c98e4c144ec6f7f8622ba5902b0d6cff"
+    },
+    "scopeowners": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p safemlx --no-default-features --features metal --lib allocation_retention -- --test-threads=1",
+      "started_utc": "2026-09-14T10:31:31.069820+00:00",
+      "elapsed_seconds": 19.653,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-record-postdelete-scope-integration-scopeowners.log",
+      "log_sha256": "0badc68d21738a1604cbd9f8866a4f8459533d8f477fc1ced7b3a640999ba3c5"
+    },
+    "recovery": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::submission_recovery:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T10:31:50.723380+00:00",
+      "elapsed_seconds": 80.912,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-record-postdelete-scope-integration-recovery.log",
+      "log_sha256": "bb2c9e642bcea7fa209c4dcbced9ee2ffc0dd40e2ea5adbdf751df63c84baedf"
+    }
+  },
+  "source_sha256": {
+    "safemlx-sys/src/mlx-c/patches/mlx-submission-recovery.patch": "a1cb5f8c4733bc33ee89e61c7a5fdeb97bfb9d347d9509667c3476865e5ddf8c",
+    "doc/bounded-inference.md": "2e8fcc252114f2f8427a429a42964233f3d975ed744d8aafdb76b9da94b9d944",
+    "doc/backend-architecture.md": "f351d6afa4ac242485f777526f2ad2eff096e2d2aecd2403b966953629893e70",
+    "safemlx-sys/src/mlx-c/tests/submission_scope_owner_tests.cpp": "4f729616a931af0a6e7b68e5367387a467f2c927c27d6b1672303b832a24bb09"
+  },
+  "source_snapshot": "/private/tmp/eredu-record-postdelete-scope-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-original-preparation-scopes-integration-2026-09-14.json": "f6a0fea0f6394a9bb20855527d84c52e8d4ef38dcee6fe688c61b9f3ed0ec5d4",
+    "/private/tmp/eredu-record-postdelete-scope-integration-applied.json": "59b3d48d9ca59b419036345fac196a884947a59ea5da3086a514441006a99519",
+    "/private/tmp/eredu-record-postdelete-scope-integration-apply.py": "d10315ea0749122e3829b360cc89783085eb3164b1ee9b9dc7cd62b4c5d10346",
+    "/private/tmp/eredu-record-postdelete-scope-integration-checks.json": "544255ded81b3a3538618a27b96f17674d9611a1524132638f2eb12bf7bc8edd",
+    "/private/tmp/eredu-record-postdelete-scope-integration-doc-applied.json": "48c77e138849f5cd65f5874f9203a04ba7685820f6cab6317830b8965bf1f7bc",
+    "/private/tmp/eredu-record-postdelete-scope-integration-patchtests.log": "71a9c9a9468904a849a3709c901f5218c98e4c144ec6f7f8622ba5902b0d6cff",
+    "/private/tmp/eredu-record-postdelete-scope-integration-patchtests.py": "c63e150b5693d79e182719397313e548bcc56738d65b42b6e9fdf88b888c6012",
+    "/private/tmp/eredu-record-postdelete-scope-integration-recovery.log": "bb2c9e642bcea7fa209c4dcbced9ee2ffc0dd40e2ea5adbdf751df63c84baedf",
+    "/private/tmp/eredu-record-postdelete-scope-integration-review.json": "5df137e21a006218d1747b6f063834c0081dcd1917f73d0beeac65cf48de1f66",
+    "/private/tmp/eredu-record-postdelete-scope-integration-root-review.json": "4fe1e13be9541b0d75e9a4ebb04f0bd8d128cb56b7082f139d47e4255fb07266",
+    "/private/tmp/eredu-record-postdelete-scope-integration-scopeowners.log": "0badc68d21738a1604cbd9f8866a4f8459533d8f477fc1ced7b3a640999ba3c5",
+    "/private/tmp/eredu-record-postdelete-scope-integration-spec.json": "599572a0ff299981aa7647f65863f279a98baa7119e18751102a75b1071af4ad",
+    "/private/tmp/eredu-record-postdelete-scope-integration-stage/all.patch": "dff1360afe10d33c8556be165dbb8dfbe5ad3fb64e9b6df68ec1676e25dec79d",
+    "/private/tmp/eredu-record-postdelete-scope-integration-stage/change.patch": "746716976fd61886e73f6070a9299665324d0d7a75e8b7121eac660051f84241",
+    "/private/tmp/eredu-record-postdelete-scope-integration-stage/manifest.json": "59b3d48d9ca59b419036345fac196a884947a59ea5da3086a514441006a99519",
+    "/private/tmp/eredu-record-postdelete-scope-integration-stage/staged-hashes.json": "7592db4c2b8c843477f6e2b5d893629e9297b8646ea398a6e2257fa02ff42506",
+    "/private/tmp/eredu-record-postdelete-scope-integration-validate.py": "a4d6a80bce42ebedb4dabda47cfce64198bdcb7374fe9fadcf90d7ec1fb7d4a9",
+    "/private/tmp/eredu-record-postdelete-scope-integration-validation-config.json": "1d9fdb6baa056bbad087890491f7fa540492c8acfc3db6b88c1785e64bc5a6b1",
+    "/private/tmp/eredu-record-postdelete-scope-root-review.json": "9028545de318dec941ceb991a7be33d281fb1632152ba4e7e0630499bf6fcae0",
+    "/private/tmp/eredu-record-postdelete-scope-root-syntax.json": "3e39af84bedb42f540ea52c5e823721e9422077897a339826667a0c25730e0e1",
+    "/private/tmp/eredu-record-postdelete-scope-stage/AUDIT.md": "49ca9719a3408f855aa797b103eabcf4c3d49518a1cae38ec5d3d505b0cb291f",
+    "/private/tmp/eredu-record-postdelete-scope-stage/FROZEN.json": "68b39fb7fb3dcba7aeb8a2247d6804d747e2a390201999522b7440968462d054",
+    "/private/tmp/eredu-record-postdelete-scope-stage/artifact-hashes.json": "d85ba020cf025320cdb77dc44958309fdc90c1caff1bb73cf6c5cc99a0bdaffd",
+    "/private/tmp/eredu-record-postdelete-scope-stage/change.patch": "746716976fd61886e73f6070a9299665324d0d7a75e8b7121eac660051f84241",
+    "/private/tmp/eredu-record-postdelete-scope-stage/doc-additions.json": "9f6b3e168cf9c81424f816fed132447659f8fa2e620d4ca32f4227b6f6249ef5",
+    "/private/tmp/eredu-record-postdelete-scope-stage/manifest.json": "59b3d48d9ca59b419036345fac196a884947a59ea5da3086a514441006a99519",
+    "/private/tmp/eredu-record-postdelete-scope-stage/native-final-hashes.json": "84575589c013ceb56bf617cc1519a1e089126e0d2f0a6059c58f6d25603b4a2e",
+    "/private/tmp/eredu-record-postdelete-scope-stage/native-final-submission.cpp": "b3fb0df92ec934ada24ee89712df2d91b78932303952c79c34c72a1daa8d333b",
+    "/private/tmp/eredu-record-postdelete-scope-stage/new-tests.json": "6c0030de34320ae9f73602a6ee6e95b16466c1e10d515e74c775ce23659ea8fc"
+  },
+  "review": {
+    "full_manifest_sha256": "7592db4c2b8c843477f6e2b5d893629e9297b8646ea398a6e2257fa02ff42506",
+    "full_patch_sha256": "dff1360afe10d33c8556be165dbb8dfbe5ad3fb64e9b6df68ec1676e25dec79d",
+    "patch_sha256": "746716976fd61886e73f6070a9299665324d0d7a75e8b7121eac660051f84241",
+    "replay": "/private/tmp/eredu-record-postdelete-scope-integration-stage/replay",
+    "review": "Root read complete native ownership/retirement and production creator paths, complete final diff and regression; matched extracted native CPP to existing source, replayed exact two-file patch and passed both C++ syntax checks. Independent policy review found reference-transfer/deallocator witness coherent. Full native execution required.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-original-preparation-scopes-integration-2026-09-14.json": "f6a0fea0f6394a9bb20855527d84c52e8d4ef38dcee6fe688c61b9f3ed0ec5d4",
+      "/private/tmp/eredu-record-postdelete-scope-integration-patchtests.py": "c63e150b5693d79e182719397313e548bcc56738d65b42b6e9fdf88b888c6012",
+      "/private/tmp/eredu-record-postdelete-scope-integration-root-review.json": "4fe1e13be9541b0d75e9a4ebb04f0bd8d128cb56b7082f139d47e4255fb07266",
+      "/private/tmp/eredu-record-postdelete-scope-integration-spec.json": "599572a0ff299981aa7647f65863f279a98baa7119e18751102a75b1071af4ad",
+      "/private/tmp/eredu-record-postdelete-scope-root-review.json": "9028545de318dec941ceb991a7be33d281fb1632152ba4e7e0630499bf6fcae0",
+      "/private/tmp/eredu-record-postdelete-scope-root-syntax.json": "3e39af84bedb42f540ea52c5e823721e9422077897a339826667a0c25730e0e1",
+      "/private/tmp/eredu-record-postdelete-scope-stage/AUDIT.md": "49ca9719a3408f855aa797b103eabcf4c3d49518a1cae38ec5d3d505b0cb291f",
+      "/private/tmp/eredu-record-postdelete-scope-stage/FROZEN.json": "68b39fb7fb3dcba7aeb8a2247d6804d747e2a390201999522b7440968462d054",
+      "/private/tmp/eredu-record-postdelete-scope-stage/artifact-hashes.json": "d85ba020cf025320cdb77dc44958309fdc90c1caff1bb73cf6c5cc99a0bdaffd",
+      "/private/tmp/eredu-record-postdelete-scope-stage/change.patch": "746716976fd61886e73f6070a9299665324d0d7a75e8b7121eac660051f84241",
+      "/private/tmp/eredu-record-postdelete-scope-stage/doc-additions.json": "9f6b3e168cf9c81424f816fed132447659f8fa2e620d4ca32f4227b6f6249ef5",
+      "/private/tmp/eredu-record-postdelete-scope-stage/manifest.json": "59b3d48d9ca59b419036345fac196a884947a59ea5da3086a514441006a99519",
+      "/private/tmp/eredu-record-postdelete-scope-stage/native-final-hashes.json": "84575589c013ceb56bf617cc1519a1e089126e0d2f0a6059c58f6d25603b4a2e",
+      "/private/tmp/eredu-record-postdelete-scope-stage/native-final-submission.cpp": "b3fb0df92ec934ada24ee89712df2d91b78932303952c79c34c72a1daa8d333b",
+      "/private/tmp/eredu-record-postdelete-scope-stage/new-tests.json": "6c0030de34320ae9f73602a6ee6e95b16466c1e10d515e74c775ce23659ea8fc"
+    },
+    "source_manifest_sha256": "59b3d48d9ca59b419036345fac196a884947a59ea5da3086a514441006a99519"
+  },
+  "behavior": [
+    "The existing unlocked retirement loop transfers the same entered Record Scope reference to a local before delete and releases it only after derived members, base vectors and allocation retirement. No reference count increase or completion change.",
+    "A derived deallocator witnesses parent and child custody after ::operator delete returns for both successful and failed terminal records; later retirement does not double-release.",
+    "The full native patch compatibility target and existing Rust constructor-owner/recovery tests exercise unchanged completion, failure, queue and guarded destruction behavior."
+  ],
+  "limits": [
+    "This closes a destruction-order gap; it does not supply finite Record counts, payload bounds, cold construction admission or complete managed eligibility.",
+    "No new checkpoint, memory-peak or native distributed measurement is claimed."
+  ]
+}

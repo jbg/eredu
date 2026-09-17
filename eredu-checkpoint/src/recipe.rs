@@ -9,10 +9,23 @@ use std::{
 use crate::store::{CheckpointSource, StoreError, TensorMetadata, TensorSelection, WeightStore};
 use crate::StoredDtype;
 
+mod encoded_projection;
+mod finite_inference;
+pub use finite_inference::{
+    infer_recipe_bytes, RecipeInferenceError, RecipeInferenceInput, RecipeInferenceLayout,
+};
+
 /// Metadata-only catalog used to validate a derived-weight recipe.
 pub trait RecipeCatalog {
     /// Returns source tensor metadata without reading its payload.
     fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError>;
+
+    /// Allocation-free retained metadata for finite uncached construction.
+    /// The catalog must preserve the same immutable authorized entry throughout
+    /// a prepared constructor. Arbitrary owned callbacks remain unqualified.
+    fn tensor_metadata_borrowed(&self, _key: &str) -> Option<&TensorMetadata> {
+        None
+    }
 
     /// Retained inference for this exact immutable catalog. Mutable catalogs
     /// leave this unset; restricted views must use a separate cache.
@@ -32,6 +45,36 @@ pub struct RecipeInferenceCache {
 type RecipeResults<T, E> = HashMap<DerivedWeightRecipe, Arc<OnceLock<Result<T, E>>>>;
 
 impl RecipeInferenceCache {
+    // Both private table locks are reached before sharing the empty cache. Their
+    // two Result/guard transports do not allocate table entries.
+    pub(crate) fn initial_control_bytes() -> Option<usize> {
+        use std::{
+            mem::{size_of, size_of_val},
+            sync::{LockResult, MutexGuard},
+        };
+        type Entries = RecipeResults<RecipeMetadata, RecipeError>;
+        type Validations = HashMap<TypeId, RecipeResults<(), String>>;
+        let controls = [
+            size_of::<Self>(),
+            size_of::<&Self>(),
+            size_of::<MutexGuard<'static, Entries>>(),
+            size_of::<LockResult<MutexGuard<'static, Entries>>>(),
+            size_of::<MutexGuard<'static, Validations>>(),
+            size_of::<LockResult<MutexGuard<'static, Validations>>>(),
+        ];
+        controls
+            .into_iter()
+            .try_fold(size_of_val(&controls), usize::checked_add)
+    }
+
+    // Eager initialization while the enclosing source has no external alias.
+    // The two pinned PAL allocations are then unique, never competing first-lock
+    // candidates. Future arbitrary recipe/validator entries remain unbounded.
+    pub(crate) fn initialize_control_storage(&self) {
+        drop(self.entries.lock().expect("new recipe cache"));
+        drop(self.validations.lock().expect("new validation cache"));
+    }
+
     /// Retains a caller's cold, metadata-only validation result for this recipe.
     /// `V` identifies one fixed validator: its answer must depend only on the
     /// recipe and this immutable catalog, never mutable device/runtime facts.
@@ -59,11 +102,12 @@ impl RecipeInferenceCache {
         cell.get_or_init(validate).clone()
     }
 
-    fn infer<C: RecipeCatalog + ?Sized>(
+    fn with_inferred<C: RecipeCatalog + ?Sized, T>(
         &self,
         recipe: &DerivedWeightRecipe,
         catalog: &C,
-    ) -> Result<RecipeMetadata, RecipeError> {
+        inspect: impl FnOnce(&RecipeMetadata) -> T,
+    ) -> Result<T, RecipeError> {
         let cell = {
             let mut entries = self
                 .entries
@@ -77,7 +121,12 @@ impl RecipeInferenceCache {
                 cell
             }
         };
-        cell.get_or_init(|| recipe.infer_uncached(catalog)).clone()
+        // The cache lock ends before initialization and before the caller's
+        // inspection. Reentrant inspections therefore never hold this mutex.
+        match cell.get_or_init(|| recipe.infer_uncached(catalog)) {
+            Ok(metadata) => Ok(inspect(metadata)),
+            Err(error) => Err(error.clone()),
+        }
     }
 }
 
@@ -120,6 +169,10 @@ impl<T: WeightStore> RecipeCatalog for T {
 impl RecipeCatalog for dyn CheckpointSource + '_ {
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         CheckpointSource::recipe_cache(self)
+    }
+
+    fn tensor_metadata_borrowed(&self, key: &str) -> Option<&TensorMetadata> {
+        self.source_metadata_borrowed(key).ok()
     }
 
     fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
@@ -221,14 +274,53 @@ pub struct RecipeMetadata {
     pub byte_len: u64,
 }
 
+/// Borrowed validated output metadata. Dimensions may apply one source
+/// selection replacement without allocating an owned shape. The loan never
+/// outlives the metadata/selection supplied to its inspection callback.
+#[derive(Clone, Copy, Debug)]
+pub struct RecipeMetadataView<'a> {
+    shape: SelectedRecipeShape<'a>,
+    dtype: &'a RecipeDtype,
+    byte_len: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SelectedRecipeShape<'a> {
+    dimensions: &'a [usize],
+    replacement: Option<(usize, usize)>,
+}
+
+impl<'a> RecipeMetadataView<'a> {
+    /// Exact dimensions in logical axis order.
+    pub fn shape(self) -> impl ExactSizeIterator<Item = usize> + Clone + 'a {
+        self.shape.iter()
+    }
+    /// Borrowed scalar representation.
+    pub const fn dtype(self) -> &'a RecipeDtype {
+        self.dtype
+    }
+    /// Exact inferred encoded or materialized byte count.
+    pub const fn byte_len(self) -> u64 {
+        self.byte_len
+    }
+}
+
 /// A validated recipe whose output can be filled directly from encoded ranges.
 /// This owns metadata and read admission, never a tensor allocation.
+/// Clones preserve the exact inferred output and original source admission,
+/// without reading payloads or pinning cached tensors. Borrowed reads reuse that
+/// immutable admission; source validation still occurs on every read.
+#[derive(Clone)]
 pub struct EncodedRecipeRead {
     output: RecipeMetadata,
     batch: crate::store::EncodedReadBatch,
 }
 
 impl EncodedRecipeRead {
+    pub(crate) fn admitted_batch(&self) -> &crate::store::EncodedReadBatch {
+        &self.batch
+    }
+
     /// Exact logical shape, dtype, and byte length of the output.
     pub fn output(&self) -> &RecipeMetadata {
         &self.output
@@ -237,6 +329,64 @@ impl EncodedRecipeRead {
     /// Exact source encodings in destination order.
     pub fn sources(&self) -> &[TensorMetadata] {
         self.batch.tensors()
+    }
+
+    /// Plans a detached finite source from these exact admitted recipe reads.
+    /// Construction copies metadata only, after the caller supplies source custody.
+    pub fn prepare_detached<'a, I>(reads: I) -> Option<crate::store::DetachedEncodedReadPlan<'a, I>>
+    where
+        I: Iterator<Item = &'a Self> + Clone + ExactSizeIterator,
+    {
+        crate::store::DetachedEncodedReadPlan::inspect(reads)
+    }
+
+    /// Requested backing for one immutable metadata clone. The inline value,
+    /// shared source custody and caller-owned destination are separate.
+    pub fn clone_storage_bytes(&self) -> Option<usize> {
+        let dtype = match &self.output.dtype {
+            RecipeDtype::Other(name) => name.len(),
+            _ => 0,
+        };
+        self.batch
+            .clone_storage_bytes()?
+            .checked_add(
+                std::alloc::Layout::array::<usize>(self.output.shape.len())
+                    .ok()?
+                    .size(),
+            )?
+            .checked_add(dtype)
+    }
+
+    /// Named clone transports, separate from the actual backing requests.
+    pub fn clone_control_bytes() -> Option<usize> {
+        crate::store::EncodedReadBatch::clone_control_bytes()?
+            .checked_add(std::mem::size_of::<Self>())?
+            .checked_add(std::mem::size_of::<RecipeMetadata>())?
+            .checked_add(std::mem::size_of::<Vec<usize>>())?
+            .checked_add(std::mem::size_of::<String>())
+    }
+
+    /// Finite synchronous-read scratch over these exact immutable read plans.
+    pub fn borrowed_read_layout<'a>(
+        reads: impl IntoIterator<Item = &'a Self>,
+    ) -> Option<crate::store::EncodedReadLayout> {
+        crate::store::EncodedReadLayout::inspect(reads.into_iter().map(|read| &read.batch))
+    }
+
+    /// Fills caller-owned outputs without cloning source metadata or read spans.
+    /// The caller retains the read plans and its scratch/error account through
+    /// this synchronous operation and discards every output on failure.
+    pub fn read_many_borrowed_into<'a, I>(
+        reads: I,
+        outputs: &mut [&mut [u8]],
+    ) -> Result<(), crate::store::EncodedReadFailure>
+    where
+        I: Iterator<Item = &'a Self> + Clone + ExactSizeIterator,
+    {
+        crate::store::EncodedReadBatch::read_many_borrowed_into(
+            reads.map(|read| &read.batch),
+            outputs,
+        )
     }
 
     /// Fills multiple final recipe outputs with a shared shard-ordered read pass.
@@ -714,6 +864,18 @@ pub fn ordered_axis_selection<C: RecipeCatalog + ?Sized>(
 }
 
 impl RecipeMetadata {
+    /// Lends the already validated output without cloning its owned fields.
+    pub fn borrowed(&self) -> RecipeMetadataView<'_> {
+        RecipeMetadataView {
+            shape: SelectedRecipeShape {
+                dimensions: &self.shape,
+                replacement: None,
+            },
+            dtype: &self.dtype,
+            byte_len: self.byte_len,
+        }
+    }
+
     /// Returns the inferred output shape.
     pub fn shape(&self) -> &[usize] {
         &self.shape
@@ -775,8 +937,37 @@ pub enum DerivedWeightRecipe {
     },
 }
 
+/// Borrowed visits of actual recipe source occurrences, preserving order and
+/// repetitions. Join events describe topology; callers own their storage policy.
+/// No source authorization, acquisition, backend behavior or fit is implied.
+pub trait RecipeSourceVisitor {
+    /// The visitor's own refusal.
+    type Error;
+    /// One actual declared source selection.
+    fn source(&mut self, key: &str, selection: &TensorSelection) -> Result<(), Self::Error>;
+    /// Enter an actual concatenate/stack before visiting its children.
+    fn enter_join(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    /// Leave a successfully visited concatenate/stack.
+    fn leave_join(&mut self) {}
+}
+
+trait RecipeSourceVisitorLoan<'a> {
+    type Error;
+    fn source(&mut self, key: &'a str, selection: &'a TensorSelection) -> Result<(), Self::Error>;
+    fn enter_join(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn leave_join(&mut self) {}
+}
+
 impl DerivedWeightRecipe {
-    /// Compiles byte-preserving, leading-axis joins into one bounded read batch.
+    /// Compiles encoded-byte recipes into one bounded read batch: joins on any
+    /// byte-aligned axis, bounded source selections, reshapes/views, same-dtype
+    /// casts, and permutations that move only singleton axes. Reordered rows
+    /// map admitted file ranges directly into the final destination; they do
+    /// not allocate intermediate payloads or convert scalar representations.
     ///
     /// Unsupported transformations or sources return `None` without payload
     /// reads. Supported recipes are inferred once against the admitted batch's
@@ -798,13 +989,57 @@ impl DerivedWeightRecipe {
                 | DerivedWeightRecipe::Stack { axis: 0, inputs } => {
                     inputs.iter().all(|input| collect(input, keys))
                 }
-                DerivedWeightRecipe::Reshape { input, .. } => collect(input, keys),
+                DerivedWeightRecipe::Reshape { input, .. }
+                | DerivedWeightRecipe::View { input, .. }
+                | DerivedWeightRecipe::Transpose { input, .. }
+                | DerivedWeightRecipe::Cast { input, .. } => collect(input, keys),
                 _ => false,
+            }
+        }
+        // The source batch is already admitted. Use that same catalog for the
+        // geometry proof; no source read, payload transform or backend branch.
+        fn preserves_bytes<C: RecipeCatalog + ?Sized>(
+            recipe: &DerivedWeightRecipe,
+            catalog: &C,
+        ) -> Result<bool, RecipeError> {
+            match recipe {
+                DerivedWeightRecipe::Source { .. } => Ok(true),
+                DerivedWeightRecipe::Concatenate { inputs, .. }
+                | DerivedWeightRecipe::Stack { inputs, .. } => {
+                    for input in inputs {
+                        if !preserves_bytes(input, catalog)? {
+                            return Ok(false);
+                        }
+                    }
+                    Ok(true)
+                }
+                DerivedWeightRecipe::Reshape { input, .. }
+                | DerivedWeightRecipe::View { input, .. } => preserves_bytes(input, catalog),
+                DerivedWeightRecipe::Cast { input, dtype } => {
+                    Ok(preserves_bytes(input, catalog)? && input.infer(catalog)?.dtype == *dtype)
+                }
+                DerivedWeightRecipe::Transpose { input, axes } => {
+                    if !preserves_bytes(input, catalog)? {
+                        return Ok(false);
+                    }
+                    let input = input.infer(catalog)?;
+                    validate_permutation(axes, input.shape.len())?;
+                    // Empty tensors contain no ordered scalar bytes. Otherwise
+                    // non-singleton axes must retain their relative order; size
+                    // equality alone cannot justify exchanging two real axes.
+                    Ok(input.shape.contains(&0)
+                        || axes
+                            .iter()
+                            .copied()
+                            .filter(|axis| input.shape[*axis] > 1)
+                            .eq((0..input.shape.len()).filter(|axis| input.shape[*axis] > 1)))
+                }
+                _ => Ok(false),
             }
         }
         let mut keys = Vec::new();
         if !collect(self, &mut keys) {
-            return Ok(None);
+            return encoded_projection::prepare(self, source);
         }
         let Some(batch) = source.prepare_encoded_read(&keys)? else {
             return Ok(None);
@@ -820,7 +1055,13 @@ impl DerivedWeightRecipe {
         }
         let output = if source.recipe_cache().is_some() {
             // Immutable sources bind read batches to the same admitted catalog.
-            self.infer(source)?
+            // Validate the whole recipe first, preserving ordinary left-to-right
+            // error precedence before checking the byte-preserving subset.
+            let output = self.infer(source)?;
+            if !preserves_bytes(self, source)? {
+                return Ok(None);
+            }
+            output
         } else {
             let catalog = Catalog(
                 batch
@@ -829,7 +1070,11 @@ impl DerivedWeightRecipe {
                     .map(|value| (value.name.as_str(), value))
                     .collect(),
             );
-            self.infer(&catalog)?
+            let output = self.infer(&catalog)?;
+            if !preserves_bytes(self, &catalog)? {
+                return Ok(None);
+            }
+            output
         };
         if output.byte_len != batch.byte_len() as u64 {
             // Packed sub-byte tensors may have padding that cannot be joined
@@ -1051,9 +1296,42 @@ impl DerivedWeightRecipe {
     /// execution or identity depends on operand order. Use [`Self::source_keys`]
     /// when only a deterministic unique dependency set is required.
     pub fn source_occurrences(&self) -> Vec<&str> {
-        let mut occurrences = Vec::new();
-        self.collect_source_occurrences(&mut occurrences);
-        occurrences
+        struct Keys<'a>(Vec<&'a str>);
+        impl<'a> RecipeSourceVisitorLoan<'a> for Keys<'a> {
+            type Error = std::convert::Infallible;
+            fn source(&mut self, key: &'a str, _: &'a TensorSelection) -> Result<(), Self::Error> {
+                self.0.push(key);
+                Ok(())
+            }
+        }
+        let mut keys = Keys(Vec::new());
+        match self.visit_source_loans(&mut keys) {
+            Ok(()) => keys.0,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Visit actual source declarations without constructing a key/selection Vec.
+    /// A failure stops traversal immediately and leaves visitor retirement to its owner.
+    pub fn visit_sources<V: RecipeSourceVisitor>(&self, visitor: &mut V) -> Result<(), V::Error> {
+        struct Adapter<'v, V>(&'v mut V);
+        impl<'a, V: RecipeSourceVisitor> RecipeSourceVisitorLoan<'a> for Adapter<'_, V> {
+            type Error = V::Error;
+            fn source(
+                &mut self,
+                key: &'a str,
+                selection: &'a TensorSelection,
+            ) -> Result<(), Self::Error> {
+                self.0.source(key, selection)
+            }
+            fn enter_join(&mut self) -> Result<(), Self::Error> {
+                self.0.enter_join()
+            }
+            fn leave_join(&mut self) {
+                self.0.leave_join()
+            }
+        }
+        self.visit_source_loans(&mut Adapter(visitor))
     }
 
     fn collect_source_keys<'a>(&'a self, keys: &mut BTreeSet<&'a str>) {
@@ -1076,13 +1354,19 @@ impl DerivedWeightRecipe {
         }
     }
 
-    fn collect_source_occurrences<'a>(&'a self, occurrences: &mut Vec<&'a str>) {
+    fn visit_source_loans<'a, V: RecipeSourceVisitorLoan<'a>>(
+        &'a self,
+        visitor: &mut V,
+    ) -> Result<(), V::Error> {
         match self {
-            Self::Source { key, .. } => occurrences.push(key),
+            Self::Source { key, selection } => visitor.source(key, selection),
             Self::Concatenate { inputs, .. } | Self::Stack { inputs, .. } => {
+                visitor.enter_join()?;
                 for input in inputs {
-                    input.collect_source_occurrences(occurrences);
+                    input.visit_source_loans(visitor)?;
                 }
+                visitor.leave_join();
+                Ok(())
             }
             Self::Select { input, .. }
             | Self::Reshape { input, .. }
@@ -1090,7 +1374,7 @@ impl DerivedWeightRecipe {
             | Self::Cast { input, .. }
             | Self::View { input, .. }
             | Self::NegLog { input }
-            | Self::SubtractOne { input } => input.collect_source_occurrences(occurrences),
+            | Self::SubtractOne { input } => input.visit_source_loans(visitor),
         }
     }
 
@@ -1099,10 +1383,60 @@ impl DerivedWeightRecipe {
         &self,
         catalog: &C,
     ) -> Result<RecipeMetadata, RecipeError> {
+        self.with_inferred(catalog, Clone::clone)
+    }
+
+    /// Inspects the validated output without cloning a cached successful result.
+    /// The callback runs outside the cache mutex. A miss performs the same
+    /// inference and retains the same result as [`Self::infer`]; an uncached
+    /// catalog owns its temporary metadata until the callback returns. Errors
+    /// preserve the ordinary owned error path. This grants no storage custody.
+    pub fn with_inferred<C: RecipeCatalog + ?Sized, T>(
+        &self,
+        catalog: &C,
+        inspect: impl FnOnce(&RecipeMetadata) -> T,
+    ) -> Result<T, RecipeError> {
         match catalog.recipe_cache() {
-            Some(cache) => cache.infer(self, catalog),
-            None => self.infer_uncached(catalog),
+            Some(cache) => cache.with_inferred(self, catalog, inspect),
+            None => self
+                .infer_uncached(catalog)
+                .map(|metadata| inspect(&metadata)),
         }
+    }
+
+    /// Validates a direct source selection and lends its inferred dimensions.
+    /// Prepared catalogs lend their retained metadata. Custom/unprepared sources
+    /// use the existing owned metadata API and retain that temporary through the
+    /// callback. Selection validation is shared with ordinary recipe inference;
+    /// no recipe/key/selection or output shape clone is constructed here.
+    /// Unsupported dtype errors retain their ordinary owned diagnostics.
+    pub fn with_source_metadata<T>(
+        key: &str,
+        selection: &TensorSelection,
+        source: &dyn CheckpointSource,
+        inspect: impl FnOnce(RecipeMetadataView<'_>) -> T,
+    ) -> Result<T, RecipeError> {
+        if key.trim().is_empty() {
+            return Err(RecipeError::EmptySourceKey);
+        }
+        let owned;
+        let metadata = match source.source_metadata_borrowed(key) {
+            Ok(metadata) => metadata,
+            // Preserve the original source's error semantics and support for
+            // custom providers; this fallback is not a closed constructor fit.
+            Err(_) => {
+                owned = source.source_metadata(key)?;
+                &owned
+            }
+        };
+        let shape = SelectedRecipeShape::new(&metadata.logical_shape, selection)?;
+        let dtype = RecipeDtype::from(metadata.stored_dtype.clone());
+        let byte_len = metadata_byte_len(shape.iter(), &dtype)?;
+        Ok(inspect(RecipeMetadataView {
+            shape,
+            dtype: &dtype,
+            byte_len,
+        }))
     }
 
     fn infer_uncached<C: RecipeCatalog + ?Sized>(
@@ -1128,28 +1462,12 @@ impl DerivedWeightRecipe {
             Self::Stack { axis, inputs } => infer_join(catalog, *axis, inputs, true),
             Self::Reshape { input, shape } => {
                 let metadata = input.infer(catalog)?;
-                let old_count = element_count(&metadata.shape, "reshape input")?;
-                let new_count = element_count(shape, "reshape output")?;
-                if old_count != new_count {
-                    return Err(RecipeError::ElementCountMismatch {
-                        input: old_count,
-                        output: new_count,
-                    });
-                }
+                validate_reshape(&metadata.shape, shape)?;
                 metadata_for(shape.clone(), metadata.dtype)
             }
             Self::Transpose { input, axes } => {
                 let metadata = input.infer(catalog)?;
-                let unique = axes.iter().copied().collect::<BTreeSet<_>>();
-                if axes.len() != metadata.shape.len()
-                    || unique.len() != axes.len()
-                    || axes.iter().any(|axis| *axis >= axes.len())
-                {
-                    return Err(RecipeError::InvalidPermutation {
-                        axes: axes.clone(),
-                        rank: metadata.shape.len(),
-                    });
-                }
+                validate_permutation(axes, metadata.shape.len())?;
                 metadata_for(
                     axes.iter().map(|axis| metadata.shape[*axis]).collect(),
                     metadata.dtype,
@@ -1176,58 +1494,88 @@ impl DerivedWeightRecipe {
     }
 }
 
+impl<'a> SelectedRecipeShape<'a> {
+    fn new(shape: &'a [usize], selection: &'a TensorSelection) -> Result<Self, RecipeError> {
+        let mut output = Self {
+            dimensions: shape,
+            replacement: None,
+        };
+        match selection {
+            TensorSelection::Full => {}
+            TensorSelection::Range { axis, start, end } => {
+                let rank = shape.len();
+                let dimension = shape
+                    .get(*axis)
+                    .ok_or(RecipeError::InvalidSelectionAxis { axis: *axis, rank })?;
+                if start >= end || *end > *dimension {
+                    return Err(RecipeError::InvalidRange {
+                        axis: *axis,
+                        start: *start,
+                        end: *end,
+                        dimension: *dimension,
+                    });
+                }
+                output.replacement = Some((*axis, end - start));
+            }
+            TensorSelection::Indices { axis, indices } => {
+                let rank = shape.len();
+                let dimension = shape
+                    .get(*axis)
+                    .ok_or(RecipeError::InvalidSelectionAxis { axis: *axis, rank })?;
+                if indices.is_empty() || indices.iter().any(|index| *index >= *dimension) {
+                    return Err(RecipeError::InvalidIndices {
+                        axis: *axis,
+                        dimension: *dimension,
+                    });
+                }
+                output.replacement = Some((*axis, indices.len()));
+            }
+            TensorSelection::Contiguous {
+                offset_elements,
+                shape: selected,
+            } => {
+                if selected.is_empty() || selected.contains(&0) {
+                    return Err(RecipeError::InvalidContiguousSelection);
+                }
+                let full = element_count(shape, "contiguous source")?;
+                let count = element_count(selected, "contiguous selection")?;
+                let end = u64::try_from(*offset_elements)
+                    .map_err(|_| RecipeError::ArithmeticOverflow("contiguous offset"))?
+                    .checked_add(count)
+                    .ok_or(RecipeError::ArithmeticOverflow("contiguous end"))?;
+                if end > full {
+                    return Err(RecipeError::InvalidContiguousSelection);
+                }
+                output.dimensions = selected;
+            }
+        }
+        Ok(output)
+    }
+
+    fn iter(self) -> impl ExactSizeIterator<Item = usize> + Clone + 'a {
+        self.dimensions
+            .iter()
+            .copied()
+            .enumerate()
+            .map(move |(axis, value)| {
+                self.replacement
+                    .filter(|(changed, _)| *changed == axis)
+                    .map_or(value, |(_, dimension)| dimension)
+            })
+    }
+}
+
 fn selected_shape(
     mut shape: Vec<usize>,
     selection: &TensorSelection,
 ) -> Result<Vec<usize>, RecipeError> {
-    match selection {
-        TensorSelection::Full => {}
-        TensorSelection::Range { axis, start, end } => {
-            let rank = shape.len();
-            let dimension = shape
-                .get_mut(*axis)
-                .ok_or(RecipeError::InvalidSelectionAxis { axis: *axis, rank })?;
-            if start >= end || *end > *dimension {
-                return Err(RecipeError::InvalidRange {
-                    axis: *axis,
-                    start: *start,
-                    end: *end,
-                    dimension: *dimension,
-                });
-            }
-            *dimension = end - start;
-        }
-        TensorSelection::Indices { axis, indices } => {
-            let rank = shape.len();
-            let dimension = shape
-                .get_mut(*axis)
-                .ok_or(RecipeError::InvalidSelectionAxis { axis: *axis, rank })?;
-            if indices.is_empty() || indices.iter().any(|index| *index >= *dimension) {
-                return Err(RecipeError::InvalidIndices {
-                    axis: *axis,
-                    dimension: *dimension,
-                });
-            }
-            *dimension = indices.len();
-        }
-        TensorSelection::Contiguous {
-            offset_elements,
-            shape: selected,
-        } => {
-            if selected.is_empty() || selected.contains(&0) {
-                return Err(RecipeError::InvalidContiguousSelection);
-            }
-            let full = element_count(&shape, "contiguous source")?;
-            let count = element_count(selected, "contiguous selection")?;
-            let end = u64::try_from(*offset_elements)
-                .map_err(|_| RecipeError::ArithmeticOverflow("contiguous offset"))?
-                .checked_add(count)
-                .ok_or(RecipeError::ArithmeticOverflow("contiguous end"))?;
-            if end > full {
-                return Err(RecipeError::InvalidContiguousSelection);
-            }
-            shape = selected.clone();
-        }
+    let selected = SelectedRecipeShape::new(&shape, selection)?;
+    let replacement = selected.replacement;
+    if let TensorSelection::Contiguous { shape: output, .. } = selection {
+        return Ok(output.clone());
+    }
+    if let Some((axis, dimension)) = replacement {
+        shape[axis] = dimension;
     }
     Ok(shape)
 }
@@ -2033,25 +2381,66 @@ fn infer_join<C: RecipeCatalog + ?Sized>(
         .iter()
         .map(|input| input.infer(catalog))
         .collect::<Result<Vec<_>, _>>()?;
-    let first = &metadata[0];
-    if metadata.iter().any(|item| item.dtype != first.dtype) {
+    let mut shape = Vec::with_capacity(metadata[0].shape.len() + usize::from(stack));
+    fill_join_shape(axis, metadata.iter(), stack, &mut shape)?;
+    metadata_for(shape, metadata[0].dtype.clone())
+}
+
+fn validate_reshape(input: &[usize], output: &[usize]) -> Result<(), RecipeError> {
+    let old_count = element_count(input, "reshape input")?;
+    let new_count = element_count(output, "reshape output")?;
+    if old_count != new_count {
+        return Err(RecipeError::ElementCountMismatch {
+            input: old_count,
+            output: new_count,
+        });
+    }
+    Ok(())
+}
+fn validate_permutation(axes: &[usize], rank: usize) -> Result<(), RecipeError> {
+    if axes.len() != rank
+        || axes
+            .iter()
+            .enumerate()
+            .any(|(index, axis)| *axis >= rank || axes[..index].contains(axis))
+    {
+        return Err(RecipeError::InvalidPermutation {
+            axes: axes.to_vec(),
+            rank,
+        });
+    }
+    Ok(())
+}
+fn fill_join_shape<'a>(
+    axis: usize,
+    metadata: impl Iterator<Item = &'a RecipeMetadata> + Clone,
+    stack: bool,
+    shape: &mut Vec<usize>,
+) -> Result<(), RecipeError> {
+    let first = metadata.clone().next().ok_or(RecipeError::EmptyInputs)?;
+    if metadata.clone().any(|item| item.dtype != first.dtype) {
         return Err(RecipeError::DtypeMismatch);
     }
     let rank = first.shape.len();
     if axis > rank || (!stack && axis == rank) {
         return Err(RecipeError::InvalidJoinAxis { axis, rank, stack });
     }
+    let output_rank = rank
+        .checked_add(usize::from(stack))
+        .ok_or(RecipeError::ArithmeticOverflow("join output rank"))?;
+    if output_rank > shape.capacity() {
+        return Err(RecipeError::ArithmeticOverflow("join shape destination"));
+    }
     if stack {
-        if metadata.iter().any(|item| item.shape != first.shape) {
+        if metadata.clone().any(|item| item.shape != first.shape) {
             return Err(RecipeError::ShapeMismatch);
         }
-        let mut shape = first.shape.clone();
-        shape.insert(axis, metadata.len());
-        metadata_for(shape, first.dtype.clone())
+        shape.extend_from_slice(&first.shape);
+        shape.insert(axis, metadata.count());
     } else {
-        let mut shape = first.shape.clone();
+        shape.extend_from_slice(&first.shape);
         shape[axis] = 0;
-        for item in &metadata {
+        for item in metadata {
             if item.shape.len() != rank
                 || item
                     .shape
@@ -2065,12 +2454,32 @@ fn infer_join<C: RecipeCatalog + ?Sized>(
                 .checked_add(item.shape[axis])
                 .ok_or(RecipeError::ArithmeticOverflow("concatenate dimension"))?;
         }
-        metadata_for(shape, first.dtype.clone())
     }
+    Ok(())
 }
 
 fn metadata_for(shape: Vec<usize>, dtype: RecipeDtype) -> Result<RecipeMetadata, RecipeError> {
-    let bits = element_count(&shape, "recipe output")?
+    let byte_len = metadata_byte_len(shape.iter().copied(), &dtype)?;
+    Ok(RecipeMetadata {
+        shape,
+        dtype,
+        byte_len,
+    })
+}
+
+fn metadata_byte_len(
+    mut shape: impl Iterator<Item = usize>,
+    dtype: &RecipeDtype,
+) -> Result<u64, RecipeError> {
+    let count = shape.try_fold(1u64, |count, dimension| {
+        count
+            .checked_mul(
+                u64::try_from(dimension)
+                    .map_err(|_| RecipeError::ArithmeticOverflow("recipe output"))?,
+            )
+            .ok_or(RecipeError::ArithmeticOverflow("recipe output"))
+    })?;
+    let bits = count
         .checked_mul(dtype.bit_width()?)
         .ok_or(RecipeError::ArithmeticOverflow("recipe output bits"))?;
     let byte_len = bits
@@ -2080,11 +2489,7 @@ fn metadata_for(shape: Vec<usize>, dtype: RecipeDtype) -> Result<RecipeMetadata,
     if byte_len == 0 {
         return Err(RecipeError::ZeroSizedOutput);
     }
-    Ok(RecipeMetadata {
-        shape,
-        dtype,
-        byte_len,
-    })
+    Ok(byte_len)
 }
 
 fn element_count(shape: &[usize], context: &'static str) -> Result<u64, RecipeError> {
@@ -2438,6 +2843,189 @@ mod tests {
             }
         });
         assert_eq!(catalog.calls.load(Ordering::Relaxed), 65);
+    }
+
+    #[test]
+    fn borrowed_recipe_results_reuse_the_same_cached_storage_outside_its_lock() {
+        struct Cached {
+            cache: RecipeInferenceCache,
+            calls: std::cell::Cell<usize>,
+        }
+        impl RecipeCatalog for Cached {
+            fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
+                Some(&self.cache)
+            }
+            fn tensor_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
+                self.calls.set(self.calls.get() + 1);
+                Ok(TensorMetadata {
+                    name: key.into(),
+                    logical_shape: vec![2, 3],
+                    physical_shape: vec![2, 3],
+                    stored_dtype: StoredDtype::F32,
+                    encoded_byte_len: 24,
+                    backing_shard: None,
+                })
+            }
+        }
+        let catalog = Cached {
+            cache: RecipeInferenceCache::default(),
+            calls: std::cell::Cell::new(0),
+        };
+        let recipe = DerivedWeightRecipe::Transpose {
+            input: Box::new(DerivedWeightRecipe::source("x", TensorSelection::Full)),
+            axes: vec![1, 0],
+        };
+        recipe
+            .with_inferred(&catalog, |first| {
+                assert_eq!(first.shape(), &[3, 2]);
+                // The second visit would deadlock if the cache mutex were retained.
+                recipe
+                    .with_inferred(&catalog, |second| {
+                        assert!(std::ptr::eq(first, second));
+                        assert_eq!(first.shape().as_ptr(), second.shape().as_ptr());
+                        assert_eq!(second.borrowed().shape().collect::<Vec<_>>(), [3, 2]);
+                        assert_eq!(second.borrowed().byte_len(), 24);
+                    })
+                    .unwrap();
+            })
+            .unwrap();
+        assert_eq!(catalog.calls.get(), 1);
+        assert_eq!(recipe.infer(&catalog).unwrap().shape(), &[3, 2]);
+        assert_eq!(catalog.calls.get(), 1);
+    }
+
+    #[test]
+    fn borrowed_direct_recipe_selections_preserve_validation_and_owned_fallback() {
+        struct Source {
+            metadata: TensorMetadata,
+            loan: bool,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl CheckpointSource for Source {
+            fn source_metadata_borrowed(&self, _: &str) -> crate::store::SourceMetadataLoan<'_> {
+                if self.loan {
+                    Ok(&self.metadata)
+                } else {
+                    Err(crate::store::SourceMetadataBorrowError::Unavailable)
+                }
+            }
+            fn source_metadata(&self, _: &str) -> Result<TensorMetadata, StoreError> {
+                assert!(
+                    !self.loan,
+                    "prepared successful loan must not clone the catalog"
+                );
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(self.metadata.clone())
+            }
+            fn source_keys(&self) -> Vec<String> {
+                panic!("keys are not part of inference")
+            }
+            fn acquire_lease(
+                &self,
+                _: TensorReadRequest,
+            ) -> Result<crate::store::CheckpointLease, StoreError> {
+                panic!("inference must not acquire payloads")
+            }
+            fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+                panic!("no diagnostics")
+            }
+        }
+        let mut source = Source {
+            metadata: TensorMetadata {
+                name: "x".into(),
+                logical_shape: vec![2, 6],
+                physical_shape: vec![2, 6],
+                stored_dtype: StoredDtype::F4,
+                encoded_byte_len: 6,
+                backing_shard: None,
+            },
+            loan: true,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let cases = [
+            (TensorSelection::Full, vec![2, 6], 6),
+            (
+                TensorSelection::Range {
+                    axis: 1,
+                    start: 1,
+                    end: 5,
+                },
+                vec![2, 4],
+                4,
+            ),
+            (
+                TensorSelection::Indices {
+                    axis: 0,
+                    indices: vec![1, 0, 1],
+                },
+                vec![3, 6],
+                9,
+            ),
+            (
+                TensorSelection::Contiguous {
+                    offset_elements: 2,
+                    shape: vec![5],
+                },
+                vec![5],
+                3,
+            ),
+        ];
+        for (selection, expected, bytes) in &cases {
+            DerivedWeightRecipe::with_source_metadata("x", selection, &source, |view| {
+                assert_eq!(view.shape().collect::<Vec<_>>(), *expected);
+                assert_eq!(view.byte_len(), *bytes);
+                assert_eq!(view.dtype(), &RecipeDtype::F4);
+            })
+            .unwrap();
+        }
+        let invalid = [
+            TensorSelection::Range {
+                axis: 2,
+                start: 0,
+                end: 1,
+            },
+            TensorSelection::Range {
+                axis: 1,
+                start: 2,
+                end: 7,
+            },
+            TensorSelection::Indices {
+                axis: 0,
+                indices: vec![2],
+            },
+            TensorSelection::Contiguous {
+                offset_elements: 8,
+                shape: vec![5],
+            },
+        ];
+        for selection in &invalid {
+            let borrowed =
+                DerivedWeightRecipe::with_source_metadata("x", selection, &source, |_| {
+                    panic!("invalid loan")
+                });
+            source.loan = false;
+            let owned = DerivedWeightRecipe::source("x", selection.clone())
+                .infer(&source as &dyn CheckpointSource);
+            assert_eq!(
+                borrowed.unwrap_err().to_string(),
+                owned.unwrap_err().to_string()
+            );
+            source.loan = true;
+        }
+        source.loan = false;
+        let before = source.calls.load(std::sync::atomic::Ordering::Relaxed);
+        for (selection, expected, bytes) in &cases {
+            DerivedWeightRecipe::with_source_metadata("x", selection, &source, |view| {
+                assert_eq!(view.shape().collect::<Vec<_>>(), *expected);
+                assert_eq!(view.byte_len(), *bytes);
+            })
+            .unwrap();
+        }
+        assert_eq!(
+            source.calls.load(std::sync::atomic::Ordering::Relaxed),
+            before + cases.len()
+        );
     }
 
     #[test]
@@ -3105,5 +3693,82 @@ mod tests {
             ),
             Err(RecipeError::DuplicateAlias { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod prepared_source_visits {
+    use super::*;
+    #[test]
+    fn actual_occurrences_share_order_selection_join_events_and_early_failure() {
+        struct Visitor {
+            rows: Vec<(String, TensorSelection, usize)>,
+            multiplicity: usize,
+            stop: bool,
+        }
+        impl RecipeSourceVisitor for Visitor {
+            type Error = &'static str;
+            fn source(
+                &mut self,
+                key: &str,
+                selection: &TensorSelection,
+            ) -> Result<(), Self::Error> {
+                if self.stop && key == "last" {
+                    return Err("actual last refusal");
+                }
+                self.rows
+                    .push((key.into(), selection.clone(), self.multiplicity));
+                Ok(())
+            }
+            fn enter_join(&mut self) -> Result<(), Self::Error> {
+                self.multiplicity *= 2;
+                Ok(())
+            }
+            fn leave_join(&mut self) {
+                self.multiplicity /= 2;
+            }
+        }
+        let selected = TensorSelection::Indices {
+            axis: 0,
+            indices: vec![1, 0, 1],
+        };
+        let recipe = DerivedWeightRecipe::Stack {
+            axis: 0,
+            inputs: vec![
+                DerivedWeightRecipe::source("same", selected.clone()),
+                DerivedWeightRecipe::NegLog {
+                    input: Box::new(DerivedWeightRecipe::Concatenate {
+                        axis: 0,
+                        inputs: vec![
+                            DerivedWeightRecipe::source("same", TensorSelection::Full),
+                            DerivedWeightRecipe::source("last", TensorSelection::Full),
+                        ],
+                    }),
+                },
+            ],
+        };
+        let mut visitor = Visitor {
+            rows: Vec::new(),
+            multiplicity: 4,
+            stop: false,
+        };
+        recipe.visit_sources(&mut visitor).unwrap();
+        assert_eq!(recipe.source_occurrences(), ["same", "same", "last"]);
+        assert_eq!(
+            visitor.rows,
+            [
+                ("same".into(), selected, 8),
+                ("same".into(), TensorSelection::Full, 16),
+                ("last".into(), TensorSelection::Full, 16)
+            ]
+        );
+        assert_eq!(visitor.multiplicity, 4);
+        visitor.rows.clear();
+        visitor.stop = true;
+        assert_eq!(
+            recipe.visit_sources(&mut visitor),
+            Err("actual last refusal")
+        );
+        assert_eq!(visitor.rows.len(), 2);
     }
 }

@@ -1,0 +1,540 @@
+--- a/src/normalizers/byte_level.rs
++++ b/src/normalizers/byte_level.rs
+@@ -1,14 +1,11 @@
+-use crate::processors::byte_level::bytes_char;
++use crate::pre_tokenizers::byte_level::alphabet::BYTE_TO_CHAR;
+ use crate::tokenizer::{NormalizedString, Normalizer, Result};
+ use crate::utils::macro_rules_attribute;
+-use ahash::{AHashMap, AHashSet};
+-use std::sync::LazyLock;
++use ahash::AHashSet;
+ 
+ #[derive(Clone, Debug)]
+ #[macro_rules_attribute(impl_serde_type!)]
+ pub struct ByteLevel;
+-
+-static BYTES_CHAR: LazyLock<AHashMap<u8, char>> = LazyLock::new(bytes_char);
+ 
+ impl Default for ByteLevel {
+     fn default() -> Self {
+@@ -22,7 +19,7 @@
+     }
+ 
+     pub fn alphabet() -> AHashSet<char> {
+-        BYTES_CHAR.values().copied().collect()
++        BYTE_TO_CHAR.iter().copied().collect()
+     }
+ }
+ 
+@@ -38,7 +35,7 @@
+                     s.as_bytes()[i..i + size]
+                         .iter()
+                         .enumerate()
+-                        .map(|(i, b)| (BYTES_CHAR[b], isize::from(i > 0))),
++                        .map(|(i, b)| (BYTE_TO_CHAR[usize::from(*b)], isize::from(i > 0))),
+                 );
+             }
+             normalized.transform(transformations, 0);
+--- a/src/pre_tokenizers/byte_level.rs
++++ b/src/pre_tokenizers/byte_level.rs
+@@ -1,4 +1,4 @@
+-use ahash::{AHashMap, AHashSet};
++use ahash::AHashSet;
+ use std::sync::LazyLock;
+ 
+ use crate::utils::SysRegex;
+@@ -10,43 +10,21 @@
+ };
+ use crate::utils::macro_rules_attribute;
+ 
+-/// Converts bytes to unicode characters.
+-/// See https://github.com/openai/gpt-2/blob/master/src/encoder.py#L9
+-pub(crate) fn bytes_char() -> AHashMap<u8, char> {
+-    let mut bs: Vec<u8> = vec![];
+-    bs.extend(b'!'..=b'~');
+-    bs.extend(b'\xA1'..=b'\xAC');
+-    bs.extend(b'\xAE'..=b'\xFF');
+-
+-    let mut cs: Vec<u32> = bs.iter().map(|i| *i as u32).collect();
+-    let mut n = 0;
+-
+-    for b in 0..=255u8 {
+-        if !bs.contains(&b) {
+-            bs.push(b);
+-            cs.push(u32::pow(2, 8) + n);
+-            n += 1;
+-        }
+-    }
+-
+-    // Safety: cs contains all values from bs (between 0 and 255),
+-    // and some values of value 2⁸ + n, where n is between 0 and 255. This is between 255 and 512.
+-    // Both ranges are valid UTF-32 values (which is fully saturated until 0xD000)
+-    bs.into_iter()
+-        .zip(cs)
+-        .map(|(f, t)| (f, unsafe { std::char::from_u32_unchecked(t) }))
+-        .collect()
+-}
++pub(crate) mod alphabet;
++use alphabet::{char_to_byte, BYTE_TO_CHAR};
++
++#[cfg(test)]
++static REGEX_INITIALIZATIONS: std::sync::atomic::AtomicUsize =
++    std::sync::atomic::AtomicUsize::new(0);
+ 
+ /// Regex that matches exactly one token.
+ /// See https://github.com/openai/gpt-2/blob/master/src/encoder.py#L98
+ static RE: LazyLock<SysRegex> = LazyLock::new(|| {
++    #[cfg(test)]
++    REGEX_INITIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+     SysRegex::new(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
+         .unwrap()
+ });
+-static BYTES_CHAR: LazyLock<AHashMap<u8, char>> = LazyLock::new(bytes_char);
+-static CHAR_BYTES: LazyLock<AHashMap<char, u8>> =
+-    LazyLock::new(|| bytes_char().into_iter().map(|(c, b)| (b, c)).collect());
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+ /// Provides all the necessary steps to handle the BPE tokenization at the byte-level. Takes care
+@@ -91,7 +69,7 @@
+     }
+ 
+     pub fn alphabet() -> AHashSet<char> {
+-        BYTES_CHAR.values().copied().collect()
++        BYTE_TO_CHAR.iter().copied().collect()
+     }
+ 
+     #[must_use]
+@@ -118,12 +96,12 @@
+ // TODO: Give the ability to modify this regex
+ impl PreTokenizer for ByteLevel {
+     fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
+-        let re_ref: &SysRegex = &RE;
+         pretokenized.split(|_, mut normalized| {
+             if self.add_prefix_space && !normalized.get().starts_with(' ') {
+                 normalized.prepend(" ");
+             }
+             if self.use_regex {
++                let re_ref: &SysRegex = &RE;
+                 normalized.split(re_ref, SplitDelimiterBehavior::Isolated)
+             } else {
+                 Ok(vec![normalized])
+@@ -138,7 +116,7 @@
+                     s.as_bytes()[i..i + size]
+                         .iter()
+                         .enumerate()
+-                        .map(|(i, b)| (BYTES_CHAR[b], isize::from(i > 0))),
++                        .map(|(i, b)| (BYTE_TO_CHAR[usize::from(*b)], isize::from(i > 0))),
+                 );
+             }
+             normalized.transform(transformations, 0);
+@@ -159,8 +137,8 @@
+             .flat_map(|t| {
+                 t.chars()
+                     .try_fold(vec![], |mut acc, c| {
+-                        CHAR_BYTES.get(&c).map(|b| {
+-                            acc.push(*b);
++                        char_to_byte(c).map(|b| {
++                            acc.push(b);
+                             acc
+                         })
+                     })
+@@ -203,12 +181,12 @@
+     encoding.process_tokens_with_offsets_mut(|(i, (token, offsets))| {
+         let mut leading_spaces = token
+             .chars()
+-            .take_while(|c| *c == BYTES_CHAR[&b' '] || c.is_whitespace())
++            .take_while(|c| *c == BYTE_TO_CHAR[usize::from(b' ')] || c.is_whitespace())
+             .count();
+         let trailing_spaces = token
+             .chars()
+             .rev()
+-            .take_while(|c| *c == BYTES_CHAR[&b' '] || c.is_whitespace())
++            .take_while(|c| *c == BYTE_TO_CHAR[usize::from(b' ')] || c.is_whitespace())
+             .count();
+ 
+         if leading_spaces > 0 || trailing_spaces > 0 {
+@@ -240,6 +218,7 @@
+         Decoder, Encoding, OffsetReferential, OffsetType, PostProcessor, PreTokenizedString,
+         PreTokenizer,
+     };
++    use ahash::AHashMap;
+     use std::iter::FromIterator;
+ 
+     #[test]
+@@ -591,3 +570,7 @@
+         assert!(!byte_level.use_regex);
+     }
+ }
++
++#[cfg(test)]
++#[path = "byte_level/static_alphabet_tests.rs"]
++mod static_alphabet_tests;
+--- /dev/null
++++ b/src/pre_tokenizers/byte_level/alphabet.rs
+@@ -0,0 +1,34 @@
++//! GPT-2's fixed byte alphabet, with no runtime allocation or initialization.
++
++pub(crate) static BYTE_TO_CHAR: [char; 256] = make_alphabet();
++
++const fn make_alphabet() -> [char; 256] {
++    let mut alphabet = ['\0'; 256];
++    let mut byte = 0u32;
++    while byte < 256 {
++        let scalar = match byte {
++            0..=32 => byte + 256,
++            127..=160 => byte + 162,
++            173 => 323,
++            _ => byte,
++        };
++        alphabet[byte as usize] = match char::from_u32(scalar) {
++            Some(value) => value,
++            None => panic!("byte alphabet contains an invalid scalar"),
++        };
++        byte += 1;
++    }
++    alphabet
++}
++
++/// Only alphabet characters decode to bytes. Unknown characters cause the
++/// existing decoder to fall back to the original UTF-8 of the entire token.
++pub(crate) const fn char_to_byte(c: char) -> Option<u8> {
++    match c as u32 {
++        scalar @ (33..=126 | 161..=172 | 174..=255) => Some(scalar as u8),
++        scalar @ 256..=288 => Some((scalar - 256) as u8),
++        scalar @ 289..=322 => Some((scalar - 162) as u8),
++        323 => Some(173),
++        _ => None,
++    }
++}
+--- /dev/null
++++ b/src/pre_tokenizers/byte_level/static_alphabet_tests.rs
+@@ -0,0 +1,329 @@
++use super::{alphabet::*, ByteLevel, REGEX_INITIALIZATIONS};
++use crate::models::bpe::BPE;
++use crate::normalizers::byte_level::ByteLevel as ByteNormalizer;
++use crate::{
++    Decoder, Encoding, ModelCachePolicy, NormalizedString, Normalizer, OffsetReferential,
++    OffsetType, PostProcessor, PreTokenizedString, PreTokenizer, Token, Tokenizer,
++};
++use ahash::{AHashMap, AHashSet};
++use std::sync::atomic::Ordering;
++
++// Independent test oracle: upstream 0.23.2's ordered-list construction, retained
++// only here. The production table is computed by disjoint scalar ranges.
++fn upstream_alphabet() -> AHashMap<u8, char> {
++    let mut bytes = Vec::new();
++    bytes.extend(b'!'..=b'~');
++    bytes.extend(b'\xA1'..=b'\xAC');
++    bytes.extend(b'\xAE'..=b'\xFF');
++    let mut scalars: Vec<u32> = bytes.iter().map(|b| u32::from(*b)).collect();
++    let mut extra = 0;
++    for byte in 0..=255u8 {
++        if !bytes.contains(&byte) {
++            bytes.push(byte);
++            scalars.push(256 + extra);
++            extra += 1;
++        }
++    }
++    bytes
++        .into_iter()
++        .zip(scalars.into_iter().map(|c| char::from_u32(c).unwrap()))
++        .collect()
++}
++
++fn encoded(input: &str, alphabet: &AHashMap<u8, char>) -> String {
++    input.as_bytes().iter().map(|b| alphabet[b]).collect()
++}
++
++#[test]
++fn all_bytes_and_every_unicode_scalar_match_the_upstream_alphabet() {
++    let expected = upstream_alphabet();
++    let reverse: AHashMap<char, u8> = expected.iter().map(|(&b, &c)| (c, b)).collect();
++    assert_eq!(reverse.len(), 256);
++    for byte in 0..=255u8 {
++        assert_eq!(BYTE_TO_CHAR[usize::from(byte)], expected[&byte]);
++    }
++    for scalar in 0..=0x10ffff {
++        if let Some(c) = char::from_u32(scalar) {
++            assert_eq!(char_to_byte(c), reverse.get(&c).copied(), "{scalar:#x}");
++        }
++    }
++    let alphabet: AHashSet<char> = expected.values().copied().collect();
++    assert_eq!(ByteLevel::alphabet(), alphabet);
++    assert_eq!(ByteNormalizer::alphabet(), alphabet);
++
++    // Exercise the real decoder with every byte, including invalid UTF-8 runs.
++    let all_bytes: Vec<u8> = (0..=255).collect();
++    let all_chars = all_bytes.iter().map(|b| expected[b]).collect();
++    assert_eq!(
++        ByteLevel::default().decode_chain(vec![all_chars]).unwrap(),
++        vec![String::from_utf8_lossy(&all_bytes).into_owned()]
++    );
++}
++
++#[test]
++fn unicode_normalization_keeps_exact_original_alignment() {
++    let alphabet = upstream_alphabet();
++    let input = "A\0\u{7f}\u{a0}é☃🦀\r\n";
++    let mut expected_text = String::new();
++    let mut expected_alignment = Vec::new();
++    for (start, c) in input.char_indices() {
++        let end = start + c.len_utf8();
++        for byte in &input.as_bytes()[start..end] {
++            let mapped = alphabet[byte];
++            expected_text.push(mapped);
++            // NormalizedString records an original span for every output byte.
++            expected_alignment.extend(std::iter::repeat_n((start, end), mapped.len_utf8()));
++        }
++    }
++    let expected = NormalizedString::new(input.into(), expected_text, expected_alignment, 0);
++    let mut actual = NormalizedString::from(input);
++    ByteNormalizer::new().normalize(&mut actual).unwrap();
++    assert_eq!(actual, expected);
++    assert_eq!(actual.alignments_original(), expected.alignments_original());
++}
++
++#[test]
++fn regex_disabled_unicode_prefix_and_offsets_are_preserved() {
++    let alphabet = upstream_alphabet();
++    for input in ["é☃\u{a0}\tZ\r\n", " leading 🦀", "\0a"] {
++        for prefix in [false, true] {
++            let byte_level = ByteLevel::new(prefix, true, false);
++            let mut actual = PreTokenizedString::from(input);
++            byte_level.pre_tokenize(&mut actual).unwrap();
++            let logical = if prefix && !input.starts_with(' ') {
++                format!(" {input}")
++            } else {
++                input.to_owned()
++            };
++            let expected = encoded(&logical, &alphabet);
++            let original = actual.get_splits(OffsetReferential::Original, OffsetType::Byte);
++            assert_eq!(original.len(), 1);
++            assert_eq!(
++                (original[0].0, original[0].1),
++                (expected.as_str(), (0, input.len()))
++            );
++            let normalized = actual.get_splits(OffsetReferential::Normalized, OffsetType::Byte);
++            assert_eq!(normalized.len(), 1);
++            assert_eq!(normalized[0].1, (0, expected.len()));
++            assert_eq!(
++                byte_level.decode_chain(vec![expected]).unwrap(),
++                vec![logical]
++            );
++        }
++    }
++}
++
++#[test]
++fn decoder_fallback_is_whole_token_and_utf8_spans_token_boundaries() {
++    let alphabet = upstream_alphabet();
++    let byte_level = ByteLevel::default();
++    let split: Vec<String> = "☃🦀"
++        .as_bytes()
++        .iter()
++        .map(|b| alphabet[b].to_string())
++        .collect();
++    assert_eq!(byte_level.decode_chain(split).unwrap(), vec!["☃🦀"]);
++    for invalid in [vec![0xe2, 0x28, 0xa1], vec![0xf0, 0x9f], vec![0xff, b'a']] {
++        let tokens = invalid.iter().map(|b| alphabet[b].to_string()).collect();
++        assert_eq!(
++            byte_level.decode_chain(tokens).unwrap(),
++            vec![String::from_utf8_lossy(&invalid).into_owned()]
++        );
++    }
++    // Ġ and é are mapped characters. A later snowman invalidates their mapped
++    // prefix for this token only; the next token still decodes its own Ġ.
++    assert_eq!(
++        byte_level
++            .decode_chain(vec!["Ġé☃".into(), "Ġ".into()])
++            .unwrap(),
++        vec!["Ġé☃ "]
++    );
++    assert_eq!(
++        byte_level
++            .decode_chain(vec!["Ġ\0".into(), "A".into()])
++            .unwrap(),
++        vec!["Ġ\0A"]
++    );
++}
++
++#[test]
++fn postprocessing_preserves_prefix_unicode_space_overflow_and_serialization() {
++    let mut base = Encoding::from_tokens(
++        vec![
++            Token::new(7, "ĠhiĠ".into(), (0, 4)),
++            Token::new(8, "\u{2003}x\u{2003}".into(), (4, 11)),
++            Token::new(9, "Ġ".into(), (11, 12)),
++        ],
++        0,
++    );
++    base.set_overflowing(vec![base.clone()]);
++    for prefix in [false, true] {
++        for trim in [false, true] {
++            for regex in [false, true] {
++                let byte_level = ByteLevel::new(prefix, trim, regex);
++                let json = serde_json::to_string(&byte_level).unwrap();
++                assert_eq!(
++                    json,
++                    format!(
++                        r#"{{"type":"ByteLevel","add_prefix_space":{prefix},"trim_offsets":{trim},"use_regex":{regex}}}"#
++                    )
++                );
++                let restored: ByteLevel = serde_json::from_str(&json).unwrap();
++                assert_eq!(restored, byte_level);
++                let mut expected = vec![base.clone(), base.clone()];
++                for (index, encoding) in expected.iter_mut().enumerate() {
++                    if trim {
++                        let offsets = [(usize::from(!prefix), 3), (5, 10), (12, 12)];
++                        encoding.get_offsets_mut().copy_from_slice(&offsets);
++                        encoding.get_overflowing_mut()[0]
++                            .get_offsets_mut()
++                            .copy_from_slice(&offsets);
++                    }
++                    encoding.set_sequence_id(index);
++                }
++                assert_eq!(
++                    restored
++                        .process_encodings(vec![base.clone(), base.clone()], false)
++                        .unwrap(),
++                    expected
++                );
++            }
++        }
++    }
++    let normalizer = ByteNormalizer::new();
++    assert_eq!(
++        serde_json::to_string(&normalizer).unwrap(),
++        r#"{"type":"ByteLevel"}"#
++    );
++    let restored: ByteNormalizer = serde_json::from_str(r#"{"type":"ByteLevel"}"#).unwrap();
++    let mut actual = NormalizedString::from("a b");
++    restored.normalize(&mut actual).unwrap();
++    assert_eq!(actual.get(), "aĠb");
++}
++
++fn tokenizer(policy: ModelCachePolicy) -> Tokenizer {
++    let vocab: AHashMap<String, u32> = upstream_alphabet()
++        .into_iter()
++        .map(|(b, c)| (c.to_string(), u32::from(b)))
++        .collect();
++    let model = BPE::builder()
++        .vocab_and_merges(vocab, vec![])
++        .cache_policy(policy)
++        .build()
++        .unwrap();
++    let mut tokenizer = Tokenizer::new(model);
++    tokenizer.with_pre_tokenizer(Some(ByteLevel::new(false, false, false)));
++    tokenizer.with_decoder(Some(ByteLevel::new(false, false, false)));
++    tokenizer
++}
++
++#[test]
++fn persistent_workers_encode_with_cloned_and_restored_sources_after_owner_drop() {
++    let mut workers = Vec::new();
++    for _ in 0..2 {
++        let (send, receive) = std::sync::mpsc::channel();
++        let (done, wait) = std::sync::mpsc::channel();
++        let worker = std::thread::spawn(move || {
++            while receive.recv().unwrap() {
++                let legacy = tokenizer(ModelCachePolicy::Legacy);
++                let original = tokenizer(ModelCachePolicy::NoModelCaches);
++                let cloned = original.clone();
++                let serialized = serde_json::to_vec(&original).unwrap();
++                let restored = Tokenizer::from_bytes_with_cache_policy(
++                    &serialized,
++                    ModelCachePolicy::NoModelCaches,
++                )
++                .unwrap();
++                drop(original);
++                let input = "\0\u{7f}\u{a0}Hé☃ 🦀\r\n";
++                let expected_ids: Vec<u32> =
++                    input.as_bytes().iter().map(|&b| u32::from(b)).collect();
++                let mut expected_offsets = Vec::new();
++                for (start, c) in input.char_indices() {
++                    expected_offsets.extend(std::iter::repeat_n(
++                        (start, start + c.len_utf8()),
++                        c.len_utf8(),
++                    ));
++                }
++                assert_eq!(legacy.model_cache_policy(), ModelCachePolicy::Legacy);
++                for source in [&cloned, &restored, &legacy] {
++                    let output = source.encode(input, false).unwrap();
++                    assert_eq!(output.get_ids(), expected_ids);
++                    assert_eq!(output.get_offsets(), expected_offsets);
++                    assert_eq!(source.decode(output.get_ids(), false).unwrap(), input);
++                }
++                assert_eq!(cloned.model_cache_policy(), ModelCachePolicy::NoModelCaches);
++                assert_eq!(
++                    restored.model_cache_policy(),
++                    ModelCachePolicy::NoModelCaches
++                );
++                done.send(()).unwrap();
++            }
++        });
++        workers.push((send, wait, worker));
++    }
++    for _ in 0..3 {
++        for (send, _, _) in &workers {
++            send.send(true).unwrap();
++        }
++        for (_, wait, _) in &workers {
++            wait.recv().unwrap();
++        }
++    }
++    for (send, _, worker) in workers {
++        send.send(false).unwrap();
++        worker.join().unwrap();
++    }
++}
++
++#[test]
++fn regex_is_initialized_only_by_enabled_work_in_a_fresh_process() {
++    const CHILD: &str = "EREDU_BYTELEVEL_REGEX_CHILD";
++    const TEST: &str = "pre_tokenizers::byte_level::static_alphabet_tests::regex_is_initialized_only_by_enabled_work_in_a_fresh_process";
++    if std::env::var_os(CHILD).is_none() {
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
++            .env(CHILD, "1")
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "{}\n{}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
++        return;
++    }
++    assert_eq!(REGEX_INITIALIZATIONS.load(Ordering::SeqCst), 0);
++    for _ in 0..3 {
++        for prefix in [false, true] {
++            let mut input = PreTokenizedString::from("é☃ two\n");
++            ByteLevel::new(prefix, true, false)
++                .pre_tokenize(&mut input)
++                .unwrap();
++            assert_eq!(
++                input
++                    .get_splits(OffsetReferential::Original, OffsetType::Byte)
++                    .len(),
++                1
++            );
++        }
++    }
++    assert_eq!(REGEX_INITIALIZATIONS.load(Ordering::SeqCst), 0);
++    let mut input = PreTokenizedString::from("hello world!");
++    ByteLevel::new(false, true, true)
++        .pre_tokenize(&mut input)
++        .unwrap();
++    assert_eq!(
++        input
++            .get_splits(OffsetReferential::Original, OffsetType::Byte)
++            .len(),
++        3
++    );
++    assert_eq!(REGEX_INITIALIZATIONS.load(Ordering::SeqCst), 1);
++    ByteLevel::new(false, true, true)
++        .pre_tokenize(&mut input)
++        .unwrap();
++    assert_eq!(REGEX_INITIALIZATIONS.load(Ordering::SeqCst), 1);
++}

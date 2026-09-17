@@ -75,8 +75,8 @@ where
             );
         }
         let resources = branch.partition_resources()?;
-        visit_resident_partitioned_architecture::<B, S, _>(
-            &branch.inspection,
+        visit_resident_partitioned_architecture_with_source::<B, S, _>(
+            &branch.inspection.sources,
             branch.selected,
             branch.target,
             self.context,
@@ -171,12 +171,14 @@ where
             );
         }
         let resources = branch.partition_resources()?;
+        let inspection = branch.inspection.retained();
         dispatch_routed_partitioned_production(
-            &branch.inspection,
+            &inspection,
             branch.selected,
             (branch.target, resources, self.gated, self.pooling),
             |(target, resources, gated, _), inspection, selected| {
-                visit_routed_partitioned_production::<B, S, _>(
+                visit_routed_partitioned_production_with_source::<B, S, _>(
+                    Some(&branch.inspection.sources),
                     inspection,
                     selected,
                     target,
@@ -276,7 +278,8 @@ where
             );
         }
         let resources = branch.partition_resources()?;
-        visit_authoritative_composite_partition::<B, S, _>(
+        visit_authoritative_composite_partition_with_source::<B, S, _>(
+            &branch.inspection.sources,
             branch.selected,
             self.context,
             (self.visitor)(resources),

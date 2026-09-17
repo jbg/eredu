@@ -1,0 +1,328 @@
+diff --git a/mlx/backend/cpu/encoder.h b/mlx/backend/cpu/encoder.h
+--- a/mlx/backend/cpu/encoder.h
++++ b/mlx/backend/cpu/encoder.h
+@@ -12,6 +12,12 @@
+ 
+ // Number of dispatches per scheduler task
+ constexpr int DISPATCHES_PER_TASK = 10;
++
++// Actual std::bind payload in one existing scheduler FIFO node. This is a
++// caller's concrete dispatch only, not encoder startup, Eval or submission fit.
++struct DispatchLayout {
++  size_t task_bytes{0}, task_alignment{0}, graph_extent{0}, controls{0};
++};
+ 
+ struct MLX_API CommandEncoder {
+   CommandEncoder(Stream stream) noexcept : stream_(stream) {}
+@@ -93,6 +99,22 @@
+   }
+ 
+   template <class F, class... Args>
++  static bool dispatch_layout(DispatchLayout& out) noexcept {
++    using Bound = decltype(std::bind(std::declval<F>(), std::declval<Args>()...));
++    using Node = scheduler::TaskNode<Bound>;
++    DispatchLayout value{};
++    value.task_bytes = sizeof(Node);
++    value.task_alignment = alignof(Node);
++    if (!scheduler::task_graph_extent<Bound>(value.graph_extent)) return false;
++    value.controls = sizeof(DispatchLayout) * 2 + sizeof(F) + sizeof(Bound) +
++        sizeof(scheduler::TaskContext) + sizeof(scheduler::TaskOwner) * 2 +
++        sizeof(submission::GraphAllocator<Node>) + sizeof(Stream) +
++        sizeof(int) * 2 + sizeof(bool) * 3 + sizeof(void*) * 3;
++    out = value;
++    return true;
++  }
++
++  template <class F, class... Args>
+   void dispatch(F&& f, Args&&... args) {
+     auto next_num_ops = (num_ops_ + 1) % DISPATCHES_PER_TASK;
+     auto task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
+--- a/mlx/distributed/distributed.cpp
++++ b/mlx/distributed/distributed.cpp
+@@ -219,6 +219,14 @@
+   group_->storage_inventory(out);
+   if (group_->terminal_owner_) out.unresolved |= group_inherited_owner;
+   return true;
++}
++
++size_t Group::dispatch_storage_inspection_controls() const noexcept {
++  return sizeof(void*) * 2 + sizeof(size_t) + (group_ ? group_->dispatch_storage_inspection_controls() : 0);
++}
++bool Group::dispatch_storage(GroupWorkerOperation operation, const array& input,
++    int peer, GroupDispatchStorage& out) const noexcept {
++  return group_ && group_->dispatch_storage(operation, input, peer, out);
+ }
+ 
+ size_t Group::worker_storage_inspection_controls() const noexcept {
+diff --git a/mlx/distributed/distributed.h b/mlx/distributed/distributed.h
+--- a/mlx/distributed/distributed.h
++++ b/mlx/distributed/distributed.h
+@@ -47,6 +47,12 @@
+   size_t pool_jobs{0}, socket_attempts{0}, destination_arrays{0};
+   size_t task_graph_extent{0}, destination_graph_extent{0}, controls{0};
+ };
++// Exact outer CPU FIFO callback; excludes primitive construction, Eval cleanup,
++// output Data/backing, event and the worker/persistent communicator owners.
++struct GroupDispatchStorage {
++  size_t task_bytes{0}, task_alignment{0}, graph_extent{0}, controls{0};
++};
++
+ 
+ /* Check if a communication backend is available */
+ MLX_API bool is_available();
+@@ -71,6 +77,9 @@
+   bool same_implementation(const Group&) const noexcept;
+   // Reads this exact implementation and immutable input geometry only.
+   // False leaves out unchanged; unknown backend/ABI/operation is not zero fit.
++  size_t dispatch_storage_inspection_controls() const noexcept;
++  bool dispatch_storage(GroupWorkerOperation, const array&, int peer,
++                        GroupDispatchStorage& out) const noexcept;
+   size_t worker_storage_inspection_controls() const noexcept;
+   bool worker_storage(GroupWorkerOperation, const array&, int peer,
+                       GroupWorkerStorage& out) const noexcept;
+diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
+--- a/mlx/distributed/distributed_impl.h
++++ b/mlx/distributed/distributed_impl.h
+@@ -30,6 +30,9 @@
+     out = GroupStorageInventory{};
+   }
+ 
++  virtual size_t dispatch_storage_inspection_controls() const noexcept { return 0; }
++  virtual bool dispatch_storage(GroupWorkerOperation, const array&, int,
++                                GroupDispatchStorage&) const noexcept { return false; }
+   virtual size_t worker_storage_inspection_controls() const noexcept { return 0; }
+   virtual bool worker_storage(GroupWorkerOperation, const array&, int,
+                               GroupWorkerStorage&) const noexcept { return false; }
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -373,6 +373,52 @@
+ } // namespace
+ 
+ class RingGroup : public GroupImpl {
++  struct GatherDispatch {
++    RingGroup* owner;
++    const char* input;
++    size_t bytes;
++    char* output;
++    submission::GraphQuotaRef allocation;
++    void operator()() const { owner->execute_gather(input, bytes, output, allocation.get()); }
++  };
++  struct SendDispatch {
++    RingGroup* owner;
++    const char* input;
++    size_t bytes;
++    int peer;
++    submission::GraphQuotaRef allocation;
++    void operator()() const { owner->execute_send(input, bytes, peer, allocation.get()); }
++  };
++  struct ReceiveDispatch {
++    RingGroup* owner;
++    char* output;
++    size_t bytes;
++    int peer;
++    submission::GraphQuotaRef allocation;
++    void operator()() const { owner->execute_recv(output, bytes, peer, allocation.get()); }
++  };
++  template<class T, class ReduceOp> struct ReduceDispatch {
++    RingGroup* owner;
++    const char* input;
++    char* output;
++    size_t elements;
++    ReduceOp operation;
++    submission::GraphQuotaRef allocation;
++    void operator()() const { owner->execute_reduce<T>(input, output, elements, operation, allocation.get()); }
++  };
++  template<class Dispatch>
++  static bool dispatch_layout(GroupDispatchStorage& out) noexcept {
++    cpu::DispatchLayout layout{};
++    if (!cpu::CommandEncoder::dispatch_layout<Dispatch>(layout)) return false;
++    out = {layout.task_bytes, layout.task_alignment, layout.graph_extent,
++        layout.controls + sizeof(GroupDispatchStorage) + sizeof(cpu::DispatchLayout)};
++    return true;
++  }
++  template<class T> static constexpr size_t reduce_dispatch_frames() noexcept {
++    return sizeof(ReduceDispatch<T,detail::SumOp<T>>) + sizeof(ReduceDispatch<T,detail::MaxOp<T>>) +
++        sizeof(ReduceDispatch<T,detail::MinOp<T>>);
++  }
++
+   struct GatherJob {
+     RingGroup* owner;
+     const char* input;
+@@ -429,6 +475,34 @@
+         sizeof(ReduceJob<T, detail::MinOp<T>>);
+   }
+  public:
++  size_t dispatch_storage_inspection_controls() const noexcept override {
++    return sizeof(GroupDispatchStorage) * 2 + sizeof(cpu::DispatchLayout) * 2 +
++        sizeof(GatherDispatch) + sizeof(SendDispatch) + sizeof(ReceiveDispatch) +
++        reduce_dispatch_frames<bool>() + reduce_dispatch_frames<int8_t>() +
++        reduce_dispatch_frames<int16_t>() + reduce_dispatch_frames<int32_t>() +
++        reduce_dispatch_frames<int64_t>() + reduce_dispatch_frames<uint8_t>() +
++        reduce_dispatch_frames<uint16_t>() + reduce_dispatch_frames<uint32_t>() +
++        reduce_dispatch_frames<uint64_t>() + reduce_dispatch_frames<float16_t>() +
++        reduce_dispatch_frames<bfloat16_t>() + reduce_dispatch_frames<float>() +
++        reduce_dispatch_frames<double>() + reduce_dispatch_frames<complex64_t>() +
++        sizeof(void*) * 8 + sizeof(size_t) * 8 + sizeof(bool) * 3 + sizeof(int);
++  }
++  bool dispatch_storage(GroupWorkerOperation operation, const array& input, int peer,
++      GroupDispatchStorage& out) const noexcept override {
++    if (size_ <= 0 || rank_ < 0 || rank_ >= size_ || sockets_right_.empty() ||
++        sockets_right_.size() != sockets_left_.size()) return false;
++    if (operation == GroupWorkerOperation::gather) return dispatch_layout<GatherDispatch>(out);
++    if (operation == GroupWorkerOperation::send)
++      return direct_sockets(operation,peer) && dispatch_layout<SendDispatch>(out);
++    if (operation == GroupWorkerOperation::recv)
++      return direct_sockets(operation,peer) && dispatch_layout<ReceiveDispatch>(out);
++    bool qualified = false;
++    SWITCH_TYPE(input,
++      if (operation == GroupWorkerOperation::sum) qualified = dispatch_layout<ReduceDispatch<T,detail::SumOp<T>>>(out);
++      else if (operation == GroupWorkerOperation::maximum) qualified = dispatch_layout<ReduceDispatch<T,detail::MaxOp<T>>>(out);
++      else if (operation == GroupWorkerOperation::minimum) qualified = dispatch_layout<ReduceDispatch<T,detail::MinOp<T>>>(out));
++    return qualified;
++  }
+   size_t worker_storage_inspection_controls() const noexcept override {
+     return sizeof(GroupWorkerStorage) * 2 + sizeof(WorkerStorageCounter) +
+         sizeof(ReductionWorkers) + sizeof(WorkerPartitions) + sizeof(DirectWorkers) +
+@@ -617,65 +691,22 @@
+     auto& encoder = cpu::get_command_encoder(stream);
+     encoder.set_input_array(input);
+     encoder.set_output_array(output);
+-    encoder.dispatch([input_ptr = input.data<char>(),
+-                      nbytes = input.nbytes(),
+-                      output_ptr = output.data<char>(),
+-                      allocation = submission::GraphQuotaRef(submission::current_graph_quota()),
+-                      this]() {
+-      WorkerPartitions parts{};
+-      if (!gather_partitions(nbytes, sockets_right_.size() + sockets_left_.size(), parts))
+-        throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
+-      const auto n_gathers = parts.jobs;
+-      auto* graph = allocation.get();
+-      PoolFutures all_gathers(n_gathers, graph);
+-      for (size_t i = 0; i < n_gathers; i++) {
+-        const auto range = parts.range(i);
+-        all_gathers.append(pool_.enqueue_with_graph(graph, GatherJob{
+-            this, input_ptr + range.first, output_ptr + range.first, nbytes,
+-            range.second - range.first, sockets_right_[i / 2], sockets_left_[i / 2],
+-            (i % 2) ? -1 : 1, graph}));
+-      }
+-      all_gathers.join();
+-    });
++    encoder.dispatch(GatherDispatch{this, input.data<char>(), input.nbytes(), output.data<char>(),
++        submission::GraphQuotaRef(submission::current_graph_quota())});
+   }
+ 
+   void send(const array& input, int dst, Stream stream) override {
+     auto& encoder = cpu::get_command_encoder(stream);
+     encoder.set_input_array(input);
+-    encoder.dispatch(
+-        [input_ptr = input.data<char>(), nbytes = input.nbytes(), dst,
+-         allocation = submission::GraphQuotaRef(submission::current_graph_quota()), this]() {
+-          if (const auto* sockets = direct_sockets(GroupWorkerOperation::send, dst)) {
+-            send(*sockets, input_ptr, nbytes, allocation.get());
+-          } else {
+-            std::ostringstream msg;
+-            msg << "[ring] Send only supported to direct neighbors "
+-                << "but tried to send to " << dst << " from " << rank_
+-                << std::endl;
+-            throw std::runtime_error(msg.str());
+-          }
+-        });
++    encoder.dispatch(SendDispatch{this, input.data<char>(), input.nbytes(), dst,
++        submission::GraphQuotaRef(submission::current_graph_quota())});
+   }
+ 
+   void recv(array& out, int src, Stream stream) override {
+     auto& encoder = cpu::get_command_encoder(stream);
+     encoder.set_output_array(out);
+-    encoder.dispatch(
+-        [out_ptr = out.data<char>(), nbytes = out.nbytes(), src,
+-         allocation = submission::GraphQuotaRef(submission::current_graph_quota()), this]() {
+-          // NOTE: We 'll check the sockets with the opposite order of send so
+-          // that they work even with 2 nodes where left and right is the same
+-          // neighbor.
+-          if (const auto* sockets = direct_sockets(GroupWorkerOperation::recv, src)) {
+-            recv(*sockets, out_ptr, nbytes, allocation.get());
+-          } else {
+-            std::ostringstream msg;
+-            msg << "[ring] Recv only supported from direct neighbors "
+-                << "but tried to recv from " << src << " to " << rank_
+-                << std::endl;
+-            throw std::runtime_error(msg.str());
+-          }
+-        });
++    encoder.dispatch(ReceiveDispatch{this, out.data<char>(), out.nbytes(), src,
++        submission::GraphQuotaRef(submission::current_graph_quota())});
+   }
+ 
+   void sum_scatter(const array& input, array& output, Stream stream) override {
+@@ -794,12 +825,57 @@
+     auto out_ptr = output.data<char>();
+     auto& encoder = cpu::get_command_encoder(stream);
+     encoder.set_output_array(output);
+-    encoder.dispatch([in_ptr, out_ptr, size = input.size(), this, reduce_op,
+-                      allocation = submission::GraphQuotaRef(submission::current_graph_quota())]() {
++    encoder.dispatch(ReduceDispatch<T,ReduceOp>{this, in_ptr, out_ptr, input.size(), reduce_op,
++        submission::GraphQuotaRef(submission::current_graph_quota())});
++  }
++
++  void execute_gather(const char* input_ptr, size_t nbytes, char* output_ptr,
++      submission::GraphQuota* graph) {
++      WorkerPartitions parts{};
++      if (!gather_partitions(nbytes, sockets_right_.size() + sockets_left_.size(), parts))
++        throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++      const auto n_gathers = parts.jobs;
++      PoolFutures all_gathers(n_gathers, graph);
++      for (size_t i = 0; i < n_gathers; i++) {
++        const auto range = parts.range(i);
++        all_gathers.append(pool_.enqueue_with_graph(graph, GatherJob{
++            this, input_ptr + range.first, output_ptr + range.first, nbytes,
++            range.second - range.first, sockets_right_[i / 2], sockets_left_[i / 2],
++            (i % 2) ? -1 : 1, graph}));
++      }
++      all_gathers.join();
++  }
++  void execute_send(const char* input_ptr, size_t nbytes, int dst, submission::GraphQuota* graph) {
++          if (const auto* sockets = direct_sockets(GroupWorkerOperation::send, dst)) {
++            send(*sockets, input_ptr, nbytes, graph);
++          } else {
++            std::ostringstream msg;
++            msg << "[ring] Send only supported to direct neighbors "
++                << "but tried to send to " << dst << " from " << rank_
++                << std::endl;
++            throw std::runtime_error(msg.str());
++          }
++  }
++  void execute_recv(char* out_ptr, size_t nbytes, int src, submission::GraphQuota* graph) {
++          // NOTE: We 'll check the sockets with the opposite order of send so
++          // that they work even with 2 nodes where left and right is the same
++          // neighbor.
++          if (const auto* sockets = direct_sockets(GroupWorkerOperation::recv, src)) {
++            recv(*sockets, out_ptr, nbytes, graph);
++          } else {
++            std::ostringstream msg;
++            msg << "[ring] Recv only supported from direct neighbors "
++                << "but tried to recv from " << src << " to " << rank_
++                << std::endl;
++            throw std::runtime_error(msg.str());
++          }
++  }
++  template<class T, class ReduceOp>
++  void execute_reduce(const char* in_ptr, char* out_ptr, size_t size, ReduceOp reduce_op,
++      submission::GraphQuota* graph) {
+       // If the input data cannot be split into size_ segments then copy it and
+       // all reduce a local buffer prefilled with 0s.
+       size_t nbytes = size * sizeof(T);
+-      auto* graph = allocation.get();
+       ReductionWorkers workers{};
+       if (!reduction_workers(size, sizeof(T), static_cast<size_t>(size_),
+             sockets_right_.size() + sockets_left_.size(), workers)) {
+@@ -845,7 +921,6 @@
+             reduce_op, graph}));
+       }
+       all_sums.join();
+-    });
+   }
+ 
+   template <typename T, typename ReduceOp>

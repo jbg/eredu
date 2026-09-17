@@ -27,10 +27,39 @@ where
         + 'static,
     F: super::partitioned::CompositeExecutableFinalizer<A>,
 {
-    let banks = session.execution_strategy().parameter_banks();
+    finalizer.finish(complete_routed_composite_session(stream, session, facts)?)
+}
+
+fn complete_routed_composite_session<A, D>(
+    stream: &Stream,
+    session: ReplicatedTextSession<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        D,
+    >,
+    facts: eredu_architectures::prepared_execution::PreparedCompositeSessionFacts<
+        A::AdmissionConfig,
+    >,
+) -> Result<CompletedComposite<A, D>, Error>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error> + 'static,
+    A::InputPartPlan: 'static,
+    A::AdmissionConfig: 'static,
+    A::Error: std::fmt::Display,
+    D: eredu_runtime::ReplicatedTextExecutionStrategy<
+            PreparedCompositeArchitecture<A>,
+            MlxNeuralBackend,
+            MlxHybridState,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        > + MlxParameterBankTelemetry
+        + 'static,
+{
+    let banks = session.execution_strategy().parameter_banks()?;
     let (text, processor, admission) = facts.into_parts();
     let (identity, capability, model_type, residency) = text.into_parts();
-    finalizer.finish(
+    Ok(
         CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
             session, admission, processor, identity, capability, model_type, residency, None, None,
             None, true, stream,
@@ -39,11 +68,48 @@ where
     )
 }
 
+fn finish_routed_media_session<A, D>(
+    stream: &Stream,
+    session: ReplicatedTextSession<
+        PreparedCompositeArchitecture<A>,
+        MlxNeuralBackend,
+        MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        D,
+    >,
+    facts: eredu_architectures::prepared_execution::PreparedCompositeSessionFacts<
+        A::AdmissionConfig,
+    >,
+) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
+where
+    A: eredu_architectures::composite_execution::CompositeMediaIngressArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+            Error = eredu_nn::Error,
+        > + 'static,
+    A::InputPartPlan: 'static,
+    A::AdmissionConfig: 'static,
+    A::Error: std::fmt::Display,
+    D: eredu_runtime::media_prefill::MediaTextExecutionStrategy<
+            PreparedCompositeArchitecture<A>,
+            MlxNeuralBackend,
+            MlxHybridState,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+            MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        > + MlxParameterBankTelemetry
+        + 'static,
+{
+    Ok(Box::new(
+        complete_routed_composite_session(stream, session, facts)?.with_media_prefill(),
+    ))
+}
+
 /// Family-agnostic MLX binder for architecture-owned composite ingress.
 #[derive(Clone, Copy)]
 pub(crate) struct CompositeBindingVisitor<'a> {
+    pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub stream: &'a Stream,
     pub weights_stream: &'a Stream,
+    pub layerwise_manager: Option<&'a LayerwiseManagerSlot>,
 }
 
 impl<A, D, P> CompositePredictionCapability<A, D> for SelectedPrediction<P>
@@ -66,6 +132,27 @@ where
             MlxEmbeddedPredictionMaterializer,
         > + 'static,
 {
+    fn collect_retained_storage(
+        &self,
+        storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    ) -> Result<(), Error> {
+        super::super::prediction::parameters::collect_retained_storage::<
+            PreparedCompositeArchitecture<A>,
+            P,
+        >(&self.extension, storage)
+    }
+
+    fn count_parameter_owners(
+        &self,
+        counts: &mut ParameterOwnerCounts,
+        guard: &mut safemlx::RuntimeCallGuard,
+    ) -> Result<(), ParameterOwnerSourceError> {
+        super::super::prediction::parameters::count_parameter_owners::<
+            PreparedCompositeArchitecture<A>,
+            P,
+        >(&self.extension, counts, guard)
+    }
+
     fn publish_parameter_replacements(
         &mut self,
         values: &BTreeMap<String, MlxTensor>,
@@ -107,6 +194,18 @@ where
         self.extension.activation_execution(&self.selected)
     }
 
+    fn prepare_original_prediction(
+        model: &CompletedComposite<A, D, Self>,
+        context: &mut OriginalPredictionStartupContext<'_>,
+    ) -> Option<Result<OriginalPredictionLane, StartupCause>> {
+        Some(context.prepare::<PreparedCompositeArchitecture<A>, P>(
+            &model.prediction.extension,
+            &model.prediction.selected,
+            model.session.control_state_origin_fixed(),
+            &model.stream,
+        ))
+    }
+
     fn lend(
         model: &mut CompletedComposite<A, D, Self>,
         continuation: &mut dyn super::prepared_speculative::MlxEmbeddedExecutorContinuation,
@@ -116,6 +215,38 @@ where
             admission: &model.admission,
             processor: &model.processor,
         };
+        let controls = [
+            std::mem::size_of::<eredu_architectures::speculative_execution::ReplicatedMaterializedPredictionStrategy<
+                PreparedCompositeArchitecture<A>,
+                MlxNeuralBackend,
+                MlxHybridState,
+                MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                D,
+                P,
+                MlxCompositePredictionInput<'_, A>,
+                MlxEmbeddedPredictionMaterializer,
+                super::prepared_speculative::MlxEmbeddedPredictionMechanisms,
+                crate::composition::mlx::replicated_text::prediction::phase::MlxPredictionPhase, >>(),
+            std::mem::size_of::<eredu_architectures::speculative_execution::EmbeddedPredictionExecutor<
+                eredu_architectures::speculative_execution::ReplicatedMaterializedPredictionStrategy<
+                PreparedCompositeArchitecture<A>,
+                MlxNeuralBackend,
+                MlxHybridState,
+                MlxReplicatedTextMechanisms<PreparedCompositeArchitecture<A>, MlxHybridState>,
+                D,
+                P,
+                MlxCompositePredictionInput<'_, A>,
+                MlxEmbeddedPredictionMaterializer,
+                super::prepared_speculative::MlxEmbeddedPredictionMechanisms,
+                crate::composition::mlx::replicated_text::prediction::phase::MlxPredictionPhase, >, super::prepared_speculative::MlxEmbeddedPredictionMechanisms>>(),
+            std::mem::size_of::<eredu_architectures::speculative_execution::DynEmbeddedExecutor<
+                super::prepared_speculative::MlxEmbeddedExecutorTypes>>(),
+            std::mem::size_of::<MlxEmbeddedPredictionObservers>(),
+            std::mem::size_of::<Result<eredu_core::SpeculativeGenerationBatchOutput, Error>>(),
+        ];
+        if let Err(cause) = continuation.construction_controls(
+            controls.into_iter().try_fold(std::mem::size_of_val(&controls), usize::checked_add),
+        ) { return Some(Err(cause)); }
         let mut strategy =
             eredu_architectures::speculative_execution::ReplicatedMaterializedPredictionStrategy::<
                 PreparedCompositeArchitecture<A>,
@@ -127,6 +258,7 @@ where
                 MlxCompositePredictionInput<'_, A>,
                 MlxEmbeddedPredictionMaterializer,
                 super::prepared_speculative::MlxEmbeddedPredictionMechanisms,
+                crate::composition::mlx::replicated_text::prediction::phase::MlxPredictionPhase,
             >::new(
                 &mut model.session,
                 &mut model.prediction.extension,
@@ -168,7 +300,7 @@ impl
         self,
         prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
         extension: <PreparedCompositeArchitecture<A> as eredu_architectures::prediction_extension::MaterializedPredictionTarget<MlxNeuralBackend>>::Extension<MlxEmbeddedPredictionMaterializer>,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
@@ -190,12 +322,13 @@ impl
             PreparedCompositeArchitecture<A>,
             _,
         >(&mut prediction.extension)?;
-        CompletedComposite::new_with_residency(
+        CompletedComposite::new_with_prepared_layerwise(
             prepared,
             store,
             self.stream,
             self.weights_stream,
             residency,
+            self.layerwise_manager.and_then(std::cell::Cell::take),
         )?
         .with_prediction(prediction, self.capability)
         .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
@@ -205,7 +338,7 @@ impl
         self,
         prepared: PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
         extension: <PreparedCompositeArchitecture<A> as eredu_architectures::prediction_extension::MaterializedPredictionTarget<MlxNeuralBackend>>::Extension<MlxEmbeddedPredictionMaterializer>,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
@@ -222,7 +355,7 @@ impl
         let mut mechanisms = MlxReplicatedTextMechanisms::<
             PreparedCompositeArchitecture<A>,
             MlxHybridState,
-        >::new(Arc::clone(&store), self.stream, self.weights_stream);
+        >::new(store.clone(), self.stream, self.weights_stream)?;
         let mut prediction = SelectedPrediction {
             extension,
             selected: self.selected,
@@ -231,6 +364,9 @@ impl
             PreparedCompositeArchitecture<A>,
             _,
         >(&mut prediction.extension)?);
+        mechanisms.set_prepared_layerwise_manager(
+            self.layerwise_manager.and_then(std::cell::Cell::take),
+        );
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
         eredu_architectures::prepared_execution::construct_selected_routed_composite_session(
@@ -240,11 +376,12 @@ impl
             |banks, options| {
                 super::routed::selected_addressable_banks(
                     banks,
-                    Arc::clone(&store),
+                    store.clone(),
                     options,
                     self.weights_stream,
                     self.stream,
-                )
+            self.addressable_manager,
+        )
             },
             (
                 self.stream,
@@ -274,7 +411,7 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
     fn visit<A>(
         self,
         prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
@@ -283,14 +420,17 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
         A::InputPartPlan: 'static,
         A::Error: std::fmt::Display,
     {
-        CompletedComposite::new(prepared, store, self.stream, self.weights_stream)
+        CompletedComposite::new_with_prepared_layerwise(
+            prepared, store, self.stream, self.weights_stream, Default::default(),
+            self.layerwise_manager.and_then(std::cell::Cell::take),
+        )
             .map(|model| Box::new(model) as Box<dyn ErasedReplicatedTextExecutable>)
     }
 
     fn visit_routed<A>(
         self,
         prepared: PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
@@ -300,10 +440,13 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        let mechanisms: MlxReplicatedTextMechanisms<
+        let mut mechanisms: MlxReplicatedTextMechanisms<
             PreparedCompositeArchitecture<A>,
             MlxHybridState,
-        > = MlxReplicatedTextMechanisms::new(Arc::clone(&store), self.stream, self.weights_stream);
+        > = MlxReplicatedTextMechanisms::new(store.clone(), self.stream, self.weights_stream)?;
+        mechanisms.set_prepared_layerwise_manager(
+            self.layerwise_manager.and_then(std::cell::Cell::take),
+        );
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
         eredu_architectures::prepared_execution::construct_selected_routed_composite_session(
@@ -313,15 +456,84 @@ impl CompositeTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
             |banks, options| {
                 super::routed::selected_addressable_banks(
                     banks,
-                    Arc::clone(&store),
+                    store.clone(),
                     options,
                     self.weights_stream,
                     self.stream,
-                )
+            self.addressable_manager,
+        )
             },
             (self.stream, OrdinaryReplicatedFinalizer),
             finish_routed_composite_session,
             finish_routed_composite_session,
+        )
+        .map_err(super::routed::construction_error)
+    }
+    fn visit_media<A>(
+        self,
+        prepared: PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_architectures::composite_execution::CompositeMediaIngressArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            > + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::Error: std::fmt::Display,
+    {
+        CompletedComposite::new_with_prepared_layerwise(
+            prepared, store, self.stream, self.weights_stream, Default::default(),
+            self.layerwise_manager.and_then(std::cell::Cell::take),
+        ).map(|model| {
+            Box::new(model.with_media_prefill()) as Box<dyn ErasedReplicatedTextExecutable>
+        })
+    }
+
+    fn visit_routed_media<A>(
+        self,
+        prepared: PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_architectures::composite_execution::CompositeMediaIngressArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            > + eredu_runtime::RoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        let mut mechanisms: MlxReplicatedTextMechanisms<
+            PreparedCompositeArchitecture<A>,
+            MlxHybridState,
+        > = MlxReplicatedTextMechanisms::new(store.clone(), self.stream, self.weights_stream)?;
+        mechanisms.set_prepared_layerwise_manager(
+            self.layerwise_manager.and_then(std::cell::Cell::take),
+        );
+        #[cfg(test)]
+        crate::tests::support::path_instrumentation::constructor();
+        eredu_architectures::prepared_execution::construct_selected_routed_composite_session(
+            prepared,
+            mechanisms,
+            self.stream,
+            |banks, options| {
+                super::routed::selected_addressable_banks(
+                    banks,
+                    store.clone(),
+                    options,
+                    self.weights_stream,
+                    self.stream,
+            self.addressable_manager,
+        )
+            },
+            self.stream,
+            finish_routed_media_session,
+            finish_routed_media_session,
         )
         .map_err(super::routed::construction_error)
     }

@@ -240,6 +240,7 @@ fn dropping_settled_text_completion_releases_model_authority() {
         model,
         token: sampled.completion,
         recovery: std::cell::RefCell::new(None),
+        observation: output_completion::Observation::new(),
     };
     assert!(authority.require_idle().is_err());
     completion.token.wait().unwrap();
@@ -267,6 +268,7 @@ fn successful_text_wait_retires_observation_tickets_after_runtime_contention() {
         model,
         token: sampled.completion,
         recovery: std::cell::RefCell::new(Some(sampling)),
+        observation: output_completion::Observation::new(),
     };
     let (start_tx, start_rx) = mpsc::channel();
     let (held_tx, held_rx) = mpsc::channel();
@@ -283,17 +285,18 @@ fn successful_text_wait_retires_observation_tickets_after_runtime_contention() {
             .is_some()
         });
     });
-    let result = completion.observe(true, || {
-        output_completion::token_then_model_wait(&completion.token, &completion.model)?;
-        start_tx.send(()).unwrap();
-        held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(!completion.is_complete().unwrap());
-        assert!(authority.require_idle().is_err());
-        release_tx.send(()).unwrap();
-        Ok(true)
-    });
+    // The production query is now statically closed; this fixture no longer
+    // injects an arbitrary callback into it. Hold the runtime after the actual
+    // event/model wait, while the real sampling ticket still retains authority.
+    output_completion::token_then_model_wait(&completion.token, &completion.model).unwrap();
+    start_tx.send(()).unwrap();
+    held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!completion.is_complete().unwrap());
+    assert!(authority.require_idle().is_err());
+    release_tx.send(()).unwrap();
+    let result = completion.wait();
     worker.join().unwrap();
-    assert!(result.unwrap());
+    result.unwrap();
     assert_eq!(authority.require_idle(), Ok(()));
     completion.wait().unwrap();
 }

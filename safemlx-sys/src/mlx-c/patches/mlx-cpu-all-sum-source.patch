@@ -1,0 +1,83 @@
+diff --git a/mlx/backend/cpu/reduction_storage.h b/mlx/backend/cpu/reduction_storage.h
+--- a/mlx/backend/cpu/reduction_storage.h
++++ b/mlx/backend/cpu/reduction_storage.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows };
++enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows, Float32All };
+ MLX_API bool reduction_dispatch_storage(ReductionEvalKind,size_t rank,
+     EvalDispatchStorage&) noexcept;
+ MLX_API bool reduction_eval_layout(ReductionEvalKind,size_t rank,size_t width,
+diff --git a/mlx/backend/cpu/reduction_storage.cpp b/mlx/backend/cpu/reduction_storage.cpp
+--- a/mlx/backend/cpu/reduction_storage.cpp
++++ b/mlx/backend/cpu/reduction_storage.cpp
+@@ -25,6 +25,7 @@
+     case ReductionEvalKind::BooleanAll:case ReductionEvalKind::BooleanAny:
+       if(rows!=1)return false;break;
+     case ReductionEvalKind::Float32Rows:break;
++    case ReductionEvalKind::Float32All:if(rank<2||rows!=1||width<=1)return false;break;
+     case ReductionEvalKind::Float32MinimumRows:if(width<=1)return false;break;
+     default:return false;
+   }
+@@ -35,7 +36,7 @@
+   const size_t controls=sizeof(kind)+sizeof(rank)+sizeof(width)+sizeof(rows)+sizeof(tracer)+sizeof(out)+
+       sizeof(elements)+sizeof(bytes)+sizeof(dispatch)+sizeof(common)+sizeof(value)+
+       sizeof(const array*)*3+sizeof(const Reduce*)+sizeof(const Shape*)+
+-      sizeof(size_t)*14+sizeof(bool)*4+sizeof(int)*3+sizeof(Reduce::ReduceType)+
++      sizeof(size_t)*15+sizeof(bool)*4+sizeof(int)*3+sizeof(Reduce::ReduceType)+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+
+       sizeof(submission::GraphQuota*)+sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+   if(!add(value.named_control_bytes,controls))return false;
+@@ -63,6 +64,15 @@
+     for(size_t axis=0;axis!=rank;++axis)
+       if(axes[axis]!=int(axis)||output.shape(axis)!=1)return false;
+     selected=kind==Reduce::And?ReductionEvalKind::BooleanAll:ReductionEvalKind::BooleanAny;
++  } else if(kind==Reduce::Sum&&rank>1&&axes.size()==rank) {
++    // This is the exact get_reduction_plan ContiguousAllReduce branch, not
++    // the last-axis cascade. Preserve the ordinary SIMD SumReduce order.
++    if(input.dtype()!=float32||input.itemsize()!=sizeof(float)||output.dtype()!=float32||
++        output.itemsize()!=sizeof(float)||!input.flags().contiguous||
++        input.data_size()!=elements||span!=elements||elements<=1||output.size()!=1)return false;
++    for(size_t axis=0;axis!=rank;++axis)
++      if(axes[axis]!=int(axis)||output.shape(axis)!=1)return false;
++    selected=ReductionEvalKind::Float32All;
+   } else if(kind==Reduce::Sum||kind==Reduce::Min) {
+     if(input.dtype()!=float32||input.itemsize()!=sizeof(float)||output.dtype()!=float32||
+         output.itemsize()!=sizeof(float)||!input.flags().row_contiguous||
+diff --git a/mlx/backend/cpu/reduce.cpp b/mlx/backend/cpu/reduce.cpp
+--- a/mlx/backend/cpu/reduce.cpp
++++ b/mlx/backend/cpu/reduce.cpp
+@@ -662,7 +662,8 @@
+   if(!rank||rank>4)return false;
+   switch(kind) {
+     case ReductionEvalKind::BooleanAll:case ReductionEvalKind::BooleanAny:
+-    case ReductionEvalKind::Float32Rows:case ReductionEvalKind::Float32MinimumRows:break;
++    case ReductionEvalKind::Float32Rows:case ReductionEvalKind::Float32MinimumRows:
++    case ReductionEvalKind::Float32All:break;
+     default:return false;
+   }
+   DispatchLayout task;WeakCopyStorage weak;
+@@ -684,13 +685,19 @@
+       sizeof(AxisView)+sizeof(MinReduce)*2+sizeof(simd::Simd<float,minimum_lanes>)*4+
+       sizeof(simd::Simd<bool,minimum_lanes>)*2+sizeof(float)*4+sizeof(size_t)*5+
+       sizeof(int)*5+sizeof(const float*)*2+sizeof(float*)*2;
++  // ContiguousAllReduce returns an empty plan immediately. Its fixed SIMD
++  // accumulator, SumReduce and tail locals never enter general nd_loop.
++  const size_t sum_all=sizeof(ReductionPlan)*2+sizeof(AxisView)*3+sizeof(SumReduce)*3+
++      sizeof(simd::Simd<float,minimum_lanes>)*6+sizeof(float)*6+
++      sizeof(const float*)*3+sizeof(float*)*3+sizeof(int)*4+sizeof(size_t)*3;
+   const size_t controls[]={task.controls,weak.controls,weak.controls,
+       kind==ReductionEvalKind::Float32Rows?cascade:
+-          kind==ReductionEvalKind::Float32MinimumRows?minimum:boolean,
++          kind==ReductionEvalKind::Float32MinimumRows?minimum:
++          kind==ReductionEvalKind::Float32All?sum_all:boolean,
+       sizeof(value)+sizeof(out)+sizeof(kind)+sizeof(rank)+sizeof(task)+sizeof(weak)+
+       sizeof(ReductionTask)*2+sizeof(array)*3+sizeof(Shape)*2+sizeof(Strides)+
+       sizeof(Stream)+sizeof(CommandEncoder*)+sizeof(size_t)*7+sizeof(void*)*5+
+-      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)};
++      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)+sizeof(sum_all)};
+   value.controls=sizeof(controls);
+   for(size_t control:controls) {
+     if(control>SIZE_MAX-value.controls)return false;value.controls+=control;

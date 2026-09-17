@@ -1,0 +1,23 @@
+diff --git a/mlx/backend/cpu/matmul.cpp b/mlx/backend/cpu/matmul.cpp
+--- a/mlx/backend/cpu/matmul.cpp
++++ b/mlx/backend/cpu/matmul.cpp
+@@ -245,7 +245,8 @@
+ void Matmul::eval_cpu(const ArrayVector& inputs, array& out) {
+   if(cpu_matmul()!=CpuMatmulKernel::PlatformDefault &&
+       (cpu_matmul()!=CpuMatmulKernel::Float32Tiles||
+-       (out.dtype()==float32&&!cpu::tiled_matmul_shape(inputs[0],inputs[1],out))))
++       (out.dtype()==float32&&out.size()!=0&&inputs[0].shape(-1)!=0&&
++        !cpu::tiled_matmul_shape(inputs[0],inputs[1],out))))
+     throw std::invalid_argument("[Matmul::eval_cpu] selected CPU tiled geometry is unavailable");
+   out.allocate_data(out.nbytes());
+   if (inputs[0].shape(-1) == 0) {
+@@ -262,7 +263,8 @@
+ void AddMM::eval_cpu(const ArrayVector& inputs, array& out) {
+   if(cpu_matmul()!=CpuMatmulKernel::PlatformDefault &&
+       (cpu_matmul()!=CpuMatmulKernel::Float32Tiles||
+-       (out.dtype()==float32&&!cpu::tiled_matmul_shape(inputs[0],inputs[1],out))))
++       (out.dtype()==float32&&out.size()!=0&&inputs[0].shape(-1)!=0&&
++        !cpu::tiled_matmul_shape(inputs[0],inputs[1],out))))
+     throw std::invalid_argument("[Matmul::eval_cpu] selected CPU tiled geometry is unavailable");
+   if (out.size() == 0) {
+     out.allocate_data(out.nbytes());

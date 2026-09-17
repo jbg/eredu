@@ -1,0 +1,198 @@
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -57,6 +57,22 @@
+   for (size_t i = 0; i < shapes.size(); ++i) {
+     outputs.emplace_back(std::move(shapes[i]), dtypes[i], primitive, inputs);
+   }
++  return publish_siblings(std::move(outputs));
++}
++
++ArrayVector array::make_arrays_borrowed(
++    std::span<const Shape> shapes,
++    std::span<const Dtype> dtypes,
++    const std::shared_ptr<Primitive>& primitive,
++    const ArrayVector& inputs) {
++  ArrayVector outputs;
++  for (size_t i = 0; i < shapes.size(); ++i) {
++    outputs.emplace_back(shapes[i], dtypes[i], primitive, inputs);
++  }
++  return publish_siblings(std::move(outputs));
++}
++
++ArrayVector array::publish_siblings(ArrayVector outputs) {
+   // Keep all roots alive until sibling publication is complete. If a later
+   // vector allocation fails, partially published cliques cannot be recognized
+   // by the ordinary last-external-owner cycle breaker.
+diff --git a/mlx/array.h b/mlx/array.h
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -6,6 +6,7 @@
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
++#include <span>
+ #include <vector>
+ 
+ #include "mlx/allocator.h"
+@@ -246,6 +247,14 @@
+   static ArrayVector make_arrays(
+       std::vector<Shape> shapes,
+       const std::vector<Dtype>& dtypes,
++      const std::shared_ptr<Primitive>& primitive,
++      const ArrayVector& inputs);
++
++  // Borrows the caller's output descriptors through construction and uses the
++  // same sibling publication/rollback as the owning public entry.
++  static ArrayVector make_arrays_borrowed(
++      std::span<const Shape> shapes,
++      std::span<const Dtype> dtypes,
+       const std::shared_ptr<Primitive>& primitive,
+       const ArrayVector& inputs);
+ 
+@@ -671,6 +680,7 @@
+     void init();
+   };
+ 
++  static ArrayVector publish_siblings(ArrayVector outputs);
+   friend class PreparedInputLeaf;
+   friend class PreparedHostCopySlot;
+   explicit array(std::shared_ptr<ArrayDesc> descriptor) noexcept : array_desc_(std::move(descriptor)) {}
+diff --git a/mlx/backend/common/metal_kernel.cpp b/mlx/backend/common/metal_kernel.cpp
+--- a/mlx/backend/common/metal_kernel.cpp
++++ b/mlx/backend/common/metal_kernel.cpp
+@@ -55,8 +55,8 @@
+     const std::vector<std::string>& input_names,
+     const ArrayVector& inputs,
+     const std::vector<std::string>& output_names,
+-    const std::vector<Dtype>& output_dtypes,
+-    const std::vector<std::pair<std::string, TemplateArg>>& template_args,
++    std::span<const Dtype> output_dtypes,
++    TemplateArgsView template_args,
+     const std::vector<std::string>& attributes,
+     const std::vector<std::tuple<bool, bool, bool>>& shape_infos,
+     bool atomic_outputs) {
+@@ -175,8 +175,7 @@
+   return kernel_source;
+ }
+ 
+-std::string write_template(
+-    const std::vector<std::pair<std::string, TemplateArg>>& template_args) {
++std::string write_template(TemplateArgsView template_args) {
+   std::ostringstream template_def;
+   template_def << "<";
+   int i = 0;
+@@ -254,15 +253,14 @@
+           shape_infos = std::move(shape_infos),
+           attributes = std::move(attributes)](
+              const ArrayVector& inputs,
+-             const std::vector<Shape>& output_shapes,
+-             const std::vector<Dtype>& output_dtypes,
++             std::span<const Shape> output_shapes,
++             std::span<const Dtype> output_dtypes,
+              std::tuple<int, int, int> grid,
+              std::tuple<int, int, int> threadgroup,
+-             const std::vector<std::pair<std::string, TemplateArg>>&
+-                 template_args = {},
+-             std::optional<float> init_value = std::nullopt,
+-             bool verbose = false,
+-             StreamOrDevice s_ = {}) {
++             TemplateArgsView template_args,
++             std::optional<float> init_value,
++             bool verbose,
++             StreamOrDevice s_) {
+     if (inputs.size() != input_names.size()) {
+       std::ostringstream msg;
+       msg << "[metal_kernel] Expected `inputs` to have size "
+@@ -347,9 +345,9 @@
+                 << "```" << std::endl;
+     }
+ 
+-    return array::make_arrays(
+-        std::move(output_shapes),
+-        std::move(output_dtypes),
++    return array::make_arrays_borrowed(
++        output_shapes,
++        output_dtypes,
+         submission::make_graph_primitive<CustomKernel>(
+             s,
+             std::move(kernel_name),
+@@ -407,4 +405,17 @@
+       compile_options);
+ }
+ 
++ViewCustomKernelFunction metal_kernel_view(
++    const std::string& name,
++    const std::vector<std::string>& input_names,
++    const std::vector<std::string>& output_names,
++    const std::string& source,
++    const std::string& header,
++    bool ensure_row_contiguous,
++    bool atomic_outputs,
++    const CompileOptions& compile_options) {
++  return make_metal_kernel(name, input_names, output_names, source, header,
++      ensure_row_contiguous, atomic_outputs, compile_options);
++}
++
+ } // namespace mlx::core::fast
+diff --git a/mlx/fast.h b/mlx/fast.h
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -3,6 +3,8 @@
+ #pragma once
+ 
+ #include <optional>
++#include <span>
++#include <string_view>
+ #include <variant>
+ 
+ #include "mlx/api.h"
+@@ -82,6 +84,48 @@
+     bool,
+     StreamOrDevice)>;
+ 
++// Synchronous template argument loan from either ordinary owned names or a
++// fixed caller's borrowed names. No view is retained by generated primitives.
++using NamedTemplateView = std::pair<std::string_view, TemplateArg>;
++class TemplateArgsView {
++ public:
++  TemplateArgsView(const std::vector<std::pair<std::string, TemplateArg>>& args)
++      : owned_(args.data()), count_(args.size()) {}
++  TemplateArgsView(std::span<const NamedTemplateView> args)
++      : borrowed_(args.data()), count_(args.size()) {}
++  size_t size() const noexcept { return count_; }
++  bool empty() const noexcept { return count_ == 0; }
++  NamedTemplateView operator[](size_t i) const {
++    return owned_ ? NamedTemplateView{owned_[i].first, owned_[i].second} : borrowed_[i];
++  }
++  struct Iterator {
++    const TemplateArgsView* owner;
++    size_t index;
++    NamedTemplateView operator*() const { return (*owner)[index]; }
++    Iterator& operator++() { ++index; return *this; }
++    bool operator!=(const Iterator& other) const { return index != other.index; }
++  };
++  Iterator begin() const { return {this, 0}; }
++  Iterator end() const { return {this, count_}; }
++ private:
++  const std::pair<std::string, TemplateArg>* owned_{nullptr};
++  const NamedTemplateView* borrowed_{nullptr};
++  size_t count_;
++};
++using ViewCustomKernelFunction = std::function<ArrayVector(
++    const ArrayVector&, std::span<const Shape>, std::span<const Dtype>,
++    std::tuple<int, int, int>, std::tuple<int, int, int>, TemplateArgsView,
++    std::optional<float>, bool, StreamOrDevice)>;
++MLX_API ViewCustomKernelFunction metal_kernel_view(
++    const std::string& name,
++    const std::vector<std::string>& input_names,
++    const std::vector<std::string>& output_names,
++    const std::string& source,
++    const std::string& header = "",
++    bool ensure_row_contiguous = true,
++    bool atomic_outputs = false,
++    const CompileOptions& compile_options = {});
++
+ MLX_API CustomKernelFunction metal_kernel(
+     const std::string& name,
+     const std::vector<std::string>& input_names,

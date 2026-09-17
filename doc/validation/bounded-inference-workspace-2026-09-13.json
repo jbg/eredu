@@ -1,0 +1,93 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted complete-request cold workspace composition and early admission-context validation",
+  "source_sha256": {
+    "eredu-core/src/capability.rs": "a39c7b078287a5db9b3bd95f24ea3e13599fe469ec2edd0d3e93134528278b3c",
+    "eredu-core/src/lib.rs": "33794f797e6e492949fa6fa351bf785836734ef3764bca326f1ec8b09075e4b5",
+    "eredu-core/src/inference.rs": "238b6b738c6006b3ef3885200df88d243bfe07cc6571f0943062b7b5a0d75871",
+    "eredu-runtime/src/working_memory.rs": "e6489b81fde7a6c5d5d8e543004ebcac186bcf31d59dc5bb0e2536ae6fd1327a",
+    "eredu-runtime/src/working_memory/trace.rs": "9caa40af82ef4b679235349feb1a1ced42ea64953460c401e5c0075b44934ff0",
+    "eredu-runtime/src/working_memory/inference.rs": "56137fd184abe47f9f4c9a382b3ef199980e06202cbedcc7a894023763cc35e9",
+    "eredu-runtime/src/working_memory/inference/tests.rs": "fe5dcb70ca181d9526acf07b96b1406af8f083d0a58d01ca232783bf1432fc4d",
+    "eredu-runtime/src/prefill.rs": "c0ff6c2c096be727d7b9313008e789b9045feda6cf03708b4d72d8d4a2ed9c97",
+    "eredu-runtime/tests/bounded_prefill.rs": "5669615e8c10f86e0086fc6c93403e9b42eb804566baf2778ae6c6ade9352d26",
+    "eredu-backend-mlx/src/backend/nn/workspace/host/tests.rs": "43f5c20d912e9639fa524c5d8cbbb25379ec461e8463b9e855247b20022b00b9",
+    "eredu-nn/src/workspace.rs": "989b6895dd3a337fc330a5f1c330403b490760b5e9d200dd18a766ac422f1bd0",
+    "doc/backend-architecture.md": "30701c9ed3c8b7131ad20f8515811eb29aca6ee043993fc67c135f3a5321cdde",
+    "doc/execution-control.md": "fea13abba12a11c7606e23199f36514d8665c0420636f9fe90e10e6e663e08b2",
+    "doc/bounded-inference.md": "b7449269243f5fd3b3b48ff916b2f4b550cb0126767a62ed3fa7b8e105181ae2"
+  },
+  "coverage": {
+    "unique_tests_passed": 76,
+    "qwen_trajectories": 36,
+    "qwen_request_spans": 240,
+    "qwen_cached_prefix_warmup_spans": 36,
+    "qwen_dimensions": "dense/affine; tied/untied; chunk sizes 1/3/7; all three output demands; batch two; cached prefix two; input seven; three decodes"
+  },
+  "behavior": [
+    "Uses the ordinary PrefillDriver to schedule cold prefill and inspects every reserved decode position, conservatively including one invocation per output token.",
+    "Aggregates simultaneous tensor-plus-host span peaks, preserving unknown bounds and first-gap diagnostics.",
+    "Rejects retained-state underestimates and geometry mismatches; requires every untraced outside component.",
+    "Prices nonmonotone chunk candidates through the existing shared pool; concurrent reservations compete atomically.",
+    "A late decode peak rejects every chunk that cannot fit; context and request identity reject before calling the equation provider."
+  ],
+  "validation": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib capability::",
+      "result": "pass",
+      "tests_passed": 5,
+      "ignored_native_tests": 0,
+      "log": "/private/tmp/eredu-inference-workspace-core.log",
+      "log_sha256": "252d3470e99c2ff060dcaba97e0c70e94c1b79208d476aeea202c18d48069a80"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib working_memory",
+      "result": "pass",
+      "tests_passed": 24,
+      "ignored_native_tests": 0,
+      "log": "/private/tmp/eredu-inference-workspace-runtime.log",
+      "log_sha256": "1ea24ad9dda010aa83b3bfd00a97a4b1eb2bc0fa4bf11ae649e6ecfa9bb93cbe"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test bounded_prefill",
+      "result": "pass",
+      "tests_passed": 14,
+      "ignored_native_tests": 0,
+      "log": "/private/tmp/eredu-inference-workspace-bounded-prefill.log",
+      "log_sha256": "c8526b58f800ddab68a242e190f1b24b09ca40b8b653cb223cfdf94584f130e9"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --lib --features metal,accelerate backend::nn::workspace -- --test-threads=1",
+      "result": "pass",
+      "tests_passed": 33,
+      "ignored_native_tests": 24,
+      "log": "/private/tmp/eredu-inference-workspace-backend-cold.log",
+      "log_sha256": "b279e64e6d864958749fb7e7ea118fd5b8acf182048db9ad085dc552c306e307"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --tests --features metal,accelerate",
+      "result": "pass",
+      "tests_passed": null,
+      "ignored_native_tests": 0,
+      "log": "/private/tmp/eredu-inference-workspace-backend-metal.log",
+      "log_sha256": "99f71393b9903dca098310bb446022a4bdee195ea9996f351a787195555210a6"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "result": "pass",
+      "tests_passed": null,
+      "ignored_native_tests": 0,
+      "log": "/private/tmp/eredu-inference-workspace-backend-portable.log",
+      "log_sha256": "02db5a66fa0c60ca8618bd08aac556eac4f3ec863e8630a0d353dba6a0f6e126"
+    }
+  ],
+  "measurement_scope": "Cold equation, policy and scheduler tests only. No additional native allocation, process-memory or released-checkpoint measurements.",
+  "limitations": [
+    "Production construction of exact metadata executions and cached-state capacity projections remains unfinished.",
+    "Production reservation ownership before preparation and through decode, concurrent sessions, snapshots and teardown remains unfinished.",
+    "Untraced preparation/materialization, sampling, media, speculation, observations and snapshot copies still require explicit native bounds.",
+    "Full family/path native mechanism coverage and facade configuration remain unfinished.",
+    "Managed payload bounds are distinct from total process/system memory; allocator caches and JIT bookkeeping are outside these quotes."
+  ]
+}

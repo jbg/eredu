@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_core::{
-    cache::derive_prompt_cache_architecture_fingerprint, AttentionPolicy, InputModalities,
+    AttentionPolicy, InputModalities,
     LayerSchedule,
 };
 use eredu_gguf::{MetadataArray, MetadataValue};
@@ -465,6 +465,43 @@ impl VisionConfig {
         ]
     }
 
+    /// Exact retained activation after a prefix of the released fold schedule.
+    /// Patch count comes from admitted raw images, not whole decoder length.
+    pub(crate) fn folded_shape(
+        &self,
+        patches: i32,
+        completed_units: usize,
+    ) -> Result<[i32; 5], String> {
+        let specs = self.layer_specs();
+        if patches <= 0 || completed_units == 0 || completed_units > specs.len() {
+            return Err("Inkling continuation has invalid patch count or unit endpoint".to_owned());
+        }
+        let mut shape = [patches, 2, 40, 40, 3];
+        for &(input, output, temporal, spatial) in &specs[..completed_units] {
+            if temporal <= 0
+                || spatial <= 0
+                || shape[1] % temporal != 0
+                || shape[2] % spatial != 0
+                || shape[3] % spatial != 0
+            {
+                return Err("Inkling continuation fold is not exact".to_owned());
+            }
+            let folded = temporal
+                .checked_mul(spatial)
+                .and_then(|n| n.checked_mul(spatial))
+                .and_then(|n| n.checked_mul(shape[4]))
+                .ok_or("Inkling fold channels overflowed")?;
+            if folded != input || output <= 0 {
+                return Err("Inkling continuation projection differs from released fold".to_owned());
+            }
+            shape[1] /= temporal;
+            shape[2] /= spatial;
+            shape[3] /= spatial;
+            shape[4] = output;
+        }
+        Ok(shape)
+    }
+
     /// Returns the exact physical format for one hMLP weight.
     pub fn linear_format_for(&self, name: &str) -> LinearFormat {
         self.quantized_weight_configs
@@ -793,64 +830,39 @@ impl ModelArgs {
 
     /// Stable normalized schedule and geometry identity.
     pub fn architecture_fingerprint(&self) -> String {
-        derive_prompt_cache_architecture_fingerprint(
-            "inkling",
-            [
-                ("model_type", self.model_type.clone()),
-                ("hidden", self.text_config.hidden_size.to_string()),
-                ("vocab", self.text_config.vocab_size.to_string()),
-                (
-                    "schedule",
-                    self.text_config
-                        .layer_schedule
-                        .iter()
-                        .map(|policy| format!("{:?}:{:?}", policy.attention, policy.feed_forward))
-                        .collect::<Vec<_>>()
-                        .join(","),
-                ),
-                (
-                    "state",
-                    format!(
-                        "{}:{}:{}",
-                        self.text_config.sconv_kernel_size,
-                        self.text_config.rel_extent,
-                        self.text_config.d_rel
-                    ),
-                ),
-                (
-                    "text_quantization",
-                    format!(
-                        "default={:?};overrides={}",
-                        self.text_config.weight_quantization,
-                        crate::cache_identity::debug_map(
-                            self.text_config.quantized_weight_configs.as_ref()
-                        )
-                    ),
-                ),
-                (
-                    "vision_quantization",
-                    self.vision_config.as_ref().map_or_else(
-                        || "none".into(),
-                        |config| {
-                            crate::cache_identity::debug_map(
-                                config.quantized_weight_configs.as_ref(),
-                            )
-                        },
-                    ),
-                ),
-                (
-                    "audio_quantization",
-                    self.audio_config.as_ref().map_or_else(
-                        || "none".into(),
-                        |config| {
-                            crate::cache_identity::debug_map(
-                                config.quantized_weight_configs.as_ref(),
-                            )
-                        },
-                    ),
-                ),
-            ],
-        )
+        self.architecture_fingerprint_with_metadata(crate::decoder::identity::Metadata::new(None))
+            .expect("ordinary fingerprint formatting is infallible")
+    }
+
+    pub(crate) fn architecture_fingerprint_with_metadata(
+        &self, metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<String, eredu_nn::Error> {
+        metadata.controls::<(&Self, Vec<String>, Option<String>)>()?;
+        metadata.fingerprint("inkling", || {
+            let mut schedule = metadata.vector(self.text_config.layer_schedule.len())?;
+            for policy in self.text_config.layer_schedule.iter() {
+                schedule.push(metadata.format(format_args!("{:?}:{:?}", policy.attention, policy.feed_forward))?);
+            }
+            let text_formats = crate::cache_identity::debug_map_with_metadata(
+                self.text_config.quantized_weight_configs.as_ref(), metadata)?;
+            Ok([
+                ("model_type", metadata.text(&self.model_type)?),
+                ("hidden", metadata.format(format_args!("{}", self.text_config.hidden_size))?),
+                ("vocab", metadata.format(format_args!("{}", self.text_config.vocab_size))?),
+                ("schedule", metadata.join(&schedule, ",")?),
+                ("state", metadata.format(format_args!("{}:{}:{}", self.text_config.sconv_kernel_size,
+                    self.text_config.rel_extent, self.text_config.d_rel))?),
+                ("text_quantization", metadata.format(format_args!("default={:?};overrides={}", self.text_config.weight_quantization, text_formats))?),
+                ("vision_quantization", match self.vision_config.as_ref() {
+                    Some(config) => crate::cache_identity::debug_map_with_metadata(config.quantized_weight_configs.as_ref(), metadata)?,
+                    None => metadata.text("none")?,
+                }),
+                ("audio_quantization", match self.audio_config.as_ref() {
+                    Some(config) => crate::cache_identity::debug_map_with_metadata(config.quantized_weight_configs.as_ref(), metadata)?,
+                    None => metadata.text("none")?,
+                }),
+            ])
+        })
     }
 
     pub(crate) fn validate(&self) -> Result<(), ConfigError> {

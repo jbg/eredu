@@ -1,14 +1,31 @@
 use crate::convert::{
     affine_shapes, conversion_kind, iquant_packed_shape, mxfp4_shapes, ConversionKind,
 };
+use crate::reader::{CatalogReader, FileReader};
+use crate::reader::{RawStorage, ReadDestinationError};
+use crate::PreparedHeader;
 use crate::{
     ConvertedTensor, DenseDtype, DenseTensorSpan, DenseTensorSpanPlan, Endian, Error, Limits,
     MetadataValue, Reader, Result, TensorDescriptor, TensorSelection, TensorSelectionPlan,
 };
 use std::collections::{BTreeMap, HashMap};
+#[cfg(test)]
 use std::fs::File;
-use std::io::BufReader;
+
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+mod materializer_index;
+mod metadata_destination;
+mod reader_storage;
+use materializer_index::MaterializerIndex;
+use metadata_destination::MetadataPolicy;
+pub use metadata_destination::{
+    MetadataLayouts, MetadataPreparationFailure, MetadataSelection, PreparedTensorMetadata,
+    SharedTensorMetadataSource, StoredCheckpointTensor, StoredMetadataFailure, StoredOutputNames,
+    StoredTensorMetadata, StoredTensorPair, TensorMetadataSource,
+};
+use reader_storage::{open_with_reader_storage, ReaderStorage};
 
 const SPLIT_NO: &str = "split.no";
 const SPLIT_COUNT: &str = "split.count";
@@ -89,9 +106,15 @@ pub struct CatalogShard {
     endian: Endian,
     alignment: u64,
     tensors: Vec<CatalogTensor>,
+    prepared_header: Option<Arc<PreparedHeader>>,
 }
 
 impl CatalogShard {
+    /// Actual cold header capability, if this source explicitly fixes reopened header bytes.
+    pub fn prepared_header(&self) -> Option<&PreparedHeader> {
+        self.prepared_header.as_deref()
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -230,11 +253,13 @@ pub struct ConvertedTensorIter<'a> {
     checkpoint: &'a Checkpoint,
     shard_index: usize,
     tensor_index: usize,
-    reader: Option<Reader<BufReader<File>>>,
+    reader: Option<CatalogReader<FileReader>>,
     finished: bool,
+    header_scratch: Vec<u8>,
+    reader_storage: ReaderStorage,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TensorLocation {
     shard_index: usize,
     tensor_index: usize,
@@ -242,13 +267,40 @@ struct TensorLocation {
 
 /// Indexed materializer that reuses the currently open GGUF shard reader.
 ///
-/// Name lookup is constant-time after construction. Consecutive requests from
-/// the same shard reuse one parsed reader; switching shards closes the previous
-/// reader before opening the next, so file-descriptor use remains bounded.
+/// Ordinary constructors use a hash index; explicit coordinate constructors
+/// binary-search retained physical names. Consecutive requests from the same
+/// shard reuse one parsed reader. Switching shards opens and validates
+/// the replacement before retiring the previous reader; an outer cache can call
+/// the explicit close operation first when enforcing its reader ceiling.
 pub struct TensorMaterializer {
-    checkpoint: Checkpoint,
-    locations: HashMap<String, TensorLocation>,
-    reader: Option<(usize, Reader<BufReader<File>>)>,
+    locations: MaterializerIndex,
+    reader: Option<(usize, CatalogReader<FileReader>)>,
+    header_scratch: Vec<u8>,
+    reader_storage: ReaderStorage,
+    // Shared custody retires after index, reader and scratch storage.
+    checkpoint: MaterializerCheckpoint,
+}
+
+// Ordinary constructors retain their original inline owner. Only an explicit
+// cold sharing request introduces the one Arc allocation; the actual checkpoint
+// and all of its name/descriptor allocations move without cloning.
+enum MaterializerCheckpoint {
+    Owned(Checkpoint),
+    Shared(prepared_materializer::SharedCheckpoint),
+}
+impl std::ops::Deref for MaterializerCheckpoint {
+    type Target = Checkpoint;
+    fn deref(&self) -> &Checkpoint {
+        match self {
+            Self::Owned(checkpoint) => checkpoint,
+            Self::Shared(checkpoint) => checkpoint,
+        }
+    }
+}
+impl From<Checkpoint> for MaterializerCheckpoint {
+    fn from(checkpoint: Checkpoint) -> Self {
+        Self::Owned(checkpoint)
+    }
 }
 
 impl std::fmt::Debug for TensorMaterializer {
@@ -289,9 +341,27 @@ impl Checkpoint {
     }
 
     pub fn open_with_limits(path: impl AsRef<Path>, limits: Limits) -> Result<Self> {
+        Self::open_policy(path.as_ref(), limits, false)
+    }
+    /// Opens a source whose later successful header reads must match these actual cold bytes.
+    ///
+    /// Unlike ordinary sources, even otherwise valid metadata changes are rejected.
+    /// Payload bytes and filesystem identity are not made immutable. Capture storage
+    /// is cold source ownership, not a complete parser or request bound.
+    pub fn open_with_prepared_headers(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_prepared_headers_and_limits(path, Limits::default())
+    }
+    /// Uses explicit parser limits with the prepared-header source contract.
+    pub fn open_with_prepared_headers_and_limits(
+        path: impl AsRef<Path>,
+        limits: Limits,
+    ) -> Result<Self> {
+        Self::open_policy(path.as_ref(), limits, true)
+    }
+    fn open_policy(path: &Path, limits: Limits, capture: bool) -> Result<Self> {
         let path = path.as_ref();
         validate_extension(path)?;
-        let first = open_reader(path, limits.clone())?;
+        let first = open_catalog_reader(path, limits.clone(), capture)?;
         let metadata = first.metadata().clone();
         let split_count = split_value(&metadata, SPLIT_COUNT)?.unwrap_or(0);
         if split_count <= 1 {
@@ -322,6 +392,7 @@ impl Checkpoint {
                     version: first.version(),
                     endian: first.endian(),
                     alignment: first.alignment(),
+                    prepared_header: first.captured_header().cloned(),
                     tensors,
                 }],
                 limits,
@@ -350,6 +421,7 @@ impl Checkpoint {
             version: first.version(),
             endian: first.endian(),
             alignment: first.alignment(),
+            prepared_header: first.captured_header().cloned(),
             tensors: first_tensors,
         });
 
@@ -360,7 +432,7 @@ impl Checkpoint {
                     shard_path.display()
                 )));
             }
-            let reader = open_reader(&shard_path, limits.clone())?;
+            let reader = open_catalog_reader(&shard_path, limits.clone(), capture)?;
             let shard_metadata = reader.metadata();
             let actual_split_no = required_split_value(shard_metadata, SPLIT_NO, &shard_path)?;
             if actual_split_no != split_no {
@@ -405,6 +477,7 @@ impl Checkpoint {
                 version: reader.version(),
                 endian: reader.endian(),
                 alignment: reader.alignment(),
+                prepared_header: reader.captured_header().cloned(),
                 tensors,
             });
         }
@@ -451,13 +524,59 @@ impl Checkpoint {
             tensor_index: 0,
             reader: None,
             finished: false,
+            header_scratch: self.header_scratch(),
+            reader_storage: ReaderStorage::Ordinary,
         }
     }
 
     /// Create an indexed named-tensor materializer with bounded reader reuse.
     pub fn materializer(&self) -> TensorMaterializer {
-        let locations = self
+        let locations = self.materializer_locations();
+        TensorMaterializer {
+            header_scratch: self.header_scratch(),
+            reader_storage: ReaderStorage::Ordinary,
+            checkpoint: self.clone().into(),
+            locations: locations.into(),
+            reader: None,
+        }
+    }
+
+    /// Create a lazy named-tensor materializer by moving this owned catalog.
+    ///
+    /// The physical-name index is constructed in the same order as
+    /// [`Self::materializer`], without cloning the retained checkpoint metadata.
+    pub fn into_materializer(self) -> TensorMaterializer {
+        let locations = self.materializer_locations();
+        TensorMaterializer {
+            header_scratch: self.header_scratch(),
+            reader_storage: ReaderStorage::Ordinary,
+            checkpoint: self.into(),
+            locations: locations.into(),
+            reader: None,
+        }
+    }
+
+    /// Move this catalog into one shared immutable owner for metadata loans
+    /// that must outlive a mutable reader-cache borrow. The existing index and
+    /// scratch construction are unchanged. This adds one cold Arc allocation;
+    /// it does not qualify that allocation or grant source/admission authority.
+    pub fn into_shared_materializer(self) -> TensorMaterializer {
+        self.into_materializer().share_catalog()
+    }
+
+    fn header_scratch(&self) -> Vec<u8> {
+        let bytes = self
             .shards
+            .iter()
+            .filter_map(|s| s.prepared_header.as_ref())
+            .map(|h| h.scratch_len())
+            .max()
+            .unwrap_or(0);
+        vec![0; bytes]
+    }
+
+    fn materializer_locations(&self) -> HashMap<String, TensorLocation> {
+        self.shards
             .iter()
             .enumerate()
             .flat_map(|(shard_index, shard)| {
@@ -475,12 +594,7 @@ impl Checkpoint {
                         )
                     })
             })
-            .collect();
-        TensorMaterializer {
-            checkpoint: self.clone(),
-            locations,
-            reader: None,
-        }
+            .collect()
     }
 
     /// Materialize and visit one physical GGUF tensor at a time.
@@ -530,17 +644,36 @@ impl Checkpoint {
 }
 
 impl TensorMaterializer {
+    /// Actual independent initialized parser-scratch backing layout. This excludes
+    /// immutable shared headers and all allocator, map, reader and native controls.
+    pub fn prepared_header_scratch_layout(&self) -> Option<std::alloc::Layout> {
+        std::alloc::Layout::array::<u8>(self.header_scratch.capacity()).ok()
+    }
+
     /// Path of the shard containing `name`, without opening its payload reader.
     pub fn shard_path_for_tensor(&self, name: &str) -> Result<&Path> {
-        let location = self
-            .locations
-            .get(name)
-            .copied()
-            .ok_or_else(|| Error::InvalidTensor {
-                tensor: name.to_string(),
-                reason: "tensor is not present in the checkpoint".into(),
-            })?;
-        Ok(&self.checkpoint.shards[location.shard_index].path)
+        self.shard_source_for_tensor(name).map(|(_, path)| path)
+    }
+
+    /// Borrow the immutable catalog shards retained by this materializer.
+    /// Indices refer only to this catalog; they grant no source admission authority.
+    pub fn shards(&self) -> &[CatalogShard] {
+        &self.checkpoint.shards
+    }
+
+    /// Borrow the actual shard index and path for a physical tensor, without I/O.
+    pub fn shard_source_for_tensor(&self, name: &str) -> Result<(usize, &Path)> {
+        let location =
+            self.locations
+                .get(name, &self.checkpoint)
+                .ok_or_else(|| Error::InvalidTensor {
+                    tensor: name.to_string(),
+                    reason: "tensor is not present in the checkpoint".into(),
+                })?;
+        Ok((
+            location.shard_index,
+            &self.checkpoint.shards[location.shard_index].path,
+        ))
     }
 
     /// Path of the currently cached shard reader, if any.
@@ -552,127 +685,310 @@ impl TensorMaterializer {
 
     /// Close the currently cached shard reader.
     pub fn close_reader(&mut self) -> Option<PathBuf> {
-        let (index, _) = self.reader.take()?;
+        let index = self.take_reader_index()?;
         Some(self.checkpoint.shards[index].path.clone())
     }
 
-    fn location_and_reader(
-        &mut self,
-        name: &str,
-    ) -> Result<(TensorLocation, TensorDescriptor, Endian)> {
-        let location = self
-            .locations
-            .get(name)
-            .copied()
-            .ok_or_else(|| Error::InvalidTensor {
-                tensor: name.to_string(),
-                reason: "tensor is not present in the checkpoint".into(),
-            })?;
+    /// Close the cached reader without allocating an owned copy of its path.
+    ///
+    /// Returns whether a reader was present. Its file, input buffer and parsed
+    /// header are retired before this method returns.
+    pub fn close_reader_without_path(&mut self) -> bool {
+        self.take_reader_index().is_some()
+    }
+
+    fn take_reader_index(&mut self) -> Option<usize> {
+        let (index, reader) = self.reader.take()?;
+        self.reader_storage.retire(reader);
+        Some(index)
+    }
+
+    fn location_and_open(&mut self, name: &str) -> Result<(TensorLocation, Endian)> {
+        let location =
+            self.locations
+                .get(name, &self.checkpoint)
+                .ok_or_else(|| Error::InvalidTensor {
+                    tensor: name.to_string(),
+                    reason: "tensor is not present in the checkpoint".into(),
+                })?;
         let shard = &self.checkpoint.shards[location.shard_index];
         if self
             .reader
             .as_ref()
             .is_none_or(|(shard_index, _)| *shard_index != location.shard_index)
         {
-            let reader = validate_reopened_shard(
-                open_reader(&shard.path, self.checkpoint.limits.clone())?,
+            let reader = open_with_reader_storage(
                 shard,
+                self.checkpoint.limits.clone(),
+                &mut self.header_scratch,
+                &mut self.reader_storage,
             )?;
-            self.reader = Some((location.shard_index, reader));
+            if let Some((_, previous)) = self.reader.replace((location.shard_index, reader)) {
+                self.reader_storage.retire(previous);
+            }
         }
+        Ok((location, shard.endian))
+    }
+    fn location_and_reader(
+        &mut self,
+        name: &str,
+    ) -> Result<(TensorLocation, TensorDescriptor, Endian)> {
+        let (location, endian) = self.location_and_open(name)?;
         Ok((
             location,
-            shard.tensors[location.tensor_index].descriptor.clone(),
-            shard.endian,
+            self.checkpoint.shards[location.shard_index].tensors[location.tensor_index]
+                .descriptor
+                .clone(),
+            endian,
         ))
-    }
-
-    fn catalog_output_names(&self, location: TensorLocation) -> Vec<String> {
-        self.checkpoint.shards[location.shard_index].tensors[location.tensor_index]
-            .outputs
-            .iter()
-            .map(|output| output.name.clone())
-            .collect()
     }
 
     /// Materialize one physical tensor by its GGUF name.
     pub fn converted_tensor(&mut self, name: &str) -> Result<ConvertedCheckpointTensor> {
-        let (location, descriptor, _) = self.location_and_reader(name)?;
-        let output_names = self.catalog_output_names(location);
-        let converted = self
-            .reader
-            .as_mut()
-            .expect("requested shard reader opened above")
-            .1
-            .read_tensor(&descriptor)
-            .map_err(|source| Error::Shard {
-                path: self.checkpoint.shards[location.shard_index].path.clone(),
-                source: Box::new(source),
-            })?;
-        Ok(ConvertedCheckpointTensor {
-            shard_index: location.shard_index,
-            tensor_index: location.tensor_index,
-            descriptor,
-            output_names,
-            converted,
-        })
+        self.converted_tensor_with_storage(name, RawStorage::Ordinary, None, None)
+            .map_err(ReadDestinationError::ordinary)
     }
-
-    /// Materialize a bounded selection along one logical row-major tensor axis.
+    /// Materialize a bounded physical axis selection.
     pub fn converted_tensor_selected(
         &mut self,
         name: &str,
         selection: &TensorSelection,
     ) -> Result<ConvertedCheckpointTensor> {
-        let (location, mut descriptor, _) = self.location_and_reader(name)?;
-        let output_names = self.catalog_output_names(location);
-        let plan = TensorSelectionPlan::new(&descriptor, selection.clone())?;
-        let converted = self
-            .reader
-            .as_mut()
-            .expect("requested shard reader opened above")
-            .1
-            .read_tensor_plan(&plan)
-            .map_err(|source| Error::Shard {
-                path: self.checkpoint.shards[location.shard_index].path.clone(),
-                source: Box::new(source),
-            })?;
-        descriptor = plan.selected_descriptor().clone();
-        Ok(ConvertedCheckpointTensor {
-            shard_index: location.shard_index,
-            tensor_index: location.tensor_index,
-            descriptor,
-            output_names,
-            converted,
-        })
+        self.converted_tensor_selected_with_storage(
+            name,
+            selection,
+            RawStorage::Ordinary,
+            None,
+            None,
+        )
+        .map_err(ReadDestinationError::ordinary)
     }
-
-    /// Materialize one bounded contiguous span from an unquantized dense tensor.
+    /// Materialize a block-aligned contiguous physical span.
     pub fn converted_dense_tensor_span(
         &mut self,
         name: &str,
         selection: &DenseTensorSpan,
     ) -> Result<ConvertedCheckpointTensor> {
-        let (location, descriptor, _) = self.location_and_reader(name)?;
-        let output_names = self.catalog_output_names(location);
-        let plan = DenseTensorSpanPlan::new(&descriptor, selection.clone())?;
+        self.converted_dense_tensor_span_with_storage(
+            name,
+            selection,
+            RawStorage::Ordinary,
+            None,
+            None,
+        )
+        .map_err(ReadDestinationError::ordinary)
+    }
+    /// Reuses the actual cached reader and ordinary conversion with exact raw storage.
+    /// Header reuse follows the source contract. Plans, names and converted
+    /// outputs in this raw-only call retain their ordinary storage.
+    pub fn converted_tensor_with_raw_destination(
+        &mut self,
+        name: &str,
+        raw: &mut [u8],
+    ) -> std::result::Result<ConvertedCheckpointTensor, ReadDestinationError> {
+        self.converted_tensor_with_storage(name, RawStorage::Borrowed(raw), None, None)
+    }
+    /// Materializes the actual axis plan with an exact borrowed encoded buffer.
+    pub fn converted_tensor_selected_with_raw_destination(
+        &mut self,
+        name: &str,
+        selection: &TensorSelection,
+        raw: &mut [u8],
+    ) -> std::result::Result<ConvertedCheckpointTensor, ReadDestinationError> {
+        self.converted_tensor_selected_with_storage(
+            name,
+            selection,
+            RawStorage::Borrowed(raw),
+            None,
+            None,
+        )
+    }
+    /// Materializes the actual contiguous plan with exact borrowed encoded storage.
+    pub fn converted_dense_tensor_span_with_raw_destination(
+        &mut self,
+        name: &str,
+        selection: &DenseTensorSpan,
+        raw: &mut [u8],
+    ) -> std::result::Result<ConvertedCheckpointTensor, ReadDestinationError> {
+        self.converted_dense_tensor_span_with_storage(
+            name,
+            selection,
+            RawStorage::Borrowed(raw),
+            None,
+            None,
+        )
+    }
+    /// Materialize one physical tensor by its GGUF name.
+    fn converted_tensor_with_storage(
+        &mut self,
+        name: &str,
+        storage: RawStorage<'_>,
+        conversion: Option<&mut crate::PreparedConversion>,
+        destination: Option<&mut PreparedTensorMetadata>,
+    ) -> std::result::Result<ConvertedCheckpointTensor, ReadDestinationError> {
+        self.converted_tensor_worker(name, storage, conversion, MetadataPolicy::new(destination))
+    }
+    fn converted_tensor_worker<'a, C: crate::reader::ConversionDestination>(
+        &mut self,
+        name: &str,
+        storage: RawStorage<'_>,
+        conversion: C,
+        mut metadata: MetadataPolicy<'a>,
+    ) -> std::result::Result<
+        <C::Output as metadata_destination::CatalogOutput>::Result,
+        ReadDestinationError,
+    >
+    where
+        C::Output: metadata_destination::CatalogOutput,
+    {
+        use metadata_destination::CatalogOutput;
+        let (location, endian) = self.location_and_open(name)?;
+        let descriptor = metadata.base(
+            &self.checkpoint.shards[location.shard_index].tensors[location.tensor_index].descriptor,
+            location,
+            endian,
+        )?;
+        let output_names = metadata.names(
+            &self.checkpoint.shards[location.shard_index].tensors[location.tensor_index].outputs,
+        )?;
+        metadata.full()?;
         let converted = self
             .reader
             .as_mut()
             .expect("requested shard reader opened above")
             .1
-            .read_dense_tensor_span(&plan)
-            .map_err(|source| Error::Shard {
-                path: self.checkpoint.shards[location.shard_index].path.clone(),
-                source: Box::new(source),
+            .read_tensor_view_with_storage(descriptor.view(), storage, conversion)
+            .map_err(|source| {
+                source.with_shard(&self.checkpoint.shards[location.shard_index].path)
             })?;
-        Ok(ConvertedCheckpointTensor {
-            shard_index: location.shard_index,
-            tensor_index: location.tensor_index,
-            descriptor: plan.selected_descriptor().clone(),
+        let converted = converted.park(&mut metadata);
+        Ok(C::Output::finish(
+            location,
+            descriptor,
             output_names,
             converted,
-        })
+        ))
+    }
+
+    /// Materialize a bounded selection along one logical row-major tensor axis.
+    fn converted_tensor_selected_with_storage(
+        &mut self,
+        name: &str,
+        selection: &TensorSelection,
+        storage: RawStorage<'_>,
+        conversion: Option<&mut crate::PreparedConversion>,
+        destination: Option<&mut PreparedTensorMetadata>,
+    ) -> std::result::Result<ConvertedCheckpointTensor, ReadDestinationError> {
+        self.converted_tensor_selected_worker(
+            name,
+            selection,
+            storage,
+            conversion,
+            MetadataPolicy::new(destination),
+        )
+    }
+    fn converted_tensor_selected_worker<'a, C: crate::reader::ConversionDestination>(
+        &mut self,
+        name: &str,
+        selection: &TensorSelection,
+        storage: RawStorage<'_>,
+        conversion: C,
+        mut metadata: MetadataPolicy<'a>,
+    ) -> std::result::Result<
+        <C::Output as metadata_destination::CatalogOutput>::Result,
+        ReadDestinationError,
+    >
+    where
+        C::Output: metadata_destination::CatalogOutput,
+    {
+        use metadata_destination::CatalogOutput;
+        let (location, endian) = self.location_and_open(name)?;
+        let mut descriptor = metadata.base(
+            &self.checkpoint.shards[location.shard_index].tensors[location.tensor_index].descriptor,
+            location,
+            endian,
+        )?;
+        let output_names = metadata.names(
+            &self.checkpoint.shards[location.shard_index].tensors[location.tensor_index].outputs,
+        )?;
+        let plan = metadata.axis(&descriptor, selection)?;
+        let converted = self
+            .reader
+            .as_mut()
+            .expect("requested shard reader opened above")
+            .1
+            .read_tensor_plan_with_storage(plan.view(), storage, conversion)
+            .map_err(|source| {
+                source.with_shard(&self.checkpoint.shards[location.shard_index].path)
+            })?;
+        let converted = converted.park(&mut metadata);
+        descriptor = metadata.selected(plan.selected_descriptor())?;
+        Ok(C::Output::finish(
+            location,
+            descriptor,
+            output_names,
+            converted,
+        ))
+    }
+
+    /// Materialize one bounded contiguous span from an unquantized dense tensor.
+    fn converted_dense_tensor_span_with_storage(
+        &mut self,
+        name: &str,
+        selection: &DenseTensorSpan,
+        storage: RawStorage<'_>,
+        conversion: Option<&mut crate::PreparedConversion>,
+        destination: Option<&mut PreparedTensorMetadata>,
+    ) -> std::result::Result<ConvertedCheckpointTensor, ReadDestinationError> {
+        self.converted_dense_tensor_span_worker(
+            name,
+            selection,
+            storage,
+            conversion,
+            MetadataPolicy::new(destination),
+        )
+    }
+    fn converted_dense_tensor_span_worker<'a, C: crate::reader::ConversionDestination>(
+        &mut self,
+        name: &str,
+        selection: &DenseTensorSpan,
+        storage: RawStorage<'_>,
+        conversion: C,
+        mut metadata: MetadataPolicy<'a>,
+    ) -> std::result::Result<
+        <C::Output as metadata_destination::CatalogOutput>::Result,
+        ReadDestinationError,
+    >
+    where
+        C::Output: metadata_destination::CatalogOutput,
+    {
+        use metadata_destination::CatalogOutput;
+        let (location, endian) = self.location_and_open(name)?;
+        let descriptor = metadata.base(
+            &self.checkpoint.shards[location.shard_index].tensors[location.tensor_index].descriptor,
+            location,
+            endian,
+        )?;
+        let output_names = metadata.names(
+            &self.checkpoint.shards[location.shard_index].tensors[location.tensor_index].outputs,
+        )?;
+        let plan = metadata.span(&descriptor, selection)?;
+        let converted = self
+            .reader
+            .as_mut()
+            .expect("requested shard reader opened above")
+            .1
+            .read_dense_tensor_span_with_storage(plan.view(), storage, conversion)
+            .map_err(|source| {
+                source.with_shard(&self.checkpoint.shards[location.shard_index].path)
+            })?;
+        let converted = converted.park(&mut metadata);
+        Ok(C::Output::finish(
+            location,
+            metadata.selected(plan.selected_descriptor())?,
+            output_names,
+            converted,
+        ))
     }
 
     /// Materialize one physical tensor without converting its native encoding.
@@ -713,13 +1029,18 @@ impl Iterator for ConvertedTensorIter<'_> {
             if self.tensor_index >= shard.tensors.len() {
                 self.shard_index += 1;
                 self.tensor_index = 0;
-                self.reader = None;
+                if let Some(reader) = self.reader.take() {
+                    self.reader_storage.retire(reader);
+                }
                 continue;
             }
             if self.reader.is_none() {
-                match open_reader(&shard.path, self.checkpoint.limits.clone())
-                    .and_then(|reader| validate_reopened_shard(reader, shard))
-                {
+                match open_with_reader_storage(
+                    shard,
+                    self.checkpoint.limits.clone(),
+                    &mut self.header_scratch,
+                    &mut self.reader_storage,
+                ) {
                     Ok(reader) => self.reader = Some(reader),
                     Err(error) => {
                         self.finished = true;
@@ -757,10 +1078,19 @@ impl Iterator for ConvertedTensorIter<'_> {
     }
 }
 
+#[cfg(test)]
 fn validate_reopened_shard(
-    reader: Reader<BufReader<File>>,
+    reader: CatalogReader<FileReader>,
     shard: &CatalogShard,
-) -> Result<Reader<BufReader<File>>> {
+) -> Result<CatalogReader<FileReader>> {
+    validate_reopened_shard_ref(&reader, shard)?;
+    Ok(reader)
+}
+
+fn validate_reopened_shard_ref(
+    reader: &CatalogReader<FileReader>,
+    shard: &CatalogShard,
+) -> Result<()> {
     let unchanged = reader.version() == shard.version
         && reader.endian() == shard.endian
         && reader.alignment() == shard.alignment
@@ -771,7 +1101,7 @@ fn validate_reopened_shard(
             .zip(&shard.tensors)
             .all(|(actual, cataloged)| actual == &cataloged.descriptor);
     if unchanged {
-        Ok(reader)
+        Ok(())
     } else {
         Err(shard_error(format!(
             "GGUF shard {:?} changed after the checkpoint was opened",
@@ -993,13 +1323,199 @@ fn validate_extension(path: &Path) -> Result<()> {
     }
 }
 
-fn open_reader(path: &Path, limits: Limits) -> Result<Reader<std::io::BufReader<std::fs::File>>> {
-    Reader::open_with_limits(path, limits).map_err(|source| Error::Shard {
-        path: path.to_path_buf(),
-        source: Box::new(source),
-    })
+fn open_catalog_reader(
+    path: &Path,
+    limits: Limits,
+    capture: bool,
+) -> Result<CatalogReader<FileReader>> {
+    if capture {
+        CatalogReader::open_captured(path, limits)
+            .map(CatalogReader::into_file_reader)
+            .map_err(|source| Error::Shard {
+                path: path.to_path_buf(),
+                source: Box::new(source),
+            })
+    } else {
+        open_reader(path, limits)
+    }
+}
+fn open_reopened_reader(
+    shard: &CatalogShard,
+    limits: Limits,
+    scratch: &mut [u8],
+) -> Result<CatalogReader<FileReader>> {
+    if let Some(header) = &shard.prepared_header {
+        CatalogReader::open_prepared(&shard.path, limits, header, scratch)
+            .map(CatalogReader::into_file_reader)
+            .map_err(|source| Error::Shard {
+                path: shard.path.to_path_buf(),
+                source: Box::new(source),
+            })
+    } else {
+        open_reader(&shard.path, limits)
+    }
+}
+
+fn open_reader(path: &Path, limits: Limits) -> Result<CatalogReader<FileReader>> {
+    Reader::open_with_limits(path, limits)
+        .map(CatalogReader::ordinary)
+        .map(CatalogReader::into_file_reader)
+        .map_err(|source| Error::Shard {
+            path: path.to_path_buf(),
+            source: Box::new(source),
+        })
 }
 
 fn shard_error(message: impl Into<String>) -> Error {
     Error::InvalidShardSet(message.into())
 }
+
+impl TensorMaterializer {
+    /// Executes the original read and conversion using both prepared destinations.
+    /// Result metadata remains owning. Header reuse follows the source contract,
+    /// and cache ownership and operation order are unchanged.
+    pub fn converted_tensor_with_destinations(
+        &mut self,
+        name: &str,
+        raw: &mut [u8],
+        conversion: &mut crate::PreparedConversion,
+    ) -> std::result::Result<ConvertedCheckpointTensor, ReadDestinationError> {
+        self.converted_tensor_with_storage(name, RawStorage::Borrowed(raw), Some(conversion), None)
+    }
+    /// Executes the original read and conversion using both prepared destinations.
+    /// Result metadata remains owning. Header reuse follows the source contract,
+    /// and cache ownership and operation order are unchanged.
+    pub fn converted_tensor_selected_with_destinations(
+        &mut self,
+        name: &str,
+        selection: &TensorSelection,
+        raw: &mut [u8],
+        conversion: &mut crate::PreparedConversion,
+    ) -> std::result::Result<ConvertedCheckpointTensor, ReadDestinationError> {
+        self.converted_tensor_selected_with_storage(
+            name,
+            selection,
+            RawStorage::Borrowed(raw),
+            Some(conversion),
+            None,
+        )
+    }
+    /// Executes the original read and conversion using both prepared destinations.
+    /// Result metadata remains owning. Header reuse follows the source contract,
+    /// and cache ownership and operation order are unchanged.
+    pub fn converted_dense_tensor_span_with_destinations(
+        &mut self,
+        name: &str,
+        selection: &DenseTensorSpan,
+        raw: &mut [u8],
+        conversion: &mut crate::PreparedConversion,
+    ) -> std::result::Result<ConvertedCheckpointTensor, ReadDestinationError> {
+        self.converted_dense_tensor_span_with_storage(
+            name,
+            selection,
+            RawStorage::Borrowed(raw),
+            Some(conversion),
+            None,
+        )
+    }
+}
+
+impl TensorMaterializer {
+    /// Executes the original full/selected driver using complete prepared result metadata.
+    /// Reopen validation, physical planning, read and conversion ordering are unchanged.
+    pub fn converted_tensor_with_metadata(
+        &mut self,
+        name: &str,
+        selection: MetadataSelection<'_>,
+        raw: &mut [u8],
+        conversion: &mut crate::PreparedConversion,
+        metadata: &mut PreparedTensorMetadata,
+    ) -> std::result::Result<ConvertedCheckpointTensor, ReadDestinationError> {
+        match selection {
+            MetadataSelection::Full => self.converted_tensor_with_storage(
+                name,
+                RawStorage::Borrowed(raw),
+                Some(conversion),
+                Some(metadata),
+            ),
+            MetadataSelection::Axis(selection) => self.converted_tensor_selected_with_storage(
+                name,
+                selection,
+                RawStorage::Borrowed(raw),
+                Some(conversion),
+                Some(metadata),
+            ),
+            MetadataSelection::Span(selection) => self.converted_dense_tensor_span_with_storage(
+                name,
+                selection,
+                RawStorage::Borrowed(raw),
+                Some(conversion),
+                Some(metadata),
+            ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod cache_controls_tests;
+
+#[cfg(test)]
+mod header_reuse_tests;
+
+impl TensorMaterializer {
+    /// Executes the unchanged full/axis/span driver into supplied output owners.
+    /// The caller retains conversion buffers, completed output and all metadata
+    /// through any read, conversion or late final-descriptor refusal.
+    pub(crate) fn converted_tensor_with_supplied_metadata<F: crate::StorageFamily>(
+        &mut self,
+        name: &str,
+        selection: MetadataSelection<'_>,
+        raw: &mut [u8],
+        conversion: &mut crate::StoredConversion<F>,
+        metadata: &mut StoredTensorMetadata<F>,
+    ) -> std::result::Result<(), ReadDestinationError> {
+        let policy = metadata.policy();
+        let result = match selection {
+            MetadataSelection::Full => {
+                self.converted_tensor_worker(name, RawStorage::Borrowed(raw), conversion, policy)
+            }
+            MetadataSelection::Axis(selection) => self.converted_tensor_selected_worker(
+                name,
+                selection,
+                RawStorage::Borrowed(raw),
+                conversion,
+                policy,
+            ),
+            MetadataSelection::Span(selection) => self.converted_dense_tensor_span_worker(
+                name,
+                selection,
+                RawStorage::Borrowed(raw),
+                conversion,
+                policy,
+            ),
+        };
+        if result.is_ok() {
+            metadata.mark_completed();
+        }
+        result
+    }
+}
+
+impl TensorMaterializer {
+    /// Execute the ordinary selected read/conversion/metadata driver into one
+    /// private destination pair. Failure preserves that same pair, including
+    /// completed conversion before any late metadata refusal.
+    pub fn converted_tensor_with_stored_pair<F: crate::StorageFamily>(
+        &mut self,
+        name: &str,
+        selection: MetadataSelection<'_>,
+        raw: &mut [u8],
+        pair: &mut StoredTensorPair<F>,
+    ) -> std::result::Result<(), ReadDestinationError> {
+        let (metadata, conversion) = pair.loans().map_err(ReadDestinationError::Metadata)?;
+        self.converted_tensor_with_supplied_metadata(name, selection, raw, conversion, metadata)
+    }
+}
+
+mod prepared_materializer;
+pub use prepared_materializer::{PreparedMaterializerFailure, PreparedMaterializerStorage};

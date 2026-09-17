@@ -2,6 +2,7 @@ use super::super::*;
 use super::*;
 
 pub(crate) struct PartitionedDenseDecoderBindingVisitor<'a> {
+    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
     pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
     pub(in crate::composition::mlx) additional_claimed_sources: std::collections::BTreeSet<String>,
     pub(in crate::composition::mlx) stream: &'a Stream,
@@ -9,6 +10,7 @@ pub(crate) struct PartitionedDenseDecoderBindingVisitor<'a> {
 }
 
 pub(crate) struct PartitionedPredictionBindingVisitor<'a> {
+    pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub distributed: crate::backend::distributed::MlxDistributedSession,
     pub additional_claimed_sources: std::collections::BTreeSet<String>,
     pub stream: &'a Stream,
@@ -41,7 +43,7 @@ impl
         extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
             MlxNeuralBackend,
         >>::Extension<MlxEmbeddedPredictionMaterializer>,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -61,6 +63,7 @@ impl
             self.additional_claimed_sources,
             self.stream,
             self.weights_stream,
+            None,
             PredictionReplicatedFinalizer {
                 prediction: SelectedPrediction {
                     extension,
@@ -73,6 +76,7 @@ impl
 }
 
 pub(crate) struct PartitionedRoutedDecoderBindingVisitor<'a> {
+    pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
     pub(in crate::composition::mlx) additional_claimed_sources: std::collections::BTreeSet<String>,
     pub(in crate::composition::mlx) stream: &'a Stream,
@@ -80,6 +84,7 @@ pub(crate) struct PartitionedRoutedDecoderBindingVisitor<'a> {
 }
 
 pub(crate) struct PartitionedPoolingRoutedDecoderBindingVisitor<'a> {
+    pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
     pub(in crate::composition::mlx) stream: &'a Stream,
     pub(in crate::composition::mlx) weights_stream: &'a Stream,
@@ -105,7 +110,7 @@ impl
                 MlxPoolingAttentionState,
             >>::Boundary,
         >,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -130,6 +135,7 @@ impl
             self.stream,
             self.weights_stream,
             OrdinaryReplicatedFinalizer,
+            self.addressable_manager,
         )
     }
 }
@@ -160,7 +166,7 @@ macro_rules! impl_partitioned_prediction_binding {
                 extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
                     MlxNeuralBackend,
                 >>::Extension<MlxEmbeddedPredictionMaterializer>,
-                store: Arc<dyn CheckpointSource>,
+                store: eredu_checkpoint::store::RetainedCheckpointSource,
             ) -> Result<Self::Output, Self::Error>
             where
                 A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -188,7 +194,8 @@ macro_rules! impl_partitioned_prediction_binding {
                         },
                         capability: self.capability,
                     },
-                )
+            self.addressable_manager,
+        )
             }
         }
     };
@@ -217,7 +224,7 @@ impl
                 MlxHybridState,
             >>::Boundary,
         >,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -237,6 +244,7 @@ impl
             self.stream,
             self.weights_stream,
             OrdinaryReplicatedFinalizer,
+            self.addressable_manager,
         )
     }
 }
@@ -260,7 +268,7 @@ impl
                 MlxHybridState,
             >>::Boundary,
         >,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -278,6 +286,7 @@ impl
             self.additional_claimed_sources,
             self.stream,
             self.weights_stream,
+            self.layerwise_manager.and_then(std::cell::Cell::take),
             OrdinaryReplicatedFinalizer,
         )
     }
@@ -290,11 +299,12 @@ pub(crate) fn bind_partitioned<A, G, F>(
         G,
         <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::Boundary,
     >,
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     distributed: crate::backend::distributed::MlxDistributedSession,
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
     finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
@@ -314,9 +324,10 @@ where
             additional_claimed_sources,
             stream,
             weights_stream,
+            layerwise_manager,
             finalizer,
         ),
-        |prepared, (store, distributed, additional, stream, weights_stream, finalizer)| {
+        |prepared, (store, distributed, additional, stream, weights_stream, layerwise_manager, finalizer)| {
             bind_partitioned_local(
                 prepared,
                 store,
@@ -324,10 +335,11 @@ where
                 additional,
                 stream,
                 weights_stream,
+                layerwise_manager,
                 finalizer,
             )
         },
-        |prepared, (store, distributed, additional, stream, weights_stream, finalizer)| {
+        |prepared, (store, distributed, additional, stream, weights_stream, layerwise_manager, finalizer)| {
             bind_partitioned_pipeline(
                 prepared,
                 store,
@@ -335,6 +347,7 @@ where
                 additional,
                 stream,
                 weights_stream,
+                layerwise_manager,
                 finalizer,
             )
         },
@@ -351,11 +364,12 @@ pub(crate) fn bind_partitioned_local<A, G, F>(
             MlxHybridState,
         >>::Boundary,
     >,
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     distributed: crate::backend::distributed::MlxDistributedSession,
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
     mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
@@ -375,7 +389,8 @@ where
     let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_parts();
     let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
         text.into_parts();
-    let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
+    let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream)?;
+    mechanisms.set_prepared_layerwise_manager(layerwise_manager);
     mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(additional_claimed_sources);
     let mut distributed = Some(distributed);

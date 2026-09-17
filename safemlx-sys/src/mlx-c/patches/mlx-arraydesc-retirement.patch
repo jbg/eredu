@@ -1,0 +1,357 @@
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -1,7 +1,7 @@
+ // Copyright © 2023-2024 Apple Inc.
+ #include <functional>
+ #include <stdexcept>
+-#include <unordered_map>
++#include <thread>
+ 
+ #include "mlx/array.h"
+ #include "mlx/host_transfer.h"
+@@ -19,7 +19,7 @@
+ }
+ 
+ array::array(const std::complex<float>& val, Dtype dtype /* = complex64 */)
+-    : array_desc_(std::make_shared<ArrayDesc>(Shape{}, dtype)) {
++    : array_desc_(make_descriptor(Shape{}, dtype)) {
+   auto cval = static_cast<complex64_t>(val);
+   init(&cval);
+ }
+@@ -30,7 +30,7 @@
+     std::shared_ptr<Primitive> primitive,
+     std::vector<array> inputs)
+     : array_desc_(
+-          std::make_shared<ArrayDesc>(
++          make_descriptor(
+               std::move(shape),
+               dtype,
+               std::move(primitive),
+@@ -56,11 +56,21 @@
+   for (size_t i = 0; i < shapes.size(); ++i) {
+     outputs.emplace_back(std::move(shapes[i]), dtypes[i], primitive, inputs);
+   }
+-  // For each node in |outputs|, its siblings are the other nodes.
+-  for (size_t i = 0; i < outputs.size(); ++i) {
+-    auto siblings = outputs;
+-    siblings.erase(siblings.begin() + i);
+-    outputs[i].set_siblings(std::move(siblings), i);
++  // Keep all roots alive until sibling publication is complete. If a later
++  // vector allocation fails, partially published cliques cannot be recognized
++  // by the ordinary last-external-owner cycle breaker.
++  try {
++    for (size_t i = 0; i < outputs.size(); ++i) {
++      auto siblings = outputs;
++      siblings.erase(siblings.begin() + i);
++      outputs[i].set_siblings(std::move(siblings), i);
++    }
++  } catch (...) {
++    for (auto& output : outputs) {
++      output.array_desc_->siblings.clear();
++      output.array_desc_->position = 0;
++    }
++    throw;
+   }
+   return outputs;
+ }
+@@ -80,7 +90,7 @@
+ 
+ array::array(std::initializer_list<float> data)
+     : array_desc_(
+-          std::make_shared<ArrayDesc>(
++          make_descriptor(
+               Shape{static_cast<ShapeElem>(data.size())},
+               float32)) {
+   init(data.begin());
+@@ -88,7 +98,7 @@
+ 
+ array::array(std::initializer_list<int> data, Dtype dtype)
+     : array_desc_(
+-          std::make_shared<ArrayDesc>(
++          make_descriptor(
+               Shape{static_cast<ShapeElem>(data.size())},
+               dtype)) {
+   init(data.begin());
+@@ -99,7 +109,7 @@
+     Shape shape,
+     Dtype dtype,
+     const std::function<void(void*)>& deleter)
+-    : array_desc_(std::make_shared<ArrayDesc>(std::move(shape), dtype)) {
++    : array_desc_(make_descriptor(std::move(shape), dtype)) {
+   auto buffer = allocator::make_buffer(data, nbytes());
+   if (buffer.ptr() == nullptr) {
+     set_data(allocator::malloc(nbytes()));
+@@ -118,7 +128,7 @@
+ 
+ /* Build an array from a shared buffer */
+ array::array(allocator::Buffer data, Shape shape, Dtype dtype, Deleter deleter)
+-    : array_desc_(std::make_shared<ArrayDesc>(std::move(shape), dtype)) {
++    : array_desc_(make_descriptor(std::move(shape), dtype)) {
+   set_data(data, deleter);
+ }
+ 
+@@ -338,68 +348,100 @@
+   init();
+ }
+ 
+-array::ArrayDesc::~ArrayDesc() {
+-  // When an array description is destroyed it will delete a bunch of arrays
+-  // that may also destroy their corresponding descriptions and so on and so
+-  // forth.
+-  //
+-  // This calls recursively the destructor and can result in stack overflow, we
+-  // instead put them in a vector and destroy them one at a time resulting in a
+-  // max stack depth of 2.
+-  if (inputs.empty()) {
+-    return;
+-  }
+-
+-  std::vector<std::shared_ptr<ArrayDesc>> for_deletion;
+-
+-  auto append_deletable_inputs = [&for_deletion](ArrayDesc& ad) {
+-    std::unordered_map<std::uintptr_t, array> input_map;
+-    for (array& a : ad.inputs) {
+-      if (a.array_desc_) {
+-        input_map.insert({a.id(), a});
+-        for (auto& s : a.siblings()) {
+-          input_map.insert({s.id(), s});
++// One out-of-line registry in this MLX image. Native thread identity reads the
++// existing thread runtime; no first-access C++ TLS storage is required. The
++// flag protects only links/identity, never destruction or arbitrary callbacks.
++struct array::DescriptorRetirement {
++  struct Frame {
++    std::thread::id thread;
++    ArrayDesc* pending;
++    Frame* next;
++  };
++  static std::atomic_flag flag;
++  static Frame* frames;
++
++  static void lock() noexcept {
++    while (flag.test_and_set(std::memory_order_acquire)) {}
++  }
++  static void unlock() noexcept {
++    flag.clear(std::memory_order_release);
++  }
++
++  static void retire(ArrayDesc* descriptor) noexcept {
++    const auto thread = std::this_thread::get_id();
++    lock();
++    for (auto* frame = frames; frame; frame = frame->next) {
++      if (frame->thread == thread) {
++        descriptor->retirement_next = frame->pending;
++        frame->pending = descriptor;
++        unlock();
++        return;
++      }
++    }
++    Frame frame{thread, descriptor, frames};
++    frames = &frame;
++    unlock();
++
++    for (;;) {
++      lock();
++      auto* next = frame.pending;
++      if (!next) {
++        auto** link = &frames;
++        while (*link != &frame) {
++          link = &(*link)->next;
+         }
+-      }
+-    }
+-    ad.inputs.clear();
+-    for (auto& [_, a] : input_map) {
+-      bool is_deletable =
+-          (a.array_desc_.use_count() <= a.siblings().size() + 1);
+-      // An array with siblings is deletable only if all of its siblings
+-      // are deletable
+-      for (auto& s : a.siblings()) {
+-        if (!is_deletable) {
+-          break;
+-        }
+-        int is_input = (input_map.find(s.id()) != input_map.end());
+-        is_deletable &=
+-            s.array_desc_.use_count() <= a.siblings().size() + is_input;
+-      }
+-      if (is_deletable) {
+-        for_deletion.push_back(std::move(a.array_desc_));
+-      }
+-    }
+-  };
+-
+-  append_deletable_inputs(*this);
+-
+-  while (!for_deletion.empty()) {
+-    // top is going to be deleted at the end of the block *after* the arrays
+-    // with inputs have been moved into the vector
+-    auto top = std::move(for_deletion.back());
+-    for_deletion.pop_back();
+-    append_deletable_inputs(*top);
+-
+-    // Clear out possible siblings to break circular references
+-    for (auto& s : top->siblings) {
+-      // Set to null here to avoid descending into top-level
+-      // array destructor for siblings
+-      s.array_desc_ = nullptr;
+-    }
+-    top->siblings.clear();
+-  }
+-}
++        *link = frame.next;
++        unlock();
++        return;
++      }
++      frame.pending = next->retirement_next;
++      if (next->retirement_phase == ArrayDesc::RetirementPhase::Expand) {
++        // Publish the continuation before releasing edges. Their final-release
++        // children land above it, retaining the parent's remaining authority
++        // and fields until those known descendants have drained.
++        next->retirement_phase = ArrayDesc::RetirementPhase::Finalize;
++        next->retirement_next = frame.pending;
++        frame.pending = next;
++        unlock();
++        next->inputs.clear();
++        next->siblings.clear();
++      } else {
++        unlock();
++        delete next;
++      }
++    }
++  }
++};
++
++std::atomic_flag array::DescriptorRetirement::flag = ATOMIC_FLAG_INIT;
++array::DescriptorRetirement::Frame* array::DescriptorRetirement::frames = nullptr;
++
++void array::RetireDescriptor::operator()(ArrayDesc* descriptor) const noexcept {
++  DescriptorRetirement::retire(descriptor);
++}
++
++std::shared_ptr<array::ArrayDesc> array::make_descriptor(Shape shape, Dtype dtype) {
++  // shared_ptr invokes the same deleter if control-block allocation fails.
++  // Do not catch and delete the raw descriptor a second time.
++  return std::shared_ptr<ArrayDesc>(
++      new ArrayDesc(std::move(shape), dtype), RetireDescriptor{});
++}
++
++std::shared_ptr<array::ArrayDesc> array::make_descriptor(
++    Shape shape,
++    Dtype dtype,
++    std::shared_ptr<Primitive> primitive,
++    std::vector<array> inputs) {
++  return std::shared_ptr<ArrayDesc>(
++      new ArrayDesc(
++          std::move(shape), dtype, std::move(primitive), std::move(inputs)),
++      RetireDescriptor{});
++}
++
++// Expand removed known edges before this point. Primitive/Event/custom Data
++// callbacks can release additional graphs here; the same outer frame drains
++// them, without asserting transitive authority through arbitrary callbacks.
++array::ArrayDesc::~ArrayDesc() = default;
+ 
+ array::ArrayIterator::ArrayIterator(const array& arr, int idx)
+     : arr(arr), idx(idx) {
+diff --git a/mlx/array.h b/mlx/array.h
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -108,14 +108,19 @@
+   array& operator=(array&& other) && = delete;
+ 
+   /** Default copy and move constructors otherwise. */
+-  array& operator=(array&& other) & = default;
++  array& operator=(array&& other) & noexcept {
++    array incoming(std::move(other));
++    array_desc_.swap(incoming.array_desc_);
++    return *this;
++  }
+   array(const array& other) = default;
+   array(array&& other) = default;
+ 
+   array& operator=(const array& other) & {
+-    if (this->id() != other.id()) {
+-      this->array_desc_ = other.array_desc_;
+-    }
++    // Keep the incoming graph rooted before retiring the old one. The ordinary
++    // array destructor breaks complete sibling cycles on replacement too.
++    array incoming(other);
++    array_desc_.swap(incoming.array_desc_);
+     return *this;
+   }
+ 
+@@ -531,7 +536,7 @@
+   void copy_shared_buffer(const array& other);
+ 
+   void overwrite_descriptor(const array& other) {
+-    array_desc_ = other.array_desc_;
++    *this = other;
+   }
+ 
+   ~array();
+@@ -596,12 +601,29 @@
+         std::shared_ptr<Primitive> primitive,
+         std::vector<array> inputs);
+ 
++    // The raw object can outlive its shared_ptr control block during reentrant
++    // retirement. Links and continuation state must therefore live here.
++    enum class RetirementPhase : uint8_t { Expand, Finalize };
++    ArrayDesc* retirement_next{nullptr};
++    RetirementPhase retirement_phase{RetirementPhase::Expand};
++
+     ~ArrayDesc();
+ 
+    private:
+     // Initialize size, strides, and other metadata
+     void init();
+   };
++
++  struct DescriptorRetirement;
++  struct RetireDescriptor {
++    void operator()(ArrayDesc* descriptor) const noexcept;
++  };
++  static std::shared_ptr<ArrayDesc> make_descriptor(Shape shape, Dtype dtype);
++  static std::shared_ptr<ArrayDesc> make_descriptor(
++      Shape shape,
++      Dtype dtype,
++      std::shared_ptr<Primitive> primitive,
++      std::vector<array> inputs);
+ 
+   // The ArrayDesc contains the details of the materialized array including the
+   // shape, strides, the data type. It also includes
+@@ -612,7 +634,7 @@
+ 
+ template <typename T>
+ array::array(T val, Dtype dtype /* = TypeToDtype<T>() */)
+-    : array_desc_(std::make_shared<ArrayDesc>(Shape{}, dtype)) {
++    : array_desc_(make_descriptor(Shape{}, dtype)) {
+   init(&val);
+ }
+ 
+@@ -621,7 +643,7 @@
+   It data,
+   Shape shape,
+   Dtype dtype /* = TypeToDtype<typename std::iterator_traits<It>::value_type>() */) :
+-    array_desc_(std::make_shared<ArrayDesc>(std::move(shape), dtype)) {
++    array_desc_(make_descriptor(std::move(shape), dtype)) {
+   init(data);
+ }
+ 
+@@ -630,7 +652,7 @@
+     std::initializer_list<T> data,
+     Dtype dtype /* = TypeToDtype<T>() */)
+     : array_desc_(
+-          std::make_shared<ArrayDesc>(
++          make_descriptor(
+               Shape{static_cast<ShapeElem>(data.size())},
+               dtype)) {
+   init(data.begin());
+@@ -641,7 +663,7 @@
+     std::initializer_list<T> data,
+     Shape shape,
+     Dtype dtype /* = TypeToDtype<T>() */)
+-    : array_desc_(std::make_shared<ArrayDesc>(std::move(shape), dtype)) {
++    : array_desc_(make_descriptor(std::move(shape), dtype)) {
+   if (data.size() != size()) {
+     throw std::invalid_argument(
+         "Data size and provided shape mismatch in array construction.");

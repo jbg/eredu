@@ -1,0 +1,362 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-17",
+  "status": "review_complete_for_shared_lifecycle_invariants",
+  "method": "Read current shared implementation and behavioral assertions; reconcile previously recorded results. No new tests, builds or native runs.",
+  "finding": "No additional concrete cancellation/completion/concurrent-admission/saved-budget implementation gap identified in the reviewed shared mechanisms. This closes the final lifecycle review obligation, not the remaining feature matrix.",
+  "current_integration": "../bounded-inference.md#current-integration-status",
+  "source_sha256_at_review": {
+    "eredu-backend-mlx/src/backend/submission_recovery/try_begin_tests.rs": "e9eb2ca9cddcc36a1e1e47655ebea01a174bb8b3348eaa515938f6a02b8e452d",
+    "eredu-backend-mlx/src/composition/mlx/session/output_completion.rs": "3635b86e8b49dafd10820e777311fed51860f16364c1fdc602b7148b0ab3ae03",
+    "eredu-backend-mlx/src/composition/mlx/session/tests.rs": "8449b5c98396b674c7fefcf01beec0fa809861d4f45857dfb980e77faaf10225",
+    "eredu-core/src/session_authority/tests.rs": "1120c15b68798c061042d1805847f788e07ee513482a9c50e753534720f38810",
+    "eredu-runtime/src/prefill.rs": "dbdb9b1de44e025e1a9f67ce73e13e4551a633d1b485ca13bb5f6de1394646d1",
+    "eredu-runtime/src/speculative/autoregressive/occurrence/account_tests.rs": "16f6725c4e8b7b8bade0ca783f75757744ccf11eeebcad66a5c172e720c6ebda",
+    "eredu-runtime/src/working_memory/funding/capacity_handoff/tests.rs": "607b3ad6b69153e79c863d94f63857d5146186b688930bb8ec61237d1028e8a4",
+    "eredu-runtime/src/working_memory/funding/tests.rs": "b5c00c8b38f266f92725feb76ca5038ddccc942aad48af8096757690adb3f531",
+    "eredu-runtime/src/working_memory/original_prepared_input/tests.rs": "f2312f21756abec7cdd281caa29b60ba56cc2cbefb186459e5000012e4cd971b",
+    "eredu/tests/native_execution_control/managed_plain.rs": "7854cbe2e416b0f7161ac2429b647d1bdca11724c11805d314df7eefdabc4938",
+    "eredu/tests/native_execution_control/managed_plain/capture/saved.rs": "d3ef1c939d5bfe54a9fb9faca88e933f236696312a8f201993c3f01f9a71c14d",
+    "eredu/tests/native_execution_control/managed_plain/snapshot.rs": "404f8b031fc29fd2693a7698ab19e3491c5689b49c4271b60b74233e9fbe0c44"
+  },
+  "invariants": [
+    {
+      "invariant": "Cancellation stops later work at the shared settled boundary without refunding already claimed attempts.",
+      "production": [
+        "eredu-runtime/src/prefill.rs::PrefillDriver::step/run/release_settled_failure"
+      ],
+      "tests": [
+        {
+          "file": "eredu-runtime/src/speculative/autoregressive/occurrence/account_tests.rs",
+          "name": "original_prefill_uses_shared_chunks_without_refunding_cancelled_claims",
+          "assertions": "Cancels during submission of actual 0..2 StateOnly chunk; exactly two positions complete, repeated advancement remains cancelled and dropping the issued claim does not reduce the retained charge."
+        },
+        {
+          "file": "eredu/tests/native_execution_control/managed_plain.rs",
+          "name": "native_managed_plain_matches_ordinary_and_controlled_generation",
+          "assertions": "Shared public driver refuses pre-start cancellation and one-byte admission, compares nonzero ordinary/managed/controlled outputs, and retains escaped output after model/source destruction."
+        }
+      ],
+      "evidence": [
+        {
+          "record": "doc/validation/bounded-media-and-submission-2026-09-16.json",
+          "record_sha256_at_review": "26f57efe466ec445be1a7e55c4e1bdceb2bf674b61923d99ccce12a179b9f4d1",
+          "result_path": [
+            "speculative_prefill_media_execution_milestone",
+            "checks",
+            "prefill-role-bank"
+          ],
+          "tests": [
+            "original_prefill_uses_shared_chunks_without_refunding_cancelled_claims"
+          ],
+          "recorded_result": {
+            "code": 0,
+            "seconds": 6.536890957970172,
+            "argv": [
+              "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-26f0745d153ba625",
+              "--exact",
+              "speculative::autoregressive::occurrence::account_tests::original_prefill_uses_shared_chunks_without_refunding_cancelled_claims",
+              "--nocapture"
+            ]
+          }
+        },
+        {
+          "record": "doc/validation/bounded-public-resident-chat-2026-09-16.json",
+          "record_sha256_at_review": "03a56000661822c39332eac9a2b0ab586e74cf1c04561f88bf07dbad951dee70",
+          "result_path": [
+            "public_native",
+            "dense",
+            "controlled"
+          ],
+          "tests": [
+            "native_managed_plain_matches_ordinary_and_controlled_generation"
+          ],
+          "recorded_result": {
+            "exit_code": 0,
+            "seconds": 0.56,
+            "argv": [
+              "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-706f95ca2890d253",
+              "--exact",
+              "managed_plain::native_managed_plain_matches_ordinary_and_controlled_generation",
+              "--ignored",
+              "--nocapture",
+              "--test-threads=1"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "invariant": "Pending or failed completion keeps mutation authority and physical owners until independent completion/recovery evidence permits release; polling failure preserves the first cause.",
+      "production": [
+        "eredu-core/src/session_authority.rs::SessionAuthority",
+        "eredu-backend-mlx/src/composition/mlx/session/output_completion.rs::token_then_model_is_complete/token_then_model_wait",
+        "eredu-backend-mlx/src/backend/submission_recovery.rs"
+      ],
+      "tests": [
+        {
+          "file": "eredu-backend-mlx/src/composition/mlx/session/tests.rs",
+          "name": "text_completion_keeps_authority_through_pending_and_failed_native_observation",
+          "assertions": "Pending, ready, nonterminal failure and terminal failure are distinct; polling failure starts no cleanup wait and cannot release mutation authority."
+        },
+        {
+          "file": "eredu-backend-mlx/src/backend/submission_recovery/try_begin_tests.rs",
+          "name": "successful_try_begin_keeps_resources_until_explicit_reap_after_real_completion",
+          "assertions": "Real CPU work and escaped numerical output; runtime contention and recovery drop retain the exact request charge until explicit reap observes actual completion, then destroy the resource owner exactly once."
+        }
+      ],
+      "evidence": [
+        {
+          "record": "doc/validation/bounded-funded-storage-2026-09-13.json",
+          "record_sha256_at_review": "4d38e4b8db0be6cbed252ad0b9266b53a8ff168d21c1e6a0bd0ae029d1575f05",
+          "result_path": [
+            "checks",
+            2
+          ],
+          "tests": [
+            "composition::mlx::session::tests::text_completion_keeps_authority_through_pending_and_failed_native_observation"
+          ],
+          "recorded_result": {
+            "exit_code": 0,
+            "passed": 85,
+            "ignored": 0,
+            "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1 --nocapture initial_publication_tests model_session::operation_ model_session::preparation_ model_session::output_retention_tests model_session::idle_storage model_session::managed_admission_tests model_session::text_step_tests model_session::text_quote model_session::text_reuse_tests adapter::tests::managed_memory observation::memory_tests admission::publication::tests prepared_speculative::memory_tests generation::token_retention_tests sampling_native_facts_cover_sort_growth_host_masks_and_retained_key_replacement frontier_tests composition::mlx::session::tests:: adapter::completion::retirement_tests",
+            "log": "/private/tmp/eredu-funding-native-final.log",
+            "sha256": "936102dc918f57b292a3746ea40a083a0b602cd09abf57d46d17d84183e63d18"
+          }
+        },
+        {
+          "record": "doc/validation/bounded-native-submission-try-entry-2026-09-14.json",
+          "record_sha256_at_review": "d780160d0b5843cbc8f8443ff96d1e14adeaeef8603f1f6bd273aadb731e97a7",
+          "result_path": [
+            "checks",
+            "recovery"
+          ],
+          "tests": [
+            "backend::submission_recovery::try_begin_tests::successful_try_begin_keeps_resources_until_explicit_reap_after_real_completion"
+          ],
+          "recorded_result": {
+            "exit_code": 0,
+            "elapsed_seconds": 70.187,
+            "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::submission_recovery:: -- --include-ignored --test-threads=1",
+            "log": "/private/tmp/eredu-submission-try-entry-recovery.log",
+            "log_sha256": "9b6c4b2a0035d2067b57535203c2fea85403a7a1381c0450b21925dd60daddb5"
+          }
+        }
+      ]
+    },
+    {
+      "invariant": "Concurrent admissions and source compilers use one atomic domain balance, preserve still-live smaller ceilings and deduplicate physical aliases without merging unrelated accounts.",
+      "production": [
+        "eredu-runtime/src/working_memory/funding/capacity_handoff.rs",
+        "eredu-runtime/src/working_memory/funding.rs",
+        "eredu-runtime/src/working_memory/original_prepared_input.rs"
+      ],
+      "tests": [
+        {
+          "file": "eredu-runtime/src/working_memory/funding/capacity_handoff/tests.rs",
+          "name": "concurrent_successors_cannot_oversubscribe_the_same_completed_account",
+          "assertions": "Two simultaneous successors race for the same finite completed account; exactly one succeeds, one fails BudgetExceeded, and the shared used bytes and effective ceiling stay exact."
+        },
+        {
+          "file": "eredu-runtime/src/working_memory/funding/tests.rs",
+          "name": "concurrent_adoption_deduplicates_aliases_and_consumes_one_atomic_envelope",
+          "assertions": "Concurrent adoption shares the same physical registration and one atomic funded envelope."
+        },
+        {
+          "file": "eredu-runtime/src/working_memory/original_prepared_input/tests.rs",
+          "name": "concurrent_real_compilers_hold_independent_original_capacity_until_terminal_source_drop",
+          "assertions": "Two real prepared-input compilers hold two separate funded sources concurrently; unquoted work refuses while active, and each terminal source drop releases only its own charge."
+        }
+      ],
+      "evidence": [
+        {
+          "record": "doc/validation/bounded-stateless-dense-2026-09-13.json",
+          "record_sha256_at_review": "db004f417b9f70ae1807a3925c661857eea1ff59c80824646b36a38a42246633",
+          "result_path": [
+            "checks",
+            "runtime"
+          ],
+          "tests": [
+            "working_memory::funding::capacity_handoff::tests::concurrent_successors_cannot_oversubscribe_the_same_completed_account",
+            "working_memory::funding::tests::concurrent_adoption_deduplicates_aliases_and_consumes_one_atomic_envelope"
+          ],
+          "recorded_result": {
+            "exit_code": 0,
+            "elapsed_seconds": 15.33,
+            "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+            "log": "/private/tmp/eredu-stateless-dense-runtime.log",
+            "log_sha256": "5d3c33ae560e7c8f8e89ce083b45d1e8b1c3473d68b3354fc8d0cb4af70b408f"
+          }
+        },
+        {
+          "record": "doc/validation/bounded-original-host-template-integration-2026-09-14.json",
+          "record_sha256_at_review": "9fc9ded19d64f69a8807cd0de18153e7b46218993b8ec56017dbcf9b1c62268e",
+          "result_path": [
+            "checks",
+            "runtime"
+          ],
+          "tests": [
+            "working_memory::original_prepared_input::tests::concurrent_real_compilers_hold_independent_original_capacity_until_terminal_source_drop"
+          ],
+          "recorded_result": {
+            "exit_code": 0,
+            "elapsed_seconds": 31.212,
+            "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime",
+            "log": "/private/tmp/eredu-original-host-template-integration-runtime.log",
+            "log_sha256": "93d71736dd60a932ecb5d48fcd11a039068e6716543c4adcc6e784378bba71d4"
+          }
+        }
+      ]
+    },
+    {
+      "invariant": "Snapshot/restore/fork preserve semantic coordinates and source identity, cumulative copy charges and the defined shared-versus-forked observation ledger. Physical retained bytes retire only with actual owners.",
+      "production": [
+        "eredu-runtime/src/execution_control.rs",
+        "eredu-runtime/src/working_memory/capture_run/checkpoint.rs",
+        "eredu-backend-mlx/src/composition/mlx/session/text_snapshot.rs"
+      ],
+      "tests": [
+        {
+          "file": "eredu/tests/native_execution_control/managed_plain/snapshot.rs",
+          "name": "native_managed_snapshot_restore_and_fork_match_uninterrupted_future / native_managed_pending_snapshot_restore_and_fork_match_uninterrupted_future",
+          "assertions": "Cancelled restore does no work; one-byte restore/fork failures keep source and nondecreasing cumulative copies; accepted restore/fork match original future; all retained counters retire after cleanup while cumulative_copy_bytes stays charged."
+        },
+        {
+          "file": "eredu/tests/native_execution_control/managed_plain/capture/saved.rs",
+          "name": "native_managed_capture_restore_preserves_spending_and_fork_inherits_saved_usage",
+          "assertions": "Restore shares the exhausted original ledger; independently admitted fork starts at immutable saved usage, reaches its limit and does not refund the parent. Escaped frames remain readable after model/source/snapshot teardown."
+        },
+        {
+          "file": "eredu/tests/native_execution_control/managed_plain/capture/saved.rs",
+          "name": "native_managed_pending_interventions_restore_and_fork_keep_schedule_and_spending / native_managed_committed_interventions_restore_and_fork_keep_schedule_and_spending",
+          "assertions": "Existing saved driver also preserves active/inactive intervention schedule, prediction coordinates and cumulative capture spending."
+        }
+      ],
+      "evidence": [
+        {
+          "record": "doc/validation/bounded-public-resident-chat-2026-09-16.json",
+          "record_sha256_at_review": "03a56000661822c39332eac9a2b0ab586e74cf1c04561f88bf07dbad951dee70",
+          "result_path": [
+            "public_managed_resume_joined",
+            "public_checks",
+            "native-dense-managed-resume"
+          ],
+          "tests": [
+            "native_managed_snapshot_restore_and_fork_match_uninterrupted_future"
+          ],
+          "recorded_result": {
+            "code": 0,
+            "seconds": 7.256483291974291,
+            "argv": [
+              "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-85ac8832168fb6dd",
+              "--exact",
+              "managed_plain::snapshot::native_managed_snapshot_restore_and_fork_match_uninterrupted_future",
+              "--nocapture",
+              "--ignored"
+            ]
+          }
+        },
+        {
+          "record": "doc/validation/bounded-public-resident-chat-2026-09-16.json",
+          "record_sha256_at_review": "03a56000661822c39332eac9a2b0ab586e74cf1c04561f88bf07dbad951dee70",
+          "result_path": [
+            "public_managed_resume_joined",
+            "public_checks",
+            "native-dense-pending-managed-resume"
+          ],
+          "tests": [
+            "native_managed_pending_snapshot_restore_and_fork_match_uninterrupted_future"
+          ],
+          "recorded_result": {
+            "code": 0,
+            "seconds": 7.55630883295089,
+            "argv": [
+              "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-85ac8832168fb6dd",
+              "--exact",
+              "managed_plain::snapshot::native_managed_pending_snapshot_restore_and_fork_match_uninterrupted_future",
+              "--nocapture",
+              "--ignored"
+            ]
+          }
+        },
+        {
+          "record": "doc/validation/bounded-media-and-submission-2026-09-16.json",
+          "record_sha256_at_review": "26f57efe466ec445be1a7e55c4e1bdceb2bf674b61923d99ccce12a179b9f4d1",
+          "result_path": [
+            "saved_capture_completion_and_foreground_first_milestone",
+            "checks",
+            "saved-capture-postcommit"
+          ],
+          "tests": [
+            "native_managed_capture_restore_preserves_spending_and_fork_inherits_saved_usage"
+          ],
+          "recorded_result": {
+            "code": 0,
+            "seconds": 6.423037750180811,
+            "argv": [
+              "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/native_execution_control-a844341dd14b9d65",
+              "--exact",
+              "managed_plain::capture::saved::native_managed_capture_restore_preserves_spending_and_fork_inherits_saved_usage",
+              "--nocapture",
+              "--ignored"
+            ]
+          }
+        },
+        {
+          "record": "doc/validation/bounded-media-and-submission-2026-09-16.json",
+          "record_sha256_at_review": "26f57efe466ec445be1a7e55c4e1bdceb2bf674b61923d99ccce12a179b9f4d1",
+          "result_path": [
+            "intervention_closure_186_and_cache_owner_188",
+            "passed",
+            "pending-saved-intervention-public"
+          ],
+          "tests": [
+            "native_managed_pending_interventions_restore_and_fork_keep_schedule_and_spending"
+          ],
+          "recorded_result": {
+            "code": 0,
+            "seconds": 0.39616758399643004,
+            "argv": [
+              "/private/tmp/eredu-original-operation-rust-diagnostic/validation/partition-native-source-and-prefix-completion/native_execution_control.runtime",
+              "--exact",
+              "managed_plain::capture::saved::native_managed_pending_interventions_restore_and_fork_keep_schedule_and_spending",
+              "--nocapture",
+              "--ignored"
+            ]
+          }
+        },
+        {
+          "record": "doc/validation/bounded-media-and-submission-2026-09-16.json",
+          "record_sha256_at_review": "26f57efe466ec445be1a7e55c4e1bdceb2bf674b61923d99ccce12a179b9f4d1",
+          "result_path": [
+            "intervention_closure_186_and_cache_owner_188",
+            "passed",
+            "committed-saved-intervention-public"
+          ],
+          "tests": [
+            "native_managed_committed_interventions_restore_and_fork_keep_schedule_and_spending"
+          ],
+          "recorded_result": {
+            "code": 0,
+            "seconds": 0.39308233303017914,
+            "argv": [
+              "/private/tmp/eredu-original-operation-rust-diagnostic/validation/partition-native-source-and-prefix-completion/native_execution_control.runtime",
+              "--exact",
+              "managed_plain::capture::saved::native_managed_committed_interventions_restore_and_fork_keep_schedule_and_spending",
+              "--nocapture",
+              "--ignored"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "limits": [
+    "Historical PASS results are attributed to their recorded source/artifact revisions; this review is not a fresh run of every test against the final source tree.",
+    "Concurrent admission is established by shared-pool and native-owner fixtures, not a concurrent released-Qwen memory measurement or a per-family hardware fault-injection matrix.",
+    "Public saved boundaries cover before prefill and after committed predictions. No snapshot boundary inside a physical prefill chunk is introduced or claimed.",
+    "Independent-cache transformed/Host/Disk and dependent saved-state retries, realtime native frames and branches, distributed intervention evidence, and final feature/dtype checks retain their separate current statuses. No pending failure is promoted by this review.",
+    "Logical attempt/copy/capture charges must not be refunded. Releasing physical retained bytes after actual terminal ownership is established is expected and does not reset those cumulative budgets."
+  ]
+}

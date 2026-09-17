@@ -2,17 +2,23 @@
 
 use eredu_architectures::ModelKind;
 use eredu_core::generation::{
-    resolve_generation_config, CheckpointGenerationConfig, GenerationConfigOverrides,
-    ResolvedGenerationConfig,
+    CheckpointGenerationConfig, GenerationConfigOverrides, ResolvedGenerationConfig,
+    resolve_generation_config,
 };
 use eredu_core::{
     ModelRuntime, RealizedDrafting, TextGenerationBackend, TextGenerationConfig, TokenOutput,
 };
 use eredu_text::tokenizer::{ModelChatTemplate, Tokenizer as ChatTokenizer};
 
+mod tokenizer_view;
+pub use tokenizer_view::LoadedTokenizerView;
+
 /// Backend-independent failure from tokenizer-aware text facade operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TextModelError {
+    /// Backend memory admission rejected host preparation before construction.
+    #[error(transparent)]
+    Backend(#[from] eredu_core::BackendFailure),
     /// Portable generation configuration was invalid.
     #[error(transparent)]
     Generation(#[from] eredu_core::generation::GenerationError),
@@ -33,6 +39,14 @@ pub enum TextModelError {
 /// Asynchronous token generation with backend-independent errors.
 pub struct TextGeneration<'a, B: TextGenerationBackend> {
     inner: eredu_core::TextGeneration<'a, B>,
+}
+
+impl<B: TextGenerationBackend> TextGeneration<'_, B> {
+    /// Borrows the actual selected chunk geometry and admission requirement.
+    /// This historical bound is distinct from measured allocator or process usage.
+    pub fn preparation_report(&self) -> Option<eredu_core::TextPreparationReport<'_>> {
+        self.inner.preparation_report()
+    }
 }
 
 impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {
@@ -63,9 +77,7 @@ impl<B: TextGenerationBackend> Clone for GeneratedToken<B> {
 impl<B: TextGenerationBackend> GeneratedToken<B> {
     /// Observes the generated ID, preserving any backend failure as its source.
     pub fn token_id(&self) -> Result<u32, eredu_core::BackendFailure> {
-        self.inner
-            .token_id()
-            .map_err(eredu_core::BackendFailure::from_error)
+        self.inner.token_id().map_err(B::into_backend_failure)
     }
 }
 
@@ -90,9 +102,9 @@ pub enum TextDecoderError {
 /// Stateful tokenizer decoder for incrementally generated token ids.
 #[derive(Clone)]
 pub struct TextDecoder {
-    // Immutable tokenizer configuration is shared between exact decoder forks;
+    // Immutable tokenizer configuration is shared with its loaded source/forks;
     // only the incremental IDs/prefix below are independently copied.
-    pub(crate) tokenizer: std::sync::Arc<tokenizers::Tokenizer>,
+    pub(crate) tokenizer: eredu_text::tokenizer::TokenizerSnapshot,
     pub(crate) skip_special_tokens: bool,
     pub(crate) ids: Vec<u32>,
     pub(crate) prefix: String,
@@ -214,7 +226,9 @@ pub struct LoadedModel<B: TextGenerationBackend> {
     pub(crate) runtime: ModelRuntime<B>,
     pub(crate) tokenizer: ChatTokenizer,
     pub(crate) tokenizer_fingerprint: [u8; 32],
-    pub(crate) token_validity: std::sync::Arc<eredu_core::TokenFilter>,
+    pub(crate) token_validity: eredu_core::SharedTokenFilter,
+    // Source-only original compiler allowance; prior HF/input ownership remains separate.
+    compiled_decoder: Option<eredu_runtime::working_memory::LoadedDecodeSource>,
     pub(crate) chat_template: Option<ModelChatTemplate>,
     pub(crate) model_family: ModelKind,
     pub(crate) effective_model_type: String,
@@ -312,6 +326,108 @@ impl<B: TextGenerationBackend, D> PlannedModel<B, D> {
     }
 }
 
+impl<B: eredu_runtime::working_memory::LoadedDecodeSourceBackend> LoadedModel<B> {
+    // Private load-composition prerequisite, deliberately absent from public
+    // managed request routes. Snapshot only shares the existing immutable HF
+    // graph; that graph and input preparation need their own original closure.
+    pub(crate) fn prepare_compiled_decoder(&mut self) -> Result<(), eredu_core::BackendFailure> {
+        if self.compiled_decoder.is_none() {
+            let snapshot = self.tokenizer.snapshot();
+            let plan = eredu_text::decoder_storage::DecodeCompilePlan::prepare(&snapshot).map_err(
+                |error| {
+                    let kind = match &error {
+                        eredu_text::decoder_storage::DecodeSourceError::UnsupportedDecoder => {
+                            eredu_core::BackendFailureKind::Unsupported
+                        }
+                        _ => eredu_core::BackendFailureKind::ResourceExhausted,
+                    };
+                    eredu_core::BackendFailure::new(kind, error)
+                },
+            )?;
+            let source = B::compile_loaded_decode_source(&self.runtime, plan)?;
+            self.compiled_decoder = Some(source);
+        }
+        Ok(())
+    }
+    // One immutable atomic request header, consumed by the same original R path.
+    // It can outlive the model because it owns a lease to the exact cold source.
+    pub(crate) fn compiled_decoder_input(
+        &self,
+        maximum: usize,
+        skip_special: bool,
+    ) -> Result<
+        Option<eredu_runtime::working_memory::LoadedGenerationDecoderInput>,
+        eredu_text::decoder_storage::DecodeStorageError,
+    > {
+        self.compiled_decoder
+            .as_ref()
+            .map(|source| {
+                eredu_runtime::working_memory::LoadedGenerationDecoderInput::new(
+                    source,
+                    maximum,
+                    skip_special,
+                )
+            })
+            .transpose()
+    }
+}
+
+impl<B: eredu_runtime::working_memory::OriginalStopSourceBackend> LoadedModel<B> {
+    // Per-request plain stop selection, not an implicit immutable model cache.
+    // Caller input ownership is outside this original packed-source allowance.
+    pub(crate) fn compile_request_stops(
+        &self,
+        stops: &[String],
+    ) -> Result<eredu_runtime::working_memory::OriginalStopSource, eredu_core::BackendFailure> {
+        let plan = eredu_text::stop_storage::StopCompilePlan::prepare(stops).map_err(|error| {
+            eredu_core::BackendFailure::new(
+                eredu_core::BackendFailureKind::ResourceExhausted,
+                error,
+            )
+        })?;
+        B::compile_original_stop_source(&self.runtime, plan)
+    }
+    // Both original sources are fixed before a request/candidate begins.
+    pub(crate) fn compiled_plain_decoder_input(
+        &self,
+        stops: &eredu_runtime::working_memory::OriginalStopSource,
+        maximum: usize,
+        skip_special: bool,
+    ) -> Result<
+        Option<eredu_runtime::working_memory::LoadedGenerationDecoderInput>,
+        eredu_runtime::working_memory::WorkingMemoryError,
+    > {
+        self.compiled_decoder
+            .as_ref()
+            .map(|source| {
+                eredu_runtime::working_memory::LoadedGenerationDecoderInput::new_plain_text(
+                    source,
+                    stops,
+                    maximum,
+                    skip_special,
+                )
+            })
+            .transpose()
+    }
+}
+
+impl<B: eredu_core::SessionResetPreparationBackend> LoadedModel<B> {
+    /// Exclusively prepares this model for one originally admitted state reset.
+    ///
+    /// Consume the returned owner with `reset_admitted(limits)` to publish fresh
+    /// request state under that reset's exact allowance. Dropping readiness leaves
+    /// state unchanged. Loaded weights, tokenizer and execution placement remain.
+    /// Preparation follows the backend's ordinary accounting contract; it may
+    /// refuse busy or unsupported completion/constructor coverage. It does not
+    /// grant copy, snapshot or fork authority. No new request can start while the
+    /// returned readiness borrows this model.
+    pub fn prepare_reset_ordinary(
+        &mut self,
+    ) -> Result<eredu_core::PreparedSessionReset<'_, B>, eredu_core::BackendFailure> {
+        self.runtime.prepare_reset_ordinary()
+    }
+}
+
 impl<B: TextGenerationBackend> LoadedModel<B> {
     /// Settles prior work and clears request state for a fresh request.
     ///
@@ -337,28 +453,35 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         self.runtime.synchronize()
     }
 
-    /// Combines any prepared backend runtime with portable tokenizer metadata.
+    /// Combines a prepared backend runtime with portable tokenizer metadata.
+    ///
+    /// The backend admits construction of the shared tokenizer-validity mask
+    /// before its allocation and retains its storage independently of requests.
+    /// A rejected construction returns the original neutral backend failure.
     pub fn from_runtime(
         runtime: ModelRuntime<B>,
         tokenizer: ChatTokenizer,
         config: LoadedTextModelConfig,
-    ) -> Self {
-        let tokenizer_fingerprint = eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
-        let token_validity =
-            std::sync::Arc::new(super::tokenizer::tokenizer_token_filter(&tokenizer));
-        Self {
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        let mut tokenizer_fingerprint = [0; 32];
+        let token_validity = B::prepare_shared_token_filter(&runtime, || {
+            tokenizer_fingerprint = eredu_text::tokenizer::vocabulary_fingerprint(&tokenizer);
+            super::tokenizer::tokenizer_token_filter(&tokenizer)
+        })?;
+        Ok(Self {
             session_identity: super::observed::new_identity("session"),
             runtime,
             tokenizer,
             tokenizer_fingerprint,
             token_validity,
+            compiled_decoder: None,
             chat_template: config.chat_template,
             model_family: config.model_family,
             effective_model_type: config.effective_model_type,
             model_id: config.model_id,
             eos_token_ids: config.eos_token_ids,
             checkpoint_generation_config: config.checkpoint_generation_config,
-        }
+        })
     }
 
     pub(crate) const fn runtime(&self) -> &ModelRuntime<B> {
@@ -380,9 +503,13 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         &self.effective_model_type
     }
 
-    /// Borrows the tokenizer attached to the prepared model.
-    pub const fn tokenizer(&self) -> &ChatTokenizer {
-        &self.tokenizer
+    /// Borrows allocation-free vocabulary metadata from the loaded tokenizer.
+    ///
+    /// This view exposes no HF object, mutable configuration, or owning snapshot.
+    /// Use [`Self::encode`], [`Self::decode`] or [`Self::text_decoder`] for text
+    /// operations; their existing allocation contracts remain separate.
+    pub fn tokenizer(&self) -> LoadedTokenizerView<'_> {
+        LoadedTokenizerView::new(&self.tokenizer, &self.tokenizer_fingerprint)
     }
 
     /// Returns the stable token-id vocabulary fingerprint.
@@ -407,9 +534,11 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
     }
 
     /// Creates an independent stateful decoder for streaming generated tokens.
+    /// It retains the loaded tokenizer configuration and may outlive this model;
+    /// incremental ids and prefix state remain independent.
     pub fn text_decoder(&self, skip_special_tokens: bool) -> TextDecoder {
         TextDecoder {
-            tokenizer: std::sync::Arc::new((*self.tokenizer).clone()),
+            tokenizer: self.tokenizer.snapshot(),
             skip_special_tokens,
             ids: Vec::new(),
             prefix: String::new(),
@@ -480,3 +609,27 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         self.eos_token_ids.contains(&id)
     }
 }
+
+#[cfg(test)]
+mod loaded_decoder_tests;
+
+mod original_token_input;
+
+mod managed_plain;
+pub use managed_plain::{
+    ManagedPlainTextError, ManagedPlainTextRequest, ManagedPlainTextSession, ManagedPreparedInputRequest, ManagedModelInputError,
+    ManagedPlainTextSnapshot, ManagedPlainTextSnapshotError, ManagedPlainTextSource,
+};
+
+mod managed_chat;
+pub use managed_chat::{ManagedChatError, ManagedChatRequest, ManagedChatSource};
+pub use original_token_input::chat::ManagedChatPolicyRejection;
+
+mod speculative_semantic;
+
+mod managed_speculative;
+pub use managed_speculative::{
+    ManagedPlainTextSpeculativeBatchLane, ManagedPlainTextSpeculativeBatchRequest,
+    ManagedPlainTextSpeculativeError, ManagedPlainTextSpeculativeRequest,
+    ManagedPreparedChatSpeculativeError, ManagedPreparedChatSpeculativeRequest,
+};

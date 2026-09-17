@@ -6,6 +6,11 @@ payloads. A compatible family name alone is not sufficient: unsupported layer
 geometry, tensor layout, quantization, tokenizer, processor, or execution
 policy produces a structured error.
 
+Family and format support describes functional execution. Finite managed-memory
+admission depends on the selected mechanisms, state residency and request. See the
+[current managed-admission matrix](bounded-inference.md#current-integration-status)
+for validated paths and remaining integration.
+
 ## Inspect an artifact
 
 Use backend structural inspection before reserving a device or loading
@@ -217,3 +222,38 @@ rules.
   prompt-cache persistence.
 - A non-replicated topology must use the matching distributed loader rather
   than the complete single-model loader.
+
+
+### PersonaPlex private numerical evidence
+
+The architecture test suite includes six private reduced-dimension PersonaPlex cases over actual F32 SafeTensors: strict public-gate/source proof; three-residency full-state continuation parity; real delayed/mixed decision demand; wide low-level readout demand and three cached continuations; initialization/observer/failure/cancellation; and physical shared-norm/final packed-slice sensitivity. The fixture keeps the released 16/16/8 topology, eight input channels, delays and normalization ownership. It is separate from public released-profile admission. Dimensions/vocabularies are reduced only through architecture-owned `cfg(test)` normalization. Existing full-checkpoint and independent-reference obligations remain open; these synthetic cases do not replace them. Execution results belong in the integration validation record after central checks.
+
+
+### Qwen composite retained-ingress conformance
+
+Qwen VL and conditional Qwen have an ordinary selected retained-media source for their existing shared prefill driver. The six added neutral numerical cases cover dense selected resident/host/disk and TP/PP/combined, complete local state, encoder-once behavior, actual Sequence/final rows, ordered raw image/video and projected-text semantics, cancellation and cached rollback parity. Central validation records report executed coverage; these cases supplement existing released-checkpoint evidence and are not native distributed validation.
+
+The native composite visitor continues its existing unsplit media route until original source/graph/control/completion admission is implemented. Other composite families still need architecture-owned retained ingress hooks; this is an implementation gap, not architectural inapplicability. This unit preserves the existing fresh-cache raw-media gate and does not claim populated-cache raw-media append, captured-media attribution or unfinished-source continuation.
+
+## Muse retained-media conformance subset
+
+Muse-Glimmer now supplies its own compact normalized raster-media source to the shared selected media lifecycle. It preserves image/video placeholder IDs, text-embedding normalization and per-layer cache-derived masks, completing all future projected rows under the first span. Received encoder boundaries rebuild placement metadata without repeating patch/learned projection. The nonzero local and selected TP/PP/combined cases cover run/step, resident/host/disk, full/last local rows, mixed image/video 2/2/1 and ordinary cancellation-prefix cached decode. Central validation records describe executed coverage.
+
+This is an ordinary/unfunded mechanism, with no native/public retained-media activation or complete peak claim. Gemma4/Inkling still require a neutral observed-inactive dependency state and their own per-layer/shared-attention or zero-unit audio semantics. Native original source/completion, funded continuation and remaining-family integration remain required follow-ons.
+
+## Gemma4 and Inkling retained-media validation matrix
+
+The selected retained-media cut now distinguishes Unseen, observed Inactive, and Produced dependency outcomes. Existing layered traversal and partition scheduling establish inactivity; later spans import it without fabricating a tensor. Missing active dependencies still reject. Inkling's active zero-unit dMel group executes its existing completion equation. Default hooks preserve other executors.
+
+Gemma4 and Inkling provide architecture-owned retained-source/span hooks through the existing selected media visitor. Gemma4 keeps independent vision/audio projection owners, original placeholders, per-layer inputs, cache positions and shared-KV transport; each input projection runs only at its existing root begin. Received encoder continuations use original metadata, without dummy shape tensors. Inkling preserves exact hMLP folds, dMel offsets/normalization/valid frames and sconv state. Full future media roots settle under the first span; original semantic vectors move into the source while encoder preprocessing temporaries remain under first-span completion.
+
+Five nonzero numerical cases cover: compact optional combinations across resident/host/disk and TP/PP/combined, ordinary versus shared full/last rows, run/step, cancellation at two actual boundaries, complete local state and three cached decodes. The exact large Inkling hMLP receives focused resident/host/disk and bounded PP coverage with 512 MiB fixture budgets. Its remaining raw-image topology/residency cross-products remain explicit unexecuted validation obligations, not unsupported behavior.
+
+Central validation records report executed coverage. This is ordinary/unfunded selected-driver support. Public/native retained-media activation, full original source/control/graph/completion admission, captured-media attribution and funded continuation remain Unit C work. New source and context allocations are not caller-owned or free; no native peak or whole managed execution claim follows from these changes.
+
+
+### Inkling hMLP cut and input-order regressions
+
+The existing exact-tower numerical case now exercises PP2 and PP4, covering internal hMLP cuts 1/2/3 through the selected transport. Its compact decoder has four alternating sliding/full layers to satisfy the existing one-decoder-unit-per-pipeline-owner rule; the released four-stage vision geometry and fixed 8192×4800 matrix are unchanged. Existing resident/host/disk ordinary versus shared run/step checks, nonzero outputs, complete state and three cached decodes remain. PP cancellation compares committed-prefix state with an independently executed prefix.
+
+An additional request in that case puts two real raw patches before the same ordered text tokens. It compares host-resident ordinary/shared run/step and PP4 execution, checks the complete two-row retained vision root, and compares cached decode state. This exercises the distinction between patch population and decoder batch. These are source-added regression assertions pending central execution, not new released-checkpoint results. Other raw-image TP/combined/topology-residency combinations and native hardware validation remain explicit unexecuted obligations.

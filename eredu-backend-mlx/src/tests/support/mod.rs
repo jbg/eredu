@@ -7,3 +7,5 @@ pub(crate) mod path_instrumentation;
 pub(crate) mod test_utils;
 
 pub(crate) mod provider_failure;
+
+pub(crate) mod media_completion;

@@ -269,7 +269,7 @@ pub struct SelectedProcessorExecution {
 }
 
 /// Authoritative combination of text/session and composite-input selection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectedCompositeRealization {
     execution: SelectedReplicatedTextRealization,
     processor: SelectedProcessorExecution,

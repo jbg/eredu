@@ -23,7 +23,7 @@ where
     if sum([
         strategy.control_target_estimate(cache),
         strategy.control_prediction_estimate(&state.prediction_cache),
-        M::control_tensor_estimate(&state.capture),
+        M::control_tensor_packet_estimate(&state.capture),
     ])
     .is_none()
     {
@@ -37,7 +37,7 @@ where
     else {
         return Ok(None);
     };
-    let Some(capture) = M::control_tensor_snapshot(&state.capture, context)? else {
+    let Some(capture) = M::control_tensor_packet_snapshot(&state.capture, context)? else {
         return Ok(None);
     };
     Ok(Some((

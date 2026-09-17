@@ -1,0 +1,73 @@
+diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
+--- a/mlx/distributed/distributed.cpp
++++ b/mlx/distributed/distributed.cpp
+@@ -236,10 +236,21 @@
+   return true;
+ }
+ 
++uint64_t detail::allocate_group_storage_identity() noexcept {
++  static std::atomic<uint64_t> next{1};
++  auto value=next.load(std::memory_order_relaxed);
++  while(value!=UINT64_MAX) {
++    if(next.compare_exchange_weak(value,value+1,std::memory_order_relaxed))return value;
++  }
++  return 0; // Exhaustion is unqualified, never an address-reused identity.
++}
++
+ bool Group::persistent_storage(GroupPersistentStorage& out) const noexcept {
+   if(!group_)return false;
+   GroupPersistentStorage value;
+   if(!group_->persistent_storage(value))return false;
++  if(!group_->storage_identity_)return false;
++  value.storage_identity=group_->storage_identity_;
+   if(group_->terminal_owner_)value.unresolved|=group_inherited_owner;
+   value.controls=persistent_storage_controls();
+   if(value.controls==SIZE_MAX)return false;
+diff --git a/mlx/distributed/distributed.h b/mlx/distributed/distributed.h
+--- a/mlx/distributed/distributed.h
++++ b/mlx/distributed/distributed.h
+@@ -1,6 +1,8 @@
+ // Copyright © 2024 Apple Inc.
+ 
+ #pragma once
++
++#include <cstdint>
+ 
+ #include <memory>
+ 
+@@ -60,6 +62,7 @@
+ // native runtime boundary excludes OS-private socket/thread resources. Missing
+ // managed producers and inherited roots remain explicit unresolved domains.
+ struct GroupPersistentStorage {
++  uint64_t storage_identity{0};
+   GroupStorageKind kind{GroupStorageKind::unknown};
+   unsigned unresolved{group_unknown_implementation};
+   size_t shared_owner_bytes{0}, shared_owner_alignment{0};
+diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
+--- a/mlx/distributed/distributed_impl.h
++++ b/mlx/distributed/distributed_impl.h
+@@ -1,12 +1,16 @@
+ // Copyright © 2024 Apple Inc.
+ 
+ #pragma once
++
++#include <cstdint>
+ 
+ #include <atomic>
+ 
+ #include "mlx/distributed/distributed.h"
+ 
+ namespace mlx::core::distributed::detail {
++
++uint64_t allocate_group_storage_identity() noexcept;
+ 
+ /**
+  * Abstract base class of a distributed group implementation.
+@@ -15,6 +19,7 @@
+   friend struct ::mlx::core::distributed::Group;
+   static_assert(std::atomic<bool>::is_always_lock_free);
+   std::atomic<bool> terminal_{false};
++  const uint64_t storage_identity_{allocate_group_storage_identity()};
+   // Bound once, before a freshly split implementation becomes externally
+   // visible. Direct root ownership prevents chains and retains native identity.
+   std::shared_ptr<GroupImpl> terminal_owner_;

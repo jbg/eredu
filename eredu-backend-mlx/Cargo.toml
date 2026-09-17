@@ -43,6 +43,11 @@ path = "examples/personaplex_full_path_bench.rs"
 name = "personaplex_quantization_eval"
 path = "examples/personaplex_quantization_eval.rs"
 
+[[example]]
+name = "readout_memory_probe"
+path = "examples/readout_memory_probe.rs"
+required-features = ["metal"]
+
 [features]
 default = []
 accelerate = ["safemlx/accelerate"]
@@ -56,6 +61,7 @@ audio = ["eredu-architectures/audio"]
 workspace = true
 
 [dependencies]
+eredu-text = { workspace = true, default-features = false }
 eredu-core.workspace = true
 eredu-checkpoint.workspace = true
 eredu-nn.workspace = true
@@ -74,11 +80,11 @@ smallvec = "1"
 ref-cast = "1"
 
 [dev-dependencies]
+eredu-runtime = { workspace = true, features = ["original-custody-test-support"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 eredu-evaluation.workspace = true
 eredu-codec.workspace = true
-eredu-text = { workspace = true, default-features = false }
 tempfile.workspace = true
 float_eq = "1"
 pretty_assertions = "1"

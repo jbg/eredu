@@ -1,0 +1,89 @@
+diff --git a/mlx/record_quota.h b/mlx/record_quota.h
+--- a/mlx/record_quota.h
++++ b/mlx/record_quota.h
+@@ -24,13 +24,18 @@
+   unbound_record = 4,
+ };
+ 
++enum class RecordCapacity : uint8_t { arena, streams, outputs, captures };
++
+ class MLX_API RecordQuotaError final : public std::exception {
+  public:
+-  explicit RecordQuotaError(QuotaFailure cause) noexcept : cause_(cause) {}
++  explicit RecordQuotaError(
++      QuotaFailure cause, RecordCapacity capacity = RecordCapacity::arena) noexcept
++      : cause_(cause), capacity_(capacity) {}
+   const char* what() const noexcept override;
+   QuotaFailure cause() const noexcept { return cause_; }
+  private:
+   QuotaFailure cause_;
++  RecordCapacity capacity_;
+ };
+ 
+ // Minimum concrete Record object block, supplied by the actual Eval class.
+diff --git a/mlx/record_quota.cpp b/mlx/record_quota.cpp
+--- a/mlx/record_quota.cpp
++++ b/mlx/record_quota.cpp
+@@ -55,7 +55,14 @@
+ 
+ const char* RecordQuotaError::what() const noexcept {
+   switch (cause_) {
+-    case QuotaFailure::exhausted: return "submission tracking capacity exhausted";
++    case QuotaFailure::exhausted:
++      switch (capacity_) {
++        case RecordCapacity::arena: return "submission tracking arena capacity exhausted";
++        case RecordCapacity::streams: return "submission tracking stream capacity exhausted";
++        case RecordCapacity::outputs: return "submission tracking output capacity exhausted";
++        case RecordCapacity::captures: return "submission tracking capture capacity exhausted";
++      }
++      return "submission tracking capacity exhausted";
+     case QuotaFailure::invalid_layout: return "invalid submission tracking layout";
+     case QuotaFailure::foreign_parent: return "submission tracking parent mismatch";
+     case QuotaFailure::unbound_record: return "record requires its bounded factory";
+diff --git a/mlx/submission.cpp b/mlx/submission.cpp
+--- a/mlx/submission.cpp
++++ b/mlx/submission.cpp
+@@ -886,7 +886,7 @@
+ 
+ void Record::reserve_streams(size_t count) {
+   if (storage_limits_ && count > storage_limits_->streams)
+-    throw RecordQuotaError(QuotaFailure::exhausted);
++    throw RecordQuotaError(QuotaFailure::exhausted, RecordCapacity::streams);
+   if (count > streams_.max_size())
+     throw RecordQuotaError(QuotaFailure::invalid_layout);
+   streams_.reserve(count);
+@@ -902,7 +902,7 @@
+   // Shared receipt moves below cannot allocate once this capacity is reserved.
+   if ((storage_limits_ && streams_.size() == storage_limits_->streams) ||
+       streams_.size() == streams_.max_size())
+-    throw RecordQuotaError(QuotaFailure::exhausted);
++    throw RecordQuotaError(QuotaFailure::exhausted, RecordCapacity::streams);
+   streams_.reserve(streams_.size() + 1);
+   StreamReceipt receipt{stream, {}, {}};
+   if (stream.device == Device::cpu) {
+@@ -959,14 +959,14 @@
+ 
+ void Record::reserve_outputs(size_t count) {
+   if (storage_limits_ && count > storage_limits_->outputs)
+-    throw RecordQuotaError(QuotaFailure::exhausted);
++    throw RecordQuotaError(QuotaFailure::exhausted, RecordCapacity::outputs);
+   outputs_.reserve(count);
+ }
+ 
+ void Record::retain_output(const std::shared_ptr<array::Data>& data) {
+   if (data) {
+     if (storage_limits_ && outputs_.size() == storage_limits_->outputs)
+-      throw RecordQuotaError(QuotaFailure::exhausted);
++      throw RecordQuotaError(QuotaFailure::exhausted, RecordCapacity::outputs);
+     outputs_.emplace_back(data);
+   }
+ }
+@@ -996,7 +996,7 @@
+ size_t Record::prepare_capture() {
+   const auto index = captures_.size();
+   if (storage_limits_ && index == storage_limits_->captures)
+-    throw RecordQuotaError(QuotaFailure::exhausted);
++    throw RecordQuotaError(QuotaFailure::exhausted, RecordCapacity::captures);
+   captures_.emplace_back(); // reservation/refusal before Data publication
+   return index;
+ }

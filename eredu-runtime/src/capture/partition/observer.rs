@@ -394,7 +394,7 @@ where
                 let before = self.session.ledger.step();
                 let prepared =
                     (|| -> Result<Selection<'_, T>, PartitionCaptureObserverError<B::Error>> {
-                        let plan = std::sync::Arc::clone(&self.session.plan);
+                        let plan = self.session.plan.clone();
                         let selection = &plan.plan().selections[index];
                         if matches!(selection.transform, CaptureTransform::RoutedUnits) {
                             return self.prepare_routed_selection(index, phase, prediction);

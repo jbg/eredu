@@ -1,0 +1,232 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted complete-prompt payload quote and selected direct encoded materialization capacity facts",
+  "source_sha256": {
+    "doc/backend-architecture.md": "2d1aad8601d80149e5669a9ca22ab653eb735515666c10763ceba67a177e5e83",
+    "doc/bounded-inference.md": "d463a595b847a1aea08f04643d371b07bfb0a798b2e4785e9926ba5b408bd32e",
+    "eredu-runtime/src/working_memory.rs": "cbe376283791ea47f1a9946257fbf41c2d5693ae404d1d893c63a29df0acd8e1",
+    "eredu-runtime/src/working_memory/preparation.rs": "06b2d88a0c3792f500e3a022b30ff92da9f1c2ab7f2d1d5d1fa4ea9d1ace5861",
+    "eredu-runtime/src/working_memory/preparation/tests.rs": "cf12a0333e76b3c18bd6ed9dfeb19806450e9b12b06cbca8339d774a8a0167aa",
+    "eredu-backend-mlx/src/backend/nn/workspace.rs": "cc27ab40b4e0eda14b17b985031a1ae8b58de97622e0ef92a92aeb2cdf8b582b",
+    "eredu-backend-mlx/src/backend/nn/workspace/basic.rs": "f3575fb958c8dcce0a04279360331e0ab28c2d93626f90254f90f0732e5c1e78",
+    "eredu-backend-mlx/src/backend/nn/workspace/host.rs": "f24e8a14d27241034be8cbb3e56411f3cf1b041a167942a19eec8d942162a17b",
+    "eredu-backend-mlx/src/backend/nn/workspace/text_prompt_tests.rs": "af13f502aca32b484e64235fb4d309763ac66479d235c799f18d33965b70eed7",
+    "eredu-backend-mlx/src/composition/mlx/model.rs": "acf38156482de895c6a36d6fc5156ef487321417769e72bec83b89c39b30b962",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "528447a7579a984af493ead6235b98b444936edbe0e54ce3034b384d416a70ce",
+    "eredu-backend-mlx/src/tests/distributed_pipeline_ring/unit_and_worker/prepared_workspace.rs": "0aefa2344071dba5d792161cb0457da1c7456a1dbc459ce8368a2f9cd433471b",
+    "eredu-backend-mlx/src/backend/runtime/checkpoint/recipe.rs": "8b2c696a46506a972c6d7f4968bbf17213b5e95255eeca72078abd3af544c7b0",
+    "eredu-backend-mlx/src/backend/runtime/checkpoint/recipe/tests.rs": "2c7430546c5c00b2276b4af0e9075edeffd9457b55b77c01a3f0f82415ab87c3",
+    "eredu-backend-mlx/src/backend/runtime/checkpoint/recipe/workspace.rs": "52c4d243d12c83723b8544a0022f018dec18289cc9f568a7c1e2cc0d522f6332",
+    "eredu-backend-mlx/src/backend/runtime/checkpoint/recipe/workspace/tests.rs": "a80f59b201818cda6a77be9efc4591d9a69888daa658580f38be24a7c0a41dd4",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager/materialization.rs": "d40b806afdbae2315da56433875e78e5bda3e4be978a8731f9c3db36f44a236a",
+    "eredu-checkpoint/src/store/bulk.rs": "40bd76dd76bd1ae3c3a2c3da56f135a61837b4c2fa408ead876ae7d671ded797",
+    "eredu-checkpoint/src/recipe.rs": "d70083d28439fa5e24f2653e229f6d793f10b092c1198bb41bcc5819644464aa",
+    "safemlx/src/array/mod.rs": "2ee8a389d59cd937cd9aa2424abe8cc2ad3ff792806b47363861d142cc829193",
+    "safemlx/src/ops/conversion.rs": "abcbd6d8ec0dcad1dddeb146244c20f54df0405bb7b063bf586c6aff2c107cd2",
+    "safemlx-sys/src/mlx-c/mlx/c/array.cpp": "b071dbbc1913005b018db55e4d87d13c33a27c04855fb214543db4df19df6957"
+  },
+  "native_audit": {
+    "source_root": "/Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build/_deps/mlx-0554f5df4203bdea90b79e3591567c29946c0ba0ca04813fe9d87fa2addf3a6f-src",
+    "sha256": {
+      "mlx/ops.cpp": "5df644c3e3a152952141dfbdc402ca2c641d66862c2bbcea955f065aee32d816",
+      "mlx/backend/common/common.cpp": "f6813c884aa6f4e0a412fafa4043b16d6d8e7bcedd62ad56107c6f06f946aa95",
+      "mlx/backend/gpu/primitives.cpp": "aec6f1dc06480f8f8c7866ff0e471c0c00ce621c18c3848dafe2ebbeb2412bfe",
+      "mlx/backend/metal/allocator.cpp": "e0b94dd881aef4ef8fdb5aafad1f775be8476c3a5758db3d0a4efe16f34a7da0"
+    }
+  },
+  "coverage": {
+    "unique_tests_passed": 44,
+    "runtime_working_memory_tests": 40,
+    "new_prompt_tests": 4,
+    "native_prompt_measurements": 10,
+    "native_direct_materialization_measurements": 6,
+    "native_prepared_execution_tests": 1,
+    "released_checkpoint_comparisons_added": 0
+  },
+  "behavior": [
+    "Full native prompt storage and actual owned source host capacity remain priced independently of chunk size.",
+    "Unknown backing, missing primitive facts, mismatched request geometry and incomplete enclosing components cannot authorize a complete quote.",
+    "The shared pool keeps the full prompt charge during concurrent requests and chunk search; a failed unknown quote does not alter another live charge.",
+    "Production prompt preparation preserves token values and cache identity; a one-position view retains full backing after original owners are dropped.",
+    "Direct encoded reads allocate final MLX buffers without host payload staging; selected MLX Copy aliases full backing across streams.",
+    "Native allocator capacity includes page rounding and bounded oversized reuse; all sixteen final measured cases fit their component bounds."
+  ],
+  "resolved_validation_finding": {
+    "finding": "The first materialization test incorrectly expected MLX Copy to allocate independent storage. It failed the alias assertion; source audit confirmed Copy::eval uses copy_shared_buffer.",
+    "correction": "Count the selected backing once across stream copies and assert complete allocation identity/capacity equality in the corrected native test.",
+    "initial_log": "/private/tmp/eredu-materialization-native-initial-alias-failure.log",
+    "initial_log_sha256": "997cb7facc473fff6d0d52031e74e8bbb3cb871471d1eb16ef5c94379dcf4370"
+  },
+  "limits": [
+    "Component quotes are not complete native request admission; facade requests remain explicitly unbudgeted.",
+    "Ordinary converted recipes, source conversion caches, host residency transfers, complete existing weight inventory and overlapping batches require enclosing accounting.",
+    "Dynamic constraints, observations, snapshots, media, prediction and distributed quote routes still require integration.",
+    "Managed tensor/host payload bounds exclude tokenizer/application strings, payload-free metadata, OS caches, native allocator caches, JIT/driver memory and unrelated process memory.",
+    "Native linking emits the existing compact-unwind size warning; the build and final tests succeed."
+  ],
+  "prompt_measurements": [
+    {
+      "positions": 1,
+      "host_capacity": 4,
+      "observed": 4,
+      "tensor_bound": 28,
+      "managed_bound": 32,
+      "retained_backing": 4
+    },
+    {
+      "positions": 1,
+      "host_capacity": 32772,
+      "observed": 4,
+      "tensor_bound": 28,
+      "managed_bound": 32800,
+      "retained_backing": 4
+    },
+    {
+      "positions": 37,
+      "host_capacity": 148,
+      "observed": 148,
+      "tensor_bound": 892,
+      "managed_bound": 1040,
+      "retained_backing": 148
+    },
+    {
+      "positions": 37,
+      "host_capacity": 32916,
+      "observed": 148,
+      "tensor_bound": 892,
+      "managed_bound": 33808,
+      "retained_backing": 148
+    },
+    {
+      "positions": 3000,
+      "host_capacity": 12000,
+      "observed": 12000,
+      "tensor_bound": 72004,
+      "managed_bound": 84004,
+      "retained_backing": 12000
+    },
+    {
+      "positions": 3000,
+      "host_capacity": 44768,
+      "observed": 12000,
+      "tensor_bound": 72004,
+      "managed_bound": 116772,
+      "retained_backing": 12000
+    },
+    {
+      "positions": 4097,
+      "host_capacity": 16388,
+      "observed": 32768,
+      "tensor_bound": 196612,
+      "managed_bound": 213000,
+      "retained_backing": 32768
+    },
+    {
+      "positions": 4097,
+      "host_capacity": 49156,
+      "observed": 32768,
+      "tensor_bound": 196612,
+      "managed_bound": 245768,
+      "retained_backing": 32768
+    },
+    {
+      "positions": 16385,
+      "host_capacity": 65540,
+      "observed": 81920,
+      "tensor_bound": 344068,
+      "managed_bound": 409608,
+      "retained_backing": 81920
+    },
+    {
+      "positions": 16385,
+      "host_capacity": 98308,
+      "observed": 81920,
+      "tensor_bound": 344068,
+      "managed_bound": 442376,
+      "retained_backing": 81920
+    }
+  ],
+  "direct_materialization_measurements": [
+    {
+      "positions": 37,
+      "copies": false,
+      "observed": 444,
+      "bound": 886
+    },
+    {
+      "positions": 37,
+      "copies": true,
+      "observed": 444,
+      "bound": 886
+    },
+    {
+      "positions": 4097,
+      "copies": false,
+      "observed": 81920,
+      "bound": 147454
+    },
+    {
+      "positions": 4097,
+      "copies": true,
+      "observed": 81920,
+      "bound": 147454
+    },
+    {
+      "positions": 16385,
+      "copies": false,
+      "observed": 229376,
+      "bound": 294910
+    },
+    {
+      "positions": 16385,
+      "copies": true,
+      "observed": 229376,
+      "bound": 294910
+    }
+  ],
+  "checks": [
+    {
+      "name": "runtime_working_memory",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib working_memory",
+      "log": "/private/tmp/eredu-prompt-working-memory-tests.log",
+      "sha256": "0e6473a96c57b301a58c536e4f263406106898cbd2204768240d434444b93fc9",
+      "passed": 40
+    },
+    {
+      "name": "cold_materialization",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib direct_materialization_quote_requires_exact_binding_bytes_and_preserves_ordinary_gap",
+      "log": "/private/tmp/eredu-materialization-final-cold-tests.log",
+      "sha256": "8d7c359d8547e7504014e9e7ccc15f79a39bc0080c9ebcd955bb01821599253e",
+      "passed": 1
+    },
+    {
+      "name": "native_prompt",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib metal_text_prompt_preparation_prices_complete_backing_across_chunks -- --ignored --test-threads=1 --nocapture",
+      "log": "/private/tmp/eredu-prompt-native-peaks.log",
+      "sha256": "801503015fa4eec4fa5ad39311459a2f6050a82dcd54033ebdae1d391538db31",
+      "passed": 1
+    },
+    {
+      "name": "native_direct_materialization",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib metal_direct_materialization_batch_peaks_include_retained_sources_and_stream_copies -- --ignored --test-threads=1 --nocapture",
+      "log": "/private/tmp/eredu-materialization-final-native-peaks.log",
+      "sha256": "e9bc814577820a59f2f370ced013b97874ebd7993d370d37e738f9decd455da3",
+      "passed": 1
+    },
+    {
+      "name": "native_prepared_execution",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib prepared_workspace_native_executable_retains_selection_and_projects_live_state -- --ignored --test-threads=1",
+      "log": "/private/tmp/eredu-preparation-native-prepared-tests.log",
+      "sha256": "69af11897e380521293f2837834eca9971fbe02883582b14952a22c76f15ed7e",
+      "passed": 1
+    },
+    {
+      "name": "portable_native_adapter",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "log": "/private/tmp/eredu-preparation-final-native-check.log",
+      "sha256": "e5ebcd2c46a966465e070800066dc00a2da93962a41120aa2b1622440dae1461",
+      "passed": null
+    }
+  ]
+}

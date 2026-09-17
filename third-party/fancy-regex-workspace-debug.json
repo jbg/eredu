@@ -1,0 +1,12 @@
+{
+  "files": {
+    "src/vm/workspace.rs": {
+      "after": "53d0b98d2854a9f84c7edf32a79fd9a9ad1ebda8785bc551b0c9a80b6eacef23",
+      "before": "640ca9b224426e71aa5ce773f8522bac48249ed2a6293719e50aa99f0a2676d9"
+    }
+  },
+  "final_complete_manifest_sha256": "0136a39305f3a1f9e22f3ecd8dd7427b9df637adef8224d7be935204886b6925",
+  "patch_sha256": "50ab251550c9e67a78c161007fe475b8fe192ce71cb488a593e06b5c6a00da15",
+  "predecessor_source_sha256": "ea8d6fee5f98e62a5129c58ed5206b0ceba8f27d6eb31135898daa4e33b01af5",
+  "scope": "Public Matches Debug required by existing upstream deny lint; no layout/search/test change."
+}

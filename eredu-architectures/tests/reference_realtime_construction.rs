@@ -23,7 +23,7 @@ use eredu_checkpoint::{
     schema::StoredDtypeConstraint,
     store::{
         CheckpointLease, CheckpointSource, MemoryWeightStore, PreparedCheckpointSource,
-        PreparedTensorSource, SharedCheckpointSource, StoreError, TensorMetadata,
+        PreparedTensorSource, RetainedCheckpointSource, StoreError, TensorMetadata,
         TensorReadRequest, TensorSelection, WeightStoreBackend, WeightStoreDiagnostics,
     },
     validation::{CatalogTensorMetadata, SafetensorsCatalog},
@@ -336,7 +336,10 @@ impl<T>
     RealtimeFrameCompletionMechanism<
         ReferenceTensor,
         T,
-        (ReferenceTensor, moshi::ForwardContext<ReferenceTensor>),
+        (
+            Option<ReferenceTensor>,
+            moshi::ForwardContext<ReferenceTensor>,
+        ),
     > for ReferenceFrameCompletionMechanism
 {
     type Completion = ReferenceCompletion;
@@ -348,12 +351,17 @@ impl<T>
         output: &CompletedRealtimeFrame<ReferenceTensor, ReferenceTensor>,
         _model_state: &T,
         _payload_history: &RealtimePayloadHistory<ReferenceTensor>,
-        execution: Option<(ReferenceTensor, moshi::ForwardContext<ReferenceTensor>)>,
+        execution: Option<(
+            Option<ReferenceTensor>,
+            moshi::ForwardContext<ReferenceTensor>,
+        )>,
     ) -> Result<Self::Completion, RealtimeCompletionCreationError<Self::Completion, Self::Error>>
     {
         self.calls += 1;
         let completion = if let Some((text_logits, forward)) = execution {
             self.retained_calls += 1;
+            let text_logits =
+                text_logits.expect("this structural scenario explicitly requests scores");
             assert_eq!(
                 text_logits,
                 ReferenceTensor(vec![
@@ -388,7 +396,7 @@ struct ConstructionTrace {
 
 struct ReferenceConstructionMechanisms {
     trace: Rc<RefCell<ConstructionTrace>>,
-    store: SharedCheckpointSource,
+    store: RetainedCheckpointSource,
     independent_authority: Option<Rc<IndependentAuthorityResources>>,
 }
 
@@ -715,7 +723,7 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
     fn visit<A>(
         self,
         mut prepared: PreparedMoshiRealtimeArchitecture<A>,
-        store: SharedCheckpointSource,
+        store: RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: MoshiRealtimeExecutionArchitecture<ReferenceBackend, ReferenceState>
@@ -803,7 +811,8 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Cons
             )
             .map_err(|error| error.to_string())?;
         let initial_offset = generation.model_state().model_state().attention_offset();
-        let mut executor = moshi::MoshiPreparedRealtimeFrameExecutor::new(execution);
+        let mut executor = moshi::MoshiPreparedRealtimeFrameExecutor::new(execution)
+            .with_readout(eredu_core::OutputDemand::Sequence);
         let mut host = ReferenceFrameTensorMechanisms;
         let mut tensors = ReferenceFrameTensorMechanisms;
         let authority_value = self
@@ -1104,7 +1113,7 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState> for Obse
     fn visit<A>(
         self,
         mut prepared: PreparedMoshiRealtimeArchitecture<A>,
-        store: SharedCheckpointSource,
+        store: RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: MoshiRealtimeExecutionArchitecture<ReferenceBackend, ReferenceState>
@@ -1460,7 +1469,7 @@ fn selected(
 
 fn reference_source(
     selected: moshi::PreparedMoshiRealtime,
-    source: SharedCheckpointSource,
+    source: RetainedCheckpointSource,
 ) -> Result<moshi::PreparedMoshiRealtimeSource, moshi::MoshiRealtimeSourceError> {
     moshi::PreparedMoshiRealtimeSource::from_reference_source(selected, source)
 }
@@ -1499,7 +1508,7 @@ fn try_run_reference_scenario_with_authority(
     let started = Rc::new(Cell::new(false));
     let prepared = selected(&config, &store, request(quantization, residency));
     selection_complete.set(true);
-    let shared_store: SharedCheckpointSource = store;
+    let shared_store: RetainedCheckpointSource = store.into();
     let prepared = reference_source(prepared, shared_store).unwrap();
     let summary =
         moshi::visit_selected_moshi_realtime_architecture::<ReferenceBackend, ReferenceState, _>(
@@ -1552,7 +1561,7 @@ fn run_observation_scenario(
     )
     .unwrap();
     let prepared = selected(&config, &store, request);
-    let shared_store: SharedCheckpointSource = store;
+    let shared_store: RetainedCheckpointSource = store.into();
     let prepared = reference_source(prepared, shared_store).unwrap();
     moshi::visit_selected_moshi_realtime_architecture::<ReferenceBackend, ReferenceState, _>(
         prepared,
@@ -1659,7 +1668,8 @@ fn selection_and_store_validation_precede_reference_construction() {
         prepared,
         Arc::new(MetadataCheckpointSource {
             tensors: BTreeMap::new(),
-        }),
+        })
+        .into(),
     ) {
         Ok(_) => panic!("mismatched source unexpectedly passed validation"),
         Err(error) => error,
@@ -1681,7 +1691,7 @@ impl MoshiRealtimeArchitectureVisitor<ReferenceBackend, ReferenceState>
     fn visit<A>(
         self,
         mut prepared: PreparedMoshiRealtimeArchitecture<A>,
-        store: SharedCheckpointSource,
+        store: RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: MoshiRealtimeExecutionArchitecture<ReferenceBackend, ReferenceState>
@@ -1722,7 +1732,7 @@ fn replicated_architecture_cannot_satisfy_tensor_parallel_selection() {
         &store,
         tensor_parallel_request(LayerWeightResidency::FullyResident),
     );
-    let prepared = reference_source(prepared, store).unwrap();
+    let prepared = reference_source(prepared, store.into()).unwrap();
     moshi::visit_selected_moshi_realtime_architecture::<ReferenceBackend, ReferenceState, _>(
         prepared,
         &(),
@@ -2219,7 +2229,7 @@ impl BoundedIndependentAdapter {
         let provenance = source.source_provenance("weight").unwrap();
         counters.reset();
         clear_reference_trace();
-        let shared: SharedCheckpointSource = source.clone();
+        let shared: RetainedCheckpointSource = source.clone().into();
         let prepared = PreparedCheckpointSource::new(
             shared,
             BTreeMap::from([(

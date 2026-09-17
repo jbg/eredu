@@ -1,11 +1,10 @@
 //! Backend-neutral bounded physical worker for cache backing-store tasks.
 
 use std::{
-    collections::HashMap,
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Condvar, Mutex,
     },
     thread::{self, JoinHandle},
 };
@@ -13,13 +12,33 @@ use std::{
 use super::{
     CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
     CacheIoExecutionStateError, CacheIoOperationKey, CacheIoPreparation, CacheIoStartDisposition,
+    CacheRecordTable,
 };
+
+#[path = "worker/registry.rs"]
+mod registry;
+pub use registry::{
+    CacheIoRegistryInstallationError, CacheIoRegistryRefusal, PreparedCacheIoRegistry,
+    RetiredCacheIoRegistry,
+};
+
+#[path = "worker/queue.rs"]
+mod queue;
+pub use queue::{CacheIoQueueInstallationError, PreparedCacheIoQueue, RetiredCacheIoQueue};
+
+#[path = "worker/task.rs"]
+mod task;
+pub use task::{
+    CacheIoBorrowedError, CacheIoTaskPreparationError, CacheIoTaskRefusal, PreparedCacheIoTask,
+    PreparedCacheIoTaskSlot,
+};
+use task::{CompletionOwner, TaskInput};
 
 enum CacheIoWorkerRequest<Task, Output> {
     Operation {
         key: CacheIoOperationKey,
-        task: Box<Task>,
-        completion: Arc<CacheIoCompletion<Output>>,
+        task: Box<Option<Task>>,
+        completion: CompletionOwner<Output>,
     },
     Stop,
 }
@@ -27,6 +46,7 @@ enum CacheIoWorkerRequest<Task, Output> {
 #[derive(Debug, Clone)]
 enum CacheIoCompletionState<Output> {
     Finished(Result<Output, String>),
+    WorkerFailure(CacheIoExecutionStateError),
     Cancelled,
 }
 
@@ -54,6 +74,15 @@ impl<Output> CacheIoCompletion<Output> {
         if let Ok(mut state) = self.state.lock() {
             if state.is_none() {
                 *state = Some(CacheIoCompletionState::Finished(result));
+                self.ready.notify_all();
+            }
+        }
+    }
+
+    fn finish_failure(&self, cause: CacheIoExecutionStateError) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.is_none() {
+                *state = Some(CacheIoCompletionState::WorkerFailure(cause));
                 self.ready.notify_all();
             }
         }
@@ -114,6 +143,9 @@ impl<Output: Clone> CacheIoCompletion<Output> {
             CacheIoCompletionState::Finished(Err(error)) => {
                 Err(CacheIoWorkerError::OperationFailed(error.clone()))
             }
+            CacheIoCompletionState::WorkerFailure(cause) => {
+                Err(CacheIoWorkerError::Execution(*cause))
+            }
             CacheIoCompletionState::Cancelled => Err(CacheIoWorkerError::Cancelled { generation }),
         }
     }
@@ -121,22 +153,32 @@ impl<Output: Clone> CacheIoCompletion<Output> {
 
 #[derive(Debug)]
 struct CacheIoWorkerShared<Output> {
-    in_flight: Mutex<HashMap<CacheIoOperationKey, Arc<CacheIoCompletion<Output>>>>,
+    in_flight: Mutex<CacheRecordTable<CacheIoOperationKey, CompletionOwner<Output>>>,
     execution: Mutex<CacheIoExecutionState>,
     space_available: Condvar,
     stopping: AtomicBool,
     shutdown_polling: AtomicBool,
+    active_payload: AtomicBool,
 }
 
 impl<Output> CacheIoWorkerShared<Output> {
     fn new(capacity: usize) -> Result<Self, CacheIoWorkerError> {
         Ok(Self {
-            in_flight: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(CacheRecordTable::new()),
             execution: Mutex::new(CacheIoExecutionState::new(capacity)?),
             space_available: Condvar::new(),
             stopping: AtomicBool::new(false),
             shutdown_polling: AtomicBool::new(false),
+            active_payload: AtomicBool::new(false),
         })
+    }
+}
+
+struct ActivePayload<'a>(&'a AtomicBool);
+
+impl Drop for ActivePayload<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 
@@ -144,7 +186,7 @@ impl<Output> CacheIoWorkerShared<Output> {
 pub struct CacheIoTicket<Output> {
     /// Exact logical operation identity.
     pub key: CacheIoOperationKey,
-    completion: Arc<CacheIoCompletion<Output>>,
+    completion: CompletionOwner<Output>,
     shared: Arc<CacheIoWorkerShared<Output>>,
 }
 
@@ -152,7 +194,7 @@ impl<Output> Clone for CacheIoTicket<Output> {
     fn clone(&self) -> Self {
         Self {
             key: self.key.clone(),
-            completion: Arc::clone(&self.completion),
+            completion: self.completion.clone(),
             shared: Arc::clone(&self.shared),
         }
     }
@@ -190,7 +232,7 @@ impl<Output: Clone> CacheIoTicket<Output> {
 
     /// Returns whether two tickets join the same exact completion owner.
     pub fn shares_completion_with(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.completion, &other.completion)
+        self.completion.same(&other.completion)
     }
 }
 
@@ -198,10 +240,10 @@ impl<Output: Clone> CacheIoTicket<Output> {
 pub struct CacheIoSubmission<Task, Output> {
     /// Ticket shared by the operation owner and all exact-key joiners.
     pub ticket: CacheIoTicket<Output>,
-    sender: mpsc::Sender<CacheIoWorkerRequest<Task, Output>>,
+    sender: queue::Sender<Task, Output>,
     shared: Arc<CacheIoWorkerShared<Output>>,
     unsent: Option<CacheIoWorkerRequest<Task, Output>>,
-    joined_task: Option<Task>,
+    joined_task: Option<TaskInput<Task, Output>>,
     /// Whether this submission joined an already prepared exact operation.
     pub joined: bool,
 }
@@ -223,7 +265,7 @@ impl<Task, Output: Clone> CacheIoSubmission<Task, Output> {
     /// Backends may disarm task-local rollback guards before the unused task is
     /// dropped; the task is never physically executed.
     pub fn joined_task_mut(&mut self) -> Option<&mut Task> {
-        self.joined_task.as_mut()
+        self.joined_task.as_mut().map(TaskInput::task_mut)
     }
 
     /// Admits this prepared task, blocking only on finite queue capacity.
@@ -245,21 +287,26 @@ impl<Task, Output: Clone> CacheIoSubmission<Task, Output> {
                     drop(request);
                     self.ticket
                         .completion
-                        .finish(Err("cache I/O physical worker stopped".into()));
+                        .finish_failure(CacheIoExecutionStateError::WorkerStopped);
                     self.ticket.completion.release_task_resources();
                     retire_completion(&self.shared, &self.ticket.key, &self.ticket.completion);
-                    return Err(CacheIoWorkerError::OperationFailed(
-                        "cache I/O physical worker stopped".into(),
-                    ));
+                    return Err(CacheIoExecutionStateError::WorkerStopped.into());
                 }
                 match execution.admit(&self.ticket.key)? {
                     CacheIoAdmission::Admitted => {
-                        if self.sender.send(request).is_err() {
-                            execution.rollback_admission(&self.ticket.key)?;
-                            self.ticket
-                                .completion
-                                .finish(Err("cache I/O physical worker stopped".into()));
+                        if let Err(failure) = self.sender.send(request) {
+                            let rollback = execution.rollback_admission(&self.ticket.key);
+                            drop(execution);
+                            drop(failure.request);
+                            self.ticket.completion.finish_failure(failure.cause);
                             self.ticket.completion.release_task_resources();
+                            retire_completion(
+                                &self.shared,
+                                &self.ticket.key,
+                                &self.ticket.completion,
+                            );
+                            rollback?;
+                            return Err(failure.cause.into());
                         }
                         break;
                     }
@@ -288,9 +335,15 @@ impl<Task, Output: Clone> CacheIoSubmission<Task, Output> {
                         };
                     }
                     CacheIoAdmission::Cancelled => {
+                        let peak_occupancy = execution.peak_queued();
+                        drop(execution);
                         drop(request);
                         self.ticket.completion.release_task_resources();
-                        break;
+                        return Ok(CacheIoSubmissionOutcome {
+                            joined: self.joined,
+                            backpressure,
+                            peak_occupancy,
+                        });
                     }
                 }
             }
@@ -325,7 +378,7 @@ impl<Task, Output> Drop for CacheIoSubmission<Task, Output> {
 
 /// Generic bounded background worker over opaque backend task and output types.
 pub struct CacheIoWorker<Task, Output> {
-    sender: mpsc::Sender<CacheIoWorkerRequest<Task, Output>>,
+    sender: queue::Sender<Task, Output>,
     handle: Mutex<Option<JoinHandle<()>>>,
     shared: Arc<CacheIoWorkerShared<Output>>,
     nonblocking_drop: bool,
@@ -352,13 +405,20 @@ where
         discard: fn(Output),
     ) -> Result<Self, CacheIoWorkerError> {
         let thread_name = thread_name.into();
-        let (sender, receiver) = mpsc::channel::<CacheIoWorkerRequest<Task, Output>>();
+        let maximum = capacity
+            .checked_add(1)
+            .ok_or(CacheIoExecutionStateError::QueueSizeOverflow)?;
         let shared = Arc::new(CacheIoWorkerShared::new(capacity)?);
+        let (sender, receiver) = queue::channel(maximum, Arc::clone(&shared));
         let worker_shared = Arc::clone(&shared);
         let handle = thread::Builder::new()
             .name(thread_name.clone())
             .spawn(move || {
                 while let Ok(request) = receiver.recv() {
+                    worker_shared.active_payload.store(true, Ordering::Release);
+                    // This outer guard drops after the match's task, output and
+                    // completion owners, including all early-continue paths.
+                    let _active = ActivePayload(&worker_shared.active_payload);
                     match request {
                         CacheIoWorkerRequest::Operation {
                             key,
@@ -366,25 +426,14 @@ where
                             completion,
                         } => {
                             if worker_shared.stopping.load(Ordering::Acquire) {
-                                if let Ok(mut execution) = worker_shared.execution.lock() {
-                                    execution.cancel(&key);
-                                    // Consume the physical queue slot and move
-                                    // cancellation to a retireable state.
-                                    let _ = execution.begin(&key);
-                                }
-                                drop(task);
-                                completion.finish(Err("cache I/O physical worker stopped".into()));
-                                retire_completion(&worker_shared, &key, &completion);
-                                completion.release_task_resources();
+                                retire_stopped_task(key, task, completion, &worker_shared);
                                 continue;
                             }
                             let start = worker_shared
                                 .execution
                                 .lock()
-                                .map_err(|_| CacheIoWorkerError::Poisoned)
-                                .and_then(|mut execution| {
-                                    execution.begin(&key).map_err(Into::into)
-                                });
+                                .map_err(|_| CacheIoExecutionStateError::CoordinationPoisoned)
+                                .and_then(|mut execution| execution.begin(&key));
                             worker_shared.space_available.notify_all();
                             match start {
                                 Ok(CacheIoStartDisposition::Execute) => {}
@@ -396,16 +445,15 @@ where
                                 }
                                 Err(error) => {
                                     drop(task);
-                                    completion.finish(Err(error.to_string()));
+                                    completion.finish_failure(error);
                                     completion.release_task_resources();
                                     retire_completion(&worker_shared, &key, &completion);
                                     continue;
                                 }
                             }
-                            let result = catch_unwind(AssertUnwindSafe(|| execute(*task)))
-                                .unwrap_or_else(|_| {
-                                    Err("cache I/O physical worker operation panicked".into())
-                                });
+                            let result = catch_unwind(AssertUnwindSafe(|| {
+                                execute((*task).expect("bound worker task"))
+                            }));
                             let disposition = worker_shared
                                 .execution
                                 .lock()
@@ -416,14 +464,20 @@ where
                             if !matches!(disposition, Ok(CacheIoCompletionDisposition::Publish))
                                 || completion.is_ready()
                             {
-                                if let Ok(output) = result {
+                                if let Ok(Ok(output)) = result {
                                     discard(output);
                                 }
                             } else {
-                                completion.finish(result);
+                                match result {
+                                    Ok(result) => completion.finish(result),
+                                    Err(_) => completion
+                                        .finish_failure(CacheIoExecutionStateError::TaskPanicked),
+                                }
                             }
-                            completion.release_task_resources();
+                            // A successful wait permits a new occurrence of this
+                            // exact key. Retire its registry entry before notifying.
                             retire_completion(&worker_shared, &key, &completion);
+                            completion.release_task_resources();
                         }
                         CacheIoWorkerRequest::Stop => break,
                     }
@@ -457,42 +511,85 @@ where
         key: CacheIoOperationKey,
         task: Task,
     ) -> Result<CacheIoSubmission<Task, Output>, CacheIoWorkerError> {
+        let mut input = Some(TaskInput::Ordinary(task));
+        self.prepare_input(key, &mut input, false)
+    }
+
+    fn prepare_input(
+        &self,
+        key: CacheIoOperationKey,
+        input: &mut Option<TaskInput<Task, Output>>,
+        require_prepared: bool,
+    ) -> Result<CacheIoSubmission<Task, Output>, CacheIoWorkerError> {
+        // Input ownership stays with the caller until all registry checks pass.
+        // Every error therefore releases locks before backend payload teardown.
         let mut execution = self
             .shared
             .execution
             .lock()
             .map_err(|_| CacheIoWorkerError::Poisoned)?;
-        let preparation = execution.prepare(key.clone());
         let mut completions = self
             .shared
             .in_flight
             .lock()
             .map_err(|_| CacheIoWorkerError::Poisoned)?;
+        let finite = execution.is_prepared();
+        if require_prepared {
+            if self.shared.stopping.load(Ordering::Acquire) {
+                return Err(CacheIoExecutionStateError::WorkerStopped.into());
+            }
+            if !finite || !self.sender.is_prepared()? {
+                return Err(CacheIoExecutionStateError::RegistryCapacity(
+                    super::CacheTableCapacityError::Unprepared,
+                )
+                .into());
+            }
+        }
+        let preparation = execution.try_prepare(key.clone())?;
         if preparation == CacheIoPreparation::Joined {
             let completion = completions
                 .get(&key)
                 .expect("runtime joined key has an exact completion");
+            if require_prepared && !completion.is_prepared() {
+                return Err(CacheIoExecutionStateError::RegistryCapacity(
+                    super::CacheTableCapacityError::Unprepared,
+                )
+                .into());
+            }
             return Ok(CacheIoSubmission {
                 ticket: CacheIoTicket {
                     key,
-                    completion: Arc::clone(completion),
+                    completion: completion.clone(),
                     shared: Arc::clone(&self.shared),
                 },
                 sender: self.sender.clone(),
                 shared: Arc::clone(&self.shared),
                 unsent: None,
-                joined_task: Some(task),
+                joined_task: input.take(),
                 joined: true,
             });
         }
-        let completion = Arc::new(CacheIoCompletion::default());
-        completions.insert(key.clone(), Arc::clone(&completion));
+        let completion = input.as_ref().expect("one task preparation").completion();
+        if finite {
+            if let Err((cause, _, retained)) =
+                completions.insert_prepared(key.clone(), completion.clone())
+            {
+                execution.retire(&key)?;
+                drop(completions);
+                drop(execution);
+                drop(retained);
+                return Err(CacheIoExecutionStateError::RegistryCapacity(cause).into());
+            }
+        } else {
+            completions.insert(key.clone(), completion.clone());
+        }
         drop(completions);
         drop(execution);
+        let task = input.take().expect("one task preparation").into_task();
         let request = CacheIoWorkerRequest::Operation {
             key: key.clone(),
-            task: Box::new(task),
-            completion: Arc::clone(&completion),
+            task,
+            completion: completion.clone(),
         };
         Ok(CacheIoSubmission {
             ticket: CacheIoTicket {
@@ -506,6 +603,37 @@ where
             joined_task: None,
             joined: false,
         })
+    }
+
+    /// Cold evidence that a prepared, queued or active task can retain payloads.
+    /// Stays true through completion publication until worker-owned roots drop.
+    /// This does not poll, retire or otherwise advance work.
+    pub fn has_retained_work(&self) -> Result<bool, CacheIoWorkerError> {
+        let pending = !self
+            .shared
+            .in_flight
+            .lock()
+            .map_err(|_| CacheIoWorkerError::Poisoned)?
+            .is_empty();
+        Ok(pending || self.shared.active_payload.load(Ordering::Acquire))
+    }
+
+    /// Nonblocking form of [`Self::has_retained_work`]. `None` means the
+    /// retained-work registry is busy, never that the worker owns no payload.
+    /// This only borrows the registry and reads the active-payload flag; it
+    /// neither allocates a snapshot nor polls, cancels or retires a task.
+    /// The result is point-in-time evidence, not a barrier against new work.
+    pub fn try_has_retained_work(&self) -> Result<Option<bool>, CacheIoWorkerError> {
+        let registry = match self.shared.in_flight.try_lock() {
+            Ok(registry) => registry,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(CacheIoWorkerError::Poisoned);
+            }
+        };
+        Ok(Some(
+            !registry.is_empty() || self.shared.active_payload.load(Ordering::Acquire),
+        ))
     }
 
     /// Releases exact-key ownership after task resources are safe to drop.
@@ -535,10 +663,26 @@ impl<Task, Output> Drop for CacheIoWorker<Task, Output> {
     }
 }
 
+fn retire_stopped_task<Task, Output>(
+    key: CacheIoOperationKey,
+    task: Box<Option<Task>>,
+    completion: CompletionOwner<Output>,
+    shared: &CacheIoWorkerShared<Output>,
+) {
+    if let Ok(mut execution) = shared.execution.lock() {
+        execution.cancel(&key);
+        let _ = execution.begin(&key);
+    }
+    drop(task);
+    completion.finish_failure(CacheIoExecutionStateError::WorkerStopped);
+    retire_completion(shared, &key, &completion);
+    completion.release_task_resources();
+}
+
 fn retire_completion<Output>(
     shared: &CacheIoWorkerShared<Output>,
     key: &CacheIoOperationKey,
-    completion: &Arc<CacheIoCompletion<Output>>,
+    completion: &CompletionOwner<Output>,
 ) {
     let retired = if let Ok(mut execution) = shared.execution.lock() {
         execution.retire(key).unwrap_or(false)
@@ -550,7 +694,7 @@ fn retire_completion<Output>(
         if let Ok(mut in_flight) = shared.in_flight.lock() {
             if in_flight
                 .get(key)
-                .is_some_and(|current| Arc::ptr_eq(current, completion))
+                .is_some_and(|current| current.same(completion))
             {
                 in_flight.remove(key);
             }
@@ -586,6 +730,10 @@ pub enum CacheIoWorkerError {
     #[error(transparent)]
     Execution(#[from] CacheIoExecutionStateError),
 }
+
+#[cfg(test)]
+#[path = "worker/test_support.rs"]
+pub(super) mod test_support;
 
 #[cfg(test)]
 mod tests {
@@ -649,8 +797,9 @@ mod tests {
         panicking.enqueue().unwrap();
         assert!(matches!(
             ticket.wait(),
-            Err(CacheIoWorkerError::OperationFailed(message))
-                if message.contains("operation panicked")
+            Err(CacheIoWorkerError::Execution(
+                CacheIoExecutionStateError::TaskPanicked
+            ))
         ));
         worker.retire(&ticket);
     }
@@ -659,14 +808,23 @@ mod tests {
     fn cancellation_wakes_a_backpressured_submission() {
         let worker =
             Arc::new(CacheIoWorker::new(1, "cache-worker-cancel-test", execute, discard).unwrap());
+        assert!(!worker.has_retained_work().unwrap());
         let (started_tx, started_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let blocker = worker
             .prepare(key(0), Task::Pause(started_tx, release_rx))
             .unwrap();
         let blocker_ticket = blocker.ticket.clone();
+        assert!(
+            worker.has_retained_work().unwrap(),
+            "prepared payload is retained before enqueue"
+        );
         blocker.enqueue().unwrap();
         started_rx.recv().unwrap();
+        assert!(
+            worker.has_retained_work().unwrap(),
+            "active worker retains the task"
+        );
 
         let queued = worker.prepare(key(1), Task::Value(1)).unwrap();
         queued.enqueue().unwrap();
@@ -725,17 +883,23 @@ mod tests {
         assert!(active_retained);
         assert!(matches!(
             rejected_prepared,
-            Err(CacheIoWorkerError::OperationFailed(_))
+            Err(CacheIoWorkerError::Execution(
+                CacheIoExecutionStateError::WorkerStopped
+            ))
         ));
         assert!(prepared_released);
         assert!(matches!(
             prepared_ticket.wait(),
-            Err(CacheIoWorkerError::OperationFailed(_))
+            Err(CacheIoWorkerError::Execution(
+                CacheIoExecutionStateError::WorkerStopped
+            ))
         ));
         assert_eq!(active_ticket.wait().unwrap(), 0);
         assert!(matches!(
             queued_ticket.wait(),
-            Err(CacheIoWorkerError::OperationFailed(_))
+            Err(CacheIoWorkerError::Execution(
+                CacheIoExecutionStateError::WorkerStopped
+            ))
         ));
         active_ticket.wait_for_task_resources().unwrap();
         queued_ticket.wait_for_task_resources().unwrap();
@@ -770,7 +934,13 @@ mod tests {
         release_tx.send(()).unwrap();
         assert!(matches!(
             outcome_before_release.unwrap(),
-            Err(CacheIoWorkerError::OperationFailed(_))
+            Err(CacheIoWorkerError::Execution(
+                CacheIoExecutionStateError::WorkerStopped
+            ))
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "worker/retained_inspection_tests.rs"]
+mod retained_inspection_tests;

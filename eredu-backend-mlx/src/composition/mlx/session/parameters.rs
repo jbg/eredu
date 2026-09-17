@@ -1,5 +1,10 @@
 //! Native loaded-slot operations. Architecture names and geometry come from traversal.
 use super::*;
+use crate::backend::nn::shared::visit_parameter_map;
+use crate::backend::runtime::residency::storage::RetainedStorage;
+use crate::composition::mlx::replicated_text::{
+    ParameterOwnerCounts, ParameterOwnerRole, ParameterOwnerSourceError,
+};
 use eredu_core::{capture::*, intervention::InterventionDtype, parameters::*};
 use eredu_nn::{ParameterMetadata, ParameterSlotVisitor};
 use safemlx::ops::indexing::{ArrayIndex, ArrayIndexOp, TryIndexMutOp};
@@ -13,6 +18,9 @@ use encoding::EffectiveLayout;
 #[cfg(test)]
 #[path = "parameters/partition_owner_tests.rs"]
 mod partition_owner_tests;
+#[cfg(test)]
+#[path = "parameters/storage_tests.rs"]
+mod storage_tests;
 
 #[derive(Default)]
 pub(super) struct NativeParameterState {
@@ -28,6 +36,86 @@ pub(super) struct NativeParameterState {
     reject_publication: bool,
     epoch: u64,
     usage: Rc<Cell<CaptureUsage>>,
+}
+
+impl NativeParameterState {
+    /// Borrows only these actual immutable maps. This is not idle-session,
+    /// native readiness, publication or submission authority.
+    pub(super) fn parameter_sources(&self) -> DisplacedParameterSource<'_> {
+        DisplacedParameterSource { state: self }
+    }
+
+    /// Retained numerical payload from reversible parameter publication.
+    ///
+    /// Originals may no longer be installed in the model; published values can
+    /// alias its current slots. Merge this inventory with the model inventory
+    /// before counting or registering storage so both cases retain exact backing
+    /// identities. Inspection never materializes lazy or unrecognized arrays;
+    /// those owners remain retained with an unknown bound.
+    ///
+    /// The remaining fields describe identity, input arithmetic, precision,
+    /// snapshot estimates and usage. They retain no numerical storage or erased
+    /// resource owner. In particular model_identity does not own a coordinator,
+    /// and baseline transforms contain enum/scalar metadata rather than tensors.
+    pub(super) fn retained_storage(&self) -> Result<RetainedStorage, Error> {
+        let mut storage = crate::backend::runtime::residency::storage::RetainedStorage::default();
+        self.collect_retained_storage(&mut storage)?;
+        Ok(storage)
+    }
+
+    /// Fills caller-owned storage without allocating an intermediate inventory.
+    pub(super) fn collect_retained_storage(
+        &self,
+        storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    ) -> Result<(), Error> {
+        for values in [&self.originals, &self.published] {
+            visit_parameter_map(values, |_, value| storage.include_array(value.as_array()))?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) struct DisplacedParameterSource<'source> {
+    state: &'source NativeParameterState,
+}
+pub(super) struct CountedDisplacedParameterSource<'source> {
+    source: DisplacedParameterSource<'source>,
+    counts: ParameterOwnerCounts,
+}
+impl<'source> DisplacedParameterSource<'source> {
+    pub(super) fn count(
+        self,
+        guard: &mut safemlx::RuntimeCallGuard,
+    ) -> Result<CountedDisplacedParameterSource<'source>, ParameterOwnerSourceError> {
+        let mut counts = ParameterOwnerCounts::default();
+        counts.observe_map(
+            ParameterOwnerRole::DisplacedOriginal,
+            None,
+            &self.state.originals,
+            guard,
+        )?;
+        counts.observe_map(
+            ParameterOwnerRole::PublishedOverlay,
+            None,
+            &self.state.published,
+            guard,
+        )?;
+        Ok(CountedDisplacedParameterSource {
+            source: self,
+            counts,
+        })
+    }
+    pub(super) fn state(&self) -> &'source NativeParameterState {
+        self.state
+    }
+}
+impl<'source> CountedDisplacedParameterSource<'source> {
+    pub(super) const fn counts(&self) -> ParameterOwnerCounts {
+        self.counts
+    }
+    pub(super) fn source(&self) -> &DisplacedParameterSource<'source> {
+        &self.source
+    }
 }
 
 /// An independently borrowed counter permits charging metadata, native loans
@@ -295,7 +383,8 @@ fn with_selected_parameter_values<T>(
 impl MlxModelSession {
     #[cfg(test)]
     pub(crate) fn reject_next_parameter_publication_for_test(&mut self) {
-        Rc::get_mut(&mut self.payload)
+        self.payload
+            .get_mut()
             .expect("idle test session")
             .parameter_state
             .reject_publication = true;
@@ -324,6 +413,11 @@ impl MlxModelSession {
             self.payload.parameter_state.epoch,
         )
     }
+    /// Pure comparison for host sequence-bank preflight; no error allocation.
+    pub(super) fn parameter_epoch_matches(&self, expected: u64) -> bool {
+        self.payload.parameter_state.epoch == expected
+    }
+
     pub(super) fn validate_parameter_epoch(&self, saved: &mut Option<u64>) -> Result<(), Error> {
         let current = self.payload.parameter_state.epoch;
         if saved.is_some_and(|epoch| epoch != current) {
@@ -375,7 +469,9 @@ impl MlxModelSession {
             .ok_or_else(|| ParameterError::Unsupported("no retained prepared identity".into()))?
             .capture()?
             .artifact_identity;
-        let payload = Rc::get_mut(&mut self.payload)
+        let payload = self
+            .payload
+            .get_mut()
             .ok_or_else(|| ParameterError::Unsupported("native payload still retained".into()))?;
         let layouts = payload
             .model
@@ -772,7 +868,9 @@ impl ParameterBackend for MlxBackend<'_> {
                 Ok(Ok(originals))
             })
             .map_err(failure)??;
-        let state = &mut Rc::get_mut(&mut session.payload)
+        let state = &mut session
+            .payload
+            .get_mut()
             .expect("completed parameter transaction")
             .parameter_state;
         state.originals = originals;
@@ -840,7 +938,9 @@ impl ParameterBackend for MlxBackend<'_> {
                 Ok(())
             })
             .map_err(failure)?;
-        let state = &mut Rc::get_mut(&mut session.payload)
+        let state = &mut session
+            .payload
+            .get_mut()
             .expect("completed parameter transaction")
             .parameter_state;
         for parameter in &mut discovery.parameters {
@@ -862,3 +962,7 @@ impl ParameterBackend for MlxBackend<'_> {
         Ok(discovery)
     }
 }
+
+#[cfg(test)]
+#[path = "parameters/owner_source_tests.rs"]
+mod owner_source_tests;

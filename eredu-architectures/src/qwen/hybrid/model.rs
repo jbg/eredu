@@ -300,7 +300,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
 /// One neutral layered model for Qwen3-Next and every Qwen3.5 text policy.
 pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    config: HybridConfig,
+    config: crate::replicated_text::config_source::ConfigOwner<HybridConfig>,
+    construction_parameters: Option<crate::routed_text::RetainedRoutedDescription>,
+    construction_units: Option<crate::routed_text::RetainedRoutedUnits>,
     decoder: HybridDecoder<B, Option<super::PredictionShared<B>>>,
     target_layers: usize,
     prediction_steps: usize,
@@ -311,12 +313,63 @@ pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    crate::routed_text::RoutedConstructionParameters<B> for LayeredModel<B>
+{
+    fn install_construction_parameters(&mut self, source: crate::routed_text::RetainedRoutedDescription) {
+        self.construction_parameters = Some(source);
+    }
+    fn prepare_construction_units(
+        &self, banks: Option<&crate::routed_text::RetainedRoutedBanks>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<crate::routed_text::RetainedRoutedUnits>, Error> {
+        super::block::construction::require_source_compiler::<B>(context)?;
+        let selected = banks.map(|banks| banks.get(&eredu_runtime::RoutedBankId::new(0))
+            .and_then(|bank| bank.plan().gated())
+            .ok_or_else(|| Error::from(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)))
+            .transpose()?;
+        let mut specs = Vec::with_capacity(self.target_layers);
+        for index in 0..self.target_layers {
+            let config = self.target_unit_config(index);
+            let realization = selected.or(self.expert_realization.as_ref());
+            let spec = realization.map(|plan| plan.unit_spec(crate::decoder::TARGET_EXECUTION_GROUP, index)
+                .cloned().ok_or_else(|| Error::backend("Qwen partition has no selected expert unit")))
+                .transpose()?;
+            specs.push(super::block::TargetBlockSpec::new(config, index, spec)?);
+        }
+        Ok(Some(crate::routed_text::RetainedRoutedUnits::qwen_source(specs)))
+    }
+    fn install_construction_units(&mut self, source: Option<crate::routed_text::RetainedRoutedUnits>) -> Result<(), Error> {
+        if let Some(source) = &source {
+            if source.qwen()?.len() != self.target_layers {
+                return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+            }
+        }
+        self.construction_units = source;
+        Ok(())
+    }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     eredu_runtime::ArchitectureParameters<B> for LayeredModel<B>
 {
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
         self.state_layout_impl()
+    }
+
+    fn state_layout_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<StateLayout, Self::DefinitionError> {
+        match &self.parallel_geometry {
+            Some(geometry) => geometry.state_layout().clone_workspace(context),
+            None => super::state_layout_with_metadata(&self.config, context),
+        }
+    }
+    fn state_identity_with_metadata(&self, state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<ModelStateIdentity, Self::DefinitionError> {
+        state_identity_with_metadata(&self.config, state.layout(), state.global_layer_offset(), topology, context)
     }
 
     fn state_identity(
@@ -348,6 +401,33 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     > {
         let recipes = super::static_recipes(source)?;
         crate::static_parameters::module_recipes(self.decoder.extended_static_modules(), recipes)
+    }
+
+    fn parameter_description_with_metadata(&self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>, Self::DefinitionError> {
+        match &self.construction_parameters {
+            Some(source) => {
+                crate::decoder::ModuleMetadata::new::<B>(context)
+                    .controls::<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>>()?;
+                Ok(std::borrow::Cow::Borrowed(source))
+            }
+            None if B::construction_metadata(context).is_some_and(|metadata| metadata.uses_checked_metadata()) => {
+                Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+            }
+            None => self.parameter_description(context).map(std::borrow::Cow::Owned),
+        }
+    }
+
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_nn::Parameterized::retained_value_slot_bound(self.decoder.extended_static_modules())
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_nn::Parameterized::visit_retained_values(
+            self.decoder.extended_static_modules(),
+            visitor,
+        )
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -385,25 +465,78 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded pinned modules and the exact configured graph.
-    pub fn new(
-        config: HybridConfig,
+    pub fn new(config: HybridConfig, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        Self::new_with_config(config.into(),context)
+    }
+    pub(crate) fn new_with_config(config:crate::replicated_text::config_source::ConfigOwner<HybridConfig>,
+        context:&<B::Tensor as Tensor>::Context)->Result<Self,Error>{
+        crate::decoder::ModuleMetadata::new::<B>(context).controls::<Self>()?;
+        let (decoder, target_layers, prediction_steps) = Self::prepare_decoder(&config, context)?;
+        Ok(Self {
+            config,
+            decoder,
+            target_layers,
+            prediction_steps,
+            construction_parameters: None,
+            construction_units: None,
+            parallel_geometry: None,
+            partition_target_start: 0,
+            global_parameters: None,
+            expert_realization: None,
+        })
+    }
+
+    /// Builds the same validated pinned decoder from the caller's immutable
+    /// configuration, then moves only its modules to composite construction.
+    pub(crate) fn prepare_static_modules(
+        config: &HybridConfig,
         context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
-            "Qwen hybrid",
-            crate::operator_requirements::QWEN_HYBRID,
-        )?;
-        config.validate().map_err(Error::backend)?;
-        let target_layers = usize::try_from(config.num_hidden_layers).map_err(Error::backend)?;
+    ) -> Result<crate::hybrid_decoder::HybridStaticModules<B, Option<super::PredictionShared<B>>>, Error>
+    {
+        crate::decoder::ModuleMetadata::new::<B>(context).controls::<
+            crate::hybrid_decoder::HybridStaticModules<B, Option<super::PredictionShared<B>>>,
+        >()?;
+        let (decoder, _, _) = Self::prepare_decoder(config, context)?;
+        Ok(decoder.into_extended_static_modules())
+    }
+
+    fn prepare_decoder(
+        config: &HybridConfig,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<
+        (
+            HybridDecoder<B, Option<super::PredictionShared<B>>>,
+            usize,
+            usize,
+        ),
+        Error,
+    > {
+        let module_metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        module_metadata.controls::<(
+            HybridDecoder<B, Option<super::PredictionShared<B>>>,
+            usize,
+            usize,
+            StaticModuleSpec,
+        )>()?;
+        module_metadata.require::<B>("Qwen hybrid", crate::operator_requirements::QWEN_HYBRID)?;
+        match metadata.context() {
+            Some(context) => {
+                config.validate_with_diagnostic(|message| context.metadata_error(message))?
+            }
+            None => config.validate().map_err(Error::backend)?,
+        }
+        let target_layers =
+            usize::try_from(config.num_hidden_layers).map_err(|cause| metadata.source(cause))?;
         let prediction_steps =
-            usize::try_from(config.mtp_num_hidden_layers).map_err(Error::backend)?;
+            usize::try_from(config.mtp_num_hidden_layers).map_err(|cause| metadata.source(cause))?;
         let embedding_name = "model.embed_tokens.weight";
         let decoder = HybridDecoder::new_with_prediction_groups(
             StaticModuleSpec {
                 normalization_groups: None,
-                embedding_weight: embedding_name.into(),
-                normalization_weight: "model.norm.weight".into(),
-                head_weight: "lm_head.weight".into(),
+                embedding_weight: metadata.text(embedding_name)?,
+                normalization_weight: metadata.text("model.norm.weight")?,
+                head_weight: metadata.text("lm_head.weight")?,
                 vocabulary: config.vocab_size,
                 hidden_size: config.hidden_size,
                 normalization_epsilon: config.rms_norm_eps,
@@ -423,19 +556,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         )?
         .with_static_extension(
             (prediction_steps > 0)
-                .then(|| super::PredictionShared::new(&config, context))
+                .then(|| super::PredictionShared::new(config, context))
                 .transpose()?,
         );
-        Ok(Self {
-            config,
-            decoder,
-            target_layers,
-            prediction_steps,
-            parallel_geometry: None,
-            partition_target_start: 0,
-            global_parameters: None,
-            expert_realization: None,
-        })
+        Ok((decoder, target_layers, prediction_steps))
     }
 
     /// Applies the architecture-owned tensor-parallel token embedding boundary.
@@ -567,7 +691,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 
     /// Returns normalized hybrid policy.
-    pub const fn config(&self) -> &HybridConfig {
+    pub fn config(&self) -> &HybridConfig {
         &self.config
     }
 
@@ -590,7 +714,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             return Ok(parameters.as_ref().clone());
         }
         if self.parallel_geometry.is_some() {
-            return Self::new(self.config.clone(), context)?.parameter_description_impl(context);
+            return Self::new((*self.config).clone(), context)?.parameter_description_impl(context);
         }
         let graph = self.decoder.execution_graph()?;
         let layout = self.unit_layout()?;
@@ -711,6 +835,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         self.parallel_geometry.as_ref().map(std::sync::Arc::clone)
     }
 
+    fn target_unit_config(&self, index: usize) -> &HybridConfig {
+        self.parallel_geometry.as_ref().and_then(|geometry| geometry.target(index))
+            .unwrap_or(&self.config)
+    }
+
     /// Constructs one canonical target or prediction unit using this model's
     /// replicated or planner-derived local geometry.
     pub fn construct_unit(
@@ -719,6 +848,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
+        if group == 0 {
+            if let Some(source) = &self.construction_units {
+                let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+                metadata.controls::<(&crate::routed_text::RetainedRoutedUnits, Unit<B>, usize)>()?;
+                let spec = source.qwen()?.get(index).ok_or_else(|| metadata.error(format_args!(
+                    "target unit {index} is outside the retained source")))?;
+                return spec.instantiate::<B>(self.target_unit_config(index), context).map(Unit::Target);
+            }
+        }
         self.decoder.unit_path(group, index)?;
         if group == 0 {
             let config = self
@@ -763,6 +901,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &mut self,
         realization: crate::ExpertRealizationPlan<eredu_nn::GroupedGatedProductSpec>,
     ) {
+        self.construction_units = None;
+        self.construction_parameters = None;
         self.expert_realization = Some(realization);
     }
 
@@ -903,6 +1043,28 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        // Target recurrence carries its complete convolution/matrix state;
+        // attention uses the same causal KV prefix and fixed rotary positions.
+        // Dense/shared/routed FFNs are row-local. Prediction availability and
+        // its separate hooks remain governed by observation_hooks below.
+        let units = self.decoder.group_unit_count(0)?;
+        let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
+            (0..units).map(|index| self.decoder.unit_path(0, index)),
+            true,
+        )?;
+        // Same target bank invocation as observed execution; its expert equations are row-local.
+        for index in 0..units {
+            let path = self.decoder.unit_path(0, index)?;
+            if self.config.num_experts > 0 {
+                crate::decoder::append_routed_prefill_path(&mut declarations, &format!("{path}.mlp"));
+            }
+        }
+        Ok(declarations)
+    }
+
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         let target_only = self.prediction_steps == 0;
         eredu_runtime::inspection::ObservationHookSupport::internal(
@@ -913,6 +1075,14 @@ where
     }
 
     type Input<'a> = EmbeddedInput<'a, B::Tensor>;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        match input {
+            EmbeddedInput::Target { tokens, .. } => crate::prefill::token_shape(*tokens).map(Some),
+            _ => Ok(None),
+        }
+    }
+
     type StaticModules =
         crate::hybrid_decoder::HybridStaticModules<B, Option<super::PredictionShared<B>>>;
     type Unit = Unit<B>;
@@ -948,6 +1118,14 @@ where
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
         self.decoder.execution_graph()
+    }
+    fn execution_graph_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        self.decoder.execution_graph_with_metadata(context)
+    }
+    fn group_unit_count_with_metadata(&self, group: usize, context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<usize, Self::Error> {
+        self.decoder.group_unit_count_with_metadata(group, context)
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
@@ -1161,6 +1339,16 @@ where
             forward.embedded.dim(1),
             self.config.hidden_size,
         ]))
+    }
+
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        crate::readout::select_readout_positions(hidden, demand, 1, context)
     }
 
     fn finish_forward(
@@ -1692,30 +1880,64 @@ pub fn state_identity(
     global_layer_start: usize,
     topology: PromptCacheTopology,
 ) -> Result<ModelStateIdentity, Error> {
-    let target_layers = usize::try_from(config.num_hidden_layers).map_err(Error::backend)?;
+    state_identity_with(
+        config,
+        layout,
+        global_layer_start,
+        topology,
+        crate::decoder::identity::Metadata::new(None),
+    )
+}
+
+pub(crate) fn state_identity_with_metadata(
+    config: &HybridConfig,
+    layout: &eredu_runtime::StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+    state_identity_with(
+        config,
+        layout,
+        global_layer_start,
+        topology,
+        crate::decoder::identity::Metadata::new(Some(context)),
+    )
+}
+fn state_identity_with(
+    config: &HybridConfig,
+    layout: &eredu_runtime::StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+    metadata.controls::<eredu_runtime::ModelStateIdentity>()?;
+
+    let target_layers =
+        usize::try_from(config.num_hidden_layers).map_err(|cause| metadata.source(cause))?;
     let prediction_layers =
-        usize::try_from(config.mtp_num_hidden_layers).map_err(Error::backend)?;
+        usize::try_from(config.mtp_num_hidden_layers).map_err(|cause| metadata.source(cause))?;
     let layer_count = target_layers
         .checked_add(prediction_layers)
-        .ok_or_else(|| Error::backend("Qwen hybrid state layer count overflowed"))?;
+        .ok_or_else(|| metadata.error(format_args!("Qwen hybrid state layer count overflowed")))?;
     let global_layer_end = global_layer_start
         .checked_add(layout.len())
-        .ok_or_else(|| Error::backend("Qwen hybrid owned layer range overflowed"))?;
+        .ok_or_else(|| metadata.error(format_args!("Qwen hybrid owned layer range overflowed")))?;
     if global_layer_end > layer_count {
-        return Err(Error::backend(format!(
+        return Err(metadata.error(format_args!(
             "Qwen hybrid owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    eredu_runtime::ModelStateIdentity::new(
-        config.variant.model_kind().canonical_name(),
-        config.model_type.clone(),
-        prompt_cache_architecture_fingerprint(config),
+    eredu_runtime::ModelStateIdentity::new_with_diagnostic(
+        metadata.text(config.variant.model_kind().canonical_name())?,
+        metadata.text(&config.model_type)?,
+        super::config::prompt_cache_architecture_fingerprint_with_metadata(config, metadata)?,
         layer_count,
         global_layer_start,
         0,
         topology,
+        |message| metadata.prompt_error(message),
     )
-    .map_err(Error::backend)
 }
 
 #[cfg(test)]

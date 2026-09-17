@@ -1,7 +1,7 @@
 //! Local-slot validation must consume the selected placement before native work.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     sync::atomic::{AtomicUsize, Ordering},
 };
@@ -18,10 +18,11 @@ use eredu_nn::{
     ParameterMetadata, ParameterSpec, ParameterVisitor, ParameterVisitorMut, Parameterized,
 };
 use eredu_runtime::{
-    build_exact_replicated_text_bindings, BindingPlanError, LocalModelLayout, LocalTensorLayout,
-    ModuleBindingPlanError, ParameterBindingTarget, ParameterRole,
-    ReplicatedTextMaterializationTask, ReplicatedTextParameterOwner, ReplicatedTextParameterRole,
-    ReplicatedTextPhysicalSource, TensorPlacement, WeightLoweringDescriptor, WeightLoweringKind,
+    build_exact_replicated_text_bindings, build_exact_replicated_text_bindings_for_targets,
+    BindingPlanError, LocalModelLayout, LocalTensorLayout, ModuleBindingPlanError,
+    ParameterBindingTarget, ParameterRole, ReplicatedTextMaterializationTask,
+    ReplicatedTextParameterOwner, ReplicatedTextParameterRole, ReplicatedTextPhysicalSource,
+    TensorPlacement, WeightLoweringDescriptor, WeightLoweringKind,
 };
 
 struct Module(ParameterBindingTarget);
@@ -305,5 +306,65 @@ fn exact_binding_does_not_reshard_selected_local_transform_output() {
             .shape(),
         [2, 4]
     );
+    assert_eq!(source.leases.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn cold_destinations_validate_exact_placement_before_native_construction() {
+    let source = source(vec![4, 2], false);
+    let task = task(&[4, 2], WeightLoweringKind::Direct, LinearFormat::Dense);
+    let selected = layout(
+        vec![4, 2],
+        vec![2, 2],
+        TensorPlacement::Shard {
+            axis: 0,
+            index: 1,
+            parts: 2,
+        },
+    );
+    let mut targets = BTreeMap::from([(
+        "weight".into(),
+        ParameterBindingTarget {
+            shape: vec![2, 2],
+            dtype: RecipeDtype::F32,
+            permitted_source_dtypes: Vec::new(),
+        },
+    )]);
+    let cold = |targets: &BTreeMap<String, ParameterBindingTarget>| {
+        build_exact_replicated_text_bindings_for_targets(
+            targets,
+            &source,
+            &[&task],
+            &BTreeSet::new(),
+            Some(&selected),
+            |_, recipe, _| Ok::<_, Infallible>(recipe),
+        )
+    };
+    let bindings = cold(&targets).unwrap();
+    assert_eq!(
+        bindings[0].selection(),
+        &TensorSelection::Range {
+            axis: 0,
+            start: 2,
+            end: 4
+        }
+    );
+    assert_eq!(bindings[0].expected_bytes(), 16);
+    assert_eq!(
+        bindings,
+        bind(&source, &task, vec![2, 2], Some(&selected)).unwrap()
+    );
+    targets.get_mut("weight").unwrap().shape = vec![4, 2];
+    assert!(matches!(
+        cold(&targets),
+        Err(ModuleBindingPlanError::Plan(
+            BindingPlanError::ShapeMismatch { .. }
+        ))
+    ));
+    targets.clear();
+    assert!(matches!(
+        cold(&targets),
+        Err(ModuleBindingPlanError::ExactTask { .. })
+    ));
     assert_eq!(source.leases.load(Ordering::SeqCst), 0);
 }

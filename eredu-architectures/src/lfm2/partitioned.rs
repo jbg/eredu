@@ -215,27 +215,14 @@ where
                 "LFM2 runtime state does not match its partition-local layout",
             ));
         }
-        let sequence = hidden.dim(1);
-        let mask =
-            if let Some(mask) = mask {
-                Some(mask.clone())
-            } else if sequence > 1
-                && self.args.layer_schedule.iter().any(|policy| {
-                    matches!(policy.operator, super::OperatorPolicy::SelfAttention(_))
-                })
-            {
-                Some(B::causal_mask(
-                    sequence,
-                    state
-                        .layer(first_state_ordinal)
-                        .map_err(Error::backend)?
-                        .position(),
-                    None,
-                    context,
-                )?)
-            } else {
-                None
-            };
+        let mask = super::causal_mask_for_local_state::<B, S>(
+            hidden.dim(1),
+            mask,
+            state,
+            expected,
+            first_state_ordinal,
+            context,
+        )?;
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext { mask },
@@ -342,6 +329,14 @@ where
         Ok(self.parameters.clone())
     }
 
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_nn::Parameterized::visit_retained_values(&self.static_modules, visitor)
+    }
+
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
     where
         V: eredu_runtime::StaticParameterVisitor<B>,
@@ -382,6 +377,11 @@ where
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     type Input<'a> = LayeredInput<'a, B::Tensor>;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::token_shape(input.tokens).map(Some)
+    }
+
     type StaticModules = PartitionStaticModules<B>;
     type Unit = super::Block<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
@@ -553,6 +553,16 @@ where
                 policy.forward_feed_forward_observed(normalized, context, instrumentation)
             },
         )
+    }
+
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        crate::readout::select_readout_positions(hidden, demand, 1, context)
     }
 
     fn finish_forward(

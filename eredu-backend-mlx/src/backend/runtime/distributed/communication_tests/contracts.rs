@@ -40,7 +40,7 @@ fn selected_setup_deadline_rejects_busy_runtime_before_native_submission() {
         entered.wait();
         let error = <MlxNeuralBackend as BarrierBackend>::barrier(&group, &stream)
             .expect_err("busy runtime must fail before collective graph submission");
-        assert!(error.what().contains("selected deadline"));
+        assert!(error.to_string().contains("selected deadline"));
         assert_eq!(
             crate::backend::runtime::distributed::group::native_collective_submissions(),
             0

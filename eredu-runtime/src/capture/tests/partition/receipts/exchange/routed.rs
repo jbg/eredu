@@ -83,3 +83,5 @@ fn sparse_exchange_uses_existing_completion_and_all_rank_delivery_agreement() {
         }
     }
 }
+
+mod funded;

@@ -1,0 +1,68 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted retained native residency inventory, synchronous array readiness and cross-unit owner preflight",
+  "source_sha256": {
+    "doc/backend-architecture.md": "231a3fb4e4779b21111104b06015f8fd3166743cad4487d287690fd7b833da23",
+    "doc/execution-control.md": "cb6e5888722456c3fb9ab51b9496627b9af47cf55b9db558b20e8d74de527c1c",
+    "doc/bounded-inference.md": "3facae652e3d2edfd81cb5a01914c517fc33a55544ef3680f6dd5b33705a3fc9",
+    "eredu-backend-mlx/src/backend/runtime/residency/mod.rs": "af0030f1a25f64cc8a5658085af99c5a2844d038a4664f0c8ead4550dcff8638",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage.rs": "48d137f17669c7e77447d86bd6fdc91df22c5ea767909b3d3688dee59c2ff5e5",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/tests.rs": "93ea7d18ac29e8aff03c05951765dbcafecd79343a3ce05a059928e3b14a9acf",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager.rs": "da3252ddba05e0ca7282c2efca60e62b4e19b7fb36012321981b5f6a00544c37",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager/transfer.rs": "97477da9313f3580e4e495ee303567e7a2055bad27ed3ec914e60e903eefdcc2",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager/tests.rs": "4283c31599113315e6bf2c34ff16c20cdfbf7b98c2e933adb679b0b8bbb406a7",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager/tests/storage.rs": "547ae94a6ecd3f5a5085df849c2af589f9631822bc59a2fe3f532e8868274ad0",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager/tests/lifecycle.rs": "ff3de79c7b2df0a27e8c26b91f3c6442ed583b532f310c1f1ac4212c77b0b299"
+  },
+  "coverage": {
+    "native_residency_tests_passed": 57,
+    "new_inventory_tests": 6,
+    "previously_ignored_alias_tests_enabled": 1,
+    "ignored_tests": 0,
+    "new_allocator_peak_measurements": 0,
+    "new_released_checkpoint_comparisons": 0
+  },
+  "behavior": [
+    "RetainedStorage deduplicates completed native allocation capacities, immutable host-transfer owners and exact checkpoint source payloads while retaining the physical owners.",
+    "Narrow array views preserve full backing capacity; shared inventories and host/source aliases do not multiply physical bytes.",
+    "Original handles and manager entries may be dropped or evicted while the inventory keeps their payloads valid; releasing the inventory releases its ownership.",
+    "Lazy, custom, unknown-source, in-flight and failed-transfer resources cannot produce a complete bound. An unknown snapshot remains unknown after external completion.",
+    "Residency inspection bypasses recovery reaping and performs no native completion polling, materialization, source reads or eviction.",
+    "The synchronous transfer boundary finalizes output array readiness before publishing the exact transfer generation, while retaining normal recovery and failure handling.",
+    "The neutral controller validates global aliases; native preflight checks only physical owner recipes against exact per-unit sources. The enabled cross-unit regression verifies one shared host capacity through eviction and reacquisition.",
+    "Capacity conflicts and arithmetic overflow reject rather than undercount."
+  ],
+  "limits": [
+    "This inventory covers the supplied owners and current residency-manager storage, not all model memory or future allocations.",
+    "Loaded module replacements, addressable parameter banks, decoder state, returned output handles and other retained owners still require composition; materialization and streaming need separate future workspace bounds.",
+    "Custom-backed arrays, including any native host-buffer donation represented by a custom deleter, remain unknown until their ownership can be proved.",
+    "Inventory retention is not a ledger pin, a working-memory reservation or permission to allocate. Public native shared-domain pool registration and complete request quotes remain incomplete.",
+    "Metadata, allocator cache, JIT, operating-system cache and process memory are outside this physical payload inventory.",
+    "No new released-checkpoint numerical comparison or allocator/process peak measurement was made.",
+    "Native builds retain the existing compact-unwind linker warning and the feature check reports four existing quote/projection helpers awaiting production integration."
+  ],
+  "checks": [
+    {
+      "name": "native_residency",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib backend::runtime::residency:: -- --test-threads=1",
+      "log": "/private/tmp/eredu-native-storage-residency-tests.log",
+      "sha256": "da2ca785f9ef37ad2c87fa2928922d978584fffb4f47f5ea2ffc255766806d09",
+      "passed": 57
+    },
+    {
+      "name": "native_test_build",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib --no-run",
+      "log": "/private/tmp/eredu-native-storage-build.log",
+      "sha256": "5bf21f308021d5da71ee6a9d17e8d5cceb4e65cf177cab7f45afe18bd5905bf6",
+      "passed": null
+    },
+    {
+      "name": "native_feature_check",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "log": "/private/tmp/eredu-native-storage-check.log",
+      "sha256": "c7a3a87685f4b43ae586250a6a3c7a68c39b3d456f2087440dac63bac940ce46",
+      "passed": null
+    }
+  ]
+}

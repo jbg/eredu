@@ -187,6 +187,21 @@ pub struct RoutedUnitInvocation<'a, T> {
 /// Implementations reserve retention, host materialization and replacements before
 /// doing that work. A local provider has not established distributed delivery.
 pub trait RoutedUnitObserver<T> {
+    /// Whole independently addressable source, distinct from an exchanged EP
+    /// source and from an actual selected-member callback.
+    fn observe_addressable_source(&mut self,_source:eredu_nn::workspace::WorkspaceAddressableObservationView<'_>)
+        ->Result<eredu_nn::workspace::WorkspaceAddressableObservationSource,Error>{
+        Err(Error::backend_source(eredu_nn::GroupedUnitError::Unavailable))
+    }
+
+    /// Cold source of a dynamic region before exchanged route counts exist.
+    /// This is distinct from an actual invocation or batch. The default refuses
+    /// observers without a qualified prospective source; no callback is skipped.
+    fn observe_region_source(&mut self, _source: eredu_nn::workspace::WorkspaceExpertObservationView<'_>)
+        -> Result<eredu_nn::workspace::WorkspaceExpertObservationSource,Error> {
+        Err(Error::backend_source(eredu_nn::GroupedUnitError::Unavailable))
+    }
+
     /// Validates and prepares one actual local invocation before provider work.
     /// Implementations may use already prepaid source preparation and group votes.
     fn begin_invocation(&mut self, _invocation: &RoutedUnitInvocation<'_, T>) -> Result<(), Error> {
@@ -352,6 +367,15 @@ fn partition_batch<'a, T: Tensor>(
     Ok(local)
 }
 impl<T: Tensor> RoutedUnitObserver<T> for PartitionUnitObserver<'_, T> {
+    fn observe_addressable_source(&mut self,source:eredu_nn::workspace::WorkspaceAddressableObservationView<'_>)
+        ->Result<eredu_nn::workspace::WorkspaceAddressableObservationSource,Error>{
+        if source.unit_coordinates.is_some(){return Err(Error::backend_source(eredu_nn::GroupedUnitError::Unavailable));}
+        self.inner.observe_addressable_source(eredu_nn::workspace::WorkspaceAddressableObservationView{
+            region:source.region,envelope:source.envelope,units:source.units,
+            unit_coordinates:Some(self.coordinates),
+        })
+    }
+
     fn begin_invocation(&mut self, invocation: &RoutedUnitInvocation<'_, T>) -> Result<(), Error> {
         if invocation.unit_coordinates.is_some() {
             return Err(Error::backend(
@@ -388,6 +412,11 @@ struct InvocationUnitObserver<'a, T> {
     inner: &'a mut dyn RoutedUnitObserver<T>,
 }
 impl<T> RoutedUnitObserver<T> for InvocationUnitObserver<'_, T> {
+    fn observe_addressable_source(&mut self,source:eredu_nn::workspace::WorkspaceAddressableObservationView<'_>)
+        ->Result<eredu_nn::workspace::WorkspaceAddressableObservationSource,Error>{
+        self.inner.observe_addressable_source(source)
+    }
+
     fn invocation_active(&self) -> bool {
         true
     }
@@ -500,6 +529,20 @@ pub fn with_resident_unit_coordinates<T: Tensor, R, E>(
 ) -> Result<R, Error>
 where
     E: std::error::Error + Send + Sync + 'static,
+{
+    with_borrowed_resident_unit_coordinates(
+        coordinates.map(|(coordinates, partitioned)| (coordinates, *partitioned)), request, execute,
+    )
+}
+
+/// Uses the same resident-coordinate invocation with an immutable source loan.
+/// The caller keeps the exact coordinate owner through the callback.
+pub fn with_borrowed_resident_unit_coordinates<T: Tensor, R, E>(
+    coordinates: Option<(&eredu_core::component::ComponentCoordinateMap, bool)>,
+    request: RoutedExpertRequest<'_, '_, T>,
+    execute: impl FnOnce(RoutedExpertRequest<'_, '_, T>) -> Result<R, E>,
+) -> Result<R, Error>
+where E: std::error::Error + Send + Sync + 'static,
 {
     let Some((coordinates, partitioned)) = coordinates else {
         return execute(request).map_err(Error::backend_source);

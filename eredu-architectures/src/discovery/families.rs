@@ -1304,6 +1304,9 @@ fn components(
         .enumerate()
     {
         let path = format!("{root}.layers.{index}");
+        // Retain the logical invocation namespace at the same declaration site
+        // as its real outer hooks; shared physical sources do not choose owners.
+        g.attach_parameters(&component.id, &path);
         g.get_mut(&component.id).layer_index = Some(index);
         g.decoder_execution(&component.id, index);
         g.get_mut(&component.id).output_axes = Some(axes(width));
@@ -1312,14 +1315,7 @@ fn components(
             (UnitObservation::Input, "Block input"),
             (UnitObservation::Output, "Block output"),
         ] {
-            g.observation(
-                &component.id,
-                boundary.path(&path),
-                meaning,
-                ObservationDtype::Floating,
-                Some(axes(width)),
-                false,
-            );
+            g.component_observation(&component.id, boundary.path(&path), meaning, axes(width));
         }
     }
     let mut shape = axes(vocab);

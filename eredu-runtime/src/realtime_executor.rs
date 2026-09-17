@@ -4,6 +4,7 @@
 //! decisions, delayed payload history, and exact completion attachment. Model
 //! equations and native tensor operations remain behind narrow injected traits.
 
+use crate::host_metadata::funded_vec;
 use std::{cell::RefCell, sync::Arc};
 
 use eredu_core::{
@@ -21,6 +22,9 @@ use crate::{
     SequentialDecisionPlanError,
 };
 
+mod host_source;
+pub use host_source::RealtimeCoordinatorHostSource;
+
 /// Architecture-owned execution of one already interpreted realtime frame.
 ///
 /// Implementations receive only canonical temporal tensors and the existing
@@ -35,6 +39,16 @@ where
     type Error;
     /// Architecture execution resources retained until exact completion exists.
     type Retained;
+
+    /// Validates the already prepared canonical transition before model work
+    /// or completion. Input materialization and interpretation have occurred;
+    /// rejection retains the coordinator's existing unpublished-branch semantics.
+    fn validate_transition(
+        &self,
+        _transition: &eredu_core::RealtimeFrameTransition,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
 
     /// Mutates only the unpublished model-state branch and resolves every
     /// decision through `driver` in architecture order.
@@ -265,6 +279,12 @@ where
     H: RealtimeFrameHostObserver<T>,
     H::Output: WorkDescriptor,
 {
+    fn distributed_output_words(&self) -> Option<usize> {
+        match &*self.observation.borrow() {
+            HostObservationState::Ready(observed) => observed.descriptor_words(),
+            HostObservationState::Pending(_) | HostObservationState::Failed(_) => None,
+        }
+    }
     fn encode_distributed_output(&self, output: &mut Vec<u32>) -> Result<(), String> {
         match &*self.observation.borrow() {
             HostObservationState::Ready(observed) => observed
@@ -409,13 +429,96 @@ where
     E: PreparedRealtimeFrameExecutor<B, S, M>,
     K: RealtimeFrameCompletionMechanism<T, M, E::Retained, Completion = C>,
 {
-    if branch.has_submission_completion() {
+    let (model,history,schedule,sampling,samplers,random,completion)=branch.frame_parts_mut();
+    let view=RealtimeFrameExecutionView::new(model,history,schedule,sampling,
+        samplers,random.as_ref(),completion.is_some());
+    let mut updates=RealtimeFrameExecutionUpdates::new();
+    let result=execute_realtime_frame_view::<B,S,M,T,C,H,F,E,K>(contract,payload_contract,
+        frame,view,&mut updates,decisions,host_materializer,tensor_mechanisms,
+        model_executor,completion_mechanism,context);
+    // Sampling advances at the same point as the ordinary driver; a failed
+    // submitted frame still publishes its exact quarantine completion to the
+    // unpublished branch before the caller discards that branch.
+    if let Some((next_samplers,next_random))=updates.sampling {
+        *samplers=next_samplers; *random=next_random;
+    }
+    if let Some(next)=updates.schedule { *schedule=next; }
+    if let Some(next)=updates.history { *history=next; }
+    if let Some(next)=updates.completion { *completion=Some(next); }
+    result
+}
+
+/// Borrowed source of one invocation of the common frame coordinator.
+///
+/// Metadata adapters project only model state, tensors and random state. The
+/// actual portable schedule and sampler controls remain borrowed. This view
+/// grants neither scheduler publication nor native submission authority.
+pub struct RealtimeFrameExecutionView<'a,M,T,S,R> {
+    model:&'a mut M,
+    history:&'a RealtimePayloadHistory<T>,
+    schedule:&'a eredu_core::RealtimeFrameScheduleState,
+    sampling:eredu_core::RealtimeSampling,
+    samplers:&'a [S],
+    random:Option<&'a R>,
+    submitted:bool,
+}
+impl<'a,M,T,S,R> RealtimeFrameExecutionView<'a,M,T,S,R> {
+    /// Borrows exact existing sources and the explicit submission state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(model:&'a mut M,history:&'a RealtimePayloadHistory<T>,
+        schedule:&'a eredu_core::RealtimeFrameScheduleState,sampling:eredu_core::RealtimeSampling,
+        samplers:&'a [S],random:Option<&'a R>,submitted:bool)->Self {
+        Self {model,history,schedule,sampling,samplers,random,submitted}
+    }
+}
+
+/// Transaction-local effects of the common coordinator. Only its successful
+/// publication points populate these fields; a completion created after a
+/// native error is retained independently of schedule/history publication.
+pub struct RealtimeFrameExecutionUpdates<T,S,R,C> {
+    history:Option<RealtimePayloadHistory<T>>,
+    schedule:Option<eredu_core::RealtimeFrameScheduleState>,
+    sampling:Option<(Vec<S>,Option<R>)>,
+    completion:Option<C>,
+}
+impl<T,S,R,C> RealtimeFrameExecutionUpdates<T,S,R,C> {
+    /// Creates an empty destination, without cloning any source.
+    pub const fn new()->Self { Self {history:None,schedule:None,sampling:None,completion:None} }
+    /// Published payload source, available only after successful completion creation.
+    pub fn payload_history(&self)->Option<&RealtimePayloadHistory<T>> { self.history.as_ref() }
+    /// Advanced random/sampler owners from a completed decision driver.
+    pub fn sampling_state(&self)->Option<(&[S],Option<&R>)> {
+        self.sampling.as_ref().map(|(samplers,random)|(samplers.as_slice(),random.as_ref()))
+    }
+    /// Completion retained even when native submission returns an error.
+    pub fn completion(&self)->Option<&C> { self.completion.as_ref() }
+}
+impl<T,S,R,C> Default for RealtimeFrameExecutionUpdates<T,S,R,C> {
+    fn default()->Self { Self::new() }
+}
+
+/// Runs the same ordinary coordinator from borrowed exact source fields.
+/// Callers must retain `updates` and discard the unpublished model branch on
+/// failure, including any completion placed in `updates` after native work.
+#[allow(clippy::too_many_arguments,clippy::type_complexity)]
+pub fn execute_realtime_frame_view<B,S,M,T,C,H,F,E,K>(
+    contract:&RealtimeIngressContract,payload_contract:&RealtimePayloadContract,
+    frame:&RealtimeInputFrame,view:RealtimeFrameExecutionView<'_,M,T,S,B::RandomState>,
+    updates:&mut RealtimeFrameExecutionUpdates<T,S,B::RandomState,C>,
+    decisions:&RealtimeDecisionExecution,host_materializer:&mut H,tensor_mechanisms:&mut F,
+    model_executor:&mut E,completion_mechanism:&mut K,context:&B::Context,
+)->Result<SubmittedRealtimeFrame<T,C>,RealtimeFrameCoordinatorError<H::Error,F::Error,E::Error,B::Error,K::Error>>
+where B:SamplingBackend<Token=T,Logits=T>,B::RandomState:Clone,C:Completion+Clone,
+    S:Sampler<B>+Clone,T:Clone,H:RealtimeHostTokenMaterializer<Tensor=T>,
+    F:RealtimeFrameTensorMechanisms<Tensor=T>,E:PreparedRealtimeFrameExecutor<B,S,M>,
+    K:RealtimeFrameCompletionMechanism<T,M,E::Retained,Completion=C> {
+    if view.submitted || updates.completion.is_some() || updates.history.is_some()
+        || updates.schedule.is_some() || updates.sampling.is_some() {
         return Err(RealtimeFrameCoordinatorError::CompletionAttachment(
             RealtimeCompletionAttachmentError::AlreadyAttached,
         ));
     }
-    branch
-        .schedule_state()
+    view.schedule
         .validate_schedule(contract.schedule())
         .map_err(|error| {
             RealtimeFrameCoordinatorError::Interpretation(
@@ -442,23 +545,32 @@ where
             RealtimePayloadContractError::AudioDomainMismatch,
         ));
     }
-    let mut payload_history = branch.model_state().payload_history().clone();
-    payload_history
-        .bind_or_validate_contract(payload_contract)
-        .map_err(|error| {
-            RealtimeFrameCoordinatorError::Interpretation(
-                RealtimeFrameInterpretationError::History(error),
-            )
-        })?;
-    let validated = contract
-        .validate(frame)
-        .map_err(RealtimeFrameCoordinatorError::Ingress)?;
-    let input = validated
-        .materialize(host_materializer)
+    view.history.validate_contract(payload_contract).map_err(|error| {
+        RealtimeFrameCoordinatorError::Interpretation(RealtimeFrameInterpretationError::History(error))
+    })?;
+    if let Some(funding)=view.history.host_funding() {
+        funding.reserve_metadata(host_source::coordinator_header_bytes::<B,S,M,T,C,H,F,E,K>()
+            .ok_or(RealtimeFrameCoordinatorError::HostMetadata(eredu_core::HostMetadataFundingError::Overflow))?)
+            .map_err(RealtimeFrameCoordinatorError::HostMetadata)?;
+    }
+    // Borrowed validation and the selected source admission precede every
+    // coordinator-owned policy/history clone and opaque tensor constructor.
+    let validated = contract.inspect(frame).map_err(RealtimeFrameCoordinatorError::Ingress)?;
+    let input = validated.materialize(host_materializer)
         .map_err(RealtimeFrameCoordinatorError::Materialization)?;
+    let mut payload_history = crate::realtime_interpreter::clone_frame_history(view.history,tensor_mechanisms)
+        .map_err(RealtimeFrameCoordinatorError::Interpretation)?;
+    payload_history.bind_or_validate_contract(payload_contract).map_err(|error| {
+        RealtimeFrameCoordinatorError::Interpretation(RealtimeFrameInterpretationError::History(error))
+    })?;
 
     let schedule = contract.schedule();
-    let mut schedule_state = branch.schedule_state().clone();
+    let mut schedule_state = match payload_history.host_funding() {
+        Some(funding)=>view.schedule.try_clone_with_host_source(funding).map_err(|cause|
+            RealtimeFrameCoordinatorError::Interpretation(RealtimeFrameInterpretationError::Schedule(
+                eredu_core::RealtimeScheduleError::HostMetadata(cause))))?,
+        None=>view.schedule.clone(),
+    };
     let prepared = prepare_realtime_frame(
         schedule,
         &mut schedule_state,
@@ -468,26 +580,46 @@ where
     )
     .map_err(RealtimeFrameCoordinatorError::Interpretation)?;
 
+    model_executor
+        .validate_transition(prepared.transition())
+        .map_err(RealtimeFrameCoordinatorError::Model)?;
+
     let (completed, execution_retained) = if prepared.transition().model_call_required() {
-        let plan = SequentialDecisionPlan::new(
-            prepared.directives().iter().cloned(),
-            prepared.retains_diagnostics(),
-            decisions.allow_fully_forced_tail_skip,
-        )
-        .map_err(RealtimeFrameCoordinatorError::DecisionPlan)?;
-        let sampling = branch.sampling();
-        let temperatures = std::iter::once(sampling.text_temperature())
-            .chain(std::iter::repeat_n(
-                sampling.audio_temperature(),
-                schedule.depth_audio_codebooks(),
-            ))
-            .collect();
-        let mut driver = branch
-            .decision_driver::<B>(plan, temperatures)
+        let funding=payload_history.host_funding();
+        let mut directives=funded_vec(prepared.directives().len(),funding)
+            .map_err(RealtimeFrameCoordinatorError::HostMetadata)?;
+        for directive in prepared.directives() {directives.push(match directive {
+            crate::PredictionDirective::Sample=>crate::PredictionDirective::Sample,
+            crate::PredictionDirective::Force(value)=>crate::PredictionDirective::Force(
+                crate::realtime_interpreter::clone_frame_tensor(value,funding,tensor_mechanisms)
+                    .map_err(RealtimeFrameCoordinatorError::Interpretation)?),
+        });}
+        let plan = SequentialDecisionPlan::from_directives(directives,
+            prepared.retains_diagnostics(),decisions.allow_fully_forced_tail_skip)
             .map_err(RealtimeFrameCoordinatorError::DecisionPlan)?;
+        let sampling=view.sampling;
+        let mut temperatures=funded_vec(plan.len(),funding).map_err(RealtimeFrameCoordinatorError::HostMetadata)?;
+        temperatures.push(sampling.text_temperature());
+        temperatures.extend(std::iter::repeat_n(sampling.audio_temperature(),schedule.depth_audio_codebooks()));
+        let mut samplers=funded_vec(view.samplers.len(),funding).map_err(RealtimeFrameCoordinatorError::HostMetadata)?;
+        for value in view.samplers {
+            samplers.push(match funding {
+                Some(funding)=>value.clone_with_host_source(funding).map_err(RealtimeFrameCoordinatorError::HostMetadata)?,
+                None=>value.clone(),
+            });
+        }
+        let random=match (view.random,funding) {
+            (Some(value),Some(funding))=>Some(B::clone_random_with_host_source(value,funding,context)
+                .map_err(RealtimeFrameCoordinatorError::RandomCopy)?),
+            (Some(value),None)=>Some(value.clone()),(None,_)=>None,
+        };
+        let mut driver=match funding {
+            Some(funding)=>SequentialDecisionDriver::<B,S>::new_with_host_source(plan,samplers,temperatures,random,funding),
+            None=>SequentialDecisionDriver::<B,S>::new(plan,samplers,temperatures,random),
+        }.map_err(RealtimeFrameCoordinatorError::DecisionPlan)?;
         let execution_retained = model_executor
             .execute(
-                branch.model_state_mut().model_state_mut(),
+                &mut *view.model,
                 prepared.temporal(),
                 &mut driver,
                 context,
@@ -496,16 +628,14 @@ where
         driver
             .finish()
             .map_err(RealtimeFrameCoordinatorError::Decision)?;
-        let resolved = driver
-            .decisions()
-            .iter()
-            .map(|decision| decision.token().clone())
-            .collect::<Vec<_>>();
-        let diagnostics = driver
-            .diagnostics()
-            .iter()
-            .map(|diagnostic| diagnostic.logits().clone())
-            .collect::<Vec<_>>();
+        let mut resolved=funded_vec(driver.decisions().len(),funding)
+            .map_err(RealtimeFrameCoordinatorError::HostMetadata)?;
+        for decision in driver.decisions() {resolved.push(crate::realtime_interpreter::clone_frame_tensor(
+            decision.token(),funding,tensor_mechanisms).map_err(RealtimeFrameCoordinatorError::Interpretation)?);}
+        let mut diagnostics=funded_vec(driver.diagnostics().len(),funding)
+            .map_err(RealtimeFrameCoordinatorError::HostMetadata)?;
+        for diagnostic in driver.diagnostics() {diagnostics.push(crate::realtime_interpreter::clone_frame_tensor(
+            diagnostic.logits(),funding,tensor_mechanisms).map_err(RealtimeFrameCoordinatorError::Interpretation)?);}
         let completed = complete_realtime_frame(
             schedule,
             &mut payload_history,
@@ -515,9 +645,8 @@ where
             tensor_mechanisms,
         )
         .map_err(RealtimeFrameCoordinatorError::Interpretation)?;
-        branch
-            .adopt_decision_driver(driver)
-            .map_err(RealtimeFrameCoordinatorError::Decision)?;
+        updates.sampling=Some(driver.finish_into_sampling_state()
+            .map_err(RealtimeFrameCoordinatorError::Decision)?);
         (completed, Some(execution_retained))
     } else {
         (
@@ -537,7 +666,7 @@ where
     let completion = match completion_mechanism.complete(
         input,
         &completed,
-        branch.model_state_mut().model_state(),
+        &*view.model,
         &payload_history,
         execution_retained,
     ) {
@@ -546,9 +675,7 @@ where
             return Err(RealtimeFrameCoordinatorError::Completion(error));
         }
         Err(RealtimeCompletionCreationError::AfterSubmission { error, completion }) => {
-            branch
-                .attach_submission_completion(completion)
-                .map_err(RealtimeFrameCoordinatorError::CompletionAttachment)?;
+            updates.completion=Some(completion);
             return Err(RealtimeFrameCoordinatorError::CompletionAfterSubmission(
                 error,
             ));
@@ -556,11 +683,9 @@ where
     };
     let retained_resources = completion_mechanism.retained_resources(&completion);
 
-    *branch.schedule_state_mut() = schedule_state;
-    *branch.model_state_mut().payload_history_mut() = payload_history;
-    branch
-        .attach_submission_completion(completion.clone())
-        .map_err(RealtimeFrameCoordinatorError::CompletionAttachment)?;
+    updates.schedule=Some(schedule_state);
+    updates.history=Some(payload_history);
+    updates.completion=Some(completion.clone());
     Ok(SubmittedRealtimeFrame {
         frame: completed,
         completion,
@@ -572,6 +697,12 @@ where
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeFrameCoordinatorError<H, F, E, B, K> {
+    /// The admitted host account refused a concrete destination.
+    #[error(transparent)]
+    HostMetadata(eredu_core::HostMetadataFundingError),
+    /// The backend's actual random-owner copy source failed.
+    #[error("realtime random-state copy failed")]
+    RandomCopy(#[source] eredu_core::BackendFailure),
     /// Session payload identity did not match ingress or accepted batch.
     #[error(transparent)]
     PayloadContract(RealtimePayloadContractError),
@@ -623,6 +754,8 @@ mod tests {
     struct Matrix {
         values: Vec<i32>,
         shape: [usize; 2],
+        // Declared after values: expiry witnesses retirement of this input's Vec.
+        lifetime: Option<Rc<()>>,
     }
 
     #[derive(Debug, Clone, Copy, thiserror::Error)]
@@ -632,6 +765,22 @@ mod tests {
     #[derive(Default)]
     struct Mechanisms {
         calls: usize,
+        track: bool,
+        lifetimes: Vec<std::rc::Weak<()>>,
+    }
+    impl Mechanisms {
+        fn matrix(&mut self, values: Vec<i32>, shape: [usize; 2]) -> Matrix {
+            let lifetime = self.track.then(|| {
+                let owner = Rc::new(());
+                self.lifetimes.push(Rc::downgrade(&owner));
+                owner
+            });
+            Matrix {
+                values,
+                shape,
+                lifetime,
+            }
+        }
     }
 
     impl RealtimeHostTokenMaterializer for Mechanisms {
@@ -644,10 +793,7 @@ mod tests {
             shape: [usize; 2],
         ) -> Result<Self::Tensor, Self::Error> {
             self.calls += 1;
-            Ok(Matrix {
-                values: values.to_vec(),
-                shape,
-            })
+            Ok(self.matrix(values.to_vec(), shape))
         }
     }
 
@@ -662,20 +808,17 @@ mod tests {
         ) -> Result<Self::Tensor, Self::Error> {
             self.calls += 1;
             let columns = matrix.shape[1];
-            Ok(Matrix {
-                values: (0..matrix.shape[0])
+            Ok(self.matrix(
+                (0..matrix.shape[0])
                     .map(|row| matrix.values[row * columns + column])
                     .collect(),
-                shape: [matrix.shape[0], 1],
-            })
+                [matrix.shape[0], 1],
+            ))
         }
 
         fn filled_column(&mut self, token: i32, batch: usize) -> Result<Self::Tensor, Self::Error> {
             self.calls += 1;
-            Ok(Matrix {
-                values: vec![token; batch],
-                shape: [batch, 1],
-            })
+            Ok(self.matrix(vec![token; batch], [batch, 1]))
         }
 
         fn stack_columns(
@@ -687,10 +830,7 @@ mod tests {
             let values = (0..batch)
                 .flat_map(|row| columns.iter().map(move |column| column.values[row]))
                 .collect();
-            Ok(Matrix {
-                values,
-                shape: [batch, columns.len()],
-            })
+            Ok(self.matrix(values, [batch, columns.len()]))
         }
     }
 
@@ -921,6 +1061,7 @@ mod tests {
                         &Matrix {
                             values: vec![value],
                             shape: [1, 1],
+                            lifetime: None,
                         },
                         domain,
                         &(),
@@ -930,6 +1071,7 @@ mod tests {
             Ok(Matrix {
                 values: vec![7],
                 shape: [1, 1],
+                lifetime: None,
             })
         }
     }
@@ -1526,5 +1668,87 @@ mod tests {
         assert_eq!(observer_calls.get(), 1);
         let (_, _, transition) = progress.committed.pop().unwrap();
         assert_eq!(transition.into_host_output().unwrap(), vec![3]);
+    }
+    #[test]
+    fn required_transition_rejection_retires_prepared_inputs_without_model_or_commit() {
+        struct Required(Executor);
+        impl PreparedRealtimeFrameExecutor<TestBackend, TestSampler, ModelState> for Required {
+            type Error = ExecutionError;
+            type Retained = Matrix;
+            fn validate_transition(
+                &self,
+                transition: &eredu_core::RealtimeFrameTransition,
+            ) -> Result<(), ExecutionError> {
+                transition
+                    .model_call_required()
+                    .then_some(())
+                    .ok_or(ExecutionError)
+            }
+            fn execute(
+                &mut self,
+                state: &mut ModelState,
+                temporal: &[Matrix],
+                driver: &mut SequentialDecisionDriver<TestBackend, TestSampler>,
+                context: &(),
+            ) -> Result<Matrix, ExecutionError> {
+                self.0.execute(state, temporal, driver, context)
+            }
+        }
+        let schedule = schedule(RealtimeFrameConvention::AbsoluteDelayedSlots);
+        let discards = Rc::new(Cell::new(0));
+        let state = state(&schedule, discards.clone());
+        let mut branch = state.branch().unwrap();
+        let mut host = Mechanisms {
+            track: true,
+            ..Default::default()
+        };
+        let mut tensors = Mechanisms {
+            track: true,
+            ..Default::default()
+        };
+        let mut executor = Required(Executor {
+            fail: false,
+            calls: 0,
+        });
+        let mut completion = CompletionMechanism::default();
+        let result = execute_realtime_frame::<TestBackend, _, _, _, _, _, _, _, _>(
+            &contract(&schedule),
+            &payload_contract(&schedule),
+            &frame(),
+            &mut branch,
+            &RealtimeDecisionExecution::new(true),
+            &mut host,
+            &mut tensors,
+            &mut executor,
+            &mut completion,
+            &(),
+        );
+        assert!(matches!(
+            result,
+            Err(RealtimeFrameCoordinatorError::Model(ExecutionError))
+        ));
+        assert!(
+            host.calls > 0 && tensors.calls > 0,
+            "rejection follows actual input preparation"
+        );
+        assert!(!host.lifetimes.is_empty() && !tensors.lifetimes.is_empty());
+        assert!(host
+            .lifetimes
+            .iter()
+            .chain(&tensors.lifetimes)
+            .all(|weak| weak.upgrade().is_none()));
+        assert_eq!(executor.0.calls, 0);
+        assert_eq!(completion.calls, 0);
+        assert_eq!(state.schedule_state().frontier(), 0);
+        assert_eq!(branch.schedule_state().frontier(), 0);
+        assert_eq!(state.model_state().model_state().executions, 0);
+        assert_eq!(branch.model_state().model_state().executions, 0);
+        assert!(state.model_state().payload_history().is_empty());
+        assert!(branch.model_state().payload_history().is_empty());
+        assert_eq!(state.random_state(), Some(&0));
+        assert_eq!(branch.random_state(), Some(&0));
+        assert!(!branch.has_submission_completion());
+        Generation::discard_branch(branch).unwrap();
+        assert_eq!(discards.get(), 1);
     }
 }

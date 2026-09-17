@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::Arc;
+use std::{rc::Rc, sync::Arc};
 
 /// MLX communication capability attached to one complete model/session.
 ///
@@ -10,7 +10,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct MlxDistributedSession {
     manifest: Arc<eredu_runtime::CommunicationManifest>,
-    communicators: ParallelCommunicators,
+    communicators: Rc<ParallelCommunicators>,
     stream: Stream,
     world: NativeGroup,
     pub(super) authority: eredu_runtime::PartitionCommunicationAuthority,
@@ -20,6 +20,20 @@ pub struct MlxDistributedSession {
 }
 
 impl MlxDistributedSession {
+    /// Logical quota equation shared with the source-retained capture adapter.
+    /// This prices no native scope and grants no submission or storage authority.
+    pub(crate) fn capture_gather_usage(participants:usize,local_words:usize)
+        ->Result<eredu_core::capture::CaptureUsage,eredu_core::capture::CaptureError> {
+        let (retained_bytes,host_bytes)=control_gather_storage(participants,local_words)
+            .ok_or(eredu_core::capture::CaptureError::Overflow)?;
+        Ok(eredu_core::capture::CaptureUsage{retained_bytes,host_bytes,..Default::default()})
+    }
+    pub(crate) fn matches_capture_source(&self, source: &eredu_runtime::RetainedCommunicationSource,
+        authority: &eredu_runtime::PartitionCommunicationAuthority) -> bool {
+        self.authority.same_authority(authority)
+            && self.communicators.control_world().retained_source()
+                .is_some_and(|actual| actual.same_source(source))
+    }
     /// Completes an already constructed ordinary source graph without a host
     /// tensor copy. The retained world also fences every logical group sharing
     /// that native communicator. The nested recovery scope keeps the enclosing
@@ -84,7 +98,7 @@ impl MlxDistributedSession {
             .transpose()?;
         let mut session = Self {
             manifest: Arc::new(manifest.clone()),
-            communicators,
+            communicators: Rc::new(communicators),
             stream: stream.clone(),
             world: world.clone(),
             authority,
@@ -100,6 +114,42 @@ impl MlxDistributedSession {
         Ok(session)
     }
 
+    /// Fund a borrow of the actual checked native communication source. This
+    /// creates no communicator, transport, completion, or original work grant.
+    pub(crate) fn original_communication_source<'a>(
+        &'a self, selected: &eredu_runtime::CommunicationManifest,
+        world: &NativeGroup, funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+    ) -> Result<crate::backend::runtime::distributed::topology::OriginalCommunicationSource<'a>, Error> {
+        self.communicators.bind_original_source(selected, world, &self.authority, funding)
+    }
+
+    /// Retain the actual immutable communicator table after the same checked
+    /// source binding. Later phases borrow this owner; no native group or
+    /// descriptor is rebuilt from a manifest.
+    pub(crate) fn original_communication_owner(
+        &self, selected: &eredu_runtime::CommunicationManifest,
+        world: &NativeGroup, funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+    ) -> Result<crate::backend::runtime::distributed::topology::OriginalCommunicationOwner, Error> {
+        crate::backend::runtime::distributed::topology::OriginalCommunicationOwner::bind(
+            &self.communicators, selected, world, &self.authority, funding)
+    }
+
+    /// Borrows this session's actual manifest/world and retains the initialized
+    /// tensor source for one complete frame. It creates no communicator.
+    pub(crate) fn original_initialized_tensor_source(&self,id:eredu_core::CollectiveGroupId,
+        pool:&eredu_runtime::working_memory::WorkingMemoryPool,
+        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
+        ->Result<crate::backend::runtime::distributed::topology::original_source::parallel::OriginalParallelSource,Error> {
+        self.original_communication_owner(&self.manifest,&self.world,funding)?
+            .prepare_initialized_parallel_source(id,pool)
+    }
+
+    pub(crate) fn retained_buffer(&self)->Option<&safemlx::distributed::RetainedGroupBuffer>{
+        self.communicators.control_world().retained_buffer()
+    }
+    pub(crate) fn collect_retained_buffers(&self,storage:&mut crate::backend::runtime::residency::storage::RetainedStorage)->Result<(),Error>{
+        self.communicators.collect_retained_buffers(storage)
+    }
     /// Common setup identity retained alongside the actual communication owner.
     pub fn session_identity(&self) -> eredu_runtime::CommunicationSessionIdentity {
         self.communicators.session_identity()
@@ -158,6 +208,23 @@ impl MlxDistributedSession {
     }
 
     /// Consumes architecture-selected communication into the neutral partition runtime.
+    /// Initial construction that retains the actual setup inventory for later
+    /// original execution. Existing consuming construction remains unchanged.
+    pub(crate) fn retained_partition_communication(&self,manifest:eredu_runtime::CommunicationManifest,
+        tensor_group:eredu_core::CollectiveGroupId)
+        ->Result<(eredu_runtime::PartitionCommunication<crate::backend::nn::shared::MlxNeuralBackend,
+            Group,crate::backend::runtime::distributed::topology::CommunicationRouteRealization,
+            crate::backend::nn::shared::MlxCommunicationTensorMetadata>,Group,Stream),Error> {
+        if self.manifest.as_ref()!=&manifest {return Err(Error::Parallel("retained partition manifest differs".into()));}
+        let parallel=self.communicators.communication_group(tensor_group)
+            .ok_or_else(||Error::Parallel("retained partition tensor group is absent".into()))?.clone();
+        let (groups,routes)=self.communicators.partition_resource_loans(&manifest)?;
+        let communication=eredu_runtime::PartitionCommunication::new_with_authority(manifest,groups,routes,
+            crate::backend::nn::shared::MlxCommunicationTensorMetadata,self.authority.clone())
+            .map_err(|cause|Error::Parallel(cause.to_string()))?;
+        Ok((communication,parallel,self.stream.clone()))
+    }
+
     pub(crate) fn into_partition_communication(
         self,
         manifest: eredu_runtime::CommunicationManifest,
@@ -209,7 +276,10 @@ impl MlxDistributedSession {
             preparation: _,
             parameter_operations: _,
         } = self;
-        let (groups, routes) = communicators.into_partition_resources(&manifest)?;
+        // Initial runtime construction keeps the existing consuming worker.
+        // A unique table moves directly; a previously shared ordinary setup
+        // takes the same container copy that session cloning used to take.
+        let (groups, routes) = Rc::unwrap_or_clone(communicators).into_partition_resources(&manifest)?;
         let communication = eredu_runtime::PartitionCommunication::new_with_authority(
             manifest,
             groups,
@@ -277,10 +347,10 @@ impl MlxDistributedSession {
             .map_err(|error| Error::Parallel(error.to_string()))
     }
 
-    pub(crate) fn coordinate_speculative_step(
+    pub(crate) fn coordinate_speculative_step<B: AsRef<[eredu_core::SpeculativeScheduleState]> + AsMut<[eredu_core::SpeculativeScheduleState]>>(
         &self,
-        local: Vec<eredu_core::SpeculativeScheduleState>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        local: B,
+    ) -> Result<B, eredu_core::BackendFailure> {
         let coordinator = self.preparation.as_ref().ok_or_else(|| {
             eredu_core::BackendFailure::new(
                 eredu_core::BackendFailureKind::Unsupported,
@@ -659,15 +729,7 @@ impl eredu_runtime::capture::partition::PartitionCaptureTransport for MlxDistrib
         &self,
         local_words: usize,
     ) -> Result<eredu_core::capture::CaptureUsage, eredu_core::capture::CaptureError> {
-        use eredu_core::capture::{CaptureError, CaptureUsage};
-        let (retained_bytes, host_bytes) =
-            control_gather_storage(self.manifest.world_size(), local_words)
-                .ok_or(CaptureError::Overflow)?;
-        Ok(CaptureUsage {
-            retained_bytes,
-            host_bytes,
-            ..Default::default()
-        })
+        Self::capture_gather_usage(self.manifest.world_size(),local_words)
     }
 
     fn fail_capture_exchange(
@@ -768,22 +830,21 @@ impl eredu_runtime::run_preparation::TextPreparationTransport for MlxDistributed
 }
 
 impl MlxDistributedSession {
+    /// Borrow the exact original setup descriptor, including remote stage
+    /// groups needed by all-rank preparation. This grants no native group loan.
+    pub(crate) fn capture_hook_source<'a>(groups:&'a [eredu_runtime::CommunicationGroupDescriptor],
+        members:&[usize])->Option<&'a eredu_runtime::CommunicationGroupDescriptor> {
+        groups.iter().find(|group|group.members()==members
+            && group.requirements().operations().iter().any(|operation|
+                operation.operation()==eredu_runtime::CommunicationOperation::FailureAgreement
+                    && operation.exact_completion()))
+    }
     fn capture_hook_descriptor(
         &self,
         members: &[usize],
     ) -> Result<&eredu_runtime::CommunicationGroupDescriptor, eredu_core::capture::CaptureError>
     {
-        self.communicators
-            .global_group_descriptors()
-            .iter()
-            .find(|group| {
-                group.members() == members
-                    && group.requirements().operations().iter().any(|operation| {
-                        operation.operation()
-                            == eredu_runtime::CommunicationOperation::FailureAgreement
-                            && operation.exact_completion()
-                    })
-            })
+        Self::capture_hook_source(self.communicators.global_group_descriptors(),members)
             .ok_or_else(|| {
                 eredu_core::capture::CaptureError::Unsupported(
                     "capture hook group has no selected exact failure agreement".into(),
@@ -795,37 +856,12 @@ impl MlxDistributedSession {
 impl eredu_runtime::capture::partition::PartitionCaptureHookTransport for MlxDistributedSession {
     type HookOutput = crate::backend::runtime::distributed::completion::MlxFailureAgreement;
 
-    fn estimate_capture_hook(
-        &self,
-        members: &[usize],
-    ) -> Result<eredu_core::capture::CaptureUsage, eredu_core::capture::CaptureError> {
-        use eredu_core::capture::{add, mul, CaptureError, CaptureUsage};
-        if members.is_empty()
-            || members.windows(2).any(|pair| pair[0] >= pair[1])
-            || members
-                .iter()
-                .any(|rank| *rank >= self.manifest.world_size())
-        {
-            return Err(CaptureError::Invalid(
-                "capture hook membership exceeds selected world".into(),
-            ));
-        }
-        // A singleton requires no collective or native status tensor.
-        if members.len() == 1 {
-            return Ok(CaptureUsage::default());
-        }
-        let descriptor = self.capture_hook_descriptor(members)?;
-        let independent = crate::backend::runtime::distributed::independent_status_members(
-            self.manifest.world_size(),
-            members,
-        );
-        if !independent {
-            return Err(CaptureError::Unsupported(
-                "selected native subgroup requires a world participation wave for status agreement"
-                    .into(),
-            ));
-        }
-        i32::try_from(members.len()).map_err(|_| CaptureError::Overflow)?;
+    fn estimate_capture_hook(&self,members:&[usize])
+        ->Result<eredu_core::capture::CaptureUsage,eredu_core::capture::CaptureError> {
+        use eredu_core::capture::CaptureError;
+        let usage=Self::capture_hook_usage(self.manifest.world_size(),members)?;
+        if members.len()==1 {return Ok(usage);}
+        let descriptor=self.capture_hook_descriptor(members)?;
         if descriptor.local_index().is_some()
             && self
                 .communicators
@@ -836,13 +872,7 @@ impl eredu_runtime::capture::partition::PartitionCaptureHookTransport for MlxDis
                 "selected capture hook group was not realized".into(),
             ));
         }
-        // Scalar input/output, conservative logical reduction temporaries and
-        // exact event/host-status storage. Private allocator workspace is excluded.
-        Ok(CaptureUsage {
-            retained_bytes: add(8192, mul(members.len() as u64, 256)?)?,
-            host_bytes: add(4096, mul(members.len() as u64, 256)?)?,
-            ..Default::default()
-        })
+        Ok(usage)
     }
 
     fn submit_capture_hook(
@@ -872,7 +902,7 @@ impl eredu_runtime::capture::partition::PartitionCaptureHookTransport for MlxDis
         .map_err(|error| self.submission_error(error, operation))?;
         Ok(Submission {
             output: submission.output,
-            completion: submission.completion.with_authority(
+            completion: submission.completion.into_native().with_authority(
                 self.authority.clone(),
                 operation,
                 eredu_runtime::DistributedExecutionPhase::Execution,
@@ -886,3 +916,51 @@ impl eredu_runtime::capture::partition::PartitionCaptureHookTransport for MlxDis
             .map_err(Into::into)
     }
 }
+
+mod readiness;
+pub use readiness::MlxTextPreparationControl;
+
+impl MlxDistributedSession {
+    /// Existing member-only hook logical equation, shared by ordinary and
+    /// original transports. This is a source fact and grants no native work.
+    pub(crate) fn capture_hook_usage(world:usize,members:&[usize])
+        ->Result<eredu_core::capture::CaptureUsage,eredu_core::capture::CaptureError> {
+        use eredu_core::capture::{add, mul, CaptureError, CaptureUsage};
+        if members.is_empty()
+            || members.windows(2).any(|pair| pair[0] >= pair[1])
+            || members
+                .iter()
+                .any(|rank| *rank >= world)
+        {
+            return Err(CaptureError::Invalid(
+                "capture hook membership exceeds selected world".into(),
+            ));
+        }
+        // A singleton requires no collective or native status tensor.
+        if members.len() == 1 {
+            return Ok(CaptureUsage::default());
+        }
+        let independent = crate::backend::runtime::distributed::independent_status_members(
+            world,
+            members,
+        );
+        if !independent {
+            return Err(CaptureError::Unsupported(
+                "selected native subgroup requires a world participation wave for status agreement"
+                    .into(),
+            ));
+        }
+        i32::try_from(members.len()).map_err(|_| CaptureError::Overflow)?;
+        // Scalar input/output, conservative logical reduction temporaries and
+        // exact event/host-status storage. Private allocator workspace is excluded.
+        Ok(CaptureUsage {
+            retained_bytes: add(8192, mul(members.len() as u64, 256)?)?,
+            host_bytes: add(4096, mul(members.len() as u64, 256)?)?,
+            ..Default::default()
+        })
+    }
+
+}
+
+mod realtime_consensus;
+pub(crate) use realtime_consensus::PreparedRealtimeConsensusTransport;

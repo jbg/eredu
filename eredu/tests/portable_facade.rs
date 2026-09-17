@@ -22,6 +22,12 @@ mod lifecycle;
 #[path = "portable_facade/nanbeige.rs"]
 mod nanbeige;
 
+#[path = "portable_facade/controller_storage.rs"]
+mod controller_storage;
+
+#[path = "portable_facade/frozen_recipe.rs"]
+mod frozen_recipe;
+
 #[derive(Default)]
 struct BackendCalls {
     configs: Vec<TextGenerationConfig>,
@@ -29,6 +35,19 @@ struct BackendCalls {
     scripted_tokens: std::collections::VecDeque<u32>,
     prompts: usize,
     speculative: usize,
+    shared_filter_attempts: usize,
+    shared_filter_factories: usize,
+    reject_shared_filter: bool,
+    shared_bytes_attempts: usize,
+    shared_bytes_factories: usize,
+    shared_bytes_payload: usize,
+    shared_bytes_capacity: u64,
+    reject_shared_bytes: bool,
+    host_attempts: usize,
+    reject_host: bool,
+    reject_submission: bool,
+    reject_prompt: bool,
+    pool: Option<eredu_runtime::working_memory::WorkingMemoryPool>,
 }
 
 #[derive(Default)]
@@ -39,6 +58,9 @@ struct MockBackend {
 
 impl MockBackend {
     fn sample(&self, filter: &TokenFilter) -> Result<MockToken, MockError> {
+        if self.calls.borrow().reject_submission {
+            return Err(MockError);
+        }
         self.calls.borrow_mut().filters.push(filter.clone());
         if let Some(token) = self.calls.borrow_mut().scripted_tokens.pop_front() {
             assert!(filter.allows(token), "scripted token {token} was masked");
@@ -60,6 +82,7 @@ struct MockSession;
 
 #[derive(Clone)]
 struct MockToken(u32);
+thread_local! { static TOKEN_READ_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 #[derive(Debug, thiserror::Error)]
 #[error("mock backend failed")]
@@ -92,7 +115,11 @@ impl TokenOutput for MockToken {
     type Error = MockError;
 
     fn token_id(&self) -> Result<u32, Self::Error> {
-        Ok(self.0)
+        if TOKEN_READ_FAILURE.with(std::cell::Cell::get) {
+            Err(MockError)
+        } else {
+            Ok(self.0)
+        }
     }
 }
 
@@ -101,6 +128,11 @@ impl BackendProvider for MockBackend {
     type Model = ();
     type Session = MockSession;
     type Error = MockError;
+
+    fn into_backend_failure(error: MockError) -> eredu_core::BackendFailure {
+        eredu_core::BackendFailure::new(eredu_core::BackendFailureKind::Busy, error)
+            .with_operation("portable-provider-hook")
+    }
 
     fn descriptor(&self) -> BackendDescriptor {
         BackendDescriptor::new("portable-mock", "1")
@@ -171,6 +203,101 @@ impl BackendSession<MockBackend> for MockSession {
 }
 
 impl TextGenerationBackend for MockBackend {
+    type TextPreparation = ();
+    type TextPreparationControl = ();
+    type TextStepPermit = ();
+
+    fn acquire_host_preparation(
+        runtime: &ModelRuntime<Self>,
+    ) -> Result<eredu_core::HostPreparationAuthority, eredu_core::BackendFailure> {
+        let pool = {
+            let mut calls = runtime.backend().calls.borrow_mut();
+            calls.host_attempts += 1;
+            if calls.reject_host {
+                return Err(eredu_core::BackendFailure::from_error(MockError));
+            }
+            calls.pool.clone()
+        };
+        match pool {
+            Some(pool) => pool
+                .acquire_unquoted()
+                .map(eredu_core::HostPreparationAuthority::retain)
+                .map_err(eredu_core::BackendFailure::from_error),
+            None => Ok(eredu_core::HostPreparationAuthority::unmanaged()),
+        }
+    }
+
+    fn text_execution_control_support(
+        _: &ModelRuntime<Self>,
+    ) -> eredu_core::execution_control::ControlSupport {
+        eredu_core::execution_control::ControlSupport::Supported
+    }
+
+    fn prepare_shared_token_filter(
+        runtime: &ModelRuntime<Self>,
+        factory: impl FnOnce() -> TokenFilter,
+    ) -> Result<eredu_core::SharedTokenFilter, eredu_core::BackendFailure> {
+        {
+            let mut calls = runtime.backend().calls.borrow_mut();
+            calls.shared_filter_attempts += 1;
+            if calls.reject_shared_filter {
+                return Err(eredu_core::BackendFailure::from_error(MockError));
+            }
+            calls.shared_filter_factories += 1;
+        }
+        Ok(eredu_core::SharedTokenFilter::new(factory()))
+    }
+
+    fn prepare_shared_controller_bytes(
+        runtime: &ModelRuntime<Self>,
+        factory: impl FnOnce() -> Vec<u8>,
+    ) -> Result<eredu_core::SharedControllerBytes, eredu_core::BackendFailure> {
+        let pool = {
+            let mut calls = runtime.backend().calls.borrow_mut();
+            calls.shared_bytes_attempts += 1;
+            if calls.reject_shared_bytes {
+                return Err(eredu_core::BackendFailure::from_error(MockError));
+            }
+            calls.pool.clone()
+        };
+        let factory = || {
+            runtime.backend().calls.borrow_mut().shared_bytes_factories += 1;
+            let bytes = factory();
+            runtime.backend().calls.borrow_mut().shared_bytes_payload += bytes.len();
+            bytes
+        };
+        let bytes = match pool {
+            Some(pool) => pool
+                .prepare_shared_controller_bytes(factory)
+                .map_err(eredu_core::BackendFailure::from_error)?,
+            None => eredu_core::SharedControllerBytes::new(factory()),
+        };
+        runtime.backend().calls.borrow_mut().shared_bytes_capacity +=
+            bytes.capacity_bytes().unwrap();
+        Ok(bytes)
+    }
+
+    fn begin_text_step<C: eredu_core::TokenFilterController>(
+        _: &eredu_core::ModelRuntime<Self>,
+        _: &Self::TextPreparation,
+        _: &Self::TextGenerationState,
+        _: &C,
+        _: eredu_core::PendingTextInput<&Self::Prompt, &Self::Token>,
+        _: &eredu_core::backend::TextStepContext,
+    ) -> Result<Self::TextStepPermit, Self::Error> {
+        Ok(())
+    }
+    fn finish_text_step(_: Self::TextStepPermit) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn admit_text_preparation<C: eredu_core::TokenFilterController>(
+        _: &ModelRuntime<Self>,
+        _: &eredu_core::TextPreparationInput<'_, Self::Prompt>,
+        _: TextGenerationConfig,
+        _: &C,
+    ) -> Result<(), eredu_core::BackendFailure> {
+        Ok(())
+    }
     fn reset_session(_: &Self, _: &mut Self::Session) -> Result<(), eredu_core::BackendFailure> {
         Ok(())
     }
@@ -193,6 +320,9 @@ impl TextGenerationBackend for MockBackend {
     }
 
     fn prepare_text_prompt(backend: &Self, ids: Vec<u32>) -> Result<Self::Prompt, Self::Error> {
+        if backend.calls.borrow().reject_prompt {
+            return Err(MockError);
+        }
         backend.calls.borrow_mut().prompts += 1;
         Ok(ids)
     }
@@ -225,6 +355,68 @@ impl TextGenerationBackend for MockBackend {
 }
 
 #[test]
+fn facade_construction_admits_shared_filter_before_invoking_its_factory() {
+    for reject in [true, false] {
+        let backend = MockBackend {
+            logits: vec![1.0, 900.0, 2.0, 1000.0],
+            ..Default::default()
+        };
+        let calls = backend.calls.clone();
+        calls.borrow_mut().reject_shared_filter = reject;
+        let words = WordLevel::builder()
+            .vocab(
+                [("first".into(), 0), ("second".into(), 2)]
+                    .into_iter()
+                    .collect(),
+            )
+            .build()
+            .unwrap();
+        let result = LoadedModel::from_runtime(
+            ModelRuntime::prepare(backend, ()).unwrap(),
+            ChatTokenizer::from_tokenizer(Tokenizer::new(words)),
+            LoadedTextModelConfig {
+                model_family: ModelKind::Qwen2,
+                effective_model_type: "qwen2".into(),
+                model_id: "shared-filter-hook".into(),
+                chat_template: None,
+                eos_token_ids: Vec::new(),
+                checkpoint_generation_config: None,
+            },
+        );
+        {
+            let calls = calls.borrow();
+            assert_eq!(calls.shared_filter_attempts, 1);
+            assert_eq!(calls.shared_filter_factories, usize::from(!reject));
+            assert_eq!(calls.prompts, 0);
+            assert!(calls.configs.is_empty());
+            assert!(calls.filters.is_empty());
+        }
+        if reject {
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("rejected filter construction returned a model"),
+            };
+            assert!(std::error::Error::source(&error).unwrap().is::<MockError>());
+        } else {
+            let mut model = result.unwrap();
+            let sampling = model
+                .resolve_generation_config(GenerationConfigOverrides {
+                    max_new_tokens: Some(1),
+                    ..Default::default()
+                })
+                .unwrap();
+            let ids = model
+                .generate_tokens(vec![0], TextGenerationConfig::new(sampling))
+                .unwrap()
+                .map(|token| token.unwrap().token_id().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(ids, [2]);
+            assert_eq!(calls.borrow().shared_filter_factories, 1);
+        }
+    }
+}
+
+#[test]
 fn loaded_model_generates_without_an_mlx_dependency() {
     let runtime = ModelRuntime::prepare(
         MockBackend {
@@ -252,7 +444,8 @@ fn loaded_model_generates_without_an_mlx_dependency() {
             eos_token_ids: vec![99],
             checkpoint_generation_config: None,
         },
-    );
+    )
+    .unwrap();
     let sampling = model
         .resolve_generation_config(GenerationConfigOverrides {
             max_new_tokens: Some(3),
@@ -323,7 +516,8 @@ fn lfm_checkpoint_native_tool_activation_with_portable_backend() {
             eos_token_ids: vec![eos],
             checkpoint_generation_config: None,
         },
-    );
+    )
+    .unwrap();
     let prepared = model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![json!({"role": "user", "content": "Look up value 7."})],
@@ -498,7 +692,8 @@ fn qwen_tool_generation_stops_at_eos_or_the_requested_call_limit() {
                         eos_token_ids: vec![eos],
                         checkpoint_generation_config: None,
                     },
-                );
+                )
+                .unwrap();
                 let prepared = model
                     .prepare_chat(ChatTemplateRequest {
                         messages: vec![json!({"role": "user", "content": "Ping twice."})],
@@ -668,6 +863,7 @@ fn sparse_vocabulary_model_with_backend(
             checkpoint_generation_config,
         },
     )
+    .unwrap()
 }
 
 #[test]
@@ -752,7 +948,8 @@ fn ordinary_generation_fails_if_no_mapped_id_is_executable() {
             eos_token_ids: vec![],
             checkpoint_generation_config: None,
         },
-    );
+    )
+    .unwrap();
     let config =
         TextGenerationConfig::new(model.resolve_generation_config(Default::default()).unwrap());
     assert!(model

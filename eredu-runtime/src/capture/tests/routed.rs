@@ -407,3 +407,145 @@ fn independent_cached_invocation_geometry_controls_sparse_receipt_completeness()
     assert_eq!(backend.calls, 5);
     assert_eq!(session.cumulative_usage().captures, 2);
 }
+
+#[test]
+fn sparse_invocation_windows_preserve_logical_stride_actual_ranges_and_spending() {
+    let (mut plan, catalog, support, capabilities) = fixture();
+    plan.selections[0].slices = vec![
+        CaptureSlice {
+            axis: "token".into(),
+            start: 1,
+            end: 5,
+            stride: 2,
+        },
+        CaptureSlice {
+            axis: "component".into(),
+            start: 1,
+            end: 3,
+            stride: 1,
+        },
+    ];
+    let admitted = plan
+        .admit_invocations(
+            &catalog,
+            &support,
+            &capabilities,
+            CaptureInvocationBounds {
+                batch: 1,
+                max_sequence: 5,
+                max_context: None,
+                max_predictions: 1,
+            },
+        )
+        .unwrap();
+    let mut session = CaptureSession::new(admitted);
+    let mut backend = Backend {
+        calls: 0,
+        fail: false,
+    };
+    let mut previous = session.cumulative_usage();
+    let mut logical_tokens = Vec::new();
+    for (start, sequence, selected) in [(0, 2, 1), (2, 2, 1), (4, 1, 0)] {
+        session
+            .begin_invocation_window(
+                CapturePhase::Prefill,
+                0,
+                CaptureInvocationShape {
+                    batch: 1,
+                    sequence,
+                    context: None,
+                },
+                CaptureInvocationSelection::default(),
+                CaptureInvocationWindow {
+                    logical_sequence: 5,
+                    start,
+                },
+            )
+            .unwrap();
+        let metadata = session.cumulative_usage();
+        let mut reserved = None;
+        for token in 0..sequence {
+            session
+                .observe_routed_units(&mut backend, "experts", false, &source(&token))
+                .unwrap();
+            let current = session.cumulative_usage();
+            if let Some(reserved) = reserved {
+                assert_eq!(current, reserved);
+            } else {
+                reserved = Some(current);
+            }
+        }
+        let step = session.take_step().unwrap();
+        assert_eq!(step.cumulative_usage, reserved.unwrap());
+        assert_eq!(step.cumulative_usage.captures, previous.captures + 1);
+        assert_eq!(
+            step.cumulative_usage.retained_bytes,
+            previous.retained_bytes + 300
+        );
+        assert!(step.cumulative_usage.host_bytes > metadata.host_bytes + 3000);
+        assert!(step.cumulative_usage.encoded_bytes > metadata.encoded_bytes + 30000);
+        assert_eq!(step.invocation.unwrap().sequence, sequence);
+        assert_eq!(step.phase, CapturePhase::Prefill);
+        assert_eq!(step.prediction_index, 0);
+        let record = &step.records[0];
+        assert_eq!(record.outcome, CaptureOutcome::Captured);
+        assert_eq!(record.source_shape, Some(vec![sequence, 2, 3]));
+        assert_eq!(record.selected_shape, Some(vec![selected, 2, 2]));
+        let Some(CapturePayload::RoutedUnits(payload)) = &record.payload else {
+            panic!("actual sparse window missing")
+        };
+        assert_eq!(
+            payload.source_token_ranges,
+            (0..sequence)
+                .map(|token| [token, token + 1])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(payload.rows.len(), selected as usize * 2);
+        for row in &payload.rows {
+            logical_tokens.push(start + row.token);
+            assert_eq!((row.unit_start, row.unit_stride), (1, 1));
+            let first = (row.token * 10 + row.slot * 3 + 1) as f32 + 0.5;
+            assert_eq!(
+                row.values.data(),
+                &TensorObservationData::F32(vec![first, first + 1.])
+            );
+        }
+        previous = step.cumulative_usage;
+    }
+    assert_eq!(logical_tokens, [1, 1, 3, 3]);
+    assert_eq!(backend.calls, 5);
+    assert_eq!(session.cumulative_usage(), previous);
+    // Repeated logical coordinates still spend; invalid native overlap poisons
+    // that invocation without refunding its already reserved record and payload.
+    session
+        .begin_invocation_window(
+            CapturePhase::Prefill,
+            0,
+            CaptureInvocationShape {
+                batch: 1,
+                sequence: 2,
+                context: None,
+            },
+            CaptureInvocationSelection::default(),
+            CaptureInvocationWindow {
+                logical_sequence: 5,
+                start: 0,
+            },
+        )
+        .unwrap();
+    session
+        .observe_routed_units(&mut backend, "experts", false, &source(&0))
+        .unwrap();
+    let reserved = session.cumulative_usage();
+    assert!(reserved.captures > previous.captures);
+    assert!(session
+        .observe_routed_units(&mut backend, "experts", false, &source(&0))
+        .is_err());
+    let failed = session.take_step().unwrap();
+    assert_eq!(failed.cumulative_usage, reserved);
+    assert!(matches!(
+        failed.records[0].outcome,
+        CaptureOutcome::Failed { .. }
+    ));
+    assert!(failed.records[0].payload.is_none());
+}

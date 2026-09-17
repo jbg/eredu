@@ -1,14 +1,19 @@
 use parking_lot::{ReentrantMutex, ReentrantMutexGuard};
 use std::{
-    cell::{Cell, RefCell},
-    rc::Rc,
+    cell::Cell,
 };
 
 static RUNTIME_LOCK: ReentrantMutex<()> = ReentrantMutex::new(());
-type HousekeepingHooks = Option<Rc<Vec<fn()>>>;
+
+pub(crate) fn static_storage_bytes() -> usize {
+    std::mem::size_of_val(&RUNTIME_LOCK)
+}
+
+mod housekeeping;
+pub use housekeeping::{HousekeepingRegistrationCause, HousekeepingRegistrationFailure,
+    PreparedThreadRuntimeHousekeeping, RegisteredThreadRuntimeHousekeeping};
 
 thread_local! {
-    static HOUSEKEEPING_HOOKS: RefCell<HousekeepingHooks> = const { RefCell::new(None) };
     static RUNNING_HOUSEKEEPING: Cell<bool> = const { Cell::new(false) };
     static RETIRING_SUBMISSIONS: Cell<bool> = const { Cell::new(false) };
 }
@@ -17,10 +22,30 @@ pub(crate) struct RuntimeLockGuard {
     _guard: ReentrantMutexGuard<'static, ()>,
 }
 
+mod waiting;
+pub use waiting::{runtime_lock_layout, RuntimeLockLayout};
+
+// The private mutex has no parked acquisition path. try_lock never publishes
+// PARKED_BIT, so its final unlock uses the uncontended CAS even when callers
+// are waiting here. Keep immediate/deadline/recovery callers on try_lock too.
+fn acquire() -> RuntimeLockGuard {
+    let mut waiting = waiting::Wait::new();
+    loop {
+        if let Some(guard) = RUNTIME_LOCK.try_lock() {
+            return RuntimeLockGuard { _guard: guard };
+        }
+        waiting.pause();
+    }
+}
+
+/// Serialize ordinary constructor entry without reclamation or callbacks.
+pub(crate) fn coordinate_entry() -> RuntimeLockGuard {
+    acquire()
+}
+
 pub(crate) fn enter() -> RuntimeLockGuard {
-    let guard = RuntimeLockGuard {
-        _guard: RUNTIME_LOCK.lock(),
-    };
+    crate::allocation_retention::reclaim_allocation_owners();
+    let guard = acquire();
     run_housekeeping_hooks();
     guard
 }
@@ -62,26 +87,8 @@ pub(crate) fn can_reclaim_submission_resources() -> bool {
     !std::thread::panicking() && !RUNTIME_LOCK.is_owned_by_current_thread()
 }
 
-pub(crate) fn register_housekeeping_hook(hook: fn()) {
-    let _ = HOUSEKEEPING_HOOKS.try_with(|hooks| {
-        let mut hooks = hooks.borrow_mut();
-        let hooks = hooks.get_or_insert_with(|| Rc::new(Vec::new()));
-        if !hooks
-            .iter()
-            .any(|candidate| std::ptr::fn_addr_eq(*candidate, hook))
-        {
-            Rc::make_mut(hooks).push(hook);
-        }
-    });
-}
-
-pub(crate) fn unregister_housekeeping_hook(hook: fn()) {
-    let _ = HOUSEKEEPING_HOOKS.try_with(|hooks| {
-        if let Some(hooks) = hooks.borrow_mut().as_mut() {
-            Rc::make_mut(hooks).retain(|candidate| !std::ptr::fn_addr_eq(*candidate, hook));
-        }
-    });
-}
+pub(crate) fn register_housekeeping_hook(hook: fn()) { housekeeping::register(hook); }
+pub(crate) fn unregister_housekeeping_hook(hook: fn()) { housekeeping::unregister(hook); }
 
 fn run_housekeeping_hooks() {
     if RETIRING_SUBMISSIONS.try_with(Cell::get).unwrap_or(true) {
@@ -98,14 +105,7 @@ fn run_housekeeping_hooks() {
             }
         }
         let _reset = Reset(running);
-        let hooks = HOUSEKEEPING_HOOKS
-            .try_with(|hooks| hooks.borrow().clone())
-            .unwrap_or_default();
-        if let Some(hooks) = hooks {
-            for hook in hooks.iter() {
-                hook();
-            }
-        }
+        housekeeping::run();
     });
 }
 
@@ -144,3 +144,7 @@ mod tests {
         unregister_housekeeping_hook(second);
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_lock/ownership_tests.rs"]
+mod ownership_tests;

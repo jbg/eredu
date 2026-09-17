@@ -3,16 +3,44 @@
 use std::{collections::BTreeMap, ops::Range};
 
 use serde::{Deserialize, Serialize};
+mod index_projection;
+pub use index_projection::{ComponentIndexProjectionError, ComponentIndexProjectionPlan};
 
 /// A local scalar axis in global component coordinates. This map describes
 /// coordinates only; it does not authorize observation, intervention or storage.
 /// Empty local selections are permitted and do not imply missing global values.
-#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(try_from = "WireMap", into = "WireMap")]
 pub struct ComponentCoordinateMap {
     global_count: usize,
     selection: Selection,
-    inverse: BTreeMap<usize, usize>,
+    inverse: Inverse,
+}
+
+#[derive(Debug, Clone)]
+enum Inverse {
+    Ordinary(BTreeMap<usize, usize>),
+    Prepared(Vec<(usize, usize)>),
+}
+impl PartialEq for ComponentCoordinateMap {
+    fn eq(&self, other: &Self) -> bool {
+        // Both constructors derive the inverse from this exact validated source.
+        // Storage policy cannot change coordinate or serialized identity.
+        self.global_count == other.global_count && self.selection == other.selection
+    }
+}
+impl Eq for ComponentCoordinateMap {}
+
+/// A destination is not the empty, sufficient storage required by a source copy.
+/// This describes host construction only and grants no allocation authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ComponentCoordinateCopyError {
+    /// Supplied storage already contains values from another construction.
+    #[error("coordinate copy destination is not empty")]
+    NonEmpty,
+    /// Either coordinate or inverse destination lacks the exact source population.
+    #[error("coordinate copy destination is too small")]
+    Capacity,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -70,7 +98,7 @@ impl ComponentCoordinateMap {
                 start: range.start,
                 end: range.end,
             },
-            inverse: BTreeMap::new(),
+            inverse: Inverse::Ordinary(BTreeMap::new()),
         })
     }
 
@@ -97,7 +125,7 @@ impl ComponentCoordinateMap {
         Ok(Self {
             global_count,
             selection: Selection::Indices { indices },
-            inverse,
+            inverse: Inverse::Ordinary(inverse),
         })
     }
 
@@ -124,6 +152,47 @@ impl ComponentCoordinateMap {
         // Bounds above prove both products are at most global_count.
         let width = global_count / units;
         Self::range(global_count, range.start * width..range.end * width)
+    }
+
+    /// Exact number of elements required in each destination of a prepared
+    /// copy. Contiguous sources need no vector backing; explicit maps retain
+    /// their existing local order and a separately sorted inverse table.
+    pub fn copy_storage_elements(&self) -> usize {
+        match &self.selection { Selection::Range { .. } => 0, Selection::Indices { indices } => indices.len() }
+    }
+
+    /// Fixed source/copy/lookup controls; the two vector backings are separate.
+    pub fn copy_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let parts=[size_of::<Self>()*2,size_of::<Selection>(),size_of::<Inverse>(),
+            size_of::<Vec<usize>>(),size_of::<Vec<(usize,usize)>>(),
+            size_of::<std::collections::btree_map::Iter<'_,usize,usize>>(),
+            size_of::<std::slice::Iter<'_,(usize,usize)>>(),size_of::<[usize;4]>(),
+            size_of::<Result<Self,ComponentCoordinateCopyError>>()];
+        parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
+    }
+
+    /// Copy the already validated source into caller-owned empty destinations.
+    /// The ordinary map lookup contract and wire representation are unchanged.
+    /// No allocation or capacity growth occurs; the caller must establish the
+    /// ownership and funding of both vectors before lending them here.
+    pub fn copy_with_storage(&self, mut indices: Vec<usize>, mut inverse: Vec<(usize, usize)>)
+        -> Result<Self, ComponentCoordinateCopyError> {
+        if !indices.is_empty() || !inverse.is_empty() { return Err(ComponentCoordinateCopyError::NonEmpty); }
+        let count = self.copy_storage_elements();
+        if indices.capacity() < count || inverse.capacity() < count { return Err(ComponentCoordinateCopyError::Capacity); }
+        let selection = match &self.selection {
+            Selection::Range { start, end } => Selection::Range { start: *start, end: *end },
+            Selection::Indices { indices: source } => {
+                indices.extend_from_slice(source);
+                match &self.inverse {
+                    Inverse::Ordinary(source) => inverse.extend(source.iter().map(|(global, local)| (*global, *local))),
+                    Inverse::Prepared(source) => inverse.extend_from_slice(source),
+                }
+                Selection::Indices { indices }
+            }
+        };
+        Ok(Self { global_count: self.global_count, selection, inverse: Inverse::Prepared(inverse) })
     }
 
     /// Complete global component count.
@@ -153,7 +222,11 @@ impl ComponentCoordinateMap {
             Selection::Range { start, end } => {
                 (*start..*end).contains(&global).then(|| global - start)
             }
-            Selection::Indices { .. } => self.inverse.get(&global).copied(),
+            Selection::Indices { .. } => match &self.inverse {
+                Inverse::Ordinary(inverse) => inverse.get(&global).copied(),
+                Inverse::Prepared(inverse) => inverse.binary_search_by_key(&global, |(key, _)| *key)
+                    .ok().map(|index| inverse[index].1),
+            },
         }
     }
 
@@ -169,26 +242,14 @@ impl ComponentCoordinateMap {
     /// Keep/delete semantics remain the caller's original action: an empty local
     /// keep set zeros the local axis, while an empty delete set leaves it intact.
     pub fn localize_indices(&self, indices: &[u32]) -> Result<Vec<u32>, ComponentCoordinateError> {
-        let mut seen = std::collections::BTreeSet::new();
-        let mut local = Vec::new();
-        for &global in indices {
-            let global = global as usize;
-            if global >= self.global_count {
-                return Err(ComponentCoordinateError::OutOfRange {
-                    index: global,
-                    count: self.global_count,
-                });
-            }
-            if !seen.insert(global) {
-                return Err(ComponentCoordinateError::Duplicate(global));
-            }
-            if let Some(index) = self.global_to_local(global) {
-                local.push(
-                    u32::try_from(index)
-                        .map_err(|_| ComponentCoordinateError::LocalIndexOverflow(index))?,
-                );
-            }
-        }
+        let mut scratch = vec![(0, 0); indices.len()];
+        let plan = ComponentIndexProjectionPlan::prepare(self, indices, &mut scratch)
+            .map_err(|cause| match cause {
+                ComponentIndexProjectionError::Coordinates(cause) => cause,
+                ComponentIndexProjectionError::Storage { .. } => unreachable!("exact scratch extent"),
+            })?;
+        let mut local = vec![0; plan.local_count()];
+        plan.write(&mut local).expect("validated exact local destination");
         Ok(local)
     }
 }
@@ -236,6 +297,28 @@ pub enum ComponentCoordinateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_coordinate_copy_keeps_permuted_lookup_wire_identity_and_empty_owners() {
+        for source in [ComponentCoordinateMap::range(12, 3..8).unwrap(),
+            ComponentCoordinateMap::range(12, 8..8).unwrap(),
+            ComponentCoordinateMap::indices(12, vec![9,2,7]).unwrap(),
+            ComponentCoordinateMap::indices(12, vec![]).unwrap()] {
+            let n=source.copy_storage_elements();
+            let indices=Vec::with_capacity(n);let inverse=Vec::with_capacity(n);
+            let pointers=(indices.as_ptr(),inverse.as_ptr());
+            let prepared=source.copy_with_storage(indices,inverse).unwrap();
+            assert_eq!(prepared,source);
+            assert_eq!(serde_json::to_string(&prepared).unwrap(),serde_json::to_string(&source).unwrap());
+            for global in 0..=source.global_count() {assert_eq!(prepared.global_to_local(global),source.global_to_local(global));}
+            for local in 0..=source.local_count() {assert_eq!(prepared.local_to_global(local),source.local_to_global(local));}
+            if let Selection::Indices{indices}= &prepared.selection {assert_eq!(indices.as_ptr(),pointers.0);}
+            let Inverse::Prepared(inverse)= &prepared.inverse else{panic!("prepared inverse")};
+            assert_eq!(inverse.as_ptr(),pointers.1);
+            if n!=0 {assert_eq!(source.copy_with_storage(Vec::new(),Vec::with_capacity(n)).unwrap_err(),ComponentCoordinateCopyError::Capacity);}
+            assert_eq!(source.copy_with_storage(vec![0],Vec::new()).unwrap_err(),ComponentCoordinateCopyError::NonEmpty);
+        }
+    }
 
     #[test]
     fn partition_masks_keep_global_identity_and_empty_local_sets() {

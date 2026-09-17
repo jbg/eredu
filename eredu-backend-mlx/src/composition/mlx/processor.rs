@@ -136,6 +136,15 @@ fn mlx_shape(shape: &[usize]) -> Result<Vec<i32>, Error> {
 
 #[cfg(any(feature = "image", feature = "audio"))]
 impl ModelProcessor {
+    /// Borrows the architecture's complete retained-policy storage declaration.
+    /// Native conversion output is request-owned and is never retained here.
+    pub(crate) fn retained_storage(&self)
+        -> eredu_architectures::processor_execution::PreparedProcessorStorage
+    {
+        let Self { processor } = self;
+        processor.retained_storage()
+    }
+
     /// Wraps a processor already prepared by the architecture construction driver.
     pub(crate) fn from_prepared(processor: PreparedProcessor) -> Self {
         Self { processor }

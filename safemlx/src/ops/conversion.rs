@@ -1,6 +1,6 @@
 use safemlx_internal_macros::generate_macro;
 
-use crate::{error::Result, utils::guard::Guarded, Array, ArrayElement, Dtype, Stream};
+use crate::{Array, ArrayElement, Dtype, Stream, error::Result, utils::guard::Guarded};
 
 impl Array {
     /// Copy the array onto the given stream.
@@ -64,6 +64,25 @@ impl Array {
         })
     }
 
+    /// Fixed controls for one `as_dtype` call borrowing an existing stream.
+    /// Native AsType/shape/copy and error owners belong to the selected original
+    /// graph/record account; this query covers only the safe wrapper frame.
+    pub fn as_dtype_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let frames = [
+            size_of::<(&Array, Dtype, &Stream)>(),
+            // The FnOnce closure borrows receiver, dtype and stream argument.
+            size_of::<(&Array, &Dtype, &&Stream)>(),
+            size_of::<Array>(),
+            size_of::<Result<Array>>() * 2,
+            size_of::<crate::utils::guard::MaybeUninitArray>(),
+            size_of::<safemlx_sys::mlx_dtype>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(size_of_val(&frames), usize::checked_add)
+    }
+
     /// View the array as a different type.
     ///
     /// The output array will change along the last axis if the input array's
@@ -75,6 +94,18 @@ impl Array {
     ///
     pub fn view<T: ArrayElement>(&self, stream: impl AsRef<Stream>) -> Result<Array> {
         self.view_dtype(T::DTYPE, stream)
+    }
+
+    /// Fixed safe-wrapper controls for byte reinterpretation. The selected
+    /// source pays the native shape/primitive/copy worker independently.
+    pub fn view_dtype_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let frames = [size_of::<(&Array,Dtype,&Stream)>(),
+            size_of::<(&Array,&Dtype,&&Stream)>(),size_of::<Array>(),
+            size_of::<Result<Array>>() * 2,
+            size_of::<crate::utils::guard::MaybeUninitArray>(),
+            size_of::<safemlx_sys::mlx_dtype>()];
+        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
     }
 
     /// Same as `view` but with a [`Dtype`] argument.

@@ -175,11 +175,25 @@ fn prepare_with_mechanisms(
     prepare_model_sources(plan, selected).unwrap()
 }
 
+// Fault injection must still require exclusive ownership at both shells.
+// This private cfg(test) child cannot expose graph mutation in production.
+fn fault_graph_mut(sources: &mut PreparedModelSources) -> &mut PreparedModelSourceGraph {
+    let selection = Arc::get_mut(
+        sources
+            .shared
+            .as_mut()
+            .expect("fresh fault-injection selection is present"),
+    )
+    .expect("fresh fault-injection selection is exclusively owned");
+    Arc::get_mut(&mut selection.graph)
+        .expect("fresh fault-injection source graph is exclusively owned")
+}
+
 #[test]
 fn prediction_role_mismatch_stops_before_width_construction_or_publication() {
     let (_root, inspection) = inspected_config(prediction_config());
     let mut sources = prepare(inspection, NormalizedLoadRequest::default());
-    assert!(sources.graph.extension.take().is_some());
+    assert!(fault_graph_mut(&mut sources).extension.take().is_some());
     let events = Events::default();
     let routes =
         PreparedExecutionRoutes::new().with_routed(RouteProbe(Rc::clone(&events), "constructor"));
@@ -195,7 +209,8 @@ fn prediction_role_mismatch_stops_before_width_construction_or_publication() {
 fn unselected_prediction_source_stops_before_width_construction_or_publication() {
     let (_root, inspection) = inspected_llama();
     let mut sources = prepare(inspection, NormalizedLoadRequest::default());
-    sources.graph.extension = Some(Arc::clone(sources.graph.target()));
+    let target = sources.graph().target().clone();
+    fault_graph_mut(&mut sources).extension = Some(target);
     let events = Events::default();
     let routes = PreparedExecutionRoutes::new()
         .with_replicated(RouteProbe(Rc::clone(&events), "constructor"));
@@ -278,7 +293,7 @@ fn invalid_architecture_floating_source_stops_before_native_width_or_constructio
         }))
         .unwrap();
     // Nemotron's declared embedding is absent from the retained Llama catalog.
-    sources.graph.architecture = other.architecture_plan().clone();
+    fault_graph_mut(&mut sources).architecture = other.architecture_plan().clone();
     let events = Events::default();
     let routes = PreparedExecutionRoutes::new()
         .with_replicated(RouteProbe(Rc::clone(&events), "constructor"));
@@ -339,34 +354,41 @@ fn removed_selected_raw_processor_stops_before_width_construction_or_publication
         NormalizedLoadRequest::default(),
         &RawImageAdapter(BoundedIndependentAdapter::default()),
     );
-    assert!(sources
-        .selected
-        .execution()
-        .processor()
-        .unwrap()
-        .raw_media());
     assert!(
-        crate::processor_execution::PreparedProcessor::from_artifact(sources.graph.architecture())
-            .is_some()
+        sources
+            .selected()
+            .execution()
+            .processor()
+            .unwrap()
+            .raw_media()
+    );
+    assert!(
+        crate::processor_execution::PreparedProcessor::from_artifact(
+            sources.graph().architecture()
+        )
+        .is_some()
     );
 
     // This internal enrichment method changes only the retained processor.
     // The already admitted family, selected raw-media proof, exact checkpoint
     // sources, and original inspection remain otherwise untouched.
-    sources.graph.architecture = sources
-        .graph
-        .architecture
+    let without_processor = sources
+        .graph()
+        .architecture()
         .clone()
         .with_safetensors_processors(b"{}", None, None, None)
         .unwrap();
-    assert!(!sources.graph.architecture.has_processor());
-    assert!(sources.inspection.architecture_plan().has_processor());
-    assert!(sources
-        .selected
-        .execution()
-        .processor()
-        .unwrap()
-        .raw_media());
+    fault_graph_mut(&mut sources).architecture = without_processor;
+    assert!(!sources.graph().architecture().has_processor());
+    assert!(sources.inspection().architecture_plan().has_processor());
+    assert!(
+        sources
+            .selected()
+            .execution()
+            .processor()
+            .unwrap()
+            .raw_media()
+    );
 
     let events = Events::default();
     let routes = PreparedExecutionRoutes::new()

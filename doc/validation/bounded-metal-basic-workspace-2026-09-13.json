@@ -1,0 +1,4862 @@
+{
+  "hardware": {
+    "chip": "Apple M3 Ultra",
+    "cpu_cores": 32,
+    "unified_memory_bytes": 274877906944,
+    "gpu_architecture": "applegpu_g15d"
+  },
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted bounded inference implementation with common Metal workspace facts and exact I32 causal coordinates",
+  "native_versions": {
+    "native_runtime": {
+      "mlx": "0.32.0",
+      "vendored_archive_sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+      "patches": "safemlx-sys/src/mlx-c/patches at the recorded source revision",
+      "safemlx": "0.3.1"
+    }
+  },
+  "host_page_size": 16384,
+  "source_sha256": {
+    "eredu-backend-mlx/src/backend/nn/workspace/basic.rs": "25b6a8aa6c6e3708007004e4e6d9a82b62f8e3835a73bcbb40036f635f81b490",
+    "eredu-backend-mlx/src/backend/nn/workspace/basic/tests.rs": "18ece529beb6ebe0d659a73b0210f5eeceeb97b6e8b381540bf8281a780cff79",
+    "eredu-backend-mlx/src/backend/nn/workspace.rs": "52df13084930f61008d4bd5ef4862f2b222193481e77dc303b9ea2a2fd16f93c",
+    "eredu-backend-mlx/src/backend/nn/tensor.rs": "ee18bd5b40852147832582222a10895fea9df54f921dc34d6bf30dee0f1389a8",
+    "eredu-nn/src/workspace.rs": "22cf29e4e0151840eb0ec3f87fb2fada85fe53cca0467c90f2d311f9f3f758fc",
+    "eredu-nn/src/workspace/tensor.rs": "55926b6ac9f44bf84585b8a60b69663b267ddd2b162385413c960e7a2ec9c0e4"
+  },
+  "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --lib --features metal,accelerate backend::nn::workspace -- --include-ignored --nocapture --test-threads=1",
+  "measurement": "MLX active peak minus evaluated input residency, reset before each equation and read after output completion. Original input handles stay live. Exclusive serial test runner with Metal access. Allocator cache retained between cases to exercise oversized reuse.",
+  "inputs": "Nonzero transposed inputs; FP32, FP16, BF16 and mixed FP16/BF16 and BF16/FP32 pairs; shapes [1,1], [7,13], [65,257]. Same generic portable equation executed by metadata and native backends.",
+  "bound_derivation": [
+    "Vendored GPU copy and Metal unary/binary/ternary implementations: output plus each possible input cast, allowing up to four bytes per element.",
+    "Backend SiLU/sigmoid custom kernels: input widening, row-contiguous copy, output and final conversion. Composed activation/gating equations count every operation and scalar.",
+    "Range slices retain input roots; native static integer selection can reshape-copy a strided slice, charged separately.",
+    "Concatenation charges output and each possible input cast; reshape permits allocation or input aliasing.",
+    "Causal masks charge exact I32 coordinate arrays, optional window subtraction/scalar and all boolean intermediates.",
+    "Each buffer includes host-page rounding and bounded oversized allocator-cache reuse. No fusion, donation or early temporary release is assumed."
+  ],
+  "limitations": [
+    "These are operator bounds and checks, not complete model workspace quotes or production request-budget admission.",
+    "Active tensor-buffer capacity excludes allocator-cache residency, Metal heaps, driver/JIT storage and unrelated process memory.",
+    "Unpriced required operators and mixed signed/unsigned integer promotions wider than four bytes remain unknown."
+  ],
+  "summary": {
+    "common_equation_cases_passed": 435,
+    "large_coordinate_mask_cases_passed": 3,
+    "recurrent_cases_passed_in_same_process": 16,
+    "unit_tests_passed": 8
+  },
+  "common_equation_results": [
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 5,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 16,
+      "cold_bound_bytes": 70
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 9,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 11,
+      "cold_bound_bytes": 77
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 35
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 35
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 29,
+      "cold_bound_bytes": 154
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 28,
+      "cold_bound_bytes": 119
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 48,
+      "cold_bound_bytes": 210
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 29,
+      "cold_bound_bytes": 126
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 52,
+      "cold_bound_bytes": 231
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 48,
+      "cold_bound_bytes": 196
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 29
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 36,
+      "cold_bound_bytes": 65
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 50,
+      "cold_bound_bytes": 101
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 2181
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 2181
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 95,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 6550
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 459,
+      "cold_bound_bytes": 5096
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 190,
+      "cold_bound_bytes": 6557
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 728,
+      "cold_bound_bytes": 2915
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 728,
+      "cold_bound_bytes": 2915
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 831,
+      "cold_bound_bytes": 13834
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 376,
+      "cold_bound_bytes": 10199
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 748,
+      "cold_bound_bytes": 16770
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 467,
+      "cold_bound_bytes": 10926
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 728,
+      "cold_bound_bytes": 5096
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 748,
+      "cold_bound_bytes": 18951
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 1112,
+      "cold_bound_bytes": 16756
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 91,
+      "cold_bound_bytes": 103
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 727
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 728,
+      "cold_bound_bytes": 2909
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 210,
+      "cold_bound_bytes": 317
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 326,
+      "cold_bound_bytes": 713
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 344061
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 344061
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 32772,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 1032190
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 114692,
+      "cold_bound_bytes": 802816
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 65544,
+      "cold_bound_bytes": 1032197
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 163840,
+      "cold_bound_bytes": 458755
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 163840,
+      "cold_bound_bytes": 458755
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 196620,
+      "cold_bound_bytes": 2179074
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 81932,
+      "cold_bound_bytes": 1605639
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 163860,
+      "cold_bound_bytes": 2637850
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 114700,
+      "cold_bound_bytes": 1720326
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 163840,
+      "cold_bound_bytes": 802816
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 163860,
+      "cold_bound_bytes": 2981911
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 245780,
+      "cold_bound_bytes": 2637836
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 1028,
+      "cold_bound_bytes": 2055
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 114687
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 147456,
+      "cold_bound_bytes": 409597
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 5278,
+      "cold_bound_bytes": 10177
+    },
+    {
+      "input_dtype": "Float32",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 10196,
+      "cold_bound_bytes": 28901
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 20,
+      "cold_bound_bytes": 70
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 77
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 35
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 35
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 27,
+      "cold_bound_bytes": 154
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 28,
+      "cold_bound_bytes": 119
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 52,
+      "cold_bound_bytes": 210
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 31,
+      "cold_bound_bytes": 126
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 62,
+      "cold_bound_bytes": 231
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 48,
+      "cold_bound_bytes": 196
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 29
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 26,
+      "cold_bound_bytes": 65
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 42,
+      "cold_bound_bytes": 101
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 2181
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 2181
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 6550
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 5096
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 6557
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 546,
+      "cold_bound_bytes": 2915
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 546,
+      "cold_bound_bytes": 2915
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 649,
+      "cold_bound_bytes": 13834
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 10199
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 568,
+      "cold_bound_bytes": 16770
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 649,
+      "cold_bound_bytes": 10926
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 546,
+      "cold_bound_bytes": 5096
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 932,
+      "cold_bound_bytes": 18951
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 384,
+      "cold_bound_bytes": 16756
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 103
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 727
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 2909
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 317
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 713
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 344061
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 344061
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 1032190
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 802816
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 1032197
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 131072,
+      "cold_bound_bytes": 458755
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 131072,
+      "cold_bound_bytes": 458755
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 163852,
+      "cold_bound_bytes": 2179074
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 1605639
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 131094,
+      "cold_bound_bytes": 2637850
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 163852,
+      "cold_bound_bytes": 1720326
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 131072,
+      "cold_bound_bytes": 802816
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 213014,
+      "cold_bound_bytes": 2981911
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 81940,
+      "cold_bound_bytes": 2637836
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 2055
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 114687
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 409597
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 10177
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Float16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28901
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 20,
+      "cold_bound_bytes": 70
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 77
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 35
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 35
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 27,
+      "cold_bound_bytes": 154
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 28,
+      "cold_bound_bytes": 119
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 52,
+      "cold_bound_bytes": 210
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 31,
+      "cold_bound_bytes": 126
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 62,
+      "cold_bound_bytes": 231
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 48,
+      "cold_bound_bytes": 196
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 29
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 26,
+      "cold_bound_bytes": 65
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 42,
+      "cold_bound_bytes": 101
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 2181
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 2181
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 6550
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 5096
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 6557
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 546,
+      "cold_bound_bytes": 2915
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 546,
+      "cold_bound_bytes": 2915
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 649,
+      "cold_bound_bytes": 13834
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 10199
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 568,
+      "cold_bound_bytes": 16770
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 649,
+      "cold_bound_bytes": 10926
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 546,
+      "cold_bound_bytes": 5096
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 932,
+      "cold_bound_bytes": 18951
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 384,
+      "cold_bound_bytes": 16756
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 103
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 727
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 2909
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 317
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 713
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 344061
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 344061
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 1032190
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 802816
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 1032197
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 131072,
+      "cold_bound_bytes": 458755
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 131072,
+      "cold_bound_bytes": 458755
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 163852,
+      "cold_bound_bytes": 2179074
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 1605639
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 131094,
+      "cold_bound_bytes": 2637850
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 163852,
+      "cold_bound_bytes": 1720326
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 131072,
+      "cold_bound_bytes": 802816
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 213014,
+      "cold_bound_bytes": 2981911
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 81940,
+      "cold_bound_bytes": 2637836
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 2055
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 114687
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 409597
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 10177
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28901
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 20,
+      "cold_bound_bytes": 70
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 11,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 77
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 35
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 35
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 27,
+      "cold_bound_bytes": 154
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 28,
+      "cold_bound_bytes": 119
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 52,
+      "cold_bound_bytes": 210
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 31,
+      "cold_bound_bytes": 126
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 14,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 62,
+      "cold_bound_bytes": 231
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 48,
+      "cold_bound_bytes": 196
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 29
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 26,
+      "cold_bound_bytes": 65
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 42,
+      "cold_bound_bytes": 101
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 184,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 2181
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 2181
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 6550
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 97,
+      "cold_bound_bytes": 5096
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 6557
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 546,
+      "cold_bound_bytes": 2915
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 546,
+      "cold_bound_bytes": 2915
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 649,
+      "cold_bound_bytes": 13834
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 10199
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 568,
+      "cold_bound_bytes": 16770
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 649,
+      "cold_bound_bytes": 10926
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 1274,
+      "cold_bound_bytes": 5096
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 932,
+      "cold_bound_bytes": 18951
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 384,
+      "cold_bound_bytes": 16756
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 103
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 727
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 728,
+      "cold_bound_bytes": 2909
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 317
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 713
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 49154,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 344061
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 344061
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 1032190
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 32774,
+      "cold_bound_bytes": 802816
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 1032197
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 131072,
+      "cold_bound_bytes": 458755
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 131072,
+      "cold_bound_bytes": 458755
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 163852,
+      "cold_bound_bytes": 2179074
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 12,
+      "cold_bound_bytes": 1605639
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 131094,
+      "cold_bound_bytes": 2637850
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 163852,
+      "cold_bound_bytes": 1720326
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 294912,
+      "cold_bound_bytes": 802816
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 213014,
+      "cold_bound_bytes": 2981911
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 81940,
+      "cold_bound_bytes": 2637836
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 2055
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 114687
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 147456,
+      "cold_bound_bytes": 409597
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 10177
+    },
+    {
+      "input_dtype": "Float16",
+      "other_input_dtype": "Bfloat16",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28901
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 21
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 2,
+      "cold_bound_bytes": 14
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 28
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 16,
+      "cold_bound_bytes": 70
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 11,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 9,
+      "cold_bound_bytes": 77
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 35
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 35
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 31,
+      "cold_bound_bytes": 154
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 32,
+      "cold_bound_bytes": 119
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 56,
+      "cold_bound_bytes": 210
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 35,
+      "cold_bound_bytes": 126
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 14,
+      "cold_bound_bytes": 56
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 62,
+      "cold_bound_bytes": 231
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 48,
+      "cold_bound_bytes": 196
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 7
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 29
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 30,
+      "cold_bound_bytes": 65
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        1,
+        1
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 46,
+      "cold_bound_bytes": 101
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 184,
+      "cold_bound_bytes": 1461
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 2181
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 364,
+      "cold_bound_bytes": 2181
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 1454
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 2188
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 368,
+      "cold_bound_bytes": 6550
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 97,
+      "cold_bound_bytes": 5096
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 6557
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 910,
+      "cold_bound_bytes": 2915
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 910,
+      "cold_bound_bytes": 2915
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 1013,
+      "cold_bound_bytes": 13834
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 376,
+      "cold_bound_bytes": 10199
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 932,
+      "cold_bound_bytes": 16770
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 1013,
+      "cold_bound_bytes": 10926
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 1274,
+      "cold_bound_bytes": 5096
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 932,
+      "cold_bound_bytes": 18951
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 748,
+      "cold_bound_bytes": 16756
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 103
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 182,
+      "cold_bound_bytes": 727
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 728,
+      "cold_bound_bytes": 2909
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 317
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        7,
+        13
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 713
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Initialize",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "HostInitialize",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "ZerosLike",
+      "incremental_peak_bytes": 49154,
+      "cold_bound_bytes": 229381
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Add",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 344061
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Divide",
+      "incremental_peak_bytes": 81920,
+      "cold_bound_bytes": 344061
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Square",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Tanh",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Exp",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 229374
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "MultiplyScalar",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "MaximumScalar",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Equal",
+      "incremental_peak_bytes": 6,
+      "cold_bound_bytes": 344068
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Clip",
+      "incremental_peak_bytes": 81924,
+      "cold_bound_bytes": 1032190
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Where",
+      "incremental_peak_bytes": 32774,
+      "cold_bound_bytes": 802816
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "LogicalOr",
+      "incremental_peak_bytes": 8,
+      "cold_bound_bytes": 1032197
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Silu",
+      "incremental_peak_bytes": 212992,
+      "cold_bound_bytes": 458755
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Sigmoid",
+      "incremental_peak_bytes": 212992,
+      "cold_bound_bytes": 458755
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Softplus",
+      "incremental_peak_bytes": 245772,
+      "cold_bound_bytes": 2179074
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gelu",
+      "incremental_peak_bytes": 81932,
+      "cold_bound_bytes": 1605639
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "GeluApproximate",
+      "incremental_peak_bytes": 213014,
+      "cold_bound_bytes": 2637850
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Elu",
+      "incremental_peak_bytes": 245772,
+      "cold_bound_bytes": 1720326
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 294912,
+      "cold_bound_bytes": 802816
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: GeluApproximate, gate_upper_bound: None, up_absolute_bound: None, sigmoid_multiplier: 1.0, up_offset: 0.0 })",
+      "incremental_peak_bytes": 213014,
+      "cold_bound_bytes": 2981911
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Gated(GatedProductPolicy { activation: Silu, gate_upper_bound: Some(0.5), up_absolute_bound: Some(0.3), sigmoid_multiplier: 1.7, up_offset: 0.2 })",
+      "incremental_peak_bytes": 163860,
+      "cold_bound_bytes": 2637836
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Views",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 0
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "StaticIndex",
+      "incremental_peak_bytes": 728,
+      "cold_bound_bytes": 2055
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Reshape",
+      "incremental_peak_bytes": 49152,
+      "cold_bound_bytes": 114687
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Concatenate",
+      "incremental_peak_bytes": 147456,
+      "cold_bound_bytes": 409597
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Mask(None)",
+      "incremental_peak_bytes": 0,
+      "cold_bound_bytes": 10177
+    },
+    {
+      "input_dtype": "Bfloat16",
+      "other_input_dtype": "Float32",
+      "shape": [
+        65,
+        257
+      ],
+      "equation": "Mask(Some(3))",
+      "incremental_peak_bytes": 4,
+      "cold_bound_bytes": 28901
+    }
+  ],
+  "large_coordinate_mask_results": [
+    {
+      "offset": 16777217,
+      "sequence": 2,
+      "max_past": null,
+      "incremental_peak_bytes": 100696072,
+      "cold_bound_bytes": 100761613,
+      "integer_oracle_match": true
+    },
+    {
+      "offset": 16777217,
+      "sequence": 2,
+      "max_past": 0,
+      "incremental_peak_bytes": 134266900,
+      "cold_bound_bytes": 167968801,
+      "integer_oracle_match": true
+    },
+    {
+      "offset": 16777217,
+      "sequence": 2,
+      "max_past": 3,
+      "incremental_peak_bytes": 134266900,
+      "cold_bound_bytes": 167968801,
+      "integer_oracle_match": true
+    }
+  ]
+}

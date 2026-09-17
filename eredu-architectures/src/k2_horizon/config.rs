@@ -23,7 +23,7 @@ pub enum ConfigError {
 }
 
 /// Published scalar configuration fields. Use the parser to validate them.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Configuration {
     /// Model type, always `k2_horizon`.
     pub model_type: String,
@@ -114,6 +114,73 @@ pub struct Configuration {
     use_sliding_window: bool,
     #[serde(default)]
     sliding_window: Option<u32>,
+}
+
+impl std::fmt::Debug for Configuration {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.fmt_identity_fields(output, false)
+    }
+}
+impl Configuration {
+    // A single field producer preserves ordinary derived-Debug encoding while
+    // the cache fingerprint excludes only the two separately sorted maps.
+    fn fmt_identity_fields(
+        &self,
+        output: &mut std::fmt::Formatter<'_>,
+        without_rope: bool,
+    ) -> std::fmt::Result {
+        output
+            .debug_struct("Configuration")
+            .field("model_type", &self.model_type)
+            .field("hidden_size", &self.hidden_size)
+            .field("num_hidden_layers", &self.num_hidden_layers)
+            .field("intermediate_size", &self.intermediate_size)
+            .field("num_attention_heads", &self.num_attention_heads)
+            .field("num_key_value_heads", &self.num_key_value_heads)
+            .field("head_dim", &self.head_dim)
+            .field("rope_head_dim", &self.rope_head_dim)
+            .field("rms_norm_eps", &self.rms_norm_eps)
+            .field("layernorm_num_groups", &self.layernorm_num_groups)
+            .field("query_key_norm", &self.query_key_norm)
+            .field("vocab_size", &self.vocab_size)
+            .field("max_position_embeddings", &self.max_position_embeddings)
+            .field("rope_theta", &self.rope_theta)
+            .field(
+                "rope_parameters",
+                &if without_rope {
+                    None
+                } else {
+                    self.rope_parameters.as_ref()
+                },
+            )
+            .field(
+                "rope_scaling",
+                &if without_rope {
+                    None
+                } else {
+                    self.rope_scaling.as_ref()
+                },
+            )
+            .field("attention_bias", &self.attention_bias)
+            .field("attention_gate_func", &self.attention_gate_func)
+            .field("tie_word_embeddings", &self.tie_word_embeddings)
+            .field("decoder_sparse_step", &self.decoder_sparse_step)
+            .field("mlp_only_layers", &self.mlp_only_layers)
+            .field("num_experts", &self.num_experts)
+            .field("num_experts_per_tok", &self.num_experts_per_tok)
+            .field("moe_intermediate_size", &self.moe_intermediate_size)
+            .field("num_shared_experts", &self.num_shared_experts)
+            .field("norm_topk_prob", &self.norm_topk_prob)
+            .field("moe_gate_bias", &self.moe_gate_bias)
+            .field("router_score_func", &self.router_score_func)
+            .field("router_scaling_factor", &self.router_scaling_factor)
+            .field("mova_num_experts", &self.mova_num_experts)
+            .field("mova_num_experts_per_tok", &self.mova_num_experts_per_tok)
+            .field("hidden_act", &self.hidden_act)
+            .field("use_sliding_window", &self.use_sliding_window)
+            .field("sliding_window", &self.sliding_window)
+            .finish()
+    }
 }
 
 fn one() -> i32 {
@@ -225,7 +292,13 @@ impl ModelArgs {
     }
     /// Validates all construction geometry before allocating backend values.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        let invalid = |s: &str| ConfigError::Invalid(s.into());
+        self.validate_with_diagnostic(|text| ConfigError::Invalid(text.to_string()))
+    }
+
+    pub(crate) fn validate_with_diagnostic<E>(
+        &self,
+        invalid: impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
         for value in [
             self.hidden_size,
             self.num_hidden_layers,
@@ -239,73 +312,85 @@ impl ModelArgs {
             self.decoder_sparse_step,
         ] {
             if value <= 0 {
-                return Err(invalid(
-                    "dimensions, group count and sparse cadence must be positive",
-                ));
+                return Err(invalid(format_args!(
+                    "dimensions, group count and sparse cadence must be positive"
+                )));
             }
         }
         if self.model_type != "k2_horizon" || self.hidden_act != "silu" {
-            return Err(invalid(
-                "expected k2_horizon with silu feed-forward activation",
-            ));
+            return Err(invalid(format_args!(
+                "expected k2_horizon with silu feed-forward activation"
+            )));
         }
         if self.num_attention_heads % self.num_key_value_heads != 0
             || self.hidden_size % self.layernorm_num_groups != 0
         {
-            return Err(invalid("nonintegral attention or normalization groups"));
+            return Err(invalid(format_args!(
+                "nonintegral attention or normalization groups"
+            )));
         }
         let rotary = self.rope_head_dim.unwrap_or(self.head_dim);
         if self.head_dim % 2 != 0 || rotary <= 0 || rotary > self.head_dim || rotary % 2 != 0 {
-            return Err(invalid(
-                "rotary paired width must be positive, even and no wider than the head",
-            ));
+            return Err(invalid(format_args!(
+                "rotary paired width must be positive, even and no wider than the head"
+            )));
         }
         if !self.rms_norm_eps.is_finite()
             || self.rms_norm_eps <= 0.0
             || !self.rope_theta.is_finite()
             || self.rope_theta <= 1.0
         {
-            return Err(invalid("invalid RMS epsilon or rotary base"));
+            return Err(invalid(format_args!("invalid RMS epsilon or rotary base")));
         }
         if self
             .dense_layers
             .iter()
             .any(|&layer| layer >= self.num_hidden_layers as usize)
         {
-            return Err(invalid("mlp_only_layers contains an out-of-range layer"));
+            return Err(invalid(format_args!(
+                "mlp_only_layers contains an out-of-range layer"
+            )));
         }
         if self.schedule.len() != self.num_hidden_layers as usize {
-            return Err(invalid("attention schedule differs from layer count"));
+            return Err(invalid(format_args!(
+                "attention schedule differs from layer count"
+            )));
         }
         if !matches!(self.router_score_func.as_str(), "sigmoid" | "softmax") {
-            return Err(invalid("router_score_func must be sigmoid or softmax"));
+            return Err(invalid(format_args!(
+                "router_score_func must be sigmoid or softmax"
+            )));
         }
         if self
             .attention_gate_func
             .as_deref()
             .is_some_and(|a| !matches!(a, "silu" | "softplus"))
         {
-            return Err(invalid("invalid attention gate activation"));
+            return Err(invalid(format_args!("invalid attention gate activation")));
         }
         let scale = self.router_scaling_factor.unwrap_or(1.0);
         if !scale.is_finite() || scale <= 0.0 {
-            return Err(invalid("router scale must be finite and positive"));
+            return Err(invalid(format_args!(
+                "router scale must be finite and positive"
+            )));
         }
         if self.num_shared_experts < 0 || self.moe_intermediate_size < 0 {
-            return Err(invalid("negative expert geometry"));
+            return Err(invalid(format_args!("negative expert geometry")));
         }
         for (count, top_k) in [
             (self.num_experts, self.num_experts_per_tok),
             (self.mova_num_experts, self.mova_num_experts_per_tok),
         ] {
             if count < 0 || top_k < 0 || top_k > count || (count > 0 && top_k == 0) {
-                return Err(invalid("invalid expert count or top-k"));
+                return Err(invalid(format_args!("invalid expert count or top-k")));
             }
         }
         if (self.num_experts > 0 && self.moe_intermediate_size == 0)
             || (self.num_experts == 0 && (self.mova_num_experts > 0 || self.num_shared_experts > 0))
         {
-            return Err(invalid("expert banks require routed feed-forward geometry"));
+            return Err(invalid(format_args!(
+                "expert banks require routed feed-forward geometry"
+            )));
         }
         for (a, b) in [
             (self.num_attention_heads, self.head_dim),
@@ -314,15 +399,18 @@ impl ModelArgs {
             (self.moe_intermediate_size, 2),
         ] {
             a.checked_mul(b)
-                .ok_or_else(|| invalid("projected dimensions exceed i32"))?;
+                .ok_or_else(|| invalid(format_args!("projected dimensions exceed i32")))?;
         }
-        self.rotary
-            .validate()
-            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        self.rotary.validate_fixed().map_err(|_| {
+            invalid(format_args!(
+                "invalid normalized rotary algorithm: {:?}",
+                self.rotary
+            ))
+        })?;
         for format in self.formats.values() {
             format
-                .validate()
-                .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+                .validate_fixed()
+                .map_err(|error| invalid(format_args!("{error}")))?;
         }
         Ok(())
     }
@@ -393,28 +481,104 @@ pub fn model_args_from_config_value(value: &serde_json::Value) -> Result<ModelAr
 
 /// Stable identity binds equations, schedule and exact per-parameter formats.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    // Maps are sorted before hashing; raw HashMap debug ordering is unstable.
-    let rope = args
-        .rope_parameters
-        .as_ref()
-        .or(args.rope_scaling.as_ref())
-        .map(|m| m.iter().collect::<BTreeMap<_, _>>());
-    let mut fields = args.fields.clone();
-    fields.rope_parameters = None;
-    fields.rope_scaling = None;
-    eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
-        "k2_horizon",
-        [(
-            "equation",
-            format!(
-                "input-score-softmax-rounding-sequential-groups-v1|{fields:?}|{rope:?}|{:?}|{:?}|{:?}",
-                args.schedule, args.formats, args.fp8
-            ),
-        )],
+    prompt_cache_architecture_fingerprint_with_metadata(
+        args,
+        crate::decoder::identity::Metadata::new(None),
     )
+    .expect("ordinary fingerprint formatting is infallible")
+}
+fn prompt_cache_architecture_fingerprint_with_metadata(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    struct Fields<'a>(&'a Configuration);
+    impl std::fmt::Debug for Fields<'_> {
+        fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            self.0.fmt_identity_fields(output, true)
+        }
+    }
+    struct Rope<'a>(Vec<(&'a String, &'a RopeValue)>);
+    impl std::fmt::Debug for Rope<'_> {
+        fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            output.debug_map().entries(self.0.iter().copied()).finish()
+        }
+    }
+    let rope = match args.rope_parameters.as_ref().or(args.rope_scaling.as_ref()) {
+        None => None,
+        Some(source) => {
+            let mut rows = metadata.vector(source.len())?;
+            rows.extend(source.iter());
+            rows.sort_unstable_by_key(|(key, _)| key.as_str());
+            Some(Rope(rows))
+        }
+    };
+    metadata.fingerprint("k2_horizon", || {
+        Ok([(
+            "equation",
+            metadata.format(format_args!(
+                "input-score-softmax-rounding-sequential-groups-v1|{:?}|{rope:?}|{:?}|{:?}|{:?}",
+                Fields(&args.fields),
+                args.schedule,
+                args.formats,
+                args.fp8
+            ))?,
+        )])
+    })
 }
 
 impl Config for ModelArgs {
+    fn weight_quantization_with_metadata(
+        &self,
+        name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<WeightQuantization>, eredu_nn::Error> {
+        Ok(self.weight_quantization_for(name))
+    }
+
+    fn linear_format_with_metadata(
+        &self,
+        name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        Ok(self.linear_format(name))
+    }
+
+    fn parameter_alias_with_metadata(
+        &self,
+        _name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn block_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn attention_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn feed_forward_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn rotary_spec_with_metadata(
+        &self,
+        dimensions: i32,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<RotarySpec, eredu_nn::Error> {
+        Ok(self.rotary_spec(dimensions))
+    }
+
     fn attention_arithmetic(&self) -> eredu_nn::AttentionArithmetic {
         eredu_nn::AttentionArithmetic::InputScores
     }
@@ -427,8 +591,25 @@ impl Config for ModelArgs {
     fn architecture_fingerprint(&self) -> String {
         prompt_cache_architecture_fingerprint(self)
     }
+    fn architecture_fingerprint_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<String, eredu_nn::Error> {
+        prompt_cache_architecture_fingerprint_with_metadata(
+            self,
+            crate::decoder::identity::Metadata::new(Some(context)),
+        )
+    }
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
         self.validate().map_err(eredu_nn::Error::backend)
+    }
+    fn validate_config_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), eredu_nn::Error> {
+        self.validate_with_diagnostic(|text| {
+            context.metadata_error(format_args!("invalid K2 Horizon configuration: {text}"))
+        })
     }
     fn routed_observation_points(
         &self,
@@ -522,12 +703,15 @@ impl Config for ModelArgs {
         self.is_mova_layer(layer)
     }
     fn attention_value_format(&self, layer: usize) -> LinearFormat {
-        let field = if self.is_mova_layer(layer) {
-            "v_experts"
-        } else {
-            "v_proj"
-        };
-        self.linear_format_for(&format!("model.layers.{layer}.self_attn.{field}.weight"))
+        self.linear_format_for(&attention_value_name(self, layer).to_string())
+    }
+    fn attention_value_format_with_metadata(
+        &self,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<LinearFormat, eredu_nn::Error> {
+        let name = attention_value_name(self, layer);
+        Ok(self.linear_format_for(&context.metadata_string(format_args!("{name}"))?))
     }
     fn attention_output_gate(&self) -> Option<(&str, OutputGateActivation)> {
         self.attention_gate_func.as_deref().map(|activation| {
@@ -540,5 +724,22 @@ impl Config for ModelArgs {
                 },
             )
         })
+    }
+}
+
+fn attention_value_name(
+    args: &ModelArgs,
+    layer: usize,
+) -> crate::decoder::parameter_metadata::LayerParameterName<'_> {
+    let field = if args.is_mova_layer(layer) {
+        "v_experts"
+    } else {
+        "v_proj"
+    };
+    crate::decoder::parameter_metadata::LayerParameterName {
+        root: "model",
+        layer,
+        module: Some("self_attn"),
+        field,
     }
 }

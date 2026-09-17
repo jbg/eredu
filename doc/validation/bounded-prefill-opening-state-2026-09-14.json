@@ -1,0 +1,256 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T03:36:23.471456+00:00",
+  "scope": "Canonical borrowed opening state before input preparation under original SessionPrefill guard",
+  "status": "Source access and provider traversal verified; complete native opening inventory and memory gate remain unfinished",
+  "previous_increment": "bounded-prefill-causal-selection-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 1083,
+      "ignored": 0
+    },
+    "backend_independence": {
+      "passed": 114,
+      "ignored": 0
+    },
+    "reference_numeric": {
+      "passed": 315,
+      "ignored": 0
+    },
+    "native_observation": {
+      "passed": 10,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 236,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1892,
+  "new_tests": [
+    {
+      "name": "partial_inventory_keeps_typed_failure_and_borrow_identity_through_adapter",
+      "source": "eredu-runtime/src/inspection/prefill_retention/opening_state/tests.rs",
+      "check": "runtime"
+    },
+    {
+      "name": "opening_precedes_source_under_guard_and_borrows_updated_cached_state",
+      "source": "eredu-runtime/tests/backend_independence/prepared_prefill_observation/opening.rs",
+      "check": "backend_independence"
+    },
+    {
+      "name": "opening_callback_failure_prevents_next_preparation_and_bridge_keeps_cause",
+      "source": "eredu-runtime/tests/backend_independence/prepared_prefill_observation/opening.rs",
+      "check": "backend_independence"
+    },
+    {
+      "name": "input_preparation_failure_after_opening_preserves_original_cause",
+      "source": "eredu-runtime/tests/backend_independence/prepared_prefill_observation/opening.rs",
+      "check": "backend_independence"
+    },
+    {
+      "name": "initial_cancellation_visits_no_opening_state_or_input",
+      "source": "eredu-runtime/tests/backend_independence/prepared_prefill_observation/opening.rs",
+      "check": "backend_independence"
+    },
+    {
+      "name": "old_retention_callback_remains_exact_with_default_or_opted_in_fallback",
+      "source": "eredu-runtime/tests/backend_independence/prepared_prefill_observation/opening.rs",
+      "check": "backend_independence"
+    },
+    {
+      "name": "whole_state_inventory_uses_actual_local_slots_independently_of_global_unit_addresses",
+      "source": "eredu-runtime/tests/backend_independence/prepared_prefill_observation/opening.rs",
+      "check": "backend_independence"
+    },
+    {
+      "name": "opening_state_tracks_real_uneven_chunks_and_nonzero_cached_frontier",
+      "source": "eredu-runtime/tests/backend_independence/prepared_prefill_observation/opening/uneven.rs",
+      "check": "backend_independence"
+    }
+  ],
+  "new_test_count": 8,
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T03:33:00.156935+00:00",
+      "elapsed_seconds": 17.574,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-opening-state-runtime.log",
+      "log_sha256": "ff985e5d785d80b1d016063ac46c6348643797e3cdb891d06d9aa90c73c9fce0"
+    },
+    "backend_independence": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence",
+      "started_utc": "2026-09-14T03:29:32.715018+00:00",
+      "elapsed_seconds": 10.263,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-opening-state-backend_independence.log",
+      "log_sha256": "1bbe289dd2474552c5eade0dfd1c4dd9fc65e9230f4282e55a34410cbf8ae07f"
+    },
+    "reference_numeric": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric",
+      "started_utc": "2026-09-14T03:29:42.978332+00:00",
+      "elapsed_seconds": 123.173,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-opening-state-reference_numeric.log",
+      "log_sha256": "7cf79d4d0365cb8d04131714d084f0f6cd0101244abbf90267dda87edfeb0c1d"
+    },
+    "native_observation": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::observation:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T03:33:17.768274+00:00",
+      "elapsed_seconds": 94.576,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-opening-state-native_observation.log",
+      "log_sha256": "1fb6e87256e0b0996f6ea49f254040ca5d6edcacb38fb00e981af83e47642d30"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::model_session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T03:34:52.346059+00:00",
+      "elapsed_seconds": 14.557,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-opening-state-session.log",
+      "log_sha256": "834852e220d81cb5f7b26d2140696d8d8a28b3829d64ced1b7a9b6dba7939d84"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T03:35:06.903919+00:00",
+      "elapsed_seconds": 43.209,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-opening-state-portable.log",
+      "log_sha256": "d4732f4d25e61beaf60922400f230dd4f66663d44f0938caeaa8b0c108107f98"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T03:35:50.114356+00:00",
+      "elapsed_seconds": 15.033,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-opening-state-minimal.log",
+      "log_sha256": "b7f34cad8f7b2f83aee7aa08c3ded8e9708533f380c844236f3a9757ac05ebd5"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T03:36:05.148104+00:00",
+      "elapsed_seconds": 15.991,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-opening-state-features.log",
+      "log_sha256": "6588a5e944ab8a0aaf3580bbe788d0d8563c3b31e8114c0aefedb2cd340bde6e"
+    }
+  },
+  "source_sha256": {
+    "eredu-architectures/tests/reference_numeric.rs": "5df0468f2b26e6e83cb9ab46d13fa869328fec74727782da2f6761567765cef5",
+    "eredu-architectures/tests/reference_numeric/prediction_adapter.rs": "0f20062b222b3ef9aec6b802237f185fbe5b1032a9f7e74855dd0ef652e3d76e",
+    "eredu-architectures/tests/support/reference_composite.rs": "c82787c37ab27517c3088fb9e90f3d76b165a3a52e62a0a341491d1f287514d7",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid.rs": "fdb808833fe463b5d2ed9af870a20f0cc008c176e4eeb0176974b4b76ac3651b",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/key_value.rs": "d7d9374ca2a31e346a20dba482b1cfda804ee36bceaf27eea6e6903f4de3f5cf",
+    "eredu-backend-mlx/src/composition/mlx/session/observation.rs": "6e32f208bbf34222ab1e8a75641d5979db788b382a961a1d651695dfcbcf54e2",
+    "eredu-backend-mlx/src/composition/mod.rs": "0c9439a5af6e0f0f9e5e67a0e81cda002898f0ee3c99c83f4cc2d813067d5b30",
+    "eredu-runtime/src/inspection.rs": "0cc90c995fc4bc19c9aed7f2be3806e3ef7cc03742563217689667c0b4f549b2",
+    "eredu-runtime/src/inspection/error_bridge.rs": "b7a2445788c2ad16222465a8b46381355b59fd76a5f741d9adb13b82071be8e3",
+    "eredu-runtime/src/inspection/prefill_retention.rs": "0cd73d8966daea133265002e6296036ad3470ffe766c332caeeb0fd2368258fc",
+    "eredu-runtime/src/inspection/prefill_retention/opening_state.rs": "6dec77bca03f92bf6a415c807464db1f7f4d5c3ee3440edf1a6e74e7489671d5",
+    "eredu-runtime/src/inspection/prefill_retention/opening_state/tests.rs": "1aed3bf99194c5cac247cea6e3e1ab0991ab73fe4ac4e947b91e508a3f4ac219",
+    "eredu-runtime/src/replicated_session/prefill.rs": "c8a1fc48c90643343d351ee0e88040bff93187713f562396640c0aed444ac27b",
+    "eredu-runtime/src/state.rs": "172a51406577de1a1c0f33e90c6a6a36d95bc27a4fd48c90e3ce0fc099b84cf4",
+    "eredu-runtime/tests/backend_independence.rs": "e9fcf669de10c8b83ecbf7acd21e61f8c1e8718088cb8a421f82a9a0650378ae",
+    "eredu-runtime/tests/backend_independence/prepared_control.rs": "0ded0231534fb0545b240afc7055b97ead7d349d4bd5d5fe832d84d127e80325",
+    "eredu-runtime/tests/backend_independence/prepared_prefill_observation.rs": "46401e3f79739e6d289cb14470aa9b86bb8f036d8606dc59ada8342f0dd50758",
+    "eredu-runtime/tests/backend_independence/prepared_prefill_observation/opening.rs": "ae69041b36052154c8f827ba42b6524ec4f89e0de67d6e6a25d7998345535722",
+    "eredu-runtime/tests/backend_independence/prepared_prefill_observation/opening/uneven.rs": "33b18025edfc9a4f39f8fd84a9681c869fdb4b9fb18cd24abcb4c829846fd593",
+    "doc/backend-architecture.md": "11882208a8c9323e13330da80403f7c8f9f9726ae63d696f4c7d6457a9f6ae32",
+    "doc/execution-control.md": "4d51fe8727a6ea4dc133ca170dbec2436542e610d968309d6fc7ef1855734259",
+    "doc/bounded-inference.md": "c23fb1f00d3733d5f6fc1074d5219dafcf09aaf88175bf12c07ac1750706c267"
+  },
+  "source_snapshot": "/private/tmp/eredu-prefill-opening-state-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-prefill-opening-state-applied.json": "ebdaddf8832b0821d707f57201de2c43bad1b8249a2492a7d1f6efd751252cd8",
+    "/private/tmp/eredu-prefill-opening-state-apply.py": "bf7bae95a72e159799deac863688b5045fd9ac6dedefa64f232ad7173264fe42",
+    "/private/tmp/eredu-prefill-opening-state-backend_independence.log": "1bbe289dd2474552c5eade0dfd1c4dd9fc65e9230f4282e55a34410cbf8ae07f",
+    "/private/tmp/eredu-prefill-opening-state-checks.json": "129436d8ff3759551fdf66bae531faee7fbdcc6eda5ceefdadf51ff876da7bb6",
+    "/private/tmp/eredu-prefill-opening-state-doc-snippets.json": "db926f4133a277095588f533b0f3fc2af9f2b6f449b0db5c2c7ca479367a7974",
+    "/private/tmp/eredu-prefill-opening-state-docs.py": "4f9a4cfc7507cdd17c72158caf6866355f9f5c4eb86571d99b9fd89ff0e69a40",
+    "/private/tmp/eredu-prefill-opening-state-features.log": "6588a5e944ab8a0aaf3580bbe788d0d8563c3b31e8114c0aefedb2cd340bde6e",
+    "/private/tmp/eredu-prefill-opening-state-integration-review.json": "ba017761d3443729108176f08a6ff533ca911f38134ac3c02ab8a893db4e60aa",
+    "/private/tmp/eredu-prefill-opening-state-minimal.log": "b7f34cad8f7b2f83aee7aa08c3ded8e9708533f380c844236f3a9757ac05ebd5",
+    "/private/tmp/eredu-prefill-opening-state-native-bridge-failure.json": "4e9166a235f7cb1a8b4687481e515279f0e2d9a9c1be74fe876b034dbe894b6b",
+    "/private/tmp/eredu-prefill-opening-state-native-bridge-failure.log": "163a300b3bb7c34bca14751b4c62c54863bf322b12fbfe6ca7c43c27d402ee1a",
+    "/private/tmp/eredu-prefill-opening-state-native-bridge-fix.py": "ae761bd53aaf29be2ebd083e31f407fb3a859d6cd641d7772e5d687ad4b87c9c",
+    "/private/tmp/eredu-prefill-opening-state-native-bridge-review-hashes.json": "9ca46858481b0df095cf5abc00b0173aead43f59bdde5a726814f637597cedab",
+    "/private/tmp/eredu-prefill-opening-state-native-bridge-review.md": "527967c6efa7bad0efe6e225649d32c2fe0e4a7eb4dd63ae0af73520ef89c358",
+    "/private/tmp/eredu-prefill-opening-state-native-bridge-stage/change.patch": "13ee3e49e60e1a4c02899404fae264d18328801b791b42642045c3635a449619",
+    "/private/tmp/eredu-prefill-opening-state-native-bridge-stage/manifest.json": "7f82f33cabbbc1541c2feefbecb613a50c64a940a33b5021a5fcd8e105a862ca",
+    "/private/tmp/eredu-prefill-opening-state-native_observation.log": "1fb6e87256e0b0996f6ea49f254040ca5d6edcacb38fb00e981af83e47642d30",
+    "/private/tmp/eredu-prefill-opening-state-native_observation.log.prevalidation": "163a300b3bb7c34bca14751b4c62c54863bf322b12fbfe6ca7c43c27d402ee1a",
+    "/private/tmp/eredu-prefill-opening-state-portable.log": "d4732f4d25e61beaf60922400f230dd4f66663d44f0938caeaa8b0c108107f98",
+    "/private/tmp/eredu-prefill-opening-state-reference_numeric.log": "7cf79d4d0365cb8d04131714d084f0f6cd0101244abbf90267dda87edfeb0c1d",
+    "/private/tmp/eredu-prefill-opening-state-resume.py": "2c92552b0e0f717d480568a134017df336789fe54bc4e8ecc6e7356bb7e50910",
+    "/private/tmp/eredu-prefill-opening-state-review-hashes.json": "83b62205f86ddf0d838ebb567232e942fa77407281cebd95337a3aa538992dc9",
+    "/private/tmp/eredu-prefill-opening-state-review.md": "c7dcb5966b002b7359ed710c51c9c46898f45d316c76c659116a7a9766bfd088",
+    "/private/tmp/eredu-prefill-opening-state-runtime.log": "ff985e5d785d80b1d016063ac46c6348643797e3cdb891d06d9aa90c73c9fce0",
+    "/private/tmp/eredu-prefill-opening-state-runtime.log.prevalidation": "e76e69131adb7e361b9fb0306bb1cbf9423e494ff4d9a1b015ed556e2549a5a1",
+    "/private/tmp/eredu-prefill-opening-state-session.log": "834852e220d81cb5f7b26d2140696d8d8a28b3829d64ced1b7a9b6dba7939d84",
+    "/private/tmp/eredu-prefill-opening-state-stage/change.patch": "e0dae3529563eedeaa2661b8f9ebad8f089555afd867bd4920d0893291a32f2a",
+    "/private/tmp/eredu-prefill-opening-state-stage/doc-additions/backend-architecture.md": "7f9a66421a7f43eed4efe10c046437ca341593c016d42f098e909e1254ab291f",
+    "/private/tmp/eredu-prefill-opening-state-stage/doc-additions/bounded-inference.md": "6630d34b647d0406fd18e4a0170003a7757a2de01a57188d16d7db938c3cb7d0",
+    "/private/tmp/eredu-prefill-opening-state-stage/doc-additions/execution-control.md": "9facaf3ecbbaea64d99a1b58a673391b2b6315ba1a4e23286cf8513451a07116",
+    "/private/tmp/eredu-prefill-opening-state-stage/draft-hashes.json": "9b46dacf2957638dea67ead8925107ef289dd5e8d615b29e9c625281070d28d3",
+    "/private/tmp/eredu-prefill-opening-state-stage/edit.py": "1474895e36bc40643043e8520b3cf9c5c15aa4d502b416dd0175e27c7b9933c8",
+    "/private/tmp/eredu-prefill-opening-state-stage/finish.py": "3dc70edc3c9cf935768daf02d92ca8fac08d78a8dcdc1366a5b6dc6d8bec8a17",
+    "/private/tmp/eredu-prefill-opening-state-stage/manifest.json": "cf4b4f4c46bbd1c3e5bb7a7d4ad077e4d935b57d95ab3fc5db73fee057f82b05",
+    "/private/tmp/eredu-prefill-opening-state-stage/whole_state.py": "95af52554459059d2dd8e4819ab6ecd5f64cf976ef5b2d75f5508b92075b8264",
+    "/private/tmp/eredu-prefill-opening-state-tests-stage/README.md": "0e3b7d565435858a79ce673ecd29b89b1cd9ef43ad28f00bcb85aa09aeccbcf1",
+    "/private/tmp/eredu-prefill-opening-state-tests-stage/artifact-hashes.json": "3976c223703767b43aa95c8bc4381a18f61460a029989ed20f01eb155f3cd4ed",
+    "/private/tmp/eredu-prefill-opening-state-tests-stage/base-hashes.json": "8cd751f323ff012747be7cf4f9162a954cb5e0cb2722c9910e912d32fc6b0c07",
+    "/private/tmp/eredu-prefill-opening-state-tests-stage/change.patch": "d0d2174eeff3c71e7de7be8a62d9704edb0c2ac9e164cffd5a01edea6e4e3f88",
+    "/private/tmp/eredu-prefill-opening-state-tests-stage/checks.json": "096898c9914e82256910e460732bc129489b2de389c3aca683c123ae4128ff19",
+    "/private/tmp/eredu-prefill-opening-state-tests-stage/dependencies.json": "e430135153acab5a03114e8f25b33e35a2d94c064b4123ffc92f3cf6d5de88a6",
+    "/private/tmp/eredu-prefill-opening-state-tests-stage/files.txt": "4497d02acccfa1fad7285c10cc33917bb91b1bd0498013947a410db601158a90",
+    "/private/tmp/eredu-prefill-opening-state-tests-stage/new-tests.json": "5874f2a0b507af2059412d343c20d06746cd30bbd842817e00a8c0231fb4efb7",
+    "/private/tmp/eredu-prefill-opening-state-tests-stage/package.py": "c3fb78debb10a601952d0a17f8ce5864a7e9a983991d6cacf31d452de55ecb01",
+    "/private/tmp/eredu-prefill-opening-state-tests-stage/staged-hashes.json": "81e0bace5bd563ebfcee4b8d819fb39d0b178c12633fd95cea06f9d08663f59a",
+    "/private/tmp/eredu-prefill-opening-state-validate.py": "af4e13b26c1fe703ed5045d4286cc04f5751e98aa38d2db768c2b8bd47e14440"
+  },
+  "review": {
+    "root_full_source_tests_docs_review": true,
+    "independent_review": {
+      "path": "/private/tmp/eredu-prefill-opening-state-review.md",
+      "sha256": "c7dcb5966b002b7359ed710c51c9c46898f45d316c76c659116a7a9766bfd088"
+    },
+    "final_delta": "Old iterator comment corrected and one private partial-source behavioral test added after independent production review. Root reviewed both.",
+    "production_manifest_sha256": "cf4b4f4c46bbd1c3e5bb7a7d4ad077e4d935b57d95ab3fc5db73fee057f82b05",
+    "test_manifest_sha256": "81e0bace5bd563ebfcee4b8d819fb39d0b178c12633fd95cea06f9d08663f59a",
+    "test_dependency_sha256": "e430135153acab5a03114e8f25b33e35a2d94c064b4123ffc92f3cf6d5de88a6",
+    "limits": [
+      "Source-only view, no production opt-in or native gate.",
+      "Native traversal and inventories require separate original preparation accounting.",
+      "Complete native opening publication and original span plan custody remain unfinished."
+    ],
+    "native_bridge_correction": {
+      "stage": "/private/tmp/eredu-prefill-opening-state-native-bridge-stage",
+      "manifest_sha256": "7f82f33cabbbc1541c2feefbecb613a50c64a940a33b5021a5fcd8e105a862ca",
+      "reason": "Native compile E0308 exposed reverse ArrayObserverAdapter conversion; use existing fixed MlxTensor::ref_cast borrowing map. Fixed controls cover actual two-map chain; same partial-source test now traverses nested adapters.",
+      "production_authority_change": false,
+      "independent_review": {
+        "path": "/private/tmp/eredu-prefill-opening-state-native-bridge-review.md",
+        "sha256": "527967c6efa7bad0efe6e225649d32c2fe0e4a7eb4dd63ae0af73520ef89c358"
+      }
+    }
+  },
+  "behavior": [
+    "Required RuntimeState whole traversal follows actual local state slots, independent of global invocation addresses; all six implementations/wrappers updated.",
+    "Default-false observer opt-in receives lexical source under existing preparation guard after chunk annotation and before prepared input; original error and agreement path preserved.",
+    "Borrowed/error/native wrappers forward source access with fixed native MlxTensor::as_array mapping.",
+    "Partial traversal failure remains incomplete; view grants no source registration, native completion or available-memory authority."
+  ],
+  "limits": [
+    "No production observer opts in and no native capture or facade gate opens in this increment.",
+    "State iterators may allocate; fixed view/control fact excludes their buffers and native inventory construction.",
+    "Manager buffers, host metadata, parameters, independent history and original controller/copy/source validators require complete native publication/custody integration.",
+    "Required RuntimeState method is a provider API change; downstream implementations must supply complete direct-local tensor traversal.",
+    "No new released checkpoint or native distributed numerical result."
+  ]
+}

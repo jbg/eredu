@@ -1,0 +1,480 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -72,6 +72,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/scan.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/select.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/concatenate_storage.cpp
++      ${CMAKE_CURRENT_SOURCE_DIR}/arange_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/selection_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/softmax.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/softmax_storage.cpp
+diff --git a/mlx/backend/cpu/arange.h b/mlx/backend/cpu/arange.h
+--- a/mlx/backend/cpu/arange.h
++++ b/mlx/backend/cpu/arange.h
+@@ -4,10 +4,24 @@
+ 
+ #include "mlx/array.h"
+ #include "mlx/backend/cpu/encoder.h"
++#include "mlx/backend/cpu/eval_storage.h"
+ 
+ namespace mlx::core {
+ 
+ namespace {
++
++template <typename T>
++struct ArangeTask {
++  T* ptr;
++  T start, step_size;
++  size_t size;
++  void operator()() {
++    for (int i = 0; i < size; ++i) {
++      ptr[i] = start;
++      start += step_size;
++    }
++  }
++};
+ 
+ template <typename T>
+ void arange(T start, T next, array& out, size_t size, Stream stream) {
+@@ -15,14 +29,21 @@
+   auto step_size = next - start;
+   auto& encoder = cpu::get_command_encoder(stream);
+   encoder.set_output_array(out);
+-  encoder.dispatch([ptr, start, step_size, size]() mutable {
+-    for (int i = 0; i < size; ++i) {
+-      ptr[i] = start;
+-      start += step_size;
+-    }
+-  });
++  encoder.dispatch(ArangeTask<T>{ptr, start, step_size, size});
+ }
+ 
+ } // namespace
+ 
++namespace cpu {
++inline bool arange_float_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  DispatchLayout task;
++  if(!CommandEncoder::dispatch_layout<ArangeTask<float>>(task))return false;
++  const size_t controls=sizeof(task)+sizeof(EvalDispatchStorage)+sizeof(out)+sizeof(ArangeTask<float>)+sizeof(float*)+
++      sizeof(float)*3+sizeof(size_t)+sizeof(Stream)+sizeof(CommandEncoder*)+
++      sizeof(array*)+sizeof(int)+sizeof(scheduler::TaskOwner);
++  if(controls>SIZE_MAX-task.controls)return false;
++  EvalDispatchStorage value{task.task_bytes,task.task_alignment,0,task.controls+controls};
++  out=value;return true;
++}
++} // namespace cpu
+ } // namespace mlx::core
+diff --git a/mlx/backend/cpu/arange_storage.cpp b/mlx/backend/cpu/arange_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/arange_storage.cpp
+@@ -0,0 +1,47 @@
++#include "mlx/backend/cpu/arange_storage.h"
++#include "mlx/backend/cpu/arange.h"
++#include "mlx/primitives.h"
++#include "mlx/submission.h"
++#include <cmath>
++#include <climits>
++#include <typeinfo>
++namespace mlx::core::cpu {
++bool is_arange_eval_primitive(const array& value) noexcept {
++  return value.has_primitive()&&value.primitive().stream().device==Device::cpu&&
++      typeid(value.primitive())==typeid(Arange);
++}
++bool arange_float_eval_layout(size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
++  if(!elements||elements>size_t(INT_MAX)||elements>size_t(PTRDIFF_MAX)/sizeof(float))return false;
++  EvalDispatchStorage task;SingleOutputEvalStorage common;
++  if(!arange_float_dispatch_storage(task)||!single_output_raw_task_layout(1,0,tracer,task,common))return false;
++  CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
++  const size_t controls=sizeof(elements)+sizeof(tracer)+sizeof(out)+sizeof(task)+sizeof(common)+sizeof(value)+
++      sizeof(std::tuple<double,double,double>)+sizeof(double)*5+sizeof(const array*)+
++      sizeof(const Arange*)+sizeof(size_t)*2+sizeof(bool)*2+
++      sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
++      sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
++  if(controls>SIZE_MAX-value.named_control_bytes)return false;
++  value.named_control_bytes+=controls;out=value;return true;
++}
++bool arange_float_eval_storage(const array& value,CopyEvalStorage& out) noexcept {
++  if(!is_arange_eval_primitive(value)||!value.siblings().empty()||!value.inputs().empty()||value.ndim()!=1||
++      value.dtype()!=float32||value.itemsize()!=sizeof(float)||value.shape(0)<=0||
++      size_t(value.shape(0))!=value.size())return false;
++  const auto [start,stop,step]=static_cast<const Arange&>(value.primitive()).state();
++  if(!std::isfinite(start)||!std::isfinite(stop)||!std::isfinite(step)||step==0)return false;
++  const auto length=std::ceil((stop-start)/step);
++  if(!std::isfinite(length)||length!=double(value.size()))return false;
++  return arange_float_eval_layout(value.size(),value.is_tracer(),out);
++}
++}
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_arange_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record=guard.record();auto* graph=record.graph_quota();auto context=current_graph_construction_context();
++  if(out||!graph||!guard.cpu()||!context.scope||context.worker||context.dispatch!=&record||current_graph_quota()!=graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if(!cpu::arange_float_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
++}
++}
+diff --git a/mlx/backend/cpu/arange_storage.h b/mlx/backend/cpu/arange_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/arange_storage.h
+@@ -0,0 +1,7 @@
++#pragma once
++#include "mlx/backend/cpu/copy_storage.h"
++namespace mlx::core::cpu {
++bool is_arange_eval_primitive(const array&) noexcept;
++bool arange_float_eval_layout(size_t elements,bool tracer,CopyEvalStorage&) noexcept;
++bool arange_float_eval_storage(const array&,CopyEvalStorage&) noexcept;
++}
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -73,7 +73,7 @@
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+-  if (rank > size_t(INT_MAX) || (copy && inputs != 1 && inputs != 2 && inputs != 3) || (!copy && rank != 0)) return false;
++  if (rank > size_t(INT_MAX) || (copy && inputs != 1 && inputs != 2 && inputs != 3 && !(raw_task && inputs == 0)) || (!copy && rank != 0)) return false;
+   SingleOutputEvalStorage value;
+   value.rank = rank; value.inputs = inputs; value.tracer = tracer;
+   submission::CpuEvalCleanupLayout cleanup;
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -1,4 +1,5 @@
+ #include "mlx/backend/cpu/concatenate_storage.h"
++#include "mlx/backend/cpu/arange_storage.h"
+ // Copyright © 2025 Apple Inc.
+ #include "mlx/backend/cpu/eval.h"
+ #include "mlx/backend/cpu/encoder.h"
+@@ -47,6 +48,7 @@
+   const bool fixed_partition = partition && arr.ndim() == 2 && arr.inputs().size() == 1 &&
+       arr.inputs()[0].ndim() == 2 && arr.siblings().empty() &&
+       partition->state().second == 1;
++  const bool fixed_arange = fixed && cpu::is_arange_eval_primitive(arr);
+   const bool fixed_concatenate = fixed && cpu::is_concatenate_eval_primitive(arr);
+   const bool fixed_selection = fixed && cpu::is_selection_eval_primitive(arr);
+   const bool fixed_reduction = fixed && cpu::is_reduction_eval_primitive(arr);
+@@ -62,7 +64,7 @@
+   const bool fixed_tiled_matmul = fixed && cpu::is_tiled_matmul_eval_primitive(arr);
+   const bool fixed_matmul = fixed && cpu::is_bf16_matmul_eval_primitive(arr);
+   const bool fixed_random = fixed && cpu::is_random_bits_eval_primitive(arr);
+-  const bool extended = fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool extended = fixed_arange || fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -70,7 +72,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_concatenate
++    const auto failure = fixed_arange
++        ? submission::GraphConstruction::create_cpu_arange_eval(*extended_prologue, extended_bank.value)
++        : fixed_concatenate
+         ? submission::GraphConstruction::create_cpu_concatenate_eval(*extended_prologue, extended_bank.value)
+         : fixed_selection
+         ? submission::GraphConstruction::create_cpu_selection_eval(*extended_prologue, extended_bank.value)
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -407,118 +407,25 @@
+   return eps_ == a_other.eps_;
+ }
+ 
+-array rope(
+-    ArrayVector inputs,
+-    int dims,
+-    bool traditional,
+-    float base,
+-    float scale,
+-    bool forward,
+-    StreamOrDevice s) {
+-  auto& x = inputs[0];
+-  auto& offset = inputs[1];
+-  if (x.ndim() < 3) {
+-    std::ostringstream msg;
+-    msg << "[rope] Input must have at least 3 dimensions but got input with "
+-        << x.ndim() << " dimensions.";
+-    throw std::invalid_argument(msg.str());
+-  }
+-  if (!issubdtype(x.dtype(), floating)) {
+-    std::ostringstream msg;
+-    msg << "[rope] Input must be a floating type but got " << x.dtype() << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-  if (offset.ndim() > 1) {
+-    std::ostringstream msg;
+-    msg << "[rope] offset must have at most one dimension but has shape "
+-        << offset.shape() << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-  if (offset.size() != 1 && offset.size() != x.shape(0)) {
+-    std::ostringstream msg;
+-    msg << "[rope] offset must be a scalar or vector with " << x.shape(0)
+-        << " elements but has shape " << offset.shape() << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-  if (!issubdtype(offset.dtype(), integer)) {
+-    std::ostringstream msg;
+-    msg << "[rope] offset must be an integer but got type " << offset.dtype()
+-        << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-  if (offset.dtype().size() != 4) {
+-    inputs[1] = astype(offset, int32, s);
+-  }
+-  if (dims <= 0) {
+-    std::ostringstream msg;
+-    msg << "[rope] dims must be positive but got " << dims << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-  if (dims % 2 != 0) {
+-    std::ostringstream msg;
+-    msg << "[rope] dims must be even but got " << dims << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-  if (dims > x.shape(-1)) {
+-    std::ostringstream msg;
+-    msg << "[rope] dims must not exceed the input's last dimension ("
+-        << x.shape(-1) << ") but got " << dims << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-
+-  if (inputs.size() == 3 &&
+-      (inputs[2].ndim() != 1 || inputs[2].shape(0) != dims / 2)) {
+-    std::ostringstream msg;
+-    msg << "[rope] freqs must be one dimensional with size " << dims / 2
+-        << " but got shape " << inputs[2].shape() << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-
+-  auto fallback = [dims, traditional, base, scale, forward, s](
+-                      ArrayVector inputs) {
+-    auto x = inputs[0];
+-    auto shape = x.shape();
+-    if (x.ndim() == 3) {
+-      x = expand_dims(x, 1, s);
+-    } else if (x.ndim() > 4) {
+-      x = flatten(x, 1, 1 + (x.ndim() - 4), s);
+-    }
+-
+-    auto B = x.shape(0);
+-    auto N = x.shape(1);
+-    auto T = x.shape(2);
+-    auto t = x.dtype();
+-    // Compute sines and cosines
+-    auto half_dims = dims / 2;
+-    auto offset = inputs[1];
+-    if (offset.size() > 1) {
+-      offset = expand_dims(offset, {-1, -2}, s);
+-    }
+-    auto positions = multiply(
+-        add(arange(x.shape(2), float32, s), offset, s),
+-        array(scale, float32),
+-        s);
+-
+-    auto default_inv_freqs = [&s, base, half_dims]() {
++namespace {
++struct RopeInvFrequencies {
++  const StreamOrDevice& s;
++  float base;
++  int half_dims;
++  array operator()() const {
+       return exp(
+           multiply(
+               arange(0, -half_dims, -1, float32, s),
+               array(std::log(base) / half_dims, float32),
+               s),
+           s);
+-    };
+-
+-    auto inv_freqs =
+-        inputs.size() == 3 ? reciprocal(inputs[2], s) : default_inv_freqs();
+-    auto theta = multiply(expand_dims(positions, -1, s), inv_freqs, s);
+-    auto coss = astype(cos(theta, s), t, s);
+-    auto sins = astype(sin(theta, s), t, s);
+-
+-    auto apply_rope = [forward, s](
+-                          const array& x1,
+-                          const array& x2,
+-                          const array& coss,
+-                          const array& sins) {
++    
++  }
++};
++struct RopeApply {
++  bool forward;
++  StreamOrDevice s;
++  ArrayVector operator()(const array& x1,const array& x2,const array& coss,const array& sins) const {
+       ArrayVector outs;
+       if (forward) {
+         outs.push_back(
+@@ -530,7 +437,48 @@
+             subtract(multiply(x2, coss, s), multiply(x1, sins, s), s));
+       }
+       return outs;
+-    };
++    
++  }
++};
++struct RopeFallback {
++  int dims;
++  bool traditional;
++  float base,scale;
++  bool forward;
++  StreamOrDevice s;
++  ArrayVector operator()(ArrayVector inputs) const {
++    auto x = inputs[0];
++    auto shape = x.shape();
++    if (x.ndim() == 3) {
++      x = expand_dims(x, 1, s);
++    } else if (x.ndim() > 4) {
++      x = flatten(x, 1, 1 + (x.ndim() - 4), s);
++    }
++
++    auto B = x.shape(0);
++    auto N = x.shape(1);
++    auto T = x.shape(2);
++    auto t = x.dtype();
++    // Compute sines and cosines
++    auto half_dims = dims / 2;
++    auto offset = inputs[1];
++    if (offset.size() > 1) {
++      offset = expand_dims(offset, {-1, -2}, s);
++    }
++    auto positions = multiply(
++        add(arange(x.shape(2), float32, s), offset, s),
++        array(scale, float32),
++        s);
++
++    auto default_inv_freqs = RopeInvFrequencies{s, base, half_dims};
++
++    auto inv_freqs =
++        inputs.size() == 3 ? reciprocal(inputs[2], s) : default_inv_freqs();
++    auto theta = multiply(expand_dims(positions, -1, s), inv_freqs, s);
++    auto coss = astype(cos(theta, s), t, s);
++    auto sins = astype(sin(theta, s), t, s);
++
++    auto apply_rope = RopeApply{forward, s};
+ 
+     if (traditional) {
+       auto x1 = slice(x, {0, 0, 0, 0}, {B, N, T, dims}, {1, 1, 1, 2}, s);
+@@ -558,7 +506,90 @@
+       }
+       return ArrayVector{reshape(concatenate(outs, -1, s), shape, s)};
+     }
+-  };
++  
++  }
++};
++} // namespace
++bool cpu_rope_fallback_control_bytes(size_t rank,size_t dimensions,size_t elements,size_t& out) noexcept {
++  if(rank!=4||!dimensions||(dimensions%2)||!elements||elements>size_t(INT_MAX)||dimensions>elements)return false;
++  const size_t parts[]={sizeof(RopeFallback),sizeof(RopeInvFrequencies),sizeof(RopeApply),
++      sizeof(ArrayVector)*5,sizeof(Shape)*3,sizeof(array)*20,sizeof(StreamOrDevice)*3,sizeof(Stream),
++      sizeof(std::optional<array>),sizeof(std::optional<float>),sizeof(float)*5,sizeof(int)*7,
++      sizeof(size_t)*4,sizeof(bool)*4,sizeof(const array*)*6,
++      sizeof(std::function<ArrayVector(ArrayVector)>)};
++  size_t total=sizeof(parts)+sizeof(out);
++  for(auto value:parts) {if(value>SIZE_MAX-total)return false;total+=value;}
++  out=total;return true;
++}
++
++array rope(
++    ArrayVector inputs,
++    int dims,
++    bool traditional,
++    float base,
++    float scale,
++    bool forward,
++    StreamOrDevice s) {
++  auto& x = inputs[0];
++  auto& offset = inputs[1];
++  if (x.ndim() < 3) {
++    std::ostringstream msg;
++    msg << "[rope] Input must have at least 3 dimensions but got input with "
++        << x.ndim() << " dimensions.";
++    throw std::invalid_argument(msg.str());
++  }
++  if (!issubdtype(x.dtype(), floating)) {
++    std::ostringstream msg;
++    msg << "[rope] Input must be a floating type but got " << x.dtype() << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  if (offset.ndim() > 1) {
++    std::ostringstream msg;
++    msg << "[rope] offset must have at most one dimension but has shape "
++        << offset.shape() << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  if (offset.size() != 1 && offset.size() != x.shape(0)) {
++    std::ostringstream msg;
++    msg << "[rope] offset must be a scalar or vector with " << x.shape(0)
++        << " elements but has shape " << offset.shape() << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  if (!issubdtype(offset.dtype(), integer)) {
++    std::ostringstream msg;
++    msg << "[rope] offset must be an integer but got type " << offset.dtype()
++        << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  if (offset.dtype().size() != 4) {
++    inputs[1] = astype(offset, int32, s);
++  }
++  if (dims <= 0) {
++    std::ostringstream msg;
++    msg << "[rope] dims must be positive but got " << dims << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  if (dims % 2 != 0) {
++    std::ostringstream msg;
++    msg << "[rope] dims must be even but got " << dims << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  if (dims > x.shape(-1)) {
++    std::ostringstream msg;
++    msg << "[rope] dims must not exceed the input's last dimension ("
++        << x.shape(-1) << ") but got " << dims << ".";
++    throw std::invalid_argument(msg.str());
++  }
++
++  if (inputs.size() == 3 &&
++      (inputs[2].ndim() != 1 || inputs[2].shape(0) != dims / 2)) {
++    std::ostringstream msg;
++    msg << "[rope] freqs must be one dimensional with size " << dims / 2
++        << " but got shape " << inputs[2].shape() << ".";
++    throw std::invalid_argument(msg.str());
++  }
++
++  auto fallback = RopeFallback{dims, traditional, base, scale, forward, s};
+   auto stream = to_stream(s);
+   if (!RoPE::use_fallback(stream)) {
+     return array(
+diff --git a/mlx/fast.h b/mlx/fast.h
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -14,6 +14,8 @@
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core::fast {
++// Pure controls of the same CPU default full-width RoPE fallback.
++bool cpu_rope_fallback_control_bytes(size_t rank,size_t dimensions,size_t elements,size_t& out) noexcept;
+ 
+ // Pure named-frame census for the existing CPU fallback; no execution authority.
+ MLX_API bool cpu_rms_fallback_control_bytes(
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -174,6 +174,7 @@
+   static GraphFailure create_cpu_random_bits_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_softmax_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_slice_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_arange_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_concatenate_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_selection_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_reduction_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;

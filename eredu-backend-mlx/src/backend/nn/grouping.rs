@@ -44,7 +44,7 @@ pub fn group_by_id(
     let order = argsort(&flat_group_ids, stream)?;
     let sorted_group_ids = flat_group_ids.take(&order, stream)?;
     let selection_indices = order.as_dtype(Dtype::Int32, stream)?;
-    let token_indices = selection_indices.floor_divide(Array::from_int(top_k), stream)?;
+    let token_indices = selection_indices.floor_divide(Array::try_from_int(top_k)?, stream)?;
 
     Ok(GroupedSelectionPlan {
         sorted_group_ids,
@@ -68,7 +68,7 @@ pub fn grouped_matmul(
     let stream = stream.as_ref();
     let inputs = inputs.as_ref();
     let weights = weights.as_ref();
-    if stream.get_device()?.get_type()? == safemlx::DeviceType::Cpu
+    if stream.device_type()? == safemlx::DeviceType::Cpu
         && matches!(inputs.dtype(), Dtype::Bfloat16 | Dtype::Float16)
     {
         return grouped_matmul_cpu(inputs, weights, group_ids.as_ref(), stream);
@@ -124,9 +124,10 @@ fn grouped_matmul_cpu(
     if inputs.dim(0) == 0 {
         return safemlx::ops::zeros_dtype(&[0, weights.dim(2)], inputs.dtype(), stream);
     }
-    let valid = ids
-        .ge(Array::from_int(0), stream)?
-        .logical_and(ids.lt(Array::from_int(weights.dim(0)), stream)?, stream)?;
+    let valid = ids.ge(Array::try_from_int(0)?, stream)?.logical_and(
+        ids.lt(Array::try_from_int(weights.dim(0))?, stream)?,
+        stream,
+    )?;
     if !valid.all(None, stream)?.try_item::<bool>(stream)? {
         return Err(safemlx::error::Exception::custom(
             "grouped matrix index is outside the bank",

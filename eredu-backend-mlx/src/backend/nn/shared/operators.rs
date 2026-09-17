@@ -1,7 +1,13 @@
 use super::parameters::*;
 use super::*;
+use eredu_nn::{ParameterSourceError, ParameterSourceVisitor};
 use safemlx::error::Exception;
 mod grouped_units;
+mod observation_transport;
+
+pub(crate) fn projection_observation_control_bytes() -> Option<usize> {
+    observation_transport::control_bytes()
+}
 
 /// MLX dense-or-quantized affine projection.
 #[derive(Debug, Clone)]
@@ -22,6 +28,21 @@ impl LinearOperator<MlxTensor> for MlxLinear {
         observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
         self.forward_observed_input(input, None, context, observer)
+    }
+}
+
+// Retained factories cross this boundary without duplicating an arbitrary
+// native/observer diagnostic. The original failure remains in the source chain.
+#[derive(Debug)]
+struct RetainedInputFailure<E>(E);
+impl<E> std::fmt::Display for RetainedInputFailure<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("retained generated input observation failed")
+    }
+}
+impl<E: std::error::Error + 'static> std::error::Error for RetainedInputFailure<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
     }
 }
 
@@ -58,6 +79,31 @@ impl common::linear::NativeProjectionInputObserver for NativeInputObserver<'_> {
                 });
         self.result(result)
     }
+    /// Forward the actual generated program and its caller-owned root retention.
+    fn observe_generated_retained(
+        &mut self,
+        prototype: &Array,
+        source: &eredu_nn::GeneratedTensorSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<Array, Exception>,
+    ) -> Result<(), Exception> {
+        let mut mapped = observation_transport::Factory::new(
+            factory,
+            MlxTensor::ref_cast,
+            MlxTensor::from_array,
+            observation_transport::native,
+            observation_transport::signal,
+        );
+        let result = self.inner.observe_generated_retained(
+            MlxTensor::ref_cast(prototype),
+            source,
+            &mut mapped,
+        );
+        result.map_err(|error| {
+            let signal = observation_transport::signal(&error);
+            self.failure = Some(error);
+            signal
+        })
+    }
 }
 impl MlxLinear {
     pub(super) fn forward_observed_input(
@@ -67,6 +113,7 @@ impl MlxLinear {
         context: &Stream,
         observer: Option<&mut dyn eredu_nn::ProjectionInputObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
+        let retained = observer.is_some() && self.module.generates_projection_input();
         let mut adapter = observer.map(|inner| NativeInputObserver {
             inner,
             failure: None,
@@ -74,25 +121,46 @@ impl MlxLinear {
         let observer = adapter
             .as_mut()
             .map(|adapter| adapter as &mut dyn common::linear::NativeProjectionInputObserver);
+        // Defer native error wrapping until after the observation adapter's
+        // own error wins, exactly as in the ordinary path.
+        enum ForwardFailure { Native(Exception), Reduction(ComputeError) }
         let result = match parallel {
-            Some(group) => self.module.forward_row_parallel_with_input_observer(
-                input.as_array(),
-                group,
-                context,
-                observer,
-            ),
-            None => self
-                .module
-                .forward_with_input_observer(input.as_array(), context, observer),
+            Some(group) => self.module.forward_row_parallel_with_reducer(
+                input.as_array(),context,observer,
+                |partial,stream| {
+                    if group.has_original_parallel() { group.sum_model(partial,stream).map_err(ForwardFailure::Reduction) }
+                    else { crate::backend::runtime::distributed::all_sum(partial,group,stream).map_err(ForwardFailure::Native) }
+                },ForwardFailure::Native),
+            None => self.module.forward_with_input_observer(input.as_array(),context,observer).map_err(ForwardFailure::Native),
         };
         match adapter.and_then(|adapter| adapter.failure) {
+            Some(error) if retained => Err(observation_transport::callback(error)),
             Some(error) => Err(error),
-            None => compute_tensor(result),
+            None => result.map(MlxTensor::from_array).map_err(|cause|match cause {
+                ForwardFailure::Native(cause) if retained=>observation_transport::source(cause),
+                ForwardFailure::Native(cause)=>ComputeError::backend_source(cause),
+                ForwardFailure::Reduction(cause)=>cause,
+            }),
         }
     }
 }
 
 impl Parameterized<MlxTensor> for MlxLinear {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, MlxTensor>,
+    {
+        visit_module_parameter_sources(&self.module, &self.topology, visitor)
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        self.module.native_retained_value_slot_bound()
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
+        self.module.visit_native_retained_values(visitor)
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -141,8 +209,14 @@ impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
             sentinel,
             context,
         ))?;
-        let nonnegative = compute(input.ge(Array::from_int(0), context))?;
-        let below_vocabulary = compute(input.lt(Array::from_int(self.vocabulary), context))?;
+        let nonnegative = compute(input.ge(
+            Array::try_from_int(0).map_err(ComputeError::backend_source)?,
+            context,
+        ))?;
+        let below_vocabulary = compute(input.lt(
+            Array::try_from_int(self.vocabulary).map_err(ComputeError::backend_source)?,
+            context,
+        ))?;
         let ordinary_mask = compute(nonnegative.logical_and(&below_vocabulary, context))?;
         let zero_tokens = compute(safemlx::ops::zeros_like(&input, context))?;
         let safe_tokens = compute(safemlx::ops::r#where(
@@ -155,7 +229,10 @@ impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
         let Some(sentinel) = sentinel else {
             return Ok(MlxTensor::from_array(embedded));
         };
-        let sentinel_mask = compute(input.eq(Array::from_int(sentinel), context))?;
+        let sentinel_mask = compute(input.eq(
+            Array::try_from_int(sentinel).map_err(ComputeError::backend_source)?,
+            context,
+        ))?;
         let output_mask = compute(sentinel_mask.expand_dims(-1, context))?;
         let zero_embeddings = compute(safemlx::ops::zeros_like(&embedded, context))?;
         compute_tensor(safemlx::ops::r#where(
@@ -176,6 +253,21 @@ impl EmbeddingOperator<MlxTensor> for MlxEmbedding {
 }
 
 impl Parameterized<MlxTensor> for MlxEmbedding {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, MlxTensor>,
+    {
+        visit_module_parameter_sources(&self.module, &self.topology, visitor)
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        self.module.native_retained_value_slot_bound()
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
+        self.module.visit_native_retained_values(visitor)
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -215,11 +307,11 @@ impl MlxRmsNorm {
     ) -> Result<Array, safemlx::error::Exception> {
         <Self as NormalizationOperator<MlxTensor>>::forward(
             self,
-            &MlxTensor::from_array(input.clone()),
+            MlxTensor::ref_cast(input),
             context,
         )
         .map(MlxTensor::into_array)
-        .map_err(|error| safemlx::error::Exception::custom(error.to_string()))
+        .map_err(safemlx::error::Exception::from_source)
     }
 }
 
@@ -244,7 +336,10 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
             if let Some(module) = &self.module {
                 let mut scale = compute(module.weight.as_ref().as_dtype(Dtype::Float32, context))?;
                 if let Some(offset) = self.offset {
-                    scale = compute(scale.add(Array::from_f32(offset), context))?;
+                    scale = compute(scale.add(
+                        Array::try_from_f32(offset).map_err(ComputeError::backend_source)?,
+                        context,
+                    ))?;
                 }
                 normalized = compute(normalized.multiply(scale, context))?;
             }
@@ -253,7 +348,10 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
         match (&mut self.module, self.offset) {
             (Some(module), None) => compute_tensor(module.forward(input, context)),
             (Some(module), Some(offset)) => {
-                let scale = compute(module.weight.as_ref().add(Array::from_f32(offset), context))?;
+                let scale = compute(module.weight.as_ref().add(
+                    Array::try_from_f32(offset).map_err(ComputeError::backend_source)?,
+                    context,
+                ))?;
                 compute_tensor(super::super::normalization::input_precision_rms(
                     input,
                     &scale,
@@ -270,6 +368,27 @@ impl NormalizationOperator<MlxTensor> for MlxRmsNorm {
 }
 
 impl Parameterized<MlxTensor> for MlxRmsNorm {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, MlxTensor>,
+    {
+        match &self.module {
+            Some(module) => visit_module_parameter_sources(module, &self.topology, visitor),
+            None if self.topology.is_empty() => Ok(()),
+            None => Err(ParameterSourceError::TopologyMismatch { slot: 0 }),
+        }
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
+        self.module
+            .as_ref()
+            .is_none_or(|module| module.visit_native_retained_values(visitor))
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -307,11 +426,14 @@ pub(super) fn mlx_weightless_rms_norm(
     let dtype = input.dtype();
     let variance = compute(input.square(context))?;
     let variance = compute(variance.mean_axis(-1, true, context))?;
-    let denominator = compute(variance.add(Array::from_f32(epsilon), context))?;
+    let denominator = compute(variance.add(
+        Array::try_from_f32(epsilon).map_err(ComputeError::backend_source)?,
+        context,
+    ))?;
     let denominator = compute(denominator.rsqrt(context))?;
     compute(input.multiply(denominator, context))?
         .as_dtype(dtype, context)
-        .map_err(ComputeError::backend)
+        .map_err(ComputeError::backend_source)
 }
 
 /// MLX RoPE variant selected from model metadata.
@@ -319,6 +441,7 @@ pub(super) fn mlx_weightless_rms_norm(
 pub struct MlxRotary {
     pub(super) native: RopeVariant,
     pub(super) explicit: Option<rope::ElementwiseRotary>,
+    pub(super) dimensions: i32,
 }
 
 impl RotaryOperator<MlxTensor> for MlxRotary {
@@ -330,10 +453,25 @@ impl RotaryOperator<MlxTensor> for MlxRotary {
     ) -> Result<MlxTensor, ComputeError> {
         match position {
             RotaryPosition::Offset(offset) => {
+                let shape = input.as_array().shape();
+                if shape.len() >= 2 && shape[shape.len() - 2] == 0 {
+                    if self.dimensions <= 0
+                        || self.dimensions % 2 != 0
+                        || self.dimensions > shape[shape.len() - 1]
+                    {
+                        return Err(ComputeError::backend(
+                            "empty rotary input has incompatible feature width",
+                        ));
+                    }
+                    // No positions exist yet in a partially filled pooling
+                    // stream. Inferred reshapes cannot represent this case;
+                    // the elementwise rotation is the identity on empty data.
+                    return Ok(input.clone());
+                }
                 let rope_input = nn::RopeInputBuilder::new(input.as_array())
                     .offset(offset)
                     .build()
-                    .map_err(ComputeError::backend)?;
+                    .map_err(ComputeError::backend_source)?;
                 match &self.explicit {
                     Some(rotary) => {
                         compute_tensor(rotary.forward(input.as_array(), offset, context))
@@ -354,6 +492,31 @@ impl RotaryOperator<MlxTensor> for MlxRotary {
 }
 
 impl Parameterized<MlxTensor> for MlxRotary {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, MlxTensor>,
+    {
+        let mut arrays = |value: &'a Array| visitor.retained(MlxTensor::ref_cast(value));
+        self.native.visit_retained_arrays(&mut arrays);
+        if let Some(explicit) = &self.explicit {
+            explicit.visit_retained_arrays(&mut arrays);
+        }
+        Ok(())
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
+        let mut arrays = |value: &Array| visitor(MlxTensor::ref_cast(value));
+        self.native.visit_retained_arrays(&mut arrays);
+        if let Some(explicit) = &self.explicit {
+            explicit.visit_retained_arrays(&mut arrays);
+        }
+        true
+    }
+
     fn visit_parameters<'a, V>(&'a self, _visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -374,6 +537,33 @@ pub struct MlxHyperConnection {
     pub(super) topology: BTreeMap<String, ParameterSpec>,
 }
 
+fn hyper_native_error(cause: Exception) -> ComputeError {
+    match safemlx::OriginalScopeObserver::try_current() {
+        Ok(None) => ComputeError::backend_source(cause),
+        _ => ComputeError::backend_retained_source(cause),
+    }
+}
+fn hyper_compute<T>(result: Result<T, Exception>) -> Result<T, ComputeError> {
+    result.map_err(hyper_native_error)
+}
+
+pub(crate) fn hyper_observation_control_bytes() -> Option<usize> {
+    use std::mem::{size_of, size_of_val};
+    let frames = [
+        observation_transport::grouped_callback_control_bytes()?,
+        size_of::<Option<ComputeError>>(),
+        size_of::<Result<Array, Exception>>(),
+        size_of::<Result<MlxTensor, ComputeError>>(),
+        size_of::<Result<(), ComputeError>>(),
+        size_of::<&mut dyn eredu_nn::TensorValueObserver<MlxTensor>>(),
+        size_of::<Option<&mut dyn FnMut(&Array) -> Result<(), Exception>>>(),
+        size_of::<bool>(),
+    ];
+    frames
+        .into_iter()
+        .try_fold(size_of_val(&frames), usize::checked_add)
+}
+
 impl HyperConnectionOperator<MlxTensor> for MlxHyperConnection {
     fn collapse(
         &mut self,
@@ -381,7 +571,7 @@ impl HyperConnectionOperator<MlxTensor> for MlxHyperConnection {
         norm_epsilon: f32,
         context: &Stream,
     ) -> Result<HyperConnectionState<MlxTensor>, ComputeError> {
-        let (collapsed, split) = compute(self.module.collapse_split(
+        let (collapsed, split) = hyper_compute(self.module.collapse_split(
             residual.as_array(),
             norm_epsilon,
             context,
@@ -401,17 +591,33 @@ impl HyperConnectionOperator<MlxTensor> for MlxHyperConnection {
         state: &HyperConnectionState<MlxTensor>,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(common::hyper_connections::expand(
+        hyper_compute(common::hyper_connections::expand(
             sublayer.as_array(),
             residual.as_array(),
             state.post.as_array(),
             state.combination.as_array(),
             context,
         ))
+        .map(MlxTensor::from_array)
     }
 }
 
 impl Parameterized<MlxTensor> for MlxHyperConnection {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, MlxTensor>,
+    {
+        visit_module_parameter_sources(&self.module, &self.topology, visitor)
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        self.module.native_retained_value_slot_bound()
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
+        self.module.visit_native_retained_values(visitor)
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -444,7 +650,7 @@ impl HyperHeadOperator<MlxTensor> for MlxHyperHead {
         residual: &MlxTensor,
         context: &Stream,
     ) -> Result<MlxTensor, ComputeError> {
-        compute_tensor(self.module.forward(residual.as_array(), context))
+        hyper_compute(self.module.forward(residual.as_array(), context)).map(MlxTensor::from_array)
     }
 
     fn forward_with_coefficients_observer(
@@ -456,6 +662,9 @@ impl HyperHeadOperator<MlxTensor> for MlxHyperHead {
         let Some(observer) = observer else {
             return self.forward(residual, context);
         };
+        let original = safemlx::OriginalScopeObserver::try_current()
+            .map_err(hyper_native_error)?
+            .is_some();
         let mut failure = None;
         let result = self.module.forward_with_coefficients_observer(
             residual.as_array(),
@@ -464,20 +673,42 @@ impl HyperHeadOperator<MlxTensor> for MlxHyperHead {
                 observer
                     .observe(MlxTensor::ref_cast(coefficients))
                     .map_err(|error| {
-                        let native = Exception::custom(error.to_string());
+                        let (error, signal) = if original {
+                            let error = observation_transport::callback(error);
+                            let signal = observation_transport::signal(&error);
+                            (error, signal)
+                        } else {
+                            let signal = Exception::custom(error.to_string());
+                            (error, signal)
+                        };
                         failure = Some(error);
-                        native
+                        signal
                     })
             }),
         );
         match failure {
             Some(error) => Err(error),
-            None => compute_tensor(result),
+            None => hyper_compute(result).map(MlxTensor::from_array),
         }
     }
 }
 
 impl Parameterized<MlxTensor> for MlxHyperHead {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, MlxTensor>,
+    {
+        visit_module_parameter_sources(&self.module, &self.topology, visitor)
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        self.module.native_retained_value_slot_bound()
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
+        self.module.visit_native_retained_values(visitor)
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -504,6 +735,21 @@ pub struct MlxTopKGroupSelector {
 }
 
 impl Parameterized<MlxTensor> for MlxTopKGroupSelector {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, MlxTensor>,
+    {
+        self.module.visit_parameter_sources(visitor)
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        self.module.retained_value_slot_bound()
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
+        self.module.visit_retained_values(visitor)
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -591,15 +837,33 @@ pub struct MlxGroupedGatedProduct {
 }
 
 impl MlxGroupedGatedProduct {
+    pub(crate) fn original_fp8_control_bytes() -> Option<usize> {
+        super::selected_linear::original::control_bytes()?
+            .checked_add(std::mem::size_of::<[Array; 3]>())?
+            .checked_add(std::mem::size_of::<Result<MlxTensor, ComputeError>>())
+    }
+
     pub(crate) fn local_parameter_names(&self) -> Vec<String> {
         self.module.local_parameter_names()
     }
 
     pub(crate) fn bind_local_parameters(
         &mut self,
-        bindings: BTreeMap<String, Array>,
+        mut bindings: BTreeMap<String, Array>,
     ) -> Result<(), ComputeError> {
-        self.module.bind_local_parameters(
+        self.bind_compact_values(&mut bindings)
+    }
+
+    pub(crate) fn bind_prepared_local_parameters(
+        &mut self, bindings: &mut super::parameters::PreparedCompactBindings<'_>,
+    ) -> Result<(), ComputeError> {
+        self.bind_compact_values(bindings)
+    }
+
+    fn bind_compact_values<V: super::parameters::CompactBindingValues + ?Sized>(
+        &mut self, bindings: &mut V,
+    ) -> Result<(), ComputeError> {
+        self.module.bind_local_parameters_from(
             bindings,
             &[
                 (
@@ -627,6 +891,21 @@ impl MlxGroupedGatedProduct {
 }
 
 impl Parameterized<MlxTensor> for MlxGroupedGatedProduct {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, MlxTensor>,
+    {
+        self.module.visit_parameter_sources(visitor)
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        self.module.retained_value_slot_bound()
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
+        self.module.visit_retained_values(visitor)
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -660,15 +939,19 @@ impl GroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedProduct {
             crate::tests::support::provider_failure::Operator::Gated,
             context,
         )?;
+        let transport = super::selected_linear::original::Transport::new(matches!(
+            self.spec.layout(), GatedProductGroupLayout::Packed { gate_up, .. }
+                if matches!(gate_up.format().encoding(), LinearFormat::E4M3BlockFp8(_))
+        ));
         let input = input.as_array();
-        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
-        let output = compute(self.module.forward(
+        let flattened = transport.compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let output = transport.compute(self.module.forward(
             &flattened,
             selections.group_indices().as_array(),
             selections.coefficients().as_array(),
             context,
         ))?;
-        compute_tensor(output.reshape(input.shape(), context))
+        transport.tensor(output.reshape(input.shape(), context))
     }
 
     fn forward_grouped_with_unit_observer(
@@ -695,9 +978,10 @@ impl TensorParallelGroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedPro
             crate::tests::support::provider_failure::Operator::Gated,
             context,
         )?;
+        let transport = super::selected_linear::original::Transport::new(true);
         let input = input.as_array();
-        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
-        let output = compute(self.module.forward_tensor_parallel(
+        let flattened = transport.compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let output = transport.compute(self.module.forward_tensor_parallel(
             &flattened,
             selections.group_indices().as_array(),
             selections.coefficients().as_array(),
@@ -706,9 +990,9 @@ impl TensorParallelGroupedGatedProductOperator<MlxTensor> for MlxGroupedGatedPro
         ))?;
         let (reducible, post_reduce) = output.into_parts();
         Ok(TensorParallelGroupedOutput::new(
-            compute_tensor(reducible.reshape(input.shape(), context))?,
+            transport.tensor(reducible.reshape(input.shape(), context))?,
             post_reduce
-                .map(|bias| compute_tensor(bias.reshape(input.shape(), context)))
+                .map(|bias| transport.tensor(bias.reshape(input.shape(), context)))
                 .transpose()?,
         ))
     }
@@ -733,6 +1017,16 @@ pub struct MlxGroupedRelu2 {
 }
 
 impl MlxGroupedRelu2 {
+    pub(crate) fn original_control_bytes() -> Option<usize> {
+        super::selected_linear::original::control_bytes()?
+            .checked_add(std::mem::size_of::<[Array; 4]>())?
+            .checked_add(std::mem::size_of::<(i32, i32, usize)>())?
+            .checked_add(std::mem::size_of::<
+                Option<&mut dyn common::grouped::NativeGroupedUnitObserver>,
+            >())?
+            .checked_add(std::mem::size_of::<Result<MlxTensor, ComputeError>>())
+    }
+
     /// Returns the architecture-owned specification used to realize this bank.
     pub const fn spec(&self) -> &GroupedRelu2Spec {
         &self.spec
@@ -744,9 +1038,21 @@ impl MlxGroupedRelu2 {
 
     pub(crate) fn bind_local_parameters(
         &mut self,
-        bindings: BTreeMap<String, Array>,
+        mut bindings: BTreeMap<String, Array>,
     ) -> Result<(), ComputeError> {
-        self.module.bind_local_parameters(
+        self.bind_compact_values(&mut bindings)
+    }
+
+    pub(crate) fn bind_prepared_local_parameters(
+        &mut self, bindings: &mut super::parameters::PreparedCompactBindings<'_>,
+    ) -> Result<(), ComputeError> {
+        self.bind_compact_values(bindings)
+    }
+
+    fn bind_compact_values<V: super::parameters::CompactBindingValues + ?Sized>(
+        &mut self, bindings: &mut V,
+    ) -> Result<(), ComputeError> {
+        self.module.bind_local_parameters_from(
             bindings,
             &[
                 (
@@ -771,6 +1077,21 @@ impl MlxGroupedRelu2 {
 }
 
 impl Parameterized<MlxTensor> for MlxGroupedRelu2 {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, MlxTensor>,
+    {
+        self.module.visit_parameter_sources(visitor)
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        self.module.retained_value_slot_bound()
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
+        self.module.visit_retained_values(visitor)
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, MlxTensor>,
@@ -806,16 +1127,17 @@ impl GroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
             crate::tests::support::provider_failure::Operator::Relu2,
             context,
         )?;
+        let transport = super::selected_linear::original::Transport::new(true);
         let input = input.as_array();
         let shape = input.shape();
-        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
-        let output = compute(self.module.forward(
+        let flattened = transport.compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let output = transport.compute(self.module.forward(
             &flattened,
             selections.group_indices().as_array(),
             selections.coefficients().as_array(),
             context,
         ))?;
-        compute_tensor(output.reshape(shape, context))
+        transport.tensor(output.reshape(shape, context))
     }
 
     fn forward_grouped_with_unit_observer(
@@ -876,3 +1198,9 @@ impl TensorParallelGroupedRelu2Operator<MlxTensor> for MlxGroupedRelu2 {
 #[cfg(test)]
 #[path = "operators/observation_errors.rs"]
 mod observation_errors;
+
+#[cfg(test)]
+mod retained_tests;
+
+#[cfg(test)]
+mod generated_factory_tests;

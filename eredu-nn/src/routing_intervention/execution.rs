@@ -100,17 +100,86 @@ pub enum RoutingExecutionError<E: std::error::Error + 'static> {
     Native(E),
 }
 
-/// Authoritative action/stage sequence. The caller reserves original-decision
-/// resources before entry and must not dispatch experts until this returns.
+/// A fixed semantic refusal from the shared routing driver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RoutingInvalidCause {
+    /// The exact policy/control source failed before score work.
+    #[error(transparent)]
+    Control(#[from] GroupSelectionValidationError),
+    /// Native dtype biasing produced a nonfinite score.
+    #[error("routing bias produced non-finite scores")]
+    NonfiniteBias,
+    /// A selected ID remains excluded on a controlled row.
+    #[error("excluded expert selected by native router")]
+    ExcludedSelection,
+    /// Effective scores or coefficients are nonfinite or negative.
+    #[error("routing intervention produced non-finite or negative coefficients")]
+    InvalidCoefficients,
+    /// An applicable effective row has no positive coefficient sum.
+    #[error("routing intervention produced a zero coefficient sum")]
+    ZeroCoefficientSum,
+}
+
+/// The fixed driver error; invalid causes own no diagnostic allocation.
+#[derive(Debug, thiserror::Error)]
+pub enum FixedRoutingExecutionError<E: std::error::Error + 'static> {
+    /// Invalid exact control or effective decision.
+    #[error(transparent)]
+    Invalid(#[from] RoutingInvalidCause),
+    /// The concrete mechanism's original failure.
+    #[error("native routing operation failed: {0}")]
+    Native(E),
+}
+
+/// Authoritative action/stage sequence with ordinary sorted validation workspace.
+/// Source/control order and native failures are unchanged.
 pub fn execute_routing_intervention<M: RoutingMechanism>(
     native: &mut M,
     input: &M::Value,
     control: &GroupSelectionControl,
 ) -> Result<IntervenedGroupSelection<M::Value>, RoutingExecutionError<M::Error>> {
-    use RoutingExecutionError::Native;
+    execute_with_workspace(
+        native,
+        input,
+        control,
+        super::validation::ExclusionWorkspace::Ordinary,
+    )
+    .map_err(|cause| match cause {
+        FixedRoutingExecutionError::Invalid(cause) => {
+            RoutingExecutionError::Invalid(Error::backend(cause))
+        }
+        FixedRoutingExecutionError::Native(cause) => RoutingExecutionError::Native(cause),
+    })
+}
+
+/// Executes the same stage/action sequence with fixed semantic error transport
+/// and borrowed control validation. Allocation behavior of the supplied native
+/// mechanism remains its own contract; this adds no execution or memory grant.
+pub fn execute_routing_intervention_fixed<M: RoutingMechanism>(
+    native: &mut M,
+    input: &M::Value,
+    control: &GroupSelectionControl,
+) -> Result<IntervenedGroupSelection<M::Value>, FixedRoutingExecutionError<M::Error>> {
+    execute_with_workspace(
+        native,
+        input,
+        control,
+        super::validation::ExclusionWorkspace::Borrowed,
+    )
+}
+
+fn execute_with_workspace<M: RoutingMechanism>(
+    native: &mut M,
+    input: &M::Value,
+    control: &GroupSelectionControl,
+    workspace: super::validation::ExclusionWorkspace,
+) -> Result<IntervenedGroupSelection<M::Value>, FixedRoutingExecutionError<M::Error>> {
+    use FixedRoutingExecutionError::Native;
     let (policy, learned) = native.policy().map_err(Native)?;
     let tokens = native.token_rows(input).map_err(Native)?;
-    control.validate(policy, learned, tokens)?;
+    control
+        .validate_with_workspace(policy, learned, tokens, workspace)
+        .map_err(RoutingInvalidCause::Control)?;
     let rows = native
         .rows(
             RoutingRows {
@@ -148,12 +217,12 @@ pub fn execute_routing_intervention<M: RoutingMechanism>(
     let add = |value: &M::Value,
                ids: &[u32],
                values: &[f32]|
-     -> Result<M::Value, RoutingExecutionError<M::Error>> {
+     -> Result<M::Value, FixedRoutingExecutionError<M::Error>> {
         let biased = native
             .add_columns(value, ids, values, &rows)
             .map_err(Native)?;
         if !native.finite(&biased).map_err(Native)? {
-            return Err(Error::backend("routing bias produced non-finite scores").into());
+            return Err(RoutingInvalidCause::NonfiniteBias.into());
         }
         Ok(biased)
     };
@@ -189,7 +258,7 @@ pub fn execute_routing_intervention<M: RoutingMechanism>(
     }
     if let GroupSelectionAction::Exclude(excluded) = &control.action {
         if !native.excludes(&ids, excluded, &rows).map_err(Native)? {
-            return Err(Error::backend("excluded expert selected by native router").into());
+            return Err(RoutingInvalidCause::ExcludedSelection.into());
         }
     }
     let (ids, selected_scores, mut weights) =
@@ -204,15 +273,12 @@ pub fn execute_routing_intervention<M: RoutingMechanism>(
         || !native.finite(&selected_scores).map_err(Native)?
         || !native.nonnegative(&selected_scores).map_err(Native)?
     {
-        return Err(Error::backend(
-            "routing intervention produced non-finite or negative coefficients",
-        )
-        .into());
+        return Err(RoutingInvalidCause::InvalidCoefficients.into());
     }
     if !matches!(control.action, GroupSelectionAction::ZeroContribution(_))
         && !native.positive_row_sums(&weights).map_err(Native)?
     {
-        return Err(Error::backend("routing intervention produced a zero coefficient sum").into());
+        return Err(RoutingInvalidCause::ZeroCoefficientSum.into());
     }
     Ok(IntervenedGroupSelection {
         original,

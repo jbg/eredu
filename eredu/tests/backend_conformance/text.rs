@@ -14,11 +14,11 @@ fn request() -> ChatTemplateRequest {
     }
 }
 
-type Terminal = (Vec<u32>, FinishReason, Option<Duration>);
+type Terminal = (eredu_core::SpeculativeTokenIds, FinishReason, Option<Duration>);
 
-fn terminal<S>(output: GenerationOutput<S>) -> Terminal {
+fn terminal<S, T: TerminalTokenStorage>(output: GenerationOutput<S, T>) -> Terminal {
     let ttft = output.timing().time_to_first_token();
-    (output.token_ids, output.finish_reason, ttft)
+    (output.token_ids.into_terminal_tokens(), output.finish_reason, ttft)
 }
 
 // Exercise all public text entry points against the neutral backend and real
@@ -75,7 +75,7 @@ fn generate<F: FnMut(SemanticEvent)>(
             )?;
             let mut lanes = output.into_requests();
             assert_eq!(lanes.len(), 1);
-            terminal(lanes.remove(0))
+            terminal(lanes.remove(0).expect("one validated request"))
         }
         3 => terminal(model.with_controlled_text_speculative(
             PreparedChatSpeculativeGenerationRequest {
@@ -98,7 +98,11 @@ fn generate<F: FnMut(SemanticEvent)>(
 }
 
 fn output_model(method: usize, pieces: [&str; 2]) -> (LoadedModel<MockBackend>, Vec<u32>) {
-    let mut probe = unicode_model_with_template(None, 64, TEMPLATE);
+    let tokenizer = unicode_tokenizer(None, 64);
+    let mut value: serde_json::Value =
+        serde_json::from_str(&tokenizer.to_string(false).unwrap()).unwrap();
+    let mut probe =
+        unicode_model_from_tokenizer(ChatTokenizer::from_tokenizer(tokenizer), TEMPLATE);
     let chat = probe.prepare_chat(request()).unwrap();
     let first = probe.encode(chat.rendered_prompt(), false).unwrap().len() as u32;
     let ids = if method == 0 {
@@ -106,8 +110,6 @@ fn output_model(method: usize, pieces: [&str; 2]) -> (LoadedModel<MockBackend>, 
     } else {
         vec![7, 11, 17]
     };
-    let mut value: serde_json::Value =
-        serde_json::from_str(&probe.tokenizer().to_string(false).unwrap()).unwrap();
     let vocab = value["model"]["vocab"].as_object_mut().unwrap();
     vocab
         .retain(|token, id| token != "<|im_end|>" && !ids.contains(&(id.as_u64().unwrap() as u32)));
@@ -130,7 +132,8 @@ fn output_model(method: usize, pieces: [&str; 2]) -> (LoadedModel<MockBackend>, 
             eos_token_ids: vec![ids[2]],
             checkpoint_generation_config: None,
         },
-    );
+    )
+    .unwrap();
     (model, ids)
 }
 
@@ -183,7 +186,7 @@ fn unrecognized_text_preserves_prompt_unicode_literal_protocol_and_cross_token_s
                         },
                     )
                     .unwrap();
-                    assert_eq!(ids, expected[..if stop { 2 } else { 3 }]);
+                    assert_eq!(ids.as_ref(), &expected[..if stop { 2 } else { 3 }]);
                     assert_eq!(
                         reason,
                         if stop {

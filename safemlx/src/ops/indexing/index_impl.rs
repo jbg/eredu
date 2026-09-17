@@ -700,6 +700,55 @@ where
 
 // Implement private bindings
 impl Array {
+    /// Exact Rust controls of the direct borrowed Slice adapter. Native
+    /// descriptor and worker storage remain in the selected Slice source.
+    pub fn static_slice_control_bytes() -> Option<usize> {
+        use std::{iter::Zip, mem::size_of, slice::Iter};
+        type Axes = Zip<Zip<Zip<Iter<'static, i32>, Iter<'static, i32>>, Iter<'static, i32>>, Iter<'static, i32>>;
+        let frames = [
+            size_of::<(&Array, &[i32], &[i32], &[i32], &Stream)>() * 2,
+            size_of::<Axes>(), size_of::<[&i32; 4]>(), size_of::<[usize; 4]>(),
+            size_of::<[i32; 4]>(), size_of::<Option<i32>>() * 2, size_of::<bool>(),
+            size_of::<Array>(), size_of::<Result<Array>>() * 2,
+            size_of::<crate::utils::guard::MaybeUninitArray>(),
+            size_of::<crate::error::Result<Option<crate::OriginalScopeObserver>>>(),
+            crate::OriginalScopeObserver::control_bytes()?,
+        ];
+        frames.into_iter().try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+    }
+
+    /// Applies one static, rank-preserving positive-stride slice. Unlike general
+    /// indexing this invokes only the native Slice operation, without gather or
+    /// additional reshape steps. Bounds are explicit and nonnegative; negative
+    /// ranges and axis removal require the existing general indexing API.
+    /// This creates a lazy result and establishes no completion or allocation
+    /// authority. Metadata/temporary native descriptors are not tensor payload.
+    pub fn try_slice(
+        &self,
+        start: &[i32],
+        stop: &[i32],
+        strides: &[i32],
+        stream: impl AsRef<Stream>,
+    ) -> Result<Array> {
+        if start.len() != self.ndim()
+            || stop.len() != start.len()
+            || strides.len() != start.len()
+            || start.iter().zip(stop).zip(strides).zip(self.shape()).any(
+                |(((&a, &b), &step), &n)| {
+                    a < 0
+                        || b < a
+                        || b > n
+                        || step <= 0
+                        || b.checked_sub(a)
+                            .and_then(|width| width.checked_add(step - 1))
+                            .is_none()
+                },
+            )
+        {
+            return Err(crate::error::Exception::custom("static slice requires matching rank and valid nonnegative bounds with positive strides"));
+        }
+        self.slice_device(start, stop, strides, stream)
+    }
     // This is exposed in the c api but not found in the swift or python api
     //
     // Thie is not the same as rust slice. Slice in python is more like `StepBy` iterator in rust
@@ -799,10 +848,10 @@ fn gather_nd<'a>(
         slice_sizes[i] = 1;
         match op {
             TakeIndex { index } => {
-                let item = Array::from_int(resolve_index_unchecked(
+                let item = Array::try_from_int(resolve_index_unchecked(
                     *index,
                     src.dim(i as i32) as usize,
-                ) as i32);
+                ) as i32)?;
                 gather_indices.push(GatherIndexItem::Owned(item));
                 is_slice.push(false);
             }
@@ -815,7 +864,7 @@ fn gather_nd<'a>(
                 let absolute_end = range.absolute_end(size);
                 let indices = absolute_indices(absolute_start, absolute_end, range.stride());
 
-                let item = Array::from_slice(&indices, &[indices.len() as i32]);
+                let item = Array::try_from_slice(&indices, &[indices.len() as i32])?;
 
                 gather_indices.push(GatherIndexItem::Owned(item));
             }
@@ -897,7 +946,7 @@ fn gather_nd<'a>(
 #[inline]
 fn get_item_index(src: &Array, index: i32, axis: i32, stream: impl AsRef<Stream>) -> Result<Array> {
     let index = resolve_index_unchecked(index, src.dim(axis) as usize) as i32;
-    src.take_axis(array!(index), axis, stream)
+    src.take_axis(Array::try_from_int(index)?, axis, stream)
 }
 
 #[inline]
@@ -1054,9 +1103,13 @@ fn get_item_nd(
         return Ok(src.into_owned());
     }
 
-    if remaining_indices.is_empty() {
-        remaining_indices = operations.to_vec();
-    }
+    // Static slice/index/new-axis calls have no gathered suffix to rebuild.
+    // Borrow their actual declarations through the same slice/reshape worker.
+    let remaining_indices = if remaining_indices.is_empty() {
+        Cow::Borrowed(operations.as_ref())
+    } else {
+        Cow::Owned(remaining_indices)
+    };
 
     // Slice handling
     let ndim = src.ndim();
@@ -1096,7 +1149,7 @@ fn get_item_nd(
     if remaining_indices.len() > ndim || squeeze_needed {
         let mut new_shape = SmallVec::<[i32; DEFAULT_STACK_VEC_LEN]>::new();
         let mut axis_ = 0;
-        for item in remaining_indices {
+        for item in remaining_indices.iter() {
             // using full match syntax to avoid forgetting to add new cases
             match item {
                 ExpandDims => new_shape.push(1),
@@ -1574,4 +1627,78 @@ mod tests {
         );
         check(result, &[3, 2, 2, 3, 1, 2], 17460, stream);
     }
+}
+
+#[cfg(test)]
+mod static_slice_tests {
+    use super::*;
+    #[test]
+    fn checked_static_slice_preserves_strided_values_scalar_and_zero_axes() {
+        let stream = crate::test_stream();
+        let source = Array::from_slice(
+            &(0..24).map(|n| n as f32 + 0.5).collect::<Vec<_>>(),
+            &[4, 6],
+        );
+        let selected = source
+            .try_slice(&[1, 0], &[4, 6], &[2, 2], &stream)
+            .unwrap();
+        assert_eq!(selected.shape(), &[2, 3]);
+        assert_eq!(
+            selected.evaluated().unwrap().try_to_vec::<f32>().unwrap(),
+            vec![6.5, 8.5, 10.5, 18.5, 20.5, 22.5]
+        );
+        let empty = source
+            .try_slice(&[0, 0], &[0, 6], &[1, 1], &stream)
+            .unwrap();
+        assert_eq!(empty.shape(), &[0, 6]);
+        assert_eq!(
+            empty.evaluated().unwrap().try_iter::<f32>().unwrap().len(),
+            0
+        );
+        let scalar = Array::from_slice(&[3.25f32], &[]);
+        let result = scalar.try_slice(&[], &[], &[], &stream).unwrap();
+        assert_eq!(
+            result.evaluated().unwrap().try_to_vec::<f32>().unwrap(),
+            vec![3.25]
+        );
+        for (start, end, stride) in [
+            (vec![0], vec![4, 6], vec![1, 1]),
+            (vec![-1, 0], vec![4, 6], vec![1, 1]),
+            (vec![3, 0], vec![2, 6], vec![1, 1]),
+            (vec![0, 0], vec![5, 6], vec![1, 1]),
+            (vec![0, 0], vec![4, 6], vec![0, 1]),
+            (vec![0, 0], vec![4, 6], vec![-1, 1]),
+            (vec![0, 0], vec![4, 6], vec![i32::MAX, 1]),
+        ] {
+            assert!(source.try_slice(&start, &end, &stride, &stream).is_err());
+        }
+        assert_eq!(
+            source.evaluated().unwrap().try_to_vec::<f32>().unwrap(),
+            (0..24).map(|n| n as f32 + 0.5).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// Host controls of the shared no-array/no-ellipsis index worker with at most
+/// four input/output axes and four index operations. All SmallVecs stay inline;
+/// declarations are borrowed, and the gather-only Vec remains empty. This is
+/// a layout query, not a source validator or allocation/submission authority.
+pub fn inline_basic_index_control_bytes() -> Option<usize> {
+    use std::mem::size_of;
+    if DEFAULT_STACK_VEC_LEN < 4 {
+        return None;
+    }
+    Some(
+        size_of::<[ArrayIndexOp<'static>; 4]>() * 2
+            + size_of::<Vec<ArrayIndexOp<'static>>>()
+            + size_of::<Cow<'static, Array>>()
+            + size_of::<Cow<'static, [ArrayIndexOp<'static>]>>() * 2
+            + size_of::<SmallVec<[i32; DEFAULT_STACK_VEC_LEN]>>() * 4
+            + size_of::<std::slice::Iter<'static, ArrayIndexOp<'static>>>() * 3
+            + size_of::<[usize; 8]>()
+            + size_of::<[bool; 5]>()
+            + size_of::<Result<Array>>()
+            + size_of::<&Array>()
+            + size_of::<&Stream>(),
+    )
 }

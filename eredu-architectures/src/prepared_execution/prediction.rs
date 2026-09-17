@@ -93,7 +93,7 @@ where
     M: PredictionExtensionMaterializer<B>,
     F: FnOnce(
         PreparedPredictionExtension<B>,
-        SharedCheckpointSource,
+        RetainedCheckpointSource,
     ) -> Result<MaterializedPredictionExtension<B, M>, E>,
 {
     let prepared = crate::prediction_extension::prepare::<B>(
@@ -108,11 +108,13 @@ where
     let placement = prepared.retained_placement(prediction.topology);
     let extension =
         mechanism(prepared, prediction.source).map_err(PreparedExecutionError::Backend)?;
-    prediction.placement.set(placement).map_err(|_| {
-        PreparedExecutionError::Architecture(
-            "prediction placement was already bound for these prepared sources".into(),
-        )
-    })?;
+    if prediction.publish_placement {
+        prediction.placement.set(placement).map_err(|_| {
+            PreparedExecutionError::Architecture(
+                "prediction placement was already bound for these prepared sources".into(),
+            )
+        })?;
+    }
     Ok((
         extension,
         PredictionBinding {
@@ -132,7 +134,7 @@ where
     M: PredictionExtensionMaterializer<B>,
     MF: FnOnce(
         PreparedPredictionExtension<B>,
-        SharedCheckpointSource,
+        RetainedCheckpointSource,
     ) -> Result<MaterializedPredictionExtension<B, M>, F>,
     VF: FnOnce(PredictionBinding) -> V,
     V: ReplicatedPredictionProfileDispatcher<B, M, Output = E, Error = F>,
@@ -149,7 +151,7 @@ where
         let (extension, binding) =
             materialize::<B, M, _, _>(prediction, source_context, context, self.materialize)?;
         dispatch_replicated_prediction_target_architecture::<B, M, _>(
-            branch.inspection.architecture_plan(),
+            &branch.inspection.sources,
             branch.selected,
             extension,
             branch.target,
@@ -177,7 +179,7 @@ where
     PS::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
     MF: FnOnce(
         PreparedPredictionExtension<B>,
-        SharedCheckpointSource,
+        RetainedCheckpointSource,
     ) -> Result<MaterializedPredictionExtension<B, M>, F>,
     VF: FnOnce(PredictionBinding) -> V,
     V: RoutedPredictionProfileDispatcher<
@@ -199,7 +201,7 @@ where
         let (extension, binding) =
             materialize::<B, M, _, _>(prediction, source_context, context, self.materialize)?;
         dispatch_routed_prediction_target_architecture::<B, M, _>(
-            &branch.inspection,
+            &branch.inspection.sources,
             branch.selected,
             extension,
             branch.target,
@@ -226,7 +228,7 @@ where
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
     MF: FnOnce(
         PreparedPredictionExtension<B>,
-        SharedCheckpointSource,
+        RetainedCheckpointSource,
     ) -> Result<MaterializedPredictionExtension<B, M>, F>,
     VF: FnOnce(PredictionBinding) -> V,
     V: CompositePredictionTargetVisitor<B, S, M, Output = E, Error = F>,
@@ -238,12 +240,10 @@ where
         source_context: &<B::Tensor as Tensor>::Context,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<E, PreparedExecutionError<F>> {
-        let requirements = composite_text_requirements(&branch.inspection)
-            .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
         let (extension, binding) =
             materialize::<B, M, _, _>(prediction, source_context, context, self.materialize)?;
-        visit_composite_prediction_target_text_architecture::<B, S, M, _>(
-            requirements,
+        visit_prepared_composite_prediction_target_text_architecture::<B, S, M, _>(
+            &branch.inspection.sources,
             branch.selected,
             extension,
             branch.target,
@@ -269,7 +269,7 @@ where
         + eredu_runtime::RuntimeStateComponents<B>,
     MF: FnOnce(
         PreparedPredictionExtension<B>,
-        SharedCheckpointSource,
+        RetainedCheckpointSource,
     ) -> Result<MaterializedPredictionExtension<B, M>, F>,
     VF: FnOnce(PreparedPartitionPredictionResources<C>) -> V,
     V: PartitionedPredictionTargetVisitor<B, S, M, Output = E, Error = F>,
@@ -282,10 +282,11 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<E, PreparedExecutionError<F>> {
         let partition = branch.partition_resources()?;
+        let inspection = branch.inspection.retained();
         let (extension, prediction) =
             materialize::<B, M, _, _>(prediction, source_context, context, self.materialize)?;
         visit_resident_partitioned_prediction_target_architecture::<B, S, M, _>(
-            &branch.inspection,
+            &inspection,
             branch.selected,
             extension,
             branch.target,
@@ -316,7 +317,7 @@ where
     PS::LayerState: eredu_nn::PoolingAttentionCache<B::Tensor>,
     MF: FnOnce(
         PreparedPredictionExtension<B>,
-        SharedCheckpointSource,
+        RetainedCheckpointSource,
     ) -> Result<MaterializedPredictionExtension<B, M>, F>,
     VF: FnOnce(PreparedPartitionPredictionResources<C>) -> V,
     V: RoutedPartitionedPredictionTargetProductionVisitor<B, S, M, Output = E, Error = F>
@@ -330,6 +331,7 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<E, PreparedExecutionError<F>> {
         let partition = branch.partition_resources()?;
+        let inspection = branch.inspection.retained();
         let (extension, prediction) =
             materialize::<B, M, _, _>(prediction, source_context, context, self.materialize)?;
         let visitor = (self.visitor)(PreparedPartitionPredictionResources {
@@ -337,7 +339,7 @@ where
             prediction,
         });
         dispatch_routed_partitioned_production(
-            &branch.inspection,
+            &inspection,
             branch.selected,
             (branch.target, extension, visitor),
             |(target, extension, visitor), inspection, selected| {
@@ -377,7 +379,7 @@ where
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
     MF: FnOnce(
         PreparedPredictionExtension<B>,
-        SharedCheckpointSource,
+        RetainedCheckpointSource,
     ) -> Result<MaterializedPredictionExtension<B, M>, F>,
     VF: FnOnce(PreparedPartitionPredictionResources<C>) -> V,
     V: AuthoritativeCompositePartitionPredictionTargetVisitor<B, S, M, Output = E, Error = F>,

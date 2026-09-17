@@ -141,22 +141,25 @@ pub fn contiguous(
 fn resolve_strides(
     shape: &[i32],
     strides: Option<&[i64]>,
-) -> SmallVec<[i64; DEFAULT_STACK_VEC_LEN]> {
-    match strides {
-        Some(strides) => SmallVec::from_slice(strides),
-        None => {
-            let result = shape
-                .iter()
-                .rev()
-                .scan(1, |acc, &dim| {
-                    let result = *acc;
-                    *acc *= dim as i64;
-                    Some(result)
-                })
-                .collect::<SmallVec<[i64; DEFAULT_STACK_VEC_LEN]>>();
-            result.into_iter().rev().collect()
-        }
+) -> Result<SmallVec<[i64; DEFAULT_STACK_VEC_LEN]>> {
+    if let Some(strides) = strides {
+        return Ok(SmallVec::from_slice(strides));
     }
+    let mut result = SmallVec::new();
+    let mut stride = 1_i64;
+    for &extent in shape.iter().rev() {
+        if extent < 0 {
+            return Err(crate::error::Exception::custom(
+                "negative strided-view extent",
+            ));
+        }
+        result.push(stride);
+        stride = stride
+            .checked_mul(i64::from(extent))
+            .ok_or_else(|| crate::error::Exception::custom("strided-view stride overflow"))?;
+    }
+    result.reverse();
+    Ok(result)
 }
 
 /// Broadcast a vector of arrays against one another. Returns an error if the shapes are
@@ -176,7 +179,8 @@ pub fn broadcast_arrays(
     })
 }
 
-/// Create a view into the array with the given shape and strides.
+/// Create a view into the logically flattened array with checked shape, signed
+/// strides and element offset. Every addressed element must lie in the source.
 ///
 /// # Example
 ///
@@ -197,8 +201,33 @@ pub fn as_strided<'a>(
 ) -> Result<Array> {
     let a = a.as_ref();
     let shape = shape.into_option().unwrap_or(a.shape());
-    let resolved_strides = resolve_strides(shape, strides.into_option());
+    let resolved_strides = resolve_strides(shape, strides.into_option())?;
     let offset = offset.into().unwrap_or(0);
+    let invalid =
+        || crate::error::Exception::custom("strided view exceeds its source or native index range");
+    let span = crate::array::host_read::checked_layout(shape, &resolved_strides, a.item_size())
+        .map_err(|error| crate::error::Exception::custom(error.to_string()))?;
+    if offset as u128 * a.item_size() as u128 > isize::MAX as u128
+        || (span.size == 0 && offset > a.size())
+        || (span.size != 0
+            && ((offset as i128 + span.minimum as i128) < 0
+                || (offset as i128 + span.maximum as i128) >= a.size() as i128))
+    {
+        return Err(invalid());
+    }
+    // Native AsStrided computes these signed spans even for empty shapes.
+    // Validate that arithmetic before publishing a graph with unchecked offsets.
+    let (mut low, mut high) = (0_i64, 0_i64);
+    for (&extent, &stride) in shape.iter().zip(&resolved_strides) {
+        let delta = stride
+            .checked_mul(i64::from(extent) - 1)
+            .ok_or_else(invalid)?;
+        let sum = if delta < 0 { &mut low } else { &mut high };
+        *sum = sum.checked_add(delta).ok_or_else(invalid)?;
+    }
+    high.checked_sub(low)
+        .and_then(|n| n.checked_add(1))
+        .ok_or_else(invalid)?;
 
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_as_strided(
@@ -270,10 +299,43 @@ pub fn concatenate_axis(
     axis: i32,
     #[optional] stream: impl AsRef<Stream>,
 ) -> Result<Array> {
+    // MLX's shared concatenate worker returns its only input before inspecting
+    // the axis. Preserve that exact alias/validation behavior through the same
+    // fallible C handle producer, without constructing an unused input vector.
+    if let [source] = arrays {
+        return source.as_ref().try_clone_handle();
+    }
     let c_arrays = VectorArray::try_from_iter(arrays.iter())?;
     Array::try_from_op(|res| unsafe {
         safemlx_sys::mlx_concatenate_axis(res, c_arrays.as_ptr(), axis, stream.as_ref().as_ptr())
     })
+}
+
+/// Managed controls of concatenating a borrowed slice of `Array` owners.
+/// The C vector's element storage belongs to the original Graph recipe; the
+/// caller separately retains and funds its Rust input slice's owning storage.
+/// This pure query neither allocates a vector nor grants submission authority.
+pub fn concatenate_axis_control_bytes() -> Option<usize> {
+    let native = unsafe { safemlx_sys::mlx_vector_array_control_bytes() };
+    if native == 0 {
+        return None;
+    }
+    [
+        std::mem::size_of::<VectorArray>(),
+        std::mem::size_of::<crate::utils::guard::MaybeUninitVectorArray>(),
+        std::mem::size_of::<crate::utils::guard::MaybeUninitArray>(),
+        std::mem::size_of::<std::slice::Iter<'static, Array>>(),
+        std::mem::size_of::<&[Array]>(),
+        std::mem::size_of::<&Stream>(),
+        std::mem::size_of::<&VectorArray>(),
+        std::mem::size_of::<Result<VectorArray>>(),
+        std::mem::size_of::<Result<Array>>(),
+        std::mem::size_of::<i32>(),
+        std::mem::size_of::<usize>(),
+        crate::OriginalScopeObserver::control_bytes()?,
+    ]
+    .into_iter()
+    .try_fold(native, usize::checked_add)
 }
 
 /// Concatenate the arrays along the first axis. Returns an error if the shapes are invalid.
@@ -775,6 +837,27 @@ pub fn pad<'a>(
             stream.as_ref().as_ptr(),
         )
     })
+}
+
+/// Named controls of the default-zero constant-padding adapter when all three
+/// width/axis vectors stay in their actual inline storage. Larger ranks retain
+/// ordinary behavior, but need a separately funded heap destination.
+/// This query grants no native allocation or submission authority.
+pub fn constant_pad_control_bytes(rank: usize) -> Option<usize> {
+    if rank > DEFAULT_STACK_VEC_LEN {
+        return None;
+    }
+    [
+        3 * std::mem::size_of::<SmallVec<[i32; DEFAULT_STACK_VEC_LEN]>>(),
+        std::mem::size_of::<PadWidth<'static>>(),
+        std::mem::size_of::<PadMode>(),
+        std::mem::size_of::<Option<Array>>(),
+        std::mem::size_of::<Array>(),
+        2 * std::mem::size_of::<Result<Array>>(),
+        2 * std::mem::size_of::<usize>(),
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
 }
 
 /// Stacks the arrays along a new axis. Returns an error if the arguments are invalid.

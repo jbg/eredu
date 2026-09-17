@@ -1,0 +1,406 @@
+--- a/src/nfa/thompson/nfa/source.rs
++++ b/src/nfa/thompson/nfa/source.rs
+@@ -77,7 +77,12 @@
+     Look(Look, usize),
+     Union(&'static [usize]),
+     BinaryUnion(usize, usize),
+-    Capture { next: usize, pattern: usize, group: usize, slot: usize },
++    Capture {
++        next: usize,
++        pattern: usize,
++        group: usize,
++        slot: usize,
++    },
+     Fail,
+     Match(usize),
+ }
+@@ -275,13 +280,19 @@
+     ) -> Result<PikeVM, Failure> {
+         let mut storage = Storage::new();
+         if !scratch.layout.fits(self.scratch) {
+-            return Err(Failure { cause: Cause::Scratch, storage });
++            return Err(Failure {
++                cause: Cause::Scratch,
++                storage,
++            });
+         }
+         macro_rules! reserve {
+             ($field:expr,$count:expr,$target:expr) => {{
+                 let expected = $count;
+-                let requested =
+-                    if fault == Some($target) { usize::MAX } else { expected };
++                let requested = if fault == Some($target) {
++                    usize::MAX
++                } else {
++                    expected
++                };
+                 if let Err(error) = $field.try_reserve_exact(requested) {
+                     return Err(Failure {
+                         cause: Cause::Reserve(error),
+@@ -289,7 +300,10 @@
+                     });
+                 }
+                 if $field.capacity() != expected {
+-                    return Err(Failure { cause: Cause::Capacity, storage });
++                    return Err(Failure {
++                        cause: Cause::Capacity,
++                        storage,
++                    });
+                 }
+             }};
+         }
+@@ -301,7 +315,10 @@
+         }) {
+             Ok(value) => value,
+             Err(error) => {
+-                return Err(Failure { cause: Cause::Groups(error), storage })
++                return Err(Failure {
++                    cause: Cause::Groups(error),
++                    storage,
++                })
+             }
+         };
+         let mut look_matcher = LookMatcher::new();
+@@ -326,7 +343,11 @@
+         for (index, recipe) in self.recipe.states.iter().enumerate() {
+             let state = match *recipe {
+                 StateRecipe::ByteRange(start, end, next) => State::ByteRange {
+-                    trans: Transition { start, end, next: sid(next) },
++                    trans: Transition {
++                        start,
++                        end,
++                        next: sid(next),
++                    },
+                 },
+                 StateRecipe::Sparse(ts) => {
+                     reserve!(
+@@ -346,9 +367,10 @@
+                             .into_boxed_slice(),
+                     })
+                 }
+-                StateRecipe::Look(look, next) => {
+-                    State::Look { look, next: sid(next) }
+-                }
++                StateRecipe::Look(look, next) => State::Look {
++                    look,
++                    next: sid(next),
++                },
+                 StateRecipe::Union(ids) => {
+                     reserve!(
+                         storage.alternates,
+@@ -363,17 +385,21 @@
+                             .into_boxed_slice(),
+                     }
+                 }
+-                StateRecipe::BinaryUnion(a, b) => {
+-                    State::BinaryUnion { alt1: sid(a), alt2: sid(b) }
+-                }
+-                StateRecipe::Capture { next, pattern, group, slot } => {
+-                    State::Capture {
+-                        next: sid(next),
+-                        pattern_id: PatternID::new(pattern).unwrap(),
+-                        group_index: SmallIndex::new(group).unwrap(),
+-                        slot: SmallIndex::new(slot).unwrap(),
+-                    }
+-                }
++                StateRecipe::BinaryUnion(a, b) => State::BinaryUnion {
++                    alt1: sid(a),
++                    alt2: sid(b),
++                },
++                StateRecipe::Capture {
++                    next,
++                    pattern,
++                    group,
++                    slot,
++                } => State::Capture {
++                    next: sid(next),
++                    pattern_id: PatternID::new(pattern).unwrap(),
++                    group_index: SmallIndex::new(group).unwrap(),
++                    slot: SmallIndex::new(slot).unwrap(),
++                },
+                 StateRecipe::Fail => State::Fail,
+                 StateRecipe::Match(pattern) => State::Match {
+                     pattern_id: PatternID::new(pattern).unwrap(),
+@@ -388,7 +414,10 @@
+         scratch.seen.resize(self.recipe.states.len());
+         inner.finalize_properties(&mut scratch.stack, &mut scratch.seen);
+         if !properties_match(inner, &self.recipe.expected) {
+-            return Err(Failure { cause: Cause::Properties, storage });
++            return Err(Failure {
++                cause: Cause::Properties,
++                storage,
++            });
+         }
+         // Equal-capacity buffers move into final owners without shrinking.
+         // Arc::new has a real priced request but process-OOM semantics.
+@@ -513,6 +542,19 @@
+     pub fn prepare(self) -> Result<Scratch, ScratchFailure> {
+         self.prepare_inner(None)
+     }
++    /// Fail one actual scratch reserve by capacity overflow for dependency tests.
++    /// The same one-attempt partial owner and real reserve cause are returned.
++    #[cfg(feature = "workspace-test-support")]
++    pub fn prepare_failing(
++        self,
++        buffer: ScratchFailureBuffer,
++    ) -> Result<Scratch, ScratchFailure> {
++        self.prepare_inner(Some(match buffer {
++            ScratchFailureBuffer::Stack => ScratchBuffer::Stack,
++            ScratchFailureBuffer::Dense => ScratchBuffer::Dense,
++            ScratchFailureBuffer::Sparse => ScratchBuffer::Sparse,
++        }))
++    }
+     fn prepare_inner(
+         self,
+         fault: Option<ScratchBuffer>,
+@@ -522,16 +564,21 @@
+             stack: Vec::new(),
+             seen: SparseSet::new(0),
+         };
+-        for buffer in
+-            [ScratchBuffer::Stack, ScratchBuffer::Dense, ScratchBuffer::Sparse]
+-        {
++        for buffer in [
++            ScratchBuffer::Stack,
++            ScratchBuffer::Dense,
++            ScratchBuffer::Sparse,
++        ] {
+             let expected = if buffer == ScratchBuffer::Stack {
+                 self.stack
+             } else {
+                 self.states
+             };
+-            let requested =
+-                if fault == Some(buffer) { usize::MAX } else { expected };
++            let requested = if fault == Some(buffer) {
++                usize::MAX
++            } else {
++                expected
++            };
+             let result = match buffer {
+                 ScratchBuffer::Stack => {
+                     scratch.stack.try_reserve_exact(requested)
+@@ -544,7 +591,10 @@
+                 }
+             };
+             if let Err(error) = result {
+-                return Err(ScratchFailure { cause: Some(error), scratch });
++                return Err(ScratchFailure {
++                    cause: Some(error),
++                    scratch,
++                });
+             }
+             let (dense, sparse) = scratch.seen.workspace_capacities();
+             let actual = match buffer {
+@@ -553,7 +603,10 @@
+                 ScratchBuffer::Sparse => sparse,
+             };
+             if actual != expected {
+-                return Err(ScratchFailure { cause: None, scratch });
++                return Err(ScratchFailure {
++                    cause: None,
++                    scratch,
++                });
+             }
+         }
+         scratch.seen.resize(self.states);
+@@ -601,7 +654,9 @@
+     a.checked_add(b).ok_or(PlanError::Overflow)
+ }
+ fn looks(values: &[Look]) -> LookSet {
+-    values.iter().fold(LookSet::empty(), |set, &look| set.insert(look))
++    values
++        .iter()
++        .fold(LookSet::empty(), |set, &look| set.insert(look))
+ }
+ fn properties_match(inner: &Inner, expected: &PropertiesRecipe) -> bool {
+     inner.has_empty == expected.has_empty
+@@ -631,8 +686,13 @@
+     {
+         return Err(PlanError::Recipe);
+     }
+-    let edge =
+-        |id: usize| if id < n { Ok(()) } else { Err(PlanError::Recipe) };
++    let edge = |id: usize| {
++        if id < n {
++            Ok(())
++        } else {
++            Err(PlanError::Recipe)
++        }
++    };
+     edge(recipe.anchored)?;
+     edge(recipe.unanchored)?;
+     edge(recipe.starts[0])?;
+@@ -684,7 +744,12 @@
+                 edge(b)?;
+                 pushes = add(pushes, 2)?;
+             }
+-            StateRecipe::Capture { next, pattern, group, slot } => {
++            StateRecipe::Capture {
++                next,
++                pattern,
++                group,
++                slot,
++            } => {
+                 edge(next)?;
+                 if pattern != 0
+                     || group >= recipe.groups[0].len()
+@@ -710,7 +775,22 @@
+     }
+     groups::array::<StateID>(pushes)?;
+     groups::array::<StateID>(n)?;
+-    Ok(ScratchLayout { stack: pushes, states: n })
++    Ok(ScratchLayout {
++        stack: pushes,
++        states: n,
++    })
++}
++
++/// Fixed finalization scratch reserve target for dependency-development tests.
++#[cfg(feature = "workspace-test-support")]
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum ScratchFailureBuffer {
++    /// Epsilon traversal stack.
++    Stack,
++    /// Dense visited-state array.
++    Dense,
++    /// Sparse visited-state array.
++    Sparse,
+ }
+ 
+ /// Fixed destination selector enabled only for dependency-development tests.
+--- a/src/nfa/thompson/pikevm/workspace.rs
++++ b/src/nfa/thompson/pikevm/workspace.rs
+@@ -11,6 +11,9 @@
+ construction, source residence, caller result storage or diagnostic formatting.
+ Ordinary PikeVM and Cache APIs retain their existing behavior.
+ */
++
++mod retirement;
++pub use retirement::RetiredPrepareError;
+ 
+ use alloc::collections::TryReserveError;
+ use alloc::vec::Vec;
+@@ -186,6 +189,8 @@
+             size_of::<Requirements>(),
+             size_of::<Workspace<'static>>(),
+             size_of::<PrepareError<'static>>(),
++            size_of::<RetiredPrepareError>(),
++            size_of::<[usize; 7]>(),
+             size_of::<Result<Plan<'static>, PlanError>>(),
+             size_of::<Result<Workspace<'static>, PrepareError<'static>>>(),
+             size_of::<Result<(), TryReserveError>>(),
+@@ -377,9 +382,16 @@
+ 
+ fn empty_cache() -> Cache {
+     fn empty_active() -> ActiveStates {
+-        ActiveStates { set: SparseSet::new(0), slot_table: SlotTable::new() }
+-    }
+-    Cache { stack: Vec::new(), curr: empty_active(), next: empty_active() }
++        ActiveStates {
++            set: SparseSet::new(0),
++            slot_table: SlotTable::new(),
++        }
++    }
++    Cache {
++        stack: Vec::new(),
++        curr: empty_active(),
++        next: empty_active(),
++    }
+ }
+ 
+ fn initialize(active: &mut ActiveStates, requirements: Requirements) {
+--- /dev/null
++++ b/src/nfa/thompson/pikevm/workspace/retirement.rs
+@@ -0,0 +1,91 @@
++//! Consuming retirement of a failed workspace while its source is still borrowed.
++use super::{capacities, Buffer, PrepareError, Requirements};
++use alloc::collections::TryReserveError;
++use core::fmt;
++
++/// Owned diagnostics and the actual reserve cause after all partial buffers retire.
++/// No source borrow or reusable storage escapes this value. Retiring buffers does
++/// not change any enclosing account; callers must keep its allowance alive until
++/// this method completes and retain their original error charge as required.
++#[derive(Debug)]
++pub struct RetiredPrepareError {
++    requirements: Requirements,
++    capacities: [usize; 7],
++    buffer: Buffer,
++    cause: TryReserveError,
++}
++impl PrepareError<'_> {
++    /// Destroy the actual partial cache before returning its owned cause.
++    pub fn retire(self) -> RetiredPrepareError {
++        let Self {
++            source: _,
++            requirements,
++            buffer,
++            cause,
++            partial,
++        } = self;
++        let capacities = capacities(&partial);
++        drop(partial);
++        RetiredPrepareError {
++            requirements,
++            capacities,
++            buffer,
++            cause,
++        }
++    }
++}
++impl RetiredPrepareError {
++    /// Original requested layouts, including preparation and retirement controls.
++    pub fn requirements(&self) -> Requirements {
++        self.requirements
++    }
++    /// Capacities which have already retired, in Buffer declaration order.
++    pub fn retired_capacities(&self) -> [usize; 7] {
++        self.capacities
++    }
++    /// Actual failed destination.
++    pub fn buffer(&self) -> Buffer {
++        self.buffer
++    }
++    /// The unchanged error returned by its real reserve attempt.
++    pub fn cause(&self) -> &TryReserveError {
++        &self.cause
++    }
++}
++impl fmt::Display for RetiredPrepareError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        self.cause.fmt(f)
++    }
++}
++#[cfg(feature = "std")]
++impl std::error::Error for RetiredPrepareError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        Some(&self.cause)
++    }
++}
++
++#[cfg(all(test, not(feature = "internal-instrument-pikevm")))]
++mod tests {
++    use super::*;
++    use crate::nfa::thompson::pikevm::PikeVM;
++    use alloc::string::ToString;
++    #[test]
++    fn each_actual_partial_frontier_retires_before_owned_error_escapes_source()
++    {
++        for buffer in Buffer::ALL {
++            let (error, before, diagnostic) = {
++                let source = PikeVM::new(r"(?:αβ|ab)+").unwrap();
++                let mut plan = source.workspace_plan().unwrap();
++                plan.fail = Some(buffer);
++                let error = plan.prepare().unwrap_err();
++                let before = error.capacities();
++                let diagnostic = error.cause().to_string();
++                (error.retire(), before, diagnostic)
++            };
++            assert_eq!(error.retired_capacities(), before);
++            assert_eq!(error.buffer(), buffer);
++            assert_eq!(error.cause().to_string(), diagnostic);
++            assert!(error.requirements().capacity(buffer) > 0);
++        }
++    }
++}

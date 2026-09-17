@@ -1,0 +1,63 @@
+diff --git a/mlx/backend/metal/indexing.cpp b/mlx/backend/metal/indexing.cpp
+--- a/mlx/backend/metal/indexing.cpp
++++ b/mlx/backend/metal/indexing.cpp
+@@ -598,9 +598,10 @@
+   kernel_name += idx.flags().row_contiguous ? "c" : "nc";
+ 
+   const bool original = d.original_precompiled_kernel_required();
+-  if (original && (reduce_type_ != ScatterAxis::None ||
+-      (out.dtype() != float32 && out.dtype() != float16 && out.dtype() != bfloat16 &&
+-       out.dtype() != bool_) ||
++  if (original && (
++      !((reduce_type_ == ScatterAxis::None && out.dtype() == bool_) ||
++        ((reduce_type_ == ScatterAxis::None || reduce_type_ == ScatterAxis::Sum) &&
++         (out.dtype() == float32 || out.dtype() == float16 || out.dtype() == bfloat16))) ||
+       (idx.dtype() != int32 && idx.dtype() != uint32)))
+     throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
+   auto lib = original ? d.precompiled_library() : d.get_library_borrowed(lib_name, [&]() {
+diff --git a/mlx/backend/metal/kernels/indexing/scatter_axis.metal b/mlx/backend/metal/kernels/indexing/scatter_axis.metal
+--- a/mlx/backend/metal/kernels/indexing/scatter_axis.metal
++++ b/mlx/backend/metal/kernels/indexing/scatter_axis.metal
+@@ -1,21 +1,26 @@
+ // Copyright © 2025 Apple Inc.
+-// Existing overwrite worker for floating scores/Bool masks and signed/unsigned indices.
++// Existing overwrite and floating sum workers for signed/unsigned indices.
++// Original roles select these finite specializations from the embedded library;
++// duplicate destinations retain the ordinary atomic accumulation semantics.
+ #include "mlx/backend/metal/kernels/utils.h"
+ #include "mlx/backend/metal/kernels/atomic.h"
+ #include "mlx/backend/metal/kernels/reduction/ops.h"
+ #include "mlx/backend/metal/kernels/indexing/scatter_axis.h"
+-#define SCATTER_AXIS_WIDTH(tname, type, iname, index, lname, location) \
+-  instantiate_kernel("scatter_axis" #tname #iname "_none_" #lname "cc", scatter_axis, type, index, location, None, true, true) \
+-  instantiate_kernel("scatter_axis" #tname #iname "_none_" #lname "cnc", scatter_axis, type, index, location, None, true, false) \
+-  instantiate_kernel("scatter_axis" #tname #iname "_none_" #lname "ncc", scatter_axis, type, index, location, None, false, true) \
+-  instantiate_kernel("scatter_axis" #tname #iname "_none_" #lname "ncnc", scatter_axis, type, index, location, None, false, false)
+-#define SCATTER_AXIS_INDEX(tname, type, iname, index) \
+-  SCATTER_AXIS_WIDTH(tname, type, iname, index, int, int) \
+-  SCATTER_AXIS_WIDTH(tname, type, iname, index, int64_t, int64_t)
+-#define SCATTER_AXIS_TYPE(tname, type) \
+-  SCATTER_AXIS_INDEX(tname, type, int32, int32_t) \
+-  SCATTER_AXIS_INDEX(tname, type, uint32, uint32_t)
+-SCATTER_AXIS_TYPE(float32, float)
+-SCATTER_AXIS_TYPE(float16, half)
+-SCATTER_AXIS_TYPE(bfloat16, bfloat16_t)
+-SCATTER_AXIS_TYPE(bool_, bool)
++#define SCATTER_AXIS_WIDTH(tname, type, iname, index, lname, location, opname, operation) \
++  instantiate_kernel("scatter_axis" #tname #iname "_" #opname "_" #lname "cc", scatter_axis, type, index, location, operation, true, true) \
++  instantiate_kernel("scatter_axis" #tname #iname "_" #opname "_" #lname "cnc", scatter_axis, type, index, location, operation, true, false) \
++  instantiate_kernel("scatter_axis" #tname #iname "_" #opname "_" #lname "ncc", scatter_axis, type, index, location, operation, false, true) \
++  instantiate_kernel("scatter_axis" #tname #iname "_" #opname "_" #lname "ncnc", scatter_axis, type, index, location, operation, false, false)
++#define SCATTER_AXIS_INDEX(tname, type, iname, index, opname, operation) \
++  SCATTER_AXIS_WIDTH(tname, type, iname, index, int, int, opname, operation) \
++  SCATTER_AXIS_WIDTH(tname, type, iname, index, int64_t, int64_t, opname, operation)
++#define SCATTER_AXIS_TYPE(tname, type, opname, operation) \
++  SCATTER_AXIS_INDEX(tname, type, int32, int32_t, opname, operation) \
++  SCATTER_AXIS_INDEX(tname, type, uint32, uint32_t, opname, operation)
++SCATTER_AXIS_TYPE(float32, float, none, None)
++SCATTER_AXIS_TYPE(float16, half, none, None)
++SCATTER_AXIS_TYPE(bfloat16, bfloat16_t, none, None)
++SCATTER_AXIS_TYPE(bool_, bool, none, None)
++SCATTER_AXIS_TYPE(float32, float, sum, Sum<float>)
++SCATTER_AXIS_TYPE(float16, half, sum, Sum<half>)
++SCATTER_AXIS_TYPE(bfloat16, bfloat16_t, sum, Sum<bfloat16_t>)

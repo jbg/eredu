@@ -5,6 +5,8 @@
 
 use crate::scheduler::{CancellationCause, RequestId, WorkId};
 use crate::{BoundedCompletion, BoundedCompletionWait, BoundedSubmissionOutcome, Submission};
+mod metadata;
+pub(crate) use metadata::{protocol_vec, reserve_protocol, protocol_string};
 
 /// Topology-scoped transport for bounded portable host protocols.
 ///
@@ -26,6 +28,11 @@ pub trait ConsensusTransport {
 
 /// Consensus transport that returns exact work ownership under a caller-selected bound.
 pub trait BoundedConsensusTransport: ConsensusTransport {
+    /// Actual cumulative Host source for protocol metadata. Ordinary transports
+    /// keep their existing caller-owned storage; original transports retain this
+    /// account through native completion and every borrowed result validation.
+    fn metadata_funding(&self) -> Option<&crate::HostMetadataFunding> { None }
+
     /// Completion retaining transport resources through completion or safe cancellation.
     type Completion: BoundedCompletion;
     /// Backend-owned gathered value that remains lazy until exact completion.
@@ -40,6 +47,21 @@ pub trait BoundedConsensusTransport: ConsensusTransport {
     /// Resolves completed backend output into rank-major portable words.
     fn resolve_all_gather_words(&self, output: Self::GatherOutput)
         -> Result<Vec<u32>, Self::Error>;
+
+    /// Lends completed rank-major words while their backend-owned destination
+    /// remains alive. Retained transports override this to keep source and host
+    /// custody through validation; ordinary transports use the same owned Vec.
+    fn with_resolved_all_gather_words<T, E, F>(
+        &self,
+        output: Self::GatherOutput,
+        validate: F,
+    ) -> Result<Result<T, E>, Self::Error>
+    where
+        F: FnOnce(&[u32]) -> Result<T, E>,
+    {
+        let words = self.resolve_all_gather_words(output)?;
+        Ok(validate(&words))
+    }
 }
 
 /// One planned transition and its stable semantic descriptor.
@@ -88,6 +110,9 @@ pub enum CompletionResolution {
 /// Structured consensus validation failure without backend error types.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum ConsensusError {
+    /// The actual retained Host source refused a protocol destination.
+    #[error(transparent)]
+    Metadata(#[from] crate::HostMetadataFundingError),
     /// A consensus topology cannot be empty.
     #[error("distributed scheduler consensus topology has no participants")]
     EmptyTopology,
@@ -181,14 +206,18 @@ pub fn validate_schedule_bounded<T: BoundedConsensusTransport>(
 where
     <T::Completion as crate::Completion>::Error: std::fmt::Display,
 {
-    let mut words = vec![
+    let count = plan.iter().try_fold(5usize, |n, work|
+        n.checked_add(5)?.checked_add(work.descriptor.len()))
+        .ok_or(ConsensusError::MetadataOverflow("schedule words"))?;
+    let mut words = protocol_vec(transport.metadata_funding(), count)?;
+    words.extend_from_slice(&[
         u32::try_from(plan.len())
             .map_err(|_| ConsensusError::MetadataOverflow("schedule length"))?,
         drain_cycle as u32,
         (drain_cycle >> 32) as u32,
         protocol as u32,
         (protocol >> 32) as u32,
-    ];
+    ]);
     for work in plan {
         push_u64(&mut words, work.id.request().value());
         push_u64(&mut words, work.id.sequence());
@@ -298,29 +327,34 @@ where
 {
     let participants = checked_participants(transport)?;
     if participants == 1 {
-        return Ok(local
-            .iter()
+        let mut result = protocol_vec(transport.metadata_funding(), local.len())?;
+        result.extend(local.iter()
             .map(|(_, status)| match status {
                 CompletionObservation::Incomplete => CompletionResolution::Incomplete,
                 CompletionObservation::Complete => CompletionResolution::Complete,
                 CompletionObservation::Failed => CompletionResolution::FailedComplete,
             })
-            .collect());
+            );
+        return Ok(result);
     }
 
-    let mut words = vec![
+    let count = local.len().checked_mul(5).and_then(|n| n.checked_add(3))
+        .ok_or(ConsensusError::MetadataOverflow("completion words"))?;
+    let mut words = protocol_vec(transport.metadata_funding(), count)?;
+    words.extend_from_slice(&[
         protocol as u32,
         (protocol >> 32) as u32,
         u32::try_from(local.len())
             .map_err(|_| ConsensusError::MetadataOverflow("completion work count"))?,
-    ];
+    ]);
     for (id, status) in local {
         push_u64(&mut words, id.request().value());
         push_u64(&mut words, id.sequence());
         words.push(status.wire());
     }
-    let gathered = gather_words_bounded(transport, &words, participants, wait)?;
-    resolve_gathered_completions(&words, &gathered, participants, local)
+    with_gathered_words_bounded(transport, &words, participants, wait, |gathered| {
+    resolve_gathered_completions(&words, gathered, participants, local, transport.metadata_funding())
+    })
 }
 
 /// Resolves completion observations and fixed-width output identities under a bound.
@@ -335,29 +369,33 @@ where
 {
     let participants = checked_participants(transport)?;
     if participants == 1 {
-        return Ok(local
-            .iter()
+        let mut result = protocol_vec(transport.metadata_funding(), local.len())?;
+        result.extend(local.iter()
             .map(|(_, status, _)| match status {
                 CompletionObservation::Incomplete => CompletionResolution::Incomplete,
                 CompletionObservation::Complete => CompletionResolution::Complete,
                 CompletionObservation::Failed => CompletionResolution::FailedComplete,
             })
-            .collect());
+            );
+        return Ok(result);
     }
 
-    let mut words = vec![
+    let count = local.len().checked_mul(13).and_then(|n| n.checked_add(3))
+        .ok_or(ConsensusError::MetadataOverflow("completion words"))?;
+    let mut words = protocol_vec(transport.metadata_funding(), count)?;
+    words.extend_from_slice(&[
         protocol as u32,
         (protocol >> 32) as u32,
         u32::try_from(local.len())
             .map_err(|_| ConsensusError::MetadataOverflow("completion work count"))?,
-    ];
+    ]);
     for (id, status, output) in local {
         push_u64(&mut words, id.request().value());
         push_u64(&mut words, id.sequence());
         words.push(status.wire());
         words.extend_from_slice(output);
     }
-    let gathered = gather_words_bounded(transport, &words, participants, wait)?;
+    with_gathered_words_bounded(transport, &words, participants, wait, |gathered| {
     let stride = 13;
     for rank in 0..participants {
         let candidate = &gathered[rank * words.len()..(rank + 1) * words.len()];
@@ -381,14 +419,12 @@ where
         }
     }
 
-    (0..local.len())
-        .map(|index| {
+    let mut result = protocol_vec(transport.metadata_funding(), local.len())?;
+    for index in 0..local.len() {
             let offset = 3 + index * stride;
-            let statuses = (0..participants)
-                .map(|rank| gathered[rank * words.len() + offset + 4])
-                .collect::<Vec<_>>();
-            let failed = statuses.contains(&CompletionObservation::Failed.wire());
-            let incomplete = statuses.contains(&CompletionObservation::Incomplete.wire());
+            let statuses = (0..participants).map(|rank| gathered[rank * words.len() + offset + 4]);
+            let failed = statuses.clone().any(|value| value == CompletionObservation::Failed.wire());
+            let incomplete = statuses.clone().any(|value| value == CompletionObservation::Incomplete.wire());
             if !failed && !incomplete {
                 let expected = &gathered[offset + 5..offset + stride];
                 for rank in 1..participants {
@@ -398,14 +434,45 @@ where
                     }
                 }
             }
-            Ok(match (failed, incomplete) {
+            result.push(match (failed, incomplete) {
                 (true, true) => CompletionResolution::FailedPending,
                 (true, false) => CompletionResolution::FailedComplete,
                 (false, true) => CompletionResolution::Incomplete,
                 (false, false) => CompletionResolution::Complete,
-            })
-        })
-        .collect()
+            });
+    }
+    Ok(result)
+    })
+}
+
+/// Agrees source preparation before any model submission. Partial local
+/// preparation counts may differ on refusal; successful ranks must retain the
+/// same prepared population before the ordinary schedule comparison.
+pub fn agree_preparation_status_bounded<T: BoundedConsensusTransport>(
+    transport: &T, protocol: u64, cycle: u64, limit: usize, prepared: usize,
+    success: bool, wait: BoundedCompletionWait,
+) -> Result<bool, ConsensusError>
+where <T::Completion as crate::Completion>::Error: std::fmt::Display {
+    let participants = checked_participants(transport)?;
+    reserve_protocol(transport.metadata_funding(), &[std::mem::size_of::<[u32;8]>()])?;
+    let words = [0x5052_4550, protocol as u32, (protocol >> 32) as u32,
+        cycle as u32, (cycle >> 32) as u32,
+        u32::try_from(limit).map_err(|_| ConsensusError::MetadataOverflow("preparation limit"))?,
+        u32::try_from(prepared).map_err(|_| ConsensusError::MetadataOverflow("prepared count"))?,
+        u32::from(success)];
+    with_gathered_words_bounded(transport, &words, participants, wait, |gathered| {
+    let mut all_prepared = true;
+    let mut counts_match = true;
+    for rank in 0..participants {
+        let frame = &gathered[rank * words.len()..(rank + 1) * words.len()];
+        if frame[..6] != words[..6] || frame[7] > 1 {
+            return Err(ConsensusError::Mismatch { context: "distributed source preparation", rank });
+        }
+        all_prepared &= frame[7] == 1;
+        counts_match &= frame[6] == words[6];
+    }
+    Ok(all_prepared && counts_match)
+    })
 }
 
 /// Agrees whether every rank submitted the exact selected schedule under the bound.
@@ -423,7 +490,8 @@ where
     <T::Completion as crate::Completion>::Error: std::fmt::Display,
 {
     let participants = checked_participants(transport)?;
-    let words = vec![
+    reserve_protocol(transport.metadata_funding(), &[std::mem::size_of::<[u32;7]>()])?;
+    let words = [
         protocol as u32,
         (protocol >> 32) as u32,
         drain_cycle as u32,
@@ -434,7 +502,7 @@ where
             .map_err(|_| ConsensusError::MetadataOverflow("local submission count"))?,
         u32::from(local_success),
     ];
-    let gathered = gather_words_bounded(transport, &words, participants, wait)?;
+    with_gathered_words_bounded(transport, &words, participants, wait, |gathered| {
     let semantic = &words[..5];
     let mut all_submitted = true;
     for rank in 0..participants {
@@ -460,6 +528,7 @@ where
         }
     }
     Ok(all_submitted)
+    })
 }
 
 /// Validates one fixed-width model identity and the expected rank ordering.
@@ -474,13 +543,12 @@ where
     <T::Completion as crate::Completion>::Error: std::fmt::Display,
 {
     let participants = checked_participants(transport)?;
-    let mut words = vec![protocol as u32, (protocol >> 32) as u32];
-    words.extend_from_slice(identity);
-    words.push(
-        u32::try_from(local_rank)
-            .map_err(|_| ConsensusError::MetadataOverflow("distributed model rank"))?,
-    );
-    let gathered = gather_words_bounded(transport, &words, participants, wait)?;
+    reserve_protocol(transport.metadata_funding(), &[std::mem::size_of::<[u32;11]>()])?;
+    let mut words = [0u32;11];
+    words[0] = protocol as u32; words[1] = (protocol >> 32) as u32;
+    words[2..10].copy_from_slice(identity);
+    words[10] = u32::try_from(local_rank).map_err(|_| ConsensusError::MetadataOverflow("distributed model rank"))?;
+    with_gathered_words_bounded(transport, &words, participants, wait, |gathered| {
     let common = &words[..words.len() - 1];
     for rank in 0..participants {
         let frame = &gathered[rank * words.len()..(rank + 1) * words.len()];
@@ -498,6 +566,7 @@ where
         }
     }
     Ok(())
+    })
 }
 
 fn resolve_gathered_completions(
@@ -505,6 +574,7 @@ fn resolve_gathered_completions(
     gathered: &[u32],
     participants: usize,
     local: &[(WorkId, CompletionObservation)],
+    funding: Option<&crate::HostMetadataFunding>,
 ) -> Result<Vec<CompletionResolution>, ConsensusError> {
     for rank in 0..participants {
         let candidate = &gathered[rank * words.len()..(rank + 1) * words.len()];
@@ -528,21 +598,19 @@ fn resolve_gathered_completions(
         }
     }
 
-    Ok((0..local.len())
-        .map(|index| {
-            let statuses = (0..participants)
-                .map(|rank| gathered[rank * words.len() + 3 + index * 5 + 4])
-                .collect::<Vec<_>>();
-            let failed = statuses.contains(&CompletionObservation::Failed.wire());
-            let incomplete = statuses.contains(&CompletionObservation::Incomplete.wire());
-            match (failed, incomplete) {
+    let mut result = protocol_vec(funding, local.len())?;
+    for index in 0..local.len() {
+            let statuses = (0..participants).map(|rank| gathered[rank * words.len() + 3 + index * 5 + 4]);
+            let failed = statuses.clone().any(|value| value == CompletionObservation::Failed.wire());
+            let incomplete = statuses.clone().any(|value| value == CompletionObservation::Incomplete.wire());
+            result.push(match (failed, incomplete) {
                 (true, true) => CompletionResolution::FailedPending,
                 (true, false) => CompletionResolution::FailedComplete,
                 (false, true) => CompletionResolution::Incomplete,
                 (false, false) => CompletionResolution::Complete,
-            }
-        })
-        .collect())
+            });
+    }
+    Ok(result)
 }
 
 fn validate_equal_words<T: ConsensusTransport>(
@@ -578,7 +646,7 @@ where
     if participants == 1 {
         return Ok(());
     }
-    let gathered = gather_words_bounded(transport, words, participants, wait)?;
+    with_gathered_words_bounded(transport, words, participants, wait, |gathered| {
     for rank in 0..participants {
         let start = rank * words.len();
         let end = start + words.len();
@@ -587,6 +655,7 @@ where
         }
     }
     Ok(())
+    })
 }
 
 fn checked_participants<T: ConsensusTransport>(transport: &T) -> Result<usize, ConsensusError> {
@@ -620,42 +689,41 @@ fn gather_words<T: ConsensusTransport>(
     Ok(gathered)
 }
 
-fn gather_words_bounded<T: BoundedConsensusTransport>(
-    transport: &T,
-    words: &[u32],
-    participants: usize,
-    wait: BoundedCompletionWait,
-) -> Result<Vec<u32>, ConsensusError>
-where
+fn with_gathered_words_bounded<T, R, F>(
+    transport: &T, words: &[u32], participants: usize, wait: BoundedCompletionWait,
+    validate: F,
+) -> Result<R, ConsensusError>
+where T: BoundedConsensusTransport,
     <T::Completion as crate::Completion>::Error: std::fmt::Display,
+    F: FnOnce(&[u32]) -> Result<R, ConsensusError>,
 {
-    let expected = words
-        .len()
-        .checked_mul(participants)
+    reserve_protocol(transport.metadata_funding(), &[
+        std::mem::size_of::<F>(), std::mem::size_of::<R>(),
+        std::mem::size_of::<Result<R, ConsensusError>>(),
+        std::mem::size_of::<crate::Submission<T::GatherOutput,T::Completion>>(),
+        std::mem::size_of::<crate::BoundedSubmissionOutcome<T::GatherOutput>>(),
+        std::mem::size_of::<[usize;3]>(), std::mem::size_of::<&[u32]>(),
+    ])?;
+    let expected = words.len().checked_mul(participants)
         .ok_or(ConsensusError::MetadataOverflow("gathered word count"))?;
-    let gathered = transport
-        .submit_all_gather_words(words)
-        .map_err(|error| ConsensusError::Transport(error.to_string()))?
-        .wait_bounded(wait)
-        .map_err(|error| ConsensusError::Transport(error.to_string()))?;
-    let gathered = match gathered {
+    let gathered = transport.submit_all_gather_words(words)
+        .map_err(|error| protocol_string(transport.metadata_funding(),format_args!("{error}"))
+            .map_or_else(ConsensusError::Metadata,ConsensusError::Transport))?
+        .wait_bounded(wait).map_err(|error| protocol_string(transport.metadata_funding(),format_args!("{error}"))
+            .map_or_else(ConsensusError::Metadata,ConsensusError::Transport))?;
+    match gathered {
         BoundedSubmissionOutcome::Completed(gathered) => transport
-            .resolve_all_gather_words(gathered)
-            .map_err(|error| ConsensusError::Transport(error.to_string()))?,
-        BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => {
-            return Err(ConsensusError::Transport(format!(
-                "bounded consensus deadline exceeded ({cancellation:?})"
-            )))
-        }
-    };
-    if gathered.len() != expected {
-        return Err(ConsensusError::MalformedGather {
-            expected,
-            actual: gathered.len(),
-            participants,
-        });
+            .with_resolved_all_gather_words(gathered, |gathered| {
+                if gathered.len() != expected {
+                    return Err(ConsensusError::MalformedGather { expected, actual:gathered.len(), participants });
+                }
+                validate(gathered)
+            }).map_err(|error| protocol_string(transport.metadata_funding(),format_args!("{error}"))
+            .map_or_else(ConsensusError::Metadata,ConsensusError::Transport))?,
+        BoundedSubmissionOutcome::DeadlineExceeded { cancellation } => Err(protocol_string(transport.metadata_funding(),
+            format_args!("bounded consensus deadline exceeded ({cancellation:?})"))
+            .map_or_else(ConsensusError::Metadata,ConsensusError::Transport)),
     }
-    Ok(gathered)
 }
 
 /// Agrees one cancellation preparation or commit-authorization status under a bound.
@@ -672,15 +740,11 @@ where
     <T::Completion as crate::Completion>::Error: std::fmt::Display,
 {
     let participants = checked_participants(transport)?;
-    let mut words = vec![protocol as u32, (protocol >> 32) as u32];
-    push_u64(&mut words, request.value());
-    words.push(match cause {
-        CancellationCause::Explicit => 1,
-        CancellationCause::Deadline => 2,
-    });
-    words.push(phase);
-    words.push(u32::from(local_ready));
-    let gathered = gather_words_bounded(transport, &words, participants, wait)?;
+    reserve_protocol(transport.metadata_funding(), &[std::mem::size_of::<[u32;7]>()])?;
+    let words = [protocol as u32,(protocol >> 32) as u32,
+        request.value() as u32,(request.value() >> 32) as u32,
+        match cause { CancellationCause::Explicit=>1,CancellationCause::Deadline=>2 },phase,u32::from(local_ready)];
+    with_gathered_words_bounded(transport, &words, participants, wait, |gathered| {
     let semantic = &words[..words.len() - 1];
     let mut all_ready = true;
     for rank in 0..participants {
@@ -703,6 +767,7 @@ where
         }
     }
     Ok(all_ready)
+    })
 }
 
 /// Agrees the exact active request set and returns every request whose deadline
@@ -727,7 +792,10 @@ where
         .map_err(|_| ConsensusError::MetadataOverflow("active deadline request count"))?;
     let slots = u32::try_from(max_requests)
         .map_err(|_| ConsensusError::MetadataOverflow("deadline request slots"))?;
-    let mut words = vec![protocol as u32, (protocol >> 32) as u32, count, slots];
+    let capacity = max_requests.checked_mul(3).and_then(|n| n.checked_add(4))
+        .ok_or(ConsensusError::MetadataOverflow("deadline words"))?;
+    let mut words = protocol_vec(transport.metadata_funding(), capacity)?;
+    words.extend_from_slice(&[protocol as u32, (protocol >> 32) as u32, count, slots]);
     let mut previous = None;
     for &(request, expired) in local {
         if previous.is_some_and(|previous| previous >= request) {
@@ -740,9 +808,10 @@ where
         push_u64(&mut words, request.value());
         words.push(u32::from(expired));
     }
-    words.resize(4 + max_requests.saturating_mul(3), 0);
-    let gathered = gather_words_bounded(transport, &words, participants, wait)?;
-    let mut expired = vec![false; local.len()];
+    words.resize(capacity, 0);
+    with_gathered_words_bounded(transport, &words, participants, wait, |gathered| {
+    let mut expired = protocol_vec(transport.metadata_funding(), local.len())?;
+    expired.resize(local.len(), false);
     for rank in 0..participants {
         let frame = &gathered[rank * words.len()..(rank + 1) * words.len()];
         if frame[..4] != words[..4] {
@@ -778,11 +847,11 @@ where
             });
         }
     }
-    Ok(local
-        .iter()
-        .zip(expired)
-        .filter_map(|(&(request, _), expired)| expired.then_some(request))
-        .collect())
+    let mut result = protocol_vec(transport.metadata_funding(), local.len())?;
+    result.extend(local.iter().zip(expired)
+        .filter_map(|(&(request, _), expired)| expired.then_some(request)));
+    Ok(result)
+    })
 }
 
 fn push_u64(output: &mut Vec<u32>, value: u64) {

@@ -6,7 +6,7 @@ impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
         &mut self,
     ) -> CaptureObserver<'_, P::Backend<'_>, impl Fn(CaptureExecutionError<P::Error>) -> E + '_>
     where
-        F: Fn(&CaptureExecutionError<P::Error>) -> E,
+        F: SpeculativeCaptureErrorTransport<P::Error, E>,
     {
         let failure = &self.failure;
         let map = &self.map_error;
@@ -24,8 +24,11 @@ impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
 impl<P, F, E> ActivationObserver<P::Tensor, E> for SpeculativeCaptureObserver<P, F>
 where
     P: CaptureBackendProvider,
-    F: Fn(&CaptureExecutionError<P::Error>) -> E,
+    F: SpeculativeCaptureErrorTransport<P::Error, E>,
 {
+    fn supports_prefill_spans(&self) -> bool {
+        true
+    }
     fn transactional(&self) -> bool {
         true
     }
@@ -65,6 +68,17 @@ where
     ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, E> {
         self.observer().routing_control(path, rows)
     }
+    fn routing_unmodified_interest(&self, path: &str) -> crate::RoutingUnmodifiedInterest {
+        self.session.routing_unmodified_interest(path)
+    }
+    fn routing_unmodified(
+        &mut self,
+        path: &str,
+        effective: crate::RoutingDecision<'_, P::Tensor>,
+    ) -> Result<(), E> {
+        self.observer().routing_unmodified(path, effective)
+    }
+
     fn routing_applied(
         &mut self,
         path: &str,

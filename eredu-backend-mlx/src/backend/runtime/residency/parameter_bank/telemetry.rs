@@ -212,7 +212,7 @@ impl ParameterBankResidencyReport {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug,Default)]
 pub(super) struct ParameterBankStatistics {
     pub(super) peak_host_bytes: u64,
     pub(super) peak_device_bytes: u64,
@@ -379,5 +379,47 @@ impl std::iter::Sum for BankPassStatistics {
                 .max(value.peak_compact_bank_bytes);
             total
         })
+    }
+}
+
+
+/// Fixed rows selected with the immutable load-time catalog. Runtime updates
+/// cannot create a new bank entry or allocate a tree node during execution.
+#[derive(Debug)]
+pub(super) struct ParameterBankStatisticsTable {
+    rows: Vec<(usize,ParameterBankStatistics)>,
+}
+impl ParameterBankStatisticsTable {
+    pub(super) fn new(catalog:&std::collections::BTreeMap<ParameterBankKey,u64>)->Self {
+        // ParameterBankKey ordering is (bank, unit, member). Both passes borrow
+        // that actual ordered source; no temporary set or copied key is made.
+        let mut previous=None;
+        let count=catalog.keys().filter(|key| {
+            let changed=previous!=Some(key.bank());previous=Some(key.bank());changed
+        }).count();
+        let mut rows=Vec::with_capacity(count);
+        for key in catalog.keys() {
+            if rows.last().is_none_or(|(bank,_)|*bank!=key.bank()) {
+                rows.push((key.bank(),ParameterBankStatistics::default()));
+            }
+        }
+        Self{rows}
+    }
+    pub(super) fn get(&self,bank:&usize)->Option<&ParameterBankStatistics> {
+        self.rows.binary_search_by_key(bank,|(key,_)|*key).ok().map(|index|&self.rows[index].1)
+    }
+    pub(super) fn get_mut(&mut self,bank:usize)->Result<&mut ParameterBankStatistics,AddressableParameterBankError> {
+        let index=self.rows.binary_search_by_key(&bank,|(key,_)|*key)
+            .map_err(|_|AddressableParameterBankError::StatisticsBank{bank})?;
+        Ok(&mut self.rows[index].1)
+    }
+    pub(super) fn iter(&self)->impl Iterator<Item=(&usize,&ParameterBankStatistics)> {
+        self.rows.iter().map(|(bank,value)|(bank,value))
+    }
+    /// Retained mutable counter destination, reported independently of native
+    /// storage and source/manager authority. No caller obtains a credit here.
+    pub(super) fn storage_bytes(&self)->Option<usize> {
+        std::alloc::Layout::array::<(usize,ParameterBankStatistics)>(self.rows.capacity()).ok()?.size()
+            .checked_add(std::mem::size_of::<std::sync::Mutex<Self>>())
     }
 }

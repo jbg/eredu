@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeSet, num::NonZeroU8, sync::Arc};
 
-use eredu_checkpoint::store::SharedCheckpointSource;
+use eredu_checkpoint::store::RetainedCheckpointSource;
 use eredu_core::{ArtifactInspection, ParallelRankTopology, ParallelTopology, SessionCapabilities};
 use eredu_runtime::{
     CacheResidencyPolicy, CommunicationManifest, ReplicatedTextMaterializationTask,
@@ -22,6 +22,20 @@ mod partitioned;
 mod prediction;
 mod routed_partition;
 mod routed_session;
+mod workspace;
+pub(crate) use workspace::layerwise::WorkspaceLayerwisePolicy;
+pub(crate) use workspace::parallel::{PreparedDirectPartitionSource, PreparedCompositeModelSource, PreparedFamilyPartitionModelSource};
+
+pub use workspace::{
+    BorrowedTextSamplingWorkspace, EmbeddedTargetWorkspaceObservation, InferenceEquationTraceObserver, MediaEquationInterval,
+    OriginalMediaWorkspaceInput, OriginalMediaWorkspaceInputError, OriginalMediaWorkspaceReport,
+    OriginalMediaWorkspaceTraceError, OriginalMediaWorkspaceTraceFailure,
+    PreparedInferenceBlueprint, PreparedMediaWorkspaceTensor, PreparedTextGenerationWorkspace,
+    ReplicatedTextBindingDestinations, WorkspaceLayerwiseParameters, WorkspacePredictionEquationTails, EmbeddedPredictionWorkspaceObservation,
+    project_replicated_text_binding_destinations,
+    PartitionedTextBindingDestinations, project_partitioned_text_binding_destinations,
+    AddressableBindingDestinations, project_addressable_binding_destinations,
+};
 
 pub use direct_session::{construct_selected_composite_session, construct_selected_text_session};
 pub use ordinary::{CompositeRoute, KeyValueRoute, ReplicatedRoute, RoutedRoute};
@@ -31,12 +45,12 @@ pub use prediction::{
     PredictionBinding, PredictionConstruction, PredictionMechanisms, WithoutPrediction,
 };
 pub use routed_partition::{
-    construct_partition_bank_providers, construct_selected_partition_providers,
     PartitionBankMechanisms, PartitionBankProviders, PreparedPartitionBanks,
+    construct_partition_bank_providers, construct_selected_partition_providers,
 };
 pub use routed_session::{
-    construct_selected_routed_composite_session, construct_selected_routed_session,
     PreparedCompositeSessionFacts, PreparedTextSessionFacts,
+    construct_selected_routed_composite_session, construct_selected_routed_session,
 };
 
 pub(crate) mod sealed {
@@ -49,6 +63,9 @@ pub enum PreparedExecutionError<E> {
     /// Selected sources or architecture construction violated their contract.
     #[error("prepared execution construction failed: {0}")]
     Architecture(String),
+    /// A participating portable host constructor preserved its typed failure.
+    #[error(transparent)]
+    Metadata(eredu_nn::Error),
     /// A native materialization, communication, or publication mechanism failed.
     #[error("prepared execution mechanism failed: {0}")]
     Backend(E),
@@ -107,9 +124,15 @@ pub struct PreparedExecutableParts<E, C> {
     communication: Option<C>,
     processor: Option<PreparedProcessor>,
     capabilities: SessionCapabilities,
+    inference: PreparedInferenceBlueprint,
 }
 
 impl<E, C> PreparedExecutableParts<E, C> {
+    /// Exact architecture selection and shared sources used for request quotes.
+    /// This contains no native tensors, devices or submission authority.
+    pub fn inference_blueprint(&self) -> &PreparedInferenceBlueprint {
+        &self.inference
+    }
     /// Physical width reported for the architecture-selected floating-state source.
     pub const fn floating_state_bytes(&self) -> NonZeroU8 {
         self.floating_state_bytes
@@ -139,7 +162,7 @@ impl<E, C> PreparedExecutableParts<E, C> {
 /// Checked native resources for a partition-specific typed binding visitor.
 pub struct PreparedPartitionResources<C> {
     communication: C,
-    target: SharedCheckpointSource,
+    target: RetainedCheckpointSource,
     extension_sources: BTreeSet<String>,
 }
 
@@ -149,7 +172,7 @@ impl<C> PreparedPartitionResources<C> {
         &self.communication
     }
     /// Exact target source, excluding prediction-only parameters.
-    pub const fn target(&self) -> &SharedCheckpointSource {
+    pub const fn target(&self) -> &RetainedCheckpointSource {
         &self.target
     }
     /// Exact physical keys claimed by the separately materialized extension.
@@ -187,8 +210,9 @@ impl<C> PreparedPartitionPredictionResources<C> {
 #[doc(hidden)]
 pub struct PreparedPredictionSelection {
     placement: crate::prediction_extension::PredictionPlacementSlot,
+    publish_placement: bool,
     extension: PredictionExtensionPlan,
-    source: SharedCheckpointSource,
+    source: RetainedCheckpointSource,
     realization: eredu_runtime::SelectedSpeculativeRealization,
     capability: CapabilityEstimate,
     topology: ParallelRankTopology,
@@ -200,8 +224,8 @@ pub struct PreparedPredictionSelection {
 #[doc(hidden)]
 pub struct PreparedConstructionBranch<S, C> {
     selected: S,
-    inspection: ArtifactInspection<ArtifactArchitecturePlan>,
-    target: SharedCheckpointSource,
+    inspection: PreparedConstructionInspection,
+    target: RetainedCheckpointSource,
     communication: Option<C>,
     extension_sources: BTreeSet<String>,
     prediction: Option<PreparedPredictionSelection>,
@@ -216,7 +240,7 @@ impl<S, C> PreparedConstructionBranch<S, C> {
                 .communication
                 .take()
                 .ok_or(PreparedExecutionError::MissingCommunication)?,
-            target: Arc::clone(&self.target),
+            target: self.target.clone(),
             extension_sources: std::mem::take(&mut self.extension_sources),
         })
     }
@@ -370,29 +394,73 @@ pub fn construct_prepared_execution<C, A, R, T, X, PD, PT, PX>(
     sources: PreparedModelSources,
     communication: Option<C>,
     routes: PreparedExecutionRoutes<R, T, X, PD, PT, PX>,
-    mut assembler: A,
+    assembler: A,
 ) -> Result<A::Output, PreparedExecutionError<A::Error>>
 where
     C: Clone,
     A: PreparedExecutableAssembler<C>,
     R: PreparedExecutionRoute<
-        eredu_runtime::SelectedReplicatedTextRealization,
-        C,
-        A::Executable,
-        A::Error,
-    >,
+            eredu_runtime::SelectedReplicatedTextRealization,
+            C,
+            A::Executable,
+            A::Error,
+        >,
     T: PreparedExecutionRoute<crate::SelectedRoutedTextRealization, C, A::Executable, A::Error>,
     X: PreparedExecutionRoute<
-        crate::replicated_text::SelectedCompositeTextRealization,
-        C,
-        A::Executable,
-        A::Error,
-    >,
+            crate::replicated_text::SelectedCompositeTextRealization,
+            C,
+            A::Executable,
+            A::Error,
+        >,
     PD: PreparedExecutionRoute<SelectedDensePartitionedExecution, C, A::Executable, A::Error>,
     PT: PreparedExecutionRoute<SelectedRoutedPartitionedExecution, C, A::Executable, A::Error>,
     PX: PreparedExecutionRoute<SelectedCompositePartitionedExecution, C, A::Executable, A::Error>,
 {
-    let (selected, inspection, graph) = sources.into_parts();
+    construct_prepared_execution_impl(sources, communication, routes, assembler, ConstructionPurpose::Executable)
+}
+
+// These private metadata consumers share selection and typed construction.
+// Only executable construction publishes native-bound prediction placement.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConstructionPurpose {
+    Executable,
+    TargetEquations,
+    BindingDestinations,
+}
+fn construct_prepared_execution_impl<C, A, R, T, X, PD, PT, PX>(
+    sources: PreparedModelSources,
+    communication: Option<C>,
+    routes: PreparedExecutionRoutes<R, T, X, PD, PT, PX>,
+    mut assembler: A,
+    purpose: ConstructionPurpose,
+) -> Result<A::Output, PreparedExecutionError<A::Error>>
+where
+    C: Clone,
+    A: PreparedExecutableAssembler<C>,
+    R: PreparedExecutionRoute<
+            eredu_runtime::SelectedReplicatedTextRealization,
+            C,
+            A::Executable,
+            A::Error,
+        >,
+    T: PreparedExecutionRoute<crate::SelectedRoutedTextRealization, C, A::Executable, A::Error>,
+    X: PreparedExecutionRoute<
+            crate::replicated_text::SelectedCompositeTextRealization,
+            C,
+            A::Executable,
+            A::Error,
+        >,
+    PD: PreparedExecutionRoute<SelectedDensePartitionedExecution, C, A::Executable, A::Error>,
+    PT: PreparedExecutionRoute<SelectedRoutedPartitionedExecution, C, A::Executable, A::Error>,
+    PX: PreparedExecutionRoute<SelectedCompositePartitionedExecution, C, A::Executable, A::Error>,
+{
+    let target_equations = purpose == ConstructionPurpose::TargetEquations;
+    let inference = PreparedInferenceBlueprint::new(sources.clone());
+    // The borrowed dispatcher selects the same admitted branch. Retain a closed
+    // source alias while the construction branch consumes its original owner.
+    let selection_owner = sources.clone();
+    let selected = selection_owner.selected();
+    let graph = sources.graph();
     match (selected.communication_manifest(), communication.as_ref()) {
         (Some(manifest), Some(communication)) => assembler
             .validate_communication(manifest, communication)
@@ -417,10 +485,14 @@ where
         (Some(extension), Some(source_extension), Some(source), Some(realization))
             if extension.same_admission(source_extension) =>
         {
+            if target_equations {
+                None
+            } else {
             Some(PreparedPredictionSelection {
                 placement: Arc::clone(&graph.prediction_placement),
+                publish_placement: purpose == ConstructionPurpose::Executable,
                 extension: extension.clone(),
-                source: Arc::clone(source),
+                source: source.clone(),
                 realization: realization.clone(),
                 capability: crate::prediction_extension::prediction_extension_capability(extension)
                     .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?,
@@ -431,6 +503,7 @@ where
                     .auxiliary_materialization_tasks()
                     .to_vec(),
             })
+            }
         }
         (None, None, None, None) => None,
         _ => return Err(PreparedExecutionError::PredictionSourceMismatch),
@@ -445,9 +518,12 @@ where
         ),
         _ => None,
     };
-    let inspection = inspection.map_architecture_plan(|_| graph.architecture().clone());
-    let source = crate::preparation::prepared_floating_state_dtype_source(&inspection)
-        .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
+    let source = crate::preparation::prepared_floating_state_dtype_source_parts(
+        sources.inspection().format(),
+        graph.architecture(),
+        sources.inspection().tensors(),
+    )
+    .map_err(|error| PreparedExecutionError::Architecture(error.to_string()))?;
     let floating_state_dtype = assembler
         .floating_state_dtype(&source)
         .map_err(PreparedExecutionError::Backend)?;
@@ -464,18 +540,23 @@ where
     }
     let floating_state_bytes = floating_state_dtype.bytes();
     let retained_communication = communication.clone();
+    let target = graph.target().clone();
+    // Equation-only routes neither build extension materialization resources
+    // nor consume their claimed-key set. Ordinary total construction preserves
+    // its existing exact extension inventory for the materializer.
+    let extension_sources = if target_equations {
+        BTreeSet::new()
+    } else {
+        graph.extension().map(|source| source.source_keys().into_iter().collect()).unwrap_or_default()
+    };
     let context = BranchContext {
-        inspection,
-        target: Arc::clone(graph.target()),
-        extension_sources: graph
-            .extension()
-            .map(|source| source.source_keys().into_iter().collect())
-            .unwrap_or_default(),
+        inspection: PreparedConstructionInspection { sources },
+        target,
+        extension_sources,
         communication,
         prediction,
     };
-    let (execution, _, _, _) = selected.into_parts();
-    let executable = execution.dispatch(ConstructionDispatcher::<
+    let executable = selected.execution().dispatch_ref(ConstructionDispatcher::<
         _,
         _,
         _,
@@ -498,13 +579,32 @@ where
             communication: retained_communication,
             processor,
             capabilities,
+            inference,
         })
         .map_err(PreparedExecutionError::Backend)
 }
 
+/// Retains the exact admitted catalog and target graph without cloning either.
+/// Plain replicated dispatch only needs the target architecture. Other typed
+/// routes borrow the exact full target inspection already validated by source
+/// preparation, preserving the same catalog/target relationship without clones.
+struct PreparedConstructionInspection {
+    sources: PreparedModelSources,
+}
+
+impl PreparedConstructionInspection {
+    fn architecture_plan(&self) -> &ArtifactArchitecturePlan {
+        self.sources.architecture()
+    }
+
+    fn retained(&self) -> &ArtifactInspection<ArtifactArchitecturePlan> {
+        self.sources.execution_inspection()
+    }
+}
+
 struct BranchContext<C> {
-    inspection: ArtifactInspection<ArtifactArchitecturePlan>,
-    target: SharedCheckpointSource,
+    inspection: PreparedConstructionInspection,
+    target: RetainedCheckpointSource,
     communication: Option<C>,
     extension_sources: BTreeSet<String>,
     prediction: Option<PreparedPredictionSelection>,
@@ -528,7 +628,7 @@ struct ConstructionDispatcher<R, T, X, PD, PT, PX, C, E, F> {
     marker: std::marker::PhantomData<fn() -> (E, F)>,
 }
 
-impl<R, T, X, PD, PT, PX, C, E, F> SelectedExecutionDispatcher
+impl<'a, R, T, X, PD, PT, PX, C, E, F> SelectedExecutionBorrowedDispatcher<'a>
     for ConstructionDispatcher<R, T, X, PD, PT, PX, C, E, F>
 where
     R: PreparedExecutionRoute<eredu_runtime::SelectedReplicatedTextRealization, C, E, F>,
@@ -542,46 +642,48 @@ where
     type Error = PreparedExecutionError<F>;
     fn replicated(
         self,
-        selected: eredu_runtime::SelectedReplicatedTextRealization,
+        selected: &'a eredu_runtime::SelectedReplicatedTextRealization,
     ) -> Result<E, Self::Error> {
         self.routes
             .replicated
-            .construct(self.context.branch(selected))
+            .construct(self.context.branch(selected.clone()))
     }
-    fn routed(self, selected: crate::SelectedRoutedTextRealization) -> Result<E, Self::Error> {
-        self.routes.routed.construct(self.context.branch(selected))
+    fn routed(self, selected: &'a crate::SelectedRoutedTextRealization) -> Result<E, Self::Error> {
+        self.routes
+            .routed
+            .construct(self.context.branch(selected.clone()))
     }
     fn composite(
         self,
-        selected: crate::replicated_text::SelectedCompositeTextRealization,
+        selected: &'a crate::replicated_text::SelectedCompositeTextRealization,
     ) -> Result<E, Self::Error> {
         self.routes
             .composite
-            .construct(self.context.branch(selected))
+            .construct(self.context.branch(selected.clone()))
     }
     fn partitioned_dense(
         self,
-        selected: SelectedDensePartitionedExecution,
+        selected: &'a SelectedDensePartitionedExecution,
     ) -> Result<E, Self::Error> {
         self.routes
             .partitioned_dense
-            .construct(self.context.branch(selected))
+            .construct(self.context.branch(selected.clone()))
     }
     fn partitioned_routed(
         self,
-        selected: SelectedRoutedPartitionedExecution,
+        selected: &'a SelectedRoutedPartitionedExecution,
     ) -> Result<E, Self::Error> {
         self.routes
             .partitioned_routed
-            .construct(self.context.branch(selected))
+            .construct(self.context.branch(selected.clone()))
     }
     fn partitioned_composite(
         self,
-        selected: SelectedCompositePartitionedExecution,
+        selected: &'a SelectedCompositePartitionedExecution,
     ) -> Result<E, Self::Error> {
         self.routes
             .partitioned_composite
-            .construct(self.context.branch(selected))
+            .construct(self.context.branch(selected.clone()))
     }
 }
 
@@ -592,6 +694,7 @@ fn replicated_error<E>(
     match error {
         Backend(error) => PreparedExecutionError::Backend(error),
         Architecture(error) => PreparedExecutionError::Architecture(error),
+        Metadata(error) => PreparedExecutionError::Metadata(error),
         Ineligible(error) => PreparedExecutionError::Architecture(error.to_string()),
     }
 }
@@ -600,6 +703,7 @@ fn routed_error<E>(
 ) -> PreparedExecutionError<E> {
     use crate::routed_text::RoutedTextDispatchError::*;
     match error {
+        Metadata(error) => PreparedExecutionError::Metadata(error),
         Backend(error) => PreparedExecutionError::Backend(error),
         Architecture(error) => PreparedExecutionError::Architecture(error),
     }

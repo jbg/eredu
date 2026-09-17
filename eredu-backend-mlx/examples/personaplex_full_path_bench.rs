@@ -1,3 +1,11 @@
+//! Ordinary application composition benchmark for PCM → tokens → PCM.
+//!
+//! Mimi encode/decode and the host token bridge run outside the realtime model
+//! request. This example uses the ordinary scheduler submission API and makes
+//! no managed working-memory claim for the composed PCM path. The explicit
+//! managed realtime API admits encoded-token frames; its account does not cover
+//! independent codec calls made before or after that request.
+
 use std::{path::PathBuf, time::Instant};
 
 #[path = "support/realtime.rs"]
@@ -37,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let frame_samples = (SAMPLE_RATE / FRAME_RATE) as i32;
     let audio_s = frames as f64 / FRAME_RATE;
 
+    println!("memory_policy=ordinary_external_codec_composition");
     println!("model_dir={}", model_dir.display());
     println!("mimi_path={}", mimi_path.display());
     println!("frames={frames}");

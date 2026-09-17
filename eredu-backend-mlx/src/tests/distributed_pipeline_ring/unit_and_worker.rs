@@ -15,3 +15,11 @@ include!("unit_and_worker/provider_failures.rs");
 include!("unit_and_worker/prediction_and_adapters.rs");
 include!("unit_and_worker/prediction_components.rs");
 include!("unit_and_worker/v4_components.rs");
+
+include!("unit_and_worker/prepared_workspace.rs");
+
+include!("unit_and_worker/prediction_storage.rs");
+
+include!("unit_and_worker/idle_model_storage.rs");
+
+include!("unit_and_worker/media_prefill.rs");

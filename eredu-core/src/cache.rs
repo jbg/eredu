@@ -9,13 +9,13 @@ mod prompt;
 pub use policy::{
     CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier,
     LayerCachePolicy, MutableStateResidency, PoolingStateComponent, StateComponentPolicy,
-    StateComponentRole, StateResidencyClass, StateTensorDimension, StateTensorDtype,
-    StateTensorOwner, StateTensorPolicy, StateTensorPresence, StateTensorRole,
+    StateComponentRole, StateResidencyClass, StateTensorDimension, StateTensorDimensionError,
+    StateTensorDtype, StateTensorOwner, StateTensorPolicy, StateTensorPresence, StateTensorRole,
 };
 pub use prompt::{
-    derive_prompt_cache_architecture_fingerprint, prompt_cache_token_fingerprint,
-    validate_prompt_cache_model_identity, PromptCacheBlock, PromptCacheDescriptor,
-    PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions,
-    PromptCacheStateSegment, PromptCacheStateTensor, PromptCacheTopology,
-    PROMPT_CACHE_SCHEMA_VERSION,
+    PROMPT_CACHE_SCHEMA_VERSION, PromptCacheArchitectureFingerprint, PromptCacheBlock,
+    PromptCacheDescriptor, PromptCacheDiagnosticKind, PromptCacheError, PromptCacheManifest,
+    PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateSegment, PromptCacheStateTensor,
+    PromptCacheTopology, derive_prompt_cache_architecture_fingerprint,
+    prompt_cache_token_fingerprint, validate_prompt_cache_model_identity,
 };

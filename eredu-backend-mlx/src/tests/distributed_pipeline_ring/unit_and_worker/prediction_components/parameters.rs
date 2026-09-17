@@ -539,7 +539,7 @@ fn verify_partitioned_prediction_parameters(
             stream_readout,
         );
         for phase in &actual.1 {
-            for partition in &phase.captures.partitions {
+            for partition in &phase.captures.as_step().partitions {
                 assert_eq!(
                     partition.context.overlay_identity.as_deref(),
                     Some(overlay.intent_identity())
@@ -555,7 +555,7 @@ fn verify_partitioned_prediction_parameters(
                     result
                         .1
                         .iter()
-                        .flat_map(|phase| &phase.captures.records)
+                        .flat_map(|phase| &phase.captures.as_step().records)
                         .filter(|record| record.path == path)
                         .filter_map(|record| record.payload.clone())
                         .collect::<Vec<_>>()

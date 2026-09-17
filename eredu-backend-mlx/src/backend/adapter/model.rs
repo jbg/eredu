@@ -14,6 +14,8 @@ pub struct MlxModel {
     capture_discovery: Option<eredu_architectures::prepared_sources::PreparedModelDiscovery>,
     #[cfg(any(feature = "image", feature = "audio"))]
     processor: Option<ModelProcessor>,
+    // Drop after native executable, processor and communication resources.
+    memory_owner: Option<crate::backend::managed_memory::NativeMemoryOwner>,
 }
 
 impl MlxModel {
@@ -32,11 +34,35 @@ impl MlxModel {
             capture_discovery: None,
             #[cfg(any(feature = "image", feature = "audio"))]
             processor: None,
+            memory_owner: None,
         }
+    }
+
+    pub(crate) fn executable(&self) -> &Executable {
+        &self.executable
     }
 
     pub(crate) fn executable_mut(&mut self) -> &mut Executable {
         &mut self.executable
+    }
+
+    pub(crate) fn with_memory_owner(
+        mut self,
+        owner: crate::backend::managed_memory::NativeMemoryOwner,
+    ) -> Result<Self, Error> {
+        // The provider's detached loading scope retains this authority through
+        // any unresolved native work. Realize only existing retained module
+        // roots before rebuilding cold inventory for initial publication.
+        self.executable.settle_loaded_numerical_values(&owner)?;
+        self.executable.retain_memory_owner(owner.clone())?;
+        self.memory_owner = Some(owner);
+        Ok(self)
+    }
+
+    pub(crate) fn memory_owner(
+        &self,
+    ) -> Option<&crate::backend::managed_memory::NativeMemoryOwner> {
+        self.memory_owner.as_ref()
     }
 
     pub(crate) const fn floating_state_dtype_bytes(&self) -> NonZeroU8 {

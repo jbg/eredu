@@ -191,7 +191,17 @@ fn verify(device: DeviceType) {
                     .as_dtype(dtype, &stream)
                     .unwrap(),
             );
-            let tokens = MlxTensor::from_array(Array::from_slice(&sorted, &[sorted.len() as i32]));
+            // Keep IDs unsigned so native normalization aliases this strided
+            // view; the host coordinate reader must follow its logical order.
+            let padded = sorted
+                .iter()
+                .flat_map(|n| [99_u32, *n as u32])
+                .collect::<Vec<_>>();
+            let tokens = MlxTensor::from_array(
+                Array::from_slice(&padded, &[sorted.len() as i32, 2])
+                    .try_index_device((.., 1), &stream)
+                    .unwrap(),
+            );
             let coefficients = MlxTensor::from_array(Array::from_slice(
                 &vec![0.5f32; sorted.len()],
                 &[sorted.len() as i32, 1],

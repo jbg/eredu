@@ -7,9 +7,11 @@ use eredu_nn::{
 use eredu_runtime::{ResidentExpertProvider, RoutedExpertProvider, RuntimeStateComponents};
 
 use crate::decoder::{Attention, AttentionInput};
+mod construction;
+pub(crate) use construction::{PredictionBlockSpec, TargetBlockSpec};
 
 use super::{
-    new_attention, new_attention_at, DenseMlp, LayerGeometry, LayerPolicy, Mamba2, ModelArgs,
+    new_attention, DenseMlp, LayerGeometry, LayerPolicy, Mamba2, ModelArgs,
     SparseMoe,
 };
 
@@ -35,7 +37,7 @@ pub struct Block<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub operator: Operator<B>,
     /// Unit pre-normalization.
     pub norm: B::Normalization,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     residual_in_fp32: bool,
 }
 
@@ -54,7 +56,7 @@ pub(crate) enum ReplicatedOperator<B: NeuralBackend> {
 pub(crate) struct ReplicatedBlock<B: NeuralBackend> {
     operator: ReplicatedOperator<B>,
     norm: B::Normalization,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     residual_in_fp32: bool,
 }
 
@@ -64,11 +66,13 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &ModelArgs, usize, String, LayerPolicy, NormalizationConstructionSpec)>()?;
         let policy = args
             .layer_schedule
             .get(layer)
             .copied()
-            .ok_or_else(|| Error::backend(format!("Nemotron-H has no layer {layer}")))?;
+            .ok_or_else(|| metadata.error(format_args!("Nemotron-H has no layer {layer}")))?;
         let operator = match policy {
             LayerPolicy::Mamba => ReplicatedOperator::Mamba(Mamba2::new(args, layer, context)?),
             LayerPolicy::SelfAttention(_) => ReplicatedOperator::Attention(new_attention(
@@ -80,14 +84,14 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
             )?),
             LayerPolicy::DenseMlp => ReplicatedOperator::Dense(DenseMlp::new(
                 args,
-                &format!("model.layers.{layer}.mlp"),
+                &metadata.text(format_args!("model.layers.{layer}.mlp"))?,
                 args.intermediate_size,
                 context,
             )?),
             LayerPolicy::SparseMoe => {
-                return Err(Error::backend(
-                    "replicated Nemotron-H unit rejects routed computation",
-                ))
+                return Err(metadata.error(format_args!(
+                    "replicated Nemotron-H unit rejects routed computation"
+                )))
             }
         };
         Ok(Self {
@@ -96,8 +100,7 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
                 NormalizationConstructionSpec::learned(
                     args.hidden_size,
                     args.layer_norm_epsilon,
-                    ParameterSpec::trainable(format!("model.layers.{layer}.norm.weight"))
-                        .map_err(Error::backend)?,
+                    metadata.named_parameter(format_args!("model.layers.{layer}.norm.weight"))?,
                 ),
                 context,
             )?,
@@ -183,24 +186,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let geometry = match args.layer_schedule.get(layer) {
-            Some(LayerPolicy::Mamba) => LayerGeometry::Mamba {
-                heads: args.mamba_num_heads,
-                groups: args.n_groups,
-            },
-            Some(LayerPolicy::SelfAttention(_)) => LayerGeometry::Attention {
-                query_heads: args.num_attention_heads,
-                kv_heads: args.num_key_value_heads,
-            },
-            Some(LayerPolicy::DenseMlp) => LayerGeometry::DenseMlp {
-                intermediate: args.intermediate_size,
-            },
-            Some(LayerPolicy::SparseMoe) => LayerGeometry::SparseMoe {
-                routed: args.moe_intermediate_size,
-                shared: args.moe_shared_expert_intermediate_size,
-            },
-            None => return Err(Error::backend(format!("Nemotron-H has no layer {layer}"))),
-        };
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        let geometry = TargetBlockSpec::global_geometry(args, layer)?;
         Self::new_with_geometry(args, layer, geometry, context)
     }
 
@@ -221,63 +208,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         routed_spec: Option<eredu_nn::GroupedRelu2Spec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let policy = args
-            .layer_schedule
-            .get(layer)
-            .copied()
-            .ok_or_else(|| Error::backend(format!("Nemotron-H has no layer {layer}")))?;
-        let operator = match (policy, geometry) {
-            (LayerPolicy::Mamba, LayerGeometry::Mamba { heads, groups }) => Operator::Mamba(
-                Mamba2::new_with_geometry(args, layer, heads, groups, context)?,
-            ),
-            (
-                LayerPolicy::SelfAttention(_),
-                LayerGeometry::Attention {
-                    query_heads,
-                    kv_heads,
-                },
-            ) => Operator::Attention(new_attention(args, layer, query_heads, kv_heads, context)?),
-            (LayerPolicy::DenseMlp, LayerGeometry::DenseMlp { intermediate }) => {
-                Operator::Dense(DenseMlp::new(
-                    args,
-                    &format!("model.layers.{layer}.mlp"),
-                    intermediate,
-                    context,
-                )?)
-            }
-            (LayerPolicy::SparseMoe, LayerGeometry::SparseMoe { routed, shared }) => {
-                let sparse = match routed_spec {
-                    Some(spec) => SparseMoe::new_at_with_spec(
-                        args,
-                        layer,
-                        &format!("model.layers.{layer}.moe"),
-                        spec,
-                        shared,
-                        context,
-                    ),
-                    None => SparseMoe::new(args, layer, routed, shared, context),
-                }?;
-                Operator::Sparse(sparse)
-            }
-            _ => {
-                return Err(Error::backend(format!(
-                    "Nemotron-H layer {layer} policy {policy:?} does not match {geometry:?}"
-                )))
-            }
-        };
-        Ok(Self {
-            operator,
-            norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.layer_norm_epsilon,
-                    ParameterSpec::trainable(format!("model.layers.{layer}.norm.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            residual_in_fp32: args.residual_in_fp32,
-        })
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        TargetBlockSpec::new(args, layer, geometry, routed_spec)?.instantiate::<B>(context)
     }
 
     /// Builds one appended MTP physical unit at its checkpoint-owned path.
@@ -313,52 +245,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         geometry: LayerGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let root = format!("model.mtp.layers.{physical}");
-        let global = usize::try_from(args.num_hidden_layers).map_err(Error::backend)? + physical;
-        let operator = match (policy, geometry) {
-            (
-                LayerPolicy::SelfAttention(attention),
-                LayerGeometry::Attention {
-                    query_heads,
-                    kv_heads,
-                },
-            ) => Operator::Attention(new_attention_at(
-                args,
-                attention,
-                &format!("{root}.mixer"),
-                query_heads,
-                kv_heads,
-                context,
-            )?),
-            (LayerPolicy::SparseMoe, LayerGeometry::SparseMoe { routed, shared }) => {
-                Operator::Sparse(SparseMoe::new_at(
-                    args,
-                    global,
-                    &format!("{root}.mixer"),
-                    routed,
-                    shared,
-                    context,
-                )?)
-            }
-            _ => {
-                return Err(Error::backend(format!(
-                    "Nemotron-H MTP physical layer {physical} policy {policy:?} does not match {geometry:?}"
-                )))
-            }
-        };
-        Ok(Self {
-            operator,
-            norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.layer_norm_epsilon,
-                    ParameterSpec::trainable(format!("{root}.norm.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            residual_in_fp32: args.residual_in_fp32,
-        })
+        construction::PredictionBlockSpec::new(args, physical, policy, geometry)?
+            .instantiate::<B>(context)
     }
 
     /// Executes one physical unit with resident experts.

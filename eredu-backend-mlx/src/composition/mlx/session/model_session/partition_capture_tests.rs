@@ -412,7 +412,7 @@ fn verify_native_partition_components(
                     let result = collector.take_activation_capture().unwrap();
                     assert!(result.completed);
                     assert_eq!(result.invocation, step_index);
-                    result.captures
+                    result.captures.into_legacy().unwrap()
                 }
                 None => capture.as_mut().unwrap().take_step().unwrap(),
             };
@@ -461,6 +461,218 @@ fn verify_native_partition_components(
 struct InputPreparationProbe {
     prepared: usize,
     finished: Vec<(u64, bool)>,
+}
+
+struct CancelPrefillChunk {
+    cancellation: eredu_core::GenerationCancellationToken,
+    completed: Vec<bool>,
+}
+impl RuntimeActivationObserver<MlxTensor, Error> for CancelPrefillChunk {
+    fn requires_sequence_readout(&self) -> bool {
+        false
+    }
+    fn transactional(&self) -> bool {
+        true
+    }
+    fn observe(&mut self, _: &str, _: &MlxTensor) -> Result<(), Error> {
+        Ok(())
+    }
+    fn finish_transaction(&mut self, _: eredu_core::DistributedCommitEpoch, committed: bool) {
+        self.completed.push(committed);
+        if committed {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+#[test]
+fn native_shared_preparation_preserves_ordinary_and_controlled_generation() {
+    use eredu_core::{ControlledTextGeneration, TextGeneration, TextGenerationInput, TokenOutput};
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, InferenceRequest};
+
+    struct AllTokens;
+    impl eredu_core::TokenFilterController for AllTokens {
+        type Error = std::convert::Infallible;
+        fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+            Ok(TokenFilter::All)
+        }
+        fn commit_token(&mut self, _: u32) -> Result<(), Self::Error> {
+            Ok(())
+        }
+        fn is_complete(&mut self) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+    }
+
+    let context =
+        crate::backend::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
+    let geometry = eredu_core::InferenceGeometry {
+        batch_size: 1,
+        cached_positions: 0,
+        input_positions: 5,
+        max_output_tokens: 2,
+        prefill_chunk_positions: 2,
+        output: eredu_core::OutputDemand::LastPosition,
+    };
+    let config = TextGenerationConfig::new(
+        eredu_core::resolve_generation_config(
+            None,
+            eredu_core::GenerationConfigOverrides {
+                temperature: Some(0.0),
+                max_new_tokens: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let mut outputs = Vec::new();
+    for controlled in [false, true] {
+        for supplied in [false, true] {
+            let backend = MlxBackend::new(stream, stream);
+            let prepared =
+                eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default())
+                    .unwrap();
+            let mut runtime = ModelRuntime::from_prepared(backend, prepared).unwrap();
+            let prompt =
+                MlxBackend::prepare_text_prompt(runtime.backend(), vec![1, 2, 3, 4, 5]).unwrap();
+            let foreign = InferenceRequest::without_memory_budget(
+                &InferenceExecutionIdentity::default(),
+                geometry,
+            )
+            .unwrap();
+            let wrong_target = prompt.clone().with_inference_request(foreign);
+            let request = InferenceRequest::without_memory_budget(
+                runtime
+                    .session()
+                    .payload
+                    .model
+                    .erased()
+                    .inference_execution_identity(),
+                geometry,
+            )
+            .unwrap();
+            let wrong_chunk = prompt
+                .clone()
+                .with_inference_request(request.clone())
+                .with_prefill_chunk_positions(std::num::NonZeroU64::new(1).unwrap());
+            let before = crate::tests::support::path_instrumentation::snapshot().forwards;
+            for rejected in [wrong_target, wrong_chunk] {
+                let error = match TextGeneration::from_prompt(&mut runtime, rejected, config) {
+                    Ok(_) => panic!("incompatible admission passed shared startup"),
+                    Err(error) => error,
+                };
+                let mut cause: &(dyn std::error::Error + 'static) = &error;
+                while let Some(source) = cause.source() {
+                    cause = source;
+                }
+                assert!(matches!(
+                    cause.downcast_ref::<eredu_runtime::working_memory::WorkingMemoryError>(),
+                    Some(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)
+                ));
+                assert_eq!(
+                    crate::tests::support::path_instrumentation::snapshot().forwards,
+                    before
+                );
+            }
+            let input = if supplied {
+                TextGenerationInput::Prepared(prompt.with_inference_request(request))
+            } else {
+                drop(prompt);
+                TextGenerationInput::TokenIds(vec![1, 2, 3, 4, 5])
+            };
+            let tokens = if controlled {
+                ControlledTextGeneration::from_input(&mut runtime, input, config, AllTokens)
+                    .unwrap()
+                    .map(|token| token.unwrap().token_id())
+                    .collect::<Vec<_>>()
+            } else {
+                let generation = match input {
+                    TextGenerationInput::TokenIds(ids) => {
+                        TextGeneration::new(&mut runtime, ids, config)
+                    }
+                    TextGenerationInput::OriginalTokenIds => {
+                        unreachable!("legacy prepared-input fixture")
+                    }
+                    TextGenerationInput::OriginalPrepared(_) => {
+                        unreachable!("ordinary fixture input")
+                    }
+                    TextGenerationInput::Prepared(prompt) => {
+                        TextGeneration::from_prompt(&mut runtime, prompt, config)
+                    }
+                }
+                .unwrap();
+                generation
+                    .map(|token| token.unwrap().token_id().unwrap())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(tokens.len(), 2);
+            outputs.push(tokens);
+            runtime.synchronize().unwrap();
+            runtime.reset().unwrap();
+        }
+    }
+    assert!(outputs.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn native_cancelled_prefill_settles_one_chunk_without_sampling_and_preserves_session() {
+    let context =
+        crate::backend::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let stream = context.stream();
+    let backend = MlxBackend::new(stream, stream);
+    let root = crate::composition::mlx::replicated_text::tests::tiny_artifact("llama", true);
+    let mut scores = Vec::new();
+    for cancel in [false, true] {
+        let prepared =
+            eredu_core::load_model(&backend, root.path(), crate::MlxLoadRequest::default())
+                .unwrap();
+        let mut session = backend.create_session(prepared).unwrap();
+        if cancel {
+            let cancellation = eredu_core::GenerationCancellationToken::new();
+            let mut observer = CancelPrefillChunk {
+                cancellation: cancellation.clone(),
+                completed: Vec::new(),
+            };
+            let prompt = MlxBackend::prepare_text_prompt(&backend, vec![1, 2, 3, 4, 5])
+                .unwrap()
+                .with_prefill_chunk_positions(std::num::NonZeroU64::new(2).unwrap());
+            let result = session
+                .submit_prefill_cancellable_result_with_observer(
+                    &backend,
+                    Ok(prompt),
+                    None,
+                    &cancellation,
+                    &mut observer,
+                )
+                .unwrap();
+            assert!(result.is_none(), "cancelled chunk must not publish scores");
+            assert_eq!(observer.completed, [true], "no second chunk may execute");
+            session.ensure_no_submission_in_flight().unwrap();
+            session.ensure_healthy().unwrap();
+        } else {
+            session
+                .prefill(
+                    &backend,
+                    MlxBackend::prepare_text_prompt(&backend, vec![1, 2]).unwrap(),
+                )
+                .unwrap()
+                .wait()
+                .unwrap();
+        }
+        let output = session
+            .decode(&backend, Array::from_slice(&[3_u32], &[1, 1]))
+            .unwrap()
+            .wait()
+            .unwrap();
+        scores.push(output.logits().unwrap().to_f32_vec(stream).unwrap());
+    }
+    assert_eq!(
+        scores[0], scores[1],
+        "cancelled prefill retains exactly its committed prefix"
+    );
+    assert!(scores[0].iter().any(|value| value.abs() > 1e-6));
 }
 impl RuntimeActivationObserver<MlxTensor, Error> for InputPreparationProbe {
     fn transactional(&self) -> bool {

@@ -6,7 +6,10 @@ pub mod input;
 #[cfg(any(test, feature = "image", feature = "audio"))]
 use eredu_core::InputModality;
 use eredu_core::{checkpoint::TensorDtype, InputTensorIdentity, PreparedInputIdentity};
-use eredu_runtime::{PreparedInputCacheIdentity, PreparedModelInput as RuntimePreparedModelInput};
+use eredu_runtime::{
+    PreparedInputCacheIdentity, PreparedModelInput as RuntimePreparedModelInput,
+    SharedPreparedInputCacheIdentity,
+};
 use safemlx::{Array, Dtype};
 
 #[cfg(any(test, feature = "image", feature = "audio"))]
@@ -33,7 +36,7 @@ fn text_input_part(ids: &[u32]) -> Result<InputPart, Error> {
 #[derive(Debug, Clone)]
 pub struct PreparedModelInput {
     inner: RuntimePreparedModelInput<Array>,
-    cache_identity: Option<PreparedInputCacheIdentity>,
+    cache_identity: Option<SharedPreparedInputCacheIdentity>,
 }
 
 impl PreparedModelInput {
@@ -61,7 +64,7 @@ impl PreparedModelInput {
             .map_err(|error| Error::Processor(error.to_string()))?;
         Ok(Self {
             inner,
-            cache_identity: Some(cache_identity),
+            cache_identity: Some(SharedPreparedInputCacheIdentity::new(cache_identity)),
         })
     }
 
@@ -86,7 +89,12 @@ impl PreparedModelInput {
     }
 
     /// Exact prepared-description and semantic-content cache identity, when supplied.
-    pub const fn cache_identity(&self) -> Option<&PreparedInputCacheIdentity> {
+    pub fn cache_identity(&self) -> Option<&PreparedInputCacheIdentity> {
+        self.cache_identity.as_ref().map(AsRef::as_ref)
+    }
+
+    /// Existing shared cache identity retained by processor output.
+    pub fn shared_cache_identity(&self) -> Option<&SharedPreparedInputCacheIdentity> {
         self.cache_identity.as_ref()
     }
 
@@ -109,7 +117,10 @@ impl PreparedModelInput {
 
     /// Calls `function` with a borrowed typed runtime input.
     pub fn with_model_input<T>(&self, function: impl FnOnce(ModelInput<'_>) -> T) -> T {
-        function(ModelInput::new(self.input_parts()))
+        function(match &self.cache_identity {
+            Some(identity) => ModelInput::with_shared_cache_identity(self.input_parts(), identity),
+            None => ModelInput::new(self.input_parts()),
+        })
     }
 
     /// Clones payload and metadata arrays in the identity's deterministic wire order.

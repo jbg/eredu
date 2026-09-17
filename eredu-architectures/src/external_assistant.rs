@@ -1,10 +1,19 @@
 //! Architecture-owned inspection and preparation of external draft assistants.
 
 mod execution_plan;
+mod evidence;
+mod selection_source;
+pub use selection_source::ExternalSelectionSource;
+pub(crate) use selection_source::CaptureSource;
+pub use evidence::{ExternalTargetResult, ExternalOperationResult};
+/// Typed operations shared by actual execution and source-bound cold tracing.
+pub mod invocation;
+pub(crate) mod prefill;
 pub use execution_plan::{
     prepare_execution_plan_assistant, MaterializedExternalAssistantExecution,
-    PreparedExternalAssistantExecution,
+    PreparedExternalAssistantExecution, SelectedExternalAssistantVisitor,
 };
+pub use prefill::ExternalPrefillReceiver;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -57,9 +66,10 @@ pub const EXTERNAL_ASSISTANT_VERIFICATION_LOGITS_OBSERVATION_PATH: &str =
 /// committed target frontier are portable lifecycle state and therefore live above every backend.
 pub struct ExternalAssistantCache<C> {
     native: C,
-    selected: eredu_runtime::SelectedSpeculativeRealization,
-    prepared_input: Option<SpeculativeIdentity>,
+    selected: selection_source::SelectedOwner,
+    prepared_input: Option<selection_source::InputIdentity>,
     frontier: u64,
+    _host:eredu_core::HostPreparationAuthority,
 }
 
 impl<C> ExternalAssistantCache<C> {
@@ -67,10 +77,18 @@ impl<C> ExternalAssistantCache<C> {
     pub fn new(native: C, selected: eredu_runtime::SelectedSpeculativeRealization) -> Self {
         Self {
             native,
-            selected,
+            selected:selection_source::SelectedOwner::Ordinary(selected),
             prepared_input: None,
             frontier: 0,
+            _host:eredu_core::HostPreparationAuthority::unmanaged(),
         }
+    }
+
+    /// Uses the exact loaded declaration source after the caller pays this
+    /// cache envelope and source-handle constructor. Native state keeps its
+    /// separate copy/completion authority; source identity grants no work.
+    pub fn from_selected_source(native:C,source:ExternalSelectionSource,host:eredu_core::HostPreparationAuthority)->Self{
+        Self{native,selected:selection_source::SelectedOwner::Source(source),prepared_input:None,frontier:0,_host:host}
     }
 
     /// Borrows opaque backend state for one native mechanism call.
@@ -86,14 +104,24 @@ impl<C> ExternalAssistantCache<C> {
     /// Binds one prepared semantic input to the reusable lane cache.
     pub fn bind_prepared_input(&mut self, identity: SpeculativeIdentity) -> Result<(), String> {
         match self.prepared_input.as_ref() {
-            Some(bound) if bound != &identity => {
+            Some(bound) if &**bound != &identity => {
                 Err("external speculative cache belongs to a different prepared input".into())
             }
             Some(_) => Ok(()),
             None => {
-                self.prepared_input = Some(identity);
+                self.prepared_input = Some(selection_source::InputIdentity::Ordinary(identity));
                 Ok(())
             }
+        }
+    }
+
+    /// Binds the one immutable identity created under the actual request host
+    /// owner. Checkpoints share its storage without repeating text allocation.
+    pub fn bind_retained_prepared_input(&mut self,values:eredu_core::SpeculativeValues<SpeculativeIdentity>)->Result<(),String>{
+        if values.len()!=1{return Err("external prepared input requires one identity".into());}
+        match self.prepared_input.as_ref(){
+            Some(bound) if &**bound!=&values[0]=>Err("external speculative cache belongs to a different prepared input".into()),
+            Some(_)=>Ok(()),None=>{self.prepared_input=Some(selection_source::InputIdentity::Retained(values));Ok(())}
         }
     }
 
@@ -130,6 +158,11 @@ impl<C> ExternalAssistantCache<C> {
             .map_err(|_| "external target cache frontier exceeds i32".to_owned())
     }
 
+    /// Borrows architecture-declared capture paths without a temporary table.
+    pub fn capture_paths_iter(&self)->impl ExactSizeIterator<Item=&str> {
+        self.selected.requirements().capture().entries().iter().map(|entry|entry.path().as_str())
+    }
+
     /// Returns architecture-declared capture paths in their validated tensor order.
     pub fn capture_paths(&self) -> Vec<&str> {
         self.selected
@@ -142,27 +175,37 @@ impl<C> ExternalAssistantCache<C> {
     }
 
     /// Closes and validates one ordered architecture capture at the current frontier.
-    pub fn validate_capture_shapes(&self, shapes: &[Vec<usize>]) -> Result<(), String> {
-        let prepared_input = self
+    pub fn validate_capture_shapes(&self,shapes:&[Vec<usize>])->Result<(),String>{
+        let input=self.prepared_input.as_ref().ok_or_else(||"external target capture precedes prepared-input binding".to_owned())?;
+        self.selected.validate_capture_values(&self.selected.lane_identity_ref(input,self.frontier),
+            self.frontier,||shapes.iter(),|shape,entry|Ok(entry.matches_dimensions(shape.len(),|i|shape.get(i).copied())),
+            |error|error.to_string())
+    }
+
+    pub(crate) fn validate_capture_values<'a,A,M,I>(&self,values:impl FnMut()->I,context:M::Context<'_>)
+        ->Result<(),M::Error>
+    where A:ExternalAssistantArchitecture,M:ExternalAssistantExecutionMechanisms<A>,
+        M::Tensor:'a,I:Iterator<Item=&'a M::Tensor> {
+        let input=self.prepared_input.as_ref().ok_or_else(||M::state_refusal(context))?;
+        self.selected.validate_capture_values(&self.selected.lane_identity_ref(input,self.frontier),
+            self.frontier,values,|value,entry|M::capture_shape_matches(value,entry,context),
+            |error|M::capture_contract_error(error,context))
+    }
+
+    pub(crate) fn prefill_parts(
+        &mut self,
+    ) -> Result<(&mut C, prefill::CaptureIdentity<'_>), String> {
+        let input = self
             .prepared_input
-            .clone()
+            .as_ref()
             .ok_or_else(|| "external target capture precedes prepared-input binding".to_owned())?;
-        let schema = self
-            .selected
-            .requirements()
-            .capture()
-            .instantiate(shapes.iter().cloned())
-            .map_err(|error| error.to_string())?;
-        let values = vec![(); schema.entries().len()];
-        let envelope = SpeculativeCaptureEnvelope::new(
-            SpeculativeCaptureMetadata::new(schema, self.frontier),
-            values,
-        )
-        .map_err(|error| error.to_string())?;
-        let lane = self.selected.lane_identity(prepared_input, self.frontier);
-        self.selected
-            .validate_capture(&lane, &envelope)
-            .map_err(|error| error.to_string())
+        Ok((
+            &mut self.native,
+            prefill::CaptureIdentity {
+                selected: &self.selected,
+                input,
+            },
+        ))
     }
 
     /// Heap and envelope storage copied with a native checkpoint.
@@ -176,10 +219,13 @@ impl<C> ExternalAssistantCache<C> {
 
     /// Wraps one opaque native checkpoint in the exact semantic cache boundary.
     pub fn checkpoint<N>(&self, native: N) -> ExternalAssistantCacheCheckpoint<N> {
+        self.checkpoint_with_host(native,self._host.clone())
+    }
+
+    /// Publishes the exact semantic checkpoint with its paid enclosing host owner.
+    pub fn checkpoint_with_host<N>(&self,native:N,host:eredu_core::HostPreparationAuthority)->ExternalAssistantCacheCheckpoint<N>{
         ExternalAssistantCacheCheckpoint {
-            native,
-            prepared_input: self.prepared_input.clone(),
-            frontier: self.frontier,
+            native,prepared_input:self.prepared_input.clone(),frontier:self.frontier,_host:host,
         }
     }
 
@@ -193,8 +239,8 @@ impl<C> ExternalAssistantCache<C> {
 /// Exact architecture-owned checkpoint envelope around opaque native cache storage.
 pub struct ExternalAssistantCacheCheckpoint<C> {
     native: C,
-    prepared_input: Option<SpeculativeIdentity>,
-    frontier: u64,
+    prepared_input: Option<selection_source::InputIdentity>,
+    frontier: u64,    _host:eredu_core::HostPreparationAuthority,
 }
 
 impl<C> ExternalAssistantCacheCheckpoint<C> {
@@ -215,8 +261,8 @@ impl<C> ExternalAssistantCacheCheckpoint<C> {
 /// They are installed on a reusable materialized assistant and invoked by its architecture-owned
 /// executor. The default is the neutral no-op observer used by ordinary generation.
 pub struct ExternalAssistantObservers<T, L, E> {
-    tensors: Box<dyn eredu_runtime::ActivationObserver<T, E>>,
-    logits: Box<dyn eredu_runtime::ActivationObserver<L, E>>,
+    tensors: Option<Box<dyn eredu_runtime::ActivationObserver<T, E>>>,
+    logits: Option<Box<dyn eredu_runtime::ActivationObserver<L, E>>>,
 }
 
 impl<T, L, E> Default for ExternalAssistantObservers<T, L, E>
@@ -225,8 +271,8 @@ where
 {
     fn default() -> Self {
         Self {
-            tensors: Box::new(eredu_runtime::NoopObserver),
-            logits: Box::new(eredu_runtime::NoopObserver),
+            tensors: None,
+            logits: None,
         }
     }
 }
@@ -238,9 +284,44 @@ impl<T, L, E> ExternalAssistantObservers<T, L, E> {
         logits: impl eredu_runtime::ActivationObserver<L, E> + 'static,
     ) -> Self {
         Self {
-            tensors: Box::new(tensors),
-            logits: Box::new(logits),
+            tensors: Some(Box::new(tensors)),
+            logits: Some(Box::new(logits)),
         }
+    }
+
+    /// Whether an actual tensor callback was installed; an empty slot needs no
+    /// raw native handle, callback allocation or observer qualification.
+    pub fn has_tensor_observer(&self) -> bool { self.tensors.is_some() }
+    /// Whether an actual logits callback was installed.
+    pub fn has_logits_observer(&self) -> bool { self.logits.is_some() }
+
+    /// Exact compatibility for prompt spans and separately attributed context.
+    pub fn supports_prefill(&self, context_values: bool) -> bool {
+        self.tensors.as_ref().is_none_or(|observer| observer.supports_prefill_spans()
+            && (!context_values || observer.supports_prefill_context()))
+    }
+    /// Preserves the installed observer's full-readout demand.
+    pub fn prefill_output_demand(&self) -> eredu_core::OutputDemand {
+        if self.tensors.as_ref().is_some_and(|observer| observer.requires_sequence_readout()) {
+            eredu_core::OutputDemand::Sequence
+        } else {
+            eredu_core::OutputDemand::LastPosition
+        }
+    }
+    /// Announces a genuine prompt span to the installed tensor observer.
+    pub fn begin_prefill_chunk(
+        &mut self,
+        chunk: &eredu_runtime::prefill::PrefillChunk,
+    ) -> Result<(), E> {
+        self.tensors.as_mut().map_or(Ok(()), |observer| observer.begin_prefill_chunk(chunk))
+    }
+    /// Announces complete context, without a prompt-row window.
+    pub fn begin_prefill_context(&mut self, frontier: u64) -> Result<(), E> {
+        self.tensors.as_mut().map_or(Ok(()), |observer| observer.begin_prefill_context(frontier))
+    }
+    /// Closes the provisional observation after the shared driver settles.
+    pub fn finish_prefill(&mut self, committed: bool) {
+        if let Some(observer) = self.tensors.as_mut() { observer.finish_prefill(committed); }
     }
 
     /// Observes and optionally replaces one tensor activation.
@@ -248,7 +329,7 @@ impl<T, L, E> ExternalAssistantObservers<T, L, E> {
     where
         T: Clone,
     {
-        eredu_runtime::observe_and_intervene(self.tensors.as_mut(), path, value)
+        self.tensors.as_mut().map_or_else(|| Ok(value.clone()), |observer| eredu_runtime::observe_and_intervene(observer.as_mut(), path, value))
     }
 
     /// Observes and optionally replaces one logits value.
@@ -256,7 +337,24 @@ impl<T, L, E> ExternalAssistantObservers<T, L, E> {
     where
         L: Clone,
     {
-        eredu_runtime::observe_and_intervene(self.logits.as_mut(), path, value)
+        self.logits.as_mut().map_or_else(|| Ok(value.clone()), |observer| eredu_runtime::observe_and_intervene(observer.as_mut(), path, value))
+    }
+}
+
+/// Borrowed target facts from the actual immutable admission configuration.
+/// This view retains no native state and grants no execution authority.
+#[derive(Debug,Clone,Copy)]
+pub enum ExternalAssistantTargetProfileRef<'a> {
+    /// Gemma text target configuration.
+    Gemma4(&'a gemma4::FamilyConfig),
+    /// Muse-Glimmer decoder target configuration.
+    MuseGlimmer(&'a muse_glimmer::DecoderConfig),
+}
+impl ExternalAssistantTargetProfileRef<'_> {
+    /// Ordinary cold materialization of the same configuration facts.
+    pub fn to_owned(self)->ExternalAssistantTargetProfile {
+        match self { Self::Gemma4(v)=>ExternalAssistantTargetProfile::Gemma4(v.clone()),
+            Self::MuseGlimmer(v)=>ExternalAssistantTargetProfile::MuseGlimmer(v.clone()) }
     }
 }
 
@@ -394,6 +492,9 @@ mod sealed {
 /// generic visitor method and never match an assistant-family enum.
 #[allow(private_bounds)]
 pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
+    /// Actual shared-driver iteration of this separately materialized strategy.
+    fn invocation_shape() -> eredu_runtime::speculative::external_occurrence::ExternalPredictionShape;
+
     /// Exact normalized architecture configuration.
     type Config: Clone + std::fmt::Debug;
 
@@ -471,6 +572,10 @@ pub trait ExternalAssistantArchitecture: sealed::Sealed + Sized + 'static {
     where
         M: ExternalAssistantExecutionMechanisms<Self> + 'static,
         V: ExternalAssistantExecutorVisitor<Self, M>;
+    /// Lends the same executor with the actual source-owned capture declaration.
+    fn visit_executor_borrowed<'a,M,V>(target:&'a mut M::Target,assistant:&'a mut M::Assistant,
+        capture:&'a crate::composite_execution::ExternalPredictionCaptureRequest,visitor:V)->V::Output
+    where M:ExternalAssistantExecutionMechanisms<Self>+'static,V:ExternalAssistantExecutorVisitor<Self,M>;
 }
 
 /// Family-blind continuation invoked with an architecture-selected external executor.
@@ -552,6 +657,89 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
     /// Native mechanism failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Whether the actual mechanism needs the shared scheduler coordinate.
+    /// Copies only the actual request assignment; no new source is inferred.
+    fn request_context<'a>(request:eredu_core::SpeculativeRequestId,context:Self::Context<'a>)->Result<Self::Context<'a>,Self::Error>{let _=request;Ok(context)}
+    /// Coordinates the same host rows without discarding their original owner.
+    /// Legacy mechanisms accept ordinary buffers; a retained buffer needs an
+    /// explicit source-aware implementation.
+    fn coordinate_speculative_buffer(
+        local: eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>,
+        context: Self::Context<'_>,
+    ) -> Result<eredu_core::SpeculativeBuffer<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        let _ = context;
+        match local.try_into_ordinary() {
+            Ok(local) => Ok(local.into()),
+            Err(_) => Err(eredu_core::HostMetadataFundingError::Unavailable.into()),
+        }
+    }
+
+    /// Retains the shared driver's original request identity.
+    fn driver_identity(context:Self::Context<'_>)->Result<eredu_core::SpeculativeRequestIdentity,Self::Error>{let _=context;Ok(eredu_core::SpeculativeRequestIdentity::new())}
+    /// Uses the existing canonical sequence-copy mechanism at checkpoint boundaries.
+    fn copy_sequence(source:eredu_core::SpeculativeSequenceRef<'_>,context:Self::Context<'_>)->Result<eredu_core::SpeculativeSequence,eredu_core::SpeculativeDriverError<Self::Error>>{let _=context;source.copy_ordinary().map_err(eredu_core::SpeculativeDriverError::Preparation)}
+    /// Exact storage query for the matching sequence-copy provider.
+    fn sequence_copy_bytes(source:&eredu_core::SpeculativeSequence)->Option<u64>{match source{eredu_core::SpeculativeSequence::Ordinary(_)=>source.snapshot_storage_bytes(),eredu_core::SpeculativeSequence::Retained(_)=>None}}
+    /// Transfers an already retained failure without another allocation.
+    fn take_retained_failure(error:Self::Error)->Result<eredu_core::BackendFailure,Self::Error>{Err(error)}
+    /// Whether the actual source needs a scheduler coordinate.
+    fn requires_activation_origin() -> bool { false }
+    /// Lends the actual coordinate to one operation; ordinary contexts are unchanged.
+    fn invocation_context<'a>(context: Self::Context<'a>,
+        _origin: Option<eredu_core::speculative::SpeculativeActivationOrigin>,
+    ) -> Result<Self::Context<'a>, Self::Error> { Ok(context) }
+    /// The request owns monotonic attempts outside all cache snapshots.
+    fn prepare_control_continuation<'a>(_committed: usize,
+        _status: eredu_core::generation::SpeculativeRequestStatus, _context: Self::Context<'a>,
+    ) -> Result<(), Self::Error> { Ok(()) }
+
+    /// Per-operation evidence context. Ordinary workers borrow the same context.
+    fn source_context<'a, 'scope>(context: Self::Context<'a>,
+        _sources: &'scope [&'scope crate::speculative_execution::PreparedEmbeddedEvidence],
+    ) -> Result<Self::Context<'scope>, Self::Error> where 'a: 'scope;
+    /// Preserves the actual source of target prefill scores and captures.
+    fn prefill_target_with_evidence<'a>(target: &mut Self::Target,
+        request: &crate::composite_execution::ExternalPredictionCaptureRequest,
+        input: Self::Input, cache: &mut Self::NativeCache, context: Self::Context<'a>,
+    ) -> Result<ExternalTargetResult<Self::Tensor>, Self::Error> {
+        Self::prefill_target_native(target, request, input, cache, context)
+            .map(|(logits, capture)| ExternalTargetResult::ordinary(logits, capture))
+    }
+    /// Preserves the actual source of target verification and prefix replay.
+    fn verify_target_with_evidence<'a>(target: &mut Self::Target,
+        request: &crate::composite_execution::ExternalPredictionCaptureRequest,
+        tokens: &Self::Tensor, cache: &mut Self::NativeCache, context: Self::Context<'a>,
+    ) -> Result<ExternalTargetResult<Self::Tensor>, Self::Error> {
+        Self::verify_target_native(target, request, tokens, cache, context)
+            .map(|(logits, capture)| ExternalTargetResult::ordinary(logits, capture))
+    }
+    /// Same token producer with its independently retained numerical source.
+    fn target_tokens_with_source<'a>(tokens: &[u32], context: Self::Context<'a>)
+        -> Result<crate::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        Self::target_tokens(tokens, context).map(crate::speculative_execution::EmbeddedPredictionTensor::ordinary)
+    }
+    /// Transfers one immutable source packet through the existing placement
+    /// worker. Original implementations must emit the actual destination source.
+    fn transfer_with_source<'a>(value: &crate::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,
+        direction: ExternalAssistantTransfer, context: Self::Context<'a>)
+        -> Result<crate::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        Self::transfer(value, direction, context).map(crate::speculative_execution::EmbeddedPredictionTensor::ordinary)
+    }
+    /// Same static target equation, with immutable source/output ownership.
+    fn target_operation_with_source<'a>(target: &mut Self::Target,
+        operation: crate::composite_execution::ExternalPredictionTargetOperation<'_, Self::Tensor>,
+        context: Self::Context<'a>,
+    ) -> Result<crate::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>, Self::Error> {
+        Self::target_operation(target, operation, context)
+            .map(crate::speculative_execution::EmbeddedPredictionTensor::ordinary)
+    }
+    /// Same assistant operation, with its real completion receipt when prepared.
+    fn assistant_operation_with_evidence<I: invocation::ExternalAssistantOperation<A>>(
+        assistant: &mut Self::Assistant, arguments: I::Arguments<'_, Self::Tensor>, context: Self::Context<'_>,
+    ) -> Result<ExternalOperationResult<I::Output<Self::Tensor>>, Self::Error> {
+        Self::assistant_operation::<I>(assistant, arguments, context).map(ExternalOperationResult::ordinary)
+    }
+
     /// Known bound for an isolated reusable target-cache checkpoint.
     fn control_cache_estimate(
         _cache: &Self::NativeCache,
@@ -592,6 +780,130 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
     fn config(assistant: &Self::Assistant) -> &A::Config;
     /// Borrows the neutral assistant module.
     fn module(assistant: &mut Self::Assistant) -> &mut A::Module<Self::NeuralBackend>;
+    /// Executes one architecture-declared assistant operation. Native backends
+    /// may surround this exact worker with source-bound quotation/admission;
+    /// ordinary mechanisms use the same equation directly.
+    fn assistant_operation<I: invocation::ExternalAssistantOperation<A>>(
+        assistant: &mut Self::Assistant,
+        arguments: I::Arguments<'_, Self::Tensor>,
+        context: Self::Context<'_>,
+    ) -> Result<I::Output<Self::Tensor>, Self::Error> {
+        I::execute::<Self::NeuralBackend, Self::AttentionCache>(
+            Self::module(assistant),
+            arguments,
+            Self::neural_context(context, ExternalAssistantTensorPlacement::Draft),
+        )
+        .map_err(Self::neural_error)
+    }
+
+    /// Reads one row using this particular completed output's source. Ordinary
+    /// mechanisms keep the same static row selection and logits conversion.
+    fn logits_row_with_source<'a>(value: &Self::Tensor, row: usize,
+        evidence: Option<&crate::speculative_execution::PreparedEmbeddedEvidence>,
+        placement: ExternalAssistantTensorPlacement, context: Self::Context<'a>,
+    ) -> Result<Self::Logits, Self::Error> {
+        let _ = evidence;
+        Self::sequence_row(value, row, false, placement, context).map(Self::into_logits)
+    }
+
+    /// Selects a static view while preserving its exact source and numerical
+    /// operation custody. Ordinary mechanisms use the same tensor Index worker.
+    fn tensor_range_with_source<'a>(value: &Self::Tensor, axis: u8, start: usize, end: usize,
+        evidence: Option<&crate::speculative_execution::PreparedEmbeddedEvidence>,
+        placement: ExternalAssistantTensorPlacement, context: Self::Context<'a>,
+    ) -> Result<ExternalOperationResult<Self::Tensor>, Self::Error> {
+        let _ = evidence;
+        let shape=Self::tensor_shape(value)?;
+        let axis=usize::from(axis);
+        if !(2..=4).contains(&shape.len()) || axis == 0 || axis >= shape.len() || start > end || end > shape[axis] {
+            return Err(Self::error("external tensor range differs from its source".into()));
+        }
+        let start=i32::try_from(start).map_err(|_|Self::error("external tensor range exceeds i32".into()))?;
+        let end=i32::try_from(end).map_err(|_|Self::error("external tensor range exceeds i32".into()))?;
+        let mut indices=[eredu_nn::Index::Full,eredu_nn::Index::Full,eredu_nn::Index::Full,eredu_nn::Index::Full];
+        indices[axis]=eredu_nn::Index::Range(start,end);
+        eredu_nn::Tensor::index(value,&indices[..shape.len()],Self::neural_context(context,placement))
+            .map(ExternalOperationResult::ordinary).map_err(Self::neural_error)
+    }
+    /// Retains one same-placement alias without constructing an unqualified
+    /// tensor handle on an original path.
+    fn tensor_alias_with_source<'a>(value: &Self::Tensor,
+        evidence: Option<&crate::speculative_execution::PreparedEmbeddedEvidence>,
+        placement: ExternalAssistantTensorPlacement, context: Self::Context<'a>,
+    ) -> Result<ExternalOperationResult<Self::Tensor>, Self::Error> {
+        let _=(evidence,placement,context);
+        Ok(ExternalOperationResult::ordinary(value.clone()))
+    }
+    /// Retains a token packet across a source-aware verification prefix.
+    fn token_prefix_with_source<'a>(value:&crate::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,end:usize,context:Self::Context<'a>)
+        ->Result<crate::speculative_execution::EmbeddedPredictionTensor<Self::Tensor>,Self::Error>{
+        Self::token_prefix(value,end,context).map(crate::speculative_execution::EmbeddedPredictionTensor::ordinary)
+    }
+    /// Copies one independently writable control value and its exact backing
+    /// source. Ordinary implementations keep the existing native copy worker.
+    fn control_copy_tensor_with_source(value:&Self::Tensor,
+        evidence:Option<&crate::speculative_execution::PreparedEmbeddedEvidence>,
+        placement:ExternalAssistantTensorPlacement,context:Self::Context<'_>)->Result<ExternalOperationResult<Self::Tensor>,Self::Error>{
+        let _=evidence;Self::control_copy_tensor(value,placement,context).map(ExternalOperationResult::ordinary)
+    }
+    /// Transfers an existing state value together with its exact source.
+    fn transfer_tensor_with_source<'a>(value:&Self::Tensor,
+        evidence:Option<&crate::speculative_execution::PreparedEmbeddedEvidence>,direction:ExternalAssistantTransfer,context:Self::Context<'a>)
+        ->Result<ExternalOperationResult<Self::Tensor>,Self::Error>{let _=evidence;Self::transfer(value,direction,context).map(ExternalOperationResult::ordinary)}
+    /// Projects source/account facts for already completed current state roots.
+    /// The visitor and finite predecessors convey no new completion authority.
+    fn join_tensor_sources<'a>(visit: impl FnMut(&mut dyn FnMut(&Self::Tensor)),
+        evidence: &[&crate::speculative_execution::PreparedEmbeddedEvidence], context: Self::Context<'a>,
+    ) -> Result<Option<crate::speculative_execution::PreparedEmbeddedEvidence>, Self::Error> {
+        let _=(visit,evidence,context); Ok(None)
+    }
+
+    /// Projects an existing state's sources for its actual consuming side.
+    /// Ordinary mechanisms keep the existing source-free join behavior.
+    fn join_tensor_sources_at<'a>(visit: impl FnMut(&mut dyn FnMut(&Self::Tensor)),
+        evidence: &[&crate::speculative_execution::PreparedEmbeddedEvidence],
+        placement: ExternalAssistantTensorPlacement, context: Self::Context<'a>,
+    ) -> Result<Option<crate::speculative_execution::PreparedEmbeddedEvidence>, Self::Error> {
+        let _=placement; Self::join_tensor_sources(visit,evidence,context)
+    }
+
+    /// Observes a borrowed state root with the current explicit source loan.
+    fn observe_borrowed_tensor<'a>(assistant:&mut Self::Assistant,path:&str,value:&Self::Tensor,
+        evidence:Option<&crate::speculative_execution::PreparedEmbeddedEvidence>,context:Self::Context<'a>)->Result<Self::Tensor,Self::Error>{
+        let _=(evidence,context);Self::observe_tensor(assistant,path,value.clone())
+    }
+    /// Pays concrete state-constructor controls before creating destinations.
+    fn state_host_metadata<'a>(bytes: Option<usize>, context: Self::Context<'a>)
+        -> Result<eredu_core::HostPreparationAuthority, Self::Error> {
+        let _=(bytes,context); Ok(eredu_core::HostPreparationAuthority::unmanaged())
+    }
+    /// Fresh finite state destination. Native implementations retain its actual H.
+    fn state_buffer<'a,T>(capacity:usize, context:Self::Context<'a>)
+        ->Result<eredu_core::SpeculativeBuffer<T>,Self::Error>{let _=context;Ok(eredu_core::SpeculativeBuffer::with_capacity(capacity))}
+    /// Allocates a finite vector whose enclosing state/source owner retains H.
+    fn state_vector<T>(capacity:usize,context:Self::Context<'_>)->Result<Vec<T>,Self::Error>{let _=context;Ok(Vec::with_capacity(capacity))}
+    /// Exact query for the selected state/driver buffer constructor.
+    fn state_buffer_bytes<T>(capacity:usize)->Option<usize>{eredu_core::SpeculativeBuffer::<T>::retained_control_bytes(capacity)}
+    /// Freezes rows using the existing shared immutable owner.
+    fn freeze_state_values<'a,T>(values:eredu_core::SpeculativeBuffer<T>,context:Self::Context<'a>)
+        ->Result<eredu_core::SpeculativeValues<T>,Self::Error>{
+        let host=Self::state_host_metadata(eredu_core::SpeculativeValues::<T>::retained_control_bytes(),context)?;
+        Ok(eredu_core::SpeculativeValues::from_prepared_buffer(values,host))
+    }
+    /// Fixed-axis descriptor query used by shared state geometry.
+    fn state_dimension<'a>(value:&Self::Tensor,axis:usize,context:Self::Context<'a>)->Result<usize,Self::Error>{
+        let _=context;Self::tensor_shape(value)?.get(axis).copied().ok_or_else(||Self::error("external state axis is absent".into()))
+    }
+    /// Fixed state-construction refusal, translated with current source custody.
+    fn state_refusal<'a>(context:Self::Context<'a>)->Self::Error{let _=context;Self::error("external state source or geometry differs".into())}
+    /// Completes the same retained values; original paths validate an already
+    /// settled exact source instead of submitting a new ordinary event.
+    fn submit_completion_with_sources<'a,'c,I>(values:I,
+        evidence:&[&crate::speculative_execution::PreparedEmbeddedEvidence],context:Self::Context<'c>)
+        ->Result<Self::Completion,Self::Error> where Self::Tensor:'a,I:IntoIterator<Item=&'a Self::Tensor>,I::IntoIter:Clone {
+        let _=(evidence,context);Self::submit_completion(values)
+    }
+
     /// Maps a portable neural error into the backend failure type.
     fn neural_error(error: eredu_nn::Error) -> Self::Error;
     /// Constructs a stable architecture lifecycle failure.
@@ -600,7 +912,40 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
     fn prepared_input_cache_identity(
         input: &Self::Input,
     ) -> Result<eredu_runtime::PreparedInputCacheIdentity, Self::Error>;
+    /// Lends the existing prepared identity; the default preserves ordinary
+    /// clone behavior, while native original input borrows its retained source.
+    fn with_prepared_input_cache_identity<R>(input:&Self::Input,run:impl FnOnce(&eredu_runtime::PreparedInputCacheIdentity)->R)->Result<R,Self::Error>{
+        Self::prepared_input_cache_identity(input).map(|identity|run(&identity))
+    }
+    /// Constructs the same identity text under the actual host authority.
+    fn identity_text(arguments:std::fmt::Arguments<'_>,_context:Self::Context<'_>)->Result<SpeculativeIdentity,Self::Error>{
+        SpeculativeIdentity::new(arguments.to_string()).map_err(|error|Self::error(error.to_string()))
+    }
+    /// Binds only the source-owned input fingerprint, without cloning its DTO.
+    fn bind_prepared_input_with_context(input:&Self::Input,cache:&mut ExternalAssistantCache<Self::NativeCache>,context:Self::Context<'_>)->Result<(),Self::Error>{
+        let identity=Self::with_prepared_input_cache_identity(input,|prepared|
+            Self::identity_text(format_args!("prepared-input/{}",prepared.prefix_content_fingerprint()),context))??;
+        let host=Self::state_host_metadata(Some(std::mem::size_of::<(SpeculativeIdentity,Result<(),String>)>()),context)?;
+        let mut values=Self::state_buffer(1,context)?;
+        values.try_push(identity).map_err(|_|Self::state_refusal(context))?;
+        let values=Self::freeze_state_values(values,context)?;
+        cache.bind_retained_prepared_input(values).map_err(Self::error)?;
+        drop(host);Ok(())
+    }
+    /// Same target checkpoint with the actual request's native source context.
+    fn checkpoint_native_with_context(cache:&Self::NativeCache,_context:Self::Context<'_>)->Result<Self::NativeCacheCheckpoint,Self::Error>{Self::checkpoint_native(cache)}
+
     /// Returns the exact logical shape of one retained target-capture tensor.
+    /// Borrows an actual tensor shape against the retained capture entry.
+    fn capture_shape_matches(value:&Self::Tensor,entry:&eredu_runtime::SpeculativeCaptureEntry,
+        _context:Self::Context<'_>)->Result<bool,Self::Error>{
+        let shape=Self::tensor_shape(value)?;
+        Ok(entry.matches_dimensions(shape.len(),|i|shape.get(i).copied()))
+    }
+    /// Preserves the fixed capture failure through the current preparation owner.
+    fn capture_contract_error(error:eredu_runtime::SpeculativeCaptureError,
+        _context:Self::Context<'_>)->Self::Error{Self::error(error.to_string())}
+
     fn tensor_shape(value: &Self::Tensor) -> Result<Vec<usize>, Self::Error>;
     /// Closes and validates one architecture-ordered capture against the selected realization.
     /// Runs native ordinary-target prefill and returns its architecture-declared capture.
@@ -617,6 +962,53 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
         ),
         Self::Error,
     >;
+    /// Explicit selected span request carried by the original prepared input.
+    fn prefill_chunk_positions(_input: &Self::Input) -> Option<std::num::NonZeroU64> {
+        None
+    }
+    /// Executes the existing shared prefill scheduler and lends each exact typed
+    /// capture to its semantic consumer before the enclosing guard settles.
+    fn prefill_target_spans_native<'a>(
+        _target: &mut Self::Target,
+        _request: &crate::composite_execution::ExternalPredictionCaptureRequest,
+        _input: Self::Input,
+        _cache: &mut Self::NativeCache,
+        _receiver: &mut dyn ExternalPrefillReceiver<Self::Tensor, Self::Error>,
+        _cancellation: &eredu_core::GenerationCancellationToken,
+        _context: Self::Context<'a>,
+    ) -> Result<
+        eredu_runtime::replicated_session::PrefillSourceProgress<Option<Self::Tensor>>,
+        Self::Error,
+    > {
+        Err(Self::error(
+            "selected external capture span mechanism is unavailable".into(),
+        ))
+    }
+    /// Exact observer compatibility; unknown callbacks do not opt in implicitly.
+    fn supports_prefill_observation(_assistant: &Self::Assistant, _context_values: bool) -> bool {
+        false
+    }
+    /// Readout required by the actual installed observer.
+    fn prefill_output_demand(_assistant: &Self::Assistant) -> eredu_core::OutputDemand {
+        eredu_core::OutputDemand::Sequence
+    }
+    /// Announces one prompt span before retained-capture observation.
+    fn begin_prefill_chunk(
+        _assistant: &mut Self::Assistant,
+        _chunk: &eredu_runtime::prefill::PrefillChunk,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    /// Announces architecture context at an actual installed frontier.
+    fn begin_prefill_context(
+        _assistant: &mut Self::Assistant,
+        _frontier: u64,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    /// Ends provisional observation; no work or communication is allowed here.
+    fn finish_prefill(_assistant: &mut Self::Assistant, _committed: bool) {}
+
     /// Runs native ordinary-target verification and returns its architecture-declared capture.
     fn verify_target_native<'a>(
         target: &mut Self::Target,
@@ -671,6 +1063,18 @@ pub trait ExternalAssistantExecutionMechanisms<A: ExternalAssistantArchitecture>
     ) -> Result<Self::Tensor, Self::Error>;
     /// Converts a retained tensor into native sampling logits.
     fn into_logits(value: Self::Tensor) -> Self::Logits;
+    /// Reads the particular completed output source; ordinary adapters retain
+    /// their existing conversion. Original implementations authenticate it.
+    fn into_logits_with_source<'a>(value: Self::Tensor,
+        _evidence: Option<&crate::speculative_execution::PreparedEmbeddedEvidence>,
+        _context: Self::Context<'a>,
+    ) -> Result<Self::Logits, Self::Error> { Ok(Self::into_logits(value)) }
+    /// Converts a completed output on its architecture-declared side. The
+    /// default preserves the existing ordinary source-aware conversion.
+    fn into_logits_with_source_at<'a>(value:Self::Tensor,
+        evidence:Option<&crate::speculative_execution::PreparedEmbeddedEvidence>,
+        _placement:ExternalAssistantTensorPlacement,context:Self::Context<'a>,
+    )->Result<Self::Logits,Self::Error>{Self::into_logits_with_source(value,evidence,context)}
     /// Retains a sequence suffix.
     fn sequence_suffix<'a>(
         value: &Self::Tensor,
@@ -726,6 +1130,10 @@ pub struct Gemma4AssistantArchitecture;
 impl sealed::Sealed for Gemma4AssistantArchitecture {}
 
 impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
+    fn invocation_shape() -> eredu_runtime::speculative::external_occurrence::ExternalPredictionShape {
+        eredu_runtime::speculative::external_occurrence::ExternalPredictionShape::Sequential
+    }
+
     type Config = gemma4::AssistantConfig;
     type Module<B>
         = gemma4::Assistant<B>
@@ -816,6 +1224,12 @@ impl ExternalAssistantArchitecture for Gemma4AssistantArchitecture {
         >::new(target, assistant, capture);
         visitor.execute(&mut executor)
     }
+    fn visit_executor_borrowed<'a,M,V>(target:&'a mut M::Target,assistant:&'a mut M::Assistant,
+        capture:&'a crate::composite_execution::ExternalPredictionCaptureRequest,visitor:V)->V::Output
+    where M:ExternalAssistantExecutionMechanisms<Self>+'static,V:ExternalAssistantExecutorVisitor<Self,M>{
+        let mut executor=gemma4::speculative::ExternalExecutor::<gemma4::speculative::ArchitectureExternalMechanisms<M>>::new_borrowed(target,assistant,capture);
+        visitor.execute(&mut executor)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -825,6 +1239,10 @@ pub struct MuseGlimmerAssistantArchitecture;
 impl sealed::Sealed for MuseGlimmerAssistantArchitecture {}
 
 impl ExternalAssistantArchitecture for MuseGlimmerAssistantArchitecture {
+    fn invocation_shape() -> eredu_runtime::speculative::external_occurrence::ExternalPredictionShape {
+        eredu_runtime::speculative::external_occurrence::ExternalPredictionShape::Fused
+    }
+
     type Config = muse_glimmer::DFlashConfig;
     type Module<B>
         = muse_glimmer::DFlash<B>
@@ -918,6 +1336,12 @@ impl ExternalAssistantArchitecture for MuseGlimmerAssistantArchitecture {
         >::new(target, assistant, capture);
         visitor.execute(&mut executor)
     }
+    fn visit_executor_borrowed<'a,M,V>(target:&'a mut M::Target,assistant:&'a mut M::Assistant,
+        capture:&'a crate::composite_execution::ExternalPredictionCaptureRequest,visitor:V)->V::Output
+    where M:ExternalAssistantExecutionMechanisms<Self>+'static,V:ExternalAssistantExecutorVisitor<Self,M>{
+        let mut executor=muse_glimmer::speculative::ExternalExecutor::<muse_glimmer::speculative::ArchitectureExternalMechanisms<M>>::new_borrowed(target,assistant,capture);
+        visitor.execute(&mut executor)
+    }
 }
 
 /// Fully inspected, architecture-typed assistant materialization input.
@@ -932,7 +1356,7 @@ pub(crate) struct PreparedExternalAssistant<A: ExternalAssistantArchitecture> {
 #[derive(Clone)]
 pub(crate) struct SelectedExternalAssistant<A: ExternalAssistantArchitecture> {
     checkpoint: ExternalAssistantCheckpoint,
-    prepared_source: Option<eredu_checkpoint::store::SharedCheckpointSource>,
+    prepared_source: Option<eredu_checkpoint::store::RetainedCheckpointSource>,
     source_config: A::Config,
     config: A::Config,
     tasks: Vec<ReplicatedTextMaterializationTask>,
@@ -943,7 +1367,7 @@ pub(crate) struct SelectedExternalAssistant<A: ExternalAssistantArchitecture> {
 pub struct PreparedExternalAssistantSource<A: ExternalAssistantArchitecture> {
     checkpoint: ExternalAssistantCheckpoint,
     artifact_identity: DeferredArtifactIdentity,
-    source: eredu_checkpoint::store::SharedCheckpointSource,
+    source: eredu_checkpoint::store::RetainedCheckpointSource,
     source_config: A::Config,
     config: A::Config,
     tasks: Vec<ReplicatedTextMaterializationTask>,
@@ -969,7 +1393,7 @@ impl<A: ExternalAssistantArchitecture> PreparedExternalAssistantSource<A> {
     pub fn into_parts(
         self,
     ) -> (
-        eredu_checkpoint::store::SharedCheckpointSource,
+        eredu_checkpoint::store::RetainedCheckpointSource,
         ExternalAssistantCheckpoint,
         DeferredArtifactIdentity,
         A::Config,
@@ -1025,7 +1449,8 @@ impl<A: ExternalAssistantArchitecture> SelectedExternalAssistant<A> {
                 shards,
                 resolution,
                 max_cached_sources,
-            )?,
+            )?
+            .into(),
             ExternalAssistantCheckpoint::Gguf {
                 checkpoint: _,
                 resolution: _,
@@ -1420,7 +1845,7 @@ impl SelectedExternalAssistantPreparation {
 
 enum SelectedCheckpointCatalog<'a> {
     SafeTensors(&'a TensorCatalog),
-    Source(Arc<dyn CheckpointSource>),
+    Source(eredu_checkpoint::store::RetainedCheckpointSource),
 }
 
 trait SelectedCatalogMetadata {
@@ -1494,15 +1919,18 @@ fn selected_checkpoint_catalog(
             checkpoint,
             resolution,
             tensor_mapping,
-        } => Ok(SelectedCheckpointCatalog::Source(Arc::new(
-            eredu_checkpoint::gguf_store::GgufWeightStore::builder()
-                .max_cached_readers(max_cached_sources)
-                .map_err(|error| error.to_string())?
-                .add_resolved_checkpoint(checkpoint.clone(), resolution, tensor_mapping)
-                .map_err(|error| error.to_string())?
-                .build()
-                .map_err(|error| error.to_string())?,
-        ))),
+        } => Ok(SelectedCheckpointCatalog::Source(
+            Arc::new(
+                eredu_checkpoint::gguf_store::GgufWeightStore::builder()
+                    .max_cached_readers(max_cached_sources)
+                    .map_err(|error| error.to_string())?
+                    .add_resolved_checkpoint(checkpoint.clone(), resolution, tensor_mapping)
+                    .map_err(|error| error.to_string())?
+                    .build_with_prepared_reader_buffers()
+                    .map_err(|error| error.to_string())?,
+            )
+            .into(),
+        )),
     }
 }
 
@@ -1652,7 +2080,7 @@ where
     let (checkpoint, source_config) = prepared.into_parts();
     let store = selected_checkpoint_catalog(&checkpoint, max_cached_sources)?;
     let prepared_source = match &store {
-        SelectedCheckpointCatalog::Source(source) => Some(Arc::clone(source)),
+        SelectedCheckpointCatalog::Source(source) => Some(source.clone()),
         SelectedCheckpointCatalog::SafeTensors(_) => None,
     };
     let source_config = if matches!(checkpoint, ExternalAssistantCheckpoint::Gguf { .. }) {
@@ -2327,7 +2755,31 @@ impl ModelConfigurationResolver for AssistantConfigurations {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn external_observers_keep_empty_slots_and_explicit_replacements_distinct() {
+        type Failure = std::convert::Infallible;
+        let mut empty = super::ExternalAssistantObservers::<u32,u32,Failure>::default();
+        assert!(!empty.has_tensor_observer());
+        assert!(!empty.has_logits_observer());
+        assert!(empty.supports_prefill(true));
+        assert_eq!(empty.prefill_output_demand(), eredu_core::OutputDemand::LastPosition);
+        assert_eq!(empty.observe_tensor("hidden", &7).unwrap(), 7);
+        assert_eq!(empty.observe_logits("scores", &11).unwrap(), 11);
+        struct Replace;
+        impl eredu_runtime::ActivationObserver<u32,Failure> for Replace {
+            fn observe(&mut self, _: &str, _: &u32) -> Result<(),Failure> { Ok(()) }
+            fn intervene(&mut self, _: &str, value: &u32) -> Result<Option<u32>,Failure> { Ok(Some(value + 5)) }
+        }
+        let mut observed = super::ExternalAssistantObservers::new(Replace, Replace);
+        assert!(observed.has_tensor_observer());
+        assert!(observed.has_logits_observer());
+        assert_eq!(observed.observe_tensor("hidden", &7).unwrap(), 12);
+        assert_eq!(observed.observe_logits("scores", &11).unwrap(), 16);
+    }
+
     mod execution_plan;
+/// Typed operations shared by actual execution and source-bound cold tracing.
+    mod reader_storage;
 
     use super::*;
     use eredu_checkpoint::{schema::StoredDtypeConstraint, SourceTensorEncoding, StoredDtype};

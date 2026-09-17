@@ -1,8 +1,30 @@
 //! Pure sequence layouts shared by patch-based encoders.
 
+mod encoder;
+mod fixed;
+pub use encoder::{
+    PatchAttentionWindows, PatchEncoderTableError, PatchEncoderTableLayout, PatchEncoderTableSpec,
+    PatchEncoderTables, PatchPositionTableSpec,
+};
+pub use fixed::{
+    fill_attention_chunk_lengths, fill_bilinear_planes, fill_gathered_patch_positions,
+    fill_spatial_patch_positions, fill_window_partition, gathered_position_population,
+    interpolation_population, patch_grid_population, visit_bilinear_samples,
+    visit_gathered_patch_positions, visit_patch_positions, visit_window_partition,
+    window_partition_population, PatchGridPopulation, WindowPartitionPopulation,
+};
+
 /// Failure while deriving a patch-grid sequence layout.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum SequenceLayoutError {
+    /// A preplanned destination cannot hold the checked complete population.
+    #[error("sequence destination holds {actual} cells but requires {required}")]
+    DestinationTooShort {
+        /// Complete required element count.
+        required: usize,
+        /// Actual supplied destination length.
+        actual: usize,
+    },
     /// A grid must contain at least one item.
     #[error("patch grid must contain at least one item")]
     EmptyGrid,
@@ -55,6 +77,20 @@ pub enum SequenceLayoutError {
         /// Learned table width.
         width: i32,
     },
+    /// A direct position lookup would leave the learned spatial table.
+    #[error("patch grid row {index} dimensions {height}x{width} exceed position table {source_height}x{source_width}")]
+    GridExceedsSourceTable {
+        /// Grid row index.
+        index: usize,
+        /// Grid height.
+        height: i32,
+        /// Grid width.
+        width: i32,
+        /// Learned table height.
+        source_height: i32,
+        /// Learned table width.
+        source_width: i32,
+    },
     /// A permutation contains an out-of-range position.
     #[error("permutation entry {value} at position {position} is outside 0..{length}")]
     PermutationOutOfRange {
@@ -79,62 +115,15 @@ pub fn validate_patch_grid(
     merge_size: i32,
     expected_patches: Option<i32>,
 ) -> Result<i32, SequenceLayoutError> {
-    if grid.is_empty() {
-        return Err(SequenceLayoutError::EmptyGrid);
-    }
-    if merge_size <= 0 {
-        return Err(SequenceLayoutError::IndivisibleGrid {
-            index: 0,
-            height: grid[0].1,
-            width: grid[0].2,
-            merge: merge_size,
-        });
-    }
-    let mut patches = 0_i32;
-    for (index, &(time, height, width)) in grid.iter().enumerate() {
-        if time <= 0 || height <= 0 || width <= 0 {
-            return Err(SequenceLayoutError::NonPositiveGrid {
-                index,
-                row: (time, height, width),
-            });
-        }
-        if height % merge_size != 0 || width % merge_size != 0 {
-            return Err(SequenceLayoutError::IndivisibleGrid {
-                index,
-                height,
-                width,
-                merge: merge_size,
-            });
-        }
-        patches = patches
-            .checked_add(
-                time.checked_mul(height)
-                    .and_then(|value| value.checked_mul(width))
-                    .ok_or(SequenceLayoutError::Overflow)?,
-            )
-            .ok_or(SequenceLayoutError::Overflow)?;
-    }
-    if let Some(expected) = expected_patches {
-        if patches != expected {
-            return Err(SequenceLayoutError::PatchCountMismatch {
-                expected,
-                actual: patches,
-            });
-        }
-    }
-    Ok(patches)
+    patch_grid_population(grid.iter().copied(), merge_size, expected_patches)
+        .map(|population| population.patches)
 }
 
 /// Returns one full-attention chunk per temporal slice.
 pub fn attention_chunk_lengths(grid: &[(i32, i32, i32)]) -> Result<Vec<i32>, SequenceLayoutError> {
-    validate_patch_grid(grid, 1, None)?;
-    let mut lengths = Vec::new();
-    for &(time, height, width) in grid {
-        let length = height
-            .checked_mul(width)
-            .ok_or(SequenceLayoutError::Overflow)?;
-        lengths.extend(std::iter::repeat_n(length, time as usize));
-    }
+    let population = patch_grid_population(grid.iter().copied(), 1, None)?;
+    let mut lengths = vec![0; population.frames];
+    fill_attention_chunk_lengths(grid.iter().copied(), &mut lengths)?;
     Ok(lengths)
 }
 
@@ -170,40 +159,10 @@ pub fn patch_positions(
     grid: &[(i32, i32, i32)],
     traversal: PatchTraversal,
 ) -> Result<Vec<[i32; 3]>, SequenceLayoutError> {
-    let merge = match traversal {
-        PatchTraversal::Raster => 1,
-        PatchTraversal::MergeMajor(merge) => merge,
-    };
-    validate_patch_grid(grid, merge, None)?;
     let mut positions = Vec::new();
-    for &(time, height, width) in grid {
-        for temporal in 0..time {
-            match traversal {
-                PatchTraversal::Raster => {
-                    for y in 0..height {
-                        for x in 0..width {
-                            positions.push([temporal, y, x]);
-                        }
-                    }
-                }
-                PatchTraversal::MergeMajor(merge) => {
-                    for group_y in 0..height / merge {
-                        for group_x in 0..width / merge {
-                            for inner_y in 0..merge {
-                                for inner_x in 0..merge {
-                                    positions.push([
-                                        temporal,
-                                        group_y * merge + inner_y,
-                                        group_x * merge + inner_x,
-                                    ]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    visit_patch_positions(grid.iter().copied(), traversal, |position| {
+        positions.push(position)
+    })?;
     Ok(positions)
 }
 
@@ -224,58 +183,15 @@ pub fn bilinear_interpolation_samples(
     mode: InterpolationMode,
     traversal: PatchTraversal,
 ) -> Result<Vec<BilinearSample>, SequenceLayoutError> {
-    if source_height <= 0 || source_width <= 0 {
-        return Err(SequenceLayoutError::NonPositiveSourceTable {
-            height: source_height,
-            width: source_width,
-        });
-    }
-    let merge = match traversal {
-        PatchTraversal::Raster => 1,
-        PatchTraversal::MergeMajor(merge) => merge,
-    };
-    validate_patch_grid(grid, merge, None)?;
     let mut samples = Vec::new();
-    for &(time, height, width) in grid {
-        for _ in 0..time {
-            match traversal {
-                PatchTraversal::Raster => {
-                    for y in 0..height {
-                        for x in 0..width {
-                            samples.push(bilinear_sample(
-                                y,
-                                x,
-                                height,
-                                width,
-                                source_height,
-                                source_width,
-                                mode,
-                            )?);
-                        }
-                    }
-                }
-                PatchTraversal::MergeMajor(merge) => {
-                    for group_y in 0..height / merge {
-                        for group_x in 0..width / merge {
-                            for inner_y in 0..merge {
-                                for inner_x in 0..merge {
-                                    samples.push(bilinear_sample(
-                                        group_y * merge + inner_y,
-                                        group_x * merge + inner_x,
-                                        height,
-                                        width,
-                                        source_height,
-                                        source_width,
-                                        mode,
-                                    )?);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    visit_bilinear_samples(
+        grid.iter().copied(),
+        source_height,
+        source_width,
+        mode,
+        traversal,
+        |sample| samples.push(sample),
+    )?;
     Ok(samples)
 }
 
@@ -288,24 +204,36 @@ fn bilinear_sample(
     source_width: i32,
     mode: InterpolationMode,
 ) -> Result<BilinearSample, SequenceLayoutError> {
-    let axis = |position: i32, target: i32, source: i32| match mode {
-        InterpolationMode::AlignCorners => {
-            if target == 1 {
-                (0, 0, 0.0)
-            } else {
-                let value = position as f32 * (source - 1) as f32 / (target - 1) as f32;
-                let low = value.floor() as i32;
-                (low, (low + 1).min(source - 1), value - low as f32)
+    let axis = |position: i32, target: i32, source: i32| -> Result<_, SequenceLayoutError> {
+        Ok(match mode {
+            InterpolationMode::AlignCorners => {
+                if target == 1 {
+                    (0, 0, 0.0)
+                } else {
+                    let value = position as f32 * (source - 1) as f32 / (target - 1) as f32;
+                    let low = value.floor() as i32;
+                    (
+                        low,
+                        low.checked_add(1)
+                            .ok_or(SequenceLayoutError::Overflow)?
+                            .min(source - 1),
+                        value - low as f32,
+                    )
+                }
             }
-        }
-        InterpolationMode::HalfPixel => {
-            let value = (position as f32 + 0.5) * source as f32 / target as f32 - 0.5;
-            let low = value.floor() as i32;
-            (low, low + 1, value - low as f32)
-        }
+            InterpolationMode::HalfPixel => {
+                let value = (position as f32 + 0.5) * source as f32 / target as f32 - 0.5;
+                let low = value.floor() as i32;
+                (
+                    low,
+                    low.checked_add(1).ok_or(SequenceLayoutError::Overflow)?,
+                    value - low as f32,
+                )
+            }
+        })
     };
-    let (y0, y1, yf) = axis(y, target_height, source_height);
-    let (x0, x1, xf) = axis(x, target_width, source_width);
+    let (y0, y1, yf) = axis(y, target_height, source_height)?;
+    let (x0, x1, xf) = axis(x, target_width, source_width)?;
     let mut indices = [0_u32; 4];
     let mut weights = [0.0_f32; 4];
     for (corner, yy, xx, weight) in [
@@ -334,75 +262,16 @@ pub fn window_partition(
     window_size: i32,
     patch_size: i32,
 ) -> Result<WindowPartition, SequenceLayoutError> {
-    validate_patch_grid(grid, merge_size, None)?;
-    if patch_size <= 0 || window_size <= 0 {
-        return Err(SequenceLayoutError::WindowTooSmall {
-            window_size,
-            merge_size,
-            patch_size,
-        });
-    }
-    let merged_window = window_size / merge_size / patch_size;
-    if merged_window <= 0 {
-        return Err(SequenceLayoutError::WindowTooSmall {
-            window_size,
-            merge_size,
-            patch_size,
-        });
-    }
-    let merge_unit = merge_size
-        .checked_mul(merge_size)
-        .ok_or(SequenceLayoutError::Overflow)?;
     let mut permutation = Vec::new();
     let mut chunk_lengths = Vec::new();
-    let mut item_offset = 0_i32;
-    for &(time, height, width) in grid {
-        let merged_height = height / merge_size;
-        let merged_width = width / merge_size;
-        let windows_height = div_ceil(merged_height, merged_window)?;
-        let windows_width = div_ceil(merged_width, merged_window)?;
-        for temporal in 0..time {
-            for window_y in 0..windows_height {
-                for window_x in 0..windows_width {
-                    let mut groups = 0_i32;
-                    for inner_y in 0..merged_window {
-                        for inner_x in 0..merged_window {
-                            let y = window_y * merged_window + inner_y;
-                            let x = window_x * merged_window + inner_x;
-                            if y < merged_height && x < merged_width {
-                                let index = temporal
-                                    .checked_mul(merged_height)
-                                    .and_then(|value| value.checked_mul(merged_width))
-                                    .and_then(|value| {
-                                        y.checked_mul(merged_width)
-                                            .and_then(|row| value.checked_add(row))
-                                    })
-                                    .and_then(|value| value.checked_add(x))
-                                    .and_then(|value| value.checked_add(item_offset))
-                                    .ok_or(SequenceLayoutError::Overflow)?;
-                                permutation.push(index);
-                                groups += 1;
-                            }
-                        }
-                    }
-                    if groups > 0 {
-                        chunk_lengths.push(
-                            groups
-                                .checked_mul(merge_unit)
-                                .ok_or(SequenceLayoutError::Overflow)?,
-                        );
-                    }
-                }
-            }
-        }
-        item_offset = item_offset
-            .checked_add(
-                time.checked_mul(merged_height)
-                    .and_then(|value| value.checked_mul(merged_width))
-                    .ok_or(SequenceLayoutError::Overflow)?,
-            )
-            .ok_or(SequenceLayoutError::Overflow)?;
-    }
+    visit_window_partition(
+        grid.iter().copied(),
+        merge_size,
+        window_size,
+        patch_size,
+        |index| permutation.push(index),
+        |length| chunk_lengths.push(length),
+    )?;
     Ok(WindowPartition {
         permutation,
         chunk_lengths,
@@ -412,6 +281,32 @@ pub fn window_partition(
 /// Validates a permutation and returns its inverse.
 pub fn inverse_permutation(indices: &[i32]) -> Result<Vec<i32>, SequenceLayoutError> {
     let mut inverse = vec![-1; indices.len()];
+    fill_inverse_permutation(indices, &mut inverse)?;
+    Ok(inverse)
+}
+
+/// Runs the same permutation validator with a prepaid output destination.
+/// The caller retains the Context's metadata custody through use of the vector.
+pub fn inverse_permutation_with_metadata(
+    indices: &[i32],
+    context: &crate::workspace::WorkspaceContext,
+) -> Result<Vec<i32>, crate::Error> {
+    context.charge_metadata(
+        std::mem::size_of::<Result<Vec<i32>, crate::Error>>()
+            + std::mem::size_of::<SequenceLayoutError>()
+            + std::mem::size_of::<std::iter::Enumerate<std::slice::Iter<'_, i32>>>(),
+    )?;
+    let mut inverse = context.metadata_vec(indices.len())?;
+    inverse.resize(indices.len(), -1);
+    fill_inverse_permutation(indices, &mut inverse)
+        .map_err(|cause| context.metadata_source(cause))?;
+    Ok(inverse)
+}
+
+fn fill_inverse_permutation(
+    indices: &[i32],
+    inverse: &mut [i32],
+) -> Result<(), SequenceLayoutError> {
     for (position, &index) in indices.iter().enumerate() {
         let destination =
             usize::try_from(index).map_err(|_| SequenceLayoutError::PermutationOutOfRange {
@@ -432,7 +327,7 @@ pub fn inverse_permutation(indices: &[i32]) -> Result<Vec<i32>, SequenceLayoutEr
         }
         *slot = position as i32;
     }
-    Ok(inverse)
+    Ok(())
 }
 
 fn div_ceil(value: i32, divisor: i32) -> Result<i32, SequenceLayoutError> {
@@ -441,6 +336,9 @@ fn div_ceil(value: i32, divisor: i32) -> Result<i32, SequenceLayoutError> {
         .map(|value| value / divisor)
         .ok_or(SequenceLayoutError::Overflow)
 }
+
+#[cfg(test)]
+mod legacy_reference;
 
 #[cfg(test)]
 mod tests {

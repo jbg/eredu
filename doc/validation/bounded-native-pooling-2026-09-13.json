@@ -1,0 +1,95 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted native pooled/indexed attention workspace bounds and pooled-mask normalization",
+  "source_sha256": {
+    "doc/backend-architecture.md": "a1ccb8c023324c7afa916a8a1b486c83efcf41f9e3b77437c868c728a29740f9",
+    "doc/execution-control.md": "29676889b8bb6e199c35bc56b3bf9fd62d0f527b1771a3894f08e5de90269132",
+    "doc/bounded-inference.md": "a2f31710c495f69aeb473c3a886bff0d1b5bb461fe6626e5f6fd6a3d79da13c5",
+    "eredu-backend-mlx/src/backend/nn/workspace.rs": "741ed399a887e0dbc5cb8c03f3d06c8bcab17f9190658b23ec513f352cb7da15",
+    "eredu-backend-mlx/src/backend/nn/workspace/pooling.rs": "5606dcaf03777c19b1253c67c0cb07908736b41abf79ff01db631894e3dbcbe9",
+    "eredu-backend-mlx/src/backend/nn/workspace/pooling/tests.rs": "f41643c53f91857c418943b86ed62d164aefab7bffc422a1d5b1a3f8a46db75a",
+    "eredu-backend-mlx/src/backend/nn/workspace/sampling.rs": "52491319451979121a6b7eeecc107fb5d53eb988662c556ef34564b1eb0ebb9d",
+    "eredu-backend-mlx/src/backend/nn/workspace/host.rs": "50275c640c14bd0587e6ef001fb1dc46cb54bde2bacc6d6cc07f1e8fcc36a2fb",
+    "eredu-backend-mlx/src/backend/nn/workspace/matrix.rs": "4defa3cb226a62de6d6bbeb286dccfa4d8b2ec68a1cd0acc1f613f2386b92774",
+    "eredu-backend-mlx/src/backend/nn/workspace/attention.rs": "91b121e54991475375fac80bf436360772cae898df2e0835bc6287effce30750",
+    "eredu-backend-mlx/src/backend/nn/workspace/reduction.rs": "c14cc64516b55d14ffe9424b96a84f128a67e44baa27a51ccf6bb4b0fbd051a1",
+    "eredu-backend-mlx/src/backend/nn/workspace/softmax.rs": "412c3908a947b4695e56be27f28adc1fbc1384d198b88f2a5b90b39761329444",
+    "eredu-backend-mlx/src/backend/nn/attention.rs": "66b0e4e83e7e3049f2ace98969e31ea63fbec4dc37d566216d89450e2893d1e6",
+    "eredu-backend-mlx/src/backend/nn/attention/pooling.rs": "5c6d0867717246644cc45ccf46ab8a4859256715584a913c05decadd55dbe27a",
+    "eredu-backend-mlx/src/backend/nn/shared/core_backend.rs": "1299c0616fb741ed9ba52831a5c9311327ab3232c954edff2756d1f6f78b2d2c",
+    "eredu-backend-mlx/src/tests/distributed_pipeline_ring/unit_and_worker/prepared_workspace.rs": "b2d7cc058bf895c4c77b12b515b51614d45aec62831d974898b78f79da2e6564",
+    "safemlx-sys/src/mlx-c/CMakeLists.txt": "587feff147adb0ee2e61c79841c7dc87418d4b8692488f5ba748b0a2e1d399a6"
+  },
+  "native_source": {
+    "archive": "safemlx-sys/vendor/mlx-v0.32.0.tar.gz",
+    "sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+    "patch_set": "427f983b2956844066ee3c996df4dbc8789fa6652bf3fd43945986cc85e69a24",
+    "derivation_files_sha256": {
+      "mlx/einsum.cpp": "046db203cf41000e1ccf58159b6b07d4acd187fd3c37642bb4c2e3b35f9ffb3e",
+      "mlx/ops.cpp": "725dd3f5021a2f3d5ccf32d91f860a651c036785c77dba9022c8631e165d0a92",
+      "mlx/backend/metal/indexing.cpp": "c9fa7383e3d490c1bd12081cf882fb1b60dccd10fee56be353046db50925e786",
+      "mlx/backend/metal/sort.cpp": "b2f2252cdb65ae18934665ba4659aca9df878cca610221c444b069c1c85fb94c"
+    }
+  },
+  "coverage": {
+    "native_cases": 648,
+    "focused_tests": 8,
+    "workspace_regressions": 36,
+    "unique_tests": 42,
+    "cold_quote_trajectories": 84,
+    "new_released_checkpoint_comparisons": 0
+  },
+  "behavior": [
+    "Pooled attention composes native bank concatenation, broadcast-mask normalization, and selected fused/fallback SDPA facts. Indexed attention composes two direct selected gathers, four batch_tensordot contractions, score masks, shared sink softmax and context addition.",
+    "Einsum bounds include input/output transpose-reshape copies around the ordinary Metal matmul cast/layout/split-product bounds. Broadcast source banks and indices remain views; direct GatherAxis facts charge selected outputs without full-bank replication.",
+    "Pooled-position selection includes explicit F32 scoring, nonnegative clamp, head weighting and reduction, optional eligibility and native argpartition sort ping-pong/partition buffers. A selected tail retains the complete U32 index backing, checked against actual native allocation identity/capacity.",
+    "Native pooled masks accept broadcast-compatible batch/head/query shapes, convert Boolean eligibility to zero/negative-infinity when mixed with additive masks, use zero for an absent additive mask, and cast the joined additive mask to the promoted attention dtype.",
+    "Empty pooled-position history produces empty U32 output with bounded scalar backing.",
+    "648 native configurations cover F32/F16/BF16, contiguous/strided inputs, empty local or pooled history, 4097-position pooled banks, masks and sinks. Active Metal allocator peaks fit cold bounds. Attention outputs match independent scalar host softmax/dot equations; selected indices are unique and meet independently computed top-k thresholds; mask gathers match exact indexing.",
+    "Routed DeepSeek execution, pooling prompt-cache restoration, and native initial/cached prepared-workspace inspection pass. Complete cached model quotes still retain explicit unknown costs for other required operators."
+  ],
+  "tolerances": {
+    "attention_f32": {
+      "atol": 2e-05,
+      "rtol": 0.0002
+    },
+    "attention_f16_bf16": {
+      "atol": 0.004,
+      "rtol": 0.05
+    },
+    "selection_score_atol": 1e-05,
+    "gather": "exact",
+    "input_reference": "native inputs converted to F32 after measurement, preserving their actual rounding"
+  },
+  "limits": [
+    "This does not complete public request admission or full-family/path coverage. Relative attention, multi-axis rotary, grouped/native routing and addressable expert scheduling still have missing prices or composition, alongside materialization/transfers, paging, TP/PP, media, observations, speculation and independent copies.",
+    "Native bounds cover active managed payload storage through completion, not allocator cache, driver/JIT, total process or system memory. No new process-memory or released-checkpoint experiment was run.",
+    "The 36-test workspace suite leaves 31 separately controlled allocator benchmarks ignored; the new pooled benchmark was explicitly run in the focused suite. Two cold pooled tests occur in both commands, hence 42 unique tests rather than 44.",
+    "An initial test build used an incorrect stride-helper import; a subsequent native run exposed additive-mask precision incompatibility. The recorded final commands passed after both fixes.",
+    "Existing large-unwind linker and unused internal quote/helper warnings remain in logs."
+  ],
+  "checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib -- pooled_workspace_ metal_pooled_mechanisms indexed_attention_shares_softmax routed_deepseek_v4_ neutral_deepseek_v4_forward prepared_workspace_native_routed --include-ignored --test-threads=1 --nocapture",
+      "passed": 8,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-native-pooling-bounds-tests.log",
+      "sha256": "7c58e4dd427a30b1ab7b6c2aafd3279b53fbbd4bdadb388260e38acc327c877f"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib -- backend::nn::workspace:: --test-threads=1",
+      "passed": 36,
+      "ignored": 31,
+      "log": "/private/tmp/eredu-native-pooling-bounds-workspace-regression.log",
+      "sha256": "edffe2d2f7fdfbb5a92c80e926f8cefa419a694c5be74b11aac4675ed6c27817"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "passed": null,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-native-pooling-bounds-check-final.log",
+      "sha256": "0a407198f0f2ead597c3f28544d77fcf6645c97beafa0333fa6acd6ff551582d"
+    }
+  ]
+}

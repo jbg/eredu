@@ -2,6 +2,10 @@
 
 use super::*;
 
+mod prepared_copy;
+pub(crate) use prepared_copy::PreparedConcatCopy;
+mod workspace;
+
 /// A cache that appends all key/value states along the sequence axis.
 #[derive(Debug, Clone, Default)]
 pub struct ConcatKeyValueCache {
@@ -44,18 +48,23 @@ impl ConcatKeyValueCache {
     /// Independent snapshot of every logical element, including strided/windowed
     /// views. Preserve capacity, offsets and window metadata with the copied arrays.
     pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
-        let mut cache = self.clone();
-        cache.keys = self
-            .keys
-            .as_ref()
-            .map(|array| array.contiguous(false, stream)?.deep_clone())
-            .transpose()?;
-        cache.values = self
-            .values
-            .as_ref()
-            .map(|array| array.contiguous(false, stream)?.deep_clone())
-            .transpose()?;
-        Ok(cache)
+        self.prepare_isolated_copy().copy(stream)
+    }
+
+    pub(crate) fn prepare_isolated_copy(&self) -> PreparedConcatCopy<'_> {
+        PreparedConcatCopy::new(self)
+    }
+
+    pub(crate) fn matches_resident_reset_policy(&self, window: Option<i32>) -> bool {
+        !self.key_only
+            && self.max_size.is_none()
+            && self.step == 0
+            && self.attention_window == window
+    }
+
+    pub(crate) fn resident_fork_is_empty(&self) -> bool {
+        self.keys.is_none() && self.values.is_none() && self.offset == 0
+            && self.length == 0 && self.capacity == 0
     }
 
     /// Creates an empty concatenating key/value cache.
@@ -86,15 +95,34 @@ impl ConcatKeyValueCache {
         Ok(cache)
     }
 
+    /// The exact branch selected by checkpoint cloning, including padded slots.
+    /// Append-only views remain immutable; capacity-backed slots require copies.
+    pub(crate) fn visit_checkpoint_operands(&self,visit:&mut dyn FnMut(&Array,bool)) {
+        for source in self.keys.iter().chain(self.values.iter()) {visit(source,self.step>1);}
+    }
+    pub(crate) fn checkpoint_clone_control_bytes<E>(&self)->Option<usize> {
+        use std::mem::size_of;
+        self.prepare_isolated_copy().control_bytes::<E>()?.checked_add(size_of::<(
+            &Self,bool,&mut dyn FnMut(crate::backend::array_copy::IsolatedArrayCopy<'_>,bool)->Result<Array,E>,
+            crate::backend::array_copy::IsolatedArrayCopy<'_>,Result<Self,E>)>())
+    }
+    /// Shared checkpoint field assembly with an explicitly sourced array worker.
+    /// The bool is this cache's actual in-place-capacity branch, never policy
+    /// supplied by a backend caller or inferred from an unbound layout.
+    pub(crate) fn checkpoint_clone_with<E>(&self,
+        clone:&mut dyn FnMut(crate::backend::array_copy::IsolatedArrayCopy<'_>,bool)->Result<Array,E>)
+        ->Result<Self,E> {
+        self.prepare_isolated_copy().copy_with(&mut |source|clone(source,self.step>1))
+    }
+
     /// Snapshots the ordinary append-only cache without changing array layout.
     /// Capacity-backed caches can update storage in place and therefore still
     /// require an independent data copy.
     pub fn checkpoint_clone_state(&self) -> Result<Self, Exception> {
-        if self.step <= 1 {
-            Ok(self.clone())
-        } else {
-            self.deep_clone_state()
-        }
+        self.checkpoint_clone_with(&mut |source,copy| {
+            let array=source.source().clone();
+            if copy {array.deep_clone()} else {Ok(array)}
+        })
     }
 
     /// Creates a cache for exact causal sliding-window attention.
@@ -478,6 +506,12 @@ impl KeyValueCache for ConcatKeyValueCache {
 
 impl eredu_runtime::RuntimeLayerState<MlxNeuralBackend> for ConcatKeyValueCache {
     type RetainedValues<'a> = RetainedArrayIter<'a>;
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) {
+        for array in self.keys.iter().chain(self.values.iter()) {
+            visitor(retained_tensor(array));
+        }
+    }
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {
         [

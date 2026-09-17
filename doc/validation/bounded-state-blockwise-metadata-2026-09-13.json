@@ -1,0 +1,210 @@
+{
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted bounded inference implementation with exact-concatenation state and blockwise attention metadata",
+  "source_sha256": {
+    "eredu-nn/src/workspace.rs": "330efc77f09687f081af09458d056ba7b62dd357416336cb6d01019fa244dccc",
+    "eredu-nn/src/workspace/backend.rs": "d120da3e571f883274b55e3577ab458403c7a28f96a4af86d003e09e432a781e",
+    "eredu-nn/src/workspace/backend/blockwise.rs": "db05af74ceb121ada5cd2c07161d06903dcc9aff8e6b9a404fb30b466fb86db7",
+    "eredu-nn/src/workspace/tests.rs": "5821f5062a0fed77e58e484e6b828c612aeef26f8aa78e20c9742b3bfcf09ca3",
+    "eredu-nn/src/workspace/tests/blockwise.rs": "b160d9c8afe31a2fcae65677df454823aaf2f73e49ca57ef6f6c69c90d19e54e",
+    "eredu-runtime/src/working_memory.rs": "3b6511fd17edcb0ee0cedeee8dbe95af2328447625dc69001c46a98f1659b636",
+    "eredu-runtime/src/working_memory/state.rs": "78ca6e36c9e83ba3144bc9c9191985dbd0f045b56d021be1ef8e49d2db48c27d",
+    "eredu-runtime/src/working_memory/state/tests.rs": "4c7c419182ec3e237270b4b614d71e80090aaf6f8ab39d29afaa64667f7a932e",
+    "eredu-runtime/src/working_memory/submission.rs": "0d22caee24fe470396916afdbeb3ea1a33187d186957240bfc85a489089c3c64",
+    "eredu-runtime/src/working_memory/trace.rs": "2b6a10372716cd03ec0459543c399156418621f32618601ba06b9266287409d2",
+    "eredu-architectures/tests/workspace_estimation.rs": "38bb29c55d75abbb171404acdc8f0d05aad839fc5745bc7b9d511afec9cecd00",
+    "eredu-architectures/tests/workspace_estimation/hybrid.rs": "64af299388ef25351e99db8d0a4dfc75576fac1569bfaa54e6f2b409ff5cd88a",
+    "eredu-architectures/tests/workspace_estimation/blockwise.rs": "7918f5f59502e56b15e9403b941c28a2ab7ba5c0def943ca195145f128a8a4e1",
+    "eredu-architectures/src/qwen/hybrid/model.rs": "27b706ba8b346e9d60c38043c606d0fc016fff4ecb274f4f3b182f4eef1e74b5",
+    "eredu-architectures/src/qwen/hybrid/linear_attention.rs": "4a4146271145ea23cb92e6d0ad6b38c8767437c23fe9dbc15a7962525b819671",
+    "eredu-architectures/src/kimi_linear/mla.rs": "cef48ecb4e48ef636b583758390c9cf6244c6df6b29039735a46b2a87d5a8c04",
+    "eredu-backend-mlx/src/backend/runtime/cache/kv/contiguous.rs": "3c4855bc850eb86b4683263df6720de0c0a4daf60cb82f58189ead3da1079e26",
+    "eredu-backend-mlx/src/backend/nn/workspace.rs": "1332e3d5472d53aad338efa6515af6ff445454b8617c3e66411e811c5a80f9d9",
+    "doc/backend-architecture.md": "7d6234898bd9412cdba1cf14cddd091bde09ad9bd121f16dba657006131a8d40",
+    "doc/execution-control.md": "637a4e77d6446875f98087e4e437712fd8b2da7377befc1e9b0387660fbffc80",
+    "doc/bounded-inference.md": "ad2e68a691d89dd7b8a8a90374c63ffed1d292857a3ea99a47d855197dc65256"
+  },
+  "date": "2026-09-13",
+  "native_execution": false,
+  "metadata_allocation_mechanism": "explicit portable fixture allocation and host facts; never substituted for selected native facts",
+  "runtime_state": {
+    "factory": "WorkspaceConcatStateFactory",
+    "mechanism": "exact concatenation, key-only shared keys, full or sliding tail views, architecture-declared fixed components",
+    "ownership": "runtime realizes selected cache metadata; architecture supplies StateLayout and equations; native backends own actual storage and completion",
+    "backing": "sliding views retain full append allocation identity even when logical shape is smaller",
+    "failure": "publish state and frontier only after successful metadata operations; preceding successful charges remain after errors",
+    "reset_and_clone": "named-segment reset preserves policy; cheap metadata clones retain storage identity; neither refunds the ledger",
+    "exclusions": [
+      "capacity-backed caches",
+      "native compressed/paged/quantized cache storage",
+      "isolated native snapshot copies"
+    ]
+  },
+  "blockwise": {
+    "stages": [
+      "begin",
+      "accumulate",
+      "finish"
+    ],
+    "policy": [
+      "absolute query start/context end",
+      "ordered absolute key blocks, allowing gaps",
+      "mask origin including padded negative origin",
+      "causal sliding window and prefix",
+      "sinks",
+      "FP32 running maximum, sum and weighted values"
+    ],
+    "telemetry": "returned reconstruction bytes are logical K/V payloads, not native scratch bounds",
+    "completion": "all metadata operation charges remain in the containing span; no native completion authority",
+    "unknown_facts": "unpriced tensor or host stages remain unknown through finish",
+    "failure": "invalid geometry/context/range and fact failure leave the preceding accumulator state and charges intact"
+  },
+  "architecture_coverage": {
+    "qwen_hybrid": {
+      "families": [
+        "qwen3_5_text",
+        "qwen3_5_moe_text",
+        "qwen3_next"
+      ],
+      "driver": "LayerwiseRuntime with ResidentUnitWindow and ResidentExpertProvider; WorkspaceConcatStateFactory",
+      "batch": 2,
+      "prefix_positions": 2,
+      "input_positions": 7,
+      "chunks": [
+        1,
+        3,
+        7
+      ],
+      "output_demands": [
+        "StateOnly",
+        "LastPosition",
+        "Sequence"
+      ],
+      "tied": [
+        false,
+        true
+      ],
+      "weights": [
+        "dense",
+        "affine 4-bit group 32"
+      ],
+      "cached_decodes": 3,
+      "trajectories": 108,
+      "reported_spans": 720,
+      "checks": [
+        "prefix built through real equations",
+        "attention and fixed component frontiers",
+        "retained convolution/recurrent shape from StateLayout",
+        "KV shape",
+        "vocabulary input positions before projection",
+        "physical packed projection geometry",
+        "routed unit count"
+      ]
+    },
+    "kimi_latent_attention": {
+      "driver": "actual KimiLatentAttention forward with immutable metadata-block cache fixture",
+      "batch": 2,
+      "prefix_positions": 2,
+      "input_positions": 7,
+      "chunks": [
+        1,
+        3,
+        7
+      ],
+      "cached_decodes": 3,
+      "query": [
+        "direct",
+        "low rank"
+      ],
+      "reconstruction": [
+        "fused",
+        "split"
+      ],
+      "weights": [
+        "dense",
+        "affine 4-bit group 32"
+      ],
+      "mask": [
+        "none",
+        "explicit causal"
+      ],
+      "maximum_block_positions": 3,
+      "trajectories": 48,
+      "reported_spans": 320,
+      "checks": [
+        "complete ordered absolute cache coverage",
+        "query/context/mask coordinates",
+        "asymmetric key and value geometry",
+        "running-state carry",
+        "logical reconstruction diagnostic"
+      ],
+      "fixture_exclusion": "does not describe native compressed-cache capacity, paging transfers, or isolated snapshot allocation"
+    }
+  },
+  "validation": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-nn --all-features --lib",
+      "result": "pass",
+      "log": "/private/tmp/eredu-blockwise-state-neural-tests.log",
+      "log_sha256": "a408818f3e7a28c74e8abc669b21b1392c942fa906c2024cc15061c7d825737e",
+      "verified_output": [
+        "75 passed; 0 failed"
+      ]
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib working_memory",
+      "result": "pass",
+      "log": "/private/tmp/eredu-blockwise-state-runtime-tests.log",
+      "log_sha256": "9e2da2d84f5e02ef35f4801d9a1ac277416cb568b512f21a3cf1c3a9694d1c42",
+      "verified_output": [
+        "12 passed; 0 failed"
+      ]
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test workspace_estimation",
+      "result": "pass",
+      "log": "/private/tmp/eredu-blockwise-state-architecture-tests.log",
+      "log_sha256": "6fcad9460d5dccaa2bc2fcd9a3b65fc5481ab333dbff747389d9d886becbd50b",
+      "verified_output": [
+        "10 passed; 0 failed"
+      ]
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "result": "pass",
+      "log": "/private/tmp/eredu-blockwise-state-facade-tests.log",
+      "log_sha256": "97525610a895e1a99bd184d4e9a8bd7537535f5b3f007445b724fcc1b62a6d83",
+      "verified_output": [
+        "83 passed; 0 failed; 0 ignored",
+        "19 passed; 0 failed; 1 ignored"
+      ]
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --tests --features metal,accelerate",
+      "result": "pass",
+      "log": "/private/tmp/eredu-blockwise-state-native-check.log",
+      "log_sha256": "fa4aafed36c1770cc9d6a3718cff50caf0967a95ba1c2f67293afa0decacf89d",
+      "verified_output": [
+        "Finished `dev`"
+      ]
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "result": "pass",
+      "log": "/private/tmp/eredu-blockwise-state-portable-native-check.log",
+      "log_sha256": "fbf9831b6e045bdd11429150fb3659a60c09320472d26cc762e7db290431fb88",
+      "verified_output": [
+        "Finished `dev`"
+      ]
+    }
+  ],
+  "ignored_test": "lfm_checkpoint_native_tool_activation_with_portable_backend requires external EREDU_LFM2_TOOL_CHECKPOINT; existing omission",
+  "remaining": [
+    "complete family state-profile tracing and selected cache metadata",
+    "missing native tensor and managed-host operation bounds",
+    "materialization/media/speculation/observation/snapshot resource composition",
+    "production reservation wiring through preparation, prefill, decode and concurrent work",
+    "remaining family/path conformance"
+  ],
+  "prior_released_checkpoint_measurements": "unchanged; this validation adds no native numerical or allocation measurements"
+}

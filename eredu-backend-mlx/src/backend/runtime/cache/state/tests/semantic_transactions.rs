@@ -193,14 +193,15 @@ fn hybrid_constructor_preserves_paged_attention_and_device_fixed_state() {
 
     let state = MlxHybridState::from_selected(&selected, Some(manager()), None).unwrap();
     assert!(matches!(
-        state.layers[0].attention,
+        state.layers.slots()[0].attention,
         Some(MlxHybridAttentionState::KeyValue(
             MlxKeyValueLayerState::Paged(_)
         ))
     ));
-    assert!(state.layers[0]
+    assert!(state.layers.slots()[0]
         .fixed
-        .contains_key(&StateTensorRole::Recurrent));
+        .iter()
+        .any(|(role, _)| *role == StateTensorRole::Recurrent));
 }
 
 #[test]
@@ -238,14 +239,10 @@ fn fixed_only_hybrid_prompt_cache_round_trips_without_attention() {
     );
     let mut state = MlxHybridState::from_selected(&selected, Some(manager()), None).unwrap();
     let values = [1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0];
-    state.layers[0].fixed.insert(
-        role,
-        Some(MlxTensor::from_array(Array::from_slice(
-            &values,
-            &[1, 2, 3],
-        ))),
-    );
-    state.layers[0].fixed_offset = 3;
+    *state.layers.slots_mut()[0].fixed_component(role).unwrap() = Some(MlxTensor::from_array(
+        Array::from_slice(&values, &[1, 2, 3]),
+    ));
+    state.layers.slots_mut()[0].fixed_offset = 3;
 
     let segment = PromptCacheStateSegment::new("state", 0..1).unwrap();
     let identity = PromptCacheModelIdentity::new(
@@ -293,8 +290,10 @@ fn fixed_only_hybrid_prompt_cache_round_trips_without_attention() {
     restored
         .restore_prompt_cache_state(tensors, 3, &[0])
         .unwrap();
-    assert_eq!(restored.layers[0].position(), 3);
-    let restored = restored.layers[0].fixed[&role]
+    assert_eq!(restored.layers.slots()[0].position(), 3);
+    let restored = restored.layers.slots_mut()[0]
+        .fixed_component(role)
+        .unwrap()
         .as_ref()
         .unwrap()
         .as_array()
@@ -326,18 +325,18 @@ fn hybrid_commit_clones_only_the_architecture_named_segment() {
     .unwrap();
     let mut canonical = MlxHybridState::device(layout.clone()).unwrap();
     let mut draft = MlxHybridState::device(layout).unwrap();
-    canonical.layers[0].fixed_offset = 1;
-    canonical.layers[1].fixed_offset = 2;
-    canonical.layers[2].fixed_offset = 3;
-    draft.layers[0].fixed_offset = 10;
-    draft.layers[1].fixed_offset = 20;
-    draft.layers[2].fixed_offset = 30;
+    canonical.layers.slots_mut()[0].fixed_offset = 1;
+    canonical.layers.slots_mut()[1].fixed_offset = 2;
+    canonical.layers.slots_mut()[2].fixed_offset = 3;
+    draft.layers.slots_mut()[0].fixed_offset = 10;
+    draft.layers.slots_mut()[1].fixed_offset = 20;
+    draft.layers.slots_mut()[2].fixed_offset = 30;
 
     canonical.commit_segment_from(&draft, "prediction").unwrap();
 
-    assert_eq!(canonical.layers[0].fixed_offset, 1);
-    assert_eq!(canonical.layers[1].fixed_offset, 2);
-    assert_eq!(canonical.layers[2].fixed_offset, 30);
+    assert_eq!(canonical.layers.slots()[0].fixed_offset, 1);
+    assert_eq!(canonical.layers.slots()[1].fixed_offset, 2);
+    assert_eq!(canonical.layers.slots()[2].fixed_offset, 30);
 }
 
 #[test]
@@ -355,7 +354,7 @@ fn paged_transaction_discard_restores_shared_manager_frontier() {
     let canonical = MlxKeyValueState::paged(layout(None), manager(), None).unwrap();
     assert!(!canonical.permits_parallel_branches());
     let branch = canonical.branch().unwrap();
-    let manager = match &branch.state.layers[0] {
+    let manager = match &branch.state.layers.slots()[0] {
         MlxKeyValueLayerState::Paged(cache) => cache.manager().clone(),
         MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => unreachable!(),
     };
@@ -389,7 +388,7 @@ fn paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback() {
     let mut canonical = MlxKeyValueState::paged(segmented_layout(), manager.clone(), None).unwrap();
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     for (layer, value) in [(0usize, 1.0f32), (1, 2.0)] {
-        canonical.layers[layer]
+        canonical.layers.slots_mut()[layer]
             .update_and_fetch(
                 Array::from_slice(&[value; 5], &[1, 1, 5, 1]),
                 Array::from_slice(&[value + 10.0; 5], &[1, 1, 5, 1]),
@@ -397,8 +396,8 @@ fn paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback() {
             )
             .unwrap();
     }
-    assert_eq!(KeyValueCache::offset(&canonical.layers[0]), 5);
-    assert_eq!(KeyValueCache::offset(&canonical.layers[1]), 5);
+    assert_eq!(KeyValueCache::offset(&canonical.layers.slots()[0]), 5);
+    assert_eq!(KeyValueCache::offset(&canonical.layers.slots()[1]), 5);
     assert!(!manager
         .layer_block_ids(0, CacheRepresentation::KeyValue, 0, i64::MAX, 0)
         .unwrap()
@@ -412,8 +411,8 @@ fn paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback() {
         .reset_segment(&StateSegmentId::new("depth").unwrap())
         .unwrap();
 
-    assert_eq!(KeyValueCache::offset(&canonical.layers[0]), 5);
-    assert_eq!(KeyValueCache::offset(&canonical.layers[1]), 0);
+    assert_eq!(KeyValueCache::offset(&canonical.layers.slots()[0]), 5);
+    assert_eq!(KeyValueCache::offset(&canonical.layers.slots()[1]), 0);
     assert!(!manager
         .layer_block_ids(0, CacheRepresentation::KeyValue, 0, i64::MAX, 0)
         .unwrap()
@@ -424,7 +423,7 @@ fn paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback() {
         .is_empty());
 
     let mut discarded = canonical.branch().unwrap();
-    discarded.layers[1]
+    discarded.layers.slots_mut()[1]
         .update_and_fetch(
             Array::from_slice(&[3.0f32; 2], &[1, 1, 2, 1]),
             Array::from_slice(&[4.0f32; 2], &[1, 1, 2, 1]),
@@ -432,11 +431,11 @@ fn paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback() {
         )
         .unwrap();
     MlxKeyValueState::discard_branch(discarded).unwrap();
-    assert_eq!(KeyValueCache::offset(&canonical.layers[0]), 5);
-    assert_eq!(KeyValueCache::offset(&canonical.layers[1]), 0);
+    assert_eq!(KeyValueCache::offset(&canonical.layers.slots()[0]), 5);
+    assert_eq!(KeyValueCache::offset(&canonical.layers.slots()[1]), 0);
 
     let mut resumed = canonical.branch().unwrap();
-    resumed.layers[1]
+    resumed.layers.slots_mut()[1]
         .update_and_fetch(
             Array::from_slice(&[5.0f32; 2], &[1, 1, 2, 1]),
             Array::from_slice(&[6.0f32; 2], &[1, 1, 2, 1]),
@@ -444,8 +443,8 @@ fn paged_depth_segment_reset_preserves_temporal_pages_and_later_rollback() {
         )
         .unwrap();
     canonical.commit_branch(resumed).unwrap();
-    assert_eq!(KeyValueCache::offset(&canonical.layers[0]), 5);
-    assert_eq!(KeyValueCache::offset(&canonical.layers[1]), 2);
+    assert_eq!(KeyValueCache::offset(&canonical.layers.slots()[0]), 5);
+    assert_eq!(KeyValueCache::offset(&canonical.layers.slots()[1]), 2);
 }
 
 #[test]
@@ -460,14 +459,14 @@ fn paged_sliding_transaction_fails_before_branch_publication() {
 fn mlx_realtime_transaction_paged_rollback_release_resume() {
     let mut canonical = MlxKeyValueState::paged(layout(None), manager(), None).unwrap();
     let mut branch = canonical.branch().unwrap();
-    let manager = match &branch.state.layers[0] {
+    let manager = match &branch.state.layers.slots()[0] {
         MlxKeyValueLayerState::Paged(cache) => cache.manager().clone(),
         MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => unreachable!(),
     };
     let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
     let keys = Array::from_slice(&[1.0_f32; 5], &[1, 1, 5, 1]);
     let values = Array::from_slice(&[2.0_f32; 5], &[1, 1, 5, 1]);
-    branch.state.layers[0]
+    branch.state.layers.slots_mut()[0]
         .update_and_fetch(keys, values, &stream)
         .unwrap();
     assert_eq!(manager.report().unwrap().logical_cached_tokens, 5);
@@ -481,7 +480,7 @@ fn mlx_realtime_transaction_paged_rollback_release_resume() {
     let mut resumed = canonical.branch().unwrap();
     let keys = Array::from_slice(&[3.0_f32; 2], &[1, 1, 2, 1]);
     let values = Array::from_slice(&[4.0_f32; 2], &[1, 1, 2, 1]);
-    resumed.state.layers[0]
+    resumed.state.layers.slots_mut()[0]
         .update_and_fetch(keys, values, &stream)
         .unwrap();
     canonical.commit_branch(resumed).unwrap();
@@ -507,14 +506,18 @@ fn key_value_profiles_keep_stateless_invocations_empty_through_snapshots() {
         MlxKeyValueState::device(layout.clone()).unwrap(),
         MlxKeyValueState::paged(layout.clone(), manager(), None).unwrap(),
     ] {
-        assert!(matches!(state.layers[1], MlxKeyValueLayerState::Stateless));
+        assert!(matches!(
+            state.layers.slots()[1],
+            MlxKeyValueLayerState::Stateless
+        ));
         assert_eq!(
-            RuntimeLayerState::<MlxNeuralBackend>::retained_values(&state.layers[1]).count(),
+            RuntimeLayerState::<MlxNeuralBackend>::retained_values(&state.layers.slots()[1])
+                .count(),
             0
         );
         let keys = Array::from_slice(&[0.5_f32; 8], &[1, 1, 1, 8]);
         assert!(KeyValueCache::update_for_attention(
-            &mut state.layers[1],
+            &mut state.layers.slots_mut()[1],
             keys.clone(),
             keys.clone(),
             &stream
@@ -522,17 +525,28 @@ fn key_value_profiles_keep_stateless_invocations_empty_through_snapshots() {
         .is_err());
         let isolated = state.isolated_snapshot(&stream).unwrap();
         assert!(matches!(
-            isolated.layers[1],
+            isolated.layers.slots()[1],
             MlxKeyValueLayerState::Stateless
         ));
         let snapshot = state.deep_clone_state().unwrap();
-        KeyValueCache::update_for_attention(&mut state.layers[0], keys.clone(), keys, &stream)
-            .unwrap();
-        assert_eq!(KeyValueCache::offset(&state.layers[0]), 1);
+        KeyValueCache::update_for_attention(
+            &mut state.layers.slots_mut()[0],
+            keys.clone(),
+            keys,
+            &stream,
+        )
+        .unwrap();
+        assert_eq!(KeyValueCache::offset(&state.layers.slots()[0]), 1);
         state.restore_checkpoint(&snapshot, &stream).unwrap();
-        assert_eq!(KeyValueCache::offset(&state.layers[0]), 0);
+        assert_eq!(KeyValueCache::offset(&state.layers.slots()[0]), 0);
         let branch = state.branch().unwrap();
         state.commit_branch(branch).unwrap();
-        assert!(matches!(state.layers[1], MlxKeyValueLayerState::Stateless));
+        assert!(matches!(
+            state.layers.slots()[1],
+            MlxKeyValueLayerState::Stateless
+        ));
     }
 }
+
+#[path = "semantic_transactions/original_realtime.rs"]
+mod original_realtime;

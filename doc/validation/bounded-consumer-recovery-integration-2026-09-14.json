@@ -1,0 +1,615 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T09:21:28.938714+00:00",
+  "scope": "Original consumer controls, guarded submission and ordinary retirement, and native text ingress",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-original-native-sequence-integration-2026-09-14.json",
+  "tests": {
+    "core": {
+      "passed": 442,
+      "ignored": 0
+    },
+    "runtime": {
+      "passed": 1443,
+      "ignored": 0
+    },
+    "doctests": {
+      "passed": 5,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 226,
+      "ignored": 2
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    },
+    "recovery": {
+      "passed": 41,
+      "ignored": 0
+    },
+    "completion": {
+      "passed": 37,
+      "ignored": 3
+    },
+    "transfer": {
+      "passed": 14,
+      "ignored": 0
+    },
+    "materialization": {
+      "passed": 17,
+      "ignored": 1
+    },
+    "session": {
+      "passed": 371,
+      "ignored": 0
+    },
+    "input": {
+      "passed": 7,
+      "ignored": 0
+    },
+    "prompt": {
+      "passed": 1,
+      "ignored": 0
+    },
+    "ordinary": {
+      "passed": 5,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 2743,
+  "new_tests": [
+    {
+      "check": "facade",
+      "name": "consumer_failure_order_retires_nonowning_controls_before_actual_owner",
+      "path": "eredu/src/runtime/generation/streaming/cursor_storage/consumer.rs"
+    },
+    {
+      "check": "facade",
+      "name": "original_consumer_rejects_unassociated_and_foreign_same_size_before_readiness",
+      "path": "eredu/src/runtime/generation/streaming/cursor_storage/tests/consumer.rs"
+    },
+    {
+      "check": "facade",
+      "name": "original_consumer_consumes_source_failure_and_preserves_concrete_error_through_erasure",
+      "path": "eredu/src/runtime/generation/streaming/cursor_storage/tests/consumer.rs"
+    },
+    {
+      "check": "facade",
+      "name": "original_consumer_pipeline_cause_retires_before_its_consumed_cursor",
+      "path": "eredu/src/runtime/generation/streaming/cursor_storage/tests/consumer.rs"
+    },
+    {
+      "check": "facade",
+      "name": "original_consumer_preparation_cause_keeps_original_owner_inside_existing_first_readiness",
+      "path": "eredu/src/runtime/generation/streaming/cursor_storage/tests/consumer.rs"
+    },
+    {
+      "check": "facade",
+      "name": "original_consumer_ordinary_and_controlled_advance_freeze_without_copy_and_keep_cancel_counts",
+      "path": "eredu/src/runtime/generation/streaming/cursor_storage/tests/consumer.rs"
+    },
+    {
+      "check": "facade",
+      "name": "original_consumer_delivery_lifecycle_and_missing_terminal_failures_keep_cursor_owner",
+      "path": "eredu/src/runtime/generation/streaming/cursor_storage/tests/consumer.rs"
+    },
+    {
+      "check": "core",
+      "name": "consumer_request_default_rejects_before_existing_sequence_hook_or_work",
+      "path": "eredu-core/src/backend/text_step/tests/sequence_preparation/consumer.rs"
+    },
+    {
+      "check": "core",
+      "name": "consumer_provider_verification_rejects_missing_and_equal_size_foreign_types_with_owner",
+      "path": "eredu-core/src/backend/text_step/tests/sequence_preparation/consumer.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_consumer_controls_add_exact_r_and_preserve_admission_phases_for_all_drivers",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/consumer.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_consumer_exact_minus_one_rejects_original_width_one_before_binding_or_work",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/consumer.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_consumer_result_and_partial_iterator_keep_same_explicit_source_transition",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/consumer.rs"
+    },
+    {
+      "check": "input",
+      "name": "text_token_extraction_preserves_single_backing_and_ordered_segments",
+      "path": "eredu-backend-mlx/src/backend/runtime/media/input.rs"
+    },
+    {
+      "check": "input",
+      "name": "text_token_extraction_validates_all_parts_before_selecting_payloads",
+      "path": "eredu-backend-mlx/src/backend/runtime/media/input.rs"
+    },
+    {
+      "check": "recovery",
+      "name": "concrete_and_erased_nodes_unbox_before_probe_and_custody_under_the_guard",
+      "path": "eredu-backend-mlx/src/backend/submission_recovery/owner_tests.rs"
+    },
+    {
+      "check": "recovery",
+      "name": "operation_unwind_seals_once_without_poisoning_or_observing_its_recovery",
+      "path": "eredu-backend-mlx/src/backend/submission_recovery/owner_tests.rs"
+    },
+    {
+      "check": "recovery",
+      "name": "callback_panic_preserves_the_current_node_and_unvisited_snapshot",
+      "path": "eredu-backend-mlx/src/backend/submission_recovery/owner_tests.rs"
+    },
+    {
+      "check": "recovery",
+      "name": "busy_fallback_callback_panic_retains_the_same_poisoned_node",
+      "path": "eredu-backend-mlx/src/backend/submission_recovery/owner_tests.rs"
+    },
+    {
+      "check": "recovery",
+      "name": "seal_panic_keeps_its_exact_payload_and_preallocated_owner",
+      "path": "eredu-backend-mlx/src/backend/submission_recovery/owner_tests.rs"
+    },
+    {
+      "check": "recovery",
+      "name": "callback_failure_before_sealing_closes_actual_thread_capture_without_releasing_it",
+      "path": "eredu-backend-mlx/src/backend/submission_recovery/owner_tests.rs"
+    },
+    {
+      "check": "recovery",
+      "name": "retirement_callback_can_inspect_the_orphan_queue_without_a_live_list_borrow",
+      "path": "eredu-backend-mlx/src/backend/submission_recovery/owner_tests.rs"
+    },
+    {
+      "check": "recovery",
+      "name": "progress_panic_during_consuming_finish_preserves_the_original_payload_and_owner",
+      "path": "eredu-backend-mlx/src/backend/submission_recovery/owner_tests.rs"
+    },
+    {
+      "check": "recovery",
+      "name": "busy_queue_retains_every_detached_link_without_invoking_callbacks",
+      "path": "eredu-backend-mlx/src/backend/submission_recovery/owner_tests.rs"
+    },
+    {
+      "check": "session",
+      "name": "recovery_node_keeps_actual_original_custody_through_typed_and_erased_retirement",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/capture/tests/controls/recovery_nodes.rs"
+    },
+    {
+      "check": "session",
+      "name": "poisoned_real_scope_retains_original_account_and_lease_after_callback_unwind",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/capture/tests/controls/recovery_nodes.rs"
+    },
+    {
+      "check": "session",
+      "name": "actual_completion_extractor_releases_its_loan_before_finish_or_drop_callbacks",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/output_completion/recovery_slot_tests.rs"
+    }
+  ],
+  "new_test_count": 26,
+  "checks": {
+    "core": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib",
+      "started_utc": "2026-09-14T09:11:11.425143+00:00",
+      "elapsed_seconds": 16.539,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-core.log",
+      "log_sha256": "9245d2eaa00f28aafea8d647c7ca47427004d549196e30ac481e9731685431d1"
+    },
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib --test backend_independence --test bounded_prefill",
+      "started_utc": "2026-09-14T09:11:27.965898+00:00",
+      "elapsed_seconds": 33.74,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-runtime.log",
+      "log_sha256": "3e825c3fc3fa6d558a1ae0b4dca387cc0ed3775b268c23a8993623c3f2b9596c"
+    },
+    "doctests": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core -p eredu-runtime --doc",
+      "started_utc": "2026-09-14T09:12:01.709167+00:00",
+      "elapsed_seconds": 1.708,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-doctests.log",
+      "log_sha256": "fe29ecc8fbf9227169a7f1c152a7af168d85ca429a3f7d6de5c0035cb6fea8c3"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib",
+      "started_utc": "2026-09-14T09:12:03.417390+00:00",
+      "elapsed_seconds": 42.209,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-facade.log",
+      "log_sha256": "1b59aad842c13f2ee3d2b417df1b9b5350983119721871a93fe53b2d8c1869a6"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T09:12:45.628519+00:00",
+      "elapsed_seconds": 19.313,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-portable.log",
+      "log_sha256": "60b9fa5d9889c2343756402a2a0679f5502182e4d2805c1f5d94088252c27b19"
+    },
+    "recovery": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib submission -- --test-threads=1",
+      "started_utc": "2026-09-14T09:19:30.060157+00:00",
+      "elapsed_seconds": 0.485,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-recovery.log",
+      "log_sha256": "d8f21c711024fddd95dca127ad2b35bb748358e75df7c00cbda855464005c084"
+    },
+    "completion": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib completion -- --test-threads=1",
+      "started_utc": "2026-09-14T09:19:30.546567+00:00",
+      "elapsed_seconds": 0.711,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-completion.log",
+      "log_sha256": "9432911ac01683cd7ffe7dd0ee4368b054ba5baac603f4123d90bd6ed19497fd"
+    },
+    "transfer": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib transfer -- --test-threads=1",
+      "started_utc": "2026-09-14T09:19:31.258344+00:00",
+      "elapsed_seconds": 0.336,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-transfer.log",
+      "log_sha256": "86065229fa5ca5e401794744c6fe790283752ca9ef4091b80e3057c7ff8d82f2"
+    },
+    "materialization": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib materialization -- --test-threads=1",
+      "started_utc": "2026-09-14T09:19:31.595081+00:00",
+      "elapsed_seconds": 0.361,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-materialization.log",
+      "log_sha256": "ca7e2294296e306bdfdd3831941da3c76c6c06203465bcdc6bf1052e639f4e22"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T09:19:32.095387+00:00",
+      "elapsed_seconds": 18.698,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-session.log",
+      "log_sha256": "100bfc251cffd51cdbb9f7ecf3df433fe6afa84708de8ef5162ca9bf39773ceb"
+    },
+    "input": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::runtime::media::input::tests:: -- --test-threads=1",
+      "started_utc": "2026-09-14T09:19:50.794793+00:00",
+      "elapsed_seconds": 0.312,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-input.log",
+      "log_sha256": "45f5e3cbcbaa149363e382c3cfefe057fed0a34d9218f15ac529a8959170cdf8"
+    },
+    "prompt": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib metal_text_prompt_preparation_prices_complete_backing_across_chunks -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T09:19:51.107458+00:00",
+      "elapsed_seconds": 0.282,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-prompt.log",
+      "log_sha256": "7d92e6f79dd4c73aff631966f27c6f75b0f70ae7c08fadb1d46f0d898c2980a7"
+    },
+    "ordinary": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::ordinary_retirement::tests:: -- --test-threads=1",
+      "started_utc": "2026-09-14T09:19:31.956939+00:00",
+      "elapsed_seconds": 0.138,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-ordinary.log",
+      "log_sha256": "36bbfe518173ab4e5b367eaded38a96fb3da9d07c0f61a19833be859179eccff"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T09:19:51.389675+00:00",
+      "elapsed_seconds": 19.587,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-minimal.log",
+      "log_sha256": "39d800cd620ae563825cb2bece38a8329d17728ff6c59ecca3abeb0c7d7e7e73"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T09:20:10.977694+00:00",
+      "elapsed_seconds": 20.686,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-consumer-recovery-integration-features.log",
+      "log_sha256": "6dc6a946001421f7705f545f4cd49d329aea4acab967e439d56ed4ba60f6c392"
+    }
+  },
+  "source_sha256": {
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/harness.rs": "726d50d27fdbb6e8ab7c26acd3f3ee4a2eb06bf5483e36735ec23d6ce9328d15",
+    "doc/bounded-inference.md": "4efde20dfa12c4da2ea158f78c9c36a9eb35ebac4d8658ab193c23593d9c2962",
+    "doc/execution-control.md": "2bb91fdb0ba4a571e07a3b400cfc621630bab7032b410aa5f3d87d65a54b6203",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence.rs": "e79d0f0729d29ec996eb8b8b2295ec597777d62149f49ea6b7940b3c10c72e95",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/consumer.rs": "3bccea445f1fc97f24b39423d31dcb7f54663877f5b9f9885d0b7ea6eb3bcc5f",
+    "doc/backend-architecture.md": "7ac19d01c86aa72419ce927883d058c6752bb8b34fab9126aadedf6a5e307b9c",
+    "eredu-core/src/backend/preparation/sequence.rs": "b23e175335364426e1ce7576f4087b1070a76f5ef3a6408f67540e2418a22d8b",
+    "eredu/src/runtime/generation/streaming/cursor_storage/tests.rs": "37b006bb77ed2e679031f5b680b7f9e4be34fcf1b625e25e7d7d65b085fd840f",
+    "eredu-core/src/backend/preparation.rs": "bba1f9a72a76b39c154648404dcb21abadc890e1b656835fed39b6b3db4ba094",
+    "eredu/src/runtime/generation/streaming/cursor_storage.rs": "f8818595a060a90514dcc3541a634f35cf2cab89f6b9f2744887209df6413989",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/capture/tests/controls/recovery_nodes.rs": "aac0b9001f7e764bcc1a001f83cb409f66ac7d9f2075b9b66a5b558a23ed5250",
+    "eredu-core/src/backend/preparation/sequence/consumer.rs": "3479c2194b519bfd012238287cf5404c3d60d12420241c34457a67430e2f00d8",
+    "eredu-runtime/src/working_memory/residual/span_workspace/text_controls/sequence/storage.rs": "7e0fade0c6f1e94e920550a66b23e33b6b977903f88e1f88b9af1a4eb5aabae6",
+    "eredu-backend-mlx/src/backend/submission_recovery/owner_tests.rs": "baa667df0481b924c352932d2b26cbb2393863139707d198e5f4786bdad99979",
+    "eredu-core/src/backend.rs": "8b6d7baabe00846c308d0aa1696ff75889902807d3019d21ad18e5f76700abe1",
+    "eredu-backend-mlx/src/composition/mlx/session/output_completion.rs": "ae4ce576c0c37615dd2144e935b3dddc2ae179ce3cfa1c152986a9e622098324",
+    "eredu-core/src/generation/sequence_storage.rs": "b7f782ec8e2c677edc47ca20bea794f4f798152ade9b5c5df550dca4983149a7",
+    "eredu/src/runtime/generation/streaming/cursor_storage/consumer.rs": "ec913f5f8ad0143601d4e3289f2812bad9e8cf1dc6cd7f3803e16337d7e7223b",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "3646a61b350018b45a33cf9c73c61fc6a37d6d1a65df4083dec58d51411c399b",
+    "eredu-backend-mlx/src/backend/ordinary_retirement.rs": "b81bad31454143a59d0d3e8c9bfb1ec6aad7488a89a20f7c911bb5b3ad63b83d",
+    "eredu/src/runtime/generation/streaming/cursor_storage/tests/consumer.rs": "2817fc1bc3c7aa0dae2c3d5d7135326c7738e7642c63bfc6cadf42ede18cd4f5",
+    "eredu-backend-mlx/src/backend/submission_recovery.rs": "00c22b7c63d72fe28b97ad75f57828158ad755af22e36ce9b2bcd1aaa9f7b115",
+    "eredu-backend-mlx/src/backend/runtime/media/input.rs": "e7636960b2c2df430b488cfaa40ba79621c17c68077db75ea95376bd63ead224",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/capture/tests/controls.rs": "1246c2238b4f7c0785903f384c6360ceac484184962d7919400d6a4dfdc9647e",
+    "eredu-core/src/lib.rs": "f99cfcec5a10b3f7dee661f8599cb467a759f40b62a797663212d8a40f8bbab8",
+    "eredu-core/src/backend/text_step/tests/sequence_preparation.rs": "0cdec355431634c08855f79cb8414147c5906dc7d7115878a412976c4497aa0f",
+    "eredu-core/src/backend/text_step/tests/sequence_preparation/consumer.rs": "fca43dc3741aec3117b71098d9177cea661517723d35df125442c45bc07a4e32",
+    "eredu-runtime/src/working_memory/residual/span_workspace/text_controls/sequence.rs": "5d820bc1eb56fa4d0455992f35efd4193bc598e24ad69c659fa80971c0958eda",
+    "eredu-backend-mlx/src/composition/mlx/session/output_completion/recovery_slot_tests.rs": "f25a976e94334ec092426179426ed85ac9a5ee15203a33d2e30547bda3ea82f7"
+  },
+  "source_snapshot": "/private/tmp/eredu-consumer-recovery-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-original-native-sequence-integration-2026-09-14.json": "f526138d292fffadf55c56bf90c2b3f35603a36e70c0d3165fd00df4940a552d",
+    "/private/tmp/eredu-consumer-admission-readiness-fixture.json": "7ae3f6e363faa84e344d50dd828f088e271d27f946809fbd6f4e68bde45dc998",
+    "/private/tmp/eredu-consumer-recovery-integration-admission-readiness-fixture-review.json": "43abc1ce1edf49035682e6c9727de41d0275a54d40fe6332ff80bad8106d9a3a",
+    "/private/tmp/eredu-consumer-recovery-integration-applied.json": "8ccbfb5866550b1f854eb9385c3b56c3958aad99e5abb92a936688f5f822d153",
+    "/private/tmp/eredu-consumer-recovery-integration-apply.py": "bfab7c9b9dbf399a6da1bbf3477d8b7f8a6539204cacfd5dd825903959f015b7",
+    "/private/tmp/eredu-consumer-recovery-integration-checks.json": "6c50fdfd3f08d203536a8bcf64b809080a93fca800363ecdca75b7857d5603ae",
+    "/private/tmp/eredu-consumer-recovery-integration-completion.log": "9432911ac01683cd7ffe7dd0ee4368b054ba5baac603f4123d90bd6ed19497fd",
+    "/private/tmp/eredu-consumer-recovery-integration-completion.log.1789377570546399000.previous": "8de8a61cf15b0387606c00d40eb413062a543747e7dd9d85a23e583e2eaac431",
+    "/private/tmp/eredu-consumer-recovery-integration-core-before-admission-fixture.log": "2a63ab980dc4565e2c336fe7ebd463207fc01b7c4ddbccc50775b9975feba8e8",
+    "/private/tmp/eredu-consumer-recovery-integration-core.log": "9245d2eaa00f28aafea8d647c7ca47427004d549196e30ac481e9731685431d1",
+    "/private/tmp/eredu-consumer-recovery-integration-core.log.1789377071424933000.previous": "2a63ab980dc4565e2c336fe7ebd463207fc01b7c4ddbccc50775b9975feba8e8",
+    "/private/tmp/eredu-consumer-recovery-integration-doc-applied.json": "337a7f0619021791827e4adaf24f3e84b53effb5a9228559713a9bf9f813e853",
+    "/private/tmp/eredu-consumer-recovery-integration-doctests.log": "fe29ecc8fbf9227169a7f1c152a7af168d85ca429a3f7d6de5c0035cb6fea8c3",
+    "/private/tmp/eredu-consumer-recovery-integration-facade.log": "1b59aad842c13f2ee3d2b417df1b9b5350983119721871a93fe53b2d8c1869a6",
+    "/private/tmp/eredu-consumer-recovery-integration-features.log": "6dc6a946001421f7705f545f4cd49d329aea4acab967e439d56ed4ba60f6c392",
+    "/private/tmp/eredu-consumer-recovery-integration-input.log": "45f5e3cbcbaa149363e382c3cfefe057fed0a34d9218f15ac529a8959170cdf8",
+    "/private/tmp/eredu-consumer-recovery-integration-input.log.1789377590794654000.previous": "142a5e1814ae97bc77849d9a8da2fc26ece9d6ebcffcbd84b46c5b59112a2245",
+    "/private/tmp/eredu-consumer-recovery-integration-materialization.log": "ca7e2294296e306bdfdd3831941da3c76c6c06203465bcdc6bf1052e639f4e22",
+    "/private/tmp/eredu-consumer-recovery-integration-materialization.log.1789377571594905000.previous": "ca7e2294296e306bdfdd3831941da3c76c6c06203465bcdc6bf1052e639f4e22",
+    "/private/tmp/eredu-consumer-recovery-integration-minimal.log": "39d800cd620ae563825cb2bece38a8329d17728ff6c59ecca3abeb0c7d7e7e73",
+    "/private/tmp/eredu-consumer-recovery-integration-ordinary.log": "36bbfe518173ab4e5b367eaded38a96fb3da9d07c0f61a19833be859179eccff",
+    "/private/tmp/eredu-consumer-recovery-integration-ordinary.log.1789377571956766000.previous": "67bde9f723926fce92e586f17436a583a12cf1db1b7ec231b29f892667c6bb7f",
+    "/private/tmp/eredu-consumer-recovery-integration-portable.log": "60b9fa5d9889c2343756402a2a0679f5502182e4d2805c1f5d94088252c27b19",
+    "/private/tmp/eredu-consumer-recovery-integration-prompt.log": "7d92e6f79dd4c73aff631966f27c6f75b0f70ae7c08fadb1d46f0d898c2980a7",
+    "/private/tmp/eredu-consumer-recovery-integration-prompt.log.1789377591107297000.previous": "7d92e6f79dd4c73aff631966f27c6f75b0f70ae7c08fadb1d46f0d898c2980a7",
+    "/private/tmp/eredu-consumer-recovery-integration-recovery.log": "d8f21c711024fddd95dca127ad2b35bb748358e75df7c00cbda855464005c084",
+    "/private/tmp/eredu-consumer-recovery-integration-recovery.log.1789377570059932000.previous": "bf9f40864875ec6d17fffe310119db9028c73ade42c559b12d1f6073d8d71417",
+    "/private/tmp/eredu-consumer-recovery-integration-review.json": "614c086d953dd81b1476c08e86785872bf2ce9fa1647992eb5d3f35cabbadd71",
+    "/private/tmp/eredu-consumer-recovery-integration-root-review.json": "50dc57c985960b0a2593ed2b1ae5fc58a1f0bdbb78e405902bd125b87a9205ad",
+    "/private/tmp/eredu-consumer-recovery-integration-runtime.log": "3e825c3fc3fa6d558a1ae0b4dca387cc0ed3775b268c23a8993623c3f2b9596c",
+    "/private/tmp/eredu-consumer-recovery-integration-session.log": "100bfc251cffd51cdbb9f7ecf3df433fe6afa84708de8ef5162ca9bf39773ceb",
+    "/private/tmp/eredu-consumer-recovery-integration-session.log.1789377572094976000.previous": "0d163e87fb6339f837475d2d3f853d1973aaf9e98c17ccefccd9e41a32f3b777",
+    "/private/tmp/eredu-consumer-recovery-integration-stage/all.patch": "062cb1667410b631d943598ec5f071399f53ab53447669e904cb8d594fcf4b69",
+    "/private/tmp/eredu-consumer-recovery-integration-stage/change.patch": "4e2c2aa2ec2523082ea1140bb0c3a899e8a5c3a0fc29e8d57743174c38ca7691",
+    "/private/tmp/eredu-consumer-recovery-integration-stage/manifest.json": "8ccbfb5866550b1f854eb9385c3b56c3958aad99e5abb92a936688f5f822d153",
+    "/private/tmp/eredu-consumer-recovery-integration-stage/staged-hashes.json": "e9709eb84e21595c6c38b5e97a7e81ac9f835029f1ed3d5ddbca2bc88d8e31b4",
+    "/private/tmp/eredu-consumer-recovery-integration-transfer.log": "86065229fa5ca5e401794744c6fe790283752ca9ef4091b80e3057c7ff8d82f2",
+    "/private/tmp/eredu-consumer-recovery-integration-transfer.log.1789377571258140000.previous": "86065229fa5ca5e401794744c6fe790283752ca9ef4091b80e3057c7ff8d82f2",
+    "/private/tmp/eredu-consumer-recovery-integration-validate.py": "f7ccb389f13164012a0caf8be80b258c71d21e7b04a1e23963f064fb4420d180",
+    "/private/tmp/eredu-consumer-recovery-integration-validation-config.json": "920425d9ec9d6f62a549048e78369972625752af5e614b7040a55c5b397cbd88",
+    "/private/tmp/eredu-extend-consumer-with-borrowed-ingress.json": "1ae1c053080a6e8cdf2d2d12ee4481c40e9376d4d128fbf0588a71f4cbb29940",
+    "/private/tmp/eredu-extend-consumer-with-ordinary-nodes.json": "44fce461f60f3b20f1ad71a7b90fe3e0f4ae32e6a9acf57d9e8721feaada1fd5",
+    "/private/tmp/eredu-extend-consumer-with-recovery-nodes.json": "d7bc1b593c52307251399c62207e691e2ccb3c5bef9d32a679b35e60db96257b",
+    "/private/tmp/eredu-facade-original-consumer-correction-root-review.json": "4d8f909931b15cef55a4703f1a017107b0a71acf96ded61bc3c2f95bdf440677",
+    "/private/tmp/eredu-facade-original-consumer-review-sha256.json": "d16fa3aef32306c43e040e0b8a29be98aa41450b96777b054994230a9140647c",
+    "/private/tmp/eredu-facade-original-consumer-review.md": "e5cc37c862659be6cab9192cabe562fc225c40306a5f709fc2694b43d65a8fc3",
+    "/private/tmp/eredu-facade-original-consumer-root-review.json": "ca1597b927ca816cd704bd52e9ec60d481196de02039edbd45c21bb1c154cd88",
+    "/private/tmp/eredu-facade-original-consumer-stage/AUDIT.md": "5a2aff0bfc06c50ac08c0441f55e7d462f34f7f0959ceca314a969ca7f5cd674",
+    "/private/tmp/eredu-facade-original-consumer-stage/FROZEN.json": "ae821b95f642c14cc35f875136434a73b42bab8bd33829d1ab458e6d278d2628",
+    "/private/tmp/eredu-facade-original-consumer-stage/README.md": "4bc784993ed64c9259d2530800dd2404b40cdecb9795e813fbe8be4d0d08b5df",
+    "/private/tmp/eredu-facade-original-consumer-stage/base-hashes.json": "1609559b3c0c99d3470c10a1f80eee5d6b69ca0b937b1cdef9703ab45852f413",
+    "/private/tmp/eredu-facade-original-consumer-stage/base-origins.json": "145772c1d3695dad156c0711bee10d533395d66fe12e51293f8c2b5aeeaf1062",
+    "/private/tmp/eredu-facade-original-consumer-stage/change.patch": "13d7a641500c0a5a50b07560eda85284dac0b3e25434e0ead28504abc3277e57",
+    "/private/tmp/eredu-facade-original-consumer-stage/checks.json": "8e65c1a3db620855ba66395d113392d4baa4bdb877a4de82f8b55b506e2dd6a7",
+    "/private/tmp/eredu-facade-original-consumer-stage/constructor_fix.py": "2013420cb80d029214f55c71bc31c27722f70c1610dfec4aa6ddc480313cb3c4",
+    "/private/tmp/eredu-facade-original-consumer-stage/dependencies.json": "a5f59728e30ffdff93dbd1dc4ebd7be00f0b4181b8a8ab15882cf82fed5deb67",
+    "/private/tmp/eredu-facade-original-consumer-stage/docs.py": "bba45fffd2b36d2c9cfbb5901957306f7f04af1d254f97e32ef3fe45acaedbeb",
+    "/private/tmp/eredu-facade-original-consumer-stage/edit.py": "5da00211803c275a2375693069319bda08b2c97f55b10b4937dd34851e389363",
+    "/private/tmp/eredu-facade-original-consumer-stage/extra_tests.py": "d8e848dea31e89d19c432a16c5ac55540bdc6d337bddfdd8fb470e4b937ef593",
+    "/private/tmp/eredu-facade-original-consumer-stage/facade.py": "c0f355d544eed37ae6ced284cfd612100cec1fe3d1975b89c3da33ac299b1540",
+    "/private/tmp/eredu-facade-original-consumer-stage/files.txt": "8a7d1c3d2eb6c5fdece1def2026965427d225f1fde82041d565897a6f949c0af",
+    "/private/tmp/eredu-facade-original-consumer-stage/freeze.py": "634ed060c338426ca04ad5acd24c6b911369ad38e9d81f5fca6cbbc6e46472ee",
+    "/private/tmp/eredu-facade-original-consumer-stage/full.patch": "22caa0a1c1ac6c2081abec6707cf6548b13342b118832a7037824c3ef0f26325",
+    "/private/tmp/eredu-facade-original-consumer-stage/manifest.json": "bd45127efefe4e1e8dd7010b83699daf4a9077128c57a424044353519a7ca536",
+    "/private/tmp/eredu-facade-original-consumer-stage/native-rebase.json": "70a8e9b681adb348a67c1dcf977f08fb5b31a10457e9550b21d2ab3824784319",
+    "/private/tmp/eredu-facade-original-consumer-stage/order_fix.py": "a9fa4bdcf3c9e4370d598240a176735ae5e7bf71c89d35238d9177cd87e30709",
+    "/private/tmp/eredu-facade-original-consumer-stage/prepare_metadata.py": "d535c3a592ef104878c11ea85690c02572749999786222655fc5fccd882a1887",
+    "/private/tmp/eredu-facade-original-consumer-stage/replay.py": "bdb4ba0060589f16c7ab2e73419fc838ea7d49028b23d3af6fce5d23ef319690",
+    "/private/tmp/eredu-facade-original-consumer-stage/source-basis.json": "9728431ad6a0e41ad80b3b8398264c45cbcfc23decc03dbf60238492df805606",
+    "/private/tmp/eredu-facade-original-consumer-stage/staged-hashes.json": "176b1e77da36bbbbadcac49598424541ebe2a075397ac8bbf4de97dce99194d2",
+    "/private/tmp/eredu-facade-original-consumer-stage/tests.json": "1e7e8282c2cc779304efdc5f9fe071e22a0cab785fb069159d4505de326ac764",
+    "/private/tmp/eredu-facade-original-consumer-stage/tests_core.py": "4e5b6718d9c3ee7c01b24045788c0762c8b16dcedcdd8d1b910bc903809c748c",
+    "/private/tmp/eredu-facade-original-consumer-stage/tests_facade.py": "337a3127c9be5c03271278676d98547f0a66f5de6942665d5e43fa24cfb777e7",
+    "/private/tmp/eredu-facade-original-consumer-stage/tests_runtime.py": "da4def6e272202d2009da23b2251bbcbd3a05ff2582239a478ce7cf329563e05",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/FROZEN.json": "ad5ff5c15dcc17cfb50bd6d791d81c487352c43d0f874af46975770e7ba21f62",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/README.md": "40e85955fe2c31e386b121705cdd82b922f39369e4f55e970fb3d291ad0a05c1",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/change.patch": "fab4cf832d42e1fe840798c46f77ddc7ecb321c1e9fddcb90d0e6ae4f3637188",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/checks.json": "69456c22b4a6cbbd0b0123d55408eb26d47092c683267b47458495aaf39db6cc",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/correction.json": "ba33c774e3a8c20be1c17ccfece6538493171be621732d6ba1c9cc714e064935",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/dependencies.json": "d958c1c48419b66066322c83d0bd8ca95944cb7ded7bd79106428ad73dd8f47c",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/effective-full-manifest.json": "ab113129f8368d0c97cf8520b671d57a77bc6378dc0d64e50433ba62fc7311eb",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/effective-source-manifest.json": "af05f83150f2e7ae70efc83d927ec6793ce8bb82ad11c5fbd581d9d3f5efd1ca",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/effective-tests.json": "4bfd718b9970beeac16f3f60dafef3afc929ed7a3046085a1a186b2154ae7e7c",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/manifest.json": "2fad6b4ab006632421c838097f4685caa2f9664135fe9c0cc270882ad0883bb7",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/metadata-manifest.json": "b624194991a5940a6b9c9d339076d4d196e025b710821f2c9f9f4fde1506d220",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/package-metadata.patch": "347113d72c6cd73a3842407e98a6d229e814513734b244fce47463de18c74d19",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/prepare.py": "8a6c6c758d715d094b33da6713da6de16c27d700a3026d3ddacaf2ad27ad221e",
+    "/private/tmp/eredu-facade-original-consumer-test-correction-stage/replay.py": "330d09f69fde5831670cc1983128a8c3b27552ffb27e1286f3c759b6fdf0c2c9",
+    "/private/tmp/eredu-next-consumer-recovery-root-proposal-review.json": "a7d6334d80c14115cc34f584adbf70536546c6b023fd790089de143d9a918b17",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/AUDIT.md": "512f0fd47dc20acf35b94fa89d441c100f16abe1fec9708fd93a51ceda3de1dc",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/FROZEN.json": "a7e1a8441ef3ea890966186633e4e0f2f743d3b45bfc59a371e58ab8811d13e0",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/PRICING.md": "b4c0bec548aa82bd636cf4135090a37e92ec4f07e4882dc0dd2e48feb70ec1f8",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/README.md": "e2976670db5fd787247711749e51ceec87d91c557aebbe77034ae8c6b0cde1e2",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/STATIC-CHECKS.json": "572464aa6684c831753db14a0aaad5c63998e7496884cb6af6e86cc5b46116c9",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/TEST-COMMANDS.md": "e6cc762f115b3171b976cc0f34c2ff43964776cf8522abedfe80f4e82bc41004",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/all.patch": "94da2e55b79e2ad3184efc94704332efd23a87e78fdcd0332fcee8cc4e75ca2e",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/artifact-hashes.json": "cbf2aee313863622abd7cd7409adae845a11afd0762b17323e43e46ef6d3acee",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/base-origins.json": "eaa2eb2e8d758511ecaf1f577494c0145b670a4cf0926686bf9c3dfcebf802df",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/change.patch": "65f75379a9fa82a420bf695d70711dfa1ef4a48a660f8e9df317fab1f2ed68bf",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/dependency-hashes.json": "38e111820e694994b9f42d6cf410e45ece6f16aab7207a6a4dba957eed3efe70",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/doc-additions.json": "bd19c5b24a02b90b85bca86743740a8a353c23de71db4e37f22b87a8df6aa141",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/manifest.json": "19b7033dac5356be379de82cab6b6680281aa1079077e7e59ae705e890770962",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/package.py": "449f36c90c9926fde430d6d506ff8bed8e88acf96a3b25264845f6235dbe92b3",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/source-basis-hashes.json": "471adee313b786e4d45859b7b28749e54d37c6079c386c99edc17ec7186804d2",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/staged-hashes.json": "4f2f719c324bc3bd78d03f1f6a3a55ee949d9b4eb3ce72b2bca1687ec4570fbf",
+    "/private/tmp/eredu-ordinary-node-retirement-stage/tests.json": "19540b63cc17604234b46b3a6ab92dbe39ba24185efd3314a86108f65794a549",
+    "/private/tmp/eredu-ordinary-node-root-review.json": "6e0e860c2362059e49dc6ac4c8b69f8b6cc433c975502ae291f8cae8e47bd00e",
+    "/private/tmp/eredu-submission-recovery-retirement-review-sha256.json": "dc02be1e813b024e062ebfd1e8e610ebdc3097d2c804f18e6e3fff8a53a443f5",
+    "/private/tmp/eredu-submission-recovery-retirement-review.md": "172cdfe90f6b92e210c74f322b898cb7d416517e4f8923b49bae9951e70753ad",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/AUDIT.md": "f4c597748683ea881e5f25296f7533eb0ee704e913191e86162247c3300d361c",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/FROZEN.json": "95e0b2051d8665c4170bacdf69327fc5109cc28686ad4e51f4f85ee1523568c3",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/PRICING.md": "65249686cc9503be81a94d1e9b6846816125e716536533d2d19cd51dcbaa9fb6",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/README.md": "fc1d30a23fb4ab34a19834ad821f92fcd84005e4de2ebd4979156e807fc8ea75",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/STATIC-CHECKS.json": "fdc70930e036b2b44869f9857f1e3364680e385343be8aaecbc3e229e8afaa7a",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/TEST-COMMANDS.md": "ab9928f4213ac45c2df1e9bc4038fa24a0599cadeb2a7e11e2150871ab4ddefd",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/all.patch": "529fed75a843c33a2c02c63c78ebf86eceaf288fd958f22f1e749055ee763aeb",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/artifact-hashes.json": "1da8d867e6cd9e06a861afdf9adb748cb52e3506e52b485948341ba0ab94c21b",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/base-origins.json": "bce8adaefc3159519a93a19ce6f5892a663d4eac4d4df305f028353ab6654314",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/change.patch": "215cd0dd951ed47f4cd8424d1868cc4c4036c72f7e05b4dae3e4109e6ecdb4c4",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/dependency-hashes.json": "4c083283a9e138b134f326711dbe40523d722068add0cd3c462aaa004179ac0d",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/doc-additions.json": "6078be9fd0afad9daa964059b5544910e9e8e689a38f0d17a320a108587fbcf3",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/manifest.json": "8c2b8bcf5ebbc5fb9a4eb5c26460e25f023baf20da5b94bf4def2319ec76e58e",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/new-tests.json": "5cc8c7a14368b45eb97ed47ed69810a522db76568f0880a52e962fcba031ebcb",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/package.py": "d522facb747cbaab6c5c32ea5a3fd16e4054e277bf18164e93ef96cc87a9da98",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/source-basis-hashes.json": "6eeee849327ff4cd4dd9bd7a4acba59a6cca7df4469c2fa37487aa30d9a72267",
+    "/private/tmp/eredu-submission-recovery-retirement-stage/staged-hashes.json": "71dc007d9126a2a964ce60bdac6f6cf2ae3271a421b5c04be10a6f688efa2ecb",
+    "/private/tmp/eredu-submission-recovery-root-review.json": "b0b25e771e6d336adc33d6f5d138861be81383e26e6162eff8666b87d10fe25c",
+    "/private/tmp/eredu-text-ingress-borrowed-parts-review-sha256.json": "822c5ab5aee745ad293544d011a1f9c98b3aff547ba3081446e6affbe23260b8",
+    "/private/tmp/eredu-text-ingress-borrowed-parts-review.md": "46ff4185a80537e2cd70886ecc2f6cf0587f35ab3c19e4ba5e044ef95203b393",
+    "/private/tmp/eredu-text-ingress-borrowed-parts-stage/FROZEN.json": "de7fc3204e7127d1532e9a04fd0e162f59cfbd0c90249bddc2c3f605bee92f89",
+    "/private/tmp/eredu-text-ingress-borrowed-parts-stage/README.md": "5c00de40ae462cd155a52f6af9c6e7783ada4f14a1b2fe5675442c957464d1fa",
+    "/private/tmp/eredu-text-ingress-borrowed-parts-stage/change.patch": "f9bbdfe8558950a4cf3505502f64bbb14f27c91e6e2e361e1bb73039014c3891",
+    "/private/tmp/eredu-text-ingress-borrowed-parts-stage/doc-additions.json": "9ce01ff83404e5f968d74fb25dafec485d709c67d467f66439dcebb834997839",
+    "/private/tmp/eredu-text-ingress-borrowed-parts-stage/manifest.json": "de078c36d01aadce38ad5489c4f44f172c11646a868f769cadc96f6f4753b06e",
+    "/private/tmp/eredu-text-ingress-borrowed-parts-stage/root-review.json": "bf53a0698f0f9b567c8637d44401908c90538163bfe5b1aae566222553f1c58d",
+    "/private/tmp/eredu-text-ingress-borrowed-parts-stage/source-basis.json": "2cc6df057a28a6dc0b1f0edf1f69c175c5e7cc5b01c423e3a67399327f9ac593"
+  },
+  "review": {
+    "full_manifest_sha256": "e9709eb84e21595c6c38b5e97a7e81ac9f835029f1ed3d5ddbca2bc88d8e31b4",
+    "full_patch_sha256": "062cb1667410b631d943598ec5f071399f53ab53447669e904cb8d594fcf4b69",
+    "patch_sha256": "4e2c2aa2ec2523082ea1140bb0c3a899e8a5c3a0fc29e8d57743174c38ca7691",
+    "replay": "/private/tmp/eredu-consumer-recovery-integration-stage/replay",
+    "review": "Final integration reviewed and validated; independent source reviews included. No managed public activation claimed.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-original-native-sequence-integration-2026-09-14.json": "f526138d292fffadf55c56bf90c2b3f35603a36e70c0d3165fd00df4940a552d",
+      "/private/tmp/eredu-consumer-admission-readiness-fixture.json": "7ae3f6e363faa84e344d50dd828f088e271d27f946809fbd6f4e68bde45dc998",
+      "/private/tmp/eredu-consumer-recovery-integration-admission-readiness-fixture-review.json": "43abc1ce1edf49035682e6c9727de41d0275a54d40fe6332ff80bad8106d9a3a",
+      "/private/tmp/eredu-consumer-recovery-integration-core-before-admission-fixture.log": "2a63ab980dc4565e2c336fe7ebd463207fc01b7c4ddbccc50775b9975feba8e8",
+      "/private/tmp/eredu-consumer-recovery-integration-root-review.json": "50dc57c985960b0a2593ed2b1ae5fc58a1f0bdbb78e405902bd125b87a9205ad",
+      "/private/tmp/eredu-extend-consumer-with-borrowed-ingress.json": "1ae1c053080a6e8cdf2d2d12ee4481c40e9376d4d128fbf0588a71f4cbb29940",
+      "/private/tmp/eredu-extend-consumer-with-ordinary-nodes.json": "44fce461f60f3b20f1ad71a7b90fe3e0f4ae32e6a9acf57d9e8721feaada1fd5",
+      "/private/tmp/eredu-extend-consumer-with-recovery-nodes.json": "d7bc1b593c52307251399c62207e691e2ccb3c5bef9d32a679b35e60db96257b",
+      "/private/tmp/eredu-facade-original-consumer-correction-root-review.json": "4d8f909931b15cef55a4703f1a017107b0a71acf96ded61bc3c2f95bdf440677",
+      "/private/tmp/eredu-facade-original-consumer-review-sha256.json": "d16fa3aef32306c43e040e0b8a29be98aa41450b96777b054994230a9140647c",
+      "/private/tmp/eredu-facade-original-consumer-review.md": "e5cc37c862659be6cab9192cabe562fc225c40306a5f709fc2694b43d65a8fc3",
+      "/private/tmp/eredu-facade-original-consumer-root-review.json": "ca1597b927ca816cd704bd52e9ec60d481196de02039edbd45c21bb1c154cd88",
+      "/private/tmp/eredu-facade-original-consumer-stage/AUDIT.md": "5a2aff0bfc06c50ac08c0441f55e7d462f34f7f0959ceca314a969ca7f5cd674",
+      "/private/tmp/eredu-facade-original-consumer-stage/FROZEN.json": "ae821b95f642c14cc35f875136434a73b42bab8bd33829d1ab458e6d278d2628",
+      "/private/tmp/eredu-facade-original-consumer-stage/README.md": "4bc784993ed64c9259d2530800dd2404b40cdecb9795e813fbe8be4d0d08b5df",
+      "/private/tmp/eredu-facade-original-consumer-stage/base-hashes.json": "1609559b3c0c99d3470c10a1f80eee5d6b69ca0b937b1cdef9703ab45852f413",
+      "/private/tmp/eredu-facade-original-consumer-stage/base-origins.json": "145772c1d3695dad156c0711bee10d533395d66fe12e51293f8c2b5aeeaf1062",
+      "/private/tmp/eredu-facade-original-consumer-stage/change.patch": "13d7a641500c0a5a50b07560eda85284dac0b3e25434e0ead28504abc3277e57",
+      "/private/tmp/eredu-facade-original-consumer-stage/checks.json": "8e65c1a3db620855ba66395d113392d4baa4bdb877a4de82f8b55b506e2dd6a7",
+      "/private/tmp/eredu-facade-original-consumer-stage/constructor_fix.py": "2013420cb80d029214f55c71bc31c27722f70c1610dfec4aa6ddc480313cb3c4",
+      "/private/tmp/eredu-facade-original-consumer-stage/dependencies.json": "a5f59728e30ffdff93dbd1dc4ebd7be00f0b4181b8a8ab15882cf82fed5deb67",
+      "/private/tmp/eredu-facade-original-consumer-stage/docs.py": "bba45fffd2b36d2c9cfbb5901957306f7f04af1d254f97e32ef3fe45acaedbeb",
+      "/private/tmp/eredu-facade-original-consumer-stage/edit.py": "5da00211803c275a2375693069319bda08b2c97f55b10b4937dd34851e389363",
+      "/private/tmp/eredu-facade-original-consumer-stage/extra_tests.py": "d8e848dea31e89d19c432a16c5ac55540bdc6d337bddfdd8fb470e4b937ef593",
+      "/private/tmp/eredu-facade-original-consumer-stage/facade.py": "c0f355d544eed37ae6ced284cfd612100cec1fe3d1975b89c3da33ac299b1540",
+      "/private/tmp/eredu-facade-original-consumer-stage/files.txt": "8a7d1c3d2eb6c5fdece1def2026965427d225f1fde82041d565897a6f949c0af",
+      "/private/tmp/eredu-facade-original-consumer-stage/freeze.py": "634ed060c338426ca04ad5acd24c6b911369ad38e9d81f5fca6cbbc6e46472ee",
+      "/private/tmp/eredu-facade-original-consumer-stage/full.patch": "22caa0a1c1ac6c2081abec6707cf6548b13342b118832a7037824c3ef0f26325",
+      "/private/tmp/eredu-facade-original-consumer-stage/manifest.json": "bd45127efefe4e1e8dd7010b83699daf4a9077128c57a424044353519a7ca536",
+      "/private/tmp/eredu-facade-original-consumer-stage/native-rebase.json": "70a8e9b681adb348a67c1dcf977f08fb5b31a10457e9550b21d2ab3824784319",
+      "/private/tmp/eredu-facade-original-consumer-stage/order_fix.py": "a9fa4bdcf3c9e4370d598240a176735ae5e7bf71c89d35238d9177cd87e30709",
+      "/private/tmp/eredu-facade-original-consumer-stage/prepare_metadata.py": "d535c3a592ef104878c11ea85690c02572749999786222655fc5fccd882a1887",
+      "/private/tmp/eredu-facade-original-consumer-stage/replay.py": "bdb4ba0060589f16c7ab2e73419fc838ea7d49028b23d3af6fce5d23ef319690",
+      "/private/tmp/eredu-facade-original-consumer-stage/source-basis.json": "9728431ad6a0e41ad80b3b8398264c45cbcfc23decc03dbf60238492df805606",
+      "/private/tmp/eredu-facade-original-consumer-stage/staged-hashes.json": "176b1e77da36bbbbadcac49598424541ebe2a075397ac8bbf4de97dce99194d2",
+      "/private/tmp/eredu-facade-original-consumer-stage/tests.json": "1e7e8282c2cc779304efdc5f9fe071e22a0cab785fb069159d4505de326ac764",
+      "/private/tmp/eredu-facade-original-consumer-stage/tests_core.py": "4e5b6718d9c3ee7c01b24045788c0762c8b16dcedcdd8d1b910bc903809c748c",
+      "/private/tmp/eredu-facade-original-consumer-stage/tests_facade.py": "337a3127c9be5c03271278676d98547f0a66f5de6942665d5e43fa24cfb777e7",
+      "/private/tmp/eredu-facade-original-consumer-stage/tests_runtime.py": "da4def6e272202d2009da23b2251bbcbd3a05ff2582239a478ce7cf329563e05",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/FROZEN.json": "ad5ff5c15dcc17cfb50bd6d791d81c487352c43d0f874af46975770e7ba21f62",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/README.md": "40e85955fe2c31e386b121705cdd82b922f39369e4f55e970fb3d291ad0a05c1",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/change.patch": "fab4cf832d42e1fe840798c46f77ddc7ecb321c1e9fddcb90d0e6ae4f3637188",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/checks.json": "69456c22b4a6cbbd0b0123d55408eb26d47092c683267b47458495aaf39db6cc",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/correction.json": "ba33c774e3a8c20be1c17ccfece6538493171be621732d6ba1c9cc714e064935",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/dependencies.json": "d958c1c48419b66066322c83d0bd8ca95944cb7ded7bd79106428ad73dd8f47c",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/effective-full-manifest.json": "ab113129f8368d0c97cf8520b671d57a77bc6378dc0d64e50433ba62fc7311eb",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/effective-source-manifest.json": "af05f83150f2e7ae70efc83d927ec6793ce8bb82ad11c5fbd581d9d3f5efd1ca",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/effective-tests.json": "4bfd718b9970beeac16f3f60dafef3afc929ed7a3046085a1a186b2154ae7e7c",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/manifest.json": "2fad6b4ab006632421c838097f4685caa2f9664135fe9c0cc270882ad0883bb7",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/metadata-manifest.json": "b624194991a5940a6b9c9d339076d4d196e025b710821f2c9f9f4fde1506d220",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/package-metadata.patch": "347113d72c6cd73a3842407e98a6d229e814513734b244fce47463de18c74d19",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/prepare.py": "8a6c6c758d715d094b33da6713da6de16c27d700a3026d3ddacaf2ad27ad221e",
+      "/private/tmp/eredu-facade-original-consumer-test-correction-stage/replay.py": "330d09f69fde5831670cc1983128a8c3b27552ffb27e1286f3c759b6fdf0c2c9",
+      "/private/tmp/eredu-next-consumer-recovery-root-proposal-review.json": "a7d6334d80c14115cc34f584adbf70536546c6b023fd790089de143d9a918b17",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/AUDIT.md": "512f0fd47dc20acf35b94fa89d441c100f16abe1fec9708fd93a51ceda3de1dc",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/FROZEN.json": "a7e1a8441ef3ea890966186633e4e0f2f743d3b45bfc59a371e58ab8811d13e0",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/PRICING.md": "b4c0bec548aa82bd636cf4135090a37e92ec4f07e4882dc0dd2e48feb70ec1f8",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/README.md": "e2976670db5fd787247711749e51ceec87d91c557aebbe77034ae8c6b0cde1e2",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/STATIC-CHECKS.json": "572464aa6684c831753db14a0aaad5c63998e7496884cb6af6e86cc5b46116c9",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/TEST-COMMANDS.md": "e6cc762f115b3171b976cc0f34c2ff43964776cf8522abedfe80f4e82bc41004",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/all.patch": "94da2e55b79e2ad3184efc94704332efd23a87e78fdcd0332fcee8cc4e75ca2e",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/artifact-hashes.json": "cbf2aee313863622abd7cd7409adae845a11afd0762b17323e43e46ef6d3acee",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/base-origins.json": "eaa2eb2e8d758511ecaf1f577494c0145b670a4cf0926686bf9c3dfcebf802df",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/change.patch": "65f75379a9fa82a420bf695d70711dfa1ef4a48a660f8e9df317fab1f2ed68bf",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/dependency-hashes.json": "38e111820e694994b9f42d6cf410e45ece6f16aab7207a6a4dba957eed3efe70",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/doc-additions.json": "bd19c5b24a02b90b85bca86743740a8a353c23de71db4e37f22b87a8df6aa141",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/manifest.json": "19b7033dac5356be379de82cab6b6680281aa1079077e7e59ae705e890770962",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/package.py": "449f36c90c9926fde430d6d506ff8bed8e88acf96a3b25264845f6235dbe92b3",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/source-basis-hashes.json": "471adee313b786e4d45859b7b28749e54d37c6079c386c99edc17ec7186804d2",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/staged-hashes.json": "4f2f719c324bc3bd78d03f1f6a3a55ee949d9b4eb3ce72b2bca1687ec4570fbf",
+      "/private/tmp/eredu-ordinary-node-retirement-stage/tests.json": "19540b63cc17604234b46b3a6ab92dbe39ba24185efd3314a86108f65794a549",
+      "/private/tmp/eredu-ordinary-node-root-review.json": "6e0e860c2362059e49dc6ac4c8b69f8b6cc433c975502ae291f8cae8e47bd00e",
+      "/private/tmp/eredu-submission-recovery-retirement-review-sha256.json": "dc02be1e813b024e062ebfd1e8e610ebdc3097d2c804f18e6e3fff8a53a443f5",
+      "/private/tmp/eredu-submission-recovery-retirement-review.md": "172cdfe90f6b92e210c74f322b898cb7d416517e4f8923b49bae9951e70753ad",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/AUDIT.md": "f4c597748683ea881e5f25296f7533eb0ee704e913191e86162247c3300d361c",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/FROZEN.json": "95e0b2051d8665c4170bacdf69327fc5109cc28686ad4e51f4f85ee1523568c3",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/PRICING.md": "65249686cc9503be81a94d1e9b6846816125e716536533d2d19cd51dcbaa9fb6",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/README.md": "fc1d30a23fb4ab34a19834ad821f92fcd84005e4de2ebd4979156e807fc8ea75",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/STATIC-CHECKS.json": "fdc70930e036b2b44869f9857f1e3364680e385343be8aaecbc3e229e8afaa7a",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/TEST-COMMANDS.md": "ab9928f4213ac45c2df1e9bc4038fa24a0599cadeb2a7e11e2150871ab4ddefd",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/all.patch": "529fed75a843c33a2c02c63c78ebf86eceaf288fd958f22f1e749055ee763aeb",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/artifact-hashes.json": "1da8d867e6cd9e06a861afdf9adb748cb52e3506e52b485948341ba0ab94c21b",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/base-origins.json": "bce8adaefc3159519a93a19ce6f5892a663d4eac4d4df305f028353ab6654314",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/change.patch": "215cd0dd951ed47f4cd8424d1868cc4c4036c72f7e05b4dae3e4109e6ecdb4c4",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/dependency-hashes.json": "4c083283a9e138b134f326711dbe40523d722068add0cd3c462aaa004179ac0d",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/doc-additions.json": "6078be9fd0afad9daa964059b5544910e9e8e689a38f0d17a320a108587fbcf3",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/manifest.json": "8c2b8bcf5ebbc5fb9a4eb5c26460e25f023baf20da5b94bf4def2319ec76e58e",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/new-tests.json": "5cc8c7a14368b45eb97ed47ed69810a522db76568f0880a52e962fcba031ebcb",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/package.py": "d522facb747cbaab6c5c32ea5a3fd16e4054e277bf18164e93ef96cc87a9da98",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/source-basis-hashes.json": "6eeee849327ff4cd4dd9bd7a4acba59a6cca7df4469c2fa37487aa30d9a72267",
+      "/private/tmp/eredu-submission-recovery-retirement-stage/staged-hashes.json": "71dc007d9126a2a964ce60bdac6f6cf2ae3271a421b5c04be10a6f688efa2ecb",
+      "/private/tmp/eredu-submission-recovery-root-review.json": "b0b25e771e6d336adc33d6f5d138861be81383e26e6162eff8666b87d10fe25c",
+      "/private/tmp/eredu-text-ingress-borrowed-parts-review-sha256.json": "822c5ab5aee745ad293544d011a1f9c98b3aff547ba3081446e6affbe23260b8",
+      "/private/tmp/eredu-text-ingress-borrowed-parts-review.md": "46ff4185a80537e2cd70886ecc2f6cf0587f35ab3c19e4ba5e044ef95203b393",
+      "/private/tmp/eredu-text-ingress-borrowed-parts-stage/FROZEN.json": "de7fc3204e7127d1532e9a04fd0e162f59cfbd0c90249bddc2c3f605bee92f89",
+      "/private/tmp/eredu-text-ingress-borrowed-parts-stage/README.md": "5c00de40ae462cd155a52f6af9c6e7783ada4f14a1b2fe5675442c957464d1fa",
+      "/private/tmp/eredu-text-ingress-borrowed-parts-stage/change.patch": "f9bbdfe8558950a4cf3505502f64bbb14f27c91e6e2e361e1bb73039014c3891",
+      "/private/tmp/eredu-text-ingress-borrowed-parts-stage/doc-additions.json": "9ce01ff83404e5f968d74fb25dafec485d709c67d467f66439dcebb834997839",
+      "/private/tmp/eredu-text-ingress-borrowed-parts-stage/manifest.json": "de078c36d01aadce38ad5489c4f44f172c11646a868f769cadc96f6f4753b06e",
+      "/private/tmp/eredu-text-ingress-borrowed-parts-stage/root-review.json": "bf53a0698f0f9b567c8637d44401908c90538163bfe5b1aae566222553f1c58d",
+      "/private/tmp/eredu-text-ingress-borrowed-parts-stage/source-basis.json": "2cc6df057a28a6dc0b1f0edf1f69c175c5e7cc5b01c423e3a67399327f9ac593"
+    },
+    "source_manifest_sha256": "8ccbfb5866550b1f854eb9385c3b56c3958aad99e5abb92a936688f5f822d153"
+  },
+  "behavior": [
+    "A concrete immutable consumer descriptor is sealed with the genuine original request and adds its fixed representations once to R; existing providers explicitly reject before old hooks or work.",
+    "The consumed bank returns its actual consumer association and core validates it inside Admission before Prompt/Sampling. Native code forwards only the neutral claim through existing original producers.",
+    "The private typed facade wrapper advances the same cursor/readiness algorithm and transfers its sole original owner through failures and frozen results; preparation failures retire the empty cursor first while ordinary causes retire before the owning cursor.",
+    "Constructor mismatch returns unchanged sequence before creating a typed failure. Equal-size foreign identities, original exact/short admission, full/raw source transitions and result/iterator/error retirement have behavioral coverage.",
+    "Single native text segments return their existing handle without an intermediate cloned-array vector; multi-segment extraction borrows original handles and preserves validation/order.",
+    "Recovery nodes preserve the original Box through callback failures and detached-list unwinding; successful consuming dispatch unboxes before probe and retained payload under the same native guard.",
+    "Poisoned callbacks report unsettled/blocked and are never retried; only unfinished native thread capture bookkeeping seals before handoff. Completion extraction ends its slot loan before callbacks.",
+    "Ordinary host retirement concretely unboxes the existing node before payload Drop while preserving detached snapshot, native-lock exclusion, reentry and TLS/unwind deferral."
+  ],
+  "limits": [
+    "Public loaded/control routing and public Vec result migration remain unfinished.",
+    "Fixed consumer representations do not bound tokenizer/parser/grammar/decoder/source/error/event/journal transitive payloads; required unknown bounds cannot activate managed work.",
+    "Exact simultaneous Recovery node/native Scope populations and full native opening/inventory/error ownership remain separate obligations.",
+    "Requested managed storage bounds do not guarantee process RSS or allocator usable size."
+  ]
+}

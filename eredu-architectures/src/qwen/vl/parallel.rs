@@ -88,6 +88,19 @@ impl PartitionLocalGeometry {
             .map_err(|error| invalid(error.to_string()))
     }
 
+    /// Copies the same exact local slice through the active metadata account.
+    pub(crate) fn local_state_layout_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<StateLayout, eredu_nn::Error> {
+        if !context.uses_checked_metadata() {
+            return self.local_state_layout().map_err(eredu_nn::Error::backend);
+        }
+        self.complete_state_layout
+            .slice_with_metadata(self.text_units.clone(), context)
+            .map_err(|cause| cause.into_workspace_error(context))
+    }
+
     /// Selected static roles in canonical graph order.
     pub fn static_roles(&self) -> &[String] {
         &self.static_roles

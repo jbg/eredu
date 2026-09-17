@@ -1,0 +1,111 @@
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -514,6 +514,7 @@
+     encoder.dispatch([input_ptr = input.data<char>(),
+                       nbytes = input.nbytes(),
+                       output_ptr = output.data<char>(),
++                      allocation = submission::GraphQuotaRef(submission::current_graph_quota()),
+                       this]() {
+       constexpr size_t min_send_size = 262144;
+       size_t n_gathers = std::max(
+@@ -522,7 +523,7 @@
+               nbytes / min_send_size),
+           size_t(1));
+       size_t bytes_per_gather = ceildiv(nbytes, n_gathers);
+-      auto* graph = submission::current_graph_quota();
++      auto* graph = allocation.get();
+       PoolFutures all_gathers(n_gathers, graph);
+       for (int i = 0; i < n_gathers; i++) {
+         auto offset = i * bytes_per_gather;
+@@ -547,13 +548,14 @@
+     auto& encoder = cpu::get_command_encoder(stream);
+     encoder.set_input_array(input);
+     encoder.dispatch(
+-        [input_ptr = input.data<char>(), nbytes = input.nbytes(), dst, this]() {
++        [input_ptr = input.data<char>(), nbytes = input.nbytes(), dst,
++         allocation = submission::GraphQuotaRef(submission::current_graph_quota()), this]() {
+           int right = (rank_ + 1) % size_;
+           int left = (rank_ + size_ - 1) % size_;
+           if (dst == right) {
+-            send(sockets_right_, input_ptr, nbytes);
++            send(sockets_right_, input_ptr, nbytes, allocation.get());
+           } else if (dst == left) {
+-            send(sockets_left_, input_ptr, nbytes);
++            send(sockets_left_, input_ptr, nbytes, allocation.get());
+           } else {
+             std::ostringstream msg;
+             msg << "[ring] Send only supported to direct neighbors "
+@@ -568,16 +570,17 @@
+     auto& encoder = cpu::get_command_encoder(stream);
+     encoder.set_output_array(out);
+     encoder.dispatch(
+-        [out_ptr = out.data<char>(), nbytes = out.nbytes(), src, this]() {
++        [out_ptr = out.data<char>(), nbytes = out.nbytes(), src,
++         allocation = submission::GraphQuotaRef(submission::current_graph_quota()), this]() {
+           // NOTE: We 'll check the sockets with the opposite order of send so
+           // that they work even with 2 nodes where left and right is the same
+           // neighbor.
+           int right = (rank_ + 1) % size_;
+           int left = (rank_ + size_ - 1) % size_;
+           if (src == left) {
+-            recv(sockets_left_, out_ptr, nbytes);
++            recv(sockets_left_, out_ptr, nbytes, allocation.get());
+           } else if (src == right) {
+-            recv(sockets_right_, out_ptr, nbytes);
++            recv(sockets_right_, out_ptr, nbytes, allocation.get());
+           } else {
+             std::ostringstream msg;
+             msg << "[ring] Recv only supported from direct neighbors "
+@@ -614,8 +617,9 @@
+                       output_ptr,
+                       send = std::move(send),
+                       recv = std::move(recv),
++                      allocation = submission::GraphQuotaRef(submission::current_graph_quota()),
+                       this]() {
+-      auto* graph = submission::current_graph_quota();
++      auto* graph = allocation.get();
+       struct PacketHeader {
+         uint64_t bytes;
+         uint32_t source;
+@@ -703,11 +707,12 @@
+     auto out_ptr = output.data<char>();
+     auto& encoder = cpu::get_command_encoder(stream);
+     encoder.set_output_array(output);
+-    encoder.dispatch([in_ptr, out_ptr, size = input.size(), this, reduce_op]() {
++    encoder.dispatch([in_ptr, out_ptr, size = input.size(), this, reduce_op,
++                      allocation = submission::GraphQuotaRef(submission::current_graph_quota())]() {
+       // If the input data cannot be split into size_ segments then copy it and
+       // all reduce a local buffer prefilled with 0s.
+       size_t nbytes = size * sizeof(T);
+-      auto* graph = submission::current_graph_quota();
++      auto* graph = allocation.get();
+       if (size < size_) {
+         // TODO: Maybe allocate dynamically so we don't have the constraint
+         // below?
+@@ -902,10 +907,10 @@
+   }
+ 
+   void
+-  send(const std::vector<int>& sockets, const char* data, size_t data_size) {
++  send(const std::vector<int>& sockets, const char* data, size_t data_size,
++       submission::GraphQuota* graph) {
+     size_t segment_size =
+         std::max(size_t(1024), ceildiv(data_size, sockets.size()));
+-    auto* graph = submission::current_graph_quota();
+     submission::GraphVector<SocketFuture> sends{submission::GraphAllocator<SocketFuture>(graph)};
+     sends.reserve(sockets.size());
+     for (int i = 0; i < sockets.size(); i++) {
+@@ -922,10 +927,10 @@
+     }
+   }
+ 
+-  void recv(const std::vector<int>& sockets, char* data, size_t data_size) {
++  void recv(const std::vector<int>& sockets, char* data, size_t data_size,
++            submission::GraphQuota* graph) {
+     size_t segment_size =
+         std::max(size_t(1024), ceildiv(data_size, sockets.size()));
+-    auto* graph = submission::current_graph_quota();
+     submission::GraphVector<SocketFuture> recvs{submission::GraphAllocator<SocketFuture>(graph)};
+     recvs.reserve(sockets.size());
+     for (int i = 0; i < sockets.size(); i++) {

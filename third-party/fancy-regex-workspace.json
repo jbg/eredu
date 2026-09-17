@@ -1,0 +1,90 @@
+{
+  "cargo": "External dependency excluded from workspace. Root patch consumes vendored fancy; both fancy manifests use exact relative RA path. Selector enabled only by fancy dev dependency. Registry publication requires upstream/published dependency support.",
+  "files": {
+    "Cargo.toml": {
+      "after": "70a7e822ba66ec5b56057154e674f304d353f5695f493d1d1fb25bb197516bf2",
+      "before": "c11d369e11774192a6b1a94c74b34ab53d7ec2151a8d16254405a2e8263c1491"
+    },
+    "Cargo.toml.orig": {
+      "after": "e4259bda6f9827bc22c37eceedf130defef80116fa23f655ffa851613458d4f4",
+      "before": "e91d9f58640a0fef4e74df27de74c56d465ec7fe65cb4badae87e69ab657ae4f"
+    },
+    "src/compile.rs": {
+      "after": "64f8549165c22dab14fb8fbd9fe3ff489fcb0b1842f5ebeb7b21a1e28de14cfd",
+      "before": "8f1bb68927606540965792ad7dfea60f5f8bca7d244707650649784a6ee10bf4"
+    },
+    "src/error.rs": {
+      "after": "71b0983544baa6cd2c79521dc8764568c788b919082246743df11616ba7de609",
+      "before": "a868560b711ecde24aef07a7eeb5cb74b3563c13dcdd1de553c71be38202e4f6"
+    },
+    "src/lib.rs": {
+      "after": "bb83df25ccf6c9c765a91c3aee7a49f2827f3bf4a66e0041eb5baa0cc2a6d58c",
+      "before": "655674fdce8ea8bad038150fd2f3997aad04d7713213fb8b564094961cdcef68"
+    },
+    "src/vm.rs": {
+      "after": "221e5dac9df0a0ce896c2332b7c6da83dcad43ebb0c53e5c2885f11eaa376024",
+      "before": "d7db3431bdbeca1010f23ac976703ce11a33179e795b6bda77b4168a9037874e"
+    },
+    "src/vm/workspace.rs": {
+      "after": "640ca9b224426e71aa5ce773f8522bac48249ed2a6293719e50aa99f0a2676d9",
+      "before": null
+    },
+    "src/vm/workspace/tests.rs": {
+      "after": "f412632651e02a885c9d4d67a7a9d1c3bacb93e2c3d519fab485015491400b34",
+      "before": null
+    }
+  },
+  "final_complete_manifest_sha256": "2fc1c13588df5311460bea52276a090bc5a2400ad2c32b094ddea6e6739c1ebe",
+  "name": "fancy-regex",
+  "patch_sha256": "f8e798d434e0dc9c0faf23293343c57b5674af419fa45110cf0146b39e386098",
+  "prerequisites": {
+    "pikevm_final": "da6c75c5691bd5f427cf414b719941a5b4a928426b8cc7948491f5bacd16d4fc",
+    "pikevm_selector_source": "d94193cd362a778af6b14313b55e4d793a59873541f8e19a4873d401acc0aae7",
+    "pikevm_step1_source": "096d71dd3426b28f099266f575fcf62f598777b5b8b8eea6159210d9e3aac0a9"
+  },
+  "scope": "Explicit source-bound reusable search storage; ordinary defaults unchanged; cold source construction and original C/E admission remain unfinished.",
+  "unsafe": "Existing upstream boundary preserved; no added unsafe and no workspace lint relaxation.",
+  "upstream_archive_sha256": "72cf461f865c862bb7dc573f643dd6a2b6842f7c30b07882b56bd148cc2761b8",
+  "upstream_complete_manifest_sha256": "f0e10de3bcde2c9827ee0eda7399209e5a7f43286f424107217186e38cfddd15",
+  "upstream_files": {
+    ".cargo_vcs_info.json": "5647ef462c350156cf28c93e20a1f9c098cbd764daed93b0b478641bb3093e60",
+    ".gitignore": "d02caed6e54b39fb898bc32f9b8d72f87b5d7a7e44f8271503984617450c1dcc",
+    "AUTHORS": "d5fca2653c88ad02d197faead77e22b80c70636b5bec6e02f2805f389a21b86d",
+    "CHANGELOG.md": "f870582ac48b5c46490cd2cc0b1436c1c976578fc383558e223082f456ef3f03",
+    "CONTRIBUTING.md": "a7e0f3d282301aa5f4b546ed7fc5376159569987a002f24bf57082d49746fde6",
+    "Cargo.lock": "23c13b3797c14a37e96a5d1b18c78aaf4e32ff1f4d1b599337fd4761d27116d0",
+    "Cargo.toml": "c11d369e11774192a6b1a94c74b34ab53d7ec2151a8d16254405a2e8263c1491",
+    "Cargo.toml.orig": "e91d9f58640a0fef4e74df27de74c56d465ec7fe65cb4badae87e69ab657ae4f",
+    "LICENSE": "3bc70e239e91272782006c638fc0452a714d384224f11f0923036b7be07cf9b5",
+    "PERFORMANCE.md": "4d0b9d68394c0255232277611d2955ce4e94ccdee75f14f1f6136d9ce7557dd1",
+    "README.md": "e2dd45390c32d575829675576ab62f69c68724438497ce358ca258d4ebeea9a8",
+    "benches/bench.rs": "3be0465a2e31554f1b3e7fba775a70344398c66f54db2324a7b42d4df23ccf52",
+    "codecov.yml": "d6ebfcadb4d940a0f86ab1a99928b673195c7d84cecee17a5eefeaf396c8477b",
+    "examples/toy.rs": "0277d4864390fb3d02687cf967294258c64d0b12d9792eef50b9962ab02f756f",
+    "src/analyze.rs": "83446e3ae41c4f31b05823625770873d6ce27a30755164005003524510b87c3f",
+    "src/compile.rs": "8f1bb68927606540965792ad7dfea60f5f8bca7d244707650649784a6ee10bf4",
+    "src/error.rs": "a868560b711ecde24aef07a7eeb5cb74b3563c13dcdd1de553c71be38202e4f6",
+    "src/expand.rs": "122f2fe0beb68f19a36ac2f1f9963692eefa0f5d5f4c7c6b4d0dccde401a2984",
+    "src/lib.rs": "655674fdce8ea8bad038150fd2f3997aad04d7713213fb8b564094961cdcef68",
+    "src/optimize.rs": "a7c6efba04c4b435412fdc7f0754b5aa9268b0b3c479cf0d09811920a7d1ddcd",
+    "src/parse.rs": "c15666ddb32906690c9bd7dfa9012618f561ae23b3181cbfb8b09e1674b5638f",
+    "src/parse_flags.rs": "73fb78791cadde939c6398a54f156eb3ad69dbe63923427f05d24301f5cf9b44",
+    "src/replacer.rs": "cf3992fea4c44c2f9846e5cb91f99d0814b2ea8c9b170f77bc2f5db3efcfd753",
+    "src/vm.rs": "d7db3431bdbeca1010f23ac976703ce11a33179e795b6bda77b4168a9037874e",
+    "tests/captures.rs": "90c87757804742f7b830442388bf3b6a7f548ebd0d5158f59dbfd73ec40f37a3",
+    "tests/common/mod.rs": "b8ab2a7a3a25adad8317c8eb1f4566df6a81978c3a7ab49847ec2f838d77c888",
+    "tests/finding.rs": "d4f5b2443b216ece0b2a79b594fb6cbb0bcd65a0fe732ad8d4314e6e95c29b54",
+    "tests/matching.rs": "da552d03c81a97e958f93bfbfa624141928eed6b77d27d305d1e22c8fcff581b",
+    "tests/oniguruma.rs": "37e6c0c9410209675ffa2729cf23d50bfd9def8fa65bbf9599129659c9d8b200",
+    "tests/oniguruma/.gitattributes": "b8d35d419a619abf4283b4f1e8a3daeaca142c87df6634b4cd706b726d29a88d",
+    "tests/oniguruma/README.md": "eae6ac089cd32010ffacb4b2f0f8cbac03ad2623e115386af53bfc93e04d1903",
+    "tests/oniguruma/test_utf8.c": "1e4813ac64703cfdbcdca359b82856c5c6778abf977e577992f6b34ab26b92de",
+    "tests/oniguruma/test_utf8_ignore.c": "6415e8361b25c8ac701e933638d441f0eef39908cbd8edc5247fceaf89348f04",
+    "tests/regex_options.rs": "39beeac1f558257d0a177fa0fd78d59da912740b9a0c60d97ed7a7f181008061",
+    "tests/replace.rs": "689fef80c2cd243a510be212cb8e6a04a30a0b0fa6f1dd6be63b17a9abb158d8",
+    "tests/send_sync.rs": "c199289872770882213bb79bb2bb8af0075d95fbd8170195eec6940935e8991c",
+    "tests/splitting.rs": "55a60e7953e92cf542fff8016c24607d3da4fdf9cbf68712348cc430b2bc0f3f"
+  },
+  "upstream_git": "1f8a5d1e7ba42fe6378e4d60efe0a61d3ee6e460",
+  "version": "0.17.0"
+}

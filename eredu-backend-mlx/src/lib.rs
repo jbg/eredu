@@ -1,5 +1,10 @@
 #![doc = include_str!("../README.md")]
 #![deny(missing_docs)]
+// Retained error auto-trait proofs traverse source accounts, prepared pin groups
+// and the deliberate pool -> quarantined source pin -> account -> pool cycle.
+// Keep those owners intact; this affects compiler proof depth, not runtime stack
+// size, allocation limits, original custody, or the workspace unsafe-code policy.
+#![recursion_limit = "256"]
 #![allow(
     clippy::arc_with_non_send_sync,
     clippy::drop_non_drop,
@@ -67,13 +72,17 @@ pub mod native {
     pub use crate::composition::mlx::realtime::{
         MlxPreparedRealtimeExecution, MlxRealtimeCompletion, MlxRealtimeExecutionContext,
         MlxRealtimeFrameCompletionMechanism, MlxRealtimeFrameTensorMechanisms,
-        MlxRealtimeHostObserver,
+        MlxRealtimeHostObserver, MlxRealtimeFramePreparation, MlxManagedRealtimeSessionState,
+        MlxManagedRealtimeScheduler, MlxManagedFrameSessionBranch,
     };
     pub use crate::composition::mlx::speculative::MlxDrafter;
     pub use crate::composition::mlx::{
-        inspect_model, inspect_model_preparation, MlxInspectionOptions, MlxModelInput,
-        MlxModelOutput, MlxModelSession, MlxNativeTextState, MlxSessionCompletion,
-        MlxTextSamplingState,
+        inspect_model, inspect_model_preparation, MlxHostInputUploadError, MlxInspectionOptions,
+        MlxModelInput, MlxModelOutput, MlxModelSession, MlxNativeTextState,
+        MlxOriginalPreparedModelInput, MlxOriginalPreparedNativeInput,
+        MlxPreparedInputMaterializer, MlxPreparedModelInputBindError, MlxPreparedModelInputError,
+        MlxPreparedModelInputPlan, MlxPreparedNativeInputError, MlxPreparedNativeInputPlan,
+        MlxSessionCompletion, MlxTextSamplingState,
     };
     /// Converts a checkpoint with an explicitly selected native execution stream.
     pub fn quantize_checkpoint(
@@ -105,6 +114,35 @@ pub mod native {
         world: &'a safemlx::distributed::Group,
     ) -> crate::backend::MlxBackend<'a> {
         crate::backend::MlxBackend::with_distributed_world(stream, weights_stream, world)
+    }
+
+    /// Native prepared stream failure retaining its actual incomplete owner.
+    pub use crate::backend::managed_memory::gpu_stream::MlxGpuStreamError;
+
+    /// Constructs a distributed backend retaining the same admitted execution
+    /// and source stream owners as the execution-plan factory.
+    ///
+    /// The supplied world remains the actual communicator. This does not adopt
+    /// ordinary stream aliases or grant native storage from a caller capacity.
+    /// `Ok(None)` preserves the factory's explicit absence of a qualified stream
+    /// constructor. The native error retains its original incomplete owners.
+    pub fn prepared_distributed_backend(
+        world: &safemlx::distributed::Group,
+    ) -> Result<Option<crate::backend::MlxBackend<'_>>, MlxGpuStreamError> {
+        prepared_distributed_backend_on(world, safemlx::DeviceType::Gpu)
+    }
+
+    /// Constructs prepared distributed streams on the selected native device
+    /// type at index zero, using the same mechanism choice as the plan factory.
+    /// The world and exact native stream owners remain retained by the backend.
+    pub fn prepared_distributed_backend_on(
+        world: &safemlx::distributed::Group,
+        device: safemlx::DeviceType,
+    ) -> Result<Option<crate::backend::MlxBackend<'_>>, MlxGpuStreamError> {
+        let streams = crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_device_factory(
+            &crate::backend::managed_memory::domain(), device,
+        )?;
+        Ok(streams.map(|streams|crate::backend::MlxBackend::with_prepared_distributed_world(streams, world)))
     }
 
     /// Binds semantic topology, wire dtype, and maximum invocation geometry to model options.

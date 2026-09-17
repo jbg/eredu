@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T13:44:05.701920+00:00",
+  "scope": "Constant ByteLevel alphabet and lazy initialization only for enabled regex work",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-tokenizer-model-cache-policy-integration-2026-09-14.json",
+  "tests": {
+    "hf": {
+      "passed": 215,
+      "ignored": 0
+    },
+    "text": {
+      "passed": 74,
+      "ignored": 3
+    },
+    "text_docs": {
+      "passed": 6,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 248,
+      "ignored": 2
+    },
+    "docs": {
+      "passed": 6,
+      "ignored": 1
+    },
+    "portable": {
+      "passed": 26,
+      "ignored": 1
+    },
+    "conformance": {
+      "passed": 110,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 685,
+  "new_tests": [
+    {
+      "check": "hf",
+      "name": "all_bytes_and_every_unicode_scalar_match_the_upstream_alphabet",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/byte_level/static_alphabet_tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "unicode_normalization_keeps_exact_original_alignment",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/byte_level/static_alphabet_tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "regex_disabled_unicode_prefix_and_offsets_are_preserved",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/byte_level/static_alphabet_tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "decoder_fallback_is_whole_token_and_utf8_spans_token_boundaries",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/byte_level/static_alphabet_tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "postprocessing_preserves_prefix_unicode_space_overflow_and_serialization",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/byte_level/static_alphabet_tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "persistent_workers_encode_with_cloned_and_restored_sources_after_owner_drop",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/byte_level/static_alphabet_tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "regex_is_initialized_only_by_enabled_work_in_a_fresh_process",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/byte_level/static_alphabet_tests.rs"
+    }
+  ],
+  "new_test_count": 7,
+  "checks": {
+    "hf": {
+      "command": "CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/tokenizers-0.23.2/Cargo.toml --locked --target-dir /Users/jbg/dev/eredu/target --no-default-features --features fancy-regex --lib",
+      "started_utc": "2026-09-14T13:41:50.203479+00:00",
+      "elapsed_seconds": 4.448,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-tokenizer-static-alphabet-integration-hf.log",
+      "log_sha256": "d453d67cecdccb882f48ea9eefbdd4aa0bc4b31f440cab807f9a91dfe4783635"
+    },
+    "text": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-text --no-default-features --lib",
+      "started_utc": "2026-09-14T13:41:54.652680+00:00",
+      "elapsed_seconds": 5.153,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-tokenizer-static-alphabet-integration-text.log",
+      "log_sha256": "c51f3671760d62ee02472be8d2aa806c30014307b843abadb82f352b09dfa9c4"
+    },
+    "text_docs": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-text --no-default-features --doc",
+      "started_utc": "2026-09-14T13:41:59.807159+00:00",
+      "elapsed_seconds": 0.986,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-tokenizer-static-alphabet-integration-text_docs.log",
+      "log_sha256": "7a1580451f194f85255a4958b77e8f67f10f6419d93bb53c72ddd2a43b2254fb"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib",
+      "started_utc": "2026-09-14T13:42:00.793442+00:00",
+      "elapsed_seconds": 40.871,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-tokenizer-static-alphabet-integration-facade.log",
+      "log_sha256": "fe230e1577c6bbc3caed9dbf9f624b492ad47729fac0fa361e2dd3e488dc0f42"
+    },
+    "docs": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --doc",
+      "started_utc": "2026-09-14T13:42:41.665419+00:00",
+      "elapsed_seconds": 2.227,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-tokenizer-static-alphabet-integration-docs.log",
+      "log_sha256": "1d0ba587d276ae90109c646c17a68a010dd150fdf7d09cc3e7d3d9b4ebb0a4ce"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade",
+      "started_utc": "2026-09-14T13:42:43.893257+00:00",
+      "elapsed_seconds": 13.38,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-tokenizer-static-alphabet-integration-portable.log",
+      "log_sha256": "3df451586548e6b5ca276551389e244bd3acc78d397c59f5f2736477268dba7c"
+    },
+    "conformance": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test backend_conformance",
+      "started_utc": "2026-09-14T13:42:57.274316+00:00",
+      "elapsed_seconds": 5.463,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-tokenizer-static-alphabet-integration-conformance.log",
+      "log_sha256": "1e58bd1ee85afbdb131163718ca581c4e686377e9fc274eba4afe6aa83a6184e"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T13:43:02.737647+00:00",
+      "elapsed_seconds": 17.186,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-tokenizer-static-alphabet-integration-minimal.log",
+      "log_sha256": "1b0ce526f22a2923900912dbf691276763f6ce47588cbf461a4d6700cc2735f7"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T13:43:19.923948+00:00",
+      "elapsed_seconds": 18.221,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-tokenizer-static-alphabet-integration-features.log",
+      "log_sha256": "b2ac0cfae2dbcdd5394885bb5093c1b1485b1616ebfc87c48348062663ce0721"
+    },
+    "artifacts": {
+      "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-tokenizer-static-alphabet-integration-artifacts.py",
+      "started_utc": "2026-09-14T13:43:38.145461+00:00",
+      "elapsed_seconds": 22.852,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-tokenizer-static-alphabet-integration-artifacts.log",
+      "log_sha256": "2538c6272a3c7a46b978aa4efa7891535ba1db47f9069f0d614a99f5fa5027df"
+    }
+  },
+  "source_sha256": {
+    "third-party/tokenizers-0.23.2/src/pre_tokenizers/byte_level.rs": "83d9e41a183497bbb80c28d0d6b6d0695c9d6a6645a065c4bd09e5c76ba9033f",
+    "third-party/README.md": "dab49ce30ff11b8bc4f3f719bcbb1962b3adc5018d0d126b975ae178a7e4e16d",
+    "doc/backend-architecture.md": "14687d140129954cb8e7dc3b3c93262aa45c644ba485a2f30189a8d58e7c7049",
+    "third-party/tokenizers-0.23.2/src/pre_tokenizers/byte_level/static_alphabet_tests.rs": "5604185e742d58e999aa8110ccbbd68bb4739f1cd1f9e302a45e841d5dd83537",
+    "third-party/tokenizers-static-alphabet.patch": "072779a52ef812887567ae5ff4c5ed7bc4e056b64489b71c3bef66c01d2740c9",
+    "third-party/tokenizers-0.23.2/src/pre_tokenizers/byte_level/alphabet.rs": "31038618bbf16f44cab764c159642fbc4047bfcbf289290af2e553859c39b18b",
+    "doc/bounded-inference.md": "a2caffaa9486e6178b981a8ccdc416921191b6bf665ac3047473ab1b65958a78",
+    "third-party/tokenizers-static-alphabet.json": "573cb26d858b34b54288cde1b55d348144a60839c0a77709e164eadb0440dc4e",
+    "third-party/tokenizers-0.23.2/src/normalizers/byte_level.rs": "0e28c6324cfef9173798e8462537ef68b46950a178358ed659752e52ae1ca182"
+  },
+  "source_snapshot": "/private/tmp/eredu-tokenizer-static-alphabet-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-tokenizer-model-cache-policy-integration-2026-09-14.json": "e8a5d3fb23b79b5a04bb04dfe3471f727b297dba589dd653d0e7b07706707292",
+    "/private/tmp/eredu-prepare-reviewed-document-operations-with-patch-artifacts.py": "5cc858a44806cb87982e4d15077aef282a2bca9ee5ae12cc174bad2ffcabf4a1",
+    "/private/tmp/eredu-static-alphabet-root-verify.py": "f279e059e86836083c17c51f09e1d49c22b1e68be193a7dfe589da23dcb1d4e3",
+    "/private/tmp/eredu-tokenizer-static-alphabet-final-root-review.json": "e0d3fc9c0125a05ef2e6a2fd6a93163c1707d0474cc4a79531fb5c77f46d8ef0",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-applied.json": "9fbce7c171050e89092f7304655756ae3de1e84c3bd943f1588aa1d12d45e660",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-apply.py": "fbcb2b98ed15fd705ae9836b78f749871031916825d33a6121094d51f1564de5",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-artifact-report.json": "c4785374d8107f667903d4d8bd1a156cf8418d52ef86d316f7b078d2f769863f",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-artifacts.log": "2538c6272a3c7a46b978aa4efa7891535ba1db47f9069f0d614a99f5fa5027df",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-artifacts.py": "c065411c628ee92547619d856c7dc3ec8d9f0824a1d5f2e94515c1b3ca460e8c",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-checks.json": "e65189bd5f6f1e50f9e435eea9c8a9d93a57416f7144ddcd73f1a421c1ff922f",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-conformance.log": "1e58bd1ee85afbdb131163718ca581c4e686377e9fc274eba4afe6aa83a6184e",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-doc-applied.json": "fe184425c3213ff3f8ae6af863b5600bf7444ec7c9479afc2c6e98c8004c94f1",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-docs.log": "1d0ba587d276ae90109c646c17a68a010dd150fdf7d09cc3e7d3d9b4ebb0a4ce",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-facade.log": "fe230e1577c6bbc3caed9dbf9f624b492ad47729fac0fa361e2dd3e488dc0f42",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-features.log": "b2ac0cfae2dbcdd5394885bb5093c1b1485b1616ebfc87c48348062663ce0721",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-hf.log": "d453d67cecdccb882f48ea9eefbdd4aa0bc4b31f440cab807f9a91dfe4783635",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-minimal.log": "1b0ce526f22a2923900912dbf691276763f6ce47588cbf461a4d6700cc2735f7",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-portable.log": "3df451586548e6b5ca276551389e244bd3acc78d397c59f5f2736477268dba7c",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-review.json": "d333e717be86fd5aeb9c71298a86a6e2bae7935ece3c1a3236e283ab13e81ad0",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-root-review.json": "770bf6ad37d33cefdcf6f40c3a68c576a21d22289b3af81637f34d049a34609a",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-spec.json": "aaf66271266242e832a8b87d592e49eeaf1ef8bbbd80f89cb71033155c5f4b79",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-spec.pending.json": "22ac24cf2da4cef0142be910b2056f63518c5d7859395bf091a6db2f55b6601e",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-stage/all.patch": "6078525c29d8a8789f02aed46f9ad6dd3ead25090966528cbe3a3ad4503a29e8",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-stage/change.patch": "6796ebe9fe8237ed3286bd9711a656a954ffbfb7e339db601acadbc143fe0563",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-stage/manifest.json": "9fbce7c171050e89092f7304655756ae3de1e84c3bd943f1588aa1d12d45e660",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-stage/staged-hashes.json": "bc0079a8459551e5da1d4ba5082bdb1a4f7b729e00abcd0975e435c840a23012",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-text.log": "c51f3671760d62ee02472be8d2aa806c30014307b843abadb82f352b09dfa9c4",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-text_docs.log": "7a1580451f194f85255a4958b77e8f67f10f6419d93bb53c72ddd2a43b2254fb",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-validate.py": "06ad38be6e54fe36086e719bdb2c11c62a307c8c90e0da0faa5a1267c57a2ea5",
+    "/private/tmp/eredu-tokenizer-static-alphabet-integration-validation-config.json": "279060a41a428df40b9375af839a61b594768f4a1a9e36f66aa7e98c15e6392a",
+    "/private/tmp/eredu-tokenizer-static-alphabet-review.md": "526a41dfec9fd03eeab56da8f45a8e9520099a041ec91ed420773b4bcbd3424c",
+    "/private/tmp/eredu-tokenizer-static-alphabet-reviewed-stage/README.md": "98bee83b74fe745c00fd5c8af922cb133485b5af7ee09d179ad1a582a84f5199",
+    "/private/tmp/eredu-tokenizer-static-alphabet-reviewed-stage/doc-snippets.json": "0c0cb55ed33df0053a18a5ce548ff93dc44c171334a63fd4be5a030ca5b4e5f5",
+    "/private/tmp/eredu-tokenizer-static-alphabet-reviewed-stage/manifest.json": "9fbce7c171050e89092f7304655756ae3de1e84c3bd943f1588aa1d12d45e660",
+    "/private/tmp/eredu-tokenizer-static-alphabet-root-verification/result.json": "b2570274ef7a65eae799d188396e7df79f7acc708002e7c4a9b814d8c0ecefd9"
+  },
+  "review": {
+    "full_manifest_sha256": "bc0079a8459551e5da1d4ba5082bdb1a4f7b729e00abcd0975e435c840a23012",
+    "full_patch_sha256": "6078525c29d8a8789f02aed46f9ad6dd3ead25090966528cbe3a3ad4503a29e8",
+    "patch_sha256": "6796ebe9fe8237ed3286bd9711a656a954ffbfb7e339db601acadbc143fe0563",
+    "replay": "/private/tmp/eredu-tokenizer-static-alphabet-integration-stage/replay",
+    "review": "Root and independent full source/test/doc reviews complete. Root verified 62 artifacts,4 base origins,16 supporting sources,17 dependencies,6/8 source/full replay,scoped formatting4 and full104\u2192106 HF reconstruction. All seven new behavioral cases source-reviewed; execution pending this integration.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-tokenizer-model-cache-policy-integration-2026-09-14.json": "e8a5d3fb23b79b5a04bb04dfe3471f727b297dba589dd653d0e7b07706707292",
+      "/private/tmp/eredu-prepare-reviewed-document-operations-with-patch-artifacts.py": "5cc858a44806cb87982e4d15077aef282a2bca9ee5ae12cc174bad2ffcabf4a1",
+      "/private/tmp/eredu-static-alphabet-root-verify.py": "f279e059e86836083c17c51f09e1d49c22b1e68be193a7dfe589da23dcb1d4e3",
+      "/private/tmp/eredu-tokenizer-static-alphabet-final-root-review.json": "e0d3fc9c0125a05ef2e6a2fd6a93163c1707d0474cc4a79531fb5c77f46d8ef0",
+      "/private/tmp/eredu-tokenizer-static-alphabet-integration-artifacts.py": "c065411c628ee92547619d856c7dc3ec8d9f0824a1d5f2e94515c1b3ca460e8c",
+      "/private/tmp/eredu-tokenizer-static-alphabet-integration-root-review.json": "770bf6ad37d33cefdcf6f40c3a68c576a21d22289b3af81637f34d049a34609a",
+      "/private/tmp/eredu-tokenizer-static-alphabet-integration-spec.json": "aaf66271266242e832a8b87d592e49eeaf1ef8bbbd80f89cb71033155c5f4b79",
+      "/private/tmp/eredu-tokenizer-static-alphabet-review.md": "526a41dfec9fd03eeab56da8f45a8e9520099a041ec91ed420773b4bcbd3424c",
+      "/private/tmp/eredu-tokenizer-static-alphabet-reviewed-stage/README.md": "98bee83b74fe745c00fd5c8af922cb133485b5af7ee09d179ad1a582a84f5199",
+      "/private/tmp/eredu-tokenizer-static-alphabet-reviewed-stage/doc-snippets.json": "0c0cb55ed33df0053a18a5ce548ff93dc44c171334a63fd4be5a030ca5b4e5f5",
+      "/private/tmp/eredu-tokenizer-static-alphabet-reviewed-stage/manifest.json": "9fbce7c171050e89092f7304655756ae3de1e84c3bd943f1588aa1d12d45e660",
+      "/private/tmp/eredu-tokenizer-static-alphabet-root-verification/result.json": "b2570274ef7a65eae799d188396e7df79f7acc708002e7c4a9b814d8c0ecefd9"
+    },
+    "source_manifest_sha256": "9fbce7c171050e89092f7304655756ae3de1e84c3bd943f1588aa1d12d45e660"
+  },
+  "behavior": [
+    "All 256 bytes and every valid Unicode scalar match the independent original alphabet algorithm.",
+    "Normalizer alignments, disabled-regex prefix/offsets, whole-token decoder fallback and cross-token UTF8 preserve existing behavior.",
+    "Full encoding/overflow/serde cases and persistent worker cache-absent clone/reload routes retain exact IDs, offsets and decoding.",
+    "Fresh-process instrumentation checks the actual regex initializer stays untouched for disabled work and initializes for enabled work."
+  ],
+  "limits": [
+    "The public alphabet method still returns its ordinary allocated owned set.",
+    "Enabled regexes and other tokenizer/matcher/Rayon globals are not covered by this change.",
+    "No new ownership/admission API and no complete tokenizer construction or process-memory guarantee."
+  ]
+}

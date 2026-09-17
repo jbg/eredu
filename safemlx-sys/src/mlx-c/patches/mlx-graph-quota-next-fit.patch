@@ -1,0 +1,100 @@
+diff --git a/mlx/graph_quota.h b/mlx/graph_quota.h
+--- a/mlx/graph_quota.h
++++ b/mlx/graph_quota.h
+@@ -90,7 +90,7 @@
+     void* result = nullptr;
+     Block* entry = nullptr;
+     Block* adjacent = nullptr;
+-    size_t offset = 0, start = 0, pointer = 0, used = 0;
++    size_t offset = 0, first = 0, start = 0, pointer = 0, used = 0;
+     size_t address = 0, remainder = 0, next = 0;
+   } scratch_;
+   GraphQuota(size_t, void*, void (*)(void*), bool direct = false) noexcept;
+@@ -101,6 +101,8 @@
+   mutable std::atomic_flag loan_ = ATOMIC_FLAG_INIT;
+   size_t capacity_;
+   size_t occupied_{0};
++  // Always a current physical block boundary, protected by loan_.
++  size_t search_{0};
+   bool direct_allocation_{false};
+   void* owner_;
+   void (*retire_)(void*);
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -277,29 +277,37 @@
+     const Loan loan(*this);
+     auto& c = scratch_;
+     c.result = nullptr;
+-    for (c.offset = 0; c.offset != absent; c.offset = block(c.offset)->next) {
++    // Start after the last successful allocation. Walking from the first
++    // block for every request revisits the entire live prefix while a large
++    // prepared graph fills an otherwise fresh arena. A failed search still
++    // visits every current block exactly once; no free capacity is skipped.
++    for (c.first = c.offset = search_;;) {
+       c.entry = block(c.offset);
+-      if (!c.entry->free) continue;
+-      c.address = reinterpret_cast<uintptr_t>(bytes() + c.offset);
+-      if (!add(c.address, sizeof(Block) + sizeof(size_t), c.start) ||
+-          !align_up(c.start, align, c.pointer) ||
+-          !add(c.pointer - c.address, std::max(requested, size_t{1}), c.used) ||
+-          !align_up(c.used, alignment, c.used) || c.used > c.entry->bytes)
+-        continue;
+-      c.remainder = c.entry->bytes - c.used;
+-      if (c.remainder >= minimum_split_bytes()) {
+-        c.next = c.offset + c.used;
+-        ::new (bytes() + c.next) Block{c.remainder, c.offset, c.entry->next, true};
+-        if (c.entry->next != absent) block(c.entry->next)->previous = c.next;
+-        c.entry->next = c.next;
+-        c.entry->bytes = c.used;
++      if (c.entry->free) {
++        c.address = reinterpret_cast<uintptr_t>(bytes() + c.offset);
++        if (add(c.address, sizeof(Block) + sizeof(size_t), c.start) &&
++            align_up(c.start, align, c.pointer) &&
++            add(c.pointer - c.address, std::max(requested, size_t{1}), c.used) &&
++            align_up(c.used, alignment, c.used) && c.used <= c.entry->bytes) {
++          c.remainder = c.entry->bytes - c.used;
++          if (c.remainder >= minimum_split_bytes()) {
++            c.next = c.offset + c.used;
++            ::new (bytes() + c.next) Block{c.remainder, c.offset, c.entry->next, true};
++            if (c.entry->next != absent) block(c.entry->next)->previous = c.next;
++            c.entry->next = c.next;
++            c.entry->bytes = c.used;
++          }
++          c.entry->free = false;
++          occupied_ += c.entry->bytes; // disjoint physical blocks, total <= capacity
++          c.result = reinterpret_cast<void*>(c.pointer);
++          // memcpy avoids imposing an alignment requirement on the back-offset.
++          std::memcpy(reinterpret_cast<std::byte*>(c.result) - sizeof(size_t), &c.offset, sizeof(c.offset));
++          search_ = c.entry->next == absent ? 0 : c.entry->next;
++          break;
++        }
+       }
+-      c.entry->free = false;
+-      occupied_ += c.entry->bytes; // disjoint physical blocks, total <= capacity
+-      c.result = reinterpret_cast<void*>(c.pointer);
+-      // memcpy avoids imposing an alignment requirement on the back-offset.
+-      std::memcpy(reinterpret_cast<std::byte*>(c.result) - sizeof(size_t), &c.offset, sizeof(c.offset));
+-      break;
++      c.offset = c.entry->next == absent ? 0 : c.entry->next;
++      if (c.offset == c.first) break;
+     }
+     result = c.result;
+     // No scratch pointer is an owning reference or consulted outside this loan.
+@@ -319,12 +327,16 @@
+   occupied_ -= c.entry->bytes;
+   c.entry->free = true;
+   if (c.entry->next != absent && block(c.entry->next)->free) {
++    // Coalescing destroys a block header; move a cursor naming that header
++    // onto the surviving block before its offset can become interior storage.
++    if (search_ == c.entry->next) search_ = c.offset;
+     c.adjacent = block(c.entry->next);
+     c.entry->bytes += c.adjacent->bytes;
+     c.entry->next = c.adjacent->next;
+     if (c.entry->next != absent) block(c.entry->next)->previous = c.offset;
+   }
+   if (c.entry->previous != absent && block(c.entry->previous)->free) {
++    if (search_ == c.offset) search_ = c.entry->previous;
+     c.adjacent = block(c.entry->previous);
+     c.adjacent->bytes += c.entry->bytes;
+     c.adjacent->next = c.entry->next;

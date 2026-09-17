@@ -1,0 +1,1431 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -24,3 +24,7 @@
+ repository = "https://github.com/n1t0/unicode-normalization"
+ [dependencies.smallvec]
+ version = "1.0"
++
++[features]
++# Development-only overflow of an actual fixed reserve target.
++workspace-test-support = []
+--- a/src/decompose.rs
++++ b/src/decompose.rs
+@@ -13,7 +13,7 @@
+ use std::ops::Range;
+ 
+ #[derive(Clone)]
+-enum DecompositionType {
++pub(crate) enum DecompositionType {
+     Canonical,
+     Compatible,
+ }
+@@ -56,105 +56,151 @@
+     }
+ }
+ 
+-impl<I> Decompositions<I> {
+-    #[inline]
+-    fn push_back(&mut self, ch: char, first: bool) {
+-        let class = super::char::canonical_combining_class(ch);
+-
+-        if class == 0 {
+-            self.sort_pending();
+-        }
+-
+-        self.buffer.push((class, ch, if first { 0 } else { 1 }));
+-    }
+-
+-    #[inline]
+-    fn sort_pending(&mut self) {
+-        // NB: `sort_by_key` is stable, so it will preserve the original text's
+-        // order within a combining class.
+-        self.buffer[self.ready.end..].sort_by_key(|k| k.0);
+-        self.ready.end = self.buffer.len();
+-    }
+-
+-    #[inline]
+-    fn reset_buffer(&mut self) {
+-        // Equivalent to `self.buffer.drain(0..self.ready.end)` (if SmallVec
+-        // supported this API)
+-        let pending = self.buffer.len() - self.ready.end;
+-        for i in 0..pending {
+-            self.buffer[i] = self.buffer[i + self.ready.end];
+-        }
+-        self.buffer.truncate(pending);
+-        self.ready = 0..0;
+-    }
+-
+-    #[inline]
+-    fn increment_next_ready(&mut self) {
+-        let next = self.ready.start + 1;
+-        if next == self.ready.end {
+-            self.reset_buffer();
+-        } else {
+-            self.ready.start = next;
+-        }
+-    }
+-}
+-
++pub(crate) trait DecompositionBuffer {
++    fn len(&self) -> usize;
++    fn get(&self, index: usize) -> (u8, char, isize);
++    fn set(&mut self, index: usize, item: (u8, char, isize));
++    fn push(&mut self, item: (u8, char, isize));
++    fn truncate(&mut self, len: usize);
++    fn sort_pending(&mut self, start: usize);
++}
++impl DecompositionBuffer for SmallVec<[(u8, char, isize); 4]> {
++    fn len(&self) -> usize {
++        SmallVec::len(self)
++    }
++    fn get(&self, index: usize) -> (u8, char, isize) {
++        self[index]
++    }
++    fn set(&mut self, index: usize, item: (u8, char, isize)) {
++        self[index] = item;
++    }
++    fn push(&mut self, item: (u8, char, isize)) {
++        SmallVec::push(self, item)
++    }
++    fn truncate(&mut self, len: usize) {
++        SmallVec::truncate(self, len)
++    }
++    fn sort_pending(&mut self, start: usize) {
++        self[start..].sort_by_key(|k| k.0);
++    }
++}
++
++#[inline]
++fn push_back<B: DecompositionBuffer>(
++    buffer: &mut B,
++    ready: &mut Range<usize>,
++    ch: char,
++    first: bool,
++) {
++    let class = super::char::canonical_combining_class(ch);
++
++    if class == 0 {
++        sort_pending(buffer, ready);
++    }
++
++    buffer.push((class, ch, if first { 0 } else { 1 }));
++}
++
++#[inline]
++fn sort_pending<B: DecompositionBuffer>(buffer: &mut B, ready: &mut Range<usize>) {
++    // NB: `sort_by_key` is stable, so it will preserve the original text's
++    // order within a combining class.
++    buffer.sort_pending(ready.end);
++    ready.end = buffer.len();
++}
++
++#[inline]
++fn reset_buffer<B: DecompositionBuffer>(buffer: &mut B, ready: &mut Range<usize>) {
++    // Equivalent to `buffer.drain(0..ready.end)` (if SmallVec
++    // supported this API)
++    let pending = buffer.len() - ready.end;
++    for i in 0..pending {
++        let item = buffer.get(i + ready.end);
++        buffer.set(i, item);
++    }
++    buffer.truncate(pending);
++    *ready = 0..0;
++}
++
++#[inline]
++fn increment_next_ready<B: DecompositionBuffer>(buffer: &mut B, ready: &mut Range<usize>) {
++    let next = ready.start + 1;
++    if next == ready.end {
++        reset_buffer(buffer, ready);
++    } else {
++        ready.start = next;
++    }
++}
+ impl<I: Iterator<Item = char>> Iterator for Decompositions<I> {
+     type Item = (char, isize);
+ 
+     #[inline]
+     fn next(&mut self) -> Option<(char, isize)> {
+-        while self.ready.end == 0 {
+-            match (self.iter.next(), &self.kind) {
+-                (Some(ch), &DecompositionType::Canonical) => {
+-                    let mut first = true;
+-                    super::char::decompose_canonical(ch, |d| {
+-                        self.push_back(d, first);
+-                        first = false;
+-                    });
+-                }
+-                (Some(ch), &DecompositionType::Compatible) => {
+-                    let mut first = true;
+-                    super::char::decompose_compatible(ch, |d| {
+-                        self.push_back(d, first);
+-                        first = false;
+-                    });
+-                }
+-                (None, _) => {
+-                    if self.buffer.is_empty() {
+-                        return None;
+-                    } else {
+-                        self.sort_pending();
+-
+-                        // This implementation means that we can call `next`
+-                        // on an exhausted iterator; the last outer `next` call
+-                        // will result in an inner `next` call. To make this
+-                        // safe, we use `fuse`.
+-                        break;
+-                    }
++        next(
++            &self.kind,
++            &mut self.iter,
++            &mut self.buffer,
++            &mut self.ready,
++        )
++    }
++
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        let (lower, _) = self.iter.size_hint();
++        (lower, None)
++    }
++}
++
++pub(crate) fn next<I: Iterator<Item = char>, B: DecompositionBuffer>(
++    kind: &DecompositionType,
++    iter: &mut Fuse<I>,
++    buffer: &mut B,
++    ready: &mut Range<usize>,
++) -> Option<(char, isize)> {
++    while ready.end == 0 {
++        match (iter.next(), kind) {
++            (Some(ch), &DecompositionType::Canonical) => {
++                let mut first = true;
++                super::char::decompose_canonical(ch, |d| {
++                    push_back(buffer, ready, d, first);
++                    first = false;
++                });
++            }
++            (Some(ch), &DecompositionType::Compatible) => {
++                let mut first = true;
++                super::char::decompose_compatible(ch, |d| {
++                    push_back(buffer, ready, d, first);
++                    first = false;
++                });
++            }
++            (None, _) => {
++                if buffer.len() == 0 {
++                    return None;
++                } else {
++                    sort_pending(buffer, ready);
++
++                    // This implementation means that we can call `next`
++                    // on an exhausted iterator; the last outer `next` call
++                    // will result in an inner `next` call. To make this
++                    // safe, we use `fuse`.
++                    break;
+                 }
+             }
+         }
+-
+-        // We can assume here that, if `self.ready.end` is greater than zero,
+-        // it's also greater than `self.ready.start`. That's because we only
+-        // increment `self.ready.start` inside `increment_next_ready`, and
+-        // whenever it reaches equality with `self.ready.end`, we reset both
+-        // to zero, maintaining the invariant that:
+-        //      self.ready.start < self.ready.end || self.ready.end == self.ready.start == 0
+-        //
+-        // This less-than-obviously-safe implementation is chosen for performance,
+-        // minimizing the number & complexity of branches in `next` in the common
+-        // case of buffering then unbuffering a single character with each call.
+-        let (_, ch, size) = self.buffer[self.ready.start];
+-        self.increment_next_ready();
+-        Some((ch, size))
+-    }
+-
+-    fn size_hint(&self) -> (usize, Option<usize>) {
+-        let (lower, _) = self.iter.size_hint();
+-        (lower, None)
+-    }
++    }
++
++    // We can assume here that, if `ready.end` is greater than zero,
++    // it's also greater than `ready.start`. That's because we only
++    // increment `ready.start` inside `increment_next_ready`, and
++    // whenever it reaches equality with `ready.end`, we reset both
++    // to zero, maintaining the invariant that:
++    //      ready.start < ready.end || ready.end == ready.start == 0
++    //
++    // This less-than-obviously-safe implementation is chosen for performance,
++    // minimizing the number & complexity of branches in `next` in the common
++    // case of buffering then unbuffering a single character with each call.
++    let (_, ch, size) = buffer.get(ready.start);
++    increment_next_ready(buffer, ready);
++    Some((ch, size))
+ }
+ 
+ impl<I: Iterator<Item = char> + Clone> fmt::Display for Decompositions<I> {
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -64,6 +64,9 @@
+ mod recompose;
+ mod stream_safe;
+ mod tables;
++
++/// Closed, source-bound NFC storage with fallible preparation.
++pub mod workspace;
+ 
+ #[doc(hidden)]
+ pub mod __test_api;
+--- a/src/recompose.rs
++++ b/src/recompose.rs
+@@ -13,7 +13,7 @@
+ use std::fmt::{self, Write};
+ 
+ #[derive(Clone)]
+-enum RecompositionState {
++pub(crate) enum RecompositionState {
+     Composing,
+     Purging(usize),
+     Finished(usize),
+@@ -56,94 +56,125 @@
+ 
+     #[inline]
+     fn next(&mut self) -> Option<(char, isize)> {
+-        use self::RecompositionState::*;
++        next(
++            &mut self.iter,
++            &mut self.state,
++            &mut self.buffer,
++            &mut self.composee,
++            &mut self.last_ccc,
++        )
++    }
++}
+ 
+-        loop {
+-            match self.state {
+-                Composing => {
+-                    for (ch, change) in self.iter.by_ref() {
+-                        let ch_class = super::char::canonical_combining_class(ch);
+-                        let k = match self.composee {
+-                            None => {
+-                                if ch_class != 0 {
+-                                    return Some((ch, change));
+-                                }
+-                                self.composee = Some((ch, change));
++pub(crate) trait RecompositionBuffer {
++    fn get(&self, index: usize) -> Option<(char, isize)>;
++    fn push(&mut self, item: (char, isize));
++    fn clear(&mut self);
++}
++impl RecompositionBuffer for SmallVec<[(char, isize); 4]> {
++    fn get(&self, index: usize) -> Option<(char, isize)> {
++        self.as_slice().get(index).cloned()
++    }
++    fn push(&mut self, item: (char, isize)) {
++        SmallVec::push(self, item)
++    }
++    fn clear(&mut self) {
++        SmallVec::clear(self)
++    }
++}
++pub(crate) fn next<I: Iterator<Item = (char, isize)>, B: RecompositionBuffer>(
++    iter: &mut I,
++    state: &mut RecompositionState,
++    buffer: &mut B,
++    composee: &mut Option<(char, isize)>,
++    last_ccc: &mut Option<u8>,
++) -> Option<(char, isize)> {
++    use self::RecompositionState::*;
++
++    loop {
++        match *state {
++            Composing => {
++                for (ch, change) in iter.by_ref() {
++                    let ch_class = super::char::canonical_combining_class(ch);
++                    let k = match *composee {
++                        None => {
++                            if ch_class != 0 {
++                                return Some((ch, change));
++                            }
++                            *composee = Some((ch, change));
++                            continue;
++                        }
++                        Some(k) => k,
++                    };
++                    match *last_ccc {
++                        None => match super::char::compose(k.0, ch) {
++                            Some(r) => {
++                                *composee = Some((r, k.1 + change - 1));
+                                 continue;
+                             }
+-                            Some(k) => k,
+-                        };
+-                        match self.last_ccc {
+-                            None => match super::char::compose(k.0, ch) {
++                            None => {
++                                if ch_class == 0 {
++                                    *composee = Some((ch, change));
++                                    return Some(k);
++                                }
++                                buffer.push((ch, change));
++                                *last_ccc = Some(ch_class);
++                            }
++                        },
++                        Some(l_class) => {
++                            if l_class >= ch_class {
++                                // `ch` is blocked from `composee`
++                                if ch_class == 0 {
++                                    *composee = Some((ch, change));
++                                    *last_ccc = None;
++                                    *state = Purging(0);
++                                    return Some(k);
++                                }
++                                buffer.push((ch, change));
++                                *last_ccc = Some(ch_class);
++                                continue;
++                            }
++                            match super::char::compose(k.0, ch) {
+                                 Some(r) => {
+-                                    self.composee = Some((r, k.1 + change - 1));
++                                    *composee = Some((r, k.1 + change - 1));
+                                     continue;
+                                 }
+                                 None => {
+-                                    if ch_class == 0 {
+-                                        self.composee = Some((ch, change));
+-                                        return Some(k);
+-                                    }
+-                                    self.buffer.push((ch, change));
+-                                    self.last_ccc = Some(ch_class);
+-                                }
+-                            },
+-                            Some(l_class) => {
+-                                if l_class >= ch_class {
+-                                    // `ch` is blocked from `composee`
+-                                    if ch_class == 0 {
+-                                        self.composee = Some((ch, change));
+-                                        self.last_ccc = None;
+-                                        self.state = Purging(0);
+-                                        return Some(k);
+-                                    }
+-                                    self.buffer.push((ch, change));
+-                                    self.last_ccc = Some(ch_class);
+-                                    continue;
+-                                }
+-                                match super::char::compose(k.0, ch) {
+-                                    Some(r) => {
+-                                        self.composee = Some((r, k.1 + change - 1));
+-                                        continue;
+-                                    }
+-                                    None => {
+-                                        self.buffer.push((ch, change));
+-                                        self.last_ccc = Some(ch_class);
+-                                    }
++                                    buffer.push((ch, change));
++                                    *last_ccc = Some(ch_class);
+                                 }
+                             }
+                         }
+                     }
+-                    self.state = Finished(0);
+-                    if self.composee.is_some() {
+-                        return self.composee.take();
+-                    }
+                 }
+-                Purging(next) => match self.buffer.get(next).cloned() {
+-                    None => {
+-                        self.buffer.clear();
+-                        self.state = Composing;
+-                    }
+-                    s => {
+-                        self.state = Purging(next + 1);
+-                        return s;
+-                    }
+-                },
+-                Finished(next) => match self.buffer.get(next).cloned() {
+-                    None => {
+-                        self.buffer.clear();
+-                        return self.composee.take();
+-                    }
+-                    s => {
+-                        self.state = Finished(next + 1);
+-                        return s;
+-                    }
+-                },
++                *state = Finished(0);
++                if composee.is_some() {
++                    return composee.take();
++                }
+             }
++            Purging(next) => match buffer.get(next) {
++                None => {
++                    buffer.clear();
++                    *state = Composing;
++                }
++                s => {
++                    *state = Purging(next + 1);
++                    return s;
++                }
++            },
++            Finished(next) => match buffer.get(next) {
++                None => {
++                    buffer.clear();
++                    return composee.take();
++                }
++                s => {
++                    *state = Finished(next + 1);
++                    return s;
++                }
++            },
+         }
+     }
+ }
+-
+ impl<I: Iterator<Item = char> + Clone> fmt::Display for Recompositions<I> {
+     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+         for c in self.clone() {
+--- /dev/null
++++ b/src/workspace.rs
+@@ -0,0 +1,432 @@
++//! One source-bound, once-reserved NFC destination with shared Unicode workers.
++//!
++//! ```compile_fail
++//! use unicode_normalization_alignments::workspace::Plan;
++//! let mut source = String::from("e\u{301}");
++//! let plan = Plan::new(&source).unwrap();
++//! source.clear();
++//! let _ = plan.prepare();
++//! ```
++//! ```compile_fail
++//! use unicode_normalization_alignments::workspace::Plan;
++//! let plan = Plan::new("text").unwrap();
++//! let _ = plan.prepare();
++//! let _ = plan.prepare();
++//! ```
++//! ```compile_fail
++//! use unicode_normalization_alignments::workspace::Plan;
++//! let mut workspace = Plan::new("e\u{301}").unwrap().prepare().unwrap();
++//! let output = workspace.normalize(0..3).unwrap();
++//! let retired = workspace.retire();
++//! println!("{} {:?}", output, retired);
++//! ```
++use decompose::{self, DecompositionBuffer, DecompositionType};
++use recompose::{self, RecompositionBuffer, RecompositionState};
++use std::{
++    alloc::Layout, collections::TryReserveError, fmt, iter::Fuse, mem::size_of, ops::Range,
++    str::Chars,
++};
++
++/// One actual destination, selected only by the development failure seam.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Buffer {
++    /// Canonical class/character/change/ordinal records.
++    Decomposition,
++    /// Pending recomposition characters and changes.
++    Recomposition,
++    /// Normalized UTF-8 output.
++    Text,
++}
++/// Geometry was rejected before any allocation.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Overflow;
++impl fmt::Display for Overflow {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        f.write_str("NFC destination layout overflow")
++    }
++}
++impl std::error::Error for Overflow {}
++/// The requested range is not a UTF-8 subrange of the originally borrowed source.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct InvalidRange;
++impl fmt::Display for InvalidRange {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        f.write_str("NFC source range is invalid")
++    }
++}
++impl std::error::Error for InvalidRange {}
++
++#[derive(Clone, Copy, Debug)]
++struct Record {
++    class: u8,
++    scalar: char,
++    change: isize,
++    ordinal: usize,
++}
++#[derive(Debug)]
++struct Decomposition {
++    entries: Vec<Record>,
++    limit: usize,
++}
++impl DecompositionBuffer for Decomposition {
++    fn len(&self) -> usize {
++        self.entries.len()
++    }
++    fn get(&self, i: usize) -> (u8, char, isize) {
++        let r = self.entries[i];
++        (r.class, r.scalar, r.change)
++    }
++    fn set(&mut self, i: usize, (class, scalar, change): (u8, char, isize)) {
++        self.entries[i] = Record {
++            class,
++            scalar,
++            change,
++            ordinal: 0,
++        };
++    }
++    fn push(&mut self, (class, scalar, change): (u8, char, isize)) {
++        assert!(
++            self.entries.len() < self.limit && self.entries.len() < self.entries.capacity(),
++            "NFC decomposition bound"
++        );
++        self.entries.push(Record {
++            class,
++            scalar,
++            change,
++            ordinal: 0,
++        });
++    }
++    fn truncate(&mut self, len: usize) {
++        self.entries.truncate(len);
++    }
++    fn sort_pending(&mut self, start: usize) {
++        let pending = &mut self.entries[start..];
++        for (ordinal, item) in pending.iter_mut().enumerate() {
++            item.ordinal = ordinal;
++        }
++        // Unique total key is exactly the ordinary stable class order. Renumber
++        // after every compaction; never retain old ordinals as source authority.
++        pending.sort_unstable_by_key(|r| (r.class, r.ordinal));
++    }
++}
++#[derive(Debug)]
++struct Recomposition {
++    entries: Vec<(char, isize)>,
++    limit: usize,
++}
++impl RecompositionBuffer for Recomposition {
++    fn get(&self, i: usize) -> Option<(char, isize)> {
++        self.entries.get(i).cloned()
++    }
++    fn push(&mut self, item: (char, isize)) {
++        assert!(
++            self.entries.len() < self.limit && self.entries.len() < self.entries.capacity(),
++            "NFC recomposition bound"
++        );
++        self.entries.push(item);
++    }
++    fn clear(&mut self) {
++        self.entries.clear();
++    }
++}
++struct Decomposing<'a, 'b> {
++    iter: Fuse<Chars<'a>>,
++    ready: Range<usize>,
++    storage: &'b mut Decomposition,
++}
++impl Iterator for Decomposing<'_, '_> {
++    type Item = (char, isize);
++    fn next(&mut self) -> Option<Self::Item> {
++        decompose::next(
++            &DecompositionType::Canonical,
++            &mut self.iter,
++            self.storage,
++            &mut self.ready,
++        )
++    }
++}
++struct Recomposing<'a, 'b> {
++    iter: Decomposing<'a, 'b>,
++    state: RecompositionState,
++    storage: &'b mut Recomposition,
++    composee: Option<(char, isize)>,
++    last_ccc: Option<u8>,
++}
++impl Iterator for Recomposing<'_, '_> {
++    type Item = (char, isize);
++    fn next(&mut self) -> Option<Self::Item> {
++        recompose::next(
++            &mut self.iter,
++            &mut self.state,
++            self.storage,
++            &mut self.composee,
++            &mut self.last_ccc,
++        )
++    }
++}
++/// Exact checked requested layouts and named controls from the actual input.
++#[derive(Clone, Copy, Debug)]
++pub struct Requirements {
++    scalars: usize,
++    bytes: usize,
++    heap: usize,
++    controls: usize,
++    total: usize,
++}
++impl Requirements {
++    /// Total canonical decomposition scalar population D.
++    pub fn scalar_capacity(&self) -> usize {
++        self.scalars
++    }
++    /// Total canonical decomposition UTF-8 bytes N, bounding recomposed output.
++    pub fn text_capacity(&self) -> usize {
++        self.bytes
++    }
++    /// Three actual destination layouts, without allocator metadata.
++    pub fn buffer_bytes(&self) -> usize {
++        self.heap
++    }
++    /// Named plan, iterator, return/error and fixed sorter-array controls.
++    pub fn control_bytes(&self) -> usize {
++        self.controls
++    }
++    /// Sum of actual destination layouts and named controls; no account grant.
++    pub fn required_bytes(&self) -> usize {
++        self.total
++    }
++}
++/// Move-only plan tied to one immutable source; counts cannot be supplied by callers.
++#[derive(Debug)]
++pub struct Plan<'a> {
++    input: &'a str,
++    requirements: Requirements,
++    #[cfg(any(test, feature = "workspace-test-support"))]
++    failure: Option<Buffer>,
++}
++impl<'a> Plan<'a> {
++    /// Scans static canonical decomposition tables without allocating.
++    pub fn new(input: &'a str) -> Result<Self, Overflow> {
++        let mut counts = Some((0usize, 0usize));
++        for c in input.chars() {
++            ::char::decompose_canonical(c, |d| {
++                counts = counts
++                    .and_then(|(n, b)| Some((n.checked_add(1)?, b.checked_add(d.len_utf8())?)));
++            });
++            if counts.is_none() {
++                return Err(Overflow);
++            }
++        }
++        let (scalars, bytes) = counts.ok_or(Overflow)?;
++        Ok(Self {
++            input,
++            requirements: requirements(scalars, bytes)?,
++            #[cfg(any(test, feature = "workspace-test-support"))]
++            failure: None,
++        })
++    }
++    /// Actual requirements of this source, not independent capacity authority.
++    pub fn requirements(&self) -> Requirements {
++        self.requirements
++    }
++    /// Overflow one selected real reserve. This never changes a successful capacity.
++    #[cfg(any(test, feature = "workspace-test-support"))]
++    #[doc(hidden)]
++    pub fn fail_reservation(mut self, buffer: Buffer) -> Self {
++        self.failure = Some(buffer);
++        self
++    }
++    fn request(&self, buffer: Buffer, n: usize) -> usize {
++        #[cfg(any(test, feature = "workspace-test-support"))]
++        if self.failure == Some(buffer) {
++            return usize::MAX;
++        }
++        let _ = buffer;
++        n
++    }
++    /// Attempts each actual destination once. Error owns every actual partial buffer.
++    pub fn prepare(self) -> Result<Workspace<'a>, PrepareFailure> {
++        let mut storage = Retired {
++            decomposition: Decomposition {
++                entries: Vec::new(),
++                limit: self.requirements.scalars,
++            },
++            recomposition: Recomposition {
++                entries: Vec::new(),
++                limit: self.requirements.scalars,
++            },
++            text: String::new(),
++        };
++        macro_rules! reserve {
++            ($buffer:expr,$target:expr,$n:expr) => {
++                if let Err(cause) = $target.try_reserve_exact(self.request($buffer, $n)) {
++                    return Err(PrepareFailure {
++                        buffer: $buffer,
++                        cause,
++                        partial: storage,
++                    });
++                }
++            };
++        }
++        reserve!(
++            Buffer::Decomposition,
++            storage.decomposition.entries,
++            self.requirements.scalars
++        );
++        reserve!(
++            Buffer::Recomposition,
++            storage.recomposition.entries,
++            self.requirements.scalars
++        );
++        reserve!(Buffer::Text, storage.text, self.requirements.bytes);
++        Ok(Workspace {
++            input: self.input,
++            requirements: self.requirements,
++            storage,
++        })
++    }
++}
++fn requirements(scalars: usize, bytes: usize) -> Result<Requirements, Overflow> {
++    let heap = Layout::array::<Record>(scalars)
++        .map_err(|_| Overflow)?
++        .size()
++        .checked_add(
++            Layout::array::<(char, isize)>(scalars)
++                .map_err(|_| Overflow)?
++                .size(),
++        )
++        .and_then(|n| n.checked_add(Layout::array::<u8>(bytes).ok()?.size()))
++        .ok_or(Overflow)?;
++    let controls = [
++        size_of::<Plan<'_>>(),
++        size_of::<Result<Plan<'_>, Overflow>>(),
++        size_of::<Requirements>(),
++        size_of::<Option<(usize, usize)>>(),
++        size_of::<Chars<'_>>(),
++        size_of::<&mut Option<(usize, usize)>>(),
++        size_of::<(&mut Decomposition, &mut Range<usize>, &mut bool)>(),
++        size_of::<Workspace<'_>>(),
++        size_of::<Result<Workspace<'_>, PrepareFailure>>(),
++        size_of::<Retired>(),
++        size_of::<PrepareFailure>(),
++        size_of::<Result<(), TryReserveError>>(),
++        size_of::<Range<usize>>(),
++        size_of::<Result<&str, InvalidRange>>(),
++        size_of::<Decomposing<'_, '_>>(),
++        size_of::<Recomposing<'_, '_>>(),
++        size_of::<Option<(char, isize)>>(),
++        size_of::<[u8; 4]>(),
++        size_of::<[Record; 48]>(),
++        size_of::<(u8, usize)>(),
++        size_of::<&Record>(),
++        size_of::<Record>(),
++    ]
++    .iter()
++    .try_fold(0usize, |sum, &n| sum.checked_add(n))
++    .ok_or(Overflow)?;
++    Ok(Requirements {
++        scalars,
++        bytes,
++        heap,
++        controls,
++        total: heap.checked_add(controls).ok_or(Overflow)?,
++    })
++}
++/// Reusable storage for checked subranges of the original source only.
++#[derive(Debug)]
++pub struct Workspace<'a> {
++    input: &'a str,
++    requirements: Requirements,
++    storage: Retired,
++}
++impl Workspace<'_> {
++    /// Normalize a UTF-8 subrange; invalid ranges reject before any destination mutation.
++    pub fn normalize(&mut self, range: Range<usize>) -> Result<&str, InvalidRange> {
++        let input = self.input.get(range).ok_or(InvalidRange)?;
++        self.storage.decomposition.entries.clear();
++        self.storage.recomposition.entries.clear();
++        self.storage.text.clear();
++        let chars = Recomposing {
++            iter: Decomposing {
++                iter: input.chars().fuse(),
++                ready: 0..0,
++                storage: &mut self.storage.decomposition,
++            },
++            state: RecompositionState::Composing,
++            storage: &mut self.storage.recomposition,
++            composee: None,
++            last_ccc: None,
++        };
++        for (c, _) in chars {
++            let next = self
++                .storage
++                .text
++                .len()
++                .checked_add(c.len_utf8())
++                .expect("checked NFC bytes");
++            assert!(
++                next <= self.requirements.bytes && next <= self.storage.text.capacity(),
++                "NFC text bound"
++            );
++            self.storage.text.push(c);
++        }
++        Ok(&self.storage.text)
++    }
++    /// Actual retained capacities in decomposition/recomposition/text order.
++    pub fn capacities(&self) -> [usize; 3] {
++        self.storage.capacities()
++    }
++    /// Consume source/cursor association, retaining the same destinations without refill APIs.
++    pub fn retire(self) -> Retired {
++        self.storage
++    }
++}
++/// Pointer-free retired destinations; no source, refill, clone or raw storage escape.
++#[derive(Debug)]
++pub struct Retired {
++    decomposition: Decomposition,
++    recomposition: Recomposition,
++    text: String,
++}
++impl Retired {
++    /// Actual capacities, including partially prepared prefixes.
++    pub fn capacities(&self) -> [usize; 3] {
++        [
++            self.decomposition.entries.capacity(),
++            self.recomposition.entries.capacity(),
++            self.text.capacity(),
++        ]
++    }
++}
++/// The real reserve error and all earlier partial destinations, without a source borrow.
++#[derive(Debug)]
++pub struct PrepareFailure {
++    buffer: Buffer,
++    cause: TryReserveError,
++    partial: Retired,
++}
++impl PrepareFailure {
++    /// The destination whose actual reserve failed.
++    pub fn buffer(&self) -> Buffer {
++        self.buffer
++    }
++    /// The original standard-library cause.
++    pub fn reserve_error(&self) -> &TryReserveError {
++        &self.cause
++    }
++    /// Actual retained prefix capacities.
++    pub fn capacities(&self) -> [usize; 3] {
++        self.partial.capacities()
++    }
++}
++impl fmt::Display for PrepareFailure {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        fmt::Display::fmt(&self.cause, f)
++    }
++}
++impl std::error::Error for PrepareFailure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        Some(&self.cause)
++    }
++}
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/src/workspace/reference/decompose.rs
+@@ -0,0 +1,167 @@
++// Copyright 2012-2015 The Rust Project Developers. See the COPYRIGHT
++// file at the top-level directory of this distribution and at
++// http://rust-lang.org/COPYRIGHT.
++//
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++use smallvec::SmallVec;
++use std::fmt::{self, Write};
++use std::iter::Fuse;
++use std::ops::Range;
++
++#[derive(Clone)]
++enum DecompositionType {
++    Canonical,
++    Compatible,
++}
++
++/// External iterator for a string decomposition's characters.
++#[derive(Clone)]
++pub struct Decompositions<I> {
++    kind: DecompositionType,
++    iter: Fuse<I>,
++
++    // This buffer stores pairs of (canonical combining class, character),
++    // pushed onto the end in text order.
++    //
++    // It's divided into up to three sections:
++    // 1) A prefix that is free space;
++    // 2) "Ready" characters which are sorted and ready to emit on demand;
++    // 3) A "pending" block which stills needs more characters for us to be able
++    //    to sort in canonical order and is not safe to emit.
++    buffer: SmallVec<[(u8, char, isize); 4]>,
++    ready: Range<usize>,
++}
++
++#[inline]
++pub fn new_canonical<I: Iterator<Item = char>>(iter: I) -> Decompositions<I> {
++    Decompositions {
++        kind: self::DecompositionType::Canonical,
++        iter: iter.fuse(),
++        buffer: SmallVec::new(),
++        ready: 0..0,
++    }
++}
++
++#[inline]
++pub fn new_compatible<I: Iterator<Item = char>>(iter: I) -> Decompositions<I> {
++    Decompositions {
++        kind: self::DecompositionType::Compatible,
++        iter: iter.fuse(),
++        buffer: SmallVec::new(),
++        ready: 0..0,
++    }
++}
++
++impl<I> Decompositions<I> {
++    #[inline]
++    fn push_back(&mut self, ch: char, first: bool) {
++        let class = super::char::canonical_combining_class(ch);
++
++        if class == 0 {
++            self.sort_pending();
++        }
++
++        self.buffer.push((class, ch, if first { 0 } else { 1 }));
++    }
++
++    #[inline]
++    fn sort_pending(&mut self) {
++        // NB: `sort_by_key` is stable, so it will preserve the original text's
++        // order within a combining class.
++        self.buffer[self.ready.end..].sort_by_key(|k| k.0);
++        self.ready.end = self.buffer.len();
++    }
++
++    #[inline]
++    fn reset_buffer(&mut self) {
++        // Equivalent to `self.buffer.drain(0..self.ready.end)` (if SmallVec
++        // supported this API)
++        let pending = self.buffer.len() - self.ready.end;
++        for i in 0..pending {
++            self.buffer[i] = self.buffer[i + self.ready.end];
++        }
++        self.buffer.truncate(pending);
++        self.ready = 0..0;
++    }
++
++    #[inline]
++    fn increment_next_ready(&mut self) {
++        let next = self.ready.start + 1;
++        if next == self.ready.end {
++            self.reset_buffer();
++        } else {
++            self.ready.start = next;
++        }
++    }
++}
++
++impl<I: Iterator<Item = char>> Iterator for Decompositions<I> {
++    type Item = (char, isize);
++
++    #[inline]
++    fn next(&mut self) -> Option<(char, isize)> {
++        while self.ready.end == 0 {
++            match (self.iter.next(), &self.kind) {
++                (Some(ch), &DecompositionType::Canonical) => {
++                    let mut first = true;
++                    super::char::decompose_canonical(ch, |d| {
++                        self.push_back(d, first);
++                        first = false;
++                    });
++                }
++                (Some(ch), &DecompositionType::Compatible) => {
++                    let mut first = true;
++                    super::char::decompose_compatible(ch, |d| {
++                        self.push_back(d, first);
++                        first = false;
++                    });
++                }
++                (None, _) => {
++                    if self.buffer.is_empty() {
++                        return None;
++                    } else {
++                        self.sort_pending();
++
++                        // This implementation means that we can call `next`
++                        // on an exhausted iterator; the last outer `next` call
++                        // will result in an inner `next` call. To make this
++                        // safe, we use `fuse`.
++                        break;
++                    }
++                }
++            }
++        }
++
++        // We can assume here that, if `self.ready.end` is greater than zero,
++        // it's also greater than `self.ready.start`. That's because we only
++        // increment `self.ready.start` inside `increment_next_ready`, and
++        // whenever it reaches equality with `self.ready.end`, we reset both
++        // to zero, maintaining the invariant that:
++        //      self.ready.start < self.ready.end || self.ready.end == self.ready.start == 0
++        //
++        // This less-than-obviously-safe implementation is chosen for performance,
++        // minimizing the number & complexity of branches in `next` in the common
++        // case of buffering then unbuffering a single character with each call.
++        let (_, ch, size) = self.buffer[self.ready.start];
++        self.increment_next_ready();
++        Some((ch, size))
++    }
++
++    fn size_hint(&self) -> (usize, Option<usize>) {
++        let (lower, _) = self.iter.size_hint();
++        (lower, None)
++    }
++}
++
++impl<I: Iterator<Item = char> + Clone> fmt::Display for Decompositions<I> {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        for c in self.clone() {
++            f.write_char(c.0)?;
++        }
++        Ok(())
++    }
++}
+--- /dev/null
++++ b/src/workspace/reference/mod.rs
+@@ -0,0 +1,6 @@
++// Test-only pre-refactor workers. Only recompose's module-relative import
++// differs from the exact pinned archive; no algorithm or data changes.
++#![allow(dead_code)]
++pub use ::char;
++pub mod decompose;
++pub mod recompose;
+--- /dev/null
++++ b/src/workspace/reference/recompose.rs
+@@ -0,0 +1,154 @@
++// Copyright 2012-2015 The Rust Project Developers. See the COPYRIGHT
++// file at the top-level directory of this distribution and at
++// http://rust-lang.org/COPYRIGHT.
++//
++// Licensed under the Apache License, Version 2.0 <LICENSE-APACHE or
++// http://www.apache.org/licenses/LICENSE-2.0> or the MIT license
++// <LICENSE-MIT or http://opensource.org/licenses/MIT>, at your
++// option. This file may not be copied, modified, or distributed
++// except according to those terms.
++
++use super::decompose::Decompositions;
++use smallvec::SmallVec;
++use std::fmt::{self, Write};
++
++#[derive(Clone)]
++enum RecompositionState {
++    Composing,
++    Purging(usize),
++    Finished(usize),
++}
++
++/// External iterator for a string recomposition's characters.
++#[derive(Clone)]
++pub struct Recompositions<I> {
++    iter: Decompositions<I>,
++    state: RecompositionState,
++    buffer: SmallVec<[(char, isize); 4]>,
++    composee: Option<(char, isize)>,
++    last_ccc: Option<u8>,
++}
++
++#[inline]
++pub fn new_canonical<I: Iterator<Item = char>>(iter: I) -> Recompositions<I> {
++    Recompositions {
++        iter: super::decompose::new_canonical(iter),
++        state: self::RecompositionState::Composing,
++        buffer: SmallVec::new(),
++        composee: None,
++        last_ccc: None,
++    }
++}
++
++#[inline]
++pub fn new_compatible<I: Iterator<Item = char>>(iter: I) -> Recompositions<I> {
++    Recompositions {
++        iter: super::decompose::new_compatible(iter),
++        state: self::RecompositionState::Composing,
++        buffer: SmallVec::new(),
++        composee: None,
++        last_ccc: None,
++    }
++}
++
++impl<I: Iterator<Item = char>> Iterator for Recompositions<I> {
++    type Item = (char, isize);
++
++    #[inline]
++    fn next(&mut self) -> Option<(char, isize)> {
++        use self::RecompositionState::*;
++
++        loop {
++            match self.state {
++                Composing => {
++                    for (ch, change) in self.iter.by_ref() {
++                        let ch_class = super::char::canonical_combining_class(ch);
++                        let k = match self.composee {
++                            None => {
++                                if ch_class != 0 {
++                                    return Some((ch, change));
++                                }
++                                self.composee = Some((ch, change));
++                                continue;
++                            }
++                            Some(k) => k,
++                        };
++                        match self.last_ccc {
++                            None => match super::char::compose(k.0, ch) {
++                                Some(r) => {
++                                    self.composee = Some((r, k.1 + change - 1));
++                                    continue;
++                                }
++                                None => {
++                                    if ch_class == 0 {
++                                        self.composee = Some((ch, change));
++                                        return Some(k);
++                                    }
++                                    self.buffer.push((ch, change));
++                                    self.last_ccc = Some(ch_class);
++                                }
++                            },
++                            Some(l_class) => {
++                                if l_class >= ch_class {
++                                    // `ch` is blocked from `composee`
++                                    if ch_class == 0 {
++                                        self.composee = Some((ch, change));
++                                        self.last_ccc = None;
++                                        self.state = Purging(0);
++                                        return Some(k);
++                                    }
++                                    self.buffer.push((ch, change));
++                                    self.last_ccc = Some(ch_class);
++                                    continue;
++                                }
++                                match super::char::compose(k.0, ch) {
++                                    Some(r) => {
++                                        self.composee = Some((r, k.1 + change - 1));
++                                        continue;
++                                    }
++                                    None => {
++                                        self.buffer.push((ch, change));
++                                        self.last_ccc = Some(ch_class);
++                                    }
++                                }
++                            }
++                        }
++                    }
++                    self.state = Finished(0);
++                    if self.composee.is_some() {
++                        return self.composee.take();
++                    }
++                }
++                Purging(next) => match self.buffer.get(next).cloned() {
++                    None => {
++                        self.buffer.clear();
++                        self.state = Composing;
++                    }
++                    s => {
++                        self.state = Purging(next + 1);
++                        return s;
++                    }
++                },
++                Finished(next) => match self.buffer.get(next).cloned() {
++                    None => {
++                        self.buffer.clear();
++                        return self.composee.take();
++                    }
++                    s => {
++                        self.state = Finished(next + 1);
++                        return s;
++                    }
++                },
++            }
++        }
++    }
++}
++
++impl<I: Iterator<Item = char> + Clone> fmt::Display for Recompositions<I> {
++    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
++        for c in self.clone() {
++            f.write_char(c.0)?;
++        }
++        Ok(())
++    }
++}
+--- /dev/null
++++ b/src/workspace/tests.rs
+@@ -0,0 +1,172 @@
++use super::*;
++use UnicodeNormalization;
++#[path = "reference/mod.rs"]
++mod reference;
++
++fn pairs(workspace: &mut Workspace, range: Range<usize>) {
++    let input = workspace.input.get(range).unwrap();
++    workspace.storage.decomposition.entries.clear();
++    workspace.storage.recomposition.entries.clear();
++    let mut actual = Recomposing {
++        iter: Decomposing {
++            iter: input.chars().fuse(),
++            ready: 0..0,
++            storage: &mut workspace.storage.decomposition,
++        },
++        state: RecompositionState::Composing,
++        storage: &mut workspace.storage.recomposition,
++        composee: None,
++        last_ccc: None,
++    };
++    let mut prior = reference::recompose::new_canonical(input.chars());
++    loop {
++        let a = actual.next();
++        let b = prior.next();
++        assert_eq!(a, b, "{input:?}");
++        if a.is_none() {
++            break;
++        }
++    }
++}
++fn pointers(workspace: &Workspace) -> (*const Record, *const (char, isize), *const u8) {
++    (
++        workspace.storage.decomposition.entries.as_ptr(),
++        workspace.storage.recomposition.entries.as_ptr(),
++        workspace.storage.text.as_ptr(),
++    )
++}
++#[test]
++fn every_scalar_preserves_pre_refactor_transformations_and_utf8_bound() {
++    let input: String = (0..=0x10ffff).filter_map(::std::char::from_u32).collect();
++    let mut workspace = Plan::new(&input).unwrap().prepare().unwrap();
++    let ptr = pointers(&workspace);
++    let cap = workspace.capacities();
++    for (start, c) in input.char_indices() {
++        let range = start..start + c.len_utf8();
++        pairs(&mut workspace, range.clone());
++        let actual = workspace.normalize(range.clone()).unwrap();
++        assert!(actual
++            .chars()
++            .eq(reference::recompose::new_canonical(input[range].chars()).map(|x| x.0)));
++    }
++    assert_eq!(workspace.capacities(), cap);
++    assert_eq!(pointers(&workspace), ptr);
++}
++#[test]
++fn nonstarter_order_blocking_hangul_expansion_and_repeated_subranges_use_same_storage() {
++    let mut input=String::from("head|e\u{301}|\u{344}|\u{1100}\u{1161}\u{11a8}|\u{301}a\u{315}\u{300}\u{315}|\u{200c}\u{200d}|\u{212b}\u{2126}|");
++    input.push_str(&"a\u{315}\u{300}\u{301}\u{0323}\u{0301}".repeat(96));
++    input.push('|');
++    input.push_str(&"\u{315}\u{300}\u{301}\u{0323}".repeat(1024));
++    input.push('|');
++    let mut workspace = Plan::new(&input).unwrap().prepare().unwrap();
++    let ptr = pointers(&workspace);
++    let cap = workspace.capacities();
++    let mut start = 0;
++    for (end, c) in input.char_indices().filter(|&(_, c)| c == '|') {
++        let range = start..end;
++        let _ = c;
++        for _ in 0..2 {
++            pairs(&mut workspace, range.clone());
++            assert!(workspace.normalize(range.clone()).unwrap().chars().eq(
++                reference::recompose::new_canonical(input[range.clone()].chars()).map(|x| x.0)
++            ));
++        }
++        start = end + 1;
++    }
++    pairs(&mut workspace, 0..input.len());
++    assert_eq!(workspace.capacities(), cap);
++    assert_eq!(pointers(&workspace), ptr);
++    let _ = workspace.normalize(0..4).unwrap();
++    let last = workspace.storage.text.clone();
++    for range in [usize::MAX..usize::MAX, 4..3, 6..7] {
++        assert_eq!(workspace.normalize(range), Err(InvalidRange));
++        assert_eq!(workspace.storage.text, last);
++    }
++    assert_eq!(pointers(&workspace), ptr);
++}
++#[test]
++fn each_actual_reserve_failure_keeps_earlier_buffers_and_real_cause() {
++    let input = String::from("a\u{315}\u{300}\u{301}\u{0323}\u{344}");
++    for (stage, buffer) in [Buffer::Decomposition, Buffer::Recomposition, Buffer::Text]
++        .iter()
++        .enumerate()
++    {
++        let failure = Plan::new(&input)
++            .unwrap()
++            .fail_reservation(*buffer)
++            .prepare()
++            .unwrap_err();
++        assert_eq!(failure.buffer(), *buffer);
++        assert!(std::error::Error::source(&failure)
++            .unwrap()
++            .is::<TryReserveError>());
++        let caps = failure.capacities();
++        assert!(caps[..stage].iter().all(|&n| n > 0));
++        assert!(caps[stage..].iter().all(|&n| n == 0));
++    }
++    let failure = Plan::new(&input)
++        .unwrap()
++        .fail_reservation(Buffer::Text)
++        .prepare()
++        .unwrap_err();
++    drop(input);
++    assert!(failure.capacities()[0] > 4 && failure.capacities()[1] > 4);
++}
++#[test]
++fn empty_overflow_and_exact_decomposition_geometry_are_distinct() {
++    let mut empty = Plan::new("").unwrap().prepare().unwrap();
++    assert_eq!(empty.capacities(), [0; 3]);
++    assert_eq!(empty.normalize(0..0).unwrap(), "");
++    let plan = Plan::new("\u{344}").unwrap();
++    assert_eq!(plan.requirements().scalar_capacity(), 2);
++    assert_eq!(plan.requirements().text_capacity(), 4);
++    let mut workspace = plan.prepare().unwrap();
++    assert_eq!(workspace.normalize(0..2).unwrap(), "\u{308}\u{301}");
++    assert!(requirements(usize::MAX, 1).is_err());
++    assert!(requirements(1, usize::MAX).is_err());
++    assert!(Plan::new("")
++        .unwrap()
++        .fail_reservation(Buffer::Text)
++        .prepare()
++        .is_err());
++}
++#[test]
++fn retirement_strips_source_without_reallocating_or_releasing_destinations() {
++    let input = String::from("e\u{301} and \u{344}");
++    let mut workspace = Plan::new(&input).unwrap().prepare().unwrap();
++    let ptr = pointers(&workspace);
++    let cap = workspace.capacities();
++    assert!(!workspace.normalize(0..input.len()).unwrap().is_empty());
++    let retired = workspace.retire();
++    drop(input);
++    assert_eq!(retired.capacities(), cap);
++    assert_eq!(retired.decomposition.entries.as_ptr(), ptr.0);
++    assert_eq!(retired.recomposition.entries.as_ptr(), ptr.1);
++    assert_eq!(retired.text.as_ptr(), ptr.2);
++}
++#[test]
++fn ordinary_clone_display_and_compatible_workers_keep_pre_refactor_pairs() {
++    for text in [
++        "e\u{301}\u{315}",
++        "\u{fb01}\u{2163}\u{344}",
++        "\u{1100}\u{1161}\u{11a8}",
++        "",
++    ] {
++        assert!(text
++            .nfd()
++            .eq(reference::decompose::new_canonical(text.chars())));
++        assert!(text
++            .nfkd()
++            .eq(reference::decompose::new_compatible(text.chars())));
++        assert!(text
++            .nfkc()
++            .eq(reference::recompose::new_compatible(text.chars())));
++        let mut current = text.nfc();
++        let _ = current.next();
++        let mut prior = reference::recompose::new_canonical(text.chars());
++        let _ = prior.next();
++        assert!(current.clone().eq(prior.clone()));
++        assert_eq!(format!("{}", current), format!("{}", prior));
++    }
++}

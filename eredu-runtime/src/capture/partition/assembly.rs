@@ -363,18 +363,16 @@ pub fn assemble_tensor_fragments(
         let Some(CapturePayload::Tensor(value)) = &fragment.record.payload else {
             unreachable!()
         };
+        let mapping = crate::capture::prefix::PrefixDestination::new(
+            &assembly.slice.shape,
+            &destination.shape,
+            &destination.starts,
+            &destination.strides,
+        )?;
         for local in 0..value.data().len() {
-            let mut remainder = local as u64;
-            let mut output = 0u64;
-            let mut output_stride = 1u64;
-            for dimension in (0..assembly.slice.shape.len()).rev() {
-                let coordinate = remainder % destination.shape[dimension];
-                remainder /= destination.shape[dimension];
-                output += (destination.starts[dimension]
-                    + coordinate * destination.strides[dimension])
-                    * output_stride;
-                output_stride *= assembly.slice.shape[dimension];
-            }
+            let output = mapping
+                .ordinal(local as u64)
+                .ok_or_else(|| invalid("raw capture prefix exceeds its destination geometry"))?;
             // A fragment's destination ordinals strictly increase. Its local
             // prefix of length N therefore includes every destination below N.
             // Exact disjoint coverage was checked before allocating this prefix.
@@ -462,18 +460,11 @@ pub fn assemble_reduced_fragments(
                         "histogram capture fragment has no histogram payload",
                     ));
                 };
-                if &value.edges != edges || value.counts.len() + 1 != edges.len() {
-                    return Err(invalid("histogram fragment changed its admitted bin edges"));
-                }
-                let count = value.counts.iter().try_fold(
-                    add(add(value.below, value.above)?, value.non_finite)?,
-                    |sum, count| add(sum, *count),
+                crate::capture::reduction::validate_histogram(
+                    value,
+                    edges,
+                    elements(&fragment.geometry.local().shape)?,
                 )?;
-                if count != elements(&fragment.geometry.local().shape)? {
-                    return Err(invalid(
-                        "histogram fragment counts disagree with its selected geometry",
-                    ));
-                }
             }
             assembly.reserve(
                 &fragments,
@@ -491,12 +482,7 @@ pub fn assemble_reduced_fragments(
                 let Some(CapturePayload::Histogram(value)) = &fragment.record.payload else {
                     unreachable!()
                 };
-                output.below = add(output.below, value.below)?;
-                output.above = add(output.above, value.above)?;
-                output.non_finite = add(output.non_finite, value.non_finite)?;
-                for (out, count) in output.counts.iter_mut().zip(&value.counts) {
-                    *out = add(*out, *count)?;
-                }
+                crate::capture::reduction::add_histogram(&mut output, value)?;
             }
             Ok(assembly.finish(fragments, CapturePayload::Histogram(output)))
         }
@@ -506,102 +492,15 @@ pub fn assemble_reduced_fragments(
     }
 }
 
-#[derive(Default)]
-struct CompensatedSum {
-    sum: f64,
-    correction: f64,
-}
-impl CompensatedSum {
-    fn add(&mut self, value: f64) -> Result<(), PartitionCaptureMergeError> {
-        let next = self.sum + value;
-        self.correction += if self.sum.abs() >= value.abs() {
-            (self.sum - next) + value
-        } else {
-            (value - next) + self.sum
-        };
-        self.sum = next;
-        if !self.sum.is_finite() || !self.correction.is_finite() {
-            return Err(invalid(
-                "summary fragment aggregation overflowed finite statistics",
-            ));
-        }
-        Ok(())
-    }
-    fn value(&self) -> f64 {
-        self.sum + self.correction
-    }
-}
-
 fn merge_summaries(
     fragments: &[CapturedPartitionFragment],
 ) -> Result<CaptureSummary, PartitionCaptureMergeError> {
-    let mut output = CaptureSummary {
-        elements: 0,
-        finite: 0,
-        non_finite: 0,
-        nan: 0,
-        positive_infinity: 0,
-        negative_infinity: 0,
-        min: None,
-        max: None,
-        mean: None,
-        rms: None,
-    };
-    let mut sum = CompensatedSum::default();
-    let mut squares = CompensatedSum::default();
+    let mut sum = crate::capture::reduction::Summary::default();
     for fragment in fragments {
         let Some(CapturePayload::Summary(value)) = &fragment.record.payload else {
             return Err(invalid("summary capture fragment has no summary payload"));
         };
-        if value.elements != elements(&fragment.geometry.local().shape)?
-            || add(value.finite, value.non_finite)? != value.elements
-            || add(
-                add(value.nan, value.positive_infinity)?,
-                value.negative_infinity,
-            )? != value.non_finite
-        {
-            return Err(invalid(
-                "summary fragment counts disagree with its selected geometry",
-            ));
-        }
-        if value.finite == 0 {
-            if [value.min, value.max, value.mean, value.rms]
-                .iter()
-                .any(Option::is_some)
-            {
-                return Err(invalid("summary fragment fabricated finite aggregates"));
-            }
-        } else {
-            let (Some(min), Some(max), Some(mean), Some(rms)) =
-                (value.min, value.max, value.mean, value.rms)
-            else {
-                return Err(invalid("summary fragment is missing finite aggregates"));
-            };
-            if ![min, max, mean, rms].iter().all(|v| v.is_finite()) || min > max || rms < 0.0 {
-                return Err(invalid(
-                    "summary fragment contains invalid finite aggregates",
-                ));
-            }
-            output.min = Some(output.min.map_or(min, |current| current.min(min)));
-            output.max = Some(output.max.map_or(max, |current| current.max(max)));
-            sum.add(mean * value.finite as f64)?;
-            squares.add(rms * rms * value.finite as f64)?;
-        }
-        output.elements = add(output.elements, value.elements)?;
-        output.finite = add(output.finite, value.finite)?;
-        output.non_finite = add(output.non_finite, value.non_finite)?;
-        output.nan = add(output.nan, value.nan)?;
-        output.positive_infinity = add(output.positive_infinity, value.positive_infinity)?;
-        output.negative_infinity = add(output.negative_infinity, value.negative_infinity)?;
+        sum = sum.appended(value, elements(&fragment.geometry.local().shape)?)?;
     }
-    if output.finite != 0 {
-        output.mean = Some(sum.value() / output.finite as f64);
-        output.rms = Some((squares.value() / output.finite as f64).sqrt());
-        if !output.mean.unwrap().is_finite() || !output.rms.unwrap().is_finite() {
-            return Err(invalid(
-                "summary fragment aggregation overflowed finite statistics",
-            ));
-        }
-    }
-    Ok(output)
+    Ok(sum.value())
 }

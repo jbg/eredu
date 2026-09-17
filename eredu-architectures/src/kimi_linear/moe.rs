@@ -92,9 +92,9 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct SparseMoe<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     layer: usize,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     observation: eredu_runtime::RoutedObservationPoints,
     /// Grouped sigmoid router with selection correction bias.
     pub router: B::Selector,

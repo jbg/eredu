@@ -1,0 +1,2897 @@
+--- a/src/processors/mod.rs
++++ b/src/processors/mod.rs
+@@ -23,6 +23,8 @@
+     Bert(BertProcessing),
+     ByteLevel(ByteLevel),
+     Template(TemplateProcessing),
++    #[serde(skip_deserializing)]
++    CompiledTemplate(template::compiled::CompiledTemplate),
+     Sequence(Sequence),
+ }
+ 
+@@ -33,6 +35,7 @@
+             Self::ByteLevel(bl) => bl.added_tokens(is_pair),
+             Self::Roberta(roberta) => roberta.added_tokens(is_pair),
+             Self::Template(template) => template.added_tokens(is_pair),
++            Self::CompiledTemplate(template) => template.added_tokens(is_pair),
+             Self::Sequence(bl) => bl.added_tokens(is_pair),
+         }
+     }
+@@ -43,11 +46,24 @@
+         add_special_tokens: bool,
+     ) -> Result<Vec<Encoding>> {
+         match self {
+-            Self::Bert(bert) => bert.process_encodings(encodings, add_special_tokens),
+-            Self::ByteLevel(bl) => bl.process_encodings(encodings, add_special_tokens),
+-            Self::Roberta(roberta) => roberta.process_encodings(encodings, add_special_tokens),
+-            Self::Template(template) => template.process_encodings(encodings, add_special_tokens),
+-            Self::Sequence(bl) => bl.process_encodings(encodings, add_special_tokens),
++            Self::Bert(bert) => {
++                bert.process_encodings(encodings, add_special_tokens)
++            }
++            Self::ByteLevel(bl) => {
++                bl.process_encodings(encodings, add_special_tokens)
++            }
++            Self::Roberta(roberta) => {
++                roberta.process_encodings(encodings, add_special_tokens)
++            }
++            Self::Template(template) => {
++                template.process_encodings(encodings, add_special_tokens)
++            }
++            Self::CompiledTemplate(template) => {
++                template.process_encodings(encodings, add_special_tokens)
++            }
++            Self::Sequence(bl) => {
++                bl.process_encodings(encodings, add_special_tokens)
++            }
+         }
+     }
+ }
+@@ -107,8 +123,7 @@
+             PostProcessorWrapper::Bert(_)
+         ));
+ 
+-        let json =
+-            r#"{"sep":["</s>",2], "cls":["<s>",0], "trim_offsets":true, "add_prefix_space":true}"#;
++        let json = r#"{"sep":["</s>",2], "cls":["<s>",0], "trim_offsets":true, "add_prefix_space":true}"#;
+         let reconstructed = serde_json::from_str::<PostProcessorWrapper>(json);
+         assert!(matches!(
+             reconstructed.unwrap(),
+--- a/src/processors/template.rs
++++ b/src/processors/template.rs
+@@ -56,6 +56,9 @@
+ //!
+ //! [`TemplateProcessing`]: struct.TemplateProcessing.html
+ //!
++pub mod compiled;
++pub(crate) mod visit;
++
+ use crate::{Encoding, PostProcessor, Result};
+ use ahash::{AHashMap, AHashSet};
+ use itertools::Itertools;
+@@ -139,7 +142,9 @@
+     fn with_type_id(self, type_id: u32) -> Self {
+         match self {
+             Self::Sequence { id, .. } => Self::Sequence { id, type_id },
+-            Self::SpecialToken { id, .. } => Self::SpecialToken { id, type_id },
++            Self::SpecialToken { id, .. } => {
++                Self::SpecialToken { id, type_id }
++            }
+         }
+     }
+ }
+@@ -225,9 +230,14 @@
+ }
+ 
+ impl SpecialToken {
+-    pub fn new(id: String, ids: Vec<u32>, tokens: Vec<String>) -> Result<Self> {
++    pub fn new(
++        id: String,
++        ids: Vec<u32>,
++        tokens: Vec<String>,
++    ) -> Result<Self> {
+         if ids.len() != tokens.len() {
+-            Err("SpecialToken: ids and tokens must be of the same length".into())
++            Err("SpecialToken: ids and tokens must be of the same length"
++                .into())
+         } else {
+             Ok(Self { id, ids, tokens })
+         }
+@@ -293,7 +303,8 @@
+ #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize, Eq)]
+ #[serde(transparent)]
+ pub struct Tokens(
+-    #[serde(serialize_with = "crate::utils::ordered_map")] pub AHashMap<String, SpecialToken>,
++    #[serde(serialize_with = "crate::utils::ordered_map")]
++    pub  AHashMap<String, SpecialToken>,
+ );
+ 
+ impl<T: Into<SpecialToken>> From<Vec<T>> for Tokens {
+@@ -440,15 +451,17 @@
+ }
+ 
+ /// Count the number of added tokens in the given template
+-fn count_added(container: &Template, special_tokens: Option<&Tokens>) -> usize {
++fn count_added(
++    container: &Template,
++    special_tokens: Option<&Tokens>,
++) -> usize {
+     container
+         .0
+         .iter()
+         .map(|p| match p {
+             Piece::Sequence { .. } => 0,
+-            Piece::SpecialToken { id, .. } => {
+-                special_tokens.map_or(0, |spt| spt.0.get(id).map_or(0, |s| s.ids.len()))
+-            }
++            Piece::SpecialToken { id, .. } => special_tokens
++                .map_or(0, |spt| spt.0.get(id).map_or(0, |s| s.ids.len())),
+         })
+         .sum()
+ }
+@@ -544,102 +557,31 @@
+     fn apply_template(
+         &self,
+         template: &[Piece],
+-        mut encodings: Vec<Encoding>,
++        encodings: Vec<Encoding>,
+         add_special_tokens: bool,
+     ) -> Result<Vec<Encoding>> {
+-        let final_encodings: Vec<Encoding> = template
++        let pieces = template
+             .iter()
+-            .flat_map(|piece| {
+-                match piece {
+-                    Piece::Sequence { id, type_id } => {
+-                        let i = usize::from(*id != Sequence::A);
+-                        let encoding = &mut encodings[i];
+-                        encoding.set_type_ids(vec![*type_id; encoding.len()]);
+-                        encoding.set_sequence_id(i);
+-                        Some(encoding.clone())
+-                    }
+-                    Piece::SpecialToken { id, type_id } => {
+-                        if add_special_tokens {
+-                            let tok = &self.special_tokens.0[id]; // We already checked existence above
+-                            let len = tok.ids.len();
+-
+-                            let encoding = Encoding::new(
+-                                tok.ids.clone(),
+-                                std::iter::repeat_n(*type_id, len).collect(),
+-                                tok.tokens.clone(),
+-                                // words
+-                                std::iter::repeat_n(None, len).collect(),
+-                                // offsets
+-                                std::iter::repeat_n((0, 0), len).collect(),
+-                                // special_tokens_mask
+-                                std::iter::repeat_n(1, len).collect(),
+-                                // attention_mask
+-                                std::iter::repeat_n(1, len).collect(),
+-                                // overflowing
+-                                vec![],
+-                                // sequence_range
+-                                AHashMap::new(),
+-                            );
+-                            Some(encoding)
+-                        } else {
+-                            None
+-                        }
++            .filter(|piece| {
++                add_special_tokens || matches!(piece, Piece::Sequence { .. })
++            })
++            .map(|piece| match piece {
++                Piece::Sequence { id, type_id } => {
++                    visit::PieceView::Sequence {
++                        index: usize::from(*id != Sequence::A),
++                        type_id: *type_id,
+                     }
+                 }
+-            })
+-            .collect();
+-
+-        //let mut pair = if encodings.len() > 1 {
+-        //    Some(encodings.pop().unwrap())
+-        //} else {
+-        //    None
+-        //};
+-        //let mut encoding = encodings.pop().unwrap();
+-
+-        //let pair_overflowing = pair.as_mut().map_or(vec![], |e| e.take_overflowing());
+-        //let mut overflowing: Vec<Encoding> = encoding
+-        //    .take_overflowing()
+-        //    .iter()
+-        //    .map(|encoding| -> Result<Vec<Encoding>> {
+-        //        // 1. The pair itself
+-        //        let mut overflowings = self.apply_template(
+-        //            template,
+-        //            if encodings.len() > 1 {
+-        //                vec![encoding.clone(), encodings[1].clone()]
+-        //            } else {
+-        //                vec![encoding.clone()]
+-        //            },
+-        //            add_special_tokens,
+-        //        )?;
+-
+-        //        // 2. Its overflowings
+-        //        for other_o in &pair_overflowing {
+-        //            overflowings.extend(self.apply_template(
+-        //                template,
+-        //                vec![encoding.clone(), other_o.clone()],
+-        //                add_special_tokens,
+-        //            )?);
+-        //        }
+-
+-        //        Ok(overflowings)
+-        //    })
+-        //    .collect::<Result<Vec<Vec<Encoding>>>>()?
+-        //    .into_iter()
+-        //    .flatten()
+-        //    .collect();
+-        //// We also need to combine the first sequence with all other overflowings
+-        //overflowing.extend(
+-        //    pair_overflowing
+-        //        .into_iter()
+-        //        .map(|pair| {
+-        //            self.apply_template(template, vec![encoding.clone(), pair], add_special_tokens)
+-        //        })
+-        //        .collect::<Result<Vec<_>>>()?
+-        //        .into_iter()
+-        //        .flatten(),
+-        //);
+-
+-        Ok(final_encodings)
++                Piece::SpecialToken { id, type_id } => {
++                    let token = &self.special_tokens.0[id];
++                    visit::PieceView::Special {
++                        ids: &token.ids,
++                        tokens: visit::Texts::Legacy(&token.tokens),
++                        type_id: *type_id,
++                    }
++                }
++            });
++        visit::encodings(pieces, encodings, add_special_tokens)
+     }
+ }
+ 
+@@ -680,7 +622,8 @@
+             1 => &self.single.0,
+             _ => todo!(),
+         };
+-        let encodings = self.apply_template(template, encodings, add_special_tokens)?;
++        let encodings =
++            self.apply_template(template, encodings, add_special_tokens)?;
+         Ok(encodings)
+     }
+ }
+@@ -776,7 +719,8 @@
+             vec!["convert".into(), "to".into(), "FR".into()],
+         )
+         .unwrap();
+-        let complete_s = r#"{"id":"[2FR]","ids":[1,2,3],"tokens":["convert","to","FR"]}"#;
++        let complete_s =
++            r#"{"id":"[2FR]","ids":[1,2,3],"tokens":["convert","to","FR"]}"#;
+         assert_eq!(serde_json::to_string(&complete).unwrap(), complete_s);
+         assert_eq!(
+             serde_json::from_str::<SpecialToken>(complete_s).unwrap(),
+@@ -809,8 +753,7 @@
+                 type_id: 0,
+             },
+         ]);
+-        let template_s =
+-            r#"[{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"[CLS]","type_id":0}}]"#;
++        let template_s = r#"[{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"[CLS]","type_id":0}}]"#;
+         assert_eq!(serde_json::to_string(&template).unwrap(), template_s);
+         assert_eq!(
+             serde_json::from_str::<Template>(template_s).unwrap(),
+@@ -880,8 +823,10 @@
+             .unwrap()
+             .build();
+ 
+-        let err_a = Err("Missing SpecialToken(s) with id(s) `[SEP], [CLS]`".into());
+-        let err_b = Err("Missing SpecialToken(s) with id(s) `[CLS], [SEP]`".into());
++        let err_a =
++            Err("Missing SpecialToken(s) with id(s) `[SEP], [CLS]`".into());
++        let err_b =
++            Err("Missing SpecialToken(s) with id(s) `[CLS], [SEP]`".into());
+         assert!(processor == err_a || processor == err_b);
+     }
+ 
+@@ -899,8 +844,12 @@
+             ],
+             0,
+         );
+-        let pair = Encoding::from_tokens(vec![Token::new(15, "pair".into(), (0, 4))], 0);
+-        let single_encoding = processor.process(encoding.clone(), None, true).unwrap();
++        let pair = Encoding::from_tokens(
++            vec![Token::new(15, "pair".into(), (0, 4))],
++            0,
++        );
++        let single_encoding =
++            processor.process(encoding.clone(), None, true).unwrap();
+         assert_eq!(
+             single_encoding,
+             Encoding::new(
+@@ -922,7 +871,8 @@
+         );
+         assert_eq!(single_encoding.token_to_sequence(2), Some(0));
+         assert_eq!(single_encoding.token_to_sequence(3), None);
+-        let pair_encoding = processor.process(encoding, Some(pair), true).unwrap();
++        let pair_encoding =
++            processor.process(encoding, Some(pair), true).unwrap();
+         assert_eq!(
+             pair_encoding,
+             Encoding::new(
+@@ -964,7 +914,10 @@
+             ],
+             0,
+         );
+-        let overflowing = Encoding::from_tokens(vec![Token::new(13, "you".into(), (12, 15))], 0);
++        let overflowing = Encoding::from_tokens(
++            vec![Token::new(13, "you".into(), (12, 15))],
++            0,
++        );
+         encoding.set_overflowing(vec![overflowing]);
+ 
+         let mut pair = Encoding::from_tokens(
+@@ -974,11 +927,14 @@
+             ],
+             0,
+         );
+-        let pair_overflowing =
+-            Encoding::from_tokens(vec![Token::new(17, "info".into(), (10, 14))], 0);
++        let pair_overflowing = Encoding::from_tokens(
++            vec![Token::new(17, "info".into(), (10, 14))],
++            0,
++        );
+         pair.set_overflowing(vec![pair_overflowing]);
+ 
+-        let single_encoding = processor.process(encoding.clone(), None, true).unwrap();
++        let single_encoding =
++            processor.process(encoding.clone(), None, true).unwrap();
+         assert_eq!(
+             single_encoding,
+             Encoding::new(
+@@ -1010,7 +966,8 @@
+         );
+         assert_eq!(single_encoding.token_to_sequence(2), Some(0));
+         assert_eq!(single_encoding.token_to_sequence(3), None);
+-        let pair_encoding = processor.process(encoding, Some(pair), true).unwrap();
++        let pair_encoding =
++            processor.process(encoding, Some(pair), true).unwrap();
+         println!("{pair_encoding:#?}");
+         assert_eq!(
+             pair_encoding,
+@@ -1094,7 +1051,14 @@
+                             "[SEP]".into()
+                         ],
+                         vec![None, None, None, None, None, None],
+-                        vec![(0, 0), (0, 5), (6, 11), (0, 0), (10, 14), (0, 0)],
++                        vec![
++                            (0, 0),
++                            (0, 5),
++                            (6, 11),
++                            (0, 0),
++                            (10, 14),
++                            (0, 0)
++                        ],
+                         vec![1, 0, 0, 1, 0, 1],
+                         vec![1, 1, 1, 1, 1, 1],
+                         vec![Encoding::new(
+--- /dev/null
++++ b/src/processors/template/compiled.rs
+@@ -0,0 +1,236 @@
++//! Packed source storage. Only the aggregate's borrowed compiler constructs it.
++pub(crate) mod compiler;
++use super::{visit, PostProcessor, Result};
++use crate::Encoding;
++pub use compiler::Failure as TemplateCompileFailure;
++use serde::{
++    ser::{SerializeMap, SerializeSeq, SerializeStruct},
++    Serialize, Serializer,
++};
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct TextRange {
++    pub(crate) start: usize,
++    pub(crate) len: usize,
++}
++impl TextRange {
++    pub(crate) fn text<'a>(&self, bytes: &'a [u8]) -> &'a str {
++        std::str::from_utf8(&bytes[self.start..self.start + self.len])
++            .expect("validated template UTF-8")
++    }
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum Kind {
++    Sequence(usize),
++    Special(usize),
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Piece {
++    pub(crate) kind: Kind,
++    pub(crate) type_id: u32,
++}
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) struct Special {
++    pub(crate) key: TextRange,
++    pub(crate) id: TextRange,
++    pub(crate) start: usize,
++    pub(crate) len: usize,
++}
++
++/// Immutable packed template. Original construction is crate-private; ordinary
++/// Clone/serialization remain unmanaged compatibility operations.
++///
++/// ```compile_fail
++/// use tokenizers::processors::template::compiled::CompiledTemplate;
++/// fn mutate(value: &mut CompiledTemplate) { value.set_single("$A"); }
++/// ```
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct CompiledTemplate {
++    pub(crate) pieces: Vec<Piece>,
++    pub(crate) specials: Vec<Special>,
++    pub(crate) ids: Vec<u32>,
++    pub(crate) tokens: Vec<TextRange>,
++    pub(crate) bytes: Vec<u8>,
++    pub(crate) single_len: usize,
++    pub(crate) added: [usize; 2],
++}
++impl CompiledTemplate {
++    pub(crate) fn empty() -> Self {
++        Self {
++            pieces: Vec::new(),
++            specials: Vec::new(),
++            ids: Vec::new(),
++            tokens: Vec::new(),
++            bytes: Vec::new(),
++            single_len: 0,
++            added: [0; 2],
++        }
++    }
++    fn pieces(&self, pair: bool) -> &[Piece] {
++        if pair {
++            &self.pieces[self.single_len..]
++        } else {
++            &self.pieces[..self.single_len]
++        }
++    }
++    pub(crate) fn views(
++        &self,
++        pair: bool,
++    ) -> impl Iterator<Item = visit::PieceView<'_>> {
++        self.pieces(pair).iter().map(move |piece| match piece.kind {
++            Kind::Sequence(index) => visit::PieceView::Sequence {
++                index,
++                type_id: piece.type_id,
++            },
++            Kind::Special(index) => {
++                let special = &self.specials[index];
++                let range = special.start..special.start + special.len;
++                visit::PieceView::Special {
++                    ids: &self.ids[range.clone()],
++                    tokens: visit::Texts::Packed(
++                        &self.tokens[range],
++                        &self.bytes,
++                    ),
++                    type_id: piece.type_id,
++                }
++            }
++        })
++    }
++    pub(crate) fn single_ids(&self, add: bool) -> Option<usize> {
++        let mut count = 0usize;
++        for piece in self.pieces(false) {
++            if let Kind::Sequence(index) = piece.kind {
++                if index != 0 {
++                    return None;
++                }
++                count = count.checked_add(1)?;
++            }
++        }
++        (count == 1).then_some(if add { self.added[0] } else { 0 })
++    }
++    pub(crate) fn visit_single<'a, E>(
++        &'a self,
++        add: bool,
++        sink: impl FnMut(visit::PieceView<'a>) -> std::result::Result<(), E>,
++    ) -> std::result::Result<(), E> {
++        visit::visit(self.views(false), add, sink)
++    }
++    pub(crate) fn visit_control_bytes() -> Option<usize> {
++        [
++            std::mem::size_of_val(&Self::empty().views(false)),
++            std::mem::size_of::<visit::PieceView<'_>>(),
++            std::mem::size_of::<Option<visit::PieceView<'_>>>(),
++            std::mem::size_of::<visit::Texts<'_>>(),
++        ]
++        .iter()
++        .try_fold(0usize, |n, v| n.checked_add(*v))
++    }
++    /// Actual retained destination capacities, in compiler reserve order.
++    pub fn capacities(&self) -> [usize; 5] {
++        [
++            self.pieces.capacity(),
++            self.specials.capacity(),
++            self.ids.capacity(),
++            self.tokens.capacity(),
++            self.bytes.capacity(),
++        ]
++    }
++}
++impl PostProcessor for CompiledTemplate {
++    fn added_tokens(&self, is_pair: bool) -> usize {
++        self.added[usize::from(is_pair)]
++    }
++    fn process_encodings(
++        &self,
++        encodings: Vec<Encoding>,
++        add: bool,
++    ) -> Result<Vec<Encoding>> {
++        let pair = match encodings.len() {
++            1 => false,
++            2 => true,
++            _ => todo!(),
++        };
++        visit::encodings(self.views(pair), encodings, add)
++    }
++}
++struct Pieces<'a>(&'a CompiledTemplate, bool);
++impl Serialize for Pieces<'_> {
++    fn serialize<S: Serializer>(
++        &self,
++        serializer: S,
++    ) -> std::result::Result<S::Ok, S::Error> {
++        #[derive(Serialize)]
++        enum Piece<'a> {
++            Sequence { id: &'static str, type_id: u32 },
++            SpecialToken { id: &'a str, type_id: u32 },
++        }
++        let mut seq =
++            serializer.serialize_seq(Some(self.0.pieces(self.1).len()))?;
++        for p in self.0.pieces(self.1) {
++            let v = match p.kind {
++                Kind::Sequence(i) => Piece::Sequence {
++                    id: if i == 0 { "A" } else { "B" },
++                    type_id: p.type_id,
++                },
++                Kind::Special(i) => Piece::SpecialToken {
++                    id: self.0.specials[i].key.text(&self.0.bytes),
++                    type_id: p.type_id,
++                },
++            };
++            seq.serialize_element(&v)?;
++        }
++        seq.end()
++    }
++}
++struct Tokens<'a>(&'a CompiledTemplate, &'a Special);
++impl Serialize for Tokens<'_> {
++    fn serialize<S: Serializer>(
++        &self,
++        serializer: S,
++    ) -> std::result::Result<S::Ok, S::Error> {
++        let mut seq = serializer.serialize_seq(Some(self.1.len))?;
++        for r in &self.0.tokens[self.1.start..self.1.start + self.1.len] {
++            seq.serialize_element(r.text(&self.0.bytes))?;
++        }
++        seq.end()
++    }
++}
++struct Specials<'a>(&'a CompiledTemplate);
++impl Serialize for Specials<'_> {
++    fn serialize<S: Serializer>(
++        &self,
++        serializer: S,
++    ) -> std::result::Result<S::Ok, S::Error> {
++        #[derive(Serialize)]
++        struct Special<'a> {
++            id: &'a str,
++            ids: &'a [u32],
++            tokens: Tokens<'a>,
++        }
++        let mut map = serializer.serialize_map(Some(self.0.specials.len()))?;
++        for s in &self.0.specials {
++            map.serialize_entry(
++                s.key.text(&self.0.bytes),
++                &Special {
++                    id: s.id.text(&self.0.bytes),
++                    ids: &self.0.ids[s.start..s.start + s.len],
++                    tokens: Tokens(self.0, s),
++                },
++            )?;
++        }
++        map.end()
++    }
++}
++impl Serialize for CompiledTemplate {
++    fn serialize<S: Serializer>(
++        &self,
++        serializer: S,
++    ) -> std::result::Result<S::Ok, S::Error> {
++        let mut s = serializer.serialize_struct("TemplateProcessing", 4)?;
++        s.serialize_field("type", "TemplateProcessing")?;
++        s.serialize_field("single", &Pieces(self, false))?;
++        s.serialize_field("pair", &Pieces(self, true))?;
++        s.serialize_field("special_tokens", &Specials(self))?;
++        s.end()
++    }
++}
+--- /dev/null
++++ b/src/processors/template/compiled/compiler.rs
+@@ -0,0 +1,355 @@
++//! Source-derived five-buffer construction; no serde allocation or account API.
++use super::*;
++use crate::tokenizer::compile::{
++    add, err, fields, required, text_is, Error, K,
++};
++use crate::utils::borrowed_json::{self as json, Reader, Span, Text};
++use std::result::Result;
++use std::{alloc::Layout, collections::TryReserveError, fmt, mem::size_of};
++
++#[derive(Debug, Clone, Copy)]
++pub(crate) struct Requirements {
++    counts: [usize; 5],
++    pub(crate) buffers: usize,
++    pub(crate) controls: usize,
++}
++#[derive(Debug)]
++pub(crate) struct Plan<'a> {
++    input: &'a str,
++    single: Span,
++    pair: Span,
++    table: Span,
++    single_len: usize,
++    added: [usize; 2],
++    requirements: Requirements,
++}
++#[derive(Clone, Copy)]
++struct SpecialPlan<'a> {
++    id: Text<'a>,
++    ids: Span,
++    tokens: Span,
++    len: usize,
++    bytes: usize,
++}
++fn text(input: &str, span: Span) -> Result<Text<'_>, Error> {
++    let mut r = Reader::new(input, span);
++    let value = r.string()?;
++    r.finish()?;
++    Ok(value)
++}
++fn number(input: &str, span: Span) -> Result<u32, Error> {
++    input[span.start..span.end]
++        .parse::<u32>()
++        .map_err(|_| err(K::ComponentProfile, span.start))
++}
++fn special(input: &str, span: Span) -> Result<SpecialPlan<'_>, Error> {
++    let f = fields(input, span, ["id", "ids", "tokens"])?;
++    let id = text(input, required(f[0], span.start)?)?;
++    let ids = required(f[1], span.start)?;
++    let tokens = required(f[2], span.start)?;
++    let mut count = 0;
++    let mut a = Reader::new(input, ids).array()?;
++    while let Some(item) = a.next()? {
++        number(input, item)?;
++        count = add(count, 1)?;
++    }
++    let mut words = 0;
++    let mut bytes = id.len();
++    let mut a = Reader::new(input, tokens).array()?;
++    while let Some(item) = a.next()? {
++        bytes = add(bytes, text(input, item)?.len())?;
++        words = add(words, 1)?;
++    }
++    if words != count {
++        return Err(err(K::ComponentProfile, tokens.start));
++    }
++    Ok(SpecialPlan {
++        id,
++        ids,
++        tokens,
++        len: count,
++        bytes,
++    })
++}
++fn find(
++    input: &str,
++    table: Span,
++    name: Text<'_>,
++) -> Result<(usize, usize), Error> {
++    let mut a = Reader::new(input, table).object()?;
++    let mut index = 0;
++    while let Some((key, value)) = a.next()? {
++        if key.bytes().eq(name.bytes()) {
++            return Ok((index, special(input, value)?.len));
++        }
++        index = add(index, 1)?;
++    }
++    Err(err(K::ComponentProfile, name.offset))
++}
++fn piece(
++    input: &str,
++    span: Span,
++    table: Span,
++    pair: bool,
++) -> Result<(Piece, usize), Error> {
++    let f = fields(input, span, ["Sequence", "SpecialToken"])?;
++    let (special_piece, value) = match f {
++        [Some(v), None] => (false, v),
++        [None, Some(v)] => (true, v),
++        _ => return Err(err(K::ComponentProfile, span.start)),
++    };
++    let f = fields(input, value, ["id", "type_id"])?;
++    let id = text(input, required(f[0], value.start)?)?;
++    let type_id = number(input, required(f[1], value.start)?)?;
++    let (kind, added) = if special_piece {
++        let (index, len) = find(input, table, id)?;
++        (Kind::Special(index), len)
++    } else if id.is("A") {
++        (Kind::Sequence(0), 0)
++    } else if pair && id.is("B") {
++        (Kind::Sequence(1), 0)
++    } else {
++        return Err(err(K::ComponentProfile, id.offset));
++    };
++    Ok((Piece { kind, type_id }, added))
++}
++impl<'a> Plan<'a> {
++    pub(crate) fn prepare(input: &'a str, span: Span) -> Result<Self, Error> {
++        let f =
++            fields(input, span, ["type", "single", "pair", "special_tokens"])?;
++        if !text_is(input, required(f[0], span.start)?, "TemplateProcessing")?
++        {
++            return Err(err(K::ComponentProfile, span.start));
++        }
++        let single = required(f[1], span.start)?;
++        let pair = required(f[2], span.start)?;
++        let table = required(f[3], span.start)?;
++        let mut counts = [0usize; 5];
++        let mut a = Reader::new(input, table).object()?;
++        while let Some((key, value)) = a.next()? {
++            // Duplicate decoded keys cannot acquire a different fill meaning later.
++            let mut previous = Reader::new(input, table).object()?;
++            while let Some((other, _)) = previous.next()? {
++                if other.offset == key.offset {
++                    break;
++                }
++                if other.bytes().eq(key.bytes()) {
++                    return Err(err(K::DuplicateField, key.offset));
++                }
++            }
++            let s = special(input, value)?;
++            counts[1] = add(counts[1], 1)?;
++            counts[2] = add(counts[2], s.len)?;
++            counts[4] = add(counts[4], add(key.len(), s.bytes)?)?;
++        }
++        counts[3] = counts[2];
++        let mut single_len = 0;
++        let mut added = [0; 2];
++        for (i, span) in [single, pair].iter().copied().enumerate() {
++            let mut a = Reader::new(input, span).array()?;
++            while let Some(value) = a.next()? {
++                let (_, n) = piece(input, value, table, i == 1)?;
++                counts[0] = add(counts[0], 1)?;
++                added[i] = add(added[i], n)?;
++                if i == 0 {
++                    single_len = add(single_len, 1)?;
++                }
++            }
++        }
++        let layouts = [
++            Layout::array::<Piece>(counts[0]),
++            Layout::array::<Special>(counts[1]),
++            Layout::array::<u32>(counts[2]),
++            Layout::array::<TextRange>(counts[3]),
++            Layout::array::<u8>(counts[4]),
++        ];
++        let mut buffers = 0;
++        for layout in layouts.iter() {
++            buffers = add(
++                buffers,
++                layout
++                    .as_ref()
++                    .map_err(|_| err(K::Overflow, span.start))?
++                    .size(),
++            )?;
++        }
++        let controls = [
++            size_of::<Self>(),
++            size_of::<Result<Self, Error>>(),
++            size_of::<Requirements>(),
++            size_of::<CompiledTemplate>(),
++            size_of::<Failure>(),
++            size_of::<Cause>(),
++            size_of::<Result<CompiledTemplate, Failure>>(),
++            size_of::<Result<(), Cause>>(),
++            size_of::<Result<(), TryReserveError>>(),
++            size_of::<[usize; 5]>(),
++            size_of::<[usize; 2]>(),
++            size_of::<[Result<Layout, std::alloc::LayoutError>; 5]>(),
++            size_of::<Result<[Option<Span>; 4], Error>>(),
++            size_of::<Result<[Option<Span>; 3], Error>>(),
++            size_of::<Result<[Option<Span>; 2], Error>>(),
++            size_of::<SpecialPlan<'_>>(),
++            size_of::<Result<SpecialPlan<'_>, Error>>(),
++            size_of::<Piece>(),
++            size_of::<Special>(),
++            size_of::<TextRange>(),
++            size_of::<Result<(Piece, usize), Error>>(),
++            size_of::<Result<(usize, usize), Error>>(),
++            size_of::<Text<'_>>(),
++            size_of::<Result<Text<'_>, Error>>(),
++            size_of::<json::Bytes<'_>>() * 2,
++            size_of::<Reader<'_>>(),
++            size_of::<json::Object<'_>>() * 2,
++            size_of::<json::Array<'_>>(),
++            json::stack_bytes(),
++        ];
++        let controls = controls.iter().try_fold(0usize, |n, v| add(n, *v))?;
++        Ok(Self {
++            input,
++            single,
++            pair,
++            table,
++            single_len,
++            added,
++            requirements: Requirements {
++                counts,
++                buffers,
++                controls,
++            },
++        })
++    }
++    pub(crate) fn requirements(&self) -> Requirements {
++        self.requirements
++    }
++    pub(crate) fn compile(
++        self,
++        failure: Option<usize>,
++    ) -> Result<CompiledTemplate, Failure> {
++        let mut p = CompiledTemplate::empty();
++        let result = (|| -> Result<(), Cause> {
++            macro_rules! reserve {
++                ($field:ident,$i:expr) => {{
++                    let count = if failure == Some($i) {
++                        usize::MAX
++                    } else {
++                        self.requirements.counts[$i]
++                    };
++                    p.$field
++                        .try_reserve_exact(count)
++                        .map_err(Cause::Reserve)?;
++                    if p.$field.capacity() > self.requirements.counts[$i] {
++                        return Err(Cause::Source(err(
++                            K::CapacityExceeded,
++                            self.table.start,
++                        )));
++                    }
++                }};
++            }
++            reserve!(pieces, 0);
++            reserve!(specials, 1);
++            reserve!(ids, 2);
++            reserve!(tokens, 3);
++            reserve!(bytes, 4);
++            let mut a = Reader::new(self.input, self.table)
++                .object()
++                .map_err(Error::from)?;
++            while let Some((key, value)) = a.next().map_err(Error::from)? {
++                let s = special(self.input, value)?;
++                let key = push_text(&mut p.bytes, key);
++                let id = push_text(&mut p.bytes, s.id);
++                let start = p.ids.len();
++                let mut a = Reader::new(self.input, s.ids)
++                    .array()
++                    .map_err(Error::from)?;
++                while let Some(v) = a.next().map_err(Error::from)? {
++                    p.ids.push(number(self.input, v)?);
++                }
++                let mut a = Reader::new(self.input, s.tokens)
++                    .array()
++                    .map_err(Error::from)?;
++                while let Some(v) = a.next().map_err(Error::from)? {
++                    p.tokens
++                        .push(push_text(&mut p.bytes, text(self.input, v)?));
++                }
++                p.specials.push(Special {
++                    key,
++                    id,
++                    start,
++                    len: s.len,
++                });
++            }
++            for (i, span) in
++                [self.single, self.pair].iter().copied().enumerate()
++            {
++                let mut a = Reader::new(self.input, span)
++                    .array()
++                    .map_err(Error::from)?;
++                while let Some(v) = a.next().map_err(Error::from)? {
++                    p.pieces.push(piece(self.input, v, self.table, i == 1)?.0);
++                }
++            }
++            p.single_len = self.single_len;
++            p.added = self.added;
++            debug_assert_eq!(p.capacities(), self.requirements.counts);
++            Ok(())
++        })();
++        match result {
++            Ok(()) => Ok(p),
++            Err(cause) => Err(Failure { cause, partial: p }),
++        }
++    }
++}
++fn push_text(bytes: &mut Vec<u8>, text: Text<'_>) -> TextRange {
++    let start = bytes.len();
++    bytes.extend(text.bytes());
++    TextRange {
++        start,
++        len: bytes.len() - start,
++    }
++}
++#[derive(Debug)]
++enum Cause {
++    Source(Error),
++    Reserve(TryReserveError),
++}
++impl From<Error> for Cause {
++    fn from(value: Error) -> Self {
++        Self::Source(value)
++    }
++}
++/// Actual template reserve/source failure and all five partial destinations.
++#[derive(Debug)]
++pub struct Failure {
++    cause: Cause,
++    partial: CompiledTemplate,
++}
++impl Failure {
++    /// Real reserve error from the selected destination, if reservation failed.
++    pub fn allocation_error(&self) -> Option<&TryReserveError> {
++        match &self.cause {
++            Cause::Reserve(e) => Some(e),
++            _ => None,
++        }
++    }
++    /// Actual retained capacities in the five-buffer reserve order.
++    pub fn capacities(&self) -> [usize; 5] {
++        self.partial.capacities()
++    }
++}
++impl fmt::Display for Failure {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match &self.cause {
++            Cause::Source(e) => fmt::Display::fmt(e, f),
++            Cause::Reserve(e) => fmt::Display::fmt(e, f),
++        }
++    }
++}
++impl std::error::Error for Failure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match &self.cause {
++            Cause::Source(e) => Some(e),
++            Cause::Reserve(e) => Some(e),
++        }
++    }
++}
+--- /dev/null
++++ b/src/processors/template/visit.rs
+@@ -0,0 +1,83 @@
++//! One ordered projection used by ordinary Encoding and original ID destinations.
++use super::*;
++
++#[derive(Clone, Copy)]
++pub(crate) enum Texts<'a> {
++    Legacy(&'a [String]),
++    Packed(&'a [compiled::TextRange], &'a [u8]),
++}
++impl Texts<'_> {
++    pub(crate) fn owned(&self) -> Vec<String> {
++        match self {
++            Self::Legacy(tokens) => tokens.to_vec(),
++            Self::Packed(ranges, bytes) => {
++                ranges.iter().map(|r| r.text(bytes).to_owned()).collect()
++            }
++        }
++    }
++}
++#[derive(Clone, Copy)]
++pub(crate) enum PieceView<'a> {
++    Sequence {
++        index: usize,
++        type_id: u32,
++    },
++    Special {
++        ids: &'a [u32],
++        tokens: Texts<'a>,
++        type_id: u32,
++    },
++}
++
++pub(crate) fn visit<'a, E>(
++    pieces: impl Iterator<Item = PieceView<'a>>,
++    add_special_tokens: bool,
++    mut sink: impl FnMut(PieceView<'a>) -> StdResult<(), E>,
++) -> StdResult<(), E> {
++    for piece in pieces {
++        if !add_special_tokens && matches!(piece, PieceView::Special { .. }) {
++            continue;
++        }
++        sink(piece)?;
++    }
++    Ok(())
++}
++
++pub(super) fn encodings<'a>(
++    pieces: impl Iterator<Item = PieceView<'a>>,
++    mut encodings: Vec<Encoding>,
++    add_special_tokens: bool,
++) -> Result<Vec<Encoding>> {
++    let mut output = Vec::new();
++    visit(pieces, add_special_tokens, |piece| {
++        let encoding = match piece {
++            PieceView::Sequence { index, type_id } => {
++                let encoding = &mut encodings[index];
++                encoding.set_type_ids(vec![type_id; encoding.len()]);
++                encoding.set_sequence_id(index);
++                encoding.clone()
++            }
++            PieceView::Special {
++                ids,
++                tokens,
++                type_id,
++            } => {
++                let len = ids.len();
++                Encoding::new(
++                    ids.to_vec(),
++                    std::iter::repeat_n(type_id, len).collect(),
++                    tokens.owned(),
++                    std::iter::repeat_n(None, len).collect(),
++                    std::iter::repeat_n((0, 0), len).collect(),
++                    std::iter::repeat_n(1, len).collect(),
++                    std::iter::repeat_n(1, len).collect(),
++                    vec![],
++                    AHashMap::new(),
++                )
++            }
++        };
++        output.push(encoding);
++        Ok::<(), crate::Error>(())
++    })?;
++    Ok(output)
++}
+--- a/src/tokenizer/compile.rs
++++ b/src/tokenizer/compile.rs
+@@ -2,8 +2,12 @@
+ mod regex;
+ use self::regex::{RegexSelection, RegexState};
+ use super::{
+-    added_vocabulary::AddedVocabularyRecipe, AddedVocabulary, AddedVocabularyCompileError,
+-    AddedVocabularyCompileFailure, Tokenizer, TokenizerImpl,
++    added_vocabulary::AddedVocabularyRecipe, AddedVocabulary,
++    AddedVocabularyCompileError, AddedVocabularyCompileFailure, Tokenizer,
++    TokenizerImpl,
++};
++use crate::processors::template::compiled::{
++    compiler as template, TemplateCompileFailure,
+ };
+ use crate::{
+     decoders::{sequence::Sequence as DecodeSequence, DecoderWrapper},
+@@ -13,8 +17,8 @@
+     },
+     normalizers::{NormalizerWrapper, NFC},
+     pre_tokenizers::{
+-        byte_level::ByteLevel, digits::Digits, sequence::Sequence as PreSequence,
+-        PreTokenizerWrapper,
++        byte_level::ByteLevel, digits::Digits,
++        sequence::Sequence as PreSequence, PreTokenizerWrapper,
+     },
+     processors::{sequence::Sequence as PostSequence, PostProcessorWrapper},
+     utils::borrowed_json::{self as json, Reader, Span},
+@@ -106,15 +110,15 @@
+         Self::Added(e)
+     }
+ }
+-type Error = TokenizerCompileError;
+-type K = TokenizerCompileErrorKind;
+-fn err(kind: K, offset: usize) -> Error {
++pub(crate) type Error = TokenizerCompileError;
++pub(crate) type K = TokenizerCompileErrorKind;
++pub(crate) fn err(kind: K, offset: usize) -> Error {
+     Error::Root { kind, offset }
+ }
+-fn add(a: usize, b: usize) -> Result<usize, Error> {
++pub(crate) fn add(a: usize, b: usize) -> Result<usize, Error> {
+     a.checked_add(b).ok_or(err(K::Overflow, 0))
+ }
+-fn fields<const N: usize>(
++pub(crate) fn fields<const N: usize>(
+     input: &str,
+     span: Span,
+     names: [&str; N],
+@@ -132,16 +136,24 @@
+     }
+     Ok(out)
+ }
+-fn required(value: Option<Span>, at: usize) -> Result<Span, Error> {
++pub(crate) fn required(value: Option<Span>, at: usize) -> Result<Span, Error> {
+     value.ok_or(err(K::MissingField, at))
+ }
+-fn text_is(input: &str, span: Span, expected: &str) -> Result<bool, Error> {
++pub(crate) fn text_is(
++    input: &str,
++    span: Span,
++    expected: &str,
++) -> Result<bool, Error> {
+     let mut r = Reader::new(input, span);
+     let t = r.string()?;
+     r.finish()?;
+     Ok(t.is(expected))
+ }
+-fn boolean(input: &str, value: Option<Span>, default: bool) -> Result<bool, Error> {
++fn boolean(
++    input: &str,
++    value: Option<Span>,
++    default: bool,
++) -> Result<bool, Error> {
+     match value {
+         None => Ok(default),
+         Some(s) => match &input[s.start..s.end] {
+@@ -165,6 +177,10 @@
+     Byte(ByteLevel),
+     Digits(bool),
+     Regex(RegexSelection),
++    Template {
++        span: Span,
++        requirements: template::Requirements,
++    },
+ }
+ fn inline(input: &str, span: Span, role: Role) -> Result<Inline, Error> {
+     // First select the actual type without building serde strings/components.
+@@ -199,6 +215,14 @@
+     } else if matches!(role, Role::Pre) && text_is(input, typ, "Digits")? {
+         let f = fields(input, span, ["type", "individual_digits"])?;
+         Ok(Inline::Digits(boolean(input, f[1], false)?))
++    } else if matches!(role, Role::Post)
++        && text_is(input, typ, "TemplateProcessing")?
++    {
++        let plan = template::Plan::prepare(input, span)?;
++        Ok(Inline::Template {
++            span,
++            requirements: plan.requirements(),
++        })
+     } else {
+         Err(err(K::ComponentProfile, span.start))
+     }
+@@ -210,9 +234,15 @@
+     count: usize,
+     role: Role,
+     regex: Option<RegexSelection>,
++    template_buffers: usize,
++    template_controls: usize,
+ }
+ impl Component {
+-    fn plan(input: &str, value: Option<Span>, role: Role) -> Result<Self, Error> {
++    fn plan(
++        input: &str,
++        value: Option<Span>,
++        role: Role,
++    ) -> Result<Self, Error> {
+         let value = absent(input, value);
+         let mut result = Self {
+             value,
+@@ -220,6 +250,8 @@
+             count: 0,
+             role,
+             regex: None,
++            template_buffers: 0,
++            template_controls: 0,
+         };
+         let Some(span) = value else {
+             if matches!(role, Role::Decode) {
+@@ -248,7 +280,9 @@
+             let mut following_byte = false;
+             let mut first_digits = false;
+             while let Some(item) = a.next()? {
+-                match inline(input, item, role)? {
++                let value = inline(input, item, role)?;
++                result.add_template(value)?;
++                match value {
+                     Inline::Digits(value) if result.count == 0 => {
+                         first_digits = value;
+                     }
+@@ -258,12 +292,14 @@
+                         } else {
+                             result.count == 0
+                         };
+-                        if !ordered || result.regex.replace(selected).is_some() {
++                        if !ordered || result.regex.replace(selected).is_some()
++                        {
+                             return Err(err(K::RegexProfile, item.start));
+                         }
+                     }
+                     Inline::Byte(byte) if result.count == 1 => {
+-                        following_byte = !byte.add_prefix_space && !byte.use_regex;
++                        following_byte =
++                            !byte.add_prefix_space && !byte.use_regex;
+                     }
+                     _ => {}
+                 }
+@@ -285,11 +321,22 @@
+             }
+             result.array = Some(array);
+         } else {
+-            if matches!(inline(input, span, role)?, Inline::Regex(_)) {
++            let value = inline(input, span, role)?;
++            result.add_template(value)?;
++            if matches!(value, Inline::Regex(_)) {
+                 return Err(err(K::RegexProfile, span.start));
+             }
+         }
+         Ok(result)
++    }
++    fn add_template(&mut self, value: Inline) -> Result<(), Error> {
++        if let Inline::Template { requirements, .. } = value {
++            self.template_buffers =
++                add(self.template_buffers, requirements.buffers)?;
++            self.template_controls =
++                add(self.template_controls, requirements.controls)?;
++        }
++        Ok(())
+     }
+     fn bytes(&self) -> Result<usize, Error> {
+         let layout = match self.role {
+@@ -297,7 +344,10 @@
+             Role::Post => Layout::array::<PostProcessorWrapper>(self.count),
+             Role::Decode => Layout::array::<DecoderWrapper>(self.count),
+         };
+-        layout.map(|l| l.size()).map_err(|_| err(K::Overflow, 0))
++        add(
++            layout.map(|l| l.size()).map_err(|_| err(K::Overflow, 0))?,
++            self.template_buffers,
++        )
+     }
+ }
+ /// Checked compiler buffers, named controls and the borrowed decoder envelope.
+@@ -352,11 +402,14 @@
+     fail_at: Option<usize>,
+     #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
+     added_failure: Option<usize>,
++    #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++    template_failure: Option<usize>,
+ }
+ impl<'a> TokenizerCompilePlan<'a> {
+     /// Borrows and validates one complete root without allocating destinations.
+     pub fn prepare_json(bytes: &'a [u8]) -> Result<Self, Error> {
+-        let input = std::str::from_utf8(bytes).map_err(|e| err(K::InvalidUtf8, e.valid_up_to()))?;
++        let input = std::str::from_utf8(bytes)
++            .map_err(|e| err(K::InvalidUtf8, e.valid_up_to()))?;
+         let mut r = Reader::new(
+             input,
+             Span {
+@@ -406,9 +459,14 @@
+             None
+         };
+         let span = required(f[8], root.start)?;
+-        let model = BpeCompilePlan::prepare_model_json(&bytes[span.start..span.end])?;
+-        let added_bytes = f[3].map_or(b"[]".as_slice(), |s| &bytes[s.start..s.end]);
+-        let added = AddedVocabularyRecipe::prepare_json(added_bytes, normalizer.as_ref())?;
++        let model =
++            BpeCompilePlan::prepare_model_json(&bytes[span.start..span.end])?;
++        let added_bytes =
++            f[3].map_or(b"[]".as_slice(), |s| &bytes[s.start..s.end]);
++        let added = AddedVocabularyRecipe::prepare_json(
++            added_bytes,
++            normalizer.as_ref(),
++        )?;
+         let m = model.requirements();
+         let a = added.requirements();
+         let buffers = add(
+@@ -419,6 +477,9 @@
+             )?,
+         )?;
+         let controls = [
++            pre.template_controls,
++            post.template_controls,
++            decoder.template_controls,
+             regex
+                 .required_bytes()?
+                 .checked_sub(regex.buffer_bytes())
+@@ -451,8 +512,10 @@
+             size_of::<Error>(),
+             size_of::<Result<Tokenizer, TokenizerCompileFailure>>(),
+             size_of::<Result<(), Cause>>(),
++            size_of::<Result<PostProcessorWrapper, Cause>>(),
+             size_of::<Result<(), TryReserveError>>(),
+-            size_of::<Result<AddedVocabulary, AddedVocabularyCompileFailure>>(),
++            size_of::<Result<AddedVocabulary, AddedVocabularyCompileFailure>>(
++            ),
+             size_of::<Option<Span>>() * 9,
+             size_of::<json::Object<'_>>(),
+             size_of::<json::Array<'_>>(),
+@@ -488,6 +551,8 @@
+             fail_at: None,
+             #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
+             added_failure: None,
++            #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++            template_failure: None,
+         })
+     }
+     /// Returns the sealed source-derived requirements without construction.
+@@ -517,8 +582,19 @@
+         self.added_failure = Some(stage);
+         self
+     }
++    /// Development-only overflow of one actual template buffer reserve.
++    #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++    #[doc(hidden)]
++    pub fn fail_template_reservation(mut self, stage: usize) -> Self {
++        assert!(stage < 5);
++        self.template_failure = Some(stage);
++        self
++    }
+     /// Development-only fixed regex construction target; it cannot replace a source.
+-    #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
++    #[cfg(all(
++        feature = "fancy-regex",
++        feature = "tokenizer-compiler-test-support"
++    ))]
+     #[doc(hidden)]
+     pub fn fail_regex_construction(
+         mut self,
+@@ -535,7 +611,23 @@
+             {
+                 self.fail_at
+             }
+-            #[cfg(not(any(test, feature = "tokenizer-compiler-test-support")))]
++            #[cfg(not(any(
++                test,
++                feature = "tokenizer-compiler-test-support"
++            )))]
++            {
++                None::<usize>
++            }
++        };
++        let template_failure = {
++            #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++            {
++                self.template_failure
++            }
++            #[cfg(not(any(
++                test,
++                feature = "tokenizer-compiler-test-support"
++            )))]
+             {
+                 None::<usize>
+             }
+@@ -551,6 +643,7 @@
+                 self.decoder,
+                 &mut regex,
+                 fail_at,
++                template_failure,
+                 &mut partial,
+             )?;
+             let plan = self.added.bind(
+@@ -607,6 +700,7 @@
+     decoder: Component,
+     regex: &mut RegexState,
+     fail: Option<usize>,
++    template_failure: Option<usize>,
+     p: &mut Partial,
+ ) -> Result<(), Cause> {
+     for component in [pre, post, decoder] {
+@@ -615,17 +709,19 @@
+         };
+         if let Some(array) = component.array {
+             match component.role {
+-                Role::Pre => p
+-                    .pre_items
+-                    .try_reserve_exact(requested(0, component.count, fail))?,
+-                Role::Post => {
+-                    p.post_items
+-                        .try_reserve_exact(requested(1, component.count, fail))?
+-                }
+-                Role::Decode => {
+-                    p.decode_items
+-                        .try_reserve_exact(requested(2, component.count, fail))?
+-                }
++                Role::Pre => p.pre_items.try_reserve_exact(requested(
++                    0,
++                    component.count,
++                    fail,
++                ))?,
++                Role::Post => p.post_items.try_reserve_exact(requested(
++                    1,
++                    component.count,
++                    fail,
++                ))?,
++                Role::Decode => p
++                    .decode_items
++                    .try_reserve_exact(requested(2, component.count, fail))?,
+             };
+             let actual = match component.role {
+                 Role::Pre => p.pre_items.capacity(),
+@@ -635,49 +731,91 @@
+             if actual > component.count {
+                 return Err(err(K::CapacityExceeded, array.start).into());
+             }
+-            let mut a = Reader::new(input, array).array().map_err(Error::from)?;
++            let mut a =
++                Reader::new(input, array).array().map_err(Error::from)?;
+             while let Some(item) = a.next().map_err(Error::from)? {
+                 let item = inline(input, item, component.role)?;
+                 match (component.role, item) {
+                     (Role::Pre, Inline::Byte(b)) => p.pre_items.push(b.into()),
+-                    (Role::Pre, Inline::Digits(d)) => p.pre_items.push(Digits::new(d).into()),
++                    (Role::Pre, Inline::Digits(d)) => {
++                        p.pre_items.push(Digits::new(d).into())
++                    }
+                     (Role::Pre, Inline::Regex(selected)) => {
+                         p.pre_items.push(regex.compile(selected)?)
+                     }
+-                    (Role::Post, Inline::Byte(b)) => p.post_items.push(b.into()),
+-                    (Role::Decode, Inline::Byte(b)) => p.decode_items.push(b.into()),
+-                    _ => return Err(err(K::ComponentProfile, span.start).into()),
++                    (Role::Post, Inline::Byte(b)) => {
++                        p.post_items.push(b.into())
++                    }
++                    (Role::Post, Inline::Template { span, .. }) => {
++                        p.post_items.push(compile_template(
++                            input,
++                            span,
++                            template_failure,
++                        )?)
++                    }
++                    (Role::Decode, Inline::Byte(b)) => {
++                        p.decode_items.push(b.into())
++                    }
++                    _ => {
++                        return Err(err(K::ComponentProfile, span.start).into())
++                    }
+                 }
+             }
+             match component.role {
+                 Role::Pre => {
+-                    p.pre = Some(PreSequence::new(std::mem::take(&mut p.pre_items)).into())
++                    p.pre = Some(
++                        PreSequence::new(std::mem::take(&mut p.pre_items))
++                            .into(),
++                    )
+                 }
+                 Role::Post => {
+-                    p.post = Some(PostSequence::new(std::mem::take(&mut p.post_items)).into())
++                    p.post = Some(
++                        PostSequence::new(std::mem::take(&mut p.post_items))
++                            .into(),
++                    )
+                 }
+                 Role::Decode => {
+-                    p.decoder =
+-                        Some(DecodeSequence::new(std::mem::take(&mut p.decode_items)).into())
++                    p.decoder = Some(
++                        DecodeSequence::new(std::mem::take(
++                            &mut p.decode_items,
++                        ))
++                        .into(),
++                    )
+                 }
+             }
+         } else {
+             match (component.role, inline(input, span, component.role)?) {
+                 (Role::Pre, Inline::Byte(b)) => p.pre = Some(b.into()),
+-                (Role::Pre, Inline::Digits(d)) => p.pre = Some(Digits::new(d).into()),
++                (Role::Pre, Inline::Digits(d)) => {
++                    p.pre = Some(Digits::new(d).into())
++                }
+                 (Role::Post, Inline::Byte(b)) => p.post = Some(b.into()),
++                (Role::Post, Inline::Template { span, .. }) => {
++                    p.post =
++                        Some(compile_template(input, span, template_failure)?)
++                }
+                 (Role::Decode, Inline::Byte(b)) => p.decoder = Some(b.into()),
+                 _ => return Err(err(K::ComponentProfile, span.start).into()),
+             }
+         }
+     }
+     Ok(())
++}
++fn compile_template(
++    input: &str,
++    span: Span,
++    failure: Option<usize>,
++) -> Result<PostProcessorWrapper, Cause> {
++    let plan = template::Plan::prepare(input, span)?;
++    let value = plan.compile(failure).map_err(Cause::Template)?;
++    Ok(PostProcessorWrapper::CompiledTemplate(value))
+ }
+ #[derive(Debug)]
+ enum Cause {
+     Source(Error),
+     Model(BpeCompileFailure),
+     Added(AddedVocabularyCompileFailure),
++    Template(TemplateCompileFailure),
+     Reserve(TryReserveError),
+     #[cfg(feature = "fancy-regex")]
+     Regex(fancy_regex::workspace::construction::Failure),
+@@ -707,6 +845,13 @@
+     /// Whether a successfully constructed model is retained by this failure.
+     pub fn completed_model(&self) -> bool {
+         self.partial.model.is_some()
++    }
++    /// Actual template constructor failure and all partial destination capacities.
++    pub fn template_failure(&self) -> Option<&TemplateCompileFailure> {
++        match &self.cause {
++            Cause::Template(error) => Some(error),
++            _ => None,
++        }
+     }
+     /// Borrows a fixed root construction diagnostic, when present.
+     pub fn source_error(&self) -> Option<&Error> {
+@@ -729,6 +874,7 @@
+             Cause::Source(e) => fmt::Display::fmt(e, f),
+             Cause::Model(e) => fmt::Display::fmt(e, f),
+             Cause::Added(e) => fmt::Display::fmt(e, f),
++            Cause::Template(e) => fmt::Display::fmt(e, f),
+             Cause::Reserve(e) => fmt::Display::fmt(e, f),
+             #[cfg(feature = "fancy-regex")]
+             Cause::Regex(e) => fmt::Display::fmt(e, f),
+@@ -741,6 +887,7 @@
+             Cause::Source(e) => Some(e),
+             Cause::Model(e) => Some(e),
+             Cause::Added(e) => Some(e),
++            Cause::Template(e) => Some(e),
+             Cause::Reserve(e) => Some(e),
+             #[cfg(feature = "fancy-regex")]
+             Cause::Regex(e) => Some(e),
+@@ -749,3 +896,6 @@
+ }
+ #[cfg(test)]
+ mod tests;
++
++#[cfg(test)]
++pub(crate) mod template_tests;
+--- /dev/null
++++ b/src/tokenizer/compile/template_tests.rs
+@@ -0,0 +1,294 @@
++use super::*;
++use crate::{EncodeIdsPlan, Encoding};
++use serde_json::{json, Value};
++
++pub(crate) fn source() -> Value {
++    let mut alphabet: Vec<_> = ByteLevel::alphabet().into_iter().collect();
++    alphabet.sort_unstable();
++    let mut vocab = serde_json::Map::new();
++    for (id, c) in alphabet.into_iter().enumerate() {
++        vocab.insert(c.to_string(), json!(id));
++    }
++    vocab.insert("hi".into(), json!(256));
++    vocab.insert("Hello".into(), json!(257));
++    let added = |id, word| json!({"id":id,"content":word,"normalized":false,"single_word":false,"lstrip":false,"rstrip":false,"special":true});
++    let mut value = json!({"version":"1.0","normalizer":null,"padding":null,"truncation":null,
++        "pre_tokenizer":null,
++        "post_processor":{"type":"TemplateProcessing",
++            "single":[{"SpecialToken":{"id":"start","type_id":3}},{"Sequence":{"id":"A","type_id":7}},{"SpecialToken":{"id":"end","type_id":5}}],
++            "pair":[{"SpecialToken":{"id":"start","type_id":3}},{"Sequence":{"id":"A","type_id":7}},{"SpecialToken":{"id":"end","type_id":5}},{"Sequence":{"id":"B","type_id":9}}],
++            "special_tokens":{"start":{"id":"stored start","ids":[259,258],"tokens":["<B>","different spelling"]},"end":{"id":"end","ids":[260],"tokens":["<E>"]}}},
++        "decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
++        "added_tokens":[added(258,"<S>"),added(259,"<B>"),added(260,"<E>")],
++        "model":{"type":"BPE","vocab":vocab,"merges":[["h","i"]],"ignore_merges":true}});
++    #[cfg(feature = "fancy-regex")]
++    {
++        value["pre_tokenizer"] = json!({"type":"Sequence","pretokenizers":[
++        {"type":"Split","pattern":{"Regex":fancy_regex::workspace::construction::patterns().nth(2).unwrap()},"behavior":"Isolated","invert":false},
++        {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]});
++    }
++    value
++}
++fn compare(a: &Encoding, b: &Encoding) {
++    assert_eq!(a.get_ids(), b.get_ids());
++    assert_eq!(a.get_tokens(), b.get_tokens());
++    assert_eq!(a.get_type_ids(), b.get_type_ids());
++    assert_eq!(a.get_offsets(), b.get_offsets());
++    assert_eq!(a.get_word_ids(), b.get_word_ids());
++    assert_eq!(a.get_attention_mask(), b.get_attention_mask());
++    assert_eq!(a.get_special_tokens_mask(), b.get_special_tokens_mask());
++    assert_eq!(a.get_sequence_ids(), b.get_sequence_ids());
++    assert_eq!(a.get_overflowing().len(), b.get_overflowing().len());
++    for (a, b) in a.get_overflowing().iter().zip(b.get_overflowing()) {
++        compare(a, b);
++    }
++}
++fn compiled(value: &Value) -> Tokenizer {
++    TokenizerCompilePlan::prepare_json(value.to_string().as_bytes())
++        .unwrap()
++        .compile()
++        .unwrap()
++}
++#[test]
++fn packed_template_preserves_single_pair_encoding_and_ordinary_clone_serde() {
++    for sequence in [false, true] {
++        let mut value = source();
++        if sequence {
++            value["post_processor"] = json!({"type":"Sequence","processors":[{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},value["post_processor"].clone()]});
++        }
++        let input = value.to_string();
++        let mut actual = compiled(&value);
++        let mut legacy = Tokenizer::from_bytes(input.as_bytes()).unwrap();
++        drop(input);
++        for encode_special in [false, true] {
++            actual.set_encode_special_tokens(encode_special);
++            legacy.set_encode_special_tokens(encode_special);
++            for special in [false, true] {
++                for text in [
++                    "Hello hi<S>",
++                    "é e\u{301}🦀",
++                    " can't 1234\r\n ",
++                    "",
++                    "\0\u{7f}",
++                ] {
++                    compare(
++                        &actual.encode(text, special).unwrap(),
++                        &legacy.encode(text, special).unwrap(),
++                    );
++                    compare(
++                        &actual.encode((text, "hi<B>"), special).unwrap(),
++                        &legacy.encode((text, "hi<B>"), special).unwrap(),
++                    );
++                    let ids = EncodeIdsPlan::prepare(&actual, text, special)
++                        .unwrap()
++                        .encode()
++                        .unwrap();
++                    assert_eq!(
++                        ids.ids(),
++                        legacy.encode(text, special).unwrap().get_ids()
++                    );
++                    assert_eq!(
++                        ids.capacities()[2],
++                        text.len() + if special { 3 } else { 0 }
++                    );
++                }
++            }
++        }
++        let cloned = actual.clone();
++        drop(actual);
++        let restored =
++            Tokenizer::from_bytes(serde_json::to_vec(&cloned).unwrap())
++                .unwrap();
++        compare(
++            &cloned.encode(("hi", "Hello"), true).unwrap(),
++            &restored.encode(("hi", "Hello"), true).unwrap(),
++        );
++        let value = serde_json::to_value(cloned.get_post_processor().unwrap())
++            .unwrap();
++        let expected =
++            serde_json::to_value(legacy.get_post_processor().unwrap())
++                .unwrap();
++        assert_eq!(value, expected);
++    }
++}
++#[test]
++fn template_special_policy_empty_and_all_target_failure_prefixes_use_real_destinations(
++) {
++    let value = source();
++    let actual = compiled(&value);
++    assert_eq!(
++        EncodeIdsPlan::prepare(&actual, "", true)
++            .unwrap()
++            .encode()
++            .unwrap()
++            .ids(),
++        [259, 258, 260]
++    );
++    assert!(EncodeIdsPlan::prepare(&actual, "", false)
++        .unwrap()
++        .encode()
++        .unwrap()
++        .ids()
++        .is_empty());
++    for stage in 0..5 {
++        let input = value.to_string();
++        let error = TokenizerCompilePlan::prepare_json(input.as_bytes())
++            .unwrap()
++            .fail_template_reservation(stage)
++            .compile()
++            .unwrap_err();
++        drop(input);
++        assert!(error.completed_model());
++        let failure = error.template_failure().unwrap();
++        assert!(failure.allocation_error().is_some());
++        let capacities = failure.capacities();
++        assert!(capacities[..stage].iter().all(|n| *n > 0));
++        assert!(capacities[stage..].iter().all(|n| *n == 0));
++    }
++    #[cfg(feature = "tokenizer-compiler-test-support")]
++    for stage in 0..4 {
++        let error = EncodeIdsPlan::prepare(&actual, "hi<S>Hello", true)
++            .unwrap()
++            .fail_reservation(stage)
++            .encode();
++        assert!(error.is_err());
++    }
++    let mut late = source();
++    late["model"]["vocab"] = json!({"h":0,"i":2});
++    late["model"]["merges"] = json!([]);
++    late["added_tokens"] = json!([{"id":2,"content":"new","normalized":false,"single_word":false,"lstrip":false,"rstrip":false,"special":true},{"id":2,"content":"i","normalized":false,"single_word":false,"lstrip":false,"rstrip":false,"special":false}]);
++    let input = late.to_string();
++    let error = TokenizerCompilePlan::prepare_json(input.as_bytes())
++        .unwrap()
++        .compile()
++        .unwrap_err();
++    assert!(matches!(&error.cause, Cause::Added(_)));
++    assert!(matches!(
++        &error.partial.post,
++        Some(PostProcessorWrapper::CompiledTemplate(_))
++    ));
++}
++#[test]
++fn template_source_validation_preserves_decoded_keys_sparse_ids_and_pair_metadata(
++) {
++    let mut value = source();
++    value["post_processor"]["special_tokens"]["start"]["ids"][0] =
++        json!(u32::MAX);
++    let input = value.to_string().replace("\"start\"", "\"st\\u0061rt\"");
++    let actual = TokenizerCompilePlan::prepare_json(input.as_bytes())
++        .unwrap()
++        .compile()
++        .unwrap();
++    let legacy = Tokenizer::from_bytes(input.as_bytes()).unwrap();
++    assert_eq!(
++        EncodeIdsPlan::prepare(&actual, "hi", true)
++            .unwrap()
++            .encode()
++            .unwrap()
++            .ids()[0],
++        u32::MAX
++    );
++    compare(
++        &actual.encode(("hi", "hi"), true).unwrap(),
++        &legacy.encode(("hi", "hi"), true).unwrap(),
++    );
++    // Distinct keys may intentionally carry the same numeric ID and a different
++    // token spelling. Object order and escaped names cannot change that meaning.
++    let mut shared = source();
++    shared["post_processor"]["special_tokens"]["end"]["ids"] = json!([259]);
++    let encoded = shared.to_string();
++    let ordinary = Tokenizer::from_bytes(encoded.as_bytes()).unwrap();
++    let packed = compiled(&shared);
++    compare(
++        &packed.encode(("hi", "hi"), true).unwrap(),
++        &ordinary.encode(("hi", "hi"), true).unwrap(),
++    );
++    let post = &shared["post_processor"];
++    let reordered = format!(
++        r#"{{"special_tokens":{},"pair":{},"single":{},"type":"TemplateProcessing"}}"#,
++        post["special_tokens"], post["pair"], post["single"]
++    );
++    let encoded = encoded.replace(&post.to_string(), &reordered);
++    let reordered = TokenizerCompilePlan::prepare_json(encoded.as_bytes())
++        .unwrap()
++        .compile()
++        .unwrap();
++    compare(
++        &reordered.encode("hi", true).unwrap(),
++        &packed.encode("hi", true).unwrap(),
++    );
++    for change in 0..7 {
++        let mut bad = source();
++        let p = &mut bad["post_processor"];
++        match change {
++            0 => p["single"][0]["SpecialToken"]["id"] = json!("missing"),
++            1 => p["pair"][3]["Sequence"]["id"] = json!("C"),
++            2 => p["special_tokens"]["start"]["ids"] = json!([1]),
++            3 => p["single"][1]["Sequence"]["type_id"] = json!(-1),
++            4 => p["unknown"] = json!(0),
++            5 => p["single"][0]["Sequence"] = json!({"id":"A","type_id":0}),
++            _ => p["special_tokens"]["end"]["ids"] = json!([4294967296u64]),
++        }
++        bad["model"] = json!(false);
++        assert!(matches!(
++            TokenizerCompilePlan::prepare_json(bad.to_string().as_bytes()),
++            Err(Error::Root { .. })
++        ));
++    }
++    let duplicate=source().to_string().replace("\"special_tokens\":{","\"special_tokens\":{\"end\":{\"id\":\"end\",\"ids\":[1],\"tokens\":[\"x\"]},");
++    assert_eq!(
++        TokenizerCompilePlan::prepare_json(duplicate.as_bytes())
++            .unwrap_err()
++            .kind(),
++        K::DuplicateField
++    );
++}
++#[test]
++fn unsupported_single_repetition_rejects_e_and_legacy_missing_special_false_stays_valid(
++) {
++    let mut value = source();
++    value["post_processor"]["single"]
++        .as_array_mut()
++        .unwrap()
++        .push(json!({"Sequence":{"id":"A","type_id":1}}));
++    let actual = compiled(&value);
++    let legacy = Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
++    compare(
++        &actual.encode("hi", true).unwrap(),
++        &legacy.encode("hi", true).unwrap(),
++    );
++    assert!(matches!(
++        EncodeIdsPlan::prepare(&actual, "hi", true),
++        Err(crate::EncodeIdsError::PipelineProfile)
++    ));
++    let mut no_a = source();
++    no_a["post_processor"]["single"] =
++        json!([{"SpecialToken":{"id":"end","type_id":0}}]);
++    let no_a = compiled(&no_a);
++    for special in [false, true] {
++        assert!(matches!(
++            EncodeIdsPlan::prepare(&no_a, "hi", special),
++            Err(crate::EncodeIdsError::PipelineProfile)
++        ));
++    }
++    let mut zero = source();
++    zero["post_processor"]["single"] =
++        json!([{"Sequence":{"id":"A","type_id":0}}]);
++    zero["post_processor"]["pair"] = json!([{"Sequence":{"id":"A","type_id":0}},{"Sequence":{"id":"B","type_id":1}}]);
++    zero["post_processor"]["special_tokens"] = json!({});
++    let zero = compiled(&zero);
++    assert!(EncodeIdsPlan::prepare(&zero, "", true)
++        .unwrap()
++        .encode()
++        .unwrap()
++        .ids()
++        .is_empty());
++    let mut value = source();
++    value["post_processor"]["special_tokens"] = json!({});
++    let legacy = Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
++    assert!(!legacy.encode("hi", false).unwrap().get_ids().is_empty());
++    assert!(
++        TokenizerCompilePlan::prepare_json(value.to_string().as_bytes())
++            .is_err()
++    );
++}
+--- a/src/tokenizer/encode_ids.rs
++++ b/src/tokenizer/encode_ids.rs
+@@ -1,5 +1,7 @@
+ //! One-attempt ID destinations for checked identity and compiled regex pipelines.
++mod post;
+ mod regex;
++use self::post::PostPlan;
+ use self::regex::RegexPlan;
+ use super::{ModelWrapper, Tokenizer};
+ use crate::models::bpe::BpeScratch;
+@@ -33,7 +35,7 @@
+ impl fmt::Display for EncodeIdsError {
+     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+         match self {
+-            Self::PipelineProfile => f.write_str("identity ID encoding requires absent pipeline transforms"),
++            Self::PipelineProfile => f.write_str("ID encoding requires a supported immutable pipeline and single-input template"),
+             Self::AddedProfile => f.write_str("identity ID encoding requires packed non-normalized literal added tokens"),
+             Self::ModelProfile => f.write_str("identity ID encoding requires packed uncached BPE without dropout, affixes or byte fallback"),
+             Self::Overflow => f.write_str("identity ID encoding layout overflow"),
+@@ -127,24 +129,27 @@
+     source: &'a Tokenizer,
+     input: &'a str,
+     regex: RegexPlan<'a>,
++    post: PostPlan<'a>,
+     requirements: EncodeIdsRequirements,
+     #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
+     failure: Option<usize>,
+ }
+ impl<'a> EncodeIdsPlan<'a> {
+-    /// Inspects the actual source. With no postprocessor, add_special_tokens never
+-    /// inserts BOS/EOS; embedded special matching still follows the source setting.
++    /// Inspects the actual source and selected single-template special policy.
++    /// Embedded special matching remains a separate immutable source setting.
+     pub fn prepare(
+         source: &'a Tokenizer,
+         input: &'a str,
+-        _add_special_tokens: bool,
++        add_special_tokens: bool,
+     ) -> Result<Self, EncodeIdsError> {
++        let post = PostPlan::inspect(source, add_special_tokens)?;
+         let regex = RegexPlan::inspect(source)?;
+         if !source.added_vocabulary.has_identity_packed_profile() {
+             return Err(EncodeIdsError::AddedProfile);
+         }
+         match &source.model {
+-            ModelWrapper::BPE(model) if model.has_identity_packed_profile() => {}
++            ModelWrapper::BPE(model)
++                if model.has_identity_packed_profile() => {}
+             _ => return Err(EncodeIdsError::ModelProfile),
+         }
+         let symbols = input.len();
+@@ -152,15 +157,26 @@
+             .saturating_sub(1)
+             .checked_mul(3)
+             .ok_or(EncodeIdsError::Overflow)?;
+-        let ids = symbols;
++        let ids = symbols
++            .checked_add(post.special_ids())
++            .ok_or(EncodeIdsError::Overflow)?;
+         let mapped = regex.mapped_capacity(symbols)?;
+         let regex_bytes = regex.required_bytes()?;
+         let regex_delegates = regex.delegate_count();
+         let buffers = BpeScratch::buffer_bytes(symbols, merges)
+-            .and_then(|bytes| bytes.checked_add(Layout::array::<u32>(ids).ok()?.size()))
+-            .and_then(|bytes| bytes.checked_add(Layout::array::<u8>(mapped).ok()?.size()))
++            .and_then(|bytes| {
++                bytes.checked_add(Layout::array::<u32>(ids).ok()?.size())
++            })
++            .and_then(|bytes| {
++                bytes.checked_add(Layout::array::<u8>(mapped).ok()?.size())
++            })
+             .ok_or(EncodeIdsError::Overflow)?;
+         let controls = [
++            PostPlan::control_bytes().ok_or(EncodeIdsError::Overflow)?,
++            size_of::<InputEncoder<'_, '_>>(),
++            size_of::<PostInputEncoder<'_, '_>>(),
++            size_of::<&mut InputEncoder<'_, '_>>(),
++            size_of::<&mut PostInputEncoder<'_, '_>>(),
+             size_of::<Self>(),
+             size_of::<Result<Self, EncodeIdsError>>(),
+             size_of::<EncodeIdsRequirements>(),
+@@ -187,6 +203,7 @@
+             source,
+             input,
+             regex,
++            post,
+             requirements: EncodeIdsRequirements {
+                 symbols,
+                 merges,
+@@ -215,7 +232,10 @@
+         self
+     }
+     /// Development-only actual outer/nested regex reserve selection.
+-    #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
++    #[cfg(all(
++        feature = "fancy-regex",
++        feature = "tokenizer-compiler-test-support"
++    ))]
+     #[doc(hidden)]
+     pub fn fail_regex_reservation(
+         mut self,
+@@ -267,17 +287,15 @@
+             let ModelWrapper::BPE(model) = &self.source.model else {
+                 unreachable!("checked immutable model")
+             };
+-            let result =
+-                self.source
+-                    .added_vocabulary
+-                    .visit_matches(input, false, |id, (start, end)| {
+-                        if let Some(id) = id {
+-                            output.ids.push(id);
+-                            Ok(())
+-                        } else {
+-                            regex.encode_span(&mut output, model, &input[start..end])
+-                        }
+-                    });
++            let result = self.post.encode(&mut PostInputEncoder {
++                input: InputEncoder {
++                    output: &mut output,
++                    regex: &mut regex,
++                    model,
++                    input,
++                },
++                added: &self.source.added_vocabulary,
++            });
+             // The same E guard surrounds this lexical retirement. No borrowed
+             // workspace escapes into the owned successful result or failure.
+             drop(regex);
+@@ -286,7 +304,11 @@
+                 mapped_reserved,
+                 "encoding grew mapped storage"
+             );
+-            debug_assert_eq!(output.capacities(), reserved, "encoding grew a destination");
++            debug_assert_eq!(
++                output.capacities(),
++                reserved,
++                "encoding grew a destination"
++            );
+             result
+         })();
+         match result {
+@@ -295,6 +317,53 @@
+                 cause,
+                 partial: output,
+             }),
++        }
++    }
++}
++// Named synchronous callback state; requirements include both states and the
++// sole mutable reference captured by each shared visitor callback.
++struct InputEncoder<'a, 's> {
++    output: &'a mut EncodeIdsOutput,
++    regex: &'a mut regex::Runtime<'s>,
++    model: &'a crate::models::bpe::BPE,
++    input: &'a str,
++}
++impl InputEncoder<'_, '_> {
++    fn span(
++        &mut self,
++        id: Option<u32>,
++        (start, end): crate::Offsets,
++    ) -> Result<(), EncodeIdsError> {
++        if let Some(id) = id {
++            self.output.ids.push(id);
++            Ok(())
++        } else {
++            self.regex.encode_span(
++                self.output,
++                self.model,
++                &self.input[start..end],
++            )
++        }
++    }
++}
++struct PostInputEncoder<'a, 's> {
++    input: InputEncoder<'a, 's>,
++    added: &'a super::AddedVocabulary,
++}
++impl PostInputEncoder<'_, '_> {
++    fn piece(
++        &mut self,
++        special: Option<&[u32]>,
++    ) -> Result<(), EncodeIdsError> {
++        if let Some(ids) = special {
++            self.input.output.ids.extend_from_slice(ids);
++            Ok(())
++        } else {
++            let text = self.input.input;
++            let encoder = &mut self.input;
++            self.added.visit_matches(text, false, |id, offsets| {
++                encoder.span(id, offsets)
++            })
+         }
+     }
+ }
+--- /dev/null
++++ b/src/tokenizer/encode_ids/post.rs
+@@ -0,0 +1,86 @@
++//! Checked single-input projection through the same ordered template visitor.
++use super::*;
++use crate::processors::{
++    template::{compiled::CompiledTemplate, visit::PieceView},
++    PostProcessorWrapper,
++};
++
++pub(super) struct PostPlan<'a> {
++    template: Option<&'a CompiledTemplate>,
++    add_special_tokens: bool,
++    special_ids: usize,
++}
++impl<'a> PostPlan<'a> {
++    pub(super) fn inspect(
++        source: &'a Tokenizer,
++        add_special_tokens: bool,
++    ) -> Result<Self, EncodeIdsError> {
++        let mut result = Self {
++            template: None,
++            add_special_tokens,
++            special_ids: 0,
++        };
++        match &source.post_processor {
++            None => {}
++            Some(PostProcessorWrapper::Sequence(sequence)) => {
++                for item in sequence.as_ref() {
++                    result.accept(item)?;
++                }
++            }
++            Some(item) => result.accept(item)?,
++        }
++        Ok(result)
++    }
++    fn accept(
++        &mut self,
++        item: &'a PostProcessorWrapper,
++    ) -> Result<(), EncodeIdsError> {
++        match item {
++            PostProcessorWrapper::ByteLevel(byte) if !byte.trim_offsets => {
++                Ok(())
++            }
++            PostProcessorWrapper::CompiledTemplate(template)
++                if self.template.is_none() =>
++            {
++                self.special_ids = template
++                    .single_ids(self.add_special_tokens)
++                    .ok_or(EncodeIdsError::PipelineProfile)?;
++                self.template = Some(template);
++                Ok(())
++            }
++            _ => Err(EncodeIdsError::PipelineProfile),
++        }
++    }
++    pub(super) fn special_ids(&self) -> usize {
++        self.special_ids
++    }
++    pub(super) fn control_bytes() -> Option<usize> {
++        [
++            size_of::<Self>(),
++            size_of::<Result<Self, EncodeIdsError>>(),
++            size_of::<std::slice::Iter<'_, PostProcessorWrapper>>(),
++            size_of::<Result<(), EncodeIdsError>>(),
++            size_of::<Option<&[u32]>>(),
++            CompiledTemplate::visit_control_bytes()?,
++        ]
++        .iter()
++        .try_fold(0usize, |n, v| n.checked_add(*v))
++    }
++    pub(super) fn encode(
++        self,
++        encoder: &mut PostInputEncoder<'_, '_>,
++    ) -> Result<(), EncodeIdsError> {
++        if let Some(template) = self.template {
++            template.visit_single(self.add_special_tokens, |piece| match piece
++            {
++                PieceView::Sequence { index, .. } => {
++                    debug_assert_eq!(index, 0);
++                    encoder.piece(None)
++                }
++                PieceView::Special { ids, .. } => encoder.piece(Some(ids)),
++            })
++        } else {
++            encoder.piece(None)
++        }
++    }
++}
+--- a/src/tokenizer/encode_ids/regex.rs
++++ b/src/tokenizer/encode_ids/regex.rs
+@@ -12,11 +12,16 @@
+     _source: PhantomData<&'a Tokenizer>,
+ }
+ impl<'a> RegexPlan<'a> {
+-    pub(super) fn inspect(source: &'a Tokenizer) -> Result<Self, EncodeIdsError> {
+-        if source.normalizer.is_some() || source.padding.is_some() || source.truncation.is_some() {
++    pub(super) fn inspect(
++        source: &'a Tokenizer,
++    ) -> Result<Self, EncodeIdsError> {
++        if source.normalizer.is_some()
++            || source.padding.is_some()
++            || source.truncation.is_some()
++        {
+             return Err(EncodeIdsError::PipelineProfile);
+         }
+-        if source.pre_tokenizer.is_none() && source.post_processor.is_none() {
++        if source.pre_tokenizer.is_none() {
+             return Ok(Self {
+                 numeric: false,
+                 #[cfg(feature = "fancy-regex")]
+@@ -26,7 +31,9 @@
+         }
+         #[cfg(feature = "fancy-regex")]
+         {
+-            let Some(PreTokenizerWrapper::Sequence(sequence)) = &source.pre_tokenizer else {
++            let Some(PreTokenizerWrapper::Sequence(sequence)) =
++                &source.pre_tokenizer
++            else {
+                 return Err(EncodeIdsError::PipelineProfile);
+             };
+             let (numeric, plan) = match sequence.as_ref() {
+@@ -44,12 +51,6 @@
+                 }
+                 _ => return Err(EncodeIdsError::PipelineProfile),
+             };
+-            match &source.post_processor {
+-                None => {}
+-                Some(crate::processors::PostProcessorWrapper::ByteLevel(post))
+-                    if !post.trim_offsets => {}
+-                _ => return Err(EncodeIdsError::PipelineProfile),
+-            }
+             Ok(Self {
+                 numeric,
+                 plan: Some(plan.map_err(EncodeIdsError::RegexPlan)?),
+@@ -70,7 +71,10 @@
+         }
+         0
+     }
+-    pub(super) fn mapped_capacity(&self, bytes: usize) -> Result<usize, EncodeIdsError> {
++    pub(super) fn mapped_capacity(
++        &self,
++        bytes: usize,
++    ) -> Result<usize, EncodeIdsError> {
+         #[cfg(feature = "fancy-regex")]
+         if self.plan.is_some() {
+             return bytes.checked_mul(2).ok_or(EncodeIdsError::Overflow);
+@@ -81,17 +85,24 @@
+     pub(super) fn required_bytes(&self) -> Result<usize, EncodeIdsError> {
+         let bytes = size_of::<Self>()
+             .checked_add(size_of::<Runtime<'a>>())
+-            .and_then(|n| n.checked_add(size_of::<Result<Runtime<'a>, EncodeIdsError>>()))
++            .and_then(|n| {
++                n.checked_add(size_of::<Result<Runtime<'a>, EncodeIdsError>>())
++            })
+             .ok_or(EncodeIdsError::Overflow)?;
+         #[cfg(feature = "fancy-regex")]
+         if let Some(plan) = &self.plan {
+             return bytes
+                 .checked_add(plan.requirements().required_bytes())
+-                .and_then(|n| n.checked_add(compiled_split::visit_control_bytes()?))
++                .and_then(|n| {
++                    n.checked_add(compiled_split::visit_control_bytes()?)
++                })
+                 .and_then(|n| n.checked_add(size_of::<SpanEncoder<'_>>()))
+                 .and_then(|n| {
+                     n.checked_add(core::mem::size_of_val(
+-                        &crate::pre_tokenizers::byte_level::transformations("").map(|(c, _)| c),
++                        &crate::pre_tokenizers::byte_level::transformations(
++                            "",
++                        )
++                        .map(|(c, _)| c),
+                     ))
+                 })
+                 .and_then(|n| {
+@@ -101,12 +112,17 @@
+                         0
+                     })
+                 })
+-                .and_then(|n| n.checked_add(size_of::<Result<(), EncodeIdsError>>()))
++                .and_then(|n| {
++                    n.checked_add(size_of::<Result<(), EncodeIdsError>>())
++                })
+                 .ok_or(EncodeIdsError::Overflow);
+         }
+         Ok(bytes)
+     }
+-    #[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
++    #[cfg(all(
++        feature = "fancy-regex",
++        feature = "tokenizer-compiler-test-support"
++    ))]
+     pub(super) fn fail(
+         &mut self,
+         failure: fancy_regex::workspace::PrepareFailure,
+@@ -121,10 +137,9 @@
+     pub(super) fn prepare(self) -> Result<Runtime<'a>, EncodeIdsError> {
+         #[cfg(feature = "fancy-regex")]
+         let workspace = match self.plan {
+-            Some(plan) => Some(
+-                plan.prepare()
+-                    .map_err(|error| EncodeIdsError::RegexPreparation(error.retire()))?,
+-            ),
++            Some(plan) => Some(plan.prepare().map_err(|error| {
++                EncodeIdsError::RegexPreparation(error.retire())
++            })?),
+             None => None,
+         };
+         Ok(Runtime {
+@@ -151,7 +166,9 @@
+         if self.numeric {
+             // The exact ordinary Digits predicate, never the regex engine's Unicode table.
+             let numeric: fn(char) -> bool = char::is_numeric;
+-            for piece in crate::tokenizer::pattern::char_coverage(text, &numeric) {
++            for piece in
++                crate::tokenizer::pattern::char_coverage(text, &numeric)
++            {
+                 let ((start, end), _) = match piece {
+                     Ok(piece) => piece,
+                     Err(never) => match never {},
+@@ -175,9 +192,11 @@
+                 model,
+                 text,
+             };
+-            return compiled_split::visit_spans(workspace, text, move |offsets| {
+-                encoder.encode(offsets)
+-            });
++            return compiled_split::visit_spans(
++                workspace,
++                text,
++                move |offsets| encoder.encode(offsets),
++            );
+         }
+         output
+             .scratch
+@@ -193,11 +212,16 @@
+ }
+ #[cfg(feature = "fancy-regex")]
+ impl SpanEncoder<'_> {
+-    fn encode(&mut self, (start, end): crate::Offsets) -> Result<(), EncodeIdsError> {
++    fn encode(
++        &mut self,
++        (start, end): crate::Offsets,
++    ) -> Result<(), EncodeIdsError> {
+         self.output.mapped.clear();
+         self.output.mapped.extend(
+-            crate::pre_tokenizers::byte_level::transformations(&self.text[start..end])
+-                .map(|(c, _)| c),
++            crate::pre_tokenizers::byte_level::transformations(
++                &self.text[start..end],
++            )
++            .map(|(c, _)| c),
+         );
+         // Keep the full mapped split for the model's existing ignore_merges fast path.
+         self.output
+@@ -213,7 +237,9 @@
+     [
+         size_of::<fn(char) -> bool>(),
+         size_of::<Coverage<CharMatches<'static, 'static, fn(char) -> bool>>>(),
+-        size_of::<Option<Result<(crate::Offsets, bool), std::convert::Infallible>>>(),
++        size_of::<
++            Option<Result<(crate::Offsets, bool), std::convert::Infallible>>,
++        >(),
+         size_of::<Result<(), EncodeIdsError>>(),
+     ]
+     .iter()
+--- a/src/tokenizer/mod.rs
++++ b/src/tokenizer/mod.rs
+@@ -25,26 +25,31 @@
+ use crate::utils::progress::{ProgressBar, ProgressStyle};
+ 
+ mod added_vocabulary;
+-mod compile;
++pub(crate) mod compile;
+ pub use compile::{
+     TokenizerCompileError, TokenizerCompileErrorKind, TokenizerCompileFailure,
+     TokenizerCompilePlan, TokenizerCompileRequirements,
+ };
+ /// Fixed development-only regex constructor and workspace failure selectors.
+-#[cfg(all(feature = "fancy-regex", feature = "tokenizer-compiler-test-support"))]
++#[cfg(all(
++    feature = "fancy-regex",
++    feature = "tokenizer-compiler-test-support"
++))]
+ pub use fancy_regex::workspace::{
+     construction::{
+         ConstructionFailure as TokenizerRegexConstructionFailure,
+         ScratchFailureBuffer as TokenizerRegexScratchBuffer,
+     },
+-    Buffer as TokenizerRegexBuffer, DelegateBuffer as TokenizerRegexDelegateBuffer,
++    Buffer as TokenizerRegexBuffer,
++    DelegateBuffer as TokenizerRegexDelegateBuffer,
+     PrepareFailure as TokenizerRegexWorkspaceFailure,
+ };
+ mod cache_policy;
+ mod encode_ids;
+ mod encoding;
+ pub use encode_ids::{
+-    EncodeIdsError, EncodeIdsFailure, EncodeIdsOutput, EncodeIdsPlan, EncodeIdsRequirements,
++    EncodeIdsError, EncodeIdsFailure, EncodeIdsOutput, EncodeIdsPlan,
++    EncodeIdsRequirements,
+ };
+ pub mod normalizer;
+ pub mod pattern;
+@@ -60,13 +65,18 @@
+ pub use crate::processors::PostProcessorWrapper;
+ // And some other types
+ pub use crate::utils::iter::LinesWithEnding;
+-pub use crate::utils::padding::{pad_encodings, PaddingDirection, PaddingParams, PaddingStrategy};
++pub use crate::utils::padding::{
++    pad_encodings, PaddingDirection, PaddingParams, PaddingStrategy,
++};
+ pub use crate::utils::truncation::{
+-    truncate_encodings, TruncationDirection, TruncationParams, TruncationStrategy,
++    truncate_encodings, TruncationDirection, TruncationParams,
++    TruncationStrategy,
+ };
+ pub use added_vocabulary::*;
+ pub use encoding::*;
+-pub use normalizer::{NormalizedString, OffsetReferential, SplitDelimiterBehavior};
++pub use normalizer::{
++    NormalizedString, OffsetReferential, SplitDelimiterBehavior,
++};
+ pub use pre_tokenizer::*;
+ 
+ pub type Error = Box<dyn std::error::Error + Send + Sync>;
+@@ -84,7 +94,10 @@
+ /// `NormalizedString` to ensure we can entirely keep track of the offsets and the mapping with
+ /// the original string.
+ pub trait PreTokenizer {
+-    fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()>;
++    fn pre_tokenize(
++        &self,
++        pretokenized: &mut PreTokenizedString,
++    ) -> Result<()>;
+ }
+ 
+ /// Represents a model used during Tokenization (like BPE or Word or Unigram).
+@@ -103,7 +116,11 @@
+     fn get_vocab_size(&self) -> usize;
+     /// Save the current `Model` in the given folder, using the given `prefix` for the various
+     /// files that need to be saved.
+-    fn save(&self, folder: &Path, prefix: Option<&str>) -> Result<Vec<PathBuf>>;
++    fn save(
++        &self,
++        folder: &Path,
++        prefix: Option<&str>,
++    ) -> Result<Vec<PathBuf>>;
+     /// Get an instance of a Trainer capable of training this Model
+     fn get_trainer(&self) -> <Self as Model>::Trainer;
+ 
+@@ -133,7 +150,8 @@
+                 max_tokens,
+                 direction,
+             ),
+-            None => pretokenized.tokenize(|normalized| self.tokenize(normalized.get())),
++            None => pretokenized
++                .tokenize(|normalized| self.tokenize(normalized.get())),
+         }
+     }
+ }
+@@ -164,7 +182,8 @@
+             encoding.set_type_ids(vec![i as u32; encoding.len()]);
+         });
+ 
+-        let encodings = self.process_encodings(encodings, add_special_tokens)?;
++        let encodings =
++            self.process_encodings(encodings, add_special_tokens)?;
+         Ok(Encoding::merge(encodings, false))
+     }
+ 
+@@ -437,7 +456,10 @@
+     }
+ 
+     /// Set the added vocabulary.
+-    pub fn with_added_vocabulary(mut self, added_vocabulary: AddedVocabulary) -> Self {
++    pub fn with_added_vocabulary(
++        mut self,
++        added_vocabulary: AddedVocabulary,
++    ) -> Self {
+         self.added_vocabulary = added_vocabulary;
+         self
+     }
+@@ -512,7 +534,10 @@
+ }
+ 
+ impl std::fmt::Debug for DecodeVocabulary<'_> {
+-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++    fn fmt(
++        &self,
++        formatter: &mut std::fmt::Formatter<'_>,
++    ) -> std::fmt::Result {
+         formatter
+             .debug_struct("DecodeVocabulary")
+             .finish_non_exhaustive()
+@@ -559,9 +584,13 @@
+     #[cfg_attr(docsrs, doc(cfg(feature = "http")))]
+     pub fn from_pretrained<S: AsRef<str>>(
+         identifier: S,
+-        params: Option<crate::utils::from_pretrained::FromPretrainedParameters>,
++        params: Option<
++            crate::utils::from_pretrained::FromPretrainedParameters,
++        >,
+     ) -> Result<Self> {
+-        let tokenizer_file = crate::utils::from_pretrained::from_pretrained(identifier, params)?;
++        let tokenizer_file = crate::utils::from_pretrained::from_pretrained(
++            identifier, params,
++        )?;
+         Tokenizer::from_file(tokenizer_file)
+     }
+ }
+@@ -670,7 +699,10 @@
+     /// re-normalizes all of them and rebuilds the matching trie. For tokenizers with
+     /// many added tokens this may be slow. Prefer setting the normalizer before adding
+     /// tokens when constructing a tokenizer programmatically.
+-    pub fn with_normalizer(&mut self, normalizer: Option<impl Into<N>>) -> Result<&mut Self> {
++    pub fn with_normalizer(
++        &mut self,
++        normalizer: Option<impl Into<N>>,
++    ) -> Result<&mut Self> {
+         self.normalizer = normalizer.map(|norm| norm.into());
+         self.added_vocabulary
+             .refresh_normalized_tokens(self.normalizer.as_ref())?;
+@@ -682,7 +714,10 @@
+     }
+ 
+     /// Set the pre tokenizer
+-    pub fn with_pre_tokenizer(&mut self, pre_tokenizer: Option<impl Into<PT>>) -> &mut Self {
++    pub fn with_pre_tokenizer(
++        &mut self,
++        pre_tokenizer: Option<impl Into<PT>>,
++    ) -> &mut Self {
+         self.pre_tokenizer = pre_tokenizer.map(|tok| tok.into());
+         self
+     }
+@@ -693,7 +728,10 @@
+     }
+ 
+     /// Set the post processor
+-    pub fn with_post_processor(&mut self, post_processor: Option<impl Into<PP>>) -> &mut Self {
++    pub fn with_post_processor(
++        &mut self,
++        post_processor: Option<impl Into<PP>>,
++    ) -> &mut Self {
+         self.post_processor = post_processor.map(|post_proc| post_proc.into());
+         self
+     }
+@@ -704,7 +742,10 @@
+     }
+ 
+     /// Set the decoder
+-    pub fn with_decoder(&mut self, decoder: Option<impl Into<D>>) -> &mut Self {
++    pub fn with_decoder(
++        &mut self,
++        decoder: Option<impl Into<D>>,
++    ) -> &mut Self {
+         self.decoder = decoder.map(|dec| dec.into());
+         self
+     }
+@@ -726,7 +767,10 @@
+     }
+ 
+     /// Set the added vocabulary.
+-    pub fn with_added_vocabulary(&mut self, added_vocabulary: AddedVocabulary) -> &mut Self {
++    pub fn with_added_vocabulary(
++        &mut self,
++        added_vocabulary: AddedVocabulary,
++    ) -> &mut Self {
+         self.added_vocabulary = added_vocabulary;
+         self
+     }
+@@ -739,10 +783,14 @@
+     /// Set the truncation parameters
+     ///
+     /// Fails if `stride` is too high relative to `max_length` and `post_processor.added_tokens()`
+-    pub fn with_truncation(&mut self, trunc: Option<TruncationParams>) -> Result<&mut Self> {
++    pub fn with_truncation(
++        &mut self,
++        trunc: Option<TruncationParams>,
++    ) -> Result<&mut Self> {
+         if let Some(trunc_params) = &trunc {
+             let n_added_tokens = self.get_n_added_tokens(false);
+-            let effective_max_length = trunc_params.max_length - n_added_tokens;
++            let effective_max_length =
++                trunc_params.max_length - n_added_tokens;
+             if effective_max_length < trunc_params.stride {
+                 return Err(Box::new(TruncationParamError(format!(
+                     "tokenizer stride set to {}, which is greater than or equal to its effective max length of {} (= {} original max length - {} added special tokens), ",
+@@ -765,7 +813,10 @@
+     }
+ 
+     /// Set the padding parameters
+-    pub fn with_padding(&mut self, padding: Option<PaddingParams>) -> &mut Self {
++    pub fn with_padding(
++        &mut self,
++        padding: Option<PaddingParams>,
++    ) -> &mut Self {
+         self.padding = padding;
+         self
+     }
+@@ -848,24 +899,25 @@
+         type_id: u32,
+         offsets_type: OffsetType,
+     ) -> Result<Encoding> {
+-        let encode = |is_pre_tokenized, subseq_idx, subseq| -> Result<Encoding> {
+-            let normalized = self
+-                .added_vocabulary
+-                .extract_and_normalize(self.normalizer.as_ref(), subseq);
+-            let pre_tokenized = self.do_pre_tokenize(normalized)?;
+-            let subseq_encoding = self.do_tokenize(
+-                pre_tokenized,
+-                type_id,
+-                if is_pre_tokenized {
+-                    Some(subseq_idx as u32)
+-                } else {
+-                    None
+-                },
+-                offsets_type,
+-            )?;
+-
+-            Ok(subseq_encoding)
+-        };
++        let encode =
++            |is_pre_tokenized, subseq_idx, subseq| -> Result<Encoding> {
++                let normalized = self
++                    .added_vocabulary
++                    .extract_and_normalize(self.normalizer.as_ref(), subseq);
++                let pre_tokenized = self.do_pre_tokenize(normalized)?;
++                let subseq_encoding = self.do_tokenize(
++                    pre_tokenized,
++                    type_id,
++                    if is_pre_tokenized {
++                        Some(subseq_idx as u32)
++                    } else {
++                        None
++                    },
++                    offsets_type,
++                )?;
++
++                Ok(subseq_encoding)
++            };
+ 
+         match sequence {
+             InputSequence::PreTokenized(seq) => seq
+@@ -909,7 +961,11 @@
+     /// // or even both types together:
+     /// tokenizer.encode_fast(("A complete sequence", &["And", "a", "tokenized"][..]), false);
+     /// ```
+-    pub fn encode_fast<'s, E>(&self, input: E, add_special_tokens: bool) -> Result<Encoding>
++    pub fn encode_fast<'s, E>(
++        &self,
++        input: E,
++        add_special_tokens: bool,
++    ) -> Result<Encoding>
+     where
+         E: Into<EncodeInput<'s>>,
+     {
+@@ -920,9 +976,12 @@
+         };
+ 
+         // Encode each sequence
+-        let encoding = self.encode_single_sequence(sequence, 0, OffsetType::None)?;
++        let encoding =
++            self.encode_single_sequence(sequence, 0, OffsetType::None)?;
+         let pair_encoding = pair
+-            .map(|sequence| self.encode_single_sequence(sequence, 1, OffsetType::None))
++            .map(|sequence| {
++                self.encode_single_sequence(sequence, 1, OffsetType::None)
++            })
+             .transpose()?;
+ 
+         // And finally post process
+@@ -951,7 +1010,11 @@
+     /// // or even both types together:
+     /// tokenizer.encode(("A complete sequence", &["And", "a", "tokenized"][..]), false);
+     /// ```
+-    pub fn encode<'s, E>(&self, input: E, add_special_tokens: bool) -> Result<Encoding>
++    pub fn encode<'s, E>(
++        &self,
++        input: E,
++        add_special_tokens: bool,
++    ) -> Result<Encoding>
+     where
+         E: Into<EncodeInput<'s>>,
+     {
+@@ -962,9 +1025,12 @@
+         };
+ 
+         // Encode each sequence
+-        let encoding = self.encode_single_sequence(sequence, 0, OffsetType::Byte)?;
++        let encoding =
++            self.encode_single_sequence(sequence, 0, OffsetType::Byte)?;
+         let pair_encoding = pair
+-            .map(|sequence| self.encode_single_sequence(sequence, 1, OffsetType::Byte))
++            .map(|sequence| {
++                self.encode_single_sequence(sequence, 1, OffsetType::Byte)
++            })
+             .transpose()?;
+ 
+         // And finally post process
+@@ -994,7 +1060,11 @@
+     /// // or even both types together:
+     /// tokenizer.encode(("A complete sequence", &["And", "a", "tokenized"][..]), false);
+     /// ```
+-    pub fn encode_char_offsets<'s, E>(&self, input: E, add_special_tokens: bool) -> Result<Encoding>
++    pub fn encode_char_offsets<'s, E>(
++        &self,
++        input: E,
++        add_special_tokens: bool,
++    ) -> Result<Encoding>
+     where
+         E: Into<EncodeInput<'s>>,
+     {
+@@ -1005,9 +1075,12 @@
+         };
+ 
+         // Encode each sequence
+-        let encoding = self.encode_single_sequence(sequence, 0, OffsetType::Char)?;
++        let encoding =
++            self.encode_single_sequence(sequence, 0, OffsetType::Char)?;
+         let pair_encoding = pair
+-            .map(|sequence| self.encode_single_sequence(sequence, 1, OffsetType::Char))
++            .map(|sequence| {
++                self.encode_single_sequence(sequence, 1, OffsetType::Char)
++            })
+             .transpose()?;
+ 
+         // And finally post process
+@@ -1015,7 +1088,11 @@
+     }
+ 
+     /// Decode the given ids, back to a String
+-    pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
++    pub fn decode(
++        &self,
++        ids: &[u32],
++        skip_special_tokens: bool,
++    ) -> Result<String> {
+         let tokens = ids
+             .iter()
+             .filter_map(|id| {
+@@ -1023,7 +1100,8 @@
+                     .simple_id_to_token(*id)
+                     .or_else(|| self.model.id_to_token(*id))
+                     .filter(|token| {
+-                        !skip_special_tokens || !self.added_vocabulary.is_special_token(token)
++                        !skip_special_tokens
++                            || !self.added_vocabulary.is_special_token(token)
+                     })
+             })
+             .collect::<Vec<_>>();
+@@ -1037,7 +1115,10 @@
+ 
+     /// Decode the given ids, back to a String
+     /// See [`DecodeStream`]
+-    pub fn decode_stream(&self, skip_special_tokens: bool) -> DecodeStream<'_, M, N, PT, PP, D> {
++    pub fn decode_stream(
++        &self,
++        skip_special_tokens: bool,
++    ) -> DecodeStream<'_, M, N, PT, PP, D> {
+         DecodeStream::new(self, skip_special_tokens)
+     }
+ }
+@@ -1184,7 +1265,10 @@
+     PP: PostProcessor,
+     D: Decoder,
+ {
+-    fn new(tokenizer: &'tok TokenizerImpl<M, N, PT, PP, D>, skip_special_tokens: bool) -> Self {
++    fn new(
++        tokenizer: &'tok TokenizerImpl<M, N, PT, PP, D>,
++        skip_special_tokens: bool,
++    ) -> Self {
+         Self {
+             tokenizer,
+             ids: vec![],
+@@ -1272,7 +1356,9 @@
+                 max_length,
+                 strategy,
+                 ..
+-            }) if *strategy != TruncationStrategy::OnlySecond || type_id != 0 => {
++            }) if *strategy != TruncationStrategy::OnlySecond
++                || type_id != 0 =>
++            {
+                 Some((*max_length, *direction))
+             }
+             _ => None,
+@@ -1289,7 +1375,10 @@
+     N: Normalizer,
+ {
+     /// Normalization logic, go through all normalizers
+-    fn do_normalize<V: Into<NormalizedString>>(&self, normalized: V) -> Result<NormalizedString> {
++    fn do_normalize<V: Into<NormalizedString>>(
++        &self,
++        normalized: V,
++    ) -> Result<NormalizedString> {
+         let mut normalized: NormalizedString = normalized.into();
+ 
+         if let Some(ref normalizer) = self.normalizer {
+@@ -1311,14 +1400,23 @@
+         &mut self,
+         tokens: impl IntoIterator<Item = AddedToken>,
+     ) -> Result<usize> {
+-        self.added_vocabulary
+-            .add_special_tokens(tokens, &self.model, self.normalizer.as_ref())
++        self.added_vocabulary.add_special_tokens(
++            tokens,
++            &self.model,
++            self.normalizer.as_ref(),
++        )
+     }
+ 
+     /// Add the given tokens to the added vocabulary
+-    pub fn add_tokens(&mut self, tokens: impl IntoIterator<Item = AddedToken>) -> Result<usize> {
+-        self.added_vocabulary
+-            .add_tokens(tokens, &self.model, self.normalizer.as_ref())
++    pub fn add_tokens(
++        &mut self,
++        tokens: impl IntoIterator<Item = AddedToken>,
++    ) -> Result<usize> {
++        self.added_vocabulary.add_tokens(
++            tokens,
++            &self.model,
++            self.normalizer.as_ref(),
++        )
+     }
+ }
+ 
+@@ -1354,7 +1452,8 @@
+         // 1. First we truncate if needed
+         let (encoding, pair_encoding) = {
+             if let Some(trunc) = &self.truncation {
+-                let n_added_tokens = self.get_n_added_tokens(pair_encoding.is_some());
++                let n_added_tokens =
++                    self.get_n_added_tokens(pair_encoding.is_some());
+ 
+                 if add_special_tokens && n_added_tokens > 0 {
+                     let params = TruncationParams {
+@@ -1379,8 +1478,10 @@
+             } else {
+                 vec![encoding]
+             };
+-            let mut encodings =
+-                <dyn PostProcessor>::default_process(encodings, add_special_tokens)?;
++            let mut encodings = <dyn PostProcessor>::default_process(
++                encodings,
++                add_special_tokens,
++            )?;
+             if encodings.len() != 1 {
+                 panic!("We haven't reduced the encodings like we should have");
+             }
+@@ -1499,7 +1600,11 @@
+     }
+ 
+     /// Train our Model from files
+-    pub fn train_from_files<T>(&mut self, trainer: &mut T, files: Vec<String>) -> Result<&mut Self>
++    pub fn train_from_files<T>(
++        &mut self,
++        trainer: &mut T,
++        files: Vec<String>,
++    ) -> Result<&mut Self>
+     where
+         T: Trainer<Model = M> + Sync,
+     {
+@@ -1522,7 +1627,9 @@
+                         // We use an iterator to be able to chain with par_bridge.
+                         itertools::Either::Left(file.lines_with_ending())
+                     }
+-                    Err(e) => itertools::Either::Right(std::iter::once(Err(e))),
++                    Err(e) => {
++                        itertools::Either::Right(std::iter::once(Err(e)))
++                    }
+                 }
+             }),
+             |sequences| -> Result<()> {
+@@ -1533,8 +1640,10 @@
+                             .template("[{elapsed_precise}] {msg:<30!} {wide_bar} {percent:>18!}%")
+                             .expect("Invalid progress template"),
+                     );
+-                    progress
+-                        .set_message(format!("Pre-processing files ({:.2} Mo)", len / 1_000_000));
++                    progress.set_message(format!(
++                        "Pre-processing files ({:.2} Mo)",
++                        len / 1_000_000
++                    ));
+                     Some(progress)
+                 } else {
+                     None
+@@ -1547,12 +1656,18 @@
+                         }
+                     }),
+                     |seq| {
+-                        let normalized = self
+-                            .added_vocabulary
+-                            .extract_and_normalize(self.normalizer.as_ref(), seq.as_ref());
+-                        let pre_tokenized = self.do_pre_tokenize(normalized)?;
++                        let normalized =
++                            self.added_vocabulary.extract_and_normalize(
++                                self.normalizer.as_ref(),
++                                seq.as_ref(),
++                            );
++                        let pre_tokenized =
++                            self.do_pre_tokenize(normalized)?;
+                         Ok(pre_tokenized
+-                            .get_splits(OffsetReferential::Original, OffsetType::Byte)
++                            .get_splits(
++                                OffsetReferential::Original,
++                                OffsetType::Byte,
++                            )
+                             .into_iter()
+                             .map(|(s, _, _)| s.to_owned())
+                             .collect())
+@@ -1572,7 +1687,11 @@
+     }
+ 
+     /// Train our Model, using the given Trainer and iterator
+-    pub fn train<T, I, S>(&mut self, trainer: &mut T, sequences: I) -> Result<&mut Self>
++    pub fn train<T, I, S>(
++        &mut self,
++        trainer: &mut T,
++        sequences: I,
++    ) -> Result<&mut Self>
+     where
+         T: Trainer<Model = M> + Sync,
+         I: Iterator<Item = S> + Send,
+@@ -1600,9 +1719,10 @@
+                 }
+             }),
+             |seq| {
+-                let normalized = self
+-                    .added_vocabulary
+-                    .extract_and_normalize(self.normalizer.as_ref(), seq.as_ref());
++                let normalized = self.added_vocabulary.extract_and_normalize(
++                    self.normalizer.as_ref(),
++                    seq.as_ref(),
++                );
+                 let pre_tokenized = self.do_pre_tokenize(normalized)?;
+                 Ok(pre_tokenized
+                     .get_splits(OffsetReferential::Original, OffsetType::Byte)
+@@ -1686,9 +1806,13 @@
+     /// It expects the `identifier` of a model that includes a `tokenizer.json` file.
+     pub fn from_pretrained<S: AsRef<str>>(
+         identifier: S,
+-        params: Option<crate::utils::from_pretrained::FromPretrainedParameters>,
++        params: Option<
++            crate::utils::from_pretrained::FromPretrainedParameters,
++        >,
+     ) -> Result<Self> {
+-        let tokenizer_file = crate::utils::from_pretrained::from_pretrained(identifier, params)?;
++        let tokenizer_file = crate::utils::from_pretrained::from_pretrained(
++            identifier, params,
++        )?;
+         TokenizerImpl::from_file(tokenizer_file)
+     }
+ }

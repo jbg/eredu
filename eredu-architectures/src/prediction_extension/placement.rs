@@ -11,6 +11,7 @@ pub struct PreparedPredictionPlacement {
     topology: ParallelRankTopology,
     parameters: Option<Arc<eredu_runtime::ArchitectureParameterDescription>>,
     layout: Option<Arc<LocalModelLayout>>,
+    construction: Option<Arc<construction::PreparedPredictionConstruction>>,
 }
 impl PreparedPredictionPlacement {
     pub(crate) fn from_prepared(
@@ -22,7 +23,22 @@ impl PreparedPredictionPlacement {
             topology,
             parameters,
             layout,
+            construction: None,
         }
+    }
+
+    pub(super) fn construction(
+        &self,
+    ) -> Option<&Arc<construction::PreparedPredictionConstruction>> {
+        self.construction.as_ref()
+    }
+    pub(super) fn retained_layout(&self) -> Option<Arc<LocalModelLayout>> {
+        self.layout.clone()
+    }
+    pub(super) fn retained_parameters(
+        &self,
+    ) -> Option<Arc<eredu_runtime::ArchitectureParameterDescription>> {
+        self.parameters.clone()
     }
 
     /// Global execution topology, including replicas outside the tensor axis.
@@ -85,8 +101,17 @@ where
                 parameters, layout, ..
             } => (Some(Arc::clone(parameters)), Some(Arc::clone(layout))),
         };
-        Arc::new(PreparedPredictionPlacement::from_prepared(
-            topology, parameters, layout,
-        ))
+        let mut placement =
+            PreparedPredictionPlacement::from_prepared(topology, parameters, layout);
+        if let Self::DeepSeekV3 { construction, .. }
+        | Self::DeepSeekV4 { construction, .. }
+        | Self::DeepSeekV4Dspark { construction, .. }
+        | Self::QwenHybrid { construction, .. }
+        | Self::Inkling { construction, .. }
+        | Self::NemotronH { construction, .. } = self
+        {
+            placement.construction = Some(construction.clone());
+        }
+        Arc::new(placement)
     }
 }

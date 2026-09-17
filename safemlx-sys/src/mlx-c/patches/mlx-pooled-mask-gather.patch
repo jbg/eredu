@@ -1,0 +1,46 @@
+diff --git a/mlx/backend/metal/indexing.cpp b/mlx/backend/metal/indexing.cpp
+--- a/mlx/backend/metal/indexing.cpp
++++ b/mlx/backend/metal/indexing.cpp
+@@ -483,8 +483,9 @@
+   kernel_name += idx.flags().row_contiguous ? "c" : "nc";
+ 
+   const bool original = d.original_precompiled_kernel_required();
+-  if (original && ((out.dtype() != float32 && out.dtype() != float16 &&
+-      out.dtype() != bfloat16) || idx.dtype() != uint32))
++  if (original && ((out.dtype() != bool_ && out.dtype() != float32 &&
++      out.dtype() != float16 && out.dtype() != bfloat16) ||
++      (idx.dtype() != int32 && idx.dtype() != uint32)))
+     throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
+   auto lib = original ? d.precompiled_library() : d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+diff --git a/mlx/backend/metal/kernels/indexing/gather_axis.metal b/mlx/backend/metal/kernels/indexing/gather_axis.metal
+--- a/mlx/backend/metal/kernels/indexing/gather_axis.metal
++++ b/mlx/backend/metal/kernels/indexing/gather_axis.metal
+@@ -1,15 +1,19 @@
+ // Copyright © 2025 Apple Inc.
+-// Existing floating values gathered by UInt32 sort/partition indices.
++// Existing mask/floating gather with source-declared signed or unsigned indices.
+ #include "mlx/backend/metal/kernels/utils.h"
+ #include "mlx/backend/metal/kernels/indexing/gather_axis.h"
+-#define GATHER_AXIS_WIDTH(tname, type, lname, location) \
+-  instantiate_kernel("gather_axis" #tname "uint32_" #lname "cc", gather_axis, type, uint32_t, location, true, true) \
+-  instantiate_kernel("gather_axis" #tname "uint32_" #lname "cnc", gather_axis, type, uint32_t, location, true, false) \
+-  instantiate_kernel("gather_axis" #tname "uint32_" #lname "ncc", gather_axis, type, uint32_t, location, false, true) \
+-  instantiate_kernel("gather_axis" #tname "uint32_" #lname "ncnc", gather_axis, type, uint32_t, location, false, false)
++#define GATHER_AXIS_WIDTH(tname, type, iname, itype, lname, location) \
++  instantiate_kernel("gather_axis" #tname #iname "_" #lname "cc", gather_axis, type, itype, location, true, true) \
++  instantiate_kernel("gather_axis" #tname #iname "_" #lname "cnc", gather_axis, type, itype, location, true, false) \
++  instantiate_kernel("gather_axis" #tname #iname "_" #lname "ncc", gather_axis, type, itype, location, false, true) \
++  instantiate_kernel("gather_axis" #tname #iname "_" #lname "ncnc", gather_axis, type, itype, location, false, false)
++#define GATHER_AXIS_INDEX(tname, type, iname, itype) \
++  GATHER_AXIS_WIDTH(tname, type, iname, itype, int, int) \
++  GATHER_AXIS_WIDTH(tname, type, iname, itype, int64_t, int64_t)
+ #define GATHER_AXIS_TYPE(tname, type) \
+-  GATHER_AXIS_WIDTH(tname, type, int, int) \
+-  GATHER_AXIS_WIDTH(tname, type, int64_t, int64_t)
++  GATHER_AXIS_INDEX(tname, type, uint32, uint32_t) \
++  GATHER_AXIS_INDEX(tname, type, int32, int32_t)
++GATHER_AXIS_TYPE(bool_, bool)
+ GATHER_AXIS_TYPE(float32, float)
+ GATHER_AXIS_TYPE(float16, half)
+ GATHER_AXIS_TYPE(bfloat16, bfloat16_t)

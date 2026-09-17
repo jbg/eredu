@@ -144,7 +144,7 @@ impl Fp8QuantizationConfig {
             None => BlockFp8ScaleEncoding::FloatingPoint,
             Some("ue8m0") => BlockFp8ScaleEncoding::Ue8m0,
             Some(format) => {
-                return Err(invalid(format!("unsupported FP8 scale format {format:?}")))
+                return Err(invalid(format!("unsupported FP8 scale format {format:?}")));
             }
         };
         Ok(LinearFormat::E4M3BlockFp8(
@@ -410,8 +410,17 @@ impl V3Args {
 
     /// Validates all derived geometry and execution policies.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with_diagnostic(|message| ConfigError::Invalid(message.to_string()))
+    }
+    pub(crate) fn validate_with_diagnostic<E>(
+        &self,
+        mut diagnostic: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
+        let mut reject =
+            |message: std::fmt::Arguments<'_>| diagnostic(format_args!("DeepSeek-V3 {message}"));
+
         if self.model_type != "deepseek_v3" {
-            return Err(invalid(format!(
+            return Err(reject(format_args!(
                 "unsupported model_type {:?}",
                 self.model_type
             )));
@@ -430,7 +439,7 @@ impl V3Args {
             ("v_head_dim", self.v_head_dim),
         ] {
             if value <= 0 {
-                return Err(invalid(format!("{name} must be positive, got {value}")));
+                return Err(reject(format_args!("{name} must be positive, got {value}")));
             }
         }
         if self.qk_rope_head_dim % 2 != 0
@@ -442,9 +451,9 @@ impl V3Args {
             || !self.routed_scaling_factor.is_finite()
             || self.routed_scaling_factor <= 0.0
         {
-            return Err(invalid(
+            return Err(reject(format_args!(
                 "invalid rotary, normalization, or low-rank geometry",
-            ));
+            )));
         }
         let group_capacity = self.n_routed_experts.checked_div(self.n_group.max(1));
         if self.n_routed_experts <= 0
@@ -458,21 +467,21 @@ impl V3Args {
             || group_capacity
                 .is_none_or(|capacity| self.num_experts_per_tok > self.topk_group * capacity)
         {
-            return Err(invalid("invalid routed-expert group geometry"));
+            return Err(reject(format_args!("invalid routed-expert group geometry")));
         }
         if self.tie_word_embeddings || self.num_nextn_predict_layers < 0 {
-            return Err(invalid(
+            return Err(reject(format_args!(
                 "published V3/R1 requires untied embeddings and nonnegative MTP layers",
-            ));
+            )));
         }
         if let Some(yarn) = &self.rope_scaling {
-            if yarn.r#type != "yarn" || yarn.rotary_algorithm().validate().is_err() {
-                return Err(invalid("invalid YaRN configuration"));
+            if yarn.r#type != "yarn" || yarn.rotary_algorithm().validate_fixed().is_err() {
+                return Err(reject(format_args!("invalid YaRN configuration")));
             }
         }
         self.linear_format
-            .validate()
-            .map_err(|error| invalid(error.to_string()))
+            .validate_fixed()
+            .map_err(|cause| reject(format_args!("{cause}")))
     }
 }
 
@@ -594,23 +603,41 @@ impl V4TargetCapturePolicy {
 
     /// Validates and preserves an exact ordered target-layer capture list.
     pub fn new(layer_ids: Vec<usize>, target_layer_count: usize) -> Result<Self, ConfigError> {
+        Self::validate_ids(&layer_ids, target_layer_count, |message| invalid_v4(message.to_string()))?;
+        Ok(Self { layer_ids: layer_ids.into_boxed_slice() })
+    }
+
+    fn validate_ids<E>(layer_ids: &[usize], target_layer_count: usize,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E) -> Result<(), E> {
         if layer_ids.is_empty() {
-            return Err(invalid_v4("target capture policy must not be empty"));
+            return Err(error(format_args!("target capture policy must not be empty")));
         }
         if layer_ids.iter().any(|layer| *layer >= target_layer_count) {
-            return Err(invalid_v4(
-                "target capture layer lies outside the target decoder",
-            ));
+            return Err(error(format_args!("target capture layer lies outside the target decoder")));
         }
-        let mut distinct = layer_ids.clone();
-        distinct.sort_unstable();
-        distinct.dedup();
-        if distinct.len() != layer_ids.len() {
-            return Err(invalid_v4("target capture layers must be distinct"));
+        if layer_ids.iter().enumerate().any(|(index, layer)| layer_ids[..index].contains(layer)) {
+            return Err(error(format_args!("target capture layers must be distinct")));
         }
-        Ok(Self {
-            layer_ids: layer_ids.into_boxed_slice(),
-        })
+        Ok(())
+    }
+
+    pub(crate) fn clone_workspace(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, eredu_nn::Error> {
+        use std::{alloc::Layout, mem::size_of};
+        let bytes = Layout::array::<usize>(self.layer_ids.len())
+            .map_err(|_| eredu_nn::workspace::WorkspaceMetadataError::Overflow)?
+            .size()
+            .checked_add(size_of::<(
+                Self,
+                Result<Self, eredu_nn::Error>,
+                &Self,
+                &eredu_nn::workspace::WorkspaceContext,
+            )>())
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+        context.charge_metadata(bytes)?;
+        Ok(self.clone())
     }
 
     /// Returns target-layer identities in the checkpoint-declared capture order.
@@ -937,8 +964,12 @@ impl V4Args {
 
     /// Validates derived geometry and exact V4 execution policy.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with_diagnostic(|message| invalid_v4(message.to_string()))
+    }
+    pub(crate) fn validate_with_diagnostic<E>(&self,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E) -> Result<(), E> {
         if self.model_type != "deepseek_v4" {
-            return Err(invalid_v4(format!(
+            return Err(error(format_args!(
                 "unsupported model_type {:?}",
                 self.model_type
             )));
@@ -967,7 +998,7 @@ impl V4Args {
             ("num_experts_per_tok", self.num_experts_per_tok),
         ] {
             if value <= 0 {
-                return Err(invalid_v4(format!("{name} must be positive, got {value}")));
+                return Err(error(format_args!("{name} must be positive, got {value}")));
             }
         }
         if self.num_key_value_heads != 1
@@ -980,7 +1011,7 @@ impl V4Args {
             || self.num_hash_layers > self.num_hidden_layers
             || !self.norm_topk_prob
         {
-            return Err(invalid_v4("invalid attention, routing, or hash geometry"));
+            return Err(error(format_args!("invalid attention, routing, or hash geometry")));
         }
         if ![
             self.rms_norm_eps,
@@ -992,12 +1023,11 @@ impl V4Args {
         .iter()
         .all(|value| value.is_finite() && *value > 0.0)
         {
-            return Err(invalid_v4(
-                "normalization and scaling values must be positive",
-            ));
+            return Err(error(format_args!("normalization and scaling values must be positive")));
         }
-        let expected = usize::try_from(self.num_hidden_layers + self.num_nextn_predict_layers)
-            .map_err(|_| invalid_v4("layer count overflow"))?;
+        let expected = usize::try_from(self.num_hidden_layers.checked_add(self.num_nextn_predict_layers)
+            .ok_or_else(|| error(format_args!("layer count overflow")))?)
+            .map_err(|_| error(format_args!("layer count overflow")))?;
         if self.attention_schedule.len() != expected
             || self
                 .attention_schedule
@@ -1005,19 +1035,17 @@ impl V4Args {
                 .skip(self.num_hidden_layers as usize)
                 .any(|policy| *policy != V4AttentionPolicy::Local)
         {
-            return Err(invalid_v4(
-                "compression schedule must cover target and local-only prediction layers",
-            ));
+            return Err(error(format_args!("compression schedule must cover target and local-only prediction layers")));
         }
         if let Some(yarn) = &self.rope_scaling {
             if yarn.r#type != "yarn" || yarn.rotary_algorithm().validate().is_err() {
-                return Err(invalid_v4("invalid YaRN configuration"));
+                return Err(error(format_args!("invalid YaRN configuration")));
             }
         }
         if let Some(policy) = &self.target_capture_policy {
             let target_layer_count = usize::try_from(self.num_hidden_layers)
-                .map_err(|_| invalid_v4("target layer count exceeds usize"))?;
-            V4TargetCapturePolicy::new(policy.layer_ids().to_vec(), target_layer_count)?;
+                .map_err(|_| error(format_args!("target layer count exceeds usize")))?;
+            V4TargetCapturePolicy::validate_ids(policy.layer_ids(), target_layer_count, &mut error)?;
         }
         if let Some(dspark) = &self.dspark {
             if self.num_nextn_predict_layers <= 0
@@ -1027,16 +1055,14 @@ impl V4Args {
                 || dspark.markov_rank <= 0
                 || self.target_capture_policy.is_none()
             {
-                return Err(invalid_v4("invalid DSpark configuration"));
+                return Err(error(format_args!("invalid DSpark configuration")));
             }
         } else if self.num_nextn_predict_layers > 0 && self.target_capture_policy.is_some() {
-            return Err(invalid_v4(
-                "target capture policy without DSpark requires an ordinary target projection",
-            ));
+            return Err(error(format_args!("target capture policy without DSpark requires an ordinary target projection")));
         }
         self.linear_format
             .validate()
-            .map_err(|error| invalid_v4(error.to_string()))
+            .map_err(|cause| error(format_args!("{cause}")))
     }
 
     /// Returns the normalized policy for a target or embedded prediction layer.
@@ -1394,47 +1420,71 @@ fn gguf_wrong_type(key: &str) -> ConfigError {
 
 /// Derives the canonical V3/R1 cache-relevant architecture fingerprint.
 pub fn v3_architecture_fingerprint(args: &V3Args) -> String {
-    eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
-        "deepseek_v3",
-        [
+    v3_architecture_fingerprint_with_metadata(args, crate::decoder::identity::Metadata::new(None))
+        .expect("ordinary fingerprint formatting is infallible")
+}
+pub(crate) fn v3_architecture_fingerprint_with_metadata(
+    args: &V3Args,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    metadata.fingerprint("deepseek_v3", || {
+        Ok([
             // Cached later-layer latents depend on correctly token-indexed query
             // rotation; reject states produced by the former head-axis equation.
-            ("mla_equation_revision", "2".to_owned()),
-            ("model_type", args.model_type.clone()),
-            ("hidden_size", args.hidden_size.to_string()),
-            ("num_hidden_layers", args.num_hidden_layers.to_string()),
-            ("num_attention_heads", args.num_attention_heads.to_string()),
-            ("kv_lora_rank", args.kv_lora_rank.to_string()),
-            ("qk_rope_head_dim", args.qk_rope_head_dim.to_string()),
-            ("layer_schedule", format!("{:?}", args.layer_schedule)),
-            ("linear_format", format!("{:?}", args.linear_format)),
-        ],
-    )
+            ("mla_equation_revision", metadata.text("2")?),
+            ("model_type", metadata.text(&args.model_type)?),
+            (
+                "hidden_size",
+                metadata.format(format_args!("{}", args.hidden_size))?,
+            ),
+            (
+                "num_hidden_layers",
+                metadata.format(format_args!("{}", args.num_hidden_layers))?,
+            ),
+            (
+                "num_attention_heads",
+                metadata.format(format_args!("{}", args.num_attention_heads))?,
+            ),
+            (
+                "kv_lora_rank",
+                metadata.format(format_args!("{}", args.kv_lora_rank))?,
+            ),
+            (
+                "qk_rope_head_dim",
+                metadata.format(format_args!("{}", args.qk_rope_head_dim))?,
+            ),
+            (
+                "layer_schedule",
+                metadata.format(format_args!("{:?}", args.layer_schedule))?,
+            ),
+            (
+                "linear_format",
+                metadata.format(format_args!("{:?}", args.linear_format))?,
+            ),
+        ])
+    })
 }
 
 /// Derives the canonical V4 cache-relevant architecture fingerprint.
 pub fn v4_architecture_fingerprint(args: &V4Args) -> String {
-    eredu_core::cache::derive_prompt_cache_architecture_fingerprint(
-        "deepseek_v4",
-        [
-            ("model_type", args.model_type.clone()),
-            ("hidden_size", args.hidden_size.to_string()),
-            ("num_hidden_layers", args.num_hidden_layers.to_string()),
-            ("num_attention_heads", args.num_attention_heads.to_string()),
-            ("head_dim", args.head_dim.to_string()),
-            (
-                "attention_schedule",
-                format!("{:?}", args.attention_schedule),
-            ),
-            ("hc_mult", args.hc_mult.to_string()),
-            (
-                "target_capture_policy",
-                format!("{:?}", args.target_capture_policy),
-            ),
-            ("dspark", format!("{:?}", args.dspark)),
-            ("linear_format", format!("{:?}", args.linear_format)),
-        ],
-    )
+    v4_architecture_fingerprint_with_metadata(args, crate::decoder::identity::Metadata::new(None))
+        .expect("ordinary fingerprint destination is infallible")
+}
+pub(crate) fn v4_architecture_fingerprint_with_metadata(
+    args: &V4Args, metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    metadata.fingerprint("deepseek_v4", || Ok([
+        ("model_type", metadata.text(&args.model_type)?),
+        ("hidden_size", metadata.format(format_args!("{}", args.hidden_size))?),
+        ("num_hidden_layers", metadata.format(format_args!("{}", args.num_hidden_layers))?),
+        ("num_attention_heads", metadata.format(format_args!("{}", args.num_attention_heads))?),
+        ("head_dim", metadata.format(format_args!("{}", args.head_dim))?),
+        ("attention_schedule", metadata.format(format_args!("{:?}", args.attention_schedule))?),
+        ("hc_mult", metadata.format(format_args!("{}", args.hc_mult))?),
+        ("target_capture_policy", metadata.format(format_args!("{:?}", args.target_capture_policy))?),
+        ("dspark", metadata.format(format_args!("{:?}", args.dspark))?),
+        ("linear_format", metadata.format(format_args!("{:?}", args.linear_format))?),
+    ]))
 }
 
 #[cfg(test)]
@@ -1489,8 +1539,8 @@ mod tests {
     #[test]
     fn v3_rejects_cache_identity_from_head_indexed_query_rotation() {
         use eredu_core::cache::{
-            validate_prompt_cache_model_identity, PromptCacheDescriptor, PromptCacheError,
-            PromptCacheTopology,
+            PromptCacheDescriptor, PromptCacheError, PromptCacheTopology,
+            validate_prompt_cache_model_identity,
         };
         let args = parse_v3_config(&fixture()).unwrap();
         let layout = crate::deepseek::v3::state_layout(&args).unwrap();
@@ -1697,11 +1747,13 @@ mod tests {
             panic!("prediction target projection changed family")
         };
         assert_eq!(target.num_nextn_predict_layers, 0);
-        assert!(target_plan
-            .checkpoint()
-            .common_tensors
-            .iter()
-            .all(|tensor| !tensor.key.starts_with("model.layers.3.")));
+        assert!(
+            target_plan
+                .checkpoint()
+                .common_tensors
+                .iter()
+                .all(|tensor| !tensor.key.starts_with("model.layers.3."))
+        );
 
         let mut dspark = fixture;
         dspark["dspark_block_size"] = Value::from(4);
@@ -1723,14 +1775,18 @@ mod tests {
         assert_eq!(strategy.proposal_capacity(), 4);
         assert_eq!(strategy.target_capture_width().unwrap(), 32);
         strategy.validate_target_capture_shape(&[2, 5, 32]).unwrap();
-        assert!(strategy
-            .validate_target_capture_shape(&[2, 5, 16])
-            .unwrap_err()
-            .to_string()
-            .contains("[batch, sequence, 32]"));
-        assert!(strategy
-            .validate_target_capture_shape(&[2, 5, 2, 16])
-            .is_err());
+        assert!(
+            strategy
+                .validate_target_capture_shape(&[2, 5, 16])
+                .unwrap_err()
+                .to_string()
+                .contains("[batch, sequence, 32]")
+        );
+        assert!(
+            strategy
+                .validate_target_capture_shape(&[2, 5, 2, 16])
+                .is_err()
+        );
         strategy.validate_proposal_capacity(4).unwrap();
         assert!(strategy.validate_proposal_capacity(0).is_err());
         assert!(strategy.validate_proposal_capacity(5).is_err());
@@ -1782,14 +1838,18 @@ mod tests {
             .target_capture()
             .instantiate([vec![1, 3, 16], vec![2, 1, 16]])
             .unwrap();
-        assert!(contract
-            .target_capture()
-            .instantiate([vec![1, 6, 16], vec![2, 1, 16]])
-            .is_err());
-        assert!(contract
-            .target_capture()
-            .instantiate([vec![1, 3, 15], vec![2, 1, 16]])
-            .is_err());
+        assert!(
+            contract
+                .target_capture()
+                .instantiate([vec![1, 6, 16], vec![2, 1, 16]])
+                .is_err()
+        );
+        assert!(
+            contract
+                .target_capture()
+                .instantiate([vec![1, 3, 15], vec![2, 1, 16]])
+                .is_err()
+        );
 
         let target = complete.prediction_target().unwrap();
         assert_eq!(target.num_nextn_predict_layers, 0);
@@ -1817,14 +1877,18 @@ mod tests {
 
     #[test]
     fn v4_target_capture_policy_rejects_duplicate_or_out_of_range_layers() {
-        assert!(V4TargetCapturePolicy::new(vec![0, 0], 3)
-            .unwrap_err()
-            .to_string()
-            .contains("distinct"));
-        assert!(V4TargetCapturePolicy::new(vec![0, 3], 3)
-            .unwrap_err()
-            .to_string()
-            .contains("outside"));
+        assert!(
+            V4TargetCapturePolicy::new(vec![0, 0], 3)
+                .unwrap_err()
+                .to_string()
+                .contains("distinct")
+        );
+        assert!(
+            V4TargetCapturePolicy::new(vec![0, 3], 3)
+                .unwrap_err()
+                .to_string()
+                .contains("outside")
+        );
     }
 
     #[test]
@@ -1942,14 +2006,18 @@ mod tests {
             component.role().stable_name() == "state.pooling.1.pooled"
                 && component.residency() == eredu_core::cache::StateResidencyClass::SealablePaged
         }));
-        assert!(crate::deepseek::v4::moe_policy(&v4, 0)
-            .unwrap()
-            .correction_bias
-            .is_none());
-        assert!(crate::deepseek::v4::moe_policy(&v4, 1)
-            .unwrap()
-            .correction_bias
-            .is_some());
+        assert!(
+            crate::deepseek::v4::moe_policy(&v4, 0)
+                .unwrap()
+                .correction_bias
+                .is_none()
+        );
+        assert!(
+            crate::deepseek::v4::moe_policy(&v4, 1)
+                .unwrap()
+                .correction_bias
+                .is_some()
+        );
     }
 
     #[test]

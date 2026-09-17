@@ -1,6 +1,39 @@
 //! Sparse global-coordinate lowering and ordinary run ownership.
 use super::*;
-use std::collections::BTreeSet;
+mod worker;
+pub(crate) mod progress;
+mod prepared;
+pub use prepared::{PreparedRoutedInterventionRows, PreparedRoutedIntervention, PreparedRoutedInterventionError};
+pub use worker::{RoutedInterventionLoweringError, routed_intervention_full_component_count, routed_intervention_full_component_count_control_bytes};
+
+/// Numerical operation after sparse row selection. Mask predicates only select
+/// the overwritten elements; they share the same zero worker after lowering.
+/// Payload variants still borrow the actual immutable source tensor.
+#[derive(Clone, Copy)]
+pub enum RoutedInterventionNumericalAction<'a> {
+    /// Zero all lowered selected elements.
+    Zero(InterventionDtype),
+    /// Scale the lowered selected elements by this exact source scalar.
+    Scale(InterventionDtype, f32),
+    /// Gather the actual replacement payload in selected native-row order.
+    Replace(&'a InterventionTensor),
+    /// Gather the actual additive payload in selected native-row order.
+    Add(&'a InterventionTensor),
+}
+impl<'a> RoutedInterventionNumericalAction<'a> {
+    /// Shared ordinary/paid lowering classification. This is descriptive and
+    /// supplies neither selected indices nor a native execution permission.
+    pub fn from_action(action: &'a InterventionAction) -> Result<Self, RoutedInterventionLoweringError> {
+        use InterventionAction as A;
+        Ok(match action {
+            A::Zero { dtype } | A::Mask { dtype, .. } | A::MaskComponents { dtype, .. } => Self::Zero(*dtype),
+            A::Scale { dtype, factor } => Self::Scale(*dtype, *factor),
+            A::Replace { tensor } => Self::Replace(tensor),
+            A::Add { tensor } => Self::Add(tensor),
+            _ => return Err(RoutedInterventionLoweringError::Coordinates),
+        })
+    }
+}
 
 /// A bounded lowering recipe; it grants no admission or reservation authority.
 #[derive(Debug, Clone, PartialEq)]
@@ -68,153 +101,13 @@ fn lower_rows(
     action: &InterventionAction,
     coordinates: Option<&eredu_core::component::RoutedComponentCoordinateMap>,
 ) -> Result<LoweredRoutedIntervention, CaptureError> {
-    let components = geometry.components()?;
-    let invalid = || CaptureError::Invalid("invalid sparse intervention coordinates".into());
-    if [&slice.starts, &slice.ends, &slice.strides, &slice.shape]
-        .iter()
-        .any(|v| v.len() != 2)
-        || slice.ends[1] > components
-    {
-        return Err(invalid());
-    }
-    for axis in 0..2 {
-        if slice.strides[axis] == 0
-            || slice.starts[axis] >= slice.ends[axis]
-            || (slice.ends[axis] - slice.starts[axis]).div_ceil(slice.strides[axis])
-                != slice.shape[axis]
-        {
-            return Err(invalid());
-        }
-    }
-    let dtype = action.dtype().ok_or_else(invalid)?;
+    geometry.components()?;
+    worker::validate_slice(geometry, slice)?;
+    let dtype = action.dtype().ok_or_else(|| {
+        CaptureError::Invalid("invalid sparse intervention coordinates".into())
+    })?;
     action.validate_activation_region(dtype, &slice.shape)?;
-    let compact: Option<(BTreeSet<u32>, bool)> = match action {
-        InterventionAction::MaskComponents {
-            indices,
-            keep_selected,
-            ..
-        } => {
-            if slice.starts[1] != 0 || slice.ends[1] != components || slice.strides[1] != 1 {
-                return Err(invalid());
-            }
-            Some((indices.iter().copied().collect(), *keep_selected))
-        }
-        InterventionAction::MaskLogits { .. } => return Err(invalid()),
-        _ => None,
-    };
-    let local_units = coordinates.map_or(geometry.units_per_expert, |map| {
-        map.units().local_count() as u64
-    });
-    let mut seen = BTreeSet::new();
-    let mut indices = Vec::new();
-    let mut payload_indices = Vec::new();
-    for (row_index, row) in rows.iter().enumerate() {
-        if row.slot >= geometry.routes_per_token
-            || row.expert >= geometry.experts
-            || coordinates.is_some_and(|map| {
-                usize::try_from(row.expert)
-                    .ok()
-                    .and_then(|expert| map.experts().global_to_local(expert))
-                    .is_none()
-            })
-            || !seen.insert((row.source_peer, row.token, row.slot))
-        {
-            return Err(invalid());
-        }
-        if row.token < slice.starts[0]
-            || row.token >= slice.ends[0]
-            || !(row.token - slice.starts[0]).is_multiple_of(slice.strides[0])
-        {
-            continue;
-        }
-        for local_unit in 0..local_units {
-            let unit = match coordinates {
-                Some(map) => map
-                    .units()
-                    .local_to_global(local_unit as usize)
-                    .ok_or_else(invalid)? as u64,
-                None => local_unit,
-            };
-            let component = add(mul(row.expert, geometry.units_per_expert)?, unit)?;
-            if component < slice.starts[1]
-                || component >= slice.ends[1]
-                || !(component - slice.starts[1]).is_multiple_of(slice.strides[1])
-            {
-                continue;
-            }
-            let payload_index = add(
-                mul(
-                    (row.token - slice.starts[0]) / slice.strides[0],
-                    slice.shape[1],
-                )?,
-                (component - slice.starts[1]) / slice.strides[1],
-            )?;
-            let payload_index =
-                usize::try_from(payload_index).map_err(|_| CaptureError::Overflow)?;
-            if let Some((set, keep)) = &compact {
-                let selected = u32::try_from(component)
-                    .ok()
-                    .is_some_and(|n| set.contains(&n));
-                if selected == *keep {
-                    continue;
-                }
-            }
-            if let InterventionAction::Mask { keep, .. } = action {
-                if *keep.get(payload_index).ok_or_else(invalid)? {
-                    continue;
-                }
-            }
-            indices.push(add(mul(row_index as u64, local_units)?, local_unit)?);
-            payload_indices.push(payload_index);
-        }
-    }
-    let n = indices.len() as u64;
-    if n == 0 {
-        return Ok(LoweredRoutedIntervention {
-            indices,
-            action: None,
-        });
-    }
-    let gather = |tensor: &InterventionTensor| -> Result<InterventionTensor, CaptureError> {
-        macro_rules! gather {
-            ($values:expr, $kind:ident) => {
-                InterventionValues::$kind(
-                    payload_indices
-                        .iter()
-                        .map(|i| $values.get(*i).copied().ok_or_else(invalid))
-                        .collect::<Result<Vec<_>, _>>()?,
-                )
-            };
-        }
-        Ok(InterventionTensor {
-            shape: vec![n],
-            values: match &tensor.values {
-                InterventionValues::Float32(v) => gather!(v, Float32),
-                InterventionValues::Float16(v) => gather!(v, Float16),
-                InterventionValues::Bfloat16(v) => gather!(v, Bfloat16),
-            },
-        })
-    };
-    let action = match action {
-        InterventionAction::Zero { .. }
-        | InterventionAction::Mask { .. }
-        | InterventionAction::MaskComponents { .. } => InterventionAction::Zero { dtype },
-        InterventionAction::Scale { factor, .. } => InterventionAction::Scale {
-            dtype,
-            factor: *factor,
-        },
-        InterventionAction::Replace { tensor } => InterventionAction::Replace {
-            tensor: gather(tensor)?,
-        },
-        InterventionAction::Add { tensor } => InterventionAction::Add {
-            tensor: gather(tensor)?,
-        },
-        _ => return Err(invalid()),
-    };
-    Ok(LoweredRoutedIntervention {
-        indices,
-        action: Some(action),
-    })
+    worker::lower(geometry, rows, slice, action, coordinates, &mut worker::Ordinary)
 }
 
 pub(super) fn cost(
@@ -259,6 +152,11 @@ impl CaptureSession {
         use CaptureExecutionError::Backend;
         self.validate_ordinary_intervention()?;
         let tensor_geometry = self.tensor_geometry()?;
+        let window_geometry = self
+            .invocation_window
+            .map(|window| window.validate(tensor_geometry))
+            .transpose()?;
+        let logical_geometry = window_geometry.unwrap_or(tensor_geometry);
         let Some(run) = &mut self.interventions else {
             return Ok(None);
         };
@@ -303,50 +201,65 @@ impl CaptureSession {
                         CaptureError::Invalid("invalid native sparse unit shape".into()).into(),
                     );
                 }
-                let shape = tensor_geometry
+                let shape = logical_geometry
                     .resolve(&point.observation_geometry())?
                     .ok_or_else(|| CaptureError::Invalid("unknown sparse unit extent".into()))?;
+                // Static ordinary admission keeps its original shape owner and
+                // None invocation identity. Only an explicit window needs a
+                // second physical extent alongside the logical source extent.
+                let window_shape = window_geometry
+                    .map(|_| {
+                        tensor_geometry
+                            .resolve(&point.observation_geometry())?
+                            .ok_or_else(|| {
+                                CaptureError::Invalid("unknown physical sparse unit extent".into())
+                            })
+                    })
+                    .transpose()?;
+                let physical_shape = window_shape.as_deref().unwrap_or(&shape);
                 let slice = run.plan.validate_at(
                     index,
                     self.phase,
                     self.prediction,
-                    self.invocation,
+                    window_geometry.or(self.invocation),
                     &shape,
                     Some(dtype),
                 )?;
                 let end = add(source.token_offset, actual[0] / geometry.routes_per_token)?;
-                if source.token_offset
-                    != record
-                        .routed_units
-                        .as_ref()
-                        .map_or(0, |r| r.completed_tokens)
-                    || end > shape[0]
-                {
-                    return Err(CaptureError::Invalid(
-                        "sparse intervention chunk gap, overlap or excess".into(),
-                    )
-                    .into());
-                }
+                let progress = progress::prepare(record.routed_units, physical_shape[0], [source.token_offset,end]).map_err(CaptureError::from)?;
                 if record.routed_units.is_none() {
-                    let usage = cost(
-                        run.estimator.as_ref(),
-                        geometry,
-                        &shape,
-                        &slice,
-                        &operation.action,
-                    )?;
+                    let usage = if self.invocation_window.is_some() {
+                        let usage = run.estimator.window_routed_unit_usage(
+                            geometry,
+                            &shape,
+                            physical_shape,
+                            &slice,
+                            &operation.action,
+                        )?;
+                        if usage.captures != 0 || usage.encoded_bytes != 0 {
+                            return Err(CaptureError::Invalid(
+                                "sparse window estimate includes record encoding".into(),
+                            )
+                            .into());
+                        }
+                        usage
+                    } else {
+                        cost(
+                            run.estimator.as_ref(),
+                            geometry,
+                            &shape,
+                            &slice,
+                            &operation.action,
+                        )?
+                    };
                     reserve_envelope(&mut self.ledger, usage)?;
                     record.charged = record.charged.checked_add(usage)?;
-                    record.routed_units = Some(RoutedUnitInterventionReceipt {
-                        source_tokens: shape[0],
-                        completed_tokens: 0,
-                        affected_values: 0,
-                    });
+                    record.routed_units = Some(progress);
                 }
                 let unavailable = || {
                     CaptureError::Unsupported("sparse native editing primitive unavailable".into())
                 };
-                let locations = backend
+                let mut locations = backend
                     .routed_unit_locations(source, geometry)
                     .ok_or_else(unavailable)?
                     .map_err(Backend)?;
@@ -355,6 +268,27 @@ impl CaptureSession {
                         "sparse native receipt changed token range".into(),
                     )
                     .into());
+                }
+                if let Some(window) = self.invocation_window {
+                    // Validate the actual local receipt before mapping it in place;
+                    // no duplicate coordinate buffer or global tensor is created.
+                    if locations
+                        .rows
+                        .iter()
+                        .any(|row| row.token < source.token_offset || row.token >= end)
+                    {
+                        return Err(CaptureError::Invalid(
+                            "sparse local coordinate exceeds its actual chunk".into(),
+                        )
+                        .into());
+                    }
+                    for row in &mut locations.rows {
+                        row.token = add(row.token, window.start)?;
+                    }
+                    locations.source_token_range = [
+                        add(source.token_offset, window.start)?,
+                        add(end, window.start)?,
+                    ];
                 }
                 let lowered =
                     lower_routed_intervention(geometry, &locations, &slice, &operation.action)?;
@@ -396,15 +330,9 @@ impl CaptureSession {
                     None
                 };
                 let receipt = record.routed_units.as_mut().unwrap();
-                receipt.completed_tokens = end;
-                receipt.affected_values =
-                    add(receipt.affected_values, lowered.indices.len() as u64)?;
-                if end == shape[0] {
-                    record.outcome = if receipt.affected_values == 0 {
-                        InterventionOutcome::Unmatched
-                    } else {
-                        InterventionOutcome::Applied
-                    };
+                *receipt = progress::advance(*receipt,[source.token_offset,end],lowered.indices.len() as u64).map_err(CaptureError::from)?;
+                if end == physical_shape[0] {
+                    record.outcome = progress::outcome(*receipt).map_err(CaptureError::from)?;
                 }
                 Ok(output)
             })();

@@ -131,6 +131,21 @@ PY_DOUBLE_STRING: /"([^"\\\x00-\x1f]|\\(['"\\\/bfnrt]|x[0-9A-Fa-f]{2}|u[0-9A-Fa-
 }
 
 impl FormatDialect for Lfm2Dialect {
+    fn profile_declaration(
+        &self,
+        parameters: DialectParameters,
+    ) -> Result<super::dialect::ProfileDeclaration, super::dialect::DeclarationError> {
+        parameters.custom_fixed::<Lfm2Parameters>()?;
+        Ok(super::dialect::ProfileDeclaration {
+            generation: GenerationPromptBehavior::HonorRequest,
+            reasoning_kwarg: "enable_thinking",
+            tool_reasoning: true,
+            reasoning_parsing: false,
+            structural: STRUCTURAL_TOKENS,
+            stops: STOPS,
+        })
+    }
+
     fn generation_prompt_behavior(
         &self,
         parameters: DialectParameters,
@@ -711,7 +726,7 @@ impl Lfm2Parser {
                     }
                 }
                 ParserState::Done => {
-                    return Err("unexpected data after terminal LFM2 output".into())
+                    return Err("unexpected data after terminal LFM2 output".into());
                 }
                 ParserState::Poisoned => unreachable!("parser state restored before return"),
             };
@@ -729,7 +744,7 @@ impl Lfm2Parser {
     }
 }
 
-use crate::runtime::generation::storage::{snapshot_fields, SnapshotStorage};
+use crate::runtime::generation::storage::{SnapshotStorage, snapshot_fields};
 snapshot_fields!(Lfm2Parser { state });
 snapshot_fields!(PythonValueNormalizer {
     mode,
@@ -904,7 +919,7 @@ impl PythonValueNormalizer {
                         _ => {
                             return Err(format!(
                                 "invalid character {current:?} in LFM2 Python value"
-                            ))
+                            ));
                         }
                     }
                 }
@@ -918,7 +933,7 @@ impl PythonValueNormalizer {
                             "False" | "false" => "false",
                             "None" | "null" => "null",
                             _ => {
-                                return Err(format!("unsupported bare LFM2 Python value {word:?}"))
+                                return Err(format!("unsupported bare LFM2 Python value {word:?}"));
                             }
                         };
                         self.emit(normalized, sink);
@@ -1057,7 +1072,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use llguidance::toktrie::TokenId;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::{LFM2_DIALECT, LFM2_PARAMETERS, STRUCTURAL_TOKENS, TOOL_CALL_END, TOOL_CALL_START};
     use crate::{
@@ -1523,12 +1538,12 @@ mod tests {
             assert!(parser.events().contains(&SemanticEvent::ToolCallEnd));
             for event in parser.events() {
                 let fragment = match event {
-                    SemanticEvent::TextDelta(fragment)
-                    | SemanticEvent::ReasoningDelta(fragment)
-                    | SemanticEvent::ToolArgumentsDelta {
+                    SemanticEvent::ReasoningDelta(fragment)
+                    | SemanticEvent::TextDelta(fragment) => Some(fragment.as_str()),
+                    SemanticEvent::ToolArgumentsDelta {
                         json_fragment: fragment,
                         ..
-                    } => Some(fragment),
+                    } => Some(fragment.as_str()),
                     _ => None,
                 };
                 assert!(
@@ -1600,10 +1615,12 @@ mod tests {
             joined_arguments(parser.events(), 0),
             "{\"candidate_id\":\"東京\\nready\""
         );
-        assert!(!parser
-            .events()
-            .iter()
-            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+        assert!(
+            !parser
+                .events()
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::ToolCallEnd))
+        );
     }
 
     #[test]
@@ -1642,10 +1659,12 @@ mod tests {
                 "{incomplete}"
             );
             if !incomplete.ends_with(']') {
-                assert!(!parser
-                    .events()
-                    .iter()
-                    .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+                assert!(
+                    !parser
+                        .events()
+                        .iter()
+                        .any(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                );
             }
         }
     }

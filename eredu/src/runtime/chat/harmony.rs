@@ -171,6 +171,21 @@ impl HarmonyDialect {
 }
 
 impl FormatDialect for HarmonyDialect {
+    fn profile_declaration(
+        &self,
+        parameters: DialectParameters,
+    ) -> Result<super::dialect::ProfileDeclaration, super::dialect::DeclarationError> {
+        parameters.custom_fixed::<HarmonyParameters>()?;
+        Ok(super::dialect::ProfileDeclaration {
+            generation: GenerationPromptBehavior::HonorRequest,
+            reasoning_kwarg: "enable_thinking",
+            tool_reasoning: true,
+            reasoning_parsing: true,
+            structural: STRUCTURAL_TOKENS,
+            stops: STOPS,
+        })
+    }
+
     fn supports_reasoning_parsing(&self, parameters: DialectParameters) -> bool {
         Self::parameters(parameters).is_ok()
     }
@@ -521,7 +536,7 @@ fn longest_marker_prefix(input: &str) -> usize {
         .unwrap_or_default()
 }
 
-use crate::runtime::generation::storage::{snapshot_fields, SnapshotStorage};
+use crate::runtime::generation::storage::{SnapshotStorage, snapshot_fields};
 snapshot_fields!(HarmonyParser { state, pending });
 impl SnapshotStorage for ParserState {
     fn heap_bytes(&self) -> Option<u64> {
@@ -590,7 +605,7 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use llguidance::toktrie::TokenId;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     use super::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT, STRUCTURAL_TOKENS};
     use crate::{
@@ -897,12 +912,13 @@ mod tests {
             );
             for event in events {
                 let text = match event {
-                    SemanticEvent::ReasoningDelta(text)
-                    | SemanticEvent::TextDelta(text)
-                    | SemanticEvent::ToolArgumentsDelta {
+                    SemanticEvent::ReasoningDelta(text) | SemanticEvent::TextDelta(text) => {
+                        Some(text.as_str())
+                    }
+                    SemanticEvent::ToolArgumentsDelta {
                         json_fragment: text,
                         ..
-                    } => Some(text),
+                    } => Some(text.as_str()),
                     _ => None,
                 };
                 assert!(
@@ -998,12 +1014,14 @@ mod tests {
         );
 
         let mut missing_start = plan.create_parser().unwrap();
-        assert!(missing_start
-            .push(concat!(
-                "<|channel|>analysis<|message|>reason<|end|>",
-                "<|channel|>final<|message|>visible<|return|>"
-            ))
-            .is_err());
+        assert!(
+            missing_start
+                .push(concat!(
+                    "<|channel|>analysis<|message|>reason<|end|>",
+                    "<|channel|>final<|message|>visible<|return|>"
+                ))
+                .is_err()
+        );
 
         let mut malformed_json = plan.create_parser().unwrap();
         assert!(malformed_json
@@ -1018,10 +1036,12 @@ mod tests {
                 " to=functions.get_weather<|channel|>commentary json<|message|>{\"location\":\"Bog<|call|>"
             )
             .is_err());
-        assert!(!stopped_incomplete
-            .events()
-            .iter()
-            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+        assert!(
+            !stopped_incomplete
+                .events()
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::ToolCallEnd))
+        );
 
         let mut max_tokens = plan.create_parser().unwrap();
         max_tokens
@@ -1030,9 +1050,11 @@ mod tests {
             )
             .unwrap();
         max_tokens.finish(FinishReason::MaxTokens).unwrap();
-        assert!(!max_tokens
-            .events()
-            .iter()
-            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+        assert!(
+            !max_tokens
+                .events()
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::ToolCallEnd))
+        );
     }
 }

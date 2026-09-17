@@ -328,7 +328,11 @@ fn compressed_latent_live_disk_demotion_and_rehydration_preserve_atomic_pairs() 
 
     drop(cache);
     drop(manager);
-    assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
+    // A rehydration can start another demotion. A late disk commit removes
+    // its output after the final state owner retires; drop need not join it.
+    crate::backend::submission_recovery::wait_for_retirement(|| {
+        fs::read_dir(directory.path()).unwrap().next().is_none()
+    });
 }
 
 #[test]

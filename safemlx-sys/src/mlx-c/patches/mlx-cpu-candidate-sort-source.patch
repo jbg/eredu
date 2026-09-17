@@ -1,0 +1,263 @@
+diff --git a/mlx/backend/cpu/sort.cpp b/mlx/backend/cpu/sort.cpp
+--- a/mlx/backend/cpu/sort.cpp
++++ b/mlx/backend/cpu/sort.cpp
+@@ -5,6 +5,8 @@
+ #include <cmath>
+ #include <functional>
+ #include <numeric>
++#include <climits>
++#include <typeinfo>
+ 
+ #include "mlx/backend/common/utils.h"
+ #include "mlx/backend/cpu/argsort_f32.h"
+@@ -14,6 +16,7 @@
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/dtype_utils.h"
+ #include "mlx/primitives.h"
++#include "mlx/submission.h"
+ 
+ namespace mlx::core {
+ 
+@@ -323,21 +326,11 @@
+   }
+ }
+ 
+-} // namespace
+-
+-void ArgSort::eval_cpu(const ArrayVector& inputs, array& out) {
+-  assert(inputs.size() == 1);
+-  auto& in = inputs[0];
+-
+-  // Allocate output
+-  out.allocate_data(out.nbytes());
+-
+-  auto& encoder = cpu::get_command_encoder(stream());
+-  encoder.set_input_array(in);
+-  encoder.set_input_array(out);
+-  encoder.dispatch([in = array::unsafe_weak_copy(in),
+-                    out = array::unsafe_weak_copy(out),
+-                    axis_ = axis_]() mutable {
++// Naming the unchanged ArgSort callable exposes its real queued TaskNode.
++struct ArgSortTask {
++  array in,out;
++  int axis_;
++  void operator()() {
+     if (in.dtype() == float32 && in.ndim() == 1) {
+       const auto count = static_cast<size_t>(in.shape(0));
+       // Avoid both the generic worker's zero-width division and a null data
+@@ -379,7 +372,23 @@
+       case complex64:
+         return argsort<complex64_t>(in, out, axis_);
+     }
+-  });
++  }
++};
++
++} // namespace
++
++void ArgSort::eval_cpu(const ArrayVector& inputs, array& out) {
++  assert(inputs.size() == 1);
++  auto& in = inputs[0];
++
++  // Allocate output
++  out.allocate_data(out.nbytes());
++
++  auto& encoder = cpu::get_command_encoder(stream());
++  encoder.set_input_array(in);
++  encoder.set_input_array(out);
++  encoder.dispatch(ArgSortTask{array::unsafe_weak_copy(in),
++      array::unsafe_weak_copy(out),axis_});
+ }
+ 
+ void Sort::eval_cpu(const ArrayVector& inputs, array& out) {
+@@ -524,3 +533,49 @@
+ }
+ 
+ } // namespace mlx::core
++
++namespace mlx::core::cpu {
++bool is_argsort_eval_primitive(const array& output) noexcept {
++  return output.has_primitive() && output.primitive().stream().device==Device::cpu &&
++      typeid(output.primitive())==typeid(ArgSort);
++}
++bool argsort_eval_layout(size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
++  if(!elements || elements>size_t(INT_MAX) || Shape::inline_capacity<1 || Strides::inline_capacity<1)return false;
++  DispatchLayout task;EvalDispatchStorage dispatch;SingleOutputEvalStorage common;
++  if(!CommandEncoder::dispatch_layout<ArgSortTask>(task))return false;
++  const size_t worker_controls=detail::argsort_f32_row_control_bytes();
++  if(task.controls>SIZE_MAX-worker_controls)return false;
++  dispatch={task.task_bytes,task.task_alignment,0,task.controls+worker_controls};
++  if(!single_output_eval_layout(1,1,tracer,&dispatch,common))return false;
++  CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
++  const size_t controls=sizeof(elements)+sizeof(tracer)+sizeof(out)+sizeof(task)+sizeof(dispatch)+
++      sizeof(common)+sizeof(value)+sizeof(worker_controls)+sizeof(ArgSortTask)*2+
++      sizeof(const array*)*2+sizeof(size_t)*4+sizeof(int)+sizeof(int64_t)+sizeof(bool)*4;
++  if(value.named_control_bytes>SIZE_MAX-controls)return false;
++  value.named_control_bytes+=controls;out=value;return true;
++}
++bool argsort_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(!is_argsort_eval_primitive(output) || !output.siblings().empty() || output.inputs().size()!=1 ||
++      output.ndim()!=1 || output.dtype()!=uint32 || output.itemsize()!=sizeof(uint32_t))return false;
++  const auto& input=output.inputs()[0];
++  if(input.ndim()!=1 || input.dtype()!=float32 || input.itemsize()!=sizeof(float) ||
++      input.shape()!=output.shape() || input.shape(0)<=0 || input.strides().size()!=1 ||
++      input.strides()[0]<0 || static_cast<const ArgSort&>(output.primitive()).state()!=0)return false;
++  const size_t elements=input.size(),stride=size_t(input.strides()[0]);
++  if(elements>size_t(INT_MAX) || (elements>1 && stride>(size_t(PTRDIFF_MAX)-1)/(elements-1)))return false;
++  const size_t span=1+(elements-1)*stride;
++  if(span>input.data_size() || span>size_t(PTRDIFF_MAX)/sizeof(float))return false;
++  return argsort_eval_layout(elements,output.is_tracer(),out);
++}
++} // namespace mlx::core::cpu
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_argsort_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record=guard.record();auto* graph=record.graph_quota();const auto context=current_graph_construction_context();
++  if(out || !graph || !guard.cpu() || !context.scope || context.worker || context.dispatch!=&record ||
++      current_graph_quota()!=graph)return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if(!cpu::argsort_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
++}
++}
+diff --git a/mlx/backend/cpu/argsort_f32.h b/mlx/backend/cpu/argsort_f32.h
+--- a/mlx/backend/cpu/argsort_f32.h
++++ b/mlx/backend/cpu/argsort_f32.h
+@@ -12,19 +12,13 @@
+ // and valid signed strides; count is bounded by MLX's signed dimension width.
+ // Ascending IDs encode stable ties, including the old stable_sort's trailing
+ // NaN equivalence class. No score is rewritten and no auxiliary heap is used.
+-inline void argsort_f32_row(
+-    const float* values,
+-    int64_t input_stride,
+-    uint32_t* indices,
+-    int64_t output_stride,
+-    size_t count) noexcept {
+-  if (count == 0) {
+-    return;
+-  }
+-  const auto at = [indices, output_stride](size_t i) -> uint32_t& {
++inline auto argsort_f32_at(uint32_t* indices, int64_t output_stride) noexcept {
++  return [indices, output_stride](size_t i) -> uint32_t& {
+     return indices[static_cast<int64_t>(i) * output_stride];
+   };
+-  const auto less = [values, input_stride](uint32_t a, uint32_t b) {
++}
++inline auto argsort_f32_less(const float* values, int64_t input_stride) noexcept {
++  return [values, input_stride](uint32_t a, uint32_t b) {
+     const float x = values[static_cast<int64_t>(a) * input_stride];
+     const float y = values[static_cast<int64_t>(b) * input_stride];
+     if (std::isnan(x)) {
+@@ -35,12 +29,10 @@
+     }
+     return x < y || (x == y && a < b);
+   };
+-  for (size_t i = 0; i < count; ++i) {
+-    at(i) = static_cast<uint32_t>(i);
+-  }
+-  // Test before computing 2 * root + 1; the child is then strictly below
+-  // length, including the final single-child parent of an even-length heap.
+-  const auto sift = [&](size_t root, size_t length) {
++}
++template<class At,class Less>
++inline auto argsort_f32_sift(const At& at,const Less& less) noexcept {
++  return [&at, &less](size_t root, size_t length) {
+     while (root < length / 2) {
+       size_t child = root * 2 + 1;
+       if (child + 1 < length && less(at(child), at(child + 1))) {
+@@ -53,6 +45,34 @@
+       root = child;
+     }
+   };
++}
++// The same three callables execute the worker and describe its fixed controls.
++inline size_t argsort_f32_row_control_bytes() noexcept {
++  const auto at=argsort_f32_at(nullptr,0);
++  const auto less=argsort_f32_less(nullptr,0);
++  const auto sift=argsort_f32_sift(at,less);
++  return sizeof(at)+sizeof(less)+sizeof(sift)+sizeof(const float*)+sizeof(uint32_t*)+
++      sizeof(int64_t)*2+sizeof(size_t)*7+sizeof(uint32_t)*3+sizeof(float)*2+
++      sizeof(const decltype(at)*)+sizeof(const decltype(less)*)+sizeof(bool)*4;
++}
++
++inline void argsort_f32_row(
++    const float* values,
++    int64_t input_stride,
++    uint32_t* indices,
++    int64_t output_stride,
++    size_t count) noexcept {
++  if (count == 0) {
++    return;
++  }
++  const auto at = argsort_f32_at(indices, output_stride);
++  const auto less = argsort_f32_less(values, input_stride);
++  for (size_t i = 0; i < count; ++i) {
++    at(i) = static_cast<uint32_t>(i);
++  }
++  // Test before computing 2 * root + 1; the child is then strictly below
++  // length, including the final single-child parent of an even-length heap.
++  const auto sift = argsort_f32_sift(at, less);
+   for (size_t parent = count / 2; parent > 0; --parent) {
+     sift(parent - 1, count);
+   }
+@@ -63,3 +83,10 @@
+ }
+ 
+ } // namespace mlx::core::cpu::detail
++
++#include "mlx/backend/cpu/copy_storage.h"
++namespace mlx::core::cpu {
++MLX_API bool is_argsort_eval_primitive(const array&) noexcept;
++MLX_API bool argsort_eval_layout(size_t elements,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool argsort_eval_storage(const array&,CopyEvalStorage&) noexcept;
++}
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -17,6 +17,7 @@
+ #include "mlx/backend/cpu/copy_storage.h"
+ #include "mlx/backend/cpu/gather_storage.h"
+ #include "mlx/backend/cpu/scatter_storage.h"
++#include "mlx/backend/cpu/argsort_f32.h"
+ #include "mlx/backend/cpu/reduction_storage.h"
+ #include "mlx/backend/cpu/selection_storage.h"
+ #include "mlx/backend/cpu/unary_storage.h"
+@@ -53,6 +54,7 @@
+   const bool fixed_concatenate = fixed && cpu::is_concatenate_eval_primitive(arr);
+   const bool fixed_selection = fixed && cpu::is_selection_eval_primitive(arr);
+   const bool fixed_reduction = fixed && cpu::is_reduction_eval_primitive(arr);
++  const bool fixed_argsort = fixed && cpu::is_argsort_eval_primitive(arr);
+   const bool fixed_scatter = fixed && cpu::is_scatter_axis_eval_primitive(arr);
+   const bool fixed_gather = fixed && cpu::is_gather_eval_primitive(arr);
+   const bool fixed_copy = fixed && cpu::is_copy_eval_primitive(arr);
+@@ -66,7 +68,7 @@
+   const bool fixed_tiled_matmul = fixed && cpu::is_tiled_matmul_eval_primitive(arr);
+   const bool fixed_matmul = fixed && cpu::is_bf16_matmul_eval_primitive(arr);
+   const bool fixed_random = fixed && cpu::is_random_bits_eval_primitive(arr);
+-  const bool extended = fixed_scatter || fixed_arange || fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool extended = fixed_argsort || fixed_scatter || fixed_arange || fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -74,7 +76,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_scatter
++    const auto failure = fixed_argsort
++        ? submission::GraphConstruction::create_cpu_argsort_eval(*extended_prologue, extended_bank.value)
++        : fixed_scatter
+         ? submission::GraphConstruction::create_cpu_scatter_axis_eval(*extended_prologue, extended_bank.value)
+         : fixed_arange
+         ? submission::GraphConstruction::create_cpu_arange_eval(*extended_prologue, extended_bank.value)
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -167,6 +167,7 @@
+   static GraphFailure create_cpu_cleanup(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_argpartition(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_argsort_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_greedy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_reshape_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;

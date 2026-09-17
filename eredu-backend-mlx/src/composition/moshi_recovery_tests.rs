@@ -11,6 +11,33 @@ impl Drop for TestExecution {
 }
 
 impl ErasedRealtimeExecutionContract for TestExecution {
+    fn collect_retained_module_storage(
+        &self,
+        _: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+    fn realtime_operation_plan(
+        &self,
+        _: &Stream,
+        _: crate::backend::nn::workspace::MetalAllocationFacts,
+        _: &eredu_runtime::working_memory::WorkingMemoryPool,
+        _: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<RealtimeOperationPlan, Error> {
+        Err(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+        ))
+    }
+    fn with_workspace_frame(
+        &self,
+        _: crate::backend::nn::workspace::MetalAllocationFacts,
+        _: &eredu_nn::workspace::WorkspaceContext,
+        _: &mut dyn RealtimeWorkspaceVisitor,
+    ) -> Result<(), Error> {
+        Err(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+        ))
+    }
     fn selected(&self) -> &SelectedRealtimeRealization {
         panic!("recovery fixture does not execute architecture policy")
     }
@@ -29,7 +56,14 @@ impl ErasedRealtimeExecutionContract for TestExecution {
         _: &[crate::MlxTensor],
         _: &mut SequentialDecisionDriver<MlxSamplingBackend, eredu_runtime::GenerationSampler>,
         _: &Stream,
-    ) -> Result<(crate::MlxTensor, moshi::ForwardContext<crate::MlxTensor>), Error> {
+        _: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+    ) -> Result<
+        (
+            Option<crate::MlxTensor>,
+            moshi::ForwardContext<crate::MlxTensor>,
+        ),
+        Error,
+    > {
         Err(Error::ArchitectureModel(
             "injected execution failure".into(),
         ))
@@ -64,10 +98,18 @@ fn model(drops: Rc<Cell<usize>>) -> MlxRealtimeExecution {
             execution: Box::new(TestExecution(drops)),
             resources: Arc::new(SelectedRealtimeResources {
                 inner: OrdinaryRetirement::new(RealtimeResourcePayload {
-                    _store: Arc::new(eredu_checkpoint::store::MemoryWeightStore::default()),
+                    loaded: std::cell::OnceCell::new(),
+                    execution_identity: Default::default(),
+                    ingress: moshi::realtime_ingress_contract(
+                        &MoshiConfig::from_json(
+                            r#"{"model_type":"personaplex","version":"7b-v1"}"#,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                    _store: Arc::new(eredu_checkpoint::store::MemoryWeightStore::default()).into(),
                     world: None,
-                    stream: stream.clone(),
-                    _weights_stream: stream,
+                    backend: Rc::new(crate::backend::MlxBackend::new(&stream, &stream)),
                     poisoned: Rc::clone(&poisoned),
                 }),
             }),
@@ -206,7 +248,8 @@ fn last_completion_resource_owner_stages_store_drop_outside_native_retirement() 
     Arc::get_mut(&mut payload.resources).unwrap().inner._store = Arc::new(Store {
         inner: Default::default(),
         drops: Arc::clone(&drops),
-    });
+    })
+    .into();
     let resources = model.completion_resources();
     drop(model);
     ordinary_retirement::reclaim();

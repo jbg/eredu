@@ -1,12 +1,13 @@
 //! Native binding metadata and slot access for architecture-enumerated modules.
 use super::*;
+use crate::backend::nn::shared::visit_parameter_map;
 use crate::backend::runtime::{
-    checkpoint::binding::populate_module_from_lease,
+    checkpoint::binding::populate_module_from_ordinary_lease,
     execution::generic::{with_module_transfer, SupplementaryResidencyUnit},
-    residency::manager::ResidencyManager,
+    residency::{manager::ResidencyManager, storage::RetainedStorage},
 };
 use eredu_architectures::prediction_extension::{
-    MaterializedPredictionExecutor, PredictionModuleVisitor,
+    MaterializedPredictionExecutor, PredictionModuleVisitor, PredictionResourceVisitor,
 };
 use eredu_core::residency::{MemoryTier, OffloadUnitId};
 use eredu_nn::{ParameterMetadata, ParameterSlotVisitor, ParameterVisitorMut};
@@ -15,6 +16,16 @@ use eredu_runtime::parameter_operations::{
 };
 use std::convert::Infallible;
 use std::sync::OnceLock;
+
+pub(super) mod original;
+mod workspace;
+pub(crate) use original::{
+    clear_prediction_module_bank, inspect_prediction_module_plan, install_prediction_module_bank,
+};
+pub(crate) use workspace::{
+    prepare_prediction_parameters, MlxWorkspacePredictionParameterSource,
+    NativePredictionParameters, PredictionParameterStorage,
+};
 
 type ManagerSlot = Arc<OnceLock<ResidencyManager>>;
 
@@ -39,9 +50,10 @@ impl PredictionResidency {
 pub struct MlxPredictionModule<M> {
     pub inner: M,
     pub parameters: Vec<PreparedParameterSlot>,
-    pub tasks: Vec<ReplicatedTextMaterializationTask>,
+    pub tasks: Arc<Vec<ReplicatedTextMaterializationTask>>,
+    pub(super) layout: Option<Arc<eredu_runtime::LocalModelLayout>>,
     pub materialization: eredu_runtime::WeightMaterializationReport,
-    pub(super) source: SharedCheckpointSource,
+    pub(super) source: RetainedCheckpointSource,
     pub(super) bindings: Vec<eredu_runtime::WeightBinding>,
     pub(super) residency: eredu_runtime::LayerWeightResidency,
     pub(super) shared: bool,
@@ -50,6 +62,8 @@ pub struct MlxPredictionModule<M> {
     pub(super) placeholders: BTreeMap<String, MlxTensor>,
     pub(super) replacements: BTreeMap<String, MlxTensor>,
     pub(super) stream: Stream,
+    pub(super) original:
+        Option<crate::backend::runtime::execution::generic::PredictionModuleProjection>,
 }
 impl<M: std::fmt::Debug> std::fmt::Debug for MlxPredictionModule<M> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -62,11 +76,97 @@ impl<M: std::fmt::Debug> std::fmt::Debug for MlxPredictionModule<M> {
     }
 }
 impl<M: Parameterized<MlxTensor>> MlxPredictionModule<M> {
+    fn register_residency(
+        &mut self,
+        ordinal: usize,
+        registry: &mut PredictionResidency,
+    ) -> Result<(), Error> {
+        if self.id.is_some() {
+            return Err(Error::ArchitectureModel(
+                "prediction module residency registered twice".into(),
+            ));
+        }
+        let id = OffloadUnitId::new(format!("prediction.module.{ordinal:05}"))?;
+        self.id = Some(id.clone());
+        registry.units.push(SupplementaryResidencyUnit {
+            definition: eredu_runtime::OffloadUnit::new(id, self.bindings.clone())?,
+            source: self.source.clone(),
+            shared: self.shared,
+        });
+        registry.managers.push(Arc::clone(&self.manager));
+        Ok(())
+    }
+
+    fn count_parameter_owners(
+        &self,
+        ordinal: usize,
+        counts: &mut ParameterOwnerCounts,
+        guard: &mut safemlx::RuntimeCallGuard,
+    ) -> Result<(), ParameterOwnerSourceError> {
+        counts.prediction_module(self.id.is_some(), self.manager.get().is_some())?;
+        counts.observe_source(
+            ParameterOwnerRole::PredictionInner,
+            Some(ordinal),
+            &self.inner,
+            guard,
+        )?;
+        counts.observe_map(
+            ParameterOwnerRole::PredictionPlaceholder,
+            Some(ordinal),
+            &self.placeholders,
+            guard,
+        )?;
+        counts.observe_map(
+            ParameterOwnerRole::PredictionReplacement,
+            Some(ordinal),
+            &self.replacements,
+            guard,
+        )
+    }
+
+    /// Reads actual retained storage, including overrides while the module is
+    /// unloaded. Native allocation identities deduplicate manager/module aliases.
+    fn retained_storage(&self) -> Result<RetainedStorage, Error> {
+        let mut storage = crate::backend::runtime::residency::storage::RetainedStorage::default();
+        self.collect_retained_storage(&mut storage)?;
+        Ok(storage)
+    }
+
+    /// Fills caller-owned storage without allocating an intermediate inventory.
+    fn collect_retained_storage(
+        &self,
+        storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    ) -> Result<(), Error> {
+        storage.include_retained_values::<Error>(|visitor| {
+            let complete = self.inner.visit_retained_values(visitor);
+            for values in [&self.placeholders, &self.replacements] {
+                let result: Result<(), Infallible> = visit_parameter_map(values, |_, value| {
+                    visitor(value);
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => {}
+                    Err(never) => match never {},
+                }
+            }
+            Ok(complete)
+        })?;
+        storage.include_checkpoint_source(self.source.as_ref())?;
+        match self.manager.get() {
+            Some(manager) => manager.collect_retained_storage(storage)?,
+            None => storage.mark_incomplete(),
+        }
+        Ok(())
+    }
+
     pub(super) fn invoke<O>(
         &mut self,
         stream: &Stream,
         operation: impl FnOnce(&mut M) -> (Result<O, Error>, Vec<MlxTensor>),
     ) -> Result<O, Error> {
+        if safemlx::OriginalScopeObserver::try_current()?.is_some() {
+            return Err(Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch).at_speculative_stage("ordinary prediction module entry"));
+        }
         let manager = self
             .manager
             .get()
@@ -88,7 +188,7 @@ impl<M: Parameterized<MlxTensor>> MlxPredictionModule<M> {
         let transfer =
             manager.acquire_many_with_transfer(&[(id.clone(), 1)], MemoryTier::Device)?;
         let outcome = with_module_transfer(transfer, stream, |lease| {
-            if let Err(error) = populate_module_from_lease(&mut self.inner, lease) {
+            if let Err(error) = populate_module_from_ordinary_lease(&mut self.inner, lease) {
                 return (Err(error.into()), Vec::new());
             }
             self.inner
@@ -110,6 +210,113 @@ impl<M: Parameterized<MlxTensor>> MlxPredictionModule<M> {
     }
 }
 
+/// Only module parameter components are observed. Prototype callbacks retain
+/// explicit separate occurrence counts; their state/manager storage is unpriced.
+pub(in crate::composition::mlx::replicated_text) fn count_parameter_owners<A, P>(
+    extension: &P,
+    counts: &mut ParameterOwnerCounts,
+    guard: &mut safemlx::RuntimeCallGuard,
+) -> Result<(), ParameterOwnerSourceError>
+where
+    P: MaterializedPredictionExecutor<A, MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>,
+{
+    struct Count<'a, 'g> {
+        counts: &'a mut ParameterOwnerCounts,
+        guard: &'g mut safemlx::RuntimeCallGuard,
+    }
+    impl PredictionResourceVisitor<MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>
+        for Count<'_, '_>
+    {
+        type Error = ParameterOwnerSourceError;
+        fn module<M: Parameterized<MlxTensor>>(
+            &mut self,
+            ordinal: usize,
+            module: &MlxPredictionModule<M>,
+        ) -> Result<(), Self::Error> {
+            module.count_parameter_owners(ordinal, self.counts, self.guard)
+        }
+        fn pooling_state(
+            &mut self,
+            _state: &super::OwnedPredictionCache<
+                crate::backend::runtime::cache::state::MlxPoolingAttentionCache,
+            >,
+        ) -> Result<(), Self::Error> {
+            self.counts.pooling_prototype()
+        }
+        fn model_state(&mut self, _state: &MlxHybridState) -> Result<(), Self::Error> {
+            self.counts.model_prototype()
+        }
+    }
+    extension.visit_retained_resources(&mut Count { counts, guard })
+}
+
+/// Inventory the architecture-declared extension owners without executing a
+/// prediction operation or creating a lane from a retained prototype.
+pub(in crate::composition::mlx::replicated_text) fn retained_storage<A, P>(
+    extension: &P,
+) -> Result<RetainedStorage, Error>
+where
+    P: MaterializedPredictionExecutor<A, MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>,
+{
+    let mut storage = RetainedStorage::default();
+    collect_retained_storage::<A, P>(extension, &mut storage)?;
+    Ok(storage)
+}
+
+pub(in crate::composition::mlx::replicated_text) fn collect_retained_storage<A, P>(
+    extension: &P,
+    storage: &mut RetainedStorage,
+) -> Result<(), Error>
+where
+    P: MaterializedPredictionExecutor<A, MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>,
+{
+    struct Collect<'a>(&'a mut RetainedStorage);
+    impl PredictionResourceVisitor<MlxNeuralBackend, MlxEmbeddedPredictionMaterializer>
+        for Collect<'_>
+    {
+        type Error = Error;
+
+        fn module<M: Parameterized<MlxTensor>>(
+            &mut self,
+            _ordinal: usize,
+            module: &MlxPredictionModule<M>,
+        ) -> Result<(), Error> {
+            module.collect_retained_storage(self.0)?;
+            Ok(())
+        }
+
+        fn pooling_state(
+            &mut self,
+            state: &super::OwnedPredictionCache<
+                crate::backend::runtime::cache::state::MlxPoolingAttentionCache,
+            >,
+        ) -> Result<(), Error> {
+            self.0.include_retained_values::<Error>(|visitor| {
+                eredu_runtime::RuntimeLayerState::<MlxNeuralBackend>::visit_retained_values(
+                    state.inner(),
+                    visitor,
+                );
+                Ok(true)
+            })?;
+            if let Some(manager) = state.inner().residency_manager() {
+                manager.collect_retained_storage(self.0)?;
+            }
+            Ok(())
+        }
+
+        fn model_state(&mut self, state: &MlxHybridState) -> Result<(), Error> {
+            state.collect_retained_storage(self.0)?;
+            // A dormant prototype owns its own layout and fixed layer/role
+            // tables, independently of the target's live decoder state.
+            MlxStateMechanisms::collect_retained_host_storage(state, self.0)?;
+            Ok(())
+        }
+    }
+    let mut collect = Collect(storage);
+    extension.visit_retained_resources(&mut collect)?;
+    Ok(())
+}
+
 pub(in crate::composition::mlx::replicated_text) fn residency<A, P>(
     extension: &mut P,
 ) -> Result<PredictionResidency, Error>
@@ -124,20 +331,7 @@ where
             ordinal: usize,
             module: &mut MlxPredictionModule<M>,
         ) -> Result<(), Error> {
-            if module.id.is_some() {
-                return Err(Error::ArchitectureModel(
-                    "prediction module residency registered twice".into(),
-                ));
-            }
-            let id = OffloadUnitId::new(format!("prediction.module.{ordinal:05}"))?;
-            module.id = Some(id.clone());
-            self.0.units.push(SupplementaryResidencyUnit {
-                definition: eredu_runtime::OffloadUnit::new(id, module.bindings.clone())?,
-                source: Arc::clone(&module.source),
-                shared: module.shared,
-            });
-            self.0.managers.push(Arc::clone(&module.manager));
-            Ok(())
+            module.register_residency(ordinal, &mut self.0)
         }
     }
     let mut collect = Collect(PredictionResidency::default());
@@ -215,7 +409,7 @@ where
                 slot.location = PreparedParameterLocation::Prediction { module: ordinal };
                 self.slots.push(slot);
             }
-            for task in &module.tasks {
+            for task in module.tasks.iter() {
                 match self
                     .tasks
                     .iter()
@@ -378,15 +572,54 @@ pub(in crate::composition::mlx::replicated_text) fn publish<A, P>(
     }
 }
 
-pub(super) fn placeholders<M: Parameterized<MlxTensor>>(module: &M) -> BTreeMap<String, MlxTensor> {
-    struct Collect(BTreeMap<String, MlxTensor>);
-    impl<'a> eredu_nn::ParameterVisitor<'a, MlxTensor> for Collect {
+/// Shape-preserving unloaded values backed by completed scalar storage. Keeping
+/// the constructor's lazy full-shape tensors would retain unmeasured graphs;
+/// evaluating those tensors would instead allocate another full parameter set.
+fn placeholder(value: &MlxTensor, stream: &Stream) -> Result<MlxTensor, Error> {
+    let scalar = safemlx::ops::zeros_dtype(&[], value.as_array().dtype(), stream)?;
+    let view = safemlx::ops::broadcast_to(&scalar, value.as_array().shape(), stream)?;
+    view.evaluated()?;
+    Ok(MlxTensor::from_array(view))
+}
+
+pub(super) fn placeholders<M: Parameterized<MlxTensor>>(
+    module: &mut M,
+    stream: &Stream,
+) -> Result<BTreeMap<String, MlxTensor>, Error> {
+    struct Collect<'a> {
+        values: BTreeMap<String, MlxTensor>,
+        stream: &'a Stream,
+        failure: Option<Error>,
+    }
+    impl<'a> eredu_nn::ParameterVisitor<'a, MlxTensor> for Collect<'_> {
         fn visit(&mut self, metadata: ParameterMetadata, value: &'a MlxTensor) {
-            self.0
-                .insert(metadata.id.as_str().to_owned(), value.clone());
+            if self.failure.is_some() {
+                return;
+            }
+            match placeholder(value, self.stream) {
+                Ok(value) => {
+                    self.values.insert(metadata.id.as_str().to_owned(), value);
+                }
+                Err(error) => self.failure = Some(error),
+            }
         }
     }
-    let mut collect = Collect(BTreeMap::new());
+    let mut collect = Collect {
+        values: BTreeMap::new(),
+        stream,
+        failure: None,
+    };
     module.visit_parameters(&mut collect);
-    collect.0
+    if let Some(error) = collect.failure {
+        return Err(error);
+    }
+    module.visit_parameters_mut(&mut Slots(&mut Publish(&collect.values)));
+    Ok(collect.values)
 }
+
+#[cfg(test)]
+#[path = "parameters/storage_tests.rs"]
+mod storage_tests;
+
+#[cfg(test)]
+mod owner_source_tests;

@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_core::cache::derive_prompt_cache_architecture_fingerprint;
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_gguf::{MetadataArray, MetadataValue};
 use eredu_nn::RotarySpec;
@@ -74,7 +73,7 @@ impl TextConfigContext {
 }
 
 /// Normalized Qwen arguments shared by inspection, checkpoint planning, and execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelArgs {
     /// Exact supported architecture variant.
     pub variant: QwenVariant,
@@ -171,6 +170,13 @@ impl ModelArgs {
         validate_model_args(self)
     }
 
+    pub(crate) fn validate_with_diagnostic<E>(
+        &self,
+        invalid: impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
+        validate_model_args_with(self, &invalid)
+    }
+
     /// Returns whether decoder blocks use routed experts.
     pub const fn is_moe(&self) -> bool {
         matches!(self.variant, QwenVariant::Qwen3Moe)
@@ -214,6 +220,77 @@ impl ModelArgs {
 }
 
 impl Config for ModelArgs {
+    fn weight_quantization_with_metadata(
+        &self,
+        name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<WeightQuantization>, eredu_nn::Error> {
+        Ok(self.weight_quantization_for(name))
+    }
+
+    fn linear_format_with_metadata(
+        &self,
+        name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        Ok(self.linear_format(name))
+    }
+
+    fn parameter_alias_with_metadata(
+        &self,
+        _name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn block_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn attention_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn feed_forward_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn rotary_spec_with_metadata(
+        &self,
+        dimensions: i32,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<RotarySpec, eredu_nn::Error> {
+        Ok(RotarySpec {
+            arithmetic: eredu_nn::RotaryArithmetic::Native,
+            dimensions,
+            base: self.rope_theta,
+            traditional: false,
+            algorithm: crate::rotary::normalize_algorithm_with(
+                self.rope_scaling.as_ref(),
+                |args| context.metadata_error(args),
+            )?,
+        })
+    }
+
+    fn attention_value_format_with_metadata(
+        &self,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        crate::decoder::parameter_metadata::default_attention_value_format_with_metadata(
+            self, layer, context,
+        )
+    }
+
     fn model_family(&self) -> &'static str {
         self.variant.model_kind().canonical_name()
     }
@@ -222,6 +299,15 @@ impl Config for ModelArgs {
     }
     fn architecture_fingerprint(&self) -> String {
         prompt_cache_architecture_fingerprint(self)
+    }
+    fn architecture_fingerprint_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<String, eredu_nn::Error> {
+        prompt_cache_architecture_fingerprint_with_metadata(
+            self,
+            crate::decoder::identity::Metadata::new(Some(context)),
+        )
     }
     fn parameter_root(&self) -> &str {
         &self.parameter_root
@@ -235,6 +321,12 @@ impl Config for ModelArgs {
     }
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
         self.validate().map_err(eredu_nn::Error::backend)
+    }
+    fn validate_config_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), eredu_nn::Error> {
+        self.validate_with_diagnostic(|text| context.metadata_error(text))
     }
     fn hidden_size(&self) -> i32 {
         self.hidden_size
@@ -652,78 +744,137 @@ pub fn model_args_from_gguf_catalog_with_context(
 
 /// Returns the stable cache-compatibility fingerprint for normalized Qwen policy.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    let rope_scaling = args.rope_scaling.as_ref().map_or_else(
-        || "none".to_string(),
-        |config| {
-            let mut entries = config.iter().collect::<Vec<_>>();
+    prompt_cache_architecture_fingerprint_with_metadata(
+        args,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary fingerprint formatting is infallible")
+}
+
+fn prompt_cache_architecture_fingerprint_with_metadata(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    let rope_scaling = match &args.rope_scaling {
+        None => metadata.text("none")?,
+        Some(config) => {
+            let mut entries = metadata.vector(config.len())?;
+            entries.extend(config.iter());
             entries.sort_unstable_by_key(|(key, _)| key.as_str());
-            entries
-                .into_iter()
-                .map(|(key, value)| format!("{key}={value:?}"))
-                .collect::<Vec<_>>()
-                .join(";")
-        },
-    );
-    let mut quantized_weights = args
-        .quantized_weights
-        .as_ref()
-        .map(|weights| weights.iter().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
+            let mut values = metadata.vector(entries.len())?;
+            for (key, value) in entries {
+                values.push(metadata.format(format_args!("{key}={value:?}"))?);
+            }
+            metadata.join(&values, ";")?
+        }
+    };
+    let mut quantized_weights = metadata.vector(
+        args.quantized_weights
+            .as_ref()
+            .map_or(0, |weights| weights.len()),
+    )?;
+    if let Some(weights) = &args.quantized_weights {
+        quantized_weights.extend(weights.iter());
+    }
     quantized_weights.sort_unstable();
-    let mut quantized_weight_configs = args
-        .quantized_weight_configs
-        .as_ref()
-        .map(|configs| {
-            configs
-                .iter()
-                .map(|(name, config)| format!("{name}={config:?}"))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut quantized_weight_configs = metadata.vector(
+        args.quantized_weight_configs
+            .as_ref()
+            .map_or(0, |configs| configs.len()),
+    )?;
+    if let Some(configs) = &args.quantized_weight_configs {
+        for (name, config) in configs {
+            quantized_weight_configs.push(metadata.format(format_args!("{name}={config:?}"))?);
+        }
+    }
     quantized_weight_configs.sort_unstable();
-    derive_prompt_cache_architecture_fingerprint(
-        args.variant.model_kind().canonical_name(),
-        [
-            ("variant", format!("{:?}", args.variant)),
-            ("model_type", args.model_type.clone()),
-            ("parameter_root", args.parameter_root.clone()),
-            ("hidden_size", args.hidden_size.to_string()),
-            ("num_hidden_layers", args.num_hidden_layers.to_string()),
-            ("intermediate_size", args.intermediate_size.to_string()),
-            ("num_attention_heads", args.num_attention_heads.to_string()),
-            ("num_key_value_heads", args.num_key_value_heads.to_string()),
-            ("head_dim", args.head_dim.to_string()),
+    metadata.fingerprint(args.variant.model_kind().canonical_name(), || {
+        Ok([
+            (
+                "variant",
+                metadata.format(format_args!("{:?}", args.variant))?,
+            ),
+            ("model_type", metadata.text(&args.model_type)?),
+            ("parameter_root", metadata.text(&args.parameter_root)?),
+            (
+                "hidden_size",
+                metadata.format(format_args!("{}", args.hidden_size))?,
+            ),
+            (
+                "num_hidden_layers",
+                metadata.format(format_args!("{}", args.num_hidden_layers))?,
+            ),
+            (
+                "intermediate_size",
+                metadata.format(format_args!("{}", args.intermediate_size))?,
+            ),
+            (
+                "num_attention_heads",
+                metadata.format(format_args!("{}", args.num_attention_heads))?,
+            ),
+            (
+                "num_key_value_heads",
+                metadata.format(format_args!("{}", args.num_key_value_heads))?,
+            ),
+            (
+                "head_dim",
+                metadata.format(format_args!("{}", args.head_dim))?,
+            ),
             (
                 "rms_norm_eps",
-                format!("{:08x}", args.rms_norm_eps.to_bits()),
+                metadata.format(format_args!("{:08x}", args.rms_norm_eps.to_bits()))?,
             ),
-            ("vocab_size", args.vocab_size.to_string()),
+            (
+                "vocab_size",
+                metadata.format(format_args!("{}", args.vocab_size))?,
+            ),
             (
                 "max_position_embeddings",
-                args.max_position_embeddings.to_string(),
+                metadata.format(format_args!("{}", args.max_position_embeddings))?,
             ),
-            ("rope_theta", format!("{:08x}", args.rope_theta.to_bits())),
+            (
+                "rope_theta",
+                metadata.format(format_args!("{:08x}", args.rope_theta.to_bits()))?,
+            ),
             ("rope_scaling", rope_scaling),
             (
                 "attention_schedule",
-                args.attention_schedule.fingerprint_component(),
+                metadata.format(format_args!(
+                    "{}",
+                    args.attention_schedule.display_fingerprint_component()
+                ))?,
             ),
             (
                 "moe_intermediate_size",
-                args.moe_intermediate_size.to_string(),
+                metadata.format(format_args!("{}", args.moe_intermediate_size))?,
             ),
-            ("num_experts", args.num_experts.to_string()),
-            ("num_experts_per_tok", args.num_experts_per_tok.to_string()),
-            ("norm_topk_prob", args.norm_topk_prob.to_string()),
-            ("tie_word_embeddings", args.tie_word_embeddings.to_string()),
-            ("quantization", format!("{:?}", args.weight_quantization())),
-            ("quantized_weights", quantized_weights.join(";")),
+            (
+                "num_experts",
+                metadata.format(format_args!("{}", args.num_experts))?,
+            ),
+            (
+                "num_experts_per_tok",
+                metadata.format(format_args!("{}", args.num_experts_per_tok))?,
+            ),
+            (
+                "norm_topk_prob",
+                metadata.format(format_args!("{}", args.norm_topk_prob))?,
+            ),
+            (
+                "tie_word_embeddings",
+                metadata.format(format_args!("{}", args.tie_word_embeddings))?,
+            ),
+            (
+                "quantization",
+                metadata.format(format_args!("{:?}", args.weight_quantization()))?,
+            ),
+            ("quantized_weights", metadata.join(&quantized_weights, ";")?),
             (
                 "quantized_weight_configs",
-                quantized_weight_configs.join(";"),
+                metadata.join(&quantized_weight_configs, ";")?,
             ),
-        ],
-    )
+        ])
+    })
 }
 
 fn validate_source_policy(
@@ -758,12 +909,19 @@ fn validate_source_policy(
 }
 
 fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
+    validate_model_args_with(args, &|text| invalid(text.to_string()))
+}
+
+fn validate_model_args_with<E>(
+    args: &ModelArgs,
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     if args.parameter_root.is_empty()
         || args.parameter_root.starts_with('.')
         || args.parameter_root.ends_with('.')
         || args.parameter_root.split('.').any(str::is_empty)
     {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "invalid Qwen parameter root {:?}",
             args.parameter_root
         )));
@@ -778,11 +936,13 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
         ("max_position_embeddings", args.max_position_embeddings),
     ] {
         if value <= 0 {
-            return Err(invalid(format!("{name} must be positive, got {value}")));
+            return Err(invalid(format_args!(
+                "{name} must be positive, got {value}"
+            )));
         }
     }
     if args.num_attention_heads % args.num_key_value_heads != 0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
             args.num_attention_heads, args.num_key_value_heads
         )));
@@ -790,32 +950,32 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
     let query_width = args
         .num_attention_heads
         .checked_mul(args.head_dim)
-        .ok_or_else(|| invalid("query projection width overflows i32"))?;
+        .ok_or_else(|| invalid(format_args!("query projection width overflows i32")))?;
     args.num_key_value_heads
         .checked_mul(args.head_dim)
-        .ok_or_else(|| invalid("key/value projection width overflows i32"))?;
+        .ok_or_else(|| invalid(format_args!("key/value projection width overflows i32")))?;
     if args.variant == QwenVariant::Qwen2 && query_width != args.hidden_size {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "Qwen2 hidden_size {} does not equal query width {query_width}",
             args.hidden_size
         )));
     }
     if !args.rms_norm_eps.is_finite() || args.rms_norm_eps <= 0.0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "rms_norm_eps must be finite and positive, got {}",
             args.rms_norm_eps
         )));
     }
     if !args.rope_theta.is_finite() || args.rope_theta <= 0.0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "rope_theta must be finite and positive, got {}",
             args.rope_theta
         )));
     }
     if args.attention_schedule.len() != args.num_hidden_layers as usize {
-        return Err(invalid(
-            "attention schedule length does not match decoder layers",
-        ));
+        return Err(invalid(format_args!(
+            "attention schedule length does not match decoder layers"
+        )));
     }
     if args.variant != QwenVariant::Qwen2
         && args
@@ -823,9 +983,11 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
             .iter()
             .any(|policy| *policy != AttentionPolicy::Full)
     {
-        return Err(invalid("Qwen3 requires full attention in every layer"));
+        return Err(invalid(format_args!(
+            "Qwen3 requires full attention in every layer"
+        )));
     }
-    validate_rope_scaling(args.rope_scaling.as_ref())?;
+    validate_rope_scaling_with(args.rope_scaling.as_ref(), invalid)?;
     if args.is_moe() {
         for (name, value) in [
             ("moe_intermediate_size", args.moe_intermediate_size),
@@ -833,14 +995,18 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
             ("num_experts_per_tok", args.num_experts_per_tok),
         ] {
             if value <= 0 {
-                return Err(invalid(format!("{name} must be positive, got {value}")));
+                return Err(invalid(format_args!(
+                    "{name} must be positive, got {value}"
+                )));
             }
         }
         if args.num_experts_per_tok > args.num_experts {
-            return Err(invalid("num_experts_per_tok exceeds num_experts"));
+            return Err(invalid(format_args!(
+                "num_experts_per_tok exceeds num_experts"
+            )));
         }
     } else if args.intermediate_size <= 0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "intermediate_size must be positive, got {}",
             args.intermediate_size
         )));
@@ -899,6 +1065,13 @@ fn validate_declared_architectures(value: &Value, model_type: &str) -> Result<()
 }
 
 fn validate_rope_scaling(scaling: Option<&HashMap<String, RopeValue>>) -> Result<(), ConfigError> {
+    validate_rope_scaling_with(scaling, &|text| invalid(text.to_string()))
+}
+
+fn validate_rope_scaling_with<E>(
+    scaling: Option<&HashMap<String, RopeValue>>,
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     let Some(scaling) = scaling else {
         return Ok(());
     };
@@ -909,27 +1082,33 @@ fn validate_rope_scaling(scaling: Option<&HashMap<String, RopeValue>>) -> Result
             RopeValue::String(value) => Some(value.as_str()),
             _ => None,
         })
-        .ok_or_else(|| invalid("rope_scaling requires string type or rope_type"))?;
+        .ok_or_else(|| {
+            invalid(format_args!(
+                "rope_scaling requires string type or rope_type"
+            ))
+        })?;
     if !matches!(kind, "default" | "linear" | "yarn") {
-        return Err(invalid(format!("unsupported Qwen RoPE scaling {kind:?}")));
+        return Err(invalid(format_args!(
+            "unsupported Qwen RoPE scaling {kind:?}"
+        )));
     }
     if matches!(kind, "linear" | "yarn") {
         let factor = rope_number(scaling, "factor")
-            .ok_or_else(|| invalid("scaled Qwen RoPE requires a numeric factor"))?;
+            .ok_or_else(|| invalid(format_args!("scaled Qwen RoPE requires a numeric factor")))?;
         if factor <= 0.0 {
-            return Err(invalid("scaled Qwen RoPE factor must be positive"));
+            return Err(invalid(format_args!(
+                "scaled Qwen RoPE factor must be positive"
+            )));
         }
     }
     if kind == "yarn"
         && rope_number(scaling, "original_max_position_embeddings").is_none_or(|value| value <= 0.0)
     {
-        return Err(invalid(
-            "YaRN requires positive original_max_position_embeddings",
-        ));
+        return Err(invalid(format_args!(
+            "YaRN requires positive original_max_position_embeddings"
+        )));
     }
-    crate::rotary::normalize_algorithm(Some(scaling))
-        .map(|_| ())
-        .map_err(invalid)
+    crate::rotary::normalize_algorithm_with(Some(scaling), invalid).map(|_| ())
 }
 
 fn rope_number(values: &HashMap<String, RopeValue>, key: &str) -> Option<f32> {

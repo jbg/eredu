@@ -1,0 +1,306 @@
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -527,7 +527,7 @@
+       PoolFutures all_gathers(n_gathers, graph);
+       for (int i = 0; i < n_gathers; i++) {
+         auto offset = i * bytes_per_gather;
+-        all_gathers.append(pool_.enqueue(
++        all_gathers.append(pool_.enqueue_with_graph(graph,
+             std::bind(
+                 &RingGroup::all_gather_impl,
+                 this,
+@@ -755,7 +755,7 @@
+       PoolFutures all_sums(n_reduces, graph);
+ 
+       for (int i = 0; i < n_reduces; i++) {
+-        all_sums.append(pool_.enqueue(
++        all_sums.append(pool_.enqueue_with_graph(graph,
+             std::bind(
+                 &RingGroup::all_reduce_impl<T, ReduceOp>,
+                 this,
+diff --git a/mlx/distributed/ring/socket_tasks.h b/mlx/distributed/ring/socket_tasks.h
+--- a/mlx/distributed/ring/socket_tasks.h
++++ b/mlx/distributed/ring/socket_tasks.h
+@@ -4,6 +4,7 @@
+ #include <limits>
+ #include <utility>
+ #include "mlx/scheduler_task.h"
++#include "mlx/promise_storage.h"
+ 
+ namespace mlx::core::distributed::ring {
+ 
+@@ -42,26 +43,6 @@
+ };
+ 
+ namespace socket_detail {
+-inline bool promise_layout(size_t& bytes, size_t& alignment) noexcept {
+-#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
+-  using State = std::__assoc_sub_state_alloc<submission::GraphAllocator<std::byte>>;
+-  bytes = sizeof(State);
+-  alignment = alignof(State);
+-  return true;
+-#else
+-  return false;
+-#endif
+-}
+-inline std::promise<void> make_promise(submission::GraphQuota* graph) {
+-  if (!graph) return std::promise<void>();
+-  size_t bytes, alignment;
+-  if (!promise_layout(bytes, alignment))
+-    throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
+-  // The allocator state is retained in the actual promise/future shared state,
+-  // including after a socket worker drops its completed task node.
+-  return std::promise<void>(std::allocator_arg,
+-                           submission::GraphAllocator<std::byte>(graph));
+-}
+ struct Operation {
+   void* buffer;
+   size_t size;
+@@ -70,7 +51,7 @@
+   std::promise<void> promise;
+   std::future<void> future;
+   Operation(void* buffer, size_t size, submission::GraphQuota* graph)
+-      : buffer(buffer), size(size), promise(make_promise(graph)),
++      : buffer(buffer), size(size), promise(submission::make_graph_promise<void>(graph)),
+         future(promise.get_future()) {}
+   Operation(Operation&&) noexcept = default;
+   void operator()() { promise.set_value(); }
+@@ -147,7 +128,7 @@
+   SocketTaskLayout value{};
+   value.node_bytes = sizeof(socket_detail::Node);
+   value.node_alignment = alignof(socket_detail::Node);
+-  if (!socket_detail::promise_layout(value.promise_bytes, value.promise_alignment) ||
++  if (!submission::promise_storage_layout<void>(value.promise_bytes, value.promise_alignment) ||
+       !submission::GraphQuota::allocation_extent(value.node_bytes, value.node_alignment, value.node_extent) ||
+       !submission::GraphQuota::allocation_extent(value.promise_bytes, value.promise_alignment, value.promise_extent))
+     return false;
+diff --git a/mlx/promise_storage.h b/mlx/promise_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/promise_storage.h
+@@ -0,0 +1,34 @@
++#pragma once
++
++#include <future>
++#include <type_traits>
++#include "mlx/graph_quota.h"
++
++namespace mlx::core::submission {
++// The ordinary promise and the source-allocated promise share the standard
++// ready/exception protocol. Only the actual shared-state allocator differs.
++template<class R>
++bool promise_storage_layout(size_t& bytes, size_t& alignment) noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++  using Allocator = GraphAllocator<std::byte>;
++  if constexpr (std::is_void_v<R>) {
++    using State = std::__assoc_sub_state_alloc<Allocator>;
++    bytes = sizeof(State); alignment = alignof(State);
++  } else {
++    using State = std::__assoc_state_alloc<R, Allocator>;
++    bytes = sizeof(State); alignment = alignof(State);
++  }
++  return true;
++#else
++  return false;
++#endif
++}
++template<class R>
++std::promise<R> make_graph_promise(GraphQuota* graph) {
++  if (!graph) return std::promise<R>();
++  size_t bytes, alignment;
++  if (!promise_storage_layout<R>(bytes, alignment))
++    throw GraphQuotaError(GraphFailure::invalid_layout);
++  return std::promise<R>(std::allocator_arg, GraphAllocator<std::byte>(graph));
++}
++} // namespace mlx::core::submission
+diff --git a/mlx/threadpool.h b/mlx/threadpool.h
+--- a/mlx/threadpool.h
++++ b/mlx/threadpool.h
+@@ -1,4 +1,5 @@
+ // This code was modified from https://github.com/progschj/ThreadPool
++// Eredu alteration: source-owned native task nodes replace erased queue storage.
+ // The original License is copied below:
+ //
+ // Copyright (c) 2012 Jakob Progsch, Václav Zeman
+@@ -27,10 +28,11 @@
+ #include <future>
+ #include <memory>
+ #include <mutex>
+-#include <queue>
+ #include <stdexcept>
+ #include <thread>
+ #include <vector>
++#include "mlx/threadpool_task.h"
++#include "mlx/native_control.h"
+ 
+ class ThreadPool {
+  public:
+@@ -38,6 +40,17 @@
+   template <class F, class... Args>
+   auto enqueue(F&& f, Args&&... args)
+       -> std::future<typename std::invoke_result_t<F, Args...>>;
++  // Source allocation is explicit and retained by the accepted task/promise.
++  // This grants no submission Scope or worker TLS context.
++  template <class F, class... Args>
++  auto enqueue_with_graph(mlx::core::submission::GraphQuota*, F&& f, Args&&... args)
++      -> std::future<typename std::invoke_result_t<F, Args...>>;
++  template <class F, class... Args>
++  static bool task_layout(mlx::core::threadpool_detail::TaskLayout& out) noexcept {
++    using Bound = decltype(std::bind(std::declval<F>(), std::declval<Args>()...));
++    using R = std::invoke_result_t<F, Args...>;
++    return mlx::core::threadpool_detail::task_layout<Bound, R>(out);
++  }
+   void resize(size_t);
+   // Read only while the owner excludes resize/destruction; no task-queue read.
+   size_t retained_worker_count() const noexcept { return workers.size(); }
+@@ -49,7 +62,8 @@
+   void start_threads(size_t);
+ 
+   std::vector<std::thread> workers;
+-  std::queue<std::function<void()>> tasks;
++  mlx::core::scheduler::Task* head{nullptr};
++  mlx::core::scheduler::Task* tail{nullptr};
+   std::mutex queue_mutex;
+   std::condition_variable condition;
+   bool stop;
+@@ -62,24 +76,37 @@
+ template <class F, class... Args>
+ auto ThreadPool::enqueue(F&& f, Args&&... args)
+     -> std::future<typename std::invoke_result_t<F, Args...>> {
+-  using return_type = typename std::invoke_result_t<F, Args...>;
++  return enqueue_with_graph(nullptr, std::forward<F>(f), std::forward<Args>(args)...);
++}
+ 
+-  auto task = std::make_shared<std::packaged_task<return_type()>>(
+-      std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+-
+-  std::future<return_type> res = task->get_future();
++template <class F, class... Args>
++auto ThreadPool::enqueue_with_graph(mlx::core::submission::GraphQuota* graph,
++    F&& f, Args&&... args) -> std::future<typename std::invoke_result_t<F, Args...>> {
++  using namespace mlx::core;
++  using R = std::invoke_result_t<F, Args...>;
++  auto callable = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
++  using Body = threadpool_detail::Operation<decltype(callable), R>;
++  using Node = scheduler::TaskNode<Body>;
++  auto task = scheduler::make_task(graph, {}, nullptr, false,
++                                  Body(graph, std::move(callable)));
++  std::future<R> result;
+   {
+     std::unique_lock<std::mutex> lock(queue_mutex);
+-
+     if (stop) {
+-      throw std::runtime_error(
+-          "[ThreadPool::enqueue] Not allowed on stopped ThreadPool");
++      if (graph) throw submission::NativeControlError(submission::NativeControlFailure::stopped_worker);
++      throw std::runtime_error("[ThreadPool::enqueue] Not allowed on stopped ThreadPool");
+     }
+-
+-    tasks.emplace([task]() { (*task)(); });
++    // No allocation, callback or potentially throwing move follows this
++    // existing FIFO acceptance point. Before it, the node owns both promise
++    // and future so refusal cannot allocate a broken-promise exception.
++    result = std::move(static_cast<Node*>(task.get())->body.future);
++    auto* accepted = task.release();
++    if (tail) tail->next = accepted;
++    else head = accepted;
++    tail = accepted;
+   }
+   condition.notify_one();
+-  return res;
++  return result;
+ }
+ 
+ inline void ThreadPool::resize(size_t threads) {
+@@ -117,19 +144,22 @@
+   for (size_t i = 0; i < threads; ++i) {
+     workers.emplace_back([this] {
+       for (;;) {
+-        std::function<void()> task;
++        mlx::core::scheduler::Task* selected;
+ 
+         {
+           std::unique_lock<std::mutex> lock(this->queue_mutex);
+           this->condition.wait(
+-              lock, [this] { return this->stop || !this->tasks.empty(); });
+-          if (this->stop && this->tasks.empty())
++              lock, [this] { return this->stop || this->head != nullptr; });
++          if (this->stop && !this->head)
+             return;
+-          task = std::move(this->tasks.front());
+-          this->tasks.pop();
++          selected = this->head;
++          this->head = selected->next;
++          if (!this->head) this->tail = nullptr;
++          selected->next = nullptr;
+         }
+ 
+-        task();
++        mlx::core::scheduler::TaskOwner task(selected);
++        selected->invoke(selected);
+       }
+     });
+   }
+diff --git a/mlx/threadpool_task.h b/mlx/threadpool_task.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/threadpool_task.h
+@@ -0,0 +1,57 @@
++#pragma once
++
++#include <functional>
++#include <future>
++#include <mutex>
++#include <type_traits>
++#include <utility>
++#include "mlx/scheduler_task.h"
++#include "mlx/promise_storage.h"
++
++namespace mlx::core::threadpool_detail {
++// Concrete owner requests only. This does not qualify arbitrary callable
++// constructors, captures, invocation work or a total operation population.
++struct TaskLayout {
++  size_t node_bytes, node_alignment, node_extent;
++  size_t promise_bytes, promise_alignment, promise_extent;
++  size_t controls;
++};
++
++template<class F, class R> struct Operation {
++  F callable;
++  // An unaccepted construction destroys future before promise. Throwing
++  // callable construction/move happens before either future owner transfers.
++  std::promise<R> promise;
++  std::future<R> future;
++  template<class U>
++  Operation(submission::GraphQuota* graph, U&& body)
++      : callable(std::forward<U>(body)), promise(submission::make_graph_promise<R>(graph)),
++        future(promise.get_future()) {}
++  Operation(Operation&&) = default;
++  void operator()() noexcept {
++    // Same packaged-task result/exception semantics, using the concrete
++    // callable inline in the existing native TaskNode instead of type erasure.
++    try {
++      if constexpr (std::is_void_v<R>) { callable(); promise.set_value(); }
++      else promise.set_value(callable());
++    } catch (...) { promise.set_exception(std::current_exception()); }
++  }
++};
++template<class F, class R>
++bool task_layout(TaskLayout& out) noexcept {
++  using Body = Operation<F, R>;
++  using Node = scheduler::TaskNode<Body>;
++  TaskLayout value{};
++  value.node_bytes = sizeof(Node); value.node_alignment = alignof(Node);
++  if (!submission::promise_storage_layout<R>(value.promise_bytes, value.promise_alignment) ||
++      !submission::GraphQuota::allocation_extent(value.node_bytes, value.node_alignment, value.node_extent) ||
++      !submission::GraphQuota::allocation_extent(value.promise_bytes, value.promise_alignment, value.promise_extent)) return false;
++  value.controls = sizeof(TaskLayout) * 2 + sizeof(Body) + sizeof(F) +
++      sizeof(scheduler::TaskOwner) * 2 + sizeof(std::future<R>) * 2 +
++      sizeof(submission::GraphAllocator<Node>) + sizeof(submission::GraphAllocator<std::byte>) * 3 +
++      sizeof(std::unique_lock<std::mutex>) + sizeof(std::exception_ptr) +
++      sizeof(void*) * 6 + sizeof(size_t) * 4 + sizeof(bool) * 2;
++  out = value;
++  return true;
++}
++} // namespace mlx::core::threadpool_detail

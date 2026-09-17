@@ -235,6 +235,27 @@ impl Module<&Array> for QuantizedEmbedding {
             .map(|biases| biases.try_index_device(&x, stream))
             .transpose()?;
 
+        // MLX's affine Metal dequantizer reads both companions using the
+        // scale dtype. Promote differing floating companions before dispatch;
+        // the outer result cast cannot repair a differently typed bias read.
+        // Only selected rows are converted, preserving bounded lookup storage.
+        let (scales, biases) = match biases {
+            Some(biases) if scales.dtype() != biases.dtype() => {
+                let floating =
+                    |dtype| matches!(dtype, Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16);
+                if !floating(scales.dtype()) || !floating(biases.dtype()) {
+                    return Err(Exception::custom(
+                        "quantized embedding requires floating affine companions",
+                    ));
+                }
+                (
+                    scales.as_dtype(Dtype::Float32, stream)?,
+                    Some(biases.as_dtype(Dtype::Float32, stream)?),
+                )
+            }
+            biases => (scales, biases),
+        };
+
         let out = dequantize_with_mode(
             &w,
             &scales,
@@ -245,11 +266,47 @@ impl Module<&Array> for QuantizedEmbedding {
             stream,
         )?;
 
-        let ret_shape = s.iter().copied().chain(once(-1)).collect::<Vec<_>>();
+        let ret_shape = s
+            .iter()
+            .copied()
+            .chain(once(-1))
+            .collect::<smallvec::SmallVec<[i32; 4]>>();
         // Packed embedding capabilities promise F32 activations. MLX's MXFP4
         // dequantizer defaults to BF16; normalize the selected rows before they
         // reach vocabulary reduction, state or prediction fusion.
         out.as_dtype(Dtype::Float32, stream)?
             .reshape(&ret_shape, stream)
+    }
+}
+
+/// Fixed controls of the selected-row embedding worker. The original receipt
+/// permits at most two input axes; ordinary higher-rank calls keep SmallVec's
+/// existing allocating behavior and receive no finite claim from this query.
+impl QuantizedEmbedding {
+    pub(crate) fn forward_control_bytes(input_rank: usize) -> Option<usize> {
+        use std::mem::size_of;
+        if input_rank > 2 {
+            return None;
+        }
+        [
+            size_of::<smallvec::SmallVec<[i32; 4]>>(),
+            size_of::<
+                std::iter::Chain<
+                    std::iter::Copied<std::slice::Iter<'_, i32>>,
+                    std::iter::Once<i32>,
+                >,
+            >(),
+            size_of::<&[i32]>(),
+            6 * size_of::<Array>(),
+            2 * size_of::<Option<Array>>(),
+            size_of::<(Array, Option<Array>)>(),
+            size_of::<Result<Array, Exception>>(),
+            3 * size_of::<&Array>(),
+            size_of::<&Stream>(),
+            size_of::<Dtype>(),
+            2 * size_of::<i32>(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
     }
 }

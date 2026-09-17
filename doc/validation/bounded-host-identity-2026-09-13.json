@@ -1,0 +1,119 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted certified host-transfer array ownership and cross-category physical deduplication",
+  "native_patch_set": "6195b16ecc646f9a8bf1cbbafeaa7985961ee6e7542a982be29552081797379d",
+  "source_sha256": {
+    "doc/backend-architecture.md": "e6db6957e1623255437e8d8c91930dc496fa473a4462ab18b0bccc23bc1e84f2",
+    "doc/execution-control.md": "f105fa3bfeecfdb21859c1819b06822c92877a15b78922ae3039b588d6c552c4",
+    "doc/bounded-inference.md": "2e71bfa1e189a8c5aaf67cfabc58552262bccf34568818dcec22da6f6aa12b15",
+    "safemlx-sys/README.md": "b35256ffc6af915c5812205db38bcf9dd49dab255cb8ea97c643697d77eec858",
+    "safemlx-sys/src/bindings.rs": "b2db16e5a45e95f536c194f17d9e622f733ca6d34444a8bc098ab28d717d2780",
+    "safemlx-sys/src/mlx-c/CMakeLists.txt": "587feff147adb0ee2e61c79841c7dc87418d4b8692488f5ba748b0a2e1d399a6",
+    "safemlx-sys/src/mlx-c/patches/mlx-host-transfer-allocation-identity.patch": "ba3655fb7e047ea4b1b7b37c60c600c5828dbf385efdbcd09c2fe89445a717b9",
+    "safemlx-sys/src/mlx-c/mlx/c/array.cpp": "5e1e2bd8854b0a6a6d557900b02b8509245be6b8e8145e33e1f28dd7264cab81",
+    "safemlx-sys/src/mlx-c/mlx/c/array.h": "908508b72e4457039fec9f74b943d5bdd8d410792ac8b37ca4dfa84b469a0a88",
+    "safemlx-sys/src/mlx-c/mlx/c/host_transfer.cpp": "84a0b65f05ddebbc357bdf69fdb7a1de673902b5586db770d6b35741192f6555",
+    "safemlx-sys/src/mlx-c/mlx/c/host_transfer.h": "dff49febf46e3c2aa7cb0f02b91e5519f5dfd29d3efdd3ce9e10ab71670bd88e",
+    "safemlx/src/array/mod.rs": "d2ca52d4f25aa9da12cd717a9cd3a762c074f32072f1fdd0f8c1d8d82f8bfb1b",
+    "safemlx/src/host_transfer.rs": "d315fd9bfb8cdef455a59ad2d4d821733cdc9f1b67ef394eaac298de3a8d8f2f",
+    "eredu-backend-mlx/src/backend/nn/workspace/projection.rs": "156272750a1b61f94a35ff2d33a231be0ac5eeb7f10b19fddc189994a485f137",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage.rs": "15aacb79771e39d87390e5e74c3dde191fa6e9454c7389c497bc412e5cd27838",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/tests.rs": "f6e7ce84b083568c08a1546513dd77ba0f21701c691868a2245134077156dc64",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/tests/retained_parameters.rs": "3da46abd4debb8f4a4b3f698dacd7d16fa5442c016e2241bad282d0cb23adfbe"
+  },
+  "coverage": {
+    "tests_passed": 118,
+    "allocation_identity_tests": 6,
+    "native_residency_tests": 59,
+    "native_cache_tests": 51,
+    "native_projection_tests": 1,
+    "native_target_tests": 1,
+    "native_target_configurations": 9,
+    "certified_target_configurations": 9,
+    "new_allocator_peak_measurements": 0,
+    "new_released_checkpoint_comparisons": 0
+  },
+  "behavior": [
+    "MLX host-transfer arrays retain a named native owner. Cold inspection verifies the exact backing buffer and completed status before reporting that owner identity and its charged capacity.",
+    "Unfinished arrays and unrecognized custom/foreign deleters remain unknown; no query evaluates a graph, polls completion or calls allocator size functions on foreign memory.",
+    "The safe wrapper exposes an opaque typed allocation identity with distinct allocator and host-transfer domains. Immutable host buffers and their completed native array/view aliases report the same host-transfer identity.",
+    "RetainedStorage retains both host and array owners, checks capacity agreement and counts their shared backing once regardless of insertion or merge order. Portable workspace projection uses the same typed identities for native aliases.",
+    "CPU-only and Metal tests preserve nonzero values and full backing capacity through narrow views and original-host-handle destruction, while independent native allocations remain distinct and lazy graphs stay unknown.",
+    "All nine dense/tied/packed target configurations now produce certified retained-storage bounds after prefill and two cached decodes under resident, host-layerwise and disk-streamed execution. Hidden checkpoint files still permit cold inspection; replacements add their own allocation once and restoration returns the original bound."
+  ],
+  "limits": [
+    "This closes the certified shared-host identity gap for target inventories; it does not provide complete model/request admission or automatic pool reservations.",
+    "Prediction module/prototype resources, observers, escaped outputs and enclosing request resources still require composition. Future execution, cache growth, streaming/materialization and copy workspace require separate enforced bounds.",
+    "Retained inventories themselves own physical payloads and must be charged when integrated into shared admission; they are not native residency ledger pins.",
+    "Arbitrary custom storage and unresolved native work remain unknown. Metadata, allocator caches, JIT and other process/system memory remain outside these payload capacity facts.",
+    "CPU-only and Metal realizations were executed. CUDA-specific native validation remains unavailable on this host.",
+    "No new allocator/process peak measurement or released-checkpoint comparison was performed; the change preserves transfer equations and ownership while making existing identities inspectable.",
+    "The existing compact-unwind warning and unused native quote/projection helpers remain pending full production admission wiring."
+  ],
+  "checks": [
+    {
+      "name": "safemlx-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p safemlx --no-default-features --features metal --lib allocation_info -- --test-threads=1",
+      "log": "/private/tmp/eredu-host-identity-safemlx-tests.log",
+      "sha256": "aa5ec2d98178f073ffb79a458ef8b5d24104e0dcb2190d523b3907be0b45a353",
+      "passed": 3
+    },
+    {
+      "name": "cpu-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p safemlx --no-default-features --lib allocation_info -- --test-threads=1",
+      "log": "/private/tmp/eredu-host-identity-cpu-tests.log",
+      "sha256": "0281e7477e9acc0a2796d7fd73f92f4bd183e53df9a74e60f6107a689f7a0f88",
+      "passed": 3
+    },
+    {
+      "name": "target-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib retained_target_parameters_track_replacements_without_loading_or_double_counting -- --test-threads=1",
+      "log": "/private/tmp/eredu-host-identity-target-tests.log",
+      "sha256": "e51f063b1393ee420e73d734415ac27f3ffb1f355882f8e49817affaf86b5bfb",
+      "passed": 1
+    },
+    {
+      "name": "residency-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib backend::runtime::residency:: -- --test-threads=1",
+      "log": "/private/tmp/eredu-host-identity-residency-tests.log",
+      "sha256": "d7d5260278a9c1908e3cabc926f9d42296c294d147792304e8c8f33f1b6e4117",
+      "passed": 59
+    },
+    {
+      "name": "cache-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib backend::runtime::cache::residency:: -- --test-threads=1",
+      "log": "/private/tmp/eredu-host-identity-cache-tests.log",
+      "sha256": "c99d91610ecf3a1f61ace8e62ac66b2c4f5466b95e2cc61f1e03b8645a41b635",
+      "passed": 44
+    },
+    {
+      "name": "cache-explicit-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib backend::runtime::cache::residency:: -- --ignored --test-threads=1",
+      "log": "/private/tmp/eredu-host-identity-cache-explicit-tests.log",
+      "sha256": "b1b2eddf88541d933d517205b0d884490047073408a54702ec23433819641f2e",
+      "passed": 7
+    },
+    {
+      "name": "projection-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib native_storage_projection_preserves_capacity_aliases_and_unknown_lazy_state -- --ignored --test-threads=1",
+      "log": "/private/tmp/eredu-host-identity-projection-tests.log",
+      "sha256": "352a83aba34dc8ce32b69f17d0c8bee955612204902c2e4bcc29002fc8a84198",
+      "passed": 1
+    },
+    {
+      "name": "build",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib --no-run",
+      "log": "/private/tmp/eredu-host-identity-build.log",
+      "sha256": "4d64f61ec3cdf0a2d42f3240cf1cda46a87cc761fc99e968d166df7411f537b0",
+      "passed": null
+    },
+    {
+      "name": "final-check",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "log": "/private/tmp/eredu-host-identity-final-check.log",
+      "sha256": "d052b1652770021b07ae9b898778b6f20e1fe1f5dead4bc0e71bb7c4eac1b957",
+      "passed": null
+    }
+  ]
+}

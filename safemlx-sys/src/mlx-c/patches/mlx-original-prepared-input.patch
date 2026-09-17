@@ -1,0 +1,806 @@
+diff --git a/mlx/CMakeLists.txt b/mlx/CMakeLists.txt
+--- a/mlx/CMakeLists.txt
++++ b/mlx/CMakeLists.txt
+@@ -19,6 +19,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/submission.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/record_quota.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/graph_quota.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/prepared_input.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/timing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/transforms.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
+diff --git a/mlx/allocator.h b/mlx/allocator.h
+--- a/mlx/allocator.h
++++ b/mlx/allocator.h
+@@ -7,6 +7,8 @@
+ #include <stdexcept>
+ 
+ #include "mlx/api.h"
++
++namespace mlx::core::submission { class GraphQuota; }
+ 
+ namespace mlx::core::allocator {
+ 
+@@ -42,6 +44,32 @@
+   void* ptr() {
+     return ptr_;
+   };
++};
++
++class Allocator;
++enum class PreparedInputCause : unsigned { success = 0, unsupported = 1, invalid = 2,
++  busy = 3, allocation_failed = 4, capacity = 5, identity_exhausted = 6 };
++struct PreparedInputFacts {
++  size_t page_size = 0;
++  size_t maximum = 0;
++  HostTransferStorageKind kind = HostTransferStorageKind::cpu;
++  size_t controls = 0;
++};
++struct PreparedInputResidency {
++  PreparedInputResidency* previous = nullptr;
++  PreparedInputResidency* next = nullptr;
++  void* allocation = nullptr;
++  bool wired = false;
++  bool installed = false;
++};
++// Stable source-arena block, owned by one shared Data. No source/array backedge.
++struct MLX_API PreparedInputAllocation {
++  Allocator* allocator = nullptr;
++  submission::GraphQuota* quota = nullptr;
++  Buffer buffer{nullptr};
++  size_t capacity = 0;
++  PreparedInputResidency residency;
++  void destroy() noexcept;
+ };
+ 
+ class MLX_API Allocator {
+@@ -97,6 +125,13 @@
+         : 2 * size;
+   }
+ 
++  // Called explicitly during ordinary runtime preparation, before original admission.
++  virtual bool prepare_input_runtime(PreparedInputFacts&) { return false; }
++  virtual PreparedInputCause allocate_prepared_input(size_t, PreparedInputAllocation&) noexcept {
++    return PreparedInputCause::unsupported;
++  }
++  virtual void free_prepared_input(PreparedInputAllocation&) noexcept { std::terminate(); }
++
+   Allocator() = default;
+   Allocator(const Allocator& other) = delete;
+   Allocator(Allocator&& other) = delete;
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -14,7 +14,7 @@
+ namespace mlx::core {
+ 
+ uint64_t next_allocation_generation() noexcept {
+-  static detail::AllocationGenerationCounter generations;
++  constinit static detail::AllocationGenerationCounter generations;
+   return generations.next();
+ }
+ 
+@@ -197,6 +197,11 @@
+   // examines the named deleter directly; set_data runs before output status
+   // changes, and this path must never poll an event or evaluate another graph.
+   if (retain_host_transfer_backing_owner(data, owners)) {
++    return;
++  }
++  if (data->original_input && data->buffer.ptr() == data->original_input->buffer.ptr() &&
++      data->allocation_generation != 0) {
++    if (!data->allocation_owners.contains(owners)) data->allocation_owners.push_back(owners);
+     return;
+   }
+   using NativeDeleter = void (*)(allocator::Buffer);
+@@ -352,6 +357,13 @@
+ 
+ array::ArrayDesc::ArrayDesc(Shape shape, Dtype dtype)
+     : shape(std::move(shape), Shape::allocator_type{}), dtype(dtype), status(Status::available) {
++  init();
++}
++
++array::ArrayDesc::ArrayDesc(Shape&& shape, Dtype dtype, submission::GraphQuota* source)
++    : shape(std::move(shape), Shape::allocator_type{source}),
++      strides(Strides::allocator_type{source}), dtype(dtype), status(Status::available),
++      inputs(ArrayVector::allocator_type{source}), siblings(ArrayVector::allocator_type{source}) {
+   init();
+ }
+ 
+diff --git a/mlx/array.h b/mlx/array.h
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -18,12 +18,14 @@
+ 
+ namespace mlx::core {
+ 
++class PreparedInputLeaf;
++
+ namespace detail {
+ // Each counter issues nonzero generations once and remains exhausted at zero.
+ // The production counter has one out-of-line owner, never a header/DSO singleton.
+ class AllocationGenerationCounter {
+  public:
+-  explicit AllocationGenerationCounter(uint64_t first = 1) : next_(first) {}
++  explicit constexpr AllocationGenerationCounter(uint64_t first = 1) : next_(first) {}
+   uint64_t next() noexcept {
+     auto value = next_.load(std::memory_order_relaxed);
+     while (value != 0) {
+@@ -267,6 +269,7 @@
+   struct Data {
+     allocator::Buffer buffer;
+     Deleter d;
++    allocator::PreparedInputAllocation* original_input{nullptr};
+     uint64_t allocation_generation;
+     // Opaque allocation owners do not replace the certified buffer/deleter.
+     // Mutation is serialized by the embedding runtime before exposing aliases.
+@@ -278,12 +281,15 @@
+     std::atomic_flag recovery_pin_lock = ATOMIC_FLAG_INIT;
+     Data(allocator::Buffer buffer, Deleter d = allocator::free)
+         : buffer(buffer), d(d), allocation_generation(next_allocation_generation()) {}
++    Data(allocator::PreparedInputAllocation* original, uint64_t generation) noexcept
++        : buffer(original->buffer), d(), original_input(original), allocation_generation(generation) {}
+     // Not copyable
+     Data(const Data& d) = delete;
+     Data& operator=(const Data& d) = delete;
+     Data(Data&& o)
+         : buffer(o.buffer),
+           d(o.d),
++          original_input(std::exchange(o.original_input, nullptr)),
+           allocation_generation(o.allocation_generation),
+           allocation_owners(std::move(o.allocation_owners)) {
+       o.buffer = allocator::Buffer(nullptr);
+@@ -291,7 +297,8 @@
+       o.d = [](allocator::Buffer) {};
+     }
+     ~Data() {
+-      d(buffer);
++      if (original_input) original_input->destroy();
++      else d(buffer);
+     }
+   };
+ 
+@@ -346,6 +353,7 @@
+       return false;
+     }
+     auto* data = array_desc_->data.get();
++    if (data->original_input) return false; // immutable original source backing
+     // The ordinary unique-owner case needs no recovery bookkeeping. New
+     // physical pins cannot introduce another logical reader of this value.
+     if (array_desc_->data.use_count() == 1) {
+@@ -597,6 +605,7 @@
+     uint32_t position{0};
+ 
+     explicit ArrayDesc(Shape shape, Dtype dtype);
++    ArrayDesc(Shape&& shape, Dtype dtype, submission::GraphQuota* source);
+ 
+     explicit ArrayDesc(
+         Shape shape,
+@@ -619,6 +628,8 @@
+     void init();
+   };
+ 
++  friend class PreparedInputLeaf;
++  explicit array(std::shared_ptr<ArrayDesc> descriptor) noexcept : array_desc_(std::move(descriptor)) {}
+   struct DescriptorRetirement;
+   struct RetireDescriptor {
+     void operator()(ArrayDesc* descriptor) const noexcept;
+diff --git a/mlx/backend/metal/allocator.cpp b/mlx/backend/metal/allocator.cpp
+--- a/mlx/backend/metal/allocator.cpp
++++ b/mlx/backend/metal/allocator.cpp
+@@ -106,6 +106,52 @@
+   return limit;
+ };
+ 
++bool MetalAllocator::prepare_input_runtime(allocator::PreparedInputFacts& facts) {
++  std::lock_guard<std::mutex> guard(mutex_);
++  facts = {vm_page_size, device_->maxBufferLength(),
++      allocator::HostTransferStorageKind::metal_shared,
++      sizeof(std::lock_guard<std::mutex>) + sizeof(MTL::Buffer*) + sizeof(size_t) * 3};
++  return true;
++}
++allocator::PreparedInputCause MetalAllocator::allocate_prepared_input(
++    size_t bytes, allocator::PreparedInputAllocation& output) noexcept {
++  using Cause = allocator::PreparedInputCause;
++  if (!bytes || bytes > std::numeric_limits<size_t>::max() - (vm_page_size - 1))
++    return Cause::invalid;
++  const auto capacity = vm_page_size * ((bytes + vm_page_size - 1) / vm_page_size);
++  if (capacity > device_->maxBufferLength()) return Cause::capacity;
++  if (!mutex_.try_lock()) return Cause::busy;
++  std::lock_guard<std::mutex> guard(mutex_, std::adopt_lock);
++  if (num_resources_ >= resource_limit_ ||
++      active_memory_ > std::numeric_limits<size_t>::max() - capacity)
++    return Cause::capacity;
++  // No cache trim, reuse, heap allocation or ordinary residency hash insertion.
++  auto* buffer = device_->newBuffer(capacity, resource_options);
++  if (!buffer) return Cause::allocation_failed;
++  if (buffer->length() != capacity) { buffer->release(); return Cause::capacity; }
++  output.allocator = this;
++  output.buffer = Buffer{static_cast<void*>(buffer)};
++  output.capacity = capacity;
++  residency_set_.insert_prepared(buffer, output.residency);
++  ++num_resources_;
++  active_memory_ += capacity;
++  peak_memory_ = std::max(peak_memory_, active_memory_);
++  return Cause::success;
++}
++void MetalAllocator::free_prepared_input(allocator::PreparedInputAllocation& input) noexcept {
++  auto* buffer = static_cast<MTL::Buffer*>(input.buffer.ptr());
++  if (!buffer) return;
++  {
++    std::lock_guard<std::mutex> guard(mutex_);
++    active_memory_ -= input.capacity;
++    --num_resources_;
++    residency_set_.erase_prepared(input.residency);
++  }
++  // Direct retained-object release; no library-owned autorelease-pool allocation.
++  buffer->release();
++  input.buffer = Buffer{nullptr};
++}
++
+ Buffer MetalAllocator::malloc(size_t size) {
+   // Metal doesn't like empty buffers
+   if (size == 0) {
+diff --git a/mlx/backend/metal/allocator.h b/mlx/backend/metal/allocator.h
+--- a/mlx/backend/metal/allocator.h
++++ b/mlx/backend/metal/allocator.h
+@@ -39,6 +39,11 @@
+   size_t host_transfer_capacity_upper_bound(
+       size_t size,
+       allocator::HostTransferPolicy policy) const override;
++
++  bool prepare_input_runtime(allocator::PreparedInputFacts&) override;
++  allocator::PreparedInputCause allocate_prepared_input(
++      size_t, allocator::PreparedInputAllocation&) noexcept override;
++  void free_prepared_input(allocator::PreparedInputAllocation&) noexcept override;
+ 
+   size_t get_active_memory() {
+     return active_memory_;
+diff --git a/mlx/backend/metal/resident.cpp b/mlx/backend/metal/resident.cpp
+--- a/mlx/backend/metal/resident.cpp
++++ b/mlx/backend/metal/resident.cpp
+@@ -49,6 +49,38 @@
+   }
+ }
+ 
++allocator::PreparedInputResidency* ResidencySet::find_prepared(const MTL::Allocation* value) noexcept {
++  for (auto* node = prepared_; node; node = node->next)
++    if (node->allocation == value) return node;
++  return nullptr;
++}
++void ResidencySet::insert_prepared(
++    MTL::Allocation* value, allocator::PreparedInputResidency& node) noexcept {
++  node.allocation = value;
++  node.previous = nullptr;
++  node.next = prepared_;
++  if (prepared_) prepared_->previous = &node;
++  prepared_ = &node;
++  node.installed = true;
++  if (wired_set_ && wired_set_->allocatedSize() <= capacity_ &&
++      value->allocatedSize() <= capacity_ - wired_set_->allocatedSize()) {
++    wired_set_->addAllocation(value);
++    wired_set_->commit();
++    node.wired = true;
++  }
++}
++void ResidencySet::erase_prepared(allocator::PreparedInputResidency& node) noexcept {
++  if (!node.installed) return;
++  if (node.wired) {
++    wired_set_->removeAllocation(static_cast<MTL::Allocation*>(node.allocation));
++    wired_set_->commit();
++  }
++  if (node.previous) node.previous->next = node.next;
++  else prepared_ = node.next;
++  if (node.next) node.next->previous = node.previous;
++  node = {};
++}
++
+ void ResidencySet::resize(size_t size) {
+   if (!wired_set_) {
+     return;
+@@ -63,6 +95,17 @@
+ 
+   if (current_size < size) {
+     auto pool = new_scoped_memory_pool();
++    // Prepared entries never migrate to the ordinary allocating hash set.
++    for (auto* node = prepared_; node; node = node->next) {
++      if (node->wired) continue;
++      auto* value = static_cast<MTL::Allocation*>(node->allocation);
++      const auto bytes = value->allocatedSize();
++      if (current_size <= size && bytes <= size - current_size) {
++        wired_set_->addAllocation(value);
++        current_size += bytes;
++        node->wired = true;
++      }
++    }
+     // Add unwired allocations to the set
+     for (auto it = unwired_set_.begin(); it != unwired_set_.end();) {
+       auto buf_size = (*it)->allocatedSize();
+@@ -84,7 +127,8 @@
+       auto buf = static_cast<const MTL::Allocation*>(allocations->object(i));
+       wired_set_->removeAllocation(buf);
+       current_size -= buf->allocatedSize();
+-      unwired_set_.insert(buf);
++      if (auto* node = find_prepared(buf)) node->wired = false;
++      else unwired_set_.insert(buf);
+     }
+     wired_set_->commit();
+   }
+diff --git a/mlx/backend/metal/resident.h b/mlx/backend/metal/resident.h
+--- a/mlx/backend/metal/resident.h
++++ b/mlx/backend/metal/resident.h
+@@ -5,6 +5,7 @@
+ #include <unordered_set>
+ 
+ #include <Metal/Metal.hpp>
++#include "mlx/allocator.h"
+ 
+ namespace mlx::core::metal {
+ 
+@@ -24,11 +25,15 @@
+   void erase(MTL::Allocation* buf);
+ 
+   void resize(size_t size);
++  void insert_prepared(MTL::Allocation*, allocator::PreparedInputResidency&) noexcept;
++  void erase_prepared(allocator::PreparedInputResidency&) noexcept;
+ 
+  private:
+   NS::SharedPtr<MTL::ResidencySet> wired_set_;
+   std::unordered_set<const MTL::Allocation*> unwired_set_;
+   size_t capacity_{0};
++  allocator::PreparedInputResidency* prepared_{nullptr};
++  allocator::PreparedInputResidency* find_prepared(const MTL::Allocation*) noexcept;
+ };
+ 
+ } // namespace mlx::core::metal
+diff --git a/mlx/backend/no_gpu/allocator.cpp b/mlx/backend/no_gpu/allocator.cpp
+--- a/mlx/backend/no_gpu/allocator.cpp
++++ b/mlx/backend/no_gpu/allocator.cpp
+@@ -105,6 +105,9 @@
+ class CommonAllocator : public Allocator {
+   /** A general CPU allocator with buffer caching. */
+  public:
++  bool prepare_input_runtime(PreparedInputFacts& facts) override;
++  PreparedInputCause allocate_prepared_input(size_t, PreparedInputAllocation&) noexcept override;
++  void free_prepared_input(PreparedInputAllocation&) noexcept override;
+   virtual Buffer malloc(size_t size) override;
+   virtual void free(Buffer buffer) override;
+   virtual size_t size(Buffer buffer) const override;
+@@ -166,6 +169,47 @@
+   }
+ }
+ 
++bool CommonAllocator::prepare_input_runtime(PreparedInputFacts& facts) {
++  // Materializes this actual mutex and the host page-size static during ordinary setup.
++  const auto page = host_transfer_page_size();
++  std::lock_guard<std::mutex> guard(mutex_);
++  facts = {page, std::numeric_limits<size_t>::max(), HostTransferStorageKind::cpu,
++      sizeof(std::lock_guard<std::mutex>) + sizeof(void*) + sizeof(size_t) * 3};
++  return true;
++}
++PreparedInputCause CommonAllocator::allocate_prepared_input(
++    size_t bytes, PreparedInputAllocation& output) noexcept {
++  if (!bytes || bytes > std::numeric_limits<size_t>::max() - sizeof(size_t) -
++          (host_transfer_page_size() - 1)) return PreparedInputCause::invalid;
++  const auto capacity = host_transfer_page_size() *
++      ((bytes + sizeof(size_t) + host_transfer_page_size() - 1) / host_transfer_page_size());
++  if (!mutex_.try_lock()) return PreparedInputCause::busy;
++  std::lock_guard<std::mutex> guard(mutex_, std::adopt_lock);
++  if (active_memory_ > std::numeric_limits<size_t>::max() - capacity)
++    return PreparedInputCause::capacity;
++#ifdef _WIN32
++  void* memory = VirtualAlloc(nullptr, capacity, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
++#else
++  void* memory = ::mmap(nullptr, capacity, PROT_READ | PROT_WRITE,
++      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++  if (memory == MAP_FAILED) memory = nullptr;
++#endif
++  if (!memory) return PreparedInputCause::allocation_failed;
++  *static_cast<size_t*>(memory) = capacity - sizeof(size_t);
++  output.buffer = Buffer{memory};
++  output.capacity = capacity;
++  output.allocator = this;
++  active_memory_ += capacity;
++  peak_memory_ = std::max(peak_memory_, active_memory_);
++  return PreparedInputCause::success;
++}
++void CommonAllocator::free_prepared_input(PreparedInputAllocation& input) noexcept {
++  if (!input.buffer.ptr()) return;
++  { std::lock_guard<std::mutex> guard(mutex_); active_memory_ -= input.capacity; }
++  free_host_transfer_pages(input.buffer.ptr(), input.capacity);
++  input.buffer = Buffer{nullptr};
++}
++
+ Buffer CommonAllocator::malloc(size_t size) {
+   std::unique_lock lk(mutex_);
+   // Try cache first
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -3,9 +3,11 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cstring>
++#include <cstdlib>
+ #include <limits>
+ #include <new>
+ #include <thread>
++#include <iterator>
+ 
+ namespace mlx::core::submission {
+ namespace {
+@@ -34,6 +36,7 @@
+   void* allocation;
+   void* owner;
+   void (*retire)(void*);
++  bool direct;
+ };
+ } // namespace
+ 
+@@ -73,12 +76,13 @@
+     return false;
+   }
+   out = {capacity, total, alignment,
+-      sizeof(ArenaRetirement) + sizeof(ArenaConstruction) + sizeof(Loan)};
+-  return true;
+-}
+-
+-GraphQuota::GraphQuota(size_t capacity, void* owner, void (*retire)(void*)) noexcept
+-    : capacity_(capacity), owner_(owner), retire_(retire) {
++      sizeof(ArenaRetirement) + sizeof(ArenaConstruction) + sizeof(Loan) +
++      sizeof(PreparedBlock) * prepared_limit + sizeof(size_t) * 2};
++  return true;
++}
++
++GraphQuota::GraphQuota(size_t capacity, void* owner, void (*retire)(void*), bool direct) noexcept
++    : capacity_(capacity), direct_allocation_(direct), owner_(owner), retire_(retire) {
+   ::new (bytes()) Block{capacity, absent, absent, true};
+ }
+ 
+@@ -100,9 +104,10 @@
+   // Every allocator, including empty containers, and every allocated block
+   // owns a reference. Block return precedes releasing its allocation reference.
+   assert(occupied_ == 0);
+-  const ArenaRetirement retirement{this, owner_, retire_};
++  const ArenaRetirement retirement{this, owner_, retire_, direct_allocation_};
+   this->~GraphQuota();
+-  ::operator delete(retirement.allocation, std::align_val_t(alignment));
++  if (retirement.direct) std::free(retirement.allocation);
++  else ::operator delete(retirement.allocation, std::align_val_t(alignment));
+   if (retirement.retire) retirement.retire(retirement.owner);
+ }
+ size_t GraphQuota::occupied_bytes() const noexcept {
+@@ -116,7 +121,71 @@
+   return reinterpret_cast<Block*>(bytes() + offset);
+ }
+ 
++bool GraphQuota::allocation_extent(size_t requested, size_t align, size_t& out) noexcept {
++  size_t bytes;
++  if (!align || (align & (align - 1)) || align > alignment) return false;
++  return add(sizeof(Block) + sizeof(size_t), align - 1, bytes) &&
++      add(bytes, std::max(requested, size_t{1}), bytes) &&
++      align_up(bytes, alignment, out);
++}
++
++GraphQuota* GraphQuota::try_create(size_t capacity, void* owner, void (*retire)(void*)) noexcept {
++  GraphQuotaLayout facts;
++  if (!layout(capacity, facts)) return nullptr;
++  // malloc supplies max_align_t alignment and never invokes a C++ new_handler.
++  void* memory = std::malloc(facts.allocation_bytes);
++  if (!memory) return nullptr;
++  return ::new (memory) GraphQuota(capacity, owner, retire, true);
++}
++
++bool GraphQuota::prepare_blocks(const Request* requests, size_t count) noexcept {
++  if (count > prepared_limit) return false;
++  {
++    const Loan loan(*this);
++    if (preparing_) return false;
++    for (const auto& block : prepared_) if (block.pointer) return false;
++  }
++  // This method is used only while the closed source owns exclusive construction
++  // access. Existing leaves can retire, but cannot allocate through this arena.
++  for (size_t i = 0; i < count; ++i) {
++    auto* pointer = try_allocate(requests[i].bytes, requests[i].alignment);
++    if (!pointer) { finish_blocks(); return false; }
++    prepared_[i] = {pointer, requests[i].bytes, requests[i].alignment};
++  }
++  { const Loan loan(*this); preparing_ = true; }
++  return true;
++}
++void GraphQuota::finish_blocks() noexcept {
++  PreparedBlock unused[prepared_limit];
++  {
++    const Loan loan(*this);
++    preparing_ = false;
++    std::copy(std::begin(prepared_), std::end(prepared_), unused);
++    for (auto& block : prepared_) block = {};
++  }
++  for (const auto& block : unused)
++    if (block.pointer) deallocate(block.pointer, block.bytes, block.alignment);
++}
+ void* GraphQuota::allocate(size_t requested, size_t align) {
++  {
++    const Loan loan(*this);
++    if (preparing_) {
++      for (auto& block : prepared_) {
++        if (block.pointer && block.bytes == requested && block.alignment == align) {
++          void* pointer = block.pointer;
++          block = {};
++          return pointer; // reservation already owns the physical reference
++        }
++      }
++      // ABI/layout drift is a broken closed-constructor invariant, never a
++      // heap fallback or a dynamically allocated exception in original work.
++      std::terminate();
++    }
++  }
++  if (auto* result = try_allocate(requested, align)) return result;
++  throw GraphQuotaError(GraphFailure::exhausted);
++}
++void* GraphQuota::try_allocate(size_t requested, size_t align) noexcept {
+   void* result = nullptr;
+   {
+     const Loan loan(*this);
+@@ -149,7 +218,7 @@
+     result = c.result;
+     // No scratch pointer is an owning reference or consulted outside this loan.
+   }
+-  if (!result) throw GraphQuotaError(GraphFailure::exhausted);
++  if (!result) return nullptr;
+   retain(); // independent allocation custody, beyond any allocator/control owner
+   return result;
+ }
+diff --git a/mlx/graph_quota.h b/mlx/graph_quota.h
+--- a/mlx/graph_quota.h
++++ b/mlx/graph_quota.h
+@@ -40,6 +40,15 @@
+  public:
+   static bool layout(size_t capacity, GraphQuotaLayout& out) noexcept;
+   static GraphQuota* create(size_t capacity, void* owner, void (*retire)(void*));
++  static GraphQuota* try_create(size_t capacity, void* owner, void (*retire)(void*)) noexcept;
++  // Exact worst-alignment block extent used by both the allocator and source recipes.
++  static bool allocation_extent(size_t bytes, size_t alignment, size_t& out) noexcept;
++  struct Request { size_t bytes; size_t alignment; };
++  // A source-private arena can reserve one leaf's concrete blocks without throwing.
++  // No ordinary allocator is used if a prepared constructor requests a mismatch.
++  bool prepare_blocks(const Request* requests, size_t count) noexcept;
++  void finish_blocks() noexcept;
++  void* try_allocate(size_t, size_t) noexcept;
+   void retain() noexcept;
+   void release() noexcept;
+   size_t capacity() const noexcept { return capacity_; }
+@@ -48,6 +57,10 @@
+   void deallocate(void*, size_t, size_t) noexcept;
+  private:
+   struct Block;
++  static constexpr size_t prepared_limit = 8;
++  struct PreparedBlock { void* pointer = nullptr; size_t bytes = 0; size_t alignment = 0; };
++  PreparedBlock prepared_[prepared_limit]{};
++  bool preparing_{false};
+   struct Loan;
+   struct Scratch {
+     void* result = nullptr;
+@@ -56,7 +69,7 @@
+     size_t offset = 0, start = 0, pointer = 0, used = 0;
+     size_t address = 0, remainder = 0, next = 0;
+   } scratch_;
+-  GraphQuota(size_t, void*, void (*)(void*)) noexcept;
++  GraphQuota(size_t, void*, void (*)(void*), bool direct = false) noexcept;
+   ~GraphQuota() = default;
+   std::byte* bytes() noexcept;
+   Block* block(size_t) noexcept;
+@@ -64,6 +77,7 @@
+   mutable std::atomic_flag loan_ = ATOMIC_FLAG_INIT;
+   size_t capacity_;
+   size_t occupied_{0};
++  bool direct_allocation_{false};
+   void* owner_;
+   void (*retire_)(void*);
+ };
+diff --git a/mlx/prepared_input.cpp b/mlx/prepared_input.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/prepared_input.cpp
+@@ -0,0 +1,161 @@
++#include "mlx/prepared_input.h"
++#include <algorithm>
++#include <climits>
++#include <limits>
++#include <new>
++#include <utility>
++
++namespace mlx::core {
++namespace {
++using Cause = allocator::PreparedInputCause;
++using Quota = submission::GraphQuota;
++bool add(size_t a, size_t b, size_t& out) noexcept {
++  if (a > std::numeric_limits<size_t>::max() - b) return false;
++  out = a + b; return true;
++}
++bool multiply(size_t a, size_t b, size_t& out) noexcept {
++  if (b && a > std::numeric_limits<size_t>::max() / b) return false;
++  out = a * b; return true;
++}
++struct Construction {
++  Quota::Request requests[8];
++  size_t count{0};
++  PreparedInputSlotLayout layout;
++  uint64_t generation{0};
++  void* memory{nullptr};
++  allocator::PreparedInputAllocation* backing{nullptr};
++  size_t maximum{0};
++  Cause cause{Cause::invalid};
++};
++struct FinishBlocks {
++  Quota* quota;
++  ~FinishBlocks() { quota->finish_blocks(); }
++};
++struct Incoming {
++  allocator::PreparedInputAllocation* backing;
++  ~Incoming() { if (backing) backing->destroy(); }
++};
++}
++
++void allocator::PreparedInputAllocation::destroy() noexcept {
++  auto* original_quota = quota;
++  if (allocator) allocator->free_prepared_input(*this);
++  this->~PreparedInputAllocation();
++  original_quota->deallocate(this, sizeof(PreparedInputAllocation), alignof(PreparedInputAllocation));
++}
++
++bool PreparedInputLeaf::requests(size_t rank, Quota::Request* out, size_t& count) noexcept {
++#ifndef _LIBCPP_VERSION
++  // No guessed standard-library control layout for another native ABI.
++  return false;
++#else
++  using DescAllocator = submission::GraphAllocator<array::ArrayDesc>;
++  using DescControl = std::__shared_ptr_pointer<array::ArrayDesc*, array::RetireDescriptor, DescAllocator>;
++  using DataAllocator = submission::GraphAllocator<array::Data>;
++  using DataControl = std::__shared_ptr_emplace<array::Data, DataAllocator>;
++  const Quota::Request fixed[] = {
++    {sizeof(PreparedInputLeaf), alignof(PreparedInputLeaf)},
++    {sizeof(allocator::PreparedInputAllocation), alignof(allocator::PreparedInputAllocation)},
++    {sizeof(array::ArrayDesc), alignof(array::ArrayDesc)},
++    {sizeof(DescControl), alignof(DescControl)},
++    {sizeof(DataControl), alignof(DataControl)},
++  };
++  count = 0;
++  for (const auto& request : fixed) out[count++] = request;
++  if (rank > 10) {
++    // Exact first-growth rule of Shape/Strides SmallVector<...,10>.
++    const auto capacity = std::max(rank, size_t{20});
++    size_t shape_bytes, stride_bytes;
++    if (!multiply(capacity, sizeof(Shape::value_type), shape_bytes) ||
++        !multiply(capacity, sizeof(Strides::value_type), stride_bytes)) return false;
++    out[count++] = {shape_bytes, alignof(Shape::value_type)};
++    out[count++] = {stride_bytes, alignof(Strides::value_type)};
++  }
++  return true;
++#endif
++}
++
++bool PreparedInputLeaf::layout(const allocator::PreparedInputFacts& facts,
++    const PreparedInputSource& source, PreparedInputSlotLayout& out) noexcept {
++  if (!source.shape || !source.rank || source.rank > static_cast<size_t>(INT_MAX) ||
++      source.kind > 2 || !facts.page_size || (facts.page_size & (facts.page_size - 1))) return false;
++  size_t elements = 1;
++  for (size_t i = 0; i < source.rank; ++i) {
++    if (!source.shape[i] || source.shape[i] > static_cast<size_t>(INT_MAX) ||
++        !multiply(elements, source.shape[i], elements)) return false;
++  }
++  if (elements != source.elements) return false;
++  size_t bytes, rounded;
++  if (!multiply(elements, size_t{4}, bytes) || bytes > static_cast<size_t>(PTRDIFF_MAX)) return false;
++  if (facts.kind == allocator::HostTransferStorageKind::cpu) {
++    if (!add(bytes, sizeof(size_t), bytes)) return false;
++  } else if (facts.kind != allocator::HostTransferStorageKind::metal_shared) return false;
++  if (!add(bytes, facts.page_size - 1, rounded)) return false;
++  rounded &= ~(facts.page_size - 1);
++  if (rounded > facts.maximum) return false;
++  Construction c;
++  if (!requests(source.rank, c.requests, c.count)) return false;
++  size_t metadata = 0;
++  for (size_t i = 0; i < c.count; ++i) {
++    size_t extent;
++    if (!Quota::allocation_extent(c.requests[i].bytes, c.requests[i].alignment, extent) ||
++        !add(metadata, extent, metadata)) return false;
++  }
++  out = {metadata, rounded,
++      sizeof(Construction) + sizeof(FinishBlocks) + sizeof(Incoming) + sizeof(Shape) +
++      sizeof(submission::GraphAllocator<array::ArrayDesc>) + sizeof(std::shared_ptr<array::ArrayDesc>) +
++      sizeof(std::shared_ptr<array::Data>) + sizeof(array) + sizeof(PreparedInputSource) +
++      sizeof(allocator::PreparedInputFacts) + sizeof(size_t) * 5 + facts.controls};
++  return true;
++}
++
++Cause PreparedInputLeaf::create(allocator::Allocator& allocator,
++    const allocator::PreparedInputFacts& facts, Quota* quota,
++    const PreparedInputSource& source, PreparedInputLeaf*& output) noexcept {
++  Construction c;
++  if (output || !quota || !source.data || !layout(facts, source, c.layout) ||
++      !requests(source.rank, c.requests, c.count)) return Cause::invalid;
++  if (!quota->prepare_blocks(c.requests, c.count)) return Cause::capacity;
++  FinishBlocks finish{quota};
++  c.generation = next_allocation_generation();
++  if (!c.generation) return Cause::identity_exhausted;
++  c.memory = quota->allocate(sizeof(allocator::PreparedInputAllocation), alignof(allocator::PreparedInputAllocation));
++  c.backing = ::new (c.memory) allocator::PreparedInputAllocation{};
++  c.backing->quota = quota;
++  Incoming incoming{c.backing};
++  c.cause = allocator.allocate_prepared_input(source.elements * size_t{4}, *c.backing);
++  if (c.cause != Cause::success) return c.cause;
++  if (c.backing->capacity != c.layout.backing_bytes) std::terminate();
++  Shape shape(source.rank, Shape::allocator_type{quota});
++  for (size_t i = 0; i < source.rank; ++i) {
++    shape[i] = static_cast<int>(source.shape[i]);
++    c.maximum = std::max(c.maximum, source.shape[i]);
++  }
++  const Dtype dtype = source.kind == 0 ? uint32 : source.kind == 1 ? int32 : float32;
++  submission::GraphAllocator<array::ArrayDesc> descriptor_allocator(quota);
++  auto* memory = descriptor_allocator.allocate(1);
++  auto* descriptor = ::new (memory) array::ArrayDesc(std::move(shape), dtype, quota);
++  descriptor->allocation_quota = quota;
++  std::shared_ptr<array::ArrayDesc> owned(descriptor, array::RetireDescriptor{}, descriptor_allocator);
++  owned->data = std::allocate_shared<array::Data>(
++      submission::GraphAllocator<array::Data>{quota}, c.backing, c.generation);
++  incoming.backing = nullptr;
++  owned->data_size = source.elements;
++  owned->flags = {true, true, source.elements <= 1 || source.elements == c.maximum};
++  void* destination = c.backing->buffer.raw_ptr();
++  if (source.kind == 0)
++    std::copy_n(static_cast<const uint32_t*>(source.data), source.elements, static_cast<uint32_t*>(destination));
++  else if (source.kind == 1)
++    std::copy_n(static_cast<const int32_t*>(source.data), source.elements, static_cast<int32_t*>(destination));
++  else
++    std::copy_n(static_cast<const float*>(source.data), source.elements, static_cast<float*>(destination));
++  c.memory = quota->allocate(sizeof(PreparedInputLeaf), alignof(PreparedInputLeaf));
++  output = ::new (c.memory) PreparedInputLeaf(array(std::move(owned)), quota);
++  return Cause::success;
++}
++void PreparedInputLeaf::destroy() noexcept {
++  auto* quota = quota_;
++  this->~PreparedInputLeaf();
++  quota->deallocate(this, sizeof(PreparedInputLeaf), alignof(PreparedInputLeaf));
++}
++} // namespace mlx::core
+diff --git a/mlx/prepared_input.h b/mlx/prepared_input.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/prepared_input.h
+@@ -0,0 +1,36 @@
++#pragma once
++#include "mlx/array.h"
++#include "mlx/graph_quota.h"
++
++namespace mlx::core {
++struct PreparedInputSlotLayout {
++  size_t metadata_bytes{0};
++  size_t backing_bytes{0};
++  size_t controls{0};
++};
++// Borrowed validated source input; no callback, erased owner or arbitrary array.
++struct PreparedInputSource {
++  const void* data;
++  const size_t* shape;
++  size_t rank;
++  size_t elements;
++  unsigned kind; // 0 U32, 1 I32, 2 F32
++};
++class MLX_API PreparedInputLeaf final {
++ public:
++  static bool layout(const allocator::PreparedInputFacts&, const PreparedInputSource&,
++      PreparedInputSlotLayout&) noexcept;
++  static allocator::PreparedInputCause create(allocator::Allocator&,
++      const allocator::PreparedInputFacts&, submission::GraphQuota*,
++      const PreparedInputSource&, PreparedInputLeaf*&) noexcept;
++  void destroy() noexcept;
++  const array& value() const noexcept { return value_; }
++ private:
++  PreparedInputLeaf(array&& value, submission::GraphQuota* quota) noexcept
++      : value_(std::move(value)), quota_(quota) {}
++  ~PreparedInputLeaf() = default;
++  static bool requests(size_t, submission::GraphQuota::Request*, size_t&) noexcept;
++  array value_;
++  submission::GraphQuota* quota_;
++};
++} // namespace mlx::core

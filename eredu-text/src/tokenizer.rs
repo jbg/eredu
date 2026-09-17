@@ -4,6 +4,7 @@ use std::{
     ops::{Deref, DerefMut},
     path::Path,
     str::FromStr,
+    sync::Arc,
 };
 
 use minijinja::{Environment, Template};
@@ -14,6 +15,8 @@ use tokenizers::Encoding;
 use crate::error::Error;
 
 mod json;
+/// Shared exact structural-token validation with caller-owned destinations.
+pub mod structural;
 
 const DEFAULT_CHAT_TEMPLATE_NAME: &str = "default";
 const TOOL_USE_CHAT_TEMPLATE_NAME: &str = "tool_use";
@@ -134,9 +137,33 @@ impl ModelChatTemplate {
 /// Wrapper around [`tokenizers::Tokenizer`] and [`minijinja::Environment`]
 /// providing more utilities.
 pub struct Tokenizer {
-    inner: tokenizers::Tokenizer,
+    inner: Arc<tokenizers::Tokenizer>,
     env: Environment<'static>,
     template_kwargs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Owning, read-only snapshot of one tokenizer configuration.
+///
+/// Clones share only the HF tokenizer, not chat-template caches or variables.
+/// Mutating the original wrapper preserves this snapshot through copy-on-write.
+/// Sharing is an ownership contract, not a storage bound or funding authority.
+///
+/// ```compile_fail
+/// fn mutate(mut snapshot: eredu_text::tokenizer::TokenizerSnapshot) {
+///     snapshot.add_tokens([tokenizers::AddedToken::from("changed", false)]).unwrap();
+/// }
+/// ```
+#[derive(Clone)]
+pub struct TokenizerSnapshot {
+    inner: Arc<tokenizers::Tokenizer>,
+}
+
+impl Deref for TokenizerSnapshot {
+    type Target = tokenizers::Tokenizer;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 struct TemplateKwargs<'defaults, 'overrides> {
@@ -153,20 +180,43 @@ impl FromStr for Tokenizer {
 }
 
 impl Tokenizer {
-    /// Wraps a Hugging Face tokenizer with chat-template support.
+    /// Wraps an already-constructed Hugging Face tokenizer with chat-template support.
+    /// This unmanaged import establishes neither construction provenance nor allocation authority.
     pub fn from_tokenizer(tokenizer: tokenizers::Tokenizer) -> Self {
-        let mut env = Environment::new();
-        // Match the Jinja environment used by Transformers chat templates.
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_filter("tojson", json::tojson);
-        env.add_function("dict", python_dict);
+        let env = chat_environment();
         Self {
-            inner: tokenizer,
+            inner: Arc::new(tokenizer),
             env,
             template_kwargs: serde_json::Map::new(),
         }
+    }
+
+    /// Retains this exact immutable tokenizer configuration without copying it.
+    ///
+    /// The snapshot may outlive the wrapper. It excludes mutable chat-template
+    /// state and exposes no mutable or raw Arc exit. Wrapper mutation may copy
+    /// the HF tokenizer if a snapshot is still alive; that copy is not admission.
+    pub fn snapshot(&self) -> TokenizerSnapshot {
+        TokenizerSnapshot {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Constructs with an explicit model-cache policy before HF models are built.
+    /// This does not bound JSON parsing, HF residence, templates or tokenization.
+    pub fn from_bytes_with_cache_policy(
+        bytes: impl AsRef<[u8]>,
+        policy: tokenizers::ModelCachePolicy,
+    ) -> tokenizers::Result<Self> {
+        tokenizers::Tokenizer::from_bytes_with_cache_policy(bytes, policy).map(Self::from_tokenizer)
+    }
+
+    /// Reads a tokenizer with an explicit model-cache construction policy.
+    pub fn from_file_with_cache_policy(
+        file: impl AsRef<Path>,
+        policy: tokenizers::ModelCachePolicy,
+    ) -> tokenizers::Result<Self> {
+        tokenizers::Tokenizer::from_file_with_cache_policy(file, policy).map(Self::from_tokenizer)
     }
 
     /// Replaces the default variables supplied to chat templates.
@@ -317,9 +367,13 @@ impl Deref for Tokenizer {
 
 impl DerefMut for Tokenizer {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+        Arc::make_mut(&mut self.inner)
     }
 }
+
+#[cfg(test)]
+#[path = "tokenizer/snapshot_tests.rs"]
+mod snapshot_tests;
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -620,8 +674,19 @@ where
     R: Serialize + 'a,
     T: Serialize + 'a,
 {
-    env.add_function("strftime_now", |format: &str| {
-        chrono::Local::now().format(format).to_string()
+    // One environmental snapshot keeps all calls within this render coherent.
+    let now = chrono::Local::now();
+    let clock = crate::chat_storage::ChatClockSnapshot::from_local(now.naive_local());
+    env.add_function("strftime_now", move |format: &str| {
+        if crate::chat_storage::ChatClockSnapshot::supports(format) {
+            let mut output = String::new();
+            clock
+                .write(&mut output, format)
+                .expect("validated local date format");
+            output
+        } else {
+            now.format(format).to_string()
+        }
     });
 
     let ApplyChatTemplateArgs {
@@ -642,12 +707,7 @@ where
     let template = match chat_template_id {
         Some(chat_template_id) => env.get_template(chat_template_id)?,
         None => {
-            let selected_template_id = match selected.identity() {
-                ChatTemplateIdentity::Single => model_id.to_owned(),
-                ChatTemplateIdentity::Named(name) => {
-                    format!("{model_id}::chat_template::{name}")
-                }
-            };
+            let selected_template_id = selected_template_id(model_id, &selected);
             match env.get_template(&selected_template_id) {
                 Ok(template) => template,
                 Err(_) => {
@@ -678,27 +738,8 @@ where
 /// tracking block. Rendering without an assistant mask treats it as a
 /// transparent block while preserving the template's whitespace controls.
 fn normalize_generation_blocks(template: &str) -> String {
-    let mut output = String::with_capacity(template.len());
-    let mut remaining = template;
-    while let Some(start) = remaining.find("{%") {
-        output.push_str(&remaining[..start]);
-        let statement = &remaining[start..];
-        let Some(end) = statement.find("%}") else {
-            output.push_str(statement);
-            return output;
-        };
-        let end = end + 2;
-        let tag = &statement[..end];
-        let body = tag[2..tag.len() - 2].trim().trim_matches('-').trim();
-        match body {
-            "generation" => output.push_str(&tag.replacen("generation", "if true", 1)),
-            "endgeneration" => output.push_str(&tag.replacen("endgeneration", "endif", 1)),
-            _ => output.push_str(tag),
-        }
-        remaining = &statement[end..];
-    }
-    output.push_str(remaining);
-    output
+    String::from_utf8(crate::generation_blocks::Bytes::new(template.bytes()).collect())
+        .expect("normalization preserves valid UTF-8")
 }
 
 /// Jinja permits a conditional expression directly as a keyword argument,
@@ -1102,10 +1143,10 @@ mod tests {
     use std::{collections::BTreeSet, path::PathBuf};
 
     use crate::tokenizer::{
-        apply_chat_template, apply_chat_template_json, load_model_chat_template_from_file,
-        load_model_chat_template_from_str, normalize_conditional_keyword_arguments,
-        normalize_generation_blocks, ApplyChatTemplateArgs, ChatTemplateIdentity, Conversation,
-        ModelChatTemplate, Role, Tokenizer,
+        ApplyChatTemplateArgs, ChatTemplateIdentity, Conversation, ModelChatTemplate, Role,
+        Tokenizer, apply_chat_template, apply_chat_template_json,
+        load_model_chat_template_from_file, load_model_chat_template_from_str,
+        normalize_conditional_keyword_arguments, normalize_generation_blocks,
     };
 
     /// Returns the path to test fixtures. Uses TEST_MODEL_DIR env var if set,
@@ -1251,8 +1292,10 @@ mod tests {
             "<atem:function_calls>\n<atem:invoke name=\"lookup\">\n",
             "<atem:parameter name=\"value\">probe-value</atem:parameter>"
         )));
-        assert!(history
-            .contains("<|start|>tool lookup<|message|><tool_output name=\"lookup\">\nresult"));
+        assert!(
+            history
+                .contains("<|start|>tool lookup<|message|><tool_output name=\"lookup\">\nresult")
+        );
     }
 
     #[test]
@@ -1459,11 +1502,13 @@ mod tests {
     fn test_apply_chat_template() {
         let file = fixtures_dir().join("tokenizer_config.json");
         let model_chat_template = load_model_chat_template_from_file(file).unwrap().unwrap();
-        assert!(!model_chat_template
-            .select(None)
-            .unwrap()
-            .template()
-            .is_empty());
+        assert!(
+            !model_chat_template
+                .select(None)
+                .unwrap()
+                .template()
+                .is_empty()
+        );
 
         let model_id = "mlx-community/Qwen3-4B-bf16".to_string();
         let conversations = vec![Conversation {
@@ -1614,11 +1659,13 @@ mod tests {
         let model_chat_template = load_model_chat_template_from_file(tokenizer_config_file)
             .unwrap()
             .unwrap();
-        assert!(!model_chat_template
-            .select(None)
-            .unwrap()
-            .template()
-            .is_empty());
+        assert!(
+            !model_chat_template
+                .select(None)
+                .unwrap()
+                .template()
+                .is_empty()
+        );
 
         let args = ApplyChatTemplateArgs {
             conversations: [conversations.into()],
@@ -1654,11 +1701,13 @@ mod tests {
         let model_chat_template = load_model_chat_template_from_file(tokenizer_config_file)
             .unwrap()
             .unwrap();
-        assert!(!model_chat_template
-            .select(None)
-            .unwrap()
-            .template()
-            .is_empty());
+        assert!(
+            !model_chat_template
+                .select(None)
+                .unwrap()
+                .template()
+                .is_empty()
+        );
 
         let args = ApplyChatTemplateArgs {
             conversations: [conversations.into()],
@@ -1677,3 +1726,29 @@ mod tests {
         println!("{:?}", encodings.iter().flat_map(|e| e.get_ids()));
     }
 }
+
+#[cfg(test)]
+#[path = "tokenizer/model_cache_tests.rs"]
+mod model_cache_tests;
+
+fn chat_environment() -> Environment<'static> {
+    let mut env = Environment::new();
+    // Match the Jinja environment used by Transformers chat templates.
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
+    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
+    env.add_filter("tojson", json::tojson);
+    env.add_function("dict", python_dict);
+    env
+}
+
+fn selected_template_id(model_id: &str, selected: &SelectedChatTemplate<'_>) -> String {
+    match selected.identity() {
+        ChatTemplateIdentity::Single => model_id.to_owned(),
+        ChatTemplateIdentity::Named(name) => format!("{model_id}::chat_template::{name}"),
+    }
+}
+
+/// Development-only ordinary compiler image emission, never allocation authority.
+#[cfg(feature = "development-chat-recipe")]
+pub mod development_recipe;

@@ -4,6 +4,8 @@
 #![warn(missing_docs)]
 
 mod checkpoint;
+/// Shared small checkpoint fixtures for native and public conformance.
+pub mod fixtures;
 /// Host reference arithmetic for signed component reconstruction.
 pub mod component_attribution;
 mod distribution;

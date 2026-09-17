@@ -1,0 +1,212 @@
+diff --git a/mlx/distributed/CMakeLists.txt b/mlx/distributed/CMakeLists.txt
+--- a/mlx/distributed/CMakeLists.txt
++++ b/mlx/distributed/CMakeLists.txt
+@@ -2,6 +2,7 @@
+   mlx
+   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/ops.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/constructor.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cpp)
+ 
+ if(MLX_BUILD_CPU AND NOT WIN32)
+diff --git a/mlx/distributed/constructor.cpp b/mlx/distributed/constructor.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/distributed/constructor.cpp
+@@ -0,0 +1,127 @@
++#include "mlx/distributed/constructor.h"
++#include "mlx/distributed/primitives.h"
++#include "mlx/prepared_input.h"
++#include "mlx/submission.h"
++#include <algorithm>
++#include <climits>
++#include <limits>
++#include <memory>
++
++namespace mlx::core::distributed {
++namespace {
++using submission::GraphAllocator;
++using submission::GraphQuota;
++using submission::GraphConstruction;
++bool multiply(size_t a, size_t b, size_t& out) noexcept {
++  if (b && a > size_t(PTRDIFF_MAX) / b) return false;
++  out = a * b; return true;
++}
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++template<class T> GraphQuota::Request primitive_request() noexcept {
++  using Control = std::__shared_ptr_emplace<T, GraphAllocator<T>>;
++  return {sizeof(Control),alignof(Control)};
++}
++#endif
++}
++size_t constructor_storage_inspection_controls() noexcept {
++  return sizeof(GroupConstructorStorage) + sizeof(GroupStorageInventory) +
++      sizeof(GraphQuota::Request) * 3 + sizeof(const Group*) + sizeof(const array*) +
++      sizeof(GroupWorkerOperation) + sizeof(int) * 3 + sizeof(size_t) * 9 + sizeof(bool) * 4 +
++      GraphConstruction::layout_control_bytes();
++}
++bool constructor_storage(const Group& group, const array& input,
++    GroupWorkerOperation operation, int peer, GroupConstructorStorage& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  if (static_cast<unsigned>(operation) > 5 || group.terminal_submission()) return false;
++  GroupStorageInventory inventory;
++  // Only these concrete implementations have the qualified scalar rank/size
++  // readers. Requested backend and geometry never qualify another native type.
++  if (!group.storage_inventory(inventory) ||
++      (inventory.kind != GroupStorageKind::ring && inventory.kind != GroupStorageKind::empty)) return false;
++  const int members = group.size(), rank = group.rank();
++  if (members <= 0 || rank < 0 || rank >= members || input.ndim() > size_t(INT_MAX)) return false;
++  const bool direct = operation == GroupWorkerOperation::send || operation == GroupWorkerOperation::recv;
++  if (direct && (members == 1 || peer < 0 || peer >= members)) return false;
++  GroupConstructorStorage value;
++  value.output_rank = input.ndim();
++  value.output_elements = 1;
++  // Reject overflowing output geometry before ordinary all_gather multiplies
++  // its leading signed extent. Zero-dimensional gather produces [members].
++  for (size_t i = 0; i < input.ndim(); ++i) {
++    const auto dimension = input.shape()[i];
++    if (dimension < 0 || !multiply(value.output_elements,size_t(dimension),value.output_elements)) return false;
++  }
++  if (operation == GroupWorkerOperation::gather && members > 1) {
++    if (input.ndim() && input.shape()[0] > INT_MAX / members) return false;
++    if (!multiply(value.output_elements,size_t(members),value.output_elements)) return false;
++    if (!value.output_rank) value.output_rank = 1;
++  }
++  size_t bytes;
++  if (!multiply(value.output_elements,input.itemsize(),bytes)) return false;
++  // Even a singleton identity returns a fresh qualified C handle. It does not
++  // manufacture a descriptor, primitive, input edge or communicator task.
++  value.request_bytes[0] = sizeof(PreparedInputArray);
++  value.request_alignments[0] = alignof(PreparedInputArray);
++  value.request_counts[0] = 1;
++  value.named_control_bytes = constructor_storage_inspection_controls() +
++      sizeof(Group) * 5 + sizeof(std::optional<Group>) * 2 + sizeof(array) * 4 +
++      sizeof(Shape) * 4 + sizeof(Strides) + sizeof(ArrayVector) * 3 +
++      sizeof(Stream) * 3 + sizeof(StreamOrDevice) * 2 +
++      sizeof(std::shared_ptr<Primitive>) * 3 + sizeof(GraphAllocator<array>) * 3 +
++      PreparedInputLeaf::descriptor_shared_control_bytes() +
++      PreparedInputLeaf::descriptor_allocator_control_bytes();
++  if (members > 1) {
++    GraphQuota::Request descriptor[2];
++    if (!PreparedInputLeaf::descriptor_shell_requests(descriptor)) return false;
++    for (size_t i=0;i<2;++i) {
++      value.request_bytes[1+i]=descriptor[i].bytes;
++      value.request_alignments[1+i]=descriptor[i].alignment;
++      value.request_counts[1+i]=1;
++    }
++    GraphQuota::Request primitive;
++    switch(operation) {
++      case GroupWorkerOperation::sum: case GroupWorkerOperation::maximum: case GroupWorkerOperation::minimum:
++        primitive=primitive_request<AllReduce>(); break;
++      case GroupWorkerOperation::gather: primitive=primitive_request<AllGather>(); break;
++      case GroupWorkerOperation::send: primitive=primitive_request<Send>(); break;
++      case GroupWorkerOperation::recv: primitive=primitive_request<Recv>(); break;
++      default: return false;
++    }
++    value.request_bytes[3]=primitive.bytes;
++    value.request_alignments[3]=primitive.alignment;
++    value.request_counts[3]=1;
++    value.primitives=1;
++    value.input_edges=operation == GroupWorkerOperation::recv ? 0 : 1;
++    value.request_bytes[4]=sizeof(array);
++    value.request_alignments[4]=alignof(array);
++    value.request_counts[4]=value.input_edges;
++    if (value.output_rank > 10) {
++      // Ordinary Shape copy allocates exact rank; subsequent moves share the
++      // same current Graph and steal it. ArrayDesc::init grows Strides from 10.
++      if (!multiply(value.output_rank,sizeof(Shape::value_type),value.request_bytes[5]) ||
++          !multiply(std::max(value.output_rank,size_t{20}),sizeof(Strides::value_type),value.request_bytes[6])) return false;
++      value.request_alignments[5]=alignof(Shape::value_type);
++      value.request_alignments[6]=alignof(Strides::value_type);
++      value.request_counts[5]=value.request_counts[6]=1;
++    }
++  }
++  if (!GraphConstruction::complete_layout(value)) return false;
++  out=value; return true;
++#endif
++}
++} // namespace mlx::core::distributed
++
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_distributed(GraphQuota& quota,uint64_t scope,
++    const distributed::Group& group,const array& input,
++    distributed::GroupWorkerOperation operation,int peer,GraphConstruction*& output) noexcept {
++  const auto context=current_graph_construction_context();
++  if (output || !scope || context.worker || context.dispatch || context.scope != scope ||
++      current_graph_quota() != &quota) return GraphFailure::foreign_parent;
++  distributed::GroupConstructorStorage actual;
++  if (!distributed::constructor_storage(group,input,operation,peer,actual)) return GraphFailure::invalid_layout;
++  return create_layout(quota,scope,nullptr,actual,output);
++}
++} // namespace mlx::core::submission
+diff --git a/mlx/distributed/constructor.h b/mlx/distributed/constructor.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/distributed/constructor.h
+@@ -0,0 +1,13 @@
++#pragma once
++#include "mlx/distributed/distributed.h"
++#include "mlx/graph_construction.h"
++namespace mlx::core::distributed {
++// Exact host-only lazy constructor. No Data/backing, Eval, task, completion or
++// persistent communicator allowance. The original source remains borrowed.
++struct GroupConstructorStorage : submission::GraphConstructionLayout {
++  size_t output_rank{0}, output_elements{0}, primitives{0}, input_edges{0};
++};
++MLX_API bool constructor_storage(const Group&, const array&, GroupWorkerOperation,
++    int peer, GroupConstructorStorage&) noexcept;
++MLX_API size_t constructor_storage_inspection_controls() noexcept;
++} // namespace mlx::core::distributed
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -1,5 +1,6 @@
+ #pragma once
+ #include "mlx/graph_quota.h"
++namespace mlx::core { class array; namespace distributed { class Group; enum class GroupWorkerOperation : unsigned; } }
+ 
+ namespace mlx::core::submission {
+ // Internal closed-producer recipe. Classes reserve maximum byte extents at
+@@ -139,9 +140,14 @@
+ // GraphQuota. No inner arena, fallback, refill or recycled construction credit.
+ class MLX_API GraphConstruction final {
+  public:
++  static size_t layout_control_bytes() noexcept;
+   static bool complete_layout(GraphConstructionLayout&) noexcept;
+   static GraphFailure create(GraphQuota&, uint64_t scope,
+       const PointwiseGraphLayout&, GraphConstruction*&) noexcept;
++  // Actual distributed source, not a caller-provided byte/count envelope.
++  static GraphFailure create_distributed(GraphQuota&, uint64_t scope,
++      const distributed::Group&, const array&, distributed::GroupWorkerOperation,
++      int peer, GraphConstruction*&) noexcept;
+   static GraphFailure create_resident(GraphQuota&, uint64_t scope,
+       const ResidentGraphLayout&, GraphConstruction*&) noexcept;
+   static GraphFailure create_eval(GraphQuota&, uint64_t scope,
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -347,6 +347,11 @@
+   release();
+ }
+ 
++size_t GraphConstruction::layout_control_bytes() noexcept {
++  return sizeof(GraphConstruction*) + sizeof(GraphQuotaRef) +
++      sizeof(GraphConstructionContext) + sizeof(GraphQuota::Loan) +
++      sizeof(size_t) * 10 + sizeof(SizeClass*) + sizeof(GraphFailure);
++}
+ bool GraphConstruction::complete_layout(GraphConstructionLayout& value) noexcept {
+   size_t count = 0, requested = 0, extents = 0;
+   for (size_t i = 0; i < GraphConstructionLayout::classes; ++i) {
+@@ -375,9 +380,7 @@
+       !add(requested, value.slots_bytes, value.requested_bytes) ||
+       !add(extents, header_extent, extents) ||
+       !add(extents, slots_extent, value.allocation_extents)) return false;
+-  value.named_control_bytes += sizeof(GraphConstruction*) + sizeof(GraphQuotaRef) +
+-      sizeof(GraphConstructionContext) + sizeof(GraphQuota::Loan) +
+-      sizeof(size_t) * 10 + sizeof(SizeClass*) + sizeof(GraphFailure);
++  value.named_control_bytes += layout_control_bytes();
+   return true;
+ }
+ GraphFailure GraphConstruction::create(GraphQuota& quota, uint64_t scope,

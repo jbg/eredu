@@ -635,20 +635,27 @@ where
         )?,
         TokenMixer::ShortConvolution(convolution) => {
             let role = StateTensorRole::Convolution { slot: 0 };
-            let result = {
-                let history = state.fixed_component(role).map_err(Error::backend)?;
-                match parallel {
-                    Some(parallel) => convolution.forward_parallel(
-                        &normalized,
-                        history.as_ref(),
-                        parallel,
-                        context,
-                    )?,
-                    None => convolution.forward(&normalized, history.as_ref(), context)?,
-                }
+            // Width one has no carried history and its declared state is
+            // NoState. It neither reads nor advances a fixed-state frontier.
+            let carries_history = convolution.convolution.history_len() != 0;
+            let history = if carries_history {
+                state
+                    .fixed_component(role)
+                    .map_err(Error::backend)?
+                    .as_ref()
+            } else {
+                None
             };
-            *state.fixed_component(role).map_err(Error::backend)? = result.history;
-            state.advance_fixed(hidden.dim(1)).map_err(Error::backend)?;
+            let result = match parallel {
+                Some(parallel) => {
+                    convolution.forward_parallel(&normalized, history, parallel, context)?
+                }
+                None => convolution.forward(&normalized, history, context)?,
+            };
+            if carries_history {
+                *state.fixed_component(role).map_err(Error::backend)? = result.history;
+                state.advance_fixed(hidden.dim(1)).map_err(Error::backend)?;
+            }
             result.output
         }
     };
@@ -698,7 +705,7 @@ fn short_convolution_spec(
 ) -> Result<GatedShortConvolutionSpec, Error> {
     let prefix = format!("{root}.conv");
     let parameter = |name: String| ParameterSpec::trainable(name).map_err(Error::backend);
-    let linear = |field: &str, input, output| {
+    let linear = |field: &str, input, output| -> Result<LinearSpec, Error> {
         let weight_name = format!("{prefix}.{field}.weight");
         Ok(LinearSpec {
             input,

@@ -1,10 +1,22 @@
 use super::*;
-use eredu_runtime::{SamplingConfigurationError, SpeculativeSampler};
+use crate::backend::managed_memory::NativeMemoryRetention;
+
+mod ordinary_sampler;
+pub(super) use ordinary_sampler::MlxOrdinarySampler;
+use ordinary_sampler::PreparedOrdinarySampler;
+
+#[cfg(test)]
+mod token_retention_tests;
 
 /// MLX sampling and randomness state for backend-generic text generation.
 pub struct MlxTextGenerationState {
     pub(super) sampling: MlxTextSamplingState,
     pub(super) capture: Option<eredu_runtime::capture::CaptureSession>,
+    // Mutually exclusive with the legacy collector; no raw ledger export.
+    pub(super) funded_capture: Option<super::model_session::text_capture::InstalledCapture>,
+    // Declared last: sampler host history, RNG and capture payload retire before
+    // closing future funding. Native work scopes retain unresolved operations.
+    pub(super) funding: Option<eredu_runtime::working_memory::WorkingMemoryFundingRun>,
 }
 
 /// Native sampling component copied by the shared ordinary snapshot driver.
@@ -12,138 +24,64 @@ pub struct MlxTextGenerationState {
 pub struct MlxTextSamplingState {
     pub(super) temperature: f32,
     pub(super) prng: Option<RandomState>,
-    pub(super) sampler: MlxTextSampler,
+    pub(super) sampler: MlxOrdinarySampler,
     pub(super) next_prediction: u64,
     /// Parameter version bound on first submission and preserved by snapshots.
     pub(super) parameter_epoch: Option<u64>,
+    /// Charges shared by prepared, copied and restored sampler owners.
+    pub(super) inference_retention: eredu_runtime::working_memory::InferenceRetention,
+    /// Unquoted authority for independently prepared or copied sampling payloads.
+    pub(super) memory_retention: NativeMemoryRetention,
+    /// Exact cold operation contract, distinct from historical storage charges.
+    pub(super) quote: Option<super::model_session::text_quote::TextExecutionQuoteOwner>,
 }
 
-#[derive(Clone)]
-pub(crate) enum MlxTextSampler {
-    Standard(GenerationSampler),
-    MirostatV2(MirostatV2Sampler),
+pub(crate) type MlxTextSampler = eredu_runtime::ConfiguredTextSampler;
+
+/// Recovery retains sampler charges independently of the caller's state handle.
+pub(super) struct TextInferenceRetention {
+    _inference: eredu_runtime::working_memory::InferenceRetention,
+    _memory: NativeMemoryRetention,
 }
 
-impl MlxTextSampler {
-    pub(crate) fn from_config(
-        config: TextGenerationConfig,
-    ) -> Result<Self, SamplingConfigurationError> {
-        let sampling = config.sampling();
-        Ok(match config.strategy() {
-            TextSamplingStrategy::Standard => {
-                Self::Standard(GenerationSampler::from_resolved(sampling))
-            }
-            TextSamplingStrategy::MirostatV2 { tau, eta } => {
-                Self::MirostatV2(MirostatV2Sampler::new(tau, eta)?.penalties(
-                    sampling.repetition_penalty,
-                    sampling.repeat_last_n,
-                    sampling.frequency_penalty,
-                    sampling.presence_penalty,
-                ))
-            }
-        })
+impl TextInferenceRetention {
+    pub(super) fn new(
+        inference: eredu_runtime::working_memory::InferenceRetention,
+        memory: NativeMemoryRetention,
+    ) -> Self {
+        Self {
+            _inference: inference,
+            _memory: memory,
+        }
     }
+}
+impl super::recovery::Retention for TextInferenceRetention {
+    fn observe(&self, _: super::recovery::Status) {}
+}
 
-    fn sample(
+struct FilteredTextSampler<'a> {
+    sampler: Option<PreparedOrdinarySampler<'a>>,
+    filter: &'a TokenFilter,
+}
+
+impl FilteredTextSampler<'_> {
+    fn sample_original(
         &mut self,
         logits: &MlxTensor,
         temperature: f32,
         random: Option<&mut RandomState>,
-        stream: &Stream,
-    ) -> Result<MlxTensor, Exception> {
-        match self {
-            Self::Standard(sampler) => {
-                Sampler::<MlxSamplingBackend>::sample(sampler, logits, temperature, random, stream)
-            }
-            Self::MirostatV2(sampler) => {
-                Sampler::<MlxSamplingBackend>::sample(sampler, logits, temperature, random, stream)
-            }
-        }
+        context: &crate::backend::runtime::generation::OriginalSamplingContext<'_>,
+    ) -> Result<MlxTensor, Error> {
+        use crate::backend::runtime::generation::OriginalSamplingBackend;
+        use eredu_runtime::SamplingBackend;
+        let sampler = self
+            .sampler
+            .take()
+            .ok_or(Error::PredictionScopeUnavailable)?;
+        let logits = OriginalSamplingBackend::apply_token_filter(logits, self.filter, context)?;
+        sampler.sample_with::<OriginalSamplingBackend>(&logits, temperature, random, context)
     }
 }
-
-impl SpeculativeSampler<MlxSamplingBackend> for MlxTextSampler {
-    fn control_requires_positive_temperature(&self) -> Option<bool> {
-        Some(matches!(self, Self::MirostatV2(_)))
-    }
-    fn control_snapshot_bytes(&self) -> Option<u64> {
-        let history = match self {
-            Self::Standard(sampler) => sampler.generated_tokens(),
-            Self::MirostatV2(sampler) => sampler.generated_tokens(),
-        };
-        (history.len() as u64)
-            .checked_mul(4)?
-            .checked_add(std::mem::size_of::<Self>() as u64)
-    }
-
-    fn supports_exact_optimistic_promotion(&self) -> bool {
-        match self {
-            Self::Standard(sampler) => {
-                SpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(
-                    sampler,
-                )
-            }
-            Self::MirostatV2(sampler) => {
-                SpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(
-                    sampler,
-                )
-            }
-        }
-    }
-
-    fn process_logits(
-        &mut self,
-        logits: &MlxTensor,
-        temperature: f32,
-        history: &[u32],
-        stream: &Stream,
-    ) -> Result<MlxTensor, Exception> {
-        match self {
-            Self::Standard(sampler) => SpeculativeSampler::<MlxSamplingBackend>::process_logits(
-                sampler,
-                logits,
-                temperature,
-                history,
-                stream,
-            ),
-            Self::MirostatV2(sampler) => SpeculativeSampler::<MlxSamplingBackend>::process_logits(
-                sampler,
-                logits,
-                temperature,
-                history,
-                stream,
-            ),
-        }
-    }
-
-    fn commit_token(
-        &mut self,
-        processed_logits: &MlxTensor,
-        token: u32,
-        stream: &Stream,
-    ) -> Result<(), Exception> {
-        match self {
-            Self::Standard(sampler) => SpeculativeSampler::<MlxSamplingBackend>::commit_token(
-                sampler,
-                processed_logits,
-                token,
-                stream,
-            ),
-            Self::MirostatV2(sampler) => SpeculativeSampler::<MlxSamplingBackend>::commit_token(
-                sampler,
-                processed_logits,
-                token,
-                stream,
-            ),
-        }
-    }
-}
-
-struct FilteredTextSampler<'a> {
-    sampler: &'a mut MlxTextSampler,
-    filter: &'a TokenFilter,
-}
-
 impl Sampler<MlxSamplingBackend> for FilteredTextSampler<'_> {
     fn sample(
         &mut self,
@@ -152,19 +90,44 @@ impl Sampler<MlxSamplingBackend> for FilteredTextSampler<'_> {
         random: Option<&mut RandomState>,
         stream: &Stream,
     ) -> Result<MlxTensor, Exception> {
+        // Consume before filtering: a failed filter cannot reuse the permit.
+        let sampler = self
+            .sampler
+            .take()
+            .ok_or_else(|| Exception::custom("sampler step was already consumed"))?;
         let logits = MlxSamplingBackend::apply_token_filter(logits, self.filter, stream)?;
-        self.sampler.sample(&logits, temperature, random, stream)
+        sampler.sample(&logits, temperature, random, stream)
     }
 }
 
 pub(super) fn sample_text_submission(
     session: &MlxModelSession,
-    submission: Submission<MlxModelOutput, MlxSessionCompletion>,
+    mut submission: Submission<MlxModelOutput, MlxSessionCompletion>,
     filter: &TokenFilter,
     state: &mut MlxTextGenerationState,
     stream: Stream,
 ) -> Result<Submission<MlxTextToken, MlxTextCompletion>, Error> {
-    let operation = super::model_session::ResourceOperation::begin(submission.completion.owner())?;
+    let host = state
+        .capture
+        .as_ref()
+        .and_then(|capture| capture.ordinary_error_custody())
+        .cloned();
+    submission.completion.retain_ordinary_capture(host.clone());
+    submission
+        .completion
+        .owner()
+        .retain_inference(&state.sampling.inference_retention);
+    submission
+        .completion
+        .owner()
+        .retain_memory(&state.sampling.memory_retention);
+
+    let operation =
+        super::model_session::ResourceOperation::begin_prediction(submission.completion.owner())
+            .map_err(|error| error.at_text_admission())?;
+
+    let original = operation.sampling_context(&stream, submission.output.logits(), session.original_sampling_selection()).map_err(|error| error.at_text_admission())?;
+
     let sampled = (|| {
         let MlxTextSamplingState {
             temperature,
@@ -172,8 +135,24 @@ pub(super) fn sample_text_submission(
             sampler,
             ..
         } = &mut state.sampling;
-        let mut sampler = FilteredTextSampler { sampler, filter };
-        let token = if session.synchronizes_sampling() {
+        // Reject history growth before filter construction or synchronized
+        // native sampling; the host permit is separate from submission authority.
+        let mut sampler = FilteredTextSampler {
+            sampler: Some(sampler.prepare_sample()?),
+            filter,
+        };
+
+        let token = if let Some(context) = &original {
+            if session.synchronizes_sampling() {
+                context.sample_synchronized(prng.as_mut(), |random| {
+                    sampler.sample_original(submission.output.logits().ok_or(Error::PredictionScopeUnavailable)?,
+                        *temperature,random,context)
+                })?
+            } else {
+                sampler.sample_original(submission.output.logits().ok_or(Error::PredictionScopeUnavailable)?,
+                    *temperature,prng.as_mut(),context)?.into_array()
+            }
+        } else if session.synchronizes_sampling() {
             session
                 .sample_under_submission(
                     submission.output.logits(),
@@ -198,24 +177,58 @@ pub(super) fn sample_text_submission(
             )?
             .into_array()
         };
-        MlxCompletion::submission(token)
+
+        if let Some(context) = original {
+            return context.finish(token).map_err(|error| error.at_text_admission());
+        }
+        let random = state
+            .sampling
+            .prng
+            .as_ref()
+            .map(|random| random.as_array().clone());
+        // Complete the next RNG root alongside this token. It belongs to the
+        // sampling quote and must not leave a growing lazy sibling graph.
+        MlxCompletion::submission_retaining_with_scope(
+            token,
+            random,
+            &stream,
+            submission.completion.owner().take_sampling_event_scope()?,
+        )
     })();
-    let (sampled, recovery) = operation.finish(sampled)?;
+
+    let (sampled, recovery) = operation.finish(sampled.map_err(|error| error.at_text_admission()))
+        .map_err(|error| error.at_text_admission())?;
+    submission
+        .completion
+        .owner()
+        .retain_funded_array(&sampled.output);
+    if let Some(random) = &state.sampling.prng {
+        submission
+            .completion
+            .owner()
+            .retain_funded_array(random.as_array());
+    }
+
     state.sampling.next_prediction = state
         .sampling
         .next_prediction
         .checked_add(1)
         .ok_or_else(|| Error::ArchitectureModel("text prediction overflow".into()))?;
+
     Ok(Submission {
-        output: MlxTextToken {
-            value: sampled.output,
+        output: MlxTextToken::new_with_sampling_source(
+            sampled.output,
             stream,
-            owner: std::rc::Rc::clone(submission.completion.owner()),
-        },
+            submission.completion.owner().clone(),
+            submission.completion.owner().take_token_scalar_scope()?,
+            host.clone(),
+            sampled.completion.original_sampling_source(),
+        ),
         completion: MlxTextCompletion {
             model: submission.completion,
             token: sampled.completion,
             recovery: std::cell::RefCell::new(Some(recovery)),
+            observation: super::output_completion::Observation::with_ordinary_capture(host),
         },
     })
 }
@@ -267,7 +280,7 @@ mod tests {
                     _ => None,
                 };
                 let token = FilteredTextSampler {
-                    sampler: &mut sampler,
+                    sampler: Some(PreparedOrdinarySampler::Unquoted(&mut sampler)),
                     filter: &filter,
                 }
                 .sample(&logits, temperature, Some(&mut random), &stream)
@@ -283,5 +296,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn failed_filter_consumes_sampling_attempt_before_retry_can_touch_rng_or_history() {
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let logits = MlxTensor::from_array(Array::from_slice(&[1.0f32, 0.2, -0.5, 2.0], &[1, 4]));
+        // Short masks are deliberately padded. This allows only an ID beyond
+        // the score row, leaving no valid token after width normalization.
+        let invalid_filter = TokenFilter::allowed(vec![false, false, false, false, true]).unwrap();
+        let valid_filter = TokenFilter::allowed(vec![false, false, true, false]).unwrap();
+        let key = |random: &RandomState| {
+            random
+                .as_array()
+                .evaluated()
+                .unwrap()
+                .as_slice::<u32>()
+                .to_vec()
+        };
+        let mut random = RandomState::with_seed(12345).unwrap();
+        let mut expected_random = RandomState::with_seed(12345).unwrap();
+        let initial_key = key(&random);
+        let mut sampler = MlxTextSampler::Standard(
+            GenerationSampler::new()
+                .top_k(4)
+                .top_p(1.0)
+                .min_p(0.0)
+                .penalties(1.2, 64, 0.1, 0.1)
+                .with_generated_tokens([1]),
+        );
+        let initial_sampler = format!("{sampler:?}");
+        let mut expected_sampler = sampler.clone();
+        let mut prepared = FilteredTextSampler {
+            sampler: Some(PreparedOrdinarySampler::Unquoted(&mut sampler)),
+            filter: &invalid_filter,
+        };
+        assert!(
+            prepared
+                .sample(&logits, 0.8, Some(&mut random), &stream)
+                .is_err()
+        );
+        assert!(prepared.sampler.is_none());
+        assert_eq!(key(&random), initial_key);
+
+        prepared.filter = &valid_filter;
+        let retry = prepared
+            .sample(&logits, 0.8, Some(&mut random), &stream)
+            .err()
+            .unwrap();
+        assert!(
+            retry
+                .to_string()
+                .contains("sampler step was already consumed")
+        );
+        assert_eq!(key(&random), initial_key);
+        drop(prepared);
+        assert_eq!(format!("{sampler:?}"), initial_sampler);
+
+        let actual = FilteredTextSampler {
+            sampler: Some(PreparedOrdinarySampler::Unquoted(&mut sampler)),
+            filter: &valid_filter,
+        }
+        .sample(&logits, 0.8, Some(&mut random), &stream)
+        .unwrap();
+        let expected = FilteredTextSampler {
+            sampler: Some(PreparedOrdinarySampler::Unquoted(&mut expected_sampler)),
+            filter: &valid_filter,
+        }
+        .sample(&logits, 0.8, Some(&mut expected_random), &stream)
+        .unwrap();
+        assert_eq!(MlxSamplingBackend::token_id(&actual, &stream).unwrap(), 2);
+        assert_eq!(MlxSamplingBackend::token_id(&expected, &stream).unwrap(), 2);
+        assert_eq!(key(&random), key(&expected_random));
+        assert_ne!(key(&random), initial_key);
+        assert_eq!(format!("{sampler:?}"), format!("{expected_sampler:?}"));
+        let MlxTextSampler::Standard(sampler) = sampler else {
+            unreachable!("the fixture uses the ordinary standard sampler");
+        };
+        assert_eq!(sampler.generated_tokens(), [1, 2]);
     }
 }

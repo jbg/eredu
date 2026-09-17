@@ -66,6 +66,9 @@ it.
   Bounded capture admission and host records are neutral contracts; runtime owns
   reservation and one-step delivery policy, backends own native transformations,
   and the facade composes capture with ordinary generation and text termination.
+  Core also owns fixed host-metadata funding refusals in the public error chain.
+  `eredu-nn` may depend on `eredu-core` for this neutral error contract and
+  reexport it; core must not depend on NN mechanisms or workspace policy.
 - `eredu-codec` owns backend-neutral neural audio codec architectures, released
   checkpoint schemas, parameter topology, layout recipes, and typed artifact
   construction. It consumes general neutral tensor, parameter, and runtime
@@ -214,6 +217,13 @@ Any additional native-backend unsafe-code exception must be explicit and
 crate-local, document the safety boundary here and in
 `doc/backend-architecture.md`, and must not weaken the lint for neutral or
 unrelated crates.
+
+Pinned parser forks under `third-party` are portable workspace members and
+inherit the same `unsafe_code = "forbid"` lint. They own dependency-internal
+allocation facts and parser growth checks, never backend resources or admission
+policy. The local llguidance fork exposes only its safe Rust API; upstream C-ABI
+modules and header generation are not compiled. Preserve upstream licenses and
+archive provenance in `third-party/parser-upstream.json` when updating them.
 
 Do not add tests that inspect the Cargo dependency graph, recursively inspect
 repository source text, forbid family names by substring, or assert a particular

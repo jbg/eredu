@@ -1,0 +1,145 @@
+diff --git a/mlx/distributed/constructor.cpp b/mlx/distributed/constructor.cpp
+--- a/mlx/distributed/constructor.cpp
++++ b/mlx/distributed/constructor.cpp
+@@ -29,7 +29,10 @@
+       sizeof(GroupWorkerOperation) + sizeof(int) * 3 + sizeof(size_t) * 9 + sizeof(bool) * 4 +
+       sizeof(GroupTensorLayout)+sizeof(std::optional<GroupTensorLayout>)+
+       sizeof(std::span<const int>)+sizeof(Dtype)+sizeof(size_t)*4+
+-      GraphConstruction::layout_control_bytes();
++      GraphConstruction::layout_control_bytes() +
++      // Shared exact-source helper, optional resident association and lexical
++      // restoration guard. These are controls, not added native capacity.
++      GraphConstruction::distributed_resident_loan_control_bytes();
+ }
+ bool constructor_storage(const Group& group, const array& input,
+     GroupWorkerOperation operation, int peer, GroupConstructorStorage& out) noexcept {
+@@ -124,11 +127,12 @@
+ GraphFailure GraphConstruction::create_distributed(GraphQuota& quota,uint64_t scope,
+     const distributed::Group& group,const array& input,
+     distributed::GroupWorkerOperation operation,int peer,GraphConstruction*& output) noexcept {
+-  const auto context=current_graph_construction_context();
+-  if (output || !scope || context.worker || context.dispatch || context.scope != scope ||
+-      current_graph_quota() != &quota) return GraphFailure::foreign_parent;
+-  distributed::GroupConstructorStorage actual;
+-  if (!distributed::constructor_storage(group,input,operation,peer,actual)) return GraphFailure::invalid_layout;
+-  return create_layout(quota,scope,nullptr,actual,output);
++  return create_distributed_bound(quota,scope,group,input,operation,peer,output,nullptr);
++}
++GraphFailure GraphConstruction::create_distributed_with_resident_loan(
++    GraphQuota& quota,uint64_t scope,const distributed::Group& group,const array& input,
++    distributed::GroupWorkerOperation operation,int peer,GraphConstruction*& output,
++    GraphNestedConstruction& parent) noexcept {
++  return create_distributed_bound(quota,scope,group,input,operation,peer,output,&parent);
+ }
+ } // namespace mlx::core::submission
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -135,12 +135,15 @@
+   size_t output_slots{0}, streams{0}, captures{0};
+ };
+ class GraphNestedEvaluation;
++class GraphNestedConstruction;
+ 
+ // The header, slots and reserved blocks are ordinary blocks of the existing
+ // GraphQuota. No inner arena, fallback, refill or recycled construction credit.
+ class MLX_API GraphConstruction final {
+  public:
+   static size_t layout_control_bytes() noexcept;
++  // Defined beside the private allocator Loan's complete type.
++  static size_t distributed_resident_loan_control_bytes() noexcept;
+   static bool complete_layout(GraphConstructionLayout&) noexcept;
+   static GraphFailure create(GraphQuota&, uint64_t scope,
+       const PointwiseGraphLayout&, GraphConstruction*&) noexcept;
+@@ -148,6 +151,11 @@
+   static GraphFailure create_distributed(GraphQuota&, uint64_t scope,
+       const distributed::Group&, const array&, distributed::GroupWorkerOperation,
+       int peer, GraphConstruction*&) noexcept;
++  // Only this exact source constructor may borrow an existing resident bank.
++  // It reserves its own quoted blocks and never consumes resident/Eval slots.
++  static GraphFailure create_distributed_with_resident_loan(GraphQuota&, uint64_t scope,
++      const distributed::Group&, const array&, distributed::GroupWorkerOperation,
++      int peer, GraphConstruction*&, GraphNestedConstruction&) noexcept;
+   static GraphFailure create_resident(GraphQuota&, uint64_t scope,
+       const ResidentGraphLayout&, GraphConstruction*&) noexcept;
+   static GraphFailure create_eval(GraphQuota&, uint64_t scope,
+@@ -167,6 +175,10 @@
+  private:
+   friend class GraphQuota;
+   friend class GraphNestedEvaluation;
++  friend class GraphNestedConstruction;
++  static GraphFailure create_distributed_bound(GraphQuota&, uint64_t scope,
++      const distributed::Group&, const array&, distributed::GroupWorkerOperation,
++      int peer, GraphConstruction*&, GraphNestedConstruction*) noexcept;
+   void resume_nested() noexcept;
+   struct Slot { void* pointer; size_t bytes; };
+   // Recipes allocate contiguous runs. Consumed slots never re-enter a run,
+@@ -192,6 +204,19 @@
+   size_t nested_remaining_{0};
+   bool nested_configured_{false};
+ };
++// A source-bound distributed constructor is lexical within the current resident
++// model equation. Its C caller destroys the separate bank before this guard.
++// No general suspend method is exposed and the original parent keeps all slots.
++class GraphNestedConstruction final {
++ public:
++  GraphNestedConstruction() noexcept = default;
++  GraphNestedConstruction(const GraphNestedConstruction&) = delete;
++  GraphNestedConstruction& operator=(const GraphNestedConstruction&) = delete;
++  ~GraphNestedConstruction() { if (owner_) owner_->resume_nested(); }
++ private:
++  friend class GraphConstruction;
++  GraphConstruction* owner_{nullptr};
++};
+ // Synchronous no-callback suspension. Unused host blocks remain reserved; nested
+ // Eval/worker requests use their own ordinary GraphQuota destinations. The caller
+ // keeps the bank alive until this guard restores its exact association.
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -3,6 +3,7 @@
+ #include "mlx/original_buffer.h"
+ #include "mlx/graph_quota.h"
+ #include "mlx/graph_construction.h"
++#include "mlx/distributed/constructor.h"
+ #include "mlx/submission.h"
+ #include "mlx/prepared_input.h"
+ #include "mlx/primitives.h"
+@@ -649,6 +650,37 @@
+   output = value;
+   return static_cast<GraphFailure>(0);
+ }
++size_t GraphConstruction::distributed_resident_loan_control_bytes() noexcept {
++  return sizeof(GraphNestedConstruction) + sizeof(GraphNestedConstruction*) * 3 +
++      sizeof(GraphConstruction*) * 2 + sizeof(GraphQuota::Loan) +
++      sizeof(GraphConstructionContext);
++}
++GraphFailure GraphConstruction::create_distributed_bound(GraphQuota& quota,uint64_t scope,
++    const distributed::Group& group,const array& input,
++    distributed::GroupWorkerOperation operation,int peer,GraphConstruction*& output,
++    GraphNestedConstruction* parent) noexcept {
++  const auto context=current_graph_construction_context();
++  if (output || !scope || context.worker || context.dispatch || context.scope != scope ||
++      current_graph_quota() != &quota) return GraphFailure::foreign_parent;
++  if (parent && parent->owner_) return GraphFailure::construction_busy;
++  distributed::GroupConstructorStorage actual;
++  if (!distributed::constructor_storage(group,input,operation,peer,actual)) return GraphFailure::invalid_layout;
++  if (parent) {
++    const GraphQuota::Loan loan(quota);
++    if (quota.preparing_) return GraphFailure::construction_busy;
++    if (auto* owner=quota.construction_) {
++      // Exact active resident producer only. Pointwise, worker and foreign
++      // banks retain the old refusal. No user callback runs during this loan.
++      if (!owner->resident_host_ || owner->dispatch_) return GraphFailure::construction_busy;
++      if (owner->scope_ != scope || owner->quota_ != &quota) return GraphFailure::foreign_parent;
++      parent->owner_=owner;
++      quota.construction_=nullptr;
++    }
++  }
++  // Every block still comes from the same finite original Graph. On failure the
++  // caller's guard restores the resident association after partial rollback.
++  return create_layout(quota,scope,nullptr,actual,output);
++}
+ GraphFailure GraphConstruction::configure_nested(
+     const NestedGraphEvaluationLimits& limits, size_t attempts) noexcept {
+   const auto context = current_graph_construction_context();

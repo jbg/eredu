@@ -1,0 +1,104 @@
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -33,6 +33,28 @@
+ bool exact_contiguous(const array& output) noexcept {
+   return output.has_primitive() && typeid(output.primitive()) == typeid(Contiguous);
+ }
++bool exact_cast(const array& output) noexcept {
++  return output.has_primitive() && typeid(output.primitive()) == typeid(AsType);
++}
++bool copy_dtype(Dtype dtype) noexcept {
++  switch(dtype) {
++    case bool_: return dtype.size() == bool_.size();
++    case uint8: return dtype.size() == uint8.size();
++    case uint16: return dtype.size() == uint16.size();
++    case uint32: return dtype.size() == uint32.size();
++    case uint64: return dtype.size() == uint64.size();
++    case int8: return dtype.size() == int8.size();
++    case int16: return dtype.size() == int16.size();
++    case int32: return dtype.size() == int32.size();
++    case int64: return dtype.size() == int64.size();
++    case float16: return dtype.size() == float16.size();
++    case bfloat16: return dtype.size() == bfloat16.size();
++    case float32: return dtype.size() == float32.size();
++    case float64: return dtype.size() == float64.size();
++    case complex64: return dtype.size() == complex64.size();
++    default: return false;
++  }
++}
+ size_t single_output_controls() noexcept {
+   return sizeof(const array*) * 3 + sizeof(SingleOutputEvalStorage) * 2 +
+       sizeof(bool) * 5 + sizeof(size_t) * 7 + sizeof(int) * 2 + sizeof(Dtype) * 2 +
+@@ -43,7 +65,7 @@
+ } // namespace
+ bool is_copy_eval_primitive(const array& output) noexcept {
+   return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
+-      (exact_contiguous(output) || is_completion_synchronizer(output));
++      (exact_contiguous(output) || exact_cast(output) || is_completion_synchronizer(output));
+ }
+ bool single_output_eval_layout(size_t rank, size_t inputs, bool tracer,
+     const EvalDispatchStorage* dispatch_source, SingleOutputEvalStorage& out) noexcept {
+@@ -137,13 +159,37 @@
+   out = value; return true;
+ }
+ 
++bool cast_eval_layout(size_t rank, Dtype source, Dtype destination,
++    size_t elements, bool tracer, CopyEvalStorage& out) noexcept {
++  // General-copy loops include an int product over the last three dimensions.
++  // This bound is checked before dispatch; vector and donation paths can use less.
++  if (!copy_dtype(source) || !copy_dtype(destination) || elements > size_t(INT_MAX)) return false;
++  CopyEvalStorage value;
++  if (!copy_eval_layout(rank, 1, true, tracer, value) ||
++      !add(value.named_control_bytes, sizeof(value) + sizeof(rank) + sizeof(source) +
++          sizeof(destination) + sizeof(elements) + sizeof(tracer) + sizeof(out) +
++          sizeof(const array*) * 2 + sizeof(size_t) * 3 + sizeof(bool) * 2)) return false;
++  out = value; return true;
++}
++
+ bool copy_eval_storage(const array& output, CopyEvalStorage& out) noexcept {
+   if (!is_copy_eval_primitive(output) || !output.siblings().empty()) return false;
+-  const bool copy = exact_contiguous(output);
++  const bool cast = exact_cast(output);
++  const bool copy = exact_contiguous(output) || cast;
+   if (copy) {
+     if (output.inputs().size() != 1) return false;
+     const auto& input = output.inputs()[0];
+-    if (input.dtype() != output.dtype() || input.shape() != output.shape()) return false;
++    if ((!cast && input.dtype() != output.dtype()) || input.shape() != output.shape()) return false;
++    if (cast) {
++      if (static_cast<const AsType&>(output.primitive()).state() != output.dtype()) return false;
++      size_t elements = 1;
++      for (auto dimension : input.shape()) {
++        if (dimension < 0 || !multiply(elements, size_t(dimension), elements)) return false;
++      }
++      if (elements != output.size() || input.data_size() > size_t(INT_MAX)) return false;
++      return cast_eval_layout(output.ndim(), input.dtype(), output.dtype(), elements,
++          output.is_tracer(), out);
++    }
+     for (auto dimension : input.shape()) if (dimension < 0) return false;
+   } else if (output.ndim() != 0 || output.dtype() != bool_) return false;
+   return copy_eval_layout(output.ndim(), output.inputs().size(), copy, output.is_tracer(), out);
+diff --git a/mlx/backend/cpu/copy_storage.h b/mlx/backend/cpu/copy_storage.h
+--- a/mlx/backend/cpu/copy_storage.h
++++ b/mlx/backend/cpu/copy_storage.h
+@@ -3,7 +3,7 @@
+ #include "mlx/backend/cpu/eval_storage.h"
+ 
+ namespace mlx::core::cpu {
+-// Existing Contiguous copy branch or the private completion no-op. These are
++// Existing Contiguous / AsType copy branch or the private completion no-op. These are
+ // host/worker request populations only; backing, events and source custody are
+ // separate. Physical bank installation requires the actual accepted primitive.
+ struct CopyEvalStorage : SingleOutputEvalStorage {
+@@ -11,6 +11,10 @@
+ };
+ MLX_API bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
+     CopyEvalStorage&) noexcept;
++// Cast shares the same copy worker and bank; geometry/dtypes describe the
++// actual source and output, while native Eval still authenticates the primitive.
++MLX_API bool cast_eval_layout(size_t rank, Dtype source, Dtype destination,
++    size_t elements, bool tracer, CopyEvalStorage&) noexcept;
+ MLX_API bool is_copy_eval_primitive(const array&) noexcept;
+ MLX_API bool copy_eval_storage(const array&, CopyEvalStorage&) noexcept;
+ } // namespace mlx::core::cpu

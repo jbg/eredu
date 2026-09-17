@@ -11,7 +11,7 @@ pub(crate) const REASONING: [(&str, &str, &str); 3] = [
     ("low", "<ifm|think_faster>\n", "</ifm|think_faster>"),
 ];
 
-const TOKENS: &[&str] = &[
+pub(crate) const TOKENS: &[&str] = &[
     "<|ifm|im_start|>",
     "<|ifm|im_end|>",
     "<ifm|think>",
@@ -138,12 +138,12 @@ pub(crate) fn spec(
 mod tests {
     use super::*;
     use crate::runtime::chat::{
-        constraints::ConstraintCompiler,
-        dialect::{DialectParameters, DECLARATIVE_DIALECT},
         ParallelToolCallPolicy, ToolChoice,
+        constraints::ConstraintCompiler,
+        dialect::{DECLARATIVE_DIALECT, DialectParameters},
     };
     use eredu_core::generation::{FinishReason, SemanticEvent};
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     // Byte-token grammar fixtures; facade tests bind the published special IDs.
     static BYTE_SPECS: [[[DeclarativeDialectSpec; 2]; 4]; 3] = {
@@ -353,13 +353,17 @@ mod tests {
             }
             if format == 2 {
                 let mut parser = plan.create_parser().unwrap();
-                assert!(parser
-                    .push(&call.replacen("<ifm|arg_type>string", "<ifm|arg_type>integer", 1))
-                    .is_err());
-                assert!(!parser
-                    .events()
-                    .iter()
-                    .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+                assert!(
+                    parser
+                        .push(&call.replacen("<ifm|arg_type>string", "<ifm|arg_type>integer", 1))
+                        .is_err()
+                );
+                assert!(
+                    !parser
+                        .events()
+                        .iter()
+                        .any(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                );
             }
         }
     }

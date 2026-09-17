@@ -10,7 +10,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, MutexGuard, OnceLock, Weak,
     },
-    time::SystemTime,
 };
 
 use crate::{
@@ -133,6 +132,9 @@ pub trait EncodedTensorLease: Send + Sync + 'static {
     fn encoded_bytes(&self) -> Option<&[u8]>;
 }
 
+mod encoded_owner;
+pub use encoded_owner::PinnedEncodedBytes;
+
 /// Type-erased neutral lease covering the checkpoint formats supported by Eredu.
 #[derive(Debug, Clone)]
 pub enum CheckpointLease {
@@ -234,10 +236,7 @@ impl EncodedTensorLease for MemoryLease {
     }
 
     fn encoded_bytes(&self) -> Option<&[u8]> {
-        match &self.selected_bytes {
-            Some(bytes) => Some(bytes.as_ref()),
-            None => self.tensor.bytes.get(self.span.clone()),
-        }
+        encoded_owner::memory_bytes(&self.tensor, &self.selected_bytes, &self.span)
     }
 }
 
@@ -358,6 +357,77 @@ impl WeightStore for MemoryWeightStore {
 }
 
 impl CheckpointSource for MemoryWeightStore {
+    fn prepare_encoded_read(
+        &self,
+        keys: &[String],
+    ) -> Result<Option<EncodedReadBatch>, StoreError> {
+        bulk::prepare_memory(self, keys).map(Some)
+    }
+
+    fn prepared_acquisition_owner(self: Arc<Self>) -> Option<PreparedAcquisitionOwner> {
+        Some(acquisition::retained_route::owner_memory(self))
+    }
+
+    fn prepared_acquisition_source(&self) -> PreparedAcquisitionSource<'_> {
+        PreparedAcquisitionSource(acquisition::Route::Memory(self))
+    }
+
+    fn source_lease_controls<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Result<SourceLeaseControls<'a>, LeaseControlBorrowError<'a>> {
+        let metadata = self.source_metadata_borrowed(key)?;
+        Ok(SourceLeaseControls::new(
+            LeaseProvider::Memory,
+            metadata,
+            key,
+        ))
+    }
+
+    fn source_metadata_borrowed(&self, key: &str) -> SourceMetadataLoan<'_> {
+        self.tensors
+            .get(key)
+            .map(|tensor| &tensor.metadata)
+            .ok_or(SourceMetadataBorrowError::UnknownTensor)
+    }
+    fn source_key_authority_borrowed(
+        &self,
+        _: &str,
+    ) -> Result<SourceKeyAuthority, SourceMetadataBorrowError<'_>> {
+        Ok(SourceKeyAuthority::Ordinary)
+    }
+
+    fn source_storage_slot_bound(&self) -> Result<Option<usize>, StoreError> {
+        Ok(Some(self.tensors.len()))
+    }
+
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn FnMut(SourceStorageRef<'_>),
+    ) -> Result<bool, StoreError> {
+        for tensor in self.tensors.values() {
+            let bytes =
+                u64::try_from(tensor.bytes.capacity()).map_err(|_| StoreError::Overflow {
+                    context: "in-memory checkpoint payload capacity".into(),
+                })?;
+            visitor(SourceStorageRef::new(tensor, bytes));
+        }
+        Ok(true)
+    }
+
+    fn source_storage(&self) -> Result<Option<SourceStorage>, StoreError> {
+        let mut storage = SourceStorage::default();
+        for tensor in self.tensors.values() {
+            let bytes =
+                u64::try_from(tensor.bytes.capacity()).map_err(|_| StoreError::Overflow {
+                    context: "in-memory checkpoint payload capacity".into(),
+                })?;
+            storage.insert(Arc::clone(tensor), bytes)?;
+        }
+        storage.bytes()?;
+        Ok(Some(storage))
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         Some(&self.recipes)
     }
@@ -381,6 +451,89 @@ impl CheckpointSource for MemoryWeightStore {
 
 /// Object-safe cold-path checkpoint source used by generic materializers.
 pub trait CheckpointSource: Send + Sync {
+    /// Cold owning loan for the closed prepared GGUF route. Only concrete
+    /// built-in implementations can construct an owner; forwarding a different
+    /// owner cannot certify this root. The default leaves custom roots unknown.
+    /// Selection retains this owner so accepted acquisition calls no virtual
+    /// source methods. This loan grants no storage or submission authority.
+    fn prepared_acquisition_owner(self: Arc<Self>) -> Option<PreparedAcquisitionOwner> {
+        None
+    }
+
+    /// Lends this source's concrete acquisition route for final prepared storage.
+    /// The default has no prepared destination and never invokes ordinary
+    /// acquisition. Forwarding implementations must preserve their own complete
+    /// authorization and validation route; this loan grants no budget authority.
+    fn prepared_acquisition_source(&self) -> PreparedAcquisitionSource<'_> {
+        PreparedAcquisitionSource::unavailable()
+    }
+
+    /// Borrows the concrete selected provider and actual request-forwarding
+    /// population. Does not acquire a lease or fall back to owned metadata.
+    /// Custom sources must explicitly forward their exact selected source;
+    /// this description grants no complete storage/admission authority.
+    fn source_lease_controls<'a>(
+        &'a self,
+        _key: &'a str,
+    ) -> Result<SourceLeaseControls<'a>, LeaseControlBorrowError<'a>> {
+        Err(SourceMetadataBorrowError::Unavailable.into())
+    }
+
+    /// Borrows the actual retained catalog entry without preparing headers,
+    /// reading payloads, cloning metadata or invoking the ordinary fallback.
+    /// Custom sources may implement this diagnostic; it grants no source or
+    /// request custody. Authorization views preserve their actual selection.
+    fn source_metadata_borrowed(&self, _key: &str) -> SourceMetadataLoan<'_> {
+        Err(SourceMetadataBorrowError::Unavailable)
+    }
+
+    /// Allocation-free companion to materialized overlay membership. Unknown
+    /// implementations remain unavailable instead of calling the ordinary API.
+    fn source_key_authority_borrowed(
+        &self,
+        _key: &str,
+    ) -> Result<SourceKeyAuthority, SourceMetadataBorrowError<'_>> {
+        Err(SourceMetadataBorrowError::Unavailable)
+    }
+
+    /// Stable maximum visits from `visit_source_storage` for this exact source
+    /// instance. Duplicate physical branches and zero-byte owners count. The
+    /// bound includes every source-owned payload that may appear during ordinary
+    /// use; mutable implementations without such a contract return None.
+    /// No source visit, materialization, owner clone or accounting is performed.
+    /// Callers must retain/bind this exact source rather than reuse the scalar
+    /// for a replacement source; this diagnostic grants no storage authority.
+    fn source_storage_slot_bound(&self) -> Result<Option<usize>, StoreError> {
+        Ok(None)
+    }
+
+    /// Visits every physical source owner without building a storage map,
+    /// reading payloads, or reopening files. `true` means complete visitation;
+    /// `false` means unknown/incomplete even if no owner was visited. The default
+    /// does not call the allocating legacy [`Self::source_storage`] method.
+    ///
+    /// Authorization views include hidden physical owners. Aliases may repeat:
+    /// callers must deduplicate and check capacities/overflow, and preprice their
+    /// own slots and pins. A caller may retain each borrowed owner immediately;
+    /// later errors/unwind leave that caller-owned prefix intact. This contract
+    /// covers source payload/reader storage only, not catalog/recipe metadata,
+    /// external leases, operating-system caches or conversion workspace.
+    fn visit_source_storage(
+        &self,
+        _visitor: &mut dyn FnMut(SourceStorageRef<'_>),
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
+    /// Complete source-owned host payload bound, or explicitly unknown.
+    /// Inspect retained metadata only: do not read, convert or allocate payloads.
+    /// Forwarding views must include their complete physical source even when
+    /// they expose fewer tensor keys. Transient/external leases are separately
+    /// charged by their operation owner; see [`SourceStorage`].
+    fn source_storage(&self) -> Result<Option<SourceStorage>, StoreError> {
+        Ok(None)
+    }
+
     /// Inference cache bound to this immutable catalog and authorization view.
     /// Returning a cache promises metadata and provenance remain fixed, and
     /// every returned lease/read batch is checked against that same catalog.
@@ -399,8 +552,9 @@ pub trait CheckpointSource: Send + Sync {
 
     /// Prepares an ordered, bounded read of complete encoded tensors into
     /// caller-owned storage. Unsupported sources return `None` without reading
-    /// payloads. The returned batch retains exact file admission and metadata;
-    /// execution checks each shard once before and after reading its ranges.
+    /// payloads. The returned batch retains exact file admission or the existing
+    /// immutable memory owner and its metadata. Execution validates file versions
+    /// around reads; memory ranges copy directly into the supplied destination.
     fn prepare_encoded_read(
         &self,
         _keys: &[String],
@@ -454,8 +608,61 @@ pub trait CheckpointSource: Send + Sync {
 /// Shared ownership of one backend-neutral checkpoint source.
 pub type SharedCheckpointSource = Arc<dyn CheckpointSource>;
 
+mod retained_source;
+pub use retained_source::{
+    CheckpointSourceIdentity, RetainedCheckpointSource, SourceErasureStorageRequest,
+};
+
+pub(crate) mod acquisition;
+mod memory_destination;
+pub use acquisition::{
+    PreparedAcquisitionBank, PreparedAcquisitionBankError, PreparedAcquisitionFailure,
+    PreparedAcquisitionOwner, PreparedAcquisitionRefusal, PreparedAcquisitionSource,
+    PreparedAcquisitionStorage, PreparedCheckpointAcquisition, SelectedGgufAcquisitionStorage,
+    SelectedGgufConversionPlan,
+};
+mod cache_policy;
+mod lease_destination;
+pub use lease_destination::{
+    PreparedSafetensorsLease, PreparedSafetensorsLeaseFailure, SafetensorsLeaseSource,
+};
+mod read_bytes;
+pub use read_bytes::{
+    SafetensorsByteError, SafetensorsByteFailure, SafetensorsBytePlan, SafetensorsBytes,
+};
+
+mod read_plan;
+pub(crate) use read_plan::encoded_selection_ranges;
+pub use read_plan::{
+    SafetensorsReadDestinationPlan, SafetensorsReadError, SafetensorsReadRanges,
+    SafetensorsReadSource,
+};
+
+mod lease_controls;
+pub use lease_controls::{
+    GgufLeaseCloneLayout, LeaseCloneLayout, LeaseControlBorrowError, LeaseProvider,
+    RequestCloneLayout, SourceLeaseControls,
+};
+mod selection_validation;
+pub use selection_validation::{SelectionValidationError, SelectionValidationPlan};
+
+mod metadata_borrow;
+pub use metadata_borrow::{
+    MetadataCloneLayout, SelectedMetadataCloneLayout, SelectionCloneLayout, SourceKeyAuthority,
+    SourceMetadataBorrowError, SourceMetadataLoan,
+};
+
+mod storage;
+pub(crate) use storage::{SourceControl, SourceHandle};
+pub use storage::{SourceStorage, SourceStorageIdentity, SourceStorageOwner, SourceStorageRef};
+
 mod bulk;
-pub use bulk::EncodedReadBatch;
+pub(crate) use bulk::EncodedRange;
+pub use bulk::{
+    DetachedEncodedReadPlan, DetachedEncodedReadSlice, DetachedEncodedReads,
+    DetachedReadBuildCause, DetachedReadBuildError, DetachedReadFailure, EncodedReadBatch,
+    EncodedReadFailure, EncodedReadFailureCause, EncodedReadLayout,
+};
 
 /// Opens one exact admitted SafeTensors source and applies its retained resolution.
 ///
@@ -526,7 +733,7 @@ pub struct PreparedTensorSource {
 /// buffering payloads.
 pub struct PreparedCheckpointSource {
     recipes: RecipeInferenceCache,
-    source: SharedCheckpointSource,
+    source: RetainedCheckpointSource,
     catalog: BTreeMap<String, PreparedTensorSource>,
 }
 
@@ -578,7 +785,7 @@ impl PreparedCheckpointSource {
             })
             .collect();
         Ok(Self {
-            source,
+            source: source.into(),
             catalog,
             recipes: RecipeInferenceCache::default(),
         })
@@ -586,11 +793,11 @@ impl PreparedCheckpointSource {
 
     /// Pins a source to the supplied exact catalog.
     pub fn new(
-        source: SharedCheckpointSource,
+        source: impl Into<RetainedCheckpointSource>,
         catalog: BTreeMap<String, PreparedTensorSource>,
     ) -> Result<Self, StoreError> {
         let prepared = Self {
-            source,
+            source: source.into(),
             catalog,
             recipes: RecipeInferenceCache::default(),
         };
@@ -619,6 +826,17 @@ impl PreparedCheckpointSource {
             || self.source.source_provenance(key)? != expected.provenance
         {
             return Err(StoreError::PreparedCatalogMismatch { key: key.into() });
+        }
+        Ok(())
+    }
+
+    fn validate_acquired(
+        &self,
+        request: &TensorReadRequest,
+        lease: &CheckpointLease,
+    ) -> Result<(), StoreError> {
+        if self.source.recipe_cache().is_none() {
+            self.validate_lease(request, lease)?;
         }
         Ok(())
     }
@@ -656,6 +874,52 @@ impl PreparedCheckpointSource {
 }
 
 impl CheckpointSource for PreparedCheckpointSource {
+    fn prepared_acquisition_owner(self: Arc<Self>) -> Option<PreparedAcquisitionOwner> {
+        Some(acquisition::retained_route::owner_prepared(self))
+    }
+
+    fn prepared_acquisition_source(&self) -> PreparedAcquisitionSource<'_> {
+        PreparedAcquisitionSource(acquisition::Route::Prepared(self))
+    }
+
+    fn source_lease_controls<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Result<SourceLeaseControls<'a>, LeaseControlBorrowError<'a>> {
+        if !self.catalog.contains_key(key) {
+            return Err(SourceMetadataBorrowError::UnknownTensor.into());
+        }
+        self.source.source_lease_controls(key)?.through_prepared()
+    }
+
+    fn source_metadata_borrowed(&self, key: &str) -> SourceMetadataLoan<'_> {
+        self.catalog
+            .get(key)
+            .map(|entry| &entry.metadata)
+            .ok_or(SourceMetadataBorrowError::UnknownTensor)
+    }
+    fn source_key_authority_borrowed(
+        &self,
+        key: &str,
+    ) -> Result<SourceKeyAuthority, SourceMetadataBorrowError<'_>> {
+        self.source.source_key_authority_borrowed(key)
+    }
+
+    fn source_storage_slot_bound(&self) -> Result<Option<usize>, StoreError> {
+        self.source.source_storage_slot_bound()
+    }
+
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn FnMut(SourceStorageRef<'_>),
+    ) -> Result<bool, StoreError> {
+        self.source.visit_source_storage(visitor)
+    }
+
+    fn source_storage(&self) -> Result<Option<SourceStorage>, StoreError> {
+        self.source.source_storage()
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         Some(self.source.recipe_cache().unwrap_or(&self.recipes))
     }
@@ -697,9 +961,7 @@ impl CheckpointSource for PreparedCheckpointSource {
     fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
         self.expected(&request.key)?;
         let lease = self.source.acquire_lease(request.clone())?;
-        if self.source.recipe_cache().is_none() {
-            self.validate_lease(&request, &lease)?;
-        }
+        self.validate_acquired(&request, &lease)?;
         Ok(lease)
     }
 
@@ -732,28 +994,46 @@ impl CheckpointSource for PreparedCheckpointSource {
     }
 }
 
+mod composite;
+pub use composite::{
+    GgufCompositeBuildFailure, GgufCompositeInputError, GgufCompositePlan,
+    GgufCompositeStorageRequest,
+};
+
 /// Disjoint logical union of independently opened checkpoint artifacts.
 ///
 /// This is used by split model/projector artifacts while preserving each
 /// source's native leases, bounded-read guarantees, and physical diagnostics.
 pub struct CompositeCheckpointSource {
     recipes: RecipeInferenceCache,
-    sources: Vec<SharedCheckpointSource>,
-    owners: BTreeMap<String, usize>,
+    sources: Vec<RetainedCheckpointSource>,
+    owners: composite::OwnerRows,
+    // Nested Vec/key/node/PAL storage retires before its constructor account.
+    // The composite root and any ordinary child erasure remain separate owners.
+    control: Option<storage::SourceControl>,
 }
 
 impl CompositeCheckpointSource {
+    /// Borrow this exact built-in constructor custody without extracting it.
+    /// Ordinary composites have none; a runtime recognizes only its private type.
+    pub fn constructor_control_owner<C: std::any::Any>(&self) -> Option<&C> {
+        self.control.as_ref()?.origin()
+    }
+
     /// Creates a deterministic union and rejects ambiguous logical keys.
     pub fn new(
-        sources: impl IntoIterator<Item = SharedCheckpointSource>,
+        sources: impl IntoIterator<Item = impl Into<RetainedCheckpointSource>>,
     ) -> Result<Self, StoreError> {
-        let sources = sources.into_iter().collect::<Vec<_>>();
+        let sources = sources
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<RetainedCheckpointSource>>();
         if sources.is_empty() {
             return Err(StoreError::Internal(
                 "composite checkpoint source requires at least one artifact".into(),
             ));
         }
-        let mut owners = BTreeMap::new();
+        let mut owners = composite::OwnerRows::default();
         for (owner, source) in sources.iter().enumerate() {
             for key in source.source_keys() {
                 if let Some(previous) = owners.insert(key.clone(), owner) {
@@ -767,19 +1047,96 @@ impl CompositeCheckpointSource {
             sources,
             owners,
             recipes: RecipeInferenceCache::default(),
+            control: None,
         })
     }
 
-    fn source_for(&self, key: &str) -> Result<&dyn CheckpointSource, StoreError> {
+    fn source_owner_for(&self, key: &str) -> Result<&RetainedCheckpointSource, StoreError> {
         self.owners
             .get(key)
             .and_then(|owner| self.sources.get(*owner))
-            .map(AsRef::as_ref)
             .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })
+    }
+    fn source_for(&self, key: &str) -> Result<&dyn CheckpointSource, StoreError> {
+        self.source_owner_for(key)
+            .map(|source| source.as_ref() as &dyn CheckpointSource)
     }
 }
 
 impl CheckpointSource for CompositeCheckpointSource {
+    fn prepared_acquisition_owner(self: Arc<Self>) -> Option<PreparedAcquisitionOwner> {
+        Some(acquisition::retained_route::owner_composite(self))
+    }
+
+    fn prepared_acquisition_source(&self) -> PreparedAcquisitionSource<'_> {
+        PreparedAcquisitionSource(acquisition::Route::Composite(self))
+    }
+
+    fn source_lease_controls<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Result<SourceLeaseControls<'a>, LeaseControlBorrowError<'a>> {
+        let owner = *self
+            .owners
+            .get(key)
+            .ok_or(SourceMetadataBorrowError::UnknownTensor)?;
+        self.sources[owner].source_lease_controls(key)
+    }
+
+    fn source_metadata_borrowed(&self, key: &str) -> SourceMetadataLoan<'_> {
+        let owner = *self
+            .owners
+            .get(key)
+            .ok_or(SourceMetadataBorrowError::UnknownTensor)?;
+        self.sources[owner].source_metadata_borrowed(key)
+    }
+    fn source_key_authority_borrowed(
+        &self,
+        key: &str,
+    ) -> Result<SourceKeyAuthority, SourceMetadataBorrowError<'_>> {
+        match self.owners.get(key) {
+            Some(owner) => self.sources[*owner].source_key_authority_borrowed(key),
+            None => Ok(SourceKeyAuthority::Ordinary),
+        }
+    }
+
+    fn source_storage_slot_bound(&self) -> Result<Option<usize>, StoreError> {
+        let mut count = 0usize;
+        let mut complete = true;
+        for source in &self.sources {
+            match source.source_storage_slot_bound()? {
+                Some(n) => {
+                    count = count.checked_add(n).ok_or_else(|| StoreError::Overflow {
+                        context: "composite source owner slots".into(),
+                    })?
+                }
+                None => complete = false,
+            }
+        }
+        Ok(complete.then_some(count))
+    }
+
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn FnMut(SourceStorageRef<'_>),
+    ) -> Result<bool, StoreError> {
+        let mut complete = true;
+        for source in &self.sources {
+            // Inspect all physical sources, including hidden/repeated owners.
+            // An incomplete child cannot short-circuit later known owners.
+            complete &= source.visit_source_storage(visitor)?;
+        }
+        Ok(complete)
+    }
+
+    fn source_storage(&self) -> Result<Option<SourceStorage>, StoreError> {
+        SourceStorage::collect(
+            self.sources
+                .iter()
+                .map(|source| source.as_ref() as &dyn CheckpointSource),
+        )
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         self.sources
             .iter()
@@ -920,7 +1277,7 @@ impl CheckpointSource for CompositeCheckpointSource {
 /// exact provenance and bounded-read guarantees.
 pub struct RestrictedCheckpointSource {
     recipes: RecipeInferenceCache,
-    source: SharedCheckpointSource,
+    source: RetainedCheckpointSource,
     contract: String,
     denied: BTreeSet<String>,
     allowed: Option<BTreeSet<String>>,
@@ -932,10 +1289,11 @@ impl RestrictedCheckpointSource {
     /// Every denied key must exist in the source at construction time. This
     /// prevents a misspelled projection from silently widening the view.
     pub fn excluding(
-        source: SharedCheckpointSource,
+        source: impl Into<RetainedCheckpointSource>,
         contract: impl Into<String>,
         denied: BTreeSet<String>,
     ) -> Result<Self, StoreError> {
+        let source = source.into();
         let contract = contract.into();
         if contract.is_empty() {
             return Err(StoreError::Internal(
@@ -961,10 +1319,11 @@ impl RestrictedCheckpointSource {
     /// retained so callers can audit the projection without reconstructing it
     /// from the source catalog and an exclusion set.
     pub fn including(
-        source: SharedCheckpointSource,
+        source: impl Into<RetainedCheckpointSource>,
         contract: impl Into<String>,
         allowed: BTreeSet<String>,
     ) -> Result<Self, StoreError> {
+        let source = source.into();
         let contract = contract.into();
         if contract.is_empty() {
             return Err(StoreError::Internal(
@@ -1020,6 +1379,55 @@ impl RestrictedCheckpointSource {
 }
 
 impl CheckpointSource for RestrictedCheckpointSource {
+    fn prepared_acquisition_owner(self: Arc<Self>) -> Option<PreparedAcquisitionOwner> {
+        Some(acquisition::retained_route::owner_restricted(self))
+    }
+
+    fn prepared_acquisition_source(&self) -> PreparedAcquisitionSource<'_> {
+        PreparedAcquisitionSource(acquisition::Route::Restricted(self))
+    }
+
+    fn source_lease_controls<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Result<SourceLeaseControls<'a>, LeaseControlBorrowError<'a>> {
+        if !self.is_authorized(key) {
+            return Err(SourceMetadataBorrowError::UnauthorizedTensor.into());
+        }
+        self.source.source_lease_controls(key)
+    }
+
+    fn source_metadata_borrowed(&self, key: &str) -> SourceMetadataLoan<'_> {
+        if !self.is_authorized(key) {
+            return Err(SourceMetadataBorrowError::UnauthorizedTensor);
+        }
+        self.source.source_metadata_borrowed(key)
+    }
+    fn source_key_authority_borrowed(
+        &self,
+        key: &str,
+    ) -> Result<SourceKeyAuthority, SourceMetadataBorrowError<'_>> {
+        if !self.is_authorized(key) {
+            return Ok(SourceKeyAuthority::Ordinary);
+        }
+        self.source.source_key_authority_borrowed(key)
+    }
+
+    fn source_storage_slot_bound(&self) -> Result<Option<usize>, StoreError> {
+        self.source.source_storage_slot_bound()
+    }
+
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn FnMut(SourceStorageRef<'_>),
+    ) -> Result<bool, StoreError> {
+        self.source.visit_source_storage(visitor)
+    }
+
+    fn source_storage(&self) -> Result<Option<SourceStorage>, StoreError> {
+        self.source.source_storage()
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         self.source.recipe_cache().map(|_| &self.recipes)
     }
@@ -1096,18 +1504,18 @@ impl CheckpointSource for RestrictedCheckpointSource {
 /// rejects every lease request not selected by the resolved physical layout.
 pub struct ResolvedCheckpointSource {
     recipes: RecipeInferenceCache,
-    source: Arc<dyn CheckpointSource>,
+    source: RetainedCheckpointSource,
     contract: crate::validation::ResolvedCheckpointPlan,
 }
 
 impl ResolvedCheckpointSource {
     /// Restricts a source to the physical keys selected by a contract.
     pub fn new(
-        source: Arc<dyn CheckpointSource>,
+        source: impl Into<RetainedCheckpointSource>,
         contract: crate::validation::ResolvedCheckpointPlan,
     ) -> Self {
         Self {
-            source,
+            source: source.into(),
             contract,
             recipes: RecipeInferenceCache::default(),
         }
@@ -1123,6 +1531,13 @@ impl ResolvedCheckpointSource {
         self.contract.unclaimed_keys()
     }
 
+    fn authorize_acquisition(&self, key: &str) -> Result<(), StoreError> {
+        if !self.source.is_authoritative_materialized_key(key) {
+            self.authorize(key)?;
+        }
+        Ok(())
+    }
+
     fn authorize(&self, key: &str) -> Result<(), StoreError> {
         if self.contract.source_keys().contains(key) {
             Ok(())
@@ -1136,6 +1551,58 @@ impl ResolvedCheckpointSource {
 }
 
 impl CheckpointSource for ResolvedCheckpointSource {
+    fn prepared_acquisition_owner(self: Arc<Self>) -> Option<PreparedAcquisitionOwner> {
+        Some(acquisition::retained_route::owner_resolved(self))
+    }
+
+    fn prepared_acquisition_source(&self) -> PreparedAcquisitionSource<'_> {
+        PreparedAcquisitionSource(acquisition::Route::Resolved(self))
+    }
+
+    fn source_lease_controls<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Result<SourceLeaseControls<'a>, LeaseControlBorrowError<'a>> {
+        if !self.contract.source_keys().contains(key)
+            && self.source.source_key_authority_borrowed(key)? != SourceKeyAuthority::Materialized
+        {
+            return Err(SourceMetadataBorrowError::UnauthorizedTensor.into());
+        }
+        self.source.source_lease_controls(key)
+    }
+
+    fn source_metadata_borrowed(&self, key: &str) -> SourceMetadataLoan<'_> {
+        // A contract member needs no overlay exception. Outside that contract,
+        // use only the actual source's closed membership companion.
+        if !self.contract.source_keys().contains(key)
+            && self.source.source_key_authority_borrowed(key)? != SourceKeyAuthority::Materialized
+        {
+            return Err(SourceMetadataBorrowError::UnauthorizedTensor);
+        }
+        self.source.source_metadata_borrowed(key)
+    }
+    fn source_key_authority_borrowed(
+        &self,
+        key: &str,
+    ) -> Result<SourceKeyAuthority, SourceMetadataBorrowError<'_>> {
+        self.source.source_key_authority_borrowed(key)
+    }
+
+    fn source_storage_slot_bound(&self) -> Result<Option<usize>, StoreError> {
+        self.source.source_storage_slot_bound()
+    }
+
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn FnMut(SourceStorageRef<'_>),
+    ) -> Result<bool, StoreError> {
+        self.source.visit_source_storage(visitor)
+    }
+
+    fn source_storage(&self) -> Result<Option<SourceStorage>, StoreError> {
+        self.source.source_storage()
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         self.source.recipe_cache().map(|_| &self.recipes)
     }
@@ -1171,9 +1638,7 @@ impl CheckpointSource for ResolvedCheckpointSource {
     }
 
     fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
-        if !self.source.is_authoritative_materialized_key(&request.key) {
-            self.authorize(&request.key)?;
-        }
+        self.authorize_acquisition(&request.key)?;
         self.source.acquire_lease(request)
     }
 
@@ -1277,6 +1742,34 @@ pub struct WeightStoreDiagnostics {
 /// Structured neutral checkpoint store failures.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum StoreError {
+    /// Explicit prepared GGUF reader storage could not supply its destination.
+    #[error("GGUF prepared reader storage failed for tensor {key:?}: {source}")]
+    GgufPreparedReaderStorage {
+        /// Actual requested logical name.
+        key: String,
+        /// Original fixed cause and any shard context.
+        #[source]
+        source: Arc<eredu_gguf::Error>,
+    },
+    /// A prepared GGUF header cannot supply its exact retained destination.
+    #[error("GGUF prepared header storage failed for tensor {key:?}: {source}")]
+    GgufPreparedHeaderStorage {
+        /// Actual requested logical name.
+        key: String,
+        /// Original typed cause and its shard context.
+        #[source]
+        source: Arc<eredu_gguf::Error>,
+    },
+
+    /// An explicitly prepared GGUF source observed different header bytes.
+    #[error("GGUF prepared header changed for tensor {key:?}: {source}")]
+    GgufPreparedHeaderChanged {
+        /// Actual requested logical name.
+        key: String,
+        /// Original typed GGUF cause, retaining its shard context.
+        #[source]
+        source: Arc<eredu_gguf::Error>,
+    },
     /// The configured cached-shard or reader limit was zero.
     #[error("maximum cached-shard count must be nonzero")]
     InvalidShardCacheLimit,
@@ -1414,7 +1907,7 @@ struct CacheEntry {
 struct CacheState {
     entries: BTreeMap<PathBuf, CacheEntry>,
     touched: BTreeSet<PathBuf>,
-    payloads: BTreeSet<PathBuf>,
+    payloads: bulk::PayloadPaths,
     tick: u64,
     hits: u64,
     misses: u64,
@@ -1435,58 +1928,16 @@ struct CatalogEntry {
 #[derive(Debug, Eq, PartialEq)]
 struct AdmittedFileIdentity {
     canonical_path: PathBuf,
-    len: u64,
-    modified: SystemTime,
-    #[cfg(unix)]
-    device: u64,
-    #[cfg(unix)]
-    inode: u64,
-    // Unix ctime is the strongest change-version metadata exposed by the
-    // standard library: unlike mtime, normal timestamp APIs cannot restore it.
-    #[cfg(unix)]
-    change_time_seconds: i64,
-    #[cfg(unix)]
-    change_time_nanoseconds: i64,
-    // Other targets do not expose an equivalent change counter through the
-    // portable Metadata API. Retain creation time when the filesystem reports
-    // it, in addition to length and modification time.
-    #[cfg(not(unix))]
-    created: Option<SystemTime>,
-    #[cfg(windows)]
-    file_attributes: u32,
-    #[cfg(windows)]
-    creation_time: u64,
+    version: crate::artifact::file::FileVersion,
 }
 
 impl AdmittedFileIdentity {
     fn from_metadata(path: &Path, metadata: &std::fs::Metadata) -> Result<Self, StoreError> {
-        #[cfg(unix)]
-        use std::os::unix::fs::MetadataExt as _;
-
         Ok(Self {
+            // Keep the ordinary path allocation and error semantics unchanged.
             canonical_path: path.to_path_buf(),
-            len: metadata.len(),
-            modified: metadata.modified().map_err(|error| fs_error(path, error))?,
-            #[cfg(unix)]
-            device: metadata.dev(),
-            #[cfg(unix)]
-            inode: metadata.ino(),
-            #[cfg(unix)]
-            change_time_seconds: metadata.ctime(),
-            #[cfg(unix)]
-            change_time_nanoseconds: metadata.ctime_nsec(),
-            #[cfg(not(unix))]
-            created: metadata.created().ok(),
-            #[cfg(windows)]
-            file_attributes: {
-                use std::os::windows::fs::MetadataExt as _;
-                metadata.file_attributes()
-            },
-            #[cfg(windows)]
-            creation_time: {
-                use std::os::windows::fs::MetadataExt as _;
-                metadata.creation_time()
-            },
+            version: crate::artifact::file::FileVersion::from_metadata(metadata)
+                .map_err(|error| fs_error(path, error))?,
         })
     }
 }
@@ -1518,16 +1969,7 @@ impl AdmittedFile {
     }
 
     fn validate_file(&self, path: &Path, file: &File) -> Result<(), StoreError> {
-        let current = AdmittedFileIdentity::from_metadata(
-            path,
-            &file.metadata().map_err(|error| fs_error(path, error))?,
-        )?;
-        if current != self.identity {
-            return Err(StoreError::AdmittedFileChanged {
-                path: path.to_path_buf(),
-            });
-        }
-        Ok(())
+        read_bytes::ordinary_validate_file(self, path, file)
     }
 }
 
@@ -1716,76 +2158,27 @@ impl SafetensorsWeightStore {
                 })
                 .collect()
         };
+        let payloads = bulk::PayloadPaths::new(shards.payload_paths());
         Ok(Self {
             catalog,
             shards,
-            cache: Arc::new(Mutex::new(CacheState::default())),
+            cache: Arc::new(Mutex::new(CacheState {
+                payloads,
+                ..CacheState::default()
+            })),
             read_telemetry: Arc::new(SafetensorsReadTelemetry::default()),
             max_cached_shards,
         })
     }
 
     fn lock_cache(&self) -> Result<MutexGuard<'_, CacheState>, StoreError> {
-        self.cache
-            .lock()
-            .map_err(|_| StoreError::Internal("checkpoint shard cache is poisoned".into()))
+        cache_policy::lock(&self.cache)
     }
 
     fn acquire_shard(&self, entry: &CatalogEntry) -> Result<Arc<CachedShard>, StoreError> {
-        let canonical_path = entry.shard.clone();
-        let mut cache = self.lock_cache()?;
-        cache.tick = cache.tick.saturating_add(1);
-        let tick = cache.tick;
-        if let Some(shard) = cache
-            .entries
-            .get(&canonical_path)
-            .map(|entry| Arc::clone(&entry.shard))
-        {
-            cache.hits = cache.hits.saturating_add(1);
-            cache.entries.get_mut(&canonical_path).unwrap().last_used = tick;
-            return Ok(shard);
-        }
-        cache.misses = cache.misses.saturating_add(1);
-        if cache.entries.len() >= self.max_cached_shards {
-            let victim = cache
-                .entries
-                .iter()
-                .filter(|(_, candidate)| Arc::strong_count(&candidate.shard) == 1)
-                .min_by(|(left_path, left), (right_path, right)| {
-                    (left.last_used, *left_path).cmp(&(right.last_used, *right_path))
-                })
-                .map(|(path, _)| path.clone());
-            if let Some(victim) = victim {
-                cache.entries.remove(&victim);
-                cache.evictions = cache.evictions.saturating_add(1);
-            } else {
-                return Err(StoreError::CapacityExhausted {
-                    maximum: self.max_cached_shards,
-                    leased: cache
-                        .entries
-                        .values()
-                        .map(|entry| entry.shard.path.clone())
-                        .collect(),
-                });
-            }
-        }
-        let admission = Arc::clone(self.shards.admission(&canonical_path));
-        admission.header(&canonical_path)?;
-        let shard = Arc::new(CachedShard {
-            path: canonical_path.clone(),
-            admitted_file: Arc::clone(&admission.file),
-            admission,
-            full_tensors: Mutex::new(BTreeMap::new()),
-        });
-        cache.touched.insert(entry.shard.clone());
-        cache.entries.insert(
-            canonical_path,
-            CacheEntry {
-                shard: Arc::clone(&shard),
-                last_used: tick,
-            },
-        );
-        Ok(shard)
+        cache_policy::acquire_shard(&self.cache, self.max_cached_shards, &entry.shard, || {
+            Arc::clone(self.shards.admission(&entry.shard))
+        })
     }
 
     fn cached_metadata(&self, key: &str) -> Result<TensorMetadata, StoreError> {
@@ -1801,7 +2194,7 @@ impl SafetensorsWeightStore {
             .get(key)
             .cloned()
             .ok_or_else(|| StoreError::UnknownTensor { key: key.into() })?;
-        self.lock_cache()?.touched.insert(entry.shard.clone());
+        cache_policy::touch_metadata(&self.cache, &entry.shard)?;
         Ok(metadata)
     }
 }
@@ -1859,23 +2252,18 @@ impl WeightStore for SafetensorsWeightStore {
             &output_shape,
             request.policy,
         )?;
-        let cached = shard
-            .full_tensors
-            .lock()
-            .map_err(|_| StoreError::Internal("checkpoint tensor cache is poisoned".into()))?
-            .get(&request.key)
-            .and_then(Weak::upgrade);
+        let cached = cache_policy::lookup(&shard, &request.key)?;
         let complete_tensor =
             read.ranges.len() == 1 && read.ranges[0].start == 0 && read.ranges[0].end == tensor_len;
         let cache_hit = cached.is_some();
-        if cache_hit {
-            drop(shard.admitted_file.open_validated(&shard.path)?);
-        }
+        let cached = cached
+            .map(cache_policy::CachedPayload::validate)
+            .transpose()?;
         let bytes = match cached {
-            Some(bytes) if complete_tensor => bytes,
+            Some(bytes) if complete_tensor => bytes.into_bytes(),
             Some(bytes) => Arc::new(copy_safetensors_ranges(
                 &request.key,
-                bytes.as_ref(),
+                bytes.bytes(),
                 &read.ranges,
             )?),
             None => {
@@ -1887,13 +2275,7 @@ impl WeightStore for SafetensorsWeightStore {
                     self.read_telemetry.as_ref(),
                 )?);
                 if complete_tensor {
-                    shard
-                        .full_tensors
-                        .lock()
-                        .map_err(|_| {
-                            StoreError::Internal("checkpoint tensor cache is poisoned".into())
-                        })?
-                        .insert(request.key.clone(), Arc::downgrade(&bytes));
+                    cache_policy::publish_full(&shard, &request.key, &bytes)?;
                 }
                 bytes
             }
@@ -1901,7 +2283,7 @@ impl WeightStore for SafetensorsWeightStore {
         let length = u64::try_from(bytes.len()).map_err(|_| StoreError::Overflow {
             context: format!("physical read length for {:?}", request.key),
         })?;
-        self.lock_cache()?.payloads.insert(shard.path.clone());
+        cache_policy::publish_payload(&self.cache, &shard)?;
         Ok(SafetensorsLease {
             metadata,
             selection: request.selection,
@@ -1947,6 +2329,96 @@ impl WeightStore for SafetensorsWeightStore {
 }
 
 impl CheckpointSource for SafetensorsWeightStore {
+    fn prepared_acquisition_owner(self: Arc<Self>) -> Option<PreparedAcquisitionOwner> {
+        Some(acquisition::retained_route::owner_safetensors(self))
+    }
+
+    fn prepared_acquisition_source(&self) -> PreparedAcquisitionSource<'_> {
+        PreparedAcquisitionSource(acquisition::Route::Safetensors(self))
+    }
+
+    fn source_lease_controls<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Result<SourceLeaseControls<'a>, LeaseControlBorrowError<'a>> {
+        let metadata = self.source_metadata_borrowed(key)?;
+        let entry = &self.catalog[key];
+        let admission = self.shards.admission(&entry.shard);
+        let header = admission
+            .header
+            .get()
+            .ok_or(SourceMetadataBorrowError::HeaderUnavailable)?
+            .as_ref()
+            .map_err(SourceMetadataBorrowError::Retained)?;
+        let info = header
+            .metadata
+            .info(key)
+            .ok_or(SourceMetadataBorrowError::UnknownTensor)?;
+        Ok(
+            SourceLeaseControls::new(LeaseProvider::Safetensors, metadata, key)
+                .with_safetensors_lease(SafetensorsLeaseSource::new(self, key, metadata))
+                .with_safetensors_reads(
+                    SafetensorsReadSource::new(
+                        key,
+                        &metadata.logical_shape,
+                        &info.shape,
+                        info.dtype,
+                        info.data_offsets,
+                    )
+                    .with_file(read_bytes::ReadFileSource {
+                        path: &entry.shard,
+                        admitted: &admission.file,
+                        header_payload_start: header.payload_offset,
+                        telemetry: &self.read_telemetry,
+                    }),
+                ),
+        )
+    }
+
+    fn source_metadata_borrowed(&self, key: &str) -> SourceMetadataLoan<'_> {
+        let entry = self
+            .catalog
+            .get(key)
+            .ok_or(SourceMetadataBorrowError::UnknownTensor)?;
+        let admitted = self.shards.admission(&entry.shard);
+        let header = admitted
+            .header
+            .get()
+            .ok_or(SourceMetadataBorrowError::HeaderUnavailable)?;
+        let header = header
+            .as_ref()
+            .map_err(SourceMetadataBorrowError::Retained)?;
+        header
+            .tensors
+            .get(key)
+            .ok_or(SourceMetadataBorrowError::UnknownTensor)
+    }
+    fn source_key_authority_borrowed(
+        &self,
+        _: &str,
+    ) -> Result<SourceKeyAuthority, SourceMetadataBorrowError<'_>> {
+        Ok(SourceKeyAuthority::Ordinary)
+    }
+
+    fn source_storage_slot_bound(&self) -> Result<Option<usize>, StoreError> {
+        Ok(Some(0))
+    }
+
+    fn visit_source_storage(
+        &self,
+        _visitor: &mut dyn FnMut(SourceStorageRef<'_>),
+    ) -> Result<bool, StoreError> {
+        // Header/file admission is separate metadata; payload cache entries are
+        // Weak. Externally retained leases belong to their operation owners.
+        Ok(true)
+    }
+
+    fn source_storage(&self) -> Result<Option<SourceStorage>, StoreError> {
+        // Cached shards own exact file/header admission; payload cache entries
+        // are Weak and the source does not keep encoded tensor bytes alive.
+        Ok(Some(SourceStorage::default()))
+    }
+
     fn recipe_cache(&self) -> Option<&RecipeInferenceCache> {
         Some(self.shards.recipe_cache())
     }
@@ -1997,7 +2469,7 @@ fn read_safetensors_metadata(
     let mut file = admitted_file.open_validated(path)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|error| io_error(path, error))?;
-    let file_len = admitted_file.identity.len;
+    let file_len = admitted_file.identity.version.length;
     let metadata = read_safetensors_metadata_from(path, &mut file, file_len)?;
     admitted_file.validate_file(path, &file)?;
     Ok(metadata)
@@ -2083,16 +2555,6 @@ impl SafetensorsReadPlan {
     }
 }
 
-fn push_coalesced_range(ranges: &mut Vec<Range<usize>>, range: Range<usize>) {
-    if let Some(previous) = ranges.last_mut() {
-        if previous.end == range.start {
-            previous.end = range.end;
-            return;
-        }
-    }
-    ranges.push(range);
-}
-
 fn plan_safetensors_reads(
     key: &str,
     dtype: Dtype,
@@ -2102,148 +2564,15 @@ fn plan_safetensors_reads(
     output_shape: &[usize],
     policy: ReadPolicy,
 ) -> Result<SafetensorsReadPlan, StoreError> {
-    let bounded = matches!(policy, ReadPolicy::RequireBounded);
-    if matches!(selection, TensorSelection::Full) {
-        return Ok(SafetensorsReadPlan::single(0..payload_len, true));
-    }
-    let bits = dtype.bitsize();
-    let scalar_bytes = bits.checked_div(8).filter(|_| bits.is_multiple_of(8));
-    if let (
-        Some(scalar_bytes),
-        TensorSelection::Contiguous {
-            offset_elements,
-            shape,
-        },
-    ) = (scalar_bytes, selection)
-    {
-        let start =
-            offset_elements
-                .checked_mul(scalar_bytes)
-                .ok_or_else(|| StoreError::Overflow {
-                    context: format!("contiguous byte start for {key:?}"),
-                })?;
-        let end = checked_elements(key, shape)?
-            .checked_mul(scalar_bytes)
-            .and_then(|length| start.checked_add(length))
-            .ok_or_else(|| StoreError::Overflow {
-                context: format!("contiguous byte end for {key:?}"),
-            })?;
-        if end > payload_len {
-            return Err(invalid_selection(
-                key,
-                "contiguous byte span outside payload",
-            ));
-        }
-        return Ok(SafetensorsReadPlan::single(start..end, true));
-    }
-    if let (
-        Some(_),
-        TensorSelection::Range {
-            axis: 0,
-            start,
-            end,
-        },
-    ) = (scalar_bytes, selection)
-    {
-        let row_bytes = payload_len
-            .checked_div(shape[0])
-            .filter(|_| payload_len.is_multiple_of(shape[0]))
-            .ok_or_else(|| invalid_selection(key, "payload is not row divisible"))?;
-        let byte_start = start
-            .checked_mul(row_bytes)
-            .ok_or_else(|| StoreError::Overflow {
-                context: format!("row selection byte start for {key:?}"),
-            })?;
-        let byte_end = end
-            .checked_mul(row_bytes)
-            .ok_or_else(|| StoreError::Overflow {
-                context: format!("row selection byte end for {key:?}"),
-            })?;
-        return Ok(SafetensorsReadPlan::single(byte_start..byte_end, true));
-    }
-    if !bounded {
-        return Ok(SafetensorsReadPlan::single(0..payload_len, false));
-    }
-    let (axis, indices): (usize, Vec<usize>) = match selection {
-        TensorSelection::Range { axis, start, end } => (*axis, (*start..*end).collect()),
-        TensorSelection::Indices { axis, indices } => (*axis, indices.clone()),
-        TensorSelection::Contiguous { .. } => {
-            return Err(StoreError::BoundedSelectionUnavailable {
-                key: key.into(),
-                message: "packed contiguous selection is not byte aligned".into(),
-            });
-        }
-        TensorSelection::Full => unreachable!(),
-    };
-    let axis_len = shape[axis];
-    let outer = shape[..axis].iter().product::<usize>();
-    let inner = shape[axis + 1..].iter().product::<usize>();
-    let output_bits = checked_elements(key, output_shape)?
-        .checked_mul(bits)
-        .ok_or_else(|| StoreError::Overflow {
-            context: format!("selected bit length for {key:?}"),
-        })?;
-    if !output_bits.is_multiple_of(8) {
-        return Err(StoreError::BoundedSelectionUnavailable {
-            key: key.into(),
-            message: "selected packed payload is not byte aligned".into(),
-        });
-    }
-    let block_bytes = if bits == 4 {
-        if !inner.is_multiple_of(2)
-            || indices
-                .iter()
-                .any(|index| !(index * inner).is_multiple_of(2))
-        {
-            return Err(StoreError::BoundedSelectionUnavailable {
-                key: key.into(),
-                message: "FP4 selection crosses a nibble boundary".into(),
-            });
-        }
-        inner / 2
-    } else {
-        inner
-            .checked_mul(
-                scalar_bytes.ok_or_else(|| StoreError::BoundedSelectionUnavailable {
-                    key: key.into(),
-                    message: "stored scalar width is not byte aligned".into(),
-                })?,
-            )
-            .ok_or_else(|| StoreError::Overflow {
-                context: format!("selection block bytes for {key:?}"),
-            })?
-    };
-    let mut ranges = Vec::new();
-    for outer_index in 0..outer {
-        for index in &indices {
-            let start = outer_index
-                .checked_mul(axis_len)
-                .and_then(|value| value.checked_add(*index))
-                .and_then(|value| value.checked_mul(block_bytes))
-                .ok_or_else(|| StoreError::Overflow {
-                    context: format!("selection byte start for {key:?}"),
-                })?;
-            let end = start
-                .checked_add(block_bytes)
-                .ok_or_else(|| StoreError::Overflow {
-                    context: format!("selection byte end for {key:?}"),
-                })?;
-            if end > payload_len {
-                return Err(invalid_selection(key, "selection exceeds payload"));
-            }
-            push_coalesced_range(&mut ranges, start..end);
-        }
-    }
-    if ranges.is_empty() {
-        return Err(invalid_selection(
-            key,
-            "selection produced no physical ranges",
-        ));
-    }
-    Ok(SafetensorsReadPlan {
-        ranges,
-        physically_bounded: true,
-    })
+    read_plan::ordinary(
+        key,
+        dtype,
+        shape,
+        payload_len,
+        selection,
+        output_shape,
+        policy,
+    )
 }
 
 fn read_safetensors_ranges(
@@ -2300,29 +2629,14 @@ fn read_safetensors_range_pass(
     capacity: usize,
     telemetry: &SafetensorsReadTelemetry,
 ) -> Result<Vec<u8>, StoreError> {
-    let mut output = Vec::with_capacity(capacity);
-    for range in ranges {
-        let absolute = tensor_payload_start
-            .checked_add(range.start)
-            .ok_or_else(|| StoreError::Overflow {
-                context: format!("selected payload offset for {}", path.display()),
-            })?;
-        file.seek(SeekFrom::Start(u64::try_from(absolute).map_err(|_| {
-            StoreError::Overflow {
-                context: format!("selected payload offset for {}", path.display()),
-            }
-        })?))
-        .map_err(|error| io_error(path, error))?;
-        let start = output.len();
-        output.resize(start + range.len(), 0);
-        file.read_exact(&mut output[start..])
-            .map_err(|error| io_error(path, error))?;
-        telemetry.physical_reads.fetch_add(1, Ordering::Relaxed);
-        telemetry
-            .physical_read_bytes
-            .fetch_add(range.len() as u64, Ordering::Relaxed);
-    }
-    Ok(output)
+    read_bytes::ordinary_read_pass(
+        path,
+        file,
+        tensor_payload_start,
+        ranges,
+        capacity,
+        telemetry,
+    )
 }
 
 fn copy_safetensors_ranges(
@@ -2330,22 +2644,7 @@ fn copy_safetensors_ranges(
     payload: &[u8],
     ranges: &[Range<usize>],
 ) -> Result<Vec<u8>, StoreError> {
-    let capacity = ranges.iter().try_fold(0usize, |total, range| {
-        total
-            .checked_add(range.len())
-            .ok_or_else(|| StoreError::Overflow {
-                context: format!("cached selected payload length for {key:?}"),
-            })
-    })?;
-    let mut output = Vec::with_capacity(capacity);
-    for range in ranges {
-        output.extend_from_slice(
-            payload
-                .get(range.clone())
-                .ok_or_else(|| invalid_selection(key, "cached selection exceeds payload"))?,
-        );
-    }
-    Ok(output)
+    read_bytes::ordinary_copy(key, payload, ranges)
 }
 
 fn metadata_for_parts(
@@ -2384,51 +2683,7 @@ pub(crate) fn validate_selection(
     shape: &[usize],
     selection: &TensorSelection,
 ) -> Result<Vec<usize>, StoreError> {
-    checked_elements(key, shape)?;
-    let mut output = shape.to_vec();
-    match selection {
-        TensorSelection::Full => {}
-        TensorSelection::Range { axis, start, end } => {
-            let dimension = shape
-                .get(*axis)
-                .ok_or_else(|| invalid_selection(key, "axis outside rank"))?;
-            if start >= end || *end > *dimension {
-                return Err(invalid_selection(key, "range outside dimension"));
-            }
-            output[*axis] = end - start;
-        }
-        TensorSelection::Indices { axis, indices } => {
-            let dimension = shape
-                .get(*axis)
-                .ok_or_else(|| invalid_selection(key, "axis outside rank"))?;
-            if indices.is_empty() || indices.iter().any(|index| *index >= *dimension) {
-                return Err(invalid_selection(
-                    key,
-                    "indices are empty or outside dimension",
-                ));
-            }
-            output[*axis] = indices.len();
-        }
-        TensorSelection::Contiguous {
-            offset_elements,
-            shape: selected,
-        } => {
-            if selected.is_empty() || selected.contains(&0) {
-                return Err(invalid_selection(key, "contiguous output shape is empty"));
-            }
-            let end = offset_elements
-                .checked_add(checked_elements(key, selected)?)
-                .ok_or_else(|| StoreError::Overflow {
-                    context: format!("contiguous selection end for {key:?}"),
-                })?;
-            if end > checked_elements(key, shape)? {
-                return Err(invalid_selection(key, "contiguous span outside tensor"));
-            }
-            output = selected.clone();
-        }
-    }
-    checked_elements(key, &output)?;
-    Ok(output)
+    selection_validation::ordinary(key, shape, selection)
 }
 
 fn select_safetensors_bytes(
@@ -2440,121 +2695,7 @@ fn select_safetensors_bytes(
     output_shape: &[usize],
     policy: ReadPolicy,
 ) -> Result<(Range<usize>, Option<Vec<u8>>), StoreError> {
-    if matches!(selection, TensorSelection::Full) {
-        return Ok((0..data.len(), None));
-    }
-    let bits = dtype.bitsize();
-    let scalar_bytes = bits.checked_div(8).filter(|_| bits.is_multiple_of(8));
-    if let (
-        Some(scalar_bytes),
-        TensorSelection::Contiguous {
-            offset_elements,
-            shape,
-        },
-    ) = (scalar_bytes, selection)
-    {
-        let start =
-            offset_elements
-                .checked_mul(scalar_bytes)
-                .ok_or_else(|| StoreError::Overflow {
-                    context: format!("contiguous byte start for {key:?}"),
-                })?;
-        let end = checked_elements(key, shape)?
-            .checked_mul(scalar_bytes)
-            .and_then(|length| start.checked_add(length))
-            .ok_or_else(|| StoreError::Overflow {
-                context: format!("contiguous byte end for {key:?}"),
-            })?;
-        return data
-            .get(start..end)
-            .map(|_| (start..end, None))
-            .ok_or_else(|| invalid_selection(key, "contiguous byte span outside payload"));
-    }
-    if let (
-        Some(_),
-        TensorSelection::Range {
-            axis: 0,
-            start,
-            end,
-        },
-    ) = (scalar_bytes, selection)
-    {
-        let row_bytes = data
-            .len()
-            .checked_div(shape[0])
-            .filter(|_| data.len().is_multiple_of(shape[0]))
-            .ok_or_else(|| invalid_selection(key, "payload is not row divisible"))?;
-        let start = start * row_bytes;
-        let end = end * row_bytes;
-        return Ok((start..end, None));
-    }
-    if matches!(policy, ReadPolicy::AllowFullTensorRead) {
-        return Ok((0..data.len(), None));
-    }
-    let (axis, indices): (usize, Vec<usize>) = match selection {
-        TensorSelection::Range { axis, start, end } => (*axis, (*start..*end).collect()),
-        TensorSelection::Indices { axis, indices } => (*axis, indices.clone()),
-        TensorSelection::Contiguous { .. } => {
-            return Err(StoreError::BoundedSelectionUnavailable {
-                key: key.into(),
-                message: "packed contiguous selection is not byte aligned".into(),
-            });
-        }
-        TensorSelection::Full => unreachable!(),
-    };
-    let axis_len = shape[axis];
-    let outer = shape[..axis].iter().product::<usize>();
-    let inner = shape[axis + 1..].iter().product::<usize>();
-    let output_bits = checked_elements(key, output_shape)?
-        .checked_mul(bits)
-        .ok_or_else(|| StoreError::Overflow {
-            context: format!("selected bit length for {key:?}"),
-        })?;
-    if !output_bits.is_multiple_of(8) {
-        return Err(StoreError::BoundedSelectionUnavailable {
-            key: key.into(),
-            message: "selected packed payload is not byte aligned".into(),
-        });
-    }
-    let mut output = Vec::with_capacity(output_bits / 8);
-    if bits == 4 {
-        if !inner.is_multiple_of(2)
-            || indices
-                .iter()
-                .any(|index| !(index * inner).is_multiple_of(2))
-        {
-            return Err(StoreError::BoundedSelectionUnavailable {
-                key: key.into(),
-                message: "FP4 selection crosses a nibble boundary".into(),
-            });
-        }
-        let block_bytes = inner / 2;
-        for outer_index in 0..outer {
-            for index in &indices {
-                let start = (outer_index * axis_len + index) * block_bytes;
-                output.extend_from_slice(
-                    data.get(start..start + block_bytes)
-                        .ok_or_else(|| invalid_selection(key, "selection exceeds payload"))?,
-                );
-            }
-        }
-    } else {
-        let scalar_bytes = scalar_bytes.ok_or_else(|| StoreError::BoundedSelectionUnavailable {
-            key: key.into(),
-            message: "stored scalar width is not byte aligned".into(),
-        })?;
-        let block_bytes = inner * scalar_bytes;
-        for outer_index in 0..outer {
-            for index in &indices {
-                let start = (outer_index * axis_len + index) * block_bytes;
-                output.extend_from_slice(
-                    data.get(start..start + block_bytes)
-                        .ok_or_else(|| invalid_selection(key, "selection exceeds payload"))?,
-                );
-            }
-        }
-    }
-    Ok((0..output.len(), Some(output)))
+    memory_destination::ordinary_selection(key, dtype, shape, data, selection, output_shape, policy)
 }
 
 fn checked_elements(key: &str, shape: &[usize]) -> Result<usize, StoreError> {
@@ -2681,6 +2822,21 @@ mod tests {
         for _ in 0..3 {
             for key in ["left", "right"] {
                 assert_eq!(store.metadata(key).unwrap(), *catalog.tensor(key).unwrap());
+                let before = shards
+                    .admission(&store.catalog[key].shard)
+                    .header_reads
+                    .load(Ordering::Relaxed);
+                let loan = store.source_metadata_borrowed(key).unwrap();
+                let again = store.source_metadata_borrowed(key).unwrap();
+                assert!(std::ptr::eq(loan, again));
+                assert_eq!(loan, catalog.tensor(key).unwrap());
+                assert_eq!(
+                    shards
+                        .admission(&store.catalog[key].shard)
+                        .header_reads
+                        .load(Ordering::Relaxed),
+                    before
+                );
                 drop(
                     store
                         .acquire(TensorReadRequest {
@@ -2740,7 +2896,54 @@ mod tests {
         .unwrap();
         let shards = SafetensorsShards::discover_catalog(directory.path()).unwrap();
         let store = SafetensorsWeightStore::open_admitted(shards.clone(), 1).unwrap();
+        assert!(matches!(
+            store.source_metadata_borrowed("weight"),
+            Err(SourceMetadataBorrowError::HeaderUnavailable)
+        ));
+        assert_eq!(
+            shards
+                .admission(&store.catalog["weight"].shard)
+                .header_reads
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert!(matches!(
+            store.source_lease_controls("weight"),
+            Err(LeaseControlBorrowError::Source(
+                SourceMetadataBorrowError::HeaderUnavailable
+            ))
+        ));
         let first = store.metadata("weight").unwrap_err().to_string();
+        let borrowed = store.source_metadata_borrowed("weight").unwrap_err();
+        let SourceMetadataBorrowError::Retained(cause) = borrowed else {
+            panic!("expected retained header failure")
+        };
+        let retained = shards
+            .admission(&store.catalog["weight"].shard)
+            .header
+            .get()
+            .unwrap()
+            .as_ref()
+            .unwrap_err();
+        assert!(std::ptr::eq(cause, retained));
+        let lease_error = store.source_lease_controls("weight").unwrap_err();
+        assert_eq!(lease_error.to_string(), first);
+        assert!(std::ptr::eq(
+            std::error::Error::source(&lease_error)
+                .unwrap()
+                .downcast_ref::<StoreError>()
+                .unwrap(),
+            retained
+        ));
+
+        assert_eq!(borrowed.to_string(), first);
+        assert!(std::ptr::eq(
+            std::error::Error::source(&borrowed)
+                .unwrap()
+                .downcast_ref::<StoreError>()
+                .unwrap(),
+            retained
+        ));
         std::fs::write(&path, b"different header").unwrap();
         assert_eq!(store.metadata("weight").unwrap_err().to_string(), first);
         assert_eq!(
@@ -3735,6 +3938,18 @@ mod tests {
         let source = ResolvedCheckpointSource::new(source, contract);
 
         assert_eq!(source.source_keys(), ["selected"]);
+        assert_eq!(
+            source.source_metadata_borrowed("selected").unwrap(),
+            &source.source_metadata("selected").unwrap()
+        );
+        assert!(matches!(
+            source.source_metadata_borrowed("unselected"),
+            Err(SourceMetadataBorrowError::UnauthorizedTensor)
+        ));
+        assert!(matches!(
+            source.source_metadata_borrowed("missing"),
+            Err(SourceMetadataBorrowError::UnauthorizedTensor)
+        ));
         assert!(source.source_metadata("selected").is_ok());
         assert!(matches!(
             source.source_metadata("unselected"),

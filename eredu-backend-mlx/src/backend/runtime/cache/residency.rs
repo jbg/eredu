@@ -7,47 +7,49 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fs::{self, File},
-    panic::{catch_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
     },
     thread::{self, JoinHandle},
     time::Instant,
 };
 
 use safemlx::{
-    host_transfer_capacity_upper_bound,
-    transforms::{async_eval_with_event, eval},
     Array, Device, DeviceType, Dtype, Event, HostTransferBuffer, HostTransferPolicy,
-    ImmutableHostTransferBuffer, Stream,
+    ImmutableHostTransferBuffer, Stream, host_transfer_capacity_upper_bound,
+    transforms::{async_eval_with_event, eval},
 };
-use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
+use safetensors::tensor::{Dtype as StoredDtype, TensorView, serialize_to_file};
 use sha2::{Digest, Sha256};
 
 use eredu_core::{
     cache::{
-        prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, CacheBlockId,
-        CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier, PromptCacheBlock,
-        PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
-        PromptCacheOptions, PromptCacheStateTensor, StateTensorOwner, StateTensorRole,
-        PROMPT_CACHE_SCHEMA_VERSION,
+        CacheBlockId, CachePolicyError, CacheRankIdentity, CacheRepresentation, CacheTier,
+        PROMPT_CACHE_SCHEMA_VERSION, PromptCacheBlock, PromptCacheDescriptor, PromptCacheError,
+        PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor,
+        StateTensorOwner, StateTensorRole, prompt_cache_token_fingerprint,
+        validate_prompt_cache_model_identity,
     },
     residency::CacheEvictionPolicy,
 };
+use eredu_runtime::cache::LiveCacheBlockSource;
 use eredu_runtime::{
-    finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
-    resolve_prompt_cache_root, safe_prompt_cache_shard_path, CacheBlockLifecycle,
-    CacheBlockStorage, CacheHostDemotionOperation, CacheIoExecutionStateError, CacheIoOperation,
-    CacheIoOperationKey, CacheIoOperationKind, CacheIoSubmission as RuntimeCacheIoSubmission,
-    CacheIoSubmissionOutcome, CacheIoTicket as RuntimeCacheIoTicket,
-    CacheIoWorker as RuntimeCacheIoWorker, CacheIoWorkerError, CacheLayerResidencyStats,
-    CacheLifecycleError, CachePoolError, CachePoolMembership, CachePoolReservation,
-    CachePoolResource, CachePoolUsage, CacheResidencyConfigurationError, CacheResidencyPool,
-    CacheResidencyReport, CacheResidencyTelemetry, CacheStorageError, CacheStoragePhase,
-    LiveCacheBlockPublication, LiveCacheDiskPolicy, LiveCachePublicationError, MutableCacheTail,
-    PagedCacheOptions, PromptCachePersistenceError, PromptCachePublication,
+    CacheBlockLifecycle, CacheBlockStorage, CacheHostDemotionOperation, CacheIoExecutionStateError,
+    CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind,
+    CacheIoSubmission as RuntimeCacheIoSubmission, CacheIoSubmissionOutcome,
+    CacheIoTicket as RuntimeCacheIoTicket, CacheIoWorker as RuntimeCacheIoWorker,
+    CacheIoWorkerError, CacheLayerResidencyStats, CacheLifecycleError, CachePoolError,
+    CachePoolMembership, CachePoolReservation, CachePoolResource, CachePoolUsage,
+    CacheResidencyConfigurationError, CacheResidencyPool, CacheResidencyReport,
+    CacheResidencyTelemetry, CacheStorageError, CacheStoragePhase, LiveCacheBlockPublication,
+    LiveCacheDiskPolicy, LiveCachePublicationError, MutableCacheTail, PagedCacheOptions,
+    PromptCachePersistenceError, PromptCachePublication, finalize_prompt_cache_shard,
+    hash_prompt_cache_shard_payload, inspect_prompt_cache, resolve_prompt_cache_root,
+    safe_prompt_cache_shard_path,
 };
 
 /// Maximum number of cache blocks scheduled ahead by paged-cache prefetch.
@@ -174,7 +176,7 @@ fn host_cache_layout_capacity_upper_bound(
                 other => {
                     return Err(CacheResidencyError::Runtime(format!(
                         "unsupported host cache dtype {other} in capacity admission"
-                    )))
+                    )));
                 }
             };
             let logical_bytes = shape.iter().try_fold(element_bytes, |bytes, dimension| {
@@ -482,6 +484,14 @@ enum HostDemotionRequest {
 struct HostDemotionWorker {
     sender: mpsc::Sender<HostDemotionRequest>,
     handle: Mutex<Option<JoinHandle<()>>>,
+    active_payload: Arc<AtomicBool>,
+}
+
+struct ActiveHostPayload<'a>(&'a AtomicBool);
+impl Drop for ActiveHostPayload<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for HostDemotionWorker {
@@ -493,10 +503,14 @@ impl std::fmt::Debug for HostDemotionWorker {
 impl HostDemotionWorker {
     fn new() -> Result<Self, CacheResidencyError> {
         let (sender, receiver) = mpsc::channel();
+        let active_payload = Arc::new(AtomicBool::new(false));
+        let worker_active = Arc::clone(&active_payload);
         let handle = thread::Builder::new()
             .name("eredu-mlx-cache-host-demotion".into())
             .spawn(move || {
                 while let Ok(request) = receiver.recv() {
+                    worker_active.store(true, Ordering::Release);
+                    let _active = ActiveHostPayload(&worker_active);
                     match request {
                         HostDemotionRequest::Demote {
                             arrays,
@@ -538,6 +552,7 @@ impl HostDemotionWorker {
         Ok(Self {
             sender,
             handle: Mutex::new(Some(handle)),
+            active_payload,
         })
     }
 
@@ -588,8 +603,8 @@ fn transfer_error(
 
 mod io;
 pub use io::{
-    load_prompt_cache_state_tensors, open_prompt_cache, CacheBlockLease, CacheBlockPrefetch,
-    CacheResidencyManager, LoadedPromptCacheStateTensor, PromptCacheStateArray,
+    CacheBlockLease, CacheBlockPrefetch, CacheResidencyManager, LoadedPromptCacheStateTensor,
+    PromptCacheStateArray, load_prompt_cache_state_tensors, open_prompt_cache,
 };
 
 /// Structured cache residency and persistence failures.
@@ -622,6 +637,12 @@ pub enum CacheResidencyError {
     /// Backend-neutral live-cache file publication failed.
     #[error(transparent)]
     LivePublication(#[from] LiveCachePublicationError),
+    /// Shared neutral live-cache schema/write failure.
+    #[error(transparent)]
+    Shard(#[from] eredu_runtime::cache::CacheShardError),
+    /// Actual live-file version/read failure with retained publication custody.
+    #[error(transparent)]
+    LiveRead(#[from] eredu_runtime::cache::LiveCacheReadFailure),
     /// Paged options were contradictory or unbounded.
     #[error("invalid paged cache options: {0}")]
     InvalidOptions(String),
@@ -694,3 +715,32 @@ pub enum CacheResidencyError {
         reason: String,
     },
 }
+
+pub(crate) use io::{
+    CacheBlockSource, CacheBlockSourceLoan, CacheDiskSource, CacheSourceError, CacheSourceFailure,
+    CacheSourceFailureCause, IndependentCacheManagerPlan, PinnedCacheBlock, PinnedCacheBlockLease,
+    PinnedCacheSource, PreparedIndependentCacheManager,
+};
+
+pub(crate) use io::{
+    CacheBlockMetadata, CatalogInstallFailure, InstalledManagerCatalog,
+    PreparedFloatingBlockMetadata, PreparedManagerCatalog,
+};
+
+pub(crate) use io::{PagedArrayCopyLayout, PreparedPagedArrayCopy};
+
+pub(crate) use io::{PreparedCacheHostPromotion, PreparedCacheHostPromotionSlots};
+
+pub(crate) use io::{PreparedCacheHostDemotion, StoredCacheHostSource};
+
+pub(crate) use io::PreparedDiskWrite;
+
+pub(crate) use io::PreparedDiskWriteDestination;
+
+pub(crate) use io::{DiskWriteOperation, InstalledDiskWorker, PreparedDiskWorker};
+
+pub(crate) use io::{DiskReadBinding, PreparedDiskReadDestination, disk_read_source_facts};
+
+pub(crate) use io::{DiskReadOperation, PreparedDiskReadSource};
+
+pub(crate) use io::PreparedInitialDiskReturn;

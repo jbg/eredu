@@ -15,9 +15,12 @@ use safemlx::{
 };
 
 mod collectives;
+mod logical_exchange;
+pub(crate) use logical_exchange::{LogicalExchangePlan, LogicalExchangeCause, LogicalPackedWorldPlan, LogicalVariableWorldPlan, LogicalRoutedPlan, LogicalRoutedValue, LogicalVariableRoutePlan, LogicalVariableRoute};
 mod handle;
 mod point_to_point;
 mod status;
+pub(crate) use status::{StatusPlan,StatusChainOperations};
 
 pub(crate) use status::independent_status_members;
 
@@ -31,6 +34,6 @@ pub use point_to_point::{recv, send};
 
 #[cfg(test)]
 pub(crate) use handle::{
-    contracted_collective_submissions, native_collective_submissions,
+    contracted_collective_submissions, original_model_collective_submissions, native_collective_submissions,
     reset_native_collective_submissions,
 };

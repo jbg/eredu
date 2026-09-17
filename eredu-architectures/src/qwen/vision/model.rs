@@ -1,19 +1,22 @@
 //! Shared backend-neutral Qwen vision equations.
 
 use eredu_nn::{
-    multimodal::{
-        multi_axis_rotary_embeddings, project_flattened_patches, FlattenedPatchSpec,
-        MultiAxisRotaryLayout, MultiAxisRotarySpec, RotaryAxisSpec,
-    },
-    sequence_layout::{
-        attention_chunk_lengths, bilinear_interpolation_samples, inverse_permutation,
-        patch_positions, validate_patch_grid, window_partition, InterpolationMode, PatchTraversal,
-    },
     EmbeddingOperator, EmbeddingSpec, Error, Index, LinearOperator, LinearSpec, NeuralBackend,
     Parameter, ParameterSpec, Parameterized, SegmentedAttentionInput, Tensor,
+    multimodal::{
+        FlattenedPatchSpec, MultiAxisRotaryLayout, MultiAxisRotarySpec, RotaryAxisSpec,
+        multi_axis_rotary_embeddings, project_flattened_patches,
+    },
+    sequence_layout::{
+        InterpolationMode, PatchTraversal, attention_chunk_lengths, bilinear_interpolation_samples,
+        inverse_permutation, patch_positions, validate_patch_grid, visit_gathered_patch_positions,
+        window_partition,
+    },
 };
 
 use super::{VisionAttentionPolicy, VisionConfig, VisionMode};
+use eredu_runtime::input::PreparedModelInputOwner;
+mod prepared_tables;
 
 /// Prepared flattened patches and their `(time, height, width)` grids.
 pub struct VisionInput<'a, T> {
@@ -26,26 +29,92 @@ pub struct VisionInput<'a, T> {
 /// Parameter-free state retained between streamable vision blocks.
 #[derive(Debug, Clone)]
 pub struct VisionState<T> {
-    full_chunks: Vec<i32>,
-    window_chunks: Vec<i32>,
-    permutation: Vec<i32>,
+    tables: VisionStateTables<T>,
     cosine: T,
     sine: T,
     deepstack: Vec<T>,
+    metadata: Option<eredu_nn::workspace::WorkspaceContext>,
+}
+#[derive(Debug, Clone)]
+enum VisionStateTables<T> {
+    Ordinary {
+        full_chunks: Vec<i32>,
+        window_chunks: Vec<i32>,
+        permutation: Vec<i32>,
+    },
+    Original(PreparedModelInputOwner<T>),
+    Projected(eredu_runtime::input::OriginalEncoderTableProjection),
+}
+impl<T> VisionStateTables<T> {
+    fn full_chunks(&self) -> &[i32] {
+        match self {
+            Self::Ordinary { full_chunks, .. } => full_chunks,
+            Self::Original(owner) => owner
+                .original_encoder_tables()
+                .expect("original tables")
+                .full_chunks(),
+            Self::Projected(owner) => owner.tables().full_chunks(),
+        }
+    }
+    fn window_chunks(&self) -> &[i32] {
+        match self {
+            Self::Ordinary { window_chunks, .. } => window_chunks,
+            Self::Original(owner) => owner
+                .original_encoder_tables()
+                .expect("original tables")
+                .window_chunks(),
+            Self::Projected(owner) => owner.tables().window_chunks(),
+        }
+    }
+    fn permutation(&self) -> &[i32] {
+        match self {
+            Self::Ordinary { permutation, .. } => permutation,
+            Self::Original(owner) => owner
+                .original_encoder_tables()
+                .expect("original tables")
+                .permutation(),
+            Self::Projected(owner) => owner.tables().permutation(),
+        }
+    }
+    fn inverse(
+        &self,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<std::borrow::Cow<'_, [i32]>, Error> {
+        metadata.controls::<std::borrow::Cow<'_, [i32]>>()?;
+        match self {
+            Self::Ordinary { permutation, .. } => match metadata.context() {
+                Some(context) => eredu_nn::sequence_layout::inverse_permutation_with_metadata(
+                    permutation,
+                    context,
+                )
+                .map(std::borrow::Cow::Owned),
+                None => inverse_permutation(permutation)
+                    .map(std::borrow::Cow::Owned)
+                    .map_err(Error::backend),
+            },
+            Self::Original(owner) => Ok(std::borrow::Cow::Borrowed(
+                owner
+                    .original_encoder_tables()
+                    .expect("original tables")
+                    .inverse(),
+            )),
+            Self::Projected(owner) => Ok(std::borrow::Cow::Borrowed(owner.tables().inverse())),
+        }
+    }
 }
 
 impl<T> VisionState<T> {
     /// Full-attention contiguous segment lengths.
     pub fn full_chunks(&self) -> &[i32] {
-        &self.full_chunks
+        self.tables.full_chunks()
     }
     /// Window-attention contiguous segment lengths.
     pub fn window_chunks(&self) -> &[i32] {
-        &self.window_chunks
+        self.tables.window_chunks()
     }
     /// Merge-group execution permutation.
     pub fn permutation(&self) -> &[i32] {
-        &self.permutation
+        self.tables.permutation()
     }
     /// Captured DeepStack features.
     pub fn deepstack_features(&self) -> &[T] {
@@ -58,22 +127,25 @@ impl<T> VisionState<T> {
             .chain(self.deepstack.iter())
     }
     /// Replaces the backend tensors transported between component owners.
-    pub fn replace_retained_values(&mut self, values: Vec<T>) -> Result<(), Error> {
+    pub fn replace_retained_values(&mut self, mut values: Vec<T>) -> Result<(), Error> {
         if values.len() < 2 {
             return Err(Error::backend(
                 "vision continuation requires rotary cosine and sine tensors",
             ));
         }
-        let mut values = values.into_iter();
-        self.cosine = values.next().expect("validated cosine");
-        self.sine = values.next().expect("validated sine");
-        self.deepstack = values.collect();
+        let mut prefix = values.drain(..2);
+        let cosine = prefix.next().expect("validated cosine");
+        let sine = prefix.next().expect("validated sine");
+        drop(prefix);
+        self.cosine = cosine;
+        self.sine = sine;
+        self.deepstack = values;
         Ok(())
     }
     fn chunks(&self, policy: VisionAttentionPolicy) -> &[i32] {
         match policy {
-            VisionAttentionPolicy::Full => &self.full_chunks,
-            VisionAttentionPolicy::Windowed => &self.window_chunks,
+            VisionAttentionPolicy::Full => self.tables.full_chunks(),
+            VisionAttentionPolicy::Windowed => self.tables.window_chunks(),
         }
     }
 }
@@ -100,9 +172,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayerNorm<B> {
         width: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let modules = crate::decoder::ModuleMetadata::new::<B>(context);
+        modules.controls::<(Self, ParameterSpec, [i32; 1])>()?;
         let make = |field: &str| {
             Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.{field}")).map_err(Error::backend)?,
+                modules.named_parameter(format_args!("{prefix}.{field}"))?,
                 &[width],
                 context,
             )
@@ -132,7 +206,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LayerNorm<B> {
 pub(super) struct PatchEmbed<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     weight: Parameter<B::Tensor>,
     bias: Parameter<B::Tensor>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     spec: FlattenedPatchSpec,
 }
 
@@ -142,6 +216,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbed<B> {
         root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let modules = crate::decoder::ModuleMetadata::new::<B>(context);
+        modules.controls::<(Self, ParameterSpec, [i32; 5], FlattenedPatchSpec)>()?;
         let spec = FlattenedPatchSpec {
             channels: config.in_channels,
             temporal: config.temporal_patch_size,
@@ -151,8 +227,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbed<B> {
         };
         Ok(Self {
             weight: Parameter::unloaded(
-                ParameterSpec::trainable(rooted(root, "patch_embed.proj.weight"))
-                    .map_err(Error::backend)?,
+                modules.named_parameter(format_args!(
+                    "{}",
+                    RootedName(root, "patch_embed.proj.weight")
+                ))?,
                 &[
                     config.hidden_size,
                     config.in_channels,
@@ -163,8 +241,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbed<B> {
                 context,
             )?,
             bias: Parameter::unloaded(
-                ParameterSpec::trainable(rooted(root, "patch_embed.proj.bias"))
-                    .map_err(Error::backend)?,
+                modules.named_parameter(format_args!(
+                    "{}",
+                    RootedName(root, "patch_embed.proj.bias")
+                ))?,
                 &[config.hidden_size],
                 context,
             )?,
@@ -193,16 +273,19 @@ fn linear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     output: i32,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Linear, Error> {
-    let weight = format!("{prefix}.weight");
+    let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+    let modules = crate::decoder::ModuleMetadata::new::<B>(context);
+    modules.controls::<(B::Linear, LinearSpec, String)>()?;
+    let weight = metadata.format(format_args!("{prefix}.weight"))?;
     B::linear(
         LinearSpec {
             input,
             output,
-            weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-            bias: Some(ParameterSpec::trainable(format!("{prefix}.bias")).map_err(Error::backend)?),
-            format: crate::linear_format::standard_linear_format(
+            weight: modules.plain_parameter(&weight)?,
+            bias: Some(modules.named_parameter(format_args!("{prefix}.bias"))?),
+            format: modules.format(
                 &weight,
-                config.linear_format(relative_vision_name(&weight)),
+                config.linear_format_with_metadata(relative_vision_name(&weight), metadata)?,
             )?,
         },
         context,
@@ -214,11 +297,11 @@ fn linear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
 pub(super) struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub(super) qkv: B::Linear,
     pub(super) output: B::Linear,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dim: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     scale: f32,
 }
 
@@ -230,19 +313,25 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         heads: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let root = rooted(parameter_root, &format!("blocks.{layer}.attn"));
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        metadata.controls::<(Self, String)>()?;
+        let root = rooted_with_metadata(
+            parameter_root,
+            &metadata.format(format_args!("blocks.{layer}.attn"))?,
+            metadata,
+        )?;
         let head_dim = config.hidden_size / config.num_heads;
         Ok(Self {
             qkv: linear::<B>(
                 config,
-                &format!("{root}.qkv"),
+                &metadata.format(format_args!("{root}.qkv"))?,
                 config.hidden_size,
                 3 * heads * head_dim,
                 context,
             )?,
             output: linear::<B>(
                 config,
-                &format!("{root}.proj"),
+                &metadata.format(format_args!("{root}.proj"))?,
                 heads * head_dim,
                 config.hidden_size,
                 context,
@@ -259,6 +348,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         cos: &B::Tensor,
         sin: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
+        metadata: crate::decoder::identity::Metadata<'_>,
     ) -> Result<B::Tensor, Error> {
         let sequence = hidden.dim(0);
         let qkv = self
@@ -280,7 +370,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         let query = apply_rotary(&select(0)?, cos, sin, context)?;
         let key = apply_rotary(&select(1)?, cos, sin, context)?;
         let value = select(2)?;
-        let attended = B::segmented_attention(
+        let attended = segmented_attention::<B>(
             SegmentedAttentionInput {
                 queries: &query,
                 keys: &key,
@@ -289,6 +379,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
                 scale: self.scale,
             },
             context,
+            metadata,
         )?;
         self.forward_output(&attended, None, context)
     }
@@ -301,6 +392,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         sin: &B::Tensor,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
+        metadata: crate::decoder::identity::Metadata<'_>,
     ) -> Result<B::Tensor, Error> {
         let sequence = hidden.dim(0);
         let qkv = self
@@ -322,7 +414,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         let query = apply_rotary(&select(0)?, cos, sin, context)?;
         let key = apply_rotary(&select(1)?, cos, sin, context)?;
         let value = select(2)?;
-        let attended = B::segmented_attention(
+        let attended = segmented_attention::<B>(
             SegmentedAttentionInput {
                 queries: &query,
                 keys: &key,
@@ -331,6 +423,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
                 scale: self.scale,
             },
             context,
+            metadata,
         )?;
         self.forward_output(&attended, Some(parallel), context)
     }
@@ -352,6 +445,17 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
     }
 }
 
+fn segmented_attention<B: NeuralBackend>(
+    input: SegmentedAttentionInput<'_, B::Tensor>,
+    context: &<B::Tensor as Tensor>::Context,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<B::Tensor, Error> {
+    match metadata.context() {
+        Some(metadata) => B::segmented_attention_with_metadata(input, context, metadata),
+        None => B::segmented_attention(input, context),
+    }
+}
+
 /// One shared, independently streamable vision transformer block.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -361,7 +465,7 @@ pub struct VisionBlock<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub(super) norm2: LayerNorm<B>,
     pub(super) fc1: B::Linear,
     pub(super) fc2: B::Linear,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     activation: String,
 }
 
@@ -401,26 +505,40 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
         intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let root = rooted(parameter_root, &format!("blocks.{layer}"));
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        metadata.controls::<(Self, String)>()?;
+        let root = rooted_with_metadata(
+            parameter_root,
+            &metadata.format(format_args!("blocks.{layer}"))?,
+            metadata,
+        )?;
         Ok(Self {
-            norm1: LayerNorm::new(&format!("{root}.norm1"), config.hidden_size, context)?,
+            norm1: LayerNorm::new(
+                &metadata.format(format_args!("{root}.norm1"))?,
+                config.hidden_size,
+                context,
+            )?,
             attention: Attention::new_with_heads(config, parameter_root, layer, heads, context)?,
-            norm2: LayerNorm::new(&format!("{root}.norm2"), config.hidden_size, context)?,
+            norm2: LayerNorm::new(
+                &metadata.format(format_args!("{root}.norm2"))?,
+                config.hidden_size,
+                context,
+            )?,
             fc1: linear::<B>(
                 config,
-                &format!("{root}.mlp.linear_fc1"),
+                &metadata.format(format_args!("{root}.mlp.linear_fc1"))?,
                 config.hidden_size,
                 intermediate,
                 context,
             )?,
             fc2: linear::<B>(
                 config,
-                &format!("{root}.mlp.linear_fc2"),
+                &metadata.format(format_args!("{root}.mlp.linear_fc2"))?,
                 intermediate,
                 config.hidden_size,
                 context,
             )?,
-            activation: config.hidden_act.clone(),
+            activation: metadata.text(&config.hidden_act)?,
         })
     }
     /// Applies exact attention/MLP residual equations over validated segments.
@@ -432,9 +550,30 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
         sin: &B::Tensor,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_with_metadata(
+            hidden,
+            chunks,
+            cos,
+            sin,
+            context,
+            crate::decoder::identity::Metadata::new(B::construction_metadata(context)),
+        )
+    }
+
+    fn forward_with_metadata(
+        &mut self,
+        hidden: &B::Tensor,
+        chunks: &[i32],
+        cos: &B::Tensor,
+        sin: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<B::Tensor, Error> {
         let normed = self.norm1.forward(hidden, context)?;
         let hidden = hidden.add(
-            &self.attention.forward(&normed, chunks, cos, sin, context)?,
+            &self
+                .attention
+                .forward(&normed, chunks, cos, sin, context, metadata)?,
             context,
         )?;
         let normed = self.norm2.forward(&hidden, context)?;
@@ -444,9 +583,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
             "gelu" => B::Tensor::gelu(&projected, context)?,
             "gelu_pytorch_tanh" => B::gelu_approximate(projected, context)?,
             other => {
-                return Err(Error::backend(format!(
-                    "unsupported vision activation {other:?}"
-                )))
+                return Err(metadata.error(format_args!("unsupported vision activation {other:?}")));
             }
         };
         hidden.add(&self.fc2.forward(&activated, context)?, context)
@@ -462,11 +599,32 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_parallel_with_metadata(
+            hidden,
+            chunks,
+            cos,
+            sin,
+            parallel,
+            context,
+            crate::decoder::identity::Metadata::new(B::construction_metadata(context)),
+        )
+    }
+
+    fn forward_parallel_with_metadata(
+        &mut self,
+        hidden: &B::Tensor,
+        chunks: &[i32],
+        cos: &B::Tensor,
+        sin: &B::Tensor,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<B::Tensor, Error> {
         let normed = self.norm1.forward(hidden, context)?;
         let hidden = hidden.add(
             &self
                 .attention
-                .forward_parallel(&normed, chunks, cos, sin, parallel, context)?,
+                .forward_parallel(&normed, chunks, cos, sin, parallel, context, metadata)?,
             context,
         )?;
         let normed = self.norm2.forward(&hidden, context)?;
@@ -476,9 +634,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionBlock<B> {
             "gelu" => B::Tensor::gelu(&projected, context)?,
             "gelu_pytorch_tanh" => B::gelu_approximate(projected, context)?,
             other => {
-                return Err(Error::backend(format!(
-                    "unsupported vision activation {other:?}"
-                )))
+                return Err(metadata.error(format_args!("unsupported vision activation {other:?}")));
             }
         };
         hidden.add(
@@ -494,13 +650,13 @@ pub(super) struct Merger<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> 
     pub(super) norm: LayerNorm<B>,
     pub(super) fc1: B::Linear,
     pub(super) fc2: B::Linear,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     unit: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     width: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     postshuffle: bool,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     approximate: bool,
 }
 
@@ -513,11 +669,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
         intermediate: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        metadata.controls::<(Self, String)>()?;
         let unit = config.spatial_merge_size * config.spatial_merge_size;
         let width = config.hidden_size * unit;
         Ok(Self {
             norm: LayerNorm::new(
-                &format!("{prefix}.norm"),
+                &metadata.format(format_args!("{prefix}.norm"))?,
                 if postshuffle {
                     width
                 } else {
@@ -527,14 +685,14 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
             )?,
             fc1: linear::<B>(
                 config,
-                &format!("{prefix}.linear_fc1"),
+                &metadata.format(format_args!("{prefix}.linear_fc1"))?,
                 width,
                 intermediate,
                 context,
             )?,
             fc2: linear::<B>(
                 config,
-                &format!("{prefix}.linear_fc2"),
+                &metadata.format(format_args!("{prefix}.linear_fc2"))?,
                 intermediate,
                 config.out_hidden_size,
                 context,
@@ -551,9 +709,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         if hidden.dim(0) % self.unit != 0 {
-            return Err(Error::backend(
-                "vision merge geometry does not divide sequence",
-            ));
+            return Err(
+                crate::decoder::identity::Metadata::new(B::construction_metadata(context)).error(
+                    format_args!("vision merge geometry does not divide sequence"),
+                ),
+            );
         }
         let hidden = if self.postshuffle {
             self.norm
@@ -579,9 +739,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Merger<B> {
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         if hidden.dim(0) % self.unit != 0 {
-            return Err(Error::backend(
-                "vision merge geometry does not divide sequence",
-            ));
+            return Err(
+                crate::decoder::identity::Metadata::new(B::construction_metadata(context)).error(
+                    format_args!("vision merge geometry does not divide sequence"),
+                ),
+            );
         }
         let hidden = if self.postshuffle {
             self.norm
@@ -609,8 +771,8 @@ pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub(super) patch: PatchEmbed<B>,
     pub(super) merger: Merger<B>,
     pub(super) deepstack_mergers: Vec<Merger<B>>,
-    #[parameter(skip)]
-    config: VisionConfig,
+    #[parameter(skip, metadata)]
+    config: crate::replicated_text::SharedCompositeConfig<VisionConfig>,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
@@ -628,9 +790,29 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         parameter_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        Self::new_with_config(
+            crate::replicated_text::CompositeModelConfig::Owned(config),
+            parameter_root,
+            context,
+        )
+    }
+
+    pub(crate) fn new_with_config(
+        config: crate::replicated_text::CompositeModelConfig<VisionConfig>,
+        parameter_root: &str,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        metadata.controls::<(
+            Self,
+            crate::replicated_text::CompositeModelConfig<VisionConfig>,
+            Vec<i32>,
+        )>()?;
         let width = config.hidden_size * config.spatial_merge_size * config.spatial_merge_size;
-        let intermediates = vec![width; config.deepstack_layer_count() + 1];
-        Self::new_parallel_with_root(config, parameter_root, &intermediates, context)
+        let count = config.deepstack_layer_count() + 1;
+        let mut intermediates = metadata.vector(count)?;
+        intermediates.resize(count, width);
+        Self::new_parallel_with_config(config, parameter_root, &intermediates, context)
     }
 
     /// Builds pinned modules with rank-local merger intermediate widths.
@@ -640,22 +822,44 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         merger_intermediates: &[i32],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate().map_err(Error::backend)?;
+        Self::new_parallel_with_config(
+            crate::replicated_text::CompositeModelConfig::Owned(config),
+            parameter_root,
+            merger_intermediates,
+            context,
+        )
+    }
+
+    fn new_parallel_with_config(
+        config: crate::replicated_text::CompositeModelConfig<VisionConfig>,
+        parameter_root: &str,
+        merger_intermediates: &[i32],
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        let modules = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, EmbeddingSpec, Vec<Merger<B>>)>()?;
+        match B::construction_metadata(context).filter(|context| context.uses_checked_metadata()) {
+            Some(context) => config.validate_with_metadata(context)?,
+            None => config.validate().map_err(Error::backend)?,
+        }
         if merger_intermediates.len() != config.deepstack_layer_count() + 1
             || merger_intermediates.iter().any(|width| *width <= 0)
         {
-            return Err(Error::backend(
-                "vision merger local-width plan is incomplete",
-            ));
+            return Err(
+                metadata.error(format_args!("vision merger local-width plan is incomplete"))
+            );
         }
         let position = B::embedding(
             EmbeddingSpec {
                 vocabulary: config.num_position_embeddings,
                 dimensions: config.hidden_size,
-                weight: ParameterSpec::trainable(rooted(parameter_root, "pos_embed.weight"))
-                    .map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &rooted(parameter_root, "pos_embed.weight"),
+                weight: modules.named_parameter(format_args!(
+                    "{}",
+                    RootedName(parameter_root, "pos_embed.weight")
+                ))?,
+                format: modules.format(
+                    &rooted_with_metadata(parameter_root, "pos_embed.weight", metadata)?,
                     eredu_checkpoint::LinearFormat::Dense,
                 )?,
             },
@@ -664,30 +868,31 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         let patch = PatchEmbed::new(&config, parameter_root, context)?;
         let merger = Merger::new_with_intermediate(
             &config,
-            &rooted(parameter_root, "merger"),
+            &rooted_with_metadata(parameter_root, "merger", metadata)?,
             false,
             config.mode == VisionMode::WindowScheduled,
             merger_intermediates[0],
             context,
         )?;
-        let deepstack_mergers = (0..config.deepstack_layer_count())
-            .map(|i| {
-                Merger::new_with_intermediate(
-                    &config,
-                    &rooted(parameter_root, &format!("deepstack_merger_list.{i}")),
-                    true,
-                    false,
-                    merger_intermediates[i + 1],
-                    context,
-                )
-            })
-            .collect::<Result<_, _>>()?;
+        let mut deepstack_mergers = metadata.vector(config.deepstack_layer_count())?;
+        for i in 0..config.deepstack_layer_count() {
+            let relative = metadata.format(format_args!("deepstack_merger_list.{i}"))?;
+            let name = rooted_with_metadata(parameter_root, &relative, metadata)?;
+            deepstack_mergers.push(Merger::new_with_intermediate(
+                &config,
+                &name,
+                true,
+                false,
+                merger_intermediates[i + 1],
+                context,
+            )?);
+        }
         Ok(Self {
             position,
             patch,
             merger,
             deepstack_mergers,
-            config,
+            config: config.into_shared(B::construction_metadata(context))?,
         })
     }
 
@@ -720,13 +925,39 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
             )?,
         };
         hidden = hidden.add(&positions, context)?;
-        let full_chunks = attention_chunk_lengths(input.grid).map_err(Error::backend)?;
+        let (hidden, state) =
+            self.continuation_state_with_hidden(input.grid, hidden.dim(0), Some(hidden), context)?;
+        Ok((hidden.expect("patch input was supplied"), state))
+    }
+
+    /// Builds parameter-free state for a received patch activation, without
+    /// rerunning patch or learned-position projection on continuation owners.
+    pub(crate) fn continuation_state(
+        &self,
+        grid: &[(i32, i32, i32)],
+        sequence: i32,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<VisionState<B::Tensor>, Error> {
+        validate_patch_grid(grid, self.config.spatial_merge_size, Some(sequence))
+            .map_err(Error::backend)?;
+        self.continuation_state_with_hidden(grid, sequence, None, context)
+            .map(|(_, state)| state)
+    }
+
+    fn continuation_state_with_hidden(
+        &self,
+        grid: &[(i32, i32, i32)],
+        sequence: i32,
+        hidden: Option<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<(Option<B::Tensor>, VisionState<B::Tensor>), Error> {
+        let full_chunks = attention_chunk_lengths(grid).map_err(Error::backend)?;
         let unit = self.config.spatial_merge_size * self.config.spatial_merge_size;
         let (permutation, window_chunks) = match self.config.mode {
-            VisionMode::DeepStack => ((0..hidden.dim(0) / unit).collect(), full_chunks.clone()),
+            VisionMode::DeepStack => ((0..sequence / unit).collect(), full_chunks.clone()),
             VisionMode::WindowScheduled => {
                 let p = window_partition(
-                    input.grid,
+                    grid,
                     self.config.spatial_merge_size,
                     self.config.window_size,
                     self.config.patch_size,
@@ -735,26 +966,55 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
                 (p.permutation, p.chunk_lengths)
             }
         };
-        let indexes =
-            B::Tensor::from_i32_slice(&permutation, &[permutation.len() as i32], context)?;
-        let sequence = hidden.dim(0);
+        self.reorder_continuation(
+            sequence,
+            hidden,
+            VisionStateTables::Ordinary {
+                full_chunks,
+                window_chunks,
+                permutation,
+            },
+            || rotary_embeddings::<B::Tensor>(grid, &self.config, context),
+            context,
+            B::construction_metadata(context),
+        )
+    }
+
+    fn reorder_continuation(
+        &self,
+        sequence: i32,
+        hidden: Option<B::Tensor>,
+        tables: VisionStateTables<B::Tensor>,
+        rotary: impl FnOnce() -> Result<(B::Tensor, B::Tensor), Error>,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<(Option<B::Tensor>, VisionState<B::Tensor>), Error> {
+        let metadata = crate::decoder::identity::Metadata::new(metadata);
+        metadata.controls::<(
+            VisionState<B::Tensor>,
+            VisionStateTables<B::Tensor>,
+            [i32; 3],
+        )>()?;
+        let deepstack = metadata.vector(self.config.deepstack_layer_count())?;
+        let unit = self.config.spatial_merge_size * self.config.spatial_merge_size;
+        let permutation = tables.permutation();
+        let indexes = B::Tensor::from_i32_slice(permutation, &[permutation.len() as i32], context)?;
         let reorder = |value: B::Tensor| {
             value
                 .reshape(&[-1, unit, value.dim(1)], context)?
                 .take_axis(&indexes, 0, context)?
                 .reshape(&[sequence, -1], context)
         };
-        hidden = reorder(hidden)?;
-        let (cosine, sine) = rotary_embeddings::<B::Tensor>(input.grid, &self.config, context)?;
+        let hidden = hidden.map(reorder).transpose()?;
+        let (cosine, sine) = rotary()?;
         Ok((
             hidden,
             VisionState {
-                full_chunks,
-                window_chunks,
-                permutation,
+                metadata: metadata.context().cloned(),
+                tables,
                 cosine: reorder(cosine)?,
                 sine: reorder(sine)?,
-                deepstack: Vec::new(),
+                deepstack,
             },
         ))
     }
@@ -768,22 +1028,35 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         state: &mut VisionState<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        let retained_metadata = state.metadata.clone();
+        let metadata = crate::decoder::identity::Metadata::new(
+            retained_metadata
+                .as_ref()
+                .or_else(|| B::construction_metadata(context)),
+        );
+        metadata.controls::<(B::Tensor, super::VisionLayerPolicy)>()?;
         let policy = *self
             .config
             .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("vision schedule has no block {layer}")))?;
-        let hidden = block.forward(
+            .ok_or_else(|| metadata.error(format_args!("vision schedule has no block {layer}")))?;
+        let hidden = block.forward_with_metadata(
             hidden,
             state.chunks(policy.attention),
             &state.cosine,
             &state.sine,
             context,
+            metadata,
         )?;
         if let Some(index) = policy.deepstack_merger {
+            if let Some(context) = metadata.context() {
+                context.reserve_metadata_vec(&mut state.deepstack, 1)?;
+            } else {
+                state.deepstack.reserve(1);
+            }
             let feature = self
                 .deepstack_mergers
                 .get_mut(index as usize)
-                .ok_or_else(|| Error::backend("missing DeepStack merger"))?
+                .ok_or_else(|| metadata.error(format_args!("missing DeepStack merger")))?
                 .forward(&hidden, context)?
                 .expand_dims(0, context)?;
             state.deepstack.push(feature);
@@ -801,23 +1074,36 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        let retained_metadata = state.metadata.clone();
+        let metadata = crate::decoder::identity::Metadata::new(
+            retained_metadata
+                .as_ref()
+                .or_else(|| B::construction_metadata(context)),
+        );
+        metadata.controls::<(B::Tensor, super::VisionLayerPolicy)>()?;
         let policy = *self
             .config
             .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("vision schedule has no block {layer}")))?;
-        let hidden = block.forward_parallel(
+            .ok_or_else(|| metadata.error(format_args!("vision schedule has no block {layer}")))?;
+        let hidden = block.forward_parallel_with_metadata(
             hidden,
             state.chunks(policy.attention),
             &state.cosine,
             &state.sine,
             parallel,
             context,
+            metadata,
         )?;
         if let Some(index) = policy.deepstack_merger {
+            if let Some(context) = metadata.context() {
+                context.reserve_metadata_vec(&mut state.deepstack, 1)?;
+            } else {
+                state.deepstack.reserve(1);
+            }
             let feature = self
                 .deepstack_mergers
                 .get_mut(index as usize)
-                .ok_or_else(|| Error::backend("missing DeepStack merger"))?
+                .ok_or_else(|| metadata.error(format_args!("missing DeepStack merger")))?
                 .forward_parallel(&hidden, parallel, context)?
                 .expand_dims(0, context)?;
             state.deepstack.push(feature);
@@ -832,8 +1118,15 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         state: &mut VisionState<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<VisionOutput<B::Tensor>, Error> {
+        let retained_metadata = state.metadata.clone();
+        let metadata = crate::decoder::identity::Metadata::new(
+            retained_metadata
+                .as_ref()
+                .or_else(|| B::construction_metadata(context)),
+        );
+        metadata.controls::<(VisionOutput<B::Tensor>, B::Tensor)>()?;
         let merged = self.merger.forward(hidden, context)?;
-        let inverse = inverse_permutation(&state.permutation).map_err(Error::backend)?;
+        let inverse = state.tables.inverse(metadata)?;
         let inverse = B::Tensor::from_i32_slice(&inverse, &[inverse.len() as i32], context)?;
         Ok(VisionOutput {
             embeddings: merged
@@ -851,8 +1144,15 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<VisionOutput<B::Tensor>, Error> {
+        let retained_metadata = state.metadata.clone();
+        let metadata = crate::decoder::identity::Metadata::new(
+            retained_metadata
+                .as_ref()
+                .or_else(|| B::construction_metadata(context)),
+        );
+        metadata.controls::<(VisionOutput<B::Tensor>, B::Tensor)>()?;
         let merged = self.merger.forward_parallel(hidden, parallel, context)?;
-        let inverse = inverse_permutation(&state.permutation).map_err(Error::backend)?;
+        let inverse = state.tables.inverse(metadata)?;
         let inverse = B::Tensor::from_i32_slice(&inverse, &[inverse.len() as i32], context)?;
         Ok(VisionOutput {
             embeddings: merged
@@ -888,9 +1188,17 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionTower<B> {
         parameter_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let blocks = (0..config.layer_count())
-            .map(|i| VisionBlock::new_with_root(&config, parameter_root, i, context))
-            .collect::<Result<_, _>>()?;
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        metadata.controls::<(Self, Vec<VisionBlock<B>>)>()?;
+        let mut blocks = metadata.vector(config.layer_count())?;
+        for i in 0..config.layer_count() {
+            blocks.push(VisionBlock::new_with_root(
+                &config,
+                parameter_root,
+                i,
+                context,
+            )?);
+        }
         Ok(Self {
             static_modules: VisionStatic::new_with_root(config, parameter_root, context)?,
             blocks,
@@ -916,12 +1224,30 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionTower<B> {
     }
 }
 
-fn rooted(root: &str, relative: &str) -> String {
-    if root.is_empty() {
-        relative.to_owned()
-    } else {
-        format!("{root}.{relative}")
+struct RootedName<'a>(&'a str, &'a str);
+impl std::fmt::Display for RootedName<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if !self.0.is_empty() {
+            write!(output, "{}.", self.0)?;
+        }
+        output.write_str(self.1)
     }
+}
+fn rooted(root: &str, relative: &str) -> String {
+    rooted_with_metadata(
+        root,
+        relative,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary rooted-name construction is infallible")
+}
+
+fn rooted_with_metadata(
+    root: &str,
+    relative: &str,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, Error> {
+    metadata.format(format_args!("{}", RootedName(root, relative)))
 }
 
 fn relative_vision_name(name: &str) -> &str {
@@ -943,18 +1269,8 @@ fn gathered_positions<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
         return Err(Error::backend("vision position table is not square"));
     }
     let mut ids = Vec::new();
-    for &(time, height, width) in grid {
-        if height > side || width > side {
-            return Err(Error::backend("vision grid exceeds position table"));
-        }
-        for _ in 0..time {
-            for y in 0..height {
-                for x in 0..width {
-                    ids.push(y * side + x);
-                }
-            }
-        }
-    }
+    visit_gathered_patch_positions(grid.iter().copied(), side, side, |index| ids.push(index))
+        .map_err(Error::backend)?;
     embedding.forward(
         &B::Tensor::from_i32_slice(&ids, &[ids.len() as i32], context)?,
         context,
@@ -981,8 +1297,7 @@ fn interpolated_positions<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>
     )
     .map_err(Error::backend)?;
     let length = samples.len() as i32;
-    let mut output: Option<B::Tensor> = None;
-    for corner in 0..4 {
+    project_interpolated_positions::<B>(embedding, context, |corner| {
         let ids = samples
             .iter()
             .map(|s| s.indices[corner] as i32)
@@ -991,8 +1306,23 @@ fn interpolated_positions<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>
             .iter()
             .map(|s| s.weights[corner])
             .collect::<Vec<_>>();
-        let ids = B::Tensor::from_i32_slice(&ids, &[length], context)?;
-        let weights = B::Tensor::from_f32_slice(&weights, &[length, 1], context)?;
+        Ok((
+            B::Tensor::from_i32_slice(&ids, &[length], context)?,
+            B::Tensor::from_f32_slice(&weights, &[length, 1], context)?,
+        ))
+    })
+}
+
+// Ordinary collected and original borrowed tables feed the same ordered native
+// embedding/multiply/add equation. The producer changes only host table access.
+fn project_interpolated_positions<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
+    embedding: &mut B::Embedding,
+    context: &<B::Tensor as Tensor>::Context,
+    mut corner_values: impl FnMut(usize) -> Result<(B::Tensor, B::Tensor), Error>,
+) -> Result<B::Tensor, Error> {
+    let mut output: Option<B::Tensor> = None;
+    for corner in 0..4 {
+        let (ids, weights) = corner_values(corner)?;
         let part = embedding
             .forward(&ids, context)?
             .multiply(&weights, context)?;

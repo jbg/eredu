@@ -22,6 +22,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use std::{collections::BTreeSet, fs, path::Path};
 
+mod output;
+
 /// Stateless registry for every architecture family implemented by this crate.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ModelConfigurations;
@@ -1468,6 +1470,20 @@ pub fn inspect_artifact(
     eredu_core::inspect_artifact(path, &MODEL_CONFIGURATIONS)
 }
 
+/// Inspects through the authoritative family registry and captures actual GGUF headers.
+///
+/// The retained checkpoint owners require matching headers on later cold reads.
+/// Payloads remain lazy and mutable; this does not certify a complete memory bound.
+/// SafeTensors inspection keeps its ordinary behavior.
+pub fn inspect_artifact_with_prepared_gguf_headers(
+    path: impl AsRef<Path>,
+) -> Result<
+    eredu_core::ArtifactInspection<crate::processor_plan::ArtifactArchitecturePlan>,
+    ArtifactError,
+> {
+    eredu_core::inspect_artifact_with_prepared_gguf_headers(path, &MODEL_CONFIGURATIONS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1577,6 +1593,113 @@ mod tests {
             "tie_word_embeddings": false, "attention_dropout": 0.0,
             "hidden_act": "silu", "num_nextn_predict_layers": 1
         })
+    }
+
+    #[test]
+    fn cold_text_output_width_preserves_tied_nested_and_prediction_output_domains() {
+        use crate::processor_plan::ArtifactArchitecturePlan;
+        for tied in [false, true] {
+            let mut json = qwen_vl_config();
+            json["tie_word_embeddings"] = tied.into();
+            let plan = resolve_model_config(&json).unwrap().architecture;
+            let catalog = test_catalog(plan.checkpoint());
+            let key = if tied {
+                "model.language_model.embed_tokens.weight"
+            } else {
+                "lm_head.weight"
+            };
+            let output = catalog.get(key).unwrap();
+            assert_eq!(output.shape[0], 64);
+            assert_eq!(
+                ArtifactArchitecturePlan::from_safetensors_architecture(plan).text_output_width(),
+                Some(64)
+            );
+        }
+        let plan = resolve_model_config(&tiny_deepseek_prediction_config())
+            .unwrap()
+            .architecture;
+        let (target, _) = plan.prediction_target_projection().unwrap().unwrap();
+        for plan in [plan, target] {
+            let catalog = test_catalog(plan.checkpoint());
+            assert_eq!(catalog.get("lm_head.weight").unwrap().shape[0], 128);
+            assert_eq!(
+                ArtifactArchitecturePlan::from_safetensors_architecture(plan).text_output_width(),
+                Some(128)
+            );
+        }
+    }
+
+    #[test]
+    fn cold_inkling_output_domain_preserves_protocol_trimming_in_both_formats() {
+        use crate::processor_plan::ArtifactArchitecturePlan;
+        for unpadded in [None, Some(62)] {
+            let mut json = serde_json::json!({
+                "model_type": "inkling_mm_model", "image_token_id": 60, "audio_token_id": 61,
+                "text_config": {
+                    "hidden_size": 16, "num_hidden_layers": 3, "vocab_size": 64,
+                    "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 4,
+                    "sliding_window_size": 8,
+                    "layer_types": ["sliding_attention", "full_attention", "sliding_attention"],
+                    "mlp_layer_types": ["dense", "moe", "moe"], "sconv_kernel_size": 4,
+                    "d_rel": 2, "rel_extent": 16, "intermediate_size": 32,
+                    "n_routed_experts": 4, "num_experts_per_tok": 2, "n_shared_experts": 1
+                },
+                "mtp_config": {"num_nextn_predict_layers": 2, "local_layer_ids": [1]},
+                "audio_config": {"text_hidden_size": 16, "num_codebooks": 4, "codebook_size": 8},
+                "vision_config": {"text_hidden_size": 16, "patch_size": 40,
+                    "temporal_patch_size": 2, "num_channels": 3, "num_hidden_layers": 4}
+            });
+            if let Some(width) = unpadded {
+                json["text_config"]["unpadded_vocab_size"] = width.into();
+            }
+            let plan = resolve_model_config(&json).unwrap().architecture;
+            let catalog = test_catalog(plan.checkpoint());
+            assert_eq!(
+                catalog.get("model.llm.unembed.weight").unwrap().shape[0],
+                64
+            );
+            let SafetensorsModelConfig::Inkling(args) = plan.model() else {
+                panic!("expected Inkling");
+            };
+            assert_eq!(
+                GgufModelConfig::Inkling(args.clone()).text_output_width(),
+                Some(unpadded.unwrap_or(64))
+            );
+            // These public enum values can also hold caller-mutated geometry.
+            // No width may be inferred from an impossible trim.
+            for invalid in [-1, 0, 65] {
+                let mut invalid_args = args.clone();
+                invalid_args.text_config.unpadded_vocab_size = Some(invalid);
+                assert_eq!(
+                    SafetensorsModelConfig::Inkling(invalid_args.clone()).text_output_width(),
+                    None
+                );
+                assert_eq!(
+                    GgufModelConfig::Inkling(invalid_args).text_output_width(),
+                    None
+                );
+            }
+            assert_eq!(
+                ArtifactArchitecturePlan::from_safetensors_architecture(plan).text_output_width(),
+                Some(unpadded.unwrap_or(64))
+            );
+        }
+    }
+
+    #[test]
+    fn cold_moshi_text_output_width_excludes_input_padding_and_audio_domains() {
+        use crate::processor_plan::ArtifactArchitecturePlan;
+        let plan = resolve_model_config(&tiny_moshi_config())
+            .unwrap()
+            .architecture;
+        let catalog = test_catalog(plan.checkpoint());
+        let rows = |name| catalog.get(name).unwrap().shape[0];
+        assert_eq!(rows("text_emb.weight"), 102);
+        assert_eq!(rows("text_linear.weight"), 101);
+        assert_eq!(
+            ArtifactArchitecturePlan::from_safetensors_architecture(plan).text_output_width(),
+            Some(101)
+        );
     }
 
     #[test]
@@ -2227,6 +2350,7 @@ mod tests {
             panic!("expected Llama GGUF plan");
         };
         assert_eq!(args.vocab_size, 1);
+        assert_eq!(inspection.architecture_plan().text_output_width(), Some(1));
         assert_eq!(plan.tensor_mapping().len(), tensors.len());
         let query = plan
             .tensor_mapping()

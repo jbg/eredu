@@ -1,0 +1,85 @@
+diff --git a/mlx/prepared_input.cpp b/mlx/prepared_input.cpp
+--- a/mlx/prepared_input.cpp
++++ b/mlx/prepared_input.cpp
+@@ -3,6 +3,7 @@
+ #include "mlx/submission.h"
+ #include <algorithm>
+ #include <climits>
++#include <cstring>
+ #include <initializer_list>
+ #include <limits>
+ #include <new>
+@@ -191,7 +192,7 @@
+   // Only positive rank needs a shape pointer; the same product/count and
+   // allocator checks below remain authoritative for every typed source.
+   if ((source.rank && !source.shape) || source.rank > static_cast<size_t>(INT_MAX) ||
+-      source.kind > 3 || !facts.page_size || (facts.page_size & (facts.page_size - 1))) return false;
++      source.kind > 9 || !facts.page_size || (facts.page_size & (facts.page_size - 1))) return false;
+   size_t elements = 1;
+   for (size_t i = 0; i < source.rank; ++i) {
+     if (!source.shape[i] || source.shape[i] > static_cast<size_t>(INT_MAX) ||
+@@ -199,7 +200,10 @@
+   }
+   if (elements != source.elements) return false;
+   size_t bytes, rounded;
+-  const Dtype dtype = source.kind == 0 ? uint32 : source.kind == 1 ? int32 : source.kind == 2 ? float32 : bool_;
++  const Dtype dtype = source.kind == 0 || source.kind == 8 ? uint32 :
++      source.kind == 1 || source.kind == 7 ? int32 :
++      source.kind == 2 || source.kind == 6 ? float32 :
++      source.kind == 4 ? float16 : source.kind == 5 ? bfloat16 : bool_;
+   if (!multiply(elements, dtype.size(), bytes) || bytes > static_cast<size_t>(PTRDIFF_MAX)) return false;
+   if (facts.kind == allocator::HostTransferStorageKind::cpu) {
+     if (!add(bytes, sizeof(size_t), bytes)) return false;
+@@ -220,7 +224,7 @@
+       sizeof(submission::GraphAllocator<array::ArrayDesc>) + sizeof(std::shared_ptr<array::ArrayDesc>) +
+       sizeof(std::shared_ptr<array::Data>) + sizeof(array) + sizeof(PreparedInputSource) +
+       sizeof(allocator::PreparedInputFacts) + sizeof(size_t) * 6 + sizeof(Dtype) * 2 +
+-      sizeof(const uint8_t*) + sizeof(bool*) + facts.controls};
++      sizeof(const uint8_t*) + sizeof(bool*) + sizeof(void*) + sizeof(size_t) + facts.controls};
+   return true;
+ }
+ 
+@@ -228,7 +232,7 @@
+     const allocator::PreparedInputFacts& facts, Quota* quota,
+     const PreparedInputSource& source, PreparedInputLeaf*& output) noexcept {
+   Construction c;
+-  if (output || !quota || !source.data || !layout(facts, source, c.layout) ||
++  if (output || !quota || (source.kind < 4 && !source.data) || !layout(facts, source, c.layout) ||
+       !requests(source.rank, c.requests, c.count)) return Cause::invalid;
+   if (!quota->prepare_blocks(c.requests, c.count)) return Cause::capacity;
+   FinishBlocks finish{quota};
+@@ -238,7 +242,10 @@
+   c.backing = ::new (c.memory) allocator::PreparedInputAllocation{};
+   c.backing->quota = quota;
+   Incoming incoming{c.backing};
+-  const Dtype dtype = source.kind == 0 ? uint32 : source.kind == 1 ? int32 : source.kind == 2 ? float32 : bool_;
++  const Dtype dtype = source.kind == 0 || source.kind == 8 ? uint32 :
++      source.kind == 1 || source.kind == 7 ? int32 :
++      source.kind == 2 || source.kind == 6 ? float32 :
++      source.kind == 4 ? float16 : source.kind == 5 ? bfloat16 : bool_;
+   c.cause = allocator.allocate_prepared_input(source.elements * dtype.size(), *c.backing);
+   if (c.cause != Cause::success) return c.cause;
+   if (c.backing->capacity != c.layout.backing_bytes) std::terminate();
+@@ -258,7 +265,9 @@
+   owned->data_size = source.elements;
+   owned->flags = {true, true, source.elements <= 1 || source.elements == c.maximum};
+   void* destination = c.backing->buffer.raw_ptr();
+-  if (source.kind == 0)
++  if (source.kind >= 4)
++    std::memset(destination, 0, source.elements * dtype.size());
++  else if (source.kind == 0)
+     std::copy_n(static_cast<const uint32_t*>(source.data), source.elements, static_cast<uint32_t*>(destination));
+   else if (source.kind == 1)
+     std::copy_n(static_cast<const int32_t*>(source.data), source.elements, static_cast<int32_t*>(destination));
+diff --git a/mlx/prepared_input.h b/mlx/prepared_input.h
+--- a/mlx/prepared_input.h
++++ b/mlx/prepared_input.h
+@@ -15,7 +15,7 @@
+   const size_t* shape;
+   size_t rank;
+   size_t elements;
+-  unsigned kind; // 0 U32, 1 I32, 2 F32, 3 canonical Boolean bytes
++  unsigned kind; // 0 U32, 1 I32, 2 F32, 3 Boolean; 4..9 initialized zeros: F16, BF16, F32, I32, U32, Bool
+ };
+ // A distinct arena-owned C handle. The C ABI retains its closed owner separately
+ // from the array* value; this object must never reach ordinary operator delete.

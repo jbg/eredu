@@ -1,0 +1,24 @@
+{
+  "archive_sha256": "86886cf6dbf4e614b19c9a1eec9775f021869d7eadde0fc73921a81b90c9b4c9",
+  "boundary": "One character-set argument for borrowed-atom trim through existing shared VM. Ordinary and bounded adapters share exact Unicode scalar membership. Concatenation character trimming remains typed Profile refusal; no second rendering engine or new dependency.",
+  "dependency": "minijinja-2.24.0",
+  "files": {
+    "src/bounded/source.rs": {
+      "after": "ad60c990d03279284b83f88515cdf262d447d4bd35cd4aa00c216e1d5f4b21e3",
+      "before": "42115e107f8a0afb9b77509f6791d58c4478ba2477ed690315d72743b826ac29"
+    },
+    "src/bounded/template_syntax/emit.rs": {
+      "after": "4da87fbe16a686097aaf2b94ff06527314da19dea60445e4de221f5b1db41fbb",
+      "before": "be657cdd9669067fc04d92fe208aafcd8f01eb604ec3889e5cf5f1364a28427c"
+    },
+    "src/bounded/worker.rs": {
+      "after": "151d42e5fecdbf59b0bb38c367f78e14549fc263073daeb1a7ddd82e5e976d1e",
+      "before": "507d0d0c53cc25346f7817e13c9232a0e4700df293234f405940891d682ef53e"
+    },
+    "src/filters.rs": {
+      "after": "ee7538bce5b6c606421417a66b4422d979abca06d0c2defb4afaf183fda1b304",
+      "before": "a941ebf47e0c4a78c36c7cae77515623eea0e6ac14893dee0116ecbc082f7718"
+    }
+  },
+  "patch_sha256": "c1e8dec1df62b7c6f282c167fd80661bb406879b8e034af80c30e459deb0b298"
+}

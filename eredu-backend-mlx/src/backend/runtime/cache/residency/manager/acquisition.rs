@@ -281,6 +281,7 @@ impl CacheResidencyManager {
                                 record.physical.begin_read(MlxCacheIoOperation {
                                     ticket: ticket.clone(),
                                     reserved_host_bytes: Some(reserved_host_bytes),
+                                    prepared_read: None,
                                 })?;
                                 update_report_totals(&mut state);
                                 drop(host_admission);
@@ -334,7 +335,7 @@ impl CacheResidencyManager {
                                 drop(state);
                                 worker.retire(&ticket);
                                 return Err(CacheResidencyError::MalformedShard {
-                                    path: location.path,
+                                    path: location.path.clone(),
                                     reason: "array shape or dtype does not match the manifest"
                                         .into(),
                                 });
@@ -413,24 +414,13 @@ impl CacheResidencyManager {
                         let promotion = record.physical.promote_host(device_arrays.clone())?;
                         (record.bytes, promotion)
                     };
-                    state.telemetry.report.demand_misses += 1;
-                    if loaded_from_disk {
-                        state.telemetry.report.disk_promotions += 1;
-                    } else {
-                        state.telemetry.report.host_promotions += 1;
-                    }
-                    state.telemetry.report.transfer_bytes += bytes;
-                    let transfer_wait = started.elapsed();
-                    state.telemetry.report.transfer_wait += transfer_wait;
-                    let activity = state.layer_activity_mut(id.global_layer);
-                    activity.demand_misses += 1;
-                    if loaded_from_disk {
-                        activity.disk_promotions += 1;
-                    } else {
-                        activity.host_promotions += 1;
-                    }
-                    activity.transfer_bytes += bytes;
-                    activity.transfer_wait += transfer_wait;
+                    record_host_promotion(
+                        &mut state,
+                        id,
+                        loaded_from_disk,
+                        bytes,
+                        started.elapsed(),
+                    );
                     drop(state);
                     if let Err(error) = self.rebalance(Some(id), true) {
                         let mut state = self.lock()?;
@@ -477,12 +467,7 @@ impl CacheResidencyManager {
                         state.lifecycle.release(id)?;
                         return Err(CacheResidencyError::DiskOperationCancelled { generation });
                     }
-                    state.telemetry.report.demand_hits += 1;
-                    let transfer_wait = started.elapsed();
-                    state.telemetry.report.transfer_wait += transfer_wait;
-                    let activity = state.layer_activity_mut(id.global_layer);
-                    activity.demand_hits += 1;
-                    activity.transfer_wait += transfer_wait;
+                    record_device_hit(&mut state, id, started.elapsed());
                     drop(state);
                     if let Err(error) = self.rebalance(Some(id), true) {
                         if let Ok(mut state) = self.lock() {
@@ -518,4 +503,45 @@ impl CacheResidencyManager {
             let _ = self.rebalance(None, false);
         }
     }
+}
+
+/// The actual device demand receipt shared by ordinary promotion and the
+/// already-completed, pinned original source consumer.
+pub(super) fn record_device_hit(
+    state: &mut CacheManagerState,
+    id: &CacheBlockId,
+    elapsed: std::time::Duration,
+) {
+    state.telemetry.report.demand_hits += 1;
+    state.telemetry.report.transfer_wait += elapsed;
+    let activity = state.layer_activity_mut(id.global_layer);
+    activity.demand_hits += 1;
+    activity.transfer_wait += elapsed;
+}
+
+/// Same successful demand-promotion telemetry for ordinary and original storage.
+pub(super) fn record_host_promotion(
+    state: &mut CacheManagerState,
+    id: &CacheBlockId,
+    loaded_from_disk: bool,
+    bytes: u64,
+    transfer_wait: std::time::Duration,
+) {
+    state.telemetry.report.demand_misses += 1;
+    if loaded_from_disk {
+        state.telemetry.report.disk_promotions += 1;
+    } else {
+        state.telemetry.report.host_promotions += 1;
+    }
+    state.telemetry.report.transfer_bytes += bytes;
+    state.telemetry.report.transfer_wait += transfer_wait;
+    let activity = state.layer_activity_mut(id.global_layer);
+    activity.demand_misses += 1;
+    if loaded_from_disk {
+        activity.disk_promotions += 1;
+    } else {
+        activity.host_promotions += 1;
+    }
+    activity.transfer_bytes += bytes;
+    activity.transfer_wait += transfer_wait;
 }

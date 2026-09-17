@@ -406,14 +406,16 @@ fn mlx_parameter_binding_target(parameter: &crate::MlxTensor) -> Option<Paramete
         .map(|&dimension| usize::try_from(dimension))
         .collect::<Result<Vec<_>, _>>()
         .ok()?;
-    Some(ParameterBindingTarget {
+    Some(mlx_binding_target(shape, parameter.as_array().dtype()))
+}
+
+fn mlx_binding_target(shape: Vec<usize>, dtype: safemlx::Dtype) -> ParameterBindingTarget {
+    ParameterBindingTarget {
         shape,
-        dtype: recipe_dtype_from_mlx(parameter.as_array().dtype()),
-        // Floating parameters are unloaded handles whose storage is replaced by
-        // the materialized source. Their initial dtype does not request a cast.
-        // FP8 values and exponent scales use MLX byte arrays without conversion.
-        // Other packed and integer parameters retain exact representation matching.
-        permitted_source_dtypes: match parameter.as_array().dtype() {
+        dtype: recipe_dtype_from_mlx(dtype),
+        // Floating unloaded slots are replaced by the checkpoint value; byte
+        // slots accept the same FP8/exponent encodings as actual native slots.
+        permitted_source_dtypes: match dtype {
             safemlx::Dtype::Float16 | safemlx::Dtype::Bfloat16 | safemlx::Dtype::Float32 => vec![
                 eredu_checkpoint::recipe::RecipeDtype::F16,
                 eredu_checkpoint::recipe::RecipeDtype::BF16,
@@ -426,7 +428,33 @@ fn mlx_parameter_binding_target(parameter: &crate::MlxTensor) -> Option<Paramete
             ],
             _ => Vec::new(),
         },
-    })
+    }
+}
+
+/// Scalar translation of architecture-created metadata slots through the same
+/// binding-target worker used by the eventual native parameter visitor.
+pub(crate) fn mlx_workspace_binding_targets(
+    layouts: &BTreeMap<String, eredu_nn::workspace::WorkspaceLayout>,
+) -> Option<BTreeMap<String, ParameterBindingTarget>> {
+    use eredu_nn::workspace::WorkspaceDtype;
+    layouts
+        .iter()
+        .map(|(name, layout)| {
+            let dtype = match layout.dtype() {
+                WorkspaceDtype::Float32 => safemlx::Dtype::Float32,
+                WorkspaceDtype::Int32 => safemlx::Dtype::Int32,
+                WorkspaceDtype::Uint32 => safemlx::Dtype::Uint32,
+                WorkspaceDtype::Uint8 => safemlx::Dtype::Uint8,
+                WorkspaceDtype::Bool => safemlx::Dtype::Bool,
+            };
+            let shape = layout
+                .shape()
+                .iter()
+                .map(|n| usize::try_from(*n).ok())
+                .collect::<Option<Vec<_>>>()?;
+            Some((name.clone(), mlx_binding_target(shape, dtype)))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -457,12 +485,46 @@ where
     M: Parameterized<crate::MlxTensor>,
     F: Fn(&str) -> bool,
 {
+    populate_module_from_lease_values(module, lease, excluded, |lease, name| {
+        match crate::backend::runtime::residency::manager::clone_original_source_value(lease, name)? {
+            Some(value) => Ok(value),
+            None => Ok(lease.device_value(name)?.clone()),
+        }
+    })
+}
+
+/// Rebinds an ordinary invocation from the retained values. Its native handle
+/// allocations belong to ordinary execution; the finite source-construction
+/// aliases remain reserved for the initial admitted parameter binding.
+pub(crate) fn populate_module_from_ordinary_lease<M>(
+    module: &mut M,
+    lease: &ResidentUnitLease,
+) -> Result<(), ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+{
+    populate_module_from_lease_values(module, lease, |_| false, |lease, name| {
+        Ok(lease.device_value(name)?.clone())
+    })
+}
+
+fn populate_module_from_lease_values<M, F, V>(
+    module: &mut M,
+    lease: &ResidentUnitLease,
+    excluded: F,
+    clone_value: V,
+) -> Result<(), ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+    F: Fn(&str) -> bool,
+    V: Fn(&ResidentUnitLease, &str) -> Result<Array, ModuleBindingError>,
+{
     let weights = lease
         .binding_names()
         .map(|name| {
             let id = ParameterId::new(name)
                 .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))?;
-            let value = lease.device_value(name)?.clone();
+            let value = clone_value(lease, name)?;
             Ok((id, crate::MlxTensor::from_array(value)))
         })
         .collect::<Result<Vec<_>, ModuleBindingError>>()?;
@@ -472,6 +534,69 @@ where
         excluded(id.as_str())
     })
     .map_err(|error| ModuleBindingError::BindingPlan(error.to_string()))
+}
+
+/// Final prepared host binding rows. The caller authenticates the accepted
+/// per-unit row limit and owns Q through this call and the populated unit.
+pub(crate) fn populate_module_from_original_lease_excluding<M, F>(
+    module: &mut M,
+    lease: &ResidentUnitLease,
+    limit: usize,
+    excluded: F,
+) -> Result<(), ModuleBindingError>
+where
+    M: Parameterized<crate::MlxTensor>,
+    F: Fn(&str) -> bool,
+{
+    let count = lease.binding_names().count();
+    if count > limit {
+        return Err(ModuleBindingError::PreparedBindingCapacity);
+    }
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(count)
+        .map_err(ModuleBindingError::PreparedBindingReserve)?;
+    for name in lease.binding_names() {
+        if rows.len() == count {
+            return Err(ModuleBindingError::PreparedBindingCapacity);
+        }
+        let value = lease
+            .device_value(name)?
+            .try_clone_handle()
+            .map_err(ModuleBindingError::PreparedBindingNative)?;
+        rows.push(eredu_runtime::PreparedParameterBinding::new(
+            name,
+            crate::MlxTensor::from_array(value),
+        ));
+    }
+    if rows.len() != count {
+        return Err(ModuleBindingError::PreparedBindingCapacity);
+    }
+    eredu_runtime::bind_prepared_parameter_values(
+        module,
+        &mut rows,
+        |id| excluded(id.as_str()),
+        MlxNeuralBackend::validate_prepared_bind,
+        <MlxNeuralBackend as eredu_runtime::ParameterBackend>::bind,
+    )
+    .map_err(ModuleBindingError::PreparedBinding)
+}
+
+pub(crate) fn original_parameter_binding_control_bytes(rows: usize) -> Option<usize> {
+    use std::mem::size_of;
+    eredu_runtime::prepared_parameter_binding_control_bytes::<crate::MlxTensor,crate::MlxTensor,
+        crate::backend::nn::shared::MlxParameterError>(rows)?
+        .checked_add(MlxNeuralBackend::prepared_binding_visit_control_bytes(rows)?)?
+        .checked_add(size_of::<std::collections::TryReserveError>())?
+        .checked_add(size_of::<Result<(),std::collections::TryReserveError>>())?
+        .checked_add(size_of::<Result<(),ModuleBindingError>>())?
+        .checked_add(size_of::<Result<Array,safemlx::error::Exception>>())?
+        .checked_add(size_of::<&ResidentUnitLease>())?
+        .checked_add(size_of::<&mut crate::MlxTensor>())?
+        .checked_add(size_of::<&str>())?
+        .checked_add(size_of::<[usize;3]>())?
+        .checked_add(size_of::<&dyn Fn(&str)->bool>())?
+        .checked_add(size_of::<<crate::backend::runtime::residency::manager::ResidentLeaseStorage
+            as eredu_runtime::ResidencyLeaseStorage>::BindingNames<'static>>())
 }
 
 /// Returns the checked total byte count of a binding collection.
@@ -491,6 +616,21 @@ pub fn binding_bytes(bindings: &[WeightBinding]) -> Result<u64, ModuleBindingErr
 /// Structured module-to-checkpoint binding failures.
 #[derive(Debug, thiserror::Error)]
 pub enum ModuleBindingError {
+    /// The accepted finite binding source changed population.
+    #[error("prepared parameter binding capacity differs")]
+    PreparedBindingCapacity,
+    /// Final finite row storage could not be reserved.
+    #[error("prepared parameter binding allocation failed")]
+    PreparedBindingReserve(#[source] std::collections::TryReserveError),
+    /// Native handle sharing failed under the current scope.
+    #[error(transparent)]
+    PreparedBindingNative(safemlx::error::Exception),
+    /// Shared prepublication validation refused the finite binding source.
+    #[error(transparent)]
+    PreparedBinding(
+        eredu_runtime::PreparedParameterBindingError<crate::backend::nn::shared::MlxParameterError>,
+    ),
+
     /// The declarative binding plan was invalid or disagreed with source metadata.
     #[error("checkpoint binding plan is invalid: {0}")]
     BindingPlan(String),

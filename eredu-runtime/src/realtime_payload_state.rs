@@ -107,6 +107,35 @@ impl<B, P> RealtimePayloadBranch<B, P> {
     }
 }
 
+impl<M:SemanticStateTransaction,P> RealtimePayloadState<M,P> {
+    /// Exact branch and history host destinations, excluding dynamic model
+    /// and tensor copy workers supplied by the caller's retained sources.
+    pub fn branch_host_bytes<F,G>(&self)->Option<usize>
+    where G:FnMut(&P,&eredu_core::HostMetadataFunding)->Result<P,eredu_core::BackendFailure> {
+        let mapper=payload_branch_mapper::<P,G>(None,None);
+        Self::branch_shell_bytes::<F,G>()?.checked_add(self.payload_history.map_host_bytes::<P,eredu_core::BackendFailure,_>(&mapper)?)
+    }
+    fn branch_shell_bytes<F,G>()->Option<usize> {
+        let frames=[std::mem::size_of::<F>(),std::mem::size_of::<G>(),
+            std::mem::size_of::<RealtimePayloadBranch<M::Branch,P>>(),
+            std::mem::size_of::<Result<RealtimePayloadBranch<M::Branch,P>,eredu_core::BackendFailure>>()];
+        frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
+    }
+    /// Constructs the real unpublished state from a paid history destination
+    /// and caller-supplied model/payload copy sources. No native work is inferred.
+    pub fn branch_with_host_source<F,G>(&self,funding:&eredu_core::HostMetadataFunding,
+        branch_model:F,mut clone_payload:G)
+        ->Result<RealtimePayloadBranch<M::Branch,P>,eredu_core::BackendFailure>
+    where F:FnOnce(&M,&eredu_core::HostMetadataFunding)->Result<M::Branch,eredu_core::BackendFailure>,
+        G:FnMut(&P,&eredu_core::HostMetadataFunding)->Result<P,eredu_core::BackendFailure> {
+        funding.reserve_metadata(Self::branch_shell_bytes::<F,G>()
+            .ok_or(eredu_core::HostMetadataFundingError::Overflow)?)?;
+        let payload_history=self.payload_history.try_map_with(funding,&mut payload_branch_mapper(Some(&mut clone_payload),Some(funding)))?;
+        let model_state=branch_model(&self.model_state,funding)?;
+        Ok(RealtimePayloadBranch{model_state,payload_history})
+    }
+}
+
 impl<M, P> SemanticStateTransaction for RealtimePayloadState<M, P>
 where
     M: SemanticStateTransaction,
@@ -120,7 +149,9 @@ where
         let model_state = self.model_state.branch().map_err(Self::Error::Model)?;
         Ok(RealtimePayloadBranch {
             model_state,
-            payload_history: self.payload_history.clone(),
+            payload_history: self.payload_history.try_clone()
+                .map_err(RealtimePayloadHistoryError::HostMetadata)
+                .map_err(Self::Error::PayloadHistory)?,
         })
     }
 
@@ -492,4 +523,11 @@ mod tests {
             Ok(&"canonical")
         );
     }
+}
+
+fn payload_branch_mapper<'a,P,G>(mut source:Option<&'a mut G>,funding:Option<&'a eredu_core::HostMetadataFunding>)
+    ->impl FnMut(&P)->Result<P,eredu_core::BackendFailure>+'a
+where G:FnMut(&P,&eredu_core::HostMetadataFunding)->Result<P,eredu_core::BackendFailure> {
+    move |value|source.as_mut().ok_or(eredu_core::HostMetadataFundingError::Unavailable)?(
+        value,funding.ok_or(eredu_core::HostMetadataFundingError::Unavailable)?)
 }

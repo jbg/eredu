@@ -64,7 +64,7 @@ fn adaptive_lookahead_uses_deterministic_reuse_accounting() {
     no_reuse.update_adaptive_lookahead(options);
     assert!(no_reuse.adaptive_lookahead_disabled());
 
-    let mut disabled_policy = unprofitable.clone();
+    let mut disabled_policy = unprofitable;
     disabled_policy.reset_adaptive_lookahead_decision();
     disabled_policy.update_adaptive_lookahead(SpeculativeSchedulerOptions {
         adaptive_lookahead: false,

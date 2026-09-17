@@ -7,6 +7,13 @@ pub struct MlxModelConfig {
 }
 
 impl MlxModelConfig {
+    /// Borrows the exact cold source and selection retained by this configuration.
+    /// Native materialization can borrow the same configuration after original
+    /// semantic compilation, without invalidating this loan.
+    pub const fn prepared_sources(&self) -> &PreparedModelSources {
+        &self.sources
+    }
+
     pub(crate) fn new(
         selected: eredu_core::SelectedModelPreparation<crate::backend::MlxBackend<'_>>,
     ) -> Result<Self, Error> {

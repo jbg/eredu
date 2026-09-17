@@ -1,0 +1,111 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "Uncommitted working tree; source hashes identify this integration on top of earlier goal work. Historical milestone records remain unchanged.",
+  "source_sha256": {
+    "doc/backend-architecture.md": "9533f3bc1658b55f7d0e2e3da4a64f2836bff41b1564a5d99d94a7752a376f05",
+    "doc/bounded-inference.md": "6c014c805e7d08a95661270055a6deb4b0a902459e809ec63a1037d958cf63ec",
+    "doc/execution-control.md": "e105c597f447ca0d5d0e23877c27df525b95c921faef40fabf2e78dbdb33a210",
+    "eredu-backend-mlx/src/backend/runtime/checkpoint/recipe.rs": "a89325998795e6b688b0976d21a22ce738c394f822a06a312fb8d9af51a47743",
+    "eredu-backend-mlx/src/backend/runtime/checkpoint/recipe/tests.rs": "db306064c28da2004304fa40c0d22962483f099bd29a5414210c1bbb3eb9360a",
+    "eredu-backend-mlx/src/backend/runtime/execution/generic.rs": "f504c23c263b76d2af303cac445d7fc582a0c41b5e51b44c0159339291140eb7",
+    "eredu-backend-mlx/src/backend/runtime/execution/generic/bounded.rs": "331f1d7656b4368eb60bde0875dc76a9ccef80090dde7d9d14d0e1d6a7f626a4",
+    "eredu-backend-mlx/src/backend/runtime/execution/generic/host_workspace.rs": "762ec8ec652faacd223733ebc945d1105f5853e80ab7c4d31ef6d59634f8aa36",
+    "eredu-backend-mlx/src/backend/runtime/execution/generic/managed_disk_tests.rs": "eb240444e28b0530197b12c7c95fcdebfa313567af34390a422f2bfdb76ec7dd",
+    "eredu-backend-mlx/src/backend/runtime/execution/layerwise/dense_stream.rs": "9351109013b312f88d920216ad9855f0c424dc9eabdc7455ebe66f3c30170cad",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager.rs": "4f049014d9aa4758ae0168c8beddab80dd76e872e141bb40e972d821008fabb7",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager/disk_workspace.rs": "cb0ef39e7d8b21d11a12049f61fb2c018ed6e67a8837008c4001dfee7aab4455",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager/disk_workspace/route.rs": "1eb4161df1cf00ffb183fc2c6b8c695c110599603b5a469e3ab4d7e8b26078cc",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager/disk_workspace/route/tests.rs": "2c70df7f49d91bee9a6e4b18a1544236b0e6ec19b812b4350c1a52fbd66dabaa",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager/disk_workspace/tests.rs": "66f72f3e531123d23ef9ab29767b95285c68ac02a858966e282dee43af13be21",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager/transfer.rs": "e64c7a95ea30a6d773304a1b38e7e7941f969340164fa81d5457d9baf6044817",
+    "eredu-backend-mlx/src/composition/mlx/model.rs": "ba0a9583190c3d159edbe473704a266ddae9ef5e33985f1b14f1f95e12f52a66",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/partitioned.rs": "b255868f341f77f023e4f70a36970ae7ad6d4c54dc42bbdcd264dd497c8ee3ca",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction.rs": "1f4883802c58223120e22568138d57022d7351f579472c4c6b5ec19a6860cc7b",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/composite.rs": "13cd77b0808013c563c5ab981a55b2443f992e6b172ea4c50e0ed8733aed447f",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/mechanisms.rs": "0067afa6c8a94c4770d18a9eaadde8540da08b9f2749702f2cc050436ade977a",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/replicated.rs": "bcf47c758e9f004f23dd70b27b98c47160b81ccffe4c919aa0c64463bd21495e",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "fa3732f6cf949d83707a26098241814b2af88475b341bb32a124e6076f1efe94",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/disk_layerwise_tests.rs": "53c02177d64381f6b4fa7ba140406cd36d81b7e9da92082369cf55fdbf665045",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/host_layerwise_tests.rs": "736be9f8e7b3951d3942770208e0cf46c80f52468b47813bcc15e420fd8af8c5",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote.rs": "fe0ca3b13331b3c1ea52fd0b07bb6f11e1ad7ab2441a7fed272b81925d14b127",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_step.rs": "f61720892a3c05eaed7eeb795d5cd38e74f25f3f2ed5f6d7dc7aeae701464811"
+  },
+  "prior_record": "bounded-disk-read-prerequisites-2026-09-13.json",
+  "coverage": {
+    "passed": 106,
+    "new_tests": 21,
+    "native_new_breakdown": {
+      "typed_recipe_sources": 1,
+      "completed_disk_window_policy": 8,
+      "manager_operation_route": 7,
+      "managed_disk_generation": 5
+    }
+  },
+  "behavior": [
+    "Loading retains exact reusable direct encoded read plans; cold candidates do not re-admit source files or read payloads.",
+    "Selected foreground disk text shares architecture equations, candidate planning, controller contracts and ordinary/controlled drivers with resident/host execution.",
+    "A metadata-only weak-manager receipt binds per-binding capacity and exact group-local windows plus the complete persistent canonical-owner unit closure.",
+    "SessionOperation activates after recovery setup and before input/constructor work; recovery tickets keep the guard until settlement, independently of escaped token owners.",
+    "Manager validates warm/pending provenance, Host rejection and full owner closure before allocation; setter prevalidates branch metadata before construction; retained plans never fall back to ordinary conversion.",
+    "Policy completes old consumers/transfers, reclaims owners and evicts old Device copies before implicit initial and subsequent refill. A native allocation-owner witness proves physical retirement while an enclosing submission scope remains open.",
+    "Checkpoint and MLX recipe wrappers expose source-less leaf failures in Error::source without changing displayed errors."
+  ],
+  "verified_fixtures": [
+    "Real nonzero three-layer Llama SafeTensors, roomy 1 GiB logical Device budget and zero Host prefetch; resident versus disk, greedy/seeded stochastic, ordinary/controlled; uneven prefill 2+2+1 and three cached decodes.",
+    "Exact minimum-chunk capacity succeeds; one byte less rejects before controller, input, reset, read or sampling activity; repeated cold quotes leave telemetry and pool unchanged.",
+    "Cached continuation runs while prior tokens, raw backing alias and old SubmissionResources survive; physical-only charges and original common finite ceiling retire with their actual owners.",
+    "Replacing the admitted SafeTensors inode after first output preserves StoreError::AdmittedFileChanged, prevents another commitment and retains uncertified funding after teardown.",
+    "Five unequal I32 units in groups 3+2, shortened tails and warm second pass; persistent owner includes companion output; local/external aliases share canonical storage. Equivalent singleton-group depths accepted; incompatible depths rejected.",
+    "Own pending transfers remain allowed only with exact activation provenance; unrelated Host/background/outside-window changes reject without source I/O; repeated receipt clones do not extend activation."
+  ],
+  "limits": [
+    "Positive native route is foreground direct encoded reads, Device decoder state and ordinary token-ID managed text only. Background prefetch and ordinary conversion still need selected bounds and funded ownership.",
+    "No new released-checkpoint comparison, whole-model allocator/process peak, or native distributed run. Prior pinned Qwen measurements and direct-read allocator experiments remain separate evidence.",
+    "Tests retain one common finite ceiling for cached successors. Raising a ceiling while historical metadata or physical descendants retain the original ceiling is not solved by this change.",
+    "Grammar, dynamic controls/capture, independent quoted reset/restore/fork/copy, full media/speculative/distributed and remaining host/disk admission, quarantine/capacity handoff, and arbitrary escaped raw-output/completion accounting remain unfinished. This milestone does not complete the full goal."
+  ],
+  "checks": [
+    {
+      "name": "native",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1 --nocapture checkpoint::recipe::tests::source_less_checkpoint_and_native_failures_remain_typed_causes residency::manager execution::generic execution::layerwise::dense_stream model_session::disk_layerwise_tests model_session::host_layerwise_tests model_session::text_quote model_session::text_reuse_tests model_session::managed_admission_tests model_session::controller_credit_tests model_session::operation_memory_tests model_session::operation_exchange_tests",
+      "log": "/private/tmp/eredu-disk-admission-native.log",
+      "exit_code": 0,
+      "sha256": "6aa5512955ec6eafb5072c44cbe7a64bdd51c942dc8e7423d9e72c9651812bf1",
+      "passed": 106,
+      "ignored": 0
+    },
+    {
+      "name": "minimal",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "log": "/private/tmp/eredu-disk-admission-minimal.log",
+      "exit_code": 0,
+      "sha256": "4ccd81399b13727539ac77e7273cf63a3f30e632654fed39caf94e0865e5ba69",
+      "passed": 0,
+      "ignored": 0
+    },
+    {
+      "name": "features",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal,image,audio",
+      "log": "/private/tmp/eredu-disk-admission-features.log",
+      "exit_code": 0,
+      "sha256": "cc0cb9e8b3740aee0afbcb184b8c40ca7472e55d56a39417f932b930d7c1acc0",
+      "passed": 0,
+      "ignored": 0
+    }
+  ],
+  "supplementary_checks": [
+    {
+      "name": "scoped-format",
+      "log": "/private/tmp/eredu-disk-admission-format.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exit_code": 0
+    },
+    {
+      "name": "scoped-whitespace",
+      "log": "/private/tmp/eredu-disk-admission-whitespace.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exit_code": 0
+    }
+  ]
+}

@@ -6,15 +6,13 @@ use eredu_core::{
     BoundedCompletion, BoundedCompletionOutcome, BoundedCompletionWait,
 };
 
-const RECEIPT_WORDS: usize = 18;
-const RECEIPT_MAGIC: u32 = 0x4552_4953;
+const RECEIPT_WORDS: usize = PartitionInterventionReceipt::WORDS;
 mod routed;
 
 /// Move-only authority for one globally admitted activation operation. Every
 /// actual invocation member, including replicas and empty shards, acknowledges
 /// it. Pipeline nonmembers join only the shared completion boundary.
 pub struct SessionPartitionIntervention<'a, T: PartitionCaptureHookTransport> {
-    owner: Arc<()>,
     epoch: DistributedCommitEpoch,
     pub(in crate::capture::partition) index: usize,
     plan_identity: String,
@@ -28,6 +26,8 @@ pub struct SessionPartitionIntervention<'a, T: PartitionCaptureHookTransport> {
     descriptor: [u8; 32],
     charged: CaptureUsage,
     evidence: Vec<SessionPartitionCapture<'a, T>>,
+    // Last: all retained plan/work payloads retire before preparation custody.
+    owner: Arc<crate::capture::CaptureHostOwner>,
 }
 
 // Projection preparation runs on every rank. Native retention is charged once
@@ -427,65 +427,13 @@ where
         self.transport.ensure_capture_active()?;
         let rank = self.transport.capture_rank();
         let world = self.transport.participant_count();
-        let status = if self.members.contains(&rank) {
-            u32::from(self.accepted)
-        } else {
-            2
-        };
-        let mut frame = [0u32; RECEIPT_WORDS];
-        frame[..8].copy_from_slice(&[
-            RECEIPT_MAGIC,
-            1,
-            rank as u32,
-            world as u32,
-            self.epoch.value() as u32,
-            (self.epoch.value() >> 32) as u32,
-            self.index as u32,
-            status,
-        ]);
-        for (word, bytes) in frame[8..16].iter_mut().zip(self.descriptor.chunks_exact(4)) {
-            *word = u32::from_le_bytes(bytes.try_into().expect("digest word"));
-        }
+        let receipt = PartitionInterventionReceipt::new(rank, world, self.epoch,
+            self.index, &self.members, &self.descriptor, self.routed.is_some())?;
         let affected = self.routed.as_ref().map_or(0, |work| work.affected);
-        frame[16] = affected as u32;
-        frame[17] = (affected >> 32) as u32;
-        let gathered =
-            super::super::exchange::gather_capture_words(self.transport, self.wait, world, &frame)?;
-        for (rank, peer) in gathered.chunks_exact(RECEIPT_WORDS).enumerate() {
-            if peer[..7]
-                != [
-                    RECEIPT_MAGIC,
-                    1,
-                    rank as u32,
-                    world as u32,
-                    frame[4],
-                    frame[5],
-                    frame[6],
-                ]
-                || peer[8..16] != frame[8..16]
-                || (self.routed.is_none() && peer[16..] != [0, 0])
-                || (peer[7] != 1 && peer[16..] != [0, 0])
-                || peer[7] > 2
-                || (peer[7] == 2) == self.members.contains(&rank)
-            {
-                return Err(PartitionCaptureExchangeError::Protocol(
-                    "intervention outcome identity or membership",
-                ));
-            }
-        }
-        if let Some(rank) = gathered
-            .chunks_exact(RECEIPT_WORDS)
-            .position(|peer| peer[7] == 0)
-        {
-            return Err(PartitionCaptureExchangeError::PeerRejected {
-                rank,
-                stage: PartitionCaptureExchangeStage::Delivery,
-            });
-        }
-        gathered
-            .chunks_exact(RECEIPT_WORDS)
-            .try_fold(0u64, |sum, peer| {
-                add(sum, u64::from(peer[16]) | (u64::from(peer[17]) << 32)).map_err(Into::into)
-            })
+        let frame = receipt.frame(self.accepted, affected)?;
+        let source = PartitionCaptureFrame::new(PartitionCaptureFrameKind::InterventionReceipt,
+            rank, world, &frame, RECEIPT_WORDS)?;
+        let gathered = super::super::exchange::gather_capture_words(self.transport, self.wait, &source)?;
+        receipt.validate(&gathered)
     }
 }

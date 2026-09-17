@@ -37,14 +37,19 @@ fn array_f32_host(array: &Array, stream: &Stream) -> Result<Vec<f32>, Error> {
 /// MLX host observer used by the neutral prepublication transition.
 #[derive(Clone)]
 pub struct MlxRealtimeHostObserver {
-    stream: Stream,
+    stream: Option<Stream>,
+    original: Option<super::original_observation::OriginalRealtimeHostObserver>,
 }
 
 impl MlxRealtimeHostObserver {
+    pub(super) fn from_original(original:super::original_observation::OriginalRealtimeHostObserver)->Self {
+        Self {stream:None,original:Some(original)}
+    }
     /// Creates an observer on the selected execution stream.
     pub fn new(stream: &Stream) -> Self {
         Self {
-            stream: stream.clone(),
+            stream: Some(stream.clone()),
+            original: None,
         }
     }
 }
@@ -57,6 +62,7 @@ impl RealtimeFrameHostObserver<MlxTensor> for MlxRealtimeHostObserver {
         &mut self,
         frame: &CompletedRealtimeFrame<MlxTensor, MlxTensor>,
     ) -> Result<Self::Output, Self::Error> {
+        if let Some(original)=&self.original { return original.observe(frame); }
         let text = frame.text().as_array();
         let batch = usize::try_from(text.dim(0))
             .map_err(|_| Error::Parallel("negative realtime output batch".into()))?;
@@ -78,7 +84,7 @@ impl RealtimeFrameHostObserver<MlxTensor> for MlxRealtimeHostObserver {
                 RealtimeDecisionDiagnostics::new(
                     prediction,
                     shape,
-                    array_f32_host(logits, &self.stream)?,
+                    array_f32_host(logits, self.stream.as_ref().expect("ordinary observer stream"))?,
                 )
                 .map_err(|error| Error::ArchitectureModel(error.to_string()))
             })
@@ -99,11 +105,12 @@ impl RealtimeFrameHostObserver<MlxTensor> for MlxRealtimeHostObserver {
 }
 
 /// Neutral scheduler branch specialized to MLX model mechanisms.
-pub type MlxFrameSessionBranch = RealtimeSessionBranch<
+pub type MlxFrameSessionBranch<P = ()> = RealtimeSessionBranch<
     RealtimePayloadBranch<MlxKeyValueTransactionBranch, MlxTensor>,
     GenerationSampler,
     RandomState,
     MlxRealtimeCompletion,
+    P,
 >;
 
 /// MLX submission whose host observation must succeed before publication.

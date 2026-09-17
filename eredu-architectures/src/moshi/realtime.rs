@@ -4,7 +4,7 @@ use std::{borrow::Borrow, collections::BTreeMap};
 
 use eredu_checkpoint::{
     recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeDtype, RecipeMetadata},
-    store::{SharedCheckpointSource, TensorMetadata, TensorSourceProvenance},
+    store::{RetainedCheckpointSource, TensorMetadata, TensorSourceProvenance},
     LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization,
 };
 use eredu_core::{
@@ -75,7 +75,8 @@ pub fn realtime_generation_samplers(
 /// Selects Moshi's architecture-proven fully-forced depth-tail optimization.
 ///
 /// The neutral sequential driver still disables the optimization whenever
-/// diagnostics are requested or any remaining target is sampled/existing.
+/// diagnostics are requested or any remaining directive is sampled. Existing
+/// target payloads become forced directives during realtime interpretation.
 pub const fn realtime_decision_execution() -> RealtimeDecisionExecution {
     RealtimeDecisionExecution::new(true)
 }
@@ -109,6 +110,10 @@ where
     /// Constructs the architecture-owned boundary for one decision traversal.
     fn realtime_decision_boundary(&self) -> Result<DecisionBoundary, eredu_nn::Error>;
 
+    /// Borrows the immutable construction source retained by this executable.
+    /// The source supplies metadata equations only, never native capabilities.
+    fn realtime_workspace_source(&self) -> super::MoshiRealtimeModelSource;
+
     /// Returns canonical text-plus-audio temporal input cardinality.
     fn realtime_temporal_cardinality(&self) -> usize;
 }
@@ -121,6 +126,10 @@ where
 {
     fn realtime_decision_boundary(&self) -> Result<DecisionBoundary, eredu_nn::Error> {
         DecisionBoundary::new(self.config())
+    }
+
+    fn realtime_workspace_source(&self) -> super::MoshiRealtimeModelSource {
+        super::LayeredModel::realtime_workspace_source(self)
     }
 
     fn realtime_temporal_cardinality(&self) -> usize {
@@ -139,6 +148,8 @@ where
 {
     execution: eredu_runtime::ConstructedRealtimeExecution<A, B, M>,
     observer: O,
+    required_observation: bool,
+    output_demand: eredu_core::OutputDemand,
 }
 
 impl<A, B, M> MoshiPreparedRealtimeFrameExecutor<A, B, M, eredu_runtime::NoopObserver>
@@ -154,6 +165,8 @@ where
         Self {
             execution,
             observer: eredu_runtime::NoopObserver,
+            required_observation: false,
+            output_demand: eredu_core::OutputDemand::StateOnly,
         }
     }
 }
@@ -174,7 +187,30 @@ where
         Self {
             execution,
             observer,
+            required_observation: true,
+            output_demand: eredu_core::OutputDemand::StateOnly,
         }
+    }
+
+    /// Preserves legacy tracing of already produced scores without requiring
+    /// wholly forced depth tails to execute. Final public scores remain present.
+    pub const fn with_opportunistic_observer(
+        execution: eredu_runtime::ConstructedRealtimeExecution<A, B, M>,
+        observer: O,
+    ) -> Self {
+        Self {
+            execution,
+            observer,
+            required_observation: false,
+            output_demand: eredu_core::OutputDemand::Sequence,
+        }
+    }
+
+    /// Sets final public demand; required observations remain an independent
+    /// consumer and cannot be disabled by this selection.
+    pub const fn with_readout(mut self, demand: eredu_core::OutputDemand) -> Self {
+        self.output_demand = demand;
+        self
     }
 
     /// Borrows the detached selected execution.
@@ -212,9 +248,19 @@ where
 {
     type Error = MoshiRealtimeExecutionError<M::PolicyError>;
     type Retained = (
-        <B as NeuralBackend>::Tensor,
+        Option<<B as NeuralBackend>::Tensor>,
         super::ForwardContext<<B as NeuralBackend>::Tensor>,
     );
+
+    fn validate_transition(
+        &self,
+        transition: &eredu_core::RealtimeFrameTransition,
+    ) -> Result<(), Self::Error> {
+        if self.required_observation && !transition.model_call_required() {
+            return Err(MoshiRealtimeExecutionError::ObservationWithoutModel);
+        }
+        Ok(())
+    }
 
     fn execute(
         &mut self,
@@ -223,13 +269,20 @@ where
         driver: &mut eredu_runtime::SequentialDecisionDriver<SB, S>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<Self::Retained, Self::Error> {
-        execute_detached_replicated_moshi_realtime_with_observer(
+        let observation = if self.required_observation {
+            required_decision_observation::<B::Tensor, eredu_nn::Error, O>(&self.observer)
+        } else {
+            eredu_runtime::SequentialDecisionObservation::Opportunistic
+        };
+        execute_detached_replicated_moshi_realtime_with_observation(
             &mut self.execution,
             &mut **model_state,
             temporal,
             driver,
             context,
             &mut self.observer,
+            self.output_demand,
+            observation,
         )
     }
 }
@@ -267,13 +320,95 @@ where
     SB::Error: std::fmt::Display,
     S: eredu_runtime::Sampler<SB>,
 {
-    execute_detached_replicated_moshi_realtime_with_observer(
+    execute_detached_replicated_moshi_realtime_with_readout(
+        constructed,
+        state,
+        temporal,
+        driver,
+        context,
+        eredu_core::OutputDemand::Sequence,
+    )
+    .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
+}
+
+/// Runs the same detached traversal with explicit public readout demand.
+pub fn execute_detached_replicated_moshi_realtime_with_readout<A, B, M, SB, S>(
+    constructed: &mut eredu_runtime::ConstructedRealtimeExecution<A, B, M>,
+    state: &mut M::State,
+    temporal: &[B::Tensor],
+    driver: &mut eredu_runtime::SequentialDecisionDriver<SB, S>,
+    context: &<B::Tensor as Tensor>::Context,
+    demand: eredu_core::OutputDemand,
+) -> Result<
+    (Option<B::Tensor>, super::ForwardContext<B::Tensor>),
+    MoshiRealtimeExecutionError<M::PolicyError>,
+>
+where
+    B: eredu_runtime::SubmissionBackend<
+            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
+        > + DistributedNeuralBackend,
+    A: MoshiRealtimeExecutionArchitecture<B, M::State> + 'static,
+    M: eredu_runtime::RealtimeModelConstructionMechanisms<A, B>,
+    M::State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
+    <M::State as eredu_runtime::LayerRuntimeState<B>>::LayerState:
+        eredu_nn::AttentionCache<B::Tensor>,
+    M::PolicyError: std::fmt::Display,
+    SB: eredu_runtime::SamplingBackend<
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = <B::Tensor as Tensor>::Context,
+    >,
+    SB::Error: std::fmt::Display,
+    S: eredu_runtime::Sampler<SB>,
+{
+    execute_detached_replicated_moshi_realtime_with_observation(
         constructed,
         state,
         temporal,
         driver,
         context,
         &mut eredu_runtime::NoopObserver,
+        demand,
+        eredu_runtime::SequentialDecisionObservation::Opportunistic,
+    )
+}
+
+/// Executes a canonical frame whose published values are the actual decisions.
+pub fn execute_detached_replicated_moshi_frame<A, B, M, SB, S>(
+    constructed: &mut eredu_runtime::ConstructedRealtimeExecution<A, B, M>,
+    state: &mut M::State,
+    temporal: &[B::Tensor],
+    driver: &mut eredu_runtime::SequentialDecisionDriver<SB, S>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<
+    (Option<B::Tensor>, super::ForwardContext<B::Tensor>),
+    MoshiRealtimeExecutionError<M::PolicyError>,
+>
+where
+    B: eredu_runtime::SubmissionBackend<
+            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
+        > + DistributedNeuralBackend,
+    A: MoshiRealtimeExecutionArchitecture<B, M::State> + 'static,
+    M: eredu_runtime::RealtimeModelConstructionMechanisms<A, B>,
+    M::State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
+    <M::State as eredu_runtime::LayerRuntimeState<B>>::LayerState:
+        eredu_nn::AttentionCache<B::Tensor>,
+    M::PolicyError: std::fmt::Display,
+    SB: eredu_runtime::SamplingBackend<
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = <B::Tensor as Tensor>::Context,
+    >,
+    SB::Error: std::fmt::Display,
+    S: eredu_runtime::Sampler<SB>,
+{
+    execute_detached_replicated_moshi_realtime_with_readout(
+        constructed,
+        state,
+        temporal,
+        driver,
+        context,
+        eredu_core::OutputDemand::StateOnly,
     )
 }
 
@@ -313,6 +448,106 @@ where
     S: eredu_runtime::Sampler<SB>,
     O: ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
 {
+    execute_detached_replicated_moshi_realtime_with_observer_and_readout(
+        constructed,
+        state,
+        temporal,
+        driver,
+        context,
+        observer,
+        eredu_core::OutputDemand::Sequence,
+    )
+    .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
+}
+
+/// Requires actual observed scores; the observer's sequence flag specifies
+/// geometry only. Required observation also disables forced-tail omission.
+pub fn execute_detached_replicated_moshi_realtime_with_observer_and_readout<A, B, M, SB, S, O>(
+    constructed: &mut eredu_runtime::ConstructedRealtimeExecution<A, B, M>,
+    state: &mut M::State,
+    temporal: &[B::Tensor],
+    driver: &mut eredu_runtime::SequentialDecisionDriver<SB, S>,
+    context: &<B::Tensor as Tensor>::Context,
+    observer: &mut O,
+    demand: eredu_core::OutputDemand,
+) -> Result<
+    (Option<B::Tensor>, super::ForwardContext<B::Tensor>),
+    MoshiRealtimeExecutionError<M::PolicyError>,
+>
+where
+    B: eredu_runtime::SubmissionBackend<
+            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
+        > + DistributedNeuralBackend,
+    A: MoshiRealtimeExecutionArchitecture<B, M::State> + 'static,
+    M: eredu_runtime::RealtimeModelConstructionMechanisms<A, B>,
+    M::State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
+    <M::State as eredu_runtime::LayerRuntimeState<B>>::LayerState:
+        eredu_nn::AttentionCache<B::Tensor>,
+    M::PolicyError: std::fmt::Display,
+    SB: eredu_runtime::SamplingBackend<
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = <B::Tensor as Tensor>::Context,
+    >,
+    SB::Error: std::fmt::Display,
+    S: eredu_runtime::Sampler<SB>,
+    O: ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
+{
+    let observation = required_decision_observation::<B::Tensor, eredu_nn::Error, O>(observer);
+    execute_detached_replicated_moshi_realtime_with_observation(
+        constructed,
+        state,
+        temporal,
+        driver,
+        context,
+        observer,
+        demand,
+        observation,
+    )
+}
+
+fn required_decision_observation<T, E, O: ActivationObserver<T, E> + ?Sized>(
+    observer: &O,
+) -> eredu_runtime::SequentialDecisionObservation {
+    if observer.requires_sequence_readout() {
+        eredu_runtime::SequentialDecisionObservation::RequiredSequence
+    } else {
+        eredu_runtime::SequentialDecisionObservation::RequiredLastPosition
+    }
+}
+
+fn execute_detached_replicated_moshi_realtime_with_observation<A, B, M, SB, S, O>(
+    constructed: &mut eredu_runtime::ConstructedRealtimeExecution<A, B, M>,
+    state: &mut M::State,
+    temporal: &[B::Tensor],
+    driver: &mut eredu_runtime::SequentialDecisionDriver<SB, S>,
+    context: &<B::Tensor as Tensor>::Context,
+    observer: &mut O,
+    demand: eredu_core::OutputDemand,
+    observation: eredu_runtime::SequentialDecisionObservation,
+) -> Result<
+    (Option<B::Tensor>, super::ForwardContext<B::Tensor>),
+    MoshiRealtimeExecutionError<M::PolicyError>,
+>
+where
+    B: eredu_runtime::SubmissionBackend<
+            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
+        > + DistributedNeuralBackend,
+    A: MoshiRealtimeExecutionArchitecture<B, M::State> + 'static,
+    M: eredu_runtime::RealtimeModelConstructionMechanisms<A, B>,
+    M::State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
+    <M::State as eredu_runtime::LayerRuntimeState<B>>::LayerState:
+        eredu_nn::AttentionCache<B::Tensor>,
+    M::PolicyError: std::fmt::Display,
+    SB: eredu_runtime::SamplingBackend<
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = <B::Tensor as Tensor>::Context,
+    >,
+    SB::Error: std::fmt::Display,
+    S: eredu_runtime::Sampler<SB>,
+    O: ActivationObserver<B::Tensor, eredu_nn::Error> + ?Sized,
+{
     let expected = constructed
         .selected()
         .requirements()
@@ -326,47 +561,105 @@ where
             actual: temporal.len(),
         });
     }
-    let (text, audio) = temporal
-        .split_first()
-        .expect("validated Moshi temporal cardinality is positive");
-    let audio = audio.iter().collect::<Vec<_>>();
-    let input = super::Input {
-        text,
-        audio: &audio,
-        mask: None,
+    match constructed.execution_mut() {
+        eredu_runtime::RealtimeLayerwiseRuntime::Resident(runtime) =>
+            execute_layerwise_moshi_realtime_with_observation(
+                runtime, state, temporal, driver, context, observer, demand, observation),
+        eredu_runtime::RealtimeLayerwiseRuntime::Bounded(runtime) =>
+            execute_layerwise_moshi_realtime_with_observation(
+                runtime, state, temporal, driver, context, observer, demand, observation),
+    }
+}
+
+/// Executes the shared temporal/depth equations through an already bound unit
+/// provider. Native execution and metadata quotation use this same traversal;
+/// the provider retains actual parameter sources and the caller supplies actual
+/// projected state, prepared temporal values and decision-driver state.
+///
+/// Observation and output demand keep their ordinary causal order, including
+/// the architecture's forced-tail decision optimization. This entry grants no
+/// materialization, native submission or admission authority.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_layerwise_moshi_realtime_with_observation<A,B,State,P,SB,S,O>(
+    runtime:&mut eredu_runtime::LayerwiseRuntime<A,B,State,P>,
+    state:&mut State, temporal:&[B::Tensor],
+    driver:&mut eredu_runtime::SequentialDecisionDriver<SB,S>,
+    context:&<B::Tensor as Tensor>::Context, observer:&mut O,
+    demand:eredu_core::OutputDemand,
+    observation:eredu_runtime::SequentialDecisionObservation,
+)->Result<(Option<B::Tensor>,super::ForwardContext<B::Tensor>),MoshiRealtimeExecutionError<P::Error>>
+where
+    B:eredu_runtime::SubmissionBackend<Executor=<<B as eredu_nn::NeuralBackend>::Tensor as Tensor>::Context>+DistributedNeuralBackend,
+    State:eredu_runtime::LayerRuntimeState<B>+ResettableRuntimeState<B>,
+    State::LayerState:eredu_nn::AttentionCache<B::Tensor>,
+    A:MoshiRealtimeExecutionArchitecture<B,State>+'static,
+    P:eredu_runtime::LayerwisePolicy<B,A::Unit>,
+    P::Error:std::fmt::Display,
+    SB:eredu_runtime::SamplingBackend<Logits=B::Tensor,Token=B::Tensor,Context=<B::Tensor as Tensor>::Context>,
+    SB::Error:std::fmt::Display,
+    S:eredu_runtime::Sampler<SB>,
+    O:ActivationObserver<B::Tensor,eredu_nn::Error>+?Sized,
+{
+    execute_layerwise_moshi_realtime_with_parallel_observation(runtime,state,temporal,driver,context,observer,demand,observation,None)
+}
+
+pub(crate) fn execute_layerwise_moshi_realtime_with_parallel_observation<A,B,State,P,SB,S,O>(
+    runtime:&mut eredu_runtime::LayerwiseRuntime<A,B,State,P>,
+    state:&mut State, temporal:&[B::Tensor],
+    driver:&mut eredu_runtime::SequentialDecisionDriver<SB,S>,
+    context:&<B::Tensor as Tensor>::Context, observer:&mut O,
+    demand:eredu_core::OutputDemand,
+    observation:eredu_runtime::SequentialDecisionObservation,
+    parallel:Option<&B::ParallelContext>,
+)->Result<(Option<B::Tensor>,super::ForwardContext<B::Tensor>),MoshiRealtimeExecutionError<P::Error>>
+where
+    B:eredu_runtime::SubmissionBackend<Executor=<<B as eredu_nn::NeuralBackend>::Tensor as Tensor>::Context>+DistributedNeuralBackend,
+    State:eredu_runtime::LayerRuntimeState<B>+ResettableRuntimeState<B>,
+    State::LayerState:eredu_nn::AttentionCache<B::Tensor>,
+    A:MoshiRealtimeExecutionArchitecture<B,State>+'static,
+    P:eredu_runtime::LayerwisePolicy<B,A::Unit>,
+    P::Error:std::fmt::Display,
+    SB:eredu_runtime::SamplingBackend<Logits=B::Tensor,Token=B::Tensor,Context=<B::Tensor as Tensor>::Context>,
+    SB::Error:std::fmt::Display,
+    S:eredu_runtime::Sampler<SB>,
+    O:ActivationObserver<B::Tensor,eredu_nn::Error>+?Sized,
+{
+    let demand=eredu_runtime::merge_output_demand(demand,observation.demand());
+    let expected=runtime.architecture().realtime_temporal_cardinality();
+    if temporal.len()!=expected || expected==0 {
+        return Err(MoshiRealtimeExecutionError::TemporalCardinality{expected,actual:temporal.len()});
+    }
+    let (text,audio)=temporal.split_first().expect("validated positive temporal cardinality");
+    let mut audio_refs=match B::construction_metadata(context) {
+        Some(metadata)=>metadata.metadata_vec(audio.len()).map_err(|cause|
+            MoshiRealtimeExecutionError::Execution(eredu_runtime::LayerwiseRuntimeError::Architecture(cause)))?,
+        None=>Vec::with_capacity(audio.len()),
     };
-    let (output, mut forward) = match constructed.execution_mut() {
-        eredu_runtime::RealtimeLayerwiseRuntime::Resident(runtime) => {
-            let mut boundary = runtime
-                .architecture()
-                .realtime_decision_boundary()
-                .map_err(MoshiRealtimeExecutionError::DecisionBoundary)?;
-            let observations = MoshiRealtimeObservationTraversal { observer };
-            let decisions = eredu_runtime::SequentialDecisionTraversal::new(driver, &mut boundary);
-            let mut traversal = CompositeLayeredTraversalHook::new(observations, decisions);
-            runtime
-                .forward_with_traversal_hook(input, state, context, &mut traversal)
-                .map_err(MoshiRealtimeExecutionError::Execution)
-        }
-        eredu_runtime::RealtimeLayerwiseRuntime::Bounded(runtime) => {
-            let mut boundary = runtime
-                .architecture()
-                .realtime_decision_boundary()
-                .map_err(MoshiRealtimeExecutionError::DecisionBoundary)?;
-            let observations = MoshiRealtimeObservationTraversal { observer };
-            let decisions = eredu_runtime::SequentialDecisionTraversal::new(driver, &mut boundary);
-            let mut traversal = CompositeLayeredTraversalHook::new(observations, decisions);
-            runtime
-                .forward_with_traversal_hook(input, state, context, &mut traversal)
-                .map_err(MoshiRealtimeExecutionError::Execution)
-        }
-    }?;
-    let output = observe_model_logits(observer, &output).map_err(|error| {
-        MoshiRealtimeExecutionError::Execution(eredu_runtime::LayerwiseRuntimeError::Architecture(
-            error,
-        ))
-    })?;
-    forward.replace_text_logits(output.clone());
+    audio_refs.extend(audio);
+    let input=super::Input{text,audio:&audio_refs,mask:None};
+    let mut boundary=runtime.architecture().realtime_decision_boundary()
+        .map_err(MoshiRealtimeExecutionError::DecisionBoundary)?;
+    let observations=MoshiRealtimeObservationTraversal{observer};
+    let decisions=eredu_runtime::SequentialDecisionTraversal::new(driver,&mut boundary)
+        .with_observation(observation);
+    let mut traversal=CompositeLayeredTraversalHook::new(observations,decisions);
+    let (output,mut forward)=match parallel {
+        Some(parallel)=>runtime.forward_parallel_with_traversal_hook_with_readout(input,state,parallel,context,&mut traversal,demand),
+        None=>runtime.forward_with_traversal_hook_with_readout(input,state,context,&mut traversal,demand),
+    }.map_err(MoshiRealtimeExecutionError::Execution)?;
+    let output = output
+        .map(|output| observe_model_logits(observer, &output))
+        .transpose()
+        .map_err(|error| {
+            MoshiRealtimeExecutionError::Execution(
+                eredu_runtime::LayerwiseRuntimeError::Architecture(error),
+            )
+        })?;
+    // Retain the actually observed final output, while preserving the complete
+    // temporal hidden value needed by state and depth execution.
+    if let Some(output) = &output {
+        forward.replace_text_logits(output.clone());
+    }
     Ok((output, forward))
 }
 
@@ -402,9 +695,12 @@ where
         group: usize,
         index: usize,
         value: &mut B::Tensor,
-        _forward: &mut super::ForwardContext<B::Tensor>,
+        forward: &mut super::ForwardContext<B::Tensor>,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(), eredu_nn::Error> {
+        if group == 1 && !forward.has_depth_logits() {
+            return Ok(());
+        }
         let point = match group {
             0 => super::ObservationPoint::TemporalLayer { layer: index },
             1 => super::ObservationPoint::DepthSliceLogits { slice: index },
@@ -422,9 +718,9 @@ where
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(), eredu_nn::Error> {
         if group == 0 {
-            let logits = forward
-                .text_logits()
-                .ok_or_else(|| eredu_nn::Error::backend("Moshi text logits are unavailable"))?;
+            let Some(logits) = forward.text_logits() else {
+                return Ok(());
+            };
             let logits = observe_and_intervene(
                 self.observer,
                 &super::ObservationPoint::TextLogits.path(),
@@ -488,8 +784,158 @@ where
     SB::Error: std::fmt::Display,
     S: eredu_runtime::Sampler<SB>,
 {
+    execute_detached_partitioned_moshi_realtime_with_readout(
+        runtime,
+        state,
+        temporal,
+        driver,
+        context,
+        eredu_core::OutputDemand::Sequence,
+    )
+    .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
+}
+
+/// Uses the selected parallel traversal with actual public readout demand.
+#[allow(clippy::type_complexity)]
+pub fn execute_detached_partitioned_moshi_realtime_with_readout<
+    A,
+    B,
+    State,
+    Policy,
+    G,
+    R,
+    I,
+    T,
+    U,
+    V,
+    SB,
+    S,
+>(
+    runtime: &mut eredu_runtime::LayerwiseTraversalRuntime<
+        eredu_runtime::LayerwiseRuntime<A, B, State, Policy>,
+        Box<
+            eredu_runtime::PartitionedTextRuntime<
+                A,
+                B,
+                State,
+                (),
+                eredu_runtime::LayerwiseTraversalPartitionExecutor<A, B, State, Policy>,
+                G,
+                R,
+                I,
+                T,
+                U,
+                V,
+            >,
+        >,
+    >,
+    state: &mut State,
+    temporal: &[B::Tensor],
+    driver: &mut eredu_runtime::SequentialDecisionDriver<SB, S>,
+    context: &<B::Tensor as Tensor>::Context,
+    demand: eredu_core::OutputDemand,
+) -> Result<
+    (Option<B::Tensor>, super::ForwardContext<B::Tensor>),
+    MoshiRealtimeExecutionError<Policy::Error>,
+>
+where
+    B: eredu_runtime::CommunicationBackend<
+            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
+        > + DistributedNeuralBackend,
+    State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
+    State::LayerState: eredu_nn::AttentionCache<B::Tensor>,
+    A: MoshiRealtimeExecutionArchitecture<B, State>
+        + eredu_runtime::ParallelLayeredArchitecture<B, State>,
+    Policy: eredu_runtime::LayerwisePolicy<B, A::Unit>,
+    Policy::Error: std::fmt::Display,
+    G: Borrow<B::CommunicationGroup>,
+    R: Borrow<B::CommunicationRoute>,
+    I: eredu_runtime::CommunicationTensorMetadata<B>,
+    T: eredu_runtime::PartitionBoundaryTransport<B, G, R, I>,
+    U: eredu_runtime::PartitionOutputPublisher<B, G, R, I>,
+    V: eredu_runtime::PartitionCommitAgreement<B, G, R, I>,
+    B::ParallelContext: Sized,
+    SB: eredu_runtime::SamplingBackend<
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = <B::Tensor as Tensor>::Context,
+    >,
+    SB::Error: std::fmt::Display,
+    S: eredu_runtime::Sampler<SB>,
+{
+    execute_detached_partitioned_moshi_realtime_with_context(runtime,state,temporal,driver,context,demand,None)
+}
+
+/// The same frame body with an explicitly borrowed prepared parallel context.
+pub fn execute_detached_partitioned_moshi_realtime_with_context<
+    A,
+    B,
+    State,
+    Policy,
+    G,
+    R,
+    I,
+    T,
+    U,
+    V,
+    SB,
+    S,
+>(
+    runtime: &mut eredu_runtime::LayerwiseTraversalRuntime<
+        eredu_runtime::LayerwiseRuntime<A, B, State, Policy>,
+        Box<
+            eredu_runtime::PartitionedTextRuntime<
+                A,
+                B,
+                State,
+                (),
+                eredu_runtime::LayerwiseTraversalPartitionExecutor<A, B, State, Policy>,
+                G,
+                R,
+                I,
+                T,
+                U,
+                V,
+            >,
+        >,
+    >,
+    state: &mut State,
+    temporal: &[B::Tensor],
+    driver: &mut eredu_runtime::SequentialDecisionDriver<SB, S>,
+    context: &<B::Tensor as Tensor>::Context,
+    demand: eredu_core::OutputDemand,
+    parallel: Option<&B::ParallelContext>,
+) -> Result<
+    (Option<B::Tensor>, super::ForwardContext<B::Tensor>),
+    MoshiRealtimeExecutionError<Policy::Error>,
+>
+where
+    B: eredu_runtime::CommunicationBackend<
+            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
+        > + DistributedNeuralBackend,
+    State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
+    State::LayerState: eredu_nn::AttentionCache<B::Tensor>,
+    A: MoshiRealtimeExecutionArchitecture<B, State>
+        + eredu_runtime::ParallelLayeredArchitecture<B, State>,
+    Policy: eredu_runtime::LayerwisePolicy<B, A::Unit>,
+    Policy::Error: std::fmt::Display,
+    G: Borrow<B::CommunicationGroup>,
+    R: Borrow<B::CommunicationRoute>,
+    I: eredu_runtime::CommunicationTensorMetadata<B>,
+    T: eredu_runtime::PartitionBoundaryTransport<B, G, R, I>,
+    U: eredu_runtime::PartitionOutputPublisher<B, G, R, I>,
+    V: eredu_runtime::PartitionCommitAgreement<B, G, R, I>,
+    B::ParallelContext: Sized,
+    SB: eredu_runtime::SamplingBackend<
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = <B::Tensor as Tensor>::Context,
+    >,
+    SB::Error: std::fmt::Display,
+    S: eredu_runtime::Sampler<SB>,
+{
     let expected = runtime.architecture().realtime_temporal_cardinality();
-    if temporal.len() != expected {
+    if temporal.len() != expected || expected==0 {
         return Err(MoshiRealtimeExecutionError::TemporalCardinality {
             expected,
             actual: temporal.len(),
@@ -498,10 +944,15 @@ where
     let (text, audio) = temporal
         .split_first()
         .expect("validated Moshi temporal cardinality is positive");
-    let audio = audio.iter().collect::<Vec<_>>();
+    let mut audio_refs=match B::construction_metadata(context) {
+        Some(metadata)=>metadata.metadata_vec(audio.len()).map_err(|cause|
+            MoshiRealtimeExecutionError::Execution(eredu_runtime::LayerwiseRuntimeError::Architecture(cause)))?,
+        None=>Vec::with_capacity(audio.len()),
+    };
+    audio_refs.extend(audio);
     let input = super::Input {
         text,
-        audio: &audio,
+        audio: &audio_refs,
         mask: None,
     };
     let mut boundary = runtime
@@ -510,7 +961,7 @@ where
         .map_err(MoshiRealtimeExecutionError::DecisionBoundary)?;
     let mut traversal = eredu_runtime::SequentialDecisionTraversal::new(driver, &mut boundary);
     runtime
-        .forward_with_traversal_hook(input, state, context, &mut traversal)
+        .forward_with_traversal_hook_with_readout_in(input, state, context, &mut traversal, demand,parallel)
         .map_err(|error| match error {
             eredu_runtime::PartitionedTraversalError::Contract(message) => {
                 MoshiRealtimeExecutionError::PartitionedContract(message)
@@ -520,6 +971,130 @@ where
             }
         })
 }
+
+/// Executes canonical frame decisions through the selected parallel traversal.
+#[allow(clippy::type_complexity)]
+pub fn execute_detached_partitioned_moshi_frame<A, B, State, Policy, G, R, I, T, U, V, SB, S>(
+    runtime: &mut eredu_runtime::LayerwiseTraversalRuntime<
+        eredu_runtime::LayerwiseRuntime<A, B, State, Policy>,
+        Box<
+            eredu_runtime::PartitionedTextRuntime<
+                A,
+                B,
+                State,
+                (),
+                eredu_runtime::LayerwiseTraversalPartitionExecutor<A, B, State, Policy>,
+                G,
+                R,
+                I,
+                T,
+                U,
+                V,
+            >,
+        >,
+    >,
+    state: &mut State,
+    temporal: &[B::Tensor],
+    driver: &mut eredu_runtime::SequentialDecisionDriver<SB, S>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<
+    (Option<B::Tensor>, super::ForwardContext<B::Tensor>),
+    MoshiRealtimeExecutionError<Policy::Error>,
+>
+where
+    B: eredu_runtime::CommunicationBackend<
+            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
+        > + DistributedNeuralBackend,
+    State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
+    State::LayerState: eredu_nn::AttentionCache<B::Tensor>,
+    A: MoshiRealtimeExecutionArchitecture<B, State>
+        + eredu_runtime::ParallelLayeredArchitecture<B, State>,
+    Policy: eredu_runtime::LayerwisePolicy<B, A::Unit>,
+    Policy::Error: std::fmt::Display,
+    G: Borrow<B::CommunicationGroup>,
+    R: Borrow<B::CommunicationRoute>,
+    I: eredu_runtime::CommunicationTensorMetadata<B>,
+    T: eredu_runtime::PartitionBoundaryTransport<B, G, R, I>,
+    U: eredu_runtime::PartitionOutputPublisher<B, G, R, I>,
+    V: eredu_runtime::PartitionCommitAgreement<B, G, R, I>,
+    B::ParallelContext: Sized,
+    SB: eredu_runtime::SamplingBackend<
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = <B::Tensor as Tensor>::Context,
+    >,
+    SB::Error: std::fmt::Display,
+    S: eredu_runtime::Sampler<SB>,
+{
+    execute_detached_partitioned_moshi_realtime_with_readout(
+        runtime,
+        state,
+        temporal,
+        driver,
+        context,
+        eredu_core::OutputDemand::StateOnly,
+    )
+}
+
+/// Executes the existing selected frame under its exact admitted context loan.
+#[allow(clippy::type_complexity)]
+pub fn execute_detached_partitioned_moshi_frame_with_parallel<A, B, State, Policy, G, R, I, T, U, V, SB, S>(
+    runtime: &mut eredu_runtime::LayerwiseTraversalRuntime<
+        eredu_runtime::LayerwiseRuntime<A, B, State, Policy>,
+        Box<
+            eredu_runtime::PartitionedTextRuntime<
+                A,
+                B,
+                State,
+                (),
+                eredu_runtime::LayerwiseTraversalPartitionExecutor<A, B, State, Policy>,
+                G,
+                R,
+                I,
+                T,
+                U,
+                V,
+            >,
+        >,
+    >,
+    state: &mut State,
+    temporal: &[B::Tensor],
+    driver: &mut eredu_runtime::SequentialDecisionDriver<SB, S>,
+    context: &<B::Tensor as Tensor>::Context,
+    parallel:&B::ParallelContext,
+) -> Result<
+    (Option<B::Tensor>, super::ForwardContext<B::Tensor>),
+    MoshiRealtimeExecutionError<Policy::Error>,
+>
+where
+    B: eredu_runtime::CommunicationBackend<
+            Executor = <<B as NeuralBackend>::Tensor as Tensor>::Context,
+        > + DistributedNeuralBackend,
+    State: eredu_runtime::LayerRuntimeState<B> + ResettableRuntimeState<B>,
+    State::LayerState: eredu_nn::AttentionCache<B::Tensor>,
+    A: MoshiRealtimeExecutionArchitecture<B, State>
+        + eredu_runtime::ParallelLayeredArchitecture<B, State>,
+    Policy: eredu_runtime::LayerwisePolicy<B, A::Unit>,
+    Policy::Error: std::fmt::Display,
+    G: Borrow<B::CommunicationGroup>,
+    R: Borrow<B::CommunicationRoute>,
+    I: eredu_runtime::CommunicationTensorMetadata<B>,
+    T: eredu_runtime::PartitionBoundaryTransport<B, G, R, I>,
+    U: eredu_runtime::PartitionOutputPublisher<B, G, R, I>,
+    V: eredu_runtime::PartitionCommitAgreement<B, G, R, I>,
+    B::ParallelContext: Sized,
+    SB: eredu_runtime::SamplingBackend<
+        Logits = B::Tensor,
+        Token = B::Tensor,
+        Context = <B::Tensor as Tensor>::Context,
+    >,
+    SB::Error: std::fmt::Display,
+    S: eredu_runtime::Sampler<SB>,
+{
+    execute_detached_partitioned_moshi_realtime_with_context(
+        runtime,state,temporal,driver,context,eredu_core::OutputDemand::StateOnly,Some(parallel))
+}
+
 
 /// Runs one prepared temporal token list through a combined constructed model.
 ///
@@ -559,6 +1134,9 @@ where
 /// Failure while running one already-prepared Moshi temporal execution slice.
 #[derive(Debug, thiserror::Error)]
 pub enum MoshiRealtimeExecutionError<P: std::fmt::Display> {
+    /// An initialization-only transition has no model activations to observe.
+    #[error("required Moshi observation has no model call in this prepared transition")]
+    ObservationWithoutModel,
     /// Text plus audio cardinality overflowed the host representation.
     #[error("Moshi temporal token cardinality overflowed")]
     TemporalCardinalityOverflow,
@@ -703,7 +1281,7 @@ impl MoshiWeightLoweringSummary {
 /// Selected Moshi execution inseparably paired with its exact neutral source handoff.
 pub struct PreparedMoshiRealtimeSource {
     selected: PreparedMoshiRealtime,
-    source: SharedCheckpointSource,
+    source: RetainedCheckpointSource,
     artifact_identity: DeferredArtifactIdentity,
     lowering: MoshiWeightLoweringSummary,
 }
@@ -715,7 +1293,7 @@ impl PreparedMoshiRealtimeSource {
     }
 
     /// Exact prepared checkpoint source; payloads remain lazy until lease acquisition.
-    pub fn source(&self) -> &SharedCheckpointSource {
+    pub fn source(&self) -> &RetainedCheckpointSource {
         &self.source
     }
 
@@ -741,7 +1319,7 @@ impl PreparedMoshiRealtimeSource {
         self,
     ) -> (
         PreparedMoshiRealtime,
-        SharedCheckpointSource,
+        RetainedCheckpointSource,
         DeferredArtifactIdentity,
         MoshiWeightLoweringSummary,
     ) {
@@ -760,7 +1338,7 @@ impl PreparedMoshiRealtimeSource {
     #[cfg(debug_assertions)]
     pub fn from_reference_source(
         selected: PreparedMoshiRealtime,
-        source: SharedCheckpointSource,
+        source: RetainedCheckpointSource,
     ) -> Result<Self, MoshiRealtimeSourceError> {
         validate_store_metadata(&selected, source.as_ref())
             .map_err(MoshiRealtimeSourceError::Source)?;
@@ -944,7 +1522,7 @@ where
     fn visit<A>(
         self,
         prepared: PreparedMoshiRealtimeArchitecture<A>,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: MoshiRealtimeExecutionArchitecture<B, S>
@@ -1176,7 +1754,7 @@ pub fn prepare_selected_moshi_realtime_source(
     let lowering = selected_moshi_lowering_summary(selected.selected())?;
     Ok(PreparedMoshiRealtimeSource {
         selected,
-        source,
+        source: source.into(),
         artifact_identity,
         lowering,
     })
@@ -2797,3 +3375,9 @@ mod tests {
         )));
     }
 }
+
+mod workspace;
+pub use workspace::execute_moshi_workspace_frame;
+
+mod prepared_workspace;
+pub use prepared_workspace::{PreparedMoshiWorkspaceFrame,MoshiWorkspaceFrameExecutor};

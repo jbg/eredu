@@ -1,4 +1,5 @@
 use super::*;
+use eredu_nn::GroupedLinearSpec;
 use super::{operators::*, parameters::*};
 
 impl HyperNeuralBackend for MlxNeuralBackend {
@@ -127,44 +128,7 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
         input: JointGroupSelectionInput<'_, MlxTensor>,
         context: &Stream,
     ) -> Result<JointGroupSelection<MlxTensor>, ComputeError> {
-        input.validate()?;
-        let hidden_width = input.hidden().as_array().dim(-1);
-        let flat = compute(
-            input
-                .hidden()
-                .as_array()
-                .reshape(&[-1, hidden_width], context),
-        )?;
-        let logits = compute(matmul(
-            &flat,
-            &compute(input.weight().as_array().transpose(context))?,
-            context,
-        ))?;
-        let primary = compute(logits.try_index_device((.., ..input.selectable_groups()), context))?;
-        let always_on =
-            compute(logits.try_index_device((.., input.selectable_groups()..), context))?;
-        let choice = compute(sigmoid(&primary, context))?;
-        let choice = compute(choice.add(input.correction_bias().as_array(), context))?;
-        let primary_indices = compute(argpartition_axis(choice, -input.top_k(), -1, context))?;
-        let primary_indices =
-            compute(primary_indices.try_index_device((.., -input.top_k()..), context))?;
-        let selected_logits = compute(take_along_axis(&primary, &primary_indices, -1, context))?;
-        let all_logits = compute(concatenate_axis(&[selected_logits, always_on], -1, context))?;
-        let coefficients = compute(nn::log_sigmoid(all_logits, context))?;
-        let coefficients = compute(softmax_axis(coefficients, -1, true, context))?;
-        let coefficients =
-            compute(coefficients.multiply(Array::from_f32(input.coefficient_scale()), context))?;
-        let coefficients =
-            compute(coefficients.multiply(input.global_scale().as_array(), context))?;
-        let primary_coefficients =
-            compute(coefficients.try_index_device((.., ..input.top_k()), context))?;
-        let always_on_coefficients =
-            compute(coefficients.try_index_device((.., input.top_k()..), context))?;
-        Ok(JointGroupSelection::new(
-            MlxTensor::from_array(primary_indices),
-            MlxTensor::from_array(primary_coefficients),
-            MlxTensor::from_array(always_on_coefficients),
-        ))
+        common::grouped::joint_selection(input, context)
     }
 
     fn top_k_group_selector(
@@ -230,147 +194,13 @@ impl GroupedNeuralBackend for MlxNeuralBackend {
         })
     }
 
-    fn grouped_gated_product(
-        spec: GroupedGatedProductSpec,
-        context: &Stream,
-    ) -> Result<Self::GatedProductGroups, ComputeError> {
-        spec.validate()?;
-        if spec.input_dimensions() != spec.output_dimensions() {
-            return Err(ComputeError::backend(
-                "MLX packed gated-product groups require equal input and output dimensions",
-            ));
-        }
-        let policy = spec.policy();
-        let GatedProductGroupLayout::Packed { gate_up, down } = spec.layout() else {
-            return Err(ComputeError::backend(
-                "independent group units must be acquired through a runtime group provider",
-            ));
-        };
-        let native_fp8 = match (gate_up.format().encoding(), down.format().encoding()) {
-            (LinearFormat::E4M3BlockFp8(gate), LinearFormat::E4M3BlockFp8(down))
-                if gate == down =>
-            {
-                Some(gate)
-            }
-            (LinearFormat::E4M3BlockFp8(_), LinearFormat::E4M3BlockFp8(_)) => {
-                return Err(ComputeError::backend(
-                    "MLX packed block-FP8 groups require matching formats",
-                ));
-            }
-            (LinearFormat::E4M3BlockFp8(_), _) | (_, LinearFormat::E4M3BlockFp8(_)) => {
-                return Err(ComputeError::backend(
-                    "packed group projections must use one physical format",
-                ));
-            }
-            _ => None,
-        };
-        let mut module = compute(common::grouped::PackedGatedProductGroups::new(
-            spec.group_count(),
-            spec.input_dimensions(),
-            spec.intermediate_dimensions(),
-            gate_up.format().encoding().weight_quantization(),
-            down.format().encoding().weight_quantization(),
-            [gate_up.bias().is_some(), down.bias().is_some()],
-            context,
-        ))?;
-        module = compute(module.with_policy(policy))?;
-        module.reduction = spec.reduction();
-        if let Some(format) = native_fp8 {
-            module =
-                compute(module.with_native_fp8(format, gate_up.format().row_layout(), context))?;
-        }
-        let mut topology = vec![
-            ("gate_up_proj", gate_up.weight().clone()),
-            ("down_proj", down.weight().clone()),
-        ];
-        if let Some(bias) = gate_up.bias() {
-            topology.push(("gate_up_proj_bias", bias.clone()));
-        }
-        if let Some(bias) = down.bias() {
-            topology.push(("down_proj_bias", bias.clone()));
-        }
-        if let Some(scale) = gate_up.format().scale() {
-            topology.push((
-                "gate_up_proj_scales",
-                bind_linear_companion(gate_up.weight(), scale.clone()),
-            ));
-        }
-        if let Some(bias) = gate_up.format().affine_bias() {
-            topology.push((
-                "gate_up_proj_biases",
-                bind_linear_companion(gate_up.weight(), bias.clone()),
-            ));
-        }
-        if let Some(scale) = down.format().scale() {
-            topology.push((
-                "down_proj_scales",
-                bind_linear_companion(down.weight(), scale.clone()),
-            ));
-        }
-        if let Some(bias) = down.format().affine_bias() {
-            topology.push((
-                "down_proj_biases",
-                bind_linear_companion(down.weight(), bias.clone()),
-            ));
-        }
-        Ok(MlxGroupedGatedProduct {
-            spec,
-            module: MlxNamedModule::with_exact_topology(module, topology)?,
-        })
+    fn grouped_gated_product(spec: GroupedGatedProductSpec, context: &Stream)
+        -> Result<Self::GatedProductGroups, ComputeError> {
+        construct_gated(spec, grouped_construction::Constructor::ordinary(context))
     }
-
-    fn grouped_relu2(
-        spec: GroupedRelu2Spec,
-        context: &Stream,
-    ) -> Result<Self::Relu2Groups, ComputeError> {
-        spec.validate()?;
-        if spec.up().bias().is_some() || spec.down().bias().is_some() {
-            return Err(ComputeError::backend(
-                "MLX packed ReLU2 groups do not support ordinary projection biases",
-            ));
-        }
-        let module = compute(common::grouped::PackedRelu2Groups::new(
-            spec.group_count(),
-            spec.hidden_dimensions(),
-            spec.intermediate_dimensions(),
-            [
-                spec.up().format().encoding().weight_quantization(),
-                spec.down().format().encoding().weight_quantization(),
-            ],
-            context,
-        ))?;
-        let mut topology = vec![
-            ("up_proj", spec.up().weight().clone()),
-            ("down_proj", spec.down().weight().clone()),
-        ];
-        if let Some(scale) = spec.up().format().scale() {
-            topology.push((
-                "up_proj_scales",
-                bind_linear_companion(spec.up().weight(), scale.clone()),
-            ));
-        }
-        if let Some(bias) = spec.up().format().affine_bias() {
-            topology.push((
-                "up_proj_biases",
-                bind_linear_companion(spec.up().weight(), bias.clone()),
-            ));
-        }
-        if let Some(scale) = spec.down().format().scale() {
-            topology.push((
-                "down_proj_scales",
-                bind_linear_companion(spec.down().weight(), scale.clone()),
-            ));
-        }
-        if let Some(bias) = spec.down().format().affine_bias() {
-            topology.push((
-                "down_proj_biases",
-                bind_linear_companion(spec.down().weight(), bias.clone()),
-            ));
-        }
-        Ok(MlxGroupedRelu2 {
-            spec,
-            module: MlxNamedModule::with_exact_topology(module, topology)?,
-        })
+    fn grouped_relu2(spec: GroupedRelu2Spec, context: &Stream)
+        -> Result<Self::Relu2Groups, ComputeError> {
+        construct_relu2(spec, grouped_construction::Constructor::ordinary(context))
     }
 }
 
@@ -459,6 +289,164 @@ impl eredu_nn::AuxiliaryConvolutionState<MlxTensor>
             self,
             eredu_core::cache::StateTensorRole::Convolution { slot },
         )
-        .map_err(ComputeError::backend)
+        .map_err(ComputeError::backend_source)
+    }
+}
+
+#[cfg(test)]
+mod convolution_error_tests {
+    use crate::backend::runtime::cache::state::MlxHybridState;
+    use eredu_core::{
+        cache::{LayerCachePolicy, StateTensorRole},
+        LayerSchedule,
+    };
+    use eredu_nn::AuxiliaryConvolutionState;
+    use eredu_runtime::{StateError, StateLayout};
+    use std::error::Error as _;
+
+    #[test]
+    fn missing_convolution_errors_keep_typed_roles_after_native_state_drop() {
+        // The actual NoState realization requires no device, stream or tensor.
+        let layout =
+            StateLayout::new(LayerSchedule::new(1, vec![LayerCachePolicy::NoState]).unwrap())
+                .unwrap();
+        let mut state = MlxHybridState::device(layout).unwrap();
+        let mut errors = Vec::new();
+        for slot in 0..4 {
+            errors.push((
+                slot,
+                state.layers_mut()[0].convolution_state(slot).unwrap_err(),
+            ));
+        }
+        assert_eq!(state.offset(), 0);
+        drop(state);
+        for (slot, error) in errors {
+            let cloned = error.clone();
+            drop(error);
+            let role = StateTensorRole::Convolution { slot };
+            assert!(matches!(
+                cloned.source().and_then(|cause| cause.downcast_ref::<StateError>()),
+                Some(StateError::UnknownComponent { role: actual }) if *actual == role
+            ));
+            assert_eq!(
+                cloned.to_string(),
+                StateError::UnknownComponent { role }.to_string()
+            );
+        }
+    }
+}
+
+
+impl MlxNeuralBackend {
+    pub(crate) fn grouped_gated_product_from_bindings(spec:GroupedGatedProductSpec,
+        bindings:PreparedCompactBindings<'_>)->Result<MlxGroupedGatedProduct,ComputeError> {
+        construct_gated(spec,grouped_construction::Constructor::prepared::<MlxGroupedGatedProduct>(bindings)?)
+    }
+    pub(crate) fn grouped_relu2_from_bindings(spec:GroupedRelu2Spec,
+        bindings:PreparedCompactBindings<'_>)->Result<MlxGroupedRelu2,ComputeError> {
+        construct_relu2(spec,grouped_construction::Constructor::prepared::<MlxGroupedRelu2>(bindings)?)
+    }
+}
+fn construct_gated(spec:GroupedGatedProductSpec, mut constructor:grouped_construction::Constructor<'_,'_>)
+    ->Result<MlxGroupedGatedProduct,ComputeError> {
+        spec.validate()?;
+        if spec.input_dimensions() != spec.output_dimensions() {
+            return Err(ComputeError::backend(
+                "MLX packed gated-product groups require equal input and output dimensions",
+            ));
+        }
+        let policy = spec.policy();
+        let GatedProductGroupLayout::Packed { gate_up, down } = spec.layout() else {
+            return Err(ComputeError::backend(
+                "independent group units must be acquired through a runtime group provider",
+            ));
+        };
+        let native_fp8 = match (gate_up.format().encoding(), down.format().encoding()) {
+            (LinearFormat::E4M3BlockFp8(gate), LinearFormat::E4M3BlockFp8(down))
+                if gate == down =>
+            {
+                Some(gate)
+            }
+            (LinearFormat::E4M3BlockFp8(_), LinearFormat::E4M3BlockFp8(_)) => {
+                return Err(ComputeError::backend(
+                    "MLX packed block-FP8 groups require matching formats",
+                ));
+            }
+            (LinearFormat::E4M3BlockFp8(_), _) | (_, LinearFormat::E4M3BlockFp8(_)) => {
+                return Err(ComputeError::backend(
+                    "packed group projections must use one physical format",
+                ));
+            }
+            _ => None,
+        };
+
+    let mut module=common::grouped::PackedGatedProductGroups::new_with_parameter_factory(
+        spec.group_count(),spec.input_dimensions(),spec.intermediate_dimensions(),
+        gate_up.format().encoding().weight_quantization(),down.format().encoding().weight_quantization(),
+        [gate_up.bias().is_some(),down.bias().is_some()],Dtype::Float32,
+        native_fp8.map(|format|(format,gate_up.format().row_layout())),&mut constructor)?;
+    module=compute(module.with_policy(policy))?;
+    module.reduction=spec.reduction();
+    let rows=gated_declarations(&spec)?;
+    let module=constructor.named(module,&rows)?;
+    Ok(MlxGroupedGatedProduct{spec,module})
+}
+fn construct_relu2(spec:GroupedRelu2Spec, mut constructor:grouped_construction::Constructor<'_,'_>)
+    ->Result<MlxGroupedRelu2,ComputeError> {
+        spec.validate()?;
+        if spec.up().bias().is_some() || spec.down().bias().is_some() {
+            return Err(ComputeError::backend(
+                "MLX packed ReLU2 groups do not support ordinary projection biases",
+            ));
+        }
+
+    let module=common::grouped::PackedRelu2Groups::new_with_parameter_factory(
+        spec.group_count(),spec.hidden_dimensions(),spec.intermediate_dimensions(),
+        [spec.up().format().encoding().weight_quantization(),spec.down().format().encoding().weight_quantization()],
+        Dtype::Float32,&mut constructor)?;
+    let rows=relu2_declarations(&spec);
+    let module=constructor.named(module,&rows)?;
+    Ok(MlxGroupedRelu2{spec,module})
+}
+
+fn gated_declarations(spec:&GroupedGatedProductSpec)
+    ->Result<[Option<grouped_construction::Declaration<'_>>;8],ComputeError> {
+    use grouped_construction::Declaration as D;
+    let GatedProductGroupLayout::Packed{gate_up,down}=spec.layout() else {
+        return Err(ComputeError::backend("compact gated bank requires the retained packed declaration"));
+    };
+    Ok([Some(D::parameter("down_proj",down.weight())),
+        down.bias().map(|p|D::parameter("down_proj_bias",p)),
+        down.format().affine_bias().map(|p|D::companion("down_proj_biases",down.weight(),p)),
+        down.format().scale().map(|p|D::companion("down_proj_scales",down.weight(),p)),
+        Some(D::parameter("gate_up_proj",gate_up.weight())),
+        gate_up.bias().map(|p|D::parameter("gate_up_proj_bias",p)),
+        gate_up.format().affine_bias().map(|p|D::companion("gate_up_proj_biases",gate_up.weight(),p)),
+        gate_up.format().scale().map(|p|D::companion("gate_up_proj_scales",gate_up.weight(),p))])
+}
+fn relu2_declarations(spec:&GroupedRelu2Spec)
+    ->[Option<grouped_construction::Declaration<'_>>;6] {
+    use grouped_construction::Declaration as D;
+    [Some(D::parameter("down_proj",spec.down().weight())),
+        spec.down().format().affine_bias().map(|p|D::companion("down_proj_biases",spec.down().weight(),p)),
+        spec.down().format().scale().map(|p|D::companion("down_proj_scales",spec.down().weight(),p)),
+        Some(D::parameter("up_proj",spec.up().weight())),
+        spec.up().format().affine_bias().map(|p|D::companion("up_proj_biases",spec.up().weight(),p)),
+        spec.up().format().scale().map(|p|D::companion("up_proj_scales",spec.up().weight(),p))]
+}
+impl MlxNeuralBackend {
+    pub(crate) fn gated_compact_parameter_names(spec:&GroupedGatedProductSpec)
+        ->Result<[Option<&'static str>;8],ComputeError> {
+        Ok(gated_declarations(spec)?.map(|row|row.map(|row|row.name)))
+    }
+    pub(crate) fn relu2_compact_parameter_names(spec:&GroupedRelu2Spec)->[Option<&'static str>;6] {
+        relu2_declarations(spec).map(|row|row.map(|row|row.name))
+    }
+    pub(crate) fn linear_compact_parameter_names(spec:&GroupedLinearSpec)->[Option<&str>;4] {
+        super::selected_linear::MlxGroupedLinear::local_bindings(spec)
+    }
+    pub(crate) fn grouped_linear_from_bindings(spec:GroupedLinearSpec,bindings:PreparedCompactBindings<'_>)
+        ->Result<super::selected_linear::MlxGroupedLinear,ComputeError> {
+        super::selected_linear::MlxGroupedLinear::from_prepared_bindings(spec,bindings)
     }
 }

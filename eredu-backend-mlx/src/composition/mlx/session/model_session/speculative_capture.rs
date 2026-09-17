@@ -49,10 +49,10 @@ impl MlxModelSession {
     }
 }
 impl SpeculativePartitionBinding {
-    pub(in crate::composition::mlx) fn coordinate_speculative_step(
+    pub(in crate::composition::mlx) fn coordinate_speculative_step<B: AsRef<[eredu_core::SpeculativeScheduleState]> + AsMut<[eredu_core::SpeculativeScheduleState]>>(
         &self,
-        local: Vec<eredu_core::SpeculativeScheduleState>,
-    ) -> Result<Vec<eredu_core::SpeculativeScheduleState>, eredu_core::BackendFailure> {
+        local: B,
+    ) -> Result<B, eredu_core::BackendFailure> {
         self.transport.coordinate_speculative_step(local)
     }
 
@@ -156,6 +156,15 @@ impl SpeculativePartitionBinding {
         >,
         SpeculativeControlError,
     > {
+        self.observer_with_error(plan,request,stream,
+            |error:&CaptureExecutionError<Error>|Exception::custom(error.to_string()))
+    }
+    pub(in crate::composition::mlx) fn observer_with_error<E:'static,F>(
+        &self,plan:&AdmittedSpeculativeActivations,request:eredu_core::SpeculativeRequestId,
+        stream:&Stream,map_error:F,
+    )->Result<Option<Box<dyn eredu_runtime::inspection::SpeculativeActivationObserver<MlxTensor,E>>>,SpeculativeControlError>
+    where F:eredu_runtime::capture::SpeculativeCaptureErrorTransport<Error,E>+'static,
+    {
         if plan.is_empty() {
             return Ok(None);
         }
@@ -190,7 +199,7 @@ impl SpeculativePartitionBinding {
         Ok(SpeculativeCaptureObserver::from_admitted(
             plan,
             provider,
-            |error: &CaptureExecutionError<Error>| Exception::custom(error.to_string()),
+            map_error,
             request,
             Arc::new(super::super::intervention::NativeInterventionEstimator),
         )?
@@ -199,7 +208,7 @@ impl SpeculativePartitionBinding {
                 as Box<
                     dyn eredu_runtime::inspection::SpeculativeActivationObserver<
                         MlxTensor,
-                        Exception,
+                        E,
                     >,
                 >
         }))

@@ -78,23 +78,31 @@ pub(super) fn load_tokenizer_for_kind(
     kind: ModelKind,
     model_dir: &Path,
 ) -> Result<Tokenizer, TextMetadataError> {
+    load_tokenizer_for_kind_with_cache_policy(kind, model_dir, tokenizers::ModelCachePolicy::Legacy)
+}
+
+pub(super) fn load_tokenizer_for_kind_with_cache_policy(
+    kind: ModelKind,
+    model_dir: &Path,
+    policy: tokenizers::ModelCachePolicy,
+) -> Result<Tokenizer, TextMetadataError> {
     if is_gguf_file(model_dir) {
-        return Ok(load_gguf_tokenizer(model_dir)?.tokenizer);
+        return Ok(load_gguf_tokenizer_with_cache_policy(model_dir, policy)?.tokenizer);
     }
     match kind {
         ModelKind::KimiLinear => {
             let converted = model_dir.join("tokenizer.json");
             if converted.exists() {
-                Ok(Tokenizer::from_file(converted)?)
+                Ok(Tokenizer::from_file_with_cache_policy(converted, policy)?)
             } else {
-                eredu_text::tiktoken::load_kimi_k2(model_dir)
+                eredu_text::tiktoken::load_kimi_k2_with_cache_policy(model_dir, policy)
                     .map_err(|error| TextMetadataError::TokenizerConfiguration(error.to_string()))
             }
         }
         ModelKind::Moshi => Err(TextMetadataError::UnsupportedArchitecture(
             "Moshi-family models use a realtime tokenizer contract; load it outside the chat tokenizer API".into(),
         )),
-        _ => Ok(Tokenizer::from_file(model_dir.join("tokenizer.json"))?),
+        _ => Ok(Tokenizer::from_file_with_cache_policy(model_dir.join("tokenizer.json"), policy)?),
     }
 }
 
@@ -157,8 +165,15 @@ pub(crate) fn gguf_sidecar_dir(path: &Path) -> &Path {
 }
 
 pub(super) fn load_gguf_tokenizer(gguf_file: &Path) -> Result<GgufTokenizer, TextMetadataError> {
+    load_gguf_tokenizer_with_cache_policy(gguf_file, tokenizers::ModelCachePolicy::Legacy)
+}
+
+fn load_gguf_tokenizer_with_cache_policy(
+    gguf_file: &Path,
+    policy: tokenizers::ModelCachePolicy,
+) -> Result<GgufTokenizer, TextMetadataError> {
     let metadata = portable_gguf_metadata(gguf_file)?;
-    load_gguf_tokenizer_from_metadata(gguf_file, &metadata)
+    load_gguf_tokenizer_from_metadata_with_cache_policy(gguf_file, &metadata, policy)
 }
 
 fn portable_gguf_metadata(
@@ -171,12 +186,25 @@ fn portable_gguf_metadata(
         .collect())
 }
 
+// Inspection remains an ordinary Legacy construction route.
 pub(crate) fn load_gguf_tokenizer_from_metadata(
     gguf_file: &Path,
     metadata: &std::collections::HashMap<String, GgufMetadataValue>,
 ) -> Result<GgufTokenizer, TextMetadataError> {
+    load_gguf_tokenizer_from_metadata_with_cache_policy(
+        gguf_file,
+        metadata,
+        tokenizers::ModelCachePolicy::Legacy,
+    )
+}
+
+pub(crate) fn load_gguf_tokenizer_from_metadata_with_cache_policy(
+    gguf_file: &Path,
+    metadata: &std::collections::HashMap<String, GgufMetadataValue>,
+    policy: tokenizers::ModelCachePolicy,
+) -> Result<GgufTokenizer, TextMetadataError> {
     let sidecar_dir = gguf_sidecar_dir(gguf_file);
-    if let Some(mut embedded) = gguf_tokenizer::from_metadata(metadata)
+    if let Some(mut embedded) = gguf_tokenizer::from_metadata_with_cache_policy(metadata, policy)
         .map_err(|error| TextMetadataError::GgufTokenizer(error.to_string()))?
     {
         embedded
@@ -185,7 +213,10 @@ pub(crate) fn load_gguf_tokenizer_from_metadata(
         return Ok(embedded);
     }
     Ok(GgufTokenizer {
-        tokenizer: Tokenizer::from_file(sidecar_dir.join("tokenizer.json"))?,
+        tokenizer: Tokenizer::from_file_with_cache_policy(
+            sidecar_dir.join("tokenizer.json"),
+            policy,
+        )?,
         template_kwargs: load_tokenizer_template_kwargs(sidecar_dir)?,
     })
 }
@@ -287,4 +318,90 @@ mod vocabulary_fingerprint_tests {
             vocabulary_fingerprint(&remapped)
         );
     }
+}
+
+#[cfg(test)]
+#[path = "tokenizer/cache_policy_tests.rs"]
+mod cache_policy_tests;
+
+/// Private original borrowed-JSON producer. Caller bytes, chat/parser and public
+/// operation destinations remain separate; this never imports a prebuilt HF value.
+pub(crate) fn compile_original_tokenizer<
+    B: eredu_runtime::working_memory::OriginalTokenizerBackend,
+>(
+    runtime: &eredu_core::ModelRuntime<B>,
+    bytes: &[u8],
+) -> Result<eredu_runtime::working_memory::OriginalTokenizer, eredu_core::BackendFailure> {
+    let plan =
+        eredu_text::tokenizer_storage::TokenizerPlan::prepare_json(bytes).map_err(|error| {
+            eredu_core::BackendFailure::new(eredu_core::BackendFailureKind::Unsupported, error)
+        })?;
+    B::compile_original_tokenizer(runtime, plan)
+}
+
+/// Private consumed-file producer. Path selection/opening precedes the admitted
+/// boundary; runtime retains actual I through fresh C construction in one pool.
+pub(crate) fn compile_original_tokenizer_file<
+    B: eredu_runtime::working_memory::OriginalTokenizerBackend,
+>(
+    runtime: &eredu_core::ModelRuntime<B>,
+    file: std::fs::File,
+) -> Result<eredu_runtime::working_memory::OriginalTokenizer, eredu_core::BackendFailure> {
+    let read = prepare_original_tokenizer_file(file)?;
+    B::compile_original_tokenizer_file(runtime, read)
+}
+
+/// Private original checked-profile producer. Public loaded encoding stays on its
+/// existing path until the remaining profiles and input/event obligations close.
+pub(crate) fn encode_original_tokenizer_ids<
+    B: eredu_runtime::working_memory::OriginalTokenizerBackend,
+>(
+    runtime: &eredu_core::ModelRuntime<B>,
+    source: &eredu_runtime::working_memory::OriginalTokenizer,
+    input: &str,
+    add_special_tokens: bool,
+) -> Result<eredu_runtime::working_memory::OriginalEncodedTokenIds, eredu_core::BackendFailure> {
+    B::encode_original_tokenizer_ids(runtime, source, input, add_special_tokens)
+}
+
+/// Fresh generation-enabled C from the same retained-file producer. Opening is
+/// caller work; exact input I and C coexist under the selected backend's pool.
+pub(crate) fn compile_original_text_tokenizer_file<
+    B: eredu_runtime::working_memory::OriginalTokenizerBackend,
+>(
+    runtime: &eredu_core::ModelRuntime<B>,
+    file: std::fs::File,
+) -> Result<
+    eredu_runtime::working_memory::OriginalTokenizer,
+    eredu_runtime::working_memory::OriginalTextSourceError,
+> {
+    B::compile_original_tokenizer_file_for_generation(
+        runtime,
+        prepare_original_tokenizer_file_raw(file)?,
+    )
+}
+fn prepare_original_tokenizer_file(
+    file: std::fs::File,
+) -> Result<eredu_checkpoint::artifact::PreparedArtifactFileRead, eredu_core::BackendFailure> {
+    let read = prepare_original_tokenizer_file_raw(file).map_err(|error| {
+        use eredu_checkpoint::artifact::ArtifactFileReadError;
+        let kind = match &error {
+            ArtifactFileReadError::IncompletePlatform => {
+                eredu_core::BackendFailureKind::Unsupported
+            }
+            ArtifactFileReadError::Io(_) => eredu_core::BackendFailureKind::Io,
+            _ => eredu_core::BackendFailureKind::InvalidInput,
+        };
+        eredu_core::BackendFailure::new(kind, error)
+    })?;
+    Ok(read)
+}
+
+fn prepare_original_tokenizer_file_raw(
+    file: std::fs::File,
+) -> Result<
+    eredu_checkpoint::artifact::PreparedArtifactFileRead,
+    eredu_checkpoint::artifact::ArtifactFileReadError,
+> {
+    eredu_checkpoint::artifact::PreparedArtifactFileRead::new(file)
 }

@@ -1,0 +1,13 @@
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -364,7 +364,8 @@
+       resident_primitive_control<LogicalOr>(), resident_primitive_control<LogicalAnd>(),
+       resident_primitive_control<LogicalNot>(), resident_primitive_control<GreaterEqual>(),
+       resident_primitive_control<Less>(), resident_primitive_control<Equal>(),
+-      resident_primitive_control<Maximum>(), resident_primitive_control<Select>(),
++      resident_primitive_control<Maximum>(), resident_primitive_control<Minimum>(),
++      resident_primitive_control<Power>(), resident_primitive_control<Select>(),
+       resident_primitive_control<Square>(), resident_primitive_control<Exp>(),
+       resident_primitive_control<Tanh>(), resident_primitive_control<Reshape>(),
+       resident_primitive_control<Squeeze>(), resident_primitive_control<ExpandDims>(),

@@ -8,11 +8,12 @@ pub(in super::super) fn write_live_block(
     block: &HostCacheBlock,
 ) -> Result<DiskLocation, CacheResidencyError> {
     let publication = LiveCacheBlockPublication::begin(directory, id);
-    save_host_cache_block(publication.staging_path(), block)?;
+    let layout = save_live_host_cache_block(publication.staging_path(), block)?;
     sync_file(publication.staging_path())?;
-    let path = publication.commit()?;
+    let live_source = publication.commit_owned_with_layout(layout)?;
+    let path = live_source.path().to_path_buf();
     let names = array_names(id.representation);
-    Ok(DiskLocation {
+    Ok(DiskLocation::ordinary(DiskLocationData {
         path,
         first_name: names.0.into(),
         second_name: names.1.into(),
@@ -20,7 +21,46 @@ pub(in super::super) fn write_live_block(
         buffered: None,
         payload_sha256: None,
         payload_verification: Arc::new(OnceLock::new()),
-    })
+        live_source: Some(live_source),
+    }))
+}
+
+// Both ordinary live writes and the future original task consume the same
+// neutral header/source worker. The live publication already owns a unique
+// staging path, so no secondary tempfile or metadata-index reconstruction is needed.
+fn save_live_host_cache_block(
+    path: &Path,
+    block: &HostCacheBlock,
+) -> Result<eredu_runtime::cache::CacheShardLayout, CacheResidencyError> {
+    let [first, second] = block.buffers();
+    let shapes = [host_shape_to_stored(first)?, host_shape_to_stored(second)?];
+    let dtypes = [host_dtype_to_stored(first)?, host_dtype_to_stored(second)?];
+    let bytes = [
+        first
+            .as_bytes()
+            .map_err(|source| transfer_error("read first live cache payload", source))?,
+        second
+            .as_bytes()
+            .map_err(|source| transfer_error("read second live cache payload", source))?,
+    ];
+    let source = eredu_runtime::cache::CacheShardMetadata::ordinary(
+        block.representation(),
+        [&shapes[0], &shapes[1]],
+        dtypes,
+        [bytes[0].len(), bytes[1].len()],
+    )?;
+    let layout = source.into_ordinary_layout()?;
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|source| CacheResidencyError::Io {
+            action: "create unique live cache staging file",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    layout.write_to(&mut file, bytes)?;
+    Ok(layout)
 }
 
 pub(in super::super) fn save_block_arrays(
@@ -85,7 +125,11 @@ pub(in super::super) fn host_dtype_to_stored(
     let dtype = buffer
         .dtype()
         .map_err(|source| transfer_error("inspect host cache dtype", source))?;
-    Ok(match dtype {
+    Ok(host_scalar_to_stored(dtype))
+}
+
+pub(in super::super) fn host_scalar_to_stored(dtype: Dtype) -> StoredDtype {
+    match dtype {
         Dtype::Bool => StoredDtype::BOOL,
         Dtype::Uint8 => StoredDtype::U8,
         Dtype::Uint16 => StoredDtype::U16,
@@ -100,7 +144,7 @@ pub(in super::super) fn host_dtype_to_stored(
         Dtype::Float64 => StoredDtype::F64,
         Dtype::Bfloat16 => StoredDtype::BF16,
         Dtype::Complex64 => StoredDtype::C64,
-    })
+    }
 }
 
 pub(in super::super) fn stored_dtype_to_host(
@@ -177,6 +221,19 @@ pub(in super::super) fn load_host_cache_block_direct(
     let owned;
     let bytes = if let Some(buffered) = &location.buffered {
         buffered.as_ref()
+    } else if let Some(source) = location.live_source.as_ref().filter(|_| cfg!(unix)) {
+        let bytes = source
+            .file_bytes()
+            .ok_or(eredu_runtime::cache::CacheShardError::Header)?;
+        let file = File::open(source.path()).map_err(|source| CacheResidencyError::Io {
+            action: "open retained live cache shard",
+            path: location.path.clone(),
+            source,
+        })?;
+        let mut output = vec![0; bytes];
+        source.read_ordinary_into(file, &mut output)?;
+        owned = output;
+        owned.as_slice()
     } else {
         owned = fs::read(&location.path).map_err(|source| CacheResidencyError::Io {
             action: "read cache block shard",
@@ -185,6 +242,23 @@ pub(in super::super) fn load_host_cache_block_direct(
         })?;
         owned.as_slice()
     };
+    if let Some(layout) = location
+        .live_source
+        .as_ref()
+        .and_then(|source| source.writer_layout())
+    {
+        if layout.names() != [location.first_name.as_str(), location.second_name.as_str()]
+            || layout.names() != eredu_runtime::cache::cache_shard_tensor_names(representation)
+        {
+            return Err(eredu_runtime::cache::CacheShardError::Header.into());
+        }
+        let [first, second] = layout.tensors(bytes)?;
+        return Ok(HostCacheBlock::from_buffers(
+            representation,
+            host_buffer_from_parts(first.dtype(), first.shape(), first.data())?,
+            host_buffer_from_parts(second.dtype(), second.shape(), second.data())?,
+        ));
+    }
     let tensors = safetensors::SafeTensors::deserialize(bytes).map_err(|error| {
         CacheResidencyError::MalformedShard {
             path: location.path.clone(),
@@ -219,8 +293,14 @@ pub(in super::super) fn load_host_cache_block_direct(
 pub(in super::super) fn host_buffer_from_view(
     view: safetensors::tensor::TensorView<'_>,
 ) -> Result<ImmutableHostTransferBuffer, CacheResidencyError> {
-    let shape = view
-        .shape()
+    host_buffer_from_parts(view.dtype(), view.shape(), view.data())
+}
+fn host_buffer_from_parts(
+    dtype: StoredDtype,
+    shape: &[usize],
+    data: &[u8],
+) -> Result<ImmutableHostTransferBuffer, CacheResidencyError> {
+    let shape = shape
         .iter()
         .map(|dimension| {
             i32::try_from(*dimension).map_err(|_| {
@@ -230,27 +310,19 @@ pub(in super::super) fn host_buffer_from_view(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let dtype = stored_dtype_to_host(view.dtype())?;
+    let dtype = stored_dtype_to_host(dtype)?;
     let mut buffer = HostTransferBuffer::new(&shape, dtype, HostTransferPolicy::Transfer)
         .map_err(|source| transfer_error("allocate disk-loaded host cache buffer", source))?;
     let destination = buffer
         .as_bytes_mut()
         .map_err(|source| transfer_error("access disk-loaded host cache buffer", source))?;
-    if destination.len() != view.data().len() {
+    if destination.len() != data.len() {
         return Err(CacheResidencyError::ArrayMismatch(
             "cache block payload length does not match its shape and dtype".into(),
         ));
     }
-    destination.copy_from_slice(view.data());
+    destination.copy_from_slice(data);
     Ok(buffer.freeze())
-}
-
-pub(in super::super) fn remove_ephemeral_file(record: &CacheBlockRecord) {
-    if let Some(location) = record.disk() {
-        if !location.persistent {
-            let _ = fs::remove_file(&location.path);
-        }
-    }
 }
 
 pub(in super::super) fn array_names(

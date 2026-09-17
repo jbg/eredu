@@ -8,6 +8,7 @@ fn relative_attention_rejects_invalid_geometry_before_backend_work() {
         shape: shape.to_vec(),
         data: Vec::new(),
         dtype: eredu_core::checkpoint::TensorDtype::F32,
+        retirement_probe: None,
     };
     let mut q = make(&[1, 4, 3, 8]);
     let mut k = make(&[1, 2, 3, 8]);

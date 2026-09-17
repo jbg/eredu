@@ -1,5 +1,6 @@
 //! Joint projection alignment while retaining complete grouped-query heads.
 
+use super::parameter_metadata::{DeclarationDestination, ParameterGroupError};
 use super::{AttentionProjectionLayout, Config};
 use eredu_checkpoint::LinearFormat;
 use eredu_runtime::{MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole};
@@ -12,7 +13,17 @@ pub(crate) struct AttentionPartition {
 
 impl AttentionPartition {
     pub(crate) fn new(config: &impl Config, layer: usize) -> Result<Self, ParallelPlanError> {
-        let invalid = |message: &str| ParallelPlanError::InvalidGroup(message.into());
+        Self::new_with(config, layer, DeclarationDestination(None))
+            .map_err(ParameterGroupError::ordinary)
+    }
+
+    pub(crate) fn new_with(
+        config: &impl Config,
+        layer: usize,
+        destination: DeclarationDestination<'_>,
+    ) -> Result<Self, ParameterGroupError> {
+        destination.controls::<Self>()?;
+        let invalid = |message: &str| destination.group_error(format_args!("{message}"));
         let heads = usize::try_from(config.num_key_value_heads())
             .map_err(|_| invalid("attention key/value head count is negative"))?;
         let queries = usize::try_from(config.num_attention_heads())
@@ -29,47 +40,58 @@ impl AttentionPartition {
             .ok_or_else(|| invalid("attention group width overflows"))?;
         let fields = config
             .block_parameter_fields()
-            .validate()
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-        let prefix = format!(
+            .validate_with(|args| destination.group_error(args))?;
+        let prefix = destination.text(format_args!(
             "{}.layers.{layer}.{}",
             config.parameter_root(),
             fields.attention
-        );
-        let format = |field: &str| config.linear_format(&format!("{prefix}.{field}.weight"));
+        ))?;
+        let format = |field: &str| -> Result<LinearFormat, ParameterGroupError> {
+            let name = destination.text(format_args!("{prefix}.{field}.weight"))?;
+            destination.linear_format(config, &name)
+        };
         let (query, key, value) = match config.attention_projection_layout() {
             AttentionProjectionLayout::Split => (
-                format(fields.attention_query),
-                format(fields.attention_key),
-                config.attention_value_format(layer),
+                format(fields.attention_query)?,
+                format(fields.attention_key)?,
+                match destination.0 {
+                    Some(context) => config
+                        .attention_value_format_with_metadata(layer, context)
+                        .map_err(ParameterGroupError::Metadata)?,
+                    None => config.attention_value_format(layer),
+                },
             ),
             AttentionProjectionLayout::Fused { field } => {
-                let fused = format(field);
+                let fused = format(field)?;
                 (fused, fused, fused)
             }
         };
         let mut heads_per_chunk = 1usize;
-        let mut constrain = |elements: usize, alignment: usize| -> Result<(), ParallelPlanError> {
-            if alignment == 0 {
-                return Err(invalid("attention encoding alignment is zero"));
-            }
-            let required = alignment / gcd(elements, alignment);
-            heads_per_chunk = (heads_per_chunk / gcd(heads_per_chunk, required))
-                .checked_mul(required)
-                .ok_or_else(|| invalid("joint attention alignment overflows"))?;
-            Ok(())
-        };
+        let mut constrain =
+            |elements: usize, alignment: usize| -> Result<(), ParameterGroupError> {
+                if alignment == 0 {
+                    return Err(invalid("attention encoding alignment is zero"));
+                }
+                let required = alignment / gcd(elements, alignment);
+                heads_per_chunk = (heads_per_chunk / gcd(heads_per_chunk, required))
+                    .checked_mul(required)
+                    .ok_or_else(|| invalid("joint attention alignment overflows"))?;
+                Ok(())
+            };
         for (format, elements) in [(query, query_width), (key, width), (value, width)] {
-            constrain(elements, row_alignment(format)?)?;
+            constrain(elements, row_alignment_with(format, destination)?)?;
         }
         if let Some((field, _)) = config.attention_output_gate() {
-            constrain(query_width, row_alignment(format(field))?)?;
+            constrain(
+                query_width,
+                row_alignment_with(format(field)?, destination)?,
+            )?;
         }
         constrain(
             query_width,
             usize::try_from(crate::linear_format::input_partition_alignment(format(
                 fields.attention_output,
-            )))
+            )?))
             .map_err(|_| invalid("attention output alignment is negative"))?,
         )?;
         Ok(Self {
@@ -109,6 +131,21 @@ impl AttentionPartition {
         group: ParameterGroupSpec,
         format_of: impl Fn(&str) -> LinearFormat,
     ) -> Result<ParameterGroupSpec, ParallelPlanError> {
+        self.apply_with(
+            group,
+            |name| Ok(format_of(name)),
+            DeclarationDestination(None),
+        )
+        .map_err(ParameterGroupError::ordinary)
+    }
+
+    pub(crate) fn apply_with(
+        self,
+        group: ParameterGroupSpec,
+        format_of: impl Fn(&str) -> Result<LinearFormat, ParameterGroupError>,
+        destination: DeclarationDestination<'_>,
+    ) -> Result<ParameterGroupSpec, ParameterGroupError> {
+        destination.controls::<Self>()?;
         if !matches!(
             group.role(),
             ParameterRole::AttentionHeads | ParameterRole::ExpertOutput
@@ -116,55 +153,49 @@ impl AttentionPartition {
             return Ok(group);
         }
         if self.heads.is_multiple_of(self.heads_per_chunk) {
-            return ParameterGroupSpec::partitioned(
-                group.logical_name(),
-                group.role(),
-                self.preferred_units(),
-                group.members().iter().cloned(),
-            );
+            return destination.repartition(group, self.preferred_units());
         }
-        let members = group.members().to_vec();
-        eredu_runtime::partition_parameter_group_chunks(
+        destination.chunks(
             group,
             self.heads.div_ceil(self.heads_per_chunk),
-            |member| {
+            |member, members| {
                 let (axis, segments) = match member.sharding() {
                     MemberSharding::Partitioned { axis } => (*axis, None),
                     MemberSharding::PartitionedSegments { axis, segments } => {
                         (*axis, Some(segments))
                     }
                     _ => {
-                        return Err(ParallelPlanError::InvalidTensor(
-                            "attention member has no shared head partition".into(),
-                        ))
+                        return Err(destination.tensor_error(format_args!(
+                            "attention member has no shared head partition"
+                        )));
                     }
                 };
-                let fp8_owner =
-                    member
-                        .linear_companion_of()
-                        .and_then(|owner| match format_of(owner) {
-                            LinearFormat::E4M3BlockFp8(format) => Some((owner, format)),
-                            _ => None,
-                        });
+                let fp8_owner = match member.linear_companion_of() {
+                    Some(owner) => match format_of(owner)? {
+                        LinearFormat::E4M3BlockFp8(format) => Some((owner, format)),
+                        _ => None,
+                    },
+                    None => None,
+                };
                 let (primary, divisor) = if let Some((owner, format)) = fp8_owner {
                     format
                         .validate()
-                        .map_err(|error| ParallelPlanError::InvalidTensor(error.to_string()))?;
+                        .map_err(|error| destination.tensor_error(format_args!("{error}")))?;
                     let primary = members
                         .iter()
                         .find(|candidate| candidate.target() == owner)
                         .ok_or_else(|| {
-                            ParallelPlanError::InvalidTensor(
-                                "attention scale has no primary in its group".into(),
-                            )
+                            destination.tensor_error(format_args!(
+                                "attention scale has no primary in its group"
+                            ))
                         })?;
                     let divisor = match primary.global_shape().len().checked_sub(axis) {
                         Some(2) => format.block_rows as usize,
                         Some(1) => format.block_columns as usize,
                         _ => {
-                            return Err(ParallelPlanError::InvalidTensor(
-                                "attention scale does not partition a matrix axis".into(),
-                            ))
+                            return Err(destination.tensor_error(format_args!(
+                                "attention scale does not partition a matrix axis"
+                            )));
                         }
                     };
                     (primary, divisor)
@@ -176,34 +207,31 @@ impl AttentionPartition {
                         let first = segments
                             .first()
                             .ok_or_else(|| {
-                                ParallelPlanError::InvalidTensor(
-                                    "attention segments are empty".into(),
-                                )
+                                destination
+                                    .tensor_error(format_args!("attention segments are empty"))
                             })?
                             .len();
                         if segments.iter().any(|segment| segment.len() != first) {
-                            return Err(ParallelPlanError::InvalidTensor(
-                                "partial attention segments require distinct chunk widths".into(),
-                            ));
+                            return Err(destination.tensor_error(format_args!(
+                                "partial attention segments require distinct chunk widths"
+                            )));
                         }
                         first
                     }
                     _ => *primary.global_shape().get(axis).ok_or_else(|| {
-                        ParallelPlanError::InvalidTensor(
-                            "attention partition axis is absent".into(),
-                        )
+                        destination.tensor_error(format_args!("attention partition axis is absent"))
                     })?,
                 };
                 let numerator = extent.checked_mul(self.heads_per_chunk).ok_or_else(|| {
-                    ParallelPlanError::InvalidTensor("attention physical chunk overflows".into())
+                    destination.tensor_error(format_args!("attention physical chunk overflows"))
                 })?;
                 let denominator = self.heads.checked_mul(divisor).ok_or_else(|| {
-                    ParallelPlanError::InvalidTensor("attention scale divisor overflows".into())
+                    destination.tensor_error(format_args!("attention scale divisor overflows"))
                 })?;
                 if !numerator.is_multiple_of(denominator) {
-                    return Err(ParallelPlanError::InvalidTensor(
-                        "attention chunk splits a physical encoding block".into(),
-                    ));
+                    return Err(destination.tensor_error(format_args!(
+                        "attention chunk splits a physical encoding block"
+                    )));
                 }
                 Ok(numerator / denominator)
             },
@@ -211,12 +239,15 @@ impl AttentionPartition {
     }
 }
 
-fn row_alignment(format: LinearFormat) -> Result<usize, ParallelPlanError> {
+fn row_alignment_with(
+    format: LinearFormat,
+    destination: DeclarationDestination<'_>,
+) -> Result<usize, ParameterGroupError> {
     match format {
         LinearFormat::E4M3BlockFp8(format) => {
             format
                 .validate()
-                .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+                .map_err(|cause| destination.group_error(format_args!("{cause}")))?;
             Ok(format.block_rows as usize)
         }
         _ => Ok(1),

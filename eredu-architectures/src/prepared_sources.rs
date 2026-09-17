@@ -5,11 +5,12 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
+use eredu_checkpoint::gguf_store::open_prepared_gguf_source_with_reader_buffers;
 use eredu_checkpoint::{
-    gguf_store::open_prepared_gguf_source,
     store::{
         CheckpointSource, CompositeCheckpointSource, RestrictedCheckpointSource,
-        SharedCheckpointSource, StoreError, TensorMetadata,
+        RetainedCheckpointSource, StoreError, TensorMetadata,
     },
     validation::{resolve_gguf_plan, ResolvedCheckpointPlan},
 };
@@ -79,13 +80,47 @@ impl PreparedSourceResolutions {
 
 /// One exact architecture-selected source graph prepared before native materialization.
 ///
-/// Every logical view shares the same underlying physical source objects. Creating
-/// target or extension views therefore cannot multiply reader caches or reopen an
-/// admitted artifact.
+/// Every clone shares the complete immutable selection, artifact inspection and
+/// underlying physical source graph. Retaining a quote blueprint therefore
+/// allocates no configuration, parameter catalog or source-map copy. Target and
+/// extension views cannot multiply reader caches or reopen an admitted artifact.
 pub struct PreparedModelSources {
+    // No weak or raw handle escapes. Retire this outer allocation before its
+    // source/selection payload, including any retained source custody.
+    shared: Option<Arc<PreparedSourceSelection>>,
+}
+
+#[cfg_attr(test, derive(Clone))]
+struct PreparedSourceSelection {
     selected: SelectedPreparation,
     inspection: eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
-    graph: PreparedModelSourceGraph,
+    // Actual target inspection constructed and validated once during source
+    // preparation. Quotes borrow it rather than copying the complete catalog
+    // and target plan at every invocation.
+    execution_inspection: eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
+    // The actual composite requirements already validated during source
+    // preparation. Its inspection/catalog has no edge back to these sources.
+    composite_requirements: Option<crate::replicated_text::CompositeTextRequirements>,
+    graph: Arc<PreparedModelSourceGraph>,
+    construction: crate::replicated_text::PreparedConstructionSemantics,
+}
+
+impl Clone for PreparedModelSources {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl Drop for PreparedModelSources {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.take() {
+            // Exactly one final owner receives the payload, also when owners
+            // retire concurrently. The Arc allocation is gone before it drops.
+            drop(Arc::into_inner(shared));
+        }
+    }
 }
 
 /// Exact source roles released only by consuming their paired total selection.
@@ -96,11 +131,11 @@ pub struct PreparedModelSourceGraph {
     architecture: ArtifactArchitecturePlan,
     prediction_extension: Option<PredictionExtensionPlan>,
     pub(crate) prediction_placement: crate::prediction_extension::PredictionPlacementSlot,
-    primary: SharedCheckpointSource,
-    companions: BTreeMap<GgufCompanionRole, SharedCheckpointSource>,
-    complete: SharedCheckpointSource,
-    target: SharedCheckpointSource,
-    extension: Option<SharedCheckpointSource>,
+    primary: RetainedCheckpointSource,
+    companions: BTreeMap<GgufCompanionRole, RetainedCheckpointSource>,
+    complete: RetainedCheckpointSource,
+    target: RetainedCheckpointSource,
+    extension: Option<RetainedCheckpointSource>,
     resolutions: PreparedSourceResolutions,
     source_metadata: BTreeMap<String, TensorMetadata>,
 }
@@ -127,6 +162,9 @@ struct PreparedPredictionDiscovery {
     descriptor: eredu_core::ArchitectureDescriptor,
     intervention_points: Vec<eredu_core::intervention::InterventionPoint>,
 }
+
+mod intervention_source;
+mod activation_source;
 
 impl PreparedModelDiscovery {
     /// Retains hook facts projected from the actual constructed executor and
@@ -317,6 +355,38 @@ impl PreparedModelDiscovery {
         target
             .with_prediction(&prediction.descriptor, placement, execution)
             .map(Some)
+    }
+
+    /// Revalidates an immutable admission against this retained selected catalog
+    /// and ordinary collector support. No content identity is resolved, discovery
+    /// DTO constructed, payload cloned or capture digest recomputed on success.
+    ///
+    /// This does not authenticate a session, origin, parameter epoch, prepared
+    /// path binding or execution authority. The enclosing accepted binding must
+    /// check those independently. Refined partition support remains a separate
+    /// contract; this method uses the stored ordinary support unchanged.
+    pub fn validate_capture_admission(
+        &self,
+        admission: &eredu_core::capture::AdmittedCapturePlan,
+    ) -> Result<(), eredu_core::capture::CaptureError> {
+        admission.revalidate_parts(&self.descriptor.observations, &self.support)
+    }
+
+    /// Binds explicit causal row/readout declarations retained by the actual
+    /// loaded architecture to this accepted immutable capture source. No content
+    /// hashing, discovery copy or native work occurs. The caller still validates
+    /// the actual session's prepared path token before admission/installation.
+    /// No execution, native transformation or host allocation grant is produced.
+    pub fn prepare_capture_selection(
+        &self,
+        source: &eredu_core::capture::SharedCapturePlan,
+        paths: &eredu_runtime::SharedLayeredObservationPaths,
+    ) -> Result<
+        eredu_runtime::layered::PreparedCaptureSelection,
+        eredu_runtime::layered::PreparedCaptureSelectionError,
+    > {
+        self.validate_capture_admission(source.admission())?;
+        paths.prepare_capture_selection(source)
     }
 
     /// Resolves the exact content identity for a caller using capture features.
@@ -542,6 +612,60 @@ impl PreparedModelDiscovery {
 }
 
 impl PreparedModelSources {
+    fn shared(&self) -> &PreparedSourceSelection {
+        self.shared
+            .as_deref()
+            .expect("prepared source selection already consumed")
+    }
+
+    pub(crate) fn composite_requirements(
+        &self,
+    ) -> Option<&crate::replicated_text::CompositeTextRequirements> {
+        self.shared().composite_requirements.as_ref()
+    }
+
+    pub(crate) fn construction_semantics(&self) -> &crate::replicated_text::PreparedConstructionSemantics {
+        &self.shared().construction
+    }
+
+    /// Complete retained source-owned host payload bound across every prepared
+    /// role. Physical owners shared by target, extension and companion views
+    /// count once. This reads no payload and does not reconstruct sources.
+    pub fn source_storage(
+        &self,
+    ) -> Result<Option<eredu_checkpoint::store::SourceStorage>, eredu_checkpoint::store::StoreError>
+    {
+        eredu_checkpoint::store::SourceStorage::collect(
+            [self.primary(), self.complete(), self.target()]
+                .into_iter()
+                .chain(self.companions().map(|(_, source)| source))
+                .chain(self.extension())
+                .map(|source| source.as_ref() as &dyn CheckpointSource),
+        )
+    }
+
+    /// Borrows every retained source role without constructing an ownership map.
+    /// The callback may receive aliases; false preserves incomplete source coverage.
+    pub fn visit_source_storage(
+        &self,
+        visitor: &mut dyn FnMut(eredu_checkpoint::store::SourceStorageRef<'_>),
+    ) -> Result<bool, eredu_checkpoint::store::StoreError> {
+        let mut complete = true;
+        for source in [self.primary(), self.complete(), self.target()]
+            .into_iter()
+            .chain(self.companions().map(|(_, source)| source))
+            .chain(self.extension())
+        {
+            complete &= source.visit_source_storage(visitor)?;
+        }
+        Ok(complete)
+    }
+
+    /// Retains this exact selection and source graph for cold equation inspection.
+    pub fn inference_blueprint(&self) -> crate::prepared_execution::PreparedInferenceBlueprint {
+        crate::prepared_execution::PreparedInferenceBlueprint::new(self.clone())
+    }
+
     /// Retains architecture-owned mutable hooks with actual selected-session facts.
     pub fn intervention_discovery(
         &self,
@@ -555,9 +679,19 @@ impl PreparedModelSources {
         )
     }
 
+    /// Exact source graph, admission origin and complete immutable selection.
+    /// Content digests and architecture fingerprints do not substitute for this.
+    pub fn same_selected_sources(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared().graph, &other.shared().graph)
+            && self
+                .shared()
+                .selected
+                .same_complete_selection(&other.shared().selected)
+    }
+
     /// Authoritative total selection inseparably paired with these exact sources.
-    pub const fn selected(&self) -> &SelectedPreparation {
-        &self.selected
+    pub fn selected(&self) -> &SelectedPreparation {
+        &self.shared().selected
     }
 
     /// Projects catalog semantics from the retained architecture and combines them
@@ -584,7 +718,7 @@ impl PreparedModelSources {
         );
         support.capture = capture;
         PreparedModelDiscovery {
-            identity: self.graph.source_identity().clone(),
+            identity: self.shared().graph.source_identity().clone(),
             execution_identity: self.execution_identity().to_owned(),
             descriptor,
             partition_selection: self
@@ -599,9 +733,9 @@ impl PreparedModelSources {
             observation_context,
             intervention_points: self.architecture().intervention_points(),
             prediction: self.prediction_extension().map(|_| {
-                let complete = self.inspection.architecture_plan();
+                let complete = self.shared().inspection.architecture_plan();
                 PreparedPredictionDiscovery {
-                    placement: Arc::clone(&self.graph.prediction_placement),
+                    placement: Arc::clone(&self.shared().graph.prediction_placement),
                     descriptor: complete.architecture_descriptor(),
                     intervention_points: complete.intervention_points(),
                 }
@@ -618,87 +752,119 @@ impl PreparedModelSources {
         self.prepare_discovery(mechanisms, capture).capture()
     }
 
-    /// Consumes the authoritative pairing immediately before typed execution dispatch.
+    /// Borrows the admitted container/catalog while target architecture comes from the graph.
+    pub(crate) fn inspection(&self) -> &eredu_core::ArtifactInspection<ArtifactArchitecturePlan> {
+        &self.shared().inspection
+    }
+
+    /// Exact target-only inspection already authenticated at source preparation.
+    /// Its artifact admission/catalog and target architecture remain inseparable.
+    pub(crate) fn execution_inspection(&self) -> &eredu_core::ArtifactInspection<ArtifactArchitecturePlan> {
+        &self.shared().execution_inspection
+    }
+
+    /// Consumes the authoritative pairing for the source conformance fixture.
+    /// A unique owner moves its payload; a shared fixture preserves the original
+    /// owned comparison without changing production's borrowed construction path.
+    #[cfg(test)]
     pub(crate) fn into_parts(
-        self,
+        mut self,
     ) -> (
         SelectedPreparation,
         eredu_core::ArtifactInspection<ArtifactArchitecturePlan>,
-        PreparedModelSourceGraph,
+        Arc<PreparedModelSourceGraph>,
     ) {
-        (self.selected, self.inspection, self.graph)
+        let shared = self
+            .shared
+            .take()
+            .expect("prepared source selection already consumed");
+        let payload = match Arc::try_unwrap(shared) {
+            Ok(payload) => payload,
+            Err(shared) => {
+                // Keep the closed owner installed while cloning so even unwind
+                // retires the outer shell before its retained payload.
+                self.shared = Some(shared);
+                self.shared().clone()
+            }
+        };
+        (payload.selected, payload.inspection, payload.graph)
     }
 
     /// Exact prepared source graph paired with the selection.
-    pub const fn graph(&self) -> &PreparedModelSourceGraph {
-        &self.graph
+    pub fn graph(&self) -> &PreparedModelSourceGraph {
+        &self.shared().graph
     }
 
     /// Computes and retains the exact source identity when explicitly requested.
     pub fn source_identity(&self) -> Result<ArtifactIdentity, Arc<ArtifactError>> {
-        self.graph.source_identity().resolve()
+        self.shared().graph.source_identity().resolve()
     }
 
     /// Architecture identity retained by the selected neutral execution requirements.
     pub fn execution_identity(&self) -> &str {
-        self.graph.execution_identity()
+        self.shared().graph.execution_identity()
     }
 
     /// Admitted physical container format.
-    pub const fn format(&self) -> ArtifactFormat {
-        self.graph.format()
+    pub fn format(&self) -> ArtifactFormat {
+        self.shared().graph.format()
     }
 
     /// Target architecture paired with these exact source roles.
-    pub const fn architecture(&self) -> &ArtifactArchitecturePlan {
-        self.graph.architecture()
+    pub fn architecture(&self) -> &ArtifactArchitecturePlan {
+        self.shared().graph.architecture()
     }
 
     /// Selected embedded prediction extension, when requested and admitted.
-    pub const fn prediction_extension(&self) -> Option<&PredictionExtensionPlan> {
-        self.graph.prediction_extension()
+    pub fn prediction_extension(&self) -> Option<&PredictionExtensionPlan> {
+        self.shared().graph.prediction_extension()
+    }
+
+    /// Borrows the construction completed for this exact immutable source graph.
+    pub(crate) fn retained_prediction_placement(&self) -> Option<&Arc<crate::prediction_extension::PreparedPredictionPlacement>> {
+        self.shared().graph.prediction_placement.get()
     }
 
     /// Primary artifact source, excluding separately stored companions.
-    pub fn primary(&self) -> &SharedCheckpointSource {
-        self.graph.primary()
+    pub fn primary(&self) -> &RetainedCheckpointSource {
+        self.shared().graph.primary()
     }
 
     /// Separately stored source for one architecture-declared semantic role.
-    pub fn companion(&self, role: &GgufCompanionRole) -> Option<&SharedCheckpointSource> {
-        self.graph.companion(role)
+    pub fn companion(&self, role: &GgufCompanionRole) -> Option<&RetainedCheckpointSource> {
+        self.shared().graph.companion(role)
     }
 
     /// Separately stored companions in deterministic semantic-role order.
     pub fn companions(
         &self,
-    ) -> impl Iterator<Item = (&GgufCompanionRole, &SharedCheckpointSource)> {
-        self.graph.companions()
+    ) -> impl Iterator<Item = (&GgufCompanionRole, &RetainedCheckpointSource)> {
+        self.shared().graph.companions()
     }
 
     /// Complete selected source graph used while materializing auxiliary roles.
-    pub fn complete(&self) -> &SharedCheckpointSource {
-        self.graph.complete()
+    pub fn complete(&self) -> &RetainedCheckpointSource {
+        self.shared().graph.complete()
     }
 
     /// Explicit ordinary-target projection, which cannot expose extension-only keys.
-    pub fn target(&self) -> &SharedCheckpointSource {
-        self.graph.target()
+    pub fn target(&self) -> &RetainedCheckpointSource {
+        self.shared().graph.target()
     }
 
     /// Explicit extension-only projection, when embedded prediction was selected.
-    pub fn extension(&self) -> Option<&SharedCheckpointSource> {
-        self.graph.extension()
+    pub fn extension(&self) -> Option<&RetainedCheckpointSource> {
+        self.shared().graph.extension()
     }
 
     /// Exact resolved contracts used to build and project this source graph.
-    pub const fn resolutions(&self) -> &PreparedSourceResolutions {
-        self.graph.resolutions()
+    pub fn resolutions(&self) -> &PreparedSourceResolutions {
+        self.shared().graph.resolutions()
     }
 
     /// Metadata snapshot for every key in the complete selected source graph.
-    pub const fn source_metadata(&self) -> &BTreeMap<String, TensorMetadata> {
-        self.graph.source_metadata()
+    pub fn source_metadata(&self) -> &BTreeMap<String, TensorMetadata> {
+        self.shared().graph.source_metadata()
     }
 }
 
@@ -729,34 +895,34 @@ impl PreparedModelSourceGraph {
     }
 
     /// Primary artifact source, excluding separately stored companions.
-    pub fn primary(&self) -> &SharedCheckpointSource {
+    pub fn primary(&self) -> &RetainedCheckpointSource {
         &self.primary
     }
 
     /// Separately stored source for one architecture-declared semantic role.
-    pub fn companion(&self, role: &GgufCompanionRole) -> Option<&SharedCheckpointSource> {
+    pub fn companion(&self, role: &GgufCompanionRole) -> Option<&RetainedCheckpointSource> {
         self.companions.get(role)
     }
 
     /// Separately stored companions in deterministic semantic-role order.
     pub fn companions(
         &self,
-    ) -> impl Iterator<Item = (&GgufCompanionRole, &SharedCheckpointSource)> {
+    ) -> impl Iterator<Item = (&GgufCompanionRole, &RetainedCheckpointSource)> {
         self.companions.iter()
     }
 
     /// Complete selected source graph used while materializing auxiliary roles.
-    pub fn complete(&self) -> &SharedCheckpointSource {
+    pub fn complete(&self) -> &RetainedCheckpointSource {
         &self.complete
     }
 
     /// Explicit ordinary-target projection, which cannot expose extension-only keys.
-    pub fn target(&self) -> &SharedCheckpointSource {
+    pub fn target(&self) -> &RetainedCheckpointSource {
         &self.target
     }
 
     /// Explicit extension-only projection, when embedded prediction was selected.
-    pub fn extension(&self) -> Option<&SharedCheckpointSource> {
+    pub fn extension(&self) -> Option<&RetainedCheckpointSource> {
         self.extension.as_ref()
     }
 
@@ -783,6 +949,24 @@ pub enum PreparedModelSourcesError {
     /// An exact checkpoint source or logical view could not be constructed.
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// Cold GGUF reader/index source preparation refused with its real owners.
+    #[error(transparent)]
+    GgufSource(#[from] eredu_checkpoint::gguf_store::GgufSourcePreparationFailure),
+    /// Catalog-only cold comparison/compilation refused with its actual input.
+    #[error(transparent)]
+    GgufCatalog(#[from] eredu_runtime::working_memory::OriginalGgufCatalogError),
+    /// Exact finite source constructor refusal after immutable catalog admission.
+    #[error(transparent)]
+    GgufSourceConstructor(#[from] eredu_runtime::working_memory::OriginalGgufSourceError),
+    /// The exact built-in GGUF primary/companion union constructor refused.
+    #[error(transparent)]
+    GgufCompositeConstructor(#[from] eredu_runtime::working_memory::OriginalGgufCompositeError),
+    /// Exact original root allocation refused before source publication.
+    #[error(transparent)]
+    SourceErasure(#[from] eredu_runtime::working_memory::OriginalRetainedSourceError),
+    /// Typed retained union input did not contain the required built-in sources.
+    #[error(transparent)]
+    CompositeInput(#[from] eredu_checkpoint::store::GgufCompositeInputError),
 }
 
 /// Consumes one admitted artifact into the only architecture-aware prepared source graph.
@@ -793,6 +977,27 @@ pub enum PreparedModelSourcesError {
 pub fn prepare_model_sources(
     plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
     selected: SelectedPreparation,
+) -> Result<PreparedModelSources, PreparedModelSourcesError> {
+    prepare_model_sources_impl(plan, selected, None)
+}
+
+/// Same selected cold driver with an explicitly supplied pool for immutable GGUF
+/// catalog, reader/materializer and built-in union construction. Outer erasure
+/// shells, future recipe entries, graph/manager storage and other constructors
+/// remain separate prerequisites. This is not complete model admission and never
+/// promotes an ordinary source or catalog.
+pub fn prepare_model_sources_with_catalog_pool(
+    plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    selected: SelectedPreparation,
+    pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+) -> Result<PreparedModelSources, PreparedModelSourcesError> {
+    prepare_model_sources_impl(plan, selected, Some(pool))
+}
+
+fn prepare_model_sources_impl(
+    plan: ModelPreparationPlan<ArtifactArchitecturePlan>,
+    selected: SelectedPreparation,
+    catalog_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
 ) -> Result<PreparedModelSources, PreparedModelSourcesError> {
     if !selected
         .admission_token()
@@ -860,18 +1065,24 @@ pub fn prepare_model_sources(
         .inspection()
         .clone()
         .map_architecture_plan(|_| architecture.clone());
-    let expected_execution_identity =
+    let (expected_execution_identity, composite_requirements) =
         match crate::replicated_text::replicated_text_execution_class(&execution_inspection)
             .map_err(|error| PreparedModelSourcesError::InvalidSelection(error.to_string()))?
         {
             crate::replicated_text::ReplicatedTextExecutionClass::Replicated(requirements) => {
-                requirements.architecture_identity().to_owned()
+                (requirements.architecture_identity().to_owned(), None)
             }
             crate::replicated_text::ReplicatedTextExecutionClass::Routed(requirements) => {
-                requirements.text().architecture_identity().to_owned()
+                (
+                    requirements.text().architecture_identity().to_owned(),
+                    None,
+                )
             }
             crate::replicated_text::ReplicatedTextExecutionClass::Composite(requirements) => {
-                requirements.execution().architecture_identity().to_owned()
+                (
+                    requirements.execution().architecture_identity().to_owned(),
+                    Some(requirements),
+                )
             }
         };
     if execution_identity != expected_execution_identity {
@@ -906,6 +1117,7 @@ pub fn prepare_model_sources(
                 validated,
                 max_cached_sources,
                 media_projector,
+                catalog_pool,
             )
         }
         _ => Err(PreparedModelSourcesError::InvalidSelection(
@@ -913,9 +1125,14 @@ pub fn prepare_model_sources(
         )),
     }?;
     Ok(PreparedModelSources {
-        selected,
-        inspection,
-        graph,
+        shared: Some(Arc::new(PreparedSourceSelection {
+            selected,
+            inspection,
+            execution_inspection,
+            graph: Arc::new(graph),
+            composite_requirements,
+            construction: Default::default(),
+        })),
     })
 }
 
@@ -1001,20 +1218,22 @@ fn prepare_safetensors_sources(
             )
         })?
         .clone();
-    let primary = eredu_core::artifact::open_prepared_safetensors_artifact(
-        &tensors,
-        shards,
-        source_resolution.clone(),
-        max_cached_shards,
-    )?;
-    let complete = Arc::clone(&primary);
+    let primary: RetainedCheckpointSource =
+        eredu_core::artifact::open_prepared_safetensors_artifact(
+            &tensors,
+            shards,
+            source_resolution.clone(),
+            max_cached_shards,
+        )?
+        .into();
+    let complete = primary.clone();
     let (target, extension) = match prediction_extension.as_ref() {
         Some(extension) => {
             let extension_keys = extension.source_keys(target_architecture)?;
             let target_keys = target_resolution.source_keys().clone();
             projected_prediction_views(&complete, target_keys, extension_keys)?
         }
-        None => (Arc::clone(&complete), None),
+        None => (complete.clone(), None),
     };
     let source_metadata = metadata_snapshot(complete.as_ref())?;
     Ok(PreparedModelSourceGraph {
@@ -1039,6 +1258,30 @@ fn prepare_safetensors_sources(
     })
 }
 
+fn compile_resolved_gguf_source(
+    checkpoint: eredu_gguf::Checkpoint,
+    resolved: &ResolvedCheckpointPlan,
+    mapping: &[eredu_gguf::TranslatedTensorLayout],
+    maximum: usize,
+    pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+) -> Result<RetainedCheckpointSource, PreparedModelSourcesError> {
+    match pool {
+        Some(pool) => {
+            let catalog = pool
+                .compile_gguf_catalog(eredu_checkpoint::gguf_store::GgufCatalogPlan::new(
+                    checkpoint, resolved, mapping, maximum,
+                ))?
+                .into_prepared();
+            Ok(pool.retain_gguf_source(pool.compile_gguf_source(catalog)?)?)
+        }
+        None => Ok(RetainedCheckpointSource::from_gguf(
+            eredu_checkpoint::gguf_store::open_resolved_gguf_source_with_reader_buffers(
+                checkpoint, resolved, mapping, maximum,
+            )?,
+        )),
+    }
+}
+
 fn prepare_gguf_sources(
     source_identity: DeferredArtifactIdentity,
     execution_identity: String,
@@ -1046,6 +1289,7 @@ fn prepare_gguf_sources(
     validated: eredu_core::ValidatedGguf,
     max_cached_readers: usize,
     media_projector: MediaProjectorSourcePolicy,
+    catalog_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
 ) -> Result<PreparedModelSourceGraph, PreparedModelSourcesError> {
     let primary_plan = architecture.gguf_plan().ok_or_else(|| {
         PreparedModelSourcesError::InvalidSelection(
@@ -1093,14 +1337,16 @@ fn prepare_gguf_sources(
                 "GGUF primary checkpoint contract no longer resolves: {validation:?}"
             ))
         })?;
-    let primary: SharedCheckpointSource = Arc::new(open_prepared_gguf_source(
+    let primary = compile_resolved_gguf_source(
         checkpoint,
-        primary_plan.checkpoint(),
+        &primary_resolution,
         primary_mapping,
         max_cached_readers,
-    )?);
+        catalog_pool,
+    )?;
     let mut companions = BTreeMap::new();
     let mut companion_resolutions = BTreeMap::new();
+    let mut union_child = None;
     if let Some((plan, admitted)) = admitted_projector {
         let resolution =
             resolve_gguf_plan(admitted.checkpoint(), plan.checkpoint()).map_err(|validation| {
@@ -1108,22 +1354,36 @@ fn prepare_gguf_sources(
                     "GGUF media-projector contract no longer resolves: {validation:?}"
                 ))
             })?;
-        let source: SharedCheckpointSource = Arc::new(open_prepared_gguf_source(
+        let source = compile_resolved_gguf_source(
             admitted.checkpoint().clone(),
-            plan.checkpoint(),
+            &resolution,
             plan.tensor_mapping(),
             max_cached_readers,
-        )?);
-        companions.insert(GgufCompanionRole::MediaProjector, source);
+            catalog_pool,
+        )?;
+        let erased: RetainedCheckpointSource = source.clone();
+        companions.insert(GgufCompanionRole::MediaProjector, erased);
+        union_child = Some(source);
         companion_resolutions.insert(GgufCompanionRole::MediaProjector, resolution);
     }
-    let complete = if companions.is_empty() {
-        Arc::clone(&primary)
-    } else {
-        Arc::new(CompositeCheckpointSource::new(
-            std::iter::once(Arc::clone(&primary)).chain(companions.values().cloned()),
-        )?)
+    let complete: RetainedCheckpointSource = match union_child {
+        None => primary.clone(),
+        Some(companion) => {
+            let pair = eredu_checkpoint::store::GgufCompositePlan::from_retained(
+                primary.clone(),
+                companion,
+            )?;
+            match catalog_pool {
+                Some(pool) => pool.retain_gguf_composite(pool.compile_gguf_composite(pair)?)?,
+                // Preserve the ordinary StoreError category and duplicate text.
+                None => RetainedCheckpointSource::from_composite(
+                    pair.build()
+                        .map_err(|failure| StoreError::Internal(failure.to_string()))?,
+                ),
+            }
+        }
     };
+    let primary: RetainedCheckpointSource = primary;
     let source_metadata = metadata_snapshot(complete.as_ref())?;
     let target_companion_resolutions = companion_resolutions.clone();
     Ok(PreparedModelSourceGraph {
@@ -1133,9 +1393,9 @@ fn prepare_gguf_sources(
         format: ArtifactFormat::Gguf,
         architecture,
         prediction_extension: None,
-        primary: Arc::clone(&primary),
+        primary: primary.clone(),
         companions,
-        complete: Arc::clone(&complete),
+        complete: complete.clone(),
         target: complete,
         extension: None,
         resolutions: PreparedSourceResolutions {
@@ -1149,10 +1409,10 @@ fn prepare_gguf_sources(
 }
 
 fn projected_prediction_views(
-    complete: &SharedCheckpointSource,
+    complete: &RetainedCheckpointSource,
     target_keys: BTreeSet<String>,
     extension_keys: BTreeSet<String>,
-) -> Result<(SharedCheckpointSource, Option<SharedCheckpointSource>), StoreError> {
+) -> Result<(RetainedCheckpointSource, Option<RetainedCheckpointSource>), StoreError> {
     if !target_keys.is_disjoint(&extension_keys) {
         return Err(StoreError::Internal(
             "prediction target and extension source projections overlap".into(),
@@ -1168,16 +1428,18 @@ fn projected_prediction_views(
             "prediction target and extension projections do not cover the selected source".into(),
         ));
     }
-    let target: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-        Arc::clone(complete),
+    let target: RetainedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
+        complete.clone(),
         "prediction-target",
         target_keys,
-    )?);
-    let extension: SharedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
-        Arc::clone(complete),
+    )?)
+    .into();
+    let extension: RetainedCheckpointSource = Arc::new(RestrictedCheckpointSource::including(
+        complete.clone(),
         "prediction-extension",
         extension_keys,
-    )?);
+    )?)
+    .into();
     Ok((target, Some(extension)))
 }
 
@@ -1194,6 +1456,9 @@ fn metadata_snapshot(
 #[cfg(test)]
 #[path = "prepared_execution/source_contract_tests.rs"]
 mod construction_tests;
+
+#[cfg(test)]
+mod capture_validation_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1254,7 +1519,7 @@ mod tests {
             .unwrap();
     }
 
-    fn gemma4_gguf_fixture() -> tempfile::TempDir {
+    pub(super) fn gemma4_gguf_fixture() -> tempfile::TempDir {
         use eredu_gguf::{MetadataArray, MetadataValue};
 
         let root = tempfile::tempdir().unwrap();
@@ -1396,6 +1661,12 @@ mod tests {
     }
 
     impl CheckpointSource for LeaseCountingSource {
+        fn source_storage(
+            &self,
+        ) -> Result<Option<eredu_checkpoint::store::SourceStorage>, StoreError> {
+            self.source.source_storage()
+        }
+
         fn source_keys(&self) -> Vec<String> {
             self.source.source_keys()
         }
@@ -1424,7 +1695,7 @@ mod tests {
     #[test]
     fn prediction_views_are_disjoint_exact_and_share_one_source() {
         let acquisitions = Arc::new(AtomicUsize::new(0));
-        let source: SharedCheckpointSource = Arc::new(LeaseCountingSource {
+        let source: RetainedCheckpointSource = Arc::new(LeaseCountingSource {
             source: MemoryWeightStore::from_safetensors([
                 (
                     "target.weight".into(),
@@ -1441,7 +1712,8 @@ mod tests {
             ])
             .unwrap(),
             acquisitions: Arc::clone(&acquisitions),
-        });
+        })
+        .into();
         let (target, extension) = projected_prediction_views(
             &source,
             BTreeSet::from(["target.weight".into()]),
@@ -1449,6 +1721,17 @@ mod tests {
         )
         .unwrap();
         let extension = extension.unwrap();
+
+        let storage = eredu_checkpoint::store::SourceStorage::collect([
+            source.as_ref(),
+            target.as_ref(),
+            extension.as_ref(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(storage.bytes().unwrap(), 8);
+        assert_eq!(storage.owner_count(), 2);
+        assert_eq!(acquisitions.load(Ordering::Relaxed), 0);
 
         assert_eq!(target.source_keys(), ["target.weight"]);
         assert_eq!(extension.source_keys(), ["extension.weight"]);
@@ -1483,13 +1766,14 @@ mod tests {
 
     #[test]
     fn prediction_views_reject_overlap_and_incomplete_partition() {
-        let source: SharedCheckpointSource = Arc::new(
+        let source: RetainedCheckpointSource = Arc::new(
             MemoryWeightStore::from_safetensors([
                 ("a".into(), Dtype::F32, vec![1], f32_bytes(&[1.0])),
                 ("b".into(), Dtype::F32, vec![1], f32_bytes(&[2.0])),
             ])
             .unwrap(),
-        );
+        )
+        .into();
         assert!(projected_prediction_views(
             &source,
             BTreeSet::from(["a".into()]),
@@ -1520,6 +1804,28 @@ mod tests {
         )
         .unwrap();
         let sources = prepare_model_sources(plan, selected).unwrap();
+
+        let storage = sources
+            .inference_blueprint()
+            .source_storage()
+            .unwrap()
+            .unwrap();
+        let primary_storage = sources.primary().source_storage().unwrap().unwrap();
+        let companion_storage = sources
+            .companion(&GgufCompanionRole::MediaProjector)
+            .unwrap()
+            .source_storage()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            storage.bytes().unwrap(),
+            primary_storage.bytes().unwrap() + companion_storage.bytes().unwrap()
+        );
+        assert_eq!(
+            storage.owner_count(),
+            2,
+            "complete/target aliases must not multiply reader buffers"
+        );
 
         let role = GgufCompanionRole::MediaProjector;
         let primary = sources.primary().source_keys();
@@ -1565,3 +1871,9 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod captured_headers_tests;
+
+#[cfg(test)]
+mod catalog_tests;

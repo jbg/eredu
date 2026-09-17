@@ -4,14 +4,25 @@
 //! policies select a residency realization, while concrete backends retain
 //! their native layer-state and tensor types.
 
+mod construction;
+mod pooling;
+pub use pooling::{PoolingAttentionGeometry, pooling_attention_geometry};
+pub use pooling::{PoolingAttentionGeometryPlan, pooling_attention_geometry_plan};
+mod identity_workspace;
+#[cfg(test)]
+mod shared_construction_tests;
+mod shared_layout;
+mod workspace;
+pub use shared_layout::SharedStateLayout;
+
 use std::{marker::PhantomData, ops::Range};
 
 use eredu_core::{
+    LayerSchedule,
     cache::{
         LayerCachePolicy, PromptCacheError, PromptCacheModelIdentity, PromptCacheStateSegment,
         PromptCacheTopology, StateComponentPolicy, StateTensorRole,
     },
-    LayerSchedule,
 };
 use eredu_nn::NeuralBackend;
 
@@ -274,90 +285,17 @@ impl StateLayout {
     /// Creates and validates a simple ordered layout with one persistent
     /// segment named [`DEFAULT_STATE_SEGMENT_ID`].
     pub fn new(layers: LayerSchedule<LayerCachePolicy>) -> Result<Self, StateError> {
-        if layers.is_empty() {
-            return Err(StateError::EmptyLayout);
-        }
-        let count = layers.len();
-        Self::segmented(
-            layers,
-            [StateSegmentSpec::new(
-                DEFAULT_STATE_SEGMENT_ID,
-                0..count,
-                StateSegmentLifetime::Persistent,
-                0,
-            )?],
-        )
+        construction::simple(layers, None)
     }
 
     /// Creates an ordered layout partitioned into named contiguous segments.
-    ///
     /// Segment declarations are sorted into layer order and must form an exact,
-    /// non-overlapping partition of every state-bearing layer. Stable segment
-    /// identity and lifetime therefore participate in layout equality and
-    /// runtime-state compatibility checks.
+    /// non-overlapping partition. Their identity and lifetime remain semantic.
     pub fn segmented(
         layers: LayerSchedule<LayerCachePolicy>,
         segments: impl IntoIterator<Item = StateSegmentSpec>,
     ) -> Result<Self, StateError> {
-        if layers.is_empty() {
-            return Err(StateError::EmptyLayout);
-        }
-        for (layer, policy) in layers.iter().enumerate() {
-            policy
-                .validate()
-                .map_err(|error| StateError::InvalidLayer {
-                    layer,
-                    reason: error.to_string(),
-                })?;
-        }
-        let components = layers.iter().map(LayerCachePolicy::components).collect();
-        let mut segments = segments.into_iter().collect::<Vec<_>>();
-        if segments.is_empty() {
-            return Err(StateError::EmptySegments);
-        }
-        segments.sort_by(|left, right| {
-            left.layers
-                .start
-                .cmp(&right.layers.start)
-                .then_with(|| left.layers.end.cmp(&right.layers.end))
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        let mut identities = std::collections::BTreeSet::new();
-        let mut frontier = 0usize;
-        for segment in &segments {
-            if !identities.insert(segment.id.clone()) {
-                return Err(StateError::DuplicateSegment {
-                    segment: segment.id.clone(),
-                });
-            }
-            if segment.layers.end > layers.len() {
-                return Err(StateError::SegmentOutOfBounds {
-                    segment: segment.id.clone(),
-                    start: segment.layers.start,
-                    end: segment.layers.end,
-                    layers: layers.len(),
-                });
-            }
-            if segment.layers.start < frontier {
-                return Err(StateError::OverlappingSegment {
-                    segment: segment.id.clone(),
-                    start: segment.layers.start,
-                    frontier,
-                });
-            }
-            if segment.layers.start > frontier {
-                return Err(StateError::UnassignedStateLayer { layer: frontier });
-            }
-            frontier = segment.layers.end;
-        }
-        if frontier != layers.len() {
-            return Err(StateError::UnassignedStateLayer { layer: frontier });
-        }
-        Ok(Self {
-            layers,
-            components,
-            segments,
-        })
+        construction::segmented(layers, || Ok(segments.into_iter().collect()), None)
     }
 
     /// Returns the number of architecture-global layers represented here.
@@ -411,6 +349,12 @@ impl StateLayout {
         &self.layers
     }
 
+    /// Moves the validated schedule into an accounting or identity projection.
+    /// Components and segment metadata retire without cloning their payloads.
+    pub fn into_layers(self) -> LayerSchedule<LayerCachePolicy> {
+        self.layers
+    }
+
     /// Returns ordered named semantic components for one layer.
     pub fn components(&self, layer: usize) -> Option<&[StateComponentPolicy]> {
         self.components.get(layer).map(Vec::as_slice)
@@ -436,56 +380,28 @@ impl StateLayout {
     /// Expands architecture-declared segment frontiers into layer order.
     pub fn layer_prefix_offsets(&self) -> Vec<i32> {
         let mut offsets = Vec::with_capacity(self.len());
-        for segment in &self.segments {
-            offsets.extend(std::iter::repeat_n(
-                segment.processed_token_offset(),
-                segment.layers.len(),
-            ));
-        }
+        offsets.extend(self.iter_layer_prefix_offsets());
         offsets
+    }
+
+    /// Borrows the exact ordered prefix offsets without allocating an expanded
+    /// per-layer array. Cold comparison and admission use this same projection.
+    pub fn iter_layer_prefix_offsets(&self) -> impl Iterator<Item = i32> + '_ {
+        self.segments.iter().flat_map(|segment| {
+            std::iter::repeat_n(segment.processed_token_offset(), segment.layers.len())
+        })
     }
 
     /// Selects a contiguous architecture-global range while preserving the
     /// intersecting segment identities, lifetimes, and token frontiers.
     pub fn slice(&self, layers: Range<usize>) -> Result<Self, StateError> {
-        if layers.is_empty() || layers.end > self.len() {
-            return Err(StateError::InvalidLayoutSlice {
-                start: layers.start,
-                end: layers.end,
-                layers: self.len(),
-            });
-        }
-        let policies = self
-            .layers
-            .iter()
-            .skip(layers.start)
-            .take(layers.len())
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut segments = Vec::new();
-        for segment in &self.segments {
-            let start = segment.layers.start.max(layers.start);
-            let end = segment.layers.end.min(layers.end);
-            if start < end {
-                segments.push(StateSegmentSpec::new(
-                    segment.id.as_str(),
-                    start - layers.start..end - layers.start,
-                    segment.lifetime,
-                    segment.processed_token_offset,
-                )?);
-            }
-        }
-        Self::segmented(
-            LayerSchedule::new(policies.len(), policies)
-                .map_err(|error| StateError::InvalidResidency(error.to_string()))?,
-            segments,
-        )
+        construction::slice(self, layers, None)
     }
 }
 
 /// Concrete layer state capable of exposing backend-native retained tensors.
 pub trait RuntimeLayerState<B: NeuralBackend> {
-    /// Allocation-free iterator returned for one layer.
+    /// Borrowing iterator returned for one layer; construction may allocate.
     type RetainedValues<'a>: Iterator<Item = &'a B::Tensor>
     where
         Self: 'a,
@@ -493,6 +409,16 @@ pub trait RuntimeLayerState<B: NeuralBackend> {
 
     /// Borrows tensors that must remain alive through this layer's submission.
     fn retained_values(&self) -> Self::RetainedValues<'_>;
+
+    /// Visits the same retained layer values without cloning tensor handles.
+    /// The default preserves the iterator contract and may allocate its
+    /// container. Concrete owners can override this with a direct borrowed
+    /// traversal; the callback's own work remains the caller's responsibility.
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) {
+        for value in self.retained_values() {
+            visitor(value);
+        }
+    }
 }
 
 /// Reset capability for one concrete backend-native layer state.
@@ -540,6 +466,44 @@ pub trait RuntimeState<B: NeuralBackend> {
     /// override this method so generic session control never invents sentinel state geometry.
     fn optional_layout(&self) -> Option<&StateLayout> {
         Some(self.layout())
+    }
+
+    /// Exact immutable owner of this realization's live layout, when supplied.
+    ///
+    /// A borrowed layout alone does not establish shared storage custody. The
+    /// default reports no owner rather than wrapping or copying that borrow.
+    fn shared_layout(&self) -> Option<&SharedStateLayout> {
+        None
+    }
+
+    /// Visits every tensor retained directly by this state realization, across
+    /// its actual local slots, without reconstructing an execution-unit mapping.
+    /// Shared/invocation state slots are visited as owned storage, not once per
+    /// logical call; stateless realizations visit nothing. Errors make the whole
+    /// inventory incomplete, even when earlier values have already been visited.
+    ///
+    /// This grants no native completion or allocation authority. Independently
+    /// retained residency-manager buffers and host payloads remain separate
+    /// backend inventory obligations. Concrete iteration may allocate and must
+    /// be covered by the caller's original preparation controls where required.
+    fn visit_all_retained_values(
+        &self,
+        visitor: &mut dyn FnMut(&B::Tensor),
+    ) -> Result<(), StateError>;
+
+    /// Visits one unit's retention in the same order without cloning handles.
+    /// The default preserves the existing iterator. Concrete original state
+    /// owners override it to lend actual fields without a temporary container.
+    fn visit_unit_retained_values<'a>(
+        &'a self,
+        ordinal: usize,
+        address: crate::ExecutionUnitAddress,
+        visitor: &mut dyn FnMut(&'a B::Tensor),
+    ) -> Result<(), StateError> {
+        for value in self.retained_values(ordinal, address)? {
+            visitor(value);
+        }
+        Ok(())
     }
 
     /// Borrows tensors retained by one execution unit without cloning handles.
@@ -624,8 +588,9 @@ pub trait LayerRuntimeState<B: NeuralBackend>: RuntimeState<B> {
 /// Fully device-resident state with one concrete value per architecture layer.
 #[derive(Debug)]
 pub struct DeviceState<B: NeuralBackend, L> {
-    layout: Option<StateLayout>,
-    layers: Vec<L>,
+    layout: Option<SharedStateLayout>,
+    layers: Option<crate::HostSlotTable<L>>,
+    inference_retention: crate::working_memory::InferenceRetention,
     backend: PhantomData<fn() -> B>,
 }
 
@@ -633,24 +598,70 @@ impl<B: NeuralBackend, L: Clone> Clone for DeviceState<B, L> {
     fn clone(&self) -> Self {
         Self {
             layout: self.layout.clone(),
-            layers: self.layers.clone(),
+            layers: self
+                .layers
+                .as_ref()
+                .map(|table| crate::HostSlotTable::new(table.slots().to_vec().into_boxed_slice())),
+            inference_retention: self.inference_retention.clone(),
             backend: PhantomData,
         }
     }
 
     fn clone_from(&mut self, source: &Self) {
+        self.inference_retention
+            .restore_admission(&source.inference_retention);
         self.layout.clone_from(&source.layout);
-        self.layers.clone_from(&source.layers);
+        match (&mut self.layers, &source.layers) {
+            (Some(target), Some(source)) if target.len() == source.len() => {
+                target.slots_mut().clone_from_slice(source.slots());
+            }
+            (target, source) => {
+                *target = source.as_ref().map(|table| {
+                    crate::HostSlotTable::new(table.slots().to_vec().into_boxed_slice())
+                });
+            }
+        }
     }
 }
 
 impl<B: NeuralBackend, L> DeviceState<B, L> {
+    /// Actual fixed layer-slot metadata. This reports only the inline table;
+    /// nested layer resources and construction workspace require separate facts.
+    /// A token grants neither access to values nor allocation permission.
+    pub fn layer_slot_metadata(&self) -> Option<&crate::HostSlotMetadata> {
+        self.layers.as_ref().map(crate::HostSlotTable::metadata)
+    }
+
+    /// Borrows the actual layer table for closed same-type slot initialization.
+    /// This preserves an explicitly stateless state's absent table as `None`;
+    /// it does not manufacture an empty owner, copy elements, or grant funding.
+    /// Nested layer payload remains a separate native copy/inventory obligation.
+    pub fn prepare_layer_copy_slots(
+        &self,
+    ) -> Result<Option<crate::HostSlotInitialization<'_, L>>, crate::HostSlotInitializationError>
+    {
+        self.layers
+            .as_ref()
+            .map(crate::HostSlotTable::prepare_copy_slots)
+            .transpose()
+    }
+
     /// Realizes every layer through a backend-specific construction closure.
     pub fn create<E>(
         layout: StateLayout,
+        create: impl FnMut(usize, &LayerCachePolicy) -> Result<L, E>,
+    ) -> Result<Self, E> {
+        Self::create_with_shared_layout(SharedStateLayout::new(layout), create)
+    }
+
+    /// Realizes independent layer state while sharing the exact immutable layout
+    /// owner and any custody already attached to it. No layout payload is copied.
+    pub fn create_with_shared_layout<E>(
+        layout: SharedStateLayout,
         mut create: impl FnMut(usize, &LayerCachePolicy) -> Result<L, E>,
     ) -> Result<Self, E> {
         let layers = layout
+            .layout()
             .layers()
             .iter()
             .enumerate()
@@ -658,7 +669,31 @@ impl<B: NeuralBackend, L> DeviceState<B, L> {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             layout: Some(layout),
-            layers,
+            layers: Some(crate::HostSlotTable::new(layers.into_boxed_slice())),
+            inference_retention: crate::working_memory::InferenceRetention::new(),
+            backend: PhantomData,
+        })
+    }
+
+    /// Moves an existing fixed layer table into fresh runtime state without
+    /// allocating or cloning its payload or shared layout. The caller supplies
+    /// custody for nested values; this constructor grants no funding, native
+    /// completion or execution authority. Historical inference retention is
+    /// never inherited. A length mismatch retires the supplied owners normally.
+    pub fn from_prepared_layers(
+        layout: SharedStateLayout,
+        layers: crate::HostSlotTable<L>,
+    ) -> Result<Self, StateError> {
+        if layers.len() != layout.layout().len() {
+            return Err(StateError::PreparedLayerCount {
+                expected: layout.layout().len(),
+                actual: layers.len(),
+            });
+        }
+        Ok(Self {
+            layout: Some(layout),
+            layers: Some(layers),
+            inference_retention: crate::working_memory::InferenceRetention::new(),
             backend: PhantomData,
         })
     }
@@ -667,9 +702,24 @@ impl<B: NeuralBackend, L> DeviceState<B, L> {
     pub const fn stateless() -> Self {
         Self {
             layout: None,
-            layers: Vec::new(),
+            layers: None,
+            inference_retention: crate::working_memory::InferenceRetention::new(),
             backend: PhantomData,
         }
+    }
+}
+
+impl<B: NeuralBackend, L> crate::working_memory::InferenceStateRetention for DeviceState<B, L> {
+    fn inference_retention(&self) -> &crate::working_memory::InferenceRetention {
+        &self.inference_retention
+    }
+
+    fn inference_retention_mut(&mut self) -> &mut crate::working_memory::InferenceRetention {
+        &mut self.inference_retention
+    }
+
+    fn retain_inference(&mut self, request: &crate::working_memory::InferenceRequest) {
+        self.inference_retention.retain(request);
     }
 }
 
@@ -688,10 +738,25 @@ where
         self.layout
             .as_ref()
             .expect("layout requires a stateful DeviceState")
+            .layout()
     }
 
     fn optional_layout(&self) -> Option<&StateLayout> {
+        self.layout.as_ref().map(SharedStateLayout::layout)
+    }
+
+    fn shared_layout(&self) -> Option<&SharedStateLayout> {
         self.layout.as_ref()
+    }
+
+    fn visit_all_retained_values(
+        &self,
+        visitor: &mut dyn FnMut(&B::Tensor),
+    ) -> Result<(), StateError> {
+        for layer in self.as_ref() {
+            layer.visit_retained_values(visitor);
+        }
+        Ok(())
     }
 
     fn retained_values(
@@ -700,12 +765,12 @@ where
         _address: crate::ExecutionUnitAddress,
     ) -> Result<Self::RetainedValues<'_>, StateError> {
         let layer = ordinal;
-        self.layers
+        self.as_ref()
             .get(layer)
             .map(|layer| layer.retained_values())
             .ok_or(StateError::UnknownLayer {
                 layer,
-                count: self.layers.len(),
+                count: self.as_ref().len(),
             })
     }
 }
@@ -718,8 +783,8 @@ where
     type LayerState = L;
 
     fn layer(&mut self, layer: usize) -> Result<&mut Self::LayerState, StateError> {
-        let count = self.layers.len();
-        self.layers
+        let count = self.as_ref().len();
+        self.as_mut()
             .get_mut(layer)
             .ok_or(StateError::UnknownLayer { layer, count })
     }
@@ -735,12 +800,13 @@ where
             .layout
             .as_ref()
             .expect("stateful reset requires DeviceState layout")
+            .layout()
             .segment(segment)
             .map(StateSegmentSpec::layers)
             .ok_or_else(|| StateError::UnknownSegment {
                 segment: segment.clone(),
             })?;
-        for layer in &mut self.layers[range] {
+        for layer in &mut self.as_mut()[range] {
             layer.reset()?;
         }
         Ok(())
@@ -749,13 +815,17 @@ where
 
 impl<B: NeuralBackend, L> AsRef<[L]> for DeviceState<B, L> {
     fn as_ref(&self) -> &[L] {
-        &self.layers
+        self.layers
+            .as_ref()
+            .map_or(&[], crate::HostSlotTable::slots)
     }
 }
 
 impl<B: NeuralBackend, L> AsMut<[L]> for DeviceState<B, L> {
     fn as_mut(&mut self) -> &mut [L] {
-        &mut self.layers
+        self.layers
+            .as_mut()
+            .map_or(&mut [], crate::HostSlotTable::slots_mut)
     }
 }
 
@@ -790,23 +860,45 @@ impl ModelStateIdentity {
         sink_tokens: usize,
         topology: PromptCacheTopology,
     ) -> Result<Self, PromptCacheError> {
-        let model_family = model_family.into();
-        let effective_model_type = effective_model_type.into();
-        let architecture_fingerprint = architecture_fingerprint.into();
+        Self::new_with_diagnostic(
+            model_family.into(),
+            effective_model_type.into(),
+            architecture_fingerprint.into(),
+            layer_count,
+            global_layer_start,
+            sink_tokens,
+            topology,
+            |message| PromptCacheError::Malformed(message.to_string()),
+        )
+    }
+
+    /// Consumes actual architecture identity strings and preserves the same validation
+    /// ordering while allowing the owning caller to fund its diagnostic transport.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_diagnostic<E>(
+        model_family: String,
+        effective_model_type: String,
+        architecture_fingerprint: String,
+        layer_count: usize,
+        global_layer_start: usize,
+        sink_tokens: usize,
+        topology: PromptCacheTopology,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         if model_family.trim().is_empty()
             || effective_model_type.trim().is_empty()
             || architecture_fingerprint.trim().is_empty()
         {
-            return Err(PromptCacheError::Malformed(
-                "model-state identity strings must be non-empty".into(),
-            ));
+            return Err(error(format_args!(
+                "model-state identity strings must be non-empty"
+            )));
         }
         if layer_count == 0 || global_layer_start > layer_count {
-            return Err(PromptCacheError::Malformed(format!(
+            return Err(error(format_args!(
                 "model-state layer start {global_layer_start} is invalid for {layer_count} layers"
             )));
         }
-        topology.validate()?;
+        topology.validate_with_diagnostic(&mut error)?;
         Ok(Self {
             model_family,
             effective_model_type,
@@ -859,10 +951,22 @@ impl ModelStateIdentity {
     }
 }
 
-/// Invalid architecture state geometry or runtime access.
-#[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
+/// Invalid architecture state geometry, runtime access, or metadata construction.
+#[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum StateError {
+    /// Metadata construction failed before its next allocation or publication.
+    /// Keeps the original portable cause without allocating another wrapper.
+    #[error("workspace state construction failed: {0}")]
+    WorkspaceConstruction(#[source] eredu_nn::Error),
+    /// An existing fixed table does not realize the supplied layout.
+    #[error("prepared state table has {actual} layers, expected {expected}")]
+    PreparedLayerCount {
+        /// Number of actual architecture-declared local layers.
+        expected: usize,
+        /// Number of existing supplied slots.
+        actual: usize,
+    },
     /// A model declared no state-bearing layer slots.
     #[error("runtime state layout must contain at least one layer")]
     EmptyLayout,
@@ -975,6 +1079,48 @@ pub enum StateError {
     /// A fixed-state token frontier could not be advanced safely.
     #[error("invalid fixed-state advance: {0}")]
     InvalidAdvance(String),
+}
+
+impl From<eredu_nn::Error> for StateError {
+    fn from(cause: eredu_nn::Error) -> Self {
+        Self::WorkspaceConstruction(cause)
+    }
+}
+
+impl StateError {
+    pub(crate) fn workspace_invalid_layer(
+        context: &eredu_nn::workspace::WorkspaceContext,
+        layer: usize,
+        reason: std::fmt::Arguments<'_>,
+    ) -> Self {
+        match context.metadata_string(reason) {
+            Ok(reason) => Self::InvalidLayer { layer, reason },
+            Err(cause) => Self::WorkspaceConstruction(cause),
+        }
+    }
+
+    pub(crate) fn workspace_invalid_advance(
+        context: &eredu_nn::workspace::WorkspaceContext,
+        reason: std::fmt::Arguments<'_>,
+    ) -> Self {
+        match context.metadata_string(reason) {
+            Ok(reason) => Self::InvalidAdvance(reason),
+            Err(cause) => Self::WorkspaceConstruction(cause),
+        }
+    }
+
+    /// Returns the original workspace construction cause without adding an
+    /// allocating wrapper. Ordinary state-policy failures retain their typed
+    /// source through the existing diagnostic error representation.
+    pub fn into_workspace_error(
+        self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> eredu_nn::Error {
+        match self {
+            Self::WorkspaceConstruction(cause) => cause,
+            other => context.metadata_source(other),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1200,7 +1346,7 @@ mod tests {
             ],
         )
         .unwrap_err();
-        assert_eq!(gap, StateError::UnassignedStateLayer { layer: 1 });
+        assert!(matches!(gap, StateError::UnassignedStateLayer { layer: 1 }));
 
         let outside = StateLayout::segmented(
             four_layer_schedule(),
@@ -1208,5 +1354,49 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(outside, StateError::SegmentOutOfBounds { .. }));
+    }
+}
+
+#[cfg(test)]
+#[path = "state/prepared_layer_tests.rs"]
+mod prepared_layer_tests;
+
+#[cfg(test)]
+#[path = "state/retained_visit_tests.rs"]
+mod retained_visit_tests;
+
+impl<B: NeuralBackend + 'static, L: crate::working_memory::ResidentKvResetLayer>
+    crate::working_memory::ResidentKvResetState for DeviceState<B, L>
+{
+    type Layer = L;
+    type ResetPlan = ();
+    type ResetContext = ();
+    type Child = ();
+    fn resident_reset_layers(&self) -> &crate::HostSlotTable<L> {
+        self.layers
+            .as_ref()
+            .expect("selected state has actual layer table")
+    }
+    fn resident_reset_layout(&self) -> &SharedStateLayout {
+        self.layout
+            .as_ref()
+            .expect("selected state has actual shared layout")
+    }
+    fn resident_reset_global_start(&self) -> usize {
+        0
+    }
+    fn validate_resident_reset_layer(layer: &L, policy: &LayerCachePolicy) -> bool {
+        layer.matches_resident_reset(policy)
+    }
+    fn empty_resident_reset_layer(policy: &LayerCachePolicy) -> L {
+        L::empty_resident_reset(policy)
+    }
+    fn from_resident_reset(
+        layout: SharedStateLayout,
+        global_start: usize,
+        layers: crate::HostSlotTable<L>,
+    ) -> Self {
+        assert_eq!(global_start, 0, "DeviceState uses local layer ordinals");
+        Self::from_prepared_layers(layout, layers).expect("validated exact layer count")
     }
 }

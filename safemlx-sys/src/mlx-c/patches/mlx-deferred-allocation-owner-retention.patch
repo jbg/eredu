@@ -1,0 +1,189 @@
+diff --git a/mlx/array.h b/mlx/array.h
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -495,6 +495,12 @@
+   // Check if the array is a tracer array
+   bool is_tracer() const;
+ 
++  // Retain payload-free authority without evaluating this descriptor. The
++  // embedding runtime serializes encoding/attachment; payloads must not retain
++  // this graph. Native workers only use already-published backing ownership.
++  // Materialization publishes the authority to certified physical backing.
++  void retain_deferred_allocation_owner(std::shared_ptr<void> owner) const;
++
+   void set_data(allocator::Buffer buffer, Deleter d = allocator::free);
+ 
+   void set_data(
+@@ -530,6 +536,11 @@
+   ~array();
+ 
+  private:
++  using DeferredAllocationOwners = std::vector<std::shared_ptr<void>>;
++  void publish_deferred_allocation_owners(
++      const std::shared_ptr<Data>& data,
++      const std::shared_ptr<DeferredAllocationOwners>& owners) const;
++
+   // Initialize the arrays data
+   template <typename It>
+   void init(const It src);
+@@ -549,6 +560,12 @@
+     // Indicates an array is being used in a graph transform
+     // and should not be detached from the graph
+     bool is_tracer{false};
++
++    // Descriptor clones share this bundle before materialization. Data/host
++    // storage also owns it after publication, so detaching graph inputs never
++    // releases authority while native aliases or submission pins survive.
++    // It contains no array, primitive, descriptor or physical-storage roots.
++    std::shared_ptr<DeferredAllocationOwners> deferred_allocation_owners;
+ 
+     // This is a shared pointer so that *different* arrays
+     // can share the underlying data buffer.
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -1,8 +1,10 @@
+ // Copyright © 2023-2024 Apple Inc.
+ #include <functional>
++#include <stdexcept>
+ #include <unordered_map>
+ 
+ #include "mlx/array.h"
++#include "mlx/host_transfer.h"
+ #include "mlx/ops.h"
+ #include "mlx/primitives.h"
+ #include "mlx/submission.h"
+@@ -172,8 +174,60 @@
+       detail::retain_graph();
+ }
+ 
++void array::publish_deferred_allocation_owners(
++    const std::shared_ptr<Data>& data,
++    const std::shared_ptr<DeferredAllocationOwners>& owners) const {
++  if (!owners || !data) {
++    return;
++  }
++  if (!data->buffer.ptr() && size() == 0) {
++    return;
++  }
++  // Host storage can outlive every native Data wrapper. Certification here
++  // examines the named deleter directly; set_data runs before output status
++  // changes, and this path must never poll an event or evaluate another graph.
++  if (retain_host_transfer_backing_owner(data, owners)) {
++    return;
++  }
++  using NativeDeleter = void (*)(allocator::Buffer);
++  const auto* deleter = data->d.target<NativeDeleter>();
++  if (!deleter || *deleter != &allocator::free ||
++      !data->buffer.ptr() || data->allocation_generation == 0) {
++    throw std::runtime_error(
++        "Deferred allocation ownership requires certified owned backing.");
++  }
++  for (const auto& retained : data->allocation_owners) {
++    if (retained == owners) {
++      return;
++    }
++  }
++  data->allocation_owners.push_back(owners);
++}
++
++void array::retain_deferred_allocation_owner(std::shared_ptr<void> owner) const {
++  if (!owner) {
++    throw std::invalid_argument("Missing deferred allocation owner.");
++  }
++  auto owners = array_desc_->deferred_allocation_owners;
++  if (!owners) {
++    owners = std::make_shared<DeferredAllocationOwners>();
++  }
++  // Reserve before touching physical ownership. Once publication succeeds,
++  // insertion and descriptor installation cannot throw or consume ownership
++  // on a failed call. The C payload remains disarmed until this returns.
++  if (owners->size() == owners->max_size()) {
++    throw std::length_error("Too many deferred allocation owners.");
++  }
++  owners->reserve(owners->size() + 1);
++  publish_deferred_allocation_owners(array_desc_->data, owners);
++  owners->push_back(std::move(owner));
++  array_desc_->deferred_allocation_owners = std::move(owners);
++}
++
+ void array::set_data(allocator::Buffer buffer, Deleter d) {
+-  array_desc_->data = std::make_shared<Data>(buffer, d);
++  auto data = std::make_shared<Data>(buffer, d);
++  publish_deferred_allocation_owners(data, array_desc_->deferred_allocation_owners);
++  array_desc_->data = std::move(data);
+   submission::capture_data(array_desc_->data);
+   array_desc_->offset = 0;
+   array_desc_->data_size = size();
+@@ -190,7 +244,9 @@
+     Flags flags,
+     int64_t offset,
+     Deleter d) {
+-  array_desc_->data = std::make_shared<Data>(buffer, d);
++  auto data = std::make_shared<Data>(buffer, d);
++  publish_deferred_allocation_owners(data, array_desc_->deferred_allocation_owners);
++  array_desc_->data = std::move(data);
+   submission::capture_data(array_desc_->data);
+   array_desc_->offset = offset;
+   array_desc_->data_size = data_size;
+@@ -204,6 +260,8 @@
+     Flags flags,
+     size_t data_size,
+     int64_t offset /* = 0 */) {
++  publish_deferred_allocation_owners(
++      other.array_desc_->data, array_desc_->deferred_allocation_owners);
+   array_desc_->data = other.array_desc_->data;
+   array_desc_->strides = strides;
+   array_desc_->flags = flags;
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -33,6 +33,11 @@
+  * Caller serializes attachment. Does not evaluate or alter the buffer/deleter. */
+ MLX_API bool retain_host_transfer_allocation_owner(
+     const array& value, std::shared_ptr<void> owner);
++
++/** Internal publication while an output is being materialized. Certifies the
++ * shared host owner without depending on array status, evaluating or polling. */
++MLX_API bool retain_host_transfer_backing_owner(
++    const std::shared_ptr<array::Data>& data, std::shared_ptr<void> owner);
+ 
+ struct MLX_API HostTransferMemoryStats {
+   size_t active_bytes;
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -92,6 +92,11 @@
+     return generation_;
+   }
+   void retain_allocation_owner(std::shared_ptr<void> owner) {
++    for (const auto& retained : allocation_owners_) {
++      if (retained == owner) {
++        return;
++      }
++    }
+     allocation_owners_.push_back(std::move(owner));
+   }
+ 
+@@ -161,6 +166,21 @@
+   }
+   const auto* retained =
+       value.data_shared_ptr()->d.target<HostTransferArrayDeleter>();
++  retained->owner->retain_allocation_owner(std::move(owner));
++  return true;
++}
++
++bool retain_host_transfer_backing_owner(
++    const std::shared_ptr<array::Data>& data, std::shared_ptr<void> owner) {
++  if (!data) {
++    return false;
++  }
++  const auto* retained = data->d.target<HostTransferArrayDeleter>();
++  if (!retained || !retained->owner ||
++      data->buffer.ptr() != retained->owner->buffer().ptr() ||
++      retained->owner->allocation_generation() == 0) {
++    return false;
++  }
+   retained->owner->retain_allocation_owner(std::move(owner));
+   return true;
+ }

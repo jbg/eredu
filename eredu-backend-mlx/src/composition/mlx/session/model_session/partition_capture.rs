@@ -12,6 +12,14 @@ pub(super) struct LoadedPartitionCapture {
 }
 
 impl LoadedPartitionCapture {
+    /// Borrow only identities already established by loaded public discovery.
+    /// No source resolution, declaration clone or lazy metadata population.
+    pub(super) fn layouts(&self) -> &eredu_architectures::component_partition::ComponentPartitionLayouts {
+        &self.layouts
+    }
+    pub(super) fn source_labels(&self) -> (&str, &str, eredu_runtime::CommunicationSessionIdentity) {
+        (&self.discovery.artifact_identity, &self.execution, self.setup)
+    }
     pub(super) fn identity(
         &self,
         overlay: Option<&str>,
@@ -134,7 +142,7 @@ fn observer<'a>(
     .with_interventions()
 }
 
-struct RejectedCapture(CaptureError);
+struct RejectedCapture(CaptureError, Option<eredu_core::HostPreparationAuthority>);
 impl RuntimeActivationObserver<MlxTensor, Error> for RejectedCapture {
     fn transactional(&self) -> bool {
         true
@@ -144,10 +152,10 @@ impl RuntimeActivationObserver<MlxTensor, Error> for RejectedCapture {
         _: eredu_core::DistributedCommitEpoch,
         _: eredu_runtime::ExpertPass,
     ) -> Result<(), Error> {
-        Err(Error::observation(self.0.clone()))
+        Err(Error::observation(self.0.clone()).retain_ordinary_capture(self.1.clone()))
     }
     fn observe(&mut self, _: &str, _: &MlxTensor) -> Result<(), Error> {
-        Err(Error::observation(self.0.clone()))
+        Err(Error::observation(self.0.clone()).retain_ordinary_capture(self.1.clone()))
     }
 }
 
@@ -165,6 +173,7 @@ pub(super) fn with_observer<R>(
         &mut dyn RuntimeActivationObserver<MlxTensor, Error>,
     ) -> Result<R, Error>,
 ) -> Result<R, Error> {
+    let host = capture.ordinary_error_custody().cloned();
     let loaded = session.loaded_partition_capture();
     let transport = session.payload.distributed.clone();
     let mut observer: Box<dyn RuntimeActivationObserver<MlxTensor, Error> + '_> =
@@ -177,15 +186,20 @@ pub(super) fn with_observer<R>(
                     Ok(identity) => Box::new(observer(
                         capture, stream, domain, prediction, transport, loaded, identity,
                     )),
-                    Err(error) => Box::new(RejectedCapture(error)),
+                    Err(error) => Box::new(RejectedCapture(error, host.clone())),
                 }
             }
-            (_, Err(error)) => Box::new(RejectedCapture(error.clone())),
-            _ => Box::new(RejectedCapture(CaptureError::Invalid(
-                "native capture owner and retained placement disagree".into(),
-            ))),
+            (_, Err(error)) => Box::new(RejectedCapture(error.clone(), host.clone())),
+            _ => Box::new(RejectedCapture(
+                CaptureError::Invalid(
+                    "native capture owner and retained placement disagree".into(),
+                ),
+                host.clone(),
+            )),
         };
-    submit(session, &mut *observer)
+    let result = submit(session, &mut *observer);
+    drop(observer);
+    result.map_err(|error| error.retain_ordinary_capture(host))
 }
 
 #[cfg(test)]

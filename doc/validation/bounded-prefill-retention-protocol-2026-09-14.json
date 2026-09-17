@@ -1,0 +1,325 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T02:52:54.730479+00:00",
+  "scope": "Original-bank canonical chunk registration and successful-boundary ticket",
+  "status": "Verified neutral association protocol; native retirement integration and bounded inference remain unfinished",
+  "previous_increment": "bounded-observable-native-retirement-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 1070,
+      "ignored": 0
+    },
+    "runtime_integration": {
+      "passed": 68,
+      "ignored": 0
+    },
+    "backend_integration": {
+      "passed": 107,
+      "ignored": 0
+    },
+    "native_observation": {
+      "passed": 10,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 230,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1619,
+  "new_tests": [
+    "upcoming_epoch_check_is_readonly_and_rejects_the_last_counter_before_preparation",
+    "active_and_indeterminate_epochs_keep_original_rejection_before_guarded_work",
+    "bootstrap_before_claim_uses_exact_h_without_another_hold_and_short_h_rejects",
+    "bootstrap_rejects_foreign_request_pool_and_wrong_fixed_chunk_before_allocation",
+    "actual_source_chunk_epoch_and_slot_cannot_be_replaced_by_equal_geometry",
+    "escaped_registration_retains_original_h_and_channel_drop_quarantines_every_origin",
+    "source_health_is_rechecked_before_bootstrap_and_after_committed_association",
+    "last_registration_retains_original_h_after_certified_scope_teardown",
+    "actual_session_issues_final_ticket_before_outer_frame_commit",
+    "initial_cancel_never_bootstraps_or_claims",
+    "bootstrap_and_input_failures_keep_original_cause_without_frame_or_ticket",
+    "retirement_error_survives_guard_settlement_failure_and_aborts_sealed_frame",
+    "final_callback_cancellation_aborts_frame_after_one_ticket"
+  ],
+  "new_test_count": 13,
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T02:47:24.160048+00:00",
+      "elapsed_seconds": 17.753,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-retention-protocol-runtime.log",
+      "log_sha256": "919423c29d55b5691b11f9215337966fa4550e8164fde9768c56ac371cae02a7"
+    },
+    "runtime_integration": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test bounded_prefill",
+      "started_utc": "2026-09-14T02:47:41.913634+00:00",
+      "elapsed_seconds": 7.636,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-retention-protocol-runtime_integration.log",
+      "log_sha256": "297ecb65cfb3dd689c858d64eba53024d8ae7dfd19d1d23b24c126c1f2621bc8"
+    },
+    "backend_integration": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence",
+      "started_utc": "2026-09-14T02:49:29.010671+00:00",
+      "elapsed_seconds": 9.822,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-retention-protocol-backend_integration.log",
+      "log_sha256": "eb4ba81b26c554c5fb373bb99892380a5549d04bb80bddfb9455b481c385d20c"
+    },
+    "native_observation": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::observation:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T02:49:38.833760+00:00",
+      "elapsed_seconds": 96.329,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-retention-protocol-native_observation.log",
+      "log_sha256": "6ea3b4da6767da77ba00247f198d32670e06d37b1df653c4fce77bd6c140ae0d"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::model_session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T02:51:15.163797+00:00",
+      "elapsed_seconds": 14.356,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-retention-protocol-session.log",
+      "log_sha256": "f718ec378e71e21207a9442b6464bcb88bef60a939e70bc60a0779fdd60709be"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T02:51:29.520368+00:00",
+      "elapsed_seconds": 42.727,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-retention-protocol-portable.log",
+      "log_sha256": "e86508b32e8476ba62aecb9ffa570d6eeab2aea285ba1b8c70b940ac621a0a56"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T02:52:12.248545+00:00",
+      "elapsed_seconds": 17.481,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-retention-protocol-minimal.log",
+      "log_sha256": "56f1523e739d5eb7c6fc40232a4706665a0702b14486399535dc815ee2ebd98e"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T02:52:29.730500+00:00",
+      "elapsed_seconds": 20.156,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-retention-protocol-features.log",
+      "log_sha256": "71628e9d990fdfc3856d910bc28f7578b8e79f24f2aa9e32597e8455c074660c"
+    }
+  },
+  "source_sha256": {
+    "eredu-backend-mlx/src/composition/mlx/session/observation.rs": "f18571cd288148506b9d24214276c3193b732b09b633f35f9d4dc2803a1f5d21",
+    "eredu-backend-mlx/src/composition/mod.rs": "3c046afad6a3c7eef7953447f2dad2412d2383e64bef7dbc7f9ea4e29e7340f8",
+    "eredu-runtime/src/capture/funded.rs": "834c458689b41ae9e728b842a39b871ba5cd5258e6df889db2773ee77144daa2",
+    "eredu-runtime/src/capture/funded/observer.rs": "6ae497dfc6b63fc443612b1d73b6f1d17ed800ce86fdeb06862a2a2d34804b43",
+    "eredu-runtime/src/capture/funded/observer/prefill.rs": "9d05f857ced4715fd0f555009d0faf3eef7e60aff71468fbbd7b744a79613962",
+    "eredu-runtime/src/inspection.rs": "fd83a8011beda73ad816f61b2dcbdb26789c8db592a9f998421842e6dce687fd",
+    "eredu-runtime/src/inspection/error_bridge.rs": "d6c1084c10580592a2e2efdc2fb383d8fad1a3470b00e234c71b98a5a48a8082",
+    "eredu-runtime/src/inspection/prefill_retention.rs": "10f9e6c7f72125bd5aacb5213c09c7adbd0268f9e70c47c10d5d447f9b4ed9cd",
+    "eredu-runtime/src/replicated_session.rs": "ea4bc0f08b6a132e3c1722f56b17d6dfb0433d75a1fe318071be09f4d9645c42",
+    "eredu-runtime/src/replicated_session/prefill.rs": "fbaeb5046041fe893fe68788f4386fbdc33e5d24b63daec2ff1e94717a56e41e",
+    "eredu-runtime/src/replicated_session/prefill/retention_tests.rs": "67501025b35f7446c4fad20f75caa93309a85fc87fdcb69bbcc5dc4bd9a00c6d",
+    "eredu-runtime/src/working_memory.rs": "123b8c84acf5d6667803c35c4418a9af054a71c44241edf311b29273eac81ead",
+    "eredu-runtime/src/working_memory/capture_run.rs": "cfcaf4d81851308b2e76123ddb62fdaeaa2d8563ecbbf2ccca54ad4b02622ece",
+    "eredu-runtime/src/working_memory/capture_run/plan.rs": "072d383cb07ed21bc2080f5e538c12c923b08ec671aed554302b766affdbe483",
+    "eredu-runtime/src/working_memory/capture_run/prefill_source.rs": "7cb34593122248b461b5e011e836ded209e3497fe99005b95fdde0f271a84249",
+    "eredu-runtime/src/working_memory/capture_run/tests.rs": "f7b91aeba4c32f10a8f87ebe9ec544fa15cc0f454371b231d9145131f9925417",
+    "eredu-runtime/src/working_memory/capture_run/tests/retention.rs": "965a5874638a695789bda8232a1e163fdde8fff0704a18216ff8c9163064176d",
+    "eredu-runtime/src/working_memory/funding.rs": "ada7748dad3aeb11cc52c12918b30559bac3a6a0576f29788a503f53e3070a43",
+    "eredu-runtime/src/working_memory/funding/capture_source.rs": "d8d3796b7400c6bc1df5a7d3bbd384301929fdb5a598974f07197989c450a98d",
+    "eredu-runtime/src/working_memory/funding/capture_source/prefill.rs": "51625c5a8acc80540ad0af2f8b18d200765daa9fbd650da0aa76d80df473ea8f",
+    "eredu-runtime/tests/backend_independence/prepared_prefill_observation.rs": "2e7490b4f951b21d830277b78e335cfcec1bdf90bb2d8016b0174895d9db6836",
+    "eredu-runtime/tests/backend_independence/prepared_prefill_observation/retention.rs": "80c65dd027637aa713df98838376e03c6826937f3bbe431c437ddee28e8301aa",
+    "eredu-runtime/src/working_memory/capture_run/claims.rs": "8fd510b4b526beb65bd525d23a7cd3a450cb02d137406a0fd8c1c481608dc9f2",
+    "eredu-runtime/src/prefill.rs": "620b349362cceed91544892842716da2828560b513480dc16ebb5f19f5ee0944",
+    "doc/backend-architecture.md": "5835bf990b65a54984a4525eb6ff4c8a9bac7089d94d034d265945fa272a6116",
+    "doc/execution-control.md": "1deb48284047161af307e93e55120b28d25c6d7d2a39817ef8c0543d8253c519",
+    "doc/bounded-inference.md": "83cc5dea3223107bd65bfeb96a8e7cbe5179f5951bf47fb7964c767bca1cf2be"
+  },
+  "source_snapshot": "/private/tmp/eredu-prefill-retention-protocol-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage/README.md": "b2d9be76d04533377605715aacf82916968af452e2cb1d840c487856fba0ba53",
+    "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage/artifact-hashes.json": "50a6c940b1d305fbb9688b9bf3da4b8c7c5b59f7a2e04634ad669cabbef38bd3",
+    "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage/base-hashes.json": "7b29e3a5cb946bb62d21c6b2dde3df89c07275f7025efe57110c1d2718343669",
+    "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage/build.py": "fdfa97ec68bc65a02b3db4938e56f38d08597ecd018edae4ecb0826764e5f77d",
+    "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage/change.patch": "81c6f58b6bf6198d8386ef37d18a9aadbf0c0be85c2109470d586007e4634b4f",
+    "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage/checks.json": "43f90b2e74ec7abb039f770cbfa3e628a58d8c6a49e6b8a7d120e04bf66f6d7a",
+    "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage/dependencies.json": "f0e9124024109956a69024ccf1c57e6ba527c9bc9fe9a8e8144f583ecf18ca29",
+    "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage/doc-additions.json": "b575bd2b3f96d74c6699d2cb3593aa7318e89e33545795fffc091dc969a491e4",
+    "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage/files.txt": "5221ad67595fddf8a637d152f304b4dca7e9892a7f664409f21c1f0fed957b1b",
+    "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage/package.py": "4561741c3caac7389acae1cf568b07a478b0f3fc6d2d6cbf3ce9d1003cdcd97e",
+    "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage/staged-hashes.json": "a13d1a196967854a36e4a00465056514f36ce4b13be4d0ed9ed9030c76a31950",
+    "/private/tmp/eredu-prefill-retention-protocol-applied.json": "59a9ea0713a5b3e2a460d2b37259b51075c7c492a8d94fae0f4c6bd4b29551fd",
+    "/private/tmp/eredu-prefill-retention-protocol-assertions-stage/README.md": "d728156d78349ea20d794e501e9017abc163c95adc2acf3acbfd642f1908f888",
+    "/private/tmp/eredu-prefill-retention-protocol-assertions-stage/artifact-hashes.json": "4f43ef4773d56d93a57996a71ba463059f242b4d042bab2ba0a8947e23883e8d",
+    "/private/tmp/eredu-prefill-retention-protocol-assertions-stage/base-hashes.json": "d451a79a063a4df42ef88911d61a7a03b9bdd7e2f00386a7b39a943ff1cfd8b6",
+    "/private/tmp/eredu-prefill-retention-protocol-assertions-stage/build.py": "76dfa9e8d44155ef462e048bae5ed103178db137f3033d0b1587e596d4e59ea5",
+    "/private/tmp/eredu-prefill-retention-protocol-assertions-stage/change.patch": "099220381c19543845efc33a66d4ba9a9694533092a9d36a006470fbcc43f587",
+    "/private/tmp/eredu-prefill-retention-protocol-assertions-stage/checks.json": "cccc75dee125b5e2052c18c0cdf52eea9657f14aecd3221c1c78d030a9d5eb9d",
+    "/private/tmp/eredu-prefill-retention-protocol-assertions-stage/dependencies.json": "f5214177b8aec38e69dad46ebefda344020faa7800e542a8110345ab2108b34d",
+    "/private/tmp/eredu-prefill-retention-protocol-assertions-stage/files.txt": "a85c8bd74d3c0cd58ff72f872e99f179f071554bdce0a49ac8d9eb4a78ff76e5",
+    "/private/tmp/eredu-prefill-retention-protocol-assertions-stage/new-tests.json": "52c5c568c4d8cf8cf9909c2a4bb12bce04bb55830249d531fff0f267d51a546b",
+    "/private/tmp/eredu-prefill-retention-protocol-assertions-stage/package.py": "93a747d1cb8be2ae80a8efa28f4bb027048988a0bb427b82bc35a8d124b57813",
+    "/private/tmp/eredu-prefill-retention-protocol-assertions-stage/staged-hashes.json": "7a177f12bf5ea50fb68198823a09389104a73e0cca7d77386ec1816dde01dd8b",
+    "/private/tmp/eredu-prefill-retention-protocol-backend_integration.log": "eb4ba81b26c554c5fb373bb99892380a5549d04bb80bddfb9455b481c385d20c",
+    "/private/tmp/eredu-prefill-retention-protocol-backend_integration.log.prevalidation": "b832b45c8ceac4af946824dffa266af45a0a2f40edd0b390622ff18ecad3bdc9",
+    "/private/tmp/eredu-prefill-retention-protocol-cancellation-pre-model-shape.json": "73612a1895bb15cc7e96c13c0ed38f964745d5e98e6eafb01f9b7f942816b9ad",
+    "/private/tmp/eredu-prefill-retention-protocol-cancellation-pre-model-shape.log": "d8d5258f7ebaf637cfa62be1ffbca75c729c30913b2cd8a159d3c1bbcf039a7d",
+    "/private/tmp/eredu-prefill-retention-protocol-cancellation-red-applied.json": "55002974bb31ea2c4e58ceb94ee63c21aa255120e4864c276c5db32ac47b4f09",
+    "/private/tmp/eredu-prefill-retention-protocol-cancellation-red.json": "cc3a06440cd7d82bbff6c8a0dae08799907e9903953f5385cf75e85750c83e47",
+    "/private/tmp/eredu-prefill-retention-protocol-cancellation-red.log": "fc88d2a24e13827e3da077d51924f9c65510bac6bb99caf522ab4711413a8eeb",
+    "/private/tmp/eredu-prefill-retention-protocol-checks.json": "bbe8ef6e048d241ee4c0d8f5bdca2d9ef812eb108133ebce2665864de848dd12",
+    "/private/tmp/eredu-prefill-retention-protocol-compile-1.json": "30cec2cfb68805d952fd9c2a1ccbba1f1760aa40559f125d4c3b3a4d3b930e25",
+    "/private/tmp/eredu-prefill-retention-protocol-compile-1.log": "286f06bbc308967422a3815fde3ad234e38b53c3cd62e3b338d3078b75cb5c3a",
+    "/private/tmp/eredu-prefill-retention-protocol-compile-2.json": "dd1a51f92cd530ccb69a195b7630d1c40817f4b8c34c322b08d1f2e20e1f8178",
+    "/private/tmp/eredu-prefill-retention-protocol-compile-2.log": "82c37640b3489854fc8b3073a407f163c93545433763144ba6adfeef4110fce3",
+    "/private/tmp/eredu-prefill-retention-protocol-features.log": "71628e9d990fdfc3856d910bc28f7578b8e79f24f2aa9e32597e8455c074660c",
+    "/private/tmp/eredu-prefill-retention-protocol-files.txt": "780ee66d26f353d4c127defdd73eca18c3f21a1b7ea10f8dfe29022a48c577f8",
+    "/private/tmp/eredu-prefill-retention-protocol-fixture-shape-failure.json": "1d322cf9588e60a06042fce010212994ec92a0fb46a9fa631aa9cf0a31965349",
+    "/private/tmp/eredu-prefill-retention-protocol-fixture-shape-failure.log": "b832b45c8ceac4af946824dffa266af45a0a2f40edd0b390622ff18ecad3bdc9",
+    "/private/tmp/eredu-prefill-retention-protocol-fixture-shape-stage/README.md": "cff65d154ba9fa22b4b686af4b7a77ab55ff809d6f361168c957abab50088f03",
+    "/private/tmp/eredu-prefill-retention-protocol-fixture-shape-stage/base-hashes.json": "2368c416d7c94231e5e432cafca3a1ab0ceabb599c0848b97ac7ecb959e58bd4",
+    "/private/tmp/eredu-prefill-retention-protocol-fixture-shape-stage/change.patch": "2b9cc0a9fd25912b47588d0151f677cbe81a8579b99cbc6bd30d9918ce970dc6",
+    "/private/tmp/eredu-prefill-retention-protocol-fixture-shape-stage/staged-hashes.json": "614db3973cf4204a8720f272c3daa298c36226f3abdf81aeeab84daa310b2d01",
+    "/private/tmp/eredu-prefill-retention-protocol-minimal.log": "56f1523e739d5eb7c6fc40232a4706665a0702b14486399535dc815ee2ebd98e",
+    "/private/tmp/eredu-prefill-retention-protocol-native_observation.log": "6ea3b4da6767da77ba00247f198d32670e06d37b1df653c4fce77bd6c140ae0d",
+    "/private/tmp/eredu-prefill-retention-protocol-new-tests.json": "202eafc5294e927d446f1069e2dcc78e6441274475d02ebc9a5364544de959e8",
+    "/private/tmp/eredu-prefill-retention-protocol-portable.log": "e86508b32e8476ba62aecb9ffa570d6eeab2aea285ba1b8c70b940ac621a0a56",
+    "/private/tmp/eredu-prefill-retention-protocol-privacy-stage/README.md": "5155175f49ffdabfae040db7c473f28e275acfd7a43d41dabbcb927058c0adda",
+    "/private/tmp/eredu-prefill-retention-protocol-privacy-stage/base-hashes.json": "7d1af1bdfb529eb2ec7b79bbe90065de15739f43ce355cce839e4d9e2b9059cd",
+    "/private/tmp/eredu-prefill-retention-protocol-privacy-stage/change.patch": "d9144657beae66dd9dbca0800d23872ae9d9e273f05cf6aba9dd88a24aff745a",
+    "/private/tmp/eredu-prefill-retention-protocol-privacy-stage/staged-hashes.json": "d6aa085f5d13275d10a235d119a6be46567bd15645431e3c2bb3f5a156755ab0",
+    "/private/tmp/eredu-prefill-retention-protocol-red-applied.json": "b6c8e69fe825e468e2312be6d680e78d4c1121ce792569859d5ed72243262be3",
+    "/private/tmp/eredu-prefill-retention-protocol-red.py": "68ada687d688d9978efcf41c649287c2af37df33bb916ff36d0d9a56a72ce730",
+    "/private/tmp/eredu-prefill-retention-protocol-review-hashes.json": "8b1de64cd328e4c724b7f26525d1095f5e33a5c60a625e59fba24c177f28a852",
+    "/private/tmp/eredu-prefill-retention-protocol-review.json": "1c2d830765dd14094655f45ed78a9714539e043d3bdb7d3c07c4e0a1abc79d7e",
+    "/private/tmp/eredu-prefill-retention-protocol-review.md": "352f9ad4c023cdd4213f1cf8d81f4b376bb8a9a0db4bc46a5d24950f046d6bb6",
+    "/private/tmp/eredu-prefill-retention-protocol-runtime.log": "919423c29d55b5691b11f9215337966fa4550e8164fde9768c56ac371cae02a7",
+    "/private/tmp/eredu-prefill-retention-protocol-runtime.log.prevalidation": "82c37640b3489854fc8b3073a407f163c93545433763144ba6adfeef4110fce3",
+    "/private/tmp/eredu-prefill-retention-protocol-runtime_integration.log": "297ecb65cfb3dd689c858d64eba53024d8ae7dfd19d1d23b24c126c1f2621bc8",
+    "/private/tmp/eredu-prefill-retention-protocol-session.log": "f718ec378e71e21207a9442b6464bcb88bef60a939e70bc60a0779fdd60709be",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/README.md": "0e0b600fbf18fb4aee98bc375b52405a6ed981ca2399465d92834ae2fc7b7a9b",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/base-hashes.json": "6014d38a3d5825a127edaf4f4d207212dae2b646f312d50346110af194b9a7d1",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/change.patch": "2143ffa770afc229cc92a9225539dd44170d2919b753af6ad0f5995b919c388d",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/checks.json": "34f543dba5ec4645b92d935a38a096e42b5e2d15acb62166492a4533993e5d5a",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/dependencies.json": "f7ab64ef0c4a70875d9870dd2b0a4936783e78af54bd1dfa3f2eec5d6e390f5b",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/dependency-51.json": "64c23787ed273ce9ba5b88f2238ca34649531fc0da1cdda341daf4679e31f7bf",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/doc-additions.json": "786af82bdacdbcaab7dd4535b61c3f905922852bdae65532e9371d1d40f40e33",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/files.txt": "8ec1e48f580f04a5f19283f4d9e1bfcb33dd447b01f4cffbe476c7f2206845c3",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/initial-files.txt": "a653cb9992c23c7ef7e6365758cfc520e5fa201e08b3fc9eb8fed124adf8f8c5",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/package.py": "c78ac31f29058049984eaa5fb9bd7cc8eaa58c3f210fe59fb48121784023959e",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/staged-hashes.json": "2a678843a4b39638f5072d380c1cfcfaaad77803e22b7b41d84f1f23d8df5e66",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/tests.json": "3f60208d3bf25c4f33f8379abeee336c6001aa001d2640df6b855371b4c890e0",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/write_callbacks.py": "84cbdfc200fbc986d9e0a93b5ab1420da2bd48347f282bde9998f7bb079f1c00",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/write_foundation.py": "f1c56af0ee6ed7a9ddfd083cc0c30cfd6126b8772237040d3050a886d29f40aa",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/write_integration_tests.py": "59d4aa8698d97ff4e75218aaa2cdb0e75cb016db4133682ba8a1977119b81498",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/write_runtime.py": "f2861a098d4346c53efdb8459041a08d7d3885e4f14c62d60ff354e63e38e446",
+    "/private/tmp/eredu-prefill-retention-protocol-stage/write_tests.py": "fc369987247852677628b3cfd9ac0aaaa7b0bf2977ba1c58c6b39540fd0d3ec4",
+    "/private/tmp/eredu-prefill-retention-protocol-test-compile-stage/README.md": "4d0ccd3102fde810a794a814d8c30f1edc886aad293ce2bbea1626ae92bf3003",
+    "/private/tmp/eredu-prefill-retention-protocol-test-compile-stage/base-hashes.json": "0fa7b738797d37dbc6076363a36c86e6f11bce58f5ce0c5c4398563ac0c091d2",
+    "/private/tmp/eredu-prefill-retention-protocol-test-compile-stage/change.patch": "969286c5130c814fd9d2b6e131a14586d74ed65fad98d94eec0961ac1ee4151a",
+    "/private/tmp/eredu-prefill-retention-protocol-test-compile-stage/staged-hashes.json": "857f5e60bdd02e670bf2d8ece1dd0abfe811de644de63f09bd33467a061f6533",
+    "/private/tmp/eredu-prefill-retention-protocol-validate.py": "12c1f060fec78c62572228fe92b7e1ca0c3fa2687dd513915b4bed3c8b257448"
+  },
+  "review": {
+    "review": "Root read full22-file A diff,13 combined tests, assertion overlay, fresh-token two-file correction, narrow private-bootstrap correction, documentation and independent reviews. Actual final-callback cancellation regression reproduced after compilation correction, before timing fix.",
+    "independent_reviews": {
+      "/private/tmp/eredu-prefill-retention-protocol-review.md": "352f9ad4c023cdd4213f1cf8d81f4b376bb8a9a0db4bc46a5d24950f046d6bb6",
+      "/private/tmp/eredu-prefill-retention-supplements-review.md": "e3ccaa090fd188006104f5a0f249e11429b543e2bc7be4521093a4800ffced53"
+    },
+    "behavior": [
+      "Runtime alone issues exact request/chunk/epoch context; original bank bootstrap spends no frame or tensor claim.",
+      "Exact committed model epoch and both successful existing guard completions precede the one-use ticket. Post-chunk callback consumes it under existing cancellation reservation.",
+      "The shared driver retains live cancellation-token access through callback/readiness and samples immediately before the existing vote. Legacy boolean overrides preserve behavior.",
+      "All available rejected guards settle and original callback errors survive secondary failure. No source release, credit or native completion is inferred from the ticket.",
+      "Source/control representations and stamped identity retain original cumulative H; one slot at a time remains a future C invariant."
+    ],
+    "corrections": [
+      {
+        "kind": "compile",
+        "evidence": "/private/tmp/eredu-prefill-retention-protocol-compile-1.json",
+        "details": "Initial compilation found private sibling access to ScheduledCaptureStep.claim. Move its method to claims and use a narrow capture_run-private constructor; private fields and validation stay unchanged.",
+        "stage": "/private/tmp/eredu-prefill-retention-protocol-privacy-stage"
+      },
+      {
+        "kind": "behavior",
+        "evidence": "/private/tmp/eredu-prefill-retention-protocol-cancellation-red.json",
+        "details": "Actual SessionPrefill final callback cancelled the token but stale pre-callback boolean allowed completion. Add token-aware executor default and sample after callback/readiness before the same vote; one shared implementation.",
+        "stage": "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage"
+      },
+      {
+        "kind": "test compile",
+        "evidence": "/private/tmp/eredu-prefill-retention-protocol-compile-2.json",
+        "details": "Use real bootstrap behavior for private funding-slot assertions and drop exclusive step before bank. No production visibility change.",
+        "stage": "/private/tmp/eredu-prefill-retention-protocol-test-compile-stage"
+      },
+      {
+        "kind": "fixture geometry",
+        "evidence": "/private/tmp/eredu-prefill-retention-protocol-fixture-shape-failure.json",
+        "details": "Mock architecture executes one position; use matching one-position Sequence admission. Prior cancellation failure occurred before callback and was not the intended behavioral reproduction. Repeat exact pre-fix test after shape correction.",
+        "stage": "/private/tmp/eredu-prefill-retention-protocol-fixture-shape-stage"
+      }
+    ],
+    "limits": [
+      "Selected split-prefill gates remain unchanged; no native fragment transfer or carrier retirement claim.",
+      "Completion-guard creation failure preserves early fence/return; initial and completion guard creation still need a mechanism-owned distributed-retention/terminal-failure contract.",
+      "New canonical integration tests run one Sequence chunk with a deliberately unemitted hook and neutral scalar mechanisms. No released-checkpoint/native-distributed result."
+    ]
+  },
+  "corrections": [
+    {
+      "kind": "compile",
+      "evidence": "/private/tmp/eredu-prefill-retention-protocol-compile-1.json",
+      "details": "Initial compilation found private sibling access to ScheduledCaptureStep.claim. Move its method to claims and use a narrow capture_run-private constructor; private fields and validation stay unchanged.",
+      "stage": "/private/tmp/eredu-prefill-retention-protocol-privacy-stage"
+    },
+    {
+      "kind": "behavior",
+      "evidence": "/private/tmp/eredu-prefill-retention-protocol-cancellation-red.json",
+      "details": "Actual SessionPrefill final callback cancelled the token but stale pre-callback boolean allowed completion. Add token-aware executor default and sample after callback/readiness before the same vote; one shared implementation.",
+      "stage": "/private/tmp/eredu-prefill-retention-fresh-cancellation-stage"
+    },
+    {
+      "kind": "test compile",
+      "evidence": "/private/tmp/eredu-prefill-retention-protocol-compile-2.json",
+      "details": "Use real bootstrap behavior for private funding-slot assertions and drop exclusive step before bank. No production visibility change.",
+      "stage": "/private/tmp/eredu-prefill-retention-protocol-test-compile-stage"
+    },
+    {
+      "kind": "fixture geometry",
+      "evidence": "/private/tmp/eredu-prefill-retention-protocol-fixture-shape-failure.json",
+      "details": "Mock architecture executes one position; use matching one-position Sequence admission. Prior cancellation failure occurred before callback and was not the intended behavioral reproduction. Repeat exact pre-fix test after shape correction.",
+      "stage": "/private/tmp/eredu-prefill-retention-protocol-fixture-shape-stage"
+    }
+  ],
+  "red_regression": {
+    "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence prepared_prefill_observation::retention::final_callback_cancellation_aborts_frame_after_one_ticket -- --exact --nocapture",
+    "started_utc": "2026-09-14T02:48:41.451563+00:00",
+    "elapsed_seconds": 9.733973958995193,
+    "exit_code": 101,
+    "log": "/private/tmp/eredu-prefill-retention-protocol-cancellation-red.log",
+    "log_sha256": "fc88d2a24e13827e3da077d51924f9c65510bac6bb99caf522ab4711413a8eeb"
+  },
+  "behavior": [
+    "Claim-free bootstrap joins actual scheduled source/account, original active native scope and canonical request/chunk/upcoming epoch.",
+    "Registration cannot clear pins. The exact committed epoch and both successful guard settlements precede one-use ticket creation.",
+    "Post-chunk cancellation readiness consumes the ticket under its existing guard, including after a final provisional host frame.",
+    "The reproduced final-callback cancellation gap is fixed by reading the live shared token after retirement/readiness and before the existing vote; legacy boolean callbacks remain compatible.",
+    "New typed retention input failures enter the same original transaction/input agreement; available rejected guards explicitly settle and original callback errors survive secondary failures.",
+    "All observer/error adapters forward additive callbacks. Source-slot/fragment/ticket checks remain read-only, with actual controls included in original H."
+  ],
+  "limits": [
+    "No native carrier, source-pin release, byte refund, certification, next-chunk budget reuse or managed selected-prefill activation is implemented.",
+    "Failed completion-agreement guard creation preserves the existing fenced early return; a retained distributed-failure handoff is still required. Initial guard creation has the same inherited contract gap.",
+    "New real-session tests use one selected full-sequence chunk with scalar neutral mechanisms and no emitted numerical hook; they do not establish split-prefill or native fragment equivalence.",
+    "H covers one stamped slot at a time; future replacement must consume and drop the previous identity rather than accumulate escaped chunk stamps.",
+    "No released-checkpoint or native distributed measurement is added."
+  ]
+}

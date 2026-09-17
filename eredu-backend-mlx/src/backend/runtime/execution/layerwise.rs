@@ -6,7 +6,7 @@
 use eredu_checkpoint::recipe::DerivedWeightRecipe;
 use eredu_checkpoint::{
     recipe::RecipeDtype,
-    store::{SafetensorsWeightStore, SharedCheckpointSource, TensorSelection},
+    store::{RetainedCheckpointSource, SafetensorsWeightStore, TensorSelection},
     WeightQuantization,
 };
 use eredu_runtime::{
@@ -42,6 +42,10 @@ use eredu_nn::{LinearCompanionRole, ParameterMetadata, ParameterVisitor, Paramet
 use eredu_runtime::WeightMaterializationReport;
 
 mod dense_stream;
+pub(crate) use dense_stream::{
+    dense_window_names, DenseControllerHandle, OriginalDenseControllerFacts,
+    PreparedDenseController, PreparedDenseControllerError,
+};
 pub use dense_stream::{
     open_safetensors_weight_store, DensePreparedTransfer, DenseStreamController,
     DenseStreamForwardGuard, DenseStreamGroupGuard, DenseTransferWindow,

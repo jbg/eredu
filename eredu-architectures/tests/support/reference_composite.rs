@@ -23,6 +23,20 @@ impl eredu_runtime::RuntimeState<ReferenceBackend> for ReferencePredictionState 
         &self.layout
     }
 
+    fn visit_all_retained_values(
+        &self,
+        visitor: &mut dyn FnMut(&ReferenceTensor),
+    ) -> Result<(), eredu_runtime::StateError> {
+        for layer in &self.layers {
+            for value in
+                eredu_runtime::RuntimeLayerState::<ReferenceBackend>::retained_values(layer)
+            {
+                visitor(value);
+            }
+        }
+        Ok(())
+    }
+
     fn retained_values(
         &self,
         _ordinal: usize,
@@ -52,6 +66,36 @@ impl<M> AsMut<M> for ReferencePredictionModule<M> {
 
 struct ReferencePredictionMaterializer;
 
+/// Snapshot authority deliberately has a different type from the tensor stream.
+#[derive(Clone, Copy, Default)]
+struct ReferencePredictionSnapshotContext<'a> {
+    marker: u64,
+    observed: Option<&'a RefCell<Vec<(&'static str, u64)>>>,
+}
+
+impl ReferencePredictionSnapshotContext<'_> {
+    fn record(self, member: &'static str) {
+        if let Some(observed) = self.observed {
+            observed.borrow_mut().push((member, self.marker));
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ReferenceEmbeddedContext<'a> {
+    stream: &'a (),
+    snapshot: ReferencePredictionSnapshotContext<'a>,
+}
+
+impl Default for ReferenceEmbeddedContext<'_> {
+    fn default() -> Self {
+        Self {
+            stream: &(),
+            snapshot: ReferencePredictionSnapshotContext::default(),
+        }
+    }
+}
+
 struct ReferencePredictionMaterializationContext<'a> {
     store: &'a dyn eredu_checkpoint::store::CheckpointSource,
 }
@@ -65,6 +109,7 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
     type SequentialState = ReferenceCache;
     type ModelState = ReferencePredictionState;
     type Context<'a> = ReferencePredictionMaterializationContext<'a>;
+    type SnapshotContext<'a> = ReferencePredictionSnapshotContext<'a>;
 
     fn complete_prediction_values<'a>(
         values: impl IntoIterator<Item = &'a ReferenceTensor>,
@@ -196,6 +241,30 @@ impl eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
             fixed: None,
         }
     }
+
+    fn sequential_snapshot<'a>(
+        state: &Self::SequentialState,
+        context: Self::SnapshotContext<'a>,
+    ) -> Result<Option<Self::SequentialState>, eredu_core::BackendFailure> {
+        context.record("sequential");
+        Ok(Some(state.clone()))
+    }
+
+    fn pooling_snapshot<'a>(
+        state: &Self::PoolingState,
+        context: Self::SnapshotContext<'a>,
+    ) -> Result<Option<Self::PoolingState>, eredu_core::BackendFailure> {
+        context.record("pooling");
+        Ok(Some(state.clone()))
+    }
+
+    fn model_snapshot<'a>(
+        state: &Self::ModelState,
+        context: Self::SnapshotContext<'a>,
+    ) -> Result<Option<Self::ModelState>, eredu_core::BackendFailure> {
+        context.record("model");
+        Ok(Some(state.clone()))
+    }
 }
 
 struct ReferenceReplicatedMechanisms;
@@ -204,6 +273,28 @@ impl<A> ReplicatedTextSessionMechanisms<A, ReferenceBackend> for ReferenceReplic
 where
     A: eredu_runtime::LayeredArchitecture<ReferenceBackend, ReferenceState, Error = Error>,
 {
+    fn prefill_state_frontier(&self, state: &Self::State) -> Result<Option<u64>, Self::Error> {
+        state
+            .as_ref()
+            .first()
+            .map(|layer| u64::try_from(layer.offset).map_err(Error::backend))
+            .transpose()
+    }
+
+    type PrefillReservationGuard = eredu_runtime::working_memory::InferenceRequest;
+    fn begin_prefill_reservation(
+        &mut self,
+        reservation: Self::PrefillReservationGuard,
+    ) -> Result<Self::PrefillReservationGuard, Self::Error> {
+        Ok(reservation)
+    }
+    fn finish_prefill_reservation(
+        &mut self,
+        _guard: Self::PrefillReservationGuard,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     type State = ReferenceState;
     type PolicyError = eredu_runtime::ResidentUnitWindowError;
     type ResidentPolicy = ResidentUnitWindow<A::Unit>;
@@ -282,7 +373,7 @@ where
         Ok(output)
     }
 
-    fn checkpoint_state(
+    fn copy_checkpoint_state(
         &mut self,
         state: &Self::State,
         _: &(),
@@ -290,7 +381,7 @@ where
         Ok(state.clone())
     }
 
-    fn restore_state(
+    fn restore_checkpoint_state(
         &mut self,
         state: &mut Self::State,
         checkpoint: Self::StateCheckpoint,
@@ -342,7 +433,7 @@ where
 
     fn complete(
         &mut self,
-        _: &ReferenceTensor,
+        _: Option<&ReferenceTensor>,
         _: &Self::State,
         _: &(),
     ) -> Result<(), Self::Error> {
@@ -384,6 +475,7 @@ impl eredu_runtime::PreparedInputInspector<ReferenceTensor> for ReferenceInputIn
 struct ReferencePreparedInput {
     input: eredu_runtime::PreparedModelInput<ReferenceTensor>,
     identity: eredu_runtime::PreparedInputCacheIdentity,
+    chunk: Option<std::num::NonZeroU64>,
 }
 
 impl ReferencePreparedInput {
@@ -402,7 +494,11 @@ impl ReferencePreparedInput {
         let identity = input
             .cache_identity(format!("reference-tokens-{tokens:?}"))
             .map_err(|error| Error::backend(error.to_string()))?;
-        Ok(Self { input, identity })
+        Ok(Self {
+            input,
+            identity,
+            chunk: None,
+        })
     }
 }
 
@@ -420,6 +516,42 @@ where
     A: eredu_runtime::ReplicatedTextArchitecture<ReferenceBackend, S, Error = Error>,
 {
     type Input = ReferencePreparedInput;
+
+    type Prefill =
+        eredu_architectures::speculative_execution::TextPredictionPrefill<ReferenceTensor>;
+
+    fn with_prefill_source<R>(
+        &mut self,
+        input: Self::Input,
+        _: &(),
+        operation: impl FnOnce(Result<Self::Prefill, Error>) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let prepared = input
+            .input
+            .parts()
+            .iter()
+            .map(|part| match part.payload() {
+                eredu_runtime::PreparedInputPayload::TokenIds(tokens) => Ok(tokens.clone()),
+                _ => Err(Error::backend(
+                    "reference prediction input is not token IDs",
+                )),
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(|tokens| {
+                eredu_architectures::speculative_execution::TextPredictionPrefill::new(
+                    tokens,
+                    Some(eredu_runtime::SharedPreparedInputCacheIdentity::new(
+                        input.identity.clone(),
+                    )),
+                    input.chunk,
+                )
+            });
+        operation(prepared)
+    }
+
+    fn requested_chunks(input: &Self::Input) -> Option<std::num::NonZeroU64> {
+        input.chunk
+    }
 
     fn with_prefill<R>(
         &mut self,
@@ -465,7 +597,7 @@ impl eredu_architectures::speculative_execution::EmbeddedExecutorTypes
 {
     type Input = ReferencePreparedInput;
     type Logits = u32;
-    type Context<'a> = ();
+    type Context<'a> = ReferenceEmbeddedContext<'a>;
     type Completion = ReferenceExternalCompletion;
     type Telemetry = ();
     type Error = Error;
@@ -492,12 +624,40 @@ where
     type ExecutorTypes = ReferenceEmbeddedExecutorTypes;
 
     fn executor_context<'a>(
-        _: <Self::ExecutorTypes as eredu_architectures::speculative_execution::EmbeddedExecutorTypes>::Context<'a>,
+        context: <Self::ExecutorTypes as eredu_architectures::speculative_execution::EmbeddedExecutorTypes>::Context<'a>,
     ) -> <ReferenceEmbeddedMechanisms as eredu_architectures::speculative_execution::SpeculativeTensorMechanisms>::Context<'a>{
+        context
     }
 
-    fn target_context<'a>(_: ()) -> &'a () {
-        &()
+    fn target_context<'a>(
+        context: <ReferenceEmbeddedMechanisms as eredu_architectures::speculative_execution::SpeculativeTensorMechanisms>::Context<'a>,
+    ) -> &'a () {
+        context.stream
+    }
+
+    fn prediction_snapshot_context<'a>(
+        context: <ReferenceEmbeddedMechanisms as eredu_architectures::speculative_execution::SpeculativeTensorMechanisms>::Context<'a>,
+    ) -> <Self as eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
+        ReferenceBackend,
+    >>::SnapshotContext<'a>
+    where
+        Self: eredu_architectures::prediction_extension::PredictionExtensionMaterializer<
+            ReferenceBackend,
+        >,
+        ReferenceBackend: eredu_nn::BlockwiseAttentionBackend
+            + eredu_nn::DistributedNeuralBackend
+            + eredu_nn::GroupedNeuralBackend
+            + eredu_nn::HyperNeuralBackend,
+    {
+        context.snapshot
+    }
+
+    fn control_state_snapshot<'a>(
+        state: &S,
+        context: ReferenceEmbeddedContext<'a>,
+    ) -> Result<Option<S>, eredu_core::speculative::SpeculativeControlError> {
+        context.snapshot.record("target");
+        Ok(Some(state.clone()))
     }
 
     fn checkpoint(state: &S) -> Result<S, Error> {
@@ -518,7 +678,7 @@ where
         u64::try_from(position).map_err(Error::backend)
     }
 
-    fn token(_: u32, _: &()) -> Result<ReferenceTensor, Error> {
+    fn token(_: u32, _: ReferenceEmbeddedContext<'_>) -> Result<ReferenceTensor, Error> {
         Ok(ReferenceTensor(vec![1, 1]))
     }
 
@@ -548,7 +708,7 @@ impl eredu_architectures::speculative_execution::SpeculativeTensorMechanisms
 {
     type Tensor = ReferenceTensor;
     type Logits = u32;
-    type Context<'a> = ();
+    type Context<'a> = ReferenceEmbeddedContext<'a>;
     type Completion = ReferenceExternalCompletion;
     type Error = Error;
 
@@ -590,6 +750,10 @@ impl eredu_architectures::speculative_execution::SpeculativeTensorMechanisms
             .copied()
             .ok_or_else(|| Error::backend("reference embedded tensor has no sequence axis"))
             .and_then(|value| usize::try_from(value).map_err(Error::backend))
+    }
+
+    fn selected_prefill_logits(_: Self::Tensor) -> Result<Self::Logits, Self::Error> {
+        Ok(2)
     }
 
     fn logits_row<'a>(
@@ -691,6 +855,11 @@ impl ExactReferenceCaptureObserver {
 }
 
 impl eredu_runtime::ActivationObserver<ReferenceTensor, Error> for ExactReferenceCaptureObserver {
+    fn requires_sequence_readout(&self) -> bool {
+        self.paths
+            .iter()
+            .any(|path| path == eredu_core::MODEL_LOGITS_OBSERVATION_PATH)
+    }
     fn observe(&mut self, path: &str, value: &ReferenceTensor) -> Result<(), Error> {
         if let Some(index) = self.paths.iter().position(|expected| expected == path) {
             if self.values.borrow_mut()[index]
@@ -718,6 +887,8 @@ where
     A::InputPartPlan: 'static,
 {
     type Output = ReferenceTensor;
+
+    fn preserves_architecture_declarations(&self) -> bool { true }
 
     fn apply(
         self,
@@ -751,6 +922,20 @@ trait ReferenceExternalTarget {
             ReferenceTensor,
             ExternalPredictionTargetCapture<ReferenceTensor>,
         ),
+        Error,
+    >;
+    fn prefill_spans(
+        &mut self,
+        input: ReferencePreparedInput,
+        request: &ExternalPredictionCaptureRequest,
+        cache: &mut ReferenceState,
+        receiver: &mut dyn eredu_architectures::external_assistant::ExternalPrefillReceiver<
+            ReferenceTensor,
+            Error,
+        >,
+        cancellation: &GenerationCancellationToken,
+    ) -> Result<
+        eredu_runtime::replicated_session::PrefillSourceProgress<Option<ReferenceTensor>>,
         Error,
     >;
     fn verify(
@@ -901,6 +1086,60 @@ where
         self.run_capture(input, request, cache, true)
     }
 
+    fn prefill_spans(
+        &mut self,
+        input: ReferencePreparedInput,
+        request: &ExternalPredictionCaptureRequest,
+        cache: &mut ReferenceState,
+        receiver: &mut dyn eredu_architectures::external_assistant::ExternalPrefillReceiver<
+            ReferenceTensor,
+            Error,
+        >,
+        cancellation: &GenerationCancellationToken,
+    ) -> Result<
+        eredu_runtime::replicated_session::PrefillSourceProgress<Option<ReferenceTensor>>,
+        Error,
+    > {
+        let admitted =
+            A::admit_prepared_input(&self.admission, &input.input, &ReferenceInputInspector)
+                .map_err(|e| Error::backend(e.to_string()))?;
+        let shape = admitted.decoder_shape();
+        let allow_whole_input = input.chunk.is_none();
+        let chunk = receiver.prefill_chunk_positions(
+            input.chunk,
+            Some(shape[1]),
+            eredu_architectures::prefill::is_prepared_token_input(&input.input),
+        );
+        let admission = self.admission.clone();
+        self.with_lane(cache, |session| {
+            session
+                .try_prefill_unbudgeted_source_with_operation(
+                    Some(shape),
+                    chunk,
+                    receiver.output_demand(),
+                    |geometry| {
+                        eredu_architectures::prefill::PreparedExternalPrefill::from_prepared(
+                            input.input,
+                            admitted,
+                            geometry,
+                            admission,
+                            ReferenceInputInspector,
+                            allow_whole_input,
+                        )
+                    },
+                    cancellation,
+                    &(),
+                    &mut eredu_runtime::NoopObserver,
+                    ReferenceExternalSpan::<A> {
+                        request,
+                        receiver,
+                        _architecture: std::marker::PhantomData,
+                    },
+                )
+                .map_err(|error| Error::backend(error.to_string()))
+        })
+    }
+
     fn verify(
         &mut self,
         tokens: &ReferenceTensor,
@@ -955,7 +1194,7 @@ impl
             A,
             A::AdmissionConfig,
         >,
-        _: eredu_checkpoint::store::SharedCheckpointSource,
+        _: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: CompositeArchitecture<ReferenceBackend, ReferenceState, Error = Error>
@@ -984,7 +1223,7 @@ impl
             A,
             A::AdmissionConfig,
         >,
-        _: eredu_checkpoint::store::SharedCheckpointSource,
+        _: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: CompositeArchitecture<ReferenceBackend, ReferenceState, Error = Error>
@@ -1004,7 +1243,10 @@ fn reference_composite_selection(
     requirements: &eredu_architectures::replicated_text::CompositeTextRequirements,
     input: &eredu_runtime::PreparedModelInput<ReferenceTensor>,
 ) -> eredu_architectures::replicated_text::SelectedCompositeTextRealization {
-    let capabilities = reference_text_capabilities(requirements.execution());
+    // These shape-only operators are eager, and ReferenceReplicatedMechanisms
+    // completes their actual state synchronously.
+    let capabilities =
+        reference_text_capabilities(requirements.execution()).with_exact_completion(true);
     let processor_request = eredu_runtime::ProcessorSelectionRequest::new(
         input.parts().iter().map(|part| part.modality()),
     )
@@ -1185,9 +1427,10 @@ fn construct_reference_composite_target(
         eredu_architectures::replicated_text::composite_text_requirements(&inspection).unwrap();
     let input = ReferencePreparedInput::tokens(&[9]).unwrap();
     let selected = reference_composite_selection(&requirements, &input.input);
-    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+    let store: eredu_checkpoint::store::RetainedCheckpointSource = std::sync::Arc::new(
         eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-    );
+    )
+    .into();
     let target = eredu_architectures::replicated_text::visit_composite_text_architecture::<
         ReferenceBackend,
         ReferenceState,
@@ -1246,10 +1489,13 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for ReferenceAssis
                     .product::<u64>()
                     * 4;
                 self.0.push(
-                    eredu_runtime::WeightBinding::new(
+                    // ReferenceBackend materializes shapes. Keep the exact source
+                    // recipe and binding checks without reading the released-size
+                    // sparse payload which this fixture never uses numerically.
+                    eredu_runtime::WeightBinding::from_recipe(
                         metadata.id.as_str(),
-                        metadata.id.as_str(),
-                        eredu_checkpoint::store::TensorSelection::Full,
+                        eredu_checkpoint::recipe::DerivedWeightRecipe::source(
+                            metadata.id.as_str(),eredu_checkpoint::store::TensorSelection::Full),
                         expected_bytes,
                     )
                     .unwrap(),
@@ -1339,8 +1585,15 @@ impl ReferenceCompletionControl {
     }
 }
 
+#[derive(Clone)]
+struct ReferenceCompletionInjection {
+    mode: ReferenceCompletionMode,
+    control: Rc<ReferenceCompletionControl>,
+    before_publication: Option<Rc<ReferenceCompletionControl>>,
+}
+
 thread_local! {
-    static REFERENCE_COMPLETION_CONTROL: RefCell<Option<(ReferenceCompletionMode, Rc<ReferenceCompletionControl>)>> =
+    static REFERENCE_COMPLETION_CONTROL: RefCell<Option<ReferenceCompletionInjection>> =
         const { RefCell::new(None) };
     static REFERENCE_COMPLETION_QUARANTINE: RefCell<ReferenceCompletionQuarantine> =
         RefCell::new(ReferenceCompletionQuarantine::default());
@@ -1371,7 +1624,11 @@ fn with_reference_completion_control<R>(
             slot.borrow().is_none(),
             "reference completion control is nested"
         );
-        *slot.borrow_mut() = Some((mode, Rc::clone(&control)));
+        *slot.borrow_mut() = Some(ReferenceCompletionInjection {
+            mode,
+            control: Rc::clone(&control),
+            before_publication: None,
+        });
     });
     let result = operation();
     REFERENCE_COMPLETION_CONTROL.with(|slot| {
@@ -1380,9 +1637,51 @@ fn with_reference_completion_control<R>(
     (result, control.evidence())
 }
 
+// Verification injection starts only after the actual Publisher has committed
+// the target-only token. Capture/seed completions retain separate evidence.
+fn with_reference_verification_completion_control<R>(
+    mode: ReferenceCompletionMode,
+    operation: impl FnOnce() -> R,
+) -> (R, ReferenceCompletionEvidence, ReferenceCompletionEvidence) {
+    let control = Rc::new(ReferenceCompletionControl::default());
+    let prefill = Rc::new(ReferenceCompletionControl::default());
+    REFERENCE_COMPLETION_CONTROL.with(|slot| {
+        assert!(
+            slot.borrow().is_none(),
+            "reference completion control is nested"
+        );
+        *slot.borrow_mut() = Some(ReferenceCompletionInjection {
+            mode,
+            control: Rc::clone(&control),
+            before_publication: Some(Rc::clone(&prefill)),
+        });
+    });
+    let result = operation();
+    REFERENCE_COMPLETION_CONTROL.with(|slot| {
+        slot.borrow_mut().take();
+    });
+    (result, control.evidence(), prefill.evidence())
+}
+
 fn record_reference_publication() {
     REFERENCE_COMPLETION_CONTROL.with(|slot| {
-        if let Some((_, control)) = slot.borrow().as_ref() {
+        if let Some(injection) = slot.borrow().as_ref() {
+            let control = &injection.control;
+            if control.publications.get() == 0 {
+                if let Some(prefill) = &injection.before_publication {
+                    assert_eq!(
+                        prefill.submissions.get(),
+                        prefill.drops.get(),
+                        "capture/seed completion must retire before target publication"
+                    );
+                    assert_eq!(
+                        prefill.retained_at_wait.get(),
+                        prefill.released_resources.get(),
+                        "capture/seed roots must retire before target publication"
+                    );
+                    assert_eq!(prefill.failures.get(), 0);
+                }
+            }
             control.publications.set(control.publications.get() + 1);
         }
     });
@@ -1390,7 +1689,8 @@ fn record_reference_publication() {
 
 fn record_reference_lifecycle(stage: eredu_core::SpeculativeLifecycleStage) {
     REFERENCE_COMPLETION_CONTROL.with(|slot| {
-        if let Some((_, control)) = slot.borrow().as_ref() {
+        if let Some(injection) = slot.borrow().as_ref() {
+            let control = &injection.control;
             control.lifecycle.borrow_mut().push(stage);
         }
     });
@@ -1398,7 +1698,8 @@ fn record_reference_lifecycle(stage: eredu_core::SpeculativeLifecycleStage) {
 
 fn record_reference_restore(exact: bool) {
     REFERENCE_COMPLETION_CONTROL.with(|slot| {
-        if let Some((_, control)) = slot.borrow().as_ref() {
+        if let Some(injection) = slot.borrow().as_ref() {
+            let control = &injection.control;
             control.restores.set(control.restores.get() + 1);
             if exact {
                 control.exact_restores.set(control.exact_restores.get() + 1);
@@ -1420,7 +1721,14 @@ impl ReferenceExternalCompletion {
         let retained = retained.into_iter().collect::<Vec<_>>();
         let configured = REFERENCE_COMPLETION_CONTROL.with(|slot| slot.borrow().clone());
         let (mode, control) = configured
-            .map(|(mode, control)| (mode, Some(control)))
+            .map(|injection| {
+                if injection.control.publications.get() == 0 {
+                    if let Some(prefill) = injection.before_publication {
+                        return (ReferenceCompletionMode::Immediate, Some(prefill));
+                    }
+                }
+                (injection.mode, Some(injection.control))
+            })
             .unwrap_or((ReferenceCompletionMode::Immediate, None));
         if let Some(control) = &control {
             control.submissions.set(control.submissions.get() + 1);
@@ -1555,6 +1863,10 @@ where
     type Telemetry = ();
     type Error = Error;
 
+    fn source_context<'a, 'scope>(context: Self::Context<'a>,
+        _sources: &'scope [&'scope eredu_architectures::speculative_execution::PreparedEmbeddedEvidence],
+    ) -> Result<Self::Context<'scope>, Self::Error> where 'a: 'scope { Ok(context) }
+
     fn config(assistant: &Self::Assistant) -> &A::Config {
         &assistant.config
     }
@@ -1593,6 +1905,48 @@ where
         _: Self::Context<'a>,
     ) -> Result<(Self::Tensor, ExternalPredictionTargetCapture<Self::Tensor>), Self::Error> {
         target.prefill(input, request, cache)
+    }
+
+    fn prefill_chunk_positions(input: &Self::Input) -> Option<std::num::NonZeroU64> {
+        input.chunk
+    }
+    fn prefill_target_spans_native<'a>(
+        target: &mut Self::Target,
+        request: &ExternalPredictionCaptureRequest,
+        input: Self::Input,
+        cache: &mut Self::NativeCache,
+        receiver: &mut dyn eredu_architectures::external_assistant::ExternalPrefillReceiver<
+            Self::Tensor,
+            Self::Error,
+        >,
+        cancellation: &GenerationCancellationToken,
+        _: Self::Context<'a>,
+    ) -> Result<
+        eredu_runtime::replicated_session::PrefillSourceProgress<Option<Self::Tensor>>,
+        Self::Error,
+    > {
+        target.prefill_spans(input, request, cache, receiver, cancellation)
+    }
+    fn supports_prefill_observation(assistant: &Self::Assistant, context: bool) -> bool {
+        assistant.observers.supports_prefill(context)
+    }
+    fn prefill_output_demand(assistant: &Self::Assistant) -> eredu_core::OutputDemand {
+        assistant.observers.prefill_output_demand()
+    }
+    fn begin_prefill_chunk(
+        assistant: &mut Self::Assistant,
+        chunk: &eredu_runtime::prefill::PrefillChunk,
+    ) -> Result<(), Self::Error> {
+        assistant.observers.begin_prefill_chunk(chunk)
+    }
+    fn begin_prefill_context(
+        assistant: &mut Self::Assistant,
+        frontier: u64,
+    ) -> Result<(), Self::Error> {
+        assistant.observers.begin_prefill_context(frontier)
+    }
+    fn finish_prefill(assistant: &mut Self::Assistant, committed: bool) {
+        assistant.observers.finish_prefill(committed);
     }
 
     fn verify_target_native<'a>(
@@ -1841,30 +2195,42 @@ fn run_reference_embedded_scheduler(
         '_,
         ReferenceEmbeddedExecutorTypes,
     >,
+    captured: Option<&ReferenceCapturedCase>,
 ) -> Result<ReferenceProductionOutcome, String> {
     let mut cache = executor.new_cache().map_err(|error| error.to_string())?;
     let publications = Rc::new(Cell::new(0));
     let execution_stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let observed_execution = execution_stages.clone();
     let runtime = SpeculativeOutputRuntime::new(
-        ReferenceProductionSampling,
-        GenerationSequence::new(3, []),
+        ReferenceProductionSampling::<ReferenceEmbeddedSamplingContext>::default(),
+        GenerationSequence::new(if captured.is_some() { 13 } else { 3 }, []),
         Constraint,
         Publisher {
             publications: publications.clone(),
         },
-        GenerationCancellationToken::new(),
+        captured
+            .map(|case| case.cancellation.clone())
+            .unwrap_or_default(),
     )
     .with_lifecycle_observer(std::sync::Arc::new(move |stage| {
         observed_execution.lock().unwrap().push(stage);
         record_reference_lifecycle(stage);
         Ok(())
     }));
+    let tokens = captured
+        .map(|case| {
+            (0..case.prompt_positions)
+                .map(|i| [1, 3, 2, 4, 5][i % 5])
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| vec![9]);
+    let mut input = ReferencePreparedInput::tokens(&tokens).map_err(|error| error.to_string())?;
+    input.chunk = captured.and_then(|case| case.chunk);
     let lane = PreparedSpeculativeLane::new(
         &mut cache,
-        ReferencePreparedInput::tokens(&[9]).map_err(|error| error.to_string())?,
+        input,
         SpeculativeConfig {
-            max_tokens: 3,
+            max_tokens: if captured.is_some() { 13 } else { 3 },
             max_draft_tokens: selected.requirements().strategy().proposal_capacity().get(),
             temperature: 0.0,
             eos_token_ids: Vec::new(),
@@ -1878,7 +2244,7 @@ fn run_reference_embedded_scheduler(
         SpeculativeExecutionTopology::Single,
         false,
         false,
-        (),
+        ReferenceEmbeddedContext::default(),
     )
     .map_err(|error| format!("{error:?}"))?;
     scheduler.submit(lane).map_err(|error| error.to_string())?;
@@ -1901,6 +2267,8 @@ fn run_reference_embedded_scheduler(
 
 struct RunReferenceEmbedded {
     selected: eredu_runtime::SelectedSpeculativeRealization,
+    check_snapshot_context: bool,
+    captured: Option<ReferenceCapturedCase>,
 }
 
 impl
@@ -1919,7 +2287,7 @@ impl
         mut extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
             ReferenceBackend,
         >>::Extension<ReferencePredictionMaterializer>,
-        _: eredu_checkpoint::store::SharedCheckpointSource,
+        _: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<
@@ -1954,19 +2322,133 @@ impl
                 ReferencePredictionInput,
                 &(),
             );
+        if self.check_snapshot_context {
+            use eredu_architectures::speculative_execution::EmbeddedPredictionStrategy;
+
+            let mut cache = strategy.new_cache().map_err(|error| error.to_string())?;
+            let observed = RefCell::new(Vec::new());
+            let context = |marker| ReferenceEmbeddedContext {
+                stream: &(),
+                snapshot: ReferencePredictionSnapshotContext {
+                    marker,
+                    observed: Some(&observed),
+                },
+            };
+            let snapshot = strategy
+                .control_target_snapshot(&cache, context(17))
+                .map_err(|error| error.to_string())?
+                .expect("the target and prediction snapshot must be available");
+            assert!(snapshot.target().is_some());
+            let target_calls = observed.take();
+            assert_eq!(target_calls.first(), Some(&("target", 17)));
+            assert!(target_calls.len() > 1, "prediction members must be copied");
+            assert!(target_calls[1..]
+                .iter()
+                .all(|(member, marker)| *member != "target" && *marker == 17));
+
+            let prediction = cache.prediction_fork().map_err(|error| error.to_string())?;
+            let snapshot = strategy
+                .control_prediction_snapshot(&prediction, context(29))
+                .map_err(|error| error.to_string())?
+                .expect("the separately retained prediction snapshot must be available");
+            let prediction_calls = observed.take();
+            assert_eq!(prediction_calls.len(), target_calls.len() - 1);
+            assert!(prediction_calls.iter().all(|(_, marker)| *marker == 29));
+            assert_eq!(
+                prediction_calls
+                    .iter()
+                    .map(|(member, _)| member)
+                    .collect::<Vec<_>>(),
+                target_calls[1..]
+                    .iter()
+                    .map(|(member, _)| member)
+                    .collect::<Vec<_>>(),
+            );
+            drop(snapshot);
+
+            let target = cache.take_target().unwrap();
+            assert!(strategy
+                .control_target_snapshot(&cache, context(41))
+                .map_err(|error| error.to_string())?
+                .is_none());
+            assert!(observed.borrow().is_empty());
+            cache.restore_target(target);
+        }
+        if self.captured.as_ref().is_some_and(|case| {
+            case.span_supported && case.cancel_after.is_none() && !case.cancellation.is_cancelled()
+        }) {
+            use eredu_architectures::speculative_execution::EmbeddedPredictionStrategy;
+            let mut cache = strategy.new_cache().map_err(|error| error.to_string())?;
+            let mut input = ReferencePreparedInput::tokens(&[1, 3, 2, 4, 5])
+                .map_err(|error| error.to_string())?;
+            input.chunk = self.captured.as_ref().and_then(|case| case.chunk);
+            clear_reference_trace();
+            let completed = strategy.prefill_cancellable(
+                input, &mut cache,
+                &mut eredu_architectures::speculative_execution::EmbeddedPredictionObservers::default(),
+                &GenerationCancellationToken::new(), ReferenceEmbeddedContext::default(),
+            ).map_err(|error|error.to_string())?;
+            assert!(matches!(
+                completed,
+                eredu_core::SpeculativePrefillOutcome::Complete(_)
+            ));
+            let trace = reference_trace();
+            // These are actual operator invocations on materialized parameters,
+            // not source inspection or a formula mirroring the implementation.
+            let target_heads = trace
+                .linear_outputs
+                .iter()
+                .filter(|(id, _)| matches!(id.as_str(), "lm_head.weight" | "head.weight"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                target_heads.len(),
+                1,
+                "only the final selected target row projects scores"
+            );
+            assert_eq!(target_heads[0].1[1], 1);
+            assert!(
+                trace
+                    .linear_outputs
+                    .iter()
+                    .all(|(id, _)| !id.ends_with("shared_head.head.weight")),
+                "sequential cache seeding must not evaluate the prediction vocabulary head"
+            );
+        }
+        let observers = match &self.captured {
+            Some(case) => {
+                eredu_architectures::speculative_execution::EmbeddedPredictionObservers::default()
+                    .with_internal(ReferenceSpanObserver::new(case.clone()))
+            }
+            None => Default::default(),
+        };
         let mut executor = eredu_architectures::speculative_execution::EmbeddedPredictionExecutor::<
             _,
             ReferenceEmbeddedMechanisms,
-        >::new(&mut strategy);
+        >::with_observers(&mut strategy, observers);
         let mut executor = eredu_architectures::speculative_execution::DynEmbeddedExecutor::<
             ReferenceEmbeddedExecutorTypes,
         >::new(&mut executor);
-        run_reference_embedded_scheduler(&self.selected, &mut executor)
+        run_reference_embedded_scheduler(&self.selected, &mut executor, self.captured.as_ref())
     }
 }
 
 fn run_reference_embedded_production(
     target_config: &serde_json::Value,
+) -> Result<ReferenceProductionOutcome, String> {
+    run_reference_embedded_production_with_snapshots(target_config, false)
+}
+
+fn run_reference_embedded_production_with_snapshots(
+    target_config: &serde_json::Value,
+    check_snapshot_context: bool,
+) -> Result<ReferenceProductionOutcome, String> {
+    run_reference_embedded_production_with_prefill(target_config, check_snapshot_context, None)
+}
+
+fn run_reference_embedded_production_with_prefill(
+    target_config: &serde_json::Value,
+    check_snapshot_context: bool,
+    captured: Option<ReferenceCapturedCase>,
 ) -> Result<ReferenceProductionOutcome, String> {
     use std::num::NonZeroUsize;
 
@@ -1998,7 +2480,12 @@ fn run_reference_embedded_production(
             topology,
             identity("reference-text-processor")?,
             NonZeroUsize::new(1).unwrap(),
-            NonZeroUsize::new(8).unwrap(),
+            NonZeroUsize::new(
+                captured
+                    .as_ref()
+                    .map_or(8, |case| case.prompt_positions.max(8)),
+            )
+            .unwrap(),
             capacity,
         ),
     )
@@ -2011,10 +2498,11 @@ fn run_reference_embedded_production(
             .iter()
             .copied(),
     );
-    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+    let store: eredu_checkpoint::store::RetainedCheckpointSource = std::sync::Arc::new(
         eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path())
             .map_err(|error| error.to_string())?,
-    );
+    )
+    .into();
     let requirements = eredu_architectures::routed_text::routed_text_requirements(&inspection)
         .map_err(|error| error.to_string())?;
     let selected_target = eredu_architectures::routed_text::select_routed_text_realization(
@@ -2027,7 +2515,7 @@ fn run_reference_embedded_production(
             eredu_runtime::WeightResidency::fully_resident(),
         )
         .map_err(|error| error.to_string())?,
-        &reference_text_capabilities(requirements.text()),
+        &reference_text_capabilities(requirements.text()).with_exact_completion(true),
     )
     .map_err(|error| error.to_string())?;
     let prediction_tasks = selected_target
@@ -2083,7 +2571,11 @@ fn run_reference_embedded_production(
                 extension,
                 store,
                 &(),
-                RunReferenceEmbedded { selected },
+                RunReferenceEmbedded {
+                    selected,
+                    check_snapshot_context,
+                    captured,
+                },
             )
             .map_err(|error| error.to_string())?
         }
@@ -2099,7 +2591,11 @@ fn run_reference_embedded_production(
                 extension,
                 store,
                 &(),
-                RunReferenceEmbedded { selected },
+                RunReferenceEmbedded {
+                    selected,
+                    check_snapshot_context,
+                    captured,
+                },
             )
             .map_err(|error| error.to_string())?
         }
@@ -2109,7 +2605,31 @@ fn run_reference_embedded_production(
     Ok(output)
 }
 
+#[allow(
+    dead_code,
+    reason = "owned by the unified reference_conformance target"
+)]
+pub(crate) fn embedded_snapshot_context_reaches_target_and_prediction_only_copies() {
+    std::thread::Builder::new()
+        .name("reference-embedded-snapshot-context".into())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            for config in [
+                production_deepseek_v3_prediction_config(),
+                production_deepseek_v4_dspark_config(),
+            ] {
+                let outcome = run_reference_embedded_production_with_snapshots(&config, true)
+                    .expect("both snapshot branches must preserve their resource context");
+                assert_construction_stages(&outcome);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 struct RunReferenceExternal {
+    spans: Option<ReferenceExternalCase>,
     target: Box<dyn ReferenceExternalTarget>,
     cache: eredu_architectures::external_assistant::ExternalAssistantCache<ReferenceState>,
     capture: ExternalPredictionCaptureRequest,
@@ -2126,42 +2646,74 @@ impl
         mut self,
         assistant: &mut ReferenceMaterializedAssistant<A>,
     ) -> Self::Output {
+        if let Some(case) = &self.spans {
+            assistant.observers =
+                eredu_architectures::external_assistant::ExternalAssistantObservers::new(
+                    ReferenceExternalSpanObserver {
+                        case: case.clone(),
+                        start: None,
+                    },
+                    eredu_runtime::NoopObserver,
+                );
+        }
         A::visit_executor::<ReferenceExternalMechanisms, _>(
             self.target.as_mut(),
             assistant,
             self.capture,
             RunReferenceScheduler {
                 cache: &mut self.cache,
+                spans: self.spans,
             },
         )
     }
 }
 
-#[derive(Clone, Default)]
-struct ReferenceProductionSampling;
+trait ReferenceProductionSamplingContext: Clone {
+    type Context<'a>: Copy;
+}
 
-impl SpeculativeSampling for ReferenceProductionSampling {
+impl ReferenceProductionSamplingContext for () {
+    type Context<'a> = ();
+}
+
+#[derive(Clone, Default)]
+struct ReferenceEmbeddedSamplingContext;
+
+impl ReferenceProductionSamplingContext for ReferenceEmbeddedSamplingContext {
+    type Context<'a> = ReferenceEmbeddedContext<'a>;
+}
+
+#[derive(Clone, Default)]
+struct ReferenceProductionSampling<C = ()>(std::marker::PhantomData<C>);
+
+impl<C: ReferenceProductionSamplingContext> SpeculativeSampling for ReferenceProductionSampling<C> {
     type Logits = u32;
     type Distribution = u32;
     type Seed = ();
     type RandomState = usize;
     type DraftRandomness = usize;
     type RandomnessRoot = usize;
-    type Context<'a> = ();
+    type Context<'a>
+        = C::Context<'a>
+    where
+        Self: 'a;
     type Error = Error;
 
     fn supports_exact_optimistic_promotion(&self) -> bool {
         true
     }
 
-    fn randomness_root<'a>(_: Option<()>, _: ()) -> Result<usize, Error>
+    fn randomness_root<'a>(_: Option<()>, _: Self::Context<'a>) -> Result<usize, Error>
     where
         Self: 'a,
     {
         Ok(0)
     }
 
-    fn target_randomness_from_root<'a>(root: &mut usize, _: ()) -> Result<usize, Error>
+    fn target_randomness_from_root<'a>(
+        root: &mut usize,
+        _: Self::Context<'a>,
+    ) -> Result<usize, Error>
     where
         Self: 'a,
     {
@@ -2170,7 +2722,10 @@ impl SpeculativeSampling for ReferenceProductionSampling {
         Ok(value)
     }
 
-    fn draft_randomness_from_root<'a>(root: &mut usize, _: ()) -> Result<usize, Error>
+    fn draft_randomness_from_root<'a>(
+        root: &mut usize,
+        _: Self::Context<'a>,
+    ) -> Result<usize, Error>
     where
         Self: 'a,
     {
@@ -2182,7 +2737,7 @@ impl SpeculativeSampling for ReferenceProductionSampling {
     fn draft_randomness_at<'a>(
         root: &usize,
         position: SpeculativeDraftRandomPosition,
-        _: (),
+        _: Self::Context<'a>,
     ) -> Result<usize, Error>
     where
         Self: 'a,
@@ -2196,7 +2751,7 @@ impl SpeculativeSampling for ReferenceProductionSampling {
         _: f32,
         _: &[u32],
         _: SamplingPlacement,
-        _: (),
+        _: Self::Context<'a>,
     ) -> Result<u32, Error>
     where
         Self: 'a,
@@ -2210,7 +2765,7 @@ impl SpeculativeSampling for ReferenceProductionSampling {
         _: f32,
         _: Option<&mut usize>,
         _: SamplingPlacement,
-        _: (),
+        _: Self::Context<'a>,
     ) -> Result<u32, Error>
     where
         Self: 'a,
@@ -2223,7 +2778,7 @@ impl SpeculativeSampling for ReferenceProductionSampling {
         distribution: &u32,
         token: u32,
         _: SamplingPlacement,
-        _: (),
+        _: Self::Context<'a>,
     ) -> Result<f32, Error>
     where
         Self: 'a,
@@ -2231,7 +2786,11 @@ impl SpeculativeSampling for ReferenceProductionSampling {
         Ok(if *distribution == token { 1.0 } else { 0.0 })
     }
 
-    fn sample_unit_interval<'a>(&self, _: Option<&mut usize>, _: ()) -> Result<f32, Error>
+    fn sample_unit_interval<'a>(
+        &self,
+        _: Option<&mut usize>,
+        _: Self::Context<'a>,
+    ) -> Result<f32, Error>
     where
         Self: 'a,
     {
@@ -2243,7 +2802,7 @@ impl SpeculativeSampling for ReferenceProductionSampling {
         target: &u32,
         _: &u32,
         _: SamplingPlacement,
-        _: (),
+        _: Self::Context<'a>,
     ) -> Result<Option<u32>, Error>
     where
         Self: 'a,
@@ -2256,7 +2815,7 @@ impl SpeculativeSampling for ReferenceProductionSampling {
         _: &u32,
         _: u32,
         _: SamplingPlacement,
-        _: (),
+        _: Self::Context<'a>,
     ) -> Result<(), Error>
     where
         Self: 'a,
@@ -2266,6 +2825,7 @@ impl SpeculativeSampling for ReferenceProductionSampling {
 }
 
 struct RunReferenceScheduler<'a> {
+    spans: Option<ReferenceExternalCase>,
     cache: &'a mut eredu_architectures::external_assistant::ExternalAssistantCache<ReferenceState>,
 }
 
@@ -2298,13 +2858,16 @@ where
         let execution_stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let observed_execution = execution_stages.clone();
         let runtime = SpeculativeOutputRuntime::new(
-            ReferenceProductionSampling,
-            GenerationSequence::new(3, []),
+            ReferenceProductionSampling::<()>::default(),
+            GenerationSequence::new(if self.spans.is_some() { 13 } else { 3 }, []),
             Constraint,
             Publisher {
                 publications: publications.clone(),
             },
-            GenerationCancellationToken::new(),
+            self.spans
+                .as_ref()
+                .map(|case| case.cancellation.clone())
+                .unwrap_or_default(),
         )
         .with_lifecycle_observer(std::sync::Arc::new(move |stage| {
             observed_execution.lock().unwrap().push(stage);
@@ -2313,9 +2876,21 @@ where
         }));
         let lane = PreparedSpeculativeLane::new(
             self.cache,
-            ReferencePreparedInput::tokens(&[9]).map_err(|error| error.to_string())?,
+            {
+                let tokens = self.spans.as_ref().map(|case| {
+                    [1, 3, 2, 4, 5]
+                        .into_iter()
+                        .cycle()
+                        .take(case.prompt_positions)
+                        .collect::<Vec<_>>()
+                });
+                let mut input = ReferencePreparedInput::tokens(tokens.as_deref().unwrap_or(&[9]))
+                    .map_err(|e| e.to_string())?;
+                input.chunk = self.spans.as_ref().and_then(|case| case.chunk);
+                input
+            },
             SpeculativeConfig {
-                max_tokens: 3,
+                max_tokens: if self.spans.is_some() { 13 } else { 3 },
                 max_draft_tokens: 2,
                 temperature: 0.0,
                 eos_token_ids: Vec::new(),
@@ -2326,7 +2901,7 @@ where
         let completion_never = REFERENCE_COMPLETION_CONTROL.with(|slot| {
             slot.borrow()
                 .as_ref()
-                .is_some_and(|(mode, _)| matches!(mode, ReferenceCompletionMode::Never))
+                .is_some_and(|injection| matches!(injection.mode, ReferenceCompletionMode::Never))
         });
         let mut scheduler_options = SpeculativeSchedulerOptions::default().with_lookahead(false);
         if completion_never {
@@ -2368,6 +2943,14 @@ where
 fn run_reference_external_production(
     target_config: &serde_json::Value,
     assistant_artifact: &std::path::Path,
+) -> Result<ReferenceProductionOutcome, String> {
+    run_reference_external_spans(target_config, assistant_artifact, None)
+}
+
+fn run_reference_external_spans(
+    target_config: &serde_json::Value,
+    assistant_artifact: &std::path::Path,
+    spans: Option<ReferenceExternalCase>,
 ) -> Result<ReferenceProductionOutcome, String> {
     use std::num::NonZeroUsize;
 
@@ -2445,9 +3028,14 @@ fn run_reference_external_production(
         eredu_architectures::external_assistant::ExternalAssistantCache::new(native, selected);
     let mut outcome = assistant.visit(RunReferenceExternal {
         target,
+        spans,
         cache,
         capture,
     })?;
     outcome.construction_stages = construction_stages.lock().unwrap().clone();
     Ok(outcome)
 }
+
+include!("reference_captured_prefill.rs");
+
+include!("reference_external_prefill.rs");

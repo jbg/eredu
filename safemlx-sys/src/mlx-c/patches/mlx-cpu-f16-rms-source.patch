@@ -1,0 +1,12 @@
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -85,7 +85,7 @@
+ 
+ bool cpu_rms_fallback_control_bytes(
+     Dtype dtype, size_t rank, size_t width, size_t rows, size_t& out) noexcept {
+-  if ((dtype != float32 && dtype != bfloat16) || rank == 0 || rank > 4 ||
++  if ((dtype != float32 && dtype != float16 && dtype != bfloat16) || rank == 0 || rank > 4 ||
+       width == 0 || rows == 0 || width > size_t(INT_MAX) ||
+       rows > size_t(INT_MAX) / width) return false;
+   // ArrayVector destinations use the existing resident Graph constructor bank;

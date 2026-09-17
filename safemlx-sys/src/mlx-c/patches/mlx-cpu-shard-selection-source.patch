@@ -1,0 +1,81 @@
+diff --git a/mlx/backend/cpu/selection_storage.cpp b/mlx/backend/cpu/selection_storage.cpp
+--- a/mlx/backend/cpu/selection_storage.cpp
++++ b/mlx/backend/cpu/selection_storage.cpp
+@@ -11,15 +11,18 @@
+       (dtype==int32&&dtype.size()==4)||(dtype==uint32&&dtype.size()==4)||
+       (dtype==float32&&dtype.size()==4)||(dtype==bfloat16&&dtype.size()==2);
+ }
++bool full_dtype(Dtype dtype) noexcept {
++  return canonical(dtype)||(dtype==float16&&dtype.size()==sizeof(float16_t));
++}
+ bool product(size_t a,size_t b,size_t& out) noexcept {
+   if(b&&a>size_t(PTRDIFF_MAX)/b)return false;out=a*b;return true;
+ }
+ bool add(size_t& total,size_t value) noexcept {
+   if(value>size_t(PTRDIFF_MAX)-total)return false;total+=value;return true;
+ }
+-bool common(Dtype dtype,size_t rank,size_t elements) noexcept {
++bool common(Dtype dtype,size_t rank,size_t elements,bool full=false) noexcept {
+   size_t bytes=0;
+-  return canonical(dtype)&&rank<=4&&elements&&elements<=size_t(INT_MAX)&&product(elements,dtype.size(),bytes);
++  return (full?full_dtype(dtype):canonical(dtype))&&rank<=4&&elements&&elements<=size_t(INT_MAX)&&product(elements,dtype.size(),bytes);
+ }
+ bool shape(const array& input,size_t& elements,size_t maximum_rank=4) noexcept {
+   if(size_t(input.ndim())>maximum_rank||input.strides().size()!=input.ndim())return false;
+@@ -70,7 +73,7 @@
+   out=value;return true;
+ }
+ bool scalar_full_eval_layout(Dtype dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
+-  if(!common(dtype,rank,elements))return false;
++  if(!common(dtype,rank,elements,true))return false;
+   CopyEvalStorage value;
+   if(!copy_eval_layout(rank,1,true,tracer,value))return false;
+   const size_t controls=sizeof(dtype)+sizeof(rank)+sizeof(elements)+sizeof(tracer)+sizeof(out)+
+@@ -99,14 +102,16 @@
+   out=value;return true;
+ }
+ static bool row_selection_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+-  if(!is_selection_eval_primitive(output)||!output.siblings().empty()||!canonical(output.dtype()))return false;
++  if(!is_selection_eval_primitive(output)||!output.siblings().empty())return false;
++  const bool full=typeid(output.primitive())==typeid(Full);
++  if(!(full?full_dtype(output.dtype()):canonical(output.dtype())))return false;
+   size_t elements=0;if(!shape(output,elements))return false;
+-  const bool full=typeid(output.primitive())==typeid(Full);
+   if(output.inputs().size()!=(full?1:3))return false;
+   for(size_t i=0;i!=output.inputs().size();++i) {
+     const auto& input=output.inputs()[i];size_t actual=0;
+     if(input.shape()!=output.shape()||!shape(input,actual)||actual!=elements||
+-        input.dtype()!=(!full&&i==0?bool_:output.dtype())||!canonical(input.dtype()))return false;
++        input.dtype()!=(!full&&i==0?bool_:output.dtype())||
++        !(full?full_dtype(input.dtype()):canonical(input.dtype())))return false;
+     if(full) {
+       if(input.data_size()==1) {
+         for(size_t axis=0;axis!=size_t(input.ndim());++axis)
+@@ -120,7 +125,7 @@
+   return full?scalar_full_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out):
+       select_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out);
+ }
+-// An additive source for the existing F32/F16/BF16 Select over stored or broadcast
++// An additive source for the existing F32/F16/BF16/I32 Select over stored or broadcast
+ // operands. Rank five is the actual GQA mask expansion; the legacy row source
+ // and scalar Full contracts remain unchanged.
+ bool typed_select_broadcast_eval_layout(Dtype dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
+@@ -145,6 +150,7 @@
+   if(!is_selection_eval_primitive(output)||typeid(output.primitive())!=typeid(Select)||
+       !output.siblings().empty()||output.inputs().size()!=3||
+       !((output.dtype()==float32&&output.itemsize()==sizeof(float))||
++        (output.dtype()==int32&&output.itemsize()==sizeof(int32_t))||
+         (output.dtype()==float16&&output.itemsize()==sizeof(float16_t))||
+         (output.dtype()==bfloat16&&output.itemsize()==sizeof(bfloat16_t))))return false;
+   size_t elements=0;if(!shape(output,elements,5)||output.ndim()==0)return false;
+diff --git a/mlx/backend/cpu/select.cpp b/mlx/backend/cpu/select.cpp
+--- a/mlx/backend/cpu/select.cpp
++++ b/mlx/backend/cpu/select.cpp
+@@ -147,6 +147,7 @@
+ }
+ bool typed_select_broadcast_dispatch_storage(Dtype dtype,size_t rank,EvalDispatchStorage& out) noexcept {
+   if(!((dtype==float32&&dtype.size()==sizeof(float))||
++       (dtype==int32&&dtype.size()==sizeof(int32_t))||
+        (dtype==float16&&dtype.size()==sizeof(float16_t))||
+        (dtype==bfloat16&&dtype.size()==sizeof(bfloat16_t))))return false;
+   return select_task_storage(dtype,rank,true,out);

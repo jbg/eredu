@@ -32,6 +32,7 @@ struct CountingSampler {
 }
 
 impl SpeculativeSampler<MlxSamplingBackend> for CountingSampler {
+    type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
     fn supports_exact_optimistic_promotion(&self) -> bool {
         true
     }
@@ -66,6 +67,7 @@ struct GrammarCountingSampler {
 }
 
 impl SpeculativeSampler<MlxSamplingBackend> for GrammarCountingSampler {
+    type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
     fn supports_exact_optimistic_promotion(&self) -> bool {
         true
     }
@@ -126,7 +128,7 @@ impl SpeculativeSemanticState for TestSemanticState {
     fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {
         self.tokens.push(token);
         self.events
-            .push(SemanticEvent::TextDelta(token.to_string()));
+            .push(SemanticEvent::TextDelta(token.to_string().into()));
         Ok(!self.stop.is_empty() && self.tokens.ends_with(&self.stop))
     }
 
@@ -142,8 +144,8 @@ impl SpeculativeSemanticState for TestSemanticState {
         Ok(())
     }
 
-    fn take_events(&mut self) -> Vec<SemanticEvent> {
-        std::mem::take(&mut self.events)
+    fn take_events(&mut self) -> eredu_core::SpeculativeBuffer<SemanticEvent> {
+        std::mem::take(&mut self.events).into()
     }
 }
 
@@ -151,6 +153,7 @@ impl SpeculativeSemanticState for TestSemanticState {
 struct UniformSampler;
 
 impl SpeculativeSampler<MlxSamplingBackend> for UniformSampler {
+    type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
     fn supports_exact_optimistic_promotion(&self) -> bool {
         true
     }
@@ -199,6 +202,17 @@ impl SpeculativeExecutor for ScriptedBackend {
     type Cache = usize;
     type TargetState = ();
     type DraftState = ScriptedDraftState;
+
+    fn copy_draft_state<'a>(
+        &self,
+        state: &Self::DraftState,
+        _context: Self::Context<'a>,
+    ) -> Result<Self::DraftState, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(state.clone())
+    }
     type CacheCheckpoint = usize;
     type Verification = Array;
     type Logits = Array;
@@ -363,6 +377,17 @@ impl SpeculativeExecutor for CommitFailBackend {
     type Cache = usize;
     type TargetState = ();
     type DraftState = ScriptedDraftState;
+
+    fn copy_draft_state<'a>(
+        &self,
+        state: &Self::DraftState,
+        _context: Self::Context<'a>,
+    ) -> Result<Self::DraftState, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(state.clone())
+    }
     type CacheCheckpoint = usize;
     type Verification = Array;
     type Logits = Array;

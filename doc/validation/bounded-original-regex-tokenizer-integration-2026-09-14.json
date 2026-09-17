@@ -1,0 +1,876 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T18:24:31.239671+00:00",
+  "scope": "Fresh original regex sources and ID encoding for actual explicit-Split and Digits/implicit-ByteLevel profiles",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-regex-top-candidates-integration-2026-09-14.json",
+  "tests": {
+    "ra": {
+      "passed": 222,
+      "ignored": 0
+    },
+    "ra_doc_source": {
+      "passed": 1,
+      "ignored": 0
+    },
+    "ra_doc_workspace": {
+      "passed": 5,
+      "ignored": 0
+    },
+    "fancy": {
+      "passed": 275,
+      "ignored": 1
+    },
+    "fancy_doc": {
+      "passed": 30,
+      "ignored": 0
+    },
+    "hf": {
+      "passed": 263,
+      "ignored": 0
+    },
+    "hf_parity": {
+      "passed": 279,
+      "ignored": 0
+    },
+    "hf_doc": {
+      "passed": 2,
+      "ignored": 0
+    },
+    "text": {
+      "passed": 98,
+      "ignored": 4
+    },
+    "text_features": {
+      "passed": 99,
+      "ignored": 4
+    },
+    "runtime": {
+      "passed": 1627,
+      "ignored": 0
+    },
+    "facade_private": {
+      "passed": 10,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 26,
+      "ignored": 1
+    },
+    "conformance": {
+      "passed": 116,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 3053,
+  "new_tests": [
+    {
+      "check": "ra",
+      "name": "anonymous_source_metadata_preserves_actual_capture_queries",
+      "path": "third-party/regex-automata-0.4.18/src/util/captures/construction.rs"
+    },
+    {
+      "check": "ra",
+      "name": "each_actual_capture_reserve_failure_keeps_earlier_buffers",
+      "path": "third-party/regex-automata-0.4.18/src/util/captures/construction.rs"
+    },
+    {
+      "check": "ra",
+      "name": "invalid_capture_geometry_rejects_before_any_storage_exists",
+      "path": "third-party/regex-automata-0.4.18/src/util/captures/construction.rs"
+    },
+    {
+      "check": "ra",
+      "name": "every_emitted_source_reconstructs_actual_states_properties_and_search",
+      "path": "third-party/regex-automata-0.4.18/src/nfa/thompson/nfa/source/tests.rs"
+    },
+    {
+      "check": "ra",
+      "name": "actual_state_start_capture_and_nested_failures_retain_prefixes",
+      "path": "third-party/regex-automata-0.4.18/src/nfa/thompson/nfa/source/tests.rs"
+    },
+    {
+      "check": "ra",
+      "name": "each_real_scratch_reserve_failure_keeps_previous_capacity",
+      "path": "third-party/regex-automata-0.4.18/src/nfa/thompson/nfa/source/tests.rs"
+    },
+    {
+      "check": "ra",
+      "name": "wrong_scratch_and_foreign_source_reject_without_construction",
+      "path": "third-party/regex-automata-0.4.18/src/nfa/thompson/nfa/source/tests.rs"
+    },
+    {
+      "check": "ra",
+      "name": "private_empty_look_and_ordered_recipes_preserve_utf8_iteration",
+      "path": "third-party/regex-automata-0.4.18/src/nfa/thompson/nfa/source/tests.rs"
+    },
+    {
+      "check": "ra",
+      "name": "malformed_private_geometry_and_layout_overflow_reject_before_storage",
+      "path": "third-party/regex-automata-0.4.18/src/nfa/thompson/nfa/source/tests.rs"
+    },
+    {
+      "check": "fancy",
+      "name": "all_five_fresh_sources_match_existing_source_and_ordinary_iterators",
+      "path": "third-party/fancy-regex-0.17.0/src/vm/workspace/construction/tests.rs"
+    },
+    {
+      "check": "fancy",
+      "name": "actual_pattern_program_and_each_literal_frontier_retains_prefix",
+      "path": "third-party/fancy-regex-0.17.0/src/vm/workspace/construction/tests.rs"
+    },
+    {
+      "check": "fancy",
+      "name": "nested_real_last_transition_failure_retains_completed_delegates",
+      "path": "third-party/fancy-regex-0.17.0/src/vm/workspace/construction/tests.rs"
+    },
+    {
+      "check": "fancy",
+      "name": "completed_rejection_keeps_real_source_and_shared_scratch",
+      "path": "third-party/fancy-regex-0.17.0/src/vm/workspace/construction/tests.rs"
+    },
+    {
+      "check": "fancy",
+      "name": "exact_source_profile_and_checked_layout_errors_precede_storage",
+      "path": "third-party/fancy-regex-0.17.0/src/vm/workspace/construction/tests.rs"
+    },
+    {
+      "check": "ra",
+      "name": "each_actual_partial_frontier_retires_before_owned_error_escapes_source",
+      "path": "third-party/regex-automata-0.4.18/src/nfa/thompson/pikevm/workspace/retirement.rs"
+    },
+    {
+      "check": "fancy",
+      "name": "outer_and_nested_real_errors_outlive_source_after_consuming_retirement",
+      "path": "third-party/fancy-regex-0.17.0/src/vm/workspace/retirement.rs"
+    },
+    {
+      "check": "fancy",
+      "name": "development_selectors_fail_actual_source_scratch_and_late_delegate_targets",
+      "path": "third-party/fancy-regex-0.17.0/src/vm/workspace/construction/tests.rs"
+    },
+    {
+      "check": "fancy",
+      "name": "public_development_selector_checks_exact_delegate_before_attempt",
+      "path": "third-party/fancy-regex-0.17.0/src/vm/workspace/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "all_actual_sources_preserve_nonzero_split_spans_and_bytelevel_offsets",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_split/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "closed_clone_keeps_actual_source_and_serializes_to_ordinary_split_shape",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_split/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "repeated_coverage_reuses_one_workspace_and_keeps_full_mapped_splits",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_split/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "shared_coverage_preserves_empty_and_terminal_error_without_advancing_again",
+      "path": "third-party/tokenizers-0.23.2/src/tokenizer/pattern.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "regex_c_and_e_exact_one_short_and_closed_result_lifetimes",
+      "path": "eredu-runtime/src/working_memory/original_tokenizer/encode/tests/regex.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "regex_real_nested_failures_keep_full_e_and_c_after_workspace_retirement",
+      "path": "eredu-runtime/src/working_memory/original_tokenizer/encode/tests/regex.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "same_regex_source_has_independent_concurrent_original_workspaces_and_no_foreign_custody",
+      "path": "eredu-runtime/src/working_memory/original_tokenizer/encode/tests/regex.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "cold_regex_partial_and_completed_rejections_hold_one_original_c_until_error_drop",
+      "path": "eredu-runtime/src/working_memory/original_tokenizer/encode/tests/regex.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "file_regex_source_uses_same_original_provider_across_two_requests_and_all_drivers",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/decoder/aggregate.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_regex_encoded_ids_use_same_real_input_all_routes_and_destination_once",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/token_input.rs"
+    },
+    {
+      "check": "facade_private",
+      "name": "private_file_regex_c_and_original_e_share_real_backend_pool_and_decoder_source",
+      "path": "eredu/src/api/portable/loaded_decoder_tests/regex.rs"
+    },
+    {
+      "check": "hf",
+      "name": "full_regex_pipeline_and_original_ids_match_ordinary_spelling_offsets_and_special_policy",
+      "path": "third-party/tokenizers-0.23.2/src/tokenizer/encode_ids/regex_tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "decoded_pattern_and_component_settings_are_checked_before_model_construction",
+      "path": "third-party/tokenizers-0.23.2/src/tokenizer/encode_ids/regex_tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "real_cold_regex_failures_retain_completed_model_and_original_nested_cause",
+      "path": "third-party/tokenizers-0.23.2/src/tokenizer/encode_ids/regex_tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "mapped_and_every_actual_regex_reserve_fail_once_with_retired_nested_prefixes",
+      "path": "third-party/tokenizers-0.23.2/src/tokenizer/encode_ids/regex_tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "independent_workspaces_share_only_immutable_source_and_reuse_no_model_cache",
+      "path": "third-party/tokenizers-0.23.2/src/tokenizer/encode_ids/regex_tests.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "implicit_regex_c_and_e_exact_one_short_and_closed_result_lifetimes",
+      "path": "eredu-runtime/src/working_memory/original_tokenizer/encode/tests/regex.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "implicit_regex_real_nested_failures_keep_full_e_and_c_after_workspace_retirement",
+      "path": "eredu-runtime/src/working_memory/original_tokenizer/encode/tests/regex.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "implicit_same_regex_source_has_independent_concurrent_original_workspaces_and_no_foreign_custody",
+      "path": "eredu-runtime/src/working_memory/original_tokenizer/encode/tests/regex.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "implicit_cold_regex_partial_and_completed_rejections_hold_one_original_c_until_error_drop",
+      "path": "eredu-runtime/src/working_memory/original_tokenizer/encode/tests/regex.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "file_implicit_source_uses_same_original_provider_across_two_requests_and_all_drivers",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/decoder/aggregate.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_implicit_encoded_ids_use_same_real_input_all_routes_and_destination_once",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/token_input.rs"
+    },
+    {
+      "check": "facade_private",
+      "name": "private_file_implicit_c_and_original_e_share_real_backend_pool_and_decoder_source",
+      "path": "eredu/src/api/portable/loaded_decoder_tests/regex.rs"
+    },
+    {
+      "check": "hf",
+      "name": "complete_implicit_profile_matches_legacy_ids_spellings_offsets_and_numeric_boundaries",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_byte_level/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "closed_byte_source_preserves_two_stage_serde_clone_and_ordinary_offset_worker",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_byte_level/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "implicit_settings_and_default_use_regex_bind_before_model_construction",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_byte_level/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "implicit_first_literal_and_each_real_workspace_frontier_keep_owned_causes",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_byte_level/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "accepted_source_never_initializes_ordinary_regex_in_a_fresh_process",
+      "path": "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_byte_level/tests.rs"
+    },
+    {
+      "check": "hf",
+      "name": "shared_numeric_coverage_matches_scalar_boundaries_for_all_unicode_in_batches",
+      "path": "third-party/tokenizers-0.23.2/src/tokenizer/pattern.rs"
+    },
+    {
+      "check": "hf",
+      "name": "predicate_invocations_keep_empty_and_scalar_order_without_extra_probes",
+      "path": "third-party/tokenizers-0.23.2/src/tokenizer/pattern.rs"
+    }
+  ],
+  "new_test_count": 48,
+  "compile_fail_examples": {
+    "ra_doc_source": [
+      "test src/nfa/thompson/nfa/source.rs - nfa::thompson::nfa::source::Plan (line 125) - compile fail ... ok"
+    ],
+    "fancy_doc": [
+      "test src/vm/workspace/construction.rs - vm::workspace::construction::Plan (line 159) - compile fail ... ok",
+      "test src/vm/workspace/construction.rs - vm::workspace::construction::Plan (line 152) - compile fail ... ok"
+    ],
+    "hf_doc": [
+      "test src/pre_tokenizers/compiled_split.rs - pre_tokenizers::compiled_split::CompiledRegexSplit (line 40) - compile fail ... ok",
+      "test src/pre_tokenizers/compiled_byte_level.rs - pre_tokenizers::compiled_byte_level::CompiledByteLevel (line 13) - compile fail ... ok"
+    ]
+  },
+  "checks": {
+    "cold_evidence": {
+      "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-original-regex-tokenizer-integration-verify-cold.py",
+      "started_utc": "2026-09-14T18:24:15.068855+00:00",
+      "elapsed_seconds": 0.067,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-cold_evidence.log",
+      "log_sha256": "085fd9f504119a1476e2d57b0fa1301a16630e8dabd1b53ea838f211d66cb0e8"
+    },
+    "ra": {
+      "command": "CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/regex-automata-0.4.18/Cargo.toml --lib --features workspace-test-support",
+      "started_utc": "2026-09-14T18:15:47.035930+00:00",
+      "elapsed_seconds": 8.592,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-ra.log",
+      "log_sha256": "09f192d60e1172ede501f04d49625e90ea3eef034d3da4d0d8a7623c7caf4955"
+    },
+    "ra_doc_source": {
+      "command": "CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/regex-automata-0.4.18/Cargo.toml --doc nfa::thompson::nfa::source",
+      "started_utc": "2026-09-14T18:15:55.629098+00:00",
+      "elapsed_seconds": 1.991,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-ra_doc_source.log",
+      "log_sha256": "b01321234b9e35e8fd66adc4fa1b60de0b7574bca47f392cfb1e842cb28873c8"
+    },
+    "ra_doc_workspace": {
+      "command": "CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/regex-automata-0.4.18/Cargo.toml --doc nfa::thompson::pikevm::workspace",
+      "started_utc": "2026-09-14T18:15:57.621003+00:00",
+      "elapsed_seconds": 0.414,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-ra_doc_workspace.log",
+      "log_sha256": "51bfed9d8ed62c16628b1cd671cc710642d509314ba7f343ba80944ea9e1e399"
+    },
+    "fancy": {
+      "command": "CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/fancy-regex-0.17.0/Cargo.toml --tests --features workspace-test-support -- --test-threads=1",
+      "started_utc": "2026-09-14T18:17:10.625305+00:00",
+      "elapsed_seconds": 8.355,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-fancy.log",
+      "log_sha256": "854efa488e59a6bf47fd1c24a6f4e3ba76fc1a233a33edac1016eb7132b1b8f9"
+    },
+    "fancy_doc": {
+      "command": "CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/fancy-regex-0.17.0/Cargo.toml --doc",
+      "started_utc": "2026-09-14T18:17:18.981559+00:00",
+      "elapsed_seconds": 8.972,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-fancy_doc.log",
+      "log_sha256": "df7b8ccdc2470e9a9ccae026a220062ccdf6f3d7107bfb0539f3cf9a670217bf"
+    },
+    "hf": {
+      "command": "CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/tokenizers-0.23.2/Cargo.toml --lib --features fancy-regex,tokenizer-compiler-test-support",
+      "started_utc": "2026-09-14T18:18:28.362891+00:00",
+      "elapsed_seconds": 5.114,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-hf.log",
+      "log_sha256": "2dc26e0e1742797173f31400864a0f7b2aed85128081ef2e3137a6efa20d3b81"
+    },
+    "hf_parity": {
+      "command": "CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/tokenizers-0.23.2/Cargo.toml --lib --features parity-aware-bpe,fancy-regex,tokenizer-compiler-test-support",
+      "started_utc": "2026-09-14T18:18:33.478770+00:00",
+      "elapsed_seconds": 5.139,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-hf_parity.log",
+      "log_sha256": "8226b29705096d4c4bff4666bf00af521ef2dd16a3cfd465ea8dd2c5555017e5"
+    },
+    "hf_doc": {
+      "command": "CARGO_INCREMENTAL=0 cargo test --manifest-path third-party/tokenizers-0.23.2/Cargo.toml --doc --features fancy-regex pre_tokenizers::compiled_",
+      "started_utc": "2026-09-14T18:18:38.618081+00:00",
+      "elapsed_seconds": 4.679,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-hf_doc.log",
+      "log_sha256": "0f0b2bafac7bdfa45218269f7a7036052d3c8a964cdb7260dda3733b06f292ae"
+    },
+    "hf_minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check --manifest-path third-party/tokenizers-0.23.2/Cargo.toml --no-default-features --features fancy-regex",
+      "started_utc": "2026-09-14T18:18:59.820381+00:00",
+      "elapsed_seconds": 2.316,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-hf_minimal.log",
+      "log_sha256": "1049cede478c472a3723d3ce44ff67608589eb90bf1732c85bf84dfb0dda87f0"
+    },
+    "hf_onig": {
+      "command": "CARGO_INCREMENTAL=0 cargo check --manifest-path third-party/tokenizers-0.23.2/Cargo.toml --no-default-features --features onig",
+      "started_utc": "2026-09-14T18:19:02.137017+00:00",
+      "elapsed_seconds": 1.673,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-hf_onig.log",
+      "log_sha256": "2685845e7eeb64dcb81abb009f3748436c34912f292d807cf31d0902fce518e6"
+    },
+    "hf_features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check --manifest-path third-party/tokenizers-0.23.2/Cargo.toml --all-features",
+      "started_utc": "2026-09-14T18:19:18.088000+00:00",
+      "elapsed_seconds": 10.83,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-hf_features.log",
+      "log_sha256": "691c125b2507fb688eb6f6d0f26d686f4cd2683bbd77e0493c529c9da67a7026"
+    },
+    "text": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-text --no-default-features",
+      "started_utc": "2026-09-14T18:19:30.392152+00:00",
+      "elapsed_seconds": 9.165,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-text.log",
+      "log_sha256": "480a86b8760400fc2795ef1e9498a1527000172311037b7f9cb98c45432fd03f"
+    },
+    "text_features": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-text --all-features",
+      "started_utc": "2026-09-14T18:19:39.557552+00:00",
+      "elapsed_seconds": 9.021,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-text_features.log",
+      "log_sha256": "b3550f885bedcb368bdce5bdd26779de9cc103250858504334c738ad22720611"
+    },
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime",
+      "started_utc": "2026-09-14T18:20:52.203750+00:00",
+      "elapsed_seconds": 30.372,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-runtime.log",
+      "log_sha256": "191752a2c0e458534f5b6763e961f2db0826059ad7e2db0201fdc1007fd7e2e7"
+    },
+    "facade_private": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib loaded_decoder_tests",
+      "started_utc": "2026-09-14T18:21:22.579414+00:00",
+      "elapsed_seconds": 34.001,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-facade_private.log",
+      "log_sha256": "97bdff7a588d271a4ff0ed55ed2ae6629152c9b0395f608a44950f75a220a219"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade",
+      "started_utc": "2026-09-14T18:21:56.581997+00:00",
+      "elapsed_seconds": 15.407,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-portable.log",
+      "log_sha256": "b7a8f3bb50fa74f30fda83625b0ff1a0f871407300d800ecfa0fcdd7822730d5"
+    },
+    "conformance": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test backend_conformance",
+      "started_utc": "2026-09-14T18:22:11.989597+00:00",
+      "elapsed_seconds": 5.539,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-conformance.log",
+      "log_sha256": "307a98bfb06292da250275b8124ce0a6e529a5cea465d2cd79d270cd3ba93e40"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T18:22:17.529718+00:00",
+      "elapsed_seconds": 19.06,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-minimal.log",
+      "log_sha256": "4242feb75fdabd79d5edab4ee30003f8ea971bf566a944c83cf7e7d55238ac0c"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T18:22:36.590317+00:00",
+      "elapsed_seconds": 19.526,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-features.log",
+      "log_sha256": "9de14181640cad97e1bbaa28a74d2918e1273c81ab4a63ba1364ca21b2d67585"
+    },
+    "oracle": {
+      "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-original-regex-tokenizer-integration-run-oracle.py",
+      "started_utc": "2026-09-14T18:23:28.767722+00:00",
+      "elapsed_seconds": 26.967,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-regex-tokenizer-integration-oracle.log",
+      "log_sha256": "2bfdb4bcdf01d43cc3d1c2b6b43810cb8579823656987133d03fe788dcc17c5f"
+    }
+  },
+  "source_sha256": {
+    "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_split.rs": "5574e474635ad9f3f53b606555c24b7b89a35a2c7511d62cecd14a6473aa636b",
+    "third-party/tokenizers-original-regex-mechanisms.json": "e720936b1d613b502fbe47c059600363f323a7b84bc83e5a283d6b29aa9f34a6",
+    "third-party/fancy-regex-0.17.0/src/vm/workspace/recipe_emitter.rs": "ad40ce1a35603714100423af4bf8f2b5e3579015c537fb44e8327ca27056892e",
+    "third-party/fancy-regex-original-regex-mechanisms.patch": "6c7b2fd607ef500287954f51e45ed485630a9d0663774e66fde5f993e3e60511",
+    "third-party/tokenizers-0.23.2/src/tokenizer/compile.rs": "6219a50e23a091ef7ea0db5858e4294c97cffec7336ba2a538a29d5e1ce10a1c",
+    "doc/bounded-inference.md": "998202362375660b29c75798913e3129f4ccce6e72fe8d1941016238933bece2",
+    "third-party/regex-automata-0.4.18/src/nfa/thompson/pikevm/workspace/retirement.rs": "d05f3213a0f2bf6d826042893ca4c670cc4bd85afa707b26cd59ea8954a7a941",
+    "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_byte_level.rs": "02a35eed63d55882c78f5fbefcaff0bff797eff7c23f655e3d798b49c9ecaec3",
+    "eredu/src/api/portable/loaded_decoder_tests/regex.rs": "82aa4ae6233301ea6cd157fb721dcd2b77c7ab1b77bb9714d9acc06c372b061c",
+    "eredu-runtime/src/working_memory/original_tokenizer/encode/tests.rs": "29cee0cc73b67dfd68f336d83c8ef780112acc4d2328ecc4cf9eda3c3c2acfd7",
+    "third-party/regex-automata-0.4.18/src/util/captures.rs": "55bf51e5cfab9d5d49f5d0590b5143467d841571a7f259b6180c4f3be393a990",
+    "third-party/tokenizers-0.23.2/src/tokenizer/encode_ids.rs": "2c5493e47e9c231510732f9bdf3c395862aaa8a8b24001e5e3abcf9938706f2c",
+    "third-party/fancy-regex-source-emitter.json": "fb837db04949512f9c3d56b303ddddec68638cf040779b23a696d9a868836dce",
+    "third-party/regex-automata-0.4.18/src/nfa/thompson/mod.rs": "1034da9a881f84a57097f8560719cde825996e0a7c47a2f2a65dd46dc0458936",
+    "eredu-text/src/tokenizer_storage.rs": "afa60c5bd411268745c8b17274c57226e574ef77ed386e3f0451e764be817eac",
+    "third-party/fancy-regex-0.17.0/src/vm/workspace/construction/tests.rs": "00c154d8d04a85c12b773f5aac00918bf5122306c8d2a307d466f0ba3e75c2ec",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/decoder/aggregate.rs": "99818ee2f535f813673dd6bee928e68ee0f57cd7749082569337a8f5a0e462a3",
+    "third-party/fancy-regex-0.17.0/Cargo.toml.orig": "655cecbb997c89b5480d2b39eae0e77569758e2951ecd7128381f7636d068127",
+    "third-party/regex-automata-original-regex-mechanisms.json": "3997b44802ad271da06aa16c2136c2357e48d06ad1b839d08a20b75c90c535d7",
+    "third-party/regex-automata-source-construction.patch": "6cc2a04fe77c2f5cb67a9a353ae0f4dd3783c9466d681e0448e1d520690f480f",
+    "third-party/tokenizers-0.23.2/Cargo.toml": "100111709d73f5e1dec2050304ea2f120f0ad67ea9e52226ddb13d7d3813c0d7",
+    "third-party/tokenizers-0.23.2/Cargo.toml.orig": "918f4f6a4727c32589b1beb86abaa1eba5e800d2e4981f749f588e85447e411d",
+    "third-party/fancy-regex-original-regex-mechanisms.json": "a3d2a00a83555fe4d5f75b3c04c3dcc719d135dffaa050dccac58e5a99ee2970",
+    "eredu/src/api/portable/loaded_decoder_tests.rs": "ec22b46f6c8a9e1ff0c1c9da4850ef310af586f022a444715d570028d23717d1",
+    "third-party/fancy-regex-0.17.0/src/vm/workspace.rs": "e2de50c9836d7e6264a44fcfbc3bbcc4d2a588a11d3202c694a1f61ad3cfade3",
+    "third-party/fancy-regex-0.17.0/src/vm/workspace/tests.rs": "19a61341222059b0a4cbbda1ad595b69dfbbf1b3ba9059be3e7e4a0eb1e1a8c5",
+    "third-party/regex-automata-0.4.18/src/nfa/thompson/nfa/source/recipes.rs": "e082933738767bdaf5e40a8d254a3bf62b7b191fa60f58ed27f6b0d8bc375936",
+    "third-party/tokenizers-original-regex-tokenizer.json": "37637132b6f470946054ec1d83db1faa8f19b740bb6a357fd83eff477b9b214d",
+    "third-party/fancy-regex-0.17.0/src/vm/workspace/construction/recipes.rs": "aa13ae05b327e2767aeedfc342bb99259b88b0de48d388486f211d47ee6baab6",
+    "third-party/fancy-regex-0.17.0/src/vm/workspace/retirement.rs": "dd820758defcabafb2b6308032d79111043679fef1cba92bdea27bfba3708225",
+    "third-party/fancy-regex-source-construction.json": "4ddd29c65fe04310d4f79b18756e23619162dd465566e2444efebf9d44fa605f",
+    "third-party/tokenizers-0.23.2/src/tokenizer/mod.rs": "42e58d77537b031d965aa798a529db2e96ec8555a201ef003e8c5cfbcc1dc3ca",
+    "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_split/tests.rs": "7aea998bdac59ff6c6f0e574657295a0e7743cb3b41793a39ab22dde0c7372d6",
+    "third-party/tokenizers-original-implicit-bytelevel.patch": "e4bbd99aec550dad2610f12d0ea476caca94c729d29bf9996c8e45fb4ed046eb",
+    "eredu/src/api/tokenizer.rs": "42f418263d8b346812b215edef59128a7f38965ae189e6b84913c7beb64ebb3e",
+    "third-party/fancy-regex-0.17.0/src/compile.rs": "931d04db19d2b22ad10aa5b82b69086067ead92cc8fa71923dc63081df09f8c2",
+    "doc/backend-architecture.md": "ffbde85c2839309aba8ca8befb436a5e0ed64638265b1648ae9c483489c2b8e8",
+    "eredu-runtime/src/working_memory/original_tokenizer/encode/tests/regex.rs": "d4ea690697c3c477b863ebd0dd68c8115fe2a3d3664dc0054a52e8cfbece575a",
+    "third-party/tokenizers-original-regex-mechanisms.patch": "bc8241fb9bd05ca8f99b5c4ec7e6acdb647a7ff53e7775770a02617020ab8ca1",
+    "third-party/fancy-regex-0.17.0/Cargo.toml": "1fa3277caea36b59adb4ebe5a155047f49fc013040df0accd9fe817eac68d1b4",
+    "third-party/regex-automata-0.4.18/src/nfa/thompson/pikevm/workspace.rs": "3a4bf0bdc938e334edfd4221071502858ff93d97c42db2219bb30111c57ad607",
+    "eredu-runtime/src/working_memory/original_tokenizer/encode.rs": "85b3773ac47d62707a40257ca3a91eba4fca833b525297996950e82ae796f7c2",
+    "eredu-runtime/src/working_memory/original_tokenizer/file/tests.rs": "8aee4c36e75ed3e78f29db176dfa8c1dee5cda15525362aeaa1b2069e51ff9f1",
+    "third-party/fancy-regex-0.17.0/src/vm/workspace/construction.rs": "c37e45c11eccfc8c1057f3f23ffd883da997c5dc52dc72caa9267bba1bcc414a",
+    "third-party/tokenizers-0.23.2/src/tokenizer/encode_ids/regex.rs": "576fec3fa78b1038d261034319c0a4dafe4cedf20f469148c1f32dbd4fedde38",
+    "third-party/tokenizers-0.23.2/src/tokenizer/normalizer.rs": "571ee83e773f1ab868322eeee37f9c571bff079ad2136e0e14975a151dc72cee",
+    "third-party/regex-automata-0.4.18/src/nfa/thompson/nfa/source/tests.rs": "992ed1916e072874ef0410ba3406e8dddc85401d38632dc28075d1bb0c9e0cc4",
+    "third-party/tokenizers-0.23.2/src/pre_tokenizers/mod.rs": "efcdcc0051c5925213435efae17601ca7160aa230eee8e80884994a1e1d3fdbc",
+    "third-party/tokenizers-original-regex-tokenizer.patch": "f2bead2fe41f3aed29a7d07c0d801e39fd09c6e4bbb10c66999ebb8033d1f936",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/token_input.rs": "446e4c7b3b3756ccdbbb0aff53937bd86d92c44fbecf7b3e34a71c39f0df9664",
+    "third-party/fancy-regex-source-construction.patch": "6279df281e2864a279a41cba0146bb0f4d516cf04eb85328fca5cde104d6e00d",
+    "third-party/regex-automata-0.4.18/src/util/captures/construction.rs": "7b193217abd320134c4881f10e0c5e84b47b29dee8e6486416c86312690ec41a",
+    "third-party/tokenizers-0.23.2/src/pre_tokenizers/compiled_byte_level/tests.rs": "779303682555ce088e751f47546a80eb9a9c6276fc2da23724082df8008cdfe0",
+    "third-party/tokenizers-0.23.2/src/tokenizer/pattern.rs": "d9ee999c7a0a1d3299c21705efc943833ca394b1090e3bdfe11dd272cb66ffcb",
+    "third-party/tokenizers-0.23.2/src/tokenizer/compile/regex.rs": "691a7739ec71291fbc585c88911630433beef0b133452cb1a96068d723ea3a03",
+    "third-party/tokenizers-original-implicit-bytelevel.json": "b38f5e662344845987574008457d21b1cc4fe0e9e21c55a057a2eccf7c92d75d",
+    "eredu-text/src/tokenizer_storage/encode.rs": "1130f3fbf36828e5835ae6ecc7469e334558da69b20f21a2ef368de89c5fbaff",
+    "third-party/regex-automata-0.4.18/src/nfa/thompson/nfa.rs": "b6e45ecdc9d8a27ca7b49e147fefc3a72c5e1305879dd1277a2a6038d0beef5a",
+    "third-party/tokenizers-0.23.2/src/tokenizer/encode_ids/regex_tests.rs": "07c739f890cfcf206e4a995c29e99d495ace44825f8a0eda37ef67db927d1511",
+    "third-party/fancy-regex-source-emitter.patch": "7859b9b86b728fe99d91592703426d3380315440855e506a69efbcea329a90dd",
+    "third-party/regex-automata-0.4.18/src/nfa/thompson/pikevm.rs": "5e54352582bcebc0d64c129d102acb1e7878905d2afab117c86b23f289244d2a",
+    "third-party/regex-automata-original-regex-mechanisms.patch": "a84aca7a45c53409118beb5ea50744cc6a4a241465bbc5f0d0e88ac37807a917",
+    "third-party/tokenizers-0.23.2/src/pre_tokenizers/byte_level.rs": "08d529cd2be7a7044fb11b144f0517f8914585c2eda09a48aae2bece7601c15c",
+    "third-party/regex-automata-source-construction.json": "f750392c0e18b44bc6e363300776e9ae4a0267e1dd1d61e81c7a404f1cee36a3",
+    "third-party/regex-automata-0.4.18/src/nfa/thompson/nfa/source.rs": "fb5b6e3cb520ebe8d4ef67a79ae67e8f35f06f74ef432c53a7a02023c5c76eb6"
+  },
+  "source_snapshot": "/private/tmp/eredu-original-regex-tokenizer-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-regex-top-candidates-integration-2026-09-14.json": "5d5b9223f3a3827bfd7e668d69bfe50df55c9c4957c4e488dfd4ac1e9a264c7c",
+    "/private/tmp/eredu-original-regex-minimal-feature-correction/correction.json": "3fa41d5c4bfd695e632cb6a8c198ef2a38d6706620b73de55cd22160ac48deb2",
+    "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-apply.py": "5287af9911753bd94ff9508897db8d862edbd359a7b14b3536447cb671e9b3b9",
+    "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-record.py": "1e8973c255f7896a7abcf143a4e4a9374f9254fdd55b4e1d266eaa250f37b7b5",
+    "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-review.json": "009490a2217b1321dacfa728714bad669f2c32d314aff34923baf777ab67ae46",
+    "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-spec.json": "3c666201073f18be0803d642651d49afb9ea7ebe96686bba1c89e38a25db4f80",
+    "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-validate.py": "a196f4a7b071da4139b63582d93b11f5368462da57a6d17801fb92bdff6643b3",
+    "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-validation-config.json": "0c21b43c6923896b61d73f29fe4c20605b3f7b71af75de6312cf2a2cad112903",
+    "/private/tmp/eredu-original-regex-oracle-offline-correction/correction.json": "e93be787d81db01ad42d1224d75e1c8e19078656361abfb90c2be17f0b321ce5",
+    "/private/tmp/eredu-original-regex-oracle-offline-correction/eredu-original-regex-tokenizer-integration-run-oracle.py": "37f113cef8be65355995e7c99aad0993d790b382582e3ed50f43136800032088",
+    "/private/tmp/eredu-original-regex-rustdoc-path-correction/correction.json": "3febebc7f5d293aef2950b7881a8136b8a571ca0ab432e35765565175ae3fb42",
+    "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-apply.py": "194ceeaa6eb95224449f6670393460e18718600350ab49048c0a47859c20f855",
+    "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-record.py": "3144d7cf91f1ab481bebb481de08cf79e74be96e7d815154ddaabf75e882693a",
+    "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-review.json": "820989f131e47e880ded7a613f23f32c26add87558235814ed1d16820cd7b1b1",
+    "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-spec.json": "a18f34c8aec502b86dd99c1e1ede5e8af239018647a93e80a07ab7e76fb366c4",
+    "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-validate.py": "9261462c469281184e397e1194b3ba9426d6a74f42e8008eedc717b05302dfc7",
+    "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-validation-config.json": "f1384d8c52f4daa79cf7e3ee0f38c3d8d32fd1e84416f47c9051d77b8a55502c",
+    "/private/tmp/eredu-original-regex-tokenizer-composition-final-root-review.json": "efb767ad2e1e8112697d0c009745ebbc90658d198f7efd92482236606d9453db",
+    "/private/tmp/eredu-original-regex-tokenizer-composition-reviewed/change.patch": "d9892056806281e96acdcd8aac5d9a32e42df2158eabe77b66ef25140857254f",
+    "/private/tmp/eredu-original-regex-tokenizer-composition-reviewed/docs.json": "b48b28901c70f358d3fb4cfd91ff7738e4be61b935d62b454cd828ea31d6b0dd",
+    "/private/tmp/eredu-original-regex-tokenizer-composition-reviewed/manifest.json": "970568c38cc59ec0a58913636138e2769e89c89b4d49cddfb4901463dde96c87",
+    "/private/tmp/eredu-original-regex-tokenizer-composition-reviewed/review.json": "21e984b0ad0754dc0c48052cfe6ab554c7f01ce012b90fbf9ffd8d8639b476c5",
+    "/private/tmp/eredu-original-regex-tokenizer-composition-reviewed/source-origins.json": "d873ffb587e9f29859655721302c78ea7a37e24bc0b7944e1f709d9f16838480",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-applied.json": "203fd5f57d9c0fa93cd02beda39dace85a012dd976d5d21eeacdb2f3e8bb9fd1",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-apply.py": "09c3ca3f02b6e4c9d1afd97d75c471c5a9dda3a951f7894ed7851e4a28f65f23",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-checks.json": "8ce1e8bb1d739134b00da1b98cdc2483aae66b4035af79c5189e1244fe11090e",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-cold_evidence.log": "085fd9f504119a1476e2d57b0fa1301a16630e8dabd1b53ea838f211d66cb0e8",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-cold_evidence.log.1789410255068647000.previous": "085fd9f504119a1476e2d57b0fa1301a16630e8dabd1b53ea838f211d66cb0e8",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-conformance.log": "307a98bfb06292da250275b8124ce0a6e529a5cea465d2cd79d270cd3ba93e40",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-doc-applied.json": "f8549c75b1de2c4199d48c4ea4882e8c31c8e5a6c15ad44f980b4acf0e0b457a",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-facade_private.log": "97bdff7a588d271a4ff0ed55ed2ae6629152c9b0395f608a44950f75a220a219",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-fancy.log": "854efa488e59a6bf47fd1c24a6f4e3ba76fc1a233a33edac1016eb7132b1b8f9",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-fancy.log.1789409807032780000.previous": "b709cd2d0aaf5f3028bb386bb6328489e39d99918c29f11ca7778c934b31c291",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-fancy.log.1789409830625116000.previous": "ab400b9fe2bb908c1e49a7da553668dc8bc8eb13d5abae8dc9c746b02f8da552",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-fancy_doc.log": "df7b8ccdc2470e9a9ccae026a220062ccdf6f3d7107bfb0539f3cf9a670217bf",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-features.log": "9de14181640cad97e1bbaa28a74d2918e1273c81ab4a63ba1364ca21b2d67585",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/Cargo.lock": "203d901d721ebfd12e5b46fb3f639bf17c415a471b6aa8552d6f5d3e9b79762e",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/config-before.json": "593738f0181ff980c56390ea20cff9e25b4534b94a68dbb9e05875c9471c87d8",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/eredu-original-regex-tokenizer-integration-apply.py.before": "b699bc55cc8e690b2fe2f4493a772b30f5dd250f3eef77530b97b2b572dc2a40",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/eredu-original-regex-tokenizer-integration-record.py.before": "3b974c1e5d5a5b85ccf69ad5c0413f7b288650ec479e2a26a87ff37b6a346e41",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/eredu-original-regex-tokenizer-integration-validate.py.before": "32e75b25fc7327c177097e567fbb3d30b1f67c740f8a009da81b91f148932209",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/evidence.json": "71b97f2e0f8b41a9477e9f364525d3b3ca3cdcec8b255ef3dde6335fc8ef5809",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/third-party/fancy-regex-0.17.0/Cargo.lock": "0b46a2324d14e9d8f85bb772c228f13fe40d122e6be11b9f6419e5d70feca4d8",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/third-party/regex-automata-0.4.18/Cargo.lock": "950dff7078a38c3e41562992454789a553d7c9ee082e0035e24ca681c72bd7b0",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/third-party/tokenizers-0.23.2/Cargo.lock": "c66bd8c62c0c1f4ce20f08c72e4eff6cb25b420bef3ad41f02134ae151acfdd7",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-four-unit-spec-before-runner-config.json": "b3d18ad32b16bc8d255b85de8c1de7de97d1b5d64fb00bd5ff17d742990238d6",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-hf.log": "2dc26e0e1742797173f31400864a0f7b2aed85128081ef2e3137a6efa20d3b81",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-hf.log.1789409908362697000.previous": "e3a3fdf04f9bcb34be1e08935f359434a562200fc15676d2718c0bb3b5cc9265",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-hf_doc.log": "0f0b2bafac7bdfa45218269f7a7036052d3c8a964cdb7260dda3733b06f292ae",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-hf_features.log": "691c125b2507fb688eb6f6d0f26d686f4cd2683bbd77e0493c529c9da67a7026",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-hf_features.log.1789409958087789000.previous": "e203fc6ada14717722d2f1e715d91c154470ee14ace17d32a7dd7a694b684218",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-hf_minimal.log": "1049cede478c472a3723d3ce44ff67608589eb90bf1732c85bf84dfb0dda87f0",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-hf_minimal.log.1789409939820202000.previous": "a1fe12c021e3c5e6998f3b291f04a2bd6297cd889181110bf096e9fa6bdaaa4a",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-hf_onig.log": "2685845e7eeb64dcb81abb009f3748436c34912f292d807cf31d0902fce518e6",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-hf_parity.log": "8226b29705096d4c4bff4666bf00af521ef2dd16a3cfd465ea8dd2c5555017e5",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-minimal.log": "4242feb75fdabd79d5edab4ee30003f8ea971bf566a944c83cf7e7d55238ac0c",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-next-root-review.json": "6328ae2c6ed2052c57a88c294ff9494fc59218bdc408f384b85c7b72a5803d84",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-next.md": "474bc327ae5b93e1e1a060ed22418bb7be27b54dcc0954bdd5a82dd1db06006a",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-oracle-run/Cargo.lock": "229ecf9161e6058f694e7d8495120e93fea2b87c4282cb27a67d0e365479364f",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-oracle-run/Cargo.toml": "d8f718e1542fe73d0ae9e31de38c3ffad5b2684f2eb9dceb33c6657d242d8d86",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-oracle-run/artifacts.json": "633337674a65395f6e332b7db15f8593da8e6af7ec149c69c1a277a19ce77fd7",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-oracle-run/oracle.stdout.json": "b2a73a4810933815fb3229a5055915520c7cd2ca226183c807d462f7cc0dd174",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-oracle-run/src/allocations.rs": "7c3e32c291c2ccbc4d34eed7473fc3c05a26b18afb7ac3e083b812189b907772",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-oracle-run/src/corpus.rs": "07935473765c6054d3045353bcbf20c204af508ad8257d26a19d2127412bc68e",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-oracle-run/src/main.rs": "9f38ac54370b736736a25b126adf3aeeae77fa5bb0afa8c54ac94e8c3f3a678a",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-oracle-run/verified-oracle.json": "5a1696f5cd37ab05352d750f60139c440eb8e465e49b7806b513743412a58061",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-oracle.log": "2bfdb4bcdf01d43cc3d1c2b6b43810cb8579823656987133d03fe788dcc17c5f",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-oracle.log.1789410208767527000.previous": "760f57d8be0458e4cdf50f9fa0bb8031bc43a77bdbf8edfd4a25b1e8c5ebd719",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-portable.log": "b7a8f3bb50fa74f30fda83625b0ff1a0f871407300d800ecfa0fcdd7822730d5",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-ra.log": "09f192d60e1172ede501f04d49625e90ea3eef034d3da4d0d8a7623c7caf4955",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-ra_doc_source.log": "b01321234b9e35e8fd66adc4fa1b60de0b7574bca47f392cfb1e842cb28873c8",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-ra_doc_workspace.log": "51bfed9d8ed62c16628b1cd671cc710642d509314ba7f343ba80944ea9e1e399",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-review.json": "5c254a1935b367c2f224c08ab75c1f16e016d41ad8c02e86280401bffe705fe3",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-root-review.json": "ff4db507c85bf9748124f8ec5fec0a0ebbdf5b8db9b91f7dd0bfebdad1403acb",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-run-oracle.py": "907a720039048c2bfb7562f28b6d30411c07f178b0d56ea3c6ebcbbd5786f37b",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-runtime.log": "191752a2c0e458534f5b6763e961f2db0826059ad7e2db0201fdc1007fd7e2e7",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-runtime.log.1789410052203521000.previous": "1873232002511155889c1146cda0002c450c8cc9534eb3b25af40a0a4dbff1da",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-spec.json": "65dd32908623cff0cbde839fe4a280c72e8e2207f50e1e12fe48539421c10e4a",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-stage/all.patch": "dc2df53bc402655d647052572b350634e16f8863373e78daf5583d86f1d831c2",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-stage/change.patch": "7c0bc2bf8daeec3e5faf6ba7cbc6741bd5950c86da76255e3fae2acaaef8ccf0",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-stage/manifest.json": "203fd5f57d9c0fa93cd02beda39dace85a012dd976d5d21eeacdb2f3e8bb9fd1",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-stage/staged-hashes.json": "fac51f7ed665324ff8b9bffa661371b933f912f969a9559d39b3e8cc8217ec05",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-text.log": "480a86b8760400fc2795ef1e9498a1527000172311037b7f9cb98c45432fd03f",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-text_features.log": "b3550f885bedcb368bdce5bdd26779de9cc103250858504334c738ad22720611",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-validate.py": "411f02f753d5c6393bbf5121ebf42b5d09aac27ecb563209080f428356f80a4d",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-validation-config.json": "380b4854a1ad235da674d723fdc1aff2d9eecfcc3bd79b311ccb968a5c84376c",
+    "/private/tmp/eredu-original-regex-tokenizer-integration-verify-cold.py": "38119627bbb0124d16d2e821d6075e5125d52bc92cc08ad4167d7d7dd5d72374",
+    "/private/tmp/eredu-original-regex-tokenizer-vendor-final-root-review.json": "7a597af0a44e54ce87c70af82277935ea3fa5e6b9a347b2c5ffee3f5280e0afc",
+    "/private/tmp/eredu-original-regex-tokenizer-vendor-reviewed/change.patch": "d964f569e3f6fbae8b821a30c6f22570a1c50feeab48c8363c851428c11ef4dc",
+    "/private/tmp/eredu-original-regex-tokenizer-vendor-reviewed/docs.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+    "/private/tmp/eredu-original-regex-tokenizer-vendor-reviewed/manifest.json": "108fd178b0968f2a8b9770adf610f22df443e0aed218457d74e4d56156b5daa5",
+    "/private/tmp/eredu-original-regex-tokenizer-vendor-reviewed/review.json": "6d271dfb9b21fbdb3a209c509d1aa7b76f1bf9df4cd275c6cf2f490032930211",
+    "/private/tmp/eredu-original-smollm2-tokenizer-final-root-review.json": "31c08e49f73fd3c4430b0c4bd8463a1374dae71791e2f81ecada8488e45a4c7c",
+    "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/change.patch": "5ca8e86788d484c771cfbcca1010f527d5b83e3e5441120e47e212f7b8311a1e",
+    "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/docs.json": "554ab0b53724cea47a2a7c7bcb595917c5633bd8679d056e39791b13a91f43b6",
+    "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/integration-three-unit-spec-before-implicit.json": "3a4bbed28e6017530d7af189626c7c5e10bcaff22415f1b24964b0b039577074",
+    "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/manifest.json": "8714a808d191ccfd8db1959a96ef25810712205213c35912899d2e6c547d611b",
+    "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/review.json": "73ecfa4f22740e975106ff6a1440b33561ec300527eae5724fe76c5aeb3517fb",
+    "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/source-origins.json": "1da09bf8cdea797656a1472880cdb3ecc374e4b491858a71b6aecf19b39acc7d",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/AUDIT.md": "61f12ac8125ceabdea759b1682d723d30d267d4bc7869348d5f06d582425a173",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/FROZEN.json": "c3b4090db1517a53e1fcd2d3263a2e12ac2242223a9db4ddf1d4c1c7ba9c1ece",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/PRICING.md": "7a949c277777d0a6984b07a117b276f7c0e1af0912e228d7dbe4e5e5040f268d",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/README.md": "63e12b0fc42640e2f041668d53803b76e4e232d4e7ad7bc4ee92e31d6708e99e",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/TESTS.json": "1727d1c1cc5d60d014d303328448ae93cc4e52ee30e299a33f8e03d026bdb7a2",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/VALIDATION.md": "ce03a0b7c2ff4c316262312d3464c09d48e08657e347a4896615d77ff4097804",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/VERIFICATION.json": "e07295079ec08f385456f4a9ee32eb5eac39ce635a5a5a298a7a2dc0ada06b16",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/add-hf-tests.py": "51bfa31a910ed5f0d1096d1338d977f5b023446bd03ef529aed755b27babe096",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/artifact-index.json": "8b7566c338800b2104c0432d6f97576076e955a186dbc9efcab060d82b037ec3",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/base-manifest.json": "b80bce73951bb217b209f25209c5b5952a5352bc5079e6114a0eaf57a9675a95",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/change-with-docs.patch": "084e49a93920e20b46ef39f97baa2d8bd7afdcca18ffbe23d0adc1feaf5dcb23",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/change.patch": "5ca8e86788d484c771cfbcca1010f527d5b83e3e5441120e47e212f7b8311a1e",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/dependencies.json": "89de65d562dac8f9f1a32c62322575d38740254aacf85353d67b92b9ed1ea8cb",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/doc-operations.json": "ec750930600e2e60c046baf344a0f62b6db757bd14ff248604271b99eea6ba16",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/edit-encoder.py": "81e1dd7db188a1bc0b0711e6c5a3883ae48ddb92c876d1dcca17791443a17462",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/edit-fixtures.py": "bb26d70f43c9361613cf0292bee9517996538b5c57462199a4b6a99186f102e8",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/edit-vendor.py": "857b5bbabad35616a205d7b52a1fd097d0d5655bb13783f4422ee7cdac002d12",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/final-hf-manifest.json": "6ad5fbfbc77d4083959c59c7b4697afade557c65609838286f0bc9cdba605fa8",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/format.json": "afe0ce933b83f34feed9f0865db4d06f3d9402d993ecadd274291b38b8e9f002",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/manifest-with-docs.json": "5dbf610b77e58ab69b91c68468f4d2b32d282b5aeba37548f310087121aaece3",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/manifest.json": "8714a808d191ccfd8db1959a96ef25810712205213c35912899d2e6c547d611b",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/package.py": "55c6b96f02f4750f1d798822bc6fa278494d18f93ed31c4abd7e1d5d3911c88e",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/predecessor-hf-manifest.json": "b6827f952610720b2b0eaad32b6730351f3fc3ae50192f2ce2d1bd887f5c038f",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/replay.py": "309338ff83263f7f82a980c92acc98733670d0edaedf89a392e59f0bbd796d58",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/review-map.json": "9ac87b764312176f1d5162dace872fb6d26a78f3225979ae5ba4ba08967402d1",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/source-origins.json": "dadd0fd949629c483be19768ca865f24f5d4b04b5dc178baa74d4b5daaaf2542",
+    "/private/tmp/eredu-original-smollm2-tokenizer-stage/work-manifest.json": "317503060a3f4606078c07d74ec96e33a59c66bcb92adcac4373ef01751fa126",
+    "/private/tmp/eredu-prepare-reviewed-vendor-evidence.py": "d58a64fd6466ddf73757f5950d3ec3522e3e6517bb4c1c261e3eeb14431b25c2",
+    "/private/tmp/eredu-regex-construction-selector-type-reviewed/change.patch": "88ce8d39c672b3c8845138d6205393c6368e875cf6b778b14c58fd30c126bf36",
+    "/private/tmp/eredu-regex-construction-selector-type-reviewed/docs.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+    "/private/tmp/eredu-regex-construction-selector-type-reviewed/integration-before/eredu-original-regex-tokenizer-integration-applied.json": "d7ad2da3220aaab6440bf950459e8d8124ca67b6607f6f59997340037748ab3e",
+    "/private/tmp/eredu-regex-construction-selector-type-reviewed/integration-before/eredu-original-regex-tokenizer-integration-review.json": "aeeb953e29803a035946c14b8c1694f3585a77342955eff7b65b32de77144730",
+    "/private/tmp/eredu-regex-construction-selector-type-reviewed/integration-before/eredu-original-regex-tokenizer-integration-root-review.json": "592a44d04d5067274334e13b743e86648d67630bb0570f9b1fd7e8460981d69b",
+    "/private/tmp/eredu-regex-construction-selector-type-reviewed/integration-before/eredu-original-regex-tokenizer-integration-spec.json": "f0b8805c0edb36f952fef271f63c18c5c7aba0e820720512ed9b49387fa604a1",
+    "/private/tmp/eredu-regex-construction-selector-type-reviewed/integration-before/eredu-original-regex-tokenizer-integration-validation-config.json": "1eac7d9ee7a5f9cc22d6cfa54b174aa6965c72ec61bb600b0bb3d72e28e3c3a6",
+    "/private/tmp/eredu-regex-construction-selector-type-reviewed/manifest.json": "c7300a5ad22ea102067957b9f3fd60d4b08623ab6d085fb8dfc9a8849f3472c3",
+    "/private/tmp/eredu-regex-construction-selector-type-reviewed/review.json": "8a95eb5aa674bdb412423811ad514a53c16d7830f05ccc7e3f77f7721b158e55",
+    "/private/tmp/eredu-regex-emitter-construction-reviewed/change.patch": "05e590bcef38d35b3e9e97b03b7e5eb7af494c827bd4af944bf558586dfea5d4",
+    "/private/tmp/eredu-regex-emitter-construction-reviewed/docs.json": "657c96928d3f12475997a651e788e7ae388d540af39b02a9f75e5754366c84bb",
+    "/private/tmp/eredu-regex-emitter-construction-reviewed/manifest.json": "7db504582f1f1c2ed6a6589925d4834a1dbb4f0fc7d7e2eb983443cfaf496cde",
+    "/private/tmp/eredu-regex-emitter-construction-reviewed/review.json": "1ae67f1d8df152f571e9a1b8ae67cd4584ce081aa7fd517a084934e8ab239d25",
+    "/private/tmp/eredu-regex-encode-borrow-reviewed/change.patch": "38f733f26111684af46f02db7dda88a7e908d44d75f940ac245891cc351015ab",
+    "/private/tmp/eredu-regex-encode-borrow-reviewed/docs.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+    "/private/tmp/eredu-regex-encode-borrow-reviewed/integration-before/eredu-original-regex-tokenizer-integration-applied.json": "fa17f09798cc1d9bf13bd686b6298ac2e6e89ad971c3e82b2103f1becd4c823a",
+    "/private/tmp/eredu-regex-encode-borrow-reviewed/integration-before/eredu-original-regex-tokenizer-integration-review.json": "a8a803cc0b200fbd631220e44d2530c1dbf1409f1a5c88fbda17bd44972d1a41",
+    "/private/tmp/eredu-regex-encode-borrow-reviewed/integration-before/eredu-original-regex-tokenizer-integration-root-review.json": "52adc7cffd8df381f7feba22b9cffff8a2c0f67be06f039978f5a039b3c28ba1",
+    "/private/tmp/eredu-regex-encode-borrow-reviewed/integration-before/eredu-original-regex-tokenizer-integration-spec.json": "ba17a4139e866de7ca5690faacbe0a47a71e54d21cd1f45ed82f475ffe5eb32b",
+    "/private/tmp/eredu-regex-encode-borrow-reviewed/integration-before/eredu-original-regex-tokenizer-integration-validation-config.json": "ea2fcf1d9bd8356e9559a9da473e59bc53909675073b8c4082e150632559020f",
+    "/private/tmp/eredu-regex-encode-borrow-reviewed/manifest.json": "16297e71cf0944dd96f9b14a7b1605918a143cd93d47c22e19b6ac2738b3edb0",
+    "/private/tmp/eredu-regex-encode-borrow-reviewed/review.json": "5a5d302ec4b7003769cdac055653333d59cff7602f757e55a1cba4b10b77f3a7",
+    "/private/tmp/eredu-regex-file-profile-fixture-reviewed/change.patch": "6791dde215026d7cb037f8e0fcf1e42390b0622fbfafde9ef11d29f56eb3a54d",
+    "/private/tmp/eredu-regex-file-profile-fixture-reviewed/docs.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+    "/private/tmp/eredu-regex-file-profile-fixture-reviewed/integration-before/eredu-original-regex-tokenizer-integration-applied.json": "ada0bb05a2edda138813f4fe35ece231504767d7babd3cfbc6b314eef266c3c1",
+    "/private/tmp/eredu-regex-file-profile-fixture-reviewed/integration-before/eredu-original-regex-tokenizer-integration-review.json": "dda6e4c989d1dfb08f49e640d67482cb3bd648dbe74692809f1b33777076fe46",
+    "/private/tmp/eredu-regex-file-profile-fixture-reviewed/integration-before/eredu-original-regex-tokenizer-integration-root-review.json": "741f472cccb84d1e96c28948a6d5bc13420d24d91867e2d1bce9f8be984186ef",
+    "/private/tmp/eredu-regex-file-profile-fixture-reviewed/integration-before/eredu-original-regex-tokenizer-integration-spec.json": "a00d4a64e332d5119fdc1df158aec9d49662980998ed046b0a49e86f26877f7c",
+    "/private/tmp/eredu-regex-file-profile-fixture-reviewed/integration-before/eredu-original-regex-tokenizer-integration-validation-config.json": "b74b20fa4aa1593b4fb783314495c3b18b1288796eeb6e3b69637312f942da0f",
+    "/private/tmp/eredu-regex-file-profile-fixture-reviewed/manifest.json": "bc8dabd5dbcf0d755a1db12a77329f6b6690a9569772c0b3da6c22fc8fc3ba17",
+    "/private/tmp/eredu-regex-file-profile-fixture-reviewed/review.json": "bb2bcd5e8b586ce55ca9e3e99ca8c3d494dcd97cef06b42a42b01276eb92f290",
+    "/private/tmp/eredu-regex-selector-field-docs-reviewed/change.patch": "cab1aca7c2a527269b30fff3609c25cefbd2d0c5929202e5c3e99b365ef26313",
+    "/private/tmp/eredu-regex-selector-field-docs-reviewed/docs.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+    "/private/tmp/eredu-regex-selector-field-docs-reviewed/integration-before/eredu-original-regex-tokenizer-integration-applied.json": "880f0d093149c76946515a96a13ef96494378306c4823c1b2fd23c92e12c27ae",
+    "/private/tmp/eredu-regex-selector-field-docs-reviewed/integration-before/eredu-original-regex-tokenizer-integration-review.json": "c37b812ecf2447f438a74cb9954c454be5f68c17dbd173787b02f49287373d12",
+    "/private/tmp/eredu-regex-selector-field-docs-reviewed/integration-before/eredu-original-regex-tokenizer-integration-root-review.json": "23b9fb91d15c081f8e6bdf377d0ddbc04634ac4887de1d023fff41d9f60e840c",
+    "/private/tmp/eredu-regex-selector-field-docs-reviewed/integration-before/eredu-original-regex-tokenizer-integration-spec.json": "84d6df70084a3dc122724603c48d00cf360f9cf6e1ba8fdcbc967b58862d2482",
+    "/private/tmp/eredu-regex-selector-field-docs-reviewed/integration-before/eredu-original-regex-tokenizer-integration-validation-config.json": "101b95c029e737ffb2bafcd057f126fcb89d832e3b400d210e0766cd79e8cecc",
+    "/private/tmp/eredu-regex-selector-field-docs-reviewed/manifest.json": "8655ab24ed0fcc553d70d9b9f65108e5c88c14912bd424ecabac3a1e1bc44ec6",
+    "/private/tmp/eredu-regex-selector-field-docs-reviewed/review.json": "e1b99ad0ae14433eb0d47687a6ef7cf21505f42b85d2a90ea8d00bfc80f1ee86",
+    "/private/tmp/eredu-regex-source-construction-final-root-review.json": "87e65f7274db12006a452fb79280e9f9bfd195fd63f1f1885d17570302bf4dad",
+    "/private/tmp/eredu-regex-source-emitter-root-review.json": "b8c94402b759426e4bcecba523d920681c17ecea963fcaaf1c261e098ff631e6",
+    "/private/tmp/eredu-vendor-evidence-helper-syntax-review.json": "3a1681cdb0dd48256bd61dbb38086e60403a26238e7b1ed141771182838e6bc7"
+  },
+  "review": {
+    "full_manifest_sha256": "fac51f7ed665324ff8b9bffa661371b933f912f969a9559d39b3e8cc8217ec05",
+    "full_patch_sha256": "dc2df53bc402655d647052572b350634e16f8863373e78daf5583d86f1d831c2",
+    "patch_sha256": "7c0bc2bf8daeec3e5faf6ba7cbc6741bd5950c86da76255e3fae2acaaef8ccf0",
+    "replay": "/private/tmp/eredu-original-regex-tokenizer-integration-stage/replay-eredu-regex-file-profile-fixture-reviewed",
+    "review": "All three exact source units fully root-reviewed and normalized. Requires successful immutable standalone cold constructor proof, actual integrated behavior and complete-file original C/E oracle before writing. No execution yet. Added fully reviewed SmolLM2 successor. The new complete ten-file oracle must validate both profiles; old one-profile oracle remains immutable and is not run against new broader support. Source correction: Use the existing typed workspace Geometry rejection for a development selector targeting a missing literal/instruction, matching existing invalid-delegate selector behavior. Three return sites and one exact assertion corrected; no production branch, enum layout or reserve behavior changes. Exact seven-member vendor patch reconstruction and replay passed. Source correction: Document the development selector public ordinal and buffer fields to satisfy the existing missing_docs deny lint. No executable changes; seven-member stored vendor patch replay passed. Source correction: Bind the immutable input borrow before consuming the regex plan so the Rust2018 nested callback captures the str borrow rather than partially moved Self. No extra allocation or owner clone; same reserve order, regex retirement, error/result ownership and source workers. Exact single-member vendor patch replay; other stored sections unchanged. Source correction: Update existing late-profile fixture for newly supported implicit ByteLevel regex. Preserve former input as typed C-budget rejection retaining only I; use valid unimplemented Whitespace pretokenizer for planning rejection. All malformed/empty/late semantic errors and exact I/C ownership assertions remain. No production change.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-regex-top-candidates-integration-2026-09-14.json": "5d5b9223f3a3827bfd7e668d69bfe50df55c9c4957c4e488dfd4ac1e9a264c7c",
+      "/private/tmp/eredu-original-regex-minimal-feature-correction/correction.json": "3fa41d5c4bfd695e632cb6a8c198ef2a38d6706620b73de55cd22160ac48deb2",
+      "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-apply.py": "5287af9911753bd94ff9508897db8d862edbd359a7b14b3536447cb671e9b3b9",
+      "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-record.py": "1e8973c255f7896a7abcf143a4e4a9374f9254fdd55b4e1d266eaa250f37b7b5",
+      "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-review.json": "009490a2217b1321dacfa728714bad669f2c32d314aff34923baf777ab67ae46",
+      "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-spec.json": "3c666201073f18be0803d642651d49afb9ea7ebe96686bba1c89e38a25db4f80",
+      "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-validate.py": "a196f4a7b071da4139b63582d93b11f5368462da57a6d17801fb92bdff6643b3",
+      "/private/tmp/eredu-original-regex-minimal-feature-correction/eredu-original-regex-tokenizer-integration-validation-config.json": "0c21b43c6923896b61d73f29fe4c20605b3f7b71af75de6312cf2a2cad112903",
+      "/private/tmp/eredu-original-regex-oracle-offline-correction/correction.json": "e93be787d81db01ad42d1224d75e1c8e19078656361abfb90c2be17f0b321ce5",
+      "/private/tmp/eredu-original-regex-oracle-offline-correction/eredu-original-regex-tokenizer-integration-run-oracle.py": "37f113cef8be65355995e7c99aad0993d790b382582e3ed50f43136800032088",
+      "/private/tmp/eredu-original-regex-rustdoc-path-correction/correction.json": "3febebc7f5d293aef2950b7881a8136b8a571ca0ab432e35765565175ae3fb42",
+      "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-apply.py": "194ceeaa6eb95224449f6670393460e18718600350ab49048c0a47859c20f855",
+      "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-record.py": "3144d7cf91f1ab481bebb481de08cf79e74be96e7d815154ddaabf75e882693a",
+      "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-review.json": "820989f131e47e880ded7a613f23f32c26add87558235814ed1d16820cd7b1b1",
+      "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-spec.json": "a18f34c8aec502b86dd99c1e1ede5e8af239018647a93e80a07ab7e76fb366c4",
+      "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-validate.py": "9261462c469281184e397e1194b3ba9426d6a74f42e8008eedc717b05302dfc7",
+      "/private/tmp/eredu-original-regex-rustdoc-path-correction/eredu-original-regex-tokenizer-integration-validation-config.json": "f1384d8c52f4daa79cf7e3ee0f38c3d8d32fd1e84416f47c9051d77b8a55502c",
+      "/private/tmp/eredu-original-regex-tokenizer-composition-final-root-review.json": "efb767ad2e1e8112697d0c009745ebbc90658d198f7efd92482236606d9453db",
+      "/private/tmp/eredu-original-regex-tokenizer-composition-reviewed/change.patch": "d9892056806281e96acdcd8aac5d9a32e42df2158eabe77b66ef25140857254f",
+      "/private/tmp/eredu-original-regex-tokenizer-composition-reviewed/docs.json": "b48b28901c70f358d3fb4cfd91ff7738e4be61b935d62b454cd828ea31d6b0dd",
+      "/private/tmp/eredu-original-regex-tokenizer-composition-reviewed/manifest.json": "970568c38cc59ec0a58913636138e2769e89c89b4d49cddfb4901463dde96c87",
+      "/private/tmp/eredu-original-regex-tokenizer-composition-reviewed/review.json": "21e984b0ad0754dc0c48052cfe6ab554c7f01ce012b90fbf9ffd8d8639b476c5",
+      "/private/tmp/eredu-original-regex-tokenizer-composition-reviewed/source-origins.json": "d873ffb587e9f29859655721302c78ea7a37e24bc0b7944e1f709d9f16838480",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/Cargo.lock": "203d901d721ebfd12e5b46fb3f639bf17c415a471b6aa8552d6f5d3e9b79762e",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/config-before.json": "593738f0181ff980c56390ea20cff9e25b4534b94a68dbb9e05875c9471c87d8",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/eredu-original-regex-tokenizer-integration-apply.py.before": "b699bc55cc8e690b2fe2f4493a772b30f5dd250f3eef77530b97b2b572dc2a40",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/eredu-original-regex-tokenizer-integration-record.py.before": "3b974c1e5d5a5b85ccf69ad5c0413f7b288650ec479e2a26a87ff37b6a346e41",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/eredu-original-regex-tokenizer-integration-validate.py.before": "32e75b25fc7327c177097e567fbb3d30b1f67c740f8a009da81b91f148932209",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/evidence.json": "71b97f2e0f8b41a9477e9f364525d3b3ca3cdcec8b255ef3dde6335fc8ef5809",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/third-party/fancy-regex-0.17.0/Cargo.lock": "0b46a2324d14e9d8f85bb772c228f13fe40d122e6be11b9f6419e5d70feca4d8",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/third-party/regex-automata-0.4.18/Cargo.lock": "950dff7078a38c3e41562992454789a553d7c9ee082e0035e24ca681c72bd7b0",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-final-evidence/third-party/tokenizers-0.23.2/Cargo.lock": "c66bd8c62c0c1f4ce20f08c72e4eff6cb25b420bef3ad41f02134ae151acfdd7",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-four-unit-spec-before-runner-config.json": "b3d18ad32b16bc8d255b85de8c1de7de97d1b5d64fb00bd5ff17d742990238d6",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-root-review.json": "ff4db507c85bf9748124f8ec5fec0a0ebbdf5b8db9b91f7dd0bfebdad1403acb",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-run-oracle.py": "907a720039048c2bfb7562f28b6d30411c07f178b0d56ea3c6ebcbbd5786f37b",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-spec.json": "65dd32908623cff0cbde839fe4a280c72e8e2207f50e1e12fe48539421c10e4a",
+      "/private/tmp/eredu-original-regex-tokenizer-integration-verify-cold.py": "38119627bbb0124d16d2e821d6075e5125d52bc92cc08ad4167d7d7dd5d72374",
+      "/private/tmp/eredu-original-regex-tokenizer-vendor-final-root-review.json": "7a597af0a44e54ce87c70af82277935ea3fa5e6b9a347b2c5ffee3f5280e0afc",
+      "/private/tmp/eredu-original-regex-tokenizer-vendor-reviewed/change.patch": "d964f569e3f6fbae8b821a30c6f22570a1c50feeab48c8363c851428c11ef4dc",
+      "/private/tmp/eredu-original-regex-tokenizer-vendor-reviewed/docs.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "/private/tmp/eredu-original-regex-tokenizer-vendor-reviewed/manifest.json": "108fd178b0968f2a8b9770adf610f22df443e0aed218457d74e4d56156b5daa5",
+      "/private/tmp/eredu-original-regex-tokenizer-vendor-reviewed/review.json": "6d271dfb9b21fbdb3a209c509d1aa7b76f1bf9df4cd275c6cf2f490032930211",
+      "/private/tmp/eredu-original-smollm2-tokenizer-final-root-review.json": "31c08e49f73fd3c4430b0c4bd8463a1374dae71791e2f81ecada8488e45a4c7c",
+      "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/change.patch": "5ca8e86788d484c771cfbcca1010f527d5b83e3e5441120e47e212f7b8311a1e",
+      "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/docs.json": "554ab0b53724cea47a2a7c7bcb595917c5633bd8679d056e39791b13a91f43b6",
+      "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/integration-three-unit-spec-before-implicit.json": "3a4bbed28e6017530d7af189626c7c5e10bcaff22415f1b24964b0b039577074",
+      "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/manifest.json": "8714a808d191ccfd8db1959a96ef25810712205213c35912899d2e6c547d611b",
+      "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/review.json": "73ecfa4f22740e975106ff6a1440b33561ec300527eae5724fe76c5aeb3517fb",
+      "/private/tmp/eredu-original-smollm2-tokenizer-reviewed/source-origins.json": "1da09bf8cdea797656a1472880cdb3ecc374e4b491858a71b6aecf19b39acc7d",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/AUDIT.md": "61f12ac8125ceabdea759b1682d723d30d267d4bc7869348d5f06d582425a173",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/FROZEN.json": "c3b4090db1517a53e1fcd2d3263a2e12ac2242223a9db4ddf1d4c1c7ba9c1ece",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/PRICING.md": "7a949c277777d0a6984b07a117b276f7c0e1af0912e228d7dbe4e5e5040f268d",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/README.md": "63e12b0fc42640e2f041668d53803b76e4e232d4e7ad7bc4ee92e31d6708e99e",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/TESTS.json": "1727d1c1cc5d60d014d303328448ae93cc4e52ee30e299a33f8e03d026bdb7a2",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/VALIDATION.md": "ce03a0b7c2ff4c316262312d3464c09d48e08657e347a4896615d77ff4097804",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/VERIFICATION.json": "e07295079ec08f385456f4a9ee32eb5eac39ce635a5a5a298a7a2dc0ada06b16",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/add-hf-tests.py": "51bfa31a910ed5f0d1096d1338d977f5b023446bd03ef529aed755b27babe096",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/artifact-index.json": "8b7566c338800b2104c0432d6f97576076e955a186dbc9efcab060d82b037ec3",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/base-manifest.json": "b80bce73951bb217b209f25209c5b5952a5352bc5079e6114a0eaf57a9675a95",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/change-with-docs.patch": "084e49a93920e20b46ef39f97baa2d8bd7afdcca18ffbe23d0adc1feaf5dcb23",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/change.patch": "5ca8e86788d484c771cfbcca1010f527d5b83e3e5441120e47e212f7b8311a1e",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/dependencies.json": "89de65d562dac8f9f1a32c62322575d38740254aacf85353d67b92b9ed1ea8cb",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/doc-operations.json": "ec750930600e2e60c046baf344a0f62b6db757bd14ff248604271b99eea6ba16",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/edit-encoder.py": "81e1dd7db188a1bc0b0711e6c5a3883ae48ddb92c876d1dcca17791443a17462",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/edit-fixtures.py": "bb26d70f43c9361613cf0292bee9517996538b5c57462199a4b6a99186f102e8",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/edit-vendor.py": "857b5bbabad35616a205d7b52a1fd097d0d5655bb13783f4422ee7cdac002d12",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/final-hf-manifest.json": "6ad5fbfbc77d4083959c59c7b4697afade557c65609838286f0bc9cdba605fa8",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/format.json": "afe0ce933b83f34feed9f0865db4d06f3d9402d993ecadd274291b38b8e9f002",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/manifest-with-docs.json": "5dbf610b77e58ab69b91c68468f4d2b32d282b5aeba37548f310087121aaece3",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/manifest.json": "8714a808d191ccfd8db1959a96ef25810712205213c35912899d2e6c547d611b",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/package.py": "55c6b96f02f4750f1d798822bc6fa278494d18f93ed31c4abd7e1d5d3911c88e",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/predecessor-hf-manifest.json": "b6827f952610720b2b0eaad32b6730351f3fc3ae50192f2ce2d1bd887f5c038f",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/replay.py": "309338ff83263f7f82a980c92acc98733670d0edaedf89a392e59f0bbd796d58",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/review-map.json": "9ac87b764312176f1d5162dace872fb6d26a78f3225979ae5ba4ba08967402d1",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/source-origins.json": "dadd0fd949629c483be19768ca865f24f5d4b04b5dc178baa74d4b5daaaf2542",
+      "/private/tmp/eredu-original-smollm2-tokenizer-stage/work-manifest.json": "317503060a3f4606078c07d74ec96e33a59c66bcb92adcac4373ef01751fa126",
+      "/private/tmp/eredu-prepare-reviewed-vendor-evidence.py": "d58a64fd6466ddf73757f5950d3ec3522e3e6517bb4c1c261e3eeb14431b25c2",
+      "/private/tmp/eredu-regex-construction-selector-type-reviewed/change.patch": "88ce8d39c672b3c8845138d6205393c6368e875cf6b778b14c58fd30c126bf36",
+      "/private/tmp/eredu-regex-construction-selector-type-reviewed/docs.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "/private/tmp/eredu-regex-construction-selector-type-reviewed/integration-before/eredu-original-regex-tokenizer-integration-applied.json": "d7ad2da3220aaab6440bf950459e8d8124ca67b6607f6f59997340037748ab3e",
+      "/private/tmp/eredu-regex-construction-selector-type-reviewed/integration-before/eredu-original-regex-tokenizer-integration-review.json": "aeeb953e29803a035946c14b8c1694f3585a77342955eff7b65b32de77144730",
+      "/private/tmp/eredu-regex-construction-selector-type-reviewed/integration-before/eredu-original-regex-tokenizer-integration-root-review.json": "592a44d04d5067274334e13b743e86648d67630bb0570f9b1fd7e8460981d69b",
+      "/private/tmp/eredu-regex-construction-selector-type-reviewed/integration-before/eredu-original-regex-tokenizer-integration-spec.json": "f0b8805c0edb36f952fef271f63c18c5c7aba0e820720512ed9b49387fa604a1",
+      "/private/tmp/eredu-regex-construction-selector-type-reviewed/integration-before/eredu-original-regex-tokenizer-integration-validation-config.json": "1eac7d9ee7a5f9cc22d6cfa54b174aa6965c72ec61bb600b0bb3d72e28e3c3a6",
+      "/private/tmp/eredu-regex-construction-selector-type-reviewed/manifest.json": "c7300a5ad22ea102067957b9f3fd60d4b08623ab6d085fb8dfc9a8849f3472c3",
+      "/private/tmp/eredu-regex-construction-selector-type-reviewed/review.json": "8a95eb5aa674bdb412423811ad514a53c16d7830f05ccc7e3f77f7721b158e55",
+      "/private/tmp/eredu-regex-emitter-construction-reviewed/change.patch": "05e590bcef38d35b3e9e97b03b7e5eb7af494c827bd4af944bf558586dfea5d4",
+      "/private/tmp/eredu-regex-emitter-construction-reviewed/docs.json": "657c96928d3f12475997a651e788e7ae388d540af39b02a9f75e5754366c84bb",
+      "/private/tmp/eredu-regex-emitter-construction-reviewed/manifest.json": "7db504582f1f1c2ed6a6589925d4834a1dbb4f0fc7d7e2eb983443cfaf496cde",
+      "/private/tmp/eredu-regex-emitter-construction-reviewed/review.json": "1ae67f1d8df152f571e9a1b8ae67cd4584ce081aa7fd517a084934e8ab239d25",
+      "/private/tmp/eredu-regex-encode-borrow-reviewed/change.patch": "38f733f26111684af46f02db7dda88a7e908d44d75f940ac245891cc351015ab",
+      "/private/tmp/eredu-regex-encode-borrow-reviewed/docs.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "/private/tmp/eredu-regex-encode-borrow-reviewed/integration-before/eredu-original-regex-tokenizer-integration-applied.json": "fa17f09798cc1d9bf13bd686b6298ac2e6e89ad971c3e82b2103f1becd4c823a",
+      "/private/tmp/eredu-regex-encode-borrow-reviewed/integration-before/eredu-original-regex-tokenizer-integration-review.json": "a8a803cc0b200fbd631220e44d2530c1dbf1409f1a5c88fbda17bd44972d1a41",
+      "/private/tmp/eredu-regex-encode-borrow-reviewed/integration-before/eredu-original-regex-tokenizer-integration-root-review.json": "52adc7cffd8df381f7feba22b9cffff8a2c0f67be06f039978f5a039b3c28ba1",
+      "/private/tmp/eredu-regex-encode-borrow-reviewed/integration-before/eredu-original-regex-tokenizer-integration-spec.json": "ba17a4139e866de7ca5690faacbe0a47a71e54d21cd1f45ed82f475ffe5eb32b",
+      "/private/tmp/eredu-regex-encode-borrow-reviewed/integration-before/eredu-original-regex-tokenizer-integration-validation-config.json": "ea2fcf1d9bd8356e9559a9da473e59bc53909675073b8c4082e150632559020f",
+      "/private/tmp/eredu-regex-encode-borrow-reviewed/manifest.json": "16297e71cf0944dd96f9b14a7b1605918a143cd93d47c22e19b6ac2738b3edb0",
+      "/private/tmp/eredu-regex-encode-borrow-reviewed/review.json": "5a5d302ec4b7003769cdac055653333d59cff7602f757e55a1cba4b10b77f3a7",
+      "/private/tmp/eredu-regex-file-profile-fixture-reviewed/change.patch": "6791dde215026d7cb037f8e0fcf1e42390b0622fbfafde9ef11d29f56eb3a54d",
+      "/private/tmp/eredu-regex-file-profile-fixture-reviewed/docs.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "/private/tmp/eredu-regex-file-profile-fixture-reviewed/integration-before/eredu-original-regex-tokenizer-integration-applied.json": "ada0bb05a2edda138813f4fe35ece231504767d7babd3cfbc6b314eef266c3c1",
+      "/private/tmp/eredu-regex-file-profile-fixture-reviewed/integration-before/eredu-original-regex-tokenizer-integration-review.json": "dda6e4c989d1dfb08f49e640d67482cb3bd648dbe74692809f1b33777076fe46",
+      "/private/tmp/eredu-regex-file-profile-fixture-reviewed/integration-before/eredu-original-regex-tokenizer-integration-root-review.json": "741f472cccb84d1e96c28948a6d5bc13420d24d91867e2d1bce9f8be984186ef",
+      "/private/tmp/eredu-regex-file-profile-fixture-reviewed/integration-before/eredu-original-regex-tokenizer-integration-spec.json": "a00d4a64e332d5119fdc1df158aec9d49662980998ed046b0a49e86f26877f7c",
+      "/private/tmp/eredu-regex-file-profile-fixture-reviewed/integration-before/eredu-original-regex-tokenizer-integration-validation-config.json": "b74b20fa4aa1593b4fb783314495c3b18b1288796eeb6e3b69637312f942da0f",
+      "/private/tmp/eredu-regex-file-profile-fixture-reviewed/manifest.json": "bc8dabd5dbcf0d755a1db12a77329f6b6690a9569772c0b3da6c22fc8fc3ba17",
+      "/private/tmp/eredu-regex-file-profile-fixture-reviewed/review.json": "bb2bcd5e8b586ce55ca9e3e99ca8c3d494dcd97cef06b42a42b01276eb92f290",
+      "/private/tmp/eredu-regex-selector-field-docs-reviewed/change.patch": "cab1aca7c2a527269b30fff3609c25cefbd2d0c5929202e5c3e99b365ef26313",
+      "/private/tmp/eredu-regex-selector-field-docs-reviewed/docs.json": "ca3d163bab055381827226140568f3bef7eaac187cebd76878e0b63e9e442356",
+      "/private/tmp/eredu-regex-selector-field-docs-reviewed/integration-before/eredu-original-regex-tokenizer-integration-applied.json": "880f0d093149c76946515a96a13ef96494378306c4823c1b2fd23c92e12c27ae",
+      "/private/tmp/eredu-regex-selector-field-docs-reviewed/integration-before/eredu-original-regex-tokenizer-integration-review.json": "c37b812ecf2447f438a74cb9954c454be5f68c17dbd173787b02f49287373d12",
+      "/private/tmp/eredu-regex-selector-field-docs-reviewed/integration-before/eredu-original-regex-tokenizer-integration-root-review.json": "23b9fb91d15c081f8e6bdf377d0ddbc04634ac4887de1d023fff41d9f60e840c",
+      "/private/tmp/eredu-regex-selector-field-docs-reviewed/integration-before/eredu-original-regex-tokenizer-integration-spec.json": "84d6df70084a3dc122724603c48d00cf360f9cf6e1ba8fdcbc967b58862d2482",
+      "/private/tmp/eredu-regex-selector-field-docs-reviewed/integration-before/eredu-original-regex-tokenizer-integration-validation-config.json": "101b95c029e737ffb2bafcd057f126fcb89d832e3b400d210e0766cd79e8cecc",
+      "/private/tmp/eredu-regex-selector-field-docs-reviewed/manifest.json": "8655ab24ed0fcc553d70d9b9f65108e5c88c14912bd424ecabac3a1e1bc44ec6",
+      "/private/tmp/eredu-regex-selector-field-docs-reviewed/review.json": "e1b99ad0ae14433eb0d47687a6ef7cf21505f42b85d2a90ea8d00bfc80f1ee86",
+      "/private/tmp/eredu-regex-source-construction-final-root-review.json": "87e65f7274db12006a452fb79280e9f9bfd195fd63f1f1885d17570302bf4dad",
+      "/private/tmp/eredu-regex-source-emitter-root-review.json": "b8c94402b759426e4bcecba523d920681c17ecea963fcaaf1c261e098ff631e6",
+      "/private/tmp/eredu-vendor-evidence-helper-syntax-review.json": "3a1681cdb0dd48256bd61dbb38086e60403a26238e7b1ed141771182838e6bc7"
+    },
+    "source_manifest_sha256": "203fd5f57d9c0fa93cd02beda39dace85a012dd976d5d21eeacdb2f3e8bb9fd1"
+  },
+  "behavior": [
+    "Exact five-source construction uses frozen emitter artifacts and actual native Rust layout facts under fresh C.",
+    "One source-bound workspace and checked2B mapped string reuse existing regex, ByteLevel and packed BPE workers under E.",
+    "Actual nested partial failures, all-strong source custody, exact/one-short and concurrent allowance tests preserve genuine C/E/I separation.",
+    "Actual consumed file and same ordinary/controlled/detached drivers cover source and decoder ownership.",
+    "The actual Digits(true)\u2192implicit ByteLevel profile shares char::is_numeric coverage with ordinary HF, preserves per-piece regex lookaround and original serde shape, and reuses one workspace without global RE/TLS cache initialization."
+  ],
+  "limits": [
+    "Exactly the first explicit-Split\u2192ByteLevel and Digits(true)\u2192implicit-ByteLevel semantic profiles have complete private C/E integration in this increment.",
+    "NFC, normalized added matching, templates and the remaining actual complete tokenizer configurations remain required follow-ons.",
+    "Public managed activation, owned text/chat inputs, path opening, events/native/copy inventories remain incomplete.",
+    "Allocator observations concern requested layouts, not process RSS or allocator overhead; cold fixed failures are labeled."
+  ]
+}

@@ -1,9 +1,9 @@
 use half::{bf16, f16};
 use safemlx_sys::{__BindgenComplex, bfloat16_t, float16_t, mlx_array};
 
-use crate::{complex64, error::Exception, Array};
+use crate::{Array, complex64, error::Exception};
 
-use super::{VectorArray, SUCCESS};
+use super::{SUCCESS, VectorArray};
 
 type Status = i32;
 
@@ -25,8 +25,24 @@ pub(crate) trait Guarded: Sized {
     where
         F: FnOnce(<Self::Guard as Guard<Self>>::MutRawPtr) -> Status,
     {
+        if let Some(observer) = crate::OriginalScopeObserver::try_current()? {
+            return Self::try_from_original_op(f, observer);
+        }
         crate::error::ensure_mlx_error_handler();
+        Self::try_from_initialized_op(f)
+    }
 
+    /// Same status conversion after a caller-owned cold preparation initialized
+    /// the handler. This path never enters the initializer's potentially waiting
+    /// Once. Keep it crate-private and use only after that construction boundary.
+    #[track_caller]
+    fn try_from_initialized_op<F>(f: F) -> Result<Self, Exception>
+    where
+        F: FnOnce(<Self::Guard as Guard<Self>>::MutRawPtr) -> Status,
+    {
+        if let Some(observer) = crate::OriginalScopeObserver::try_current()? {
+            return Self::try_from_original_op(f, observer);
+        }
         let mut guard = Self::Guard::default();
         let status = f(guard.as_mut_raw_ptr());
         match status {
@@ -34,19 +50,32 @@ pub(crate) trait Guarded: Sized {
                 guard.set_init_success(true);
                 guard.try_into_guarded()
             }
-            _ => {
-                // Err(crate::error::get_and_clear_last_mlx_error()
-                // .expect("MLX operation failed but no error was set"))
-                let what = crate::error::get_and_clear_last_mlx_error()
-                    .expect("MLX operation failed but no error was set")
-                    .what;
-                let location = std::panic::Location::caller();
-                Err(Exception {
-                    what,
-                    location,
-                    source: None,
-                })
+            _ => Err(crate::error::get_and_clear_last_mlx_error()
+                .expect("MLX operation failed but no error was set")
+                .into()),
+        }
+    }
+
+    // Same native operation and destination guard. Original execution neither
+    // initializes nor reads the ordinary text-error channel; the exact Scope
+    // retains any caught native exception independently of this returned error.
+    fn try_from_original_op<F>(
+        f: F,
+        observer: crate::OriginalScopeObserver,
+    ) -> Result<Self, Exception>
+    where
+        F: FnOnce(<Self::Guard as Guard<Self>>::MutRawPtr) -> Status,
+    {
+        let Some(_loan) = crate::utils::runtime_lock::try_enter_for_recovery() else {
+            return Err(observer.error(10));
+        };
+        let mut guard = Self::Guard::default();
+        match f(guard.as_mut_raw_ptr()) {
+            SUCCESS => {
+                guard.set_init_success(true);
+                guard.try_into_guarded()
             }
+            _ => Err(observer.error(7)),
         }
     }
 }
@@ -333,6 +362,9 @@ impl Guard<crate::DeviceType> for safemlx_sys::mlx_device_type {
                 what: "Unknown device type".to_string(),
                 location: std::panic::Location::caller(),
                 source: None,
+                tracking: None,
+                graph: None,
+                scoped: None,
             }),
         }
     }
@@ -397,6 +429,7 @@ impl Default for MaybeUninitHostTransferBuffer {
         Self {
             ptr: safemlx_sys::mlx_host_transfer_buffer {
                 ctx: std::ptr::null_mut(),
+                prepared_owner: std::ptr::null_mut(),
             },
             init_success: false,
         }
@@ -426,7 +459,10 @@ impl Guard<crate::HostTransferBuffer> for MaybeUninitHostTransferBuffer {
 
     fn try_into_guarded(self) -> Result<crate::HostTransferBuffer, Exception> {
         debug_assert!(self.init_success);
-        Ok(crate::HostTransferBuffer { raw: self.ptr })
+        Ok(crate::HostTransferBuffer {
+            raw: self.ptr,
+            prepared_source: None,
+        })
     }
 }
 

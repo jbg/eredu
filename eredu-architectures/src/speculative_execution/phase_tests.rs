@@ -57,13 +57,13 @@ impl SpeculativeActivationObserver<Tensor, TestError> for Observer {
         trace.remaining = trace
             .remaining
             .checked_sub(sequence)
-            .ok_or_else(|| TestError("phase budget exhausted".into()))?;
+            .ok_or_else(|| TestError::Message("phase budget exhausted".into()))?;
         Ok(())
     }
     fn complete_activation_invocation(&mut self) -> Result<(), TestError> {
         let trace = self.0.lock().unwrap();
         if trace.active == trace.fail {
-            return Err(TestError("injected phase delivery failure".into()));
+            return Err(TestError::Message("injected phase delivery failure".into()));
         }
         Ok(())
     }
@@ -169,7 +169,7 @@ fn prefill_delivery_failures_restore_state_without_restoring_authority() {
             .prefill(vec![1, 2, 3], &mut cache, ())
             .err()
             .unwrap();
-        assert_eq!(error.0, "injected phase delivery failure");
+        assert_eq!(error.to_string(), "injected phase delivery failure");
         assert_eq!(cache, checkpoint);
         let consumed = if phase == Phase::TargetPrefill { 3 } else { 5 };
         assert_eq!(trace.lock().unwrap().remaining, 10 - consumed);
@@ -209,7 +209,7 @@ fn replay_delivery_failures_restore_preverification_state_and_keep_tentative_evi
             .commit_verification(submission.output, draft, &mut cache, &checkpoint, 2, ())
             .err()
             .unwrap();
-        assert_eq!(error.0, "injected phase delivery failure");
+        assert_eq!(error.to_string(), "injected phase delivery failure");
         assert_eq!(cache, checkpoint.cache);
         let trace = trace.lock().unwrap();
         assert_eq!(trace.phases.last().unwrap().0, phase);
@@ -246,7 +246,7 @@ fn phase_admission_precedes_execution_and_unsupported_selection_precedes_admissi
         let trace = trace.lock().unwrap();
         assert!(trace.observations.is_empty());
         assert_eq!(trace.phases.len(), usize::from(!fused));
-        assert!(error.0.contains(if fused {
+        assert!(error.to_string().contains(if fused {
             "no complete internal activation path"
         } else {
             "budget exhausted"

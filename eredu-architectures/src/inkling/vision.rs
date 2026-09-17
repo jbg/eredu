@@ -13,9 +13,9 @@ use super::VisionConfig;
 pub struct VisionLayer<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     projection: B::Linear,
     norm: Option<B::Normalization>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     temporal_fold: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     spatial_fold: i32,
 }
 
@@ -27,40 +27,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionLayer<B> {
         spec: (i32, i32, i32, i32),
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let (input, output, temporal_fold, spatial_fold) = spec;
-        let weight = format!("visual.layers.{layer}.projection.weight");
-        Ok(Self {
-            projection: B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        config.linear_format_for(&weight),
-                    )?,
-                },
-                context,
-            )?,
-            norm: (layer + 1 != config.num_hidden_layers as usize)
-                .then(|| {
-                    B::normalization(
-                        NormalizationConstructionSpec::learned(
-                            output,
-                            config.rms_norm_eps,
-                            ParameterSpec::trainable(format!(
-                                "visual.layers.{layer}.layer_norm.weight"
-                            ))
-                            .map_err(Error::backend)?,
-                        ),
-                        context,
-                    )
-                })
-                .transpose()?,
-            temporal_fold,
-            spatial_fold,
-        })
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        VisionLayerSpec::new(config, layer, spec)?.instantiate::<B>(context)
     }
 
     /// Folds and projects one hMLP stage.
@@ -83,7 +51,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionLayer<B> {
 #[parameterized(tensor = "B::Tensor")]
 pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     final_norm: B::Normalization,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     hidden_size: i32,
 }
 
@@ -93,17 +61,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         config: &VisionConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        Ok(Self {
-            final_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    config.text_hidden_size,
-                    config.rms_norm_eps,
-                    ParameterSpec::trainable("visual.final_norm.weight").map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            hidden_size: config.text_hidden_size,
-        })
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        VisionStaticSpec::new(config)?.instantiate::<B>(context)
     }
 
     /// Normalizes and flattens the final hMLP activation into decoder embeddings.
@@ -357,5 +316,58 @@ mod tests {
         assert_eq!(folded.shape(), [2, 2, 8, 8, 75]);
         let folded = fold(&ShapeTensor(vec![2, 2, 1, 1, 4800]), 2, 1, &()).unwrap();
         assert_eq!(folded.shape(), [2, 1, 1, 1, 9600]);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct VisionStaticSpec {
+    final_norm: NormalizationConstructionSpec,
+    hidden_size: i32,
+}
+impl VisionStaticSpec {
+    pub(crate) fn new(config: &VisionConfig) -> Result<Self, Error> {
+        Ok(Self {
+            final_norm: NormalizationConstructionSpec::learned(config.text_hidden_size, config.rms_norm_eps,
+                ParameterSpec::trainable("visual.final_norm.weight").map_err(Error::backend)?),
+            hidden_size: config.text_hidden_size,
+        })
+    }
+    pub(crate) fn instantiate<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
+        &self, context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<VisionStatic<B>, Error> {
+        crate::decoder::ModuleMetadata::new::<B>(context).controls::<(&Self, VisionStatic<B>)>()?;
+        Ok(VisionStatic {
+            final_norm: B::normalization(crate::decoder::construction_specs::copy_normalization::<B>(
+                &self.final_norm, context)?, context)?,
+            hidden_size: self.hidden_size,
+        })
+    }
+}
+
+/// Original folded projection declarations, compiled once by their source owner.
+#[derive(Debug)]
+pub(crate) struct VisionLayerSpec {
+    projection: LinearSpec, norm: Option<NormalizationConstructionSpec>, temporal_fold:i32, spatial_fold:i32,
+}
+impl VisionLayerSpec {
+    pub(crate) fn new(config: &VisionConfig, layer:usize, spec:(i32,i32,i32,i32)) -> Result<Self, Error> {
+        let (input,output,temporal_fold,spatial_fold)=spec;
+        let weight=format!("visual.layers.{layer}.projection.weight");
+        Ok(Self {
+            projection:LinearSpec {input,output,weight:ParameterSpec::trainable(&weight).map_err(Error::backend)?,bias:None,
+                format:crate::linear_format::standard_linear_format(&weight,config.linear_format_for(&weight))?},
+            norm:(layer+1 != config.num_hidden_layers as usize).then(|| Ok::<_,Error>(NormalizationConstructionSpec::learned(output,config.rms_norm_eps,
+                ParameterSpec::trainable(format!("visual.layers.{layer}.layer_norm.weight")).map_err(Error::backend)?))).transpose()?,
+            temporal_fold,spatial_fold,
+        })
+    }
+    pub(crate) fn instantiate<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(&self,
+        context:&<B::Tensor as Tensor>::Context) -> Result<VisionLayer<B>,Error> {
+        crate::decoder::ModuleMetadata::new::<B>(context).controls::<(&Self,VisionLayer<B>)>()?;
+        Ok(VisionLayer {
+            projection:B::linear(crate::decoder::construction_specs::copy_linear::<B>(&self.projection,context)?,context)?,
+            norm:self.norm.as_ref().map(|spec| B::normalization(crate::decoder::construction_specs::copy_normalization::<B>(spec,context)?,context)).transpose()?,
+            temporal_fold:self.temporal_fold,spatial_fold:self.spatial_fold,
+        })
     }
 }

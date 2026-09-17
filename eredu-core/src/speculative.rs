@@ -1,25 +1,74 @@
 //! High-level contracts and orchestration for speculative execution backends.
 
+mod semantic_owner;
+pub use semantic_owner::SpeculativeSemanticOwner;
+
+/// Allocation-free byte-trigger matching shared by semantic controllers.
+pub mod byte_trigger;
+mod forbidden_controller;
+pub use forbidden_controller::{
+    ForbiddenControllerDecision, ForbiddenControllerError, ForbiddenControllerInputs,
+    ForbiddenControllerMutation, ForbiddenControllerSource, PreparedForbiddenControllerIdentity,
+    PreparedForbiddenInputCopy, packed_controller_token_bytes,
+};
+
+mod grammar_controller;
+pub use grammar_controller::{NoPreparedGrammar, PreparedGrammarIdentity, PreparedGrammarController, PreparedGrammarInstallCause, PreparedGrammarInstallError, PreparedGrammarSource};
+
+mod plain_controller;
+pub use plain_controller::{
+    PlainControllerError, PlainControllerHistory, PlainControllerSource,
+    PreparedPlainControllerIdentity,
+};
+
+mod frontdoor;
+pub use frontdoor::{
+    SpeculativeConfiguration, SpeculativeConfigurationError, SpeculativeEventCallback,
+};
+
+mod configuration;
+use configuration::RequestConfiguration;
+
+mod geometry;
+mod prefill;
+pub use geometry::SpeculativeRequestGeometry;
+pub use prefill::{PredictionPrefillAlignment, PredictionPrefillSeed};
+
+mod identity;
+pub use identity::SpeculativeRequestIdentity;
+
+mod sequence;
+pub use sequence::{
+    SpeculativeSequence, SpeculativeSequenceAllocationError, SpeculativeSequenceRef,
+    SpeculativeTokenIds, SpeculativeTokenIdsIntoIter,
+};
+
+mod buffer;
+pub use buffer::{SpeculativeBuffer, SpeculativeBufferAllocationError, SpeculativeBufferIntoIter};
+
+#[cfg(test)]
+use crate::{GenerationSequence, backend::BoundedCompletionOutcome};
 use crate::{
     backend::{
-        BoundedCompletion, BoundedCompletionWait, Completion,
-        CompletionCancellationMode, ModelRuntime, SpeculativeTokenFilterController, Submission,
-        TextGenerationBackend, TextGenerationConfig,
+        BoundedCompletion, BoundedCompletionWait, Completion, CompletionCancellationMode,
+        ModelRuntime, SpeculativeTokenFilterController, Submission, TextGenerationBackend,
+        TextGenerationConfig,
     },
     generation::{
-        FinishReason, GenerationCancellationToken, GenerationError, GenerationSequence,
-        SemanticEvent, SpeculativeCancellationDisposition, SpeculativeConfig, SpeculativeRequestId,
+        FinishReason, GenerationCancellationToken, GenerationError, SemanticEvent,
+        SpeculativeCancellationDisposition, SpeculativeConfig, SpeculativeRequestId,
         SpeculativeRequestLifecycle, SpeculativeRequestStatus, SpeculativeRound,
         SpeculativeSchedulerOptions, TokenTerminalSignals,
     },
 };
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use crate::backend::BoundedCompletionOutcome;
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+
+mod values;
+pub use values::{SpeculativeValues, SpeculativeValuesIntoIter};
 
 mod control;
 pub use control::*;
@@ -27,6 +76,8 @@ mod activation;
 pub use activation::*;
 mod coordination;
 pub use coordination::*;
+mod rollback;
+pub use rollback::SpeculativeRollbackFailure;
 
 /// Draft-model source selected for one speculative-generation request.
 #[non_exhaustive]
@@ -38,12 +89,13 @@ pub enum SpeculativeDraft<'a, D> {
 }
 
 /// Shared terminal generation output with speculative execution statistics.
-pub type SpeculativeGenerationOutput = crate::generation::GenerationOutput<SpeculativeStats>;
+pub type SpeculativeGenerationOutput =
+    crate::generation::GenerationOutput<SpeculativeStats, SpeculativeTokenIds>;
 
 /// Completed speculative requests plus aggregate fair-scheduler telemetry.
 pub struct SpeculativeGenerationBatchOutput {
     /// Per-request results in submission order.
-    requests: Vec<SpeculativeGenerationOutput>,
+    requests: SpeculativeBuffer<SpeculativeGenerationOutput>,
     /// Aggregate scheduler telemetry.
     scheduler: SpeculativeSchedulerStats,
 }
@@ -51,11 +103,11 @@ pub struct SpeculativeGenerationBatchOutput {
 impl SpeculativeGenerationBatchOutput {
     /// Creates a completed batch in stable submission order.
     pub fn new(
-        requests: Vec<SpeculativeGenerationOutput>,
+        requests: impl Into<SpeculativeBuffer<SpeculativeGenerationOutput>>,
         scheduler: SpeculativeSchedulerStats,
     ) -> Self {
         Self {
-            requests,
+            requests: requests.into(),
             scheduler,
         }
     }
@@ -64,7 +116,7 @@ impl SpeculativeGenerationBatchOutput {
         &self.requests
     }
     /// Consumes the batch and returns its request results.
-    pub fn into_requests(self) -> Vec<SpeculativeGenerationOutput> {
+    pub fn into_requests(self) -> SpeculativeBuffer<SpeculativeGenerationOutput> {
         self.requests
     }
     /// Aggregate scheduler telemetry.
@@ -72,8 +124,11 @@ impl SpeculativeGenerationBatchOutput {
         &self.scheduler
     }
     /// Appends a result while adapting another backend-neutral execution path.
-    pub fn push_request(&mut self, request: SpeculativeGenerationOutput) {
-        self.requests.push(request);
+    pub fn push_request(
+        &mut self,
+        request: SpeculativeGenerationOutput,
+    ) -> Result<(), GenerationError> {
+        self.requests.try_push(request)
     }
     /// Clears adapted request results while retaining scheduler telemetry.
     pub fn clear_requests(&mut self) {
@@ -92,15 +147,15 @@ where
     /// Fully resolved portable sampling configuration and random seed.
     generation: Option<TextGenerationConfig>,
     /// Resolved token budget, proposal width, temperature, and EOS ids.
-    config: Option<SpeculativeConfig>,
+    config: Option<SpeculativeConfiguration>,
     /// Portable canonical grammar state.
     constraint: Option<C>,
     /// Transactional decoded semantic parser state.
-    semantic: Option<Box<dyn SpeculativeSemanticState>>,
+    semantic: Option<SpeculativeSemanticOwner>,
     /// Cooperative cancellation owned by this lane.
     cancellation: Option<GenerationCancellationToken>,
     /// Called synchronously for canonical events from this lane.
-    on_event: Option<Box<dyn FnMut(SemanticEvent) + 'a>>,
+    on_event: Option<SpeculativeEventCallback<'a>>,
 }
 
 impl<'a, B, C> SpeculativeGenerationLane<'a, B, C>
@@ -113,20 +168,20 @@ where
     pub fn new(
         prompt: B::Prompt,
         generation: TextGenerationConfig,
-        config: SpeculativeConfig,
+        config: impl Into<SpeculativeConfiguration>,
         constraint: C,
-        semantic: Box<dyn SpeculativeSemanticState>,
+        semantic: impl Into<SpeculativeSemanticOwner>,
         cancellation: GenerationCancellationToken,
-        on_event: Box<dyn FnMut(SemanticEvent) + 'a>,
+        on_event: impl Into<SpeculativeEventCallback<'a>>,
     ) -> Self {
         Self {
             prompt: Some(prompt),
             generation: Some(generation),
-            config: Some(config),
+            config: Some(config.into()),
             constraint: Some(constraint),
-            semantic: Some(semantic),
+            semantic: Some(semantic.into()),
             cancellation: Some(cancellation),
-            on_event: Some(on_event),
+            on_event: Some(on_event.into()),
         }
     }
     /// Takes the backend-owned prompt exactly once.
@@ -150,12 +205,22 @@ where
             .expect("lane generation already taken")
     }
     /// Takes the speculative controls exactly once.
-    pub fn take_config(&mut self) -> SpeculativeConfig {
+    pub fn take_config(&mut self) -> SpeculativeConfiguration {
         self.config.take().expect("lane config already taken")
     }
     /// Borrows speculative controls.
     pub fn config(&self) -> &SpeculativeConfig {
         self.config.as_ref().expect("lane config already taken")
+    }
+    /// Borrows the closed initial configuration for source authentication.
+    pub fn configuration(&self) -> &SpeculativeConfiguration {
+        self.config.as_ref().expect("lane config already taken")
+    }
+    /// Borrows the closed event callback for source authentication.
+    pub fn event_callback(&self) -> &SpeculativeEventCallback<'a> {
+        self.on_event
+            .as_ref()
+            .expect("lane event callback already taken")
     }
     /// Takes the grammar controller exactly once.
     pub fn take_constraint(&mut self) -> C {
@@ -163,8 +228,14 @@ where
             .take()
             .expect("lane constraint already taken")
     }
+    /// Borrows the closed semantic source without permitting replacement.
+    pub fn semantic(&self) -> &SpeculativeSemanticOwner {
+        self.semantic
+            .as_ref()
+            .expect("lane semantic state already taken")
+    }
     /// Takes semantic state exactly once.
-    pub fn take_semantic(&mut self) -> Box<dyn SpeculativeSemanticState> {
+    pub fn take_semantic(&mut self) -> SpeculativeSemanticOwner {
         self.semantic
             .take()
             .expect("lane semantic state already taken")
@@ -176,7 +247,7 @@ where
             .expect("lane cancellation already taken")
     }
     /// Takes the event callback exactly once.
-    pub fn take_on_event(&mut self) -> Box<dyn FnMut(SemanticEvent) + 'a> {
+    pub fn take_on_event(&mut self) -> SpeculativeEventCallback<'a> {
         self.on_event
             .take()
             .expect("lane event callback already taken")
@@ -192,7 +263,7 @@ where
     /// Embedded or separately prepared draft-model selection.
     drafting: Option<SpeculativeDraft<'a, D>>,
     /// Independently prepared speculative lanes.
-    lanes: Option<Vec<SpeculativeGenerationLane<'a, B, C>>>,
+    lanes: Option<SpeculativeBuffer<SpeculativeGenerationLane<'a, B, C>>>,
     /// Target tokenizer vocabulary identity used for drafter compatibility.
     tokenizer_fingerprint: [u8; 32],
 }
@@ -205,12 +276,12 @@ where
     /// Creates one validated backend-preparation request.
     pub fn new(
         drafting: SpeculativeDraft<'a, D>,
-        lanes: Vec<SpeculativeGenerationLane<'a, B, C>>,
+        lanes: impl Into<SpeculativeBuffer<SpeculativeGenerationLane<'a, B, C>>>,
         tokenizer_fingerprint: [u8; 32],
     ) -> Self {
         Self {
             drafting: Some(drafting),
-            lanes: Some(lanes),
+            lanes: Some(lanes.into()),
             tokenizer_fingerprint,
         }
     }
@@ -223,7 +294,7 @@ where
         self.drafting.take().expect("draft selection already taken")
     }
     /// Takes prepared lanes exactly once.
-    pub fn take_lanes(&mut self) -> Vec<SpeculativeGenerationLane<'a, B, C>> {
+    pub fn take_lanes(&mut self) -> SpeculativeBuffer<SpeculativeGenerationLane<'a, B, C>> {
         self.lanes.take().expect("speculative lanes already taken")
     }
 }
@@ -241,6 +312,17 @@ pub trait SpeculativeGenerationBackend: TextGenerationBackend {
 
     /// Reports fail-closed speculative support for the selected model session.
     fn speculative_capability(runtime: &ModelRuntime<Self>) -> SpeculativeCapability;
+
+    /// Whether this selected target/draft path accepts an explicit prefill chunk
+    /// policy. This cold query must not allocate or enter native work. Returning
+    /// true requires the shared scheduler through ordinary and controlled
+    /// execution; it does not imply managed-memory or observation support.
+    fn supports_speculative_prefill_chunking(
+        _runtime: &ModelRuntime<Self>,
+        _drafting: &SpeculativeDraft<'_, Self::Drafter>,
+    ) -> bool {
+        false
+    }
 
     /// Exact internal activation/edit support for the selected speculative path.
     /// Ordinary sampler-logit capture has a separate admission contract.
@@ -403,9 +485,10 @@ impl SpeculativeCapability {
     }
 }
 
-/// Statistics collected from one speculative sequence.
-#[derive(Debug, Clone, Default)]
-pub struct SpeculativeStats {
+/// Scalar telemetry shared by ordinary and retained speculative statistics.
+/// Copying these counters allocates nothing and carries no execution authority.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SpeculativeStatsCounters {
     /// Relationship between the request's target and draft execution placements.
     execution_topology: SpeculativeExecutionTopology,
     /// Target tokens evaluated during prefill and verification.
@@ -416,8 +499,6 @@ pub struct SpeculativeStats {
     accepted_tokens: usize,
     /// Number of target verification rounds.
     rounds: usize,
-    /// Accepted proposal count for each round.
-    accept_lens: Vec<usize>,
     /// Tokens emitted, including a terminal EOS token when one is produced.
     emitted_tokens: usize,
     /// Tokens drafted on an optimistic continuation.
@@ -466,126 +547,163 @@ pub struct SpeculativeStats {
     submission_to_first_token: Option<Duration>,
 }
 
+/// Statistics with the actual immutable-history custody of this branch.
+/// Managed history copies are fallible; scalar observations need no allocation.
+#[derive(Debug, Default)]
+pub struct SpeculativeStats {
+    counters: SpeculativeStatsCounters,
+    accept_lens: SpeculativeBuffer<usize>,
+}
+impl SpeculativeStats {
+    /// Accepted proposal count per completed round.
+    pub fn accept_lens(&self) -> &[usize] {
+        &self.accept_lens
+    }
+    /// Stack-only telemetry comparison without copying the history allocation.
+    pub const fn counters(&self) -> SpeculativeStatsCounters {
+        self.counters
+    }
+    /// The same concrete provider query used for the next actual copy.
+    pub fn copy_storage_bytes<E: SpeculativeExecutor>(&self, executor: &E) -> Option<u64> {
+        u64::try_from(executor.driver_buffer_bytes::<usize>(self.accept_lens.len())?).ok()
+    }
+    /// Copies the current history and, for a verification transaction, one
+    /// next-round slot through the actual driver destination. Snapshot copies
+    /// request only their existing prefix. Scalar state moves unchanged.
+    pub fn copy_for_driver<E: SpeculativeExecutor>(
+        &self,
+        executor: &E,
+        append_round: bool,
+        context: E::Context<'_>,
+    ) -> Result<Self, SpeculativeDriverError<E::Error>> {
+        let capacity = driver_capacity(self.accept_lens.len(), usize::from(append_round))?;
+        let mut accept_lens = executor.driver_buffer(capacity, context)?;
+        accept_lens
+            .try_extend(self.accept_lens.iter().copied())
+            .map_err(SpeculativeDriverError::Generation)?;
+        Ok(Self {
+            counters: self.counters,
+            accept_lens,
+        })
+    }
+}
+
 impl SpeculativeStats {
     /// Host time from lane submission to first commitment, before publication.
     /// No draft proposal or visible-text event starts this metric. Preparation
     /// and time queued before submission are included in the terminal output's
     /// [`crate::GenerationTiming`] instead.
     pub const fn submission_to_first_token(&self) -> Option<Duration> {
-        self.submission_to_first_token
+        self.counters.submission_to_first_token
     }
 
     /// Selected target/draft placement relationship.
     pub const fn execution_topology(&self) -> SpeculativeExecutionTopology {
-        self.execution_topology
+        self.counters.execution_topology
     }
     /// Target tokens evaluated.
     pub const fn target_tokens(&self) -> usize {
-        self.target_tokens
+        self.counters.target_tokens
     }
     /// Assistant tokens proposed.
     pub const fn draft_tokens(&self) -> usize {
-        self.draft_tokens
+        self.counters.draft_tokens
     }
     /// Assistant tokens accepted.
     pub const fn accepted_tokens(&self) -> usize {
-        self.accepted_tokens
+        self.counters.accepted_tokens
     }
     /// Target verification rounds.
     pub const fn rounds(&self) -> usize {
-        self.rounds
-    }
-    /// Accepted proposal count per round.
-    pub fn accept_lens(&self) -> &[usize] {
-        &self.accept_lens
+        self.counters.rounds
     }
     /// Emitted token count.
     pub const fn emitted_tokens(&self) -> usize {
-        self.emitted_tokens
+        self.counters.emitted_tokens
     }
     /// Optimistically drafted token count.
     pub const fn optimistic_draft_tokens(&self) -> usize {
-        self.optimistic_draft_tokens
+        self.counters.optimistic_draft_tokens
     }
     /// Optimistic block count.
     pub const fn optimistic_draft_blocks(&self) -> usize {
-        self.optimistic_draft_blocks
+        self.counters.optimistic_draft_blocks
     }
     /// Reused optimistic token count.
     pub const fn reused_optimistic_tokens(&self) -> usize {
-        self.reused_optimistic_tokens
+        self.counters.reused_optimistic_tokens
     }
     /// Reused optimistic block count.
     pub const fn reused_optimistic_blocks(&self) -> usize {
-        self.reused_optimistic_blocks
+        self.counters.reused_optimistic_blocks
     }
     /// Optimistic tokens consumed by target bonuses.
     pub const fn consumed_optimistic_tokens(&self) -> usize {
-        self.consumed_optimistic_tokens
+        self.counters.consumed_optimistic_tokens
     }
     /// Discarded optimistic token count.
     pub const fn discarded_optimistic_tokens(&self) -> usize {
-        self.discarded_optimistic_tokens
+        self.counters.discarded_optimistic_tokens
     }
     /// Discarded optimistic block count.
     pub const fn discarded_optimistic_blocks(&self) -> usize {
-        self.discarded_optimistic_blocks
+        self.counters.discarded_optimistic_blocks
     }
     /// Target bonuses emitted while an optimistic branch existed.
     pub const fn optimistic_target_bonus_tokens(&self) -> usize {
-        self.optimistic_target_bonus_tokens
+        self.counters.optimistic_target_bonus_tokens
     }
     /// Matching optimistic bonus count.
     pub const fn optimistic_bonus_matches(&self) -> usize {
-        self.optimistic_bonus_matches
+        self.counters.optimistic_bonus_matches
     }
     /// Mismatching optimistic bonus count.
     pub const fn optimistic_bonus_mismatches(&self) -> usize {
-        self.optimistic_bonus_mismatches
+        self.counters.optimistic_bonus_mismatches
     }
     /// Whether adaptive lookahead is disabled.
     pub const fn adaptive_lookahead_disabled(&self) -> bool {
-        self.adaptive_lookahead_disabled
+        self.counters.adaptive_lookahead_disabled
     }
     /// Time spent drafting optimistic branches.
     pub const fn optimistic_draft_time(&self) -> Duration {
-        self.optimistic_draft_time
+        self.counters.optimistic_draft_time
     }
     /// Time retained verification remained in flight.
     pub const fn verification_in_flight_time(&self) -> Duration {
-        self.verification_in_flight_time
+        self.counters.verification_in_flight_time
     }
     /// Whether component timings were collected.
     pub const fn component_timings_collected(&self) -> bool {
-        self.component_timings_collected
+        self.counters.component_timings_collected
     }
     /// Draft-context device time.
     pub const fn draft_context_time(&self) -> Duration {
-        self.draft_context_time
+        self.counters.draft_context_time
     }
     /// Draft-assistant device time.
     pub const fn draft_assistant_time(&self) -> Duration {
-        self.draft_assistant_time
+        self.counters.draft_assistant_time
     }
     /// Draft-head device time.
     pub const fn draft_head_time(&self) -> Duration {
-        self.draft_head_time
+        self.counters.draft_head_time
     }
     /// Target-verification device time.
     pub const fn target_verification_time(&self) -> Duration {
-        self.target_verification_time
+        self.counters.target_verification_time
     }
     /// Scheduler turns for this request.
     pub const fn scheduler_turns(&self) -> usize {
-        self.scheduler_turns
+        self.counters.scheduler_turns
     }
     /// Draft turns performed beside other in-flight target work.
     pub const fn cross_request_draft_opportunities(&self) -> usize {
-        self.cross_request_draft_opportunities
+        self.counters.cross_request_draft_opportunities
     }
     /// Wall-clock generation duration.
     pub const fn elapsed(&self) -> Duration {
-        self.elapsed
+        self.counters.elapsed
     }
 
     /// Adds backend-measured component timings without exposing mutable fields.
@@ -596,16 +714,16 @@ impl SpeculativeStats {
         draft_head: Duration,
         target_verification: Duration,
     ) {
-        self.draft_context_time += draft_context;
-        self.draft_assistant_time += draft_assistant;
-        self.draft_head_time += draft_head;
-        self.target_verification_time += target_verification;
-        self.component_timings_collected = true;
+        self.counters.draft_context_time += draft_context;
+        self.counters.draft_assistant_time += draft_assistant;
+        self.counters.draft_head_time += draft_head;
+        self.counters.target_verification_time += target_verification;
+        self.counters.component_timings_collected = true;
     }
 
     /// Adds completed scheduler rounds to portable telemetry.
     pub fn add_scheduler_rounds(&mut self, rounds: usize) {
-        self.rounds += rounds;
+        self.counters.rounds += rounds;
     }
 
     /// Records aggregate optimistic work used by adaptive-lookahead policy.
@@ -615,35 +733,58 @@ impl SpeculativeStats {
         reused_tokens: usize,
         discarded_tokens: usize,
     ) {
-        self.optimistic_draft_blocks += drafted_blocks;
-        self.reused_optimistic_tokens += reused_tokens;
-        self.discarded_optimistic_tokens += discarded_tokens;
+        self.counters.optimistic_draft_blocks += drafted_blocks;
+        self.counters.reused_optimistic_tokens += reused_tokens;
+        self.counters.discarded_optimistic_tokens += discarded_tokens;
     }
 
     /// Clears the cached adaptive-lookahead decision before policy re-evaluation.
     pub fn reset_adaptive_lookahead_decision(&mut self) {
-        self.adaptive_lookahead_disabled = false;
+        self.counters.adaptive_lookahead_disabled = false;
     }
 
     /// Fraction of proposed tokens accepted by the target.
     pub fn accept_rate(&self) -> f64 {
-        if self.draft_tokens == 0 {
+        if self.counters.draft_tokens == 0 {
             0.0
         } else {
-            self.accepted_tokens as f64 / self.draft_tokens as f64
+            self.counters.accepted_tokens as f64 / self.counters.draft_tokens as f64
         }
     }
 
     /// Re-evaluates whether optional lookahead remains profitable.
     pub fn update_adaptive_lookahead(&mut self, options: SpeculativeSchedulerOptions) {
         if !options.adaptive_lookahead
-            || self.adaptive_lookahead_disabled
-            || self.optimistic_draft_blocks < options.adaptive_lookahead_min_blocks
+            || self.counters.adaptive_lookahead_disabled
+            || self.counters.optimistic_draft_blocks < options.adaptive_lookahead_min_blocks
         {
             return;
         }
-        self.adaptive_lookahead_disabled = self.reused_optimistic_tokens == 0
-            || self.reused_optimistic_tokens < self.discarded_optimistic_tokens;
+        self.counters.adaptive_lookahead_disabled = self.counters.reused_optimistic_tokens == 0
+            || self.counters.reused_optimistic_tokens < self.counters.discarded_optimistic_tokens;
+    }
+}
+
+impl SpeculativeStatsCounters {
+    /// Completed verification rounds.
+    pub const fn rounds(&self) -> usize {
+        self.rounds
+    }
+    /// Accepted proposal tokens.
+    pub const fn accepted_tokens(&self) -> usize {
+        self.accepted_tokens
+    }
+    /// Reused optimistic tokens.
+    pub const fn reused_optimistic_tokens(&self) -> usize {
+        self.reused_optimistic_tokens
+    }
+    /// Optimistic tokens consumed as a bonus.
+    pub const fn consumed_optimistic_tokens(&self) -> usize {
+        self.consumed_optimistic_tokens
+    }
+    /// Discarded optimistic tokens.
+    pub const fn discarded_optimistic_tokens(&self) -> usize {
+        self.discarded_optimistic_tokens
     }
 }
 
@@ -696,6 +837,33 @@ pub trait SpeculativeTelemetry: Default {
 
 impl SpeculativeTelemetry for () {
     fn record(self, _stats: &mut SpeculativeStats) {}
+}
+
+/// Result of synchronous speculative prefill at a safe cache boundary.
+/// Cancellation supplies no logits or seed and must precede sampling. A backend
+/// returns it only after its native work and distributed cancellation agree.
+#[derive(Debug)]
+pub enum SpeculativePrefillOutcome<T> {
+    /// Prefill completed and supplies its actual selected result.
+    Complete(T),
+    /// Prefill stopped at a safely completed, collectively agreed boundary.
+    Cancelled {
+        /// Target input positions already evaluated, retained across rollback.
+        /// A mechanism for one model reports that model's completed positions;
+        /// a composed target/draft executor reports target work only.
+        evaluated_tokens: usize,
+    },
+}
+impl<T> SpeculativePrefillOutcome<T> {
+    /// Transforms a completed payload without manufacturing one for cancellation.
+    pub fn map<U>(self, map: impl FnOnce(T) -> U) -> SpeculativePrefillOutcome<U> {
+        match self {
+            Self::Complete(value) => SpeculativePrefillOutcome::Complete(map(value)),
+            Self::Cancelled { evaluated_tokens } => {
+                SpeculativePrefillOutcome::Cancelled { evaluated_tokens }
+            }
+        }
+    }
 }
 
 /// Backend-owned first-token output and assistant seed state.
@@ -763,7 +931,18 @@ pub trait SpeculativeExecutor {
     /// Target state used to seed one proposal round.
     type TargetState;
     /// Private, discardable assistant state.
-    type DraftState: Clone;
+    type DraftState;
+
+    /// Copies the pending proposal state for independent optimistic advancement.
+    /// Preparation may fail; the existing pending branch remains owned and unchanged.
+    /// Backends with retained state must use their actual admitted copy mechanism.
+    fn copy_draft_state<'a>(
+        &self,
+        state: &Self::DraftState,
+        context: Self::Context<'a>,
+    ) -> Result<Self::DraftState, Self::Error>
+    where
+        Self: 'a;
     /// Exact target-cache checkpoint marker.
     type CacheCheckpoint;
     /// Retained target verification output.
@@ -778,6 +957,87 @@ pub trait SpeculativeExecutor {
     type Telemetry: SpeculativeTelemetry;
     /// Structured backend error.
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Selects the already retained execution assignment for one stable table ID.
+    /// The outer context owns batch coordination and shared table storage. This
+    /// projection must preserve that lifetime, allocate nothing, and return the
+    /// same request/source assignment each time. It grants no new admission.
+    /// Backends with a single assignment preserve ordinary behavior by default.
+    fn request_context<'a>(
+        &self,
+        _request: SpeculativeRequestId,
+        context: Self::Context<'a>,
+    ) -> Result<Self::Context<'a>, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(context)
+    }
+
+    /// Creates one host destination before the shared driver starts its work.
+    /// Managed implementations construct fixed storage with retained original
+    /// custody; ordinary implementations preserve the allocating Vec behavior.
+    fn driver_buffer<T>(
+        &self,
+        capacity: usize,
+        _context: Self::Context<'_>,
+    ) -> Result<SpeculativeBuffer<T>, Self::Error> {
+        Ok(SpeculativeBuffer::with_capacity(capacity))
+    }
+
+    /// Admits one actual non-vector host metadata constructor before its birth.
+    /// `None` is unknown storage: managed implementations must refuse it. The
+    /// ordinary default grants no managed evidence. The caller retains this
+    /// authority through the concrete payload, shared shell and failure owners.
+    fn driver_host_metadata(
+        &self,
+        _bytes: Option<usize>,
+        _context: Self::Context<'_>,
+    ) -> Result<crate::HostPreparationAuthority, Self::Error> {
+        Ok(crate::HostPreparationAuthority::unmanaged())
+    }
+
+    /// Requested storage for the same driver destination constructor.
+    fn driver_buffer_bytes<T>(&self, capacity: usize) -> Option<usize> {
+        SpeculativeBuffer::<T>::retained_control_bytes(capacity)
+    }
+    /// Creates the exact request/snapshot identity before any prefill work.
+    fn driver_identity(
+        &self,
+        _context: Self::Context<'_>,
+    ) -> Result<SpeculativeRequestIdentity, Self::Error> {
+        Ok(SpeculativeRequestIdentity::new())
+    }
+
+    /// Copies canonical sequence state before transactional work. Ordinary
+    /// defaults never relabel or allocate a retained provider without its owner.
+    fn copy_sequence(
+        &self,
+        source: SpeculativeSequenceRef<'_>,
+        _context: Self::Context<'_>,
+    ) -> Result<SpeculativeSequence, SpeculativeDriverError<Self::Error>> {
+        source
+            .copy_ordinary()
+            .map_err(SpeculativeDriverError::Preparation)
+    }
+    /// Provider copy storage within a complete controlled snapshot estimate.
+    /// This is descriptive; the actual constructor still requires fresh admission.
+    fn sequence_copy_bytes(&self, source: &SpeculativeSequence) -> Option<u64> {
+        match source {
+            SpeculativeSequence::Ordinary(_) => source.snapshot_storage_bytes(),
+            SpeculativeSequence::Retained(_) => None,
+        }
+    }
+
+    /// Transfers an already retained neutral failure without allocating a new source.
+    /// Success must preserve its existing kind, operation and source identity;
+    /// it must not infer origin or reclassify an arbitrary error. Return
+    /// `Err(error)` with the identical unmodified owner when no retained
+    /// representation is available. The default preserves ordinary conversion.
+    /// This hook does not allocate storage, grant admission, or settle work.
+    fn take_retained_failure(error: Self::Error) -> Result<crate::BackendFailure, Self::Error> {
+        Err(error)
+    }
 
     /// Agrees a host preparation result before any participant enters the next
     /// speculative phase. Distributed executors use their retained session
@@ -809,6 +1069,22 @@ pub trait SpeculativeExecutor {
         Ok(local)
     }
 
+    /// Coordinates the same facts while preserving their actual host owner.
+    /// Legacy adapters receive only ordinary storage; unsupported retained
+    /// storage refuses before any scheduling action or ordinary conversion.
+    fn coordinate_speculative_buffer<'a>(
+        &mut self,
+        local: SpeculativeBuffer<SpeculativeScheduleState>,
+        context: Self::Context<'a>,
+    ) -> Result<SpeculativeBuffer<SpeculativeScheduleState>, crate::BackendFailure> {
+        match local.try_into_ordinary() {
+            Ok(local) => self
+                .coordinate_speculative_step(local, context)
+                .map(Into::into),
+            Err(_) => Err(crate::HostMetadataFundingError::Unavailable.into()),
+        }
+    }
+
     /// Whether internal activation collection needs scheduler provenance.
     /// Disabled instrumentation does not hash or retain generated prefixes.
     fn requires_activation_origin(&self) -> bool {
@@ -828,6 +1104,20 @@ pub trait SpeculativeExecutor {
     /// Drains a retained portable capture failure across the native error domain.
     fn take_activation_error(&mut self) -> Option<SpeculativeControlError> {
         None
+    }
+
+    /// Mandatory loaded-authority revalidation before internal edit replacement.
+    /// Original executors may use their retained declaration instead of rebuilding
+    /// admission DTOs; ordinary executors keep the same discovery validation.
+    fn validate_activation_readmission(
+        &self,
+        plan: &AdmittedSpeculativeActivations,
+        discovery: Option<&SpeculativeActivationDiscovery>,
+    ) -> Result<(), SpeculativeControlError> {
+        plan.validate(discovery.ok_or(SpeculativeControlError::Unsupported(
+            "loaded execution has no internal activation discovery",
+        ))?)
+        .map_err(Into::into)
     }
 
     /// Replaces prospective internal edits at a drained canonical boundary.
@@ -878,6 +1168,19 @@ pub trait SpeculativeExecutor {
         _context: Self::Context<'a>,
     ) -> Result<Option<(Self::CacheCheckpoint, Self::TargetState)>, SpeculativeControlError> {
         Ok(None)
+    }
+
+    /// Prepares fresh execution occurrences for an authenticated canonical
+    /// snapshot before copying or replacing any mutable state. The lifecycle is
+    /// explicit: a terminal snapshot must not regain work merely from its length.
+    /// Existing copy, observation and occurrence spending is never refunded.
+    fn prepare_control_continuation<'a>(
+        &mut self,
+        _committed: usize,
+        _status: SpeculativeRequestStatus,
+        _context: Self::Context<'a>,
+    ) -> Result<(), SpeculativeControlError> {
+        Ok(())
     }
 
     /// Atomically restores cache and returns an isolated assistant seed. The saved
@@ -931,6 +1234,27 @@ pub trait SpeculativeExecutor {
         context: Self::Context<'context>,
     ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error>;
 
+    /// Cancellable prefill, with no sampling or output publication on cancellation.
+    /// Successful return must permit the existing cache rollback protocol.
+    ///
+    /// Compatibility executors still enter their complete prefill operation:
+    /// local cancellation cannot skip a collective-bearing call. The shared
+    /// registration path agrees cancellation after this return, before sampling.
+    /// Scheduled implementations override this to stop at agreed settled spans.
+    fn prefill_cancellable<'context>(
+        &mut self,
+        input: Self::Input,
+        cache: &mut Self::Cache,
+        _cancellation: &GenerationCancellationToken,
+        context: Self::Context<'context>,
+    ) -> Result<
+        SpeculativePrefillOutcome<SpeculativePrefill<Self::TargetState, Self::Logits>>,
+        Self::Error,
+    > {
+        self.prefill(input, cache, context)
+            .map(SpeculativePrefillOutcome::Complete)
+    }
+
     /// Starts one private proposal round sized to the available output budget.
     fn begin_proposal<'a>(
         &mut self,
@@ -950,6 +1274,16 @@ pub trait SpeculativeExecutor {
 
     /// Captures the exact cache boundary before target verification.
     fn checkpoint(&self, cache: &Self::Cache) -> Result<Self::CacheCheckpoint, Self::Error>;
+
+    /// Captures the same boundary with the actual request's host-construction
+    /// authority. Ordinary executors keep their existing checkpoint worker.
+    fn checkpoint_with_context<'a>(
+        &self,
+        cache: &Self::Cache,
+        _context: Self::Context<'a>,
+    ) -> Result<Self::CacheCheckpoint, Self::Error> {
+        self.checkpoint(cache)
+    }
 
     /// Restores the exact cache boundary after an aborted verification transaction.
     fn restore_checkpoint<'a>(
@@ -1058,7 +1392,7 @@ where
     /// Backend-owned prepared model input.
     input: Option<E::Input>,
     /// Validated speculative generation controls.
-    config: Option<SpeculativeConfig>,
+    config: Option<SpeculativeConfiguration>,
     /// Canonical sampling, constraint, publication, and cancellation state.
     runtime: Option<SpeculativeOutputRuntime<S, C, P>>,
     /// Independent target and draft random streams.
@@ -1076,14 +1410,14 @@ where
     pub fn new(
         cache: &'a mut E::Cache,
         input: E::Input,
-        config: SpeculativeConfig,
+        config: impl Into<SpeculativeConfiguration>,
         runtime: SpeculativeOutputRuntime<S, C, P>,
         randomness: SpeculativeRandomness<S::RandomState, S::DraftRandomness>,
     ) -> Self {
         Self {
             cache: Some(cache),
             input: Some(input),
-            config: Some(config),
+            config: Some(config.into()),
             runtime: Some(runtime),
             randomness: Some(randomness),
         }
@@ -1097,8 +1431,12 @@ where
         self.input.take().expect("prepared input already taken")
     }
     /// Takes speculative controls exactly once.
-    pub fn take_config(&mut self) -> SpeculativeConfig {
+    pub fn take_config(&mut self) -> SpeculativeConfiguration {
         self.config.take().expect("prepared config already taken")
+    }
+    /// Borrows the actually selected finite output allowance before installation.
+    pub fn config(&self) -> &SpeculativeConfig {
+        self.config.as_ref().expect("prepared config already taken")
     }
     /// Borrows canonical output controls before submitting a prepared lane.
     pub fn runtime_mut(&mut self) -> &mut SpeculativeOutputRuntime<S, C, P> {
@@ -1124,12 +1462,19 @@ where
 /// visitor owns request registration, fair action selection, completion
 /// driving, terminal validation, and public output construction.
 pub trait SpeculativeGenerationVisitor {
+    /// Actual retained scheduler policy used by this visitor. Cold admission
+    /// consumes these options before preparing native sources or lane state.
+    /// A custom lifecycle with no fixed policy leaves its bound unknown.
+    fn scheduler_options(&self) -> Option<SpeculativeSchedulerOptions> {
+        None
+    }
+
     /// Drives one prepared set of lanes through the neutral lifecycle.
     #[allow(clippy::too_many_arguments)]
     fn run<'a, E, S, C, P>(
         self,
         executor: &'a mut E,
-        lanes: Vec<PreparedSpeculativeLane<'a, E, S, C, P>>,
+        lanes: impl Into<SpeculativeBuffer<PreparedSpeculativeLane<'a, E, S, C, P>>>,
         topology: SpeculativeExecutionTopology,
         optimistic_execution_available: bool,
         component_timings_collected: bool,
@@ -1150,6 +1495,37 @@ pub trait SpeculativeGenerationVisitor {
 /// accept-or-replace algorithm. Core owns when those mechanisms run, which
 /// token is selected, and when tentative sampler state is promoted.
 pub trait SpeculativeSampling: Clone {
+    /// Revalidate borrowed admitted edits against a retained loaded declaration
+    /// when no ordinary discovery DTO is installed. This grants no execution.
+    fn validate_control_interventions_prepared<'a>(
+        &self,
+        plans: &[SpeculativeInterventionPlan],
+        _context: Self::Context<'a>,
+    ) -> Result<(), SpeculativeControlError>
+    where
+        Self: 'a,
+    {
+        if plans.is_empty() {
+            Ok(())
+        } else {
+            Err(SpeculativeControlError::Unsupported(
+                "loaded execution has no speculative intervention discovery",
+            ))
+        }
+    }
+    /// Context-bearing installation boundary for a freshly paid immutable edit
+    /// source. Ordinary samplers preserve their existing replacement semantics;
+    /// original samplers must construct their own source/destination custody.
+    fn control_intervene_prepared<'a>(
+        &mut self,
+        plans: Vec<SpeculativeInterventionPlan>,
+        _context: Self::Context<'a>,
+    ) -> Result<(), SpeculativeControlError>
+    where
+        Self: 'a,
+    {
+        self.control_intervene(plans)
+    }
     /// Installs immutable role-specific plans, preserving the shared capture ledger.
     fn control_intervene(
         &mut self,
@@ -1194,6 +1570,12 @@ pub trait SpeculativeSampling: Clone {
     fn control_clear_forced(&mut self) -> bool {
         false
     }
+    /// Clears a choice with explicit preparation failure. The default preserves
+    /// the existing infallible ordinary callback; retained implementations may
+    /// prepare an isolated replacement before changing their source owner.
+    fn try_control_clear_forced(&mut self) -> Result<bool, SpeculativeControlError> {
+        Ok(self.control_clear_forced())
+    }
     /// Canonical choice waiting for target commitment.
     fn control_pending_forced(&self) -> Option<u32> {
         None
@@ -1217,6 +1599,16 @@ pub trait SpeculativeSampling: Clone {
     /// Structured backend error.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Transfers an already retained neutral failure without allocating a new source.
+    /// Success must preserve its existing kind, operation and source identity;
+    /// it must not infer origin or reclassify an arbitrary error. Return
+    /// `Err(error)` with the identical unmodified owner when no retained
+    /// representation is available. The default preserves ordinary conversion.
+    /// This hook does not allocate storage, grant admission, or settle work.
+    fn take_retained_failure(error: Self::Error) -> Result<crate::BackendFailure, Self::Error> {
+        Err(error)
+    }
+
     /// Installs explicitly admitted raw-logit capture before any generation. Clones
     /// must share non-rewindable capture accounting, never duplicate its allowance.
     fn enable_control_capture(
@@ -1232,10 +1624,26 @@ pub trait SpeculativeSampling: Clone {
         }
     }
 
+    /// Context-bearing preparation of the same raw-logit observer. Original
+    /// implementations construct their source/destinations before execution;
+    /// ordinary implementations retain the existing installation behavior.
+    fn enable_control_capture_prepared<'a>(
+        &mut self,
+        plan: crate::capture::AdmittedCapturePlan,
+        _context: Self::Context<'a>,
+    ) -> Result<(), SpeculativeControlError>
+    where
+        Self: 'a,
+    {
+        self.enable_control_capture(plan).map_err(Into::into)
+    }
+
     /// Drains completed captures from the last scheduler action, including
     /// tentative target rows and failed draft proposals. No native values escape.
-    fn take_control_captures(&mut self) -> Vec<SpeculativePredictionCapture> {
-        Vec::new()
+    /// Original producers return their freshly admitted buffer and shared frame
+    /// owners; ordinary Vec conversion remains ordinary and gains no custody.
+    fn take_control_captures(&mut self) -> SpeculativeBuffer<SpeculativePredictionCapture> {
+        SpeculativeBuffer::default()
     }
 
     /// Complete conservative bytes for cloning this sampler and both RNG streams.
@@ -1246,6 +1654,46 @@ pub trait SpeculativeSampling: Clone {
         _draft: Option<&Self::DraftRandomness>,
     ) -> Option<u64> {
         None
+    }
+
+    /// Exact host allocations and controls made by `copy_control_snapshot` for
+    /// these actual source values. This is separate from logical snapshot size;
+    /// it grants no native copy/completion authority. Unknown state stays unknown.
+    fn control_snapshot_metadata_bytes(
+        &self,
+        _target: Option<&Self::RandomState>,
+        _draft: Option<&Self::DraftRandomness>,
+    ) -> Option<usize> {
+        None
+    }
+
+    /// Copies the sampler and RNG state after the actual executor pays the query
+    /// above. A qualified implementation must preserve capture/copy ledgers and
+    /// retain the supplied host custody in every independently escaping payload,
+    /// clone and allocating failure. Retaining it only in an enclosing snapshot
+    /// is insufficient. Native work needs its own admitted copy mechanism.
+    /// The ordinary default preserves Clone; retained unknown state is rejected
+    /// before any clone is invoked.
+    #[allow(clippy::type_complexity)]
+    fn copy_control_snapshot(
+        &self,
+        target: Option<&Self::RandomState>,
+        draft: Option<&Self::DraftRandomness>,
+        host: crate::HostPreparationAuthority,
+    ) -> Result<
+        (
+            Self,
+            Option<Self::RandomState>,
+            Option<Self::DraftRandomness>,
+        ),
+        SpeculativeControlError,
+    > {
+        if !host.is_unmanaged() {
+            return Err(SpeculativeControlError::Unsupported(
+                "sampler has no paid isolated snapshot constructor",
+            ));
+        }
+        Ok((self.clone(), target.cloned(), draft.cloned()))
     }
 
     /// Whether cloned sampler state is safe for optimistic promotion.
@@ -1496,13 +1944,16 @@ pub struct SpeculativeDraftBlock<S, D> {
     /// Assistant state after producing every proposal.
     state: S,
     /// Ordered proposed tokens and opaque distributions.
-    proposals: Vec<SpeculativeProposal<D>>,
+    proposals: SpeculativeBuffer<SpeculativeProposal<D>>,
 }
 
 impl<S, D> SpeculativeDraftBlock<S, D> {
     /// Creates one ordered assistant proposal block.
-    pub fn new(state: S, proposals: Vec<SpeculativeProposal<D>>) -> Self {
-        Self { state, proposals }
+    pub fn new(state: S, proposals: impl Into<SpeculativeBuffer<SpeculativeProposal<D>>>) -> Self {
+        Self {
+            state,
+            proposals: proposals.into(),
+        }
     }
     /// Assistant state after every proposal.
     pub const fn state(&self) -> &S {
@@ -1519,15 +1970,18 @@ pub struct SpeculativeOptimisticBranch<S, D> {
     /// Backend-owned tentative draft block.
     block: SpeculativeDraftBlock<S, D>,
     /// Prefix against which the block was produced.
-    assumed_prefix: Vec<u32>,
+    assumed_prefix: SpeculativeBuffer<u32>,
 }
 
 impl<S, D> SpeculativeOptimisticBranch<S, D> {
     /// Creates one tentative continuation tied to an assumed prefix.
-    pub fn new(block: SpeculativeDraftBlock<S, D>, assumed_prefix: Vec<u32>) -> Self {
+    pub fn new(
+        block: SpeculativeDraftBlock<S, D>,
+        assumed_prefix: impl Into<SpeculativeBuffer<u32>>,
+    ) -> Self {
         Self {
             block,
-            assumed_prefix,
+            assumed_prefix: assumed_prefix.into(),
         }
     }
 }
@@ -1567,6 +2021,8 @@ where
     optimistic: Option<SpeculativeOptimisticBranch<E::DraftState, D>>,
     submitted: Instant,
     submitted_tokens: usize,
+    // Prepared before submission; retained through completion and restoration.
+    rollback_failure: rollback::PreparedRollback<SpeculativeDriverError<E::Error>, E::Error>,
 }
 
 impl<E, D> PendingSpeculativeVerification<E, D>
@@ -1615,6 +2071,19 @@ where
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SpeculativeOutputError {
+    /// Paid shared diagnostic retaining the actual portable producer source,
+    /// partial output/input and its funding. Aliases allocate no new source.
+    #[error("{0}")]
+    Retained(#[from] crate::SharedBackendFailure),
+    /// Actual fixed host-account refusal before a semantic allocation.
+    #[error("{0}")]
+    HostFunding(#[from] crate::HostMetadataFundingError),
+    /// Original decoder/stop transition failed without allocating a diagnostic.
+    #[error("{0}")]
+    Decoder(#[from] crate::GenerationDecoderError),
+    /// A qualified semantic destination or source refused this operation.
+    #[error("speculative semantic storage: {0}")]
+    Storage(&'static str),
     /// Transactional semantic parsing, decoding, or stop matching failed.
     #[error("speculative semantic state failed during {operation}: {message}")]
     Semantic {
@@ -1704,6 +2173,28 @@ pub trait SpeculativeConstraint: Sized {
         None
     }
 
+    /// Exact host allocations and controls made by the qualified control fork.
+    /// A logical snapshot estimate alone does not qualify a callback constructor.
+    fn control_snapshot_metadata_bytes(&self) -> Option<usize> {
+        None
+    }
+
+    /// Forks a controlled snapshot after the actual executor pays its host query.
+    /// Qualified implementations retain custody in independently escaping state,
+    /// aliases and allocating failures, without refunding observation budgets.
+    /// Unknown caller state keeps its ordinary behavior only without custody.
+    fn fork_control_snapshot(
+        &self,
+        host: crate::HostPreparationAuthority,
+    ) -> Result<Self, SpeculativeControlError> {
+        if !host.is_unmanaged() {
+            return Err(SpeculativeControlError::Unsupported(
+                "constraint has no paid isolated snapshot constructor",
+            ));
+        }
+        self.fork().map_err(SpeculativeControlError::Output)
+    }
+
     /// Forks state for tentative verification.
     fn fork(&self) -> Result<Self, SpeculativeOutputError>;
     /// Stages one token and reports a matched stop condition.
@@ -1744,6 +2235,36 @@ pub trait SpeculativeSemanticState {
         None
     }
 
+    /// Actual isolated host copy allocations; unknown callbacks remain unknown.
+    fn control_snapshot_metadata_bytes(&self) -> Option<usize> {
+        None
+    }
+    /// Actual prepared source for read-only concrete authentication only.
+    fn prepared_source(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+    /// Ordinary defaults retain their existing fork. Prepared implementations
+    /// reserve before copying and return a closed owner instead of a raw Box.
+    fn fork_owned(&self) -> Result<SpeculativeSemanticOwner, SpeculativeOutputError> {
+        self.fork_box().map(Into::into)
+    }
+    /// Copy after the shared snapshot driver pays this source's exact query.
+    fn fork_prepared(
+        &self,
+        host: crate::HostPreparationAuthority,
+    ) -> Result<SpeculativeSemanticOwner, SpeculativeOutputError> {
+        if !host.is_unmanaged() {
+            return Err(SpeculativeOutputError::Storage(
+                "semantic state has no paid isolated copy",
+            ));
+        }
+        self.fork_owned()
+    }
+    /// Ordinary boxes retain ordinary drop; prepared implementations move the
+    /// concrete payload out so the shell retires before its funding.
+    fn retire(self: Box<Self>) {
+        drop(self);
+    }
     /// Forks the exact committed prefix for tentative verification.
     fn fork_box(&self) -> Result<Box<dyn SpeculativeSemanticState>, SpeculativeOutputError>;
     /// Stages one token and reports whether a stop sequence matched.
@@ -1753,12 +2274,19 @@ pub trait SpeculativeSemanticState {
     /// Stages cancellation output.
     fn cancel(&mut self) -> Result<(), SpeculativeOutputError>;
     /// Drains events authorized by the next exact commit boundary.
-    fn take_events(&mut self) -> Vec<crate::generation::SemanticEvent>;
+    fn take_events(&mut self) -> SpeculativeBuffer<crate::generation::SemanticEvent>;
+    /// Synchronous publication through the same callback. Prepared implementations
+    /// can drain in place, retaining their exact fixed queue for the next round.
+    fn publish_events(&mut self, emit: &mut dyn FnMut(crate::generation::SemanticEvent)) {
+        for event in self.take_events() {
+            emit(event);
+        }
+    }
 }
 
 /// Optional transactional semantic state shared by plain and structured speculative decoding.
 pub struct SpeculativeSemanticConstraint {
-    state: Option<Box<dyn SpeculativeSemanticState>>,
+    state: Option<SpeculativeSemanticOwner>,
 }
 
 impl SpeculativeSemanticConstraint {
@@ -1768,40 +2296,64 @@ impl SpeculativeSemanticConstraint {
     }
 
     /// Creates a transactional structured-output state.
-    pub fn semantic(state: Box<dyn SpeculativeSemanticState>) -> Self {
-        Self { state: Some(state) }
+    pub fn semantic(state: impl Into<SpeculativeSemanticOwner>) -> Self {
+        Self {
+            state: Some(state.into()),
+        }
     }
 }
 
 impl SpeculativeConstraint for SpeculativeSemanticConstraint {
     fn control_snapshot_bytes(&self) -> Option<u64> {
         match &self.state {
-            Some(state) => state.control_snapshot_bytes(),
+            Some(state) => state.state().control_snapshot_bytes(),
             None => Some(0),
         }
     }
 
-    fn fork(&self) -> Result<Self, SpeculativeOutputError> {
+    fn control_snapshot_metadata_bytes(&self) -> Option<usize> {
+        let outer = std::mem::size_of::<Self>()
+            .checked_add(std::mem::size_of::<Result<Self, SpeculativeControlError>>())?
+            .checked_add(std::mem::size_of::<crate::HostPreparationAuthority>())?;
+        match &self.state {
+            Some(state) => outer.checked_add(state.state().control_snapshot_metadata_bytes()?),
+            None => Some(outer),
+        }
+    }
+    fn fork_control_snapshot(
+        &self,
+        host: crate::HostPreparationAuthority,
+    ) -> Result<Self, SpeculativeControlError> {
+        if host.is_unmanaged() {
+            return self.fork().map_err(SpeculativeControlError::Output);
+        }
         Ok(Self {
             state: self
                 .state
                 .as_ref()
-                .map(|state| state.fork_box())
-                .transpose()?,
+                .map(|state| state.fork_prepared(host))
+                .transpose()
+                .map_err(SpeculativeControlError::Output)?,
+        })
+    }
+
+    fn fork(&self) -> Result<Self, SpeculativeOutputError> {
+        Ok(Self {
+            state: self.state.as_ref().map(|state| state.fork()).transpose()?,
         })
     }
 
     fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {
         self.state
             .as_mut()
-            .map(|state| state.push_token(token))
+            .map(|state| state.state_mut().push_token(token))
             .transpose()
             .map(|matched| matched.unwrap_or(false))
     }
 
     fn finish(&mut self, reason: FinishReason) -> Result<(), SpeculativeOutputError> {
         if let Some(state) = &mut self.state {
-            state.finish(reason)?;
+            state.state_mut().finish(reason)?;
         }
         Ok(())
     }
@@ -1812,8 +2364,9 @@ type SpeculativeTokenCallback<'a> = dyn FnMut(&[u32]) -> Result<(), SpeculativeO
 
 /// Core-owned committed-token and semantic-event publication adapter.
 pub struct SpeculativeCallbackPublisher<'a> {
-    on_tokens: Box<SpeculativeTokenCallback<'a>>,
-    on_event: Option<Box<dyn FnMut(crate::generation::SemanticEvent) + 'a>>,
+    on_tokens: Option<Box<SpeculativeTokenCallback<'a>>>,
+    on_event: Option<SpeculativeEventCallback<'a>>,
+    host: crate::HostPreparationAuthority,
 }
 
 impl<'a> SpeculativeCallbackPublisher<'a> {
@@ -1824,17 +2377,55 @@ impl<'a> SpeculativeCallbackPublisher<'a> {
         on_tokens: impl FnMut(&[u32]) -> Result<(), SpeculativeOutputError> + 'a,
     ) -> Self {
         Self {
-            on_tokens: Box::new(on_tokens),
+            on_tokens: Some(Box::new(on_tokens)),
             on_event: None,
+            host: crate::HostPreparationAuthority::unmanaged(),
         }
     }
 
     /// Publishes transactional semantic events and ignores raw token callbacks.
     pub fn semantic(on_event: impl FnMut(crate::generation::SemanticEvent) + 'a) -> Self {
+        Self::semantic_boxed(Box::new(on_event))
+    }
+    /// Moves an existing caller-owned callback; no second callback Box is born.
+    pub fn semantic_boxed(on_event: Box<dyn FnMut(crate::generation::SemanticEvent) + 'a>) -> Self {
+        Self::semantic_prepared_boxed(on_event, crate::HostPreparationAuthority::unmanaged())
+    }
+    /// Retains paid publisher controls. The supplied callback is caller-owned;
+    /// this neither adopts its earlier allocation nor qualifies callback work.
+    pub fn semantic_prepared_boxed(
+        on_event: Box<dyn FnMut(crate::generation::SemanticEvent) + 'a>,
+        host: crate::HostPreparationAuthority,
+    ) -> Self {
+        Self::semantic_prepared_callback(on_event.into(), host)
+    }
+    /// Moves the closed callback without extracting or reboxing its allocation.
+    pub fn semantic_callback(on_event: SpeculativeEventCallback<'a>) -> Self {
+        Self::semantic_prepared_callback(on_event, crate::HostPreparationAuthority::unmanaged())
+    }
+    /// Retains the separately paid publisher controls around a closed callback.
+    pub fn semantic_prepared_callback(
+        on_event: SpeculativeEventCallback<'a>,
+        host: crate::HostPreparationAuthority,
+    ) -> Self {
         Self {
-            on_tokens: Box::new(|_| Ok(())),
-            on_event: Some(Box::new(on_event)),
+            on_tokens: None,
+            on_event: Some(on_event),
+            host,
         }
+    }
+    /// Fixed handoff and callback-invocation controls, excluding caller payload.
+    pub fn prepared_control_bytes() -> Option<usize> {
+        let parts = [
+            std::mem::size_of::<Self>(),
+            std::mem::size_of::<crate::HostPreparationAuthority>(),
+            std::mem::size_of::<Result<bool, SpeculativeOutputError>>(),
+            std::mem::size_of::<Result<(), SpeculativeOutputError>>(),
+            std::mem::size_of::<crate::generation::SemanticEvent>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
     }
 }
 
@@ -1849,23 +2440,21 @@ impl SpeculativePublisher<SpeculativeSemanticConstraint> for SpeculativeCallback
         let cancellation_won = cancellation.is_cancelled() && !sequence_finished;
         if cancellation_won {
             if let Some(state) = &mut constraint.state {
-                state.cancel()?;
+                state.state_mut().cancel()?;
             }
         }
-        (self.on_tokens)(tokens)?;
+        if let Some(on_tokens) = &mut self.on_tokens {
+            on_tokens(tokens)?;
+        }
         if let (Some(state), Some(on_event)) = (&mut constraint.state, &mut self.on_event) {
-            for event in state.take_events() {
-                on_event(event);
-            }
+            state.state_mut().publish_events(on_event.callback_mut());
         }
         let cancellation_after_callbacks =
             !cancellation_won && cancellation.is_cancelled() && !sequence_finished;
         if cancellation_after_callbacks {
             if let (Some(state), Some(on_event)) = (&mut constraint.state, &mut self.on_event) {
-                state.cancel()?;
-                for event in state.take_events() {
-                    on_event(event);
-                }
+                state.state_mut().cancel()?;
+                state.state_mut().publish_events(on_event.callback_mut());
             }
         }
         Ok(cancellation_won || cancellation_after_callbacks)
@@ -1876,10 +2465,8 @@ impl SpeculativePublisher<SpeculativeSemanticConstraint> for SpeculativeCallback
         constraint: &mut SpeculativeSemanticConstraint,
     ) -> Result<(), SpeculativeOutputError> {
         if let (Some(state), Some(on_event)) = (&mut constraint.state, &mut self.on_event) {
-            state.cancel()?;
-            for event in state.take_events() {
-                on_event(event);
-            }
+            state.state_mut().cancel()?;
+            state.state_mut().publish_events(on_event.callback_mut());
         }
         Ok(())
     }
@@ -1888,7 +2475,7 @@ impl SpeculativePublisher<SpeculativeSemanticConstraint> for SpeculativeCallback
 /// Canonical speculative sampler, sequence, constraint, and output sink.
 pub struct SpeculativeOutputRuntime<S, C, P> {
     sampler: S,
-    sequence: GenerationSequence,
+    sequence: SpeculativeSequence,
     constraint: C,
     publisher: P,
     cancellation: GenerationCancellationToken,
@@ -1904,14 +2491,14 @@ where
     /// Creates one canonical output runtime.
     pub fn new(
         sampler: S,
-        sequence: GenerationSequence,
+        sequence: impl Into<SpeculativeSequence>,
         constraint: C,
         publisher: P,
         cancellation: GenerationCancellationToken,
     ) -> Self {
         Self {
             sampler,
-            sequence,
+            sequence: sequence.into(),
             constraint,
             publisher,
             cancellation,
@@ -1949,12 +2536,12 @@ where
     }
 
     /// Canonical committed sequence.
-    pub const fn sequence(&self) -> &GenerationSequence {
+    pub const fn sequence(&self) -> &SpeculativeSequence {
         &self.sequence
     }
 
     /// Mutable canonical committed sequence.
-    pub const fn sequence_mut(&mut self) -> &mut GenerationSequence {
+    pub const fn sequence_mut(&mut self) -> &mut SpeculativeSequence {
         &mut self.sequence
     }
 
@@ -1979,10 +2566,10 @@ where
             return Ok(());
         }
         let mut constraint = self.constraint.fork()?;
-        let mut sequence = self.sequence.clone();
-        self.cancel_candidate(&mut constraint, &mut sequence)?;
+        self.observe_lifecycle(SpeculativeLifecycleStage::Cancellation)?;
+        self.publisher.publish_cancelled(&mut constraint)?;
         self.constraint = constraint;
-        self.sequence = sequence;
+        self.sequence.cancel();
         Ok(())
     }
 
@@ -1991,7 +2578,7 @@ where
         &mut self,
         sampler: S,
         constraint: C,
-        sequence: GenerationSequence,
+        sequence: SpeculativeSequence,
     ) {
         self.sampler = sampler;
         self.constraint = constraint;
@@ -2017,7 +2604,7 @@ where
     fn publish_candidate(
         &mut self,
         constraint: &mut C,
-        sequence: &mut GenerationSequence,
+        sequence: &mut SpeculativeSequence,
         tokens: &[u32],
     ) -> Result<bool, SpeculativeOutputError> {
         self.observe_lifecycle(SpeculativeLifecycleStage::Publication)?;
@@ -2036,7 +2623,7 @@ where
     fn cancel_candidate(
         &mut self,
         constraint: &mut C,
-        sequence: &mut GenerationSequence,
+        sequence: &mut SpeculativeSequence,
     ) -> Result<(), SpeculativeOutputError> {
         if !sequence.is_finished() {
             self.observe_lifecycle(SpeculativeLifecycleStage::Cancellation)?;
@@ -2048,7 +2635,7 @@ where
     }
 
     /// Consumes the runtime into its backend-owned parts.
-    pub(crate) fn into_parts(self) -> (S, GenerationSequence, C, P) {
+    pub(crate) fn into_parts(self) -> (S, SpeculativeSequence, C, P) {
         (self.sampler, self.sequence, self.constraint, self.publisher)
     }
 }
@@ -2060,6 +2647,23 @@ pub enum SpeculativeDriverError<E: std::error::Error + 'static> {
     /// Backend execution or sampling failed.
     #[error("{0}")]
     Backend(#[from] E),
+    /// Verification submission failed and its checkpoint could not be restored.
+    /// Both concrete causes retain their independent resource custody. This
+    /// outcome never certifies rollback, completion or reusable cache state.
+    #[error(
+        "verification submission failed: {submission}; checkpoint restoration also failed: {rollback}"
+    )]
+    SubmissionRollback {
+        /// Original submission failure, preserved as the primary source.
+        #[source]
+        submission: E,
+        /// Failed cleanup; retained independently of the submission source.
+        rollback: E,
+    },
+    /// An operation failed and checkpoint restoration also failed. Both owned
+    /// causes survive through a diagnostic prepared before native submission.
+    #[error(transparent)]
+    Rollback(crate::BackendFailure),
     /// Peer preparation rejection or failure of its retained transport.
     #[error(transparent)]
     Preparation(crate::BackendFailure),
@@ -2093,19 +2697,28 @@ pub struct ResolvedSpeculativeRound<S, C, R> {
     /// Tentatively advanced semantic state.
     constraint: C,
     /// Tentatively advanced canonical sequence.
-    sequence: GenerationSequence,
+    sequence: SpeculativeSequence,
     /// Tentatively advanced target randomness.
     target_randomness: Option<R>,
     /// Number of accepted proposals.
     accepted_proposals: usize,
     /// Tokens visible after cache commit.
-    committed_tokens: Vec<u32>,
+    committed_tokens: SpeculativeBuffer<u32>,
     /// Exact verification inputs retained by cache commit.
     verified_inputs: usize,
     /// Target bonus token, when full acceptance produced one.
     bonus_token: Option<u32>,
     /// Terminal reason after this round.
     finish_reason: Option<FinishReason>,
+}
+
+fn driver_capacity<E: std::error::Error + 'static>(
+    a: usize,
+    b: usize,
+) -> Result<usize, SpeculativeDriverError<E>> {
+    a.checked_add(b).ok_or_else(|| {
+        SpeculativeDriverError::Preparation(crate::HostMetadataFundingError::Overflow.into())
+    })
 }
 
 /// Generates one assistant proposal block through opaque backend operations.
@@ -2121,7 +2734,7 @@ pub fn propose_block<'a, E, S>(
     eos_token_ids: &[u32],
     draft_randomness: Option<&S::DraftRandomness>,
     context: E::Context<'a>,
-) -> Result<Vec<SpeculativeProposal<S::Distribution>>, SpeculativeDriverError<E::Error>>
+) -> Result<SpeculativeBuffer<SpeculativeProposal<S::Distribution>>, SpeculativeDriverError<E::Error>>
 where
     E: SpeculativeExecutor + 'a,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>> + 'a,
@@ -2154,15 +2767,19 @@ fn propose_block_at<'a, E, S>(
     draft_randomness: Option<&S::DraftRandomness>,
     context: E::Context<'a>,
     origin: Option<SpeculativeActivationOrigin>,
-) -> Result<Vec<SpeculativeProposal<S::Distribution>>, SpeculativeDriverError<E::Error>>
+) -> Result<SpeculativeBuffer<SpeculativeProposal<S::Distribution>>, SpeculativeDriverError<E::Error>>
 where
     E: SpeculativeExecutor + 'a,
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>> + 'a,
 {
     let mut branch_sampler = sampler.clone();
-    let mut history = Vec::with_capacity(base_history.len() + count);
-    history.extend_from_slice(base_history);
-    let mut proposals: Vec<SpeculativeProposal<S::Distribution>> = Vec::with_capacity(count);
+    let mut history =
+        executor.driver_buffer(driver_capacity(base_history.len(), count)?, context)?;
+    history
+        .try_extend(base_history.iter().copied())
+        .map_err(SpeculativeDriverError::Generation)?;
+    let mut proposals =
+        executor.driver_buffer::<SpeculativeProposal<S::Distribution>>(count, context)?;
     for offset in 0..count {
         let local = (|| -> Result<bool, SpeculativeDriverError<E::Error>> {
             let previous = proposals
@@ -2196,11 +2813,15 @@ where
                 SamplingPlacement::Draft,
                 context,
             )?;
-            proposals.push(SpeculativeProposal {
-                token,
-                distribution,
-            });
-            history.push(token);
+            proposals
+                .try_push(SpeculativeProposal {
+                    token,
+                    distribution,
+                })
+                .map_err(SpeculativeDriverError::Generation)?;
+            history
+                .try_push(token)
+                .map_err(SpeculativeDriverError::Generation)?;
             Ok(eos_token_ids.contains(&token) || branch_sampler.prefix_is_complete(&history)?)
         })();
         if coordination::ready_result(executor, local, context)? {
@@ -2212,12 +2833,12 @@ where
 
 /// Resolves one target verification transaction without backend-specific math.
 #[allow(clippy::too_many_arguments)]
-pub fn resolve_round<'a, E, S, C>(
+pub fn resolve_round<'a, 'sequence, E, S, C>(
     executor: &E,
     verification: &E::Verification,
-    mut proposals: Vec<SpeculativeProposal<S::Distribution>>,
+    proposals: impl Into<SpeculativeBuffer<SpeculativeProposal<S::Distribution>>>,
     sampler: &S,
-    sequence: &GenerationSequence,
+    sequence: impl Into<SpeculativeSequenceRef<'sequence>>,
     constraint: &C,
     target_randomness: Option<&S::RandomState>,
     temperature: f32,
@@ -2228,19 +2849,32 @@ where
     S: SpeculativeSampling<Logits = E::Logits, Error = E::Error, Context<'a> = E::Context<'a>> + 'a,
     C: SpeculativeConstraint,
 {
-    let mut draft_distributions = proposals
-        .iter_mut()
-        .map(|proposal| &mut proposal.distribution)
-        .collect::<Vec<_>>();
+    let mut proposals = proposals.into();
+    let mut draft_distributions = executor.driver_buffer(proposals.len(), context)?;
+    draft_distributions
+        .try_extend(
+            proposals
+                .iter_mut()
+                .map(|proposal| &mut proposal.distribution),
+        )
+        .map_err(SpeculativeDriverError::Generation)?;
     sampler.prepare_verification(&mut draft_distributions, temperature, context)?;
+    drop(draft_distributions);
     let proposal_count = proposals.len();
     let mut sampler = sampler.clone();
-    let mut sequence = sequence.clone();
+    let mut sequence = executor.copy_sequence(sequence.into(), context)?;
     let mut constraint = constraint.fork().map_err(SpeculativeDriverError::Output)?;
     let mut target_randomness = target_randomness.cloned();
-    let mut history = sequence.tokens().to_vec();
-    let mut round =
-        SpeculativeRound::new(proposal_count).map_err(SpeculativeDriverError::Generation)?;
+    let mut history = executor.driver_buffer(
+        driver_capacity(sequence.tokens().len(), proposal_count)?,
+        context,
+    )?;
+    history
+        .try_extend(sequence.tokens().iter().copied())
+        .map_err(SpeculativeDriverError::Generation)?;
+    let round_tokens = executor.driver_buffer(driver_capacity(proposal_count, 1)?, context)?;
+    let mut round = SpeculativeRound::with_buffer(proposal_count, round_tokens)
+        .map_err(SpeculativeDriverError::Generation)?;
     let mut finish_reason = None;
 
     for (index, proposal) in proposals.iter().enumerate() {
@@ -2268,7 +2902,9 @@ where
                     SamplingPlacement::Target,
                     context,
                 )?;
-                history.push(proposal.token);
+                history
+                    .try_push(proposal.token)
+                    .map_err(SpeculativeDriverError::Generation)?;
                 finish_reason = commit_terminal_token(
                     &mut sequence,
                     &mut sampler,
@@ -2331,14 +2967,17 @@ where
     let plan = round
         .commit_plan()
         .map_err(SpeculativeDriverError::Generation)?;
+    let accepted_proposals = plan.accepted_proposals;
+    let verified_inputs = plan.verified_inputs;
+    let committed_tokens = round.into_storage();
     Ok(ResolvedSpeculativeRound {
         sampler,
         constraint,
         sequence,
         target_randomness,
-        accepted_proposals: plan.accepted_proposals,
-        committed_tokens: plan.committed_tokens.to_vec(),
-        verified_inputs: plan.verified_inputs,
+        accepted_proposals,
+        committed_tokens,
+        verified_inputs,
         bonus_token,
         finish_reason,
     })
@@ -2360,16 +2999,36 @@ where
             GenerationError::EmptyProposalBlock,
         ));
     }
-    let mut input_tokens = Vec::with_capacity(block.proposals.len() + 1);
-    input_tokens.push(last_committed_token);
-    input_tokens.extend(block.proposals.iter().map(|proposal| proposal.token));
-    let checkpoint = executor.checkpoint(cache).map_err(SpeculativeDriverError::Backend);
+    let rollback_failure =
+        rollback::PreparedRollback::<SpeculativeDriverError<E::Error>, E::Error>::prepare(
+            executor, context,
+        )?;
+    let mut input_tokens =
+        executor.driver_buffer(driver_capacity(block.proposals.len(), 1)?, context)?;
+    input_tokens
+        .try_push(last_committed_token)
+        .map_err(SpeculativeDriverError::Generation)?;
+    input_tokens
+        .try_extend(block.proposals.iter().map(|proposal| proposal.token))
+        .map_err(SpeculativeDriverError::Generation)?;
+    let checkpoint = executor
+        .checkpoint_with_context(cache, context)
+        .map_err(SpeculativeDriverError::Backend);
     let checkpoint = coordination::ready_result(executor, checkpoint, context)?;
     let submission = match executor.submit_verification(&input_tokens, cache, context) {
         Ok(submission) => submission,
-        Err(error) => {
-            executor.restore_checkpoint(cache, &checkpoint, context)?;
-            return Err(error.into());
+        Err(submission) => {
+            // Restoration runs while the original failure and its native
+            // prefix remain owned. Retain both causes if it cannot settle.
+            return Err(
+                match executor.restore_checkpoint(cache, &checkpoint, context) {
+                    Ok(()) => SpeculativeDriverError::Backend(submission),
+                    Err(rollback) => SpeculativeDriverError::SubmissionRollback {
+                        submission,
+                        rollback,
+                    },
+                },
+            );
         }
     };
     Ok(PendingSpeculativeVerification {
@@ -2380,6 +3039,7 @@ where
         optimistic: None,
         submitted: Instant::now(),
         submitted_tokens: input_tokens.len(),
+        rollback_failure,
     })
 }
 
@@ -2451,6 +3111,7 @@ where
         optimistic,
         submitted,
         submitted_tokens: _,
+        rollback_failure,
     } = pending;
     // Keep unconsumed native payloads outside phase closures so a local or
     // peer preparation failure restores the checkpoint before releasing them.
@@ -2471,19 +3132,21 @@ where
             let telemetry = executor.take_verification_telemetry(
                 verification.as_mut().expect("pending verification"),
             )?;
-            stats.verification_in_flight_time += submitted.elapsed();
+            stats.counters.verification_in_flight_time += submitted.elapsed();
             runtime
                 .observe_lifecycle(SpeculativeLifecycleStage::Observation)
                 .map_err(SpeculativeDriverError::Output)?;
-            let mut canonical_proposal_prefix = runtime.sequence().tokens().to_vec();
-            canonical_proposal_prefix.extend(
-                block
-                    .as_ref()
-                    .expect("pending draft")
-                    .proposals
-                    .iter()
-                    .map(|proposal| proposal.token),
-            );
+            let proposals = &block.as_ref().expect("pending draft").proposals;
+            let mut canonical_proposal_prefix = executor.driver_buffer(
+                driver_capacity(runtime.sequence().tokens().len(), proposals.len())?,
+                context,
+            )?;
+            canonical_proposal_prefix
+                .try_extend(runtime.sequence().tokens().iter().copied())
+                .map_err(SpeculativeDriverError::Generation)?;
+            canonical_proposal_prefix
+                .try_extend(proposals.iter().map(|proposal| proposal.token))
+                .map_err(SpeculativeDriverError::Generation)?;
             let resolved = resolve_round::<E, S, C>(
                 executor,
                 verification.as_ref().expect("pending verification"),
@@ -2503,9 +3166,12 @@ where
                 &mut stats,
             )
             .map_err(SpeculativeDriverError::Generation)?;
-            stats.accepted_tokens += resolved.accepted_proposals;
-            stats.accept_lens.push(resolved.accepted_proposals);
-            stats.rounds += 1;
+            stats.counters.accepted_tokens += resolved.accepted_proposals;
+            stats
+                .accept_lens
+                .try_push(resolved.accepted_proposals)
+                .map_err(SpeculativeDriverError::Generation)?;
+            stats.counters.rounds += 1;
             runtime
                 .observe_lifecycle(SpeculativeLifecycleStage::CachePersistence)
                 .map_err(SpeculativeDriverError::Output)?;
@@ -2536,8 +3202,8 @@ where
             |status| executor.agree_text_preparation(stage, status, context),
             SpeculativeDriverError::Preparation,
         )?;
-        stats.target_tokens += commit.replayed_tokens;
-        stats.emitted_tokens += committed_tokens.len();
+        stats.counters.target_tokens += commit.replayed_tokens;
+        stats.counters.emitted_tokens += committed_tokens.len();
         let target_randomness = resolved.target_randomness;
         let cancelled = coordination::publish_candidate(
             executor,
@@ -2569,12 +3235,12 @@ where
             status,
         })
     })();
-    if result.is_err() {
-        // A failed restore is an explicit indeterminate backend error. It does
-        // not permit publication or reuse of the original native transaction.
-        executor.restore_checkpoint(cache, &checkpoint, context)?;
+    match result {
+        Ok(value) => Ok(value),
+        Err(operation) => {
+            Err(rollback_failure.restore(operation, executor, cache, &checkpoint, context))
+        }
     }
-    result
 }
 
 /// Resolves an exact retained verification solely to reach a safe cancellation boundary.
@@ -2602,6 +3268,7 @@ where
         optimistic,
         submitted,
         submitted_tokens: _,
+        rollback_failure,
     } = pending;
     let mut completion = Some(completion);
     let mut verification = Some(verification);
@@ -2615,7 +3282,7 @@ where
             let telemetry = executor.take_verification_telemetry(
                 verification.as_mut().expect("pending verification"),
             )?;
-            stats.verification_in_flight_time += submitted.elapsed();
+            stats.counters.verification_in_flight_time += submitted.elapsed();
             runtime
                 .observe_lifecycle(SpeculativeLifecycleStage::Observation)
                 .map_err(SpeculativeDriverError::Output)?;
@@ -2627,7 +3294,11 @@ where
                 .constraint()
                 .fork()
                 .map_err(SpeculativeDriverError::Output)?;
-            Ok((constraint, runtime.sequence().clone(), telemetry))
+            Ok((
+                constraint,
+                executor.copy_sequence(runtime.sequence().into(), context)?,
+                telemetry,
+            ))
         })();
         let (mut constraint, mut sequence, telemetry) = crate::run_preparation::finish_preparation(
             stage,
@@ -2651,7 +3322,7 @@ where
             |status| executor.agree_text_preparation(stage, status, context),
             SpeculativeDriverError::Preparation,
         )?;
-        stats.target_tokens += commit.replayed_tokens;
+        stats.counters.target_tokens += commit.replayed_tokens;
         let cancelled = runtime
             .cancel_candidate(&mut constraint, &mut sequence)
             .map_err(SpeculativeDriverError::Output);
@@ -2664,10 +3335,12 @@ where
         runtime.install_committed_state(runtime.sampler().clone(), constraint, sequence);
         Ok((stats, telemetry))
     })();
-    if result.is_err() {
-        executor.restore_checkpoint(cache, &checkpoint, context)?;
+    match result {
+        Ok(value) => Ok(value),
+        Err(operation) => {
+            Err(rollback_failure.restore(operation, executor, cache, &checkpoint, context))
+        }
     }
-    result
 }
 
 /// Resolves, promotes, or discards one optimistic branch and updates telemetry.
@@ -2685,49 +3358,49 @@ pub fn resolve_optimistic_branch<S, D>(
         discard_branch(stats, Some(branch));
         return Ok(SpeculativeContinuation::None);
     };
-    let optimistic_tokens = branch
-        .block
-        .proposals
-        .iter()
-        .map(|proposal| proposal.token)
-        .collect::<Vec<_>>();
-    let decision = crate::generation::resolve_optimistic_reuse(
+    let decision = crate::generation::resolve_optimistic_reuse_parts(
         &branch.assumed_prefix,
         canonical_prefix,
-        &optimistic_tokens,
+        branch
+            .block
+            .proposals
+            .first()
+            .map(|proposal| proposal.token),
+        branch.block.proposals.len(),
         bonus,
         terminal,
     )?;
-    stats.optimistic_target_bonus_tokens += 1;
+    stats.counters.optimistic_target_bonus_tokens += 1;
     if decision == crate::generation::OptimisticReuseDecision::DiscardTerminal {
         discard_branch(stats, Some(branch));
         return Ok(SpeculativeContinuation::None);
     }
     let drafted = branch.block.proposals.len();
-    let SpeculativeDraftBlock { state, proposals } = branch.block;
-    let mut proposals = proposals.into_iter();
+    let SpeculativeDraftBlock {
+        state,
+        mut proposals,
+    } = branch.block;
     let _matched_or_discarded = proposals
-        .next()
+        .remove_first()
         .expect("validated optimistic branch is non-empty");
     Ok(match decision {
         crate::generation::OptimisticReuseDecision::DiscardMismatch => {
-            stats.optimistic_bonus_mismatches += 1;
-            stats.discarded_optimistic_tokens += drafted;
-            stats.discarded_optimistic_blocks += 1;
+            stats.counters.optimistic_bonus_mismatches += 1;
+            stats.counters.discarded_optimistic_tokens += drafted;
+            stats.counters.discarded_optimistic_blocks += 1;
             SpeculativeContinuation::None
         }
         crate::generation::OptimisticReuseDecision::MatchedConsumed => {
-            stats.optimistic_bonus_matches += 1;
-            stats.consumed_optimistic_tokens += 1;
+            stats.counters.optimistic_bonus_matches += 1;
+            stats.counters.consumed_optimistic_tokens += 1;
             SpeculativeContinuation::None
         }
         crate::generation::OptimisticReuseDecision::MatchedRetained => {
-            stats.optimistic_bonus_matches += 1;
-            stats.consumed_optimistic_tokens += 1;
-            let proposals = proposals.collect::<Vec<_>>();
-            stats.draft_tokens += proposals.len();
-            stats.reused_optimistic_tokens += proposals.len();
-            stats.reused_optimistic_blocks += 1;
+            stats.counters.optimistic_bonus_matches += 1;
+            stats.counters.consumed_optimistic_tokens += 1;
+            stats.counters.draft_tokens += proposals.len();
+            stats.counters.reused_optimistic_tokens += proposals.len();
+            stats.counters.reused_optimistic_blocks += 1;
             SpeculativeContinuation::Promoted(SpeculativeDraftBlock { state, proposals })
         }
         crate::generation::OptimisticReuseDecision::DiscardTerminal => {
@@ -2741,8 +3414,8 @@ fn discard_branch<S, D>(
     branch: Option<SpeculativeOptimisticBranch<S, D>>,
 ) {
     if let Some(branch) = branch {
-        stats.discarded_optimistic_tokens += branch.block.proposals.len();
-        stats.discarded_optimistic_blocks += 1;
+        stats.counters.discarded_optimistic_tokens += branch.block.proposals.len();
+        stats.counters.discarded_optimistic_blocks += 1;
     }
 }
 
@@ -2751,18 +3424,23 @@ fn discard_continuation<S, D>(
     continuation: SpeculativeContinuation<S, D>,
 ) {
     if let SpeculativeContinuation::Promoted(block) = continuation {
-        stats.discarded_optimistic_tokens += block.proposals.len();
-        stats.discarded_optimistic_blocks += 1;
-        stats.draft_tokens = stats.draft_tokens.saturating_sub(block.proposals.len());
-        stats.reused_optimistic_tokens = stats
+        stats.counters.discarded_optimistic_tokens += block.proposals.len();
+        stats.counters.discarded_optimistic_blocks += 1;
+        stats.counters.draft_tokens = stats
+            .counters
+            .draft_tokens
+            .saturating_sub(block.proposals.len());
+        stats.counters.reused_optimistic_tokens = stats
+            .counters
             .reused_optimistic_tokens
             .saturating_sub(block.proposals.len());
-        stats.reused_optimistic_blocks = stats.reused_optimistic_blocks.saturating_sub(1);
+        stats.counters.reused_optimistic_blocks =
+            stats.counters.reused_optimistic_blocks.saturating_sub(1);
     }
 }
 
 fn commit_terminal_token<S, C>(
-    sequence: &mut GenerationSequence,
+    sequence: &mut SpeculativeSequence,
     sampler: &mut S,
     constraint: &mut C,
     token: u32,
@@ -2810,10 +3488,10 @@ where
     C: SpeculativeConstraint,
     P: SpeculativePublisher<C>,
 {
-    control_identity: Arc<()>,
+    control_identity: SpeculativeRequestIdentity,
     id: SpeculativeRequestId,
     cache: &'cache mut E::Cache,
-    config: SpeculativeConfig,
+    config: RequestConfiguration,
     runtime: SpeculativeOutputRuntime<S, C, P>,
     target_randomness: Option<S::RandomState>,
     draft_randomness: Option<S::DraftRandomness>,
@@ -2858,7 +3536,7 @@ where
     }
 
     /// Canonical committed token sequence.
-    pub const fn sequence(&self) -> &GenerationSequence {
+    pub const fn sequence(&self) -> &SpeculativeSequence {
         self.runtime.sequence()
     }
 
@@ -2901,7 +3579,7 @@ where
                     return Err(SpeculativeDriverError::Output(error));
                 }
                 self.block = None;
-                self.stats.elapsed = self.started.elapsed();
+                self.stats.counters.elapsed = self.started.elapsed();
             }
         }
         Ok(())
@@ -2912,6 +3590,7 @@ where
         executor: &E,
         optimistic_execution_available: bool,
         completion_wait: BoundedCompletionWait,
+        context: E::Context<'context>,
     ) -> Result<SpeculativeCandidate, SpeculativeDriverError<E::Error>>
     where
         E: 'context,
@@ -2943,13 +3622,20 @@ where
                 .as_ref()
                 .expect("in-flight request retains its verification transaction");
             let block = pending.block();
-            let assumed_len = self.runtime.sequence().tokens().len() + block.proposals.len();
-            let mut assumed_prefix = Vec::with_capacity(assumed_len);
-            assumed_prefix.extend_from_slice(self.runtime.sequence().tokens());
-            assumed_prefix.extend(block.proposals.iter().map(|proposal| proposal.token));
+            let assumed_len = driver_capacity(
+                self.runtime.sequence().tokens().len(),
+                block.proposals.len(),
+            )?;
+            let mut assumed_prefix = executor.driver_buffer(assumed_len, context)?;
+            assumed_prefix
+                .try_extend(self.runtime.sequence().tokens().iter().copied())
+                .map_err(SpeculativeDriverError::Generation)?;
+            assumed_prefix
+                .try_extend(block.proposals.iter().map(|proposal| proposal.token))
+                .map_err(SpeculativeDriverError::Generation)?;
             executor.supports_exact_optimistic_promotion()
                 && self.runtime.sampler().supports_exact_optimistic_promotion()
-                && !self.stats.adaptive_lookahead_disabled
+                && !self.stats.counters.adaptive_lookahead_disabled
                 && !block.proposals.is_empty()
                 && !self.runtime.sampler().prefix_is_complete(&assumed_prefix)?
                 && !block
@@ -2979,22 +3665,18 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
-        let observed = self.runtime
+        let observed = self
+            .runtime
             .observe_lifecycle(SpeculativeLifecycleStage::Execution)
             .map_err(SpeculativeDriverError::Output);
         coordination::ready_result(executor, observed, context)?;
         let target_count = self
             .config
-            .max_draft_tokens
-            .min(executor.max_proposals())
-            .min(
-                self.config
-                    .max_tokens
-                    .saturating_sub(self.runtime.sequence().tokens().len()),
-            );
+            .geometry(executor.max_proposals())
+            .proposal_count(self.runtime.sequence().tokens().len());
         if target_count == 0 {
             self.transition(SpeculativeRequestStatus::Completed)?;
-            self.stats.elapsed = self.started.elapsed();
+            self.stats.counters.elapsed = self.started.elapsed();
             return Ok(false);
         }
 
@@ -3014,10 +3696,11 @@ where
                 .expect("ready request has target state");
             let state = with_activation_origin(executor, origin, |executor| {
                 executor.begin_proposal(target_state, last, target_count, context)
-            }).map_err(SpeculativeDriverError::Backend);
+            })
+            .map_err(SpeculativeDriverError::Backend);
             SpeculativeDraftBlock {
                 state: coordination::ready_result(executor, state, context)?,
-                proposals: Vec::new(),
+                proposals: SpeculativeBuffer::default(),
             }
         };
         if block.proposals.len() > target_count {
@@ -3038,10 +3721,32 @@ where
             target_count - block.proposals.len()
         };
         if additional > 0 {
-            let mut history =
-                Vec::with_capacity(self.runtime.sequence().tokens().len() + block.proposals.len());
-            history.extend_from_slice(self.runtime.sequence().tokens());
-            history.extend(block.proposals.iter().map(|proposal| proposal.token));
+            // A fresh block can use the canonical slice directly and keep the
+            // returned proposal destination. Only an actual promoted prefix
+            // needs concatenation storage before the next native proposal.
+            let history = if block.proposals.is_empty() {
+                None
+            } else {
+                let mut history = executor.driver_buffer(
+                    driver_capacity(
+                        self.runtime.sequence().tokens().len(),
+                        block.proposals.len(),
+                    )?,
+                    context,
+                )?;
+                history
+                    .try_extend(self.runtime.sequence().tokens().iter().copied())
+                    .map_err(SpeculativeDriverError::Generation)?;
+                history
+                    .try_extend(block.proposals.iter().map(|proposal| proposal.token))
+                    .map_err(SpeculativeDriverError::Generation)?;
+                Some(history)
+            };
+            let combined = if block.proposals.is_empty() {
+                None
+            } else {
+                Some(executor.driver_buffer(target_count, context)?)
+            };
             let previous = block.proposals.last().map_or_else(
                 || {
                     *self
@@ -3059,15 +3764,27 @@ where
                 &mut block.state,
                 previous,
                 additional,
-                &history,
+                history
+                    .as_deref()
+                    .unwrap_or(self.runtime.sequence().tokens()),
                 self.config.temperature,
                 &self.config.eos_token_ids,
                 self.draft_randomness.as_ref(),
                 context,
                 origin,
             )?;
-            self.stats.draft_tokens += proposals.len();
-            block.proposals.extend(proposals);
+            self.stats.counters.draft_tokens += proposals.len();
+            block.proposals = if let Some(mut combined) = combined {
+                combined
+                    .try_extend(block.proposals)
+                    .map_err(SpeculativeDriverError::Generation)?;
+                combined
+                    .try_extend(proposals)
+                    .map_err(SpeculativeDriverError::Generation)?;
+                combined
+            } else {
+                proposals
+            };
         }
         executor.take_telemetry()?.record(&mut self.stats);
         self.block = Some(block);
@@ -3088,7 +3805,8 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
-        let observed = self.runtime
+        let observed = self
+            .runtime
             .observe_lifecycle(SpeculativeLifecycleStage::Execution)
             .map_err(SpeculativeDriverError::Output);
         coordination::ready_result(executor, observed, context)?;
@@ -3106,7 +3824,7 @@ where
         let pending = with_activation_origin(executor, origin, |executor| {
             submit_verification_transaction(executor, self.cache, last, block, context)
         })?;
-        self.stats.target_tokens += pending.submitted_tokens();
+        self.stats.counters.target_tokens += pending.submitted_tokens();
         self.pending = Some(pending);
         self.transition(SpeculativeRequestStatus::TargetVerificationInFlight)
     }
@@ -3124,7 +3842,8 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
-        let observed = self.runtime
+        let observed = self
+            .runtime
             .observe_lifecycle(SpeculativeLifecycleStage::Execution)
             .map_err(SpeculativeDriverError::Output);
         coordination::ready_result(executor, observed, context)?;
@@ -3136,21 +3855,30 @@ where
             .as_mut()
             .expect("optimistic request has an in-flight verification");
         let block = pending.block();
-        let assumed_len = self.runtime.sequence().tokens().len() + block.proposals.len();
+        let assumed_len = driver_capacity(
+            self.runtime.sequence().tokens().len(),
+            block.proposals.len(),
+        )?;
         let count = self
             .config
-            .max_draft_tokens
-            .min(executor.max_proposals())
-            .min(self.config.max_tokens.saturating_sub(assumed_len));
-        let mut state = block.state.clone();
+            .geometry(executor.max_proposals())
+            .proposal_count(assumed_len);
+        let copied = executor
+            .copy_draft_state(&block.state, context)
+            .map_err(SpeculativeDriverError::Backend);
+        let mut state = coordination::ready_result(executor, copied, context)?;
         let last = block
             .proposals
             .last()
             .expect("optimistic block has an assumed token")
             .token;
-        let mut history = Vec::with_capacity(assumed_len);
-        history.extend_from_slice(self.runtime.sequence().tokens());
-        history.extend(block.proposals.iter().map(|proposal| proposal.token));
+        let mut history = executor.driver_buffer(assumed_len, context)?;
+        history
+            .try_extend(self.runtime.sequence().tokens().iter().copied())
+            .map_err(SpeculativeDriverError::Generation)?;
+        history
+            .try_extend(block.proposals.iter().map(|proposal| proposal.token))
+            .map_err(SpeculativeDriverError::Generation)?;
         let proposals = propose_block_at(
             executor,
             self.runtime.sampler(),
@@ -3164,9 +3892,9 @@ where
             context,
             origin,
         )?;
-        self.stats.optimistic_draft_tokens += proposals.len();
-        self.stats.optimistic_draft_blocks += 1;
-        self.stats.optimistic_draft_time += started.elapsed();
+        self.stats.counters.optimistic_draft_tokens += proposals.len();
+        self.stats.counters.optimistic_draft_blocks += 1;
+        self.stats.counters.optimistic_draft_time += started.elapsed();
         pending
             .set_optimistic_branch(SpeculativeOptimisticBranch {
                 block: SpeculativeDraftBlock { state, proposals },
@@ -3190,6 +3918,8 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
+        let prepared_stats = self.stats.copy_for_driver(executor, true, context);
+        let stats = coordination::ready_result(executor, prepared_stats, context)?;
         let origin = self.activation_origin(executor, false);
         self.transition(SpeculativeRequestStatus::VerificationResolution)?;
         let pending = self
@@ -3203,7 +3933,7 @@ where
                     self.cache,
                     pending,
                     &mut self.runtime,
-                    self.stats.clone(),
+                    stats,
                     options
                         .completion_wait()
                         .map_err(SpeculativeDriverError::Generation)?,
@@ -3213,7 +3943,7 @@ where
             telemetry.record(&mut stats);
             self.stats = stats;
             self.transition(SpeculativeRequestStatus::Cancelled)?;
-            self.stats.elapsed = self.started.elapsed();
+            self.stats.counters.elapsed = self.started.elapsed();
             return Ok(());
         }
         let mut published = with_activation_origin(executor, origin, |executor| {
@@ -3224,7 +3954,7 @@ where
                 &mut self.runtime,
                 self.target_randomness.as_ref(),
                 self.config.temperature,
-                self.stats.clone(),
+                stats,
                 options,
                 context,
             )
@@ -3240,11 +3970,11 @@ where
             }
             SpeculativePublicationStatus::Completed => {
                 self.transition(SpeculativeRequestStatus::Completed)?;
-                self.stats.elapsed = self.started.elapsed();
+                self.stats.counters.elapsed = self.started.elapsed();
             }
             SpeculativePublicationStatus::Cancelled => {
                 self.transition(SpeculativeRequestStatus::Cancelled)?;
-                self.stats.elapsed = self.started.elapsed();
+                self.stats.counters.elapsed = self.started.elapsed();
             }
         }
         Ok(())
@@ -3256,7 +3986,7 @@ pub struct CompletedSpeculativeRequest<S> {
     /// Stable request identity.
     id: SpeculativeRequestId,
     /// Canonical generated token sequence.
-    token_ids: Vec<u32>,
+    token_ids: SpeculativeTokenIds,
     /// Portable request telemetry.
     stats: SpeculativeStats,
     /// Final backend sampling state.
@@ -3308,7 +4038,7 @@ impl<S> CompletedSpeculativeRequest<S> {
 /// Named consuming artifact for adapting one completed speculative request.
 pub struct CompletedSpeculativeRequestArtifact<S> {
     id: SpeculativeRequestId,
-    token_ids: Vec<u32>,
+    token_ids: SpeculativeTokenIds,
     stats: SpeculativeStats,
     sampler: S,
     finish_reason: Option<FinishReason>,
@@ -3321,7 +4051,7 @@ impl<S> CompletedSpeculativeRequestArtifact<S> {
         self.id
     }
     /// Takes canonical token ids.
-    pub fn take_token_ids(&mut self) -> Vec<u32> {
+    pub fn take_token_ids(&mut self) -> SpeculativeTokenIds {
         std::mem::take(&mut self.token_ids)
     }
     /// Takes request telemetry.
@@ -3345,18 +4075,18 @@ impl<S> CompletedSpeculativeRequestArtifact<S> {
 /// Completed request table and aggregate fair-scheduler telemetry.
 pub struct CompletedSpeculativeSchedule<S> {
     /// Requests in stable submission order.
-    requests: Vec<CompletedSpeculativeRequest<S>>,
+    requests: SpeculativeBuffer<CompletedSpeculativeRequest<S>>,
     /// Aggregate scheduler telemetry.
     scheduler: SpeculativeSchedulerStats,
 }
 
 impl<S> CompletedSpeculativeSchedule<S> {
     /// Consumes the schedule into request results.
-    pub fn into_requests(self) -> Vec<CompletedSpeculativeRequest<S>> {
+    pub fn into_requests(self) -> SpeculativeBuffer<CompletedSpeculativeRequest<S>> {
         self.requests
     }
     /// Takes completed requests while retaining access to scheduler telemetry.
-    pub fn take_requests(&mut self) -> Vec<CompletedSpeculativeRequest<S>> {
+    pub fn take_requests(&mut self) -> SpeculativeBuffer<CompletedSpeculativeRequest<S>> {
         std::mem::take(&mut self.requests)
     }
     /// Takes aggregate scheduler telemetry.
@@ -3378,7 +4108,8 @@ where
     P: SpeculativePublisher<C>,
 {
     schedule: SpeculativeSchedule,
-    requests: Vec<SpeculativeRequest<'cache, E, S, C, P>>,
+    requests: SpeculativeBuffer<SpeculativeRequest<'cache, E, S, C, P>>,
+    completed: SpeculativeBuffer<CompletedSpeculativeRequest<S>>,
     stats: SpeculativeSchedulerStats,
 }
 
@@ -3396,12 +4127,35 @@ where
     ) -> Result<Self, GenerationError> {
         Ok(Self {
             schedule: SpeculativeSchedule::new(options)?,
-            requests: Vec::new(),
+            requests: SpeculativeBuffer::default(),
+            completed: SpeculativeBuffer::default(),
             stats: SpeculativeSchedulerStats {
                 execution_topology: topology,
                 ..SpeculativeSchedulerStats::default()
             },
         })
+    }
+
+    /// Reserves both actual request and terminal row destinations before any
+    /// lane begins. Growth constructs a new paid buffer before moving old rows;
+    /// existing Vec allocations are never relabelled with fresh custody.
+    pub fn reserve_requests(
+        &mut self,
+        count: usize,
+        executor: &E,
+        context: E::Context<'_>,
+    ) -> Result<(), SpeculativeDriverError<E::Error>> {
+        if count <= self.requests.capacity() && count <= self.completed.capacity() {
+            return Ok(());
+        }
+        let mut requests = executor.driver_buffer(count, context)?;
+        let completed = executor.driver_buffer(count, context)?;
+        requests
+            .try_extend(std::mem::take(&mut self.requests))
+            .map_err(SpeculativeDriverError::Generation)?;
+        self.requests = requests;
+        self.completed = completed;
+        Ok(())
     }
 
     /// Returns one request by stable identity.
@@ -3436,7 +4190,7 @@ where
         executor: &mut E,
         cache: &'cache mut E::Cache,
         input: E::Input,
-        config: SpeculativeConfig,
+        config: impl Into<SpeculativeConfiguration>,
         mut runtime: SpeculativeOutputRuntime<S, C, P>,
         randomness: SpeculativeRandomness<S::RandomState, S::DraftRandomness>,
         component_timings_collected: bool,
@@ -3450,6 +4204,7 @@ where
                 Context<'context> = E::Context<'context>,
             > + 'context,
     {
+        let config = config.into();
         let stage = crate::run_preparation::TextPreparationStage::Delivery;
         let prepared = (|| {
             config
@@ -3472,14 +4227,68 @@ where
         {
             runtime.cancellation().cancel();
         }
-        let id = SpeculativeRequestId::new(self.requests.len());
         let started = Instant::now();
-        let mut stats = SpeculativeStats {
-            execution_topology: self.stats.execution_topology,
-            component_timings_collected,
-            ..SpeculativeStats::default()
+        let needed = driver_capacity(self.requests.len(), 1)?;
+        let capacity = if needed > self.requests.capacity() {
+            driver_capacity(self.requests.capacity(), self.requests.capacity())?.max(needed)
+        } else {
+            needed
         };
-        let (target_randomness, draft_randomness) = (randomness.target, randomness.draft);
+        let storage = self.reserve_requests(capacity, executor, context);
+        crate::run_preparation::finish_preparation(
+            stage,
+            storage,
+            |status| executor.agree_text_preparation(stage, status, context),
+            SpeculativeDriverError::Preparation,
+        )?;
+        let id = SpeculativeRequestId::new(self.requests.len());
+        let selected = executor
+            .request_context(id, context)
+            .map_err(SpeculativeDriverError::Backend);
+        let context = crate::run_preparation::finish_preparation(
+            stage,
+            selected,
+            |status| executor.agree_text_preparation(stage, status, context),
+            SpeculativeDriverError::Preparation,
+        )?;
+        let history = executor
+            .driver_host_metadata(Self::publication_control_bytes(), context)
+            .map_err(SpeculativeDriverError::Backend)
+            .and_then(|funding| {
+                executor
+                    .driver_buffer(0, context)
+                    .map(|history| (funding, history))
+                    .map_err(SpeculativeDriverError::Backend)
+            });
+        let history = history.and_then(|(funding, history)| {
+            executor
+                .driver_identity(context)
+                .map(|identity| (funding, history, identity))
+                .map_err(SpeculativeDriverError::Backend)
+        });
+        let history = history.and_then(|(funding, history, identity)| {
+            RequestConfiguration::prepare(config, executor, context)
+                .map(|config| (funding, history, identity, config))
+        });
+        // This is the selected request's ordinary coordinated preparation. The
+        // final row-assembly controls stay owned through its consuming call;
+        // the fixed destination already owns the row after that call returns.
+        let (_publication_funding, accept_lens, control_identity, config) =
+            crate::run_preparation::finish_preparation(
+                stage,
+                history,
+                |status| executor.agree_text_preparation(stage, status, context),
+                SpeculativeDriverError::Preparation,
+            )?;
+        let mut stats = SpeculativeStats {
+            counters: SpeculativeStatsCounters {
+                execution_topology: self.stats.execution_topology,
+                component_timings_collected,
+                ..SpeculativeStatsCounters::default()
+            },
+            accept_lens,
+        };
+        let (mut target_randomness, draft_randomness) = (randomness.target, randomness.draft);
         let (target_state, lifecycle) = if runtime.cancellation().is_cancelled() {
             let cancelled = runtime.cancel().map_err(SpeculativeDriverError::Output);
             crate::run_preparation::finish_preparation(
@@ -3488,164 +4297,224 @@ where
                 |status| executor.agree_text_preparation(stage, status, context),
                 SpeculativeDriverError::Preparation,
             )?;
-            stats.elapsed = started.elapsed();
+            stats.counters.elapsed = started.elapsed();
             (None, SpeculativeRequestLifecycle::cancelled())
         } else if runtime.sequence().is_finished() {
-            stats.elapsed = started.elapsed();
+            stats.counters.elapsed = started.elapsed();
             (None, SpeculativeRequestLifecycle::completed())
         } else {
-            let observed = runtime
-                .observe_lifecycle(SpeculativeLifecycleStage::Input)
-                .and_then(|()| runtime.observe_lifecycle(SpeculativeLifecycleStage::Execution))
-                .map_err(SpeculativeDriverError::Output);
-            crate::run_preparation::finish_preparation(
-                stage,
-                observed,
-                |status| executor.agree_text_preparation(stage, status, context),
-                SpeculativeDriverError::Preparation,
-            )?;
-            let checkpoint = executor
-                .checkpoint(cache)
+            'prefill_registration: {
+                let observed = runtime
+                    .observe_lifecycle(SpeculativeLifecycleStage::Input)
+                    .and_then(|()| runtime.observe_lifecycle(SpeculativeLifecycleStage::Execution))
+                    .map_err(SpeculativeDriverError::Output);
+                crate::run_preparation::finish_preparation(
+                    stage,
+                    observed,
+                    |status| executor.agree_text_preparation(stage, status, context),
+                    SpeculativeDriverError::Preparation,
+                )?;
+                let rollback_failure = rollback::PreparedRollback::<
+                    SpeculativeDriverError<E::Error>,
+                    E::Error,
+                >::prepare(executor, context)
                 .map_err(SpeculativeDriverError::Backend);
-            let checkpoint = crate::run_preparation::finish_preparation(
-                stage,
-                checkpoint,
-                |status| executor.agree_text_preparation(stage, status, context),
-                SpeculativeDriverError::Preparation,
-            )?;
-            let attempt = (|| {
-                let computed = (|| {
+                let rollback_failure = crate::run_preparation::finish_preparation(
+                    stage,
+                    rollback_failure,
+                    |status| executor.agree_text_preparation(stage, status, context),
+                    SpeculativeDriverError::Preparation,
+                )?;
+                let checkpoint = executor
+                    .checkpoint_with_context(cache, context)
+                    .map_err(SpeculativeDriverError::Backend);
+                let checkpoint = crate::run_preparation::finish_preparation(
+                    stage,
+                    checkpoint,
+                    |status| executor.agree_text_preparation(stage, status, context),
+                    SpeculativeDriverError::Preparation,
+                )?;
+                let attempt = (|| {
                     let origin = executor
                         .requires_activation_origin()
                         .then(|| SpeculativeActivationOrigin::new(id, &[], false));
+                    let cancellation = runtime.cancellation().clone();
                     let prefill = with_activation_origin(executor, origin, |executor| {
-                        executor.prefill(input, cache, context)
-                    })?;
-                    let mut sampler = runtime.sampler().clone();
-                    let mut constraint = runtime
-                        .constraint()
-                        .fork()
-                        .map_err(SpeculativeDriverError::Output)?;
-                    let mut sequence = runtime.sequence().clone();
-                    let mut target_randomness = target_randomness.clone();
-                    let first_logits = sampler.process_logits(
-                        &prefill.logits,
-                        config.temperature,
-                        &[],
-                        SamplingPlacement::Target,
-                        context,
-                    )?;
-                    let first = sampler.sample(
-                        &first_logits,
-                        config.temperature,
-                        target_randomness.as_mut(),
-                        SamplingPlacement::Target,
-                        context,
-                    )?;
-                    sampler.update_sampler_state(
-                        &first_logits,
-                        first,
-                        SamplingPlacement::Target,
-                        context,
-                    )?;
-                    let reason =
-                        commit_terminal_token(&mut sequence, &mut sampler, &mut constraint, first)?;
-                    let submission_to_first_token = started.elapsed();
-                    Ok((
+                        executor.prefill_cancellable(input, cache, &cancellation, context)
+                    })
+                    .map_err(SpeculativeDriverError::Backend)
+                    .map(|outcome| match outcome {
+                        SpeculativePrefillOutcome::Complete(value) => {
+                            stats.counters.target_tokens = value.evaluated_tokens;
+                            (!cancellation.is_cancelled()).then_some(value)
+                        }
+                        SpeculativePrefillOutcome::Cancelled { evaluated_tokens } => {
+                            stats.counters.target_tokens = evaluated_tokens;
+                            None
+                        }
+                    });
+                    // Every participant resolves this boundary before any sampler
+                    // clone/update or first-token publication can happen.
+                    let Some(prefill) = crate::run_preparation::finish_preparation_cancellable(
+                        stage,
+                        prefill,
+                        |status| executor.agree_text_preparation(stage, status, context),
+                        SpeculativeDriverError::Preparation,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    let computed = (|| {
+                        let mut sampler = runtime.sampler().clone();
+                        let mut constraint = runtime
+                            .constraint()
+                            .fork()
+                            .map_err(SpeculativeDriverError::Output)?;
+                        let mut sequence =
+                            executor.copy_sequence(runtime.sequence().into(), context)?;
+                        let mut target_randomness = target_randomness.clone();
+                        let first_logits = sampler.process_logits(
+                            &prefill.logits,
+                            config.temperature,
+                            &[],
+                            SamplingPlacement::Target,
+                            context,
+                        )?;
+                        let first = sampler.sample(
+                            &first_logits,
+                            config.temperature,
+                            target_randomness.as_mut(),
+                            SamplingPlacement::Target,
+                            context,
+                        )?;
+                        sampler.update_sampler_state(
+                            &first_logits,
+                            first,
+                            SamplingPlacement::Target,
+                            context,
+                        )?;
+                        let reason = commit_terminal_token(
+                            &mut sequence,
+                            &mut sampler,
+                            &mut constraint,
+                            first,
+                        )?;
+                        let submission_to_first_token = started.elapsed();
+                        Ok((
+                            prefill,
+                            sampler,
+                            constraint,
+                            sequence,
+                            target_randomness,
+                            reason,
+                            first,
+                            submission_to_first_token,
+                        ))
+                    })();
+                    let (
                         prefill,
                         sampler,
-                        constraint,
-                        sequence,
+                        mut constraint,
+                        mut sequence,
                         target_randomness,
                         reason,
                         first,
                         submission_to_first_token,
-                    ))
+                    ) = crate::run_preparation::finish_preparation(
+                        stage,
+                        computed,
+                        |status| executor.agree_text_preparation(stage, status, context),
+                        SpeculativeDriverError::Preparation,
+                    )?;
+                    let cancelled = coordination::publish_candidate(
+                        executor,
+                        &mut runtime,
+                        &mut constraint,
+                        &mut sequence,
+                        &[first],
+                        context,
+                    )?;
+                    runtime.install_committed_state(sampler, constraint, sequence);
+                    Ok::<_, SpeculativeDriverError<E::Error>>(Some((
+                        prefill.evaluated_tokens,
+                        prefill.state,
+                        target_randomness,
+                        reason,
+                        cancelled,
+                        submission_to_first_token,
+                    )))
                 })();
                 let (
-                    prefill,
-                    sampler,
-                    mut constraint,
-                    mut sequence,
-                    target_randomness,
-                    reason,
-                    first,
-                    submission_to_first_token,
-                ) = crate::run_preparation::finish_preparation(
-                    stage,
-                    computed,
-                    |status| executor.agree_text_preparation(stage, status, context),
-                    SpeculativeDriverError::Preparation,
-                )?;
-                let cancelled = coordination::publish_candidate(
-                    executor,
-                    &mut runtime,
-                    &mut constraint,
-                    &mut sequence,
-                    &[first],
-                    context,
-                )?;
-                runtime.install_committed_state(sampler, constraint, sequence);
-                Ok::<_, SpeculativeDriverError<E::Error>>((
-                    prefill.evaluated_tokens,
-                    prefill.state,
-                    target_randomness,
+                    evaluated_tokens,
+                    target_state,
+                    committed_randomness,
                     reason,
                     cancelled,
                     submission_to_first_token,
-                ))
-            })();
-            let (
-                evaluated_tokens,
-                target_state,
-                target_randomness,
-                reason,
-                cancelled,
-                submission_to_first_token,
-            ) = match attempt {
-                Ok(result) => result,
-                Err(error) => {
-                    executor.restore_checkpoint(cache, &checkpoint, context)?;
-                    return Err(error);
-                }
-            };
-            stats.submission_to_first_token = Some(submission_to_first_token);
-            stats.target_tokens = evaluated_tokens;
-            stats.scheduler_turns = 1;
-            stats.emitted_tokens = 1;
-            let lifecycle = if cancelled {
-                stats.elapsed = started.elapsed();
-                SpeculativeRequestLifecycle::cancelled()
-            } else if reason.is_some() {
-                stats.elapsed = started.elapsed();
-                SpeculativeRequestLifecycle::completed()
-            } else {
-                let mut lifecycle = SpeculativeRequestLifecycle::new();
-                lifecycle
-                    .transition(SpeculativeRequestStatus::ReadyToDraft)
-                    .map_err(SpeculativeDriverError::Generation)?;
-                lifecycle
-            };
-            self.stats.turns += 1;
-            self.requests.push(SpeculativeRequest {
-                control_identity: Arc::new(()),
-                id,
-                cache,
-                config,
-                runtime,
-                target_randomness,
-                draft_randomness,
-                stats,
-                started,
-                target_state: Some(target_state),
-                block: None,
-                pending: None,
-                lifecycle,
-            });
-            return Ok(id);
+                ) = match attempt {
+                    Ok(Some(result)) => result,
+                    Ok(None) => {
+                        let restored = executor
+                            .restore_checkpoint(cache, &checkpoint, context)
+                            .map_err(SpeculativeDriverError::Backend);
+                        crate::run_preparation::finish_preparation(
+                            stage,
+                            restored,
+                            |status| executor.agree_text_preparation(stage, status, context),
+                            SpeculativeDriverError::Preparation,
+                        )?;
+                        runtime.cancellation().cancel();
+                        let cancelled = runtime.cancel().map_err(SpeculativeDriverError::Output);
+                        crate::run_preparation::finish_preparation(
+                            stage,
+                            cancelled,
+                            |status| executor.agree_text_preparation(stage, status, context),
+                            SpeculativeDriverError::Preparation,
+                        )?;
+                        stats.counters.elapsed = started.elapsed();
+                        break 'prefill_registration (
+                            None,
+                            SpeculativeRequestLifecycle::cancelled(),
+                        );
+                    }
+                    Err(operation) => {
+                        return Err(rollback_failure.restore(
+                            operation,
+                            executor,
+                            cache,
+                            &checkpoint,
+                            context,
+                        ));
+                    }
+                };
+                stats.counters.submission_to_first_token = Some(submission_to_first_token);
+                stats.counters.target_tokens = evaluated_tokens;
+                stats.counters.scheduler_turns = 1;
+                stats.counters.emitted_tokens = 1;
+                let lifecycle = if cancelled {
+                    stats.counters.elapsed = started.elapsed();
+                    SpeculativeRequestLifecycle::cancelled()
+                } else if reason.is_some() {
+                    stats.counters.elapsed = started.elapsed();
+                    SpeculativeRequestLifecycle::completed()
+                } else {
+                    let mut lifecycle = SpeculativeRequestLifecycle::new();
+                    lifecycle
+                        .transition(SpeculativeRequestStatus::ReadyToDraft)
+                        .map_err(SpeculativeDriverError::Generation)?;
+                    lifecycle
+                };
+                self.stats.turns += 1;
+                // Both terminal and prefilled requests publish through the
+                // same paid destination below. Keep first-token RNG progress;
+                // cancelled/failed attempts above still restore their checkpoint.
+                target_randomness = committed_randomness;
+                (Some(target_state), lifecycle)
+            }
         };
-        self.requests.push(SpeculativeRequest {
-            control_identity: Arc::new(()),
+        // No row assembly temporary needs to overlap the cold prefill quote.
+        self.publish_submitted(
+            control_identity,
             id,
             cache,
             config,
@@ -3655,10 +4524,69 @@ where
             stats,
             started,
             target_state,
-            block: None,
-            pending: None,
             lifecycle,
-        });
+        )
+    }
+
+    fn publication_control_bytes() -> Option<usize> {
+        let parts = [
+            std::mem::size_of::<(
+                &mut Self,
+                SpeculativeRequestIdentity,
+                SpeculativeRequestId,
+                &'cache mut E::Cache,
+                RequestConfiguration,
+                SpeculativeOutputRuntime<S, C, P>,
+                Option<S::RandomState>,
+                Option<S::DraftRandomness>,
+                SpeculativeStats,
+                Instant,
+                Option<E::TargetState>,
+                SpeculativeRequestLifecycle,
+            )>(),
+            std::mem::size_of::<SpeculativeRequest<'cache, E, S, C, P>>(),
+            std::mem::size_of::<Result<(), GenerationError>>(),
+            std::mem::size_of::<Result<SpeculativeRequestId, SpeculativeDriverError<E::Error>>>(),
+            std::mem::size_of::<crate::HostPreparationAuthority>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn publish_submitted(
+        &mut self,
+        control_identity: SpeculativeRequestIdentity,
+        id: SpeculativeRequestId,
+        cache: &'cache mut E::Cache,
+        config: RequestConfiguration,
+        runtime: SpeculativeOutputRuntime<S, C, P>,
+        target_randomness: Option<S::RandomState>,
+        draft_randomness: Option<S::DraftRandomness>,
+        stats: SpeculativeStats,
+        started: Instant,
+        target_state: Option<E::TargetState>,
+        lifecycle: SpeculativeRequestLifecycle,
+    ) -> Result<SpeculativeRequestId, SpeculativeDriverError<E::Error>> {
+        self.requests
+            .try_push(SpeculativeRequest {
+                control_identity,
+                id,
+                cache,
+                config,
+                runtime,
+                target_randomness,
+                draft_randomness,
+                stats,
+                started,
+                target_state,
+                block: None,
+                pending: None,
+                lifecycle,
+            })
+            .map_err(SpeculativeDriverError::Generation)?;
         Ok(id)
     }
 
@@ -3706,10 +4634,10 @@ where
             > + 'context,
     {
         let stage = crate::run_preparation::TextPreparationStage::Delivery;
-        let local = self
-            .requests
-            .iter()
-            .map(|request| {
+        let local = (|| {
+            let mut local = executor.driver_buffer(self.requests.len(), context)?;
+            for request in &self.requests {
+                let request_context = executor.request_context(request.id, context)?;
                 let candidate = request.candidate(
                     executor,
                     optimistic_execution_available,
@@ -3717,18 +4645,22 @@ where
                         .options()
                         .completion_wait()
                         .expect("speculative schedule retains validated completion options"),
+                    request_context,
                 )?;
-                Ok(SpeculativeScheduleState {
-                    request: request.id,
-                    status: candidate.status,
-                    cancellation_requested: request.runtime.cancellation().is_cancelled()
-                        || request.lifecycle.cancellation_pending(),
-                    verification_complete: candidate.verification_complete,
-                    verification_deadline_expired: candidate.verification_deadline_expired,
-                    optimistic_eligible: candidate.optimistic_eligible,
-                })
-            })
-            .collect::<Result<Vec<_>, SpeculativeDriverError<E::Error>>>();
+                local
+                    .try_push(SpeculativeScheduleState {
+                        request: request.id,
+                        status: candidate.status,
+                        cancellation_requested: request.runtime.cancellation().is_cancelled()
+                            || request.lifecycle.cancellation_pending(),
+                        verification_complete: candidate.verification_complete,
+                        verification_deadline_expired: candidate.verification_deadline_expired,
+                        optimistic_eligible: candidate.optimistic_eligible,
+                    })
+                    .map_err(SpeculativeDriverError::Generation)?;
+            }
+            Ok::<_, SpeculativeDriverError<E::Error>>(local)
+        })();
         let local = crate::run_preparation::finish_preparation(
             stage,
             local,
@@ -3736,7 +4668,7 @@ where
             SpeculativeDriverError::Preparation,
         )?;
         let coordinated = executor
-            .coordinate_speculative_step(local, context)
+            .coordinate_speculative_buffer(local, context)
             .map_err(SpeculativeDriverError::Preparation)
             .and_then(|states| {
                 if states.len() != self.requests.len()
@@ -3775,16 +4707,22 @@ where
         if self.is_finished() {
             return Ok(false);
         }
-        let candidates = coordinated
-            .into_iter()
-            .zip(&self.requests)
-            .map(|(state, request)| SpeculativeCandidate {
-                status: request.lifecycle.status(),
-                optimistic_eligible: state.optimistic_eligible && !state.cancellation_requested,
-                verification_complete: state.verification_complete,
-                verification_deadline_expired: state.verification_deadline_expired,
-            })
-            .collect::<Vec<_>>();
+        let candidates = (|| {
+            let mut candidates = executor.driver_buffer(self.requests.len(), context)?;
+            for (state, request) in coordinated.into_iter().zip(&self.requests) {
+                candidates
+                    .try_push(SpeculativeCandidate {
+                        status: request.lifecycle.status(),
+                        optimistic_eligible: state.optimistic_eligible
+                            && !state.cancellation_requested,
+                        verification_complete: state.verification_complete,
+                        verification_deadline_expired: state.verification_deadline_expired,
+                    })
+                    .map_err(SpeculativeDriverError::Generation)?;
+            }
+            Ok(candidates)
+        })();
+        let candidates = coordination::ready_result(executor, candidates, context)?;
         let Some(action) = self
             .schedule
             .next_action(&candidates)
@@ -3799,12 +4737,21 @@ where
             | SpeculativeAction::ResolveVerification(index)
             | SpeculativeAction::DraftCommitted { index, .. } => index,
         };
+        let selected = executor
+            .request_context(self.requests[index].id, context)
+            .map_err(SpeculativeDriverError::Backend);
+        let request_context = crate::run_preparation::finish_preparation(
+            stage,
+            selected,
+            |status| executor.agree_text_preparation(stage, status, context),
+            SpeculativeDriverError::Preparation,
+        )?;
         self.stats.turns += 1;
-        self.requests[index].stats.scheduler_turns += 1;
+        self.requests[index].stats.counters.scheduler_turns += 1;
         let completed = (|| {
             match action {
                 SpeculativeAction::SubmitVerification(index) => {
-                    self.requests[index].submit_verification(executor, context)?;
+                    self.requests[index].submit_verification(executor, request_context)?;
                     let in_flight = self
                         .requests
                         .iter()
@@ -3817,14 +4764,18 @@ where
                     index,
                     cross_request,
                 } => {
-                    let drafted = self.requests[index].draft_committed(executor, context)?;
+                    let drafted =
+                        self.requests[index].draft_committed(executor, request_context)?;
                     if cross_request && drafted {
-                        self.requests[index].stats.cross_request_draft_opportunities += 1;
+                        self.requests[index]
+                            .stats
+                            .counters
+                            .cross_request_draft_opportunities += 1;
                         self.stats.cross_request_draft_opportunities += 1;
                     }
                 }
                 SpeculativeAction::DraftOptimistic(index) => {
-                    self.requests[index].draft_optimistic(executor, context)?;
+                    self.requests[index].draft_optimistic(executor, request_context)?;
                     let optimistic =
                         self.requests
                             .iter()
@@ -3842,7 +4793,7 @@ where
                     self.requests[index].resolve_verification(
                         executor,
                         self.schedule.options(),
-                        context,
+                        request_context,
                     )?;
                 }
             }
@@ -3884,22 +4835,22 @@ where
                 GenerationError::ActiveSpeculativeRequests,
             ));
         }
-        Ok(CompletedSpeculativeSchedule {
-            requests: self
-                .requests
-                .into_iter()
-                .map(|request| {
-                    let (sampler, sequence, _, _) = request.runtime.into_parts();
-                    CompletedSpeculativeRequest {
-                        id: request.id,
-                        finish_reason: sequence.finish_reason(),
-                        token_ids: sequence.into_tokens(),
-                        stats: request.stats,
-                        sampler,
-                        status: request.lifecycle.status(),
-                    }
+        let mut completed = self.completed;
+        for request in self.requests {
+            let (sampler, sequence, _, _) = request.runtime.into_parts();
+            completed
+                .try_push(CompletedSpeculativeRequest {
+                    id: request.id,
+                    finish_reason: sequence.finish_reason(),
+                    token_ids: sequence.into_token_ids(),
+                    stats: request.stats,
+                    sampler,
+                    status: request.lifecycle.status(),
                 })
-                .collect(),
+                .map_err(SpeculativeDriverError::Generation)?;
+        }
+        Ok(CompletedSpeculativeSchedule {
+            requests: completed,
             scheduler: self.stats,
         })
     }
@@ -4071,8 +5022,8 @@ mod tests {
         fmt,
         rc::Rc,
         sync::{
-            atomic::{AtomicUsize, Ordering},
             Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
         },
     };
 
@@ -4081,20 +5032,22 @@ mod tests {
     #[test]
     fn speculative_telemetry_preserves_exact_statistics_and_durations() {
         let stats = SpeculativeStats {
-            execution_topology: SpeculativeExecutionTopology::CrossDeviceSplit,
-            target_tokens: 31,
-            draft_tokens: 8,
-            accepted_tokens: 5,
-            rounds: 2,
-            accept_lens: vec![2, 3],
-            emitted_tokens: 7,
-            optimistic_draft_tokens: 9,
-            reused_optimistic_tokens: 4,
-            discarded_optimistic_tokens: 5,
-            adaptive_lookahead_disabled: true,
-            optimistic_draft_time: Duration::from_millis(125),
-            verification_in_flight_time: Duration::from_millis(375),
-            ..SpeculativeStats::default()
+            counters: SpeculativeStatsCounters {
+                execution_topology: SpeculativeExecutionTopology::CrossDeviceSplit,
+                target_tokens: 31,
+                draft_tokens: 8,
+                accepted_tokens: 5,
+                rounds: 2,
+                emitted_tokens: 7,
+                optimistic_draft_tokens: 9,
+                reused_optimistic_tokens: 4,
+                discarded_optimistic_tokens: 5,
+                adaptive_lookahead_disabled: true,
+                optimistic_draft_time: Duration::from_millis(125),
+                verification_in_flight_time: Duration::from_millis(375),
+                ..SpeculativeStatsCounters::default()
+            },
+            accept_lens: vec![2, 3].into(),
         };
         assert_eq!(
             crate::speculative_decoding_telemetry(&stats),
@@ -4171,7 +5124,9 @@ mod tests {
         assert!(ready.is_ready_for(SpeculativeDraftSource::Embedded));
         assert!(!unsupported.admits_source(SpeculativeDraftSource::Embedded));
         assert!(!unsupported.is_ready_for(SpeculativeDraftSource::Embedded));
-        assert!(!SpeculativeCapability::Unavailable.admits_source(SpeculativeDraftSource::Embedded));
+        assert!(
+            !SpeculativeCapability::Unavailable.admits_source(SpeculativeDraftSource::Embedded)
+        );
     }
 
     #[derive(Debug, Clone, Default)]
@@ -4219,7 +5174,7 @@ mod tests {
         fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {
             self.events
                 .push(crate::generation::SemanticEvent::TextDelta(
-                    token.to_string(),
+                    token.to_string().into(),
                 ));
             Ok(false)
         }
@@ -4234,8 +5189,8 @@ mod tests {
             self.finish(FinishReason::Cancelled)
         }
 
-        fn take_events(&mut self) -> Vec<crate::generation::SemanticEvent> {
-            std::mem::take(&mut self.events)
+        fn take_events(&mut self) -> SpeculativeBuffer<crate::generation::SemanticEvent> {
+            std::mem::take(&mut self.events).into()
         }
     }
 
@@ -4251,14 +5206,16 @@ mod tests {
             let mut publisher = SpeculativeCallbackPublisher::semantic(move |event| {
                 published.borrow_mut().push(event)
             });
-            assert!(!publisher
-                .publish_committed(
-                    &mut constraint,
-                    &[7],
-                    &GenerationCancellationToken::new(),
-                    true,
-                )
-                .unwrap());
+            assert!(
+                !publisher
+                    .publish_committed(
+                        &mut constraint,
+                        &[7],
+                        &GenerationCancellationToken::new(),
+                        true,
+                    )
+                    .unwrap()
+            );
         }
         assert_eq!(
             *published.borrow(),
@@ -4306,8 +5263,11 @@ mod tests {
 
     #[derive(Default)]
     struct MockExecutor {
+        host: Option<crate::HostPreparationAuthority>,
         trace: Option<TransactionTrace>,
         full_acceptance: bool,
+        cancel_during_prefill: Option<GenerationCancellationToken>,
+        peer_cancels_prefill: bool,
         capture_origins: bool,
         origin: Option<SpeculativeActivationOrigin>,
         activations: Vec<(&'static str, Option<SpeculativeActivationOrigin>)>,
@@ -4323,6 +5283,17 @@ mod tests {
         type Cache = Vec<u32>;
         type TargetState = usize;
         type DraftState = Vec<u32>;
+
+        fn copy_draft_state<'a>(
+            &self,
+            state: &Self::DraftState,
+            _context: Self::Context<'a>,
+        ) -> Result<Self::DraftState, Self::Error>
+        where
+            Self: 'a,
+        {
+            Ok(state.clone())
+        }
         type CacheCheckpoint = usize;
         type Verification = MockVerification;
         type Logits = Vec<f32>;
@@ -4330,6 +5301,63 @@ mod tests {
         type Completion = Done;
         type Telemetry = ();
         type Error = Infallible;
+
+        fn driver_buffer<T>(
+            &self,
+            capacity: usize,
+            _: (),
+        ) -> Result<SpeculativeBuffer<T>, Infallible> {
+            Ok(match &self.host {
+                Some(host) => SpeculativeBuffer::try_new_retained(capacity, host.clone()).unwrap(),
+                None => SpeculativeBuffer::with_capacity(capacity),
+            })
+        }
+        fn driver_identity(&self, _: ()) -> Result<SpeculativeRequestIdentity, Infallible> {
+            Ok(match &self.host {
+                Some(host) => SpeculativeRequestIdentity::with_authority(host.clone()),
+                None => SpeculativeRequestIdentity::new(),
+            })
+        }
+        fn driver_host_metadata(
+            &self,
+            _: Option<usize>,
+            _: (),
+        ) -> Result<crate::HostPreparationAuthority, Infallible> {
+            Ok(self
+                .host
+                .clone()
+                .unwrap_or_else(crate::HostPreparationAuthority::unmanaged))
+        }
+        fn coordinate_speculative_buffer<'a>(
+            &mut self,
+            local: SpeculativeBuffer<SpeculativeScheduleState>,
+            _: (),
+        ) -> Result<SpeculativeBuffer<SpeculativeScheduleState>, crate::BackendFailure> {
+            Ok(local) // this fixture's same existing single-participant coordinator
+        }
+
+        fn agree_text_preparation<'a>(
+            &mut self,
+            _: crate::run_preparation::TextPreparationStage,
+            status: crate::run_preparation::TextPreparationStatus,
+            _: Self::Context<'a>,
+        ) -> Result<crate::run_preparation::TextPreparationOutcome, crate::BackendFailure> {
+            use crate::run_preparation::{TextPreparationOutcome as O, TextPreparationStatus as S};
+            if self.peer_cancels_prefill
+                && self
+                    .activations
+                    .last()
+                    .is_some_and(|(phase, _)| *phase == "prefill")
+            {
+                self.peer_cancels_prefill = false;
+                return Ok(O::Cancelled);
+            }
+            Ok(match status {
+                S::Ready => O::Ready,
+                S::Cancelled => O::Cancelled,
+                S::Failed => O::Rejected { rank: 0 },
+            })
+        }
 
         fn requires_activation_origin(&self) -> bool {
             self.capture_origins
@@ -4351,6 +5379,9 @@ mod tests {
         ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error> {
             self.activations.push(("prefill", self.origin));
             cache.extend_from_slice(&input);
+            if let Some(token) = &self.cancel_during_prefill {
+                token.cancel();
+            }
             Ok(SpeculativePrefill {
                 logits: vec![0.0, 1.0],
                 state: cache.len(),
@@ -4799,6 +5830,245 @@ mod tests {
         )
     }
 
+    #[test]
+    fn snapshot_configuration_copies_before_retention_and_rejects_unknown_callbacks() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Custody(Arc<AtomicUsize>);
+        impl Drop for Custody {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        struct UnknownConstraint(std::rc::Rc<std::cell::Cell<usize>>);
+        impl SpeculativeConstraint for UnknownConstraint {
+            fn control_snapshot_bytes(&self) -> Option<u64> {
+                Some(0)
+            }
+            fn fork(&self) -> Result<Self, SpeculativeOutputError> {
+                self.0.set(self.0.get() + 1);
+                Ok(Self(self.0.clone()))
+            }
+            fn push_token(&mut self, _: u32) -> Result<bool, SpeculativeOutputError> {
+                Ok(false)
+            }
+            fn finish(&mut self, _: FinishReason) -> Result<(), SpeculativeOutputError> {
+                Ok(())
+            }
+        }
+        let source = SpeculativeConfig {
+            max_tokens: 17,
+            max_draft_tokens: 4,
+            temperature: 0.0,
+            eos_token_ids: vec![3, 11],
+        };
+        let ordinary_pointer = source.eos_token_ids.as_ptr();
+        let expected_geometry = SpeculativeRequestGeometry::new(&source, 2);
+        let ordinary = RequestConfiguration::prepare(source, &MockExecutor::default(), ()).unwrap();
+        assert_eq!(ordinary.eos_token_ids.as_ptr(), ordinary_pointer);
+        assert_eq!(ordinary.geometry(2), expected_geometry);
+
+        let retired = Arc::new(AtomicUsize::new(0));
+        let host = crate::HostPreparationAuthority::retain(Custody(retired.clone()));
+        let executor = MockExecutor {
+            host: Some(host.clone()),
+            ..MockExecutor::default()
+        };
+        let source = SpeculativeConfig {
+            max_tokens: 17,
+            max_draft_tokens: 4,
+            temperature: 0.0,
+            eos_token_ids: vec![3, 11],
+        };
+        let input_pointer = source.eos_token_ids.as_ptr();
+        let config = RequestConfiguration::prepare(source, &executor, ()).unwrap();
+        assert_ne!(config.eos_token_ids.as_ptr(), input_pointer);
+        assert_eq!(
+            config.eos_token_ids.as_slice(),
+            ordinary.eos_token_ids.as_slice()
+        );
+        assert_eq!(config.geometry(2), expected_geometry);
+        let snapshot = config.clone();
+        assert_eq!(
+            snapshot.eos_token_ids.as_ptr(),
+            config.eos_token_ids.as_ptr()
+        );
+
+        let forks = std::rc::Rc::new(std::cell::Cell::new(0));
+        let unknown = UnknownConstraint(forks.clone());
+        assert_eq!(unknown.control_snapshot_bytes(), Some(0));
+        assert_eq!(unknown.control_snapshot_metadata_bytes(), None);
+        assert!(matches!(
+            unknown.fork_control_snapshot(host.clone()),
+            Err(SpeculativeControlError::Unsupported(_))
+        ));
+        assert_eq!(forks.get(), 0);
+        unknown
+            .fork_control_snapshot(crate::HostPreparationAuthority::unmanaged())
+            .unwrap();
+        assert_eq!(forks.get(), 1);
+        let sampler = MockSampling {
+            committed: vec![2, 7],
+            ..MockSampling::default()
+        };
+        assert!(matches!(
+            sampler.copy_control_snapshot(Some(&5), Some(&9), host.clone()),
+            Err(SpeculativeControlError::Unsupported(_))
+        ));
+        let (copied, target, draft) = sampler
+            .copy_control_snapshot(
+                Some(&5),
+                Some(&9),
+                crate::HostPreparationAuthority::unmanaged(),
+            )
+            .unwrap();
+        assert_eq!(copied.committed, sampler.committed);
+        assert_eq!((target, draft), (Some(5), Some(9)));
+        let plain = SpeculativeSemanticConstraint::plain();
+        assert!(plain.control_snapshot_metadata_bytes().is_some());
+        plain.fork_control_snapshot(host.clone()).unwrap();
+
+        drop(config);
+        drop(executor);
+        drop(host);
+        assert_eq!(retired.load(Ordering::SeqCst), 0);
+        assert_eq!(snapshot.eos_token_ids.as_slice(), &[3, 11]);
+        drop(snapshot);
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn controlled_record_values_keep_wire_arrays_and_shared_custody() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Custody(Arc<AtomicUsize>);
+        impl Drop for Custody {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(transparent)]
+        struct Row(u32);
+        impl Clone for Row {
+            fn clone(&self) -> Self {
+                panic!("retained record clone must not clone its payload")
+            }
+        }
+        let retired = Arc::new(AtomicUsize::new(0));
+        let host = crate::HostPreparationAuthority::retain(Custody(retired.clone()));
+        let executor = MockExecutor {
+            host: Some(host.clone()),
+            ..MockExecutor::default()
+        };
+        let values = SpeculativeValues::collect_with_metadata(
+            [Row(2), Row(5)].into_iter(),
+            &executor,
+            (),
+            0,
+        )
+        .unwrap();
+        let alias = values.clone();
+        assert_eq!(serde_json::to_string(&alias).unwrap(), "[2,5]");
+        let decoded: SpeculativeValues<Row> = serde_json::from_str("[2,5]").unwrap();
+        assert_eq!(alias, decoded);
+        let tokens =
+            SpeculativeValues::collect_with_metadata([4, 7, 9].into_iter(), &executor, (), 0)
+                .unwrap();
+        let mut iter = tokens.into_iter();
+        assert_eq!(iter.next(), Some(4));
+        assert_eq!(iter.next_back(), Some(9));
+        drop(values);
+        drop(executor);
+        drop(host);
+        assert_eq!(retired.load(Ordering::SeqCst), 0);
+        assert_eq!(serde_json::to_string(&alias).unwrap(), "[2,5]");
+        drop(alias);
+        assert_eq!(retired.load(Ordering::SeqCst), 0);
+        assert_eq!(iter.next(), Some(7));
+        assert_eq!(iter.next(), None);
+        drop(iter);
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn fixed_request_and_stats_destinations_match_scheduler_and_keep_terminal_custody() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Custody(Arc<AtomicUsize>);
+        impl Drop for Custody {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn run(
+            host: Option<crate::HostPreparationAuthority>,
+        ) -> CompletedSpeculativeSchedule<MockSampling> {
+            let mut executor = MockExecutor {
+                host,
+                full_acceptance: true,
+                ..MockExecutor::default()
+            };
+            let mut cache = Vec::new();
+            let mut table = SpeculativeRequestTable::new(
+                SpeculativeSchedulerOptions::default().with_lookahead(false),
+                SpeculativeExecutionTopology::Single,
+            )
+            .unwrap();
+            table.reserve_requests(1, &executor, ()).unwrap();
+            table
+                .submit(
+                    &mut executor,
+                    &mut cache,
+                    vec![4],
+                    SpeculativeConfig {
+                        max_tokens: 5,
+                        max_draft_tokens: 2,
+                        temperature: 0.7,
+                        eos_token_ids: Vec::new(),
+                    },
+                    empty_mock_runtime(5, GenerationCancellationToken::new()),
+                    SpeculativeRandomness {
+                        target: Some(0),
+                        draft: Some(0),
+                    },
+                    false,
+                    (),
+                )
+                .unwrap();
+            table.run(&mut executor, false, ()).unwrap();
+            let completed = table.finish().unwrap();
+            drop(executor);
+            completed
+        }
+        let mut ordinary = run(None).take_requests();
+        let retired = Arc::new(AtomicUsize::new(0));
+        let mut retained = run(Some(crate::HostPreparationAuthority::retain(Custody(
+            retired.clone(),
+        ))))
+        .take_requests();
+        let ordinary_request = ordinary.pop().unwrap();
+        let retained_request = retained.pop().unwrap();
+        drop(ordinary);
+        drop(retained);
+        let ordinary = ordinary_request;
+        let retained = retained_request;
+        assert_eq!(retained.token_ids(), ordinary.token_ids());
+        assert_eq!(
+            retained.stats().accept_lens(),
+            ordinary.stats().accept_lens()
+        );
+        assert_eq!(retained.stats().rounds(), ordinary.stats().rounds());
+        let mut artifact = retained.into_artifact();
+        let stats = artifact.take_stats();
+        drop(artifact);
+        assert_eq!(retired.load(Ordering::SeqCst), 0);
+        // The returned history owns its constructor custody after both the
+        // request table and completed-row allocation have retired.
+        drop(stats);
+        assert_eq!(retired.load(Ordering::SeqCst), 1);
+    }
+
     #[derive(Default)]
     struct LifecycleTrace {
         stages: Mutex<Vec<SpeculativeLifecycleStage>>,
@@ -4893,6 +6163,87 @@ mod tests {
             .unwrap();
         assert!(observation < persistence);
         assert!(persistence < final_publication);
+    }
+
+    #[test]
+    fn cancelled_prefill_rolls_back_before_sampling_in_run_and_step_registration() {
+        for stepped in [false, true] {
+            for peer in [false, true] {
+                let cancel = GenerationCancellationToken::new();
+                let trace = TransactionTrace::default();
+                let mut executor = MockExecutor {
+                    cancel_during_prefill: (!peer).then(|| cancel.clone()),
+                    peer_cancels_prefill: peer,
+                    ..Default::default()
+                };
+                // The compatibility executor mutates its cache before returning;
+                // cancellation becomes visible only at the shared post-prefill vote.
+                let mut cache = vec![9];
+                let runtime = SpeculativeOutputRuntime::new(
+                    MockSampling {
+                        trace: Some(trace.clone()),
+                        ..Default::default()
+                    },
+                    GenerationSequence::new(7, []),
+                    MockConstraint::default(),
+                    MockPublisher {
+                        trace: Some(trace.clone()),
+                        ..Default::default()
+                    },
+                    cancel.clone(),
+                );
+                let mut table = SpeculativeRequestTable::new(
+                    SpeculativeSchedulerOptions::default(),
+                    SpeculativeExecutionTopology::Single,
+                )
+                .unwrap();
+                let id = table
+                    .submit(
+                        &mut executor,
+                        &mut cache,
+                        vec![1, 3, 2, 4, 5],
+                        SpeculativeConfig {
+                            max_tokens: 7,
+                            max_draft_tokens: 2,
+                            temperature: 0.7,
+                            eos_token_ids: vec![],
+                        },
+                        runtime,
+                        SpeculativeRandomness {
+                            target: Some(0),
+                            draft: Some(0),
+                        },
+                        false,
+                        (),
+                    )
+                    .unwrap();
+                assert_eq!(table.status(id), Some(SpeculativeRequestStatus::Cancelled));
+                if stepped {
+                    assert!(!table.step(&mut executor, false, ()).unwrap());
+                } else {
+                    table.run(&mut executor, false, ()).unwrap();
+                }
+                let mut completed = table.finish().unwrap().into_requests();
+                let completed = completed.pop().unwrap();
+                assert_eq!(completed.stats.target_tokens(), 5);
+                assert_eq!(completed.stats.emitted_tokens(), 0);
+                assert_eq!(completed.stats.draft_tokens(), 0);
+                assert!(completed.token_ids.is_empty());
+                assert!(completed.sampler.committed.is_empty());
+                assert_eq!(completed.finish_reason, Some(FinishReason::Cancelled));
+                assert!(cancel.is_cancelled());
+                assert_eq!(cache, [9]);
+                assert_eq!(*trace.borrow(), ["cancel"]);
+                assert_eq!(
+                    executor
+                        .activations
+                        .iter()
+                        .map(|(name, _)| *name)
+                        .collect::<Vec<_>>(),
+                    ["prefill"]
+                );
+            }
+        }
     }
 
     #[test]
@@ -5273,8 +6624,14 @@ mod tests {
             output.requests[0].status,
             SpeculativeRequestStatus::Completed
         );
-        assert!(output.requests[0].stats.optimistic_draft_blocks > 0);
-        assert!(output.requests[0].stats.discarded_optimistic_blocks > 0);
+        assert!(output.requests[0].stats.counters.optimistic_draft_blocks > 0);
+        assert!(
+            output.requests[0]
+                .stats
+                .counters
+                .discarded_optimistic_blocks
+                > 0
+        );
         assert_eq!(output.scheduler.peak_optimistic_branches, 1);
     }
 
@@ -5333,11 +6690,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [1]
         );
-        assert_eq!(request.stats().optimistic_bonus_matches, 1);
-        assert_eq!(request.stats().consumed_optimistic_tokens, 1);
-        assert_eq!(request.stats().reused_optimistic_tokens, 1);
-        assert_eq!(request.stats().reused_optimistic_blocks, 1);
-        assert_eq!(request.stats().discarded_optimistic_tokens, 0);
+        assert_eq!(request.stats().optimistic_bonus_matches(), 1);
+        assert_eq!(request.stats().consumed_optimistic_tokens(), 1);
+        assert_eq!(request.stats().reused_optimistic_tokens(), 1);
+        assert_eq!(request.stats().reused_optimistic_blocks(), 1);
+        assert_eq!(request.stats().discarded_optimistic_tokens(), 0);
     }
 
     #[test]
@@ -5389,7 +6746,7 @@ mod tests {
             SpeculativeRequestStatus::ReadyToSubmitVerification
         );
         assert_eq!(request.block().unwrap().proposals().len(), 1);
-        assert_eq!(request.stats().draft_tokens, 1);
+        assert_eq!(request.stats().draft_tokens(), 1);
     }
 
     #[test]
@@ -5411,7 +6768,8 @@ mod tests {
                     token: 1,
                     distribution: vec![0.0, 1.0],
                 },
-            ],
+            ]
+            .into(),
         };
         let mut pending =
             submit_verification_transaction(&mut executor, &mut cache, 5, block, ()).unwrap();
@@ -5422,9 +6780,10 @@ mod tests {
                     proposals: vec![SpeculativeProposal {
                         token: 2,
                         distribution: vec![0.0, 0.0, 1.0],
-                    }],
+                    }]
+                    .into(),
                 },
-                assumed_prefix: vec![5, 1, 1],
+                assumed_prefix: vec![5, 1, 1].into(),
             })
             .unwrap();
         let mut runtime =
@@ -5446,8 +6805,8 @@ mod tests {
             published.status,
             SpeculativePublicationStatus::Continue(SpeculativeContinuation::None)
         ));
-        assert_eq!(published.stats.accepted_tokens, 1);
-        assert_eq!(published.stats.discarded_optimistic_tokens, 1);
+        assert_eq!(published.stats.counters.accepted_tokens, 1);
+        assert_eq!(published.stats.counters.discarded_optimistic_tokens, 1);
         assert_eq!(cache, [4, 5, 5, 1]);
         let (_, sequence, constraint, publisher) = runtime.into_parts();
         assert_eq!(sequence.tokens(), [5, 1, 0]);
@@ -5470,7 +6829,8 @@ mod tests {
             proposals: vec![SpeculativeProposal {
                 token: 1,
                 distribution: vec![0.0, 1.0],
-            }],
+            }]
+            .into(),
         };
         let mut pending =
             submit_verification_transaction(&mut executor, &mut cache, 5, block, ()).unwrap();
@@ -5481,9 +6841,10 @@ mod tests {
                     proposals: vec![SpeculativeProposal {
                         token: 2,
                         distribution: vec![0.0, 0.0, 1.0],
-                    }],
+                    }]
+                    .into(),
                 },
-                assumed_prefix: vec![5, 1],
+                assumed_prefix: vec![5, 1].into(),
             })
             .unwrap();
         let cancellation = GenerationCancellationToken::new();
@@ -5502,7 +6863,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(stats.discarded_optimistic_tokens, 1);
+        assert_eq!(stats.counters.discarded_optimistic_tokens, 1);
         assert_eq!(cache, [4, 5, 5]);
         let (_, sequence, _, publisher) = runtime.into_parts();
         assert_eq!(sequence.finish_reason(), Some(FinishReason::Cancelled));
@@ -5515,6 +6876,8 @@ mod tests {
 
     #[derive(Debug, Clone, Copy, Eq, PartialEq)]
     enum TransactionFailure {
+        RequestSource,
+        Submission,
         Completion,
         Commit,
         Restore,
@@ -5523,6 +6886,8 @@ mod tests {
     impl fmt::Display for TransactionFailure {
         fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             formatter.write_str(match self {
+                Self::RequestSource => "request source unavailable",
+                Self::Submission => "submission failed",
                 Self::Completion => "completion failed",
                 Self::Commit => "commit failed",
                 Self::Restore => "restore failed",
@@ -5631,6 +6996,8 @@ mod tests {
     }
 
     struct TransactionExecutor {
+        rejected_request: Option<SpeculativeRequestId>,
+        fail_submission: bool,
         fail_completion: bool,
         fail_commit: bool,
         replayed_tokens: usize,
@@ -5647,6 +7014,8 @@ mod tests {
     impl TransactionExecutor {
         fn new(trace: FailureTrace, publication_attempts: Rc<Cell<usize>>) -> Self {
             Self {
+                rejected_request: None,
+                fail_submission: false,
                 fail_completion: false,
                 fail_commit: false,
                 replayed_tokens: 0,
@@ -5667,6 +7036,17 @@ mod tests {
         type Cache = TransactionCache;
         type TargetState = (Vec<u32>, Vec<u32>);
         type DraftState = TransactionDraftState;
+
+        fn copy_draft_state<'a>(
+            &self,
+            state: &Self::DraftState,
+            _context: Self::Context<'a>,
+        ) -> Result<Self::DraftState, Self::Error>
+        where
+            Self: 'a,
+        {
+            Ok(state.clone())
+        }
         type CacheCheckpoint = TransactionCheckpoint;
         type Verification = TransactionVerification;
         type Logits = Vec<f32>;
@@ -5674,6 +7054,21 @@ mod tests {
         type Completion = DelayedCompletion;
         type Telemetry = ();
         type Error = TransactionFailure;
+
+        fn request_context<'a>(
+            &self,
+            request: SpeculativeRequestId,
+            context: (),
+        ) -> Result<(), TransactionFailure>
+        where
+            Self: 'a,
+        {
+            if self.rejected_request == Some(request) {
+                Err(TransactionFailure::RequestSource)
+            } else {
+                Ok(context)
+            }
+        }
 
         fn prefill<'a>(
             &mut self,
@@ -5744,6 +7139,9 @@ mod tests {
             self.completion_polls.set(0);
             cache.target.extend_from_slice(input_tokens);
             self.trace.borrow_mut().push("submit");
+            if self.fail_submission {
+                return Err(TransactionFailure::Submission);
+            }
             Ok(Submission {
                 output: TransactionVerification {
                     logits: vec![vec![0.0, 1.0], vec![1.0, 0.0], vec![0.0, 1.0]],
@@ -6051,6 +7449,174 @@ mod tests {
             },
             GenerationCancellationToken::new(),
         )
+    }
+
+    #[test]
+    fn request_context_refusal_preserves_lanes_before_prefill_and_scheduling() {
+        for reject_before_prefill in [true, false] {
+            let trace = FailureTrace::default();
+            let attempts = Rc::new(Cell::new(0));
+            let mut executor = TransactionExecutor::new(trace.clone(), attempts.clone());
+            let mut first = transaction_cache(trace.clone());
+            let mut second = transaction_cache(trace.clone());
+            let untouched_second = (second.target.clone(), second.draft.clone());
+            let mut table = SpeculativeRequestTable::new(
+                SpeculativeSchedulerOptions::default().with_lookahead(false),
+                SpeculativeExecutionTopology::Single,
+            )
+            .unwrap();
+            let config = || SpeculativeConfig {
+                max_tokens: 4,
+                max_draft_tokens: 2,
+                temperature: 0.7,
+                eos_token_ids: Vec::new(),
+            };
+            let first_id = table
+                .submit(
+                    &mut executor,
+                    &mut first,
+                    vec![7, 9],
+                    config(),
+                    empty_transaction_runtime(4, trace.clone(), attempts.clone()),
+                    SpeculativeRandomness::new(Some(0), Some(0)),
+                    false,
+                    (),
+                )
+                .unwrap();
+            let second_id = SpeculativeRequestId::new(1);
+            if reject_before_prefill {
+                executor.rejected_request = Some(second_id);
+            }
+            let attempts_before = attempts.get();
+            let first_tokens = table
+                .request(first_id)
+                .unwrap()
+                .sequence()
+                .tokens()
+                .to_vec();
+            let second_result = table.submit(
+                &mut executor,
+                &mut second,
+                vec![13],
+                config(),
+                empty_transaction_runtime(4, trace.clone(), attempts.clone()),
+                SpeculativeRandomness::new(Some(5), Some(8)),
+                false,
+                (),
+            );
+            if reject_before_prefill {
+                assert!(matches!(
+                    second_result,
+                    Err(SpeculativeDriverError::Backend(
+                        TransactionFailure::RequestSource
+                    ))
+                ));
+                assert!(table.request(second_id).is_none());
+                assert_eq!(attempts.get(), attempts_before);
+                assert_eq!(
+                    table.request(first_id).unwrap().sequence().tokens(),
+                    first_tokens
+                );
+                drop(table);
+                assert_eq!((second.target, second.draft), untouched_second);
+            } else {
+                assert_eq!(second_result.unwrap(), second_id);
+                let second_tokens = table
+                    .request(second_id)
+                    .unwrap()
+                    .sequence()
+                    .tokens()
+                    .to_vec();
+                let attempts_before = attempts.get();
+                let turns_before = table.stats.turns;
+                executor.rejected_request = Some(second_id);
+                assert!(matches!(
+                    table.step(&mut executor, false, ()),
+                    Err(SpeculativeDriverError::Backend(
+                        TransactionFailure::RequestSource
+                    ))
+                ));
+                assert_eq!(table.stats.turns, turns_before);
+                assert_eq!(attempts.get(), attempts_before);
+                assert_eq!(
+                    table.request(first_id).unwrap().sequence().tokens(),
+                    first_tokens
+                );
+                assert_eq!(
+                    table.request(second_id).unwrap().sequence().tokens(),
+                    second_tokens
+                );
+                assert!(!table.request(first_id).unwrap().has_pending_verification());
+                assert!(!table.request(second_id).unwrap().has_pending_verification());
+            }
+        }
+    }
+
+    #[test]
+    fn verification_submission_preserves_failure_when_rollback_also_fails() {
+        for fail_restore in [false, true] {
+            let trace = FailureTrace::default();
+            let attempts = Rc::new(Cell::new(0));
+            let mut executor = TransactionExecutor::new(trace.clone(), attempts.clone());
+            executor.fail_submission = true;
+            let mut cache = transaction_cache(trace.clone());
+            cache.fail_restore = fail_restore;
+            let old_target = cache.target.clone();
+            let old_draft = cache.draft.clone();
+            let draft_drops = Rc::new(Cell::new(0));
+            let block = SpeculativeDraftBlock {
+                state: TransactionDraftState {
+                    values: vec![5],
+                    _probe: Some(DropProbe {
+                        event: "drop_failed_draft",
+                        drops: draft_drops.clone(),
+                        trace: trace.clone(),
+                    }),
+                },
+                proposals: vec![SpeculativeProposal {
+                    token: 1,
+                    distribution: (),
+                }]
+                .into(),
+            };
+            let error =
+                match submit_verification_transaction(&mut executor, &mut cache, 5, block, ()) {
+                    Err(error) => error,
+                    Ok(_) => panic!("submission refusal cannot return a pending verification"),
+                };
+            if fail_restore {
+                assert!(matches!(
+                    &error,
+                    SpeculativeDriverError::SubmissionRollback {
+                        submission: TransactionFailure::Submission,
+                        rollback: TransactionFailure::Restore,
+                    }
+                ));
+                assert_eq!(
+                    std::error::Error::source(&error)
+                        .and_then(|cause| cause.downcast_ref::<TransactionFailure>()),
+                    Some(&TransactionFailure::Submission),
+                );
+                assert_ne!(
+                    cache.target, old_target,
+                    "failed rollback must not claim restoration"
+                );
+            } else {
+                assert!(matches!(
+                    error,
+                    SpeculativeDriverError::Backend(TransactionFailure::Submission)
+                ));
+                assert_eq!(cache.target, old_target);
+            }
+            assert_eq!(cache.draft, old_draft);
+            assert_eq!(attempts.get(), 0);
+            assert_eq!(executor.completion_drops.get(), 0);
+            assert_eq!(draft_drops.get(), 1);
+            assert_eq!(
+                &*trace.borrow(),
+                &["submit", "restore", "drop_failed_draft"]
+            );
+        }
     }
 
     #[test]
@@ -6413,8 +7979,8 @@ mod tests {
         table.run(&mut executor, false, ()).unwrap();
         let output = table.finish().unwrap();
         assert_eq!(output.requests[0].id(), id);
-        assert_eq!(output.requests[0].stats().target_tokens, 8);
-        assert_eq!(output.requests[0].stats().emitted_tokens, 3);
+        assert_eq!(output.requests[0].stats().target_tokens(), 8);
+        assert_eq!(output.requests[0].stats().emitted_tokens(), 3);
         assert_eq!(attempts.get(), 2);
         assert_eq!(cache.target, [4, 5, 4, 1, 1]);
         assert_eq!(cache.draft, [1, 1, 1]);
@@ -6938,7 +8504,25 @@ mod tests {
         .err()
         .unwrap();
 
-        assert_eq!(error.to_string(), "restore failed");
+        let SpeculativeDriverError::Rollback(retained) = &error else {
+            panic!("both failed operation and rollback must be retained: {error}");
+        };
+        let pair = std::error::Error::source(retained)
+            .unwrap()
+            .source()
+            .unwrap()
+            .downcast_ref::<SpeculativeRollbackFailure<
+                SpeculativeDriverError<TransactionFailure>,
+                TransactionFailure,
+            >>()
+            .unwrap();
+        assert_eq!(pair.rollback, TransactionFailure::Restore);
+        assert!(matches!(
+            pair.operation,
+            SpeculativeDriverError::Backend(TransactionFailure::Completion)
+        ));
+        assert!(error.to_string().contains("completion failed"));
+        assert!(error.to_string().contains("restore failed"));
         assert_eq!(cache.target, [4, 5, 5, 1, 1]);
         assert_eq!(cache.draft, [4, 5]);
         assert_eq!(attempts.get(), 0);

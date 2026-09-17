@@ -150,7 +150,10 @@ fn bpe_parts(ranks: &HashMap<Vec<u8>, usize>, token: &[u8], max_rank: usize) -> 
     parts
 }
 
-fn build_byte_bpe(ranked: &[Vec<u8>]) -> Result<Tokenizer, Error> {
+fn build_byte_bpe(
+    ranked: &[Vec<u8>],
+    policy: tokenizers::ModelCachePolicy,
+) -> Result<Tokenizer, Error> {
     let encoder = byte_encoder();
     let ranks = ranked
         .iter()
@@ -183,7 +186,12 @@ fn build_byte_bpe(ranked: &[Vec<u8>]) -> Result<Tokenizer, Error> {
             })
         })
         .collect();
-    let mut tokenizer = Tokenizer::new(BPE::builder().vocab_and_merges(vocab, merges).build()?);
+    let mut tokenizer = Tokenizer::new(
+        BPE::builder()
+            .cache_policy(policy)
+            .vocab_and_merges(vocab, merges)
+            .build()?,
+    );
     tokenizer.with_pre_tokenizer(Some(Sequence::new(vec![
         PreTokenizerWrapper::Split(Split::new(
             SplitPattern::Regex(KIMI_K2_PATTERN.into()),
@@ -234,8 +242,17 @@ fn special_tokens(config_path: &Path, base_count: usize) -> Result<Vec<AddedToke
 /// Loads the official Kimi/K2 `tiktoken.model` and registers its complete
 /// contiguous reserved-token range without permitting partial registration.
 pub fn load_kimi_k2(model_dir: &Path) -> Result<Tokenizer, Error> {
+    load_kimi_k2_with_cache_policy(model_dir, tokenizers::ModelCachePolicy::Legacy)
+}
+
+/// Imports the same rank/merge/token policy with model caching selected before build.
+/// Input parsing and reconstruction still allocate without a finite admission bound.
+pub fn load_kimi_k2_with_cache_policy(
+    model_dir: &Path,
+    policy: tokenizers::ModelCachePolicy,
+) -> Result<Tokenizer, Error> {
     let ranked = read_ranks(&model_dir.join("tiktoken.model"))?;
-    let mut tokenizer = build_byte_bpe(&ranked)?;
+    let mut tokenizer = build_byte_bpe(&ranked, policy)?;
     let tokens = special_tokens(&model_dir.join("tokenizer_config.json"), ranked.len())?;
     tokenizer.add_special_tokens(tokens)?;
     for id in ranked.len()..ranked.len() + 258 {
@@ -304,5 +321,50 @@ mod tests {
             bpe_parts(&ranks, b"abc", 4),
             vec![b"ab".to_vec(), b"c".to_vec()]
         );
+    }
+    #[test]
+    fn cache_policy_reaches_rank_import_and_survives_json_reload() {
+        use tokenizers::ModelCachePolicy::{Legacy, NoModelCaches};
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "eredu-cache-ranks-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
+        std::fs::write(path.join("tiktoken.model"), "YQ== 0\nYg== 1\nYWI= 2\n").unwrap();
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"added_tokens_decoder":{}}"#,
+        )
+        .unwrap();
+        let legacy = load_kimi_k2(&path).unwrap();
+        let absent = super::load_kimi_k2_with_cache_policy(&path, NoModelCaches).unwrap();
+        assert_eq!(legacy.model_cache_policy(), Legacy);
+        assert_eq!(absent.model_cache_policy(), NoModelCaches);
+        assert_eq!(absent.encode("abab", false).unwrap().get_ids(), &[2, 2]);
+        assert_eq!(
+            legacy.encode("abab", false).unwrap().get_offsets(),
+            absent.encode("abab", false).unwrap().get_offsets()
+        );
+        for id in 3..261 {
+            assert_eq!(legacy.id_to_token(id), absent.id_to_token(id));
+        }
+        let file = path.join("tokenizer.json");
+        absent.save(&file, false).unwrap();
+        let restored =
+            tokenizers::Tokenizer::from_file_with_cache_policy(&file, NoModelCaches).unwrap();
+        assert_eq!(restored.model_cache_policy(), NoModelCaches);
+        assert_eq!(restored.encode("abab", false).unwrap().get_ids(), &[2, 2]);
+        assert_eq!(restored.decode(&[2, 2], false).unwrap(), "abab");
+        std::fs::write(path.join("tiktoken.model"), "YQ== 0\nYg== 0\n").unwrap();
+        assert!(super::load_kimi_k2_with_cache_policy(&path, NoModelCaches).is_err());
     }
 }

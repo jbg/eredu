@@ -8,12 +8,12 @@
 
 use eredu_checkpoint::store::{StoreError, TensorMetadata, TensorSelection};
 use eredu_checkpoint::{
+    StoredDtype,
     gguf_store::GgufLease as NeutralGgufLease,
     store::{
         CheckpointLease, EncodedTensorLease, MemoryLease as NeutralMemoryLease,
         SafetensorsLease as NeutralSafetensorsLease,
     },
-    StoredDtype,
 };
 
 use std::{
@@ -22,7 +22,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event, Array, Event, Stream};
+use safemlx::{Array, Event, Stream, ops::indexing::TryIndexOp, transforms::async_eval_with_event};
 use safetensors::tensor::{Dtype, TensorView};
 
 use super::gguf::GgufTensor;
@@ -83,6 +83,43 @@ pub(super) fn safetensors_dtype(
 /// backend-neutral [`StoreError`] value in [`Self::Store`].
 #[derive(Debug, thiserror::Error)]
 pub enum CheckpointMaterializationError {
+    /// Actual immutable host-copy cause and independent source/control custody.
+    #[error(transparent)]
+    PreparedGgufHostCopy(#[from] PreparedGgufHostCopyFailure),
+    /// Original prepared GGUF failure retaining destinations, same source box and custody.
+    #[error(transparent)]
+    PreparedGguf(#[from] PreparedGgufMaterializationFailure),
+    /// Actual admitted raw storage/source failure, retaining its allocation owner.
+    #[error("{0}")]
+    PreparedGgufAdmitted(#[from] PreparedGgufAdmittedFailure),
+    /// Prepared acquisition failure retaining its actual source/destination and custody.
+    #[error(transparent)]
+    PreparedAcquisition(#[from] PreparedSourceAcquisitionFailure),
+    /// Original native fixed cause, without a formatted key/error shell.
+    #[error("original checkpoint operation: {0}")]
+    OriginalNative(#[source] safemlx::error::Exception),
+    /// Explicit original operation did not match its registered current role.
+    #[error("original checkpoint operation domain mismatch")]
+    OriginalOperationDomain,
+    /// A selected prepared payload cannot hold the actual operation inputs.
+    #[error("original {family} payload needs {required} rows but prepared {capacity}")]
+    OriginalPayloadCapacity {
+        /// Concrete destination family.
+        family: &'static str,
+        /// Actual caller-provided population.
+        required: usize,
+        /// Prepared final vector capacity.
+        capacity: usize,
+    },
+    /// A prepared typed operation bank is exhausted; no fallback is permitted.
+    #[error("original {family} operation storage exhausted after {prepared} slots")]
+    OriginalOperationCapacity {
+        /// Concrete prepared operation family.
+        family: &'static str,
+        /// Actual number of slots prepared in the consumed bank.
+        prepared: usize,
+    },
+
     /// Backend-neutral catalog, selection, mapping, or checkpoint I/O failure.
     #[error(transparent)]
     Store(#[from] StoreError),
@@ -143,9 +180,39 @@ pub enum CheckpointMaterializationError {
     },
 }
 
+mod cache;
+mod cache_context;
+pub(crate) use cache_context::{CacheHandle, CacheInitializationError};
+
 #[derive(Debug)]
 struct CachedGgufGroup {
-    arrays: Vec<(String, Array)>,
+    arrays: CachedGgufArrays,
+}
+
+// Supplied metadata stays with the same weak-cache group; no owning names are
+// reconstructed. Values retire before the final name-allocation receipts.
+#[derive(Debug)]
+enum CachedGgufArrays {
+    Ordinary(Vec<(String, Array)>),
+    Supplied {
+        values: [Option<Array>; 3],
+        names: eredu_gguf::StoredOutputNames<
+            crate::backend::runtime::execution::generic::gguf_host_typed::supplied::AdmittedFamily,
+        >,
+    },
+}
+impl CachedGgufArrays {
+    fn get(&self, name: &str) -> Option<&Array> {
+        match self {
+            Self::Ordinary(rows) => rows
+                .iter()
+                .find_map(|(key, value)| (key == name).then_some(value)),
+            Self::Supplied { values, names } => names
+                .iter()
+                .position(|key| key == name)
+                .and_then(|index| values[index].as_ref()),
+        }
+    }
 }
 
 /// MLX stream and lease-coalescing state used for neutral parameter realization.
@@ -153,19 +220,48 @@ struct CachedGgufGroup {
 pub struct MlxParameterMaterializationContext {
     source_stream: Stream,
     execution_stream: Stream,
-    converted_groups: Arc<
-        Mutex<BTreeMap<eredu_checkpoint::gguf_store::GgufLeaseIdentity, Weak<CachedGgufGroup>>>,
-    >,
+    converted_groups: CacheHandle,
 }
 
 impl MlxParameterMaterializationContext {
     /// Creates a reusable materialization context for one source/execution stream pair.
     pub fn new(source_stream: &Stream, execution_stream: &Stream) -> Self {
+        let converted_groups = CacheHandle::ordinary();
         Self {
             source_stream: source_stream.clone(),
             execution_stream: execution_stream.clone(),
-            converted_groups: Arc::new(Mutex::new(BTreeMap::new())),
+            converted_groups,
         }
+    }
+
+    /// Consume an already prepared cache owner and owned stream wrappers.
+    /// This constructor allocates nothing and never promotes an ordinary cache.
+    /// Stream-handle and selected-source coverage remain separate obligations.
+    pub(crate) fn with_cache(
+        source_stream: Stream,
+        execution_stream: Stream,
+        converted_groups: CacheHandle,
+    ) -> Self {
+        Self {
+            source_stream,
+            execution_stream,
+            converted_groups,
+        }
+    }
+
+    pub(crate) fn cache_handle(&self) -> CacheHandle {
+        self.converted_groups.clone()
+    }
+
+    pub(crate) fn matches_cache(&self, cache: &CacheHandle) -> bool {
+        self.converted_groups.same(cache)
+    }
+
+    /// Once-only shared cache/context owner, excluding its dynamic rows and
+    /// streams. This is existing storage, never another per-miss charge.
+    pub(crate) fn cache_context_storage_bytes()
+    -> Result<u64, eredu_runtime::working_memory::WorkingMemoryError> {
+        cache::context_storage_bytes()
     }
 
     /// Host/source stream used to create and transform checkpoint arrays.
@@ -183,7 +279,7 @@ impl MlxParameterMaterializationContext {
         &self,
         lease: CheckpointLease,
     ) -> Result<WeightLease, CheckpointMaterializationError> {
-        WeightLease::from_checkpoint_lease(lease, Arc::clone(&self.converted_groups))
+        WeightLease::from_checkpoint_lease(lease, self.converted_groups.clone())
     }
 }
 
@@ -194,10 +290,73 @@ mod leases;
 mod materialization;
 
 pub use leases::WeightLease;
-pub use materialization::{PendingWeightMaterialization, WeightMaterialization};
+#[cfg(test)]
+pub(crate) use materialization::OriginalGgufMissFixture;
+pub use materialization::{
+    GgufHostCopyCause, PendingWeightMaterialization, PreparedGgufAdmittedFailure,
+    PreparedGgufHostCopyFailure, PreparedGgufMaterializationFailure, WeightMaterialization,
+};
 
 #[cfg(test)]
 use leases::WeightLeaseSource;
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use materialization::{
+    PreparedMaterializationObservation, PreparedPendingWeight, PreparedWeightMaterialization,
+};
+
+pub(crate) use materialization::{MaterializationPayloadShape, OriginalMaterializationSlots};
+
+mod acquisition;
+pub use acquisition::PreparedSourceAcquisitionFailure;
+pub(crate) use acquisition::PreparedSourceAcquisitions;
+
+mod prepared_streams;
+mod source_stream;
+pub use prepared_streams::PreparedMaterializationStreamError;
+pub(crate) use prepared_streams::{
+    ManagerMaterializationContext, PreparedMaterializationStreams,
+    prepare_one_materialization_stream, prepare_materialization_stream_from_plan,
+};
+pub use source_stream::{
+    MaterializationSourceStreamError, MaterializationSourceWorkerError,
+    PreparedMaterializationSourceStream, PreparedMaterializationSourceWorker,
+};
+/// Synchronous borrowed view; it owns no wrapper or callback and never escapes
+/// into a native worker. Public context/Stream clone semantics remain intact.
+#[derive(Clone, Copy)]
+pub(crate) struct MaterializationView<'a> {
+    source: &'a Stream,
+    execution: &'a Stream,
+    converted_groups: &'a CacheHandle,
+}
+impl<'a> From<&'a MlxParameterMaterializationContext> for MaterializationView<'a> {
+    fn from(context: &'a MlxParameterMaterializationContext) -> Self {
+        Self {
+            source: &context.source_stream,
+            execution: &context.execution_stream,
+            converted_groups: &context.converted_groups,
+        }
+    }
+}
+impl<'a> From<&MaterializationView<'a>> for MaterializationView<'a> {
+    fn from(view: &MaterializationView<'a>) -> Self {
+        *view
+    }
+}
+impl<'a> MaterializationView<'a> {
+    pub(crate) fn source_stream(self) -> &'a Stream {
+        self.source
+    }
+    pub(crate) fn execution_stream(self) -> &'a Stream {
+        self.execution
+    }
+    pub(crate) fn weight_lease(
+        self,
+        lease: CheckpointLease,
+    ) -> Result<WeightLease, CheckpointMaterializationError> {
+        WeightLease::from_checkpoint_lease(lease, self.converted_groups.clone())
+    }
+}

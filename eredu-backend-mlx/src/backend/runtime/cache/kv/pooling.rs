@@ -2,6 +2,10 @@
 
 use super::*;
 
+mod prepared_copy;
+mod mask;
+pub(crate) use prepared_copy::PreparedPoolingCopy;
+
 /// Append-only compressed-token cache with an incomplete pooling window.
 ///
 /// Values and gate logits are accumulated until `ratio` source tokens are
@@ -71,21 +75,13 @@ impl PoolingCache {
     /// independent compact storage. Transaction graph clones are insufficient
     /// for durable snapshots of strided views.
     pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
-        let copy = |array: &Option<Array>| {
-            array
-                .as_ref()
-                .map(|array| array.contiguous(false, stream)?.deep_clone())
-                .transpose()
-        };
-        Ok(Self {
-            ratio: self.ratio,
-            pending_values: copy(&self.pending_values)?,
-            pending_gates: copy(&self.pending_gates)?,
-            pooled: copy(&self.pooled)?,
-            overlap_values: copy(&self.overlap_values)?,
-            overlap_gates: copy(&self.overlap_gates)?,
-            processed_tokens: self.processed_tokens,
-        })
+        self.prepare_isolated_copy().copy(stream)
+    }
+
+    /// Borrows the five exact optional slots copied by an isolated snapshot.
+    /// Preparing the leaf does not query native metadata or allocate a slot list.
+    pub(crate) fn prepare_isolated_copy(&self) -> PreparedPoolingCopy<'_> {
+        PreparedPoolingCopy::new(self)
     }
 
     /// Source tokens represented by complete and incomplete windows.
@@ -258,20 +254,20 @@ impl PoolingCache {
         offset: i32,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
-        let pooled_tokens = self.pooled_tokens();
-        if pooled_tokens == 0 || query_tokens == 1 {
-            return Ok(None);
-        }
-        let pooled = Array::arange::<i32, i32>(Some(0), pooled_tokens, None, stream)?;
-        let visible =
-            Array::arange::<i32, i32>(Some(offset + 1), offset + query_tokens + 1, None, stream)?
-                .floor_divide(Array::from_int(self.ratio), stream)?
-                .reshape(&[query_tokens, 1], stream)?;
-        Ok(Some(
-            pooled
-                .reshape(&[1, pooled_tokens], stream)?
-                .lt(visible, stream)?,
-        ))
+        mask::make(query_tokens, self.pooled_tokens(), offset, self.ratio, stream)
+    }
+
+    /// Fixed controls of the selected integer mask constructor and its errors.
+    pub(crate) fn mask_control_bytes() -> Option<usize> {
+        mask::control_bytes()
+    }
+
+    pub(crate) fn mask_error(cause: Exception) -> ComputeError {
+        mask::neural_error(cause)
+    }
+
+    pub(crate) fn missing_stream(stream: u32) -> ComputeError {
+        mask::missing_stream(stream)
     }
 
     /// Clears all complete and partial compressed state.

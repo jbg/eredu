@@ -1,5 +1,10 @@
 //! Typed prepared-input ingress for replicated composite architectures.
 
+mod media_prefill;
+pub(crate) mod graph;
+mod description;
+pub use media_prefill::CompositeMediaIngressArchitecture;
+
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
 use eredu_core::AttentionPolicy;
 use eredu_nn::{GroupedNeuralBackend, NeuralBackend, Tensor};
@@ -57,14 +62,64 @@ pub enum ExternalPredictionTargetCapture<T> {
     },
 }
 
+impl<T> ExternalPredictionTargetCapture<T> {
+    /// Borrows every actual captured root in its semantic order, including
+    /// shared key/value publications; aliases remain distinct logical roots.
+    pub fn visit_values(&self, visitor: &mut dyn FnMut(&T)) {
+        match self {
+            Self::Gemma4 { hidden, shared_kv } => {
+                visitor(hidden);
+                for (_, keys, values) in shared_kv {
+                    visitor(keys);
+                    visitor(values);
+                }
+            }
+            Self::MuseGlimmerDFlash { target_states } => {
+                for value in target_states { visitor(value); }
+            }
+        }
+    }
+}
+
+impl ExternalPredictionCaptureRequest {
+    pub(crate) fn collect_paths(
+        &self,
+        metadata: crate::decoder::ModuleMetadata<'_>,
+    ) -> Result<Vec<String>, eredu_nn::Error> {
+        metadata.controls::<(&Self, Vec<String>)>()?;
+        match self {
+            Self::Gemma4SharedAttention { final_hidden_path } => {
+                let mut paths = metadata.vector(1)?;
+                paths.push(metadata.text(format_args!("{final_hidden_path}"))?);
+                Ok(paths)
+            }
+            Self::MuseGlimmerDFlash { target_layers, target_paths } => {
+                if target_layers.is_empty() || target_paths.len() != target_layers.len() {
+                    return Err(metadata.error(format_args!(
+                        "Muse-Glimmer DFlash capture paths differ from its nonempty target layers"
+                    )));
+                }
+                let mut paths = metadata.vector(target_paths.len())?;
+                for path in target_paths { paths.push(metadata.text(format_args!("{path}"))?); }
+                Ok(paths)
+            }
+        }
+    }
+}
+
 /// Target-owned static operation needed by an external assistant.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum ExternalPredictionTargetOperation<'a, T> {
     /// Applies the ordinary target token embedding to assistant proposal IDs.
     TokenEmbeddings(&'a T),
     /// Applies the ordinary target vocabulary projection to assistant states.
     ProjectLogits(&'a T),
+}
+
+impl<T> Copy for ExternalPredictionTargetOperation<'_,T> {}
+impl<T> Clone for ExternalPredictionTargetOperation<'_,T> {
+    fn clone(&self)->Self { *self }
 }
 
 impl CompositeTensorCollective {
@@ -79,30 +134,32 @@ impl CompositeTensorCollective {
 /// Embedding sums for independently looked-up token segments. Media positions
 /// are supplied by their own ingress and must not enlarge these native waves.
 pub(crate) fn segmented_token_ingress_collectives(
-    positions: impl IntoIterator<Item = u64>,
-    hidden_width: i32,
-    tensor_partitions: usize,
+    positions: impl IntoIterator<Item = u64>, hidden_width: i32, tensor_partitions: usize,
 ) -> Result<Option<Vec<CompositeTensorCollective>>, String> {
-    if tensor_partitions <= 1 {
-        return Ok(None);
-    }
-    positions
-        .into_iter()
-        .map(|positions| {
-            i32::try_from(positions)
-                .map(|positions| CompositeTensorCollective::Sum {
-                    shape: vec![1, positions, hidden_width],
-                })
-                .map_err(|_| "composite token ingress positions exceed i32".to_owned())
+    segmented_token_ingress_collectives_in(positions, hidden_width, tensor_partitions,
+        graph::Destination(None)).map_err(|cause| cause.to_string())
+}
+
+pub(crate) fn segmented_token_ingress_collectives_in(
+    positions: impl IntoIterator<Item = u64>, hidden_width: i32, tensor_partitions: usize,
+    destination: graph::Destination<'_>,
+) -> Result<Option<Vec<CompositeTensorCollective>>, eredu_nn::Error> {
+    destination.controls::<(Option<Vec<CompositeTensorCollective>>, i32, usize)>()?;
+    if tensor_partitions <= 1 { return Ok(None); }
+    destination.try_collect(positions.into_iter().map(|positions| {
+        let positions = i32::try_from(positions).map_err(|_| destination.error(format_args!(
+            "composite token ingress positions exceed i32")))?;
+        Ok(CompositeTensorCollective::Sum {
+            shape: destination.collect([1, positions, hidden_width])?,
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+    })).map(Some)
 }
 
 /// Exact prepared tensors paired with their architecture-owned admission proof.
 pub struct PreparedCompositeInput<'a, T, P> {
     prepared: &'a eredu_runtime::PreparedModelInput<T>,
-    admitted: &'a AdmittedCompositeInput<P>,
+    admission: CompositeAdmissionRef<'a, P>,
+    metadata: Option<&'a eredu_nn::workspace::WorkspaceContext>,
 }
 
 impl<T, P> Clone for PreparedCompositeInput<'_, T, P> {
@@ -119,13 +176,61 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
         prepared: &'a eredu_runtime::PreparedModelInput<T>,
         admitted: &'a AdmittedCompositeInput<P>,
     ) -> Result<Self, String> {
+        Self::new_with_diagnostic(prepared, admitted, str::to_owned)
+    }
+
+    pub(crate) fn new_with_diagnostic<E>(
+        prepared: &'a eredu_runtime::PreparedModelInput<T>,
+        admitted: &'a AdmittedCompositeInput<P>,
+        diagnostic: impl FnOnce(&'static str) -> E,
+    ) -> Result<Self, E> {
         if prepared.identity() != admitted.identity() {
-            return Err("prepared composite input identity differs from admission".into());
+            return Err(diagnostic(
+                "prepared composite input identity differs from admission",
+            ));
         }
         if prepared.len() != admitted.parts().len() {
-            return Err("prepared composite part count differs from admission".into());
+            return Err(diagnostic(
+                "prepared composite part count differs from admission",
+            ));
         }
-        Ok(Self { prepared, admitted })
+        Ok(Self {
+            prepared,
+            metadata: None,
+            admission: CompositeAdmissionRef {
+                legacy: Some(admitted),
+                original: None,
+            },
+        })
+    }
+
+    /// Couples the same validated source and admission with their live metadata
+    /// destination. The caller retains its funding through dependent outputs.
+    pub fn new_with_metadata(
+        prepared: &'a eredu_runtime::PreparedModelInput<T>,
+        admitted: &'a AdmittedCompositeInput<P>,
+        context: &'a eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, eredu_nn::Error> {
+        context.charge_metadata(std::mem::size_of::<(Self, Result<Self, eredu_nn::Error>)>())?;
+        let mut input = Self::new_with_diagnostic(prepared, admitted, |message| {
+            context.metadata_error(format_args!("{message}"))
+        })?;
+        input.metadata = Some(context);
+        Ok(input)
+    }
+
+    // Used only after the same private source has validated and paid this pair
+    // in its fallible chunk constructor. Attaching the loan allocates nothing.
+    pub(crate) fn with_metadata_loan(
+        mut self,
+        context: Option<&'a eredu_nn::workspace::WorkspaceContext>,
+    ) -> Self {
+        self.metadata = context;
+        self
+    }
+
+    pub(crate) fn metadata(&self) -> Option<&'a eredu_nn::workspace::WorkspaceContext> {
+        self.metadata
     }
 
     /// Exact backend-native prepared tensor handles.
@@ -133,9 +238,35 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
         self.prepared
     }
 
-    /// Exact ordered architecture admission.
-    pub const fn admitted(&self) -> &'a AdmittedCompositeInput<P> {
-        self.admitted
+    /// Borrows either the original ordinary admission or its closed compiled
+    /// representation. Common scalar geometry never materializes legacy parts.
+    pub const fn admitted(&self) -> CompositeAdmissionRef<'a, P> {
+        self.admission
+    }
+
+    pub(crate) fn from_original(
+        prepared: &'a eredu_runtime::PreparedModelInput<T>,
+        original: &'a crate::media_plan::BoundPreparedMediaSemantics,
+    ) -> Result<Self, String> {
+        Self::from_original_with_diagnostic(prepared, original, str::to_owned)
+    }
+
+    pub(crate) fn from_original_with_diagnostic<E>(
+        prepared: &'a eredu_runtime::PreparedModelInput<T>,
+        original: &'a crate::media_plan::BoundPreparedMediaSemantics,
+        diagnostic: impl FnOnce(&'static str) -> E,
+    ) -> Result<Self, E> {
+        if prepared.len() != original.records().len() {
+            return Err(diagnostic("compiled prepared input part count differs from original source"));
+        }
+        Ok(Self {
+            prepared,
+            metadata: None,
+            admission: CompositeAdmissionRef {
+                legacy: None,
+                original: Some(original),
+            },
+        })
     }
 
     /// Derives prompt-cache identity from the exact prepared input paired with this admission.
@@ -150,6 +281,74 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
     }
 }
 
+/// Borrowed common admission geometry with explicit ordinary-part access.
+pub struct CompositeAdmissionRef<'a, P> {
+    legacy: Option<&'a AdmittedCompositeInput<P>>,
+    original: Option<&'a crate::media_plan::BoundPreparedMediaSemantics>,
+}
+impl<P> Copy for CompositeAdmissionRef<'_, P> {}
+impl<P> Clone for CompositeAdmissionRef<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, P> CompositeAdmissionRef<'a, P> {
+    /// Existing ordinary part storage, when this is an ordinary admission.
+    pub const fn legacy(self) -> Option<&'a AdmittedCompositeInput<P>> {
+        self.legacy
+    }
+    pub fn decoder_positions(self) -> u64 {
+        match self.legacy {
+            Some(value) => value.decoder_positions(),
+            None => self.original.expect("closed admission").decoder_positions() as u64,
+        }
+    }
+    pub fn decoder_shape(self) -> [u64; 2] {
+        self.legacy.map_or_else(
+            || [1, self.decoder_positions()],
+            |legacy| legacy.decoder_shape(),
+        )
+    }
+    pub fn active_modalities(self) -> eredu_core::InputModalities {
+        if let Some(legacy) = self.legacy {
+            return legacy.active_modalities();
+        }
+        let mut result = eredu_core::InputModalities {
+            text: false,
+            image: false,
+            video: false,
+            audio: false,
+        };
+        for part in self.original.expect("closed admission").records() {
+            match part.modality {
+                eredu_core::InputModality::Text => result.text = true,
+                eredu_core::InputModality::Image => result.image = true,
+                eredu_core::InputModality::Video => result.video = true,
+                eredu_core::InputModality::Audio => result.audio = true,
+                _ => {}
+            }
+        }
+        result
+    }
+    fn len(self) -> usize {
+        match self.legacy {
+            Some(value) => value.parts().len(),
+            None => self.original.expect("closed admission").records().len(),
+        }
+    }
+}
+
+impl<'a> CompositeAdmissionRef<'a, crate::media_plan::Gemma4InputPartPlan> {
+    /// Fixed ordinary plans or equivalent scalar projections from the exact
+    /// original source. No metadata Vec, native read or admission is repeated.
+    pub(crate) fn gemma_parts(self) -> impl ExactSizeIterator<Item = crate::media_plan::Gemma4InputPartPlan> + Clone + 'a {
+        (0..self.len()).map(move |index| match self.legacy {
+            Some(value) => value.parts()[index].clone(),
+            None => self.original.expect("closed Gemma admission").gemma_part(index),
+        })
+    }
+}
+
 /// Builds only semantic token parts from an exact admission. The architecture
 /// supplies placeholder identities; media tensors are neither copied nor encoded.
 pub(crate) fn prepared_token_parts<T: Tensor, P>(
@@ -157,11 +356,16 @@ pub(crate) fn prepared_token_parts<T: Tensor, P>(
     context: &T::Context,
     placeholder: impl Fn(&P) -> Option<(u32, u64)>,
 ) -> Result<Vec<T>, eredu_nn::Error> {
+    let admitted = input.admitted().legacy().ok_or_else(|| {
+        eredu_nn::Error::backend(
+            "generic placeholder conversion requires ordinary family admission",
+        )
+    })?;
     input
         .prepared()
         .parts()
         .iter()
-        .zip(input.admitted().parts())
+        .zip(admitted.parts())
         .map(|(part, plan)| {
             if let Some((token, positions)) = placeholder(plan) {
                 let token = i32::try_from(token).map_err(eredu_nn::Error::backend)?;
@@ -190,12 +394,29 @@ where
 {
     /// One architecture-specific plan for each ordered input part, with a neutral
     /// accounting projection of the same admitted geometry.
-    type InputPartPlan: Clone + Into<crate::media_plan::PreparedInputPartPlan>;
+    type InputPartPlan: Clone
+        + Into<crate::media_plan::PreparedInputPartPlan>
+        + crate::media_plan::CompositePartPlan;
     /// Minimal normalized configuration retained for repeated input admission.
     type AdmissionConfig: Clone;
 
     /// Clones the normalized architecture facts required by input admission.
     fn admission_config(&self) -> Self::AdmissionConfig;
+
+    /// Retains actual immutable admission configuration with paid control
+    /// storage. A checked backend must not silently deep-clone ordinary config.
+    fn retain_admission_config_with_metadata(
+        _config: &Self::AdmissionConfig,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self::AdmissionConfig, eredu_nn::Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
+
+    /// Borrows the target facts directly from retained admission configuration.
+    /// Missing fixed source support stays unavailable to original startup.
+    fn external_assistant_target_profile_ref(
+        _config:&Self::AdmissionConfig,
+    )->Option<crate::external_assistant::ExternalAssistantTargetProfileRef<'_>> { None }
 
     /// Publishes the target facts required to prove external-assistant compatibility.
     fn external_assistant_target_profile(
@@ -210,6 +431,18 @@ where
         input: &eredu_runtime::PreparedModelInput<B::Tensor>,
         inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
     ) -> Result<AdmittedCompositeInput<Self::InputPartPlan>, eredu_core::CapabilityError>;
+
+    /// Revalidates the same actual prepared identities and family policy using
+    /// counted descriptor/inspection destinations. No ordinary allocation is
+    /// permitted as a fallback when this constructor is not yet qualified.
+    fn admit_prepared_input_with_metadata(
+        _config: &Self::AdmissionConfig,
+        _input: &eredu_runtime::PreparedModelInput<B::Tensor>,
+        _inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<AdmittedCompositeInput<Self::InputPartPlan>, eredu_nn::Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
 
     /// Reconstructs the target's exact semantic token sequence for a prediction
     /// lane, including architecture-declared media placeholders. The default
@@ -264,6 +497,48 @@ where
         Ok(None)
     }
 
+    /// Resolves an exact selected source cut using the already retained output
+    /// extent. Uniform towers preserve their existing prepared geometry. A tower
+    /// with shape-changing units may require the actual exclusive unit endpoint;
+    /// neither source rank arithmetic nor hidden width identifies that endpoint.
+    fn group_continuation_geometry_at(
+        &self,
+        _group: usize,
+        _source_unit_end: Option<usize>,
+        _source_sequence: i32,
+        prepared: Option<(i32, i32)>,
+    ) -> Result<Option<(i32, i32)>, Self::Error> {
+        Ok(prepared)
+    }
+
+    /// Packs the activation after an exact source cut. Existing continuation
+    /// hooks remain the default; the shared source-completion step follows this
+    /// packing before values may be transferred.
+    fn encode_group_continuation_at(
+        &self,
+        group: usize,
+        _source_unit_end: Option<usize>,
+        _source_sequence: i32,
+        hidden: B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.encode_group_continuation(group, hidden, context)
+    }
+
+    /// Restores the activation at the actual destination's first unit, before
+    /// that unit executes. No different rank or width may substitute for the cut.
+    fn decode_group_continuation_at(
+        &self,
+        group: usize,
+        _source_unit_end: usize,
+        _source_sequence: i32,
+        hidden: B::Tensor,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.decode_group_continuation(group, hidden, forward, context)
+    }
+
     /// Whether a group-local continuation transports its internal activation
     /// with an explicit leading batch dimension.
     ///
@@ -310,6 +585,16 @@ where
         Ok(None)
     }
 
+    /// The same reached wave producer with admitted metadata destinations.
+    fn prepared_group_collective_waves_with_metadata(
+        &self, _group: usize,
+        _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        _tensor_partitions: usize, _pipeline_stages: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<Vec<Vec<CompositeTensorCollective>>>, eredu_nn::Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
+
     /// Exact TP collectives emitted while the primary decoder ingress is assembled.
     ///
     /// `None` preserves the ordinary single decoder-extent embedding sum. Composite
@@ -321,6 +606,14 @@ where
         _tensor_partitions: usize,
     ) -> Result<Option<Vec<CompositeTensorCollective>>, String> {
         Ok(None)
+    }
+
+    /// The same reached ingress producer with admitted metadata destinations.
+    fn prepared_primary_ingress_collectives_with_metadata(
+        &self, _input: PreparedCompositeInput<'_, B::Tensor, Self::InputPartPlan>,
+        _tensor_partitions: usize, _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<Vec<CompositeTensorCollective>>, eredu_nn::Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
     }
 
     /// Whether a retained context still has decoder-ingress collectives to run.
@@ -385,6 +678,23 @@ where
         Ok(None)
     }
 
+    /// Emits the same family boundary refinement using admitted metadata.
+    fn partition_boundary_schema_with_metadata(
+        &self,_source_group:usize,_destination_group:usize,
+        _selected:&eredu_runtime::ResolvedBoundaryWireSchema,_batch:i32,_source_sequence:i32,
+        _group_sequences:&[i32],_continuation:Option<(i32,i32)>,
+        context:&eredu_nn::workspace::WorkspaceContext,
+    )->Result<Option<eredu_runtime::ResolvedBoundaryWireSchema>,eredu_nn::Error>{
+        Err(context.metadata_source(eredu_nn::workspace::WorkspaceMetadataError::Unqualified))
+    }
+    /// Emits the same family auxiliary values using admitted metadata.
+    fn partition_boundary_values_with_metadata(
+        &self,_source_group:usize,_destination_group:usize,_schema:&eredu_runtime::ResolvedBoundaryWireSchema,
+        _hidden:&B::Tensor,_forward:&Self::ForwardContext,context:&eredu_nn::workspace::WorkspaceContext,
+    )->Result<Option<Vec<eredu_runtime::ArchitectureBoundaryValue<B::Tensor>>>,eredu_nn::Error>{
+        Err(context.metadata_source(eredu_nn::workspace::WorkspaceMetadataError::Unqualified))
+    }
+
     /// Installs a typed continuation or dependency before its destination begins.
     fn accept_partition_boundary(
         &mut self,
@@ -407,6 +717,14 @@ where
         Ok(None)
     }
 
+    /// The same exact path selection using the caller's paid host destination.
+    fn external_prediction_capture_paths_with_metadata(
+        _request: &ExternalPredictionCaptureRequest,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<Vec<String>>, eredu_nn::Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
+
     /// Forms a typed assistant capture from architecture-retained context and exact observed paths.
     fn external_prediction_capture(
         _request: &ExternalPredictionCaptureRequest,
@@ -416,7 +734,22 @@ where
         Ok(None)
     }
 
+    /// Constructs the same semantic capture while charging its owned containers
+    /// and tensor-header destinations to the existing metadata account.
+    fn external_prediction_capture_with_metadata(
+        _request: &ExternalPredictionCaptureRequest,
+        _forward: &Self::ForwardContext,
+        _observed: Vec<B::Tensor>,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<ExternalPredictionTargetCapture<B::Tensor>>, eredu_nn::Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
+
     /// Applies one target-owned static operation without transferring ordinary target ownership.
+    ///
+    /// Implementations preserve architecture geometry, parameter topology, and observation
+    /// declarations through success, errors, and unwinding. Runtime adapters retain the
+    /// existing observation binding while this operation mutates target execution state.
     fn external_prediction_target_operation(
         &mut self,
         _operation: ExternalPredictionTargetOperation<'_, B::Tensor>,
@@ -462,12 +795,28 @@ where
 /// Additive input adapter over the same architecture modules and graph lifecycle.
 pub struct PreparedCompositeArchitecture<A> {
     inner: A,
+    // Aliases only the exact selection in the matched validated module/contract.
+    // No graph payload or authority is constructed by this descriptive carrier.
+    prepared_graph: PreparedCompositeGraph,
+    // Closed description from the same completed contract/source. Mutable
+    // architecture access invalidates it along with the graph projection.
+    construction_parameters: Option<crate::routed_text::RetainedRoutedDescription>,
+}
+
+enum PreparedCompositeGraph {
+    Unprepared,
+    Validated(eredu_runtime::SelectedReplicatedTextRealization),
+    Invalidated,
 }
 
 impl<A> PreparedCompositeArchitecture<A> {
     /// Wraps one constructed composite architecture.
     pub const fn new(inner: A) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            prepared_graph: PreparedCompositeGraph::Unprepared,
+            construction_parameters: None,
+        }
     }
 
     /// Borrows the underlying architecture.
@@ -477,7 +826,18 @@ impl<A> PreparedCompositeArchitecture<A> {
 
     /// Mutably borrows the underlying architecture for generic partition execution.
     pub fn inner_mut(&mut self) -> &mut A {
+        self.construction_parameters = None;
+        if !matches!(self.prepared_graph, PreparedCompositeGraph::Unprepared) {
+            self.prepared_graph = PreparedCompositeGraph::Invalidated;
+        }
         &mut self.inner
+    }
+
+    pub(crate) fn retain_prepared_graph(
+        &mut self,
+        selected: eredu_runtime::SelectedReplicatedTextRealization,
+    ) {
+        self.prepared_graph = PreparedCompositeGraph::Validated(selected);
     }
 
     /// Consumes the adapter.
@@ -497,12 +857,28 @@ where
         self.inner.state_layout()
     }
 
+    fn state_layout_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::StateLayout, Self::DefinitionError> {
+        self.inner.state_layout_with_metadata(context)
+    }
+
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
         self.inner.state_identity(state, topology)
+    }
+
+    fn state_identity_with_metadata(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+        self.inner.state_identity_with_metadata(state, topology, context)
     }
 
     fn parameter_description(
@@ -512,11 +888,28 @@ where
         self.inner.parameter_description(context)
     }
 
+    fn parameter_description_with_metadata(
+        &self, context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>, Self::DefinitionError> {
+        match &self.construction_parameters {
+            Some(source) => Ok(std::borrow::Cow::Borrowed(&**source)),
+            None => self.inner.parameter_description_with_metadata(context),
+        }
+    }
+
     fn static_parameter_recipes(
         &self,
         source: &dyn CheckpointSource,
     ) -> Result<std::collections::BTreeMap<String, DerivedWeightRecipe>, String> {
         self.inner.static_parameter_recipes(source)
+    }
+
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_runtime::ArchitectureParameters::retained_static_value_slot_bound(&self.inner)
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_runtime::ArchitectureParameters::visit_retained_static_values(&self.inner, visitor)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -545,6 +938,10 @@ where
         = PreparedCompositeInput<'a, B::Tensor, A::InputPartPlan>
     where
         Self: 'a;
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        Ok(Some(input.admitted().decoder_shape()))
+    }
+
     type StaticModules = A::StaticModules;
     type Unit = A::Unit;
     type ForwardContext = A::ForwardContext;
@@ -555,12 +952,32 @@ where
         B::Tensor: 'a;
     type Error = A::Error;
 
+    fn prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        self.inner.prefill_observation_declarations()
+    }
+
+    fn media_prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        self.inner.media_prefill_observation_declarations()
+    }
+
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         self.inner.observation_hooks()
     }
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
         self.inner.group_transport(group)
+    }
+
+    fn group_transport_matches(
+        &self,
+        group: usize,
+        expected: &eredu_runtime::ArchitectureGroupTransport,
+    ) -> bool {
+        self.inner.group_transport_matches(group, expected)
     }
 
     fn primary_execution_group(&self) -> &str {
@@ -596,14 +1013,41 @@ where
         self.inner.execution_graph()
     }
 
+    fn execution_graph_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        self.inner.execution_graph_with_metadata(context)
+    }
+
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
         self.inner.group_unit_count(group)
+    }
+
+    fn group_unit_count_with_metadata(
+        &self,
+        group: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<usize, Self::Error> {
+        self.inner.group_unit_count_with_metadata(group, context)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
         self.inner.unit_path(group, index)
     }
 
+    fn unit_path_with_metadata(&self,group:usize,index:usize,
+        context:&eredu_nn::workspace::WorkspaceContext)->Result<String,Self::Error>{
+        self.inner.unit_path_with_metadata(group,index,context)
+    }
+    fn group_input_observation_path_with_metadata(&self,group:usize,
+        context:&eredu_nn::workspace::WorkspaceContext)->Result<Option<String>,Self::Error>{
+        self.inner.group_input_observation_path_with_metadata(group,context)
+    }
+    fn group_output_observation_path_with_metadata(&self,group:usize,
+        context:&eredu_nn::workspace::WorkspaceContext)->Result<Option<String>,Self::Error>{
+        self.inner.group_output_observation_path_with_metadata(group,context)
+    }
     fn observes_unit_boundaries(&self, group: usize, index: usize) -> bool {
         self.inner.observes_unit_boundaries(group, index)
     }
@@ -717,6 +1161,17 @@ where
         )
     }
 
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        self.inner
+            .select_readout_positions(hidden, forward, demand, context)
+    }
+
     fn finish_forward(
         &mut self,
         hidden: &B::Tensor,
@@ -725,6 +1180,25 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
         self.inner.finish_forward(hidden, state, forward, context)
+    }
+
+    fn forward_metadata(
+        &self,
+        forward: &Self::ForwardContext,
+    ) -> Option<eredu_runtime::layered::LayeredForwardMetadata<Self::Error>> {
+        <A as LayeredArchitecture<B, S>>::forward_metadata(&self.inner, forward)
+    }
+
+    fn visit_retained_context_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        group: usize,
+        index: usize,
+        visitor: &mut dyn FnMut(&'a B::Tensor),
+    ) {
+        <A as LayeredArchitecture<B, S>>::visit_retained_context_values(
+            &self.inner, forward, group, index, visitor,
+        );
     }
 
     fn retained_context_values<'a>(
@@ -961,6 +1435,11 @@ where
         self.inner.boundary_schema()
     }
 
+    fn boundary_schema_with_metadata(&self,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Self::Boundary,eredu_nn::Error> {
+        self.inner.boundary_schema_with_metadata(context)
+    }
+
     fn begin_partition<'a>(
         &mut self,
         input: eredu_runtime::LayeredPartitionInput<
@@ -1048,6 +1527,16 @@ where
             .finish_partition(hidden, state, forward, owns_output, parallel, context)
     }
 
+    fn partition_prediction_capture(
+        &self,
+        hidden: &B::Tensor,
+        forward: &Self::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        self.inner
+            .partition_prediction_capture(hidden, forward, context)
+    }
+
     fn finish_partition_observed<O>(
         &mut self,
         hidden: &B::Tensor,
@@ -1076,5 +1565,104 @@ where
             context,
             observer,
         )
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct QwenPartView<'a> {
+    pub role: crate::media_plan::qwen::QwenPartRole,
+    pub modality: eredu_core::InputModality,
+    pub positions: u64,
+    pub placeholder: u32,
+    pub grid: crate::qwen::vl::positions::GridRows<'a>,
+    pub workspace_scalars: u64,
+}
+impl<'a> QwenPartView<'a> {
+    fn original(value: crate::media_plan::qwen::QwenPartRef<'a>) -> Self {
+        Self {
+            role: value.role,
+            modality: value.modality,
+            positions: value.positions,
+            placeholder: value.placeholder,
+            grid: crate::qwen::vl::positions::GridRows::Arrays(value.grid),
+            workspace_scalars: value.workspace_scalars,
+        }
+    }
+}
+impl<'a, T> PreparedCompositeInput<'a, T, crate::media_plan::QwenVlInputPartPlan> {
+    pub(crate) fn qwen_parts(self) -> impl ExactSizeIterator<Item = QwenPartView<'a>> + Clone {
+        use crate::media_plan::{qwen::QwenPartRole as R, QwenVlInputPartPlan as P};
+        (0..self.admission.len()).map(move |index| {
+            let Some(legacy) = self.admission.legacy else {
+                return QwenPartView::original(
+                    self.admission
+                        .original
+                        .expect("closed admission")
+                        .part(index),
+                );
+            };
+            let (role, positions, placeholder, grid, workspace_scalars) =
+                match &legacy.parts()[index] {
+                    P::TextTokens { positions } => (R::Tokens, *positions, 0, &[][..], 0),
+                    P::ProjectedText { positions } => (R::Projected, *positions, 0, &[][..], 0),
+                    P::Media { ingress, shape } => (
+                        R::Encoded,
+                        shape.decoder_positions,
+                        ingress.placeholder_token_id,
+                        ingress.patch_grid.as_slice(),
+                        shape.execution_workspace_scalars,
+                    ),
+                };
+            QwenPartView {
+                role,
+                positions,
+                placeholder,
+                grid: crate::qwen::vl::positions::GridRows::Tuples(grid),
+                workspace_scalars,
+                modality: self.prepared.parts()[index].modality(),
+            }
+        })
+    }
+}
+impl<'a, T> PreparedCompositeInput<'a, T, crate::media_plan::QwenHybridInputPartPlan> {
+    pub(crate) fn qwen_parts(self) -> impl ExactSizeIterator<Item = QwenPartView<'a>> + Clone {
+        use crate::media_plan::{qwen::QwenPartRole as R, QwenHybridInputPartPlan as P};
+        (0..self.admission.len()).map(move |index| {
+            let Some(legacy) = self.admission.legacy else {
+                return QwenPartView::original(
+                    self.admission
+                        .original
+                        .expect("closed admission")
+                        .part(index),
+                );
+            };
+            let (role, positions, placeholder, grid, workspace_scalars) =
+                match &legacy.parts()[index] {
+                    P::TextTokens { positions } => (R::Tokens, *positions, 0, &[][..], 0),
+                    P::Projected { positions, .. } => (R::Projected, *positions, 0, &[][..], 0),
+                    P::Media { ingress, shape } => (
+                        R::Encoded,
+                        shape.decoder_positions,
+                        ingress.placeholder_token_id,
+                        ingress.patch_grid.as_slice(),
+                        shape.execution_workspace_scalars,
+                    ),
+                };
+            QwenPartView {
+                role,
+                positions,
+                placeholder,
+                grid: crate::qwen::vl::positions::GridRows::Tuples(grid),
+                workspace_scalars,
+                modality: self.prepared.parts()[index].modality(),
+            }
+        })
+    }
+}
+
+impl<A, B> crate::routed_text::RoutedConstructionParameters<B> for PreparedCompositeArchitecture<A>
+where B: NeuralBackend, A: ArchitectureParameters<B, DefinitionError = eredu_nn::Error> {
+    fn install_construction_parameters(&mut self, source: crate::routed_text::RetainedRoutedDescription) {
+        self.construction_parameters = Some(source);
     }
 }

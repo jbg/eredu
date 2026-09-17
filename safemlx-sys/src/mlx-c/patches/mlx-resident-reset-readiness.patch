@@ -1,0 +1,167 @@
+diff --git a/mlx/backend/cuda/eval.cpp b/mlx/backend/cuda/eval.cpp
+--- a/mlx/backend/cuda/eval.cpp
++++ b/mlx/backend/cuda/eval.cpp
+@@ -13,6 +13,11 @@
+ #include <nvtx3/nvtx3.hpp>
+ 
+ namespace mlx::core::gpu {
++
++GpuStreamRegistrationCause registered_encoder_idle(Stream, const void*) noexcept {
++  return GpuStreamRegistrationCause::unsupported;
++}
++
+ 
+ GpuStreamRegistrationCause encoder_registration_layout(GpuStreamRegistrationLayout&) noexcept {
+   return GpuStreamRegistrationCause::unsupported;
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -160,6 +160,22 @@
+   void progress_submission() noexcept;
+   gpu::ObservationRequirement observation_requirement(uint64_t end) const noexcept;
+   bool submission_idle() const noexcept { return submission_state_->idle(); }
++  // Unlike a sequence counter alone, include an open unsent receipt and all
++  // current encoder-owned work. Native mutation remains externally serialized.
++  GpuStreamRegistrationCause reset_readiness() const noexcept {
++    using Cause = GpuStreamRegistrationCause;
++    if (prepared_submission_admission() != submission::NativeControlFailure::none ||
++        commit_attempted_ || recovery_attempted_ || encoding_cleanup_failed_ || exiting_)
++      return Cause::execution_failed;
++    const auto progress = submission_state_->query();
++    if (!submission_idle() || progress.accepted != progress.completed || encoder_ ||
++        buffer_ops_ || buffer_sizes_ || timer_ || resources_.first() != nullptr ||
++        temporaries_.size() != 0 || waiting_fences_.first() != nullptr ||
++        (receipt_ && (receipt_->active || !receipt_->handlers.empty() ||
++                     !receipt_->waits.empty() || !receipt_->signals.empty())))
++      return Cause::busy;
++    return Cause::success;
++  }
+ 
+   MTL::CommandBuffer* get_command_buffer() const {
+     return buffer_.get();
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -14,6 +14,15 @@
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core::gpu {
++
++GpuStreamRegistrationCause registered_encoder_idle(
++    Stream stream, const void* expected_owner) noexcept {
++  std::shared_ptr<void> owner;
++  const auto cause = borrow_registered_encoder(stream, expected_owner, owner);
++  if (cause != GpuStreamRegistrationCause::success) return cause;
++  return static_cast<metal::CommandEncoder*>(owner.get())->reset_readiness();
++}
++
+ 
+ GpuStreamRegistrationCause encoder_registration_layout(GpuStreamRegistrationLayout& output) noexcept {
+   return metal::CommandEncoder::registration_layout(output);
+diff --git a/mlx/backend/no_gpu/eval.cpp b/mlx/backend/no_gpu/eval.cpp
+--- a/mlx/backend/no_gpu/eval.cpp
++++ b/mlx/backend/no_gpu/eval.cpp
+@@ -7,6 +7,11 @@
+ #include "mlx/gpu_stream_registration.h"
+ 
+ namespace mlx::core::gpu {
++
++GpuStreamRegistrationCause registered_encoder_idle(Stream, const void*) noexcept {
++  return GpuStreamRegistrationCause::unsupported;
++}
++
+ 
+ GpuStreamRegistrationCause encoder_registration_layout(GpuStreamRegistrationLayout&) noexcept {
+   return GpuStreamRegistrationCause::unsupported;
+diff --git a/mlx/gpu_stream_registration.h b/mlx/gpu_stream_registration.h
+--- a/mlx/gpu_stream_registration.h
++++ b/mlx/gpu_stream_registration.h
+@@ -9,7 +9,7 @@
+   success = 0, unsupported = 1, invalid = 2, busy = 3,
+   allocation_failed = 4, queue_failed = 5, buffer_failed = 6,
+   identity_mismatch = 8, identity_exhausted = 9, construction_failed = 10,
+-  layout_changed = 11,
++  layout_changed = 11, execution_failed = 12,
+ };
+ struct GpuStreamRegistrationLayout {
+   // Entry, encoder, birth, encoder control, state control, initial receipt control.
+@@ -31,6 +31,9 @@
+     StreamRegistrationOwner, std::shared_ptr<void>&) noexcept;
+ MLX_API GpuStreamRegistrationCause borrow_registered_encoder(
+     Stream, const void* expected_owner, std::shared_ptr<void>&) noexcept;
++// Observation only; caller serializes native mutation. No wait or progress.
++MLX_API GpuStreamRegistrationCause registered_encoder_idle(
++    Stream, const void* expected_owner) noexcept;
+ MLX_API std::shared_ptr<void> registered_encoder(Stream) noexcept;
+ }
+ }
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -330,6 +330,34 @@
+   } catch (...) { return {WorkerCause::busy}; }
+ }
+ 
++CpuWorkerStartupResult observe_initialized_cpu_worker_idle(uint64_t scheduler_identity,
++    Stream stream, const void* stream_birth, const void* worker_birth) noexcept {
++  if (!worker_birth || stream.device != Device::cpu) return {WorkerCause::identity_mismatch};
++  const auto prerequisite = worker_prerequisites(scheduler_identity, stream, stream_birth);
++  if (prerequisite.cause != WorkerCause::success) return prerequisite;
++  auto* owner = prepared_scheduler();
++  try {
++    std::shared_lock lock(owner->threads_mtx_, std::try_to_lock);
++    if (!lock.owns_lock()) return {WorkerCause::busy};
++    const auto* entry = owner->threads_.find(stream.index);
++    if (!entry || !entry->worker || entry->original_birth.value != worker_birth ||
++        !entry->worker->stream || *entry->worker->stream != stream)
++      return {WorkerCause::identity_mismatch};
++    const auto& worker = *entry->worker;
++    // Completed is published after actual Task/capture retirement. Read it
++    // first so concurrent acceptance cannot be hidden by a newer completion.
++    const auto completed = worker.completed.load(std::memory_order_acquire);
++    const auto admission = worker.admission.load(std::memory_order_acquire);
++    if (owner->stopping_.load(std::memory_order_acquire) ||
++        worker.failed.load(std::memory_order_acquire) ||
++        (admission & StreamThread::blocked_bit) ||
++        (admission & StreamThread::sequence_mask) == StreamThread::sequence_mask)
++      return {WorkerCause::execution_failed};
++    return {(admission & StreamThread::sequence_mask) == completed
++        ? WorkerCause::success : WorkerCause::busy};
++  } catch (...) { return {WorkerCause::busy}; }
++}
++
+ Scheduler::Scheduler() {
+   is_main_thread();
+   gpu::init();
+diff --git a/mlx/scheduler.h b/mlx/scheduler.h
+--- a/mlx/scheduler.h
++++ b/mlx/scheduler.h
+@@ -326,6 +326,8 @@
+       const CpuWorkerStartupLayout&, CpuWorkerStartupOwner, const void*&) noexcept;
+   friend CpuWorkerStartupResult borrow_initialized_cpu_worker(uint64_t, Stream,
+       const void*, const void*) noexcept;
++  friend CpuWorkerStartupResult observe_initialized_cpu_worker_idle(uint64_t, Stream,
++      const void*, const void*) noexcept;
+   friend Stream mlx::core::new_stream(Device d);
+   friend TaskContext prepare_task(Stream, bool);
+ 
+diff --git a/mlx/worker_startup.h b/mlx/worker_startup.h
+--- a/mlx/worker_startup.h
++++ b/mlx/worker_startup.h
+@@ -8,7 +8,7 @@
+   success = 0, unsupported = 1, invalid = 2, busy = 3,
+   allocation_failed = 4, ordinary_predecessor = 6, already_initialized = 7,
+   identity_mismatch = 8, construction_failed = 10, layout_changed = 11,
+-  system_failure = 12,
++  system_failure = 12, execution_failed = 13,
+ };
+ struct CpuWorkerStartupResult {
+   CpuWorkerStartupCause cause{CpuWorkerStartupCause::success};
+@@ -32,4 +32,7 @@
+ // Birth authentication only, not health/readiness or later diagnostic extent.
+ MLX_API CpuWorkerStartupResult borrow_initialized_cpu_worker(
+     uint64_t scheduler_identity, Stream, const void* stream_birth, const void* worker_birth) noexcept;
++// Same source authentication plus terminal FIFO/capture retirement. No new task.
++MLX_API CpuWorkerStartupResult observe_initialized_cpu_worker_idle(
++    uint64_t scheduler_identity, Stream, const void* stream_birth, const void* worker_birth) noexcept;
+ } // namespace mlx::core::scheduler

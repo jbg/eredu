@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T14:52:32.926707+00:00",
+  "scope": "Selected Mistral and Qwen2 sliding prefill through existing complete-session conformance",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-independent-draft-selective-prefill-integration-2026-09-14.json",
+  "tests": {
+    "numeric": {
+      "passed": 1,
+      "ignored": 0
+    },
+    "existing": {
+      "passed": 1,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 2,
+  "new_tests": [
+    {
+      "check": "numeric",
+      "name": "bounded_readout::prepared_mistral_and_qwen2_sliding_chunks_preserve_state_and_cancellation",
+      "path": "eredu-architectures/tests/reference_numeric/bounded_readout.rs"
+    }
+  ],
+  "new_test_count": 1,
+  "checks": {
+    "numeric": {
+      "command": "CARGO_INCREMENTAL=0 env RUST_MIN_STACK=33554432 cargo test -p eredu-architectures --test reference_numeric prepared_mistral_and_qwen2_sliding_chunks_preserve_state_and_cancellation -- --test-threads=1",
+      "started_utc": "2026-09-14T14:51:39.608822+00:00",
+      "elapsed_seconds": 45.553,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-additional-dense-prefill-integration-numeric.log",
+      "log_sha256": "65010839191b859b596e65f3c35662a8d6979e7d0b552ead1696c845f24a5d38"
+    },
+    "existing": {
+      "command": "CARGO_INCREMENTAL=0 env RUST_MIN_STACK=33554432 cargo test -p eredu-architectures --test reference_numeric prepared_sessions_complete_state_only_chunks_in_all_weight_residencies -- --test-threads=1",
+      "started_utc": "2026-09-14T14:52:25.163745+00:00",
+      "elapsed_seconds": 5.138,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-additional-dense-prefill-integration-existing.log",
+      "log_sha256": "9210c538690fbd16cb71e4a346a4bf30387530b6deb2b573e876afc84d00df3f"
+    }
+  },
+  "source_sha256": {
+    "eredu-architectures/tests/reference_numeric/bounded_readout.rs": "67ed74e9217f3d394d67496957a2c228766faa151e9fd300f585425f6480f8a1",
+    "doc/bounded-inference.md": "af604e49b52830aa6d4e579fa49cca33be196b912657f0658840c80f596e6952"
+  },
+  "source_snapshot": "/private/tmp/eredu-additional-dense-prefill-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-independent-draft-selective-prefill-integration-2026-09-14.json": "e635713f28ebb2f6eda5d8037edd5968dd800a7198195b4f479450fe653e294c",
+    "/private/tmp/eredu-additional-dense-prefill-integration-applied.json": "65d5676702f348642eaa11d85dc6f704fd6ef6c8912621c8e113dafaff5cb1f4",
+    "/private/tmp/eredu-additional-dense-prefill-integration-apply.py": "63578976eafd1ae27dc050c482c7f5d201e221b8cf4ff7a15947e19106cc7e40",
+    "/private/tmp/eredu-additional-dense-prefill-integration-checks.json": "e5b81a18a2b57958524c712ae72061a07a35d8432ecbe4f7d525f0c941f01587",
+    "/private/tmp/eredu-additional-dense-prefill-integration-doc-applied.json": "66b0d2cf3ce503563670207f9c0c87aa89ae9510e6570766f32631ffb7e96571",
+    "/private/tmp/eredu-additional-dense-prefill-integration-existing.log": "9210c538690fbd16cb71e4a346a4bf30387530b6deb2b573e876afc84d00df3f",
+    "/private/tmp/eredu-additional-dense-prefill-integration-numeric.log": "65010839191b859b596e65f3c35662a8d6979e7d0b552ead1696c845f24a5d38",
+    "/private/tmp/eredu-additional-dense-prefill-integration-review.json": "9e953e4c28c719e8276c333666aeec12d107afaecce503156d07201ad54a2b02",
+    "/private/tmp/eredu-additional-dense-prefill-integration-root-review.json": "6ed331bc55d3c387c30323948fd462f24db7810bad50f959d0077ac403157507",
+    "/private/tmp/eredu-additional-dense-prefill-integration-spec.json": "b86774e1172631e102ed7794b74c1dc3e2a9c19bfd3ea1c9333d0c9b6b87d2a9",
+    "/private/tmp/eredu-additional-dense-prefill-integration-stage/all.patch": "4cfd96e3b2501bc58f0ee9a0c38f409dc7db12692853e66f8c54a57325311ae8",
+    "/private/tmp/eredu-additional-dense-prefill-integration-stage/change.patch": "72bb2b420389c4379df1e45837f6275ef59372a31dc24d7298a2ee06228ff919",
+    "/private/tmp/eredu-additional-dense-prefill-integration-stage/manifest.json": "65d5676702f348642eaa11d85dc6f704fd6ef6c8912621c8e113dafaff5cb1f4",
+    "/private/tmp/eredu-additional-dense-prefill-integration-stage/staged-hashes.json": "a470a9f8267ee5658ad25f1fde9f11fd510ffd4c5247c01ad1417001cf21849d",
+    "/private/tmp/eredu-additional-dense-prefill-integration-validate.py": "c2bde41cac5600e7653b8e6828cad79bf6ead3b44f6b9d6b9f2f43cee15e0ed7",
+    "/private/tmp/eredu-additional-dense-prefill-integration-validation-config.json": "9bd9ce7f375b7d241389bbbf21a5f6e1cd5ab283e801a88dd67404ee30ae37ff",
+    "/private/tmp/eredu-additional-dense-prefill-stage/change.patch": "72bb2b420389c4379df1e45837f6275ef59372a31dc24d7298a2ee06228ff919",
+    "/private/tmp/eredu-additional-dense-prefill-stage/docs.json": "93d1bc4d0af364db4da160324e93a060f610d5ebfbbe6e7eb6a80949eeec246c",
+    "/private/tmp/eredu-additional-dense-prefill-stage/manifest.json": "b77ecd8172d502da13802f6818e5238e097f5c3bf6b456d9d7a890391fa215a4",
+    "/private/tmp/eredu-additional-dense-prefill-stage/review.json": "1bd8409a25255012531ceac7eafe1388f9513c57b131685eedf8dec329a970ec",
+    "/private/tmp/eredu-package-additional-dense-prefill.py": "ba852c3822f7dd79f4f7979ccff6660d020fbc9686d8139efe46a3770593d8ef",
+    "/private/tmp/eredu-stage-additional-dense-prefill.py": "5d953644e0a1b0020f1dd629d5feea6df8907d597569e0ec1b70a2e7c26a7552"
+  },
+  "review": {
+    "full_manifest_sha256": "a470a9f8267ee5658ad25f1fde9f11fd510ffd4c5247c01ad1417001cf21849d",
+    "full_patch_sha256": "4cfd96e3b2501bc58f0ee9a0c38f409dc7db12692853e66f8c54a57325311ae8",
+    "patch_sha256": "72bb2b420389c4379df1e45837f6275ef59372a31dc24d7298a2ee06228ff919",
+    "replay": "/private/tmp/eredu-additional-dense-prefill-integration-stage/replay",
+    "review": "Existing complete selected-session visitor and assertion coverage read; Qwen2 max_window_layers is first sliding layer and Mistral sliding_window maps all layers. New configurations reuse exact prior body via helper extraction. Strict patch replay and formatting passed. No builds or live edits.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-independent-draft-selective-prefill-integration-2026-09-14.json": "e635713f28ebb2f6eda5d8037edd5968dd800a7198195b4f479450fe653e294c",
+      "/private/tmp/eredu-additional-dense-prefill-integration-root-review.json": "6ed331bc55d3c387c30323948fd462f24db7810bad50f959d0077ac403157507",
+      "/private/tmp/eredu-additional-dense-prefill-integration-spec.json": "b86774e1172631e102ed7794b74c1dc3e2a9c19bfd3ea1c9333d0c9b6b87d2a9",
+      "/private/tmp/eredu-additional-dense-prefill-stage/change.patch": "72bb2b420389c4379df1e45837f6275ef59372a31dc24d7298a2ee06228ff919",
+      "/private/tmp/eredu-additional-dense-prefill-stage/docs.json": "93d1bc4d0af364db4da160324e93a060f610d5ebfbbe6e7eb6a80949eeec246c",
+      "/private/tmp/eredu-additional-dense-prefill-stage/manifest.json": "b77ecd8172d502da13802f6818e5238e097f5c3bf6b456d9d7a890391fa215a4",
+      "/private/tmp/eredu-additional-dense-prefill-stage/review.json": "1bd8409a25255012531ceac7eafe1388f9513c57b131685eedf8dec329a970ec",
+      "/private/tmp/eredu-package-additional-dense-prefill.py": "ba852c3822f7dd79f4f7979ccff6660d020fbc9686d8139efe46a3770593d8ef",
+      "/private/tmp/eredu-stage-additional-dense-prefill.py": "5d953644e0a1b0020f1dd629d5feea6df8907d597569e0ec1b70a2e7c26a7552"
+    },
+    "source_manifest_sha256": "65d5676702f348642eaa11d85dc6f704fd6ef6c8912621c8e113dafaff5cb1f4"
+  },
+  "behavior": [
+    "Four explicit tied/untied Mistral all-sliding and Qwen2 mixed full/sliding configurations use actual resident/host/disk selected sources.",
+    "Existing shared visitor checks chunk widths1/2/3/5, run/step, cached origins, complete state and three subsequent decodes, projection omission, source failures, cancellation and reservation retention."
+  ],
+  "limits": [
+    "No new production mechanism or native/distributed claim; other family/topology/lifecycle intersections and public managed memory remain unfinished."
+  ]
+}

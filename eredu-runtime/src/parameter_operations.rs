@@ -39,6 +39,31 @@ pub trait LayeredParameterOwner<B: NeuralBackend, S: RuntimeState<B>> {
     /// report unavailable access instead of exposing incomplete values.
     fn parameter_parts(&mut self) -> Option<(&mut Self::Architecture, &mut Self::Policy)>;
 
+    /// Borrows the same retained owners for cold inspection. No parameter
+    /// construction, mutation, completion or source resolution is authorized.
+    fn parameter_parts_ref(&self) -> Option<(&Self::Architecture, &Self::Policy)>;
+
+    /// Checked slot ceiling for the exact static and idle policy topology.
+    /// Retaining the scalar does not retain its source or replacement identity.
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        let (architecture, policy) = self.parameter_parts_ref()?;
+        architecture
+            .retained_static_value_slot_bound()?
+            .checked_add(policy.retained_value_slot_bound()?)
+    }
+
+    /// Visits currently retained numerical values, including parameters,
+    /// operator helpers, pinned modules and future-load overrides.
+    /// This is not a catalog of unloaded parameters or a future workspace bound.
+    /// False means the selected owner cannot provide a complete value traversal.
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        let Some((architecture, policy)) = self.parameter_parts_ref() else {
+            return false;
+        };
+        let complete = policy.visit_retained_values(visitor);
+        architecture.visit_retained_static_values(visitor) & complete
+    }
+
     /// Visits actual resident slots without acquiring or rebuilding a unit.
     /// False means the selected policy cannot provide resident traversal.
     fn visit_loaded_parameters(
@@ -48,15 +73,9 @@ pub trait LayeredParameterOwner<B: NeuralBackend, S: RuntimeState<B>> {
         let Some((architecture, policy)) = self.parameter_parts() else {
             return false;
         };
-        if !policy.resident_parameters_available() {
-            return false;
-        }
-        let mut adapter = LoadedSlotAdapter::<B>(visitor);
-        match architecture.visit_static_parameters_mut(&mut adapter) {
-            Ok(()) => {}
-            Err(never) => match never {},
-        }
-        policy.visit_resident_units(&mut |unit| unit.visit_parameters_mut(&mut adapter))
+        visit_loaded_parameters_in_parts::<Self::Architecture, B, S, Self::Policy>(
+            architecture, policy, visitor,
+        )
     }
 
     /// Runs bounded work through the exact prepared static or unit owner.
@@ -89,31 +108,9 @@ pub trait LayeredParameterOwner<B: NeuralBackend, S: RuntimeState<B>> {
         let Some((architecture, policy)) = self.parameter_parts() else {
             return Ok(false);
         };
-        match location {
-            PreparedParameterLocation::Bank { .. }
-            | PreparedParameterLocation::Prediction { .. } => Ok(false),
-            PreparedParameterLocation::Static { .. } => {
-                operation(&mut |visitor| match architecture
-                    .visit_static_parameters_mut(&mut LoadedSlotAdapter::<B>(visitor))
-                {
-                    Ok(()) => {}
-                    Err(never) => match never {},
-                })
-                .map_err(LayerwiseAcquireError::Policy)?;
-                Ok(true)
-            }
-            PreparedParameterLocation::Unit { ordinal, address } => policy.inspect_unit(
-                *ordinal,
-                *address,
-                |context| architecture.build_unit(address.group(), address.index(), context),
-                |unit| {
-                    operation(&mut |visitor| {
-                        unit.visit_parameters_mut(&mut LoadedSlotAdapter::<B>(visitor))
-                    })
-                },
-                context,
-            ),
-        }
+        with_parameter_slots_in_parts::<Self::Architecture, B, S, Self::Policy>(
+            architecture, policy, location, operation, context,
+        )
     }
 
     /// Publishes already-completed replacements to loaded and future loaded units.
@@ -134,25 +131,145 @@ pub trait LayeredParameterOwner<B: NeuralBackend, S: RuntimeState<B>> {
         let Some((architecture, policy)) = self.parameter_parts() else {
             return Ok(false);
         };
-        if !policy.publish_parameter_replacements(values, active)? {
-            return Ok(false);
+        publish_parameter_replacements_in_parts::<Self::Architecture, B, S, Self::Policy>(
+            architecture, policy, values, active,
+        )
+    }
+}
+
+/// Visits an exact declared static aggregate and its selected idle policy.
+/// Every row is borrowed from that owner; partial coverage cannot be installed
+/// as complete source evidence. This constructs no parameter or native value.
+pub(crate) fn visit_parameter_sources_in_parts<B, U, P, V>(
+    static_modules: &(impl Parameterized<B::Tensor> + ?Sized),
+    policy: &P,
+    visitor: &mut V,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<bool, eredu_nn::Error>
+where
+    B: NeuralBackend,
+    U: Parameterized<B::Tensor>,
+    P: LayerwisePolicy<B, U>,
+    V: for<'source> eredu_nn::ParameterSourceVisitor<'source, B::Tensor>,
+{
+    use eredu_nn::{ParameterSourceError, workspace::WorkspaceMetadataError};
+    let controls = [
+        std::mem::size_of_val(&static_modules),
+        std::mem::size_of::<(&P, &mut V, &eredu_nn::workspace::WorkspaceContext)>(),
+        std::mem::size_of::<Result<(), ParameterSourceError>>(),
+        std::mem::size_of::<Result<bool, eredu_nn::Error>>(),
+    ];
+    context.charge_metadata(
+        controls
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+            .ok_or(WorkspaceMetadataError::Overflow)?,
+    )?;
+    match static_modules.visit_parameter_sources(visitor) {
+        Ok(()) => {}
+        Err(
+            ParameterSourceError::Unavailable | ParameterSourceError::UnclassifiedRetainedField,
+        ) => return Ok(false),
+        Err(cause) => return Err(context.metadata_source(cause)),
+    }
+    policy.visit_resident_parameter_sources(visitor, context)
+}
+
+// These closed workers expose only the existing tensor-slot operations. A
+// runtime can preserve validated topology while still invalidating observation
+// bindings, without exposing its raw mutable architecture to the caller.
+pub(crate) fn visit_loaded_parameters_in_parts<A, B, S, P>(
+    architecture: &mut A,
+    policy: &mut P,
+    visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
+) -> bool
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: LayeredArchitecture<B, S>,
+    P: LayerwisePolicy<B, A::Unit>,
+{
+    if !policy.resident_parameters_available() {
+        return false;
+    }
+    let mut adapter = LoadedSlotAdapter::<B>(visitor);
+    match architecture.visit_static_parameters_mut(&mut adapter) {
+        Ok(()) => {}
+        Err(never) => match never {},
+    }
+    policy.visit_resident_units(&mut |unit| unit.visit_parameters_mut(&mut adapter))
+}
+
+pub(crate) fn with_parameter_slots_in_parts<A, B, S, P>(
+    architecture: &mut A,
+    policy: &mut P,
+    location: &PreparedParameterLocation,
+    operation: &mut ParameterSlotOperation<'_, B::Tensor, P::Error>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<bool, LayerwiseAcquireError<A::Error, P::Error>>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: LayeredArchitecture<B, S>,
+    P: LayerwisePolicy<B, A::Unit>,
+{
+    match location {
+        PreparedParameterLocation::Bank { .. }
+        | PreparedParameterLocation::Prediction { .. } => Ok(false),
+        PreparedParameterLocation::Static { .. } => {
+            operation(&mut |visitor| match architecture
+                .visit_static_parameters_mut(&mut LoadedSlotAdapter::<B>(visitor))
+            {
+                Ok(()) => {}
+                Err(never) => match never {},
+            })
+            .map_err(LayerwiseAcquireError::Policy)?;
+            Ok(true)
         }
-        struct Publish<'a, T>(&'a std::collections::BTreeMap<String, T>);
-        impl<T: Clone> eredu_nn::ParameterSlotVisitor<T> for Publish<'_, T> {
-            fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadata, value: &mut T) {
-                if let Some(replacement) = self.0.get(metadata.id.as_str()) {
-                    *value = replacement.clone();
-                }
+        PreparedParameterLocation::Unit { ordinal, address } => policy.inspect_unit(
+            *ordinal,
+            *address,
+            |context| architecture.build_unit(address.group(), address.index(), context),
+            |unit| {
+                operation(&mut |visitor| {
+                    unit.visit_parameters_mut(&mut LoadedSlotAdapter::<B>(visitor))
+                })
+            },
+            context,
+        ),
+    }
+}
+
+pub(crate) fn publish_parameter_replacements_in_parts<A, B, S, P>(
+    architecture: &mut A,
+    policy: &mut P,
+    values: &std::collections::BTreeMap<String, B::Tensor>,
+    active: bool,
+) -> Result<bool, P::Error>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: LayeredArchitecture<B, S>,
+    P: LayerwisePolicy<B, A::Unit>,
+{
+    if !policy.publish_parameter_replacements(values, active)? {
+        return Ok(false);
+    }
+    struct Publish<'a, T>(&'a std::collections::BTreeMap<String, T>);
+    impl<T: Clone> eredu_nn::ParameterSlotVisitor<T> for Publish<'_, T> {
+        fn visit_slot(&mut self, metadata: eredu_nn::ParameterMetadata, value: &mut T) {
+            if let Some(replacement) = self.0.get(metadata.id.as_str()) {
+                *value = replacement.clone();
             }
         }
-        match architecture
-            .visit_static_parameters_mut(&mut LoadedSlotAdapter::<B>(&mut Publish(values)))
-        {
-            Ok(()) => {}
-            Err(never) => match never {},
-        }
-        Ok(true)
     }
+    match architecture
+        .visit_static_parameters_mut(&mut LoadedSlotAdapter::<B>(&mut Publish(values)))
+    {
+        Ok(()) => {}
+        Err(never) => match never {},
+    }
+    Ok(true)
 }
 
 struct LoadedSlotAdapter<'a, B: NeuralBackend>(

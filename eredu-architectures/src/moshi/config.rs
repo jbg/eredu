@@ -13,6 +13,7 @@ use eredu_nn::RotarySpec;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{collections::BTreeMap, io::Read};
+mod workspace;
 
 /// Stable architecture-family identity shared by native Moshi and PersonaPlex.
 pub const MOSHI_FAMILY: &str = "moshi";
@@ -192,49 +193,56 @@ impl MoshiTransformerConfig {
 
     /// Stable identity of this decoder's complete normalized policy.
     pub fn architecture_fingerprint(&self) -> String {
-        derive_prompt_cache_architecture_fingerprint(
+        self.architecture_fingerprint_with(crate::decoder::identity::Metadata::new(None))
+            .expect("ordinary fingerprint formatting is infallible")
+    }
+    fn architecture_fingerprint_with(
+        &self,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<String, eredu_nn::Error> {
+        metadata.fingerprint(
             "moshi_shared_decoder",
-            [
-                ("model_identity", self.model_identity.clone()),
-                ("parameter_root", self.parameter_root.clone()),
-                ("block_fields", "self_attn:q_proj:k_proj:v_proj:out_proj:sinks:q_norm:k_norm:gating:gate:up:linear_out:norm1:norm2".into()),
-                ("hidden_size", self.hidden_size.to_string()),
-                ("layers", self.num_hidden_layers.to_string()),
-                ("intermediate_size", self.gated_hidden_size.to_string()),
-                ("feed_forward_size", self.feed_forward_size.to_string()),
-                ("query_heads", self.num_attention_heads.to_string()),
-                ("key_value_heads", self.num_attention_heads.to_string()),
-                ("head_dim", self.head_dim.to_string()),
-                ("context", self.context.to_string()),
-                ("attention_window", self.attention_window.to_string()),
-                ("rms_norm_epsilon", f32_fingerprint(self.rms_norm_epsilon)),
-                ("vocabulary_size", self.vocabulary_size.to_string()),
-                ("attention_biases", "q=false,k=false,v=false,o=false".into()),
-                ("attention_projection", "component_major_fused:self_attn.in_proj".into()),
-                ("learned_attention_sinks", "false".into()),
-                ("query_key_norm", "none".into()),
-                ("mlp_bias", "false".into()),
-                ("gated_projection", "fused:gating.linear_in".into()),
-                ("gated_product_policy", "ordinary_silu".into()),
-                ("tied_output", "false".into()),
+            || Ok([
+                ("model_identity", metadata.text(&self.model_identity)?),
+                ("parameter_root", metadata.text(&self.parameter_root)?),
+                ("block_fields", metadata.text("self_attn:q_proj:k_proj:v_proj:out_proj:sinks:q_norm:k_norm:gating:gate:up:linear_out:norm1:norm2")?),
+                ("hidden_size", metadata.format(format_args!("{}", self.hidden_size))?),
+                ("layers", metadata.format(format_args!("{}", self.num_hidden_layers))?),
+                ("intermediate_size", metadata.format(format_args!("{}", self.gated_hidden_size))?),
+                ("feed_forward_size", metadata.format(format_args!("{}", self.feed_forward_size))?),
+                ("query_heads", metadata.format(format_args!("{}", self.num_attention_heads))?),
+                ("key_value_heads", metadata.format(format_args!("{}", self.num_attention_heads))?),
+                ("head_dim", metadata.format(format_args!("{}", self.head_dim))?),
+                ("context", metadata.format(format_args!("{}", self.context))?),
+                ("attention_window", metadata.format(format_args!("{}", self.attention_window))?),
+                ("rms_norm_epsilon", metadata.format(format_args!("{:08x}", self.rms_norm_epsilon.to_bits()))?),
+                ("vocabulary_size", metadata.format(format_args!("{}", self.vocabulary_size))?),
+                ("attention_biases", metadata.text("q=false,k=false,v=false,o=false")?),
+                ("attention_projection", metadata.text("component_major_fused:self_attn.in_proj")?),
+                ("learned_attention_sinks", metadata.text("false")?),
+                ("query_key_norm", metadata.text("none")?),
+                ("mlp_bias", metadata.text("false")?),
+                ("gated_projection", metadata.text("fused:gating.linear_in")?),
+                ("gated_product_policy", metadata.text("ordinary_silu")?),
+                ("tied_output", metadata.text("false")?),
                 (
                     "attention_schedule",
-                    self.attention_schedule.fingerprint_component(),
+                    metadata.format(format_args!("{}", self.attention_schedule.display_fingerprint_component()))?,
                 ),
                 (
                     "weight_quantization",
-                    quantization_fingerprint(self.native_quantization),
+                    quantization_fingerprint_with_metadata(self.native_quantization, metadata)?,
                 ),
-                ("rotary_base", f32_fingerprint(self.rope_base)),
-                ("rotary_traditional", "true".into()),
-                ("rotary_max_positions", self.context.to_string()),
-                ("rotary_scaling", "none".into()),
+                ("rotary_base", metadata.format(format_args!("{:08x}", self.rope_base.to_bits()))?),
+                ("rotary_traditional", metadata.text("true")?),
+                ("rotary_max_positions", metadata.format(format_args!("{}", self.context))?),
+                ("rotary_scaling", metadata.text("none")?),
                 (
                     "rotary_enabled",
-                    (self.positional_encoding == PositionalEncoding::Rope).to_string(),
+                    metadata.format(format_args!("{}", self.positional_encoding == PositionalEncoding::Rope))?,
                 ),
-                ("parallel_local", self.parallel_local.to_string()),
-            ],
+                ("parallel_local", metadata.format(format_args!("{}", self.parallel_local))?),
+            ]),
         )
     }
 
@@ -308,20 +316,23 @@ impl MoshiTransformerConfig {
         attention_heads: i32,
         gated_hidden_size: i32,
     ) -> Result<Self, MoshiConfigError> {
-        if attention_heads <= 0
-            || gated_hidden_size <= 0
-            || attention_heads > self.num_attention_heads
-        {
-            return Err(invalid(format!(
-                "invalid rank-local Moshi geometry heads={attention_heads}, gated={gated_hidden_size}"
-            )));
-        }
+        self.validate_parallel_geometry(attention_heads,gated_hidden_size,
+            |message|invalid(message.to_string()))?;
         let mut local = self.clone();
         local.num_attention_heads = attention_heads;
         local.gated_hidden_size = gated_hidden_size;
         local.parallel_local = true;
         local.validate()?;
         Ok(local)
+    }
+
+    fn validate_parallel_geometry<E>(&self,attention_heads:i32,gated_hidden_size:i32,
+        mut fail:impl FnMut(std::fmt::Arguments<'_>)->E)->Result<(),E> {
+        if attention_heads<=0||gated_hidden_size<=0||attention_heads>self.num_attention_heads {
+            return Err(fail(format_args!(
+                "invalid rank-local Moshi geometry heads={attention_heads}, gated={gated_hidden_size}")));
+        }
+        Ok(())
     }
 
     fn with_depth_slice_root(&self, slice: usize) -> Result<Self, MoshiConfigError> {
@@ -332,12 +343,17 @@ impl MoshiTransformerConfig {
     }
 
     fn validate(&self) -> Result<(), MoshiConfigError> {
+        self.validate_with_diagnostic(|message| invalid(message.to_string()))
+    }
+
+    fn validate_with_diagnostic<E>(&self, mut fail: impl FnMut(std::fmt::Arguments<'_>) -> E)
+        -> Result<(), E> {
         if self.parameter_root.is_empty()
             || self.parameter_root.starts_with('.')
             || self.parameter_root.ends_with('.')
             || self.parameter_root.split('.').any(str::is_empty)
         {
-            return Err(invalid(format!(
+            return Err(fail(format_args!(
                 "invalid Moshi transformer parameter root {:?}",
                 self.parameter_root
             )));
@@ -352,7 +368,7 @@ impl MoshiTransformerConfig {
             || self.attention_window <= 0
             || self.vocabulary_size <= 0
         {
-            return Err(invalid("Moshi transformer geometry must be positive"));
+            return Err(fail(format_args!("Moshi transformer geometry must be positive")));
         }
         if (!self.parallel_local
             && (self.hidden_size % self.num_attention_heads != 0
@@ -363,32 +379,78 @@ impl MoshiTransformerConfig {
                     .checked_mul(self.head_dim)
                     .is_none_or(|width| width > self.hidden_size))
         {
-            return Err(invalid(
+            return Err(fail(format_args!(
                 "Moshi hidden width must divide exactly across attention heads",
-            ));
+            )));
         }
         if !self.rope_base.is_finite() || self.rope_base <= 0.0 {
-            return Err(invalid("Moshi RoPE base must be finite and positive"));
+            return Err(fail(format_args!("Moshi RoPE base must be finite and positive")));
         }
         if !self.rms_norm_epsilon.is_finite() || self.rms_norm_epsilon <= 0.0 {
-            return Err(invalid(
+            return Err(fail(format_args!(
                 "Moshi RMS normalization epsilon must be finite and positive",
-            ));
+            )));
         }
         if self.attention_schedule.len() != self.num_hidden_layers as usize
             || self.attention_schedule.iter().any(|policy| {
                 policy.sliding_window_i32().ok().flatten() != Some(self.attention_window)
             })
         {
-            return Err(invalid(
+            return Err(fail(format_args!(
                 "Moshi attention schedule does not match normalized layers/window",
-            ));
+            )));
         }
         Ok(())
     }
 }
 
 impl DecoderConfig for MoshiTransformerConfig {
+    // These are the same scalar policies used by the ordinary decoder. The
+    // shared module constructor owns all resulting parameter/spec destinations.
+    fn parameter_alias_with_metadata(&self, _name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<Option<String>, eredu_nn::Error> { Ok(None) }
+
+    fn block_output_normalization_with_metadata(&self, _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<Option<String>, eredu_nn::Error> { Ok(None) }
+
+    fn attention_output_normalization_with_metadata(&self, _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<Option<String>, eredu_nn::Error> { Ok(None) }
+
+    fn feed_forward_output_normalization_with_metadata(&self, _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<Option<String>, eredu_nn::Error> { Ok(None) }
+
+    fn weight_quantization_with_metadata(&self, name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<Option<WeightQuantization>, eredu_nn::Error> {
+        Ok(self.weight_quantization(name))
+    }
+
+    fn linear_format_with_metadata(&self, name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        Ok(self.linear_format(name))
+    }
+
+    fn attention_value_format_with_metadata(&self, layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        crate::decoder::parameter_metadata::default_attention_value_format_with_metadata(
+            self, layer, context)
+    }
+
+    fn rotary_spec_with_metadata(&self, dimensions: i32,
+        _context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<RotarySpec, eredu_nn::Error> { Ok(self.rotary_spec(dimensions)) }
+
+    fn validate_config_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<(), eredu_nn::Error> {
+        self.validate_with_diagnostic(|message| context.metadata_error(message))
+    }
+
     fn model_family(&self) -> &'static str {
         "moshi_transformer"
     }
@@ -399,6 +461,12 @@ impl DecoderConfig for MoshiTransformerConfig {
 
     fn architecture_fingerprint(&self) -> String {
         MoshiTransformerConfig::architecture_fingerprint(self)
+    }
+    fn architecture_fingerprint_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<String, eredu_nn::Error> {
+        self.architecture_fingerprint_with(crate::decoder::identity::Metadata::new(Some(context)))
     }
 
     fn parameter_root(&self) -> &str {
@@ -619,13 +687,20 @@ impl MoshiConfig {
         &self,
         codebook: usize,
     ) -> Result<MoshiTransformerConfig, MoshiConfigError> {
-        if codebook >= self.frame_schedule.depth_audio_codebooks() {
-            return Err(invalid(format!(
-                "Moshi depth slice {codebook} is outside 0..{}",
-                self.frame_schedule.depth_audio_codebooks()
-            )));
+        self.depth_template_for(codebook,|message|invalid(message.to_string()))?
+            .with_depth_slice_root(codebook)
+    }
+
+    // Execution consumes already-bound modules and only needs the retained
+    // shared depth geometry. Per-slice parameter namespaces are construction
+    // inputs; borrowing this template cannot supply a binding identity.
+    pub(in crate::moshi) fn depth_template_for<E>(&self,codebook:usize,
+        invalid:impl FnOnce(std::fmt::Arguments<'_>)->E)->Result<&MoshiTransformerConfig,E> {
+        if codebook>=self.frame_schedule.depth_audio_codebooks() {
+            return Err(invalid(format_args!("Moshi depth slice {codebook} is outside 0..{}",
+                self.frame_schedule.depth_audio_codebooks())));
         }
-        self.depth_slice_zero.with_depth_slice_root(codebook)
+        Ok(&self.depth_slice_zero)
     }
 
     /// Text vocabulary excluding the input-only padding row.
@@ -870,6 +945,37 @@ fn normalize_personaplex(source: PersonaPlexSource) -> Result<MoshiConfig, Moshi
         ParameterSharing::SharedDepthNorms,
         Some(PERSONAPLEX_VERSION.into()),
     )
+}
+
+// Private scalar proof geometry. The released parser cannot construct this
+// identity; all PersonaPlex schedule, sharing and checkpoint policies are kept.
+#[cfg(test)]
+pub(super) fn personaplex_numeric_fixture() -> MoshiConfig {
+    let mut values = native_v0_1_source();
+    values.model_type = Some("personaplex".into());
+    values.existing_text_padding_id = Some(3);
+    values.dep_q = 16;
+    values.generated_audio_codebooks = Some(8);
+    values.dim = 8;
+    values.text_card = 19;
+    values.card = 17;
+    values.num_heads = 2;
+    values.num_layers = 2;
+    values.dim_feedforward = Some(33);
+    values.depformer_dim = 8;
+    values.depformer_num_heads = 2;
+    values.depformer_num_layers = 2;
+    values.depformer_dim_feedforward = Some(33);
+    normalize(
+        values,
+        EffectiveModelType::PersonaPlex,
+        ArtifactProfile::PersonaPlex7bV1,
+        CheckpointLayout::PersonaPlexPytorch,
+        RealtimeFrameConvention::AbsoluteDelayedSlots,
+        ParameterSharing::SharedDepthNorms,
+        Some("private-scalar-proof".into()),
+    )
+    .expect("private reduced geometry preserves PersonaPlex equations")
 }
 
 fn normalize_native(
@@ -1361,14 +1467,21 @@ fn architecture_fingerprint(
 }
 
 fn quantization_fingerprint(value: Option<WeightQuantization>) -> String {
+    quantization_fingerprint_with_metadata(value, crate::decoder::identity::Metadata::new(None))
+        .expect("ordinary fingerprint formatting is infallible")
+}
+fn quantization_fingerprint_with_metadata(
+    value: Option<WeightQuantization>,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
     match value {
-        None => "dense".into(),
-        Some(WeightQuantization::Affine(value)) => format!(
+        None => metadata.text("dense"),
+        Some(WeightQuantization::Affine(value)) => metadata.format(format_args!(
             "affine:group={}:bits={}:mode={:?}",
             value.group_size, value.bits, value.mode
-        ),
-        Some(WeightQuantization::MxFp4) => "mxfp4:group=32:bits=4".into(),
-        Some(WeightQuantization::GgufIQuant { .. }) => "unsupported_gguf".into(),
+        )),
+        Some(WeightQuantization::MxFp4) => metadata.text("mxfp4:group=32:bits=4"),
+        Some(WeightQuantization::GgufIQuant { .. }) => metadata.text("unsupported_gguf"),
     }
 }
 

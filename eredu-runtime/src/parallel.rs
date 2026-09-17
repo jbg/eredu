@@ -4,6 +4,14 @@
 //! execution backend may then realize the resulting placement without knowing
 //! projection names, attention geometry, or other model-family semantics.
 
+mod construction;
+pub use construction::{
+    aligned_partition_units_with_metadata, module_parameter_group_with_metadata,
+    partition_parameter_group_chunks_with_metadata,
+    partitioned_module_parameter_group_with_metadata, partitioned_projection_group_with_metadata,
+    projection_parameter_group_with_metadata, segmented_projection_group_with_metadata,
+};
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     ops::Range,
@@ -205,16 +213,6 @@ impl ParameterMemberSpec {
         }
     }
 
-    fn with_parameter_metadata(mut self, metadata: &ParameterMetadata) -> Self {
-        self.linear_row_layout = metadata.linear_row_layout;
-        self.linear_companion = metadata.linear_companion;
-        self.linear_companion_of = metadata
-            .linear_companion_of
-            .as_ref()
-            .map(|parameter| parameter.as_str().to_owned());
-        self
-    }
-
     fn with_sharding(mut self, sharding: MemberSharding) -> Self {
         self.sharding = sharding;
         self
@@ -296,96 +294,41 @@ impl ParameterGroupSpec {
         Self::build(logical_name.into(), role, Some(units), members)
     }
 
+    /// Reuses this group's owned metadata with an exact shared partition.
+    /// The same validation as `partitioned` runs before the result is returned.
+    pub fn into_partitioned(self, units: usize) -> Result<Self, ParallelPlanError> {
+        Self::partitioned(self.logical_name, self.role, units, self.members)
+    }
+
+    /// Moves this group's metadata into an admitted checked partition result.
+    pub fn into_partitioned_with_metadata(
+        self,
+        units: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, eredu_nn::Error> {
+        construction::finish_owned(
+            self.logical_name,
+            self.role,
+            Some(units),
+            self.members,
+            context,
+        )
+    }
+
     fn build(
         logical_name: String,
         role: ParameterRole,
         partition_units: Option<usize>,
         members: impl IntoIterator<Item = ParameterMemberSpec>,
     ) -> Result<Self, ParallelPlanError> {
-        if logical_name.trim().is_empty() {
-            return Err(ParallelPlanError::InvalidGroup(
-                "parallel parameter logical name must not be empty".into(),
-            ));
-        }
+        construction::validate_name(&logical_name).map_err(construction::GroupIssue::ordinary)?;
         let members = members.into_iter().collect::<Vec<_>>();
-        if members.is_empty() {
-            return Err(ParallelPlanError::InvalidGroup(format!(
-                "parallel parameter group {logical_name:?} must contain at least one tensor"
-            )));
-        }
-        let mut targets = BTreeSet::new();
-        let mut has_partitioned_member = false;
-        for member in &members {
-            if member.target.trim().is_empty() {
-                return Err(ParallelPlanError::InvalidGroup(format!(
-                    "parallel parameter group {logical_name:?} contains an empty tensor target"
-                )));
-            }
-            if !targets.insert(member.target.clone()) {
-                return Err(ParallelPlanError::InvalidGroup(format!(
-                    "parallel parameter group {logical_name:?} repeats tensor target {:?}",
-                    member.target
-                )));
-            }
-            has_partitioned_member |= matches!(
-                member.sharding,
-                MemberSharding::Partitioned { .. }
-                    | MemberSharding::PartitionedSegments { .. }
-                    | MemberSharding::PartitionedChunks { .. }
-                    | MemberSharding::PartitionedChunkSegments { .. }
-            );
-            let chunks = match member.sharding() {
-                MemberSharding::PartitionedChunks { axis, chunk_size } => {
-                    let extent = member.global_shape().get(*axis).ok_or_else(|| {
-                        ParallelPlanError::InvalidTensor("chunked partition axis is absent".into())
-                    })?;
-                    Some((*chunk_size, vec![*extent]))
-                }
-                MemberSharding::PartitionedChunkSegments {
-                    axis,
-                    segments,
-                    chunk_size,
-                } => {
-                    let extent = member.global_shape().get(*axis).ok_or_else(|| {
-                        ParallelPlanError::InvalidTensor("chunked segment axis is absent".into())
-                    })?;
-                    let mut previous = 0;
-                    for segment in segments {
-                        if segment.start < previous
-                            || segment.start >= segment.end
-                            || segment.end > *extent
-                        {
-                            return Err(ParallelPlanError::InvalidTensor(
-                                "invalid chunked partition segments".into(),
-                            ));
-                        }
-                        previous = segment.end;
-                    }
-                    Some((
-                        *chunk_size,
-                        segments.iter().map(|segment| segment.len()).collect(),
-                    ))
-                }
-                _ => None,
-            };
-            if let Some((width, extents)) = chunks {
-                if width == 0
-                    || extents.is_empty()
-                    || extents.iter().any(|extent| {
-                        *extent == 0 || Some(extent.div_ceil(width)) != partition_units
-                    })
-                {
-                    return Err(ParallelPlanError::InvalidGroup(
-                        "physical chunks do not match the shared logical partition".into(),
-                    ));
-                }
-            }
-        }
-        if has_partitioned_member != partition_units.is_some() {
-            return Err(ParallelPlanError::InvalidGroup(format!(
-                "parallel parameter group {logical_name:?} must declare exactly one group-level logical partition for its partitioned members"
-            )));
-        }
+        construction::validate_members(
+            &logical_name,
+            partition_units,
+            &members,
+            construction::Ordinary,
+        )?;
         Ok(Self {
             logical_name,
             role,
@@ -441,31 +384,14 @@ where
             if self.error.is_some() {
                 return;
             }
-            let shape = value
-                .shape()
-                .iter()
-                .map(|dimension| {
-                    usize::try_from(*dimension).map_err(|_| {
-                        ParallelPlanError::InvalidTensor(format!(
-                            "parameter {} has negative dimension {dimension}",
-                            metadata.id.as_str()
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>();
-            let shape = match shape {
-                Ok(shape) => shape,
-                Err(error) => {
-                    self.error = Some(error);
-                    return;
-                }
-            };
-            match (self.sharding)(&metadata, &shape) {
-                Ok(sharding) => self.members.push(
-                    ParameterMemberSpec::new(metadata.id.as_str(), shape, sharding)
-                        .with_parameter_metadata(&metadata),
-                ),
-                Err(error) => self.error = Some(error),
+            match construction::member(
+                construction::MemberSource::ordinary(&metadata),
+                value.shape(),
+                construction::Ordinary,
+                |shape| (self.sharding)(&metadata, shape),
+            ) {
+                Ok(member) => self.members.push(member),
+                Err(cause) => self.error = Some(cause),
             }
         }
     }
@@ -513,26 +439,14 @@ where
             if self.error.is_some() {
                 return;
             }
-            let shape = value
-                .shape()
-                .iter()
-                .map(|dimension| {
-                    usize::try_from(*dimension).map_err(|_| {
-                        ParallelPlanError::InvalidTensor(format!(
-                            "parameter {} has negative dimension {dimension}",
-                            metadata.id.as_str()
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>();
-            match shape.and_then(|shape| {
-                (self.sharding)(&metadata, &shape).map(|sharding| {
-                    ParameterMemberSpec::new(metadata.id.as_str(), shape, sharding)
-                        .with_parameter_metadata(&metadata)
-                })
-            }) {
+            match construction::member(
+                construction::MemberSource::ordinary(&metadata),
+                value.shape(),
+                construction::Ordinary,
+                |shape| (self.sharding)(&metadata, shape),
+            ) {
                 Ok(member) => self.members.push(member),
-                Err(error) => self.error = Some(error),
+                Err(cause) => self.error = Some(cause),
             }
         }
     }
@@ -559,23 +473,10 @@ where
     T: Tensor,
     M: Parameterized<T>,
 {
-    module_parameter_group(
-        logical_name,
-        role,
-        module,
-        |metadata, shape| match placement {
-            ProjectionSharding::Replicated => Ok(MemberSharding::Replicated),
-            ProjectionSharding::Column if shape.is_empty() => {
-                Err(ParallelPlanError::InvalidTensor(format!(
-                    "column projection parameter {} is scalar",
-                    metadata.id.as_str()
-                )))
-            }
-            ProjectionSharding::Column => Ok(MemberSharding::Equal { axis: 0 }),
-            ProjectionSharding::Row if shape.len() >= 2 => Ok(MemberSharding::Equal { axis: 1 }),
-            ProjectionSharding::Row => Ok(MemberSharding::Replicated),
-        },
-    )
+    module_parameter_group(logical_name, role, module, |metadata, shape| {
+        construction::projection_sharding(placement, metadata.id.as_str(), shape)
+            .map_err(construction::GroupIssue::ordinary)
+    })
 }
 
 /// Describes projections that consume one shared logical partition.
@@ -598,14 +499,8 @@ where
     for (module, placement) in projections {
         let group = projection_parameter_group::<T, M>("projection", role, *module, *placement)?;
         for member in group.members {
-            let sharding = match (placement, member.global_shape.len()) {
-                (ProjectionSharding::Replicated, _) | (ProjectionSharding::Row, 0 | 1) => {
-                    MemberSharding::Replicated
-                }
-                (ProjectionSharding::Column, 0) => unreachable!("validated above"),
-                (ProjectionSharding::Column, _) => MemberSharding::Partitioned { axis: 0 },
-                (ProjectionSharding::Row, _) => MemberSharding::Partitioned { axis: 1 },
-            };
+            let sharding =
+                construction::partitioned_sharding(*placement, member.global_shape.len());
             members.push(member.with_sharding(sharding));
         }
     }
@@ -630,20 +525,8 @@ where
     T: Tensor,
     M: Parameterized<T>,
 {
-    if preferred_units == 0 || segments.is_empty() {
-        return Err(ParallelPlanError::InvalidGroup(
-            "segmented projection requires positive logical units and at least one segment".into(),
-        ));
-    }
-    let mut previous_end = 0usize;
-    for segment in &segments {
-        if segment.start != previous_end || segment.start >= segment.end {
-            return Err(ParallelPlanError::InvalidGroup(format!(
-                "segmented projection ranges must be positive, contiguous, and ordered, got {segments:?}"
-            )));
-        }
-        previous_end = segment.end;
-    }
+    let previous_end = construction::segment_width(preferred_units, &segments)
+        .map_err(construction::GroupIssue::ordinary)?;
 
     let fused_group =
         projection_parameter_group::<T, M>("fused", role, fused, ProjectionSharding::Column)?;
@@ -669,33 +552,13 @@ fn assemble_segmented_projection_group(
     units: usize,
     expected_fused_width: usize,
 ) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    let mut members = Vec::new();
-    for member in fused_group.members {
-        let dimension = member.global_shape.first().copied().ok_or_else(|| {
-            ParallelPlanError::InvalidTensor(format!(
-                "segmented projection parameter {} is scalar",
-                member.target
-            ))
-        })?;
-        if dimension != expected_fused_width {
-            return Err(ParallelPlanError::InvalidTensor(format!(
-                "segmented projection parameter {} has output dimension {dimension}, expected {expected_fused_width}",
-                member.target
-            )));
-        }
-        members.push(member.with_sharding(MemberSharding::PartitionedSegments {
-            axis: 0,
-            segments: segments.clone(),
-        }));
-    }
-    for member in row_group.members {
-        let sharding = if member.global_shape.len() >= 2 {
-            MemberSharding::Partitioned { axis: 1 }
-        } else {
-            MemberSharding::Replicated
-        };
-        members.push(member.with_sharding(sharding));
-    }
+    let members = construction::segmented_members(
+        fused_group,
+        row_group,
+        &segments,
+        expected_fused_width,
+        construction::Ordinary,
+    )?;
     partitioned_group_with_preferred_units(logical_name, role, units, members)
 }
 
@@ -740,8 +603,26 @@ fn partition_units(
     required_alignment: usize,
     allow_tail: bool,
 ) -> Result<usize, ParallelPlanError> {
+    partition_units_with(
+        name,
+        semantic_units,
+        elements_per_unit,
+        required_alignment,
+        allow_tail,
+        |args| ParallelPlanError::InvalidGroup(args.to_string()),
+    )
+}
+
+fn partition_units_with<E>(
+    name: &str,
+    semantic_units: usize,
+    elements_per_unit: usize,
+    required_alignment: usize,
+    allow_tail: bool,
+    mut invalid: impl FnMut(std::fmt::Arguments<'_>) -> E,
+) -> Result<usize, E> {
     if semantic_units == 0 || elements_per_unit == 0 || required_alignment == 0 {
-        return Err(ParallelPlanError::InvalidGroup(format!(
+        return Err(invalid(format_args!(
             "{name} aligned partition dimensions must be positive, got units={semantic_units}, width={elements_per_unit}, alignment={required_alignment}"
         )));
     }
@@ -751,7 +632,7 @@ fn partition_units(
         if allow_tail {
             return Ok(1);
         }
-        return Err(ParallelPlanError::InvalidGroup(format!(
+        return Err(invalid(format_args!(
             "{name} has {semantic_units} semantic units of width {elements_per_unit}, which cannot form complete alignment-{required_alignment} partitions"
         )));
     }
@@ -766,30 +647,21 @@ pub fn partition_parameter_group_chunks(
     units: usize,
     mut width: impl FnMut(&ParameterMemberSpec) -> Result<usize, ParallelPlanError>,
 ) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    let mut members = Vec::with_capacity(group.members.len());
-    for member in group.members {
-        let sharding = match member.sharding() {
-            MemberSharding::Partitioned { axis } => MemberSharding::PartitionedChunks {
-                axis: *axis,
-                chunk_size: width(&member)?,
-            },
-            MemberSharding::PartitionedSegments { axis, segments } => {
-                MemberSharding::PartitionedChunkSegments {
-                    axis: *axis,
-                    segments: segments.clone(),
-                    chunk_size: width(&member)?,
-                }
-            }
-            MemberSharding::Replicated => MemberSharding::Replicated,
-            _ => {
-                return Err(ParallelPlanError::InvalidGroup(
-                    "chunk conversion requires a uniform group-level partition".into(),
-                ))
-            }
-        };
-        members.push(member.with_sharding(sharding));
-    }
-    ParameterGroupSpec::partitioned(group.logical_name, group.role, units, members)
+    partition_parameter_group_chunks_with_source(group, units, |member, _| width(member))
+}
+
+/// Converts uniform members while borrowing the complete unchanged source group.
+/// The callback can resolve a companion's primary without cloning its metadata.
+/// It runs exactly once for each partitioned member, in source order. Widths are
+/// retained until validation of every source member succeeds; member/name/shape
+/// and segment owners are then moved into the destination.
+pub fn partition_parameter_group_chunks_with_source(
+    group: ParameterGroupSpec,
+    units: usize,
+    width: impl FnMut(&ParameterMemberSpec, &[ParameterMemberSpec]) -> Result<usize, ParallelPlanError>,
+) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    let widths = construction::chunk_widths(&group, construction::Ordinary, width)?;
+    construction::apply_chunk_widths(group, widths).into_partitioned(units)
 }
 
 /// Maps a logical chunk interval to exact physical coordinates without padding.
@@ -857,37 +729,8 @@ fn partitioned_group_with_preferred_units(
     preferred_units: usize,
     members: Vec<ParameterMemberSpec>,
 ) -> Result<ParameterGroupSpec, ParallelPlanError> {
-    let mut units = preferred_units;
-    for member in &members {
-        match member.sharding() {
-            MemberSharding::Partitioned { axis } => {
-                let dimension = member.global_shape().get(*axis).ok_or_else(|| {
-                    ParallelPlanError::InvalidTensor(format!(
-                        "partitioned parameter {} has no axis {axis}",
-                        member.target()
-                    ))
-                })?;
-                units = greatest_common_divisor(units, *dimension);
-            }
-            MemberSharding::PartitionedSegments { axis, segments }
-            | MemberSharding::Segmented { axis, segments } => {
-                if member.global_shape().get(*axis).is_none() {
-                    return Err(ParallelPlanError::InvalidTensor(format!(
-                        "segmented parameter {} has no axis {axis}",
-                        member.target()
-                    )));
-                }
-                for segment in segments {
-                    units = greatest_common_divisor(units, segment.len());
-                }
-            }
-            MemberSharding::Replicated
-            | MemberSharding::Equal { .. }
-            | MemberSharding::Balanced { .. }
-            | MemberSharding::PartitionedChunks { .. }
-            | MemberSharding::PartitionedChunkSegments { .. } => {}
-        }
-    }
+    let units = construction::preferred_units(&members, preferred_units)
+        .map_err(construction::GroupIssue::ordinary)?;
     ParameterGroupSpec::partitioned(logical_name, role, units, members)
 }
 

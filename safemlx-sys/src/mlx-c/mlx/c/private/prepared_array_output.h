@@ -37,6 +37,7 @@ class mlx_array_output_preparation_ {
     static_assert(std::is_nothrow_move_assignable_v<mlx::core::array>);
     if (storage_) {
       destination_.ctx = ::new (storage_) mlx::core::array(std::move(value));
+      destination_.prepared_owner = nullptr;
       storage_ = nullptr;
     } else {
       *static_cast<mlx::core::array*>(destination_.ctx) = std::move(value);

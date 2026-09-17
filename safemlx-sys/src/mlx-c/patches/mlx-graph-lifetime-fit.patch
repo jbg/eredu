@@ -1,0 +1,76 @@
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -146,6 +146,39 @@
+   return align_up(sizeof(Block) + sizeof(size_t), align, start) &&
+       add(start, std::max(requested, size_t{1}), used) &&
+       align_up(used, alignment, out);
++}
++
++bool GraphQuota::allocation_population_extent(
++    size_t bytes, size_t attempts, size_t& out) noexcept {
++  if (!attempts) {
++    if (bytes) return false;
++    out = 0;
++    return true;
++  }
++  // Every nonempty request costs its bytes plus the block/offset, at most
++  // alignment-1 leading bytes, and at most alignment-1 terminal rounding.
++  // This also covers GraphConstruction's max-alignment reserved payloads.
++  const size_t overhead = sizeof(Block) + sizeof(size_t) + 2 * (alignment - 1);
++  if (bytes < attempts || attempts > absent / overhead) return false;
++  size_t extent;
++  if (!add(bytes, attempts * overhead, extent) ||
++      !align_up(extent, alignment, extent) ||
++      extent > std::numeric_limits<ptrdiff_t>::max()) return false;
++  out = extent;
++  return true;
++}
++
++size_t GraphQuota::minimum_split_bytes() noexcept {
++  return sizeof(Block) + sizeof(size_t) + alignment;
++}
++
++bool GraphQuota::fresh_capacity_for_extents(size_t extents, size_t& out) noexcept {
++  size_t capacity;
++  if (extents % alignment || !add(extents, minimum_split_bytes(), capacity)) return false;
++  GraphQuotaLayout checked;
++  if (!layout(capacity, checked)) return false;
++  out = capacity;
++  return true;
+ }
+ 
+ GraphQuota* GraphQuota::try_create(size_t capacity, void* owner, void (*retire)(void*)) noexcept {
+@@ -237,7 +270,7 @@
+           !align_up(c.used, alignment, c.used) || c.used > c.entry->bytes)
+         continue;
+       c.remainder = c.entry->bytes - c.used;
+-      if (c.remainder >= sizeof(Block) + sizeof(size_t) + alignment) {
++      if (c.remainder >= minimum_split_bytes()) {
+         c.next = c.offset + c.used;
+         ::new (bytes() + c.next) Block{c.remainder, c.offset, c.entry->next, true};
+         if (c.entry->next != absent) block(c.entry->next)->previous = c.next;
+diff --git a/mlx/graph_quota.h b/mlx/graph_quota.h
+--- a/mlx/graph_quota.h
++++ b/mlx/graph_quota.h
+@@ -50,6 +50,12 @@
+   // an unusable tail, increasing occupancy. Never use worst-alignment reserve
+   // extents as lower bounds when deriving a bounded live-object population.
+   static bool minimum_allocation_extent(size_t bytes, size_t alignment, size_t& out) noexcept;
++  // Conservative extent sum for a finite population of positive requests.
++  // Uses actual block/offset/alignment policy, with no retirement credit.
++  static bool allocation_population_extent(size_t bytes, size_t attempts, size_t& out) noexcept;
++  // Fresh arena fitting every counted attempt, including failed prefixes.
++  // Adds the actual minimum split tail once; does not prove population coverage.
++  static bool fresh_capacity_for_extents(size_t extents, size_t& out) noexcept;
+   struct Request { size_t bytes; size_t alignment; };
+   // A source-private arena can reserve one leaf's concrete blocks without throwing.
+   // No ordinary allocator is used if a prepared constructor requests a mismatch.
+@@ -66,6 +72,7 @@
+   friend class GraphConstruction;
+   GraphConstruction* construction_{nullptr};
+   struct Block;
++  static size_t minimum_split_bytes() noexcept;
+   static constexpr size_t prepared_limit = 8;
+   struct PreparedBlock { void* pointer = nullptr; size_t bytes = 0; size_t alignment = 0; };
+   PreparedBlock prepared_[prepared_limit]{};

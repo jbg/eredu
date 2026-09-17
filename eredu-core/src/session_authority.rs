@@ -103,6 +103,7 @@ impl SessionAuthority {
         Ok(SubmissionLease {
             owner: Arc::clone(&self.active),
             ticket,
+            retained: Vec::new(),
         })
     }
 }
@@ -130,9 +131,18 @@ pub enum SessionAuthorityError {
 pub struct SubmissionLease {
     owner: Arc<AtomicU64>,
     ticket: u64,
+    retained: Vec<Box<dyn std::fmt::Debug + Send + Sync>>,
 }
 
 impl SubmissionLease {
+    /// Retains neutral resource authority beside native completion ownership.
+    /// Use for an admitted working-memory reservation before submitting native
+    /// work. Resolution releases session exclusion; resources remain retained
+    /// until this lease is dropped after safe completion or teardown.
+    pub fn retain_resource<R: std::fmt::Debug + Send + Sync + 'static>(&mut self, resource: R) {
+        self.retained.push(Box::new(resource));
+    }
+
     /// Releases only this ticket after the backend establishes safe resolution.
     ///
     /// Returns whether this call released it. Repeated resolution and later

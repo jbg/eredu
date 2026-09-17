@@ -14,11 +14,44 @@ use eredu_checkpoint::LinearFormat;
 
 pub use eredu_nn_macros::Parameterized;
 
+mod cpu_matmul;
+pub use cpu_matmul::{CpuMatmulError, CpuMatmulFacts, CpuMatmulGeometry, CpuMatmulImplementation, SelectedCpuMatmul};
+mod construction_names;
+pub use construction_names::{
+    LinearCompanionView, LinearFormatView, ParameterNameError, ParameterNameView,
+};
+mod parallel_gather;
+pub use parallel_gather::{ParallelGatherError, ParallelGatherOperations, gather_uneven_axis};
+mod vocabulary_range;
+pub use vocabulary_range::{BalancedVocabularyWidths, VocabularyRangeError};
+mod fixed_validation;
+pub use fixed_validation::{
+    EmbeddingValidationError, GatedProductValidationError, GroupedBankDimension,
+    GroupedBankValidationError, GroupedLinearValidationError, GroupedProjectionValidationError,
+    GroupedRelu2ValidationError, HyperConnectionValidationError, HyperHeadValidationError,
+    LinearFormatValidationError, LinearWeightValidationError, NormalizationValidationError,
+    RotaryValidationError, SelectorValidationError,
+};
+mod f32_initialization;
+pub use f32_initialization::{F32InitializationError, F32InitializationPlan};
+mod generated_factory;
 mod grouped_linear;
 mod grouped_units;
+mod isolated_copy;
+pub use generated_factory::{
+    GeneratedTensorProgram, GeneratedTensorRetentionSignal, GeneratedTensorSourceRole,
+    MappedGeneratedTensorFactory, RetainedGeneratedTensorFactory,
+};
+mod projection_observation;
+pub use projection_observation::{
+    BlockFp8InputReconstructionMechanism, BlockFp8InputReconstructionPlan,
+    ProjectionInputObservationMechanism, ProjectionObservationError, reconstruct_block_fp8_input,
+    reconstruct_block_fp8_input_retained,
+};
 mod linear_rows;
 pub use grouped_units::{GroupedUnitBatch, GroupedUnitError, GroupedUnitObserver};
-pub use linear_rows::LinearRowLayout;
+pub use isolated_copy::{IsolatedCopyMechanism, WorkspaceIsolatedCopy, isolated_copy};
+pub use linear_rows::{LinearRowError, LinearRowLayout};
 /// Reusable patch projection and multi-axis position operations.
 pub mod multimodal;
 /// Checked tensor-independent normalization and mask geometry.
@@ -28,23 +61,43 @@ pub mod routing_intervention;
 pub use grouped_linear::{GroupedLinearActivation, GroupedLinearOperator, GroupedLinearSpec};
 /// Pure sequence layouts shared by patch-based encoders.
 pub mod sequence_layout;
+/// Metadata-only execution of neural equations for selected workspace pricing.
+pub mod workspace;
 
+mod retained_error;
 /// Backend operation failure.
 #[derive(Debug, Clone)]
 pub struct Error {
-    message: String,
-    source: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
+    // Legacy constructors retain their exact formatting/clone behavior.
+    storage: ErrorStorage,
+}
+#[derive(Debug, Clone)]
+enum ErrorStorage {
+    Legacy {
+        message: String,
+        source: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
+    },
+    Retained(retained_error::RetainedSource),
+    WorkspaceMetadata(workspace::WorkspaceMetadataError),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.message)
+        match &self.storage {
+            ErrorStorage::Legacy { message, .. } => f.write_str(message),
+            ErrorStorage::Retained(source) => std::fmt::Display::fmt(source, f),
+            ErrorStorage::WorkspaceMetadata(cause) => std::fmt::Display::fmt(cause, f),
+        }
     }
 }
 
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_deref().map(|error| error as _)
+        match &self.storage {
+            ErrorStorage::Legacy { source, .. } => source.as_deref().map(|error| error as _),
+            ErrorStorage::Retained(source) => Some(source.original()),
+            ErrorStorage::WorkspaceMetadata(cause) => Some(cause),
+        }
     }
 }
 
@@ -52,17 +105,27 @@ impl Error {
     /// Creates a backend operation failure without exposing backend-native
     /// exception types through architecture code.
     pub fn backend(error: impl std::fmt::Display) -> Self {
+        Self::backend_message(error.to_string())
+    }
+
+    /// Consumes an already constructed diagnostic without allocating, copying
+    /// or formatting it again. The producing caller retains any required custody.
+    pub fn backend_message(message: String) -> Self {
         Self {
-            message: error.to_string(),
-            source: None,
+            storage: ErrorStorage::Legacy {
+                message,
+                source: None,
+            },
         }
     }
 
     /// Retains the original failure behind the backend-neutral error boundary.
     pub fn backend_source(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self {
-            message: error.to_string(),
-            source: Some(std::sync::Arc::new(error)),
+            storage: ErrorStorage::Legacy {
+                message: error.to_string(),
+                source: Some(std::sync::Arc::new(error)),
+            },
         }
     }
 }
@@ -77,6 +140,9 @@ pub enum Index {
     /// Retains the half-open interval `[start, end)`.
     Range(i32, i32),
 }
+
+mod axis_range;
+pub use axis_range::{TensorAxisRange,TensorAxisRangeError};
 
 /// Padding behavior for convolutional architecture components.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -152,6 +218,14 @@ pub struct SegmentedAttentionInput<'a, T> {
 impl<T: Tensor> SegmentedAttentionInput<'_, T> {
     /// Validates tensor and segment geometry without inspecting tensor values.
     pub fn validate(&self) -> Result<(), Error> {
+        self.validate_with_diagnostic(|message| Error::backend(message.to_string()))
+    }
+
+    /// Uses the same geometry checks with a caller-owned diagnostic destination.
+    pub fn validate_with_diagnostic<E>(
+        &self,
+        mut diagnostic: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
         let query = self.queries.shape();
         let key = self.keys.shape();
         let value = self.values.shape();
@@ -170,40 +244,53 @@ impl<T: Tensor> SegmentedAttentionInput<'_, T> {
             || !self.scale.is_finite()
             || self.scale <= 0.0
         {
-            return Err(Error::backend(format!(
+            return Err(diagnostic(format_args!(
                 "invalid segmented attention geometry q={query:?} k={key:?} v={value:?} scale={}",
                 self.scale
             )));
         }
-        validate_segment_lengths(query[0], self.segment_lengths)
+        validate_segment_lengths_with_diagnostic(query[0], self.segment_lengths, diagnostic)
     }
 }
 
 /// Validates positive contiguous segment lengths and their exact total.
 pub fn validate_segment_lengths(total: i32, segment_lengths: &[i32]) -> Result<(), Error> {
+    validate_segment_lengths_with_diagnostic(total, segment_lengths, |message| {
+        Error::backend(message.to_string())
+    })
+}
+
+/// Checks the same segment sequence and rejection order without owning diagnostics.
+pub fn validate_segment_lengths_with_diagnostic<E>(
+    total: i32,
+    segment_lengths: &[i32],
+    mut diagnostic: impl FnMut(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     if total <= 0 || segment_lengths.is_empty() {
-        return Err(Error::backend(format!(
+        return Err(diagnostic(format_args!(
             "segmented attention requires a positive total and at least one segment, got total={total} segments={segment_lengths:?}"
         )));
     }
     let mut sum = 0i32;
     for &length in segment_lengths {
         if length <= 0 {
-            return Err(Error::backend(format!(
+            return Err(diagnostic(format_args!(
                 "segmented attention lengths must be positive, got {segment_lengths:?}"
             )));
         }
         sum = sum.checked_add(length).ok_or_else(|| {
-            Error::backend("segmented attention length total overflowed signed 32-bit geometry")
+            diagnostic(format_args!(
+                "segmented attention length total overflowed signed 32-bit geometry"
+            ))
         })?;
         if sum > total {
-            return Err(Error::backend(format!(
+            return Err(diagnostic(format_args!(
                 "segmented attention lengths exceed total {total}: {segment_lengths:?}"
             )));
         }
     }
     if sum != total {
-        return Err(Error::backend(format!(
+        return Err(diagnostic(format_args!(
             "segmented attention lengths sum to {sum}, expected {total}"
         )));
     }
@@ -397,36 +484,42 @@ mod attention_state_source_tests {
 #[cfg(test)]
 mod recurrent_encoder_contract_tests {
     use super::{
-        reference_expand_heads, reference_segmented_attention, validate_segment_lengths,
-        NormalizationConstructionSpec, NormalizationScale,
+        NormalizationConstructionSpec, NormalizationScale, reference_expand_heads,
+        reference_segmented_attention, validate_segment_lengths,
     };
 
     #[test]
     fn normalization_construction_rejects_invalid_geometry_and_scalars() {
-        assert!(NormalizationConstructionSpec {
-            groups: None,
-            dimensions: 8,
-            epsilon: 1e-6,
-            scale: NormalizationScale::Unit,
-        }
-        .validate()
-        .is_ok());
-        assert!(NormalizationConstructionSpec {
-            groups: None,
-            dimensions: 0,
-            epsilon: 1e-6,
-            scale: NormalizationScale::Unit,
-        }
-        .validate()
-        .is_err());
-        assert!(NormalizationConstructionSpec {
-            groups: None,
-            dimensions: 8,
-            epsilon: f32::NAN,
-            scale: NormalizationScale::Unit,
-        }
-        .validate()
-        .is_err());
+        assert!(
+            NormalizationConstructionSpec {
+                groups: None,
+                dimensions: 8,
+                epsilon: 1e-6,
+                scale: NormalizationScale::Unit,
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            NormalizationConstructionSpec {
+                groups: None,
+                dimensions: 0,
+                epsilon: 1e-6,
+                scale: NormalizationScale::Unit,
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            NormalizationConstructionSpec {
+                groups: None,
+                dimensions: 8,
+                epsilon: f32::NAN,
+                scale: NormalizationScale::Unit,
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -598,6 +691,9 @@ impl<T: Tensor> RelativeAttentionInput<'_, T> {
     }
 }
 
+mod indexed_attention;
+pub use indexed_attention::{IndexedAttentionGeometry, IndexedAttentionValidationError};
+
 impl<T: Tensor> IndexedAttentionInput<'_, T> {
     /// Validates semantic ranks and exact non-broadcast geometry without
     /// materializing any backend values.
@@ -608,48 +704,50 @@ impl<T: Tensor> IndexedAttentionInput<'_, T> {
         let pooled_keys = self.pooled_keys.shape();
         let pooled_values = self.pooled_values.shape();
         let selected = self.selected_positions.shape();
-        if query.len() != 4
-            || local_keys.len() != 3
-            || local_values.len() != 3
-            || pooled_keys.len() != 3
-            || pooled_values.len() != 3
-            || selected.len() != 3
-            || query[0] != local_keys[0]
-            || query[0] != local_values[0]
-            || query[0] != pooled_keys[0]
-            || query[0] != pooled_values[0]
-            || query[0] != selected[0]
-            || query[2] != selected[1]
-            || query[3] != local_keys[2]
-            || query[3] != pooled_keys[2]
-            || local_keys[1] != local_values[1]
-            || pooled_keys[1] != pooled_values[1]
-            || local_values[2] != pooled_values[2]
-            || selected[2] <= 0
-            || pooled_keys[1] <= 0
-        {
-            return Err(Error::backend(format!(
-                "invalid indexed-attention geometry: queries={query:?} local_keys={local_keys:?} local_values={local_values:?} pooled_keys={pooled_keys:?} pooled_values={pooled_values:?} selected={selected:?}"
-            )));
-        }
-        if !self.scale.is_finite() || self.scale <= 0.0 {
-            return Err(Error::backend(format!(
-                "indexed-attention scale must be finite and positive, got {}",
-                self.scale
-            )));
-        }
-        if let Some(sinks) = self.sinks {
-            if sinks.shape() != [query[1]] {
+        match self.geometry() {
+            Err(IndexedAttentionValidationError::Geometry) => {
+                return Err(Error::backend(format!(
+                    "invalid indexed-attention geometry: queries={query:?} local_keys={local_keys:?} local_values={local_values:?} pooled_keys={pooled_keys:?} pooled_values={pooled_values:?} selected={selected:?}"
+                )));
+            }
+            Err(IndexedAttentionValidationError::Scale) => {
+                return Err(Error::backend(format!(
+                    "indexed-attention scale must be finite and positive, got {}",
+                    self.scale
+                )));
+            }
+            Err(IndexedAttentionValidationError::Sinks) => {
+                let sinks = self.sinks.expect("validated sink mismatch");
                 return Err(Error::backend(format!(
                     "indexed-attention sinks require shape [{}], got {:?}",
                     query[1],
                     sinks.shape()
                 )));
             }
+            Ok(_) => Ok(()),
         }
-        Ok(())
+    }
+
+    /// Checks the same semantic contract without formatting or owning a diagnostic.
+    pub fn geometry(&self) -> Result<IndexedAttentionGeometry, IndexedAttentionValidationError> {
+        IndexedAttentionGeometry::new(
+            [
+                self.queries.shape(),
+                self.local_keys.shape(),
+                self.local_values.shape(),
+                self.pooled_keys.shape(),
+                self.pooled_values.shape(),
+                self.selected_positions.shape(),
+            ],
+            self.scale,
+            self.sinks.map(Tensor::shape),
+        )
     }
 }
+
+mod module_construction;
+mod parameter_source;
+pub use parameter_source::{ParameterMetadataView, ParameterSourceError, ParameterSourceVisitor};
 
 /// Stable authoritative identity of one logical model parameter.
 #[derive(Debug, Clone, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -659,9 +757,9 @@ impl ParameterId {
     /// Creates a non-empty parameter identity.
     pub fn new(id: impl Into<String>) -> Result<Self, ParameterTopologyError> {
         let id = id.into();
-        if id.trim().is_empty() {
-            return Err(ParameterTopologyError::EmptyId);
-        }
+        ParameterNameView::new(&id)
+            .validate_fixed()
+            .map_err(|_| ParameterTopologyError::EmptyId)?;
         Ok(Self(id))
     }
 
@@ -742,15 +840,7 @@ pub struct ParameterMetadata {
 impl ParameterMetadata {
     /// Creates traversal metadata from a construction specification.
     pub fn from_spec(spec: &ParameterSpec, trainable: bool) -> Self {
-        Self {
-            id: spec.id.clone(),
-            trainable,
-            alias_of: spec.alias_of.clone(),
-            group: spec.group.clone(),
-            linear_companion: spec.linear_companion,
-            linear_companion_of: spec.linear_companion_of.clone(),
-            linear_row_layout: spec.linear_row_layout,
-        }
+        ParameterMetadataView::from_spec(spec, trainable).to_owned()
     }
 }
 
@@ -785,12 +875,39 @@ pub enum ParameterTopologyError {
 pub trait ParameterVisitor<'a, T: 'a> {
     /// Visits one authoritative parameter slot.
     fn visit(&mut self, metadata: ParameterMetadata, value: &'a T);
+
+    /// Visits metadata borrowed from the actual retained declaration.
+    /// Existing ordinary visitors retain their owned adapter semantics.
+    fn visit_borrowed(&mut self, metadata: ParameterMetadataView<'_>, value: &'a T) {
+        self.visit(metadata.to_owned(), value);
+    }
+
+    /// Requests the borrowed companion instead of an allocating legacy adapter.
+    fn requires_borrowed_metadata(&self) -> bool {
+        false
+    }
+
+    /// Reports a legacy participant without entering its allocating adapter.
+    fn borrowed_metadata_unavailable(&mut self) {}
 }
 
 /// Mutable statically dispatched parameter visitor.
 pub trait ParameterVisitorMut<'a, T: 'a> {
     /// Visits one authoritative mutable parameter slot.
     fn visit_mut(&mut self, metadata: ParameterMetadata, value: &'a mut T);
+
+    /// Visits mutable storage with its retained borrowed declaration.
+    fn visit_mut_borrowed(&mut self, metadata: ParameterMetadataView<'_>, value: &'a mut T) {
+        self.visit_mut(metadata.to_owned(), value);
+    }
+
+    /// Requests the borrowed companion instead of an allocating legacy adapter.
+    fn requires_borrowed_metadata(&self) -> bool {
+        false
+    }
+
+    /// Reports a legacy participant without entering its allocating adapter.
+    fn borrowed_metadata_unavailable(&mut self) {}
 }
 
 /// Object-safe traversal of loaded parameter slots at a quiescent boundary.
@@ -808,6 +925,34 @@ pub trait ParameterSlotVisitor<T> {
 /// visitor replaces a parameter value; runtime binding relies on this law to
 /// validate the whole topology before publishing any replacement.
 pub trait Parameterized<T: 'static> {
+    /// Borrows named parameter metadata and all known retained numerical fields.
+    ///
+    /// The strict default does not call any ordinary allocating visitor. A child
+    /// failure prevents complete coverage, even when later known values are
+    /// visited. Consumers must not publish a complete source from partial visits.
+    /// Implementations and consumers retain their actual source/callback storage;
+    /// this traversal conveys no allocation, completion or admission authority.
+    fn visit_parameter_sources<'a, V>(
+        &'a self,
+        _visitor: &mut V,
+    ) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, T>,
+    {
+        Err(ParameterSourceError::Unavailable)
+    }
+
+    /// Stable maximum number of retained value visits for this actual topology.
+    /// Includes optional physical fields ordinary execution can populate; aliases
+    /// count separately. None means unknown or checked arithmetic overflow.
+    /// This read-only diagnostic allocates no tensors and grants no storage,
+    /// completeness, source identity or accounting authority. A consumer retaining
+    /// this fact must bind the actual instance/topology and revalidate replacement;
+    /// changing container membership or an enum variant invalidates the old fact.
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        None
+    }
+
     /// Visits every parameter exactly once using stable identities.
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
@@ -820,6 +965,38 @@ pub trait Parameterized<T: 'static> {
 
     /// Updates whether all parameters in this module are trainable.
     fn set_trainable(&mut self, trainable: bool);
+
+    /// Borrows every retained numerical value, including nonparameter buffers.
+    ///
+    /// Returns true only when all retained numerical owners are represented by
+    /// visited values or recursively complete children. False preserves partial
+    /// evidence: implementations must still visit every known child, without
+    /// short-circuiting after an incomplete one. Metadata has no numerical payload.
+    ///
+    /// This read-only traversal must not allocate/materialize tensors, execute
+    /// operators, mutate state or change parameter topology. Aliases may repeat;
+    /// a backend must separately inspect and deduplicate physical backing. The
+    /// default exposes parameters but cannot certify absence of other owners.
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
+        visit_parameter_values(self, visitor);
+        false
+    }
+}
+
+/// Borrows the values retained by a parameter module without granting slot
+/// replacement or implying that logical aliases own separate allocations.
+/// Consumers that retain handles must account for their physical ownership.
+pub fn visit_parameter_values<T: 'static, M: Parameterized<T> + ?Sized>(
+    module: &M,
+    visitor: &mut dyn FnMut(&T),
+) {
+    struct Values<'a, T>(&'a mut dyn FnMut(&T));
+    impl<'a, T: 'static> ParameterVisitor<'a, T> for Values<'_, T> {
+        fn visit(&mut self, _: ParameterMetadata, value: &'a T) {
+            self.0(value);
+        }
+    }
+    module.visit_parameters(&mut Values(visitor));
 }
 
 /// Collects and validates the stable parameter topology exposed by a module.
@@ -907,29 +1084,12 @@ pub struct LinearFormatSpec {
 impl LinearFormatSpec {
     /// Declares a dense or checkpoint-native encoding with no companions.
     pub fn unscaled(format: LinearFormat) -> Result<Self, Error> {
-        let spec = Self {
-            format,
-            scale: None,
-            affine_bias: None,
-            row_layout: LinearRowLayout::Contiguous,
-        };
-        spec.validate()?;
-        Ok(spec)
+        Self::from_parts_with(format, None, None, None)
     }
 
     /// Declares an encoding with one exact scale companion.
     pub fn scaled(format: LinearFormat, scale: ParameterSpec) -> Result<Self, Error> {
-        let mut scale = scale;
-        scale.linear_companion = Some(LinearCompanionRole::Scale);
-        scale.linear_companion_of = None;
-        let spec = Self {
-            format,
-            scale: Some(scale),
-            affine_bias: None,
-            row_layout: LinearRowLayout::Contiguous,
-        };
-        spec.validate()?;
-        Ok(spec)
+        Self::from_parts_with(format, Some(scale), None, None)
     }
 
     /// Declares an affine encoding with exact scale and bias companions.
@@ -938,20 +1098,7 @@ impl LinearFormatSpec {
         scale: ParameterSpec,
         affine_bias: ParameterSpec,
     ) -> Result<Self, Error> {
-        let mut scale = scale;
-        scale.linear_companion = Some(LinearCompanionRole::Scale);
-        scale.linear_companion_of = None;
-        let mut affine_bias = affine_bias;
-        affine_bias.linear_companion = Some(LinearCompanionRole::AffineBias);
-        affine_bias.linear_companion_of = None;
-        let spec = Self {
-            format,
-            scale: Some(scale),
-            affine_bias: Some(affine_bias),
-            row_layout: LinearRowLayout::Contiguous,
-        };
-        spec.validate()?;
-        Ok(spec)
+        Self::from_parts_with(format, Some(scale), Some(affine_bias), None)
     }
 
     /// Physical tensor encoding.
@@ -983,69 +1130,13 @@ impl LinearFormatSpec {
 
     /// Validates that companion cardinality matches the physical encoding.
     pub fn validate(&self) -> Result<(), Error> {
-        self.format.validate().map_err(Error::backend)?;
-        if self.row_layout != LinearRowLayout::Contiguous
-            && !matches!(self.format, LinearFormat::E4M3BlockFp8(_))
-        {
-            return Err(Error::backend(
-                "independent row blocks require a block-FP8 encoding",
-            ));
-        }
-        let expected = match self.format {
-            LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => (false, false),
-            LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => (true, false),
-            LinearFormat::Affine(_) => (true, true),
-        };
-        if (self.scale.is_some(), self.affine_bias.is_some()) != expected {
-            return Err(Error::backend(format!(
-                "linear format {:?} requires scale/bias companions {:?}, got {:?}",
-                self.format,
-                expected,
-                (self.scale.is_some(), self.affine_bias.is_some())
-            )));
-        }
-        if self
-            .scale
-            .as_ref()
-            .zip(self.affine_bias.as_ref())
-            .is_some_and(|(scale, bias)| scale.id == bias.id)
-        {
-            return Err(Error::backend(
-                "linear scale and affine-bias companions require distinct identities",
-            ));
-        }
-        if self
-            .scale
-            .as_ref()
-            .is_some_and(|scale| scale.linear_companion != Some(LinearCompanionRole::Scale))
-            || self
-                .affine_bias
-                .as_ref()
-                .is_some_and(|bias| bias.linear_companion != Some(LinearCompanionRole::AffineBias))
-        {
-            return Err(Error::backend(
-                "linear format companions have invalid semantic roles",
-            ));
-        }
-        Ok(())
+        self.validate_fixed().map_err(Error::backend)
     }
 
     /// Validates companions against the primary weight identity.
     pub fn validate_for_weight(&self, weight: &ParameterSpec) -> Result<(), Error> {
-        self.validate()?;
-        if self
-            .scale
-            .as_ref()
-            .into_iter()
-            .chain(self.affine_bias.as_ref())
-            .any(|companion| companion.id == weight.id)
-        {
-            return Err(Error::backend(format!(
-                "linear format companion reuses primary weight identity {}",
-                weight.id
-            )));
-        }
-        Ok(())
+        self.validate_for_weight_fixed(weight)
+            .map_err(|cause| cause.into_ordinary(weight))
     }
 }
 
@@ -1061,29 +1152,13 @@ pub struct VocabularyParallelRange {
 impl VocabularyParallelRange {
     /// Validates non-empty in-bounds ownership.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.global_vocabulary == 0
-            || self.local.is_empty()
-            || self.local.end > self.global_vocabulary
-        {
-            return Err(Error::backend(format!(
-                "invalid vocabulary-parallel range {:?} of {}",
-                self.local, self.global_vocabulary
-            )));
-        }
-        Ok(())
+        self.validate_fixed().map_err(Error::from)
     }
 
     /// Validates that an operator's declared global row count is exactly this
     /// ownership range's global vocabulary.
     pub fn validate_global_rows(&self, rows: i32) -> Result<(), Error> {
-        self.validate()?;
-        if usize::try_from(rows).ok() != Some(self.global_vocabulary) {
-            return Err(Error::backend(format!(
-                "vocabulary-parallel operator declares {rows} rows but ownership covers {}",
-                self.global_vocabulary
-            )));
-        }
-        Ok(())
+        self.validate_global_rows_fixed(rows).map_err(Error::from)
     }
 
     /// Returns the exact balanced peer widths after proving this rank's local
@@ -1097,26 +1172,10 @@ impl VocabularyParallelRange {
         partitions: usize,
         rank: usize,
     ) -> Result<Vec<usize>, Error> {
-        self.validate()?;
-        if partitions == 0 || rank >= partitions {
-            return Err(Error::backend(format!(
-                "invalid vocabulary partition rank {rank} of {partitions}"
-            )));
-        }
-        let base = self.global_vocabulary / partitions;
-        let remainder = self.global_vocabulary % partitions;
-        let widths = (0..partitions)
-            .map(|peer| base + usize::from(peer < remainder))
-            .collect::<Vec<_>>();
-        let start = widths[..rank].iter().sum::<usize>();
-        let expected = start..start + widths[rank];
-        if self.local != expected {
-            return Err(Error::backend(format!(
-                "vocabulary-parallel range {:?} differs from balanced rank {rank} ownership {expected:?}",
-                self.local
-            )));
-        }
-        Ok(widths)
+        Ok(self
+            .balanced_peer_widths_plan(partitions, rank)?
+            .widths()
+            .collect())
     }
 }
 
@@ -1153,14 +1212,7 @@ pub enum EmbeddingLookupPolicy {
 impl EmbeddingLookupPolicy {
     /// Validates that the optional sentinel cannot alias an ordinary row.
     pub fn validate(self) -> Result<(), Error> {
-        if let Self::ZeroSentinel(sentinel) = self {
-            if sentinel >= 0 {
-                return Err(Error::backend(format!(
-                    "embedding zero sentinel must be negative, got {sentinel}"
-                )));
-            }
-        }
-        Ok(())
+        self.validate_fixed().map_err(Error::backend)
     }
 }
 
@@ -1174,13 +1226,7 @@ pub struct FusedProjectionSegment {
 impl FusedProjectionSegment {
     /// Creates a validated component declaration.
     pub fn new(name: impl Into<String>, width: i32) -> Result<Self, Error> {
-        let name = name.into();
-        if name.trim().is_empty() || width <= 0 {
-            return Err(Error::backend(format!(
-                "fused projection segments require a name and positive width, got name={name:?} width={width}"
-            )));
-        }
-        Ok(Self { name, width })
+        Self::from_owned_with(name.into(), width, None)
     }
 
     /// Returns the stable component name.
@@ -1204,29 +1250,7 @@ pub struct FusedProjectionLayout {
 impl FusedProjectionLayout {
     /// Validates ordered unique components and checked total width.
     pub fn new(segments: impl IntoIterator<Item = FusedProjectionSegment>) -> Result<Self, Error> {
-        let segments = segments.into_iter().collect::<Vec<_>>();
-        if segments.is_empty() {
-            return Err(Error::backend(
-                "fused projection layout must contain at least one segment",
-            ));
-        }
-        let mut names = std::collections::BTreeSet::new();
-        let mut output_width = 0i32;
-        for segment in &segments {
-            if !names.insert(segment.name.clone()) {
-                return Err(Error::backend(format!(
-                    "fused projection segment {:?} is duplicated",
-                    segment.name
-                )));
-            }
-            output_width = output_width.checked_add(segment.width).ok_or_else(|| {
-                Error::backend("fused projection output width overflowed signed 32-bit geometry")
-            })?;
-        }
-        Ok(Self {
-            segments,
-            output_width,
-        })
+        Self::from_owned_with(segments.into_iter().collect(), None)
     }
 
     /// Returns component declarations in physical output order.
@@ -1322,24 +1346,8 @@ impl NormalizationConstructionSpec {
 
     /// Validates feature geometry and fixed scalar policy.
     pub fn validate(&self) -> Result<(), Error> {
-        let offset = match &self.scale {
-            NormalizationScale::LearnedOffset { offset, .. } => Some(*offset),
-            NormalizationScale::Learned(_) | NormalizationScale::Unit => None,
-        };
-        if self.dimensions <= 0
-            || self
-                .groups
-                .is_some_and(|groups| groups <= 0 || self.dimensions % groups != 0)
-            || !self.epsilon.is_finite()
-            || self.epsilon <= 0.0
-            || offset.is_some_and(|offset| !offset.is_finite())
-        {
-            return Err(Error::backend(format!(
-                "invalid RMS normalization construction: dimensions={} epsilon={} offset={offset:?}",
-                self.dimensions, self.epsilon
-            )));
-        }
-        Ok(())
+        self.validate_fixed()
+            .map_err(|cause| cause.into_ordinary(self))
     }
 }
 
@@ -1392,49 +1400,8 @@ pub enum RotaryAlgorithm {
 impl RotaryAlgorithm {
     /// Validates the complete scalar geometry of this normalized algorithm.
     pub fn validate(self) -> Result<(), Error> {
-        let positive = |value: f32| value.is_finite() && value > 0.0;
-        let valid = match self {
-            Self::Default => true,
-            Self::Linear { factor } => positive(factor),
-            Self::Llama3 {
-                factor,
-                low_frequency_factor,
-                high_frequency_factor,
-                original_max_positions,
-            } => {
-                positive(factor)
-                    && positive(low_frequency_factor)
-                    && positive(high_frequency_factor)
-                    && high_frequency_factor > low_frequency_factor
-                    && original_max_positions > 0
-            }
-            Self::Proportional {
-                factor,
-                rotary_fraction,
-            } => positive(factor) && positive(rotary_fraction) && rotary_fraction <= 1.0,
-            Self::Yarn {
-                factor,
-                original_max_positions,
-                beta_fast,
-                beta_slow,
-                amplitude,
-                ..
-            } => {
-                positive(factor)
-                    && original_max_positions > 0
-                    && positive(beta_fast)
-                    && positive(beta_slow)
-                    && beta_fast > beta_slow
-                    && positive(amplitude)
-            }
-        };
-        if valid {
-            Ok(())
-        } else {
-            Err(Error::backend(format!(
-                "invalid normalized rotary algorithm: {self:?}"
-            )))
-        }
+        self.validate_fixed()
+            .map_err(|_| Error::backend(format!("invalid normalized rotary algorithm: {self:?}")))
     }
 }
 
@@ -1500,7 +1467,8 @@ pub enum TensorElementType {
 /// these facts describe the generated value and its additional creation cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GeneratedTensorSource {
-    /// Conservative native storage bound for the source graph and temporaries.
+    /// Conservative logical capture quota for the source graph and temporaries.
+    /// Selected physical allocation facts remain a separate admission requirement.
     pub creation_bytes: u64,
     /// Actual scalar type promised by the mechanism, or unknown to that mechanism.
     pub element_type: Option<TensorElementType>,
@@ -1512,7 +1480,8 @@ pub trait TensorValueObserver<T: Tensor> {
     /// Borrows a value already needed by inference.
     fn observe(&mut self, input: &T) -> Result<(), Error>;
     /// Offers an additional diagnostic of exactly the prototype's geometry.
-    /// `source` conservatively covers its native graph and temporaries.
+    /// `source` carries the logical creation quota and promised scalar type.
+    /// Physical admission separately prices the selected creation program.
     /// The factory may be omitted when the observation is not selected.
     fn observe_generated(
         &mut self,
@@ -1520,6 +1489,17 @@ pub trait TensorValueObserver<T: Tensor> {
         source: &GeneratedTensorSource,
         generate: &mut dyn FnMut() -> Result<T, Error>,
     ) -> Result<(), Error>;
+    /// Offers the same diagnostic with explicit input/partial-output retention.
+    /// Legacy observers retain their selection and factory laziness unchanged.
+    /// Retention is an operation-lifetime contract, not a byte allowance.
+    fn observe_generated_retained(
+        &mut self,
+        prototype: &T,
+        source: &GeneratedTensorSource,
+        factory: &mut dyn RetainedGeneratedTensorFactory<T, Error>,
+    ) -> Result<(), Error> {
+        self.observe_generated(prototype, source, &mut || factory.generate(&mut |_| Ok(())))
+    }
 }
 
 /// Actual projection-input evidence, including selected input quantization.
@@ -2013,33 +1993,8 @@ impl TopKGroupSelectorSpec {
 
     /// Validates positive input geometry.
     pub fn validate(&self) -> Result<(), Error> {
-        self.format.validate_for_weight(&self.weight)?;
-        if self.input_dimensions <= 0 {
-            return Err(Error::backend(format!(
-                "selector input dimensions must be positive, got {}",
-                self.input_dimensions
-            )));
-        }
-        if self
-            .input_transform
-            .as_ref()
-            .is_some_and(|transform| !transform.epsilon.is_finite() || transform.epsilon < 0.0)
-        {
-            return Err(Error::backend(
-                "selector input RMS epsilon must be finite and nonnegative",
-            ));
-        }
-        if self
-            .bias
-            .as_ref()
-            .zip(self.correction_bias.as_ref())
-            .is_some_and(|(bias, correction_bias)| bias.id == correction_bias.id)
-        {
-            return Err(Error::backend(
-                "selector projection bias and correction bias require distinct parameter identities",
-            ));
-        }
-        Ok(())
+        self.validate_fixed()
+            .map_err(|cause| cause.into_ordinary(self))
     }
 }
 
@@ -2213,6 +2168,7 @@ impl JointGroupSelectionSpec {
     ) -> Result<Self, Error> {
         if selectable_groups <= 0
             || always_on_groups <= 0
+            || selectable_groups.checked_add(always_on_groups).is_none()
             || top_k <= 0
             || top_k > selectable_groups
             || !coefficient_scale.is_finite()
@@ -2329,6 +2285,7 @@ impl<T: Tensor> JointGroupSelectionInput<'_, T> {
         let scale = self.global_scale.shape();
         let hidden_width = hidden.last().copied().unwrap_or(0);
         if hidden.len() < 2
+            || hidden_width <= 0
             || weight
                 != [
                     self.selectable_groups() + self.always_on_groups(),
@@ -2455,21 +2412,8 @@ impl GatedProductPolicy {
 
     /// Validates finite scalars and positive bounds/multiplier.
     pub fn validate(self) -> Result<(), Error> {
-        if self
-            .gate_upper_bound
-            .is_some_and(|bound| !bound.is_finite() || bound <= 0.0)
-            || self
-                .up_absolute_bound
-                .is_some_and(|bound| !bound.is_finite() || bound <= 0.0)
-            || !self.sigmoid_multiplier.is_finite()
-            || self.sigmoid_multiplier <= 0.0
-            || !self.up_offset.is_finite()
-        {
-            return Err(Error::backend(format!(
-                "invalid gated-product policy: {self:?}"
-            )));
-        }
-        Ok(())
+        self.validate_fixed()
+            .map_err(|_| Error::backend(format!("invalid gated-product policy: {self:?}")))
     }
 
     /// Gate activation.
@@ -2606,29 +2550,13 @@ impl GroupedProjectionSpec {
         &self.format
     }
     fn validate(&self) -> Result<(), Error> {
-        self.format.validate_for_weight(&self.weight)?;
-        let parameters = self.parameters();
-        for (index, parameter) in parameters.iter().enumerate() {
-            if parameters[index + 1..]
-                .iter()
-                .any(|candidate| candidate.id == parameter.id)
-            {
-                return Err(Error::backend(format!(
-                    "grouped projection reuses parameter identity {:?}",
-                    parameter.id
-                )));
-            }
-        }
-        Ok(())
+        self.validate_fixed()
+            .map_err(|cause| cause.into_ordinary(self))
     }
 
     /// Returns weight, optional bias, and physical companions in binding order.
     pub fn parameters(&self) -> Vec<&ParameterSpec> {
-        let mut parameters = vec![&self.weight];
-        parameters.extend(self.bias.as_ref());
-        parameters.extend(self.format.scale());
-        parameters.extend(self.format.affine_bias());
-        parameters
+        self.parameters_borrowed().collect()
     }
 }
 
@@ -2746,57 +2674,8 @@ impl GroupedGatedProductSpec {
     }
     /// Validates positive geometry and exact independent-group cardinality.
     pub fn validate(&self) -> Result<(), Error> {
-        for (name, value) in [
-            ("group_count", self.group_count),
-            ("input_dimensions", self.input_dimensions),
-            ("intermediate_dimensions", self.intermediate_dimensions),
-            ("output_dimensions", self.output_dimensions),
-        ] {
-            if value <= 0 {
-                return Err(Error::backend(format!(
-                    "gated-product group-bank {name} must be positive, got {value}"
-                )));
-            }
-        }
-        self.policy.validate()?;
-        if let GatedProductGroupLayout::Independent(groups) = &self.layout {
-            let expected = usize::try_from(self.group_count).map_err(Error::backend)?;
-            if groups.len() != expected {
-                return Err(Error::backend(format!(
-                    "independent gated-product bank has {} groups, expected {expected}",
-                    groups.len()
-                )));
-            }
-        }
-        let projections = match &self.layout {
-            GatedProductGroupLayout::Packed { gate_up, down } => {
-                gate_up
-                    .format()
-                    .row_layout()
-                    .rows_per_partition(self.intermediate_dimensions as usize * 2)?;
-                down.format()
-                    .row_layout()
-                    .rows_per_partition(self.output_dimensions as usize)?;
-                vec![gate_up, down]
-            }
-            GatedProductGroupLayout::Independent(groups) => groups
-                .iter()
-                .flat_map(|group| [&group.gate, &group.up, &group.down])
-                .collect(),
-        };
-        let mut identities = std::collections::BTreeSet::new();
-        for projection in projections {
-            projection.validate()?;
-            for parameter in projection.parameters() {
-                let identity = &parameter.id;
-                if !identities.insert(identity) {
-                    return Err(Error::backend(format!(
-                        "gated-product group parameter identity {identity} is duplicated"
-                    )));
-                }
-            }
-        }
-        Ok(())
+        self.validate_fixed()
+            .map_err(|cause| cause.into_ordinary(self))
     }
 }
 
@@ -2957,24 +2836,8 @@ impl GroupedRelu2Spec {
     }
     /// Validates positive geometry.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.group_count <= 0 || self.hidden_dimensions <= 0 || self.intermediate_dimensions <= 0
-        {
-            return Err(Error::backend("invalid ReLU2 group-bank geometry"));
-        }
-        self.up.validate()?;
-        self.down.validate()?;
-        let mut identities = std::collections::BTreeSet::new();
-        for projection in [&self.up, &self.down] {
-            for parameter in projection.parameters() {
-                if !identities.insert(&parameter.id) {
-                    return Err(Error::backend(format!(
-                        "ReLU2 group parameter identity {} is duplicated",
-                        parameter.id
-                    )));
-                }
-            }
-        }
-        Ok(())
+        self.validate_fixed()
+            .map_err(|cause| cause.into_ordinary(self))
     }
 }
 
@@ -3036,8 +2899,39 @@ pub trait TensorParallelGroupedRelu2Operator<T: Tensor>: GroupedRelu2Operator<T>
     }
 }
 
+mod indexed_invocation;
+pub use indexed_invocation::PreparedIndexedInvocationLoan;
+
 /// Neural backend extension for grouped computation.
 pub trait GroupedNeuralBackend: NeuralBackend {
+    /// Metadata-only interception of the same whole addressable callback. Native
+    /// backends return None and execute the existing provider; WorkspaceBackend
+    /// records the original source and borrows its prospective observer once.
+    fn record_addressable_region_source(
+        _source:workspace::WorkspaceAddressableRegionView<'_>,_input:&Self::Tensor,
+        _routes:&GroupSelection<Self::Tensor>,_context:&<Self::Tensor as Tensor>::Context,
+        _observe:Option<&mut dyn FnMut(workspace::WorkspaceAddressableObservationView<'_>)
+            ->Result<workspace::WorkspaceAddressableObservationSource,Error>>)
+        ->Result<Option<TensorParallelGroupedOutput<Self::Tensor>>,Error>{Ok(None)}
+
+    /// Encloses one independently addressable provider invocation, including its
+    /// spec copy, normalization, selected chunks and output joins. The default
+    /// executes the same callback. Cold and native backends must bind this
+    /// distinct source, without treating it as expert exchange.
+    fn with_addressable_region<P, E, F>(
+        source: workspace::WorkspaceAddressableRegionView<'_>,
+        owner: &mut P,
+        input: &Self::Tensor,
+        routes: &GroupSelection<Self::Tensor>,
+        context: &<Self::Tensor as Tensor>::Context,
+        run: F,
+    ) -> Result<Result<TensorParallelGroupedOutput<Self::Tensor>, E>, Error>
+    where F: FnOnce(&mut P, Option<PreparedIndexedInvocationLoan<'_>>)
+        -> Result<TensorParallelGroupedOutput<Self::Tensor>, E> {
+        let _ = (source, input, routes, context);
+        Ok(run(owner, None))
+    }
+
     /// Activated selected projections with an explicitly owned output partition.
     type LinearGroups: GroupedLinearOperator<Self::Tensor>;
 
@@ -3244,22 +3138,7 @@ pub struct HyperConnectionSpec {
 impl HyperConnectionSpec {
     /// Validates geometry and numerical policy without inspecting parameters.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.streams <= 0 || self.hidden_size <= 0 {
-            return Err(Error::backend(
-                "hyper-connection streams and hidden size must be positive",
-            ));
-        }
-        if self.sinkhorn_iterations == 0 {
-            return Err(Error::backend(
-                "hyper-connection Sinkhorn iteration count must be positive",
-            ));
-        }
-        if !self.epsilon.is_finite() || self.epsilon <= 0.0 {
-            return Err(Error::backend(
-                "hyper-connection epsilon must be finite and positive",
-            ));
-        }
-        Ok(())
+        self.validate_fixed().map_err(Error::backend)
     }
 }
 
@@ -3285,21 +3164,7 @@ pub struct HyperHeadSpec {
 impl HyperHeadSpec {
     /// Validates geometry and numerical policy without inspecting parameters.
     pub fn validate(&self) -> Result<(), Error> {
-        if self.streams <= 0 || self.hidden_size <= 0 {
-            return Err(Error::backend(
-                "hyper-head streams and hidden size must be positive",
-            ));
-        }
-        if !self.norm_epsilon.is_finite()
-            || self.norm_epsilon <= 0.0
-            || !self.epsilon.is_finite()
-            || self.epsilon <= 0.0
-        {
-            return Err(Error::backend(
-                "hyper-head epsilons must be finite and positive",
-            ));
-        }
-        Ok(())
+        self.validate_fixed().map_err(Error::backend)
     }
 }
 
@@ -3674,6 +3539,68 @@ pub struct BlockwiseAttentionSpec<'a, T> {
     pub sinks: Option<&'a T>,
 }
 
+/// Exact score arithmetic used by the existing blockwise numerical worker.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BlockwiseAttentionOptions {
+    /// Rounding policy; InputScores requires a second ordered value pass.
+    pub arithmetic: AttentionArithmetic,
+    /// Optional positive finite tanh score cap, applied before additive bias.
+    pub softcap: Option<f32>,
+}
+impl Default for BlockwiseAttentionOptions {
+    fn default() -> Self {
+        Self {
+            arithmetic: AttentionArithmetic::Fused,
+            softcap: None,
+        }
+    }
+}
+impl BlockwiseAttentionOptions {
+    /// Validates policy without allocation or native source access.
+    pub fn validate(self) -> Result<(), BlockwiseAttentionPolicyError> {
+        if self
+            .softcap
+            .is_some_and(|cap| !cap.is_finite() || cap <= 0.0)
+        {
+            return Err(BlockwiseAttentionPolicyError::Softcap);
+        }
+        Ok(())
+    }
+    /// Number of complete ordered scans used by this actual rounding policy.
+    pub fn passes(self) -> usize {
+        if self.arithmetic == AttentionArithmetic::InputScores {
+            2
+        } else {
+            1
+        }
+    }
+}
+/// Typed refusal from a backend that does not supply an exact blockwise variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BlockwiseAttentionPolicyError {
+    /// Score caps must be finite and positive.
+    #[error("blockwise score cap must be positive and finite")]
+    Softcap,
+    /// The backend implements only the original default descriptor.
+    #[error("backend does not implement this blockwise score policy")]
+    Options,
+    /// This backend has no rounded-probability value-pass worker.
+    #[error("backend does not implement a blockwise value pass")]
+    ValuePass,
+    /// This backend has no per-block additive bias worker.
+    #[error("backend does not implement blockwise additive bias")]
+    Bias,
+}
+fn blockwise_policy_error<B: NeuralBackend>(
+    cause: BlockwiseAttentionPolicyError,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Error {
+    match B::construction_metadata(context) {
+        Some(metadata) => metadata.metadata_source(cause),
+        None => Error::backend_source(cause),
+    }
+}
+
 /// Typed backend fusion for exact online softmax across ordered attention
 /// blocks. Persistent caches remain compressed; only one reconstructed block
 /// is live at a time.
@@ -3686,6 +3613,56 @@ pub trait BlockwiseAttentionBackend: NeuralBackend {
         spec: BlockwiseAttentionSpec<'_, Self::Tensor>,
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::BlockwiseAccumulator, Error>;
+
+    /// Starts the same recurrence with its exact capping and rounding policy.
+    /// Defaults remain compatible; nondefault policies require a real worker.
+    fn begin_blockwise_attention_with_options(
+        spec: BlockwiseAttentionSpec<'_, Self::Tensor>,
+        options: BlockwiseAttentionOptions,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<Self::BlockwiseAccumulator, Error> {
+        options
+            .validate()
+            .map_err(|cause| blockwise_policy_error::<Self>(cause, context))?;
+        if options != BlockwiseAttentionOptions::default() {
+            return Err(blockwise_policy_error::<Self>(
+                BlockwiseAttentionPolicyError::Options,
+                context,
+            ));
+        }
+        Self::begin_blockwise_attention(spec, context)
+    }
+
+    /// Retains the completed global normalization and starts the second scan.
+    fn begin_blockwise_value_pass(
+        _accumulator: &mut Self::BlockwiseAccumulator,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<(), Error> {
+        Err(blockwise_policy_error::<Self>(
+            BlockwiseAttentionPolicyError::ValuePass,
+            context,
+        ))
+    }
+
+    /// Applies an actual per-block additive bias through the same numerical worker.
+    /// A caller must construct the bias from its selected source and coordinates.
+    fn accumulate_blockwise_attention_with_bias(
+        accumulator: &mut Self::BlockwiseAccumulator,
+        start: i64,
+        end: i64,
+        keys: Self::Tensor,
+        values: Self::Tensor,
+        bias: Option<&Self::Tensor>,
+        context: &<Self::Tensor as Tensor>::Context,
+    ) -> Result<u64, Error> {
+        if bias.is_some() {
+            return Err(blockwise_policy_error::<Self>(
+                BlockwiseAttentionPolicyError::Bias,
+                context,
+            ));
+        }
+        Self::accumulate_blockwise_attention(accumulator, start, end, keys, values, context)
+    }
 
     /// Incorporates one absolute key/value block and reports transient bytes.
     fn accumulate_blockwise_attention(
@@ -3736,7 +3713,7 @@ pub trait CompressedAttentionCache<T: Tensor>: Debug {
     fn checkpoint(&self) -> Self::Checkpoint;
     /// Restores a previous checkpoint, removing any later paged state.
     fn restore(&mut self, checkpoint: &Self::Checkpoint, context: &T::Context)
-        -> Result<(), Error>;
+    -> Result<(), Error>;
     /// Seals mutable tails before prompt-cache snapshot persistence.
     fn finalize(&mut self) -> Result<(), Error>;
     /// Clears all resident or paged state.
@@ -3813,7 +3790,7 @@ pub trait PoolingAttentionCache<T: Tensor>: Debug {
     fn checkpoint(&self) -> Result<Self::Checkpoint, Error>;
     /// Restores a previous checkpoint.
     fn restore(&mut self, checkpoint: &Self::Checkpoint, context: &T::Context)
-        -> Result<(), Error>;
+    -> Result<(), Error>;
     /// Seals mutable local and pooled tails before persistence.
     fn finalize(&mut self) -> Result<(), Error>;
     /// Clears all local and pooling state.
@@ -3927,6 +3904,14 @@ impl NeuralOperatorCapabilities {
 
     /// Returns stable names for every required capability absent from this set.
     pub fn missing_capability_names(self, required: Self) -> Vec<&'static str> {
+        self.iter_missing_capability_names(required).collect()
+    }
+
+    /// Borrows the same ordered missing-capability declarations without a vector.
+    pub fn iter_missing_capability_names(
+        self,
+        required: Self,
+    ) -> impl Iterator<Item = &'static str> {
         const NAMES: &[(NeuralOperatorCapabilities, &str)] = &[
             (
                 NeuralOperatorCapabilities::ATTENTION_SOFTCAP,
@@ -4026,12 +4011,9 @@ impl NeuralOperatorCapabilities {
                 "masked_output_projection",
             ),
         ];
-        NAMES
-            .iter()
-            .filter_map(|(capability, name)| {
-                (required.contains(*capability) && !self.contains(*capability)).then_some(*name)
-            })
-            .collect()
+        NAMES.iter().filter_map(move |(capability, name)| {
+            (required.contains(*capability) && !self.contains(*capability)).then_some(*name)
+        })
     }
 }
 
@@ -4076,6 +4058,15 @@ mod neural_operator_capability_tests {
 /// Associated concrete types make calls statically dispatched. Implementations
 /// retain ownership of tensor storage, fusion, quantization, and collectives.
 pub trait NeuralBackend: Sized + 'static {
+    /// Optional host metadata destination for the existing generic construction
+    /// workers. This conveys neither native execution nor source authority.
+    /// Native realizations retain their ordinary constructor behavior.
+    fn construction_metadata(
+        _context: &<Self::Tensor as Tensor>::Context,
+    ) -> Option<&workspace::WorkspaceContext> {
+        None
+    }
+
     /// Optional forward operators explicitly supported by this backend.
     const OPERATOR_CAPABILITIES: NeuralOperatorCapabilities = NeuralOperatorCapabilities::NONE;
 
@@ -4098,14 +4089,8 @@ pub trait NeuralBackend: Sized + 'static {
         architecture: &'static str,
         required: NeuralOperatorCapabilities,
     ) -> Result<(), Error> {
-        let available = Self::OPERATOR_CAPABILITIES;
-        if available.contains(required) {
-            return Ok(());
-        }
-        Err(Error::backend(format!(
-            "{architecture} requires unsupported backend operators: {}",
-            available.missing_capability_names(required).join(", ")
-        )))
+        Self::OPERATOR_CAPABILITIES
+            .require_with(architecture, required, |args| Error::backend(args))
     }
 
     /// Builds one affine projection.
@@ -4250,6 +4235,23 @@ pub trait NeuralBackend: Sized + 'static {
             "segmented attention is not implemented by this backend",
         ))
     }
+    /// Executes the same segmented attention with an explicit metadata destination.
+    ///
+    /// A checked destination requires a backend implementation that pays its actual
+    /// temporary containers before constructing them. The default refuses that
+    /// claim. Callers retain the destination's funding through dependent results
+    /// and errors; this loan creates no native submission or tensor authority.
+    fn segmented_attention_with_metadata(
+        input: SegmentedAttentionInput<'_, Self::Tensor>,
+        context: &<Self::Tensor as Tensor>::Context,
+        metadata: &workspace::WorkspaceContext,
+    ) -> Result<Self::Tensor, Error> {
+        if metadata.uses_checked_metadata() {
+            return Err(workspace::WorkspaceMetadataError::Unqualified.into());
+        }
+        Self::segmented_attention(input, context)
+    }
+
     /// Adds a residual branch, optionally retaining the accumulator in FP32.
     fn add_residual(
         residual: &Self::Tensor,
@@ -4358,6 +4360,9 @@ pub trait NeuralBackend: Sized + 'static {
         )
     }
     /// Runs causal sliding-window prefill attention with optional learned sinks.
+    /// The window and position generate its mask; `request.mask` is not consumed.
+    /// Caller-specified masks use the ordinary attention operation instead.
+    /// Returns `[batch, queries, query_heads * value_width]` with heads joined.
     fn sliding_window_attention_with_sinks(
         request: AttentionRequest<'_, Self::Tensor>,
         window: i32,
@@ -4443,6 +4448,7 @@ pub trait NeuralBackend: Sized + 'static {
         context: &<Self::Tensor as Tensor>::Context,
     ) -> Result<Self::Tensor, Error>;
     /// Runs causal sliding-window prefill attention without a square mask.
+    /// Returns `[batch, queries, query_heads * value_width]` with heads joined.
     #[allow(clippy::too_many_arguments)]
     fn sliding_window_attention(
         queries: Self::Tensor,
@@ -4814,14 +4820,18 @@ mod gated_delta_reference_tests {
         )
         .unwrap();
         actual.extend(tail);
-        assert!(expected
-            .iter()
-            .zip(actual)
-            .all(|(left, right)| (left - right).abs() < 1e-6));
-        assert!(expected_state
-            .iter()
-            .zip(actual_state)
-            .all(|(left, right)| (left - right).abs() < 1e-6));
+        assert!(
+            expected
+                .iter()
+                .zip(actual)
+                .all(|(left, right)| (left - right).abs() < 1e-6)
+        );
+        assert!(
+            expected_state
+                .iter()
+                .zip(actual_state)
+                .all(|(left, right)| (left - right).abs() < 1e-6)
+        );
     }
 }
 
@@ -4890,14 +4900,18 @@ mod selective_state_space_reference_tests {
         )
         .unwrap();
         actual.extend(tail);
-        assert!(expected
-            .iter()
-            .zip(actual)
-            .all(|(left, right)| (left - right).abs() < 1e-6));
-        assert!(expected_state
-            .iter()
-            .zip(actual_state)
-            .all(|(left, right)| (left - right).abs() < 1e-6));
+        assert!(
+            expected
+                .iter()
+                .zip(actual)
+                .all(|(left, right)| (left - right).abs() < 1e-6)
+        );
+        assert!(
+            expected_state
+                .iter()
+                .zip(actual_state)
+                .all(|(left, right)| (left - right).abs() < 1e-6)
+        );
     }
 }
 
@@ -4920,6 +4934,18 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
 
     /// Allocates an unloaded floating-point parameter tensor.
     fn unloaded_f32(shape: &[i32], context: &Self::Context) -> Result<Self, Error>;
+    /// Creates the same unloaded floating placeholder with its declared identity.
+    /// Metadata execution may use the identity to recover exact retained
+    /// parameter representation facts. The default preserves native construction;
+    /// it neither loads checkpoint data nor infers a physical representation.
+    fn unloaded_parameter_f32(
+        parameter: &ParameterSpec,
+        shape: &[i32],
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        let _ = parameter;
+        Self::unloaded_f32(shape, context)
+    }
     /// Allocates an unloaded signed 32-bit integer parameter tensor.
     fn unloaded_i32(shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
         let _ = (shape, context);
@@ -4933,6 +4959,24 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
         shape: &[i32],
         context: &Self::Context,
     ) -> Result<Self, Error>;
+    /// Initializes a tensor using one fixed host F32 buffer.
+    ///
+    /// `scalar` must be an allocation-free scalar expression with no native
+    /// work or externally visible effects. It is evaluated once per row-major
+    /// element by numerical realizations and is not evaluated by metadata
+    /// execution. The shared worker owns and prices its fixed buffer only;
+    /// arbitrary resources in a callback are not covered by this contract.
+    /// Shape/overflow checks precede allocation and scalar evaluation. Native
+    /// seed/copy storage remains the selected backend's separate responsibility.
+    fn from_f32_fn(
+        shape: &[i32],
+        scalar: impl FnMut(usize) -> f32,
+        context: &Self::Context,
+    ) -> Result<Self, Error> {
+        f32_initialization::initialize(shape, scalar, |values| {
+            Self::from_f32_slice(values, shape, context)
+        })
+    }
     /// Creates a signed 32-bit integer tensor from host initialization data.
     fn from_i32_slice(
         values: &[i32],
@@ -5040,6 +5084,14 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
     fn squeeze_axes(&self, axes: &[i32], context: &Self::Context) -> Result<Self, Error>;
     /// Creates a tensor view using backend-neutral axis indexes.
     fn index(&self, indexes: &[Index], context: &Self::Context) -> Result<Self, Error>;
+    /// Retains the nonnegative half-open interval `[start,end)` on one axis.
+    /// The axis and all other dimensions remain present. Implementations can
+    /// publish exact slice source facts; the default uses the existing index
+    /// worker with identical geometry, including empty intervals.
+    fn narrow_axis(&self, axis: usize, start: i32, end: i32, context: &Self::Context) -> Result<Self, Error> {
+        let range = TensorAxisRange::new(self.shape(), axis, start, end).map_err(Error::backend_source)?;
+        self.index(&range.indexes().collect::<Vec<_>>(), context)
+    }
     /// Takes rows along one axis using a backend index tensor.
     /// Indices outside the supported axis domain must fail; deferred validation must prevent the
     /// native gather from reading outside its source while work is pending.
@@ -5232,6 +5284,18 @@ pub trait Tensor: Clone + Debug + Sized + 'static {
             "multi-axis rotary embeddings are not implemented by this backend",
         ))
     }
+    /// Builds the same rotary outputs from borrowed precomputed host frequencies.
+    /// The default rejects before work; it never constructs an owned fallback.
+    fn multi_axis_rotary_embeddings_prepared(
+        position_ids: &Self,
+        prepared: multimodal::PreparedMultiAxisRotary<'_>,
+        context: &Self::Context,
+    ) -> Result<(Self, Self), Error> {
+        let _ = (position_ids, prepared, context);
+        Err(Error::backend_source(
+            multimodal::RotaryTableError::UnsupportedBackend,
+        ))
+    }
     /// Projects selected output rows and scatters them into vocabulary order.
     fn masked_output_projection(
         input: multimodal::MaskedOutputProjectionInput<'_, Self>,
@@ -5288,7 +5352,8 @@ impl<T: Tensor> Parameter<T> {
         shape: &[i32],
         context: &T::Context,
     ) -> Result<Self, Error> {
-        Ok(Self::new(spec, T::unloaded_f32(shape, context)?))
+        let value = T::unloaded_parameter_f32(&spec, shape, context)?;
+        Ok(Self::new(spec, value))
     }
 
     /// Creates an unloaded signed 32-bit integer parameter.
@@ -5302,12 +5367,32 @@ impl<T: Tensor> Parameter<T> {
 }
 
 impl<T: 'static> Parameterized<T> for Parameter<T> {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, T>,
+    {
+        visitor.parameter(
+            ParameterMetadataView::from_spec(&self.spec, self.trainable),
+            &self.value,
+        );
+        Ok(())
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        Some(1)
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
+        visitor(&self.value);
+        true
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, T>,
     {
-        visitor.visit(
-            ParameterMetadata::from_spec(&self.spec, self.trainable),
+        visitor.visit_borrowed(
+            ParameterMetadataView::from_spec(&self.spec, self.trainable),
             &self.value,
         );
     }
@@ -5316,8 +5401,8 @@ impl<T: 'static> Parameterized<T> for Parameter<T> {
     where
         V: ParameterVisitorMut<'a, T>,
     {
-        visitor.visit_mut(
-            ParameterMetadata::from_spec(&self.spec, self.trainable),
+        visitor.visit_mut_borrowed(
+            ParameterMetadataView::from_spec(&self.spec, self.trainable),
             &mut self.value,
         );
     }
@@ -5328,6 +5413,31 @@ impl<T: 'static> Parameterized<T> for Parameter<T> {
 }
 
 impl<T: 'static, M: Parameterized<T>> Parameterized<T> for Vec<M> {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, T>,
+    {
+        let mut result = Ok(());
+        for module in self {
+            result = result.and(module.visit_parameter_sources(visitor));
+        }
+        result
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        self.iter().try_fold(0usize, |n, value| {
+            n.checked_add(value.retained_value_slot_bound()?)
+        })
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
+        let mut complete = true;
+        for module in self {
+            complete &= module.visit_retained_values(visitor);
+        }
+        complete
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, T>,
@@ -5354,6 +5464,28 @@ impl<T: 'static, M: Parameterized<T>> Parameterized<T> for Vec<M> {
 }
 
 impl<T: 'static, M: Parameterized<T>> Parameterized<T> for Option<M> {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, T>,
+    {
+        match self {
+            Some(module) => module.visit_parameter_sources(visitor),
+            None => Ok(()),
+        }
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        // None is an empty variant of this actual topology. Inserting a child
+        // replaces that topology and invalidates any previously retained fact.
+        self.as_ref()
+            .map_or(Some(0), <M as Parameterized<T>>::retained_value_slot_bound)
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
+        self.as_ref()
+            .is_none_or(|module| module.visit_retained_values(visitor))
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, T>,
@@ -5442,11 +5574,11 @@ pub struct CausalDepthwiseConvolution<B: NeuralBackend> {
     pub weight: Parameter<B::Tensor>,
     /// Optional per-channel bias.
     pub bias: Option<Parameter<B::Tensor>>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     channels: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     kernel_size: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     activation: ConvolutionActivation,
 }
 
@@ -5621,7 +5753,7 @@ pub struct GatedShortConvolution<B: NeuralBackend> {
     pub convolution: CausalDepthwiseConvolution<B>,
     /// Output projection.
     pub output_projection: B::Linear,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     channels: i32,
 }
 
@@ -5743,25 +5875,17 @@ mod grouped_contract_tests {
             GatedProductPolicy::new(GatedProductActivation::Silu, Some(0.0), None, 1.0, 0.0,)
                 .is_err()
         );
-        assert!(GatedProductPolicy::new(
-            GatedProductActivation::Silu,
-            None,
-            Some(f32::NAN),
-            1.0,
-            0.0,
-        )
-        .is_err());
+        assert!(
+            GatedProductPolicy::new(GatedProductActivation::Silu, None, Some(f32::NAN), 1.0, 0.0,)
+                .is_err()
+        );
         assert!(
             GatedProductPolicy::new(GatedProductActivation::Silu, None, None, 0.0, 0.0,).is_err()
         );
-        assert!(GatedProductPolicy::new(
-            GatedProductActivation::Silu,
-            None,
-            None,
-            1.0,
-            f32::INFINITY,
-        )
-        .is_err());
+        assert!(
+            GatedProductPolicy::new(GatedProductActivation::Silu, None, None, 1.0, f32::INFINITY,)
+                .is_err()
+        );
     }
 
     #[test]
@@ -5782,24 +5906,28 @@ mod grouped_contract_tests {
 
     #[test]
     fn independent_group_layout_requires_exact_cardinality() {
-        assert!(GroupedGatedProductSpec::new(
-            2,
-            16,
-            8,
-            16,
-            eredu_nn::GatedProductPolicy::ordinary_silu(),
-            GatedProductGroupLayout::Independent(vec![parameters("e0"), parameters("e1")]),
-        )
-        .is_ok());
-        assert!(GroupedGatedProductSpec::new(
-            2,
-            16,
-            8,
-            16,
-            eredu_nn::GatedProductPolicy::ordinary_silu(),
-            GatedProductGroupLayout::Independent(vec![parameters("e0")]),
-        )
-        .is_err());
+        assert!(
+            GroupedGatedProductSpec::new(
+                2,
+                16,
+                8,
+                16,
+                eredu_nn::GatedProductPolicy::ordinary_silu(),
+                GatedProductGroupLayout::Independent(vec![parameters("e0"), parameters("e1")]),
+            )
+            .is_ok()
+        );
+        assert!(
+            GroupedGatedProductSpec::new(
+                2,
+                16,
+                8,
+                16,
+                eredu_nn::GatedProductPolicy::ordinary_silu(),
+                GatedProductGroupLayout::Independent(vec![parameters("e0")]),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -5821,15 +5949,17 @@ mod grouped_contract_tests {
             )
         };
         assert!(LinearFormatSpec::unscaled(format).is_err());
-        assert!(projection(
-            LinearFormatSpec::affine(
-                format,
-                ParameterSpec::trainable("unrelated.scale.identity").unwrap(),
-                ParameterSpec::trainable("unrelated.affine.identity").unwrap(),
+        assert!(
+            projection(
+                LinearFormatSpec::affine(
+                    format,
+                    ParameterSpec::trainable("unrelated.scale.identity").unwrap(),
+                    ParameterSpec::trainable("unrelated.affine.identity").unwrap(),
+                )
+                .unwrap()
             )
-            .unwrap()
-        )
-        .is_ok());
+            .is_ok()
+        );
     }
 }
 
@@ -5866,6 +5996,25 @@ impl<T: Tensor> Linear<T> {
 }
 
 impl<T: 'static> Parameterized<T> for Linear<T> {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, T>,
+    {
+        let weight = self.weight.visit_parameter_sources(visitor);
+        weight.and(self.bias.visit_parameter_sources(visitor))
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        // Both concrete parameter fields are bounded even before bias exists.
+        Some(2)
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
+        let weight = self.weight.visit_retained_values(visitor);
+        let bias = self.bias.visit_retained_values(visitor);
+        weight & bias
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, T>,
@@ -5938,6 +6087,24 @@ impl<T: Tensor> LayerNorm<T> {
 }
 
 impl<T: 'static> Parameterized<T> for LayerNorm<T> {
+    fn visit_parameter_sources<'a, V>(&'a self, visitor: &mut V) -> Result<(), ParameterSourceError>
+    where
+        V: ParameterSourceVisitor<'a, T>,
+    {
+        let weight = self.weight.visit_parameter_sources(visitor);
+        weight.and(self.bias.visit_parameter_sources(visitor))
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        Some(2)
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&T)) -> bool {
+        let weight = self.weight.visit_retained_values(visitor);
+        let bias = self.bias.visit_retained_values(visitor);
+        weight & bias
+    }
+
     fn visit_parameters<'a, V>(&'a self, visitor: &mut V)
     where
         V: ParameterVisitor<'a, T>,
@@ -5971,6 +6138,9 @@ impl<T: 'static> Parameterized<T> for LayerNorm<T> {
         }
     }
 }
+
+#[cfg(test)]
+mod retained_value_tests;
 
 #[cfg(test)]
 mod parameter_topology_tests {
@@ -6014,10 +6184,12 @@ mod parameter_topology_tests {
         );
 
         module.set_trainable(false);
-        assert!(validate_parameter_topology::<i32, _>(&module)
-            .unwrap()
-            .iter()
-            .all(|entry| !entry.trainable));
+        assert!(
+            validate_parameter_topology::<i32, _>(&module)
+                .unwrap()
+                .iter()
+                .all(|entry| !entry.trainable)
+        );
 
         let choice = DerivedChoice::Present(parameter("choice.weight", 3));
         assert_eq!(
@@ -6026,9 +6198,11 @@ mod parameter_topology_tests {
                 .as_str(),
             "choice.weight"
         );
-        assert!(validate_parameter_topology::<i32, _>(&DerivedChoice::Empty)
-            .unwrap()
-            .is_empty());
+        assert!(
+            validate_parameter_topology::<i32, _>(&DerivedChoice::Empty)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6080,11 +6254,13 @@ mod fused_projection_layout_tests {
             [("query", 8), ("key", 4), ("value", 4)]
         );
         assert!(FusedProjectionLayout::new(Vec::new()).is_err());
-        assert!(FusedProjectionLayout::new([
-            FusedProjectionSegment::new("same", 1).unwrap(),
-            FusedProjectionSegment::new("same", 1).unwrap(),
-        ])
-        .is_err());
+        assert!(
+            FusedProjectionLayout::new([
+                FusedProjectionSegment::new("same", 1).unwrap(),
+                FusedProjectionSegment::new("same", 1).unwrap(),
+            ])
+            .is_err()
+        );
         assert!(FusedProjectionSegment::new("", 1).is_err());
         assert!(FusedProjectionSegment::new("bad", 0).is_err());
     }

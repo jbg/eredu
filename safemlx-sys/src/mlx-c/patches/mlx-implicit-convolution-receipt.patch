@@ -1,0 +1,375 @@
+diff --git a/mlx/backend/cuda/eval.cpp b/mlx/backend/cuda/eval.cpp
+--- a/mlx/backend/cuda/eval.cpp
++++ b/mlx/backend/cuda/eval.cpp
+@@ -182,3 +182,8 @@
+     size_t, size_t, size_t, size_t, size_t, size_t, size_t,
+     ResidentGpuWorkerLayout&) noexcept { return false; }
+ }
++
++namespace mlx::core::submission {
++bool resident_convolution_layout(const ResidentConvolutionSource&,
++    ResidentConvolutionLayout&) noexcept { return false; }
++}
+diff --git a/mlx/backend/metal/conv.cpp b/mlx/backend/metal/conv.cpp
+--- a/mlx/backend/metal/conv.cpp
++++ b/mlx/backend/metal/conv.cpp
+@@ -1,5 +1,9 @@
+ // Copyright © 2023-2024 Apple Inc.
+ #include "mlx/axis_view.h"
++#include "mlx/graph_construction.h"
++#include "mlx/backend/metal/convolution_dispatch.h"
++#include <climits>
++#include <limits>
+ #include <algorithm>
+ #include <cassert>
+ #include <numeric>
+@@ -23,7 +27,17 @@
+ 
+ inline array
+ ensure_row_contiguous(const array& x, metal::Device& d, const Stream& s) {
+-  if (x.flags().row_contiguous) {
++  // A row-contiguous view can retain arbitrary strides on singleton axes.
++  // Implicit convolution forms signed jump parameters from every spatial
++  // stride, including masked coordinates. Use the same canonical strides
++  // as the shape-derived receipt before forming those parameters.
++  bool canonical = x.flags().row_contiguous;
++  size_t expected_stride = 1;
++  for (size_t axis = x.ndim(); canonical && axis-- > 0;) {
++    canonical = x.strides()[axis] == expected_stride;
++    expected_stride *= x.shape(axis);
++  }
++  if (canonical) {
+     return x;
+   }
+   auto result = contiguous_copy_gpu(x, s);
+@@ -1006,8 +1020,8 @@
+       return depthwise_conv_2D_gpu(s, d, in, wt, out, conv_params);
+     }
+ 
+-    if ((C_per_group <= 4 || C_per_group % 16 == 0) &&
+-        (O_per_group <= 16 || O_per_group % 16 == 0)) {
++    if (metal::implicit_convolution_channels(
++            conv_params.C, conv_params.O, conv_params.groups)) {
+       return implicit_gemm_conv_2D_gpu(s, d, in, wt, out, conv_params);
+     } else {
+       return explicit_gemm_conv_group_ND_gpu(s, d, in, wt, out, conv_params);
+@@ -1015,21 +1029,18 @@
+   }
+ 
+   // Direct to winograd conv
+-  bool inp_large = (static_cast<int64_t>(conv_params.N) * conv_params.iS[0] *
+-                    conv_params.iS[1]) >= 4096;
+-  bool channels_large = (conv_params.C + conv_params.O) >= 256;
+   bool out_large = (static_cast<int64_t>(conv_params.N) * conv_params.oS[0] *
+                     conv_params.oS[1]) >= 256;
+-  if (!conv_params.flip && is_stride_one && is_kdil_one && is_idil_one &&
+-      conv_params.wS[0] == 3 && conv_params.wS[1] == 3 &&
+-      conv_params.C % 32 == 0 && conv_params.O % 32 == 0 && inp_large &&
+-      channels_large) {
++  if (metal::winograd_convolution_2d(conv_params.N, conv_params.iS[0],
++          conv_params.iS[1], conv_params.C, conv_params.O,
++          conv_params.wS[0], conv_params.wS[1], is_stride_one,
++          is_kdil_one, is_idil_one, conv_params.flip)) {
+     return winograd_conv_2D_gpu(s, d, in, wt, out, conv_params, copies);
+   }
+ 
+   // Direct to implicit gemm conv
+-  if (is_idil_one && (conv_params.C <= 4 || conv_params.C % 16 == 0) &&
+-      (conv_params.O <= 16 || conv_params.O % 16 == 0)) {
++  if (is_idil_one && metal::implicit_convolution_channels(
++          conv_params.C, conv_params.O, conv_params.groups)) {
+     return implicit_gemm_conv_2D_gpu(s, d, in, wt, out, conv_params);
+   }
+ 
+@@ -1117,12 +1128,8 @@
+     return;
+   }
+ 
+-  const int C_per_group = C / groups;
+-  const int O_per_group = O / groups;
+-
+   // Direct to implicit gemm conv
+-  if (is_idil_one && (C_per_group <= 4 || C_per_group % 16 == 0) &&
+-      (O_per_group <= 16 || O_per_group % 16 == 0)) {
++  if (is_idil_one && metal::implicit_convolution_channels(C, O, groups)) {
+     MLXConvParams<2> conv_params{
+         /* const int  N = */ static_cast<int>(in.shape(0)),
+         /* const int  C = */ C,
+@@ -1367,3 +1374,133 @@
+ }
+ 
+ } // namespace mlx::core
++
++namespace mlx::core::submission {
++bool resident_convolution_layout(const ResidentConvolutionSource& source,
++    ResidentConvolutionLayout& result) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  const auto dims = source.spatial_dimensions;
++  if ((dims != 1 && dims != 2) || source.groups <= 0) return false;
++  for (size_t axis = 0; axis != 4; ++axis) {
++    if (source.input[axis] <= 0 || source.weight[axis] <= 0) return false;
++  }
++  for (size_t axis = 0; axis != 2; ++axis) {
++    if (source.stride[axis] <= 0 || source.dilation[axis] <= 0 || source.padding[axis] < 0)
++      return false;
++  }
++  if (dims == 1 && (source.input[2] != 1 || source.weight[2] != 1 ||
++      source.stride[1] != 1 || source.dilation[1] != 1 || source.padding[1] != 0))
++    return false;
++  const int batch = source.input[0], channels = source.input[3];
++  const int outputs = source.weight[0], groups = source.groups;
++  if (static_cast<int64_t>(source.weight[3]) * groups != channels || outputs % groups)
++    return false;
++  ResidentConvolutionLayout value;
++  value.output[0] = batch; value.output[3] = outputs;
++  for (size_t axis = 0; axis != 2; ++axis) {
++    // conv_out_shape_axes uses signed int for the padded input and dilated
++    // kernel before dividing; qualify those actual constructor intermediates.
++    const int64_t padded = int64_t(source.input[axis + 1]) + 2 * int64_t(source.padding[axis]);
++    const int64_t kernel = 1 + int64_t(source.dilation[axis]) * (source.weight[axis + 1] - 1);
++    if (padded > INT_MAX || kernel > INT_MAX) return false;
++    const int64_t numerator = padded - kernel;
++    if (numerator < 0) return false;
++    const int64_t extent = numerator / source.stride[axis] + 1;
++    if (extent <= 0 || extent > INT_MAX) return false;
++    value.output[axis + 1] = static_cast<int>(extent);
++  }
++  // Constructor and native parameter arithmetic have real signed extents.
++  // These checks mirror their selected worker expressions, rather than
++  // turning telemetry or an arbitrary tensor-size ceiling into authority.
++  auto product = [](int64_t a, int64_t b, int64_t limit, int64_t& out) {
++    if (a < 0 || b < 0 || (a && b > limit / a)) return false;
++    out = a * b; return true;
++  };
++  const bool separable = dims == 1 && groups == channels && groups == outputs &&
++      source.stride[0] == 1 && source.dilation[0] == 1 && source.padding[0] == 0;
++  if (!separable) {
++    int64_t rows, source_rows, kernel_area, reduction;
++    if (!product(batch, value.output[1], INT_MAX, rows) ||
++        !product(rows, value.output[2], INT_MAX, rows) ||
++        !product(batch, source.input[1], INT64_MAX, source_rows) ||
++        !product(source_rows, source.input[2], INT64_MAX, source_rows) ||
++        !product(source.weight[1], source.weight[2], INT_MAX, kernel_area) ||
++        !product(kernel_area, source.weight[3], INT_MAX, reduction)) return false;
++    // The implicit loader computes output * stride - padding and then adds
++    // kernel * dilation in signed int. A selected depthwise tile can read
++    // the last partial 4-by-8 output tile before masking its outputs.
++    const bool tiled_depthwise = dims == 2 && groups > 1 &&
++        channels == groups && outputs == groups && channels % 16 == 0 &&
++        source.weight[1] <= 7 && source.weight[2] <= 7 &&
++        source.dilation[0] == 1 && source.dilation[1] == 1 &&
++        source.stride[0] <= 2 && source.stride[1] <= 2;
++    for (size_t axis = 0; axis != 2; ++axis) {
++      const int64_t tile = tiled_depthwise ? (axis == 0 ? 4 : 8) : 1;
++      const int64_t padded_extent = ((int64_t(value.output[axis + 1]) + tile - 1) / tile) * tile;
++      const int64_t output_span = (padded_extent - 1) * source.stride[axis];
++      const int64_t kernel_span = int64_t(source.weight[axis + 1] - 1) * source.dilation[axis];
++      if (int64_t(value.output[axis + 1]) + tile - 1 > INT_MAX ||
++          output_span > INT_MAX || kernel_span > INT_MAX ||
++          output_span - source.padding[axis] + kernel_span > INT_MAX) return false;
++    }
++    if (!metal::implicit_convolution_channels(channels, outputs, groups)) return false;
++    if (groups == 1 && metal::winograd_convolution_2d(batch,
++            source.input[1], source.input[2], channels, outputs,
++            source.weight[1], source.weight[2],
++            source.stride[0] == 1 && source.stride[1] == 1,
++            source.dilation[0] == 1 && source.dilation[1] == 1, true, false)) return false;
++    const int c = channels / groups, n = outputs / groups;
++    const int bm = rows >= 8192 && c >= 64 ? 64 : 32;
++    const int bn = n <= 16 ? 8 : (bm == 64 || n >= 64 ? 64 : 32);
++    if (rows > INT_MAX - (bm - 1) || n > INT_MAX - (bn - 1) || c > INT_MAX - 15)
++      return false;
++    int64_t iterations;
++    if (c <= 2) {
++      if (reduction > INT_MAX - 15) return false;
++    } else if (c <= 4) {
++      if (!product(kernel_area, 4, INT_MAX - 15, iterations)) return false;
++    } else if (!product(kernel_area, (c + 15) / 16, INT_MAX, iterations)) {
++      return false;
++    }
++    // The shared ensure_row_contiguous worker canonicalizes singleton
++    // strides as well, so these are the actual selected input jump operands.
++    int64_t row_stride, jump_h, jump_w, filter_h, filter_w;
++    if (!product(source.input[2], channels, INT_MAX, row_stride) ||
++        !product(row_stride, source.dilation[0], INT_MAX, jump_h) ||
++        !product(dims == 1 ? 0 : channels, source.dilation[1], INT_MAX, jump_w) ||
++        !product(source.weight[1] - 1, jump_h, INT_MAX, filter_h) ||
++        !product(source.weight[2] - 1, jump_w, INT_MAX, filter_w) ||
++        filter_h + filter_w > INT_MAX + int64_t(17) ||
++        jump_h - filter_w < INT_MIN) return false;
++  }
++  // conv_general_axes: two possible AsType descriptors and Convolution.
++  // Each native caller may compact input and weight once; the selected
++  // separable/implicit worker creates no unfolded matrix or other tensor.
++  value.primitives = 3; value.edges = 4; value.backing_births = 5;
++  constexpr size_t worker_controls =
++      // eval_gpu, contiguous caller and their source/temporary loans.
++      2 * sizeof(array) + sizeof(ArrayVector) + 12 * sizeof(void*) +
++      sizeof(bool) + 2 * sizeof(size_t) +
++      sizeof(MLXConvParams<2>) + sizeof(mlx::steel::ImplicitGemmConv2DParams) +
++      // The implicit worker's 24 scalar selections, two grid extents,
++      // filter predicate, two MTL dimensions, and caller's branch scalars.
++      24 * sizeof(int) + 2 * sizeof(size_t) + sizeof(bool) + 2 * sizeof(MTL::Size) +
++      5 * sizeof(int) + 3 * sizeof(bool) +
++      // Separable 1D's possible wide-stride argument and 2D's function
++      // constants. Names/constants/concatenate recursion are paid by the
++      // existing per-kernel selector query, with these names included there.
++      3 * sizeof(int64_t) + 10 * sizeof(int) + sizeof(bool) +
++      // Native entrypoint arguments, including fixed two-axis pair wrappers.
++      3 * sizeof(std::pair<int, int>) + sizeof(int) + sizeof(StreamOrDevice);
++  constexpr size_t query_controls = sizeof(source) + sizeof(value) + sizeof(result) +
++      sizeof(decltype(product)) + 12 * sizeof(int64_t) + 10 * sizeof(int) +
++      3 * sizeof(size_t) + 3 * sizeof(bool) +
++      4 * sizeof(int64_t) + sizeof(int64_t*) +
++      sizeof(bool) + sizeof(size_t) + 6 * sizeof(int64_t);
++  value.named_control_bytes = worker_controls + query_controls;
++  result = value; return true;
++#endif
++}
++} // namespace mlx::core::submission
+diff --git a/mlx/backend/metal/convolution_dispatch.h b/mlx/backend/metal/convolution_dispatch.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/metal/convolution_dispatch.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include <cstdint>
++
++namespace mlx::core::metal {
++// These predicates are consumed by the actual dispatch and its cold receipt.
++// All dimensions/groups have passed the convolution constructor's validation.
++inline bool implicit_convolution_channels(int channels, int outputs, int groups) {
++  const int c = channels / groups;
++  const int o = outputs / groups;
++  return (c <= 4 || c % 16 == 0) && (o <= 16 || o % 16 == 0);
++}
++inline bool winograd_convolution_2d(int batch, int height, int width,
++    int channels, int outputs, int kernel_h, int kernel_w,
++    bool stride_one, bool kernel_dilation_one, bool input_dilation_one, bool flip) {
++  return !flip && stride_one && kernel_dilation_one && input_dilation_one &&
++      kernel_h == 3 && kernel_w == 3 && channels % 32 == 0 && outputs % 32 == 0 &&
++      static_cast<int64_t>(batch) * height * width >= 4096 &&
++      static_cast<int64_t>(channels) + outputs >= 256;
++}
++} // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1980,6 +1980,9 @@
+   // The separable conv1D branch allocates one output and <=2 contiguous copies,
+   // registering each copy with add_temporary before the depthwise dispatch;
+   // its exact constructor predicates return before implicit GEMM or im2col.
++  // The source-qualified implicit 1D/2D profile has the same output/two-copy
++  // population and three array bindings, including its separable 2D fallback.
++  // Its MLXConvParams/GEMM controls are paid by resident_convolution_layout.
+   // Both use the existing temporary descriptor/Data/TemporaryBatch classes;
+   // no extra population is added for the same copies.
+   if (!add(backing_births, input_edges, temporaries) ||
+@@ -2090,7 +2093,7 @@
+   // The closed family owns eight input and four output slots. Every other
+   // selected worker below has no more bound buffers: SDPA <=7; matmul <=6;
+   // rank<10 indexed gather/scatter <=11; copy/reduce/normalization <=4;
+-  // prepared recurrent <=8 and separable depthwise conv1D <=3.
++  // prepared recurrent <=8 and qualified separable/implicit convolution <=3.
+   // Concat invokes one two-buffer copy per input, already included in K.
+   constexpr size_t argument_buffers =
+       std::tuple_size_v<decltype(fast::KernelSpecialization::inputs)> +
+diff --git a/mlx/backend/metal/selector_controls.cpp b/mlx/backend/metal/selector_controls.cpp
+--- a/mlx/backend/metal/selector_controls.cpp
++++ b/mlx/backend/metal/selector_controls.cpp
+@@ -60,10 +60,15 @@
+     source_type + 2 * integer;
+ constexpr size_t quantized_vector_split = text("affine_qvm_split_k__gs__b__spk_") +
+     source_type + 3 * integer;
++// Actual implicit convolution name and the specialized depthwise fallback.
++constexpr size_t convolution_implicit = text("implicit_gemm_conv_2d__bm_bn_bk_wm_wn_channel__filter_") + dtype_tag + 6 * integer + 1;
++constexpr size_t convolution_depthwise = text("depthwise_conv_2d__ker_h__ker_w__str_h__str_w__tgp_h__tgp_w__do_flip_") + dtype_tag + 6 * integer + 1;
++constexpr size_t convolution_separable = text("depthwise_conv_1d__large") + dtype_tag;
+ constexpr size_t maximum_name = std::max({gemm_specialized, gemm_split, gemv,
+     attention, vector_attention, reduce, indexing, gather_axis, scatter_axis, scan, single_index, sort_name, gathered_rhs,
+     pointwise, rope, normalization, quantized_vector, quantized_quad,
+-    quantized_matrix, quantized_split, quantized_vector_split});
++    quantized_matrix, quantized_split, quantized_vector_split,
++    convolution_implicit, convolution_depthwise, convolution_separable});
+ 
+ // The widest formatting call is split-K: two transpose chars, two dtype tags,
+ // five integer tile values and two alignment chars. Other formatting calls use
+@@ -91,10 +96,13 @@
+ // single-index gathers/scatters have kernel/lib copies; sort has one fmt result.
+ // Quantized selectors retain one kname and inline mode/type/function strings;
+ // their first concatenate prefix is at most affine_qmm_t_splitk_ (inline).
+-// No JIT builder body runs in this profile.
++// Implicit convolution retains one name (16 concatenate arguments), while
++// depthwise 2D retains its base and specialized name plus the by-value base
++// loan (15 arguments). The precompiled get_steel_conv_kernel branch returns
++// before JIT ownership. No JIT builder body runs in this profile.
+ constexpr size_t name_owners = 3;
+ // SDPA's first two-pass kernel has six boolean constants plus blocks (integer).
+-// Dense GEMM has six; RoPE three. All are direct vector initializer lists,
++// Dense GEMM has six; RoPE three; depthwise 2D convolution seven. All are direct vector initializer lists,
+ // never growing inserts, with the exact actual tuple element representation.
+ constexpr size_t constants = 7;
+ }
+diff --git a/mlx/backend/no_gpu/eval.cpp b/mlx/backend/no_gpu/eval.cpp
+--- a/mlx/backend/no_gpu/eval.cpp
++++ b/mlx/backend/no_gpu/eval.cpp
+@@ -93,3 +93,8 @@
+     size_t, size_t, size_t, size_t, size_t, size_t, size_t,
+     ResidentGpuWorkerLayout&) noexcept { return false; }
+ }
++
++namespace mlx::core::submission {
++bool resident_convolution_layout(const ResidentConvolutionSource&,
++    ResidentConvolutionLayout&) noexcept { return false; }
++}
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -72,6 +72,21 @@
+     size_t cpu_partitions, size_t evaluations, size_t consumer_waits,
+     ResidentGpuWorkerLayout&) noexcept;
+ MLX_API bool resident_grouped_sort_additional_kernels(size_t selections, size_t& out) noexcept;
++
++// Source-explicit nontransposed convolution profile. Spatial geometry is
++// normalized to [N,H,W,C] (W=1 for 1D); there is no native/context owner.
++struct ResidentConvolutionSource {
++  size_t spatial_dimensions{0};
++  int input[4]{}, weight[4]{};
++  int stride[2]{}, padding[2]{}, dilation[2]{};
++  int groups{0};
++};
++struct ResidentConvolutionLayout {
++  size_t primitives{0}, edges{0}, backing_births{0}, named_control_bytes{0};
++  int output[4]{};
++};
++MLX_API bool resident_convolution_layout(const ResidentConvolutionSource&,
++    ResidentConvolutionLayout&) noexcept;
+ 
+ // Four fixed-Eval host requests; no Data, worker or stream-frontier owners.
+ struct EvalGraphLayout : GraphConstructionLayout {
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4425,14 +4425,15 @@
+     const std::pair<int, int>& dilation /* = {1, 1} */,
+     int groups /* = 1 */,
+     StreamOrDevice s /* = {} */) {
+-  return conv_general(
++  return conv_general_axes(
+       /* const array& input = */ in_,
+       /* const array& weight = */ wt_,
+-      /* std::vector<int> stride = */ {stride.first, stride.second},
+-      /* std::vector<int> padding = */ {padding.first, padding.second},
+-      /* std::vector<int> kernel_dilation = */
++      /* Shape stride = */ {stride.first, stride.second},
++      /* Shape padding_lo = */ {padding.first, padding.second},
++      /* Shape padding_hi = */ {padding.first, padding.second},
++      /* Shape kernel_dilation = */
+       {dilation.first, dilation.second},
+-      /* std::vector<int> input_dilation = */ {1, 1},
++      /* Shape input_dilation = */ {1, 1},
+       /* int groups = */ groups,
+       /* bool flip = */ false,
+       s);

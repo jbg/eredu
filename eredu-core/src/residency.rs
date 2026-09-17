@@ -6,18 +6,27 @@
 //! explicit plans and records observations without knowing how a backend
 //! materializes, transfers, or synchronizes resources.
 
-use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-    time::Duration,
-};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
+use std::{collections::BTreeSet, fmt, sync::Arc, time::Duration};
 
+mod admission;
+mod eviction;
+pub use eviction::ResidencyEvictionError;
+mod storage;
+use storage::{LedgerUnits, LedgerWindows};
+pub use storage::{ResidencyLedgerStorageLayout, ResidencyStorageError};
 mod prefetch;
+pub use admission::{
+    PreparedResidencyAdmissionFailure, ResidencyAdmissionPreparationError,
+    ResidencyAdmissionStorage, ResidencyBatchError, ResidencyBatchFailure, ResidencyBlockerRef,
+    ResidencyBlockerRow, ResidencyCapacityRef, ResidencyEvictedRow, ResidencyPlanSource,
+    ResidencyProtection, ResidencyReservationRow,
+};
 
 pub use prefetch::{
     BackgroundPrefetchReport, PrefetchAdmission, PrefetchCompletion, PrefetchDemandObservation,
-    PrefetchDemandResolution, PrefetchExecutionState, PrefetchStateError, PrefetchWork,
+    PrefetchDemandResolution, PrefetchExecutionState, PrefetchStateError, PrefetchStorageCause,
+    PrefetchStorageError, PrefetchWake, PrefetchWork,
 };
 
 /// Current serialized residency-plan schema.
@@ -1205,10 +1214,9 @@ impl LedgerUnit {
 /// buffer destruction never needs to be hidden behind an untyped callback.
 #[derive(Debug)]
 pub struct ResidencyLedger {
-    plan: OffloadPlan,
-    units: BTreeMap<OffloadUnitId, LedgerUnit>,
-    group_windows: BTreeMap<(String, MemoryTier), BTreeSet<OffloadUnitId>>,
-    active_windows: BTreeMap<MemoryTier, BTreeSet<OffloadUnitId>>,
+    plan: Arc<OffloadPlan>,
+    units: LedgerUnits,
+    group_windows: LedgerWindows,
     telemetry: OffloadTelemetry,
     resident_bytes: TierByteTotals,
     tick: u64,
@@ -1219,27 +1227,12 @@ pub struct ResidencyLedger {
 impl ResidencyLedger {
     /// Creates empty ownership state for every unit in a validated plan.
     pub fn new(plan: OffloadPlan) -> Self {
-        let units = plan
-            .units()
-            .iter()
-            .cloned()
-            .map(|spec| {
-                (
-                    spec.id().clone(),
-                    LedgerUnit {
-                        spec,
-                        host: None,
-                        device: None,
-                    },
-                )
-            })
-            .collect();
+        let units = LedgerUnits::construct(&plan).expect("ordinary ledger constructor storage");
         let telemetry = OffloadTelemetry::from_plan(&plan);
         Self {
-            plan,
+            plan: Arc::new(plan),
             units,
-            group_windows: BTreeMap::new(),
-            active_windows: BTreeMap::new(),
+            group_windows: LedgerWindows::ordinary(),
             telemetry,
             resident_bytes: TierByteTotals::default(),
             tick: 0,
@@ -1248,8 +1241,31 @@ impl ResidencyLedger {
         }
     }
 
+    /// Constructs finite indexes and declared group windows under the caller's
+    /// admitted owner. No source cache, tensor or native permission is created.
+    pub fn new_prepared<G: AsRef<str>>(
+        plan: OffloadPlan,
+        groups: &[G],
+    ) -> Result<Self, ResidencyStorageError> {
+        ResidencyLedgerStorageLayout::inspect(&plan, groups)
+            .ok_or(ResidencyStorageError::Layout)?;
+        let units = LedgerUnits::construct(&plan)?;
+        let group_windows = LedgerWindows::construct(plan.units().len(), groups)?;
+        let telemetry = OffloadTelemetry::from_plan(&plan);
+        Ok(Self {
+            plan: Arc::new(plan),
+            units,
+            group_windows,
+            telemetry,
+            resident_bytes: TierByteTotals::default(),
+            tick: 0,
+            next_transfer_generation: 1,
+            initialized: false,
+        })
+    }
+
     /// Validated plan governing this ledger.
-    pub const fn plan(&self) -> &OffloadPlan {
+    pub fn plan(&self) -> &OffloadPlan {
         &self.plan
     }
 
@@ -1314,14 +1330,14 @@ impl ResidencyLedger {
         tier: MemoryTier,
     ) -> Result<(), ResidencyLedgerError> {
         validate_ledger_tier(tier, "residency batch")?;
-        let mut seen = BTreeSet::new();
-        for id in ids {
-            if !seen.insert(id) {
-                return Err(ResidencyLedgerError::DuplicateBatchUnit);
+        let mut order = vec![0; ids.len()];
+        match self.validate_batch_in(ids, tier, &mut order) {
+            Ok(()) => Ok(()),
+            Err(ResidencyBatchFailure::Ledger(cause)) => Err(cause.into_owned()),
+            Err(ResidencyBatchFailure::Destination { .. }) => {
+                unreachable!("ordinary batch owns exact index scratch")
             }
-            self.spec(id)?;
         }
-        Ok(())
     }
 
     /// Reserves capacity for one missing copy and returns backend storage evictions.
@@ -1345,107 +1361,7 @@ impl ResidencyLedger {
         tier: MemoryTier,
         protected: &BTreeSet<OffloadUnitId>,
     ) -> Result<Vec<EvictedResidencyCopy>, ResidencyLedgerError> {
-        validate_ledger_tier(tier, "capacity reservation")?;
-        let ids = requests
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        self.validate_batch(&ids, tier)?;
-        let mut total_required = 0u64;
-        for (id, required_bytes) in requests {
-            if *required_bytes == 0 {
-                return Err(ResidencyLedgerError::ZeroReservation { id: id.clone() });
-            }
-            let unit = self
-                .units
-                .get(id)
-                .ok_or_else(|| ResidencyLedgerError::UnknownUnit { id: id.clone() })?;
-            if unit.copy(tier).is_some() {
-                return Err(ResidencyLedgerError::CopyAlreadyExists {
-                    id: id.clone(),
-                    tier,
-                });
-            }
-            total_required = total_required.checked_add(*required_bytes).ok_or(
-                ResidencyLedgerError::ArithmeticOverflow {
-                    context: "batch capacity reservation",
-                },
-            )?;
-        }
-
-        if requests.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut victims = Vec::new();
-        if let Some(budget) = self.budget(tier) {
-            let needed = self.tier_bytes(tier).checked_add(total_required).ok_or(
-                ResidencyLedgerError::ArithmeticOverflow {
-                    context: "budget reservation",
-                },
-            )?;
-            let required_release = needed.saturating_sub(budget);
-            let mut releasable = 0u64;
-            if required_release != 0 {
-                for victim in self.eviction_candidates(tier, protected) {
-                    let bytes = self
-                        .units
-                        .get(&victim)
-                        .and_then(|unit| unit.copy(tier))
-                        .ok_or_else(|| inconsistent(&victim, tier, "capacity eviction planning"))?
-                        .bytes;
-                    releasable = releasable.checked_add(bytes).ok_or(
-                        ResidencyLedgerError::ArithmeticOverflow {
-                            context: "eviction capacity planning",
-                        },
-                    )?;
-                    victims.push(victim);
-                    if releasable >= required_release {
-                        break;
-                    }
-                }
-                if releasable < required_release {
-                    return Err(ResidencyLedgerError::BudgetExhausted {
-                        requested: requests[0].0.clone(),
-                        tier,
-                        required_bytes: total_required,
-                        budget_bytes: budget,
-                        resident_bytes: self.tier_bytes(tier),
-                        blocking_units: self.blockers(tier, protected),
-                    });
-                }
-            }
-        }
-
-        let mut evicted = Vec::with_capacity(victims.len());
-        for victim in victims {
-            evicted.push(self.remove_copy(&victim, tier, true)?);
-        }
-
-        let charged = self.tier_bytes(tier).checked_add(total_required).ok_or(
-            ResidencyLedgerError::ArithmeticOverflow {
-                context: "resident byte reservation",
-            },
-        )?;
-        self.set_tier_bytes(tier, charged);
-        for (id, required_bytes) in requests {
-            let tick = self.next_tick();
-            *self
-                .units
-                .get_mut(id)
-                .and_then(|unit| unit.slot_mut(tier))
-                .ok_or_else(|| inconsistent(id, tier, "reservation insertion"))? =
-                Some(LedgerCopy {
-                    lifecycle: CopyLifecycle::Reserved,
-                    bytes: *required_bytes,
-                    pins: 0,
-                    last_used: tick,
-                    frequency: 0,
-                    in_flight: None,
-                });
-        }
-        self.update_resident_telemetry(tier);
-        Ok(evicted)
+        self.reserve_copies_ordinary(requests, tier, protected)
     }
 
     /// Publishes backend storage into an existing reservation.
@@ -1517,7 +1433,10 @@ impl ResidencyLedger {
         if copy.lifecycle != CopyLifecycle::Reserved {
             return Ok(());
         }
-        self.remove_copy(id, tier, false)?;
+        self.tier_bytes(tier)
+            .checked_sub(copy.bytes)
+            .ok_or_else(|| inconsistent(id, tier, "copy removal accounting"))?;
+        self.remove_copy_committed(id, tier, copy.bytes, false);
         Ok(())
     }
 
@@ -1619,6 +1538,12 @@ impl ResidencyLedger {
         Ok(())
     }
 
+    /// Borrows an exact group name retained by finite ledger construction.
+    /// Ordinary dynamically created windows do not supply this source fact.
+    pub fn prepared_group_name(&self, group: &str) -> Option<&str> {
+        self.group_windows.prepared_name(group)
+    }
+
     /// Replaces one named protected window.
     pub fn set_group_window(
         &mut self,
@@ -1630,22 +1555,16 @@ impl ResidencyLedger {
         if group.trim().is_empty() {
             return Err(ResidencyLedgerError::InvalidGroupId);
         }
-        self.validate_batch(active, tier)?;
-        let key = (group.to_string(), tier);
-        if active.is_empty() {
-            self.group_windows.remove(&key);
-        } else {
-            self.group_windows
-                .insert(key, active.iter().cloned().collect());
+        // Same duplicate-before-unknown ordering without a growing scratch map.
+        for (index, id) in active.iter().enumerate() {
+            if active[..index].contains(id) {
+                return Err(ResidencyLedgerError::DuplicateBatchUnit);
+            }
+            if !self.units.contains_key(id) {
+                return Err(ResidencyLedgerError::UnknownUnit { id: id.clone() });
+            }
         }
-        let union = self
-            .group_windows
-            .iter()
-            .filter(|((_, candidate_tier), _)| *candidate_tier == tier)
-            .flat_map(|(_, window)| window.iter().cloned())
-            .collect();
-        self.active_windows.insert(tier, union);
-        Ok(())
+        self.group_windows.set(group, active, tier, &self.units)
     }
 
     /// Explicitly evicts an unpinned copy and returns backend storage to release.
@@ -1654,28 +1573,20 @@ impl ResidencyLedger {
         id: &OffloadUnitId,
         tier: MemoryTier,
     ) -> Result<Option<EvictedResidencyCopy>, ResidencyLedgerError> {
-        validate_ledger_tier(tier, "evict")?;
-        let unit = self
-            .units
-            .get(id)
-            .ok_or_else(|| ResidencyLedgerError::UnknownUnit { id: id.clone() })?;
-        let Some(copy) = unit.copy(tier).and_then(|copy| copy.status()) else {
+        let Some(bytes) = self
+            .check_eviction(id, tier)
+            .map_err(|cause| cause.into_owned(id, tier))?
+        else {
             return Ok(None);
         };
-        if unit.spec.policy() == ResidencyPolicy::Pinned {
-            return Err(ResidencyLedgerError::PinnedEviction {
-                id: id.clone(),
-                tier,
-            });
-        }
-        if copy.pins != 0 {
-            return Err(ResidencyLedgerError::InUseEviction {
-                id: id.clone(),
-                tier,
-                pin_count: copy.pins,
-            });
-        }
-        self.remove_copy(id, tier, true).map(Some)
+        // Preserve the ordinary owned result birth before the first mutation.
+        let result = EvictedResidencyCopy {
+            id: id.clone(),
+            tier,
+            bytes,
+        };
+        self.remove_copy_committed(id, tier, bytes, true);
+        Ok(Some(result))
     }
 
     /// Records one prefetch result in neutral telemetry.
@@ -1740,10 +1651,21 @@ impl ResidencyLedger {
 
     /// Returns the union of every named protected window.
     pub fn active_window(&self) -> BTreeSet<OffloadUnitId> {
-        self.active_windows
+        self.units
             .values()
-            .flat_map(|window| window.iter().cloned())
+            .enumerate()
+            .filter(|(ordinal, _)| {
+                self.group_windows.contains(*ordinal, MemoryTier::Host)
+                    || self.group_windows.contains(*ordinal, MemoryTier::Device)
+            })
+            .map(|(_, unit)| unit.spec.id().clone())
             .collect()
+    }
+
+    fn window_contains(&self, id: &OffloadUnitId, tier: MemoryTier) -> bool {
+        self.units
+            .ordinal(id)
+            .is_some_and(|ordinal| self.group_windows.contains(ordinal, tier))
     }
 
     fn budget(&self, tier: MemoryTier) -> Option<u64> {
@@ -1762,74 +1684,6 @@ impl ResidencyLedger {
         self.resident_bytes.set(tier, bytes);
     }
 
-    fn eviction_candidates(
-        &self,
-        tier: MemoryTier,
-        protected: &BTreeSet<OffloadUnitId>,
-    ) -> Vec<OffloadUnitId> {
-        let mut candidates = self
-            .units
-            .values()
-            .filter_map(|unit| {
-                let copy = unit.copy(tier)?;
-                if copy.lifecycle != CopyLifecycle::Resident
-                    || unit.spec.policy() == ResidencyPolicy::Pinned
-                    || copy.pins != 0
-                    || protected.contains(unit.spec.id())
-                    || self
-                        .active_windows
-                        .get(&tier)
-                        .is_some_and(|window| window.contains(unit.spec.id()))
-                {
-                    return None;
-                }
-                let priority = match unit.spec.policy() {
-                    ResidencyPolicy::Windowed => 0u8,
-                    ResidencyPolicy::Cacheable => 1u8,
-                    ResidencyPolicy::Pinned => return None,
-                };
-                let frequency = match self.plan.config().eviction_policy() {
-                    CacheEvictionPolicy::LeastRecentlyUsed => 0,
-                    CacheEvictionPolicy::LeastFrequentlyUsed => copy.frequency,
-                };
-                Some((priority, frequency, copy.last_used, unit.spec.id().clone()))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort();
-        candidates.into_iter().map(|(_, _, _, id)| id).collect()
-    }
-
-    fn blockers(
-        &self,
-        tier: MemoryTier,
-        protected: &BTreeSet<OffloadUnitId>,
-    ) -> Vec<ResidencyBlocker> {
-        self.units
-            .values()
-            .filter_map(|unit| {
-                let copy = unit.copy(tier)?;
-                if copy.lifecycle != CopyLifecycle::Resident {
-                    return None;
-                }
-                let pinned = unit.spec.policy() == ResidencyPolicy::Pinned;
-                let active_window = self
-                    .active_windows
-                    .get(&tier)
-                    .is_some_and(|window| window.contains(unit.spec.id()));
-                let request_protected = protected.contains(unit.spec.id());
-                (pinned || copy.pins != 0 || active_window || request_protected).then(|| {
-                    ResidencyBlocker {
-                        id: unit.spec.id().clone(),
-                        pinned,
-                        in_use: copy.pins,
-                        active_window,
-                        request_protected,
-                    }
-                })
-            })
-            .collect()
-    }
-
     fn remove_copy(
         &mut self,
         id: &OffloadUnitId,
@@ -1838,24 +1692,43 @@ impl ResidencyLedger {
     ) -> Result<EvictedResidencyCopy, ResidencyLedgerError> {
         let copy = self
             .units
-            .get_mut(id)
-            .and_then(|unit| unit.slot_mut(tier))
-            .and_then(Option::take)
+            .get(id)
+            .and_then(|unit| unit.copy(tier))
             .ok_or_else(|| inconsistent(id, tier, "copy removal"))?;
-        let bytes = self
-            .tier_bytes(tier)
+        self.tier_bytes(tier)
             .checked_sub(copy.bytes)
             .ok_or_else(|| inconsistent(id, tier, "copy removal accounting"))?;
-        self.set_tier_bytes(tier, bytes);
-        self.update_resident_telemetry(tier);
-        if record_eviction {
-            self.telemetry.record_tier_eviction(tier, copy.bytes);
-        }
-        Ok(EvictedResidencyCopy {
+        // The ordinary owned output is prepared before the first mutation.
+        let result = EvictedResidencyCopy {
             id: id.clone(),
             tier,
             bytes: copy.bytes,
-        })
+        };
+        self.remove_copy_committed(id, tier, result.bytes, record_eviction);
+        Ok(result)
+    }
+
+    // Called only with the same exclusive ledger borrow after checking this
+    // copy and every accounting subtraction. No owned ID/output is constructed.
+    fn remove_copy_committed(
+        &mut self,
+        id: &OffloadUnitId,
+        tier: MemoryTier,
+        bytes: u64,
+        record_eviction: bool,
+    ) {
+        let removed = self
+            .units
+            .get_mut(id)
+            .and_then(|unit| unit.slot_mut(tier))
+            .and_then(Option::take)
+            .expect("preflight copy removal");
+        debug_assert_eq!(removed.bytes, bytes);
+        self.set_tier_bytes(tier, self.tier_bytes(tier) - bytes);
+        self.update_resident_telemetry(tier);
+        if record_eviction {
+            self.telemetry.record_tier_eviction(tier, bytes);
+        }
     }
 
     fn update_resident_telemetry(&mut self, tier: MemoryTier) {
@@ -1918,6 +1791,9 @@ pub enum ResidencyLedgerError {
     /// A named protected window had no stable identity.
     #[error("resident execution group id must not be empty")]
     InvalidGroupId,
+    /// Original finite storage has no declared window with this name.
+    #[error("resident execution group was not declared by the prepared constructor")]
+    UnknownPreparedGroup,
     /// One batch named the same logical unit more than once.
     #[error("batched residency acquisition contains a duplicate unit")]
     DuplicateBatchUnit,
@@ -1948,7 +1824,9 @@ pub enum ResidencyLedgerError {
         tier: MemoryTier,
     },
     /// Backend storage exceeded the capacity reserved for its publication.
-    #[error("residency unit {id} published {actual_bytes} bytes to {tier:?} after reserving only {reserved_bytes}")]
+    #[error(
+        "residency unit {id} published {actual_bytes} bytes to {tier:?} after reserving only {reserved_bytes}"
+    )]
     PublicationExceedsReservation {
         /// Published unit.
         id: OffloadUnitId,
@@ -1974,7 +1852,9 @@ pub enum ResidencyLedgerError {
         context: &'static str,
     },
     /// No safe victim could satisfy a finite tier budget.
-    #[error("cannot reserve {required_bytes} bytes for {requested} in {tier:?}: {resident_bytes}/{budget_bytes} bytes resident")]
+    #[error(
+        "cannot reserve {required_bytes} bytes for {requested} in {tier:?}: {resident_bytes}/{budget_bytes} bytes resident"
+    )]
     BudgetExhausted {
         /// Requested unit.
         requested: OffloadUnitId,
@@ -2357,10 +2237,12 @@ mod tests {
             Err(ResidencyLedgerError::InUseEviction { pin_count: 1, .. })
         ));
 
-        assert!(ledger
-            .resolve_transfer(&[id("a")], MemoryTier::Device, generation + 1, true)
-            .unwrap()
-            .is_empty());
+        assert!(
+            ledger
+                .resolve_transfer(&[id("a")], MemoryTier::Device, generation + 1, true)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             ledger
                 .copy_status(&id("a"), MemoryTier::Device)
@@ -2373,10 +2255,12 @@ mod tests {
             .resolve_transfer(&[id("a")], MemoryTier::Device, generation, true)
             .unwrap();
         ledger.unpin(&id("a"), MemoryTier::Device);
-        assert!(ledger
-            .evict(&id("a"), MemoryTier::Device)
-            .unwrap()
-            .is_some());
+        assert!(
+            ledger
+                .evict(&id("a"), MemoryTier::Device)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             ledger.telemetry().resident_bytes().get(MemoryTier::Device),
             0

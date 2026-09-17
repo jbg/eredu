@@ -260,7 +260,7 @@ impl TextPreparationCoordinator {
         T::Error: Send + Sync + 'static,
         <T::Completion as Completion>::Error: Send + Sync + 'static,
     {
-        let gathered = self.gather_frame(transport, frame)?;
+        self.with_gathered_frame(transport, frame, |gathered| {
         if gathered.len()
             != participants
                 .checked_mul(TEXT_PREPARATION_WORDS)
@@ -311,16 +311,33 @@ impl TextPreparationCoordinator {
             None if cancelled => TextPreparationOutcome::Cancelled,
             None => TextPreparationOutcome::Ready,
         })
+        })
     }
-    fn gather_frame<T: TextPreparationTransport>(
+    fn with_gathered_frame<T: TextPreparationTransport, V, F>(
         &self,
         transport: &T,
         frame: &[u32; TEXT_PREPARATION_WORDS],
-    ) -> Result<Vec<u32>, TextPreparationAgreementError>
+        validate: F,
+    ) -> Result<V, TextPreparationAgreementError>
     where
         T::Error: Send + Sync + 'static,
         <T::Completion as Completion>::Error: Send + Sync + 'static,
+        F: FnOnce(&[u32]) -> Result<V, TextPreparationAgreementError>,
     {
+        let output=self.gather_output(transport,frame)?;
+        transport.with_resolved_all_gather_words(output,validate).map_err(BackendFailure::from_error)?
+    }
+    // The existing speculative coordination decoder consumes its ordinary Vec;
+    // both adapters share this same bounded submission and wait worker.
+    fn gather_frame<T:TextPreparationTransport>(&self,transport:&T,frame:&[u32;TEXT_PREPARATION_WORDS])
+        ->Result<Vec<u32>,TextPreparationAgreementError>
+    where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+'static {
+        let output=self.gather_output(transport,frame)?;
+        transport.resolve_all_gather_words(output).map_err(BackendFailure::from_error).map_err(Into::into)
+    }
+    fn gather_output<T:TextPreparationTransport>(&self,transport:&T,frame:&[u32;TEXT_PREPARATION_WORDS])
+        ->Result<T::GatherOutput,TextPreparationAgreementError>
+    where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+'static {
         let submission = transport
             .submit_all_gather_words(frame)
             .map_err(BackendFailure::from_error)?;
@@ -333,10 +350,7 @@ impl TextPreparationCoordinator {
                 return Err(TextPreparationAgreementError::Deadline { cancellation });
             }
         };
-        let gathered = transport
-            .resolve_all_gather_words(output)
-            .map_err(BackendFailure::from_error)?;
-        Ok(gathered)
+        Ok(output)
     }
 }
 
@@ -350,6 +364,10 @@ fn stage_word(stage: TextPreparationStage) -> Result<u32, TextPreparationAgreeme
         TextPreparationStage::Sampling => 2,
         TextPreparationStage::Instrumentation => 3,
         TextPreparationStage::Delivery => 4,
+        TextPreparationStage::Admission => 5,
+        TextPreparationStage::Prediction => 6,
+        TextPreparationStage::Decision => 7,
+        TextPreparationStage::Commitment => 8,
         _ => {
             return Err(TextPreparationAgreementError::Admission(
                 "unknown preparation stage",

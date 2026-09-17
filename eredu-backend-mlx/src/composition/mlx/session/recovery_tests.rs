@@ -396,6 +396,46 @@ fn native_session(backend: &super::MlxBackend<'_>) -> (tempfile::TempDir, super:
 }
 
 #[test]
+fn closed_session_payload_preserves_identity_exclusivity_and_active_retirement() {
+    use crate::backend::ordinary_retirement;
+    let context =
+        crate::backend::ExecutionContext::new(safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    let backend = super::MlxBackend::new(context.stream(), context.stream());
+    let (_artifact, mut session) = native_session(&backend);
+    let (_foreign_artifact, foreign) = native_session(&backend);
+    recovery::wait_for_retirement(|| session.test_payload_owner_count() == 1);
+    let drops = Arc::new(AtomicUsize::new(0));
+    session.set_retirement_probe(Box::new(Payload(drops.clone())));
+    // This observer is deliberately created before the later mutable borrow.
+    let retired = session.test_payload_retirement_probe();
+    let mut alias = session.test_payload_owner();
+    let same = alias.clone();
+    let same_retired = same.retirement_probe();
+    let other = foreign.test_payload_owner();
+    assert!(alias.same_owner(&same));
+    assert!(!alias.same_owner(&other));
+    assert_eq!(alias.active_owner_count(), 3);
+    assert!(alias.get_mut().is_none());
+    drop(session);
+    assert!(!retired() && !same_retired());
+    assert!(alias.get_mut().is_none());
+    drop(same);
+    assert_eq!(alias.active_owner_count(), 1);
+    assert!(alias.get_mut().is_some());
+    assert!(!retired() && !same_retired());
+    drop(alias);
+    assert!(retired() && same_retired());
+    assert_eq!(
+        drops.load(Ordering::SeqCst),
+        0,
+        "semantic Drop is still queued"
+    );
+    drop((foreign, other));
+    ordinary_retirement::reclaim();
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn restored_execution_error_excludes_reuse_until_native_retirement() {
     use eredu_core::Completion as _;
     let stream = crate::test_stream();
@@ -475,7 +515,7 @@ fn restored_execution_error_keeps_late_native_failure_terminal() {
                 .contains("fenced")
         });
         native.set(status(true, false, false));
-        recovery::wait_for_retirement(|| session.test_payload_weak().strong_count() == 1);
+        recovery::wait_for_retirement(|| session.test_payload_owner_count() == 1);
         assert!(session.reset().unwrap_err().to_string().contains("fenced"));
         assert_eq!(
             super::MlxBackend::synchronize_session(&backend, &session)
@@ -499,7 +539,7 @@ fn restored_execution_error_retains_payload_after_session_drop() {
     let backend = super::MlxBackend::new(stream, stream);
     let (_artifact, mut session) = native_session(&backend);
     let native = Rc::new(Cell::new(status(false, false, false)));
-    let payload = session.test_payload_weak();
+    let payload_retired = session.test_payload_retirement_probe();
     assert!(session
         .test_failed_operation(
             FakeProbe(Rc::clone(&native)),
@@ -510,9 +550,9 @@ fn restored_execution_error_retains_payload_after_session_drop() {
         .model_state_preserved());
     drop(session);
     recovery::reap();
-    assert!(payload.upgrade().is_some());
+    assert!(!payload_retired());
     native.set(status(true, false, false));
-    recovery::wait_for_retirement(|| payload.upgrade().is_none());
+    recovery::wait_for_retirement(|| payload_retired());
 }
 
 #[test]
@@ -540,7 +580,7 @@ fn pending_recovery_does_not_excuse_unknown_or_enclosing_operation_errors() {
             .is_err());
         assert!(session.reset().unwrap_err().to_string().contains("fenced"));
         native.set(status(true, false, false));
-        recovery::wait_for_retirement(|| session.test_payload_weak().strong_count() == 1);
+        recovery::wait_for_retirement(|| session.test_payload_owner_count() == 1);
         assert!(session.reset().unwrap_err().to_string().contains("fenced"));
     }
 }
@@ -662,19 +702,19 @@ fn completed_native_output_retains_entire_session_payload_after_session_drop() {
     let backend = super::MlxBackend::new(context.stream(), context.stream());
     let (_artifact, mut session) = native_session(&backend);
     let output = session.submit_token_decode(&backend, 1).unwrap();
-    let payload = session.test_payload_weak();
+    let payload_retired = session.test_payload_retirement_probe();
     drop(session);
-    assert!(payload.upgrade().is_some());
+    assert!(!payload_retired());
     output.completion.wait().unwrap();
     assert!(
-        payload.upgrade().is_none(),
+        payload_retired(),
         "terminal completion releases active session ownership; ordinary cleanup may remain staged"
     );
 }
 
 #[test]
 fn terminal_session_retirement_defers_manager_drop_until_runtime_is_unlocked() {
-    use crate::backend::ordinary_retirement::{self, OrdinaryRetirement};
+    use crate::backend::ordinary_retirement;
     use std::sync::{mpsc, Mutex};
     use std::time::Duration;
 
@@ -694,7 +734,7 @@ fn terminal_session_retirement_defers_manager_drop_until_runtime_is_unlocked() {
         }
     }
     struct WholeSession {
-        _payload: Rc<OrdinaryRetirement<super::model_session::SessionPayload>>,
+        _payload: super::model_session::SessionPayloadOwner,
     }
     impl Retention for WholeSession {
         fn observe(&self, _: Status) {}
@@ -714,9 +754,10 @@ fn terminal_session_retirement_defers_manager_drop_until_runtime_is_unlocked() {
         unsafe_drop: Arc::clone(&unsafe_drop),
     }));
     let native = Rc::new(Cell::new(status(false, false, false)));
+    let active_retired = session.test_payload_retirement_probe();
     let retained = Recovery::with_probe(
         WholeSession {
-            _payload: session.test_payload_weak().upgrade().unwrap(),
+            _payload: session.test_payload_owner(),
         },
         FakeProbe(Rc::clone(&native)),
     );
@@ -745,6 +786,7 @@ fn terminal_session_retirement_defers_manager_drop_until_runtime_is_unlocked() {
             attempt_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             native.set(status(true, false, false));
             recovery::reap();
+            assert!(active_retired());
             ordinary_retirement::reclaim();
             assert_eq!(drops.load(Ordering::SeqCst), 0);
         })

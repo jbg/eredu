@@ -1,0 +1,104 @@
+diff --git a/mlx/backend/cpu/arange.h b/mlx/backend/cpu/arange.h
+--- a/mlx/backend/cpu/arange.h
++++ b/mlx/backend/cpu/arange.h
+@@ -38,15 +38,22 @@
+ } // namespace
+ 
+ namespace cpu {
+-inline bool arange_float_dispatch_storage(EvalDispatchStorage& out) noexcept {
++template<typename T>
++inline bool arange_dispatch_storage(EvalDispatchStorage& out) noexcept {
+   DispatchLayout task;
+-  if(!CommandEncoder::dispatch_layout<ArangeTask<float>>(task))return false;
+-  const size_t controls=sizeof(task)+sizeof(EvalDispatchStorage)+sizeof(out)+sizeof(ArangeTask<float>)+sizeof(float*)+
+-      sizeof(float)*3+sizeof(size_t)+sizeof(Stream)+sizeof(CommandEncoder*)+
++  if(!CommandEncoder::dispatch_layout<ArangeTask<T>>(task))return false;
++  const size_t controls=sizeof(task)+sizeof(EvalDispatchStorage)+sizeof(out)+sizeof(ArangeTask<T>)+sizeof(T*)+
++      sizeof(T)*3+sizeof(decltype(T{}-T{}))+sizeof(size_t)+sizeof(Stream)+sizeof(CommandEncoder*)+
+       sizeof(array*)+sizeof(int)+sizeof(scheduler::TaskOwner);
+   if(controls>SIZE_MAX-task.controls)return false;
+   EvalDispatchStorage value{task.task_bytes,task.task_alignment,0,task.controls+controls};
+   out=value;return true;
+ }
++inline bool arange_float_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  return arange_dispatch_storage<float>(out);
++}
++inline bool arange_int_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  return arange_dispatch_storage<int32_t>(out);
++}
+ } // namespace cpu
+ } // namespace mlx::core
+diff --git a/mlx/backend/cpu/arange_storage.h b/mlx/backend/cpu/arange_storage.h
+--- a/mlx/backend/cpu/arange_storage.h
++++ b/mlx/backend/cpu/arange_storage.h
+@@ -4,4 +4,6 @@
+ bool is_arange_eval_primitive(const array&) noexcept;
+ bool arange_float_eval_layout(size_t elements,bool tracer,CopyEvalStorage&) noexcept;
+ bool arange_float_eval_storage(const array&,CopyEvalStorage&) noexcept;
++bool arange_int_eval_layout(size_t elements,bool tracer,CopyEvalStorage&) noexcept;
++bool arange_int_eval_storage(const array&,CopyEvalStorage&) noexcept;
+ }
+diff --git a/mlx/backend/cpu/arange_storage.cpp b/mlx/backend/cpu/arange_storage.cpp
+--- a/mlx/backend/cpu/arange_storage.cpp
++++ b/mlx/backend/cpu/arange_storage.cpp
+@@ -10,18 +10,27 @@
+   return value.has_primitive()&&value.primitive().stream().device==Device::cpu&&
+       typeid(value.primitive())==typeid(Arange);
+ }
+-bool arange_float_eval_layout(size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
+-  if(!elements||elements>size_t(INT_MAX)||elements>size_t(PTRDIFF_MAX)/sizeof(float))return false;
++namespace {
++template<typename T>
++bool arange_eval_layout(size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
++  if(!elements||elements>size_t(INT_MAX)||elements>size_t(PTRDIFF_MAX)/sizeof(T))return false;
+   EvalDispatchStorage task;SingleOutputEvalStorage common;
+-  if(!arange_float_dispatch_storage(task)||!single_output_raw_task_layout(1,0,tracer,task,common))return false;
++  if(!arange_dispatch_storage<T>(task)||!single_output_raw_task_layout(1,0,tracer,task,common))return false;
+   CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
+-  const size_t controls=sizeof(elements)+sizeof(tracer)+sizeof(out)+sizeof(task)+sizeof(common)+sizeof(value)+
++  const size_t controls=sizeof(elements)*2+sizeof(tracer)*2+sizeof(out)*2+sizeof(task)+sizeof(common)+sizeof(value)+
+       sizeof(std::tuple<double,double,double>)+sizeof(double)*5+sizeof(const array*)+
+       sizeof(const Arange*)+sizeof(size_t)*2+sizeof(bool)*2+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
+       sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+   if(controls>SIZE_MAX-value.named_control_bytes)return false;
+   value.named_control_bytes+=controls;out=value;return true;
++}
++} // namespace
++bool arange_float_eval_layout(size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
++  return arange_eval_layout<float>(elements,tracer,out);
++}
++bool arange_int_eval_layout(size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
++  return arange_eval_layout<int32_t>(elements,tracer,out);
+ }
+ bool arange_float_eval_storage(const array& value,CopyEvalStorage& out) noexcept {
+   if(!is_arange_eval_primitive(value)||!value.siblings().empty()||!value.inputs().empty()||value.ndim()!=1||
+@@ -34,6 +43,19 @@
+   return arange_float_eval_layout(value.size(),value.is_tracer(),out);
+ }
+ }
++namespace mlx::core::cpu {
++bool arange_int_eval_storage(const array& value,CopyEvalStorage& out) noexcept {
++  if(!is_arange_eval_primitive(value)||!value.siblings().empty()||!value.inputs().empty()||value.ndim()!=1||
++      value.dtype()!=int32||value.itemsize()!=sizeof(int32_t)||value.shape(0)<=0||
++      size_t(value.shape(0))!=value.size())return false;
++  const auto [start,stop,step]=static_cast<const Arange&>(value.primitive()).state();
++  // This exact coordinate producer also keeps the final loop increment in I32.
++  // No float coordinate conversion or signed wraparound is used by the mask.
++  if(!std::isfinite(start)||!std::isfinite(stop)||step!=1.0||start<0.0||stop>double(INT_MAX)||
++      start!=std::floor(start)||stop!=std::floor(stop)||stop-start!=double(value.size()))return false;
++  return arange_int_eval_layout(value.size(),value.is_tracer(),out);
++}
++}
+ namespace mlx::core::submission {
+ GraphFailure GraphConstruction::create_cpu_arange_eval(const FixedEvalPrologueGuard& guard,
+     GraphConstruction*& out) noexcept {
+@@ -41,7 +63,7 @@
+   if(out||!graph||!guard.cpu()||!context.scope||context.worker||context.dispatch!=&record||current_graph_quota()!=graph)
+     return GraphFailure::foreign_parent;
+   cpu::CopyEvalStorage actual;
+-  if(!cpu::arange_float_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  if(!cpu::arange_float_eval_storage(guard.current(),actual)&&!cpu::arange_int_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
+   return create_layout(*graph,context.scope,&record,actual,out,true);
+ }
+ }

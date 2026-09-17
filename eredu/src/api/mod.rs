@@ -31,7 +31,7 @@ pub use request::{
 };
 #[cfg(feature = "mlx")]
 pub use selected::*;
-pub use tokenizer::{chat_template_kwargs, load_tokenizer, TextMetadataError};
+pub use tokenizer::{TextMetadataError, chat_template_kwargs, load_tokenizer};
 
 mod capability;
 mod control;
@@ -42,13 +42,23 @@ mod loaded;
 mod observed;
 mod parameters;
 pub use control::{
-    ControlledGenerationBranch, ControlledGenerationError, ControlledGenerationRecord,
-    ControlledGenerationSession, ControlledGenerationSnapshot, GenerationBranchMetadata,
-    GenerationBranchOptions, GenerationOutputCheckpoint, GenerationSnapshotMetadata,
+    ControlRecordMode, ControlledGenerationBranch, ControlledGenerationError,
+    ControlledGenerationRecord, ControlledGenerationSession, ControlledGenerationSnapshot,
+    GenerationBranchMetadata, GenerationBranchOptions, GenerationOutputCheckpoint,
+    GenerationSnapshotMetadata, LegacyText, PREPARED_EXECUTION_CONTROL_SCHEMA_VERSION,
+    PreparedControlledGenerationBranch, PreparedControlledGenerationEvent,
+    PreparedControlledGenerationRecord, PreparedControlledGenerationSession,
+    PreparedControlledGenerationSnapshot, PreparedControlledInput, PreparedControlledRecordData,
+    PreparedControlledWireRecord, PreparedGenerationBranchMetadata, PreparedGenerationSnapshotData,
+    PreparedGenerationSnapshotMetadata, PreparedInputInstrumentation, PreparedInputV2,
+    PreparedInstrumentationRecord,
 };
-pub use eredu_core::{GenerationOutput, GenerationTiming, TextSamplingStrategy};
+pub use eredu_core::{
+    GenerationOutput, GenerationPlainTextEvent, GenerationPlainTextOutput, GenerationTiming,
+    TextInferencePolicy, TextSamplingStrategy,
+};
 pub use eredu_runtime::execution_control::{SamplingOverride, SamplingStateFacts};
-pub use inspection::{inspect_architecture, inspect_text_model, TextInspectionOptions};
+pub use inspection::{TextInspectionOptions, inspect_architecture, inspect_text_model};
 pub use loaded::{LoadedModelLoadError, PlannedModelLoadError};
 pub use media::MultimodalPreparationError;
 pub use observed::{
@@ -56,21 +66,32 @@ pub use observed::{
 };
 
 pub use portable::{
-    GeneratedToken, LoadedModel, LoadedTextModelConfig, PlannedModel, TextDecoder,
-    TextDecoderError, TextGeneration, TextModelError, TextModelOptions,
+    GeneratedToken, LoadedModel, LoadedTextModelConfig, LoadedTokenizerView, ManagedChatError,
+    ManagedChatPolicyRejection, ManagedChatRequest, ManagedChatSource, ManagedPlainTextError,
+    ManagedPlainTextRequest, ManagedPlainTextSession, ManagedPlainTextSnapshot, ManagedPreparedInputRequest, ManagedModelInputError,
+    ManagedPlainTextSnapshotError, ManagedPlainTextSource, ManagedPlainTextSpeculativeBatchLane,
+    ManagedPlainTextSpeculativeBatchRequest, ManagedPlainTextSpeculativeError,
+    ManagedPlainTextSpeculativeRequest, ManagedPreparedChatSpeculativeError,
+    ManagedPreparedChatSpeculativeRequest, PlannedModel, TextDecoder, TextDecoderError,
+    TextGeneration, TextModelError, TextModelOptions,
 };
 
 /// Portable failure reported by prepared-chat constraint state.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{message}")]
 pub struct ConstraintError {
-    message: String,
+    message: std::borrow::Cow<'static, str>,
 }
 
 impl ConstraintError {
+    pub(crate) const fn fixed(message: &'static str) -> Self {
+        Self {
+            message: std::borrow::Cow::Borrowed(message),
+        }
+    }
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: std::borrow::Cow::Owned(message.into()),
         }
     }
 }

@@ -1,0 +1,238 @@
+diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
+--- a/mlx/distributed/distributed.cpp
++++ b/mlx/distributed/distributed.cpp
+@@ -111,6 +111,21 @@
+     out.implementation_bytes = sizeof(EmptyGroup);
+     out.unresolved = group_shared_control;
+   }
++  bool persistent_storage(GroupPersistentStorage& out) const noexcept override {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++    using Owner=std::__shared_ptr_emplace<EmptyGroup,std::allocator<EmptyGroup>>;
++    GroupPersistentStorage value;
++    value.kind=GroupStorageKind::empty;value.unresolved=0;
++    value.shared_owner_bytes=sizeof(Owner);value.shared_owner_alignment=alignof(Owner);
++    value.retained_cpp_bytes=sizeof(Owner);value.controls=persistent_storage_controls();
++    out=value;return true;
++#else
++    return false;
++#endif
++  }
++  size_t persistent_storage_controls() const noexcept override {
++    return sizeof(GroupPersistentStorage)*2+sizeof(void*)*3+sizeof(size_t)*2;
++  }
+   Stream communication_stream(StreamOrDevice s) override {
+     return to_stream(s);
+   }
+@@ -221,6 +236,20 @@
+   return true;
+ }
+ 
++bool Group::persistent_storage(GroupPersistentStorage& out) const noexcept {
++  if(!group_)return false;
++  GroupPersistentStorage value;
++  if(!group_->persistent_storage(value))return false;
++  if(group_->terminal_owner_)value.unresolved|=group_inherited_owner;
++  value.controls=persistent_storage_controls();
++  if(value.controls==SIZE_MAX)return false;
++  out=value;return true;
++}
++size_t Group::persistent_storage_controls() const noexcept {
++  const size_t base=sizeof(GroupPersistentStorage)+sizeof(const Group*)+sizeof(void*)*2+sizeof(size_t)+sizeof(bool)*3;
++  const size_t selected=group_?group_->persistent_storage_controls():0;
++  return selected>SIZE_MAX-base?SIZE_MAX:selected+base;
++}
+ size_t Group::dispatch_storage_inspection_controls() const noexcept {
+   return sizeof(void*) * 2 + sizeof(size_t) + (group_ ? group_->dispatch_storage_inspection_controls() : 0);
+ }
+diff --git a/mlx/distributed/distributed.h b/mlx/distributed/distributed.h
+--- a/mlx/distributed/distributed.h
++++ b/mlx/distributed/distributed.h
+@@ -53,6 +53,20 @@
+   size_t task_bytes{0}, task_alignment{0}, graph_extent{0}, controls{0};
+ };
+ 
++// Allocator requests of the actual retained communicator, not scalar geometry.
++// shared_owner_bytes contains the implementation itself; do not add its sizeof
++// again. Queued operation destinations remain in GroupWorkerStorage. OS-private
++// socket/thread owners and inherited roots stay explicit unresolved domains.
++struct GroupPersistentStorage {
++  GroupStorageKind kind{GroupStorageKind::unknown};
++  unsigned unresolved{group_unknown_implementation};
++  size_t shared_owner_bytes{0}, shared_owner_alignment{0};
++  size_t socket_vector_bytes{0}, communication_buffer_bytes{0}, pool_vector_bytes{0};
++  size_t socket_nodes{0}, socket_node_bytes{0}, socket_bucket_bytes{0};
++  size_t thread_count{0}, thread_cpp_runtime_bytes{0};
++  size_t retained_cpp_bytes{0}, controls{0};
++};
++
+ 
+ /* Check if a communication backend is available */
+ MLX_API bool is_available();
+@@ -74,6 +88,8 @@
+ 
+   // Read only, no rank/size query, initialization, lock, task, polling or error.
+   bool storage_inventory(GroupStorageInventory&) const noexcept;
++  bool persistent_storage(GroupPersistentStorage&) const noexcept;
++  size_t persistent_storage_controls() const noexcept;
+   bool same_implementation(const Group&) const noexcept;
+   // Reads this exact implementation and immutable input geometry only.
+   // False leaves out unchanged; unknown backend/ABI/operation is not zero fit.
+diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
+--- a/mlx/distributed/distributed_impl.h
++++ b/mlx/distributed/distributed_impl.h
+@@ -30,6 +30,8 @@
+     out = GroupStorageInventory{};
+   }
+ 
++  virtual bool persistent_storage(GroupPersistentStorage&) const noexcept { return false; }
++  virtual size_t persistent_storage_controls() const noexcept { return 0; }
+   virtual size_t dispatch_storage_inspection_controls() const noexcept { return 0; }
+   virtual bool dispatch_storage(GroupWorkerOperation, const array&, int,
+                                 GroupDispatchStorage&) const noexcept { return false; }
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -28,6 +28,7 @@
+ #include "mlx/distributed/ring/worker_geometry.h"
+ #include "mlx/distributed/ring/worker_storage.h"
+ #include "mlx/threadpool.h"
++#include "mlx/worker_startup.h"
+ 
+ #ifndef SOL_TCP
+ #define SOL_TCP IPPROTO_TCP
+@@ -270,6 +271,17 @@
+  public:
+   size_t retained_worker_count() const noexcept { return threads_.size(); }
+   size_t retained_bucket_count() const noexcept { return threads_.bucket_count(); }
++  bool persistent_map_storage(size_t& nodes,size_t& node_bytes,size_t& buckets) const noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++    using Node=std::__hash_node<std::__hash_value_type<int,SocketThread>,void*>;
++    using Next=typename Node::__next_pointer;
++    if(threads_.size()>SIZE_MAX/sizeof(Node) || threads_.bucket_count()>SIZE_MAX/sizeof(Next))return false;
++    nodes=threads_.size();node_bytes=nodes*sizeof(Node);buckets=threads_.bucket_count()*sizeof(Next);
++    return true;
++#else
++    return false;
++#endif
++  }
+   void add(const std::vector<int>& sockets) {
+     for (int sock : sockets) {
+       threads_.emplace(sock, sock);
+@@ -574,6 +586,51 @@
+     out.unresolved = group_shared_control | group_associative_storage |
+         group_worker_runtime | group_submission_storage | group_backend_private;
+   }
++  size_t persistent_storage_controls() const noexcept override {
++    const size_t fixed=sizeof(GroupPersistentStorage)*2+sizeof(GroupStorageInventory)+
++        sizeof(scheduler::CpuWorkerStartupLayout)+sizeof(scheduler::CpuWorkerStartupResult)+
++        sizeof(size_t)*20+sizeof(void*)*5+sizeof(bool)*5+sizeof(size_t)*7;
++    const size_t thread=scheduler::cpu_worker_startup_layout_control_bytes();
++    return thread>SIZE_MAX-fixed?SIZE_MAX:thread+fixed;
++  }
++  bool persistent_storage(GroupPersistentStorage& out) const noexcept override {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++    using Owner=std::__shared_ptr_emplace<RingGroup,std::allocator<RingGroup>>;
++    GroupPersistentStorage value;
++    value.kind=GroupStorageKind::ring;
++    // Task/promise/plan owners belong to each accepted operation. The shared
++    // communicator's kernel thread/socket resources remain an explicit unknown.
++    value.unresolved=group_worker_runtime|group_backend_private;
++    value.shared_owner_bytes=sizeof(Owner);value.shared_owner_alignment=alignof(Owner);
++    const size_t left=sockets_left_.capacity(),right=sockets_right_.capacity();
++    if(right>SIZE_MAX/sizeof(int) || left>SIZE_MAX/sizeof(int)-right ||
++        pool_.retained_worker_capacity()>SIZE_MAX/sizeof(std::thread))return false;
++    value.socket_vector_bytes=(left+right)*sizeof(int);
++    value.communication_buffer_bytes=buffers_.capacity();
++    value.pool_vector_bytes=pool_.retained_worker_capacity()*sizeof(std::thread);
++    if(!comm_.persistent_map_storage(value.socket_nodes,value.socket_node_bytes,value.socket_bucket_bytes))return false;
++    if(pool_.retained_worker_count()>SIZE_MAX-comm_.retained_worker_count())return false;
++    value.thread_count=pool_.retained_worker_count()+comm_.retained_worker_count();
++    // Reuse the existing exact loaded libc++ thread runtime qualifier. The
++    // initial thread packet retires on entry; the same __thread_struct and its
++    // implementation live with each native Ring worker. Ring jobs never use
++    // notify_all_at_thread_exit or set_value_at_thread_exit extra destinations.
++    scheduler::CpuWorkerStartupLayout thread;
++    const auto known=scheduler::cpu_worker_startup_layout(thread);
++    if(known.cause!=scheduler::CpuWorkerStartupCause::success ||
++        thread.thread_handle_bytes>SIZE_MAX-thread.thread_implementation_bytes)return false;
++    const size_t cpp=thread.thread_handle_bytes+thread.thread_implementation_bytes;
++    if(cpp && value.thread_count>SIZE_MAX/cpp)return false;
++    value.thread_cpp_runtime_bytes=cpp*value.thread_count;
++    const size_t components[]={value.shared_owner_bytes,value.socket_vector_bytes,value.communication_buffer_bytes,
++        value.pool_vector_bytes,value.socket_node_bytes,value.socket_bucket_bytes,value.thread_cpp_runtime_bytes};
++    for(size_t bytes:components){if(bytes>SIZE_MAX-value.retained_cpp_bytes)return false;value.retained_cpp_bytes+=bytes;}
++    value.controls=persistent_storage_controls();
++    out=value;return true;
++#else
++    return false;
++#endif
++  }
+   RingGroup(
+       int rank,
+       std::vector<std::vector<detail::address_t>> nodes,
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -229,6 +229,22 @@
+   return {0, false};
+ #endif
+ }
++size_t cpu_worker_startup_layout_control_bytes() noexcept {
++#if MLX_SCHEDULER_CONSTANT_STORAGE && !defined(MLX_USE_CUDA)
++  return sizeof(CpuWorkerStartupLayout) * 3 + sizeof(CpuWorkerStartupResult) * 7 +
++      sizeof(SchedulerInitializationCause) + sizeof(StreamRegistrationCause) +
++      sizeof(CpuWorkerStartupOwner) * 3 + sizeof(Stream) * 3 +
++      sizeof(std::unique_ptr<Scheduler::WorkerEntry>) * 2 +
++      sizeof(std::shared_lock<std::shared_mutex>) + sizeof(std::unique_lock<std::shared_mutex>) +
++      sizeof(std::unique_lock<std::mutex>) + sizeof(std::error_code) +
++      sizeof(void*) * 24 + sizeof(uint64_t) * 8 + sizeof(size_t) * 14 +
++      sizeof(bool) * 12 + sizeof(std::string) * 4 +
++      1024 + worker_detail::qualification_controls() +
++      sizeof(submission::NativeControlBinding) + sizeof(const submission::Scope*) + sizeof(bool);
++#else
++  return sizeof(CpuWorkerStartupLayout)+sizeof(CpuWorkerStartupResult);
++#endif
++}
+ CpuWorkerStartupResult cpu_worker_startup_layout(CpuWorkerStartupLayout& output) noexcept {
+ #if MLX_SCHEDULER_CONSTANT_STORAGE && !defined(MLX_USE_CUDA)
+   if (!worker_detail::loaded_startup_matches()) return {WorkerCause::unsupported};
+@@ -256,16 +272,7 @@
+   value.thread_implementation_bytes = 48;
+   value.thread_packet_bytes = sizeof(ThreadPacket);
+   value.failure_requests = failures;
+-  value.controls = sizeof(CpuWorkerStartupLayout) * 3 + sizeof(CpuWorkerStartupResult) * 7 +
+-      sizeof(SchedulerInitializationCause) + sizeof(StreamRegistrationCause) +
+-      sizeof(CpuWorkerStartupOwner) * 3 + sizeof(Stream) * 3 +
+-      sizeof(std::unique_ptr<Scheduler::WorkerEntry>) * 2 +
+-      sizeof(std::shared_lock<std::shared_mutex>) + sizeof(std::unique_lock<std::shared_mutex>) +
+-      sizeof(std::unique_lock<std::mutex>) + sizeof(std::error_code) +
+-      sizeof(void*) * 24 + sizeof(uint64_t) * 8 + sizeof(size_t) * 14 +
+-      sizeof(bool) * 12 + sizeof(std::string) * 4 +
+-      1024 + worker_detail::qualification_controls() +
+-      sizeof(submission::NativeControlBinding) + sizeof(const submission::Scope*) + sizeof(bool);
++  value.controls = cpu_worker_startup_layout_control_bytes();
+   output = value;
+   return {};
+ #else
+diff --git a/mlx/scheduler.h b/mlx/scheduler.h
+--- a/mlx/scheduler.h
++++ b/mlx/scheduler.h
+@@ -321,6 +321,7 @@
+ 
+  private:
+   friend struct SchedulerControlTestAccess;
++  friend size_t cpu_worker_startup_layout_control_bytes() noexcept;
+   friend CpuWorkerStartupResult cpu_worker_startup_layout(CpuWorkerStartupLayout&) noexcept;
+   friend CpuWorkerStartupResult initialize_cpu_worker(uint64_t, Stream, const void*,
+       const CpuWorkerStartupLayout&, CpuWorkerStartupOwner, const void*&) noexcept;
+diff --git a/mlx/worker_startup.h b/mlx/worker_startup.h
+--- a/mlx/worker_startup.h
++++ b/mlx/worker_startup.h
+@@ -25,6 +25,7 @@
+ };
+ struct CpuWorkerStartupStaticLayout { size_t bytes{0}; bool qualified{false}; };
+ MLX_API CpuWorkerStartupStaticLayout cpu_worker_startup_static_layout() noexcept;
++MLX_API size_t cpu_worker_startup_layout_control_bytes() noexcept;
+ MLX_API CpuWorkerStartupResult cpu_worker_startup_layout(CpuWorkerStartupLayout&) noexcept;
+ MLX_API CpuWorkerStartupResult initialize_cpu_worker(
+     uint64_t scheduler_identity, Stream, const void* stream_birth,

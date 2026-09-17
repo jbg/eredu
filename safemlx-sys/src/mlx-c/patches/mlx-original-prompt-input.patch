@@ -1,0 +1,144 @@
+diff --git a/mlx/prepared_input.h b/mlx/prepared_input.h
+--- a/mlx/prepared_input.h
++++ b/mlx/prepared_input.h
+@@ -133,3 +133,20 @@
+     submission::GraphQuota*, submission::Scope&, allocator::OriginalBufferBudget&,
+     const uint32_t*, PreparedInputArray*&) noexcept;
+ }
++
++namespace mlx::core {
++// Exact eager U32/I32[1,N] source under an already admitted original Scope.
++// Graph storage and physical mutable backing are separate contributions.
++struct OriginalPromptInputLayout {
++  size_t metadata_bytes{0};
++  size_t backing_bytes{0};
++  size_t controls{0};
++  size_t ordinary_handle_bytes{0};
++};
++MLX_API bool original_prompt_input_layout(const allocator::PreparedInputFacts&,
++    size_t elements, OriginalPromptInputLayout&) noexcept;
++MLX_API PreparedHostCopyCause construct_original_prompt_input(
++    const uint32_t*, size_t elements, PreparedInputArray*&) noexcept;
++MLX_API PreparedHostCopyCause construct_original_prediction_input(
++    const int32_t*, size_t elements, PreparedInputArray*&) noexcept;
++}
+diff --git a/mlx/prepared_input.cpp b/mlx/prepared_input.cpp
+--- a/mlx/prepared_input.cpp
++++ b/mlx/prepared_input.cpp
+@@ -2,6 +2,7 @@
+ #include "mlx/primitives.h"
+ #include <algorithm>
+ #include <climits>
++#include <initializer_list>
+ #include <limits>
+ #include <new>
+ #include <utility>
+@@ -554,3 +555,108 @@
+   }
+ }
+ } // namespace mlx::core
++
++namespace mlx::core {
++namespace {
++struct PromptInputConstruction {
++  submission::GraphQuota::Request requests[5];
++  size_t count{0};
++  OriginalPromptInputLayout layout;
++};
++bool prompt_input_requests(submission::GraphQuota::Request* out, size_t& count) noexcept {
++  count = 0;
++  if (!PreparedInputLeaf::append_array_requests(2, out, count)) return false;
++  submission::OriginalBufferRoutingLayout birth;
++  if (!submission::original_buffer_routing_layout(birth)) return false;
++  out[count++] = {birth.birth_bytes, birth.birth_alignment};
++  out[count++] = {sizeof(PreparedInputArray), alignof(PreparedInputArray)};
++  return count == 5;
++}
++}
++bool original_prompt_input_layout(const allocator::PreparedInputFacts& facts,
++    size_t elements, OriginalPromptInputLayout& out) noexcept {
++  if (!elements || elements > size_t(INT_MAX) || !fixed_deleter_inline()) return false;
++  PromptInputConstruction c;
++  size_t requested = 0, metadata = 0, backing = 0, controls = 0, allocation_controls = 0;
++  if (!multiply(elements, sizeof(uint32_t), requested) ||
++      !prompt_input_requests(c.requests, c.count) ||
++      !allocator::original_buffer_physical_capacity(facts, requested, backing) ||
++      !allocator::original_buffer_allocation_control_bytes(allocation_controls)) return false;
++  for (size_t i = 0; i < c.count; ++i) {
++    size_t extent;
++    if (!submission::GraphQuota::allocation_extent(c.requests[i].bytes,
++        c.requests[i].alignment, extent) || !add(metadata, extent, metadata)) return false;
++  }
++  const auto adoption = array::buffer_adoption_layout();
++  const size_t values[] = {sizeof(PromptInputConstruction), sizeof(PromptInputConstruction),
++      sizeof(MutablePairHandle), sizeof(array), sizeof(Shape),
++      sizeof(std::initializer_list<int>), sizeof(int) * 2,
++      PreparedInputLeaf::descriptor_shared_control_bytes(),
++      PreparedInputLeaf::descriptor_allocator_control_bytes(),
++      sizeof(std::shared_ptr<array::Data>), sizeof(submission::GraphAllocator<array::Data>),
++      sizeof(submission::NativeControlBinding), sizeof(submission::OriginalBufferRoutingLayout),
++      sizeof(allocator::PreparedInputFacts), sizeof(allocator::OriginalBufferBinding),
++      sizeof(allocator::Buffer), adoption.incoming_bytes, adoption.scratch_owner_bytes,
++      adoption.deleter_bytes, adoption.deleter_bytes, adoption.deleter_bytes,
++      sizeof(allocator::OriginalBufferError), sizeof(submission::GraphQuotaError),
++      sizeof(submission::NativeControlError), sizeof(std::bad_alloc), sizeof(std::exception_ptr),
++      sizeof(FailureValue), sizeof(PreparedInputArray*), sizeof(const uint32_t*),
++      sizeof(submission::Scope*), sizeof(submission::GraphQuota*),
++      sizeof(allocator::OriginalBufferBudget*), sizeof(size_t) * 9, sizeof(bool) * 2,
++      sizeof(PreparedHostCopyCause), sizeof(Dtype), sizeof(const uint32_t*),
++      sizeof(size_t), sizeof(PreparedInputArray**), sizeof(PreparedHostCopyCause),
++      facts.controls, allocation_controls};
++  if (!add(controls, sizeof(values), controls)) return false;
++  for (size_t value : values) if (!add(controls, value, controls)) return false;
++  out = {metadata, backing, controls, sizeof(array)};
++  return true;
++}
++namespace {
++template <typename T>
++PreparedHostCopyCause construct_original_token_input(
++    const T* input, size_t elements, Dtype dtype, PreparedInputArray*& output) noexcept {
++  static_assert(sizeof(T) == sizeof(uint32_t));
++  using Status = PreparedHostCopyCause;
++  if (output || !input || reinterpret_cast<uintptr_t>(input) % alignof(T) ||
++      !elements || elements > size_t(INT_MAX)) return Status::invalid;
++  auto* scope = submission::current_scope();
++  const auto controls = submission::current_native_controls();
++  if (!scope || !scope->active_on_owner_thread() || !scope->valid_original_observer() ||
++      !controls.original || controls.failure != submission::NativeControlFailure::none ||
++      controls.scope_identity != scope->identity()) return Status::domain;
++  auto* graph = scope->graph_quota();
++  auto* budget = scope->original_buffer_budget();
++  auto* failure = scope->failure_owner().get();
++  if (!graph || !budget || !failure) return Status::domain;
++  if (failure->borrow() || scope->query().failed) return Status::failed;
++  if (failure->pending_publication()) return Status::busy;
++  PromptInputConstruction c;
++  if (!original_prompt_input_layout(budget->facts(), elements, c.layout)) return Status::invalid;
++  submission::mark_native_control_construction();
++  try {
++    // Ordinary arena allocation under the actual caller Scope. There is no
++    // shared prepared-block reservation or new arena/partition authority.
++    MutablePairHandle handle{graph,
++        graph->allocate(sizeof(PreparedInputArray), alignof(PreparedInputArray))};
++    array value(input, Shape{1, static_cast<int>(elements)}, dtype);
++    const auto& data = value.data_shared_ptr();
++    if (!data || data->original_input || data->buffer.original_buffer_budget() != budget ||
++        data->buffer.original_allocation_capacity() != c.layout.backing_bytes)
++      throw allocator::OriginalBufferError(allocator::OriginalBufferCause::foreign_domain);
++    output = PreparedInputArray::publish_storage(std::exchange(handle.memory, nullptr), value, graph);
++    return Status::success;
++  } catch (...) {
++    failure->capture_current_exception();
++    return Status::failed;
++  }
++}
++} // namespace
++PreparedHostCopyCause construct_original_prompt_input(
++    const uint32_t* input, size_t elements, PreparedInputArray*& output) noexcept {
++  return construct_original_token_input(input, elements, uint32, output);
++}
++PreparedHostCopyCause construct_original_prediction_input(
++    const int32_t* input, size_t elements, PreparedInputArray*& output) noexcept {
++  return construct_original_token_input(input, elements, int32, output);
++}
++}

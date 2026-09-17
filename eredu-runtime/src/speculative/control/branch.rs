@@ -4,7 +4,7 @@ use super::*;
 /// does not copy state. Release the slot explicitly when it is no longer needed.
 #[derive(Debug, Clone)]
 pub struct SpeculativeBranchHandle {
-    owner: Arc<()>,
+    owner: SpeculativeRequestIdentity,
     pub(super) id: u64,
 }
 impl SpeculativeBranchHandle {
@@ -20,13 +20,13 @@ pub struct SpeculativeBranchInfo {
     /// Logical run identity, independent of the exchange slot.
     pub run_id: u64,
     /// Canonical generated prefix, including inherited tokens.
-    pub token_ids: Vec<u32>,
+    pub token_ids: SpeculativeValues<u32>,
     /// Saved lifecycle; terminal branches remain inspectable.
     pub status: SpeculativeRequestStatus,
 }
 
 pub(super) struct Branch<E: SpeculativeExecutor, S: SpeculativeSampling, C> {
-    state: Rc<Saved<E, S, C>>,
+    state: SavedOwner<E, S, C>,
     run_id: u64,
     _reservation: SnapshotReservation,
 }
@@ -42,7 +42,7 @@ where
         &self,
         handle: &SpeculativeBranchHandle,
     ) -> Result<(), SpeculativeControlError> {
-        if !Arc::ptr_eq(&self.owner, &handle.owner) || !self.branches.contains_key(&handle.id) {
+        if !self.owner.same(&handle.owner) || !self.branches.contains_key(&handle.id) {
             return Err(SpeculativeControlError::IncompatibleBranch);
         }
         Ok(())
@@ -56,7 +56,8 @@ where
         let branch = &self.branches[&handle.id];
         Ok(SpeculativeBranchInfo {
             run_id: branch.run_id,
-            token_ids: branch.state.state.token_ids().to_vec(),
+            token_ids: views::collect(branch.state.state.token_ids().iter().copied(),self.scheduler.executor,self.scheduler.context,
+                std::mem::size_of::<SpeculativeBranchInfo>()+std::mem::size_of::<Result<SpeculativeBranchInfo,SpeculativeControlError>>())?,
             status: branch.state.state.status(),
         })
     }
@@ -72,27 +73,26 @@ where
         }
         let id = self.next_branch;
         let next = id.checked_add(1).ok_or(ExecutionControlError::Overflow)?;
-        let overhead = std::mem::size_of::<Branch<E, S, C>>() as u64 + 256;
-        let reservation = self.budget.as_ref().expect("snapshot budget").reserve(
-            SnapshotResourceKind::Branch,
-            Some(SnapshotEstimate {
-                retained_bytes: overhead,
-                copy_bytes: 0,
-            }),
-        )?;
+        let overhead = self.branches.growth_bytes(self.scheduler.executor)?
+            .checked_add(PendingSnapshotReservation::control_bytes().ok_or(ExecutionControlError::Overflow)?)
+            .and_then(|n| n.checked_add(std::mem::size_of::<Branch<E,S,C>>()))
+            .and_then(|n| u64::try_from(n).ok()).ok_or(ExecutionControlError::Overflow)?;
+        let reservation = self.reserve_control(SnapshotResourceKind::Branch,
+            SnapshotEstimate { retained_bytes: overhead, copy_bytes: 0 })?;
+        self.branches.prepare_insert(self.scheduler.executor, self.scheduler.context)?;
         // Immutable state can be shared until activation. The payload's original
         // reservation remains live even if the source snapshot is released.
         self.branches.insert(
             id,
             Branch {
-                state: Rc::clone(&self.snapshots[&handle.id]),
+                state: self.snapshots[&handle.id].clone(),
                 run_id: id,
                 _reservation: reservation,
             },
-        );
+        )?;
         self.next_branch = next;
         Ok(SpeculativeBranchHandle {
-            owner: Arc::clone(&self.owner),
+            owner: self.owner.clone(),
             id,
         })
     }
@@ -107,16 +107,20 @@ where
             .epoch
             .checked_add(1)
             .ok_or(ExecutionControlError::Overflow)?;
-        let incoming = Rc::clone(&self.branches[&handle.id].state);
+        let incoming = self.branches[&handle.id].state.clone();
         let incoming_run = self.branches[&handle.id].run_id;
         // Reserve both copies before replacing anything. Every switch prices
         // the actual outgoing state, including growth since its last activation.
         let outgoing = self.save_state(SnapshotResourceKind::BranchCopy)?;
-        let _restore = self
-            .budget
-            .as_ref()
-            .expect("branch budget")
-            .reserve(SnapshotResourceKind::Restore, Some(incoming.estimate))?;
+        let _restore = self.reserve_control(SnapshotResourceKind::Restore, incoming.estimate)?;
+        // Prepare the exact immutable incoming prefix before replacing either
+        // active state or the branch slot. Refusal leaves both installed owners.
+        let info=SpeculativeBranchInfo {
+            run_id:incoming_run,
+            token_ids:views::collect(incoming.state.token_ids().iter().copied(),self.scheduler.executor,self.scheduler.context,
+                std::mem::size_of::<SpeculativeBranchInfo>()+std::mem::size_of::<Result<SpeculativeBranchInfo,SpeculativeControlError>>())?,
+            status:incoming.state.status(),
+        };
         let request = self
             .scheduler
             .requests
@@ -134,10 +138,6 @@ where
         self.run_id = incoming_run;
         self.epoch = epoch;
         self.failed = false;
-        Ok(SpeculativeBranchInfo {
-            run_id: self.run_id,
-            token_ids: self.token_ids().to_vec(),
-            status: self.status(),
-        })
+        Ok(info)
     }
 }

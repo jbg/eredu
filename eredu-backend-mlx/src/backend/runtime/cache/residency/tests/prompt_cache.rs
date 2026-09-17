@@ -33,6 +33,8 @@ fn prompt_cache_save_selects_only_descriptor_owned_layers() {
                     shapes: [vec![1, 1, 1, 1], vec![1, 1, 1, 1]],
                     dtypes: ["Float32".into(), "Float32".into()],
                     imported: false,
+                    original_discard: None,
+                    _metadata_funding: None,
                 },
                 false,
                 leases,
@@ -237,10 +239,12 @@ fn v7_layer_frontiers_validate_speculative_cache_coverage() {
         serde_json::to_vec(&manifest).unwrap(),
     )
     .unwrap();
-    assert!(inspect_prompt_cache(directory.path())
-        .unwrap_err()
-        .to_string()
-        .contains("ends at 1, expected 2"));
+    assert!(
+        inspect_prompt_cache(directory.path())
+            .unwrap_err()
+            .to_string()
+            .contains("ends at 1, expected 2")
+    );
 }
 
 #[test]
@@ -252,9 +256,11 @@ fn v5_behavioral_state_layout_round_trips_and_changes_identity() {
         MutableStateResidency::AlwaysDeviceMutable,
     )
     .expect_err("large recurrent state cannot use the rolling-state lifecycle");
-    assert!(incoherent
-        .to_string()
-        .contains("requires LayerScopedOffloadable"));
+    assert!(
+        incoherent
+            .to_string()
+            .contains("requires LayerScopedOffloadable")
+    );
     let convolution = StateTensorPolicy::new(
         StateTensorRole::Convolution { slot: 0 },
         vec![
@@ -289,13 +295,15 @@ fn v5_behavioral_state_layout_round_trips_and_changes_identity() {
         .unwrap(),
         LayerSchedule::new(
             1,
-            vec![LayerCachePolicy::key_value_with_fixed_state(
-                AttentionPolicy::Full,
-                1,
-                1,
-                vec![convolution.clone()],
-            )
-            .unwrap()],
+            vec![
+                LayerCachePolicy::key_value_with_fixed_state(
+                    AttentionPolicy::Full,
+                    1,
+                    1,
+                    vec![convolution.clone()],
+                )
+                .unwrap(),
+            ],
         )
         .unwrap(),
     ];
@@ -394,9 +402,11 @@ fn manifest_rejects_reordered_duplicate_missing_and_unexpected_layers() {
 
     let mut unexpected = two_layers.clone();
     unexpected.blocks[1].global_layer = 2;
-    assert!(write(&unexpected)
-        .to_string()
-        .contains("outside the owned range"));
+    assert!(
+        write(&unexpected)
+            .to_string()
+            .contains("outside the owned range")
+    );
 }
 
 #[test]
@@ -410,10 +420,12 @@ fn manifest_rejects_policy_payload_kind_and_geometry_mismatches() {
         serde_json::to_vec(&kind).unwrap(),
     )
     .unwrap();
-    assert!(inspect_prompt_cache(directory.path())
-        .unwrap_err()
-        .to_string()
-        .contains("does not match its policy"));
+    assert!(
+        inspect_prompt_cache(directory.path())
+            .unwrap_err()
+            .to_string()
+            .contains("does not match its policy")
+    );
 
     let mut geometry = base;
     geometry.layer_layout = PromptCacheModelIdentity::key_value_layouts([None], 2, 1).unwrap();
@@ -422,10 +434,12 @@ fn manifest_rejects_policy_payload_kind_and_geometry_mismatches() {
         serde_json::to_vec(&geometry).unwrap(),
     )
     .unwrap();
-    assert!(inspect_prompt_cache(directory.path())
-        .unwrap_err()
-        .to_string()
-        .contains("does not match its policy"));
+    assert!(
+        inspect_prompt_cache(directory.path())
+            .unwrap_err()
+            .to_string()
+            .contains("does not match its policy")
+    );
 }
 
 #[test]
@@ -441,7 +455,7 @@ fn same_length_prompt_payload_corruption_is_rejected_before_array_conversion() {
     // Header-only inspection remains valid because metadata and length did
     // not change. The buffered payload gate must still reject the shard.
     inspect_prompt_cache(directory.path()).unwrap();
-    let location = DiskLocation {
+    let location = DiskLocation::ordinary(DiskLocationData {
         path: shard.clone(),
         first_name: "keys".into(),
         second_name: "values".into(),
@@ -449,7 +463,8 @@ fn same_length_prompt_payload_corruption_is_rejected_before_array_conversion() {
         buffered: Some(buffer_prompt_cache_shard(&shard).unwrap()),
         payload_sha256: Some(manifest.blocks[0].payload_sha256.clone()),
         payload_verification: Arc::new(OnceLock::new()),
-    };
+        live_source: None,
+    });
     let error = verify_disk_payload(&location).unwrap_err();
     assert!(error.to_string().contains("payload SHA-256 mismatch"));
 }
@@ -469,10 +484,12 @@ fn imported_prompt_shards_are_buffered_and_retained() {
     .unwrap();
     let state = manager.lock().unwrap();
     assert_eq!(state.telemetry.report.imported_buffered_shards, 1);
-    assert!(state.blocks.values().all(|record| record
-        .disk()
-        .and_then(|location| location.buffered.as_ref())
-        .is_some()));
+    assert!(state.blocks.values().all(|record| {
+        record
+            .disk()
+            .and_then(|location| location.buffered.as_ref())
+            .is_some()
+    }));
     for record in state.blocks.values() {
         verify_disk_payload(record.disk().unwrap()).unwrap();
     }

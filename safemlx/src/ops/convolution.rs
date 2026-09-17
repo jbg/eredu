@@ -603,3 +603,118 @@ mod tests {
         assert!(result.is_err());
     }
 }
+
+/// Actual compiled implicit/separable convolution construction and worker facts.
+/// This inspects source geometry only; it creates no tensor, context or authority.
+#[derive(Clone, Copy, Debug)]
+pub struct OriginalConvolutionLayout {
+    native: safemlx_sys::mlx_original_convolution_layout,
+    rank: usize,
+}
+impl OriginalConvolutionLayout {
+    /// Inspect a nontransposed 1D/2D convolution. Other selected algorithms
+    /// return None until their complete native construction/worker receipt exists.
+    pub fn inspect(
+        input: &[i32],
+        weight: &[i32],
+        stride: &[i32],
+        padding: &[i32],
+        dilation: &[i32],
+        groups: i32,
+    ) -> Option<Self> {
+        let dims = stride.len();
+        if !(1..=2).contains(&dims)
+            || input.len() != dims + 2
+            || weight.len() != dims + 2
+            || padding.len() != dims
+            || dilation.len() != dims
+        {
+            return None;
+        }
+        let mut source = safemlx_sys::mlx_original_convolution_source {
+            spatial_dimensions: dims,
+            input: [
+                input[0],
+                input[1],
+                if dims == 2 { input[2] } else { 1 },
+                input[dims + 1],
+            ],
+            weight: [
+                weight[0],
+                weight[1],
+                if dims == 2 { weight[2] } else { 1 },
+                weight[dims + 1],
+            ],
+            stride: [1; 2],
+            padding: [0; 2],
+            dilation: [1; 2],
+            groups,
+        };
+        source.stride[..dims].copy_from_slice(stride);
+        source.padding[..dims].copy_from_slice(padding);
+        source.dilation[..dims].copy_from_slice(dilation);
+        let mut native = safemlx_sys::mlx_original_convolution_layout::default();
+        // SAFETY: both structures live for the call; native reads fixed source
+        // fields and writes this output only. No TLS/native object is consulted.
+        if !unsafe { safemlx_sys::mlx_original_convolution_inspect(&mut native, &source) } {
+            return None;
+        }
+        if dims == 1 {
+            native.output[2] = native.output[3];
+            native.output[3] = 1;
+        }
+        Some(Self {
+            native,
+            rank: dims + 2,
+        })
+    }
+    /// Exact output geometry established by the native constructor formula.
+    pub fn output_shape(&self) -> &[i32] {
+        &self.native.output[..self.rank]
+    }
+    /// Constructor descriptor population, including its possible dtype casts.
+    pub fn primitives(self) -> usize {
+        self.native.primitives
+    }
+    /// Constructor input-edge population.
+    pub fn edges(self) -> usize {
+        self.native.edges
+    }
+    /// Output/cast births and the two possible row-contiguous input copies.
+    pub fn backing_births(self) -> usize {
+        self.native.backing_births
+    }
+    /// Named native/safe constructor and query controls, excluding the shared
+    /// per-kernel selector population already paid by the operation recipe.
+    pub fn control_bytes(self) -> Option<usize> {
+        use crate::OriginalScopeObserver;
+        use crate::utils::{guard::MaybeUninitArray, runtime_lock::RuntimeLockGuard};
+        use std::mem::{size_of, size_of_val};
+        let frames = [
+            size_of::<Self>(),
+            size_of::<Option<Self>>(),
+            size_of::<safemlx_sys::mlx_original_convolution_source>(),
+            size_of::<safemlx_sys::mlx_original_convolution_layout>(),
+            size_of::<[&[i32]; 5]>(),
+            size_of::<[usize; 2]>(),
+            size_of::<i32>(),
+            size_of::<[&Array; 2]>(),
+            size_of::<&Stream>(),
+            size_of::<[Option<(i32, i32)>; 3]>(),
+            size_of::<Option<i32>>(),
+            size_of::<Array>(),
+            size_of::<MaybeUninitArray>(),
+            size_of::<Result<Array>>(),
+            size_of::<RuntimeLockGuard>(),
+            size_of::<Option<RuntimeLockGuard>>(),
+            size_of::<OriginalScopeObserver>(),
+            size_of::<Result<Option<OriginalScopeObserver>>>(),
+        ];
+        frames.into_iter().try_fold(
+            self.native
+                .named_control_bytes
+                .checked_add(size_of_val(&frames))?,
+            usize::checked_add,
+        )
+    }
+}

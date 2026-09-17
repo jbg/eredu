@@ -5,23 +5,32 @@
 //! to a single checkpoint key. They are validated from checkpoint metadata and
 //! materialized on the residency source stream before device promotion.
 
+use crate::backend::runtime::checkpoint::store::OriginalMaterializationSlots;
 use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype};
 use eredu_checkpoint::store::{CheckpointSource, ReadPolicy, TensorReadRequest, TensorSelection};
+use safemlx::OriginalScopeObserver;
 
 use safemlx::{
+    Array, Dtype, HostTransferBuffer, HostTransferPolicy, Stream,
     ops::{concatenate_axis, contiguous, stack_axis},
-    Array, Dtype, Stream,
 };
 
 use crate::backend::runtime::checkpoint::store::{
     MlxParameterMaterializationContext, PendingWeightMaterialization, WeightMaterialization,
 };
 
-/// Conservative native tensor and host-index buffers of the recipe materializer.
+mod direct_plan;
+mod workspace;
+pub(crate) use direct_plan::{PreparedDirectReadError, PreparedDirectReadPlan};
+
+/// Logical tensor and host-index sizes of the recipe materializer.
 /// Direct encoded initialization needs only its output. The ordinary path can
 /// retain every source until completion; count all intermediates, source copies,
 /// and the final contiguous output even when the allocator can recycle them.
-/// Native driver bookkeeping and allocator caches are not tensor workspace.
+/// This diagnostic predates native allocator-capacity accounting. It cannot
+/// authorize working-memory admission: allocation rounding, reuse, source
+/// staging and some primitive scratch are absent. Use the selected batch's
+/// workspace bound where available; other paths must remain unknown.
 pub(crate) fn native_recipe_workspace(
     recipe: &DerivedWeightRecipe,
     source: &dyn CheckpointSource,
@@ -100,6 +109,7 @@ pub(crate) fn native_recipe_workspace(
 }
 
 /// A byte-preserving recipe admitted for direct initialization of native storage.
+#[derive(Clone)]
 pub(crate) struct DirectRecipeRead {
     shape: Vec<i32>,
     dtype: Dtype,
@@ -107,6 +117,15 @@ pub(crate) struct DirectRecipeRead {
 }
 
 impl DirectRecipeRead {
+    pub(crate) fn encoded(&self) -> &eredu_checkpoint::recipe::EncodedRecipeRead {
+        &self.read
+    }
+    pub(crate) fn shape(&self) -> &[i32] {
+        &self.shape
+    }
+    pub(crate) fn dtype(&self) -> Dtype {
+        self.dtype
+    }
     pub(crate) fn prepare(
         recipe: &DerivedWeightRecipe,
         source: &dyn CheckpointSource,
@@ -155,6 +174,32 @@ impl DirectRecipeRead {
             eredu_checkpoint::recipe::EncodedRecipeRead::read_many_into(reads, outputs)
                 .map_err(WeightRecipeError::CheckpointStore)
         })
+    }
+
+    /// Fill the final host-transfer allocations through the same encoded read
+    /// worker. No intermediate array, stream submission or completion is needed.
+    /// A failed synchronous read drops every unpublished destination, including
+    /// any already written prefix. Metadata and native buffer controls here are
+    /// ordinary allocations; this method does not itself grant strict admission.
+    pub(crate) fn materialize_host_many(
+        reads: Vec<Self>,
+    ) -> Result<Vec<HostTransferBuffer>, WeightRecipeError> {
+        let mut buffers = Vec::with_capacity(reads.len());
+        let mut encoded = Vec::with_capacity(reads.len());
+        for read in reads {
+            buffers.push(HostTransferBuffer::new(
+                &read.shape,
+                read.dtype,
+                HostTransferPolicy::Transfer,
+            )?);
+            encoded.push(read.read);
+        }
+        let mut destinations = buffers
+            .iter_mut()
+            .map(HostTransferBuffer::as_bytes_mut)
+            .collect::<Result<Vec<_>, _>>()?;
+        eredu_checkpoint::recipe::EncodedRecipeRead::read_many_into(encoded, &mut destinations)?;
+        Ok(buffers)
     }
 }
 
@@ -216,17 +261,38 @@ pub(crate) fn plan_binding_reads<'a>(
 
 /// Materializes a recipe already classified as requiring the ordinary path.
 /// Keeping that decision avoids preparing its encoded read a second time.
-pub(crate) fn prepare_ordinary_recipe(
+pub(crate) fn prepare_ordinary_recipe<'context>(
     recipe: &DerivedWeightRecipe,
     store: &dyn CheckpointSource,
-    context: &MlxParameterMaterializationContext,
+    context: impl Into<crate::backend::runtime::checkpoint::store::MaterializationView<'context>>,
     borrow_sources: bool,
 ) -> Result<PendingWeightRecipe, WeightRecipeError> {
+    let context = context.into();
+    prepare_ordinary_recipe_with_operations(recipe, store, context, borrow_sources, None)
+}
+pub(crate) fn prepare_ordinary_recipe_with_operations<'context>(
+    recipe: &DerivedWeightRecipe,
+    store: &dyn CheckpointSource,
+    context: impl Into<crate::backend::runtime::checkpoint::store::MaterializationView<'context>>,
+    borrow_sources: bool,
+    original: Option<(
+        &mut OriginalMaterializationSlots<'_>,
+        &OriginalScopeObserver,
+    )>,
+) -> Result<PendingWeightRecipe, WeightRecipeError> {
+    let context = context.into();
     recipe.infer(store)?;
     let mut sources = Vec::new();
     let source_stream = context.source_stream();
-    let output =
-        recipe.materialize_inner(store, source_stream, &mut sources, borrow_sources, context)?;
+    let output = materialize_inner_with_operations(
+        recipe,
+        store,
+        source_stream,
+        &mut sources,
+        borrow_sources,
+        &context,
+        original,
+    )?;
     // Derived recipe outputs are immutable and may be reused across forwards.
     // Detach gathers/transposes into their final row-major representation
     // once here so consumers do not silently repack a full weight on every
@@ -256,31 +322,34 @@ pub fn recipe_dtype_from_mlx(value: Dtype) -> RecipeDtype {
 }
 
 pub(crate) fn mlx_dtype(value: &RecipeDtype) -> Result<Dtype, WeightRecipeError> {
+    mlx_dtype_if_supported(value).ok_or_else(|| WeightRecipeError::UnsupportedDtype {
+        dtype: match value {
+            RecipeDtype::Other(dtype) => dtype.clone(),
+            _ => format!("{value:?}"),
+        },
+    })
+}
+pub(crate) fn mlx_dtype_if_supported(value: &RecipeDtype) -> Option<Dtype> {
     match value {
-        RecipeDtype::Bool => Ok(Dtype::Bool),
+        RecipeDtype::Bool => Some(Dtype::Bool),
         RecipeDtype::U8
         | RecipeDtype::F8E4M3
         | RecipeDtype::F8E5M2
         | RecipeDtype::F4
-        | RecipeDtype::F8E8M0 => Ok(Dtype::Uint8),
-        RecipeDtype::I8 => Ok(Dtype::Int8),
-        RecipeDtype::I16 => Ok(Dtype::Int16),
-        RecipeDtype::U16 => Ok(Dtype::Uint16),
-        RecipeDtype::F16 => Ok(Dtype::Float16),
-        RecipeDtype::BF16 => Ok(Dtype::Bfloat16),
-        RecipeDtype::I32 => Ok(Dtype::Int32),
-        RecipeDtype::U32 => Ok(Dtype::Uint32),
-        RecipeDtype::F32 => Ok(Dtype::Float32),
-        RecipeDtype::F64 => Ok(Dtype::Float64),
-        RecipeDtype::I64 => Ok(Dtype::Int64),
-        RecipeDtype::U64 => Ok(Dtype::Uint64),
-        RecipeDtype::C64 => Ok(Dtype::Complex64),
-        RecipeDtype::Other(dtype) => Err(WeightRecipeError::UnsupportedDtype {
-            dtype: dtype.clone(),
-        }),
-        _ => Err(WeightRecipeError::UnsupportedDtype {
-            dtype: format!("{value:?}"),
-        }),
+        | RecipeDtype::F8E8M0 => Some(Dtype::Uint8),
+        RecipeDtype::I8 => Some(Dtype::Int8),
+        RecipeDtype::I16 => Some(Dtype::Int16),
+        RecipeDtype::U16 => Some(Dtype::Uint16),
+        RecipeDtype::F16 => Some(Dtype::Float16),
+        RecipeDtype::BF16 => Some(Dtype::Bfloat16),
+        RecipeDtype::I32 => Some(Dtype::Int32),
+        RecipeDtype::U32 => Some(Dtype::Uint32),
+        RecipeDtype::F32 => Some(Dtype::Float32),
+        RecipeDtype::F64 => Some(Dtype::Float64),
+        RecipeDtype::I64 => Some(Dtype::Int64),
+        RecipeDtype::U64 => Some(Dtype::Uint64),
+        RecipeDtype::C64 => Some(Dtype::Complex64),
+        _ => None,
     }
 }
 
@@ -553,160 +622,283 @@ impl MlxWeightRecipeExt for DerivedWeightRecipe {
         borrow_sources: bool,
         context: &MlxParameterMaterializationContext,
     ) -> Result<Array, WeightRecipeError> {
-        match self {
-            Self::Source { key, selection } => {
-                let lease = store.acquire_lease(TensorReadRequest {
-                    key: key.clone(),
-                    selection: selection.clone(),
-                    policy: ReadPolicy::RequireBounded,
-                })?;
-                let lease = context.weight_lease(lease)?;
-                let pending = if borrow_sources {
-                    lease.prepare_borrowed_materialization(stream)?
-                } else {
-                    lease.prepare_materialization(stream, stream)?
-                };
-                let array = pending.output().clone();
-                sources.push(pending);
-                Ok(array)
-            }
-            Self::Select { input, selection } => {
-                let array =
-                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
-                match selection {
-                    TensorSelection::Full => Ok(array),
-                    TensorSelection::Range { axis, start, end } => {
-                        let indices = (*start..*end)
-                            .map(|index| usize_to_i32(index, "selection index"))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        Ok(array.take_axis(
-                            Array::from_slice(&indices, &[indices.len() as i32]),
-                            usize_to_i32(*axis, "selection axis")?,
-                            stream,
-                        )?)
-                    }
-                    TensorSelection::Indices { axis, indices } => {
-                        let indices = indices
-                            .iter()
-                            .map(|index| usize_to_i32(*index, "selection index"))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        Ok(array.take_axis(
-                            Array::from_slice(&indices, &[indices.len() as i32]),
-                            usize_to_i32(*axis, "selection axis")?,
-                            stream,
-                        )?)
-                    }
-                    TensorSelection::Contiguous {
-                        offset_elements,
-                        shape,
-                    } => {
-                        let elements = shape.iter().try_fold(1usize, |count, dimension| {
-                            count.checked_mul(*dimension).ok_or(
-                                WeightRecipeError::ArithmeticOverflow(
-                                    "contiguous recipe selection size",
-                                ),
-                            )
-                        })?;
-                        let indices = (*offset_elements..offset_elements + elements)
-                            .map(|index| usize_to_i32(index, "contiguous selection index"))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        let flattened = array.reshape(&[-1], stream)?;
-                        let selected = flattened.take_axis(
-                            Array::from_slice(&indices, &[indices.len() as i32]),
-                            0,
-                            stream,
-                        )?;
-                        let shape = shape
-                            .iter()
-                            .map(|dimension| usize_to_i32(*dimension, "contiguous selection shape"))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        Ok(selected.reshape(&shape, stream)?)
+        let context =
+            crate::backend::runtime::checkpoint::store::MaterializationView::from(context);
+        materialize_inner_with_operations(
+            self,
+            store,
+            stream,
+            sources,
+            borrow_sources,
+            &context,
+            None,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize_inner_with_operations<'context>(
+    recipe: &DerivedWeightRecipe,
+    store: &dyn CheckpointSource,
+    stream: &Stream,
+    sources: &mut Vec<PendingWeightMaterialization>,
+    borrow_sources: bool,
+    context: &crate::backend::runtime::checkpoint::store::MaterializationView<'context>,
+    mut original: Option<(
+        &mut OriginalMaterializationSlots<'_>,
+        &OriginalScopeObserver,
+    )>,
+) -> Result<Array, WeightRecipeError> {
+    match recipe {
+        DerivedWeightRecipe::Source { key, selection } => {
+            let pending = match original.as_mut() {
+                Some((slots, observer)) => slots
+                    .acquire_lease(store, key, selection, observer)?
+                    .prepare(context, stream, stream, slots, observer, borrow_sources)?,
+                None => {
+                    let lease =
+                        context.weight_lease(store.acquire_lease(TensorReadRequest {
+                            key: key.clone(),
+                            selection: selection.clone(),
+                            policy: ReadPolicy::RequireBounded,
+                        })?)?;
+                    if borrow_sources {
+                        lease.prepare_borrowed_materialization(stream)?
+                    } else {
+                        lease.prepare_materialization(stream, stream)?
                     }
                 }
-            }
-            Self::Concatenate { axis, inputs } => {
-                let arrays =
-                    materialize_inputs(inputs, store, stream, sources, borrow_sources, context)?;
-                let references = arrays.iter().collect::<Vec<_>>();
-                Ok(concatenate_axis(
-                    &references,
-                    usize_to_i32(*axis, "concatenate axis")?,
-                    stream,
-                )?)
-            }
-            Self::Stack { axis, inputs } => {
-                let arrays =
-                    materialize_inputs(inputs, store, stream, sources, borrow_sources, context)?;
-                let references = arrays.iter().collect::<Vec<_>>();
-                Ok(stack_axis(
-                    &references,
-                    usize_to_i32(*axis, "stack axis")?,
-                    stream,
-                )?)
-            }
-            Self::Reshape { input, shape } => {
-                let array =
-                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
-                let shape = shape
-                    .iter()
-                    .map(|dimension| usize_to_i32(*dimension, "reshape dimension"))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(array.reshape(&shape, stream)?)
-            }
-            Self::Transpose { input, axes } => {
-                let array =
-                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
-                let axes = axes
-                    .iter()
-                    .map(|axis| usize_to_i32(*axis, "transpose axis"))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(array.transpose_axes(&axes, stream)?)
-            }
-            Self::Cast { input, dtype } => {
-                let array =
-                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
-                Ok(array.as_dtype(mlx_dtype(dtype)?, stream)?)
-            }
-            Self::View {
+            };
+            let array = pending.output().clone();
+            sources.push(pending);
+            Ok(array)
+        }
+        DerivedWeightRecipe::Select { input, selection } => {
+            let array = materialize_inner_with_operations(
                 input,
-                dtype,
-                shape,
-            } => {
-                let array =
-                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
-                let shape = shape
-                    .iter()
-                    .map(|dimension| usize_to_i32(*dimension, "view dimension"))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(array
-                    .view_dtype(mlx_dtype(dtype)?, stream)?
-                    .reshape(&shape, stream)?)
-            }
-            Self::NegLog { input } => {
-                let array =
-                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
-                let prepared =
-                    WeightMaterialization::prepare_retained(vec![array], std::mem::take(sources))?;
-                let all_negative = prepared.inputs()[0]
-                    .lt(Array::from_f32(0.0), stream)?
-                    .all(false, stream)?
-                    .try_item::<bool>(stream)?;
-                if !all_negative {
-                    prepared.finish()?;
-                    return Err(WeightRecipeError::NonNegativeNegLogInput);
+                store,
+                stream,
+                sources,
+                borrow_sources,
+                context,
+                original
+                    .as_mut()
+                    .map(|(slots, observer)| (&mut **slots, *observer)),
+            )?;
+            match selection {
+                TensorSelection::Full => Ok(array),
+                TensorSelection::Range { axis, start, end } => {
+                    let indices = (*start..*end)
+                        .map(|index| usize_to_i32(index, "selection index"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(array.take_axis(
+                        Array::try_from_slice(&indices, &[indices.len() as i32])?,
+                        usize_to_i32(*axis, "selection axis")?,
+                        stream,
+                    )?)
                 }
-                let output = prepared.inputs()[0]
-                    .multiply(Array::from_f32(-1.0), stream)?
-                    .log(stream)?;
-                sources.extend(prepared.finish_preparation()?);
-                Ok(output)
+                TensorSelection::Indices { axis, indices } => {
+                    let indices = indices
+                        .iter()
+                        .map(|index| usize_to_i32(*index, "selection index"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(array.take_axis(
+                        Array::try_from_slice(&indices, &[indices.len() as i32])?,
+                        usize_to_i32(*axis, "selection axis")?,
+                        stream,
+                    )?)
+                }
+                TensorSelection::Contiguous {
+                    offset_elements,
+                    shape,
+                } => {
+                    let elements = shape.iter().try_fold(1usize, |count, dimension| {
+                        count
+                            .checked_mul(*dimension)
+                            .ok_or(WeightRecipeError::ArithmeticOverflow(
+                                "contiguous recipe selection size",
+                            ))
+                    })?;
+                    let indices = (*offset_elements..offset_elements + elements)
+                        .map(|index| usize_to_i32(index, "contiguous selection index"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let flattened = array.reshape(&[-1], stream)?;
+                    let selected = flattened.take_axis(
+                        Array::try_from_slice(&indices, &[indices.len() as i32])?,
+                        0,
+                        stream,
+                    )?;
+                    let shape = shape
+                        .iter()
+                        .map(|dimension| usize_to_i32(*dimension, "contiguous selection shape"))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(selected.reshape(&shape, stream)?)
+                }
             }
-            Self::SubtractOne { input } => {
-                let array =
-                    input.materialize_inner(store, stream, sources, borrow_sources, context)?;
-                let one = Array::from_f32(1.0).as_dtype(array.dtype(), stream)?;
-                Ok(array.subtract(one, stream)?)
+        }
+        DerivedWeightRecipe::Concatenate { axis, inputs } => {
+            let arrays = materialize_inputs(
+                inputs,
+                store,
+                stream,
+                sources,
+                borrow_sources,
+                context,
+                original
+                    .as_mut()
+                    .map(|(slots, observer)| (&mut **slots, *observer)),
+            )?;
+            let references = arrays.iter().collect::<Vec<_>>();
+            Ok(concatenate_axis(
+                &references,
+                usize_to_i32(*axis, "concatenate axis")?,
+                stream,
+            )?)
+        }
+        DerivedWeightRecipe::Stack { axis, inputs } => {
+            let arrays = materialize_inputs(
+                inputs,
+                store,
+                stream,
+                sources,
+                borrow_sources,
+                context,
+                original
+                    .as_mut()
+                    .map(|(slots, observer)| (&mut **slots, *observer)),
+            )?;
+            let references = arrays.iter().collect::<Vec<_>>();
+            Ok(stack_axis(
+                &references,
+                usize_to_i32(*axis, "stack axis")?,
+                stream,
+            )?)
+        }
+        DerivedWeightRecipe::Reshape { input, shape } => {
+            let array = materialize_inner_with_operations(
+                input,
+                store,
+                stream,
+                sources,
+                borrow_sources,
+                context,
+                original
+                    .as_mut()
+                    .map(|(slots, observer)| (&mut **slots, *observer)),
+            )?;
+            let shape = shape
+                .iter()
+                .map(|dimension| usize_to_i32(*dimension, "reshape dimension"))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(array.reshape(&shape, stream)?)
+        }
+        DerivedWeightRecipe::Transpose { input, axes } => {
+            let array = materialize_inner_with_operations(
+                input,
+                store,
+                stream,
+                sources,
+                borrow_sources,
+                context,
+                original
+                    .as_mut()
+                    .map(|(slots, observer)| (&mut **slots, *observer)),
+            )?;
+            let axes = axes
+                .iter()
+                .map(|axis| usize_to_i32(*axis, "transpose axis"))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(array.transpose_axes(&axes, stream)?)
+        }
+        DerivedWeightRecipe::Cast { input, dtype } => {
+            let array = materialize_inner_with_operations(
+                input,
+                store,
+                stream,
+                sources,
+                borrow_sources,
+                context,
+                original
+                    .as_mut()
+                    .map(|(slots, observer)| (&mut **slots, *observer)),
+            )?;
+            Ok(array.as_dtype(mlx_dtype(dtype)?, stream)?)
+        }
+        DerivedWeightRecipe::View {
+            input,
+            dtype,
+            shape,
+        } => {
+            let array = materialize_inner_with_operations(
+                input,
+                store,
+                stream,
+                sources,
+                borrow_sources,
+                context,
+                original
+                    .as_mut()
+                    .map(|(slots, observer)| (&mut **slots, *observer)),
+            )?;
+            let shape = shape
+                .iter()
+                .map(|dimension| usize_to_i32(*dimension, "view dimension"))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(array
+                .view_dtype(mlx_dtype(dtype)?, stream)?
+                .reshape(&shape, stream)?)
+        }
+        DerivedWeightRecipe::NegLog { input } => {
+            let array = materialize_inner_with_operations(
+                input,
+                store,
+                stream,
+                sources,
+                borrow_sources,
+                context,
+                original
+                    .as_mut()
+                    .map(|(slots, observer)| (&mut **slots, *observer)),
+            )?;
+            let prepared = match original.as_mut() {
+                Some((slots, observer)) => WeightMaterialization::prepare_retained_with_operations(
+                    vec![array],
+                    std::mem::take(sources),
+                    slots,
+                    observer,
+                )?,
+                None => {
+                    WeightMaterialization::prepare_retained(vec![array], std::mem::take(sources))?
+                }
+            };
+            let all_negative = prepared.inputs()[0]
+                .lt(Array::try_from_f32(0.0)?, stream)?
+                .all(false, stream)?
+                .try_item::<bool>(stream)?;
+            if !all_negative {
+                prepared.finish()?;
+                return Err(WeightRecipeError::NonNegativeNegLogInput);
             }
+            let output = prepared.inputs()[0]
+                .multiply(Array::try_from_f32(-1.0)?, stream)?
+                .log(stream)?;
+            sources.extend(prepared.finish_preparation()?);
+            Ok(output)
+        }
+        DerivedWeightRecipe::SubtractOne { input } => {
+            let array = materialize_inner_with_operations(
+                input,
+                store,
+                stream,
+                sources,
+                borrow_sources,
+                context,
+                original
+                    .as_mut()
+                    .map(|(slots, observer)| (&mut **slots, *observer)),
+            )?;
+            let one = Array::try_from_f32(1.0)?.as_dtype(array.dtype(), stream)?;
+            Ok(array.subtract(one, stream)?)
         }
     }
 }
@@ -729,13 +921,33 @@ impl PendingWeightRecipe {
     }
 }
 
-fn materialize_inputs(
+fn submit_materialized_child(
+    array: Array,
+    sources: Vec<PendingWeightMaterialization>,
+    original: Option<(
+        &mut OriginalMaterializationSlots<'_>,
+        &OriginalScopeObserver,
+    )>,
+) -> Result<WeightMaterialization, WeightRecipeError> {
+    Ok(match original {
+        Some((slots, observer)) => {
+            WeightMaterialization::submit_retained_with_operations(array, sources, slots, observer)?
+        }
+        None => WeightMaterialization::submit_retained(array, sources)?,
+    })
+}
+
+fn materialize_inputs<'context>(
     inputs: &[DerivedWeightRecipe],
     store: &dyn CheckpointSource,
     stream: &Stream,
     sources: &mut Vec<PendingWeightMaterialization>,
     borrow_sources: bool,
-    context: &MlxParameterMaterializationContext,
+    context: &crate::backend::runtime::checkpoint::store::MaterializationView<'context>,
+    mut original: Option<(
+        &mut OriginalMaterializationSlots<'_>,
+        &OriginalScopeObserver,
+    )>,
 ) -> Result<Vec<Array>, WeightRecipeError> {
     let mut pending =
         Vec::<(Array, Vec<PendingWeightMaterialization>)>::with_capacity(inputs.len());
@@ -743,18 +955,25 @@ fn materialize_inputs(
     for input in inputs {
         loop {
             let mut input_sources = Vec::new();
-            match input.materialize_inner(
+            match materialize_inner_with_operations(
+                input,
                 store,
                 stream,
                 &mut input_sources,
                 borrow_sources,
                 context,
+                original
+                    .as_mut()
+                    .map(|(slots, observer)| (&mut **slots, *observer)),
             ) {
                 Ok(array) => {
                     if detach_remaining && !input_sources.is_empty() {
-                        WeightMaterialization::submit_retained(
+                        submit_materialized_child(
                             array.clone(),
                             std::mem::take(&mut input_sources),
+                            original
+                                .as_mut()
+                                .map(|(slots, observer)| (&mut **slots, *observer)),
                         )?
                         .synchronize()?;
                     }
@@ -765,13 +984,11 @@ fn materialize_inputs(
                     if !borrow_sources
                         && !detach_remaining
                         && !pending.is_empty()
-                        && matches!(
-                            &error,
-                            WeightRecipeError::CheckpointStore(
-                                eredu_checkpoint::store::StoreError::CapacityExhausted { .. }
-                            )
-                        ) =>
+                        && recipe_cache_capacity(&error) =>
                 {
+                    // Prepared failures may retain an actual rejected lease.
+                    // It cannot keep the cache pinned across this retry.
+                    let _ordinary_error = original.is_none().then_some(error);
                     // The current child could not acquire another shard while
                     // earlier children pinned the shard cache. Their arrays
                     // are sufficient evaluation roots, so detach them and retry.
@@ -780,9 +997,12 @@ fn materialize_inputs(
                         if child_sources.is_empty() {
                             continue;
                         }
-                        WeightMaterialization::submit_retained(
+                        submit_materialized_child(
                             array.clone(),
                             std::mem::take(child_sources),
+                            original
+                                .as_mut()
+                                .map(|(slots, observer)| (&mut **slots, *observer)),
                         )?
                         .synchronize()?;
                     }
@@ -920,7 +1140,8 @@ pub enum WeightRecipeError {
     #[error("log(-x) derived-weight input must contain only negative values")]
     NonNegativeNegLogInput,
     /// Backend-neutral checkpoint inspection or lease acquisition failed.
-    #[error(transparent)]
+    /// Keep source-less admission failures in the public error chain.
+    #[error("{0}")]
     CheckpointStore(#[from] eredu_checkpoint::store::StoreError),
     /// MLX checkpoint materialization failed.
     #[error(transparent)]
@@ -928,9 +1149,25 @@ pub enum WeightRecipeError {
         #[from] crate::backend::runtime::checkpoint::store::CheckpointMaterializationError,
     ),
     /// MLX transformation or synchronization failed.
-    #[error(transparent)]
+    #[error("{0}")]
     Mlx(#[from] safemlx::error::Exception),
 }
 
 #[cfg(test)]
 mod tests;
+
+fn recipe_cache_capacity(error: &WeightRecipeError) -> bool {
+    use crate::backend::runtime::checkpoint::store::CheckpointMaterializationError;
+    match error {
+        WeightRecipeError::CheckpointStore(
+            eredu_checkpoint::store::StoreError::CapacityExhausted { .. },
+        ) => true,
+        WeightRecipeError::CheckpointMaterialization(
+            CheckpointMaterializationError::PreparedAcquisition(error),
+        ) => matches!(
+            error.store_error(),
+            Some(eredu_checkpoint::store::StoreError::CapacityExhausted { .. })
+        ),
+        _ => false,
+    }
+}

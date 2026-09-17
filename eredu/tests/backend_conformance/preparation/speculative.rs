@@ -7,6 +7,95 @@ fn schedule_fault(fault: ScheduleFault) {
 }
 
 #[test]
+fn speculative_inference_policy_rejects_before_prompt_or_target_and_draft_work() {
+    for controlled in [false, true] {
+        for policy in [
+            eredu_core::TextInferencePolicy {
+                managed_memory_capacity_bytes: Some(16 << 20),
+                ..Default::default()
+            },
+            eredu_core::TextInferencePolicy {
+                prefill_chunk_positions: std::num::NonZeroU64::new(3),
+                ..Default::default()
+            },
+            eredu_core::TextInferencePolicy {
+                submission_tracking_capacity_bytes: std::num::NonZeroU64::new(1024),
+                ..Default::default()
+            },
+            eredu_core::TextInferencePolicy {
+                graph_metadata_capacity_bytes: std::num::NonZeroU64::new(1024),
+                ..Default::default()
+            },
+        ] {
+            let (mut model, chat, mut settings) = setup();
+            settings.inference = policy;
+            let _guard = probe(Fault::None);
+            let error = run_speculative(&mut model, &chat, settings, controlled).unwrap_err();
+            let policy_error = if controlled {
+                match error.downcast_ref::<eredu::api::ControlledSpeculativeGenerationError>() {
+                    Some(eredu::api::ControlledSpeculativeGenerationError::Prepared(error)) => {
+                        error
+                    }
+                    _ => panic!("unexpected controlled error: {error}"),
+                }
+            } else {
+                error
+                    .downcast_ref::<eredu::api::PreparedChatSpeculativeError>()
+                    .expect("typed preparation error")
+            };
+            assert!(
+                matches!(policy_error, eredu::api::PreparedChatSpeculativeError::InferencePolicyUnavailable(policy) if *policy == settings.inference)
+            );
+            assert!(
+                error.to_string().contains(
+                    "does not yet implement the requested prefill or managed-memory policy"
+                ),
+                "{error}"
+            );
+            let seen = snapshot();
+            assert_eq!(seen.votes.last(), Some(&(Stage::Request, Status::Failed)));
+            assert!(seen.native.is_empty());
+            assert!(seen.actions.is_empty());
+            assert_eq!(seen.forwards, 0);
+        }
+    }
+}
+
+#[test]
+fn speculative_later_lane_inference_policy_rejects_whole_batch_before_prompt() {
+    let (mut model, chat, settings) = setup();
+    let mut bounded = settings;
+    bounded.inference.managed_memory_capacity_bytes = Some(16 << 20);
+    let _guard = probe(Fault::None);
+    let error = model
+        .generate_prepared_text_speculative_batch(PreparedChatSpeculativeBatchRequest {
+            drafting: SpeculativeDraft::Embedded,
+            lanes: [settings, bounded]
+                .into_iter()
+                .map(|settings| PreparedChatSpeculativeBatchLane {
+                    input: PreparedChatInput::token_ids(&chat, vec![3, 4]),
+                    settings,
+                    max_draft_tokens: NonZeroUsize::new(1).unwrap(),
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: Box::new(|_| {}),
+                })
+                .collect(),
+            scheduler: Default::default(),
+        })
+        .err()
+        .expect("bounded second lane must reject the batch");
+    assert!(
+        matches!(error, eredu::api::PreparedChatSpeculativeError::InferencePolicyUnavailable(policy) if policy == bounded.inference)
+    );
+    let seen = snapshot();
+    assert_eq!(seen.votes, [(Stage::Request, Status::Failed)]);
+    assert!(seen.native.is_empty());
+    assert!(seen.actions.is_empty());
+    assert_eq!(seen.forwards, 0);
+}
+
+#[test]
 fn draft_sampling_failure_agrees_before_the_next_collective_forward() {
     for controlled in [false, true] {
         for peer in [false, true] {

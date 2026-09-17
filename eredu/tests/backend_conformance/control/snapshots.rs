@@ -1,6 +1,15 @@
 use super::*;
 use eredu_core::PendingTextInput;
-use eredu_runtime::{capture::CaptureSession, execution_control::TextSnapshotBackend};
+use eredu_runtime::{
+    capture::CaptureSession,
+    execution_control::{SamplingCopyPolicy, TextSnapshotBackend},
+};
+
+#[path = "snapshots/host_authority.rs"]
+mod host_authority;
+
+#[path = "snapshots/policy.rs"]
+mod policy;
 
 // This semantic fixture has no persistent model tensors: all model continuation
 // state is its pending canonical input. Native storage conformance runs separately
@@ -13,6 +22,7 @@ impl NativeTextStateBackend for MockBackend {
         saved: &Native,
         _: u64,
     ) -> Result<Option<u64>, MockError> {
+        super::provider_errors::check("growth")?;
         Self::validate_native_text_state(runtime, saved)?;
         Ok(Some(0))
     }
@@ -23,6 +33,8 @@ impl NativeTextStateBackend for MockBackend {
         runtime: &ModelRuntime<Self>,
         saved: Option<&Native>,
     ) -> Result<Option<SnapshotEstimate>, MockError> {
+        policy::cold_estimate::ordinary_hook();
+        super::provider_errors::check("estimate")?;
         runtime.session().authority.require_idle()?;
         if let Some(saved) = saved {
             Self::validate_native_text_state(runtime, saved)?;
@@ -34,14 +46,18 @@ impl NativeTextStateBackend for MockBackend {
         }))
     }
     fn capture_native_text_state(runtime: &mut ModelRuntime<Self>) -> Result<Native, MockError> {
+        super::provider_errors::check("capture")?;
         runtime.session().authority.require_idle()?;
+        crate::host_authority::copy("native capture")?;
         Ok(Native(runtime.session().intervention_identity.clone()))
     }
     fn copy_native_text_state(
         runtime: &mut ModelRuntime<Self>,
         saved: &Native,
     ) -> Result<Native, MockError> {
+        super::provider_errors::check("copy")?;
         Self::validate_native_text_state(runtime, saved)?;
+        crate::host_authority::copy("native copy")?;
         Ok(Native(saved.0.clone()))
     }
     fn validate_native_text_state(
@@ -62,8 +78,204 @@ impl NativeTextStateBackend for MockBackend {
     }
 }
 use observed_mock::Sampling;
+// This semantic fixture has no managed component proof. Bounded copying is
+// rejected before either payload is cloned; full unquoted snapshots keep their
+// existing enclosing host authority through copying and installation.
+pub(crate) struct SavedSampling {
+    sampling: Sampling,
+    pending: Option<PendingTextInput<Vec<u32>, MockToken>>,
+}
+
+fn copy_sampling_parts(
+    runtime: &mut ModelRuntime<MockBackend>,
+    sampling: &Sampling,
+    pending: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+) -> Result<(Sampling, Option<PendingTextInput<Vec<u32>, MockToken>>), MockError> {
+    let pending = MockBackend::copy_pending_input(runtime, pending)?;
+    let sampling = MockBackend::copy_sampling_state(runtime, sampling)?;
+    Ok((sampling, pending))
+}
+
+// Only backend capture/copy hooks assemble this immutable pair. No allocating
+// Clone or mutable component extraction is exposed by its associated type.
+pub(crate) struct SavedComponents {
+    native: Native,
+    sampling: SavedSampling,
+}
+
 impl TextSnapshotBackend for MockBackend {
     type SamplingState = Sampling;
+    type SavedSamplingState = SavedSampling;
+    type SavedTextComponents = SavedComponents;
+    fn original_saved_components_preparation_bytes(
+        _: &ModelRuntime<Self>,
+        _: &Sampling,
+        _: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+    ) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
+        // Scoped admission-refusal probe only: it constructs no native planner
+        // and never enables the unpriced paired copy hook below.
+        Ok(policy::cold_estimate::preparation_bytes())
+    }
+    fn original_snapshot_estimates(
+        runtime: &ModelRuntime<Self>,
+        _: &Sampling,
+        input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+    ) -> Option<[SnapshotEstimate; 3]> {
+        policy::cold_estimate::estimate(runtime, input)
+    }
+    fn capture_saved_components(
+        runtime: &mut ModelRuntime<Self>,
+        sampling: &Sampling,
+        input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+        policy: SamplingCopyPolicy,
+    ) -> Result<SavedComponents, MockError> {
+        if !matches!(policy, SamplingCopyPolicy::Unquoted) {
+            return Err(MockError::Capture(
+                "bounded saved text components are unpriced in this fixture".into(),
+            ));
+        }
+        // Keep the established sampler/input then native-copy order. The
+        // shared driver already holds host authority through partial failure.
+        let sampling = Self::capture_saved_sampling(runtime, sampling, input, policy)?;
+        let native = Self::capture_native_text_state(runtime)?;
+        Ok(SavedComponents { native, sampling })
+    }
+    fn copy_saved_components(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &SavedComponents,
+        policy: SamplingCopyPolicy,
+    ) -> Result<SavedComponents, MockError> {
+        if !matches!(policy, SamplingCopyPolicy::Unquoted) {
+            return Err(MockError::Capture(
+                "bounded saved text components are unpriced in this fixture".into(),
+            ));
+        }
+        Self::validate_saved_components(runtime, saved)?;
+        let sampling = Self::copy_saved_sampling(runtime, &saved.sampling, policy)?;
+        let native = Self::copy_native_text_state(runtime, &saved.native)?;
+        Ok(SavedComponents { native, sampling })
+    }
+    fn saved_sampling(saved: &SavedComponents) -> &SavedSampling {
+        &saved.sampling
+    }
+    fn validate_saved_components(
+        runtime: &ModelRuntime<Self>,
+        saved: &SavedComponents,
+    ) -> Result<(), MockError> {
+        Self::validate_native_text_state(runtime, &saved.native)
+    }
+    fn estimate_saved_components(
+        runtime: &ModelRuntime<Self>,
+        saved: &SavedComponents,
+    ) -> Result<Option<SnapshotEstimate>, MockError> {
+        Self::validate_saved_components(runtime, saved)?;
+        let native = Self::estimate_native_text_state(runtime, Some(&saved.native))?;
+        let sampling = Self::estimate_saved_sampling(runtime, &saved.sampling)?;
+        Ok(native.zip(sampling).and_then(|(native, sampling)| {
+            Some(SnapshotEstimate {
+                retained_bytes: native.retained_bytes.checked_add(sampling.retained_bytes)?,
+                copy_bytes: native.copy_bytes.checked_add(sampling.copy_bytes)?,
+            })
+        }))
+    }
+    fn estimate_saved_native_growth(
+        runtime: &ModelRuntime<Self>,
+        saved: &SavedComponents,
+        input_tokens: u64,
+    ) -> Result<Option<u64>, MockError> {
+        Self::validate_saved_components(runtime, saved)?;
+        Self::estimate_native_text_growth(runtime, &saved.native, input_tokens)
+    }
+    fn prepare_saved_components_resume(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &SavedComponents,
+    ) -> Result<
+        (
+            Native,
+            Sampling,
+            Option<PendingTextInput<Vec<u32>, MockToken>>,
+        ),
+        MockError,
+    > {
+        Self::validate_saved_components(runtime, saved)?;
+        let (sampling, pending) = Self::prepare_saved_sampling_resume(runtime, &saved.sampling)?;
+        let native = Self::copy_native_text_state(runtime, &saved.native)?;
+        Ok((native, sampling, pending))
+    }
+    fn capture_saved_sampling(
+        runtime: &mut ModelRuntime<Self>,
+        sampling: &Sampling,
+        input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
+        policy: SamplingCopyPolicy,
+    ) -> Result<SavedSampling, MockError> {
+        if !matches!(policy, SamplingCopyPolicy::Unquoted) {
+            return Err(MockError::Capture(
+                "bounded saved sampling is unpriced in this fixture".into(),
+            ));
+        }
+        let (sampling, pending) = copy_sampling_parts(runtime, sampling, input)?;
+        Ok(SavedSampling { sampling, pending })
+    }
+    fn copy_saved_sampling(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &SavedSampling,
+        policy: SamplingCopyPolicy,
+    ) -> Result<SavedSampling, MockError> {
+        if !matches!(policy, SamplingCopyPolicy::Unquoted) {
+            return Err(MockError::Capture(
+                "bounded saved sampling is unpriced in this fixture".into(),
+            ));
+        }
+        let (sampling, pending) = copy_sampling_parts(
+            runtime,
+            &saved.sampling,
+            saved.pending.as_ref().map(PendingTextInput::as_ref),
+        )?;
+        Ok(SavedSampling { sampling, pending })
+    }
+    fn saved_sampling_prediction(saved: &SavedSampling) -> u64 {
+        Self::sampling_prediction(&saved.sampling)
+    }
+    fn estimate_saved_sampling(
+        runtime: &ModelRuntime<Self>,
+        saved: &SavedSampling,
+    ) -> Result<Option<SnapshotEstimate>, MockError> {
+        let sampling = Self::estimate_sampling_state(runtime, &saved.sampling)?;
+        let input = Self::estimate_pending_input(
+            runtime,
+            saved.pending.as_ref().map(PendingTextInput::as_ref),
+        )?;
+        Ok(sampling.zip(input).and_then(|(sampling, input)| {
+            Some(SnapshotEstimate {
+                retained_bytes: sampling.retained_bytes.checked_add(input.retained_bytes)?,
+                copy_bytes: sampling.copy_bytes.checked_add(input.copy_bytes)?,
+            })
+        }))
+    }
+    fn saved_input_tokens(saved: &SavedSampling, predictions: u64) -> Option<u64> {
+        Self::continuation_input_tokens(
+            saved.pending.as_ref().map(PendingTextInput::as_ref),
+            predictions,
+        )
+    }
+    fn estimate_saved_sampling_growth(
+        runtime: &ModelRuntime<Self>,
+        saved: &SavedSampling,
+        predictions: u64,
+    ) -> Result<Option<u64>, MockError> {
+        Self::estimate_sampling_growth(runtime, &saved.sampling, predictions)
+    }
+    fn prepare_saved_sampling_resume(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &SavedSampling,
+    ) -> Result<(Sampling, Option<PendingTextInput<Vec<u32>, MockToken>>), MockError> {
+        copy_sampling_parts(
+            runtime,
+            &saved.sampling,
+            saved.pending.as_ref().map(PendingTextInput::as_ref),
+        )
+    }
+
     fn continuation_input_tokens(
         input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
         predictions: u64,
@@ -102,6 +314,7 @@ impl TextSnapshotBackend for MockBackend {
         _: &ModelRuntime<Self>,
         _: &Sampling,
     ) -> Result<Option<SnapshotEstimate>, MockError> {
+        policy::cold_estimate::ordinary_hook();
         Ok(Some(SnapshotEstimate {
             retained_bytes: 64,
             copy_bytes: 64,
@@ -111,12 +324,14 @@ impl TextSnapshotBackend for MockBackend {
         _: &mut ModelRuntime<Self>,
         sampling: &Sampling,
     ) -> Result<Sampling, MockError> {
+        crate::host_authority::copy("sampling copy")?;
         Ok(sampling.clone())
     }
     fn estimate_pending_input(
         _: &ModelRuntime<Self>,
         input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
     ) -> Result<Option<SnapshotEstimate>, MockError> {
+        policy::cold_estimate::ordinary_hook();
         let bytes = match input {
             Some(PendingTextInput::Prefill(ids)) => 24 + ids.len() as u64 * 4,
             Some(PendingTextInput::Decode(_)) => 4,
@@ -131,6 +346,7 @@ impl TextSnapshotBackend for MockBackend {
         _: &mut ModelRuntime<Self>,
         input: Option<PendingTextInput<&Vec<u32>, &MockToken>>,
     ) -> Result<Option<PendingTextInput<Vec<u32>, MockToken>>, MockError> {
+        crate::host_authority::copy("input copy")?;
         Ok(input.map(|input| match input {
             PendingTextInput::Prefill(ids) => PendingTextInput::Prefill(ids.clone()),
             PendingTextInput::Decode(token) => PendingTextInput::Decode(token.clone()),
@@ -160,7 +376,7 @@ impl TextSnapshotBackend for MockBackend {
     }
 }
 
-fn snapshot_setup() -> (
+pub(super) fn snapshot_setup() -> (
     LoadedModel<MockBackend>,
     PreparedChat,
     PreparedChatGenerationSettings,
@@ -201,6 +417,48 @@ fn snapshot_limits() -> SnapshotLimits {
         max_branches: 0,
         retained_bytes: 4_000_000,
         cumulative_copy_bytes: 32_000_000,
+    }
+}
+
+#[test]
+fn snapshot_configuration_identity_retains_inference_policy() {
+    use eredu_core::TextInferencePolicy;
+    let mut identities = Vec::new();
+    for policy in [
+        TextInferencePolicy::default(),
+        TextInferencePolicy {
+            prefill_chunk_positions: std::num::NonZeroU64::new(3),
+            ..Default::default()
+        },
+        TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(16 << 20),
+            ..Default::default()
+        },
+        TextInferencePolicy {
+            managed_memory_capacity_bytes: Some(32 << 20),
+            ..Default::default()
+        },
+        TextInferencePolicy::default(),
+    ] {
+        let (mut model, chat, mut settings, _) = snapshot_setup();
+        settings.inference = policy;
+        let prepared = model
+            .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
+            .unwrap();
+        let mut session = model
+            .start_controlled_chat(prepared, &[], Default::default(), |_| {
+                ControlFlow::Continue(())
+            })
+            .unwrap();
+        session.enable_snapshots(snapshot_limits()).unwrap();
+        let saved = session.snapshot(|_| ControlFlow::Continue(())).unwrap();
+        identities.push(saved.metadata().configuration_identity);
+    }
+    assert_eq!(identities[0], identities[4]);
+    for index in 0..4 {
+        for other in 0..index {
+            assert_ne!(identities[index], identities[other]);
+        }
     }
 }
 

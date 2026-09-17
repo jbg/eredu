@@ -1,0 +1,21 @@
+diff --git a/mlx/backend/cpu/slice_storage.cpp b/mlx/backend/cpu/slice_storage.cpp
+--- a/mlx/backend/cpu/slice_storage.cpp
++++ b/mlx/backend/cpu/slice_storage.cpp
+@@ -18,7 +18,7 @@
+       typeid(output.primitive())==typeid(Slice);
+ }
+ bool slice_eval_layout(size_t rank,bool tracer,CopyEvalStorage& out) noexcept {
+-  if(rank<2||rank>4)return false;
++  if(rank<1||rank>4)return false;
+   CopyEvalStorage value;
+   // The common one-output cleanup/outputs bank is sufficient: prepare_slice's
+   // rank<=4 Strides is inline, and the existing output descriptor already owns
+@@ -40,7 +40,7 @@
+   if(!is_slice_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
+   const auto& input=output.inputs()[0];
+   const size_t rank=input.ndim();
+-  if(rank<2||rank>4||output.ndim()!=rank||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||!output.size())return false;
++  if(rank<1||rank>4||output.ndim()!=rank||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||!output.size())return false;
+   const auto& primitive=static_cast<const Slice&>(output.primitive());
+   const auto [starts,ends,steps]=primitive.state_refs();
+   if(starts.size()!=rank||ends.size()!=rank||steps.size()!=rank||input.strides().size()!=rank)return false;

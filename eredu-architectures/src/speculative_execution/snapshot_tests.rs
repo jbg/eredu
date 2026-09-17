@@ -18,11 +18,12 @@ fn complete_embedded_snapshot_keeps_both_prediction_replicas_and_is_reusable() {
     };
     let mut executor = EmbeddedPredictionExecutor::<_, Mechanisms>::new(&mut strategy);
     let mut live = Cache {
+        fail_restore: false,
         target: vec![2, 3],
         prediction: vec![5, 7, 11],
     };
     let seed = EmbeddedPredictionTargetState {
-        capture: Tensor(vec![13, 17]),
+        capture: EmbeddedPredictionTensor::ordinary(Tensor(vec![13,17])),
         prediction_cache: vec![19, 23, 29, 31],
     };
     let cost = executor.control_snapshot_estimate(&live, &seed).unwrap();
@@ -45,10 +46,10 @@ fn complete_embedded_snapshot_keeps_both_prediction_replicas_and_is_reusable() {
             .unwrap()
             .unwrap();
         assert_eq!(live, saved.cache);
-        assert_eq!(restored.capture, seed.capture);
+        assert_eq!(*restored.capture,*seed.capture);
         assert_eq!(restored.prediction_cache, seed.prediction_cache);
         restored.prediction_cache[0] = 107;
-        restored.capture.0[0] = 109;
+        restored.capture=EmbeddedPredictionTensor::ordinary(Tensor(vec![109,17]));
     }
     assert_eq!(saved.cache.prediction, [5, 7, 11]);
     assert_eq!(saved_seed.prediction_cache, [19, 23, 29, 31]);
@@ -57,18 +58,20 @@ fn complete_embedded_snapshot_keeps_both_prediction_replicas_and_is_reusable() {
 #[test]
 fn incomplete_estimate_prevents_copies_and_late_failure_preserves_live_cache_and_source() {
     let original = Cache {
+        fail_restore: false,
         target: vec![2],
         prediction: vec![3],
     };
     let saved = EmbeddedPredictionCheckpoint {
         cache: Cache {
+            fail_restore: false,
             target: vec![5],
             prediction: vec![7],
         },
         activations: None,
     };
     let seed = EmbeddedPredictionTargetState {
-        capture: Tensor(vec![11]),
+        capture: EmbeddedPredictionTensor::ordinary(Tensor(vec![11])),
         prediction_cache: vec![13],
     };
     for unbounded in [true, false] {
@@ -91,7 +94,7 @@ fn incomplete_estimate_prevents_copies_and_late_failure_preserves_live_cache_and
                 std::error::Error::source(&source)
                     .unwrap()
                     .downcast_ref::<TestError>(),
-                Some(&TestError("seed copy failed".into()))
+                Some(&TestError::Message("seed copy failed".into()))
             );
         }
         assert_eq!(live, original);

@@ -1,6 +1,6 @@
 //! Durable cache identity, geometry, and state-residency contracts.
 
-use std::{collections::BTreeSet, num::NonZeroU32};
+use std::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
@@ -358,6 +358,19 @@ impl StateComponentPolicy {
         &self.shape
     }
 
+    /// Retained symbolic-shape allocation capacity, including unused elements.
+    /// This is host metadata capacity, not the resolved tensor's storage size.
+    pub fn shape_capacity(&self) -> usize {
+        let Self {
+            role: _,
+            shape,
+            dtype: _,
+            residency: _,
+            presence: _,
+        } = self;
+        shape.capacity()
+    }
+
     /// Returns the accepted persisted dtype family.
     pub const fn dtype(&self) -> StateTensorDtype {
         self.dtype
@@ -393,12 +406,28 @@ impl LayerCachePolicy {
         num_key_value_heads: i32,
         head_dim: i32,
     ) -> Result<Self, CachePolicyError> {
+        Self::key_value_with_diagnostic(attention, num_key_value_heads, head_dim, |message| {
+            CachePolicyError::Invalid(message.to_string())
+        })
+    }
+
+    /// Runs the same constructor with a caller-owned diagnostic destination.
+    pub fn key_value_with_diagnostic<E>(
+        attention: AttentionPolicy,
+        num_key_value_heads: i32,
+        head_dim: i32,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         let policy = Self::KeyValue {
             attention,
-            num_key_value_heads: positive_u32(num_key_value_heads, "key/value head count")?,
-            head_dim: positive_u32(head_dim, "key/value head dimension")?,
+            num_key_value_heads: positive_u32_with(
+                num_key_value_heads,
+                "key/value head count",
+                &mut error,
+            )?,
+            head_dim: positive_u32_with(head_dim, "key/value head dimension", &mut error)?,
         };
-        policy.validate()?;
+        policy.validate_with_diagnostic(error)?;
         Ok(policy)
     }
 
@@ -408,12 +437,24 @@ impl LayerCachePolicy {
         num_key_heads: i32,
         head_dim: i32,
     ) -> Result<Self, CachePolicyError> {
+        Self::key_only_with_diagnostic(attention, num_key_heads, head_dim, |message| {
+            CachePolicyError::Invalid(message.to_string())
+        })
+    }
+
+    /// Runs the same constructor with a caller-owned diagnostic destination.
+    pub fn key_only_with_diagnostic<E>(
+        attention: AttentionPolicy,
+        num_key_heads: i32,
+        head_dim: i32,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         let policy = Self::KeyOnly {
             attention,
-            num_key_heads: positive_u32(num_key_heads, "key head count")?,
-            head_dim: positive_u32(head_dim, "key head dimension")?,
+            num_key_heads: positive_u32_with(num_key_heads, "key head count", &mut error)?,
+            head_dim: positive_u32_with(head_dim, "key head dimension", &mut error)?,
         };
-        policy.validate()?;
+        policy.validate_with_diagnostic(error)?;
         Ok(policy)
     }
 
@@ -423,19 +464,44 @@ impl LayerCachePolicy {
         latent_dim: i32,
         rotary_dim: i32,
     ) -> Result<Self, CachePolicyError> {
+        Self::compressed_latent_rotary_with_diagnostic(
+            attention,
+            latent_dim,
+            rotary_dim,
+            |message| CachePolicyError::Invalid(message.to_string()),
+        )
+    }
+
+    /// Runs the same constructor with a caller-owned diagnostic destination.
+    pub fn compressed_latent_rotary_with_diagnostic<E>(
+        attention: AttentionPolicy,
+        latent_dim: i32,
+        rotary_dim: i32,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         let policy = Self::CompressedLatentRotary {
             attention,
-            latent_dim: positive_u32(latent_dim, "compressed latent dimension")?,
-            rotary_dim: positive_u32(rotary_dim, "rotary-key dimension")?,
+            latent_dim: positive_u32_with(latent_dim, "compressed latent dimension", &mut error)?,
+            rotary_dim: positive_u32_with(rotary_dim, "rotary-key dimension", &mut error)?,
         };
-        policy.validate()?;
+        policy.validate_with_diagnostic(error)?;
         Ok(policy)
     }
 
     /// Constructs a validated fixed-state-only policy.
     pub fn fixed_only(tensors: Vec<StateTensorPolicy>) -> Result<Self, CachePolicyError> {
+        Self::fixed_only_with_diagnostic(tensors, |message| {
+            CachePolicyError::Invalid(message.to_string())
+        })
+    }
+
+    /// Runs the same constructor with a caller-owned diagnostic destination.
+    pub fn fixed_only_with_diagnostic<E>(
+        tensors: Vec<StateTensorPolicy>,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         let policy = Self::FixedState { tensors };
-        policy.validate()?;
+        policy.validate_with_diagnostic(error)?;
         Ok(policy)
     }
 
@@ -446,13 +512,34 @@ impl LayerCachePolicy {
         head_dim: i32,
         tensors: Vec<StateTensorPolicy>,
     ) -> Result<Self, CachePolicyError> {
+        Self::key_value_with_fixed_state_with_diagnostic(
+            attention,
+            num_key_value_heads,
+            head_dim,
+            tensors,
+            |message| CachePolicyError::Invalid(message.to_string()),
+        )
+    }
+
+    /// Runs the same constructor with a caller-owned diagnostic destination.
+    pub fn key_value_with_fixed_state_with_diagnostic<E>(
+        attention: AttentionPolicy,
+        num_key_value_heads: i32,
+        head_dim: i32,
+        tensors: Vec<StateTensorPolicy>,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         let policy = Self::KeyValueWithFixedState {
             attention,
-            num_key_value_heads: positive_u32(num_key_value_heads, "key/value head count")?,
-            head_dim: positive_u32(head_dim, "key/value head dimension")?,
+            num_key_value_heads: positive_u32_with(
+                num_key_value_heads,
+                "key/value head count",
+                &mut error,
+            )?,
+            head_dim: positive_u32_with(head_dim, "key/value head dimension", &mut error)?,
             tensors,
         };
-        policy.validate()?;
+        policy.validate_with_diagnostic(error)?;
         Ok(policy)
     }
 
@@ -463,13 +550,30 @@ impl LayerCachePolicy {
         head_dim: i32,
         tensors: Vec<StateTensorPolicy>,
     ) -> Result<Self, CachePolicyError> {
+        Self::key_only_with_fixed_state_with_diagnostic(
+            attention,
+            num_key_heads,
+            head_dim,
+            tensors,
+            |message| CachePolicyError::Invalid(message.to_string()),
+        )
+    }
+
+    /// Runs the same constructor with a caller-owned diagnostic destination.
+    pub fn key_only_with_fixed_state_with_diagnostic<E>(
+        attention: AttentionPolicy,
+        num_key_heads: i32,
+        head_dim: i32,
+        tensors: Vec<StateTensorPolicy>,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         let policy = Self::KeyOnlyWithFixedState {
             attention,
-            num_key_heads: positive_u32(num_key_heads, "key head count")?,
-            head_dim: positive_u32(head_dim, "key head dimension")?,
+            num_key_heads: positive_u32_with(num_key_heads, "key head count", &mut error)?,
+            head_dim: positive_u32_with(head_dim, "key head dimension", &mut error)?,
             tensors,
         };
-        policy.validate()?;
+        policy.validate_with_diagnostic(error)?;
         Ok(policy)
     }
 
@@ -498,7 +602,55 @@ impl LayerCachePolicy {
     /// Expands this layer policy into ordered, stably named semantic
     /// components shared by runtime residency and prompt persistence.
     pub fn components(&self) -> Vec<StateComponentPolicy> {
-        let mut components = Vec::new();
+        self.components_with_storage::<std::convert::Infallible>(
+            |capacity| Ok(Vec::with_capacity(capacity)),
+            |capacity| Ok(Vec::with_capacity(capacity)),
+        )
+        .unwrap_or_else(|never| match never {})
+    }
+
+    /// Constructs these same component declarations in caller-provided vector storage.
+    /// Storage callbacks receive exact requested lengths; semantic values always come
+    /// from this policy, including each copied symbolic shape.
+    pub fn components_with_storage<E>(
+        &self,
+        components: impl FnOnce(usize) -> Result<Vec<StateComponentPolicy>, E>,
+        mut shape: impl FnMut(usize) -> Result<Vec<StateTensorDimension>, E>,
+    ) -> Result<Vec<StateComponentPolicy>, E> {
+        let mut count = 0usize;
+        self.visit_component_parts(|_, _, _, _, _| {
+            count += 1;
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .unwrap_or_else(|never| match never {});
+        let mut components = components(count)?;
+        components.clear();
+        self.visit_component_parts(|role, dimensions, dtype, residency, presence| {
+            let mut shape = shape(dimensions.len())?;
+            shape.clear();
+            shape.extend_from_slice(dimensions);
+            components.push(StateComponentPolicy {
+                role,
+                shape,
+                dtype,
+                residency,
+                presence,
+            });
+            Ok(())
+        })?;
+        Ok(components)
+    }
+
+    fn visit_component_parts<E>(
+        &self,
+        mut visit: impl FnMut(
+            StateComponentRole,
+            &[StateTensorDimension],
+            StateTensorDtype,
+            StateResidencyClass,
+            StateTensorPresence,
+        ) -> Result<(), E>,
+    ) -> Result<(), E> {
         let floating = StateTensorDtype::Floating;
         let required = StateTensorPresence::Required;
         match self {
@@ -513,7 +665,7 @@ impl LayerCachePolicy {
                 head_dim,
                 ..
             } => {
-                let shape = vec![
+                let shape = [
                     StateTensorDimension::Batch,
                     StateTensorDimension::Fixed(*num_key_value_heads),
                     StateTensorDimension::PrefixTokens,
@@ -523,13 +675,13 @@ impl LayerCachePolicy {
                     StateComponentRole::AttentionKeys,
                     StateComponentRole::AttentionValues,
                 ] {
-                    components.push(StateComponentPolicy {
+                    visit(
                         role,
-                        shape: shape.clone(),
-                        dtype: floating,
-                        residency: StateResidencyClass::SealablePaged,
-                        presence: required,
-                    });
+                        &shape,
+                        floating,
+                        StateResidencyClass::SealablePaged,
+                        required,
+                    )?;
                 }
             }
             Self::KeyOnly {
@@ -541,18 +693,20 @@ impl LayerCachePolicy {
                 num_key_heads,
                 head_dim,
                 ..
-            } => components.push(StateComponentPolicy {
-                role: StateComponentRole::AttentionKeys,
-                shape: vec![
-                    StateTensorDimension::Batch,
-                    StateTensorDimension::Fixed(*num_key_heads),
-                    StateTensorDimension::PrefixTokens,
-                    StateTensorDimension::Fixed(*head_dim),
-                ],
-                dtype: floating,
-                residency: StateResidencyClass::SealablePaged,
-                presence: required,
-            }),
+            } => {
+                visit(
+                    StateComponentRole::AttentionKeys,
+                    &[
+                        StateTensorDimension::Batch,
+                        StateTensorDimension::Fixed(*num_key_heads),
+                        StateTensorDimension::PrefixTokens,
+                        StateTensorDimension::Fixed(*head_dim),
+                    ],
+                    floating,
+                    StateResidencyClass::SealablePaged,
+                    required,
+                )?;
+            }
             Self::CompressedLatentRotary {
                 latent_dim,
                 rotary_dim,
@@ -562,46 +716,53 @@ impl LayerCachePolicy {
                     (StateComponentRole::CompressedLatent, *latent_dim),
                     (StateComponentRole::RotaryKeys, *rotary_dim),
                 ] {
-                    components.push(StateComponentPolicy {
+                    visit(
                         role,
-                        shape: vec![
+                        &[
                             StateTensorDimension::Batch,
                             StateTensorDimension::PrefixTokens,
                             StateTensorDimension::Fixed(dimension),
                         ],
-                        dtype: floating,
-                        residency: StateResidencyClass::SealablePaged,
-                        presence: required,
-                    });
+                        floating,
+                        StateResidencyClass::SealablePaged,
+                        required,
+                    )?;
                 }
             }
         }
-        components.extend(
-            self.fixed_state()
-                .iter()
-                .map(|tensor| StateComponentPolicy {
-                    role: StateComponentRole::Fixed(tensor.role),
-                    shape: tensor.shape.clone(),
-                    dtype: tensor.dtype,
-                    residency: tensor.residency_class(),
-                    presence: tensor.presence,
-                }),
-        );
-        components
+        for tensor in self.fixed_state() {
+            visit(
+                StateComponentRole::Fixed(tensor.role),
+                &tensor.shape,
+                tensor.dtype,
+                tensor.residency_class(),
+                tensor.presence,
+            )?;
+        }
+        Ok(())
     }
 
     /// Validates dimensions and fixed-state invariants after deserialization.
     pub fn validate(&self) -> Result<(), CachePolicyError> {
+        self.validate_with_diagnostic(|text| CachePolicyError::Invalid(text.to_string()))
+    }
+
+    /// Runs the same policy validation with a caller-owned diagnostic destination.
+    /// The callback is invoked only on failure; valid policies allocate no scratch.
+    pub fn validate_with_diagnostic<E>(
+        &self,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
         if let Some(attention) = self.attention() {
             attention
                 .sliding_window_i32()
-                .map_err(|error| CachePolicyError::Invalid(error.to_string()))?;
+                .map_err(|cause| error(format_args!("{cause}")))?;
         }
-        let validate_dimension = |dimension: NonZeroU32| {
+        let mut validate_dimension = |dimension: NonZeroU32| {
             (dimension.get() <= i32::MAX as u32)
                 .then_some(())
                 .ok_or_else(|| {
-                    CachePolicyError::Invalid(format!(
+                    error(format_args!(
                         "prompt-cache layer dimension {dimension} exceeds the runtime i32 range"
                     ))
                 })
@@ -652,18 +813,27 @@ impl LayerCachePolicy {
                     | Self::KeyOnlyWithFixedState { .. }
             )
         {
-            return Err(CachePolicyError::Invalid(
-                "fixed-state cache policy must contain at least one tensor".into(),
-            ));
+            return Err(error(format_args!(
+                "fixed-state cache policy must contain at least one tensor"
+            )));
         }
-        validate_state_tensor_policies(tensors)
+        validate_state_tensor_policies_with(tensors, error)
     }
 }
 
 impl StateTensorDimension {
     /// Constructs a positive fixed dimension.
     pub fn fixed(value: i32) -> Result<Self, CachePolicyError> {
-        positive_u32(value, "fixed-state tensor dimension").map(Self::Fixed)
+        Self::fixed_with_diagnostic(value, |message| {
+            CachePolicyError::Invalid(message.to_string())
+        })
+    }
+    /// Converts the same positive dimension with a caller-owned diagnostic destination.
+    pub fn fixed_with_diagnostic<E>(
+        value: i32,
+        error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
+        positive_u32_with(value, "fixed-state tensor dimension", error).map(Self::Fixed)
     }
 }
 
@@ -685,6 +855,30 @@ impl StateTensorPolicy {
         dtype: StateTensorDtype,
         residency: StateResidencyClass,
     ) -> Result<Self, CachePolicyError> {
+        Self::new_with_residency_and_diagnostic(role, shape, dtype, residency, |message| {
+            CachePolicyError::Invalid(message.to_string())
+        })
+    }
+
+    /// Constructs the same policy with a caller-owned diagnostic destination.
+    pub fn new_with_diagnostic<E>(
+        role: StateTensorRole,
+        shape: Vec<StateTensorDimension>,
+        dtype: StateTensorDtype,
+        residency: MutableStateResidency,
+        error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
+        Self::new_with_residency_and_diagnostic(role, shape, dtype, residency.into(), error)
+    }
+
+    /// Constructs explicit residency with the same validation and diagnostic callback.
+    pub fn new_with_residency_and_diagnostic<E>(
+        role: StateTensorRole,
+        shape: Vec<StateTensorDimension>,
+        dtype: StateTensorDtype,
+        residency: StateResidencyClass,
+        error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         let policy = Self {
             role,
             shape,
@@ -692,7 +886,7 @@ impl StateTensorPolicy {
             residency,
             presence: StateTensorPresence::Required,
         };
-        validate_state_tensor_policies(std::slice::from_ref(&policy))?;
+        validate_state_tensor_policies_with(std::slice::from_ref(&policy), error)?;
         Ok(policy)
     }
 
@@ -731,15 +925,15 @@ impl StateTensorPolicy {
         self.residency
     }
 
-    /// Resolves symbolic dimensions for an exact batch and prefix length.
-    pub fn resolved_shape(
+    /// Borrows checked dimensions without constructing a shape buffer.
+    /// This is the same conversion used by [`Self::resolved_shape`].
+    pub fn resolved_dimensions(
         &self,
         batch_size: usize,
         prefix_tokens: usize,
-    ) -> Result<Vec<i32>, CachePolicyError> {
-        self.shape
-            .iter()
-            .map(|dimension| match dimension {
+    ) -> impl Iterator<Item = Result<i32, StateTensorDimensionError>> + Clone + '_ {
+        self.shape.iter().map(move |dimension| {
+            match dimension {
                 StateTensorDimension::Batch => i32::try_from(batch_size),
                 StateTensorDimension::PrefixTokens => i32::try_from(prefix_tokens),
                 StateTensorDimension::PrefixTokensDiv(divisor) => {
@@ -750,13 +944,20 @@ impl StateTensorPolicy {
                 }
                 StateTensorDimension::Fixed(value) => i32::try_from(value.get()),
                 StateTensorDimension::Scalar => Ok(1),
-            })
+            }
+            .map_err(|_| StateTensorDimensionError)
+        })
+    }
+
+    /// Resolves symbolic dimensions for an exact batch and prefix length.
+    pub fn resolved_shape(
+        &self,
+        batch_size: usize,
+        prefix_tokens: usize,
+    ) -> Result<Vec<i32>, CachePolicyError> {
+        self.resolved_dimensions(batch_size, prefix_tokens)
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|_| {
-                CachePolicyError::Invalid(
-                    "fixed-state tensor dimension exceeds runtime i32 range".into(),
-                )
-            })
+            .map_err(|error| CachePolicyError::Invalid(error.diagnostic().into()))
     }
 
     /// Tests a stable serialized dtype name against this policy.
@@ -772,22 +973,35 @@ impl StateTensorPolicy {
     }
 }
 
-fn positive_u32(value: i32, field: &str) -> Result<NonZeroU32, CachePolicyError> {
+fn positive_u32_with<E>(
+    value: i32,
+    field: &str,
+    mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+) -> Result<NonZeroU32, E> {
     u32::try_from(value)
         .ok()
         .and_then(NonZeroU32::new)
         .ok_or_else(|| {
-            CachePolicyError::Invalid(format!(
+            error(format_args!(
                 "prompt-cache {field} must be positive and fit u32, got {value}"
             ))
         })
 }
 
 fn validate_state_tensor_policies(tensors: &[StateTensorPolicy]) -> Result<(), CachePolicyError> {
-    let mut roles = BTreeSet::new();
-    for tensor in tensors {
-        if !roles.insert(tensor.role) {
-            return Err(CachePolicyError::Invalid(format!(
+    validate_state_tensor_policies_with(tensors, |text| CachePolicyError::Invalid(text.to_string()))
+}
+
+fn validate_state_tensor_policies_with<E>(
+    tensors: &[StateTensorPolicy],
+    mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
+    for (index, tensor) in tensors.iter().enumerate() {
+        if tensors[..index]
+            .iter()
+            .any(|earlier| earlier.role == tensor.role)
+        {
+            return Err(error(format_args!(
                 "duplicate fixed-state tensor role {:?}",
                 tensor.role
             )));
@@ -796,7 +1010,7 @@ fn validate_state_tensor_policies(tensors: &[StateTensorPolicy]) -> Result<(), C
             || (tensor.shape.contains(&StateTensorDimension::Scalar)
                 && tensor.shape.as_slice() != [StateTensorDimension::Scalar])
         {
-            return Err(CachePolicyError::Invalid(format!(
+            return Err(error(format_args!(
                 "invalid fixed-state tensor shape for role {:?}",
                 tensor.role
             )));
@@ -813,13 +1027,24 @@ fn validate_state_tensor_policies(tensors: &[StateTensorPolicy]) -> Result<(), C
             StateTensorRole::Pooling { .. } => StateResidencyClass::AlwaysDeviceMutable,
         };
         if tensor.residency != expected {
-            return Err(CachePolicyError::Invalid(format!(
+            return Err(error(format_args!(
                 "fixed-state tensor role {:?} requires {:?} residency, got {:?}",
                 tensor.role, expected, tensor.residency
             )));
         }
     }
     Ok(())
+}
+
+/// Fixed failure from the existing state-dimension conversion kernel.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
+#[error("fixed-state tensor dimension exceeds runtime i32 range")]
+pub struct StateTensorDimensionError;
+impl StateTensorDimensionError {
+    /// Existing stable legacy diagnostic, without formatting or allocation.
+    pub const fn diagnostic(self) -> &'static str {
+        "fixed-state tensor dimension exceeds runtime i32 range"
+    }
 }
 
 /// Invalid cache geometry or state-residency contract.
@@ -833,6 +1058,32 @@ pub enum CachePolicyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_shape_capacity_includes_spare_metadata_without_changing_geometry() {
+        let mut shape = Vec::with_capacity(19);
+        shape.extend([
+            StateTensorDimension::Batch,
+            StateTensorDimension::fixed(7).unwrap(),
+        ]);
+        let capacity = shape.capacity();
+        let component = StateComponentPolicy {
+            role: StateComponentRole::Fixed(StateTensorRole::Recurrent),
+            shape,
+            dtype: StateTensorDtype::Float32,
+            residency: StateResidencyClass::LayerScopedOffloadable,
+            presence: StateTensorPresence::Required,
+        };
+        assert_eq!(component.shape_capacity(), capacity);
+        assert!(component.shape_capacity() > component.shape().len());
+        assert_eq!(
+            component.shape(),
+            [
+                StateTensorDimension::Batch,
+                StateTensorDimension::fixed(7).unwrap()
+            ]
+        );
+    }
 
     #[test]
     fn validates_layer_and_fixed_state_contracts() {
@@ -865,13 +1116,15 @@ mod tests {
     #[test]
     fn rejects_invalid_policy_without_a_backend() {
         assert!(LayerCachePolicy::key_value(AttentionPolicy::Full, 0, 64).is_err());
-        assert!(StateTensorPolicy::new(
-            StateTensorRole::Recurrent,
-            vec![StateTensorDimension::Scalar, StateTensorDimension::Batch],
-            StateTensorDtype::Floating,
-            MutableStateResidency::LayerScopedOffloadable,
-        )
-        .is_err());
+        assert!(
+            StateTensorPolicy::new(
+                StateTensorRole::Recurrent,
+                vec![StateTensorDimension::Scalar, StateTensorDimension::Batch],
+                StateTensorDtype::Floating,
+                MutableStateResidency::LayerScopedOffloadable,
+            )
+            .is_err()
+        );
     }
 
     #[test]

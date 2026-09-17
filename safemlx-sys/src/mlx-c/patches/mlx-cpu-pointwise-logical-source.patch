@@ -1,0 +1,28 @@
+diff --git a/mlx/backend/cpu/binary_storage.cpp b/mlx/backend/cpu/binary_storage.cpp
+--- a/mlx/backend/cpu/binary_storage.cpp
++++ b/mlx/backend/cpu/binary_storage.cpp
+@@ -74,6 +74,10 @@
+   // accepted source while proving its host iterator population.
+   if (size != left.size() || size != right.size() || size != output.size() ||
+       left.data_size() > size_t(INT_MAX) || right.data_size() > size_t(INT_MAX)) return false;
++  // Scalar/vector branches can inherit a contiguous operand's data_size.
++  // Do not turn a larger source backing into an unpriced logical-size result.
++  if((left.flags().contiguous&&left.data_size()>size)||
++      (right.flags().contiguous&&right.data_size()>size))return false;
+   return binary_eval_layout(selected, left.dtype(), output.ndim(), size, output.is_tracer(), out);
+ }
+ } // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/unary_storage.cpp b/mlx/backend/cpu/unary_storage.cpp
+--- a/mlx/backend/cpu/unary_storage.cpp
++++ b/mlx/backend/cpu/unary_storage.cpp
+@@ -74,6 +74,10 @@
+   if (size != input.size() || size != output.size() ||
+       size > size_t(PTRDIFF_MAX) / output.itemsize() ||
+       input.data_size() > size_t(PTRDIFF_MAX) / output.itemsize()) return false;
++  // Contiguous unary output inherits data_size, not just logical shape.
++  // The closed physical source supplies a logical output envelope; larger
++  // borrowed backing needs a distinct source rather than unpriced allocation.
++  if(input.flags().contiguous && input.data_size()>size)return false;
+   return unary_eval_layout(selected, output.dtype(), output.ndim(), output.is_tracer(), out);
+ }
+ } // namespace mlx::core::cpu

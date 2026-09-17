@@ -1,91 +1,95 @@
 use super::*;
 use eredu_nn::{GroupedLinearActivation, GroupedLinearOperator, GroupedLinearSpec, Parameter};
 
+#[cfg(test)]
+mod retained_tests;
+pub(super) mod original;
+
 /// MLX indexed affine projections with activation before weighted reduction.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "MlxTensor")]
 pub struct MlxGroupedLinear {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     spec: GroupedLinearSpec,
     weight: Parameter<MlxTensor>,
     scale: Option<Parameter<MlxTensor>>,
     affine_bias: Option<Parameter<MlxTensor>>,
     bias: Option<Parameter<MlxTensor>>,
+    #[parameter(skip, metadata)]
+    construction_funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
 }
 
 impl MlxGroupedLinear {
-    fn local_bindings(&self) -> [Option<String>; 4] {
-        let projection = self.spec.projection();
-        [
-            Some(projection.weight()),
-            projection.format().scale(),
-            projection.format().affine_bias(),
-            projection.bias(),
-        ]
-        .map(|spec| {
-            spec.map(|spec| {
-                spec.id
-                    .as_str()
-                    .rsplit('.')
-                    .next()
-                    .expect("validated parameter identity")
-                    .to_owned()
-            })
-        })
+    pub(crate) fn original_fp8_control_bytes() -> Option<usize> {
+        original::control_bytes()
+    }
+    pub(super) fn local_bindings(spec: &GroupedLinearSpec) -> [Option<&str>; 4] {
+        let projection = spec.projection();
+        [Some(projection.weight()), projection.format().scale(),
+            projection.format().affine_bias(), projection.bias()]
+            .map(|spec| spec.map(|spec| spec.id.as_str().rsplit('.').next()
+                .expect("validated parameter identity")))
     }
 
     pub(crate) fn local_parameter_names(&self) -> Vec<String> {
-        self.local_bindings().into_iter().flatten().collect()
+        Self::local_bindings(&self.spec).into_iter().flatten().map(str::to_owned).collect()
     }
 
-    pub(crate) fn bind_local_parameters(
-        &mut self,
-        mut bindings: BTreeMap<String, Array>,
-    ) -> Result<(), ComputeError> {
-        let names = self.local_bindings();
-        let expected = names.iter().flatten().cloned().collect::<BTreeSet<_>>();
-        if bindings.keys().cloned().collect::<BTreeSet<_>>() != expected {
-            return Err(ComputeError::backend(
-                "compact linear bank bindings differ from its specification",
-            ));
+    pub(crate) fn bind_local_parameters(&mut self, mut bindings: BTreeMap<String, Array>)
+        -> Result<(), ComputeError> {
+        self.bind_compact_values(&mut bindings)
+    }
+
+    pub(crate) fn bind_prepared_local_parameters(&mut self,
+        bindings: &mut super::parameters::PreparedCompactBindings<'_>) -> Result<(), ComputeError> {
+        self.bind_compact_values(bindings)
+    }
+
+    fn bind_compact_values<V: super::parameters::CompactBindingValues + ?Sized>(
+        &mut self, bindings: &mut V) -> Result<(), ComputeError> {
+        use super::parameters::compact::CompactBindingCause;
+        bindings.begin(super::parameters::compact::linear_control_bytes())?;
+        let names = Self::local_bindings(&self.spec);
+        if bindings.len() != names.iter().flatten().count() || !bindings.ready() {
+            return Err(bindings.failure(CompactBindingCause::Identity));
         }
-        // Validate every shape before changing any parameter slot.
-        let floating_shape = [
-            self.spec.group_count(),
-            self.spec.output_dimensions(),
-            self.spec.input_dimensions(),
-        ];
-        for (name, parameter) in names.iter().zip([
-            Some(&self.weight),
-            self.scale.as_ref(),
-            self.affine_bias.as_ref(),
-            self.bias.as_ref(),
-        ]) {
-            if let (Some(name), Some(parameter)) = (name, parameter) {
-                super::parameters::validate_compact_binding(
-                    name,
-                    parameter.as_ref().as_array(),
-                    &bindings[name],
-                    (Some(name) == names[0].as_ref()).then_some(floating_shape.as_slice()),
-                )?;
+        // The immutable spec names are borrowed from their retained owner.
+        // Every shape/encoding is checked before any Array moves into a slot.
+        let floating_shape = [self.spec.group_count(), self.spec.output_dimensions(), self.spec.input_dimensions()];
+        for (slot, (name, parameter)) in names.iter().zip([
+            Some(&self.weight), self.scale.as_ref(), self.affine_bias.as_ref(), self.bias.as_ref(),
+        ]).enumerate() {
+            match (name, parameter) {
+                (Some(name), Some(parameter)) => {
+                    let value = bindings.value(name).ok_or_else(|| bindings.failure(CompactBindingCause::Identity))?;
+                    super::parameters::compact::validate(parameter.as_ref().as_array(), value,
+                        (slot == 0).then_some(floating_shape.as_slice())).map_err(|cause|bindings.failure(cause))?;
+                }
+                (None, None) => {}
+                _ => return Err(bindings.failure(CompactBindingCause::Identity)),
             }
         }
         for (name, parameter) in names.iter().zip([
-            Some(&mut self.weight),
-            self.scale.as_mut(),
-            self.affine_bias.as_mut(),
-            self.bias.as_mut(),
+            Some(&mut self.weight), self.scale.as_mut(), self.affine_bias.as_mut(), self.bias.as_mut(),
         ]) {
             if let (Some(name), Some(parameter)) = (name, parameter) {
-                parameter.replace(MlxTensor::from_array(
-                    bindings.remove(name).expect("validated binding"),
-                ));
+                parameter.replace(MlxTensor::from_array(bindings.take(name)
+                    .expect("validated unique physical binding")));
             }
         }
         Ok(())
     }
 
     pub(super) fn new(spec: GroupedLinearSpec, context: &Stream) -> Result<Self, ComputeError> {
+        Self::construct(spec,super::grouped_construction::Constructor::ordinary(context))
+    }
+    pub(crate) fn from_prepared_bindings(spec:GroupedLinearSpec,bindings:super::parameters::PreparedCompactBindings<'_>)
+        ->Result<Self,ComputeError> {
+        Self::construct(spec,super::grouped_construction::Constructor::prepared::<Self>(bindings)?)
+    }
+    fn construct(spec:GroupedLinearSpec,mut constructor:super::grouped_construction::Constructor<'_,'_>)
+        ->Result<Self,ComputeError> {
+        use crate::backend::nn::grouped::ParameterFactory;
         spec.validate()?;
         let (groups, rows, columns) = (
             spec.group_count(),
@@ -94,8 +98,8 @@ impl MlxGroupedLinear {
         );
         let projection = spec.projection();
         let encoding = projection.format().encoding();
-        let mut shape = vec![groups, rows, columns];
-        let mut scale_shape = shape.clone();
+        let mut shape = [groups, rows, columns];
+        let mut scale_shape = shape;
         match encoding {
             LinearFormat::Dense => {}
             LinearFormat::E4M3BlockFp8(fp8) => {
@@ -145,45 +149,34 @@ impl MlxGroupedLinear {
             }
             _ => safemlx::Dtype::Float32,
         };
-        let unloaded = |spec, shape: &[i32], dtype| -> Result<Parameter<MlxTensor>, ComputeError> {
-            Ok(Parameter::new(
-                spec,
-                compute_tensor(safemlx::ops::zeros_dtype(shape, dtype, context))?,
-            ))
-        };
-        let weight = unloaded(projection.weight().clone(), &shape, weight_dtype)?;
-        let scale = projection
-            .format()
-            .scale()
-            .map(|p| {
-                unloaded(
-                    bind_linear_companion(projection.weight(), p.clone()),
-                    &scale_shape,
-                    scale_dtype,
-                )
-            })
-            .transpose()?;
-        let affine_bias = projection
-            .format()
-            .affine_bias()
-            .map(|p| {
-                Parameter::unloaded(
-                    bind_linear_companion(projection.weight(), p.clone()),
-                    &scale_shape,
-                    context,
-                )
-            })
-            .transpose()?;
-        let bias = projection
-            .bias()
-            .map(|p| Parameter::unloaded(p.clone(), &[groups, rows], context))
-            .transpose()?;
+        let names=Self::local_bindings(&spec);
+        let weight_spec=constructor.clone_parameter(projection.weight(),None)?;
+        let weight_value=constructor.array(names[0].expect("declared grouped weight"),&shape,weight_dtype,
+            Some(&[groups,rows,columns]))?;
+        let weight=Parameter::new(weight_spec,MlxTensor::from_array(weight_value));
+        let scale=projection.format().scale().map(|source|{
+            let metadata=constructor.clone_parameter(source,Some(projection.weight()))?;
+            let value=constructor.array(names[1].expect("declared grouped scale"),&scale_shape,scale_dtype,None)?;
+            Ok::<_,ComputeError>(Parameter::new(metadata,MlxTensor::from_array(value)))
+        }).transpose()?;
+        let affine_bias=projection.format().affine_bias().map(|source|{
+            let metadata=constructor.clone_parameter(source,Some(projection.weight()))?;
+            let value=constructor.array(names[2].expect("declared grouped affine bias"),&scale_shape,Dtype::Float32,None)?;
+            Ok::<_,ComputeError>(Parameter::new(metadata,MlxTensor::from_array(value)))
+        }).transpose()?;
+        let bias=projection.bias().map(|source|{
+            let metadata=constructor.clone_parameter(source,None)?;
+            let value=constructor.array(names[3].expect("declared grouped bias"),&[groups,rows],Dtype::Float32,None)?;
+            Ok::<_,ComputeError>(Parameter::new(metadata,MlxTensor::from_array(value)))
+        }).transpose()?;
+        let construction_funding=constructor.finish()?;
         Ok(MlxGroupedLinear {
             spec,
             weight,
             scale,
             affine_bias,
             bias,
+            construction_funding,
         })
     }
 }
@@ -204,6 +197,10 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
             crate::tests::support::provider_failure::Operator::Linear,
             context,
         )?;
+        let transport = original::Transport::new(matches!(
+            self.spec.projection().format().encoding(),
+            LinearFormat::E4M3BlockFp8(_)
+        ));
         let input = input.as_array();
         let ids = selections.group_indices().as_array();
         if input.ndim() != 2
@@ -212,30 +209,38 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
             || ids.dim(0) != input.dim(0)
             || selections.coefficients().shape() != ids.shape()
         {
-            return Err(ComputeError::backend(
-                "selected grouped-linear input or routing geometry mismatch",
-            ));
+            return Err(
+                transport.invalid("selected grouped-linear input or routing geometry mismatch")
+            );
         }
-        let ids = compute(common::tensor::validate_token_domain(
+        let ids = match transport.compute(common::tensor::original_group_indices(
             ids,
             self.spec.group_count(),
-            None,
             context,
-        ))?;
-        let plan = compute(common::grouping::group_by_id(&ids, context))?;
-        let rows = compute(common::grouping::gather_grouped_rows(input, &plan, context))?;
+        ))? {
+            Some(safe) => safe,
+            None => transport.compute(common::tensor::validate_token_domain(
+                ids,
+                self.spec.group_count(),
+                None,
+                context,
+            ))?,
+        };
+        let plan = transport.compute(common::grouping::group_by_id(&ids, context))?;
+        let rows =
+            transport.compute(common::grouping::gather_grouped_rows(input, &plan, context))?;
         let weight = self.weight.as_ref().as_array();
         let scale = self.scale.as_ref().map(|p| p.as_ref().as_array());
         let encoding = self.spec.projection().format().encoding();
         let mut projected = match encoding {
-            LinearFormat::Dense => compute(common::grouping::grouped_matmul(
+            LinearFormat::Dense => transport.compute(common::grouping::grouped_matmul(
                 &rows,
-                compute(weight.swap_axes(-1, -2, context))?,
+                transport.compute(weight.swap_axes(-1, -2, context))?,
                 &plan.sorted_group_ids,
                 true,
                 context,
             ))?,
-            LinearFormat::E4M3BlockFp8(_) => compute(common::fp8::grouped_linear(
+            LinearFormat::E4M3BlockFp8(_) => transport.compute(common::fp8::grouped_linear(
                 &rows,
                 weight,
                 scale.expect("validated FP8 scale"),
@@ -245,7 +250,7 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
             LinearFormat::GgufIQuant { .. } => {
                 let quantization = encoding.weight_quantization().expect("GGUF format");
                 let (ty, endian) = quantization.gguf_iquant().expect("GGUF type");
-                compute(
+                transport.compute(
                     common::native_quantization::native_grouped_linear_from_array(
                         &rows,
                         weight,
@@ -262,7 +267,7 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
                 )?
             }
             LinearFormat::Affine(_) | LinearFormat::MxFp4 => {
-                compute(common::grouped::packed_grouped_linear(
+                transport.compute(common::grouped::packed_grouped_linear(
                     &rows,
                     weight,
                     scale.expect("validated packed scale"),
@@ -275,8 +280,8 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
         };
         if let Some(bias) = &self.bias {
             projected =
-                compute(projected.add(
-                    compute(bias.as_ref().as_array().take_axis(
+                transport.compute(projected.add(
+                    transport.compute(bias.as_ref().as_array().take_axis(
                         &plan.sorted_group_ids,
                         0,
                         context,
@@ -285,9 +290,9 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
                 ))?;
         }
         if self.spec.activation() == GroupedLinearActivation::Silu {
-            projected = compute(common::layers::silu(projected, context))?;
+            projected = transport.compute(common::layers::silu(projected, context))?;
         }
-        compute_tensor(common::grouped::weighted_group_sum(
+        transport.tensor(common::grouped::weighted_group_sum(
             projected,
             selections.coefficients().as_array(),
             &plan,
@@ -297,6 +302,7 @@ impl GroupedLinearOperator<MlxTensor> for MlxGroupedLinear {
         ))
     }
 }
+
 
 #[cfg(test)]
 mod tests {

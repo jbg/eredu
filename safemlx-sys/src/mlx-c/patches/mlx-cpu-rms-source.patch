@@ -1,0 +1,163 @@
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -1,8 +1,11 @@
+ // Copyright © 2023-2024 Apple Inc.
+ #include <cassert>
++#include <climits>
++#include <tuple>
+ #include <numeric>
+ 
+ #include "mlx/fast.h"
++#include "mlx/axis_view.h"
+ #include "mlx/fast_primitives.h"
+ #include "mlx/ops.h"
+ #include "mlx/transforms.h"
+@@ -50,45 +53,16 @@
+   return {outputs, out_axes};
+ }
+ 
+-array rms_norm(
+-    const array& x,
+-    const std::optional<array>& weight,
+-    float eps,
+-    StreamOrDevice s_ /* = {} */) {
+-  bool has_weight = weight.has_value();
+-
+-  if (x.ndim() == 0) {
+-    std::ostringstream msg;
+-    msg << "[rms_norm] Input must have at least 1 dimension but got input with "
+-           "0 dimensions.";
+-    throw std::invalid_argument(msg.str());
+-  }
+-  if (has_weight) {
+-    if ((*weight).ndim() != 1) {
+-      std::ostringstream msg;
+-      msg << "[rms_norm] (*weight) must have 1 dimension but has "
+-          << (*weight).ndim() << " dimensions.";
+-      throw std::invalid_argument(msg.str());
+-    }
+-    if ((*weight).size() != x.shape(-1)) {
+-      std::ostringstream msg;
+-      msg << "[rms_norm] (*weight) must have the same size as the last dimension of"
+-             " x but has "
+-          << (*weight).size() << " elements.";
+-      throw std::invalid_argument(msg.str());
+-    }
+-  }
+-
+-  auto out_type = (weight.has_value()) ? result_type(x, (*weight)) : x.dtype();
+-  if (!issubdtype(out_type, floating)) {
+-    std::ostringstream msg;
+-    msg << "[rms_norm] Received unsupported type " << out_type << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-
+-  auto s = to_stream(s_);
+-  auto fallback =
+-      [has_weight, eps, out_type, s](const ArrayVector& inputs) {
++namespace {
++// The ordinary fallback is also the source-visible CPU equation. Naming its
++// capture preserves its body and allows the cold census to measure the real
++// constructor frame without creating arrays, streams or a callable allocation.
++struct RmsFallback {
++  bool has_weight;
++  float eps;
++  Dtype out_type;
++  Stream s;
++  ArrayVector operator()(const ArrayVector& inputs) const {
+         auto x = astype(inputs[0], float32, s);
+         x = multiply(
+             x,
+@@ -105,7 +79,76 @@
+         }
+ 
+         return ArrayVector{x};
+-      };
++  }
++};
++}
++
++bool cpu_rms_fallback_control_bytes(
++    Dtype dtype, size_t rank, size_t width, size_t rows, size_t& out) noexcept {
++  if ((dtype != float32 && dtype != bfloat16) || rank == 0 || rank > 4 ||
++      width == 0 || rows == 0 || width > size_t(INT_MAX) ||
++      rows > size_t(INT_MAX) / width) return false;
++  // ArrayVector destinations use the existing resident Graph constructor bank;
++  // these are the actual caller/fallback/mean argument and result frames only.
++  const size_t parts[] = {
++      sizeof(RmsFallback), sizeof(std::optional<array>),
++      sizeof(std::tuple<const array&, const std::optional<array>&, float, StreamOrDevice>),
++      sizeof(const ArrayVector&), sizeof(ArrayVector) * 2,
++      sizeof(array) * 2, sizeof(Stream), sizeof(StreamOrDevice), sizeof(Dtype),
++      sizeof(bool), sizeof(float),
++      sizeof(std::tuple<const array&, int, bool, StreamOrDevice>),
++      sizeof(std::tuple<const array&, AxisView, bool, StreamOrDevice>),
++      sizeof(std::tuple<const array&, Shape, bool, Dtype, StreamOrDevice>),
++      sizeof(Shape) * 2, sizeof(AxisView), sizeof(double), sizeof(int) * 3,
++      sizeof(std::tuple<Dtype, size_t, size_t, size_t, size_t&>),
++      sizeof(size_t) * 2};
++  size_t total = sizeof(parts);
++  for (auto bytes : parts) {
++    if (bytes > SIZE_MAX - total) return false;
++    total += bytes;
++  }
++  out = total;
++  return true;
++}
++
++array rms_norm(
++    const array& x,
++    const std::optional<array>& weight,
++    float eps,
++    StreamOrDevice s_ /* = {} */) {
++  bool has_weight = weight.has_value();
++
++  if (x.ndim() == 0) {
++    std::ostringstream msg;
++    msg << "[rms_norm] Input must have at least 1 dimension but got input with "
++           "0 dimensions.";
++    throw std::invalid_argument(msg.str());
++  }
++  if (has_weight) {
++    if ((*weight).ndim() != 1) {
++      std::ostringstream msg;
++      msg << "[rms_norm] (*weight) must have 1 dimension but has "
++          << (*weight).ndim() << " dimensions.";
++      throw std::invalid_argument(msg.str());
++    }
++    if ((*weight).size() != x.shape(-1)) {
++      std::ostringstream msg;
++      msg << "[rms_norm] (*weight) must have the same size as the last dimension of"
++             " x but has "
++          << (*weight).size() << " elements.";
++      throw std::invalid_argument(msg.str());
++    }
++  }
++
++  auto out_type = (weight.has_value()) ? result_type(x, (*weight)) : x.dtype();
++  if (!issubdtype(out_type, floating)) {
++    std::ostringstream msg;
++    msg << "[rms_norm] Received unsupported type " << out_type << ".";
++    throw std::invalid_argument(msg.str());
++  }
++
++  auto s = to_stream(s_);
++  auto fallback = RmsFallback{has_weight, eps, out_type, s};
+ 
+   auto passed_weight =
+       (has_weight) ? astype(*weight, out_type, s) : array(1, out_type);
+diff --git a/mlx/fast.h b/mlx/fast.h
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -14,6 +14,10 @@
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core::fast {
++
++// Pure named-frame census for the existing CPU fallback; no execution authority.
++MLX_API bool cpu_rms_fallback_control_bytes(
++    Dtype dtype, size_t rank, size_t width, size_t rows, size_t& out) noexcept;
+ 
+ MLX_API array rms_norm(
+     const array& x,

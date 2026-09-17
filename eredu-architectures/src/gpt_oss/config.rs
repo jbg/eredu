@@ -4,10 +4,7 @@ use std::{collections::HashMap, io::Read};
 
 use crate::rotary::RopeValue;
 use eredu_checkpoint::WeightQuantization;
-use eredu_core::{
-    cache::{derive_prompt_cache_architecture_fingerprint, PromptCacheTopology},
-    AttentionPolicy, LayerSchedule,
-};
+use eredu_core::{AttentionPolicy, LayerSchedule, cache::PromptCacheTopology};
 use eredu_gguf::MetadataValue;
 use eredu_nn::{GatedProductActivation, GatedProductPolicy, RotarySpec};
 use eredu_runtime::{ModelStateIdentity, StateLayout};
@@ -141,6 +138,13 @@ impl ModelArgs {
         validate_model_args(self)
     }
 
+    pub(crate) fn validate_with_diagnostic<E>(
+        &self,
+        invalid: impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
+        validate_model_args_with(self, &invalid)
+    }
+
     /// Returns the canonical routed observation point for one decoder layer.
     pub fn routed_observation_points(
         &self,
@@ -175,6 +179,77 @@ impl ModelArgs {
 }
 
 impl Config for ModelArgs {
+    fn weight_quantization_with_metadata(
+        &self,
+        name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<WeightQuantization>, eredu_nn::Error> {
+        Ok(self.weight_quantization_for(name))
+    }
+
+    fn linear_format_with_metadata(
+        &self,
+        name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        Ok(self.linear_format(name))
+    }
+
+    fn parameter_alias_with_metadata(
+        &self,
+        _name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn block_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn attention_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn feed_forward_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn rotary_spec_with_metadata(
+        &self,
+        dimensions: i32,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<RotarySpec, eredu_nn::Error> {
+        Ok(RotarySpec {
+            arithmetic: eredu_nn::RotaryArithmetic::Native,
+            dimensions,
+            base: self.rope_theta,
+            traditional: false,
+            algorithm: crate::rotary::normalize_algorithm_with(
+                self.rope_scaling.as_ref(),
+                |args| context.metadata_error(args),
+            )?,
+        })
+    }
+
+    fn attention_value_format_with_metadata(
+        &self,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        crate::decoder::parameter_metadata::default_attention_value_format_with_metadata(
+            self, layer, context,
+        )
+    }
+
     fn model_family(&self) -> &'static str {
         "gpt_oss"
     }
@@ -184,6 +259,15 @@ impl Config for ModelArgs {
 
     fn architecture_fingerprint(&self) -> String {
         prompt_cache_architecture_fingerprint(self)
+    }
+    fn architecture_fingerprint_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<String, eredu_nn::Error> {
+        prompt_cache_architecture_fingerprint_with_metadata(
+            self,
+            crate::decoder::identity::Metadata::new(Some(context)),
+        )
     }
 
     fn parameter_root(&self) -> &str {
@@ -200,6 +284,12 @@ impl Config for ModelArgs {
 
     fn validate_config(&self) -> Result<(), eredu_nn::Error> {
         self.validate().map_err(eredu_nn::Error::backend)
+    }
+    fn validate_config_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), eredu_nn::Error> {
+        self.validate_with_diagnostic(|text| context.metadata_error(text))
     }
 
     fn hidden_size(&self) -> i32 {
@@ -433,98 +523,179 @@ pub fn state_identity(
 
 /// Returns the stable cache-relevant architecture fingerprint.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    let rope_scaling = args.rope_scaling.as_ref().map_or_else(
-        || "none".to_string(),
-        |config| {
-            let mut entries = config.iter().collect::<Vec<_>>();
+    prompt_cache_architecture_fingerprint_with_metadata(
+        args,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary fingerprint formatting is infallible")
+}
+
+fn prompt_cache_architecture_fingerprint_with_metadata(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    let rope_scaling = match &args.rope_scaling {
+        None => metadata.text("none")?,
+        Some(config) => {
+            let mut entries = metadata.vector(config.len())?;
+            entries.extend(config.iter());
             entries.sort_unstable_by_key(|(key, _)| key.as_str());
-            entries
-                .into_iter()
-                .map(|(key, value)| format!("{key}={}", rope_value_fingerprint(value)))
-                .collect::<Vec<_>>()
-                .join(";")
-        },
-    );
+            let mut values = metadata.vector(entries.len())?;
+            for (key, value) in entries {
+                values.push(match value {
+                    RopeValue::Float(value) => {
+                        metadata.format(format_args!("{key}=f32:{:08x}", value.to_bits()))?
+                    }
+                    RopeValue::String(value) => {
+                        metadata.format(format_args!("{key}=string:{value}"))?
+                    }
+                    RopeValue::Bool(value) => {
+                        metadata.format(format_args!("{key}=bool:{value}"))?
+                    }
+                });
+            }
+            metadata.join(&values, ";")?
+        }
+    };
     let policy = args.gated_product_policy;
-    let mut quantized_weight_configs = args
-        .quantized_weight_configs
-        .as_ref()
-        .map(|configs| {
-            configs
-                .iter()
-                .map(|(name, config)| format!("{name}={config:?}"))
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let mut quantized_weight_configs = metadata.vector(
+        args.quantized_weight_configs
+            .as_ref()
+            .map_or(0, |configs| configs.len()),
+    )?;
+    if let Some(configs) = &args.quantized_weight_configs {
+        for (name, config) in configs {
+            quantized_weight_configs.push(metadata.format(format_args!("{name}={config:?}"))?);
+        }
+    }
     quantized_weight_configs.sort_unstable();
-    derive_prompt_cache_architecture_fingerprint(
-        "gpt_oss",
-        [
-            ("model_type", args.model_type.clone()),
-            ("parameter_root", args.parameter_root.clone()),
-            ("hidden_size", args.hidden_size.to_string()),
-            ("intermediate_size", args.intermediate_size.to_string()),
-            ("layers", args.num_hidden_layers.to_string()),
-            ("query_heads", args.num_attention_heads.to_string()),
-            ("kv_heads", args.num_key_value_heads.to_string()),
-            ("head_dim", args.head_dim.to_string()),
-            ("vocab_size", args.vocab_size.to_string()),
-            ("experts", args.num_local_experts.to_string()),
-            ("top_k", args.num_experts_per_tok.to_string()),
-            ("norm_eps", f32_fingerprint(args.rms_norm_eps)),
+    metadata.fingerprint("gpt_oss", || {
+        Ok([
+            ("model_type", metadata.text(&args.model_type)?),
+            ("parameter_root", metadata.text(&args.parameter_root)?),
+            (
+                "hidden_size",
+                metadata.format(format_args!("{}", args.hidden_size))?,
+            ),
+            (
+                "intermediate_size",
+                metadata.format(format_args!("{}", args.intermediate_size))?,
+            ),
+            (
+                "layers",
+                metadata.format(format_args!("{}", args.num_hidden_layers))?,
+            ),
+            (
+                "query_heads",
+                metadata.format(format_args!("{}", args.num_attention_heads))?,
+            ),
+            (
+                "kv_heads",
+                metadata.format(format_args!("{}", args.num_key_value_heads))?,
+            ),
+            (
+                "head_dim",
+                metadata.format(format_args!("{}", args.head_dim))?,
+            ),
+            (
+                "vocab_size",
+                metadata.format(format_args!("{}", args.vocab_size))?,
+            ),
+            (
+                "experts",
+                metadata.format(format_args!("{}", args.num_local_experts))?,
+            ),
+            (
+                "top_k",
+                metadata.format(format_args!("{}", args.num_experts_per_tok))?,
+            ),
+            (
+                "norm_eps",
+                metadata.format(format_args!("{:08x}", (args.rms_norm_eps).to_bits()))?,
+            ),
             (
                 "attention_schedule",
-                args.attention_schedule.fingerprint_component(),
+                metadata.format(format_args!(
+                    "{}",
+                    args.attention_schedule.display_fingerprint_component()
+                ))?,
             ),
-            ("max_positions", args.max_position_embeddings.to_string()),
-            ("rope_theta", f32_fingerprint(args.rope_theta)),
+            (
+                "max_positions",
+                metadata.format(format_args!("{}", args.max_position_embeddings))?,
+            ),
+            (
+                "rope_theta",
+                metadata.format(format_args!("{:08x}", (args.rope_theta).to_bits()))?,
+            ),
             ("rope_scaling", rope_scaling),
             (
                 "expert_quantization",
-                args.quantization_config.quant_method.clone(),
+                metadata.text(&args.quantization_config.quant_method)?,
             ),
-            ("dense_quantization", format!("{:?}", args.quantization)),
+            (
+                "dense_quantization",
+                metadata.format(format_args!("{:?}", args.quantization))?,
+            ),
             (
                 "quantized_weight_configs",
-                quantized_weight_configs.join(";"),
+                metadata.join(&quantized_weight_configs, ";")?,
             ),
             (
                 "gate_bound",
-                policy
-                    .gate_upper_bound()
-                    .map_or_else(|| "none".into(), f32_fingerprint),
+                match policy.gate_upper_bound() {
+                    Some(value) => metadata.format(format_args!("{:08x}", value.to_bits()))?,
+                    None => metadata.text("none")?,
+                },
             ),
             (
                 "up_bound",
-                policy
-                    .up_absolute_bound()
-                    .map_or_else(|| "none".into(), f32_fingerprint),
+                match policy.up_absolute_bound() {
+                    Some(value) => metadata.format(format_args!("{:08x}", value.to_bits()))?,
+                    None => metadata.text("none")?,
+                },
             ),
             (
                 "sigmoid_multiplier",
-                f32_fingerprint(policy.sigmoid_multiplier()),
+                metadata.format(format_args!(
+                    "{:08x}",
+                    (policy.sigmoid_multiplier()).to_bits()
+                ))?,
             ),
-            ("up_offset", f32_fingerprint(policy.up_offset())),
-            ("swiglu_limit", f32_fingerprint(args.swiglu_limit)),
-        ],
-    )
+            (
+                "up_offset",
+                metadata.format(format_args!("{:08x}", (policy.up_offset()).to_bits()))?,
+            ),
+            (
+                "swiglu_limit",
+                metadata.format(format_args!("{:08x}", (args.swiglu_limit).to_bits()))?,
+            ),
+        ])
+    })
 }
 
 fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
+    validate_model_args_with(args, &|text| invalid(text.to_string()))
+}
+
+fn validate_model_args_with<E>(
+    args: &ModelArgs,
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     if args.model_type != "gpt_oss" {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "GPT-OSS requires model_type \"gpt_oss\", got {:?}",
             args.model_type
         )));
     }
     if args.parameter_root != "model" {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "GPT-OSS parameter root must be \"model\", got {:?}",
             args.parameter_root
         )));
     }
     if args.quantization_config.quant_method != "mxfp4" {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "GPT-OSS requires quantization_config.quant_method=\"mxfp4\", got {:?}",
             args.quantization_config.quant_method
         )));
@@ -542,50 +713,56 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
         ("max_position_embeddings", args.max_position_embeddings),
     ] {
         if value <= 0 {
-            return Err(invalid(format!("{name} must be positive, got {value}")));
+            return Err(invalid(format_args!(
+                "{name} must be positive, got {value}"
+            )));
         }
     }
     if args.hidden_size % MXFP4_GROUP_SIZE != 0 || args.intermediate_size % MXFP4_GROUP_SIZE != 0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "GPT-OSS MXFP4 hidden and intermediate dimensions must be divisible by {MXFP4_GROUP_SIZE}"
         )));
     }
     args.num_attention_heads
         .checked_mul(args.head_dim)
-        .ok_or_else(|| invalid("GPT-OSS query projection width overflows i32"))?;
+        .ok_or_else(|| invalid(format_args!("GPT-OSS query projection width overflows i32")))?;
     args.num_key_value_heads
         .checked_mul(args.head_dim)
-        .ok_or_else(|| invalid("GPT-OSS key/value projection width overflows i32"))?;
+        .ok_or_else(|| {
+            invalid(format_args!(
+                "GPT-OSS key/value projection width overflows i32"
+            ))
+        })?;
     args.intermediate_size
         .checked_mul(2)
-        .ok_or_else(|| invalid("GPT-OSS fused gate/up width overflows i32"))?;
+        .ok_or_else(|| invalid(format_args!("GPT-OSS fused gate/up width overflows i32")))?;
     if args.num_attention_heads % args.num_key_value_heads != 0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "num_attention_heads ({}) must be divisible by num_key_value_heads ({})",
             args.num_attention_heads, args.num_key_value_heads
         )));
     }
     if args.num_experts_per_tok > args.num_local_experts {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "num_experts_per_tok ({}) exceeds num_local_experts ({})",
             args.num_experts_per_tok, args.num_local_experts
         )));
     }
     if !args.rms_norm_eps.is_finite() || args.rms_norm_eps <= 0.0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "rms_norm_eps must be finite and positive, got {}",
             args.rms_norm_eps
         )));
     }
     if !args.rope_theta.is_finite() || args.rope_theta <= 0.0 {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "rope_theta must be finite and positive, got {}",
             args.rope_theta
         )));
     }
-    let layers = positive_usize(args.num_hidden_layers, "num_hidden_layers")?;
+    let layers = positive_usize_with(args.num_hidden_layers, "num_hidden_layers", invalid)?;
     if args.attention_schedule.len() != layers {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "attention schedule has {} entries for {layers} layers",
             args.attention_schedule.len()
         )));
@@ -595,7 +772,7 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
             if window.get() > i32::MAX as u32
                 || i64::from(window.get()) > i64::from(args.max_position_embeddings)
             {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "sliding window {} exceeds maximum positions {}",
                     window.get(),
                     args.max_position_embeddings
@@ -603,10 +780,17 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
             }
         }
     }
-    validate_normalized_rope_scaling(args.rope_scaling.as_ref(), args.max_position_embeddings)?;
-    args.gated_product_policy
-        .validate()
-        .map_err(|error| invalid(error.to_string()))?;
+    validate_normalized_rope_scaling_with(
+        args.rope_scaling.as_ref(),
+        args.max_position_embeddings,
+        invalid,
+    )?;
+    args.gated_product_policy.validate_fixed().map_err(|_| {
+        invalid(format_args!(
+            "invalid gated-product policy: {:?}",
+            args.gated_product_policy
+        ))
+    })?;
     if args.gated_product_policy.activation() != GatedProductActivation::Silu
         || args.gated_product_policy.gate_upper_bound()
             != args.gated_product_policy.up_absolute_bound()
@@ -615,7 +799,7 @@ fn validate_model_args(args: &ModelArgs) -> Result<(), ConfigError> {
         || args.gated_product_policy.sigmoid_multiplier() != GPT_OSS_SIGMOID_MULTIPLIER
         || args.gated_product_policy.up_offset() != GPT_OSS_UP_OFFSET
     {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "GPT-OSS requires its exact bounded gated-product policy, got {:?}",
             args.gated_product_policy
         )));
@@ -747,31 +931,39 @@ fn normalize_rope_scaling(
     ])))
 }
 
-fn validate_normalized_rope_scaling(
+fn validate_normalized_rope_scaling_with<E>(
     scaling: Option<&HashMap<String, RopeValue>>,
     max_positions: i32,
-) -> Result<(), ConfigError> {
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     let Some(scaling) = scaling else {
         return Ok(());
     };
-    if rope_kind(scaling)? != "yarn" {
-        return Err(invalid("normalized GPT-OSS RoPE scaling must be YaRN"));
+    if rope_kind_with(scaling, invalid)? != "yarn" {
+        return Err(invalid(format_args!(
+            "normalized GPT-OSS RoPE scaling must be YaRN"
+        )));
     }
-    validate_yarn_scalars(
-        required_rope_number(scaling, "factor")?,
-        required_rope_number(scaling, "original_max_position_embeddings")?,
-        required_rope_number(scaling, "beta_fast")?,
-        required_rope_number(scaling, "beta_slow")?,
-        required_rope_number(scaling, "mscale")?,
-        required_rope_number(scaling, "mscale_all_dim")?,
+    validate_yarn_scalars_with(
+        required_rope_number_with(scaling, "factor", invalid)?,
+        required_rope_number_with(scaling, "original_max_position_embeddings", invalid)?,
+        required_rope_number_with(scaling, "beta_fast", invalid)?,
+        required_rope_number_with(scaling, "beta_slow", invalid)?,
+        required_rope_number_with(scaling, "mscale", invalid)?,
+        required_rope_number_with(scaling, "mscale_all_dim", invalid)?,
         max_positions,
+        invalid,
     )?;
     if !matches!(scaling.get("truncate"), Some(RopeValue::Bool(_))) {
-        return Err(invalid("normalized GPT-OSS YaRN truncate must be boolean"));
+        return Err(invalid(format_args!(
+            "normalized GPT-OSS YaRN truncate must be boolean"
+        )));
     }
-    match crate::rotary::normalize_algorithm(Some(scaling)).map_err(invalid)? {
+    match crate::rotary::normalize_algorithm_with(Some(scaling), invalid)? {
         eredu_nn::RotaryAlgorithm::Yarn { .. } => Ok(()),
-        _ => Err(invalid("normalized GPT-OSS RoPE scaling must be YaRN")),
+        _ => Err(invalid(format_args!(
+            "normalized GPT-OSS RoPE scaling must be YaRN"
+        ))),
     }
 }
 
@@ -785,6 +977,29 @@ fn validate_yarn_scalars(
     mscale_all_dim: f32,
     max_positions: i32,
 ) -> Result<(), ConfigError> {
+    validate_yarn_scalars_with(
+        factor,
+        original,
+        beta_fast,
+        beta_slow,
+        mscale,
+        mscale_all_dim,
+        max_positions,
+        &|text| invalid(text.to_string()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_yarn_scalars_with<E>(
+    factor: f32,
+    original: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+    mscale: f32,
+    mscale_all_dim: f32,
+    max_positions: i32,
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     if factor <= 0.0
         || original <= 0.0
         || beta_fast <= 0.0
@@ -793,13 +1008,13 @@ fn validate_yarn_scalars(
         || mscale <= 0.0
         || mscale_all_dim < 0.0
     {
-        return Err(invalid(
-            "GPT-OSS YaRN scalars are outside their valid ranges",
-        ));
+        return Err(invalid(format_args!(
+            "GPT-OSS YaRN scalars are outside their valid ranges"
+        )));
     }
     let expanded = original * factor;
     if !expanded.is_finite() || original > max_positions as f32 || max_positions as f32 > expanded {
-        return Err(invalid(format!(
+        return Err(invalid(format_args!(
             "GPT-OSS max positions {max_positions} are incompatible with YaRN original={original} factor={factor}"
         )));
     }
@@ -807,25 +1022,43 @@ fn validate_yarn_scalars(
 }
 
 fn rope_kind(scaling: &HashMap<String, RopeValue>) -> Result<String, ConfigError> {
+    rope_kind_with(scaling, &|text| invalid(text.to_string())).map(str::to_owned)
+}
+
+fn rope_kind_with<'a, E>(
+    scaling: &'a HashMap<String, RopeValue>,
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<&'a str, E> {
+    fn parse<'a, E>(
+        value: &'a RopeValue,
+        invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<&'a str, E> {
+        match value {
+            RopeValue::String(value) => Ok(value),
+            _ => Err(invalid(format_args!(
+                "RoPE type or rope_type must be a string"
+            ))),
+        }
+    }
     let from_type = scaling.get("type");
     let from_rope_type = scaling.get("rope_type");
-    let parse = |value: &RopeValue| match value {
-        RopeValue::String(value) => Ok(value.clone()),
-        _ => Err(invalid("RoPE type or rope_type must be a string")),
-    };
     let kind = match (from_type, from_rope_type) {
         (Some(left), Some(right)) => {
-            let left = parse(left)?;
-            let right = parse(right)?;
+            let left = parse(left, invalid)?;
+            let right = parse(right, invalid)?;
             if left != right {
-                return Err(invalid(format!(
+                return Err(invalid(format_args!(
                     "conflicting RoPE type {left:?} and rope_type {right:?}"
                 )));
             }
             left
         }
-        (Some(value), None) | (None, Some(value)) => parse(value)?,
-        (None, None) => return Err(invalid("RoPE scaling requires type or rope_type")),
+        (Some(value), None) | (None, Some(value)) => parse(value, invalid)?,
+        (None, None) => {
+            return Err(invalid(format_args!(
+                "RoPE scaling requires type or rope_type"
+            )));
+        }
     };
     Ok(kind)
 }
@@ -834,14 +1067,30 @@ fn required_rope_number(
     values: &HashMap<String, RopeValue>,
     key: &str,
 ) -> Result<f32, ConfigError> {
-    optional_rope_number(values, key)?
-        .ok_or_else(|| invalid(format!("GPT-OSS YaRN requires numeric {key}")))
+    required_rope_number_with(values, key, &|text| invalid(text.to_string()))
+}
+
+fn required_rope_number_with<E>(
+    values: &HashMap<String, RopeValue>,
+    key: &str,
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<f32, E> {
+    optional_rope_number_with(values, key, invalid)?
+        .ok_or_else(|| invalid(format_args!("GPT-OSS YaRN requires numeric {key}")))
 }
 
 fn optional_rope_number(
     values: &HashMap<String, RopeValue>,
     key: &str,
 ) -> Result<Option<f32>, ConfigError> {
+    optional_rope_number_with(values, key, &|text| invalid(text.to_string()))
+}
+
+fn optional_rope_number_with<E>(
+    values: &HashMap<String, RopeValue>,
+    key: &str,
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<Option<f32>, E> {
     match values.get(key) {
         None => Ok(None),
         Some(RopeValue::Float(value)) if value.is_finite() => Ok(Some(*value)),
@@ -850,8 +1099,8 @@ fn optional_rope_number(
             .ok()
             .filter(|value| value.is_finite())
             .map(Some)
-            .ok_or_else(|| invalid(format!("GPT-OSS YaRN {key} must be finite numeric"))),
-        Some(_) => Err(invalid(format!(
+            .ok_or_else(|| invalid(format_args!("GPT-OSS YaRN {key} must be finite numeric"))),
+        Some(_) => Err(invalid(format_args!(
             "GPT-OSS YaRN {key} must be finite numeric"
         ))),
     }
@@ -904,10 +1153,18 @@ fn gguf_rope_scaling(
 }
 
 fn positive_usize(value: i32, name: &str) -> Result<usize, ConfigError> {
+    positive_usize_with(value, name, &|text| invalid(text.to_string()))
+}
+
+fn positive_usize_with<E>(
+    value: i32,
+    name: &str,
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<usize, E> {
     usize::try_from(value)
         .ok()
         .filter(|value| *value > 0)
-        .ok_or_else(|| invalid(format!("{name} must be positive, got {value}")))
+        .ok_or_else(|| invalid(format_args!("{name} must be positive, got {value}")))
 }
 
 fn gguf_vocab_size(
@@ -973,18 +1230,6 @@ fn gguf_optional_f32(
             .map(Some)
             .ok_or_else(|| invalid(format!("GGUF metadata {key:?} must be finite f32"))),
         None => Ok(None),
-    }
-}
-
-fn f32_fingerprint(value: f32) -> String {
-    format!("{:08x}", value.to_bits())
-}
-
-fn rope_value_fingerprint(value: &RopeValue) -> String {
-    match value {
-        RopeValue::Float(value) => format!("f32:{}", f32_fingerprint(*value)),
-        RopeValue::String(value) => format!("string:{value}"),
-        RopeValue::Bool(value) => format!("bool:{value}"),
     }
 }
 

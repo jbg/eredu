@@ -1,0 +1,111 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted cold retained target-module traversal and native physical inventory",
+  "source_sha256": {
+    "doc/backend-architecture.md": "a4171e97976dc78d4bb1ba179a165fea6b6482f7d0a1be30bdccd93fd07b3af6",
+    "doc/execution-control.md": "eb6310a2d48b6ec232712f8c06a11350561dd2e8e803ec536127b4bf6fdfc587",
+    "doc/bounded-inference.md": "27d2fc9e0e6f1083d2806b2f5f490711b2fdae572c2c2d7566cfe88f3bdeac23",
+    "eredu-nn/src/lib.rs": "344c6195a0efddb8b5f7e426ea9eb1c1ed2b55d5ff0b7c5d77924d80186821c3",
+    "eredu-runtime/src/parameter_operations.rs": "548c0c2e3262cc8e67d9745f8e9f618075cf7829e9328dccc0e9aba9bd8e313f",
+    "eredu-runtime/src/layered.rs": "11ca27d0d1cab12159732b764da1217c02fe24b5a37e0313cf9ecc20907e800e",
+    "eredu-runtime/src/replicated_session.rs": "6ef7c30cfca1dc5283cf1315f7d1974142213c4530f5cb18be46003f3599ad41",
+    "eredu-runtime/src/partitioned_execution.rs": "51b0949222a832f8a9b18b065bfd7149fe3cfd5e8cea511e828a5460a5079ccf",
+    "eredu-runtime/tests/backend_independence.rs": "6fc9084766eaae36dd3a457c1bee521b7bf8174bfcb9ee3d7f681a6ef70a253a",
+    "eredu-architectures/src/partitioned_parameters.rs": "1f56f2289cfd8492b2fcdad500a9ca3112905af364495e68b38ed944d35b9e2d",
+    "eredu-architectures/tests/reference_numeric.rs": "ee8120e78452945f42e91e225433caa6eee15c5aba9d5d155bfc59a605e8138e",
+    "eredu-architectures/tests/reference_numeric/parameter_access.rs": "eea1a7d3b5792fa9af0468532509cc95c9d2dedb2c74b858bd97830d39286eb4",
+    "eredu-backend-mlx/src/backend/runtime/execution/generic.rs": "29dd8336af7a6267acea63315ffeee06c84f8d305cf3a5ae35169806649b8fac",
+    "eredu-backend-mlx/src/backend/runtime/execution/generic/resident.rs": "74f989f0d5d850258139393c0301bfe7cbf8806d721018d29d993b1d5a32c8b7",
+    "eredu-backend-mlx/src/backend/runtime/execution/generic/bounded.rs": "864988b67b664d2370e8e3ef057d9637d68a1d6b65594ba4320a8e290938c261",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage.rs": "2da9cad9fad431e750234b6b97a423af3a7ab8702b40306a269ed4dacd41c095",
+    "eredu-backend-mlx/src/backend/runtime/residency/manager/transfer.rs": "2add3be35b6170ffe1d3477b0600a20c86c3dcd52519bbafe5f4cc9ca18343cc",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction.rs": "128ee5dfcc52f38d8c46418e074e0e183641db2e16aa9888b76f2502ceb23d86",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/partitioned.rs": "dcb436c7a88979e3145e4fca3097ceac9760719bafee31ecd2711a3b0ccadb4e",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/replicated.rs": "e33f8d255d08b07c6696cc05bf17bf96edc14825f4bd59f250d2b95ffd781b00",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/composite.rs": "a9eb8c958343379d769921b2c4d252d7eca48b6f20d208dbf5c57a91435724c5",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/tests/mod.rs": "a209ad21408b3f37106c768119d5a5bf8692ad4ae80255bf55b768df5c83727e",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/tests/retained_parameters.rs": "0da675f49e1bb57b407799afcd09624e9239c5f7cbb233af986e1ea01e34d454"
+  },
+  "coverage": {
+    "tests_passed": 715,
+    "runtime_tests": 656,
+    "partition_numeric_tests": 1,
+    "partition_configurations": 18,
+    "partition_sessions": 48,
+    "native_tests": 1,
+    "native_target_configurations": 9,
+    "native_residency_tests": 57,
+    "new_allocator_peak_measurements": 0,
+    "new_released_checkpoint_comparisons": 0
+  },
+  "behavior": [
+    "The neutral parameter owner exposes immutable architecture/policy borrows and visits retained parameter values through the same replicated, routed and partitioned session driver.",
+    "Native resident policies enumerate current module values; bounded policies enumerate stored reload overrides without constructing or acquiring unloaded units. Active/pending unit ownership leaves inspection unavailable.",
+    "The session rejects unresolved, fenced or active transactions before visiting parameters, without establishing completion as a side effect.",
+    "Native target-module values enter RetainedStorage with exact completed allocation capacities, physical alias deduplication and retained old ownership across later replacement.",
+    "Both resident-policy constructors settle their weight transfer before returning loaded units. Synchronous manager acquisition finalizes array readiness before publishing resident storage, so cold inventory does not need completion work.",
+    "The parameter edit/restore fixture covers tied and untied models under resident, host-layerwise and disk-streamed execution with TP, PP and combined TP/PP. It verifies no source/materialization activity during cold inspection and compares prefill plus two decodes against independent ordinary edited execution.",
+    "The portable resident window rejects cold traversal while a unit is loaned, then permits it after return without constructing a unit.",
+    "Nine native configurations cover dense, tied and packed targets across three residency modes. Hidden checkpoint files do not prevent cold inspection or replacement inventory; adding the same replacement allocation does not increase its charge, restoring removes override ownership, and retained inventories survive executable teardown."
+  ],
+  "limits": [
+    "This is the retained target-module and reload-override component. Source/residency buffers, addressable parameter banks, prediction modules, mutable state and escaped output handles still need composition.",
+    "The native inventory remains evidence rather than an automatic shared-pool reservation. Public native complete request quoting and admission are unfinished.",
+    "Unknown native backing remains unknown; no cold inspection evaluates a lazy graph or polls native completion.",
+    "Metadata, allocator caches, JIT and other process memory remain outside these physical payload bounds.",
+    "The current matrix validates parameter traversal and retention, not complete native inference budgets or new allocator/process peak measurements.",
+    "Builds retain the existing compact-unwind warning and native projection helpers awaiting full production admission integration."
+  ],
+  "checks": [
+    {
+      "name": "runtime",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --tests",
+      "log": "/private/tmp/eredu-retained-parameters-runtime-tests.log",
+      "sha256": "1d0d680246e64ab18162b507f09e195355ad0b7c3839783999872125c9a4cb34",
+      "passed": 656
+    },
+    {
+      "name": "partition_numeric",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric prepared_partition_parameter_loans_and_replacements_match_independent_execution -- --test-threads=1",
+      "log": "/private/tmp/eredu-retained-parameters-numeric-tests.log",
+      "sha256": "e1d3baf0bd025b992156473ffdfc49f5fa0b3501b9c6ad75ec41620cbf42b722",
+      "passed": 1
+    },
+    {
+      "name": "native_target_parameters",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib retained_target_parameters_track_replacements_without_loading_or_double_counting -- --test-threads=1",
+      "log": "/private/tmp/eredu-retained-parameters-native-tests.log",
+      "sha256": "d47631823bfa52415373bdfb478836efeae11715a72d7aa5bb247799ac116e88",
+      "passed": 1
+    },
+    {
+      "name": "native_residency",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib backend::runtime::residency:: -- --test-threads=1",
+      "log": "/private/tmp/eredu-retained-parameters-residency-tests.log",
+      "sha256": "858107c79fa675d6243042072237894e56168d760bc00f2d9243ebb7013a2eed",
+      "passed": 57
+    },
+    {
+      "name": "native_test_build",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib --no-run",
+      "log": "/private/tmp/eredu-retained-parameters-native-build.log",
+      "sha256": "1cde799894ce9f29483ce6c0d4f2d6fc3e9ecffd9da744dd78ddcf33ce87074a",
+      "passed": null
+    },
+    {
+      "name": "native_feature_check",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "log": "/private/tmp/eredu-retained-parameters-native-check.log",
+      "sha256": "2442ec846044c5f1eb10765364c699393cf2e44c9a01cc8e067ac329844ee6ca",
+      "passed": null
+    },
+    {
+      "name": "portable_neural_features",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-nn --all-features",
+      "log": "/private/tmp/eredu-retained-parameters-nn-check.log",
+      "sha256": "736e2582f563605dd272e5fb977840b0c0767377d27b6940c440caf75eec7157",
+      "passed": null
+    }
+  ]
+}

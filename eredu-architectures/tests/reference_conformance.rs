@@ -166,6 +166,7 @@ fn conformance_state_rollback_completion_and_failure_timing() {
 
 fn conformance_speculative_production() {
     numeric::run_reference_conformance_embedded_prediction();
+    speculative::embedded_snapshot_context_reaches_target_and_prediction_only_copies();
     speculative::sequential_embedded_runs_the_inspected_materialized_scheduler_path();
     speculative::fused_dspark_runs_the_inspected_materialized_scheduler_path();
     speculative::gemma_runs_the_inspected_materialized_scheduler_path();

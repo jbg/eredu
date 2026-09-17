@@ -1,0 +1,298 @@
+diff --git a/mlx/stream.h b/mlx/stream.h
+--- a/mlx/stream.h
++++ b/mlx/stream.h
+@@ -11,7 +11,7 @@
+ 
+ // A numerical implementation carried by an explicit context copy. This is
+ // independent of queue/device identity; consuming primitives retain it by value.
+-enum class CpuMatmulKernel : unsigned { PlatformDefault = 0, Float32Tiles = 1 };
++enum class CpuMatmulKernel : unsigned { PlatformDefault = 0, Float32Tiles = 1, Float32AndFloat16Tiles = 2 };
+ 
+ struct MLX_API Stream {
+   int index;
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -93,8 +93,10 @@
+           ${CMAKE_CURRENT_BINARY_DIR}/compiled_preamble.cpp)
+ 
+ if(MLX_BUILD_ACCELERATE)
++  target_compile_definitions(mlx PRIVATE MLX_CPU_DEFAULT_F16_TILES=0)
+   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gemms/bnns.cpp)
+ else()
++  target_compile_definitions(mlx PRIVATE MLX_CPU_DEFAULT_F16_TILES=1)
+   target_sources(mlx PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gemms/simd_fp16.cpp
+                              ${CMAKE_CURRENT_SOURCE_DIR}/gemms/simd_bf16.cpp)
+ endif()
+diff --git a/mlx/backend/cpu/matmul.cpp b/mlx/backend/cpu/matmul.cpp
+--- a/mlx/backend/cpu/matmul.cpp
++++ b/mlx/backend/cpu/matmul.cpp
+@@ -95,8 +95,17 @@
+   Strides b_strides;
+   void operator()() {
+     if constexpr (std::is_same_v<T,float>) {
+-      if(kernel==CpuMatmulKernel::Float32Tiles) {
++      if(kernel==CpuMatmulKernel::Float32Tiles||kernel==CpuMatmulKernel::Float32AndFloat16Tiles) {
+         simd_matmul<float,float>(a_ptr,b_ptr,out_ptr,a_transposed,b_transposed,
++            alpha,beta,batch_size,a_shape,a_strides,b_shape,b_strides);
++        return;
++      }
++    }
++    if constexpr (std::is_same_v<T,float16_t>) {
++      if(kernel==CpuMatmulKernel::Float32AndFloat16Tiles) {
++        // Same bundled worker as the non-Accelerate platform specialization.
++        // The explicit selection remains identical when BNNS is also compiled.
++        simd_matmul<float16_t,float>(a_ptr,b_ptr,out_ptr,a_transposed,b_transposed,
+             alpha,beta,batch_size,a_shape,a_strides,b_shape,b_strides);
+         return;
+       }
+@@ -149,18 +158,30 @@
+   if(task.controls>SIZE_MAX-controls)return false;
+   out={task.task_bytes,task.task_alignment,0,task.controls+controls};return true;
+ }
+-bool tiled_matmul_dispatch_storage(EvalDispatchStorage& out) noexcept {
++template <typename T>
++static bool fixed_tile_dispatch_storage(EvalDispatchStorage& out) noexcept {
+   DispatchLayout task;
+-  if(!CommandEncoder::dispatch_layout<MatmulTask<float>>(task))return false;
++  if(!CommandEncoder::dispatch_layout<MatmulTask<T>>(task))return false;
+   // Exact fixed tiles and SIMD values from the shared source worker. No BLAS,
+   // packing arena, opaque context, secondary thread or heap scratch is called.
+   const size_t controls=sizeof(EvalDispatchStorage)+sizeof(task)+sizeof(out)+
+-      sizeof(MatmulTask<float>)*2+sizeof(float[16*16])*3+
++      sizeof(MatmulTask<T>)*2+sizeof(float[16*16])*3+
+       sizeof(simd::Simd<float,simd::max_size<float>>)*4+
+       sizeof(size_t)*18+sizeof(int)*25+sizeof(float)*6+sizeof(bool)*4+
+-      sizeof(float*)*9+sizeof(ldiv_t)+sizeof(long)*2+sizeof(Shape)*2+sizeof(Strides)*2+sizeof(Stream);
++      sizeof(T*)*9+sizeof(ldiv_t)+sizeof(long)*2+sizeof(Shape)*2+sizeof(Strides)*2+sizeof(Stream)+
++      // Platform F16 adds the existing matmul<T> specialization call with
++      // these exact borrowed arguments before the same simd_matmul body.
++      (std::is_same_v<T,float16_t> ? sizeof(T*)*3+sizeof(bool)*2+sizeof(size_t)*4+
++       sizeof(float)*2+sizeof(Shape*)*2+sizeof(Strides*)*2 : 0)+
++      sizeof(EvalDispatchStorage*)+sizeof(bool);
+   if(task.controls>SIZE_MAX-controls)return false;
+   out={task.task_bytes,task.task_alignment,0,task.controls+controls};return true;
++}
++bool tiled_matmul_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  return fixed_tile_dispatch_storage<float>(out);
++}
++bool float16_tiled_matmul_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  return fixed_tile_dispatch_storage<float16_t>(out);
+ }
+ 
+ }
+@@ -247,8 +268,9 @@
+ 
+ void Matmul::eval_cpu(const ArrayVector& inputs, array& out) {
+   if(cpu_matmul()!=CpuMatmulKernel::PlatformDefault &&
+-      (cpu_matmul()!=CpuMatmulKernel::Float32Tiles||
+-       (out.dtype()==float32&&out.size()!=0&&inputs[0].shape(-1)!=0&&
++      ((cpu_matmul()!=CpuMatmulKernel::Float32Tiles&&cpu_matmul()!=CpuMatmulKernel::Float32AndFloat16Tiles)||
++       ((out.dtype()==float32||(out.dtype()==float16&&cpu_matmul()==CpuMatmulKernel::Float32AndFloat16Tiles))&&
++        out.size()!=0&&inputs[0].shape(-1)!=0&&
+         !cpu::tiled_matmul_shape(inputs[0],inputs[1],out))))
+     throw std::invalid_argument("[Matmul::eval_cpu] selected CPU tiled geometry is unavailable");
+   out.allocate_data(out.nbytes());
+@@ -265,8 +287,9 @@
+ 
+ void AddMM::eval_cpu(const ArrayVector& inputs, array& out) {
+   if(cpu_matmul()!=CpuMatmulKernel::PlatformDefault &&
+-      (cpu_matmul()!=CpuMatmulKernel::Float32Tiles||
+-       (out.dtype()==float32&&out.size()!=0&&inputs[0].shape(-1)!=0&&
++      ((cpu_matmul()!=CpuMatmulKernel::Float32Tiles&&cpu_matmul()!=CpuMatmulKernel::Float32AndFloat16Tiles)||
++       ((out.dtype()==float32||(out.dtype()==float16&&cpu_matmul()==CpuMatmulKernel::Float32AndFloat16Tiles))&&
++        out.size()!=0&&inputs[0].shape(-1)!=0&&
+         !cpu::tiled_matmul_shape(inputs[0],inputs[1],out))))
+     throw std::invalid_argument("[Matmul::eval_cpu] selected CPU tiled geometry is unavailable");
+   if (out.size() == 0) {
+diff --git a/mlx/backend/cpu/matmul_storage.cpp b/mlx/backend/cpu/matmul_storage.cpp
+--- a/mlx/backend/cpu/matmul_storage.cpp
++++ b/mlx/backend/cpu/matmul_storage.cpp
+@@ -35,12 +35,15 @@
+   return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
+       typeid(out.primitive())==typeid(Matmul)&&out.dtype()==bfloat16&&
+       (static_cast<const Matmul&>(out.primitive()).cpu_matmul()==CpuMatmulKernel::PlatformDefault||
+-       static_cast<const Matmul&>(out.primitive()).cpu_matmul()==CpuMatmulKernel::Float32Tiles);
++       static_cast<const Matmul&>(out.primitive()).cpu_matmul()==CpuMatmulKernel::Float32Tiles||
++       static_cast<const Matmul&>(out.primitive()).cpu_matmul()==CpuMatmulKernel::Float32AndFloat16Tiles);
+ }
+ static bool matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+-    size_t batches,bool tracer,bool tiled,CopyEvalStorage& out) noexcept {
++    size_t batches,bool tracer,Dtype dtype,CopyEvalStorage& out) noexcept {
+   if(rank<2||rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5||
+       !m||!n||!k||!batches||(rank==2&&batches!=1))return false;
++  const bool tiled=dtype==float32||dtype==float16;
++  if(!tiled&&dtype!=bfloat16)return false;
+   TiledMatmulFacts facts;
+   if(tiled&&(!tiled_matmul_facts(facts)||m>size_t(INT_MAX)-15||n>size_t(INT_MAX)-15))return false;
+   size_t left=0,right=0,result=0,bytes=0;
+@@ -49,9 +52,10 @@
+   if(!product(m,k,left)||!product(k,n,right)||!product(m,n,result)||
+       !product(left,batches,left)||!product(right,batches,right)||
+       !product(result,batches,result)||left>size_t(INT_MAX)||right>size_t(INT_MAX)||
+-      result>size_t(INT_MAX)||!product(result,tiled?sizeof(float):sizeof(bfloat16_t),bytes))return false;
++      result>size_t(INT_MAX)||!product(result,dtype.size(),bytes))return false;
+   EvalDispatchStorage task;SingleOutputEvalStorage common;RetentionLayout retention;
+-  if(!(tiled?tiled_matmul_dispatch_storage(task):bf16_matmul_dispatch_storage(task))||!single_output_raw_task_layout(rank,2,tracer,task,common)||
++  if(!(dtype==float32?tiled_matmul_dispatch_storage(task):
++      dtype==float16?float16_tiled_matmul_dispatch_storage(task):bf16_matmul_dispatch_storage(task))||!single_output_raw_task_layout(rank,2,tracer,task,common)||
+       !CommandEncoder::retention_layout(2,0,retention))return false;
+   CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
+   // matmul_general unconditionally publishes its actual (possibly empty)
+@@ -61,7 +65,7 @@
+   value.request_counts[9]=1;
+   const size_t controls=sizeof(value)+sizeof(common)+sizeof(task)+sizeof(retention)+
+       sizeof(rank)+sizeof(m)+sizeof(n)+sizeof(k)+sizeof(batches)+sizeof(tracer)+sizeof(out)+
+-      sizeof(tiled)+sizeof(facts)+sizeof(CpuMatmulKernel)*2+
++      sizeof(tiled)+sizeof(dtype)+sizeof(facts)+sizeof(CpuMatmulKernel)*2+
+       sizeof(size_t)*20+sizeof(bool)*8+sizeof(int64_t)*2+sizeof(const array*)*8+
+       sizeof(array)*2+sizeof(ArrayVector)+sizeof(std::tuple<bool,int64_t,array>)*2+
+       sizeof(Stream)*2+sizeof(float)*2+sizeof(detail::TemporaryOwner)*2+
+@@ -76,17 +80,17 @@
+ }
+ bool bf16_matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+     size_t batches,bool tracer,CopyEvalStorage& out) noexcept {
+-  return matmul_eval_layout(rank,m,n,k,batches,tracer,false,out);
++  return matmul_eval_layout(rank,m,n,k,batches,tracer,bfloat16,out);
+ }
+ bool tiled_matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+     size_t batches,bool tracer,CopyEvalStorage& out) noexcept {
+-  return matmul_eval_layout(rank,m,n,k,batches,tracer,true,out);
++  return matmul_eval_layout(rank,m,n,k,batches,tracer,float32,out);
+ }
+ static bool matmul_copy_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+-    size_t batches,size_t copies,bool tracer,bool tiled,CopyEvalStorage& out) noexcept {
++    size_t batches,size_t copies,bool tracer,Dtype dtype,CopyEvalStorage& out) noexcept {
+   if(copies>2)return false;
+   CopyEvalStorage value;
+-  if(!matmul_eval_layout(rank,m,n,k,batches,tracer,tiled,value))return false;
++  if(!matmul_eval_layout(rank,m,n,k,batches,tracer,dtype,value))return false;
+   for(size_t i=0;i!=copies;++i)
+     if(!append_copy_temporary_layout(rank,value))return false;
+   if(copies) {
+@@ -99,7 +103,7 @@
+   // Include the fixed public selector wrapper and this shared copy-layout
+   // frame. The actual zero/one/two copies retain the same native temporary bank.
+   const size_t controls=2*(sizeof(rank)+sizeof(m)+sizeof(n)+sizeof(k)+sizeof(batches)+
+-      sizeof(copies)+sizeof(tracer)+sizeof(out))+sizeof(tiled)+sizeof(value)+sizeof(size_t)+
++      sizeof(copies)+sizeof(tracer)+sizeof(out))+sizeof(dtype)+sizeof(value)+sizeof(size_t)+
+       sizeof(ArrayVector)+sizeof(submission::GraphAllocator<array>)+sizeof(array)*2;
+   if(!add(value.named_control_bytes,controls)||!submission::GraphConstruction::complete_layout(value))return false;
+   out=value;return true;
+@@ -107,11 +111,28 @@
+ 
+ bool tiled_matmul_copy_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+     size_t batches,size_t copies,bool tracer,CopyEvalStorage& out) noexcept {
+-  return matmul_copy_eval_layout(rank,m,n,k,batches,copies,tracer,true,out);
++  return matmul_copy_eval_layout(rank,m,n,k,batches,copies,tracer,float32,out);
+ }
+ bool bf16_matmul_copy_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+     size_t batches,size_t copies,bool tracer,CopyEvalStorage& out) noexcept {
+-  return matmul_copy_eval_layout(rank,m,n,k,batches,copies,tracer,false,out);
++  return matmul_copy_eval_layout(rank,m,n,k,batches,copies,tracer,bfloat16,out);
++}
++
++bool float16_matmul_copy_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,size_t copies,bool tracer,CopyEvalStorage& out) noexcept {
++  return matmul_copy_eval_layout(rank,m,n,k,batches,copies,tracer,float16,out);
++}
++
++bool platform_float16_uses_tiles() noexcept {
++#if defined(MLX_CPU_DEFAULT_F16_TILES) && MLX_CPU_DEFAULT_F16_TILES
++  return true;
++#else
++  return false;
++#endif
++}
++bool float16_tiled_matmul_facts(TiledMatmulFacts& out) noexcept {
++  // Both input types share the exact F32 accumulator tiles and lane order.
++  return sizeof(float16_t)==2 && tiled_matmul_facts(out);
+ }
+ 
+ bool tiled_matmul_facts(TiledMatmulFacts& out) noexcept {
+@@ -120,15 +141,21 @@
+   out={16,size_t(lanes),5,size_t(INT_MAX)};return true;
+ }
+ bool is_tiled_matmul_eval_primitive(const array& out) noexcept {
+-  return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
+-      typeid(out.primitive())==typeid(Matmul)&&out.dtype()==float32&&
+-      static_cast<const Matmul&>(out.primitive()).cpu_matmul()==CpuMatmulKernel::Float32Tiles;
+-}
++  if(!out.has_primitive()||out.primitive().stream().device!=Device::cpu||
++      typeid(out.primitive())!=typeid(Matmul))return false;
++  const auto kernel=static_cast<const Matmul&>(out.primitive()).cpu_matmul();
++  if(out.dtype()==float32) return kernel==CpuMatmulKernel::Float32Tiles||
++      kernel==CpuMatmulKernel::Float32AndFloat16Tiles;
++  if(out.dtype()!=float16)return false;
++  return kernel==CpuMatmulKernel::Float32AndFloat16Tiles||
++      ((kernel==CpuMatmulKernel::PlatformDefault||kernel==CpuMatmulKernel::Float32Tiles)&&
++       platform_float16_uses_tiles());
++}
++
+ static bool matmul_shape(const array& a,const array& b,const array& output,
+-    bool tiled,size_t& batches) noexcept {
++    Dtype dtype,size_t& batches) noexcept {
+   const size_t rank=output.ndim();if(rank<2||rank>5||Shape::inline_capacity<5||
+       Strides::inline_capacity<5||a.ndim()!=rank||b.ndim()!=rank)return false;
+-  const auto dtype=tiled?float32:bfloat16;
+   if(a.dtype()!=dtype||b.dtype()!=dtype||output.dtype()!=dtype||a.itemsize()!=dtype.size()||
+       b.itemsize()!=dtype.size()||output.itemsize()!=dtype.size()||a.shape(-1)!=b.shape(-2)||
+       output.shape(-2)!=a.shape(-2)||output.shape(-1)!=b.shape(-1)||
+@@ -143,30 +170,29 @@
+       !product(batches,size_t(output.shape(-2)),result)||
+       !product(result,size_t(output.shape(-1)),result)||result!=output.size()||
+       left!=a.size()||right!=b.size()||left>size_t(INT_MAX)||right>size_t(INT_MAX)||result>size_t(INT_MAX))return false;
+-  return !tiled||(output.shape(-2)<=INT_MAX-15&&output.shape(-1)<=INT_MAX-15);
++  return dtype==bfloat16||(output.shape(-2)<=INT_MAX-15&&output.shape(-1)<=INT_MAX-15);
+ }
+ bool tiled_matmul_shape(const array& a,const array& b,const array& output) noexcept {
+   TiledMatmulFacts facts;size_t batches=0;
+-  return tiled_matmul_facts(facts)&&matmul_shape(a,b,output,true,batches);
++  return (output.dtype()==float32||output.dtype()==float16)&&
++      tiled_matmul_facts(facts)&&matmul_shape(a,b,output,output.dtype(),batches);
+ }
+ static bool matmul_eval_storage(const array& output,bool tiled,CopyEvalStorage& out) noexcept {
+   if(!(tiled?is_tiled_matmul_eval_primitive(output):is_bf16_matmul_eval_primitive(output))||
+       !output.siblings().empty()||output.inputs().size()!=2)return false;
+   const auto& a=output.inputs()[0];const auto& b=output.inputs()[1];size_t batches=0;
+-  const auto dtype=tiled?float32:bfloat16;
++  const auto dtype=output.dtype();
+   bool copy_a=false,copy_b=false;
+-  if(!matmul_shape(a,b,output,tiled,batches)||!matrix_source(a,output.ndim(),dtype,copy_a)||
++  if(!matmul_shape(a,b,output,dtype,batches)||!matrix_source(a,output.ndim(),dtype,copy_a)||
+       !matrix_source(b,output.ndim(),dtype,copy_b))return false;
+   if(copy_a||copy_b) {
+-    // Both selected F32 tiles and plain BF16 rows use this exact shared
+-    // check_transpose copy path; the immutable primitive still selects its
+-    // independently qualified numeric worker before any layout is admitted.
+-    return tiled? tiled_matmul_copy_eval_layout(output.ndim(),a.shape(-2),b.shape(-1),a.shape(-1),
+-        batches,size_t(copy_a)+size_t(copy_b),output.is_tracer(),out):
+-        bf16_matmul_copy_eval_layout(output.ndim(),a.shape(-2),b.shape(-1),a.shape(-1),
+-        batches,size_t(copy_a)+size_t(copy_b),output.is_tracer(),out);
+-  }
+-  return matmul_eval_layout(output.ndim(),a.shape(-2),b.shape(-1),a.shape(-1),batches,output.is_tracer(),tiled,out);
++    // All three source-qualified workers use the same check_transpose copies.
++    // The immutable primitive above authenticates the actual selected dtype.
++    return matmul_copy_eval_layout(output.ndim(),a.shape(-2),b.shape(-1),a.shape(-1),
++        batches,size_t(copy_a)+size_t(copy_b),output.is_tracer(),dtype,out);
++  }
++  return matmul_eval_layout(output.ndim(),a.shape(-2),b.shape(-1),a.shape(-1),
++      batches,output.is_tracer(),dtype,out);
+ }
+ bool bf16_matmul_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   return matmul_eval_storage(output,false,out);
+diff --git a/mlx/backend/cpu/matmul_storage.h b/mlx/backend/cpu/matmul_storage.h
+--- a/mlx/backend/cpu/matmul_storage.h
++++ b/mlx/backend/cpu/matmul_storage.h
+@@ -4,6 +4,11 @@
+ struct TiledMatmulFacts { size_t tile_edge,reduction_lanes,max_rank,max_elements; };
+ MLX_API bool tiled_matmul_facts(TiledMatmulFacts&) noexcept;
+ MLX_API bool tiled_matmul_dispatch_storage(EvalDispatchStorage&) noexcept;
++MLX_API bool float16_tiled_matmul_facts(TiledMatmulFacts&) noexcept;
++MLX_API bool platform_float16_uses_tiles() noexcept;
++MLX_API bool float16_tiled_matmul_dispatch_storage(EvalDispatchStorage&) noexcept;
++MLX_API bool float16_matmul_copy_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,size_t copies,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool tiled_matmul_shape(const array&,const array&,const array&) noexcept;
+ MLX_API bool tiled_matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+     size_t batches,bool tracer,CopyEvalStorage&) noexcept;

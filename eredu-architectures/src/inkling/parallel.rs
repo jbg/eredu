@@ -128,8 +128,19 @@ impl PartitionLocalGeometry {
             .validate_global_rows(args.text_config.vocab_size)
             .map_err(|error| invalid(error.to_string()))?;
         let mut expected_roles = Vec::<String>::new();
-        if self.owns_input {
+        // Final vision normalization executes after the last selected hMLP
+        // unit. An absent vision tower retains the planner's zero-unit role
+        // marker on its first==last owner, but has no parameter to bind.
+        let owns_vision_completion = self
+            .vision_units
+            .as_ref()
+            .is_some_and(|range| range.end == vision_count)
+            || (vision_count == 0 && self.owns_input);
+        if owns_vision_completion {
             expected_roles.push("vision".into());
+        }
+        // Audio is a zero-unit static root whose work remains on the first owner.
+        if self.owns_input {
             expected_roles.push("audio".into());
         }
         if self.text_units.start == 0 {

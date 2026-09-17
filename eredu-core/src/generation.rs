@@ -5,8 +5,8 @@ use crate::backend::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
@@ -43,16 +43,52 @@ impl GenerationTiming {
 ///
 /// Ordinary and observed generation use `()`; speculative generation uses
 /// [`crate::SpeculativeStats`]. Token, termination, and timing semantics share
-/// this implementation in every mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GenerationOutput<S = ()> {
-    /// Every committed generated tokenizer id, including terminal special tokens.
-    /// Cancellation returns only its committed prefix.
-    pub token_ids: Vec<u32>,
+/// this implementation in every mode. The default token storage remains Vec;
+/// an ordinary retained result moves its existing immutable owner instead.
+#[derive(Debug, PartialEq, Eq)]
+pub struct GenerationOutput<S = (), T = Vec<u32>> {
     /// Deterministically selected terminal condition.
     pub finish_reason: FinishReason,
     timing: GenerationTiming,
     stats: S,
+    /// Every committed generated tokenizer id, including terminal special tokens.
+    /// Cancellation returns only its committed prefix. Retained storage has no
+    /// mutable or Vec extraction API; this final field outlives other controls.
+    pub token_ids: T,
+}
+
+/// Terminal plain-text result whose IDs and UTF-8 bytes share one retained owner.
+/// This concrete result adds no allocation or admission; its provider must have
+/// selected and priced terminal text before the original request comparison.
+#[derive(Debug)]
+pub struct GenerationPlainTextOutput {
+    /// Canonical terminal condition from the shared generation driver.
+    pub finish_reason: FinishReason,
+    /// Timing measured by the shared token source.
+    pub timing: GenerationTiming,
+    /// Immutable visible text, excluding stop strings and withheld cancellation tails.
+    pub text: GenerationText,
+    /// Committed IDs, including terminal special tokens.
+    pub token_ids: GenerationTokenIds,
+}
+impl GenerationPlainTextOutput {
+    /// Projects terminal text without copying or allocating a second control.
+    /// A provider lacking that immutable mode is returned unchanged.
+    pub fn from_retained(
+        token_ids: GenerationTokenIds,
+        finish_reason: FinishReason,
+        timing: GenerationTiming,
+    ) -> Result<Self, GenerationTokenIds> {
+        let Some(text) = token_ids.terminal_text() else {
+            return Err(token_ids);
+        };
+        Ok(Self {
+            finish_reason,
+            timing,
+            text,
+            token_ids,
+        })
+    }
 }
 
 impl<S> GenerationOutput<S> {
@@ -70,12 +106,74 @@ impl<S> GenerationOutput<S> {
             stats,
         }
     }
+}
 
+impl GenerationOutput<crate::SpeculativeStats, crate::SpeculativeTokenIds> {
+    /// Moves the actual ordinary or retained terminal owner and statistics.
+    /// No token copy, Arc allocation or accounting permission is introduced.
+    pub fn from_speculative(
+        token_ids: crate::SpeculativeTokenIds,
+        finish_reason: FinishReason,
+        timing: GenerationTiming,
+        stats: crate::SpeculativeStats,
+    ) -> Self {
+        Self {
+            token_ids,
+            finish_reason,
+            timing,
+            stats,
+        }
+    }
+}
+
+impl<S: Clone> Clone for GenerationOutput<S> {
+    fn clone(&self) -> Self {
+        Self::new(
+            self.token_ids.clone(),
+            self.finish_reason,
+            self.timing,
+            self.stats.clone(),
+        )
+    }
+}
+
+impl GenerationOutput<(), GenerationTokenIds> {
+    /// Moves the existing immutable ordinary token owner without allocating.
+    ///
+    /// This creates no admission or custody. A bounded caller must have priced
+    /// this concrete result and its controls before construction. It
+    /// certifies no mode-specific statistics or enclosing application payload.
+    ///
+    /// Retained result cloning is deliberately not exposed; callers can borrow
+    /// tokens or consume the result's existing owning token field.
+    ///
+    /// ```compile_fail
+    /// fn duplicate(output: eredu_core::GenerationOutput<(), eredu_core::GenerationTokenIds>) {
+    ///     let _copy = output.clone();
+    /// }
+    /// ```
+    pub fn from_retained(
+        token_ids: GenerationTokenIds,
+        finish_reason: FinishReason,
+        timing: GenerationTiming,
+    ) -> Self {
+        Self {
+            finish_reason,
+            timing,
+            stats: (),
+            token_ids,
+        }
+    }
+}
+
+impl<S, T: AsRef<[u32]>> GenerationOutput<S, T> {
     /// Canonical committed token ids.
     pub fn token_ids(&self) -> &[u32] {
-        &self.token_ids
+        self.token_ids.as_ref()
     }
+}
 
+impl<S, T> GenerationOutput<S, T> {
     /// Terminal generation reason.
     pub const fn finish_reason(&self) -> FinishReason {
         self.finish_reason
@@ -90,7 +188,17 @@ impl<S> GenerationOutput<S> {
     pub const fn stats(&self) -> &S {
         &self.stats
     }
+
+    /// Consumes the terminal result and transfers its existing statistics owner.
+    /// This does not copy history or discard statistics custody.
+    pub fn into_stats(self) -> S {
+        self.stats
+    }
 }
+
+#[cfg(test)]
+#[path = "generation/retained_output_tests.rs"]
+mod retained_output_tests;
 
 /// Why generation reached a terminal state.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
@@ -115,6 +223,20 @@ pub struct GenerationCancellationToken {
 }
 
 impl GenerationCancellationToken {
+    /// Requested shared cancellation cell and fixed constructor controls. This
+    /// queries only the token's actual owner; it grants no memory or execution.
+    pub fn construction_bytes() -> Option<usize> {
+        let allocation = std::alloc::Layout::new::<[std::sync::atomic::AtomicUsize; 2]>()
+            .extend(std::alloc::Layout::new::<AtomicBool>())
+            .ok()?
+            .0
+            .pad_to_align()
+            .size();
+        allocation
+            .checked_add(std::mem::size_of::<Self>())?
+            .checked_add(std::mem::size_of::<Arc<AtomicBool>>())
+    }
+
     /// Creates an active token.
     pub fn new() -> Self {
         Self::default()
@@ -151,12 +273,23 @@ pub struct TokenCommit {
     pub finish_reason: Option<FinishReason>,
 }
 
+mod sequence_storage;
+pub use sequence_storage::{
+    GenerationSequenceStorage, GenerationText, GenerationTokenIdStorage, GenerationTokenIds,
+    GenerationTokenIdsIntoIter, LegacyGenerationStorage, RetainedGenerationSequence,
+    RetainedGenerationSequenceCopy, RetainedGenerationSequenceStorage, RetainedGenerationStorage,
+    RetainedGenerationStorageOwner, RetainedSequenceConstructionError,
+    RetainedSequenceCopyMismatch, RetainedSequencePreparationError,
+};
+
 /// Canonical committed-token sequence and terminal-condition precedence.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct GenerationSequence {
+///
+/// Default storage retains the legacy allocating constructor, Clone and Vec
+/// extraction. Retained storage uses the same algorithm with one mutable owner.
+#[derive(Debug, Eq, PartialEq)]
+pub struct GenerationSequence<S = LegacyGenerationStorage> {
     max_tokens: usize,
-    eos_token_ids: Vec<u32>,
-    tokens: Vec<u32>,
+    storage: S,
     finish_reason: Option<FinishReason>,
 }
 
@@ -164,15 +297,9 @@ impl GenerationSequence {
     /// Logical data copied with the complete sequence, including EOS policy.
     /// Excludes allocator capacity and overhead.
     pub fn snapshot_storage_bytes(&self) -> Option<u64> {
-        let Self {
-            max_tokens: _,
-            eos_token_ids,
-            tokens,
-            finish_reason: _,
-        } = self;
         (std::mem::size_of::<Self>() as u64)
-            .checked_add((eos_token_ids.len() as u64).checked_mul(4)?)?
-            .checked_add((tokens.len() as u64).checked_mul(4)?)
+            .checked_add((self.storage.eos_token_ids.len() as u64).checked_mul(4)?)?
+            .checked_add((self.storage.tokens.len() as u64).checked_mul(4)?)
     }
     /// Creates an empty output sequence with a fixed token budget.
     pub fn new(max_tokens: usize, eos_token_ids: impl IntoIterator<Item = u32>) -> Self {
@@ -181,12 +308,31 @@ impl GenerationSequence {
         eos_token_ids.dedup();
         Self {
             max_tokens,
-            eos_token_ids,
-            tokens: Vec::with_capacity(max_tokens),
+            storage: LegacyGenerationStorage {
+                eos_token_ids,
+                tokens: Vec::with_capacity(max_tokens),
+            },
             finish_reason: (max_tokens == 0).then_some(FinishReason::MaxTokens),
         }
     }
 
+    /// Consumes legacy storage into its existing committed-token Vec.
+    pub fn into_tokens(self) -> Vec<u32> {
+        self.storage.tokens
+    }
+}
+
+impl Clone for GenerationSequence {
+    fn clone(&self) -> Self {
+        Self {
+            max_tokens: self.max_tokens,
+            storage: self.storage.clone(),
+            finish_reason: self.finish_reason,
+        }
+    }
+}
+
+impl<S: GenerationSequenceStorage> GenerationSequence<S> {
     /// Commits one token and applies stop, grammar, EOS, and budget precedence.
     pub fn commit(
         &mut self,
@@ -196,8 +342,8 @@ impl GenerationSequence {
         if self.finish_reason.is_some() {
             return Err(GenerationError::AlreadyFinished);
         }
-        let position = self.tokens.len();
-        self.tokens.push(token_id);
+        let position = self.storage.tokens().len();
+        self.storage.push(token_id)?;
         let finish_reason = signals
             .stop_sequence
             .then_some(FinishReason::StopSequence)
@@ -207,12 +353,15 @@ impl GenerationSequence {
                     .then_some(FinishReason::GrammarComplete)
             })
             .or_else(|| {
-                self.eos_token_ids
+                self.storage
+                    .eos_token_ids()
                     .binary_search(&token_id)
                     .is_ok()
                     .then_some(FinishReason::Eos)
             })
-            .or_else(|| (self.tokens.len() == self.max_tokens).then_some(FinishReason::MaxTokens));
+            .or_else(|| {
+                (self.storage.tokens().len() == self.max_tokens).then_some(FinishReason::MaxTokens)
+            });
         self.finish_reason = finish_reason;
         Ok(TokenCommit {
             token_id,
@@ -223,7 +372,7 @@ impl GenerationSequence {
 
     /// Applies cancellation if the sequence has not already terminated.
     pub fn cancel(&mut self) -> bool {
-        if self.tokens.is_empty() && self.finish_reason == Some(FinishReason::MaxTokens) {
+        if self.storage.tokens().is_empty() && self.finish_reason == Some(FinishReason::MaxTokens) {
             self.finish_reason = Some(FinishReason::Cancelled);
             true
         } else if self.finish_reason.is_some() {
@@ -241,17 +390,27 @@ impl GenerationSequence {
 
     /// Committed tokenizer ids in canonical order.
     pub fn tokens(&self) -> &[u32] {
-        &self.tokens
-    }
-
-    /// Consumes the state into committed tokenizer ids.
-    pub fn into_tokens(self) -> Vec<u32> {
-        self.tokens
+        self.storage.tokens()
     }
 
     /// Number of remaining token slots.
     pub fn remaining(&self) -> usize {
-        self.max_tokens.saturating_sub(self.tokens.len())
+        self.max_tokens.saturating_sub(self.storage.tokens().len())
+    }
+
+    /// Limits future commitments without increasing the existing ceiling or
+    /// reopening a terminal sequence. Retained storage keeps its original
+    /// physical capacity and custody; this changes only the logical endpoint.
+    pub fn restrict_remaining(&mut self, remaining: usize) {
+        if self.is_finished() {
+            return;
+        }
+        // The subtraction is bounded by the existing endpoint, including the
+        // committed prefix, and cannot overflow for usize::MAX requests.
+        self.max_tokens -= self.remaining().saturating_sub(remaining);
+        if self.remaining() == 0 {
+            self.finish_reason = Some(FinishReason::MaxTokens);
+        }
     }
 
     /// Configured output-token budget.
@@ -281,10 +440,10 @@ pub enum SpeculativeTail {
 
 /// Canonical bookkeeping for one proposal/verification transaction.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SpeculativeRound {
+pub struct SpeculativeRound<S = Vec<u32>> {
     proposal_count: usize,
     accepted: usize,
-    committed_tokens: Vec<u32>,
+    committed_tokens: S,
     tail: Option<SpeculativeTail>,
     terminal: bool,
 }
@@ -304,13 +463,71 @@ impl SpeculativeRound {
         })
     }
 
+    pub(crate) fn with_buffer(
+        proposal_count: usize,
+        storage: crate::SpeculativeBuffer<u32>,
+    ) -> Result<SpeculativeRound<crate::SpeculativeBuffer<u32>>, GenerationError> {
+        if proposal_count == 0 {
+            return Err(GenerationError::EmptyProposalBlock);
+        }
+        if !storage.is_empty()
+            || proposal_count
+                .checked_add(1)
+                .is_none_or(|n| n > storage.capacity())
+        {
+            return Err(GenerationError::InvalidStorage);
+        }
+        Ok(SpeculativeRound {
+            proposal_count,
+            accepted: 0,
+            committed_tokens: storage,
+            tail: None,
+            terminal: false,
+        })
+    }
+}
+mod round_storage {
+    pub trait Sealed {}
+    impl Sealed for Vec<u32> {}
+    impl Sealed for crate::SpeculativeBuffer<u32> {}
+}
+/// Fixed storage accepted by the shared speculative acceptance bookkeeping.
+/// This trait is sealed; ordinary Vec and the closed retained driver buffer
+/// use the same transitions and commitment plan.
+pub trait SpeculativeRoundStorage: round_storage::Sealed {
+    #[doc(hidden)]
+    fn tokens(&self) -> &[u32];
+    #[doc(hidden)]
+    fn push_token(&mut self, token: u32) -> Result<(), GenerationError>;
+}
+impl SpeculativeRoundStorage for Vec<u32> {
+    fn tokens(&self) -> &[u32] {
+        self
+    }
+    fn push_token(&mut self, token: u32) -> Result<(), GenerationError> {
+        self.push(token);
+        Ok(())
+    }
+}
+impl SpeculativeRoundStorage for crate::SpeculativeBuffer<u32> {
+    fn tokens(&self) -> &[u32] {
+        self
+    }
+    fn push_token(&mut self, token: u32) -> Result<(), GenerationError> {
+        self.try_push(token)
+    }
+}
+impl<S: SpeculativeRoundStorage> SpeculativeRound<S> {
+    pub(crate) fn into_storage(self) -> S {
+        self.committed_tokens
+    }
     /// Records the next accepted proposal token.
     pub fn accept(&mut self, token: u32, terminal: bool) -> Result<(), GenerationError> {
         if self.tail.is_some() || self.accepted == self.proposal_count || self.terminal {
             return Err(GenerationError::InvalidSpeculativeTransition);
         }
+        self.committed_tokens.push_token(token)?;
         self.accepted += 1;
-        self.committed_tokens.push(token);
         self.terminal = terminal;
         Ok(())
     }
@@ -320,8 +537,8 @@ impl SpeculativeRound {
         if self.tail.is_some() || self.accepted == self.proposal_count || self.terminal {
             return Err(GenerationError::InvalidSpeculativeTransition);
         }
+        self.committed_tokens.push_token(token)?;
         self.tail = Some(SpeculativeTail::Replacement);
-        self.committed_tokens.push(token);
         self.terminal = terminal;
         Ok(())
     }
@@ -331,8 +548,8 @@ impl SpeculativeRound {
         if self.tail.is_some() || self.accepted != self.proposal_count || self.terminal {
             return Err(GenerationError::InvalidSpeculativeTransition);
         }
+        self.committed_tokens.push_token(token)?;
         self.tail = Some(SpeculativeTail::Bonus);
-        self.committed_tokens.push(token);
         self.terminal = terminal;
         Ok(())
     }
@@ -349,7 +566,7 @@ impl SpeculativeRound {
         }
         Ok(SpeculativeCommitPlan {
             accepted_proposals: self.accepted,
-            committed_tokens: &self.committed_tokens,
+            committed_tokens: self.committed_tokens.tokens(),
             verified_inputs: if self.tail.is_some() {
                 1 + self.accepted
             } else {
@@ -400,19 +617,34 @@ pub fn resolve_optimistic_reuse(
     bonus: u32,
     terminal: bool,
 ) -> Result<OptimisticReuseDecision, GenerationError> {
+    resolve_optimistic_reuse_parts(
+        assumed_prefix,
+        canonical_prefix,
+        optimistic_tokens.first().copied(),
+        optimistic_tokens.len(),
+        bonus,
+        terminal,
+    )
+}
+pub(crate) fn resolve_optimistic_reuse_parts(
+    assumed_prefix: &[u32],
+    canonical_prefix: &[u32],
+    first: Option<u32>,
+    count: usize,
+    bonus: u32,
+    terminal: bool,
+) -> Result<OptimisticReuseDecision, GenerationError> {
     if assumed_prefix != canonical_prefix {
         return Err(GenerationError::OptimisticPrefixDiverged);
     }
-    let first = optimistic_tokens
-        .first()
-        .ok_or(GenerationError::EmptyOptimisticBranch)?;
+    let first = first.ok_or(GenerationError::EmptyOptimisticBranch)?;
     if terminal {
         return Ok(OptimisticReuseDecision::DiscardTerminal);
     }
-    if *first != bonus {
+    if first != bonus {
         return Ok(OptimisticReuseDecision::DiscardMismatch);
     }
-    Ok(if optimistic_tokens.len() == 1 {
+    Ok(if count == 1 {
         OptimisticReuseDecision::MatchedConsumed
     } else {
         OptimisticReuseDecision::MatchedRetained
@@ -921,28 +1153,31 @@ pub fn resolve_generation_config(
     Ok(resolved)
 }
 
+mod semantic_text;
+pub use semantic_text::{SemanticText, SemanticTextAllocationError};
+
 /// Semantic event emitted by generation orchestration.
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SemanticEvent {
-    /// Incremental reasoning content.
-    ReasoningDelta(String),
+    /// Incremental reasoning content, retaining its original owner when prepared.
+    ReasoningDelta(SemanticText),
     /// Incremental user-visible text.
-    TextDelta(String),
+    TextDelta(SemanticText),
     /// A structured tool call began.
     ToolCallStart {
         /// Zero-based tool-call position in the assistant turn.
         index: usize,
-        /// Stable tool-call identifier.
-        id: String,
-        /// Tool name selected by the model.
-        name: String,
+        /// Stable tool-call identifier, retaining its prepared owner.
+        id: SemanticText,
+        /// Tool name selected by the model, retaining its prepared owner.
+        name: SemanticText,
     },
     /// Incremental structured tool arguments.
     ToolArgumentsDelta {
         /// Zero-based tool-call position in the assistant turn.
         index: usize,
-        /// A fragment of the tool call's JSON arguments.
-        json_fragment: String,
+        /// A fragment of the tool call's JSON arguments with its prepared owner.
+        json_fragment: SemanticText,
     },
     /// A structured tool call ended.
     ToolCallEnd,
@@ -962,6 +1197,12 @@ pub enum GenerationError {
     /// A prior prediction or its semantic delivery failed and requires recovery.
     #[error("generation is fenced after a failed prediction or delivery")]
     FailedGeneration,
+    /// Retained token slots have not completed their one preparation attempt.
+    #[error("retained generation token storage is not ready")]
+    StorageNotReady,
+    /// A retained provider changed its fixed storage shape or EOS policy.
+    #[error("retained generation storage violates its prepared layout")]
+    InvalidStorage,
     /// A proposal transaction cannot be empty.
     #[error("speculative verification requires at least one proposal")]
     EmptyProposalBlock,

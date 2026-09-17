@@ -1,6 +1,9 @@
 //! Backend-neutral lossless DFlash assistant equations and committed context state.
 
 use std::collections::HashMap;
+use crate::decoder::ModuleMetadata;
+/// Shared source-qualified operations of the existing DFlash equations.
+pub mod invocation;
 
 use eredu_checkpoint::{
     schema::{
@@ -145,6 +148,17 @@ struct HfConfig {
 }
 
 impl DFlashConfig {
+    /// Concatenates already ordered target taps without constructing the
+    /// assistant model or running its encoder. This validates tensor geometry;
+    /// it does not admit a checkpoint or relax released model construction.
+    pub fn assemble_target_states<T: Tensor>(&self,states:&[T],context:&T::Context)->Result<T,Error>{
+        assemble_target_states(self.hidden_size,self.target_layer_ids.len(),states,context,|message|Error::backend(message))
+    }
+    /// Retains the ordered raw rolling suffix without encoding it.
+    pub fn prepare_raw_context_span<T:Tensor>(&self,previous:Option<&T>,states:&[T],context:&T::Context)->Result<T,Error>{
+        prepare_raw_context_span(self.hidden_size,self.target_layer_ids.len(),self.sliding_window,previous,states,context,|message|Error::backend(message))
+    }
+
     /// Parses and strictly validates the released Hugging Face assistant config.
     pub fn from_hf_json(bytes: &[u8]) -> Result<Self, DFlashConfigError> {
         let source: HfConfig = serde_json::from_slice(bytes)?;
@@ -263,6 +277,9 @@ impl DFlashConfig {
 
     /// Validates exact lossless assistant/target compatibility.
     pub fn validate_released(&self) -> Result<(), DFlashConfigError> {
+        self.validate_released_with(|message|DFlashConfigError::Invalid(message.into()))
+    }
+    fn validate_released_with<E>(&self,error:impl FnOnce(&'static str)->E)->Result<(),E>{
         if self.model_type != "muse_glimmer_assistant"
             || self.hidden_size != 6656
             || self.intermediate_size != 19968
@@ -278,9 +295,7 @@ impl DFlashConfig {
             || !self.rms_norm_eps.is_finite()
             || self.rms_norm_eps <= 0.0
         {
-            return Err(DFlashConfigError::Invalid(
-                "assistant does not match released Muse-Glimmer DFlash geometry".into(),
-            ));
+            return Err(error("assistant does not match released Muse-Glimmer DFlash geometry"));
         }
         Ok(())
     }
@@ -562,6 +577,70 @@ pub struct DFlashLayerContext<T> {
     pub values: T,
 }
 
+fn assemble_target_states<T: Tensor>(hidden_size:i32,taps:usize,
+        states: &[T],
+        context: &T::Context, error:impl Fn(&'static str)->Error+Copy,
+    ) -> Result<T, Error> {
+        if states.len() != taps
+            || states.is_empty()
+            || states.iter().any(|state| {
+                state.shape().len() != 3
+                    || state.shape()[..2] != states[0].shape()[..2]
+                    || state.dim(2) != hidden_size
+            })
+        {
+            return Err(error("invalid ordered DFlash target states"));
+        }
+        T::concatenate(states, 2, context)
+    }
+
+    /// Retains the raw feature suffix needed by the first assistant proposal.
+    /// The caller authenticates consecutive target spans; this method preserves
+    /// tap order and runs neither encoder nor attention-cache construction.
+fn prepare_raw_context_span<T: Tensor>(hidden_size:i32,taps:usize,window:i32,
+        previous: Option<&T>,
+        states: &[T],
+        context: &T::Context, error:impl Fn(&'static str)->Error+Copy,
+    ) -> Result<T, Error> {
+        if window <= 0 {
+            return Err(error("DFlash context window must be positive"));
+        }
+        let current = assemble_target_states(hidden_size,taps,states,context,error)?;
+        let width = current.dim(1);
+        if width <= 0 {
+            return Err(error("DFlash context span must be nonempty"));
+        }
+        let combined = match previous {
+            Some(previous) if width < window => {
+                if previous.shape().len() != 3
+                    || previous.dim(0) != current.dim(0)
+                    || previous.dim(2) != current.dim(2)
+                    || previous.dim(1) <= 0
+                    || previous.dim(1) > window
+                {
+                    return Err(error(
+                        "DFlash previous raw context geometry differs",
+                    ));
+                }
+                T::concatenate(&[previous.clone(), current], 1, context)?
+            }
+            _ => current,
+        };
+        let length = combined.dim(1);
+        if length <= window {
+            return Ok(combined);
+        }
+        combined.index(
+            &[
+                Index::Full,
+                Index::Range(length - window, length),
+                Index::Full,
+            ],
+            context,
+        )
+    }
+
+
 /// Canonical committed target context; transient proposal K/V is never stored here.
 #[derive(Debug, Clone)]
 pub struct DFlashContext<T> {
@@ -592,13 +671,13 @@ struct DFlashAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     query_norm: B::Normalization,
     key_norm: B::Normalization,
     rotary: B::Rotary,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     query_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     key_value_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dim: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     scale: f32,
 }
 
@@ -608,16 +687,18 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("layers.{layer}.self_attn");
+        let metadata=ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self,LinearSpec,NormalizationConstructionSpec,RotarySpec,&DFlashConfig,usize)>()?;
+        let prefix = metadata.text(format_args!("layers.{layer}.self_attn"))?;
         let linear = |field: &str, input, output| {
-            let name = format!("{prefix}.{field}.weight");
+            let name = metadata.text(format_args!("{prefix}.{field}.weight"))?;
             B::linear(
                 LinearSpec {
                     input,
                     output,
-                    weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(&name)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
+                    format: metadata.format(
                         &name,
                         config.linear_format_for(&name),
                     )?,
@@ -630,8 +711,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
                 NormalizationConstructionSpec::learned(
                     config.head_dim,
                     config.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
+                    metadata.named_parameter(format_args!("{prefix}.{field}.weight"))?,
                 ),
                 context,
             )
@@ -681,7 +761,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
         hidden: &B::Tensor,
         offset: i32,
         context: &<B::Tensor as Tensor>::Context,
+        metadata: ModuleMetadata<'_>,
     ) -> Result<DFlashLayerContext<B::Tensor>, Error> {
+        metadata.controls::<(DFlashLayerContext<B::Tensor>,Result<DFlashLayerContext<B::Tensor>,Error>,
+            B::Tensor,B::Tensor,B::Tensor,[i32;4],[i32;4],i32,i32)>()?;
         let batch = hidden.dim(0);
         let length = hidden.dim(1);
         let keys = self.key.forward(hidden, context)?.reshape(
@@ -713,7 +796,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
         absolute_end: i32,
         window: i32,
         context: &<B::Tensor as Tensor>::Context,
+        metadata: ModuleMetadata<'_>,
     ) -> Result<B::Tensor, Error> {
+        metadata.controls::<(B::Tensor,B::Tensor,B::Tensor,B::Tensor,
+            B::Tensor,B::Tensor,B::Tensor,B::Tensor,[B::Tensor;2],[i32;4],
+            i32,i32,i32,i32,Result<B::Tensor,Error>)>()?;
         let batch = hidden.dim(0);
         let block = hidden.dim(1);
         let reshape = |value: B::Tensor, heads| {
@@ -734,12 +821,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashAttention<B> {
         let block_values = reshape(self.value.forward(hidden, context)?, self.key_value_heads)?;
         let keys = B::Tensor::concatenate(&[committed.keys.clone(), block_keys], 2, context)?;
         let values = B::Tensor::concatenate(&[committed.values.clone(), block_values], 2, context)?;
-        let mask = bidirectional_block_mask::<B::Tensor>(
+        let mask = bidirectional_block_mask_with_metadata::<B::Tensor>(
             committed_len,
             block,
             absolute_end,
             window,
             context,
+            metadata,
         )?;
         let attended = B::attention(queries, keys, values, self.scale, Some(&mask), context)?
             .transpose_axes(&[0, 2, 1, 3], context)?
@@ -765,27 +853,28 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashBlock<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let root = format!("layers.{layer}");
+        let metadata=ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self,LinearSpec,NormalizationConstructionSpec,RotarySpec,&DFlashConfig,usize)>()?;
+        let root = metadata.text(format_args!("layers.{layer}"))?;
         let norm = |field: &str| {
             B::normalization(
                 NormalizationConstructionSpec::learned(
                     config.hidden_size,
                     config.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{root}.{field}.weight"))
-                        .map_err(Error::backend)?,
+                    metadata.named_parameter(format_args!("{root}.{field}.weight"))?,
                 ),
                 context,
             )
         };
         let linear = |field: &str, input, output| {
-            let name = format!("{root}.mlp.{field}.weight");
+            let name = metadata.text(format_args!("{root}.mlp.{field}.weight"))?;
             B::linear(
                 LinearSpec {
                     input,
                     output,
-                    weight: ParameterSpec::trainable(&name).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(&name)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
+                    format: metadata.format(
                         &name,
                         config.linear_format_for(&name),
                     )?,
@@ -811,7 +900,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashBlock<B> {
         absolute_end: i32,
         window: i32,
         context: &<B::Tensor as Tensor>::Context,
+        metadata: ModuleMetadata<'_>,
     ) -> Result<B::Tensor, Error> {
+        metadata.controls::<(B::Tensor,B::Tensor,B::Tensor,B::Tensor,
+            B::Tensor,B::Tensor,B::Tensor,B::Tensor,[B::Tensor;2],[i32;4],
+            i32,i32,i32,i32,Result<B::Tensor,Error>)>()?;
         let normalized = self.input_norm.forward(hidden, context)?;
         let hidden = hidden.add(
             &self.attention.forward(
@@ -821,6 +914,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlashBlock<B> {
                 absolute_end,
                 window,
                 context,
+                metadata,
             )?,
             context,
         )?;
@@ -841,9 +935,11 @@ pub struct DFlash<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     encoder_norm: B::Normalization,
     layers: Vec<DFlashBlock<B>>,
     final_norm: B::Normalization,
-    #[parameter(skip)]
-    config: DFlashConfig,
+    #[parameter(skip, metadata)]
+    config: DFlashGeometry,
 }
+#[derive(Debug,Clone)]
+struct DFlashGeometry { hidden_size:i32,target_layer_ids:Vec<usize>,sliding_window:i32,block_size:usize }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlash<B> {
     /// Builds the unloaded released assistant body.
@@ -851,15 +947,24 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlash<B> {
         config: DFlashConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate_released().map_err(Error::backend)?;
+        Self::from_config(&config,context)
+    }
+    /// Constructs the ordinary module from the exact retained source declaration.
+    pub(crate) fn from_config(config:&DFlashConfig,context:&<B::Tensor as Tensor>::Context)->Result<Self,Error>{
+        let metadata=ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self,DFlashGeometry,LinearSpec,NormalizationConstructionSpec,&DFlashConfig)>()?;
+        config.validate_released_with(|message|metadata.error(format_args!("{message}")))?;
+        let mut layers=metadata.vector(config.num_hidden_layers as usize)?;
+        let mut target_layer_ids=metadata.vector(config.target_layer_ids.len())?;
+        target_layer_ids.extend_from_slice(&config.target_layer_ids);
         let encoder_name = "encoder.fc.weight";
         let encoder = B::linear(
             LinearSpec {
                 input: config.hidden_size * config.target_layer_ids.len() as i32,
                 output: config.hidden_size,
-                weight: ParameterSpec::trainable(encoder_name).map_err(Error::backend)?,
+                weight: metadata.plain_parameter(encoder_name)?,
                 bias: None,
-                format: crate::linear_format::standard_linear_format(
+                format: metadata.format(
                     encoder_name,
                     config.linear_format_for(encoder_name),
                 )?,
@@ -871,19 +976,21 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlash<B> {
                 NormalizationConstructionSpec::learned(
                     config.hidden_size,
                     config.rms_norm_eps,
-                    ParameterSpec::trainable(name).map_err(Error::backend)?,
+                    metadata.plain_parameter(name)?,
                 ),
                 context,
             )
         };
+        let encoder_norm=norm("encoder.output_norm_enc.weight")?;
+        for layer in 0..config.num_hidden_layers as usize { layers.push(DFlashBlock::new(config,layer,context)?); }
+        let final_norm=norm("norm.weight")?;
         Ok(Self {
             encoder,
-            encoder_norm: norm("encoder.output_norm_enc.weight")?,
-            layers: (0..config.num_hidden_layers as usize)
-                .map(|layer| DFlashBlock::new(&config, layer, context))
-                .collect::<Result<Vec<_>, _>>()?,
-            final_norm: norm("norm.weight")?,
-            config,
+            encoder_norm,
+            layers,
+            final_norm,
+            config:DFlashGeometry{hidden_size:config.hidden_size,target_layer_ids,
+                sliding_window:config.sliding_window,block_size:config.block_size},
         })
     }
 
@@ -898,123 +1005,103 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlash<B> {
         states: &[B::Tensor],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        if states.len() != self.config.target_layer_ids.len()
-            || states.is_empty()
-            || states.iter().any(|state| {
-                state.shape().len() != 3
-                    || state.shape()[..2] != states[0].shape()[..2]
-                    || state.dim(2) != self.config.hidden_size
-            })
-        {
-            return Err(Error::backend("invalid ordered DFlash target states"));
-        }
-        B::Tensor::concatenate(states, 2, context)
+        let metadata=ModuleMetadata::new::<B>(context);
+        assemble_target_states(self.config.hidden_size,self.config.target_layer_ids.len(),states,context,|message|metadata.error(format_args!("{message}")))
+    }
+
+    /// Runs the same raw rolling-window worker without an encoder or layer call.
+    pub fn prepare_raw_context_span(&self,previous:Option<&B::Tensor>,states:&[B::Tensor],
+        context:&<B::Tensor as Tensor>::Context)->Result<B::Tensor,Error>{
+        self.prepare_raw_context_span_with_metadata(previous,states,context,ModuleMetadata::new::<B>(context))
+    }
+    fn prepare_raw_context_span_with_metadata(&self,previous:Option<&B::Tensor>,states:&[B::Tensor],
+        context:&<B::Tensor as Tensor>::Context,metadata:ModuleMetadata<'_>)->Result<B::Tensor,Error>{
+        metadata.controls::<(Option<&B::Tensor>,&[B::Tensor],B::Tensor,Result<B::Tensor,Error>)>()?;
+        prepare_raw_context_span(self.config.hidden_size,self.config.target_layer_ids.len(),self.config.sliding_window,
+            previous,states,context,|message|metadata.error(format_args!("{message}")))
     }
 
     /// Encodes and appends newly committed target taps, retaining one assistant window.
-    pub fn update_context(
-        &mut self,
-        previous: Option<DFlashContext<B::Tensor>>,
-        pending_target_states: &B::Tensor,
-        absolute_end: i32,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<DFlashContext<B::Tensor>, Error> {
-        let pending_len = pending_target_states.dim(1);
-        let pending_start = context_append_start(
-            previous.as_ref().map(|previous| previous.end),
-            pending_len,
-            absolute_end,
-        )?;
-        if pending_target_states.shape().len() != 3
-            || pending_target_states.dim(0) != 1
-            || pending_target_states.dim(2)
-                != self.config.hidden_size * self.config.target_layer_ids.len() as i32
-        {
-            return Err(Error::backend("invalid DFlash target context geometry"));
+    pub fn update_context(&mut self,previous:Option<DFlashContext<B::Tensor>>,
+        pending_target_states:&B::Tensor,absolute_end:i32,context:&<B::Tensor as Tensor>::Context)
+        ->Result<DFlashContext<B::Tensor>,Error>{
+        self.update_context_with_destination(previous,pending_target_states,absolute_end,context,ModuleMetadata::new::<B>(context))
+    }
+    fn update_context_borrowed(&mut self,previous:Option<&DFlashContext<B::Tensor>>,
+        pending:&B::Tensor,absolute_end:i32,context:&<B::Tensor as Tensor>::Context,metadata:ModuleMetadata<'_>)
+        ->Result<DFlashContext<B::Tensor>,Error>{
+        metadata.controls::<(Option<DFlashContext<B::Tensor>>,DFlashLayerContext<B::Tensor>,B::Tensor)>()?;
+        let previous=previous.map(|prior|{
+            let mut layers=metadata.vector(prior.layers.len())?;
+            for layer in &prior.layers{layers.push(DFlashLayerContext{keys:layer.keys.clone(),values:layer.values.clone()});}
+            Ok::<_,Error>(DFlashContext{encoded:prior.encoded.clone(),layers,start:prior.start,end:prior.end})
+        }).transpose()?;
+        self.update_context_with_destination(previous,pending,absolute_end,context,metadata)
+    }
+    fn update_context_with_destination(&mut self,previous:Option<DFlashContext<B::Tensor>>,
+        pending_target_states:&B::Tensor,absolute_end:i32,context:&<B::Tensor as Tensor>::Context,
+        metadata:ModuleMetadata<'_>)->Result<DFlashContext<B::Tensor>,Error>{
+        metadata.controls::<(DFlashContext<B::Tensor>,Option<DFlashContext<B::Tensor>>,
+            DFlashLayerContext<B::Tensor>,std::vec::IntoIter<DFlashLayerContext<B::Tensor>>,
+            Vec<DFlashLayerContext<B::Tensor>>,Vec<DFlashLayerContext<B::Tensor>>,B::Tensor,B::Tensor,
+            [B::Tensor;2],i32,i32)>()?;
+        if pending_target_states.shape().len()!=3||pending_target_states.dim(0)!=1
+            ||pending_target_states.dim(2)!=self.config.hidden_size*self.config.target_layer_ids.len() as i32{
+            return Err(metadata.error(format_args!("invalid DFlash target context geometry")));
         }
-        let encoded = self.encoder.forward(pending_target_states, context)?;
-        let encoded = self.encoder_norm.forward(&encoded, context)?;
-        let projected = self
-            .layers
-            .iter_mut()
-            .map(|layer| {
-                layer
-                    .attention
-                    .project_context(&encoded, pending_start, context)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let (encoded, layers) = match previous {
-            Some(previous) => {
-                if previous.layers.len() != projected.len()
-                    || previous.encoded.dim(1) != previous.retained_len()
-                {
-                    return Err(Error::backend("invalid cached DFlash context geometry"));
+        let pending_len=pending_target_states.dim(1);
+        let pending_start=context_append_start_with(previous.as_ref().map(|prior|prior.end),pending_len,absolute_end,
+            |message|metadata.error(format_args!("{message}")))?;
+        if let Some(prior)=&previous{self.validate_context(prior,metadata)?;}
+        let encoded=self.encoder.forward(pending_target_states,context)?;
+        let encoded=self.encoder_norm.forward(&encoded,context)?;
+        let mut projected=metadata.vector(self.layers.len())?;
+        for layer in &mut self.layers{projected.push(layer.attention.project_context(&encoded,pending_start,context,metadata)?);}
+        let mut layers=metadata.vector(projected.len())?;
+        let encoded=match previous{
+            Some(previous)=>{
+                if previous.layers.len()!=projected.len()||previous.encoded.dim(1)!=previous.retained_len(){
+                    return Err(metadata.error(format_args!("invalid cached DFlash context geometry")));
                 }
-                let encoded = retain_sequence_tail(
-                    B::Tensor::concatenate(&[previous.encoded, encoded], 1, context)?,
-                    1,
-                    self.config.sliding_window,
-                    context,
-                )?;
-                let layers = previous
-                    .layers
-                    .into_iter()
-                    .zip(projected)
-                    .map(|(previous, pending)| {
-                        Ok(DFlashLayerContext {
-                            keys: retain_sequence_tail(
-                                B::Tensor::concatenate(&[previous.keys, pending.keys], 2, context)?,
-                                2,
-                                self.config.sliding_window,
-                                context,
-                            )?,
-                            values: retain_sequence_tail(
-                                B::Tensor::concatenate(
-                                    &[previous.values, pending.values],
-                                    2,
-                                    context,
-                                )?,
-                                2,
-                                self.config.sliding_window,
-                                context,
-                            )?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, Error>>()?;
-                (encoded, layers)
+                let encoded=retain_sequence_tail_with_metadata(B::Tensor::concatenate(&[previous.encoded,encoded],1,context)?,
+                    1,self.config.sliding_window,context,metadata)?;
+                for (previous,pending) in previous.layers.into_iter().zip(projected){
+                    layers.push(DFlashLayerContext{
+                        keys:retain_sequence_tail_with_metadata(B::Tensor::concatenate(&[previous.keys,pending.keys],2,context)?,2,self.config.sliding_window,context,metadata)?,
+                        values:retain_sequence_tail_with_metadata(B::Tensor::concatenate(&[previous.values,pending.values],2,context)?,2,self.config.sliding_window,context,metadata)?,
+                    });
+                }
+                encoded
             }
-            None => {
-                let encoded =
-                    retain_sequence_tail(encoded, 1, self.config.sliding_window, context)?;
-                let layers = projected
-                    .into_iter()
-                    .map(|layer| {
-                        Ok(DFlashLayerContext {
-                            keys: retain_sequence_tail(
-                                layer.keys,
-                                2,
-                                self.config.sliding_window,
-                                context,
-                            )?,
-                            values: retain_sequence_tail(
-                                layer.values,
-                                2,
-                                self.config.sliding_window,
-                                context,
-                            )?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, Error>>()?;
-                (encoded, layers)
+            None=>{
+                let encoded=retain_sequence_tail_with_metadata(encoded,1,self.config.sliding_window,context,metadata)?;
+                for layer in projected{layers.push(DFlashLayerContext{
+                    keys:retain_sequence_tail_with_metadata(layer.keys,2,self.config.sliding_window,context,metadata)?,
+                    values:retain_sequence_tail_with_metadata(layer.values,2,self.config.sliding_window,context,metadata)?,
+                });}
+                encoded
             }
         };
-        let retained = encoded.dim(1);
-        Ok(DFlashContext {
-            encoded,
-            layers,
-            start: absolute_end - retained,
-            end: absolute_end,
-        })
+        let retained=encoded.dim(1);
+        Ok(DFlashContext{encoded,layers,start:absolute_end-retained,end:absolute_end})
+    }
+
+    fn validate_context(&self,context:&DFlashContext<B::Tensor>,metadata:ModuleMetadata<'_>)->Result<(),Error>{
+        metadata.controls::<(Result<(),Error>,std::slice::Iter<'_,DFlashLayerContext<B::Tensor>>,i32)>()?;
+        if context.start<0||context.end<context.start||context.encoded.shape().len()!=3
+            ||context.encoded.dim(0)!=1||context.encoded.dim(2)!=self.config.hidden_size
+            ||context.layers.len()!=self.layers.len(){return Err(metadata.error(format_args!("invalid cached DFlash context geometry")));}
+        let length=context.end-context.start;
+        if length<=0||length>self.config.sliding_window||context.encoded.dim(1)!=length{
+            return Err(metadata.error(format_args!("invalid cached DFlash context geometry")));
+        }
+        for (source,layer) in context.layers.iter().zip(&self.layers){
+            let shape=[1,layer.attention.key_value_heads,length,layer.attention.head_dim];
+            if source.keys.shape()!=shape||source.values.shape()!=shape{
+                return Err(metadata.error(format_args!("invalid DFlash layer context geometry")));
+            }
+        }
+        Ok(())
     }
 
     /// Runs one anchor-plus-mask proposal block and returns mask-position states.
@@ -1025,6 +1112,15 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlash<B> {
         absolute_end: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.proposal_states_with_metadata(noise_embeddings,committed,absolute_end,context,ModuleMetadata::new::<B>(context))
+    }
+    fn proposal_states_with_metadata(&mut self,noise_embeddings:&B::Tensor,
+        committed:&DFlashContext<B::Tensor>,absolute_end:i32,
+        context:&<B::Tensor as Tensor>::Context,metadata:ModuleMetadata<'_>)->Result<B::Tensor,Error>{
+        metadata.controls::<(B::Tensor,B::Tensor,Result<B::Tensor,Error>,[Index;3],
+            std::iter::Zip<std::slice::IterMut<'_,DFlashBlock<B>>,std::slice::Iter<'_,DFlashLayerContext<B::Tensor>>>,
+            i32,i32)>()?;
+        self.validate_context(committed,metadata)?;
         let block = noise_embeddings.shape().get(1).copied().unwrap_or(0);
         if noise_embeddings.shape().len() != 3
             || noise_embeddings.dim(0) != 1
@@ -1035,7 +1131,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlash<B> {
             || committed.encoded.dim(1) != committed.retained_len()
             || committed.layers.len() != self.layers.len()
         {
-            return Err(Error::backend("invalid DFlash proposal/context geometry"));
+            return Err(metadata.error(format_args!("invalid DFlash proposal/context geometry")));
         }
         let committed_len = committed.retained_len();
         let mut hidden = noise_embeddings.clone();
@@ -1043,7 +1139,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlash<B> {
             if layer_context.keys.dim(2) != committed_len
                 || layer_context.values.dim(2) != committed_len
             {
-                return Err(Error::backend("invalid DFlash layer context geometry"));
+                return Err(metadata.error(format_args!("invalid DFlash layer context geometry")));
             }
             hidden = layer.forward(
                 &hidden,
@@ -1052,6 +1148,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DFlash<B> {
                 absolute_end,
                 self.config.sliding_window,
                 context,
+                metadata,
             )?;
         }
         let hidden = self.final_norm.forward(&hidden, context)?;
@@ -1064,12 +1161,15 @@ fn context_append_start(
     pending_len: i32,
     absolute_end: i32,
 ) -> Result<i32, Error> {
+    context_append_start_with(previous_end,pending_len,absolute_end,|message|Error::backend(message))
+}
+fn context_append_start_with(previous_end:Option<i32>,pending_len:i32,absolute_end:i32,error:impl Fn(&'static str)->Error)->Result<i32,Error>{
     if pending_len <= 0 || absolute_end < pending_len {
-        return Err(Error::backend("invalid DFlash context range"));
+        return Err(error("invalid DFlash context range"));
     }
     let start = absolute_end - pending_len;
     if previous_end.is_some_and(|previous_end| previous_end != start) {
-        return Err(Error::backend("DFlash context/cache frontier mismatch"));
+        return Err(error("DFlash context/cache frontier mismatch"));
     }
     Ok(start)
 }
@@ -1080,37 +1180,45 @@ fn retain_sequence_tail<T: Tensor>(
     window: i32,
     context: &T::Context,
 ) -> Result<T, Error> {
+    retain_sequence_tail_with_metadata(value,axis,window,context,ModuleMetadata::ordinary())
+}
+fn retain_sequence_tail_with_metadata<T:Tensor>(value:T,axis:usize,window:i32,context:&T::Context,metadata:ModuleMetadata<'_>)->Result<T,Error>{
+    metadata.controls::<(T,Vec<Index>,usize,i32,i32)>()?;
     let length = value.dim(axis);
     let start = (length - window).max(0);
-    let mut indexes = vec![Index::Full; value.shape().len()];
+    let rank=value.shape().len();
+    let mut indexes=metadata.vector(rank)?;
+    indexes.resize(rank,Index::Full);
     indexes[axis] = Index::Range(start, length);
     value.index(&indexes, context)
 }
 
-fn bidirectional_block_mask<T: Tensor>(
-    context_len: i32,
-    block_len: i32,
-    context_end: i32,
-    window: i32,
-    context: &T::Context,
-) -> Result<T, Error> {
-    if context_len <= 0 || block_len <= 0 || window <= 0 || context_end < context_len {
-        return Err(Error::backend("invalid DFlash attention mask geometry"));
+fn bidirectional_block_mask<T:Tensor>(context_len:i32,block_len:i32,context_end:i32,window:i32,context:&T::Context)->Result<T,Error>{
+    bidirectional_block_mask_with_metadata(context_len,block_len,context_end,window,context,ModuleMetadata::ordinary())
+}
+fn bidirectional_block_mask_with_metadata<T:Tensor>(context_len:i32,block_len:i32,context_end:i32,window:i32,
+    context:&T::Context,metadata:ModuleMetadata<'_>)->Result<T,Error>{
+    metadata.controls::<(Vec<f32>,[i32;4],Result<T,Error>,i32,i32,i32,i32,i32,i32)>()?;
+    if context_len<=0||block_len<=0||window<=0||context_end<context_len{
+        return Err(metadata.error(format_args!("invalid DFlash attention mask geometry")));
     }
-    let key_len = context_len + block_len;
-    let context_start = context_end - context_len;
-    let mut values = Vec::with_capacity((block_len * key_len) as usize);
-    for query in 0..block_len {
-        let query_position = context_end + query;
-        for key in 0..key_len {
-            let key_position = context_start + key;
-            let in_block = key >= context_len;
-            let allowed = in_block
-                || (key_position <= query_position && query_position - key_position < window);
-            values.push(if allowed { 0.0 } else { f32::NEG_INFINITY });
+    let error=||metadata.error(format_args!("DFlash attention mask extent overflow"));
+    let key_len=context_len.checked_add(block_len).ok_or_else(error)?;
+    let final_position=context_end.checked_add(block_len-1).ok_or_else(error)?;
+    let count=usize::try_from(block_len).ok().and_then(|b|usize::try_from(key_len).ok().and_then(|k|b.checked_mul(k))).ok_or_else(error)?;
+    let context_start=context_end-context_len;
+    let mut values=metadata.vector(count)?;
+    for query in 0..block_len{
+        // Both end points were checked before allocation or native construction.
+        let query_position=final_position-(block_len-1-query);
+        for key in 0..key_len{
+            let key_position=context_start+key;
+            let in_block=key>=context_len;
+            let allowed=in_block||(key_position<=query_position&&query_position-key_position<window);
+            values.push(if allowed{0.0}else{f32::NEG_INFINITY});
         }
     }
-    T::from_f32_slice(&values, &[1, 1, block_len, key_len], context)
+    T::from_f32_slice(&values,&[1,1,block_len,key_len],context)
 }
 
 #[cfg(test)]

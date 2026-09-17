@@ -189,6 +189,9 @@ mod tests {
         }
     }
 
+    mod retained_source;
+    mod boundary_frames;
+
     struct Transport {
         rank: usize,
         payloads: Vec<Vec<u8>>,

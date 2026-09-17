@@ -87,7 +87,7 @@ pub enum ParameterBankOptionsError {
 }
 
 /// One atomic entry definition supplied by a caller.
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct ParameterBankEntry {
     pub(super) identity: ParameterBankKey,
     pub(super) unit: OffloadUnit,
@@ -136,6 +136,7 @@ impl ParameterBankEntry {
 
 /// Lowers generic selected storage members into MLX residency entries.
 /// MLX entry bindings paired with exact per-binding transformation selections.
+#[derive(Clone, Eq, PartialEq)]
 pub struct SelectedAddressableEntries {
     /// Exact logical destinations, including companions created by selected transforms.
     pub parameter_targets: BTreeMap<(ParameterBankKey, String), String>,
@@ -235,7 +236,7 @@ pub fn entries_from_selected_members(
 /// Result of replacing dense entry bindings with a disk-backed packed overlay.
 pub(crate) struct QuantizedParameterBankCatalog {
     /// Store supplying synthetic packed bindings and delegating all other keys.
-    pub(crate) store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    pub(crate) store: eredu_checkpoint::store::RetainedCheckpointSource,
     /// Entry units rebuilt against the packed store.
     pub(crate) entries: Vec<ParameterBankEntry>,
     /// Deterministic bounded-materialisation telemetry.
@@ -244,12 +245,13 @@ pub(crate) struct QuantizedParameterBankCatalog {
 
 #[cfg(test)]
 pub(crate) fn quantize_entry_catalog(
-    source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    source: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
     entries: Vec<ParameterBankEntry>,
     quantization: WeightQuantization,
     max_working_set_bytes: u64,
     source_stream: &Stream,
 ) -> Result<QuantizedParameterBankCatalog, Error> {
+    let source = source.into();
     let selected = entries
         .iter()
         .flat_map(|entry| {
@@ -284,7 +286,7 @@ pub(super) fn selected_transformation_formats(
 }
 
 pub(super) fn quantize_selected_entry_catalog(
-    mut source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    mut source: eredu_checkpoint::store::RetainedCheckpointSource,
     mut entries: Vec<ParameterBankEntry>,
     transformations: BTreeMap<(ParameterBankKey, String), SelectedBindingTransform>,
     max_working_set_bytes: u64,
@@ -326,7 +328,7 @@ pub(super) fn quantize_selected_entry_catalog(
 /// Quantizes every floating entry projection through its authoritative
 /// rank-local semantic recipe and rebuilds the catalog against packed keys.
 fn quantize_selected_entry_catalog_once(
-    source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    source: eredu_checkpoint::store::RetainedCheckpointSource,
     entries: Vec<ParameterBankEntry>,
     quantization: WeightQuantization,
     companion_dtype: &eredu_checkpoint::recipe::RecipeDtype,
@@ -400,12 +402,12 @@ fn quantize_selected_entry_catalog_once(
         targets,
     )?;
     let transformed = Arc::new(BoundedQuantizedWeightStore::create(
-        Arc::clone(&source),
+        source.clone(),
         plan,
         source_stream,
     )?);
     let report = transformed.report().clone();
-    let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = transformed;
+    let store: eredu_checkpoint::store::RetainedCheckpointSource = transformed.into();
     let mut rebuilt = Vec::with_capacity(units.len());
     for (identity, unit) in units {
         let mut bindings = Vec::new();

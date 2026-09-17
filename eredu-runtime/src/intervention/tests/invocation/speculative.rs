@@ -1,9 +1,11 @@
+mod windows;
 use super::*;
 use crate::{
     capture::{
         CaptureBackendProvider, SpeculativeCaptureObserver, SpeculativeCaptureScope as Scope,
     },
     inspection::{with_speculative_activation, SpeculativeActivationObserver},
+    ActivationObserver,
 };
 use eredu_core::speculative::{
     SpeculativeActivationOrigin, SpeculativeActivationPhase as Phase, SpeculativeControlError,
@@ -125,19 +127,19 @@ fn speculative_phases_share_value_evidence_budget_and_monotonic_restore_identity
         assert_eq!(record.invocation, index as u64);
         assert!(record.completed);
         assert_eq!(
-            record.captures.invocation.unwrap().sequence,
+            record.captures.as_step().invocation.unwrap().sequence,
             [3, 2, 3][index]
         );
         assert_eq!(record.origin.prediction, usize::from(index == 2));
-        assert!(record.captures.step_usage.encoded_bytes >= 1024);
+        assert!(record.captures.as_step().step_usage.encoded_bytes >= 1024);
     }
-    assert_eq!(records[0].captures.outcome, CaptureStepOutcome::Committed);
+    assert_eq!(records[0].captures.as_step().outcome, CaptureStepOutcome::Committed);
     assert_eq!(
-        values(&records[0].captures.interventions[0].evidence[1]),
+        values(&records[0].captures.as_step().interventions[0].evidence[1]),
         [2., 4., 6., 8., 10., 12.]
     );
     assert_eq!(
-        records[1].captures.records[0].outcome,
+        records[1].captures.as_step().records[0].outcome,
         CaptureOutcome::Skipped {
             reason: CaptureSkipReason::NotInvoked
         }
@@ -149,7 +151,7 @@ fn speculative_phases_share_value_evidence_budget_and_monotonic_restore_identity
     forward(&mut observer, Phase::Verification, 2, false).unwrap();
     let repeated = observer.take_activation_capture().unwrap();
     assert_eq!(repeated.invocation, 3);
-    assert!(repeated.captures.cumulative_usage.host_bytes > usage.host_bytes);
+    assert!(repeated.captures.as_step().cumulative_usage.host_bytes > usage.host_bytes);
 }
 
 #[test]
@@ -181,7 +183,7 @@ fn prediction_depth_scope_disables_unrelated_work_and_preserves_typed_failure() 
         [1., 2.]
     );
     let skipped = observer.take_activation_capture().unwrap();
-    assert_eq!(skipped.captures.step_usage.captures, 0);
+    assert_eq!(skipped.captures.as_step().step_usage.captures, 0);
     assert_eq!(
         forward(&mut observer, Phase::Proposal { depth: 1 }, 1, false)
             .unwrap()
@@ -189,7 +191,7 @@ fn prediction_depth_scope_disables_unrelated_work_and_preserves_typed_failure() 
         [2., 4.]
     );
     let captured = observer.take_activation_capture().unwrap();
-    assert_eq!(captured.captures.step_usage.captures, 3);
+    assert_eq!(captured.captures.as_step().step_usage.captures, 3);
     assert!(forward(&mut observer, Phase::Proposal { depth: 1 }, 1, false).is_err());
     assert!(matches!(
         observer.take_activation_error(),
@@ -200,10 +202,10 @@ fn prediction_depth_scope_disables_unrelated_work_and_preserves_typed_failure() 
     ));
     let failed = observer.take_activation_capture().unwrap();
     assert!(!failed.completed);
-    assert_eq!(failed.captures.outcome, CaptureStepOutcome::Aborted);
-    assert_eq!(failed.captures.cumulative_usage.captures, 3);
+    assert_eq!(failed.captures.as_step().outcome, CaptureStepOutcome::Aborted);
+    assert_eq!(failed.captures.as_step().cumulative_usage.captures, 3);
     assert!(
-        failed.captures.cumulative_usage.host_bytes > captured.captures.cumulative_usage.host_bytes
+        failed.captures.as_step().cumulative_usage.host_bytes > captured.captures.as_step().cumulative_usage.host_bytes
     );
 }
 
@@ -244,17 +246,17 @@ fn context_and_fused_edits_execute_only_in_their_phases_without_refunding_replay
             let record = observer.take_activation_capture().unwrap();
             assert!(record.completed);
             assert_eq!(
-                record.captures.step_usage.captures,
+                record.captures.as_step().step_usage.captures,
                 if invoked { 3 } else { 0 }
             );
             if invoked {
                 assert_eq!(
-                    values(&record.captures.interventions[0].evidence[1]),
+                    values(&record.captures.as_step().interventions[0].evidence[1]),
                     output.data
                 );
             } else {
                 assert_eq!(
-                    record.captures.records[0].outcome,
+                    record.captures.as_step().records[0].outcome,
                     CaptureOutcome::Skipped {
                         reason: CaptureSkipReason::NotInvoked
                     }
@@ -284,7 +286,7 @@ fn context_and_fused_edits_execute_only_in_their_phases_without_refunding_replay
             [2., 4., 6., 8.]
         );
         let replay = observer.take_activation_capture().unwrap();
-        assert!(replay.captures.cumulative_usage.host_bytes > usage.host_bytes);
+        assert!(replay.captures.as_step().cumulative_usage.host_bytes > usage.host_bytes);
     }
 }
 
@@ -310,8 +312,8 @@ fn missing_intervention_and_execution_failure_remain_aborted_evidence() {
     );
     let failed = observer.take_activation_capture().unwrap();
     assert!(!failed.completed);
-    assert_eq!(values(&failed.captures.records[0]), [1., 2., 3., 4.]);
-    assert_eq!(failed.captures.outcome, CaptureStepOutcome::Aborted);
+    assert_eq!(values(&failed.captures.as_step().records[0]), [1., 2., 3., 4.]);
+    assert_eq!(failed.captures.as_step().outcome, CaptureStepOutcome::Aborted);
 }
 
 #[test]
@@ -382,10 +384,10 @@ fn loaded_activation_authority_constructs_one_shared_run_and_tags_evidence() {
         record.admission_identity.as_deref(),
         Some(admitted.identity())
     );
-    assert_eq!(record.captures.step_usage.captures, 3);
+    assert_eq!(record.captures.as_step().step_usage.captures, 3);
     assert!(
         serde_json::to_vec(&record).unwrap().len() as u64
-            <= record.captures.step_usage.encoded_bytes
+            <= record.captures.as_step().step_usage.encoded_bytes
     );
     observer.set_activation_origin(None);
     let saved = observer.activation_checkpoint().unwrap();
@@ -413,7 +415,7 @@ fn loaded_activation_authority_constructs_one_shared_run_and_tags_evidence() {
         unedited.admission_identity.as_deref(),
         Some(replacement.identity())
     );
-    assert!(unedited.captures.interventions.is_empty());
+    assert!(unedited.captures.as_step().interventions.is_empty());
     observer
         .prepare_activation_restore(&saved)
         .unwrap()
@@ -433,8 +435,8 @@ fn loaded_activation_authority_constructs_one_shared_run_and_tags_evidence() {
     );
     assert!(restored.invocation > unedited.invocation);
     assert!(
-        restored.captures.cumulative_usage.encoded_bytes
-            > unedited.captures.cumulative_usage.encoded_bytes
+        restored.captures.as_step().cumulative_usage.encoded_bytes
+            > unedited.captures.as_step().cumulative_usage.encoded_bytes
     );
     let mut foreign = SpeculativeCaptureObserver::from_admitted(
         &admitted,
@@ -463,4 +465,127 @@ fn loaded_activation_authority_constructs_one_shared_run_and_tags_evidence() {
     )
     .unwrap()
     .is_none());
+}
+
+#[test]
+fn default_prefill_intervention_evidence_preserves_complete_target_and_shifted_seed_rows() {
+    // A single full span and several spans use the same logical evidence owner.
+    for (scope, phase, rows, token_start) in [
+        (Scope::Target, Phase::TargetPrefill, 3, 0),
+        (
+            Scope::Prediction { depth: 0 },
+            Phase::PredictionPrefill,
+            2,
+            1,
+        ),
+    ] {
+        let (run, _, _) = setup(64, false);
+        let mut observer = collector(run, scope);
+        assert!(observer.requires_sequence_readout());
+        observer.set_activation_origin(Some(origin(0)));
+        if observer.supports_prefill_spans() {
+            observer.set_prefill_reduction_geometry(
+                eredu_core::speculative::SpeculativePrefillReductionGeometry {
+                    target_sequence: 3,
+                    prediction_sequence: 2,
+                },
+            );
+            observer.set_prefill_span(Some(eredu_core::speculative::SpeculativePrefillSpan {
+                prompt_tokens: 3,
+                input_start: 0,
+                input_end: 3,
+                position: 0,
+                hidden_start: 0,
+                token_start,
+                sequence: rows,
+                seed_start: 0,
+            }));
+        }
+        let output = forward(&mut observer, phase, rows, true).unwrap();
+        observer.complete_prefill_reductions().unwrap();
+        observer.finish_prefill_reductions(true);
+        let expected: Vec<_> = input(rows).data.iter().map(|value| 2.0 * value).collect();
+        assert_eq!(output.data, expected);
+        let record = observer.take_activation_capture().unwrap();
+        assert!(record.completed);
+        assert_eq!(record.phase, phase);
+        assert_eq!(record.captures.as_step().invocation.unwrap().sequence, rows);
+        assert_eq!(values(&record.captures.as_step().records[0]), input(rows).data);
+        let evidence = &record.captures.as_step().interventions[0].evidence;
+        assert_eq!(values(&evidence[0]), input(rows).data);
+        assert_eq!(values(&evidence[1]), expected);
+        assert_eq!(record.captures.as_step().step_usage.captures, 3);
+        assert!(observer.take_activation_capture().is_none());
+        assert!(observer.take_activation_error().is_none());
+    }
+}
+
+#[test]
+fn speculative_span_capability_preserves_evidence_free_and_decode_only_operations() {
+    for (evidence, prefill) in [
+        (InterventionEvidence::None, true),
+        (InterventionEvidence::Preview { max_elements: 64 }, false),
+    ] {
+        let (original, mut discovery, edits) = setup(64, false);
+        let mut raw = original.plan().plan().clone();
+        raw.selections[0].transform = CaptureTransform::FullTensor;
+        discovery
+            .support
+            .capture
+            .transformations
+            .push(CaptureTransformKind::FullTensor);
+        let capture = raw
+            .admit_invocations(
+                &discovery.catalog,
+                &discovery.support,
+                &discovery.support.capture,
+                bounds(),
+            )
+            .unwrap();
+        let mut raw = original.intervention_plan().unwrap().plan().clone();
+        raw.operations[0].evidence = evidence;
+        raw.operations[0].schedule.prefill = prefill;
+        let plan = raw.admit_invocations(&edits, bounds(), "session").unwrap();
+        let mut run = CaptureSession::new(capture);
+        run.enable_interventions(plan, Arc::new(Estimates)).unwrap();
+        let mut observer = collector(run, Scope::Target);
+        assert!(observer.supports_prefill_spans());
+        observer.set_activation_origin(Some(origin(0)));
+        for start in [0, 2] {
+            observer.set_prefill_span(Some(eredu_core::speculative::SpeculativePrefillSpan {
+                prompt_tokens: 4,
+                input_start: start,
+                input_end: start + 2,
+                position: start,
+                hidden_start: start,
+                token_start: start,
+                sequence: 2,
+                seed_start: start,
+            }));
+            let output = forward_at(
+                &mut observer,
+                Phase::TargetPrefill,
+                2,
+                true,
+                DistributedCommitEpoch::new(start + 1).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                output.data,
+                if prefill {
+                    vec![2., 4., 6., 8.]
+                } else {
+                    input(2).data
+                }
+            );
+            let record = observer.take_activation_capture().unwrap();
+            assert!(record.completed);
+            assert_eq!(record.prefill_span.unwrap().input_start, start);
+            assert!(record.captures.as_step().interventions[0]
+                .evidence
+                .iter()
+                .all(|row| row.payload.is_none()));
+        }
+        assert!(observer.take_activation_error().is_none());
+    }
 }

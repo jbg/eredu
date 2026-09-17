@@ -1,0 +1,28 @@
+diff --git a/mlx/backend/metal/indexing.cpp b/mlx/backend/metal/indexing.cpp
+--- a/mlx/backend/metal/indexing.cpp
++++ b/mlx/backend/metal/indexing.cpp
+@@ -598,7 +598,8 @@
+ 
+   const bool original = d.original_precompiled_kernel_required();
+   if (original && (reduce_type_ != ScatterAxis::None ||
+-      (out.dtype() != float32 && out.dtype() != float16 && out.dtype() != bfloat16) ||
++      (out.dtype() != float32 && out.dtype() != float16 && out.dtype() != bfloat16 &&
++       out.dtype() != bool_) ||
+       idx.dtype() != uint32))
+     throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
+   auto lib = original ? d.precompiled_library() : d.get_library_borrowed(lib_name, [&]() {
+diff --git a/mlx/backend/metal/kernels/indexing/scatter_axis.metal b/mlx/backend/metal/kernels/indexing/scatter_axis.metal
+--- a/mlx/backend/metal/kernels/indexing/scatter_axis.metal
++++ b/mlx/backend/metal/kernels/indexing/scatter_axis.metal
+@@ -1,5 +1,5 @@
+ // Copyright © 2025 Apple Inc.
+-// Existing overwrite worker for floating scores and UInt32 argsort indices.
++// Existing overwrite worker for floating scores/Bool masks and UInt32 indices.
+ #include "mlx/backend/metal/kernels/utils.h"
+ #include "mlx/backend/metal/kernels/atomic.h"
+ #include "mlx/backend/metal/kernels/reduction/ops.h"
+@@ -15,3 +15,4 @@
+ SCATTER_AXIS_TYPE(float32, float)
+ SCATTER_AXIS_TYPE(float16, half)
+ SCATTER_AXIS_TYPE(bfloat16, bfloat16_t)
++SCATTER_AXIS_TYPE(bool_, bool)

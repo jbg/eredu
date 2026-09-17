@@ -2,6 +2,20 @@
 
 use super::*;
 
+mod append;
+mod original_append;
+mod scan;
+mod source;
+mod original_copy;
+mod realtime;
+pub(in crate::backend::runtime::cache) use realtime::RealtimePagedSource;
+mod visible;
+pub(crate) use source::{
+    PagedAppendWorkspaceFailure, PagedCacheArrayGeometry, PagedCacheBlockGeometry,
+    PagedCacheSourceGeometry, PagedKeyValueSource, PagedWorkspaceProjectionFailure,
+    ProjectedPagedAppendState, ProjectedPagedCacheSource, ProjectedPagedSource,
+};
+
 pub struct PagedLatentAttentionBlock {
     pub start: i64,
     pub end: i64,
@@ -79,17 +93,18 @@ where
 /// device array. Sliding attention discards state that no query can observe.
 #[derive(Debug, Clone)]
 pub struct PagedKeyValueCache {
+    // Tail arrays retire before the manager holding their registered-copy Q/H.
+    pub(super) tail_keys: Option<Array>,
+    tail_values: Option<Array>,
+    retained_history: Option<std::sync::Arc<super::super::residency::CacheHistoryRetention>>,
     manager: CacheResidencyManager,
     global_layer: usize,
     rank: Option<CacheRankIdentity>,
     sliding_window: Option<i32>,
     key_only: bool,
     prefix_tokens: i32,
-    pub(super) tail_keys: Option<Array>,
-    tail_values: Option<Array>,
     pub(super) tail_start: i64,
     pub(super) offset: i64,
-    retained_history: Option<std::sync::Arc<super::super::residency::CacheHistoryRetention>>,
 }
 
 /// Rollback metadata for one sequential semantic branch.
@@ -103,6 +118,7 @@ pub struct PagedKeyValueTransactionCheckpoint {
     offset: i64,
     tail_bytes: u64,
     block_ids: Vec<CacheBlockId>,
+    original: Option<realtime::OriginalRollback>,
 }
 
 /// A live key/value cache whose residency is selected independently from the
@@ -356,10 +372,16 @@ impl PagedKeyValueCache {
                 .map(|array| array.contiguous(false, stream)?.deep_clone())
                 .transpose()
         };
-        let mut snapshot = self.clone();
-        snapshot.tail_keys = copy(&self.tail_keys)?;
-        snapshot.tail_values = copy(&self.tail_values)?;
-        Ok(snapshot)
+        Ok(self.copied_with_tails(self.manager.clone(), copy(&self.tail_keys)?, copy(&self.tail_values)?, self.retained_history.clone()))
+    }
+
+    // Same ordinary metadata handoff for deep snapshots and registered copies.
+    fn copied_with_tails(&self, manager: CacheResidencyManager, tail_keys: Option<Array>,
+        tail_values: Option<Array>, retained_history: Option<std::sync::Arc<super::super::residency::CacheHistoryRetention>>) -> Self {
+        Self { tail_keys, tail_values, retained_history, manager,
+            global_layer: self.global_layer, rank: self.rank, sliding_window: self.sliding_window,
+            key_only: self.key_only, prefix_tokens: self.prefix_tokens,
+            tail_start: self.tail_start, offset: self.offset }
     }
 
     /// Snapshots append-only local state while retaining its exact array views.
@@ -414,6 +436,7 @@ impl PagedKeyValueCache {
             offset: self.offset,
             tail_bytes: self.tail_bytes(),
             block_ids,
+            original: None,
         })
     }
 
@@ -424,6 +447,9 @@ impl PagedKeyValueCache {
         &mut self,
         checkpoint: &PagedKeyValueTransactionCheckpoint,
     ) -> Result<(), Exception> {
+        if let Some(original)=&checkpoint.original {
+            return self.rollback_original_transaction(checkpoint,original);
+        }
         if checkpoint.session_id != self.manager.session_id()
             || checkpoint.global_layer != self.global_layer
         {
@@ -547,6 +573,34 @@ impl PagedKeyValueCache {
             offset,
             retained_history: None,
         })
+    }
+
+    /// Snapshot source compatibility with the actual enclosing layout row.
+    /// The copied pager preserves its window, prefix, offset, and local tail;
+    /// reset has a separate contract because it constructs empty state.
+    pub(crate) fn matches_original_snapshot_policy(&self, window: Option<i32>) -> bool {
+        window == self.sliding_window
+            && window.map_or_else(
+                || self.manager.options().full_attention_enabled(),
+                |width| width > 0,
+            )
+            && !self.key_only
+            && self.prefix_tokens >= 0
+            && self.retained_history.is_none()
+    }
+
+    pub(crate) fn matches_original_reset_policy(&self, window: Option<i32>) -> bool {
+        window.is_none() && self.sliding_window.is_none() && !self.key_only
+            && self.prefix_tokens >= 0 && self.retained_history.is_none()
+            && self.manager.options().full_attention_enabled()
+    }
+    /// Metadata-only form of the same empty layer constructor. The supplied
+    /// manager was just built empty from this exact state's original source.
+    pub(crate) fn empty_original_reset(&self, manager: CacheResidencyManager) -> Self {
+        let mut value = self.copied_with_tails(manager, None, None, None);
+        value.tail_start = 0;
+        value.offset = 0;
+        value
     }
 
     /// Returns the shared model-wide residency manager.
@@ -821,12 +875,12 @@ impl PagedKeyValueCache {
             || values.dim(-1) != 0
             || keys.dtype() != values.dtype()
         {
-            return Err(Exception::custom(
-                "paged key-only cache expects matching rank-4 keys and zero-width values",
-            ));
+            return Err(match safemlx::OriginalScopeObserver::try_current()? {
+                Some(scope) => scope.invalid_input_error(),
+                None => Exception::custom("paged key-only cache expects matching rank-4 keys and zero-width values"),
+            });
         }
-        let mut shape = keys.shape().to_vec();
-        *shape.last_mut().expect("rank-4 key-only cache") = 1;
+        let shape = [keys.dim(0), keys.dim(1), keys.dim(2), 1];
         zeros_dtype(&shape, keys.dtype(), stream)
     }
 
@@ -871,6 +925,9 @@ impl PagedKeyValueCache {
         retain_for_attention: bool,
         stream: &Stream,
     ) -> Result<(), Exception> {
+        if safemlx::OriginalScopeObserver::try_current()?.is_some() {
+            return self.append_original(keys, values, retain_for_attention, stream);
+        }
         self.manager
             .bind_transfer_device(stream)
             .map_err(cache_residency_exception)?;
@@ -926,47 +983,24 @@ impl PagedKeyValueCache {
         retain_for_attention: bool,
         stream: &Stream,
     ) -> Result<(), Exception> {
-        let block_size = self.manager.options().block_size_tokens();
-        let mut input_start = 0;
-        let input_len = keys.dim(-2);
-        while input_start < input_len {
-            let candidate_tail_start = if self.tail_keys.is_none() {
-                self.offset + input_start as i64
-            } else {
-                self.tail_start
-            };
-            let available = block_size - self.tail_len();
-            let take = available.min(input_len - input_start);
-            let input_end = input_start + take;
-            let key_part = keys.try_index_device((.., .., input_start..input_end, ..), stream)?;
-            let value_part =
-                values.try_index_device((.., .., input_start..input_end, ..), stream)?;
-            let candidate_keys = match &self.tail_keys {
-                Some(previous) => concatenate_axis(&[previous.clone(), key_part], -2, stream)?,
-                None => key_part,
-            };
-            let candidate_values = match &self.tail_values {
-                Some(previous) => concatenate_axis(&[previous.clone(), value_part], -2, stream)?,
-                None => value_part,
-            };
-            let candidate_bytes = candidate_keys.nbytes() as u64 + candidate_values.nbytes() as u64;
-            let candidate_end = candidate_tail_start + candidate_keys.dim(-2) as i64;
-            self.manager
-                .set_tail_state(self.global_layer, candidate_bytes, candidate_end)
-                .map_err(cache_residency_exception)?;
-            self.tail_start = candidate_tail_start;
-            self.tail_keys = Some(candidate_keys);
-            self.tail_values = Some(candidate_values);
-            input_start = input_end;
-            if self.tail_len() == block_size {
-                self.seal_tail()?;
-            }
-        }
-        self.offset += input_len as i64;
-        if !retain_for_attention {
-            self.discard_sliding_history()?;
-        }
-        Ok(())
+        let plan = eredu_runtime::cache::PagedAppendPlan::new(
+            self.manager.options().block_size_tokens(),
+            keys.dim(-2),
+            self.tail_len(),
+            self.tail_start,
+            self.offset,
+        )
+        .map_err(|cause| Exception::custom(cause.to_string()))?;
+        plan.run(
+            &mut append::NativeAppend {
+                cache: self,
+                keys,
+                values,
+                stream,
+                original: None,
+            },
+            retain_for_attention,
+        )
     }
 
     fn discard_sliding_history(&self) -> Result<(), Exception> {
@@ -1034,76 +1068,7 @@ impl PagedKeyValueCache {
         end: i64,
         stream: &Stream,
     ) -> Result<(Array, Array), Exception> {
-        let ids = self
-            .manager
-            .layer_block_ids(
-                self.global_layer,
-                CacheRepresentation::KeyValue,
-                start,
-                end,
-                0,
-            )
-            .map_err(cache_residency_exception)?;
-        let mut key_parts = Vec::new();
-        let mut value_parts = Vec::new();
-        let mut blocks = self
-            .manager
-            .prefetch_blocks(ids, stream)
-            .map_err(cache_residency_exception)?;
-        while let Some(lease) = blocks.next_block().map_err(cache_residency_exception)? {
-            let id = lease.id();
-            let slice_start = i32::try_from(start.max(id.start) - id.start)
-                .map_err(|_| Exception::custom("paged cache visible range overflow"))?;
-            let slice_end = i32::try_from(end.min(id.end) - id.start)
-                .map_err(|_| Exception::custom("paged cache visible range overflow"))?;
-            match lease.arrays() {
-                CacheBlockArrays::KeyValue { keys, values } => {
-                    key_parts
-                        .push(keys.try_index_device((.., .., slice_start..slice_end, ..), stream)?);
-                    value_parts.push(
-                        values.try_index_device((.., .., slice_start..slice_end, ..), stream)?,
-                    );
-                }
-                _ => {
-                    return Err(Exception::custom(
-                        "paged key/value cache found an incompatible block representation",
-                    ));
-                }
-            }
-        }
-        if let (Some(keys), Some(values)) = (&self.tail_keys, &self.tail_values) {
-            if self.tail_start < end && self.offset > start {
-                let slice_start = i32::try_from(start.max(self.tail_start) - self.tail_start)
-                    .map_err(|_| Exception::custom("paged cache visible range overflow"))?;
-                let slice_end = i32::try_from(end.min(self.offset) - self.tail_start)
-                    .map_err(|_| Exception::custom("paged cache visible range overflow"))?;
-                key_parts
-                    .push(keys.try_index_device((.., .., slice_start..slice_end, ..), stream)?);
-                value_parts
-                    .push(values.try_index_device((.., .., slice_start..slice_end, ..), stream)?);
-            }
-        }
-        let key_refs = key_parts.iter().collect::<Vec<_>>();
-        let value_refs = value_parts.iter().collect::<Vec<_>>();
-        if key_refs.is_empty() {
-            return Err(Exception::custom("paged cache visible range is empty"));
-        }
-        let keys = if key_refs.len() == 1 {
-            key_refs[0].clone()
-        } else {
-            concatenate_axis(&key_refs, -2, stream)?
-        };
-        let values = if value_refs.len() == 1 {
-            value_refs[0].clone()
-        } else {
-            concatenate_axis(&value_refs, -2, stream)?
-        };
-        if i64::from(keys.dim(-2)) != end - start || i64::from(values.dim(-2)) != end - start {
-            return Err(Exception::custom(
-                "paged cache visible history is incomplete",
-            ));
-        }
-        Ok((keys, values))
+        visible::contiguous_visible(self, start, end, stream)
     }
 }
 
@@ -1215,22 +1180,7 @@ impl KeyValueCache for PagedKeyValueCache {
         if let Some(window) = self.sliding_window {
             let values = self.normalize_update_values(&keys, values, stream)?;
             self.validate_update(&keys, &values)?;
-            // Retain the history needed by the earliest submitted query before
-            // append discards blocks outside the final query's window. Every
-            // submitted key remains visible to this call, including long prefill.
-            let start = (self.offset - (window - 1) as i64).max(0);
-            let visible = if start < self.offset {
-                let (past_keys, past_values) =
-                    self.contiguous_visible(start, self.offset, stream)?;
-                (
-                    concatenate_axis(&[past_keys, keys.clone()], -2, stream)?,
-                    concatenate_axis(&[past_values, values.clone()], -2, stream)?,
-                )
-            } else {
-                (keys.clone(), values.clone())
-            };
-            self.append_normalized(keys, values, false, stream)?;
-            return Ok(visible);
+            return visible::update(self, keys, values, window, stream);
         }
         let previous_offset = self.offset;
         let update_len = keys.dim(-2) as i64;
@@ -1247,6 +1197,12 @@ impl KeyValueCache for PagedKeyValueCache {
 
 impl eredu_runtime::RuntimeLayerState<MlxNeuralBackend> for PagedKeyValueCache {
     type RetainedValues<'a> = RetainedArrayIter<'a>;
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) {
+        for array in self.tail_keys.iter().chain(self.tail_values.iter()) {
+            visitor(retained_tensor(array));
+        }
+    }
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {
         [
@@ -1271,126 +1227,56 @@ impl PagedKeyValueCache {
         relative: Option<&crate::backend::nn::relative_attention::RelativeAttentionKernel>,
         stream: &Stream,
     ) -> Result<Option<Array>, Exception> {
+        if safemlx::OriginalScopeObserver::try_current()?.is_some() {
+            return scan::original_scan(self, queries, scale, mask, sinks, softcap, arithmetic, relative, stream);
+        }
         if self.key_only {
             return Err(Exception::custom(
                 "key-only paged caches require architecture-owned attention",
             ));
         }
-        let query_len = queries.dim(-2) as i64;
-        let query_start = self.offset - query_len;
-        let visible_start = self
-            .sliding_window
-            .map_or(0, |window| (query_start - (window - 1) as i64).max(0));
+        let options = eredu_nn::BlockwiseAttentionOptions {
+            arithmetic,
+            softcap,
+        };
+        let plan = scan::plan(self, queries, options)?;
         let ids = self
             .manager
             .layer_block_ids(
                 self.global_layer,
                 CacheRepresentation::KeyValue,
-                visible_start,
+                plan.visible_start(),
                 self.offset,
-                self.prefix_tokens as i64,
+                i64::from(self.prefix_tokens),
             )
             .map_err(cache_residency_exception)?;
         let mut accumulator = BlockwiseAttentionAccumulator::new(
             queries,
             scale,
             mask,
-            query_start,
+            plan.query_start(),
             self.sliding_window,
-            self.prefix_tokens as i64,
+            i64::from(self.prefix_tokens),
             sinks,
             self.offset,
             stream,
         )?;
-        accumulator.set_softcap(softcap)?;
-        accumulator.set_arithmetic(arithmetic)?;
-        let mut scanned_blocks = 0u64;
-        let mut scanned_bytes = 0u64;
-        let mut scratch = 0u64;
-        for pass in 0..if arithmetic == eredu_nn::AttentionArithmetic::InputScores {
-            2
-        } else {
-            1
-        } {
-            if pass == 1 {
-                accumulator.begin_value_pass()?;
-            }
-            let mut blocks = self
-                .manager
-                .prefetch_blocks(ids.clone(), stream)
-                .map_err(cache_residency_exception)?;
-            while let Some(lease) = blocks.next_block().map_err(cache_residency_exception)? {
-                let id = lease.id();
-                let (keys, values) = match lease.arrays() {
-                    CacheBlockArrays::KeyValue { keys, values } => (keys.clone(), values.clone()),
-                    _ => {
-                        return Err(Exception::custom(
-                            "paged key/value cache found an incompatible block representation",
-                        ));
-                    }
-                };
-                let block = KeyValueAttentionBlock::unleased(id.start, id.end, keys, values);
-                scratch = scratch.max(
-                    queries.dim(0) as u64
-                        * queries.dim(1) as u64
-                        * query_len as u64
-                        * (id.end - id.start) as u64
-                        * 4,
-                );
-                scanned_blocks += 1;
-                scanned_bytes += lease.bytes();
-                let bias = relative
-                    .map(|kernel| kernel.bias(block.start, block.end, stream))
-                    .transpose()?;
-                if let Some(bias) = &bias {
-                    scratch =
-                        scratch.max(relative.unwrap().prepared_bytes() + 3 * bias.nbytes() as u64);
-                }
-                accumulator.accumulate_with_bias(&block, bias.as_ref(), stream)?;
-                accumulator.submit()?;
-                drop(lease);
-            }
-            if let (Some(keys), Some(values)) = (&self.tail_keys, &self.tail_values) {
-                let block = KeyValueAttentionBlock::unleased(
-                    self.tail_start,
-                    self.offset,
-                    keys.clone(),
-                    values.clone(),
-                );
-                scratch = scratch.max(
-                    queries.dim(0) as u64
-                        * queries.dim(1) as u64
-                        * query_len as u64
-                        * (self.offset - self.tail_start) as u64
-                        * 4,
-                );
-                scanned_blocks += 1;
-                scanned_bytes += block.bytes;
-                let bias = relative
-                    .map(|kernel| kernel.bias(block.start, block.end, stream))
-                    .transpose()?;
-                if let Some(bias) = &bias {
-                    scratch =
-                        scratch.max(relative.unwrap().prepared_bytes() + 3 * bias.nbytes() as u64);
-                }
-                accumulator.accumulate_with_bias(&block, bias.as_ref(), stream)?;
-            }
-        }
-        let output = accumulator.finish(stream)?;
-        safemlx::transforms::eval([&output])?;
-        // Every query in the submitted span has now consumed its visible keys.
-        // Before this point, discarding by the final query's window would erase
-        // keys needed by earlier queries in a multi-token attention call.
-        self.discard_sliding_history()?;
-        self.manager
-            .record_attention_scan(
-                self.global_layer,
-                query_len > 1,
-                scanned_blocks,
-                scanned_bytes,
-                scratch,
-            )
-            .map_err(cache_residency_exception)?;
-        Ok(Some(output))
+        accumulator.set_options(options)?;
+        plan.run(&mut scan::NativeScan {
+            cache: self,
+            queries,
+            ids,
+            accumulator: Some(accumulator),
+            relative,
+            stream,
+            scanned_blocks: 0,
+            scanned_bytes: 0,
+            scratch: 0,
+        })
+        .map(Some)
     }
+}
+
+impl PagedKeyValueCache {
+    pub(crate) fn original_scan_control_bytes() -> Option<usize> { scan::original_control_bytes() }
 }

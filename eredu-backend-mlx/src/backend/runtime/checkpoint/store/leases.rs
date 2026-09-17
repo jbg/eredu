@@ -1,44 +1,62 @@
 use super::materialization::{materialize_contiguous, materialize_indices, materialize_range};
+use super::materialization::{
+    validate_operation, OriginalMaterializationSlots, PreparedPendingWeight,
+};
 use super::*;
+use eredu_checkpoint::store::PinnedEncodedBytes;
 
+const ORIGINAL_SELECTION_MESSAGE: &str = "selection does not have a whole-byte encoded length";
+pub(super) fn original_selection_error_bytes(key_bytes: usize) -> Option<usize> {
+    // str Debug emits at most ten bytes for each input byte, plus quotes. All
+    // contexts below are closed literals; this bounds their exact writer.
+    let formatted = key_bytes
+        .checked_mul(10)?
+        .checked_add(2 + "selected element count for tensor ".len())?;
+    Some(formatted.max(key_bytes.checked_add(ORIGINAL_SELECTION_MESSAGE.len())?))
+}
+fn selection_overflow(key: &str, context: &str, original: bool) -> CheckpointMaterializationError {
+    let context = if original {
+        use std::fmt::Write;
+        let mut value = String::with_capacity(
+            original_selection_error_bytes(key.len())
+                .expect("selected prequalified diagnostic layout"),
+        );
+        write!(&mut value, "{context} for tensor {key:?}").expect("String writing is infallible");
+        value
+    } else {
+        format!("{context} for tensor {key:?}")
+    };
+    CheckpointMaterializationError::ArithmeticOverflow { context }
+}
 fn selected_byte_len(
     key: &str,
     metadata: &TensorMetadata,
     selection: &TensorSelection,
     output_shape: &[usize],
+    original: bool,
 ) -> Result<usize, CheckpointMaterializationError> {
     if matches!(selection, TensorSelection::Full) {
-        return usize::try_from(metadata.encoded_byte_len).map_err(|_| {
-            CheckpointMaterializationError::ArithmeticOverflow {
-                context: format!("encoded byte length for tensor {key:?}"),
-            }
-        });
+        return usize::try_from(metadata.encoded_byte_len)
+            .map_err(|_| selection_overflow(key, "encoded byte length", original));
     }
     let count = |shape: &[usize], context: &str| {
         shape.iter().try_fold(1usize, |value, dimension| {
-            value.checked_mul(*dimension).ok_or_else(|| {
-                CheckpointMaterializationError::ArithmeticOverflow {
-                    context: format!("{context} for tensor {key:?}"),
-                }
-            })
+            value
+                .checked_mul(*dimension)
+                .ok_or_else(|| selection_overflow(key, context, original))
         })
     };
     let full_elements = count(&metadata.logical_shape, "element count")?;
     let selected_elements = count(output_shape, "selected element count")?;
-    let encoded_byte_len = usize::try_from(metadata.encoded_byte_len).map_err(|_| {
-        CheckpointMaterializationError::ArithmeticOverflow {
-            context: format!("encoded byte length for tensor {key:?}"),
-        }
-    })?;
+    let encoded_byte_len = usize::try_from(metadata.encoded_byte_len)
+        .map_err(|_| selection_overflow(key, "encoded byte length", original))?;
     let scaled = encoded_byte_len
         .checked_mul(selected_elements)
-        .ok_or_else(|| CheckpointMaterializationError::ArithmeticOverflow {
-            context: format!("selected byte length for tensor {key:?}"),
-        })?;
+        .ok_or_else(|| selection_overflow(key, "selected byte length", original))?;
     if full_elements == 0 || !scaled.is_multiple_of(full_elements) {
         return Err(StoreError::InvalidSelection {
             key: key.into(),
-            message: "selection does not have a whole-byte encoded length".into(),
+            message: ORIGINAL_SELECTION_MESSAGE.into(),
         }
         .into());
     }
@@ -48,16 +66,65 @@ fn selected_byte_len(
 #[derive(Debug, Clone)]
 pub(super) enum WeightLeaseSource {
     Safetensors(NeutralSafetensorsLease),
-    Gguf(Box<GgufLeaseSource>),
+    Gguf(GgufLeaseSource),
     Memory(NeutralMemoryLease),
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct GgufLeaseSource {
-    pub(super) lease: NeutralGgufLease,
-    converted_groups: Arc<
-        Mutex<BTreeMap<eredu_checkpoint::gguf_store::GgufLeaseIdentity, Weak<CachedGgufGroup>>>,
-    >,
+    pub(super) lease: GgufLeaseSlot,
+    converted_groups: super::CacheHandle,
+}
+
+// Empty exists only in the synchronous pre-native take/restore transaction.
+// Original copies then share this SAME Box with immutable native source custody.
+#[derive(Debug, Clone)]
+pub(super) enum GgufLeaseSlot {
+    Owned(Option<Box<NeutralGgufLease>>),
+    Original(super::materialization::gguf_host::SourceCustody),
+}
+impl GgufLeaseSlot {
+    pub(super) fn as_ref(&self) -> &NeutralGgufLease {
+        match self {
+            Self::Owned(lease) => lease
+                .as_deref()
+                .expect("GGUF source restored before native access"),
+            Self::Original(source) => source.lease(),
+        }
+    }
+    pub(super) fn take(&mut self) -> Box<NeutralGgufLease> {
+        let Self::Owned(lease) = self else {
+            unreachable!("unpublished same-Box transaction")
+        };
+        lease.take().expect("one unpublished GGUF source")
+    }
+    pub(super) fn restore(&mut self, lease: Box<NeutralGgufLease>) {
+        let Self::Owned(value) = self else {
+            unreachable!("unpublished same-Box transaction")
+        };
+        assert!(
+            value.is_none(),
+            "unpublished GGUF source was already restored"
+        );
+        *value = Some(lease);
+    }
+    pub(super) fn bind_original(
+        &mut self,
+        source: super::materialization::gguf_host::SourceCustody,
+    ) {
+        assert!(
+            matches!(self, Self::Owned(None)),
+            "source already published"
+        );
+        *self = Self::Original(source);
+    }
+}
+
+impl std::ops::Deref for GgufLeaseSlot {
+    type Target = NeutralGgufLease;
+    fn deref(&self) -> &Self::Target {
+        self.as_ref()
+    }
 }
 
 /// A validated selection that pins its buffered payload shard.
@@ -66,26 +133,78 @@ pub(super) struct GgufLeaseSource {
 /// MLX array. [`Self::materialize`] is the only array-producing operation.
 #[derive(Debug, Clone)]
 pub struct WeightLease {
-    key: String,
-    metadata: TensorMetadata,
-    selection: TensorSelection,
-    output_shape: Vec<usize>,
     selected_byte_len: usize,
     pub(super) source: WeightLeaseSource,
 }
 
+impl WeightLeaseSource {
+    /// Borrow the metadata already retained by the exact neutral source lease.
+    /// The trait-object reference carries no new allocation or source owner.
+    fn encoded_lease(&self) -> &dyn EncodedTensorLease {
+        match self {
+            Self::Safetensors(lease) => lease,
+            Self::Gguf(source) => source.lease.as_ref(),
+            Self::Memory(lease) => lease,
+        }
+    }
+}
+
+// A public acquisition failure must never retain the cache/native Array tree.
+#[derive(Debug)]
+pub(super) enum RetainedAcquisitionSource {
+    Neutral(CheckpointLease),
+    Bound(super::materialization::gguf_host::SourceCustody),
+}
 impl WeightLease {
+    pub(super) fn into_acquisition_source(self) -> RetainedAcquisitionSource {
+        match self.source {
+            WeightLeaseSource::Safetensors(lease) => {
+                RetainedAcquisitionSource::Neutral(CheckpointLease::Safetensors(lease))
+            }
+            WeightLeaseSource::Memory(lease) => {
+                RetainedAcquisitionSource::Neutral(CheckpointLease::Memory(lease))
+            }
+            WeightLeaseSource::Gguf(source) => match source.lease {
+                GgufLeaseSlot::Owned(Some(lease)) => {
+                    RetainedAcquisitionSource::Neutral(CheckpointLease::Gguf(lease))
+                }
+                GgufLeaseSlot::Original(source) => RetainedAcquisitionSource::Bound(source),
+                GgufLeaseSlot::Owned(None) => {
+                    unreachable!("unpublished transaction cannot enter pending construction")
+                }
+            },
+        }
+    }
     pub(super) fn from_checkpoint_lease(
         lease: CheckpointLease,
-        converted_groups: Arc<
-            Mutex<BTreeMap<eredu_checkpoint::gguf_store::GgufLeaseIdentity, Weak<CachedGgufGroup>>>,
-        >,
+        converted_groups: super::CacheHandle,
     ) -> Result<Self, CheckpointMaterializationError> {
-        let key = lease.metadata().name.clone();
-        let metadata = lease.metadata().clone();
-        let selection = lease.selection().clone();
-        let output_shape = lease.output_shape().to_vec();
-        let selected_byte_len = match &lease {
+        let selected = Self::checkpoint_byte_len(&lease)?;
+        Ok(Self::from_validated_checkpoint_lease(
+            lease,
+            converted_groups,
+            selected,
+        ))
+    }
+    pub(super) fn checkpoint_byte_len(
+        lease: &CheckpointLease,
+    ) -> Result<usize, CheckpointMaterializationError> {
+        Self::checkpoint_byte_len_impl(lease, false)
+    }
+    pub(super) fn checkpoint_byte_len_original(
+        lease: &CheckpointLease,
+    ) -> Result<usize, CheckpointMaterializationError> {
+        Self::checkpoint_byte_len_impl(lease, true)
+    }
+    fn checkpoint_byte_len_impl(
+        lease: &CheckpointLease,
+        original: bool,
+    ) -> Result<usize, CheckpointMaterializationError> {
+        let key = lease.metadata().name.as_str();
+        let metadata = lease.metadata();
+        let selection = lease.selection();
+        let output_shape = lease.output_shape();
+        let selected_byte_len = match lease {
             CheckpointLease::Safetensors(lease) => {
                 usize::try_from(lease.bounded_read_proof().length_bytes).map_err(|_| {
                     CheckpointMaterializationError::ArithmeticOverflow {
@@ -94,7 +213,7 @@ impl WeightLease {
                 })?
             }
             CheckpointLease::Gguf(_) => {
-                selected_byte_len(&key, &metadata, &selection, &output_shape)?
+                selected_byte_len(key, metadata, selection, output_shape, original)?
             }
             CheckpointLease::Memory(lease) => {
                 usize::try_from(lease.bounded_read_proof().length_bytes).map_err(|_| {
@@ -104,42 +223,45 @@ impl WeightLease {
                 })?
             }
         };
+        Ok(selected_byte_len)
+    }
+    pub(super) fn from_validated_checkpoint_lease(
+        lease: CheckpointLease,
+        converted_groups: super::CacheHandle,
+        selected_byte_len: usize,
+    ) -> Self {
         let source = match lease {
             CheckpointLease::Safetensors(lease) => WeightLeaseSource::Safetensors(lease),
-            CheckpointLease::Gguf(lease) => WeightLeaseSource::Gguf(Box::new(GgufLeaseSource {
-                lease: *lease,
+            CheckpointLease::Gguf(lease) => WeightLeaseSource::Gguf(GgufLeaseSource {
+                lease: GgufLeaseSlot::Owned(Some(lease)),
                 converted_groups,
-            })),
+            }),
             CheckpointLease::Memory(lease) => WeightLeaseSource::Memory(lease),
         };
-        Ok(Self {
-            key,
-            metadata,
-            selection,
-            output_shape,
+        Self {
             selected_byte_len,
             source,
-        })
+        }
     }
 
     /// Returns the logical key pinned by this lease.
     pub fn key(&self) -> &str {
-        &self.key
+        &self.metadata().name
     }
 
     /// Returns metadata captured when the lease was acquired.
     pub fn metadata(&self) -> &TensorMetadata {
-        &self.metadata
+        self.source.encoded_lease().metadata()
     }
 
     /// Returns the validated selection.
     pub fn selection(&self) -> &TensorSelection {
-        &self.selection
+        self.source.encoded_lease().selection()
     }
 
     /// Returns the selected output shape.
     pub fn output_shape(&self) -> &[usize] {
-        &self.output_shape
+        self.source.encoded_lease().output_shape()
     }
 
     /// Returns the logical encoded byte length of the validated selection.
@@ -192,15 +314,45 @@ impl WeightLease {
         source_stream: &Stream,
         execution_stream: &Stream,
     ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
-        match self.source.clone() {
-            WeightLeaseSource::Safetensors(shard) => {
-                self.prepare_safetensors(shard, source_stream, execution_stream)
+        self.prepare_materialization_impl(source_stream, execution_stream, None)
+    }
+    pub(crate) fn prepare_materialization_with_operations(
+        self,
+        source_stream: &Stream,
+        execution_stream: &Stream,
+        slots: &mut OriginalMaterializationSlots<'_>,
+        observer: &safemlx::OriginalScopeObserver,
+    ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
+        validate_operation(observer)?;
+        let ready = slots.pending_weights.checkout().map_err(|cause| {
+            CheckpointMaterializationError::OriginalOperationCapacity {
+                family: "pending weight",
+                prepared: cause.prepared,
             }
-            WeightLeaseSource::Gguf(source) => {
-                self.prepare_gguf(*source, source_stream, execution_stream)
+        })?;
+        self.prepare_materialization_impl(
+            source_stream,
+            execution_stream,
+            Some((ready, observer.clone())),
+        )
+    }
+    pub(super) fn prepare_materialization_impl(
+        self,
+        source_stream: &Stream,
+        execution_stream: &Stream,
+        original: Option<(PreparedPendingWeight, safemlx::OriginalScopeObserver)>,
+    ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
+        match &self.source {
+            WeightLeaseSource::Safetensors(source) => {
+                let bytes = source.pin_encoded_bytes();
+                self.prepare_encoded(bytes, source_stream, execution_stream, original)
+            }
+            WeightLeaseSource::Gguf(_) => {
+                self.prepare_gguf(source_stream, execution_stream, original)
             }
             WeightLeaseSource::Memory(source) => {
-                self.prepare_encoded(source, source_stream, execution_stream)
+                let bytes = source.pin_encoded_bytes();
+                self.prepare_encoded(bytes, source_stream, execution_stream, original)
             }
         }
     }
@@ -214,36 +366,51 @@ impl WeightLease {
         self,
         source_stream: &Stream,
     ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
-        match self.source.clone() {
-            WeightLeaseSource::Safetensors(shard) => {
-                self.prepare_borrowed_safetensors(shard, source_stream)
+        self.prepare_borrowed_materialization_impl(source_stream, None)
+    }
+    pub(crate) fn prepare_borrowed_materialization_with_operations(
+        self,
+        source_stream: &Stream,
+        slots: &mut OriginalMaterializationSlots<'_>,
+        observer: &safemlx::OriginalScopeObserver,
+    ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
+        validate_operation(observer)?;
+        let ready = slots.pending_weights.checkout().map_err(|cause| {
+            CheckpointMaterializationError::OriginalOperationCapacity {
+                family: "pending weight",
+                prepared: cause.prepared,
             }
-            WeightLeaseSource::Gguf(source) => {
-                self.prepare_gguf(*source, source_stream, source_stream)
+        })?;
+        self.prepare_borrowed_materialization_impl(source_stream, Some((ready, observer.clone())))
+    }
+    pub(super) fn prepare_borrowed_materialization_impl(
+        self,
+        source_stream: &Stream,
+        original: Option<(PreparedPendingWeight, safemlx::OriginalScopeObserver)>,
+    ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
+        match &self.source {
+            WeightLeaseSource::Safetensors(source) => {
+                let bytes = source.pin_encoded_bytes();
+                self.prepare_borrowed_encoded(bytes, source_stream, original)
             }
+            WeightLeaseSource::Gguf(_) => self.prepare_gguf(source_stream, source_stream, original),
             WeightLeaseSource::Memory(source) => {
-                self.prepare_borrowed_encoded(source, source_stream)
+                let bytes = source.pin_encoded_bytes();
+                self.prepare_borrowed_encoded(bytes, source_stream, original)
             }
         }
     }
 
-    fn prepare_borrowed_safetensors(
-        self,
-        source: NeutralSafetensorsLease,
-        source_stream: &Stream,
-    ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
-        self.prepare_borrowed_encoded(source, source_stream)
-    }
-
     fn prepare_borrowed_encoded(
         self,
-        source: impl EncodedTensorLease,
+        source: PinnedEncodedBytes,
         source_stream: &Stream,
+        original: Option<(PreparedPendingWeight, safemlx::OriginalScopeObserver)>,
     ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
-        let dtype = safetensors_dtype(&self.key, &self.metadata.stored_dtype)?;
+        let dtype = safetensors_dtype(self.key(), &self.metadata().stored_dtype)?;
         let data = source.encoded_bytes().ok_or_else(|| {
             CheckpointMaterializationError::InvalidEncodedTensor {
-                key: self.key.clone(),
+                key: self.key().to_owned(),
                 path: source
                     .backing_path()
                     .unwrap_or_else(|| Path::new("<unknown>"))
@@ -251,9 +418,9 @@ impl WeightLease {
                 message: "lease has no encoded bytes".into(),
             }
         })?;
-        let view = TensorView::new(dtype, self.output_shape.clone(), data).map_err(|error| {
+        let view = TensorView::new(dtype, self.output_shape().to_vec(), data).map_err(|error| {
             CheckpointMaterializationError::InvalidEncodedTensor {
-                key: self.key.clone(),
+                key: self.key().to_owned(),
                 path: source
                     .backing_path()
                     .unwrap_or_else(|| Path::new("<unknown>"))
@@ -261,11 +428,15 @@ impl WeightLease {
                 message: error.to_string(),
             }
         })?;
-        let mut pending =
-            PendingWeightMaterialization::begin(self.clone(), source_stream, source_stream)?;
+        let mut pending = PendingWeightMaterialization::begin_with_original(
+            self,
+            source_stream,
+            source_stream,
+            original,
+        )?;
         let source_value = Array::try_from(view).map_err(|conversion| {
             CheckpointMaterializationError::MlxConversion {
-                key: self.key.clone(),
+                key: pending.key().to_owned(),
                 source: conversion,
             }
         })?;
@@ -274,25 +445,17 @@ impl WeightLease {
         pending.prepared(output)
     }
 
-    fn prepare_safetensors(
-        self,
-        source: NeutralSafetensorsLease,
-        source_stream: &Stream,
-        execution_stream: &Stream,
-    ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
-        self.prepare_encoded(source, source_stream, execution_stream)
-    }
-
     fn prepare_encoded(
         self,
-        source: impl EncodedTensorLease,
+        source: PinnedEncodedBytes,
         source_stream: &Stream,
         execution_stream: &Stream,
+        original: Option<(PreparedPendingWeight, safemlx::OriginalScopeObserver)>,
     ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
-        let dtype = safetensors_dtype(&self.key, &self.metadata.stored_dtype)?;
+        let dtype = safetensors_dtype(self.key(), &self.metadata().stored_dtype)?;
         let data = source.encoded_bytes().ok_or_else(|| {
             CheckpointMaterializationError::InvalidEncodedTensor {
-                key: self.key.clone(),
+                key: self.key().to_owned(),
                 path: source
                     .backing_path()
                     .unwrap_or_else(|| Path::new("<unknown>"))
@@ -300,9 +463,9 @@ impl WeightLease {
                 message: "lease has no encoded bytes".into(),
             }
         })?;
-        let view = TensorView::new(dtype, self.output_shape.clone(), data).map_err(|error| {
+        let view = TensorView::new(dtype, self.output_shape().to_vec(), data).map_err(|error| {
             CheckpointMaterializationError::InvalidEncodedTensor {
-                key: self.key.clone(),
+                key: self.key().to_owned(),
                 path: source
                     .backing_path()
                     .unwrap_or_else(|| Path::new("<unknown>"))
@@ -310,11 +473,15 @@ impl WeightLease {
                 message: error.to_string(),
             }
         })?;
-        let mut pending =
-            PendingWeightMaterialization::begin(self.clone(), source_stream, execution_stream)?;
+        let mut pending = PendingWeightMaterialization::begin_with_original(
+            self,
+            source_stream,
+            execution_stream,
+            original,
+        )?;
         let source_value = Array::try_from(view).map_err(|conversion| {
             CheckpointMaterializationError::MlxConversion {
-                key: self.key.clone(),
+                key: pending.key().to_owned(),
                 source: conversion,
             }
         })?;
@@ -322,55 +489,123 @@ impl WeightLease {
         let materialized = pending
             .source()
             .copy(execution_stream)
-            .map_err(|error| self.mlx_error("copy", error))?;
+            .map_err(|error| pending.lease().mlx_error("copy", error))?;
         pending.prepared(materialized)
     }
+    #[cfg(test)]
+    pub(super) fn prepare_original_gguf_fixture(
+        self,
+        stream: &Stream,
+        ready: PreparedPendingWeight,
+        observer: safemlx::OriginalScopeObserver,
+    ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
+        self.prepare_gguf(stream, stream, Some((ready, observer)))
+    }
+
     fn prepare_gguf(
         self,
-        source: GgufLeaseSource,
         source_stream: &Stream,
         execution_stream: &Stream,
+        original: Option<(PreparedPendingWeight, safemlx::OriginalScopeObserver)>,
     ) -> Result<PendingWeightMaterialization, CheckpointMaterializationError> {
-        let GgufLeaseSource {
-            lease,
-            converted_groups,
-        } = source;
-        let cache_key = lease.identity().clone();
-        let selection_is_materialized = lease.selection_is_materialized();
-        let logical_output_name = lease.logical_output_name().to_owned();
-        let mut pending =
-            PendingWeightMaterialization::begin(self.clone(), source_stream, execution_stream)?;
+        let original_miss = original.is_some();
+        let WeightLeaseSource::Gguf(source) = &self.source else {
+            unreachable!("closed GGUF dispatch")
+        };
+        let selection_is_materialized = source.lease.selection_is_materialized();
+        // Only the existing cache Arc is aliased; the real GGUF Box moves below.
+        let converted_groups = source.converted_groups.clone();
+        let mut pending = PendingWeightMaterialization::begin_with_original(
+            self,
+            source_stream,
+            execution_stream,
+            original,
+        )?;
+        // Declared before the loan: any early error releases the cache lock
+        // before retired keys/weak blocks/raw custody can run destructors.
+        let retired;
+        let retired_replaced;
+        let mut ordinary_node;
         let mut groups = converted_groups
             .lock()
             .map_err(|_| CheckpointMaterializationError::StatePoisoned)?;
-        groups.retain(|_, group| group.strong_count() > 0);
-        let group = if let Some(cached) = groups.get(&cache_key).and_then(Weak::upgrade) {
-            lease.record_coalesced_group_hit();
+        retired = groups.extract_if(|_, group| group.stale());
+        #[cfg(test)]
+        super::cache::after_sweep();
+        let group = if let Some(cached) = groups
+            .get_by(|key| {
+                pending
+                    .gguf_lease()
+                    .identity()
+                    .cache_view()
+                    .cmp(&key.view())
+            })
+            .and_then(super::cache::WeakGroup::upgrade)
+        {
+            pending.gguf_lease().record_coalesced_group_hit();
+            retired_replaced = None;
             cached
         } else {
-            let portable = lease
-                .materialize_portable()
-                .map_err(CheckpointMaterializationError::from)?;
-            let converted = GgufTensor::from_portable_host(portable).map_err(|error| {
-                CheckpointMaterializationError::GgufConversion {
-                    key: self.key.clone(),
-                    message: error.to_string(),
-                }
-            })?;
-            let cached = Arc::new(CachedGgufGroup {
-                arrays: converted.into_arrays(),
-            });
-            groups.insert(cache_key, Arc::downgrade(&cached));
-            cached
+            let admitted_conversion = original_miss && pending.has_admitted_gguf_storage();
+            // Only the explicit partial Vec-only constructor lacks a source
+            // bank. A present bank remains mandatory even when exhausted or
+            // foreign; no preparation failure selects ordinary metadata.
+            let admitted_cache = admitted_conversion && pending.has_gguf_cache_source_bank();
+            if admitted_cache {
+                pending.prepare_gguf_cache_key()?;
+            }
+            let arrays = if admitted_conversion {
+                let portable = pending.materialize_gguf_admitted()?;
+                pending.convert_original_stored_gguf(portable)?
+            } else {
+                let portable = if original_miss {
+                    pending.materialize_gguf_prepared()?
+                } else {
+                    pending
+                        .gguf_lease()
+                        .materialize_portable()
+                        .map_err(CheckpointMaterializationError::from)?
+                };
+                let converted = if original_miss {
+                    pending.convert_original_gguf(portable)?
+                } else {
+                    GgufTensor::from_portable_host(portable).map_err(|error| {
+                        CheckpointMaterializationError::GgufConversion {
+                            key: pending.key().to_owned(),
+                            message: error.to_string(),
+                        }
+                    })?
+                };
+                CachedGgufArrays::Ordinary(converted.into_arrays())
+            };
+            if admitted_cache {
+                let (cached, replaced) = pending.complete_gguf_cache_entry(arrays, &mut groups)?;
+                retired_replaced = replaced;
+                cached
+            } else {
+                let cached = super::cache::Group::ordinary(arrays);
+                ordinary_node = Some(super::cache::Node::new(
+                    super::cache::Key::Ordinary(pending.gguf_lease().identity().clone()),
+                    cached.downgrade(),
+                    None,
+                ));
+                retired_replaced = groups
+                    .insert_or_replace(&mut ordinary_node, |row| row.stale())
+                    .map_err(|()| CheckpointMaterializationError::StatePoisoned)?;
+                cached
+            }
         };
         drop(groups);
-        pending.set_group(Arc::clone(&group));
+        drop(retired_replaced);
+        drop(retired);
+        pending.set_group(group.clone());
+        let logical_output_name = pending.gguf_lease().logical_output_name();
         let source_value = group
             .arrays
-            .iter()
-            .find_map(|(name, value)| (name == &logical_output_name).then(|| value.clone()))
+            .get(logical_output_name)
+            .cloned()
             .ok_or_else(|| CheckpointMaterializationError::GgufConversion {
-                key: self.key.clone(),
+                key: pending.key().to_owned(),
                 message: format!(
                     "portable GGUF group did not produce logical output {logical_output_name:?}"
                 ),
@@ -382,13 +617,13 @@ impl WeightLease {
             pending
                 .source()
                 .copy(execution_stream)
-                .map_err(|source| self.mlx_error("copy", source))?
+                .map_err(|source| pending.lease().mlx_error("copy", source))?
         } else {
-            match &self.selection {
+            match pending.lease().selection() {
                 TensorSelection::Range { axis, start, end } => materialize_range(
-                    &self.key,
+                    pending.key(),
                     pending.source().clone(),
-                    &self.metadata.logical_shape,
+                    &pending.lease().metadata().logical_shape,
                     *axis,
                     *start,
                     *end,
@@ -396,7 +631,7 @@ impl WeightLease {
                     execution_stream,
                 )?,
                 TensorSelection::Indices { axis, indices } => materialize_indices(
-                    &self.key,
+                    pending.key(),
                     pending.source(),
                     *axis,
                     indices,
@@ -408,7 +643,7 @@ impl WeightLease {
                     offset_elements,
                     shape,
                 } => materialize_contiguous(
-                    &self.key,
+                    pending.key(),
                     pending.source(),
                     *offset_elements,
                     shape,
@@ -426,7 +661,7 @@ impl WeightLease {
         source: safemlx::error::Exception,
     ) -> CheckpointMaterializationError {
         CheckpointMaterializationError::Mlx {
-            key: self.key.clone(),
+            key: self.key().to_owned(),
             operation,
             source,
         }

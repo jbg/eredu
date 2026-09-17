@@ -7,6 +7,8 @@ use eredu_nn::{
 };
 
 use super::{DecoderLayer, FeedForwardPolicy, LayerPolicy, ModelArgs, MtpConfig, TextArgs};
+pub(crate) mod construction;
+pub(crate) use construction::MtpModelSpec;
 
 /// One prediction depth's hidden/token fusion and ordinary decoder block.
 #[derive(Debug, Clone, Parameterized)]
@@ -48,7 +50,7 @@ pub struct MtpModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend
     pub layers: Vec<MtpDepth<B>>,
     /// Optional normalization between prediction depths.
     pub chain_norm: Option<B::Normalization>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     policies: Vec<AttentionPolicy>,
 }
 
@@ -58,96 +60,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> MtpModel<B> {
         args: &ModelArgs,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<Self>, Error> {
-        let Some(config) = args.mtp_config.as_ref() else {
+        if args
+            .mtp_config
+            .as_ref()
+            .is_none_or(|config| config.num_nextn_predict_layers == 0)
+        {
             return Ok(None);
-        };
-        let count = usize::try_from(config.num_nextn_predict_layers)
-            .map_err(|_| Error::backend("Inkling MTP layer count is negative"))?;
-        if count == 0 {
-            return Ok(None);
         }
-        let sliding = args
-            .text_config
-            .layer_schedule
-            .iter()
-            .find_map(|policy| policy.attention.window())
-            .map(|window| AttentionPolicy::Sliding { window });
-        if !config.local_layer_ids.is_empty() && sliding.is_none() {
-            return Err(Error::backend(
-                "Inkling MTP local layers require a backbone sliding window",
-            ));
-        }
-        let policies = (0..count)
-            .map(|depth| {
-                if config.local_layer_ids.contains(&depth) {
-                    sliding.expect("validated local MTP policy")
-                } else {
-                    AttentionPolicy::Full
-                }
-            })
-            .collect::<Vec<_>>();
-        let mut layers = Vec::with_capacity(count);
-        for (depth, attention) in policies.iter().copied().enumerate() {
-            let text = mtp_text_args(&args.text_config, config, attention)?;
-            let root = format!("model.mtp.layers.{depth}");
-            let norm = |field: &str| {
-                B::normalization(
-                    NormalizationConstructionSpec::learned(
-                        text.hidden_size,
-                        text.rms_norm_eps,
-                        ParameterSpec::trainable(format!("{root}.{field}.weight"))
-                            .map_err(Error::backend)?,
-                    ),
-                    context,
-                )
-            };
-            let input_weight = format!("{root}.input_proj.weight");
-            layers.push(MtpDepth {
-                hidden_norm: norm("hidden_norm")?,
-                embedding_norm: norm("embed_norm")?,
-                input_projection: B::linear(
-                    LinearSpec {
-                        input: text.hidden_size * 2,
-                        output: text.hidden_size,
-                        weight: ParameterSpec::trainable(&input_weight).map_err(Error::backend)?,
-                        bias: None,
-                        format: crate::linear_format::standard_linear_format(
-                            &input_weight,
-                            text.linear_format_for(&input_weight),
-                        )?,
-                    },
-                    context,
-                )?,
-                transformer_block: DecoderLayer::new_at(
-                    &text,
-                    LayerPolicy {
-                        attention,
-                        feed_forward: FeedForwardPolicy::Dense,
-                    },
-                    &format!("{root}.transformer_block"),
-                    context,
-                )?,
-            });
-        }
-        let chain_norm = config
-            .chain_hidden_post_norm
-            .then(|| {
-                B::normalization(
-                    NormalizationConstructionSpec::learned(
-                        args.text_config.hidden_size,
-                        args.text_config.rms_norm_eps,
-                        ParameterSpec::trainable("model.mtp.chain_norm.weight")
-                            .map_err(Error::backend)?,
-                    ),
-                    context,
-                )
-            })
-            .transpose()?;
-        Ok(Some(Self {
-            layers,
-            chain_norm,
-            policies,
-        }))
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        MtpModelSpec::new(args)?
+            .map(|spec| spec.instantiate::<B>(context))
+            .transpose()
     }
 
     /// Returns the exact number of prediction depths.

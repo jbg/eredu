@@ -221,6 +221,26 @@ impl eredu_runtime::ArchitectureBoundary for TargetBoundarySchema {
         let embedded = tensors.next().expect("validated target embeddings");
         Ok(TargetBoundary { tokens, embedded })
     }
+
+    fn wire_schema_with_metadata(&self,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<eredu_runtime::BoundaryWireSchema,Error>{
+        use eredu_runtime::{BoundaryTensorDimension as Dim,BoundaryTensorDtype as Dtype};
+        crate::boundary_metadata::schema(context,Self::IDENTITY,self.hidden_size,&[
+            ("tokens",&[Dim::Batch,Dim::Sequence],Dtype::Uint32),
+            ("embedded",&[Dim::Batch,Dim::Sequence,Dim::Fixed(self.hidden_size)],Dtype::Activation),
+        ],None)
+    }
+    fn encode_with_metadata<T>(&self,boundary:Self::Boundary<T>,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Vec<eredu_runtime::ArchitectureBoundaryValue<T>>,Error>{
+        crate::boundary_metadata::encode(context,Self::IDENTITY,
+            [("tokens",boundary.tokens),("embedded",boundary.embedded)],Vec::new(),0,"")
+    }
+    fn decode_with_metadata<T>(&self,tensors:Vec<T>,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Self::Boundary<T>,Error>{
+        let ([tokens,embedded],_)=crate::boundary_metadata::decode(context,Self::IDENTITY,tensors,0)?;
+        Ok(TargetBoundary{tokens,embedded})
+    }
+
 }
 
 /// Target input owned by either the first or a downstream pipeline rank.
@@ -253,7 +273,9 @@ impl<T> ForwardContext<T> {
 
 /// Shared layered Nemotron-H model including graph-visible MTP groups.
 pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    args: ModelArgs,
+    args: crate::replicated_text::config_source::ConfigOwner<ModelArgs>,
+    construction_parameters: Option<crate::routed_text::RetainedRoutedDescription>,
+    construction_units: Option<crate::routed_text::RetainedRoutedUnits>,
     static_modules: StaticModules<B>,
     groups: SequentialPredictionGroups,
     target_units: usize,
@@ -264,12 +286,63 @@ pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBac
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
+    crate::routed_text::RoutedConstructionParameters<B> for LayeredModel<B>
+{
+    fn install_construction_parameters(&mut self, source: crate::routed_text::RetainedRoutedDescription) {
+        self.construction_parameters = Some(source);
+    }
+    fn prepare_construction_units(&self, banks: Option<&crate::routed_text::RetainedRoutedBanks>, context: &<B::Tensor as Tensor>::Context)
+        -> Result<Option<crate::routed_text::RetainedRoutedUnits>, Error> {
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        let selected = banks.map(|banks| banks.get(&eredu_runtime::RoutedBankId::new(0))
+            .and_then(|bank| bank.plan().relu2())
+            .ok_or_else(|| Error::from(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)))
+            .transpose()?;
+        let mut specs = Vec::with_capacity(self.target_units);
+        for index in 0..self.target_units {
+            let geometry = match &self.parallel_geometry {
+                Some(geometry) => *geometry.target_unit(index).ok_or_else(|| Error::backend(format!(
+                    "rank-local Nemotron-H geometry is missing target unit {index}")))?,
+                None => super::block::TargetBlockSpec::global_geometry(&self.args, index)?,
+            };
+            let spec = selected.or(self.expert_realization.as_ref())
+                .and_then(|plan| plan.unit_spec("target", index)).cloned();
+            specs.push(super::block::TargetBlockSpec::new(&self.args, index, geometry, spec)?);
+        }
+        Ok(Some(crate::routed_text::RetainedRoutedUnits::nemotron_source(specs)))
+    }
+    fn install_construction_units(&mut self, source: Option<crate::routed_text::RetainedRoutedUnits>) -> Result<(), Error> {
+        if let Some(source) = &source {
+            if source.nemotron()?.len() != self.target_units {
+                return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+            }
+        }
+        self.construction_units = source;
+        Ok(())
+    }
+}
+
+impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
     eredu_runtime::ArchitectureParameters<B> for LayeredModel<B>
 {
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
         self.state_layout_impl()
+    }
+
+    fn state_layout_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<StateLayout, Self::DefinitionError> {
+        match &self.parallel_geometry {
+            Some(geometry) => geometry.state_layout().clone_workspace(context),
+            None => super::state_layout_with_metadata(&self.args, context),
+        }
+    }
+    fn state_identity_with_metadata(&self, state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+        super::state_identity_with_metadata(&self.args, state.layout(), state.global_layer_offset(), topology, context)
     }
 
     fn state_identity(
@@ -302,6 +375,30 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         super::static_recipes(source, &self.args, None)
     }
 
+    fn parameter_description_with_metadata(&self,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>, Self::DefinitionError> {
+        match &self.construction_parameters {
+            Some(source) => {
+                crate::decoder::ModuleMetadata::new::<B>(context)
+                    .controls::<std::borrow::Cow<'_, eredu_runtime::ArchitectureParameterDescription>>()?;
+                Ok(std::borrow::Cow::Borrowed(source))
+            }
+            None if B::construction_metadata(context).is_some_and(|metadata| metadata.uses_checked_metadata()) => {
+                Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+            }
+            None => self.parameter_description(context).map(std::borrow::Cow::Owned),
+        }
+    }
+
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_nn::Parameterized::visit_retained_values(&self.static_modules, visitor)
+    }
+
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
     where
         V: eredu_runtime::StaticParameterVisitor<B>,
@@ -330,19 +427,29 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
     /// Builds unloaded static modules and validates target plus MTP schedules.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
-            "Nemotron-H",
-            crate::operator_requirements::NEMOTRON_H,
-        )?;
-        args.validate().map_err(Error::backend)?;
-        let (target_units, prediction_steps, prediction_pattern) = Self::schedule(&args)?;
-        let static_modules = StaticModules::from_spec(Self::static_spec(&args), context)?;
-        let groups = SequentialPredictionGroups::new_pattern(
+        Self::new_with_config(args.into(),context)
+    }
+    pub(crate) fn new_with_config(args:crate::replicated_text::config_source::ConfigOwner<ModelArgs>,
+        context:&<B::Tensor as Tensor>::Context)->Result<Self,Error>{
+        let module_metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        module_metadata.controls::<Self>()?;
+        module_metadata.require::<B>("Nemotron-H", crate::operator_requirements::NEMOTRON_H)?;
+        args.validate_with_diagnostic(|message| metadata.error(message))?;
+        let (target_units, prediction_steps, prediction_pattern) = Self::schedule(&args, B::construction_metadata(context))?;
+        let spec = Self::static_spec_view(&args);
+        let spec = match B::construction_metadata(context) {
+            Some(metadata) => spec.to_owned_with_metadata(metadata)?,
+            None => spec.to_owned(),
+        };
+        let static_modules = StaticModules::from_spec(spec, context)?;
+        let groups = SequentialPredictionGroups::new_pattern_with_metadata(
             "model.layers",
             target_units,
             "model.mtp.layers",
             prediction_steps,
             prediction_pattern,
+            B::construction_metadata(context),
         )?;
         Ok(Self {
             args,
@@ -351,6 +458,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             target_units,
             prediction_steps,
             prediction_pattern,
+            construction_parameters: None,
+            construction_units: None,
             parallel_geometry: None,
             expert_realization: None,
         })
@@ -368,55 +477,63 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         )?;
         args.validate().map_err(Error::backend)?;
         geometry.validate_for(&args).map_err(Error::backend)?;
-        let (target_units, prediction_steps, prediction_pattern) = Self::schedule(&args)?;
+        let (target_units, prediction_steps, prediction_pattern) = Self::schedule(&args, B::construction_metadata(context))?;
         let static_modules = StaticModules::from_parallel_spec(
             Self::static_spec(&args),
             geometry.embedding_range().clone(),
             geometry.output_range().cloned(),
             context,
         )?;
-        let groups = SequentialPredictionGroups::new_pattern(
+        let groups = SequentialPredictionGroups::new_pattern_with_metadata(
             "model.layers",
             target_units,
             "model.mtp.layers",
             prediction_steps,
             prediction_pattern,
+            B::construction_metadata(context),
         )?;
         Ok(Self {
-            args,
+            args:args.into(),
             static_modules,
             groups,
             target_units,
             prediction_steps,
             prediction_pattern,
+            construction_parameters: None,
+            construction_units: None,
             parallel_geometry: Some(std::sync::Arc::new(geometry)),
             expert_realization: None,
         })
     }
 
-    fn schedule(args: &ModelArgs) -> Result<(usize, usize, usize), Error> {
-        let target_units = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    fn schedule(args: &ModelArgs, context: Option<&eredu_nn::workspace::WorkspaceContext>) -> Result<(usize, usize, usize), Error> {
+        let metadata = crate::decoder::identity::Metadata::new(context);
+        metadata.controls::<(usize, usize, usize)>()?;
+        let target_units = usize::try_from(args.num_hidden_layers).map_err(|cause| metadata.source(cause))?;
         let prediction_steps =
-            usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
-        let prediction_units = args.mtp_policies().map_err(Error::backend)?.len();
+            usize::try_from(args.num_nextn_predict_layers).map_err(|cause| metadata.source(cause))?;
+        let prediction_units = args.mtp_policy_count_with(|message| metadata.error(message))?;
         let prediction_pattern = if prediction_steps == 0 {
             0
         } else {
             prediction_units
                 .checked_div(prediction_steps)
                 .filter(|n| *n > 0)
-                .ok_or_else(|| Error::backend("Nemotron-H MTP pattern is empty"))?
+                .ok_or_else(|| metadata.error(format_args!("Nemotron-H MTP pattern is empty")))?
         };
         Ok((target_units, prediction_steps, prediction_pattern))
     }
 
     fn static_spec(args: &ModelArgs) -> StaticModuleSpec {
+        Self::static_spec_view(args).to_owned()
+    }
+    fn static_spec_view(args: &ModelArgs) -> crate::decoder::StaticModuleSpecView<'_> {
         let embedding_name = "model.embeddings.weight";
-        StaticModuleSpec {
+        crate::decoder::StaticModuleSpecView {
             normalization_groups: None,
-            embedding_weight: embedding_name.into(),
-            normalization_weight: "model.norm_f.weight".into(),
-            head_weight: "lm_head.weight".into(),
+            embedding_weight: embedding_name,
+            normalization_weight: "model.norm_f.weight",
+            head_weight: "lm_head.weight",
             vocabulary: args.vocab_size,
             hidden_size: args.hidden_size,
             normalization_epsilon: args.layer_norm_epsilon,
@@ -428,7 +545,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 
     /// Returns normalized architecture policy.
-    pub const fn args(&self) -> &ModelArgs {
+    pub fn args(&self) -> &ModelArgs {
         &self.args
     }
 
@@ -538,6 +655,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &mut self,
         realization: crate::ExpertRealizationPlan<eredu_nn::GroupedRelu2Spec>,
     ) {
+        self.construction_units = None;
+        self.construction_parameters = None;
         self.expert_realization = Some(realization);
     }
 
@@ -578,6 +697,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Unit<B>, Error> {
+        if group == 0 {
+            if let Some(source) = &self.construction_units {
+                let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+                metadata.controls::<(&crate::routed_text::RetainedRoutedUnits, Unit<B>, usize)>()?;
+                let spec = source.nemotron()?.get(index).ok_or_else(|| metadata.error(format_args!(
+                    "target unit {index} is outside the retained source")))?;
+                return spec.instantiate::<B>(context).map(Unit::Target);
+            }
+        }
         self.unit_path_inner(group, index)?;
         let mut unit = if group == 0 {
             let block = match &self.parallel_geometry {
@@ -646,6 +774,44 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             }
         }
         Ok(unit)
+    }
+
+    fn causal_mask_for_state_range<S>(
+        &self,
+        sequence: i32,
+        supplied: Option<&B::Tensor>,
+        state: &mut S,
+        expected: &StateLayout,
+        mut range: std::ops::Range<usize>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: RuntimeStateComponents<B>,
+    {
+        if let Some(mask) = supplied {
+            return Ok(Some(mask.clone()));
+        }
+        if sequence <= 1 {
+            return Ok(None);
+        }
+        // Dense/MoE slots do not advance a token frontier. Read the actual
+        // attention cache inside this invocation, never a different MTP group.
+        range
+            .find(|&ordinal| {
+                expected
+                    .layer(ordinal)
+                    .is_some_and(|p| p.attention().is_some())
+            })
+            .map(|ordinal| {
+                B::causal_mask(
+                    sequence,
+                    state.layer(ordinal).map_err(Error::backend)?.position(),
+                    None,
+                    context,
+                )
+            })
+            .transpose()
     }
 
     /// Begins a target pass from a placement-supplied token embedding.
@@ -767,7 +933,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         mask: Option<&B::Tensor>,
         state: &mut S,
         expected: &StateLayout,
-        first_state_ordinal: usize,
+        _first_state_ordinal: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
     where
@@ -780,21 +946,22 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 state.layout()
             )));
         }
-        let mask = if let Some(mask) = mask {
-            Some(mask.clone())
-        } else if hidden.dim(1) > 1 {
-            Some(B::causal_mask(
-                hidden.dim(1),
-                state
-                    .layer(first_state_ordinal)
-                    .map_err(Error::backend)?
-                    .position(),
-                None,
-                context,
-            )?)
-        } else {
-            None
-        };
+        // Sliced layouts preserve the target segment and rebase its range.
+        // A global partition ordinal is never an index into this local state;
+        // appended prediction slots must not supply a target cache frontier.
+        let target_range = expected
+            .segments()
+            .iter()
+            .find(|segment| segment.id().as_str() == super::TARGET_STATE_SEGMENT)
+            .map_or(0..0, |segment| segment.layers());
+        let mask = self.causal_mask_for_state_range(
+            hidden.dim(1),
+            mask,
+            state,
+            expected,
+            target_range,
+            context,
+        )?;
         Ok(LayeredForwardState {
             hidden: hidden.clone(),
             context: ForwardContext {
@@ -840,19 +1007,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             .target_units
             .checked_add(depth * self.prediction_pattern)
             .ok_or_else(|| Error::backend("Nemotron-H MTP mask state index overflowed"))?;
-        let mask = if embedded.dim(1) > 1 {
-            Some(B::causal_mask(
-                embedded.dim(1),
-                state
-                    .layer(position_layer)
-                    .map_err(Error::backend)?
-                    .position(),
-                None,
-                context,
-            )?)
-        } else {
-            None
-        };
+        let end = position_layer
+            .checked_add(self.prediction_pattern)
+            .ok_or_else(|| Error::backend("Nemotron-H MTP mask state range overflowed"))?;
+        let mask = self.causal_mask_for_state_range(
+            embedded.dim(1),
+            None,
+            state,
+            expected,
+            position_layer..end,
+            context,
+        )?;
         Ok(LayeredForwardState {
             hidden: hidden.clone(),
             context: ForwardContext {
@@ -1091,7 +1256,37 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        // Only the ordinary target group: causal convolution/scan and causal
+        // attention carry their complete prefix state; dense/routed/shared
+        // ReLU-squared operators act per row. Prediction groups and invocation
+        // availability remain governed by their existing separate contracts.
+        let units = self.groups.unit_count(0)?;
+        let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
+            (0..units).map(|index| self.unit_path_inner(0, index)),
+            true,
+        )?;
+        // Same target bank invocation as observed execution; its expert equations are row-local.
+        for index in 0..units {
+            let path = self.unit_path_inner(0, index)?;
+            if self.args.layer_schedule.get(index).is_some_and(|policy| *policy == crate::nemotron_h::LayerPolicy::SparseMoe) {
+                crate::decoder::append_routed_prefill_path(&mut declarations, &format!("{path}.routing"));
+            }
+        }
+        Ok(declarations)
+    }
+
     type Input<'a> = EmbeddedInput<'a, B::Tensor>;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        match input {
+            EmbeddedInput::Target { tokens, .. } => crate::prefill::token_shape(*tokens).map(Some),
+            _ => Ok(None),
+        }
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = Unit<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
@@ -1126,6 +1321,14 @@ where
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
         self.groups.execution_graph()
+    }
+    fn execution_graph_with_metadata(&self, context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        self.groups.execution_graph_with_metadata(context)
+    }
+    fn group_unit_count_with_metadata(&self, group: usize, context: &eredu_nn::workspace::WorkspaceContext)
+        -> Result<usize, Self::Error> {
+        self.groups.unit_count_with_metadata(group, context)
     }
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
         self.validate_group(group)
@@ -1177,28 +1380,27 @@ where
         };
         let embedded = self.static_modules.embeddings.forward(tokens, context)?;
         let hidden = supplied_hidden.cloned().unwrap_or_else(|| embedded.clone());
-        let position_layer = match mode {
-            ForwardMode::Target => 0,
-            ForwardMode::Draft(depth) => self
-                .target_units
-                .checked_add(depth * self.prediction_pattern)
-                .ok_or_else(|| Error::backend("Nemotron-H MTP mask state index overflowed"))?,
+        let mask_range = match mode {
+            ForwardMode::Target => 0..self.target_units,
+            ForwardMode::Draft(depth) => {
+                let start = self
+                    .target_units
+                    .checked_add(depth * self.prediction_pattern)
+                    .ok_or_else(|| Error::backend("Nemotron-H MTP mask state index overflowed"))?;
+                let end = start
+                    .checked_add(self.prediction_pattern)
+                    .ok_or_else(|| Error::backend("Nemotron-H MTP mask state range overflowed"))?;
+                start..end
+            }
         };
-        let mask = if let Some(mask) = supplied_mask {
-            Some(mask.clone())
-        } else if embedded.dim(1) > 1 {
-            Some(B::causal_mask(
-                embedded.dim(1),
-                state
-                    .layer(position_layer)
-                    .map_err(Error::backend)?
-                    .position(),
-                None,
-                context,
-            )?)
-        } else {
-            None
-        };
+        let mask = self.causal_mask_for_state_range(
+            embedded.dim(1),
+            supplied_mask,
+            state,
+            &expected,
+            mask_range,
+            context,
+        )?;
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
@@ -1329,6 +1531,16 @@ where
 
     fn prediction_target_capture(forward: &Self::ForwardContext) -> Option<&B::Tensor> {
         forward.target_capture.as_ref()
+    }
+
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        crate::readout::select_readout_positions(hidden, demand, 1, context)
     }
 
     fn finish_forward(
@@ -1622,5 +1834,14 @@ where
                 auxiliary: TargetBoundary::new(forward.tokens.clone(), forward.embedded.clone()),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod paid_boundary_metadata_tests {
+    use super::*;
+    #[test]
+    fn fixed_target_boundary_matches_ordinary_roles_and_rejects_unfunded_storage(){
+        crate::boundary_metadata::tests::check(TargetBoundarySchema{hidden_size:8},vec![17,-29]);
     }
 }

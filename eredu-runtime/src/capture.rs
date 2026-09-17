@@ -1,16 +1,54 @@
 //! Budget admission at the observation boundary, before native handles are retained.
 
+mod preflight_budget;
+pub(crate) use preflight_budget::PreflightBudget;
+
 use eredu_core::capture::*;
 
 mod checkpoint;
+pub(crate) mod funded;
+mod ordinary_delivery;
+mod ordinary_error;
+mod ordinary_prefill;
+mod policy;
+mod prefill_transaction;
+pub use funded::{
+    FundedCaptureCheckpoint, FundedCaptureCheckpointError, FundedCaptureDrainError,
+    FundedCaptureError, FundedCaptureSession, FundedEmbeddedCaptureInvocation,
+    FundedSpeculativeCaptureInvocation, PreparedFundedCaptureCheckpoint, ScheduledCaptureBackend,
+};
+pub use ordinary_prefill::OrdinaryPrefillCapture;
+pub use policy::prefill::{
+    CapturePrefillHookDecision, CapturePrefillObservationPolicy, CapturePrefillObservationRow,
+    CapturePrefillProgressError, CapturePrefillRowProgress,
+};
+pub use policy::{CaptureObservationStep, CaptureProtocolError, CaptureRecordStatus};
+mod encoded;
+pub(crate) use encoded::{
+    RECORD_ENCODING_CONTROL_BYTES, intervention_fits_encoding, record_fits_encoding,
+};
+mod source;
+use source::CapturePlanSource;
+mod host_preparation;
+use host_preparation::CaptureHostOwner;
 mod empty;
 mod generated;
 mod invocation;
+pub(crate) use invocation::InvocationPreflightBudget;
+mod prefix;
+pub(crate) use prefix::{PrefixDestination,PrefixError};
+pub(crate) mod reduction;
 pub use invocation::CaptureInvocationSelection;
+pub use reduction::{
+    CaptureHistogramError, CaptureSummaryError, histogram_prefill_usage, summary_prefill_usage,
+};
 mod speculative;
 pub use speculative::{
-    CaptureBackendProvider, PartitionCaptureBackendProvider, PreparedSpeculativeActivationRestore,
-    SpeculativeActivationCheckpoint, SpeculativeCaptureObserver, SpeculativeCaptureScope,
+    CaptureBackendProvider, OriginalSpeculativeCapture, OriginalSpeculativeCaptureError,
+    OriginalSpeculativeCaptureInvocation, OriginalSpeculativeCapturePrefix,
+    PartitionCaptureBackendProvider, PreparedSpeculativeActivationRestore,
+    SpeculativeActivationCheckpoint, SpeculativeCaptureErrorTransport, SpeculativeCaptureObserver,
+    SpeculativeCaptureScope,
 };
 mod routed;
 use empty::empty_payload;
@@ -18,6 +56,9 @@ pub use generated::generated_capture_source;
 pub mod partition;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "capture/tests/text_origin.rs"]
+mod text_origin_tests;
 pub use checkpoint::{
     CaptureCheckpoint, CaptureForkRequest, InterventionForkRequest, PreparedCaptureRestore,
 };
@@ -25,21 +66,34 @@ pub use checkpoint::{
 /// A run owns one ledger and at most one step of host records. Consumers must drain
 /// each step before another is started; there is no producer queue.
 pub struct CaptureSession {
-    // Identity is deliberately not serialized or copied into child sessions.
-    owner: std::sync::Arc<()>,
     pub(crate) checkpoint_ready: bool,
     has_step: bool,
+    ordinary_prefill: Option<OrdinaryPrefillCapture>,
+    // Only checkpoint::fork sets this payload-free identity of the exact saved
+    // frontier/usage instance. No predecessor session, ledger or account is held.
+    ordinary_prefill_parent: Option<std::sync::Arc<()>>,
+    ordinary_progress: Option<ordinary_prefill::Progress>,
     pub(crate) invocation: Option<CaptureInvocationShape>,
+    pub(crate) invocation_window: Option<CaptureInvocationWindow>,
+    // Only the original speculative collector can enable host reduction fragments.
+    window_reductions: bool,
     transaction: Option<(eredu_core::DistributedCommitEpoch, CaptureTransactionStatus)>,
     last_transaction_epoch: Option<eredu_core::DistributedCommitEpoch>,
     partition: Option<partition::PartitionCaptureRun>,
-    pub(crate) plan: std::sync::Arc<AdmittedCapturePlan>,
+    pub(crate) plan: CapturePlanSource,
     pub(crate) ledger: CaptureLedger,
     pub(crate) records: Option<Vec<CaptureRecord>>,
     pub(crate) prediction: u64,
     pub(crate) phase: CapturePhase,
     pub(crate) capture_seconds: f64,
     pub(crate) interventions: Option<crate::intervention::InterventionRun>,
+    // Records/partial state retire before the preallocated final frame custody.
+    ordinary_frame: Option<PreparedCapturedStep>,
+    // Identity is shared by checkpoints/partition handles, never child runs.
+    // All payloads retire before this owner and final immutable error custody.
+    owner: std::sync::Arc<CaptureHostOwner>,
+    // Independent of the mutable host mutex: poison diagnostics also retain custody.
+    ordinary_error_custody: Option<eredu_core::HostPreparationAuthority>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -52,16 +106,36 @@ enum CaptureTransactionStatus {
 impl CaptureSession {
     /// Creates an unstarted capture run owning its admission and ledger.
     pub fn new(plan: AdmittedCapturePlan) -> Self {
+        Self::from_source(CapturePlanSource::Legacy(std::sync::Arc::new(plan)))
+    }
+
+    /// Starts an unstarted run retaining the actual immutable shared source.
+    /// No admitted payload is cloned, re-admitted or reconstructed. Existing
+    /// per-domain source attachment remains on the original owner, including
+    /// attachments added after this alias was created. This does not fund the
+    /// session/records, register a source or authorize managed instrumentation.
+    pub fn from_shared_plan(plan: SharedCapturePlan) -> Self {
+        Self::from_source(CapturePlanSource::Shared(plan))
+    }
+
+    fn from_source(plan: CapturePlanSource) -> Self {
         Self {
-            owner: std::sync::Arc::new(()),
+            owner: std::sync::Arc::new(CaptureHostOwner::default()),
+            ordinary_error_custody: None,
             checkpoint_ready: true,
             has_step: false,
+            ordinary_prefill: None,
+            ordinary_prefill_parent: None,
+            ordinary_progress: None,
+            ordinary_frame: None,
             invocation: None,
+            invocation_window: None,
+            window_reductions: false,
             transaction: None,
             last_transaction_epoch: None,
             partition: None,
             ledger: CaptureLedger::new(&plan),
-            plan: std::sync::Arc::new(plan),
+            plan,
             records: None,
             prediction: 0,
             phase: CapturePhase::Prefill,
@@ -70,12 +144,48 @@ impl CaptureSession {
         }
     }
 
+    /// Retains already-acquired host preparation custody for this run and all
+    /// existing checkpoint/partition aliases. This grants no allocation authority
+    /// or byte bound; callers acquire before constructing or copying payloads.
+    /// Borrowed admission DTO clones remain the caller's ownership contract.
+    pub fn retain_host_preparation(
+        &self,
+        authority: &eredu_core::HostPreparationAuthority,
+    ) -> Result<(), CaptureError> {
+        let host = self.ordinary_error_custody.clone();
+        let result = self.retain_host_preparation_unretained(authority);
+        ordinary_error::retain_result(host, result)
+    }
+
+    fn retain_host_preparation_unretained(
+        &self,
+        authority: &eredu_core::HostPreparationAuthority,
+    ) -> Result<(), CaptureError> {
+        self.owner.retain(authority)
+    }
+
     /// Borrows this run's immutable admission.
     pub fn plan(&self) -> &AdmittedCapturePlan {
         &self.plan
     }
 
+    /// Borrow the actual shared source when constructed through the additive
+    /// shared route. Legacy sessions expose no fabricated shared registration.
+    pub fn shared_plan_source(&self) -> Option<&SharedCapturePlan> {
+        self.plan.shared()
+    }
+
     pub(crate) fn prepare_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+        pass: crate::ExpertPass,
+    ) -> Result<(), CaptureError> {
+        let host = self.ordinary_error_custody.clone();
+        let result = self.prepare_transaction_unretained(epoch, pass);
+        ordinary_error::retain_result(host, result)
+    }
+
+    fn prepare_transaction_unretained(
         &mut self,
         epoch: eredu_core::DistributedCommitEpoch,
         pass: crate::ExpertPass,
@@ -113,25 +223,19 @@ impl CaptureSession {
         pass: crate::ExpertPass,
         prediction: u64,
     ) -> Result<(), CaptureError> {
-        if self.plan.invocation_bounds().is_some() {
-            return Err(CaptureError::Invalid(
-                "independent capture must prepare explicit invocation geometry".into(),
-            ));
-        }
-        if self.records.is_some()
-            || self.transaction.is_some()
-            || self
-                .last_transaction_epoch
-                .is_some_and(|previous| previous >= epoch)
-        {
-            return Err(CaptureError::Invalid(
-                "capture transaction requires a fresh epoch and a drained step".into(),
-            ));
-        }
-        self.last_transaction_epoch = Some(epoch);
-        self.bind_partition_run_epoch(epoch);
-        self.transaction = Some((epoch, CaptureTransactionStatus::Pending));
-        self.checkpoint_ready = false;
+        let host = self.ordinary_error_custody.clone();
+        let result = self.prepare_step_transaction_unretained(epoch, pass, prediction);
+        ordinary_error::retain_result(host, result)
+    }
+
+    fn prepare_step_transaction_unretained(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+        pass: crate::ExpertPass,
+        prediction: u64,
+    ) -> Result<(), CaptureError> {
+        self.claim_step_epoch(epoch, false)
+            .map_err(policy::legacy_error)?;
         let phase = match pass {
             crate::ExpertPass::Prefill => CapturePhase::Prefill,
             crate::ExpertPass::Decode => CapturePhase::Decode,
@@ -140,6 +244,15 @@ impl CaptureSession {
     }
 
     pub(crate) fn complete_transaction(
+        &mut self,
+        epoch: eredu_core::DistributedCommitEpoch,
+    ) -> Result<(), CaptureError> {
+        let host = self.ordinary_error_custody.clone();
+        let result = self.complete_transaction_unretained(epoch);
+        ordinary_error::retain_result(host, result)
+    }
+
+    fn complete_transaction_unretained(
         &mut self,
         epoch: eredu_core::DistributedCommitEpoch,
     ) -> Result<(), CaptureError> {
@@ -205,6 +318,16 @@ impl CaptureSession {
     /// missing values. Exhaustion here fails the step: emitting an unaccounted skip
     /// record would itself violate the export limit.
     pub fn begin_step(&mut self, phase: CapturePhase, prediction: u64) -> Result<(), CaptureError> {
+        let host = self.ordinary_error_custody.clone();
+        let result = self.begin_step_unretained(phase, prediction);
+        ordinary_error::retain_result(host, result)
+    }
+
+    fn begin_step_unretained(
+        &mut self,
+        phase: CapturePhase,
+        prediction: u64,
+    ) -> Result<(), CaptureError> {
         if self.plan.invocation_bounds().is_some() {
             return Err(CaptureError::Invalid(
                 "independent capture requires explicit invocation geometry".into(),
@@ -223,52 +346,23 @@ impl CaptureSession {
         phase: CapturePhase,
         prediction: u64,
     ) -> Result<(), CaptureError> {
-        if self.plan.invocation_bounds().is_some() != self.invocation.is_some() {
-            return Err(CaptureError::Invalid(
-                "capture invocation geometry/authority mismatch".into(),
-            ));
-        }
-        if self.records.is_some() {
-            return Err(CaptureError::Invalid(
-                "previous capture step has not been consumed".into(),
-            ));
-        }
-        if prediction >= self.plan.request().max_predictions {
-            return Err(CaptureError::Invalid(
-                "generation exceeds admitted prediction range".into(),
-            ));
-        }
-        // Even a failed reservation can consume cumulative resources. A failed
-        // attempt is not a resumable boundary merely because records were drained.
-        self.checkpoint_ready = false;
-        self.has_step = true;
-        self.ledger.begin_step();
-        if self.invocation.is_some() {
-            if let Some(CaptureSkipReason::Limit { budget, cumulative }) = self.ledger.reserve(
-                invocation::INVOCATION_METADATA.checked_mul(
-                    self.partition
-                        .as_ref()
-                        .map_or(1, |run| run.world_size() as u64),
-                )?,
-            )? {
-                return Err(CaptureError::Limit { budget, cumulative });
-            }
-        }
-        if let Some(partition) = &mut self.partition {
-            partition.begin_step();
-        }
+        self.validate_step_start(prediction)
+            .map_err(policy::legacy_error)?;
+        self.reset_step_ledger()?;
+        // Required control is charged and preallocated before any record field.
+        // Keep it local until records are installed; partial construction errors
+        // drop the records before this actual host authority.
+        let ordinary_frame = self.prepare_ordinary_frame()?;
         let mut records = Vec::new();
         for (selection, point) in self.plan.plan().selections.iter().zip(self.plan.points()) {
-            let charged = metadata_reservation(selection, point)?;
-            if let Some(CaptureSkipReason::Limit { budget, cumulative }) = self.ledger.reserve(
-                charged.checked_mul(
-                    self.partition
-                        .as_ref()
-                        .map_or(1, |run| run.world_size() as u64),
-                )?,
-            )? {
-                return Err(CaptureError::Limit { budget, cumulative });
-            }
+            let charged = policy::reserve_metadata(
+                &mut self.ledger,
+                selection,
+                point,
+                self.partition
+                    .as_ref()
+                    .map_or(1, |run| run.world_size() as u64),
+            )?;
             records.push(CaptureRecord {
                 schema_version: CAPTURE_SCHEMA_VERSION,
                 selection_id: selection.id.clone(),
@@ -290,6 +384,7 @@ impl CaptureSession {
             });
         }
         self.records = Some(records);
+        self.ordinary_frame = ordinary_frame;
         self.phase = phase;
         self.prediction = prediction;
         self.capture_seconds = 0.0;
@@ -307,6 +402,20 @@ impl CaptureSession {
         path: &str,
         tensor: &B::Tensor,
     ) -> Result<(), CaptureExecutionError<B::Error>> {
+        let host = self.ordinary_error_custody.clone();
+        let result = self.observe_unretained(backend, path, tensor);
+        ordinary_error::retain_admission(host, result)
+    }
+
+    fn observe_unretained<B: CaptureBackend>(
+        &mut self,
+        backend: &mut B,
+        path: &str,
+        tensor: &B::Tensor,
+    ) -> Result<(), CaptureExecutionError<B::Error>> {
+        if self.ordinary_progress.is_some() {
+            return self.observe_ordinary_prefill(backend, path, tensor);
+        }
         self.observe_classified(backend, path, tensor, |error| error)
     }
 
@@ -337,16 +446,19 @@ impl CaptureSession {
             .zip(self.plan.points())
             .zip(records)
         {
-            if selection.path != path || matches!(record.outcome, CaptureOutcome::Skipped { .. }) {
-                continue;
-            }
-            if !matches!(record.outcome, CaptureOutcome::Missing) {
-                return Err(
-                    CaptureError::Invalid(format!("observation emitted twice: {path}")).into(),
-                );
+            match policy::selected_record(selection, record, path) {
+                Ok(false) => continue,
+                Ok(true) => {}
+                Err(_) => {
+                    return Err(CaptureError::Invalid(format!(
+                        "observation emitted twice: {path}"
+                    ))
+                    .into());
+                }
             }
             let started = std::time::Instant::now();
-            let result = capture_value(
+            let result = capture_window_value(
+                self.invocation_window,
                 backend,
                 tensor,
                 selection,
@@ -359,17 +471,7 @@ impl CaptureSession {
             self.capture_seconds += started.elapsed().as_secs_f64();
             if let Err(error) = result {
                 let reason = match &error {
-                    CaptureExecutionError::Admission(CaptureError::Limit {
-                        budget,
-                        cumulative,
-                    }) => CaptureFailureReason::Limit {
-                        budget: *budget,
-                        cumulative: *cumulative,
-                    },
-                    CaptureExecutionError::Admission(CaptureError::Unsupported(_)) => {
-                        CaptureFailureReason::Unsupported
-                    }
-                    CaptureExecutionError::Admission(_) => CaptureFailureReason::Invalid,
+                    CaptureExecutionError::Admission(error) => policy::failure_reason(error),
                     CaptureExecutionError::Backend(_) => CaptureFailureReason::Native,
                 };
                 record.payload = None;
@@ -383,8 +485,17 @@ impl CaptureSession {
         Ok(())
     }
 
-    /// Moves the current bounded record batch to the consumer.
+    /// Moves a legacy bounded record batch to its consumer. An installed
+    /// ordinary prepared-media run must use `take_ordinary_shared_step`; this
+    /// raw compatibility path leaves its pending/ready owner untouched.
     pub fn take_step(&mut self) -> Option<CapturedStep> {
+        if self.ordinary_prefill.is_some() {
+            return None;
+        }
+        self.take_step_inner()
+    }
+
+    fn take_step_inner(&mut self) -> Option<CapturedStep> {
         if self
             .transaction
             .is_some_and(|(_, status)| status == CaptureTransactionStatus::Pending)
@@ -411,6 +522,7 @@ impl CaptureSession {
                     .iter()
                     .any(|record| matches!(record.outcome, CaptureOutcome::Failed { .. }));
         }
+        self.invocation_window = None;
         self.records.take().map(|records| CapturedStep {
             outcome,
             phase: self.phase,
@@ -430,6 +542,54 @@ impl CaptureSession {
             capture_seconds: self.capture_seconds,
         })
     }
+}
+
+pub(crate) fn capture_window_value<B: CaptureBackend>(
+    window: Option<CaptureInvocationWindow>,
+    backend: &mut B,
+    tensor: &B::Tensor,
+    selection: &CaptureSelection,
+    point: &eredu_core::ObservationPoint,
+    record: &mut CaptureRecord,
+    physical: CaptureInvocationShape,
+    ledger: &mut CaptureLedger,
+) -> Result<(), CaptureExecutionError<B::Error>> {
+    let Some(window) = window else {
+        return capture_value(backend, tensor, selection, point, record, physical, ledger);
+    };
+    // The same bounded metadata envelope used by the existing native fragment
+    // path is reserved before constructing its vector/control projection.
+    let usage = partition::fragment_metadata_usage(
+        selection,
+        point,
+        point.axes.as_ref().map_or(32, Vec::len),
+    )?;
+    if let Some(reason) = ledger.reserve(usage)? {
+        record.outcome = CaptureOutcome::Skipped { reason };
+        return Ok(());
+    }
+    record.charged = record.charged.checked_add(usage)?;
+    let shape = backend
+        .shape(tensor)
+        .map_err(CaptureExecutionError::Backend)?;
+    record.source_dtype = backend.source_dtype(tensor);
+    let projection = window.project(physical, point, selection, &shape)?;
+    let Some(fragment) = projection.fragments().first() else {
+        record.source_shape = Some(shape);
+        record.outcome = CaptureOutcome::Skipped {
+            reason: CaptureSkipReason::NotInvoked,
+        };
+        return Ok(());
+    };
+    capture_resolved_value(
+        backend,
+        tensor,
+        selection,
+        record,
+        shape,
+        fragment.local(),
+        ledger,
+    )
 }
 
 /// Shared transformation path for ordinary captures and intervention evidence.
@@ -510,7 +670,7 @@ pub(super) fn capture_resolved_value<B: CaptureBackend>(
     Ok(())
 }
 
-fn completed_capture_outcome(transform: &CaptureTransform, available: u64) -> CaptureOutcome {
+pub(crate) fn completed_capture_outcome(transform: &CaptureTransform, available: u64) -> CaptureOutcome {
     match transform {
         CaptureTransform::Preview { max_elements } if *max_elements < available => {
             CaptureOutcome::Truncated {
@@ -552,11 +712,25 @@ pub fn metadata_reservation(
     selection: &CaptureSelection,
     point: &eredu_core::ObservationPoint,
 ) -> Result<CaptureUsage, CaptureError> {
+    metadata_reservation_fields(
+        &selection.id,
+        &selection.path,
+        &point.node_id,
+        point.axes.as_ref().map(Vec::len),
+    )
+}
+
+pub(crate) fn metadata_reservation_fields(
+    id: &str,
+    path: &str,
+    node_id: &str,
+    rank: Option<usize>,
+) -> Result<CaptureUsage, CaptureError> {
     let strings = add(
-        add(selection.id.len() as u64, selection.path.len() as u64)?,
-        point.node_id.len() as u64,
+        add(id.len() as u64, path.len() as u64)?,
+        node_id.len() as u64,
     )?;
-    let rank = point.axes.as_ref().map_or(32, |axes| axes.len() as u64);
+    let rank = rank.map_or(32, |rank| rank as u64);
     Ok(CaptureUsage {
         captures: 0,
         retained_bytes: 0,
@@ -606,14 +780,9 @@ pub(crate) fn validate_continuation(
         &ResolvedCaptureSlice,
     ) -> Result<CaptureUsage, CaptureError>,
 ) -> Result<(), CaptureError> {
-    let checked = plan.readmit(discovery)?;
-    if checked.identity() != plan.identity() {
-        return Err(CaptureError::Invalid(
-            "capture admission does not match this session's catalog".into(),
-        ));
-    }
+    plan.revalidate(discovery)?;
     preflight_continuation(
-        &checked,
+        plan,
         &[],
         CaptureUsage::default(),
         &[],
@@ -669,38 +838,21 @@ pub(crate) fn preflight_continuation(
             estimate,
         );
     }
-    let remaining = plan
-        .request()
-        .max_predictions
-        .checked_sub(next_prediction)
-        .ok_or_else(|| {
-            CaptureError::Invalid("continuation exceeds admitted prediction range".into())
-        })?;
-    let entries: Vec<_> = plan
-        .plan()
-        .selections
-        .iter()
-        .zip(plan.points())
-        .chain(extra.iter().map(|(selection, point)| (selection, point)))
-        .collect();
-    for &(selection, point) in &entries {
+    let entries = || {
+        plan.plan()
+            .selections
+            .iter()
+            .zip(plan.points())
+            .chain(extra.iter().map(|(selection, point)| (selection, point)))
+    };
+    for (selection, point) in entries() {
         base = base.checked_add(metadata_reservation(selection, point)?)?;
     }
-    if let Some(budget) = base.exceeded(plan.plan().limits.per_step) {
-        return Err(CaptureError::Limit {
-            budget,
-            cumulative: false,
-        });
-    }
-    let mut total = inherited.checked_add(base.checked_mul(remaining)?)?;
+    let mut budget = PreflightBudget::new(plan, base, next_prediction, inherited)?;
     for phase in [CapturePhase::Prefill, CapturePhase::Decode] {
-        if remaining == 0 || (phase == CapturePhase::Prefill && next_prediction > 0) {
+        if !budget.begin_phase(phase) {
             continue;
         }
-        if phase == CapturePhase::Decode && plan.request().max_predictions <= 1 {
-            continue;
-        }
-        let mut step = base;
         for (schedule, costs) in scheduled_costs {
             if let Some((count, _)) = schedule.count_and_last_from(
                 phase,
@@ -708,11 +860,10 @@ pub(crate) fn preflight_continuation(
                 plan.request().max_predictions,
             )? {
                 let cost = costs[if phase == CapturePhase::Prefill { 0 } else { 1 }];
-                step = step.checked_add(cost)?;
-                total = total.checked_add(cost.checked_mul(count)?)?;
+                budget.add(cost, count)?;
             }
         }
-        for &(selection, point) in &entries {
+        for (selection, point) in entries() {
             let Some((count, last)) = selection.schedule.count_and_last_from(
                 phase,
                 next_prediction,
@@ -721,29 +872,15 @@ pub(crate) fn preflight_continuation(
             else {
                 continue;
             };
-            if let Some(shape) = plan.request().resolve(point, phase, last)? {
+            if let Some(shape) = plan.estimate_shape(point, phase, last)? {
                 let slice = resolve_slice(point, selection, &shape)?;
                 let cost = estimate(&shape, selection, &slice)?;
-                if plan.plan().limits.on_limit == CaptureLimitPolicy::Fail {
-                    step = step.checked_add(cost)?;
-                    total = total.checked_add(cost.checked_mul(count)?)?;
-                }
+                budget.add_selection(cost, count)?;
             }
         }
-        if let Some(budget) = step.exceeded(plan.plan().limits.per_step) {
-            return Err(CaptureError::Limit {
-                budget,
-                cumulative: false,
-            });
-        }
+        budget.finish_phase()?;
     }
-    if let Some(budget) = total.exceeded(plan.plan().limits.cumulative) {
-        return Err(CaptureError::Limit {
-            budget,
-            cumulative: true,
-        });
-    }
-    Ok(())
+    budget.finish()
 }
 
 struct CountingWriter {

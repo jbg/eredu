@@ -2,6 +2,18 @@
 
 use super::*;
 
+mod prepared_copy;
+pub(crate) use prepared_copy::PagedPoolingCopy;
+mod resident_copy;
+pub(crate) use prepared_copy::PreparedPoolingAttentionCopy;
+pub(crate) use resident_copy::ResidentPoolingPreparationError;
+pub(crate) use resident_copy::{
+    DenseResidentPoolingPublishError, PreparedDenseResidentPoolingState,
+    PreparedResidentPoolingCopy, ProjectedDenseResidentPoolingCopy,
+    PublishedDenseResidentPoolingState, ResidentPoolingCopyError, SavedResidentPoolingCopy,
+};
+mod workspace;
+
 /// General MLX realization of bounded local keys plus zero, one, or two
 /// append-only pooling streams.
 #[derive(Debug, Clone)]
@@ -29,6 +41,8 @@ pub enum MlxPoolingAttentionCache {
 /// Complete MLX pooling-attention state realized directly from a neutral
 /// architecture layout.
 pub type MlxPoolingAttentionState = DeviceState<MlxNeuralBackend, MlxPoolingAttentionCache>;
+
+use eredu_runtime::working_memory::InferenceStateRetention;
 
 /// Architecture-independent MLX materializer for pooling-attention layouts.
 pub struct MlxPoolingAttentionStateFactory;
@@ -83,6 +97,17 @@ impl MlxPoolingAttentionStateFactory {
             .unwrap_or(Some(0))
     }
 
+    pub(crate) fn original_isolated_snapshot_auxiliary_bytes(
+        state: &MlxPoolingAttentionState,
+    ) -> Option<u64> {
+        state
+            .as_ref()
+            .iter()
+            .find_map(MlxPoolingAttentionCache::residency_manager)
+            .map(CacheResidencyManager::original_isolated_snapshot_bytes)
+            .unwrap_or(Some(0))
+    }
+
     pub(crate) fn continuation_capacity_bound(
         state: &MlxPoolingAttentionState,
         additional: u64,
@@ -133,9 +158,15 @@ impl MlxPoolingAttentionStateFactory {
                     .map_err(|error| Exception::custom(error.to_string()))
             })
             .transpose()?;
-        DeviceState::create(state.layout().clone(), |layer, _| {
+        let layout = state
+            .shared_layout()
+            .cloned()
+            .ok_or_else(|| Exception::custom("pooling snapshot requires an owned state layout"))?;
+        let mut copy = DeviceState::create_with_shared_layout(layout, |layer, _| {
             state.as_ref()[layer].isolated_snapshot_in(manager.as_ref(), stream)
-        })
+        })?;
+        copy.inherit_inference_retention(state);
+        Ok(copy)
     }
 
     pub(crate) fn fork_prediction_target_state(
@@ -150,17 +181,32 @@ impl MlxPoolingAttentionStateFactory {
             .map(|manager| manager.fork_session(stream))
             .transpose()
             .map_err(|error| Exception::custom(error.to_string()))?;
-        DeviceState::create(state.layout().clone(), |layer, _| {
+        let layout = state
+            .shared_layout()
+            .cloned()
+            .ok_or_else(|| Exception::custom("pooling fork requires an owned state layout"))?;
+        let mut fork = DeviceState::create_with_shared_layout(layout, |layer, _| {
             let mut cache = state.as_ref()[layer].deep_clone_state(stream)?;
             if let Some(manager) = manager.as_ref() {
                 cache.rebind_paging_manager(manager.clone());
             }
-            Ok(cache)
-        })
+            Ok::<_, Exception>(cache)
+        })?;
+        fork.inherit_inference_retention(state);
+        Ok(fork)
     }
 }
 
 impl MlxPoolingAttentionCache {
+    pub(crate) fn retained_owner_slot_counts(&self) -> NativeStateSlotCounts {
+        let arrays = match self {
+            Self::Local(_) => 2,
+            Self::Compressed { .. } => 7,
+            Self::Sparse { .. } => 12,
+        };
+        NativeStateSlotCounts::arrays(arrays, usize::from(self.residency_manager().is_some()))
+    }
+
     /// Retains exact array views plus sealed history needed after a rollback.
     pub(crate) fn checkpoint_clone_state(&self) -> Result<Self, Exception> {
         let mut checkpoint = self.clone();
@@ -254,14 +300,28 @@ impl MlxPoolingAttentionCache {
         self.isolated_snapshot_in(manager.as_ref(), stream)
     }
 
+    /// Borrows the closed resident local/pooling copy program. Paged local
+    /// storage still requires its independent manager-copy mechanism.
+    pub(crate) fn prepare_isolated_copy(
+        &self,
+    ) -> Result<PreparedPoolingAttentionCopy<'_>, Exception> {
+        PreparedPoolingAttentionCopy::new(self)
+    }
+
+    pub(crate) fn prepare_isolated_copy_fixed(
+        &self,
+    ) -> Result<PreparedPoolingAttentionCopy<'_>, prepared_copy::PagedPoolingCopy> {
+        PreparedPoolingAttentionCopy::new_fixed(self)
+    }
+
     fn isolated_snapshot_in(
         &self,
         manager: Option<&CacheResidencyManager>,
         stream: &Stream,
     ) -> Result<Self, Exception> {
         let local = match self.local() {
-            LiveKeyValueCache::Resident(cache) => {
-                LiveKeyValueCache::Resident(cache.isolated_snapshot(stream)?)
+            LiveKeyValueCache::Resident(_) => {
+                return self.prepare_isolated_copy()?.copy(stream);
             }
             LiveKeyValueCache::Paged(cache) => {
                 let manager = manager.ok_or_else(|| {
@@ -317,9 +377,7 @@ impl MlxPoolingAttentionCache {
         match (self, stream) {
             (Self::Compressed { pool, .. } | Self::Sparse { pool, .. }, 0) => Ok(pool),
             (Self::Sparse { index_pool, .. }, 1) => Ok(index_pool),
-            _ => Err(ComputeError::backend(format!(
-                "pooling attention cache has no stream {stream}"
-            ))),
+            _ => Err(PoolingCache::missing_stream(stream)),
         }
     }
 
@@ -436,141 +494,14 @@ impl MlxPoolingAttentionCache {
     }
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct PoolingAttentionGeometry {
-    sliding_window: i32,
-    stream_ratios: Vec<i32>,
-}
+use eredu_runtime::state::PoolingAttentionGeometry;
 
 fn pooling_attention_geometry(
     layer: usize,
     policy: &LayerCachePolicy,
 ) -> Result<PoolingAttentionGeometry, Exception> {
-    let (attention, tensors) = match policy {
-        LayerCachePolicy::KeyOnly { attention, .. } => (attention, &[][..]),
-        LayerCachePolicy::KeyOnlyWithFixedState {
-            attention, tensors, ..
-        } => (attention, tensors.as_slice()),
-        _ => {
-            return Err(Exception::custom(format!(
-                "MLX pooling-attention state requires key-only policy at layer {layer}: {policy:?}"
-            )))
-        }
-    };
-    let sliding_window = attention
-        .sliding_window_i32()
-        .map_err(|error| Exception::custom(error.to_string()))?
-        .ok_or_else(|| {
-            Exception::custom(format!(
-                "MLX pooling-attention state requires a sliding window at layer {layer}"
-            ))
-        })?;
-    let mut streams = BTreeMap::<u32, BTreeMap<PoolingStateComponent, _>>::new();
-    for tensor in tensors {
-        let StateTensorRole::Pooling { stream, component } = tensor.role else {
-            return Err(Exception::custom(format!(
-                "MLX pooling-attention state found non-pooling component at layer {layer}: {:?}",
-                tensor.role
-            )));
-        };
-        streams.entry(stream).or_default().insert(component, tensor);
-    }
-    let mut stream_ratios = Vec::with_capacity(streams.len());
-    let mut stream_overlaps = Vec::with_capacity(streams.len());
-    for (expected_stream, (stream, components)) in streams.into_iter().enumerate() {
-        if stream as usize != expected_stream {
-            return Err(Exception::custom(format!(
-                "MLX pooling-attention streams must be contiguous at layer {layer}, expected {expected_stream}, got {stream}"
-            )));
-        }
-        let (ratio, overlapping) = pooling_stream_geometry(layer, stream, &components)?;
-        stream_ratios.push(ratio);
-        stream_overlaps.push(overlapping);
-    }
-    if !matches!(stream_overlaps.as_slice(), [] | [false] | [true, true]) {
-        return Err(Exception::custom(format!(
-            "MLX pooling-attention stream overlap layout is unsupported at layer {layer}"
-        )));
-    }
-    Ok(PoolingAttentionGeometry {
-        sliding_window,
-        stream_ratios,
-    })
-}
-
-fn pooling_stream_geometry(
-    layer: usize,
-    stream: u32,
-    components: &BTreeMap<PoolingStateComponent, &eredu_core::cache::StateTensorPolicy>,
-) -> Result<(i32, bool), Exception> {
-    let get = |component| {
-        components.get(&component).copied().ok_or_else(|| {
-            Exception::custom(format!(
-                "MLX pooling stream {stream} at layer {layer} is missing {component:?}"
-            ))
-        })
-    };
-    let pooled = get(PoolingStateComponent::Pooled)?;
-    let ratio = match (pooled.shape.as_slice(), pooled.presence) {
-        (
-            [StateTensorDimension::Batch, StateTensorDimension::PrefixTokensDiv(shape_ratio), StateTensorDimension::Fixed(_)],
-            StateTensorPresence::PrefixAtLeast(presence_ratio),
-        ) if shape_ratio == &presence_ratio => *shape_ratio,
-        _ => {
-            return Err(Exception::custom(format!(
-                "MLX pooling stream {stream} at layer {layer} has invalid pooled geometry"
-            )))
-        }
-    };
-    for component in [
-        PoolingStateComponent::PendingValues,
-        PoolingStateComponent::PendingGates,
-    ] {
-        let pending = get(component)?;
-        match (pending.shape.as_slice(), pending.presence) {
-            (
-                [StateTensorDimension::Batch, StateTensorDimension::PrefixTokensRem(shape_ratio), StateTensorDimension::Fixed(_)],
-                StateTensorPresence::PrefixRemainderNonZero(presence_ratio),
-            ) if shape_ratio == &ratio && presence_ratio == ratio => {}
-            _ => {
-                return Err(Exception::custom(format!(
-                "MLX pooling stream {stream} at layer {layer} has invalid {component:?} geometry"
-            )))
-            }
-        }
-    }
-    let overlap_values = components.get(&PoolingStateComponent::OverlapValues);
-    let overlap_gates = components.get(&PoolingStateComponent::OverlapGates);
-    if overlap_values.is_some() != overlap_gates.is_some() {
-        return Err(Exception::custom(format!(
-            "MLX pooling stream {stream} at layer {layer} has incomplete overlap geometry"
-        )));
-    }
-    for (component, overlap) in [
-        (PoolingStateComponent::OverlapValues, overlap_values),
-        (PoolingStateComponent::OverlapGates, overlap_gates),
-    ] {
-        let Some(overlap) = overlap else { continue };
-        match (overlap.shape.as_slice(), overlap.presence) {
-            (
-                [StateTensorDimension::Batch, StateTensorDimension::Fixed(shape_ratio), StateTensorDimension::Fixed(_)],
-                StateTensorPresence::PrefixAtLeast(presence_ratio),
-            ) if shape_ratio == &ratio && presence_ratio == ratio => {}
-            _ => {
-                return Err(Exception::custom(format!(
-                "MLX pooling stream {stream} at layer {layer} has invalid {component:?} geometry"
-            )))
-            }
-        }
-    }
-    if components.len() != 3 + usize::from(overlap_values.is_some()) * 2 {
-        return Err(Exception::custom(format!(
-            "MLX pooling stream {stream} at layer {layer} has undeclared components"
-        )));
-    }
-    i32::try_from(ratio.get())
-        .map(|ratio| (ratio, overlap_values.is_some()))
-        .map_err(|_| Exception::custom("pooling ratio exceeds MLX runtime range"))
+    eredu_runtime::state::pooling_attention_geometry(layer, policy)
+        .map_err(|error| Exception::custom(error.to_string()))
 }
 
 #[cfg(test)]
@@ -653,6 +584,32 @@ fn restore_pooling_state(
 impl RuntimeLayerState<MlxNeuralBackend> for MlxPoolingAttentionCache {
     type RetainedValues<'a> = RetainedArrayVecIter<'a>;
 
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) {
+        match self.local() {
+            LiveKeyValueCache::Resident(cache) => {
+                RuntimeLayerState::<MlxNeuralBackend>::visit_retained_values(cache, visitor)
+            }
+            LiveKeyValueCache::Paged(cache) => {
+                RuntimeLayerState::<MlxNeuralBackend>::visit_retained_values(cache, visitor)
+            }
+        }
+        let mut visit_pool = |pool: &PoolingCache| {
+            for array in pool.arrays() {
+                visitor(retained_tensor(array));
+            }
+        };
+        match self {
+            Self::Local(_) => {}
+            Self::Compressed { pool, .. } => visit_pool(pool),
+            Self::Sparse {
+                pool, index_pool, ..
+            } => {
+                visit_pool(pool);
+                visit_pool(index_pool);
+            }
+        }
+    }
+
     fn retained_values(&self) -> Self::RetainedValues<'_> {
         self.retained_arrays().into_iter().map(retained_tensor)
     }
@@ -679,7 +636,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
         let tokens = keys.dim(1);
         let keys = keys
             .try_index_device((.., NewAxis, .., ..), stream)
-            .map_err(ComputeError::backend)?;
+            .map_err(ComputeError::backend_source)?;
         let dtype = keys.dtype();
         // Paged key-only storage accepts a zero-width logical value and
         // materializes its own one-channel persistence sentinel. Resident KV
@@ -690,13 +647,13 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
             .update_and_fetch(
                 keys,
                 zeros_dtype(&[batch, 1, tokens, value_width], dtype, stream)
-                    .map_err(ComputeError::backend)?,
+                    .map_err(ComputeError::backend_source)?,
                 stream,
             )
-            .map_err(ComputeError::backend)?;
+            .map_err(ComputeError::backend_source)?;
         keys.try_index_device((.., 0, .., ..), stream)
             .map(MlxTensor::from_array)
-            .map_err(ComputeError::backend)
+            .map_err(ComputeError::backend_source)
     }
 
     fn local_mask(
@@ -713,24 +670,29 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
         let key_offset = offset + query_tokens - key_tokens;
         let queries = Array::arange::<i32, i32>(Some(offset), offset + query_tokens, None, stream)
             .and_then(|values| values.try_index_device((.., NewAxis), stream))
-            .map_err(ComputeError::backend)?;
+            .map_err(ComputeError::backend_source)?;
         let keys =
             Array::arange::<i32, i32>(Some(key_offset), key_offset + key_tokens, None, stream)
                 .and_then(|values| values.try_index_device((NewAxis, ..), stream))
-                .map_err(ComputeError::backend)?;
-        let causal = queries.ge(&keys, stream).map_err(ComputeError::backend)?;
+                .map_err(ComputeError::backend_source)?;
+        let causal = queries
+            .ge(&keys, stream)
+            .map_err(ComputeError::backend_source)?;
         let recent = keys
             .gt(
                 queries
-                    .subtract(Array::from_int(window), stream)
-                    .map_err(ComputeError::backend)?,
+                    .subtract(
+                        Array::try_from_int(window).map_err(ComputeError::backend_source)?,
+                        stream,
+                    )
+                    .map_err(ComputeError::backend_source)?,
                 stream,
             )
-            .map_err(ComputeError::backend)?;
+            .map_err(ComputeError::backend_source)?;
         causal
             .logical_and(&recent, stream)
             .map(MlxTensor::from_array)
-            .map_err(ComputeError::backend)
+            .map_err(ComputeError::backend_source)
     }
 
     fn accumulate_pooling_windows(
@@ -753,7 +715,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
                 gates: MlxTensor::from_array(windows.gates),
                 base_position: windows.base_position,
             })
-            .map_err(ComputeError::backend)
+            .map_err(ComputeError::backend_source)
     }
 
     fn replace_pooling_overlap(
@@ -780,7 +742,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
         self.pool_mut(stream)?
             .update_and_fetch(values.into_array(), context)
             .map(MlxTensor::from_array)
-            .map_err(ComputeError::backend)
+            .map_err(ComputeError::backend_source)
     }
 
     fn pooling_mask(
@@ -793,11 +755,12 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
         self.pool(stream)?
             .make_mask(query_tokens, offset, context)
             .map(|mask| mask.map(MlxTensor::from_array))
-            .map_err(ComputeError::backend)
+            .map_err(PoolingCache::mask_error)
     }
 
     fn checkpoint(&self) -> Result<Self::Checkpoint, ComputeError> {
-        self.checkpoint_clone_state().map_err(ComputeError::backend)
+        self.checkpoint_clone_state()
+            .map_err(ComputeError::backend_source)
     }
 
     fn restore(
@@ -808,7 +771,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
         match (self, checkpoint) {
             (Self::Local(local), Self::Local(previous)) => local
                 .restore_checkpoint(previous, stream)
-                .map_err(ComputeError::backend),
+                .map_err(ComputeError::backend_source),
             (
                 Self::Compressed { local, pool },
                 Self::Compressed {
@@ -818,7 +781,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
             ) => {
                 local
                     .restore_checkpoint(previous_local, stream)
-                    .map_err(ComputeError::backend)?;
+                    .map_err(ComputeError::backend_source)?;
                 pool.clone_from(previous_pool);
                 Ok(())
             }
@@ -836,7 +799,7 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
             ) => {
                 local
                     .restore_checkpoint(previous_local, stream)
-                    .map_err(ComputeError::backend)?;
+                    .map_err(ComputeError::backend_source)?;
                 pool.clone_from(previous_pool);
                 index_pool.clone_from(previous_index_pool);
                 Ok(())
@@ -848,11 +811,13 @@ impl PoolingAttentionCache<MlxTensor> for MlxPoolingAttentionCache {
     }
 
     fn finalize(&mut self) -> Result<(), ComputeError> {
-        self.local_mut().finalize().map_err(ComputeError::backend)
+        self.local_mut()
+            .finalize()
+            .map_err(ComputeError::backend_source)
     }
 
     fn clear(&mut self) -> Result<(), ComputeError> {
-        self.clear().map_err(ComputeError::backend)
+        self.clear().map_err(ComputeError::backend_source)
     }
 }
 

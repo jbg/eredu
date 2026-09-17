@@ -74,7 +74,24 @@ fn failed_batch_reservation_rolls_back_and_cache_remains_usable() {
 
 #[test]
 fn batched_units_detach_prior_shards_at_mapping_capacity() {
+    use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype};
     let (_dir, store) = cross_shard_store();
+    // Exercise the mapped-source fallback: byte-preserving reads now fill host
+    // destinations directly and do not enter the shard cache. These actual
+    // numeric casts retain the original values and require materialization.
+    let transformed = |name: &str| {
+        let recipe = DerivedWeightRecipe::Cast {
+            input: Box::new(DerivedWeightRecipe::Cast {
+                input: Box::new(DerivedWeightRecipe::source(name, TensorSelection::Full)),
+                dtype: RecipeDtype::F32,
+            }),
+            dtype: RecipeDtype::I32,
+        };
+        unit(
+            name,
+            [WeightBinding::from_recipe("weight", recipe, 8).unwrap()],
+        )
+    };
     let manager = manager(
         Arc::clone(&store),
         OffloadConfig::new(None, None, 1).unwrap(),
@@ -82,7 +99,7 @@ fn batched_units_detach_prior_shards_at_mapping_capacity() {
             spec("left", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk),
             spec("right", 8, ResidencyPolicy::Cacheable, MemoryTier::Disk),
         ],
-        [single("left", "left"), single("right", "right")],
+        [transformed("left"), transformed("right")],
     );
     manager.initialize().unwrap();
 
@@ -98,7 +115,6 @@ fn batched_units_detach_prior_shards_at_mapping_capacity() {
 }
 
 #[test]
-#[ignore = "requires local MLX host-transfer device support"]
 fn cross_unit_alias_reacquisition_reuses_one_pinned_owner_read() {
     let (_dir, store) = fixture_store();
     let owner = unit(
@@ -128,6 +144,13 @@ fn cross_unit_alias_reacquisition_reuses_one_pinned_owner_read() {
     let first = manager.acquire(&id("alias"), MemoryTier::Host).unwrap();
     assert_eq!(host_i32(&first, "shared"), [1, 2]);
     assert_eq!(host_i32(&first, "local"), [3, 4]);
+    let physical_capacity = first.host_value("shared").unwrap().capacity().unwrap() as u64
+        + first.host_value("local").unwrap().capacity().unwrap() as u64;
+    assert_eq!(
+        manager.retained_storage().unwrap().byte_bound().unwrap(),
+        Some(physical_capacity),
+        "the shared owner counts once across its physical and alias units"
+    );
     drop(first);
     let reads = store.source_diagnostics().unwrap().physical_reads;
     assert_eq!(reads, 2, "one owner plus one local tensor must be read");
@@ -144,6 +167,10 @@ fn cross_unit_alias_reacquisition_reuses_one_pinned_owner_read() {
     assert!(manager.evict(&id("alias"), MemoryTier::Host).unwrap());
     let second = manager.acquire(&id("alias"), MemoryTier::Host).unwrap();
     assert_eq!(host_i32(&second, "shared"), [1, 2]);
+    assert_eq!(
+        manager.retained_storage().unwrap().byte_bound().unwrap(),
+        Some(physical_capacity)
+    );
     assert_eq!(
         store.source_diagnostics().unwrap().physical_reads,
         reads + 1,

@@ -1,0 +1,187 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-13",
+  "created_utc": "2026-09-13T21:00:56.161180+00:00",
+  "scope": "Opaque paired saved decoder/sampler/input contract and shared snapshot consumer",
+  "status": "verified_increment_full_goal_incomplete",
+  "tests": {
+    "evaluation": {
+      "passed": 7,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 127,
+      "ignored": 1
+    },
+    "facade": {
+      "passed": 212,
+      "ignored": 2
+    },
+    "snapshot": {
+      "passed": 6,
+      "ignored": 0
+    },
+    "preparation": {
+      "passed": 10,
+      "ignored": 0
+    },
+    "host": {
+      "passed": 4,
+      "ignored": 0
+    },
+    "native_copy": {
+      "passed": 11,
+      "ignored": 0
+    },
+    "bounded": {
+      "passed": 8,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 385,
+  "new_tests": {
+    "neutral_paired_snapshot": 3,
+    "native_paired_components": 3
+  },
+  "checks": {
+    "evaluation": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-evaluation --lib execution_control::",
+      "started_utc": "2026-09-13T20:56:04.875757+00:00",
+      "elapsed_seconds": 25.433,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-paired-components-evaluation.log",
+      "log_sha256": "6e9a726b8228619726baaf6e5cf3bc1082dd1722faf12a27da2af5c66818c45b"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-13T20:56:30.310854+00:00",
+      "elapsed_seconds": 41.67,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-paired-components-portable.log",
+      "log_sha256": "7b6f298109213be98a07d6cb111fb896c44e2e9b6ab63b568a291f105004d0ef"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib",
+      "started_utc": "2026-09-13T20:57:11.981264+00:00",
+      "elapsed_seconds": 11.823,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-paired-components-facade.log",
+      "log_sha256": "93107813436e59bb38c197cc8bc05e38107126cfb05b5fa76ecc0411bf12a7d1"
+    },
+    "snapshot": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::text_snapshot:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:57:23.804761+00:00",
+      "elapsed_seconds": 87.232,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-paired-components-snapshot.log",
+      "log_sha256": "2de29acda093f691917fac135655dd12ecf8cb77e1ecfac48dc5534df29fc802"
+    },
+    "preparation": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib preparation_memory_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:58:51.036678+00:00",
+      "elapsed_seconds": 0.362,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-paired-components-preparation.log",
+      "log_sha256": "82055d99f831bdbd1eff26e5b9e98a086329034f9120e97adf04da36cf68650b"
+    },
+    "host": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib host_preparation_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:58:51.399457+00:00",
+      "elapsed_seconds": 0.302,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-paired-components-host.log",
+      "log_sha256": "407830e92ec4095abeff939104320564e65db3003c77940288346c7928ddbe9f"
+    },
+    "native_copy": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib saved_array_copy -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:58:51.702100+00:00",
+      "elapsed_seconds": 0.555,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-paired-components-native_copy.log",
+      "log_sha256": "17361fc591184351e1b2129318619aced5e27f5e04e91174803b5b3e5f03ea2d"
+    },
+    "bounded": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib host_layerwise -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:58:52.257101+00:00",
+      "elapsed_seconds": 2.944,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-paired-components-bounded.log",
+      "log_sha256": "b68f64f4cd111764a0b7cdb32ab608dcffb479a47b568ef8878970959e55ba8f"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-13T20:58:55.201478+00:00",
+      "elapsed_seconds": 14.199,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-paired-components-minimal.log",
+      "log_sha256": "77576bf5c1a82e24f7c21aafdf4a2b1b4a23d32ffdb3f0d9ab6908f9734bc4c8"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-13T20:59:09.400500+00:00",
+      "elapsed_seconds": 15.11,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-paired-components-features.log",
+      "log_sha256": "a2d06b3e86e96c5e6def529d62b7f869857e5301d91c6832d7b0860c58066b9e"
+    }
+  },
+  "source_sha256": {
+    "doc/backend-architecture.md": "33299fe9b5e817444b7defba06962f32ece6a8596350403ee6ec106135f860ea",
+    "doc/bounded-inference.md": "bd73641ee4a280dc2b1a815ed0bae1be5d400e1c03e9f2bc14b9f142ee033753",
+    "doc/execution-control.md": "262540f180feb2d79a11283121cc11924af77e92a9fa6c67121cfb55dc2e9681",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "2bb0c5ccec0f93c6dc910c86b98a36e36579fca75f43576be3c848acc870d683",
+    "eredu-backend-mlx/src/composition/mlx/session/text_snapshot.rs": "b8a3060a9d1203a62a5763488ce354115c3c9f9a4f6ab692d0d9355dbf7793f9",
+    "eredu-backend-mlx/src/composition/mlx/session/text_snapshot/sampling_copy_tests.rs": "908bcd841b436aa2cde20459e00126703dcec38ffca2bb87a21bcaa3babdd999",
+    "eredu-backend-mlx/src/composition/mlx/session/text_snapshot/saved_components.rs": "71b6c61436037029703c8d403e407935c1d828900be2c42fb76b1024c2dc8c7a",
+    "eredu-evaluation/src/execution_control/tests.rs": "f602198f2e568c2426b6433b647f3102de8cd696e694ed9a83cc7ec60a340947",
+    "eredu-evaluation/src/execution_control/tests/paired_components.rs": "e8dbefbbf5364cf538b49b9705c238a3f6dba215b74fcb63d1ed8157d820a038",
+    "eredu-evaluation/src/execution_control/tests/saved_sampling.rs": "c4f8e67b902e5c9c6b626bce183683b8f4a053d49d02be4a67c13cc846d43500",
+    "eredu-runtime/src/execution_control/snapshot.rs": "79af38879f92761e1b32f933fc298493aa2adcf64661b0c6931fe3e23c1bcbdb",
+    "eredu/tests/backend_conformance/control/snapshots.rs": "eeecba9cacb6243d6ca406c314a1d5af24c8c36e2c8843c2286e46b4d6a9fcaf"
+  },
+  "artifacts": {
+    "/private/tmp/eredu-paired-components-checks.py": {
+      "sha256": "fd8221c2f4c4e81629dbe32e8a555e514c8861f4e95b3fbd21fa352e9f3701f2"
+    },
+    "/private/tmp/eredu-paired-components-format.log": {
+      "sha256": "1fc4826c1c434c7b888f03ecce95e98aa49e46e4f282a655cad746662c5feaf5"
+    },
+    "/private/tmp/eredu-paired-components-review.md": {
+      "sha256": "eadf9230572ef5cd572be9f9d02b02c4de679ee3480b43ce8779a5b1896a967f"
+    },
+    "/private/tmp/eredu-paired-components-review-sha256.json": {
+      "sha256": "9febb0b919af84d7073175d44ccdfe8c9607031fed27dfad38becea8b662875d"
+    },
+    "/private/tmp/eredu-paired-components-frozen-rust-sha256.json": {
+      "sha256": "9febb0b919af84d7073175d44ccdfe8c9607031fed27dfad38becea8b662875d"
+    },
+    "/private/tmp/eredu-paired-components-source-files.txt": {
+      "sha256": "638a6ab3da6fae13a3c7e74325df64df1b07bec470db2120281a2eaf59943779"
+    },
+    "/private/tmp/eredu-paired-native-review.md": {
+      "sha256": "be14ef7a3cae514b8c116a405c06b624a6727831cde0a02997b307192dd7da9e"
+    }
+  },
+  "previous_increment": "doc/validation/bounded-host-slot-2026-09-13.json",
+  "behavior": [
+    "Required TextSnapshotBackend paired hooks own capture, independent saved duplication, immutable sampling access, compatibility, logical estimate/growth and complete resume staging. No default bounded fallback to separate unquoted workers exists.",
+    "TextContinuationSnapshot retains one opaque saved pair; restore and fork call one paired resume hook before installation. Existing host preparation, controller/capture ownership, read-only copy boundary and monotone logical budgets remain shared.",
+    "MLX opaque saved components privately retain native state and immutable saved sampling/input. No public native extraction, exchange or mutable component replacement is available from the saved owner.",
+    "The MLX unquoted pair uses its existing real allocation owners and completed copy workers in the established order. Bounded capture/copy rejects with typed UnknownBound before either worker.",
+    "Neutral tests exercise nonzero saved-state isolation after live progress/retirement, failed final native copy after sampler copying with no partial installation, non-refunded copy allowance, wrong-runtime and unpriced-policy rejection, and restore/fork continuation parity.",
+    "Native tests verify repeated saved component staging, unchanged installed state before exchange, copied pending values/history/RNG, repeatable restored decoder logits and foreign-executable rejection. Their manual sampler fixture is component evidence, not full resumed generation."
+  ],
+  "review_findings": [
+    "The required native-growth paired hook preserves shared checked growth arithmetic without exposing an installable native state reference.",
+    "Root caught test-only direct private payload access before compilation and used a narrow cfg(test) state-presence accessor; production visibility and behavior are unchanged.",
+    "Review distinguished native component round-trip evidence from authentic resumed generation. Bounded rejection accounting counters supplement the explicit first-statement policy gate, not a claim that counters alone detect temporary allocation.",
+    "All selected checks passed on the first applied paired implementation. Three existing external/environment fixtures remain ignored."
+  ],
+  "limits": [
+    "Bounded complete paired native copying remains unimplemented until exact destination host initialization, all source proofs and one aggregate sampler/decoder/native account are available.",
+    "Source table tokens do not authenticate data by themselves; live decoder copying must borrow actual independently retained source ownership under the exact submission lease.",
+    "Funded saved copy custody does not authorize fresh resumed inference, prediction, history growth, or old receipts. Fresh funded resume remains unfinished.",
+    "The whole-host snapshot guard still rejects unpriced facade parser/controller, decoder/capture/delivery and paged/control resources.",
+    "No new released-checkpoint, distributed execution or allocator/process-memory peak validation is claimed; the full family/path bounded inference goal remains incomplete."
+  ]
+}

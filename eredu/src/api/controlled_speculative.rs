@@ -267,7 +267,7 @@ impl<B: SpeculativeGenerationBackend> LoadedModel<B> {
     }
 }
 
-fn continuous_steps(
+pub(super) fn continuous_steps(
     mut on_step: impl FnMut(ControlledSpeculativeStep) -> std::ops::ControlFlow<()>,
 ) -> impl FnOnce(&mut dyn ControlledSpeculativeSession) -> Result<(), SpeculativeControlError> {
     move |session| {

@@ -1,0 +1,161 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-13",
+  "created_utc": "2026-09-13T19:09:43.142120+00:00",
+  "scope": "Frozen grammar recipes and host preparation authority",
+  "status": "verified_increment_full_goal_incomplete",
+  "tests": {
+    "core": {
+      "passed": 4,
+      "ignored": 0
+    },
+    "native": {
+      "passed": 4,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 212,
+      "ignored": 2
+    },
+    "portable": {
+      "passed": 119,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 339,
+  "new_tests": {
+    "core_authority": 4,
+    "native_domain": 4,
+    "packed_recipe": 6,
+    "tokenizer_recipe": 6,
+    "grammar_recipe": 4,
+    "parser_custody": 6,
+    "shared_validator_custody": 3,
+    "public_facade_recipe": 5
+  },
+  "checks": {
+    "core": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core host_preparation -- --test-threads=1",
+      "started_utc": "2026-09-13T19:03:27.979782+00:00",
+      "elapsed_seconds": 9.603,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-frozen-grammar-core.log",
+      "log_sha256": "8c25dbba5fa0adf8e419a878e5f4f50b98288a1d2db37361aefb30878c8ae838"
+    },
+    "native": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --lib model_session::host_preparation_tests -- --test-threads=1",
+      "started_utc": "2026-09-13T19:03:37.584566+00:00",
+      "elapsed_seconds": 88.971,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-frozen-grammar-native.log",
+      "log_sha256": "3605a906c791c84e9aba45b0491759cb2084f1f06e77338ab4852824e2453113"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features",
+      "started_utc": "2026-09-13T19:05:48.148847+00:00",
+      "elapsed_seconds": 0.904,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-frozen-grammar-minimal.log",
+      "log_sha256": "85001dfed3a7ee9b5c9bfaf11b7afcb2f54a4673234faf04b128f92f41ee2048"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib -- --test-threads=1",
+      "started_utc": "2026-09-13T19:07:06.233818+00:00",
+      "elapsed_seconds": 18.294,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-frozen-grammar-facade.log",
+      "log_sha256": "2bcfe3ed7c15c16d69dd489c55cd23ab098c12440c5cdd24c7db1f09f4efd7ad"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-13T19:07:24.528969+00:00",
+      "elapsed_seconds": 18.867,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-frozen-grammar-portable.log",
+      "log_sha256": "15fc761a5351d42ca1d68af63fc46cb333ba0e3941c654727589a2fe622c3ca3"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-13T19:07:43.397110+00:00",
+      "elapsed_seconds": 12.268,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-frozen-grammar-features.log",
+      "log_sha256": "0a770879a36909ab7d41f57c9bdd509cc92272154014ac69c3d331491120bfc7"
+    }
+  },
+  "source_sha256": {
+    "doc/backend-architecture.md": "589aae8dfa932877f29341d0a5e6ff24b3bcc6f4e40d881e39307f9d2553ba96",
+    "doc/bounded-inference.md": "a0ed9a7d1427cb420fee0e3a6fb8f351e23f04895819cab3ff1333610a796ba6",
+    "doc/execution-control.md": "d13f9aee2e57378d4b789376fd11fe10c2083c531147f720f3a97bf2c2fc7148",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "86ff126b44bd8b5f595bae1b90c3ba766070631f94e30e25004cc1290f9bcc42",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/host_preparation_tests.rs": "512645ce90260fb50013012e86793a5b1f83501569612681c7245a53e5e6c5f2",
+    "eredu-core/src/backend.rs": "caf12a91c9ea1de9caf5c5c7ef170cbfb6f0d1607c79bcddcee5958b6f4ecfd5",
+    "eredu-core/src/backend/host_preparation.rs": "4c1b1860564c78065499166d88ae62d31cb17776c92770401bcefa76aa1ddbe5",
+    "eredu-core/src/backend/host_preparation/tests.rs": "a71232475819d1cbabb7e82fc910b3902735d6935179dbe808332604994f3805",
+    "eredu-core/src/backend/text_step/tests.rs": "af9a456eb35838ca44b9bca4d2aef30335daa09317bb2abf52b7822dff474ef7",
+    "eredu-core/src/lib.rs": "4de07058a00b6b5d4ea2d1482be933085b6911a3c4b0af9adee5905df02ae597",
+    "eredu/src/api/loaded.rs": "fab64a03847973a2cf092028f88d466ad4c94dc2832309f5ba18d6af1cf2dbc3",
+    "eredu/src/api/portable.rs": "802d959cb1730e84f434308020e72e863ffb1c401196d07d92f156c6d0a9a21e",
+    "eredu/src/api/request.rs": "a73eefd7c6594e0edea81b589a6915eac5565d10f84cb7a1f588c722b59e8192",
+    "eredu/src/runtime/chat/constraints.rs": "0be80ccb08af3a105f8e07afbfe4d841e5b2b34af15faef6b9a177e470342f58",
+    "eredu/src/runtime/chat/constraints/frozen_tests.rs": "476ba650ce7c174bc62506af2e58f3478aa0b4684fe82e536cffcb834e628832",
+    "eredu/src/runtime/chat/constraints/recipe.rs": "9cd98afc67449d66332b36afca491190d78686066adf72ccce217a0b7023e03b",
+    "eredu/src/runtime/chat/constraints/recipe/tests.rs": "cdb8dab89bba0be26380d209e2d0393de62ced7fb977aa57ec5bf986d8834837",
+    "eredu/src/runtime/chat/mod.rs": "644606029a954229c8b900996559a34560412ce73e108b27b736cc092c50f18e",
+    "eredu/src/runtime/chat/tokenizer_env.rs": "77b82785a5b902846190af15f610f07e7aa2a0233c2d60612402fc8a9d83d8cc",
+    "eredu/src/runtime/chat/tokenizer_env/recipe.rs": "3d270b0119a8e46c04e1659cd89c0cb5dbbeb5db2ecfc615ff1fde0c294f4c4d",
+    "eredu/src/runtime/chat/tokenizer_env/recipe/tests.rs": "e9bee2065e3a6cd24b8467717e0c28498b9d012f68d4753f55fa546bcf67bc35",
+    "eredu/src/runtime/chat/tool_schema.rs": "60786327db014d9d2f515032e8b47214d33ca9d5de7e87c92377468ecbfaaec9",
+    "eredu/src/runtime/chat/tool_schema/authority_tests.rs": "38e34410636033185e1610043841fd5d955b188c57e91d0e5ae047737693c3bf",
+    "eredu/src/runtime/generation/streaming.rs": "92fb24b132d3355c457d7091c7d65de3ea2c4a776869cf20837d5dd7869c22af",
+    "eredu/src/runtime/generation/streaming/authority_tests.rs": "e3ea49cff8b00bf20f80db88dd070c013ac8933b3c582403d0314508b00cae33",
+    "eredu/src/runtime/generation/streaming/snapshot.rs": "d8ac71d02cbed83a3cf54308556af176cfdee18c102a5ca75c9c055dfb088f89",
+    "eredu/tests/portable_facade.rs": "70ce73447ba2b47e035ef4928e966d89671216273040b1d98fa6c0af4cdb60fd",
+    "eredu/tests/portable_facade/controller_storage.rs": "9998779f8eae3a687792a759686702e69b837d89d0fe0adc156a128e3e97b47a",
+    "eredu/tests/portable_facade/frozen_recipe.rs": "a95a682f7b506762f95f5548b87b31d3947ef780f0be0ebf16b21fe221e682b9"
+  },
+  "artifacts": {
+    "/private/tmp/eredu-frozen-grammar-checks.py": {
+      "sha256": "868529b73505d8e7ddc6af9dd628b8bf6f4c85c56cc274a078db5e5af9c7732f"
+    },
+    "/private/tmp/eredu-frozen-grammar-format.log": {
+      "sha256": "c692f97adf6bac9d780c4b73a54a17881585b63b123b4bcd5957e75ea7ff2ab6"
+    },
+    "/private/tmp/eredu-frozen-grammar-review.md": {
+      "sha256": "77a3e83074240979189ee14677a4223997ca7a824b716124e099e30c3d0dcc1a"
+    },
+    "/private/tmp/eredu-frozen-grammar-initial-minimal.log": {
+      "sha256": "9380a53c4f938310fec91efc79883adc7334d085dcf14b4ec2d917c2d66413e7"
+    },
+    "/private/tmp/eredu-frozen-grammar-fixture-failure-facade.log": {
+      "sha256": "258a7983915722e1bee44fb62aa9cd95e6c46757842149cea34090f9cb10fe1c"
+    }
+  },
+  "previous_increment": "doc/validation/bounded-parser-copy-2026-09-13.json",
+  "behavior": [
+    "Core opaque HostPreparationAuthority carries payload-free cloneable exclusion custody; MLX validates runtime identity and acquires its existing unquoted pool lease.",
+    "Runtime prepare_chat acquires before compiler/template work, eagerly validates restored tokenizer and chosen grammar, registers one immutable complete reconstruction recipe, then retires opaque compiler products.",
+    "Recipe stores tokenizer inputs, chosen grammar, original schemas, EOS, structural IDs/spellings, stops, trigger and variable directories in one exact SharedControllerBytes allocation.",
+    "Tokenizer envelope preserves encode_special_tokens omitted by upstream serde. Configuration, canonical ID/spelling and normalized trie bytes/special metadata are roundtrip checked; sparse remapping rejects.",
+    "Explicit Text setup leaves recipe encoded. Common semantic setup acquires before reconstruction/protocol/schema work; actual tokenizer, grammar/controller and shared validator roots retain authority through aliases/forks.",
+    "Typed backend acquisition/registration causes survive public ordinary and controlled error boundaries. Existing cumulative logical control budgets and native completion obligations remain unchanged."
+  ],
+  "initial_failures": [
+    "Preliminary portable compile found the new controller authority missing from an exhaustive logical snapshot destructure; fixed by explicitly excluding shared custody metadata from logical copied payload.",
+    "First full facade run had 211 passing tests and one invalid new decoder fixture: whitespace changed a required literal protocol prefix. Corrected to a valid string argument containing an explicitly asserted space token; final 212 pass."
+  ],
+  "review_corrections": [
+    "PreparedChatControlRuntime structural token map now drops before authority-bearing controller/parser on aggregate rejection.",
+    "Rebinding parser custody retains old and incoming authorities; compatibility schema construction inherits current parser authority."
+  ],
+  "limits": [
+    "Unquoted exclusion is not a finite parser/cache/semantic-state byte bound; managed semantic admission remains incomplete.",
+    "PreparedChat public prompt/metadata vectors, Text pipeline capacity, model tokenizer/decoder caches and independently escaped application values remain separate accounting work.",
+    "Fresh host snapshot/capture/restore/fork destination funding and cross-domain copies are not completed by inherited source custody or the logical SnapshotBudget.",
+    "Synthetic nonserializable tokenizer environments are explicit test-only matcher fixtures; production uses frozen tokenizer recipes.",
+    "Recipe registration currently copies its temporary packed bytes under host authority; BPE cache capacity/state is reconstructed unquoted rather than serialized.",
+    "Zero-byte native/portable reservation fixtures prove exclusion only, not a finite inference workspace quote.",
+    "Three external checkpoint fixtures remain ignored; no new released-checkpoint/reference run, distributed run or process-peak measurement is claimed.",
+    "Full family/path bounded inference goal remains incomplete."
+  ]
+}

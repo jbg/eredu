@@ -7,9 +7,16 @@ use super::*;
 pub(crate) struct MlxPreparedTarget {
     device: Device,
     world: Option<safemlx::distributed::Group>,
+    retained_buffer: Option<safemlx::distributed::RetainedGroupBuffer>,
 }
 
 impl MlxPreparedTarget {
+    /// Cold inventory fact only. A retained native communicator needs its own
+    /// storage coverage even if no outer distributed-session wrapper survives.
+    pub(crate) fn has_retained_world(&self) -> bool {
+        self.world.is_some()
+    }
+
     pub(crate) fn new(
         stream: &Stream,
         distributed: Option<&MlxDistributedSession>,
@@ -17,7 +24,24 @@ impl MlxPreparedTarget {
         Ok(Self {
             device: stream.get_device()?,
             world: distributed.map(|distributed| distributed.native_world().clone()),
+            retained_buffer: distributed.and_then(|distributed|distributed.retained_buffer().cloned()),
         })
+    }
+
+    pub(crate) fn collect_retained_buffer(&self,storage:&mut crate::backend::runtime::residency::storage::RetainedStorage)->Result<(),Error>{
+        if self.world.is_some(){storage.include_group_buffer(self.retained_buffer.as_ref())?;}
+        Ok(())
+    }
+
+    pub(super) fn matches(
+        &self,
+        stream: &Stream,
+        world: Option<&safemlx::distributed::Group>,
+    ) -> bool {
+        stream.matches_device(&self.device)
+            && self.world.as_ref().is_none_or(|expected| {
+                world.is_some_and(|actual| expected.shares_native_handle(actual))
+            })
     }
 
     pub(super) fn validate(
@@ -60,8 +84,10 @@ mod tests {
         let target = MlxPreparedTarget {
             device: Device::new(DeviceType::Gpu, 0),
             world: None,
+            retained_buffer: None,
         };
         crate::tests::support::path_instrumentation::reset();
+        assert!(!target.matches(&stream, None));
         assert!(target
             .validate(&stream, None)
             .unwrap_err()
@@ -97,7 +123,9 @@ mod tests {
         let target = MlxPreparedTarget::new(&stream, Some(&communication)).unwrap();
         crate::tests::support::path_instrumentation::reset();
         target.validate(&stream, Some(&clone)).unwrap();
+        assert!(target.matches(&stream, Some(&clone)));
         for replacement in [None, Some(&other)] {
+            assert!(!target.matches(&stream, replacement));
             assert!(target
                 .validate(&stream, replacement)
                 .unwrap_err()

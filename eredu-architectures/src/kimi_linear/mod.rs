@@ -23,8 +23,9 @@ pub use checkpoint::{
 };
 pub use config::{
     model_args_from_config_reader, model_args_from_config_value, model_args_from_gguf_catalog,
-    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry, AttentionKind,
-    ConfigError, FeedForwardPolicy, KdaConfig, LayerCacheGeometry, LayerPolicy, ModelArgs,
+    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_metadata,
+    state_layout_with_geometry, AttentionKind, ConfigError, FeedForwardPolicy, KdaConfig,
+    LayerCacheGeometry, LayerPolicy, ModelArgs,
 };
 pub use kda::KimiDeltaAttention;
 pub use mla::KimiLatentAttention;
@@ -106,6 +107,14 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
         self.parameter_description_impl(context)
+    }
+
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_nn::Parameterized::visit_retained_values(&self.static_modules, visitor)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -601,7 +610,33 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: RuntimeStateComponents<B> + CompressedAttentionCache<B::Tensor>,
 {
+    fn prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        // KDA carries only causal convolution histories and its token-ordered
+        // recurrence; no-positional MLA uses the retained causal cache offset.
+        // Dense/routed feed-forward and readout equations act independently per row.
+        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 0)?;
+        let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
+            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 0, index)),
+            true,
+        )?;
+        // Same target bank invocation as observed execution; its expert equations are row-local.
+        for index in 0..units {
+            let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, 0, index)?;
+            if let Some(points) = self.args.routed_observation_points(&path, index) {
+                crate::decoder::append_routed_prefill_observations(&mut declarations, &points);
+            }
+        }
+        Ok(declarations)
+    }
+
     type Input<'a> = LayeredInput<'a, B::Tensor>;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::token_shape(input.tokens).map(Some)
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = Block<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
@@ -697,6 +732,16 @@ where
     ) -> Result<B::Tensor, Self::Error> {
         self.group.unit_path(group, index)?;
         self.forward_block(index, unit, hidden, state, forward, context)
+    }
+
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        crate::readout::select_readout_positions(hidden, demand, 1, context)
     }
 
     fn finish_forward(
@@ -1293,23 +1338,57 @@ pub fn state_identity(
     global_layer_start: usize,
     topology: PromptCacheTopology,
 ) -> Result<ModelStateIdentity, Error> {
-    let layer_count = usize::try_from(args.num_hidden_layers).map_err(Error::backend)?;
+    state_identity_with(
+        args,
+        layout,
+        global_layer_start,
+        topology,
+        crate::decoder::identity::Metadata::new(None),
+    )
+}
+
+pub(crate) fn state_identity_with_metadata(
+    args: &ModelArgs,
+    layout: &eredu_runtime::StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+    state_identity_with(
+        args,
+        layout,
+        global_layer_start,
+        topology,
+        crate::decoder::identity::Metadata::new(Some(context)),
+    )
+}
+fn state_identity_with(
+    args: &ModelArgs,
+    layout: &eredu_runtime::StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+    metadata.controls::<eredu_runtime::ModelStateIdentity>()?;
+
+    let layer_count =
+        usize::try_from(args.num_hidden_layers).map_err(|cause| metadata.source(cause))?;
     let global_layer_end = global_layer_start
         .checked_add(layout.len())
-        .ok_or_else(|| Error::backend("Kimi owned layer range overflowed"))?;
+        .ok_or_else(|| metadata.error(format_args!("Kimi owned layer range overflowed")))?;
     if global_layer_end > layer_count {
-        return Err(Error::backend(format!(
+        return Err(metadata.error(format_args!(
             "Kimi owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
         )));
     }
-    eredu_runtime::ModelStateIdentity::new(
-        crate::ModelKind::KimiLinear.canonical_name(),
-        args.model_type.clone(),
-        prompt_cache_architecture_fingerprint(args),
+    eredu_runtime::ModelStateIdentity::new_with_diagnostic(
+        metadata.text(crate::ModelKind::KimiLinear.canonical_name())?,
+        metadata.text(&args.model_type)?,
+        config::prompt_cache_architecture_fingerprint_with_metadata(args, metadata)?,
         layer_count,
         global_layer_start,
         0,
         topology,
+        |message| metadata.prompt_error(message),
     )
-    .map_err(Error::backend)
 }

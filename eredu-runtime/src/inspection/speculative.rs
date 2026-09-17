@@ -37,6 +37,16 @@ pub trait SpeculativeActivationObserver<T, E>: ActivationObserver<T, E> {
             ),
         )
     }
+    /// Mandatory admission validation over loaded discovery. An original observer
+    /// replaces only this producer with its exact retained source validator.
+    fn validate_activation_readmission(&self,
+        plan: &eredu_core::speculative::AdmittedSpeculativeActivations,
+        discovery: Option<&eredu_core::speculative::SpeculativeActivationDiscovery>,
+    ) -> Result<(), eredu_core::speculative::SpeculativeControlError> {
+        plan.validate(discovery.ok_or(eredu_core::speculative::SpeculativeControlError::Unsupported(
+            "loaded execution has no internal activation discovery",
+        ))?).map_err(Into::into)
+    }
     /// Replaces prospective internal edits while keeping capture authority fixed.
     /// The enclosing loaded controller validates exact discovery before this call.
     fn readmit_activation_interventions(
@@ -49,6 +59,29 @@ pub trait SpeculativeActivationObserver<T, E>: ActivationObserver<T, E> {
             ),
         )
     }
+    /// Lends exact span coordinates until this invocation is closed.
+    fn set_prefill_span(&mut self, _span: Option<eredu_core::speculative::SpeculativePrefillSpan>) {
+    }
+
+    /// Declares the actual selected target/seed extents before any split hook.
+    /// This scalar annotation grants no allocation or completion authority.
+    fn set_prefill_reduction_geometry(
+        &mut self,
+        _geometry: eredu_core::speculative::SpeculativePrefillReductionGeometry,
+    ) {
+    }
+
+    /// Validates complete logical coverage while the last span is still under
+    /// the existing fallible completion/agreement boundary. Does not publish.
+    fn complete_prefill_reductions(&mut self) -> Result<(), E> {
+        Ok(())
+    }
+
+    /// Ends logical prefill after final score selection, reservation settlement
+    /// and target-state exchange. Must not allocate, submit native work, or
+    /// communicate; may run on unwind. False never refunds prior observations.
+    fn finish_prefill_reductions(&mut self, _success: bool) {}
+
     /// Receives the shared scheduler's exact request and prefix coordinates.
     /// Clearing this scope performs no native work and does not discard already
     /// staged records. Direct low-level execution may have no scheduler origin.

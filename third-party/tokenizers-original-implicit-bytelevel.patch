@@ -1,0 +1,880 @@
+--- a/src/pre_tokenizers/byte_level.rs
++++ b/src/pre_tokenizers/byte_level.rs
+@@ -17,13 +17,19 @@
+ static REGEX_INITIALIZATIONS: std::sync::atomic::AtomicUsize =
+     std::sync::atomic::AtomicUsize::new(0);
+ 
++#[cfg(test)]
++pub(crate) fn regex_initializations_for_test() -> usize {
++    REGEX_INITIALIZATIONS.load(std::sync::atomic::Ordering::SeqCst)
++}
++
+ /// Regex that matches exactly one token.
+ /// See https://github.com/openai/gpt-2/blob/master/src/encoder.py#L98
++pub(crate) const DEFAULT_PATTERN: &str =
++    r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+ static RE: LazyLock<SysRegex> = LazyLock::new(|| {
+     #[cfg(test)]
+     REGEX_INITIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+-    SysRegex::new(r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+")
+-        .unwrap()
++    SysRegex::new(DEFAULT_PATTERN).unwrap()
+ });
+ 
+ #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+@@ -105,15 +111,20 @@
+ /// As a `PreTokenizer`, `ByteLevel` is in charge of transforming all the unicode characters into
+ /// their byte-level counterpart. It also splits the input according to the configured regex.
+ // TODO: Give the ability to modify this regex
+-impl PreTokenizer for ByteLevel {
+-    fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
++impl ByteLevel {
++    // The same prefix, split and byte/alignment transform for both source owners.
++    // Ordinary callers retain their existing LazyLock branch and allocation behavior.
++    pub(crate) fn pre_tokenize_with(
++        &self,
++        pretokenized: &mut PreTokenizedString,
++        mut split: impl FnMut(crate::NormalizedString) -> Result<Vec<crate::NormalizedString>>,
++    ) -> Result<()> {
+         pretokenized.split(|_, mut normalized| {
+             if self.add_prefix_space && !normalized.get().starts_with(' ') {
+                 normalized.prepend(" ");
+             }
+             if self.use_regex {
+-                let re_ref: &SysRegex = &RE;
+-                normalized.split(re_ref, SplitDelimiterBehavior::Isolated)
++                split(normalized)
+             } else {
+                 Ok(vec![normalized])
+             }
+@@ -124,6 +135,14 @@
+             transformations.extend(self::transformations(s));
+             normalized.transform(transformations, 0);
+             Ok(())
++        })
++    }
++}
++impl PreTokenizer for ByteLevel {
++    fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> Result<()> {
++        self.pre_tokenize_with(pretokenized, |normalized| {
++            let re_ref: &SysRegex = &RE;
++            normalized.split(re_ref, SplitDelimiterBehavior::Isolated)
+         })
+     }
+ }
+--- /dev/null
++++ b/src/pre_tokenizers/compiled_byte_level.rs
+@@ -0,0 +1,63 @@
++//! Closed fresh source for the ordinary implicit ByteLevel regex.
++use super::{
++    byte_level::ByteLevel,
++    compiled_split::{self, CompiledRegexSplit},
++};
++use crate::{PreTokenizedString, PreTokenizer};
++use fancy_regex::workspace::{Plan, PlanError};
++use serde::{Serialize, Serializer};
++use std::mem::size_of;
++
++/// Actual ByteLevel settings and one closed compiled source. Ordinary JSON
++/// restoration remains ordinary ByteLevel; no source constructor is exposed.
++/// ```compile_fail
++/// use tokenizers::pre_tokenizers::compiled_byte_level::CompiledByteLevel;
++/// fn escape(value: CompiledByteLevel) { let _ = value.into_source(); }
++/// ```
++#[derive(Clone, Debug, PartialEq)]
++pub struct CompiledByteLevel {
++    settings: ByteLevel,
++    split: CompiledRegexSplit,
++}
++impl CompiledByteLevel {
++    pub(crate) fn from_parts(settings: ByteLevel, split: CompiledRegexSplit) -> Self {
++        debug_assert!(!settings.add_prefix_space && settings.use_regex);
++        debug_assert_eq!(split.pattern(), super::byte_level::DEFAULT_PATTERN);
++        Self { settings, split }
++    }
++    pub(crate) fn settings(&self) -> ByteLevel {
++        self.settings
++    }
++    pub(crate) fn workspace_plan(&self) -> Result<Plan<'_>, PlanError> {
++        self.split.workspace_plan()
++    }
++    pub(crate) fn wrapper_control_bytes() -> Option<usize> {
++        size_of::<Self>().checked_add(size_of::<
++            Result<Self, fancy_regex::workspace::construction::Failure>,
++        >())
++    }
++}
++impl Serialize for CompiledByteLevel {
++    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
++        self.settings.serialize(serializer)
++    }
++}
++impl PreTokenizer for CompiledByteLevel {
++    fn pre_tokenize(&self, pretokenized: &mut PreTokenizedString) -> crate::Result<()> {
++        let mut workspace = self.workspace_plan()?.prepare().map_err(|e| e.retire())?;
++        self.settings.pre_tokenize_with(pretokenized, |normalized| {
++            let mut pieces = Vec::new();
++            compiled_split::visit_spans::<crate::Error>(
++                &mut workspace,
++                normalized.get(),
++                |offsets| {
++                    pieces.push(normalized.isolated_piece(offsets));
++                    Ok(())
++                },
++            )?;
++            Ok(pieces)
++        })
++    }
++}
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/src/pre_tokenizers/compiled_byte_level/tests.rs
+@@ -0,0 +1,310 @@
++use super::*;
++use crate::{
++    pre_tokenizers::{digits::Digits, sequence::Sequence, PreTokenizerWrapper},
++    EncodeIdsError, EncodeIdsPlan, OffsetReferential, OffsetType, Tokenizer, TokenizerCompilePlan,
++};
++use serde_json::{json, Value};
++fn source() -> Value {
++    let mut alphabet: Vec<_> = ByteLevel::alphabet().into_iter().collect();
++    alphabet.sort_unstable();
++    let mut vocab = serde_json::Map::new();
++    for (id, c) in alphabet.into_iter().enumerate() {
++        vocab.insert(c.to_string(), json!(id));
++    }
++    for (word, id) in [("hi", 256), ("12", 257), ("34", 258)] {
++        vocab.insert(word.into(), json!(id));
++    }
++    let added = |id, word| json!({"id":id,"content":word,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true});
++    json!({"version":"1.0","truncation":null,"padding":null,"normalizer":null,
++        "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Digits","individual_digits":true},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":true}]},
++        "post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
++        "added_tokens":[added(259,"<S>"),added(260,"<N12>")],
++        "model":{"type":"BPE","vocab":vocab,"merges":[["h","i"],["1","2"],["3","4"]]}})
++}
++fn packed(v: &Value) -> Tokenizer {
++    TokenizerCompilePlan::prepare_json(v.to_string().as_bytes())
++        .unwrap()
++        .compile()
++        .unwrap()
++}
++#[test]
++fn complete_implicit_profile_matches_legacy_ids_spellings_offsets_and_numeric_boundaries() {
++    let value = source();
++    let mut actual = packed(&value);
++    let mut ordinary = Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
++    let bytes: String = (0u8..=255).map(char::from).collect();
++    for encode_special in [false, true] {
++        actual.set_encode_special_tokens(encode_special);
++        ordinary.set_encode_special_tokens(encode_special);
++        for text in [
++            "hi 1234 hi",
++            "a12b ٣٤५６",
++            "¼Ⅷ²¹ 1\u{301}2",
++            " A\u{200d}1\u{200d}B ",
++            "hi<N12><S>1234",
++            "WE'LL can't 123\r\n  ",
++            "",
++            &bytes,
++        ] {
++            for special in [false, true] {
++                let a = actual.encode(text, special).unwrap();
++                let b = ordinary.encode(text, special).unwrap();
++                assert_eq!(a.get_ids(), b.get_ids(), "{text:?}");
++                assert_eq!(a.get_tokens(), b.get_tokens());
++                assert_eq!(a.get_offsets(), b.get_offsets());
++                let plan = EncodeIdsPlan::prepare(&actual, text, special).unwrap();
++                let facts = plan.requirements();
++                let ids = plan.encode().unwrap();
++                assert_eq!(ids.ids(), b.get_ids());
++                assert_eq!(ids.mapped_capacity(), 2 * text.len());
++                assert_eq!(
++                    ids.capacities(),
++                    [
++                        facts.symbol_capacity(),
++                        facts.merge_capacity(),
++                        facts.id_capacity()
++                    ]
++                );
++            }
++        }
++    }
++    let numeric = EncodeIdsPlan::prepare(&actual, "1234", false)
++        .unwrap()
++        .encode()
++        .unwrap();
++    assert_eq!(numeric.ids().len(), 4);
++    assert!(!numeric.ids().contains(&257));
++    assert!(!numeric.ids().contains(&258));
++}
++#[test]
++fn closed_byte_source_preserves_two_stage_serde_clone_and_ordinary_offset_worker() {
++    let value = source();
++    let actual = packed(&value);
++    let cloned = actual.clone();
++    drop(actual);
++    let json = serde_json::to_value(&cloned).unwrap();
++    assert_eq!(json["pre_tokenizer"], value["pre_tokenizer"]);
++    let restored = Tokenizer::from_bytes(json.to_string().as_bytes()).unwrap();
++    for text in ["hi 1234", " ³a1 \r\n", ""] {
++        assert_eq!(
++            cloned.encode(text, false).unwrap().get_ids(),
++            restored.encode(text, false).unwrap().get_ids()
++        );
++    }
++    assert!(matches!(
++        EncodeIdsPlan::prepare(&restored, "hi", false),
++        Err(EncodeIdsError::PipelineProfile)
++    ));
++    let compiled = CompiledByteLevel::from_parts(
++        ByteLevel::new(false, true, true),
++        CompiledRegexSplit::compile(
++            fancy_regex::workspace::construction::Plan::new(
++                super::super::byte_level::DEFAULT_PATTERN,
++            )
++            .unwrap(),
++        )
++        .unwrap(),
++    );
++    let compiled = Sequence::new(vec![
++        PreTokenizerWrapper::Digits(Digits::new(true)),
++        PreTokenizerWrapper::CompiledByteLevel(compiled),
++    ]);
++    let ordinary = Sequence::new(vec![
++        Digits::new(true).into(),
++        ByteLevel::new(false, true, true).into(),
++    ]);
++    for text in [" a123 \r\n", "٣\u{301}²x", "", " a1\t2"] {
++        let mut a = PreTokenizedString::from(text);
++        let mut b = PreTokenizedString::from(text);
++        compiled.pre_tokenize(&mut a).unwrap();
++        ordinary.pre_tokenize(&mut b).unwrap();
++        for referential in [OffsetReferential::Original, OffsetReferential::Normalized] {
++            let a: Vec<_> = a
++                .get_splits(referential, OffsetType::Byte)
++                .into_iter()
++                .map(|(s, o, _)| (s, o))
++                .collect();
++            let b: Vec<_> = b
++                .get_splits(referential, OffsetType::Byte)
++                .into_iter()
++                .map(|(s, o, _)| (s, o))
++                .collect();
++            assert_eq!(a, b);
++        }
++    }
++}
++#[test]
++fn implicit_settings_and_default_use_regex_bind_before_model_construction() {
++    let mut value = source();
++    value["pre_tokenizer"]["pretokenizers"][1]
++        .as_object_mut()
++        .unwrap()
++        .remove("use_regex");
++    let tokenizer = packed(&value);
++    assert_eq!(
++        EncodeIdsPlan::prepare(&tokenizer, "1234", false)
++            .unwrap()
++            .encode()
++            .unwrap()
++            .ids()
++            .len(),
++        4
++    );
++    for change in 0..5 {
++        let mut value = source();
++        let pre = &mut value["pre_tokenizer"]["pretokenizers"];
++        match change {
++            0 => pre[0]["individual_digits"] = json!(false),
++            1 => {
++                pre[0].as_object_mut().unwrap().remove("individual_digits");
++            }
++            2 => pre[1]["add_prefix_space"] = json!(true),
++            3 => pre.as_array_mut().unwrap().swap(0, 1),
++            _ => {
++                let extra = pre[0].clone();
++                pre.as_array_mut().unwrap().push(extra);
++            }
++        }
++        value["model"] = json!(false);
++        assert_eq!(
++            TokenizerCompilePlan::prepare_json(value.to_string().as_bytes())
++                .unwrap_err()
++                .kind(),
++            crate::TokenizerCompileErrorKind::RegexProfile
++        );
++    }
++}
++#[cfg(feature = "tokenizer-compiler-test-support")]
++#[test]
++fn implicit_first_literal_and_each_real_workspace_frontier_keep_owned_causes() {
++    use fancy_regex::workspace::{
++        construction::{ConstructionFailure as C, ScratchFailureBuffer as S},
++        Buffer as B, DelegateBuffer as D, PrepareFailure as F,
++    };
++    use std::error::Error as _;
++    for target in [
++        C::Pattern,
++        C::Instructions,
++        C::FirstLiteral,
++        C::LastDelegate,
++        C::Scratch(S::Stack),
++        C::Scratch(S::Dense),
++        C::Scratch(S::Sparse),
++        C::Completed,
++    ] {
++        let json = source().to_string();
++        let error = TokenizerCompilePlan::prepare_json(json.as_bytes())
++            .unwrap()
++            .fail_regex_construction(target)
++            .compile()
++            .unwrap_err();
++        assert!(error.completed_model());
++        drop(json);
++        let mut cause = error.source();
++        let mut reserve = false;
++        while let Some(e) = cause {
++            reserve |= e.is::<std::collections::TryReserveError>();
++            cause = e.source();
++        }
++        if !matches!(target, C::Completed) {
++            assert!(reserve);
++        }
++    }
++    let actual = packed(&source());
++    let text = "hi12 ٣<S>34";
++    let delegates = EncodeIdsPlan::prepare(&actual, text, false)
++        .unwrap()
++        .requirements()
++        .regex_delegate_count();
++    assert!(delegates > 0);
++    let inner = [
++        D::Epsilon,
++        D::CurrentDense,
++        D::CurrentSparse,
++        D::NextDense,
++        D::NextSparse,
++        D::CurrentSlots,
++        D::NextSlots,
++    ];
++    let outer = [B::Delegates, B::Saves, B::Branches, B::Undo, B::Slots];
++    let targets = outer
++        .iter()
++        .copied()
++        .map(F::Outer)
++        .chain((0..delegates).flat_map(|ordinal| {
++            inner
++                .iter()
++                .copied()
++                .map(move |buffer| F::Delegate { ordinal, buffer })
++        }));
++    for target in targets {
++        let error = EncodeIdsPlan::prepare(&actual, text, false)
++            .unwrap()
++            .fail_regex_reservation(target)
++            .unwrap()
++            .encode()
++            .unwrap_err();
++        assert_eq!(error.partial_id_count(), 0);
++        assert_eq!(error.mapped_capacity(), 2 * text.len());
++        let EncodeIdsError::RegexPreparation(retired) = error.cause() else {
++            panic!("actual failure")
++        };
++        assert!(retired.reserve_error().is_some());
++        if let F::Delegate { ordinal, buffer } = target {
++            let (actual, nested) = retired.delegate_error().unwrap();
++            assert_eq!(actual, ordinal);
++            assert_eq!(nested.buffer(), buffer);
++            assert_eq!(retired.retired_delegates(), ordinal);
++        }
++    }
++}
++#[test]
++fn accepted_source_never_initializes_ordinary_regex_in_a_fresh_process() {
++    const CHILD: &str = "EREDU_COMPILED_BYTELEVEL_CHILD";
++    const TEST:&str="pre_tokenizers::compiled_byte_level::tests::accepted_source_never_initializes_ordinary_regex_in_a_fresh_process";
++    if std::env::var_os(CHILD).is_none() {
++        let output = std::process::Command::new(std::env::current_exe().unwrap())
++            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
++            .env(CHILD, "1")
++            .output()
++            .unwrap();
++        assert!(
++            output.status.success(),
++            "{}\n{}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        assert!(String::from_utf8_lossy(&output.stdout).contains("running 1 test"));
++        return;
++    }
++    use super::super::byte_level::regex_initializations_for_test as count;
++    assert_eq!(count(), 0);
++    let value = source();
++    let actual = packed(&value);
++    for _ in 0..3 {
++        actual.encode("hi 123", false).unwrap();
++        EncodeIdsPlan::prepare(&actual, "hi 123", false)
++            .unwrap()
++            .encode()
++            .unwrap();
++    }
++    assert_eq!(count(), 0);
++    let mut input = PreTokenizedString::from("hello 123");
++    ByteLevel::new(false, true, true)
++        .pre_tokenize(&mut input)
++        .unwrap();
++    assert_eq!(count(), 1);
++    let ordinary = Tokenizer::from_bytes(value.to_string().as_bytes()).unwrap();
++    let before = crate::models::bpe::BPE::tls_cache_population();
++    ordinary.encode("hihi 123 hihi", false).unwrap();
++    let positive = crate::models::bpe::BPE::tls_cache_population();
++    assert!(positive.0 > before.0 && positive.1 > before.1);
++    for _ in 0..64 {
++        EncodeIdsPlan::prepare(&actual, "hihi 123 hihi", false)
++            .unwrap()
++            .encode()
++            .unwrap();
++        assert_eq!(crate::models::bpe::BPE::tls_cache_population(), positive);
++        assert_eq!(count(), 1);
++    }
++}
+--- a/src/pre_tokenizers/mod.rs
++++ b/src/pre_tokenizers/mod.rs
+@@ -1,5 +1,7 @@
+ pub mod bert;
+ pub mod byte_level;
++#[cfg(feature = "fancy-regex")]
++pub mod compiled_byte_level;
+ #[cfg(feature = "fancy-regex")]
+ pub mod compiled_split;
+ pub mod delimiter;
+@@ -39,6 +41,8 @@
+     Split(Split),
+     #[cfg(feature = "fancy-regex")]
+     CompiledRegexSplit(compiled_split::CompiledRegexSplit),
++    #[cfg(feature = "fancy-regex")]
++    CompiledByteLevel(compiled_byte_level::CompiledByteLevel),
+     Punctuation(Punctuation),
+     WhitespaceSplit(WhitespaceSplit),
+     Digits(Digits),
+@@ -59,6 +63,8 @@
+             Self::Split(tok) => tok.pre_tokenize(normalized),
+             #[cfg(feature = "fancy-regex")]
+             Self::CompiledRegexSplit(tok) => tok.pre_tokenize(normalized),
++            #[cfg(feature = "fancy-regex")]
++            Self::CompiledByteLevel(tok) => tok.pre_tokenize(normalized),
+             Self::WhitespaceSplit(wspt) => wspt.pre_tokenize(normalized),
+             Self::Digits(wspt) => wspt.pre_tokenize(normalized),
+             Self::UnicodeScripts(us) => us.pre_tokenize(normalized),
+--- a/src/tokenizer/compile.rs
++++ b/src/tokenizer/compile.rs
+@@ -193,7 +193,7 @@
+             boolean(input, f[3], true)?,
+         );
+         if matches!(role, Role::Pre) && value.use_regex {
+-            return Err(err(K::RegexProfile, span.start));
++            return regex::implicit_byte_level(span, value).map(Inline::Regex);
+         }
+         Ok(Inline::Byte(value))
+     } else if matches!(role, Role::Pre) && text_is(input, typ, "Digits")? {
+@@ -246,10 +246,19 @@
+             let array = required(f[1], span.start)?;
+             let mut a = Reader::new(input, array).array()?;
+             let mut following_byte = false;
++            let mut first_digits = false;
+             while let Some(item) = a.next()? {
+                 match inline(input, item, role)? {
++                    Inline::Digits(value) if result.count == 0 => {
++                        first_digits = value;
++                    }
+                     Inline::Regex(selected) => {
+-                        if result.count != 0 || result.regex.replace(selected).is_some() {
++                        let ordered = if selected.is_implicit() {
++                            result.count == 1 && first_digits
++                        } else {
++                            result.count == 0
++                        };
++                        if !ordered || result.regex.replace(selected).is_some() {
+                             return Err(err(K::RegexProfile, item.start));
+                         }
+                     }
+@@ -260,8 +269,16 @@
+                 }
+                 result.count = add(result.count, 1)?;
+             }
+-            if result.regex.is_some() && (result.count != 2 || !following_byte) {
+-                return Err(err(K::RegexProfile, array.start));
++            if let Some(selected) = result.regex {
++                if result.count != 2
++                    || if selected.is_implicit() {
++                        !first_digits
++                    } else {
++                        !following_byte
++                    }
++                {
++                    return Err(err(K::RegexProfile, array.start));
++                }
+             }
+             if matches!(role, Role::Decode) && result.count != 1 {
+                 return Err(err(K::ComponentProfile, array.start));
+--- a/src/tokenizer/compile/regex.rs
++++ b/src/tokenizer/compile/regex.rs
+@@ -1,14 +1,22 @@
+ //! One exact decoded-pattern selection in the borrowed root, never a family ID.
+ use super::*;
+ #[cfg(feature = "fancy-regex")]
+-use crate::pre_tokenizers::compiled_split::CompiledRegexSplit;
++use crate::pre_tokenizers::{
++    compiled_byte_level::CompiledByteLevel, compiled_split::CompiledRegexSplit,
++};
+ #[cfg(feature = "fancy-regex")]
+ use fancy_regex::workspace::construction;
+ 
++#[derive(Debug, Clone, Copy, PartialEq)]
++enum Origin {
++    ExplicitSplit,
++    ImplicitByteLevel(ByteLevel),
++}
+ #[derive(Debug, Clone, Copy)]
+ pub(super) struct RegexSelection {
+     pattern: &'static str,
+     span: Span,
++    origin: Origin,
+ }
+ pub(super) fn selection(input: &str, span: Span, role: Role) -> Result<RegexSelection, Error> {
+     #[cfg(not(feature = "fancy-regex"))]
+@@ -39,6 +47,33 @@
+         Ok(RegexSelection {
+             pattern: source,
+             span,
++            origin: Origin::ExplicitSplit,
++        })
++    }
++}
++impl RegexSelection {
++    pub(super) fn is_implicit(&self) -> bool {
++        matches!(self.origin, Origin::ImplicitByteLevel(_))
++    }
++}
++pub(super) fn implicit_byte_level(
++    span: Span,
++    settings: ByteLevel,
++) -> Result<RegexSelection, Error> {
++    #[cfg(not(feature = "fancy-regex"))]
++    {
++        let _ = settings;
++        Err(err(K::RegexProfile, span.start))
++    }
++    #[cfg(feature = "fancy-regex")]
++    {
++        if settings.add_prefix_space || !settings.use_regex {
++            return Err(err(K::RegexProfile, span.start));
++        }
++        Ok(RegexSelection {
++            pattern: crate::pre_tokenizers::byte_level::DEFAULT_PATTERN,
++            span,
++            origin: Origin::ImplicitByteLevel(settings),
+         })
+     }
+ }
+@@ -91,6 +126,12 @@
+                 size_of::<Self>(),
+                 size_of::<Result<Self, Error>>(),
+                 size_of::<RegexSelection>(),
++                size_of::<Origin>(),
++                if self.selected.is_some_and(|selected| selected.is_implicit()) {
++                    CompiledByteLevel::wrapper_control_bytes().ok_or_else(|| err(K::Overflow, 0))?
++                } else {
++                    0
++                },
+                 size_of::<Option<RegexSelection>>(),
+                 size_of::<Result<RegexSelection, Error>>(),
+                 size_of::<Result<PreTokenizerWrapper, Cause>>(),
+@@ -116,7 +157,8 @@
+         let actual = self
+             .selected
+             .ok_or_else(|| err(K::RegexProfile, selected.span.start))?;
+-        if actual.pattern != selected.pattern
++        if actual.origin != selected.origin
++            || actual.pattern != selected.pattern
+             || actual.span.start != selected.span.start
+             || actual.span.end != selected.span.end
+         {
+@@ -140,9 +182,13 @@
+                     .map(|_| unreachable!("fixed failure target succeeded"))
+                     .map_err(Cause::Regex);
+             }
+-            CompiledRegexSplit::compile(plan)
+-                .map(PreTokenizerWrapper::CompiledRegexSplit)
+-                .map_err(Cause::Regex)
++            let split = CompiledRegexSplit::compile(plan).map_err(Cause::Regex)?;
++            Ok(match selected.origin {
++                Origin::ExplicitSplit => PreTokenizerWrapper::CompiledRegexSplit(split),
++                Origin::ImplicitByteLevel(settings) => PreTokenizerWrapper::CompiledByteLevel(
++                    CompiledByteLevel::from_parts(settings, split),
++                ),
++            })
+         }
+     }
+ }
+--- a/src/tokenizer/encode_ids/regex.rs
++++ b/src/tokenizer/encode_ids/regex.rs
+@@ -6,6 +6,7 @@
+ use core::marker::PhantomData;
+ 
+ pub(super) struct RegexPlan<'a> {
++    numeric: bool,
+     #[cfg(feature = "fancy-regex")]
+     plan: Option<fancy_regex::workspace::Plan<'a>>,
+     _source: PhantomData<&'a Tokenizer>,
+@@ -17,6 +18,7 @@
+         }
+         if source.pre_tokenizer.is_none() && source.post_processor.is_none() {
+             return Ok(Self {
++                numeric: false,
+                 #[cfg(feature = "fancy-regex")]
+                 plan: None,
+                 _source: PhantomData,
+@@ -27,14 +29,21 @@
+             let Some(PreTokenizerWrapper::Sequence(sequence)) = &source.pre_tokenizer else {
+                 return Err(EncodeIdsError::PipelineProfile);
+             };
+-            let [PreTokenizerWrapper::CompiledRegexSplit(split), PreTokenizerWrapper::ByteLevel(byte)] =
+-                sequence.as_ref()
+-            else {
+-                return Err(EncodeIdsError::PipelineProfile);
++            let (numeric, plan) = match sequence.as_ref() {
++                [PreTokenizerWrapper::CompiledRegexSplit(split), PreTokenizerWrapper::ByteLevel(byte)]
++                    if !byte.add_prefix_space && !byte.use_regex =>
++                {
++                    (false, split.workspace_plan())
++                }
++                [PreTokenizerWrapper::Digits(digits), PreTokenizerWrapper::CompiledByteLevel(byte)]
++                    if digits.individual_digits
++                        && !byte.settings().add_prefix_space
++                        && byte.settings().use_regex =>
++                {
++                    (true, byte.workspace_plan())
++                }
++                _ => return Err(EncodeIdsError::PipelineProfile),
+             };
+-            if byte.add_prefix_space || byte.use_regex {
+-                return Err(EncodeIdsError::PipelineProfile);
+-            }
+             match &source.post_processor {
+                 None => {}
+                 Some(crate::processors::PostProcessorWrapper::ByteLevel(post))
+@@ -42,7 +51,8 @@
+                 _ => return Err(EncodeIdsError::PipelineProfile),
+             }
+             Ok(Self {
+-                plan: Some(split.workspace_plan().map_err(EncodeIdsError::RegexPlan)?),
++                numeric,
++                plan: Some(plan.map_err(EncodeIdsError::RegexPlan)?),
+                 _source: PhantomData,
+             })
+         }
+@@ -83,6 +93,13 @@
+                     n.checked_add(core::mem::size_of_val(
+                         &crate::pre_tokenizers::byte_level::transformations("").map(|(c, _)| c),
+                     ))
++                })
++                .and_then(|n| {
++                    n.checked_add(if self.numeric {
++                        numeric_control_bytes()?
++                    } else {
++                        0
++                    })
+                 })
+                 .and_then(|n| n.checked_add(size_of::<Result<(), EncodeIdsError>>()))
+                 .ok_or(EncodeIdsError::Overflow);
+@@ -111,6 +128,7 @@
+             None => None,
+         };
+         Ok(Runtime {
++            numeric: self.numeric,
+             #[cfg(feature = "fancy-regex")]
+             workspace,
+             _source: PhantomData,
+@@ -118,12 +136,33 @@
+     }
+ }
+ pub(super) struct Runtime<'a> {
++    numeric: bool,
+     #[cfg(feature = "fancy-regex")]
+     workspace: Option<fancy_regex::workspace::Workspace<'a>>,
+     _source: PhantomData<&'a Tokenizer>,
+ }
+ impl Runtime<'_> {
+     pub(super) fn encode_span(
++        &mut self,
++        output: &mut EncodeIdsOutput,
++        model: &BPE,
++        text: &str,
++    ) -> Result<(), EncodeIdsError> {
++        if self.numeric {
++            // The exact ordinary Digits predicate, never the regex engine's Unicode table.
++            let numeric: fn(char) -> bool = char::is_numeric;
++            for piece in crate::tokenizer::pattern::char_coverage(text, &numeric) {
++                let ((start, end), _) = match piece {
++                    Ok(piece) => piece,
++                    Err(never) => match never {},
++                };
++                self.encode_piece(output, model, &text[start..end])?;
++            }
++            return Ok(());
++        }
++        self.encode_piece(output, model, text)
++    }
++    fn encode_piece(
+         &mut self,
+         output: &mut EncodeIdsOutput,
+         model: &BPE,
+@@ -167,3 +206,16 @@
+             .map_err(|_| EncodeIdsError::MissingUnknown)
+     }
+ }
++
++#[cfg(feature = "fancy-regex")]
++fn numeric_control_bytes() -> Option<usize> {
++    use crate::tokenizer::pattern::{CharMatches, Coverage};
++    [
++        size_of::<fn(char) -> bool>(),
++        size_of::<Coverage<CharMatches<'static, 'static, fn(char) -> bool>>>(),
++        size_of::<Option<Result<(crate::Offsets, bool), std::convert::Infallible>>>(),
++        size_of::<Result<(), EncodeIdsError>>(),
++    ]
++    .iter()
++    .try_fold(0usize, |sum, &n| sum.checked_add(n))
++}
+--- a/src/tokenizer/pattern.rs
++++ b/src/tokenizer/pattern.rs
+@@ -138,43 +138,46 @@
+     }
+ }
+ 
++// Shared scalar-predicate enumeration; offsets always refer to original UTF-8 bytes.
++// Ordinary Pattern collects the same coverage which original E visits directly.
++pub(crate) struct CharMatches<'a, 'p, F> {
++    chars: std::str::CharIndices<'a>,
++    predicate: &'p F,
++}
++impl<F: Fn(char) -> bool> Iterator for CharMatches<'_, '_, F> {
++    type Item = std::result::Result<Offsets, std::convert::Infallible>;
++    fn next(&mut self) -> Option<Self::Item> {
++        for (start, c) in self.chars.by_ref() {
++            if (self.predicate)(c) {
++                return Some(Ok((start, start + c.len_utf8())));
++            }
++        }
++        None
++    }
++}
++pub(crate) fn char_coverage<'a, 'p, F: Fn(char) -> bool>(
++    inside: &'a str,
++    predicate: &'p F,
++) -> Coverage<CharMatches<'a, 'p, F>> {
++    coverage(
++        inside.len(),
++        CharMatches {
++            chars: inside.char_indices(),
++            predicate,
++        },
++    )
++}
+ impl<F> Pattern for F
+ where
+     F: Fn(char) -> bool,
+ {
+     fn find_matches(&self, inside: &str) -> Result<Vec<(Offsets, bool)>> {
+-        if inside.is_empty() {
+-            return Ok(vec![((0, 0), false)]);
+-        }
+-
+-        let mut last_offset = 0;
+-        let mut last_seen = 0;
+-
+-        let mut matches = inside
+-            .char_indices()
+-            .flat_map(|(b, c)| {
+-                last_seen = b + c.len_utf8();
+-                if self(c) {
+-                    let mut events = Vec::with_capacity(2);
+-                    if last_offset < b {
+-                        // We need to emit what was before this match
+-                        events.push(((last_offset, b), false));
+-                    }
+-                    events.push(((b, b + c.len_utf8()), true));
+-                    last_offset = b + c.len_utf8();
+-                    events
+-                } else {
+-                    vec![]
+-                }
++        Ok(char_coverage(inside, self)
++            .map(|item| match item {
++                Ok(item) => item,
++                Err(never) => match never {},
+             })
+-            .collect::<Vec<_>>();
+-
+-        // Do not forget the last potential split
+-        if last_seen > last_offset {
+-            matches.push(((last_offset, last_seen), false));
+-        }
+-
+-        Ok(matches)
++            .collect())
+     }
+ }
+ 
+@@ -295,3 +298,47 @@
+         do_test!("aaa", &is_whitespace => vec![((0, 3), false)]);
+     }
+ }
++
++#[cfg(test)]
++mod numeric_tests {
++    use super::*;
++    #[test]
++    fn shared_numeric_coverage_matches_scalar_boundaries_for_all_unicode_in_batches() {
++        for start in (0..=0x10ffffu32).step_by(4096) {
++            let text: String = (start..=(start + 4095).min(0x10ffff))
++                .filter_map(char::from_u32)
++                .collect();
++            let mut expected = Vec::new();
++            let mut end = 0;
++            for (at, c) in text.char_indices() {
++                if c.is_numeric() {
++                    if end < at {
++                        expected.push(((end, at), false));
++                    }
++                    end = at + c.len_utf8();
++                    expected.push(((at, end), true));
++                }
++            }
++            if end < text.len() {
++                expected.push(((end, text.len()), false));
++            }
++            if text.is_empty() {
++                expected.push(((0, 0), false));
++            }
++            assert_eq!(char::is_numeric.find_matches(&text).unwrap(), expected);
++        }
++    }
++    #[test]
++    fn predicate_invocations_keep_empty_and_scalar_order_without_extra_probes() {
++        let seen = std::cell::RefCell::new(Vec::new());
++        let predicate = |c| {
++            seen.borrow_mut().push(c);
++            char::is_numeric(c)
++        };
++        assert_eq!(predicate.find_matches("").unwrap(), vec![((0, 0), false)]);
++        assert!(seen.borrow().is_empty());
++        let text = "a²12¼Ⅷ٣\u{301}z";
++        let _ = predicate.find_matches(text).unwrap();
++        assert_eq!(*seen.borrow(), text.chars().collect::<Vec<_>>());
++    }
++}

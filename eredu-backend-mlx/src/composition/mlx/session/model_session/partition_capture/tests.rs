@@ -135,9 +135,10 @@ fn verify_capture_failures(device: safemlx::DeviceType) {
                         &backend,
                         decode,
                         3,
-                        &mut RejectedCapture(CaptureError::Unsupported(
-                            "cold collector fixture".into(),
-                        )),
+                        &mut RejectedCapture(
+                            CaptureError::Unsupported("cold collector fixture".into()),
+                            None,
+                        ),
                     ) {
                         Err(error) => error,
                         Ok(_) => panic!("cold rejection entered forward"),

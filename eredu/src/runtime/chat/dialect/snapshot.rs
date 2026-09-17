@@ -32,19 +32,15 @@ snapshot_fields!(TaggedToolSchema {
     parameters,
     required
 });
-snapshot_fields!(IncrementalJsonCall {
-    phase,
-    fragment,
-    fields,
-    name,
-    id,
-    arguments,
-    arguments_seen,
-    arguments_emitted,
-    started,
-    complete,
+snapshot_fields!(IncrementalJsonCall { cursor, data });
+snapshot_fields!(JsonCallData {
+    fragment, fields, name, id, arguments, arguments_seen, arguments_emitted, started
 });
-snapshot_fields!(JsonValueAccumulator { raw, kind });
+impl SnapshotStorage for eredu_text::json_fragments::ObjectCursor<String> {
+    fn heap_bytes(&self) -> Option<u64> {
+        self.key().map_or(Some(0), |key| key.heap_bytes())
+    }
+}
 snapshot_fields!(StructuralObjectNormalizer {
     string_delimiter,
     phase,
@@ -92,33 +88,11 @@ impl SnapshotStorage for DeclarativeParserState {
             | Self::TaggedFunctionPrefix
             | Self::TaggedFunctionName
             | Self::StructuralName { prefix_consumed: _ }
+            | Self::AfterJsonFunctionSuffix
             | Self::AfterPayload
             | Self::AfterEnvelope
             | Self::ListItemOrEnd { allow_end: _ }
             | Self::ToolSuffix => Some(0),
-        }
-    }
-}
-impl SnapshotStorage for JsonCallPhase {
-    fn heap_bytes(&self) -> Option<u64> {
-        match self {
-            Self::Start | Self::KeyOrEnd { allow_end: _ } | Self::AfterValue => Some(0),
-            Self::Key { raw, escaped: _ } => raw.heap_bytes(),
-            Self::Colon { key } | Self::ValueStart { key } => key.heap_bytes(),
-            Self::Value { key, value } => key.heap_bytes()?.checked_add(value.heap_bytes()?),
-        }
-    }
-}
-impl SnapshotStorage for JsonValueKind {
-    fn heap_bytes(&self) -> Option<u64> {
-        match self {
-            Self::Container {
-                depth: _,
-                in_string: _,
-                escaped: _,
-            }
-            | Self::String { escaped: _ }
-            | Self::Scalar => Some(0),
         }
     }
 }

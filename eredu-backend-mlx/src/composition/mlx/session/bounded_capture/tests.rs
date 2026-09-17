@@ -7,8 +7,8 @@ fn verify_native_partition_capture_fragments(
 ) {
     use eredu_core::{component::ComponentCoordinateMap, *};
     use eredu_runtime::capture::partition::{
-        capture_fragment, PartitionCaptureExchange, PartitionCaptureProducer,
-        PartitionCaptureReceiptLimits, PartitionCaptureReceiptPlan, PartitionCaptureRequest,
+        PartitionCaptureExchange, PartitionCaptureProducer, PartitionCaptureReceiptLimits,
+        PartitionCaptureReceiptPlan, PartitionCaptureRequest, capture_fragment,
     };
     let stream = Stream::new_with_device(&safemlx::Device::new(device, 0));
     let transport = native_exchange.then(|| {
@@ -754,19 +754,22 @@ fn bounded_native_estimate_scales_host_transfer_with_preview_or_reduction() {
     .unwrap();
     assert_eq!(preview.host_bytes, 128);
     assert!(reduced.host_bytes < full.host_bytes / 50);
-    assert!(estimate_shape(
-        &[u64::MAX, 2],
-        &selection(CaptureTransform::Summary),
-        &request
-    )
-    .is_err());
+    assert!(
+        estimate_shape(
+            &[u64::MAX, 2],
+            &selection(CaptureTransform::Summary),
+            &request
+        )
+        .is_err()
+    );
 }
 
 #[test]
 fn bounded_native_candidate_estimate_charges_the_row_not_the_prefill_source() {
     let vocabulary = 262_144;
     let request = selection(CaptureTransform::TopCandidates { count: 16 });
-    let decode = estimate_shape(&[1, 1, vocabulary], &request, &whole(&[1, 1, vocabulary])).unwrap();
+    let decode =
+        estimate_shape(&[1, 1, vocabulary], &request, &whole(&[1, 1, vocabulary])).unwrap();
     let prefill = estimate_shape(
         &[1, 4096, vocabulary],
         &request,
@@ -949,7 +952,7 @@ fn original_and_effective_candidate_records_share_the_exact_domain() {
             partition: None,
             stream: &stream,
             domain: Some(CaptureTokenDomain {
-                filter: &filter,
+                filter: (&filter).into(),
                 tokenizer_validity: &validity,
             }),
         };
@@ -978,5 +981,71 @@ fn original_and_effective_candidate_records_share_the_exact_domain() {
         assert!(!result.candidates[0].allowed);
         assert!(result.candidates[1].allowed);
         assert_eq!(result.candidates[0].score, 8.0);
+    }
+}
+
+#[test]
+fn terminal_candidates_ignore_earlier_nonfinite_rows_preserve_ties_and_half_conversion() {
+    let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+    for dtype in [Dtype::Float32, Dtype::Float16, Dtype::Bfloat16] {
+        let input = Array::from_slice(
+            &[f32::INFINITY, f32::NAN, 1000.0, 900.0, -0.0, 0.0, 2.0, 2.0],
+            &[1, 2, 4],
+        )
+        .as_dtype(dtype, &stream)
+        .unwrap();
+        let tensor = MlxTensor::from_array(input);
+        let mut native = NativeCapture {
+            partition: None,
+            stream: &stream,
+            domain: None,
+        };
+        for k in [1, 4] {
+            let request = selection(CaptureTransform::TopCandidates { count: k });
+            let CapturePayload::Candidates(result) = native
+                .transform(&tensor, &request, &whole(&[1, 2, 4]))
+                .unwrap()
+            else {
+                panic!("candidates")
+            };
+            let row = Array::from_slice(&[-0.0f32, 0.0, 2.0, 2.0], &[4]);
+            let sorted = safemlx::ops::argsort(&row, &stream).unwrap();
+            let sorted = sorted.evaluated().unwrap();
+            let expected: Vec<_> = sorted
+                .as_slice::<u32>()
+                .iter()
+                .rev()
+                .take(k as usize)
+                .copied()
+                .collect();
+            assert_eq!(
+                result
+                    .candidates
+                    .iter()
+                    .map(|c| c.token_id)
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert!(
+                result
+                    .candidates
+                    .iter()
+                    .all(|c| c.score.is_finite() && c.allowed)
+            );
+        }
+        let invalid = MlxTensor::from_array(
+            Array::from_slice(&[0.0f32, 1.0, f32::NAN, 3.0], &[1, 1, 4])
+                .as_dtype(dtype, &stream)
+                .unwrap(),
+        );
+        assert!(
+            native
+                .transform(
+                    &invalid,
+                    &selection(CaptureTransform::TopCandidates { count: 2 }),
+                    &whole(&[1, 1, 4])
+                )
+                .is_err()
+        );
     }
 }

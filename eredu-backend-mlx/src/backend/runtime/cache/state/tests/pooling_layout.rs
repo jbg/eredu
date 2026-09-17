@@ -7,7 +7,11 @@ use eredu_core::{
 
 use super::*;
 
-fn pooling_stream(stream: u32, ratio: u32, overlapping: bool) -> Vec<StateTensorPolicy> {
+pub(in crate::backend::runtime::cache::state) fn pooling_stream(
+    stream: u32,
+    ratio: u32,
+    overlapping: bool,
+) -> Vec<StateTensorPolicy> {
     let ratio = NonZeroU32::new(ratio).unwrap();
     let role = |component| StateTensorRole::Pooling { stream, component };
     let pending = |component| {

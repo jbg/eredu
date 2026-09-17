@@ -595,7 +595,7 @@ fn lfm2_fixture() -> Fixture {
     lfm2_fixture_with_banks(false)
 }
 
-fn lfm2_fixture_with_banks(banked: bool) -> Fixture {
+pub(super) fn lfm2_fixture_with_banks(banked: bool) -> Fixture {
     let root = fixture(false);
     let mut config = serde_json::json!({
         "model_type":"lfm2", "vocab_size":64, "hidden_size":16,
@@ -919,7 +919,7 @@ fn edit_component_reference(root: &Path, edits: &[eredu_core::parameters::Parame
 fn qwen_next_fixture() -> Fixture {
     qwen_hybrid_fixture("qwen3_next")
 }
-fn qwen_35_fixture() -> Fixture {
+pub(super) fn qwen_35_fixture() -> Fixture {
     qwen_hybrid_fixture("qwen3_5_text")
 }
 fn qwen_hybrid_fixture(family: &str) -> Fixture {
@@ -1200,7 +1200,7 @@ fn native_muse_component_analysis_metal() {
     muse_component_analysis(LocalDevice::Accelerator(0));
 }
 
-fn qwen_vl_component_fixture(tied: bool) -> Fixture {
+pub(super) fn qwen_vl_component_fixture(tied: bool) -> Fixture {
     let root = fixture(false);
     let config = serde_json::json!({
         "architectures":["Qwen3VLForConditionalGeneration"], "model_type":"qwen3_vl",
@@ -1309,7 +1309,7 @@ fn native_qwen_vl_component_analysis_metal() {
     qwen_vl_component_analysis(LocalDevice::Accelerator(0));
 }
 
-fn gemma4_component_fixture(tied: bool) -> Fixture {
+pub(super) fn gemma4_component_fixture(tied: bool) -> Fixture {
     let root = fixture(false);
     let config = serde_json::json!({
         "model_type":"gemma4_unified", "tie_word_embeddings":tied, "eos_token_id":63,

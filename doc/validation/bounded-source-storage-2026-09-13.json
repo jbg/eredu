@@ -1,0 +1,96 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted source-owned host payload accounting across retained prepared roles and native quantization overlays",
+  "source_sha256": {
+    "doc/backend-architecture.md": "3efd2505eda40c1b5716465a881b71328ed624d29f678c06bc25d90916f47d09",
+    "doc/execution-control.md": "dfacaf2ed08844636f9086a8415ce20763a4dd2c927127e0e02adbfc2f777eda",
+    "doc/bounded-inference.md": "4d10839c8d846e05c4fc4b44891eddb3cc2702042e0e9eb8a341cdc9ba63dc7f",
+    "eredu-gguf/src/reader.rs": "f28a10ad1ea1dbdc5dfd1a03bb90f3bc8809e4b974cab0cc06c04c3fa45eb450",
+    "eredu-checkpoint/src/store.rs": "753b8f73393a5c1ab88cab5c0308e4ab3969ca112a2e10e623c8194903341150",
+    "eredu-checkpoint/src/store/storage.rs": "44600a15c5c92103bbd7e2d24e1895b18cd7b331f0fbc1a897ed127c19727976",
+    "eredu-checkpoint/src/store/storage/tests.rs": "727ea2e6f2c2f00b3556334d5a2f7191a2c6243a6adbc5e289d2f37b6af6ebbe",
+    "eredu-checkpoint/src/gguf_store.rs": "06fa76c6c8be966e935983b558e42152433e8351a4aef0d7b4cb263c19d90140",
+    "eredu-architectures/src/prepared_sources.rs": "b6f5be85a26fab27963619c82d1524b9b5ce1046ccc8b8a46f419f729083832c",
+    "eredu-architectures/src/prepared_execution/workspace.rs": "5de4b8a1919a1f0e6fc01f6466ea435aa75534b5b1c45ec3f1c2a6ec58867d72",
+    "eredu-architectures/src/prepared_execution/source_contract_tests.rs": "a0d2655bd652e2343db837d55efda57b68f45f33748cced8af87c6aceead5be0",
+    "eredu-architectures/src/replicated_text.rs": "0daad1a072a36e830d755f8328c7c054f9dc8c63be528021fcc452779095a4cc",
+    "eredu-runtime/tests/bounded_prefill.rs": "5381278cc047ddcf23c8646a2cd3e5d5abbc1a88a568ce2bd62071be47cc7f2d",
+    "eredu-backend-mlx/src/backend/runtime/checkpoint/bounded_quantization/pipeline.rs": "b1c46515a27ccbeace10d2f56301c0fd3ea7f5933e6bbdc5c3cf10aaa84594a5",
+    "eredu-backend-mlx/src/backend/runtime/checkpoint/bounded_quantization/tests.rs": "210342027c96e67ab9e4afb9da7e61fa93c07c690faccf167be9771da89ba5fe"
+  },
+  "coverage": {
+    "unique_tests_passed": 800,
+    "checkpoint_tests": 104,
+    "gguf_tests": 54,
+    "architecture_library_tests": 621,
+    "bounded_prefill_tests": 20,
+    "native_cpu_quantization_tests": 1,
+    "preexisting_manual_scaling_ignored_tests": 1,
+    "new_allocator_peak_measurements": 0,
+    "new_released_checkpoint_comparisons": 0
+  },
+  "behavior": [
+    "SourceStorage retains physical owners, deduplicates shared allocations and includes spare memory-vector capacity across restricted, prepared, resolved and composite views.",
+    "Unknown custom source storage propagates an unknown combined bound; conflicting alias capacities and overflow reject.",
+    "SafeTensors source caches retain only weak payload references; externally owned leases remain separate operation resources.",
+    "GGUF uses an explicit 8192-byte file reader buffer. Source bounds cover the configured cache ceiling capped by immutable reader slots, without opening payloads.",
+    "Prepared architecture blueprints aggregate primary, companion, complete, target and prediction roles without duplicating physical source storage.",
+    "Native CPU load-time quantization reports original source payload capacity plus retained packed host outputs, including under restricted logical views.",
+    "A source-capacity pool baseline selects smaller chunks, rejects a concurrent request and remains charged after ordinary or controlled request completion; nonzero outputs preserve parity.",
+    "Four stale fault-injection tests now require exclusive Arc ownership before corrupting a test source graph, preserving the original source-admission rejection assertions."
+  ],
+  "limits": [
+    "This inventory covers source-owned host payloads and bounded reader buffers. It does not include native weights/state, temporary leases or materialization workspace, catalog/recipe metadata, operating-system file cache or other process memory.",
+    "SourceStorage is retained accounting evidence, not a budget reservation. Production native existing-residency inventory and shared-domain pool registration remain incomplete.",
+    "A prepared architecture blueprint covers its retained source graph; native loader-created overlays must also be collected by their native owner through the implemented source contract.",
+    "Public MLX requests remain explicitly unbudgeted without a supplied internal admission; complete native request quotes and media/speculative/capture/snapshot/output retention integration remain required.",
+    "The shared pool test is neutral conformance using a synthetic execution quote and actual source capacity; the native overlay test is storage-accounting validation, not full-budget native inference.",
+    "No new allocator peak or released-checkpoint numerical measurements were made.",
+    "Native linking emits the existing compact-unwind size warning and the feature check may report quote helpers awaiting production integration."
+  ],
+  "checks": [
+    {
+      "name": "checkpoint_and_gguf",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-gguf -p eredu-checkpoint --tests",
+      "log": "/private/tmp/eredu-source-storage-foundation-tests.log",
+      "sha256": "79c34960c4ea736b0e1ea918720506adc16861e56a4d89ce713dceb2a2479a4d",
+      "passed": 158
+    },
+    {
+      "name": "architecture_library",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib",
+      "log": "/private/tmp/eredu-source-storage-architecture-tests.log",
+      "sha256": "6ba8ab527ba864eebb6aa0527d799f2ebb49249b61dd3c4d36fbcdec0f502958",
+      "passed": 621
+    },
+    {
+      "name": "bounded_prefill",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test bounded_prefill",
+      "log": "/private/tmp/eredu-source-storage-runtime-tests.log",
+      "sha256": "f5503d9ce10e562327993c06adf7690e2f2a771165c684628b75aba1855bec76",
+      "passed": 20
+    },
+    {
+      "name": "native_feature_check",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "log": "/private/tmp/eredu-source-storage-native-check.log",
+      "sha256": "1f86ac2b7f2e4af79c13b415f0321f4cc39172316e1c0755b8d680f03a5a036e",
+      "passed": null
+    },
+    {
+      "name": "native_test_build",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib --no-run",
+      "log": "/private/tmp/eredu-source-storage-native-build.log",
+      "sha256": "8c70cf3877db60ec08818b0176471e523b19a3977a06a45c429ff42d486386ea",
+      "passed": null
+    },
+    {
+      "name": "native_quantized_overlay",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib source_storage_includes_dense_memory_and_quantized_overlay_without_reconversion -- --test-threads=1",
+      "log": "/private/tmp/eredu-source-storage-native-tests.log",
+      "sha256": "8e0158df631908112f31942bdeadd4e1bc3a0148c2812eb221e23797ca82c9d7",
+      "passed": 1
+    }
+  ]
+}

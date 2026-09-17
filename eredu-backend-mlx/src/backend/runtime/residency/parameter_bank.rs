@@ -54,21 +54,26 @@ use catalog::{
 };
 
 mod telemetry;
-use telemetry::ParameterBankStatistics;
+use telemetry::{ParameterBankStatistics,ParameterBankStatisticsTable};
 pub use telemetry::{
     BankPassStatistics, BankTierStatistics, ParameterBankResidencyReport,
     ParameterBanksResidencyReport,
 };
 
 mod acquisition;
+pub(crate) use acquisition::PreparedAddressableSource;
 mod parameters;
 pub use acquisition::{
     AcquiredParameterGroups, AddressableParameterBank, SharedAddressableParameterBank,
 };
 pub(crate) use parameters::publish_bank_parameter_replacements;
 
+mod source;
+pub(crate) use source::{AddressableBankSourceLoan, AddressableSourceFailure};
+
 mod movement;
 pub use movement::MlxIndexedMovement;
+pub(crate) use movement::{IndexedChunkLayout, OriginalIndexedChunkSource, IndexedResidencyPlan, IndexedConstructorPartitions, OriginalIndexedResidencyInvocation, OriginalIndexedResidencyFactory, IndexedBankSource, IndexedBindingLayout, IndexedBindingStorage, IndexedBindingIdentity, IndexedRequestSource, IndexedRequestInstallation};
 
 /// Structured sparse entry cache failures.
 #[derive(Debug, thiserror::Error)]
@@ -218,6 +223,12 @@ pub enum AddressableParameterBankError {
     /// Cache statistics mutex was poisoned by a panic.
     #[error("sparse entry cache statistics are unavailable after a panic")]
     StatisticsPoisoned,
+    /// A counter update named a bank outside the retained load-time catalog.
+    #[error("sparse entry cache has no declared statistics bank {bank}")]
+    StatisticsBank {
+        /// Exact undeclared bank identity.
+        bank: usize,
+    },
     /// A required compact binding had no selected source entries.
     #[error("compact entry binding {name:?} has no source arrays")]
     EmptyCompactBinding {

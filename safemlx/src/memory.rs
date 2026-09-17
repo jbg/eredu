@@ -19,6 +19,20 @@ fn check_status(status: i32) -> Result<()> {
     }
 }
 
+/// Returns the host virtual-memory page size without initializing MLX, a device
+/// or an allocator. Native cold allocation bounds can use this OS fact before
+/// any tensor preparation. A missing or invalid OS result remains an error.
+#[cfg(unix)]
+pub fn host_page_size() -> Result<usize> {
+    // SAFETY: sysconf takes a constant selector, reads OS configuration, and
+    // neither dereferences caller pointers nor changes native runtime state.
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(value)
+        .ok()
+        .filter(|value| value.is_power_of_two())
+        .ok_or_else(|| error::Exception::custom("host page size is unavailable or invalid"))
+}
+
 /// Returns bytes currently held by active MLX allocations.
 pub fn active_memory() -> Result<usize> {
     let _guard = runtime_lock::enter();

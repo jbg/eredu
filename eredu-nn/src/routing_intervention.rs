@@ -1,9 +1,13 @@
 //! Host-only selector inputs, separate from native tensors and family dispatch.
 use crate::{Error, GroupSelection, TopKGroupSelectionSpec};
 
+mod validation;
+pub use validation::GroupSelectionValidationError;
+
 mod execution;
 pub use execution::{
-    execute_routing_intervention, RoutingExecutionError, RoutingMechanism, RoutingRows,
+    execute_routing_intervention, execute_routing_intervention_fixed, FixedRoutingExecutionError,
+    RoutingExecutionError, RoutingInvalidCause, RoutingMechanism, RoutingRows,
 };
 
 /// Precise stage at which router bias is added.
@@ -65,76 +69,13 @@ impl GroupSelectionControl {
         learned_scale: bool,
         token_rows: u64,
     ) -> Result<(), Error> {
-        let ensure = |condition, message| {
-            if condition {
-                Ok(())
-            } else {
-                Err(Error::backend(message))
-            }
-        };
-        ensure(
-            self.expected == actual && self.learned_coefficient_scale == learned_scale,
-            "runtime router policy differs from intervention admission",
-        )?;
-        ensure(
-            self.row_stride > 0 && self.first_row < self.end_row && self.end_row <= token_rows,
-            "invalid intervention token-row selection",
-        )?;
-        let rows = (self.end_row - self.first_row).div_ceil(self.row_stride);
-        let check_ids = |ids: &[u32]| {
-            let mut unique = std::collections::BTreeSet::new();
-            ensure(
-                !ids.is_empty()
-                    && ids
-                        .iter()
-                        .all(|id| *id < actual.group_count() as u32 && unique.insert(*id)),
-                "duplicate or out-of-range intervention expert IDs",
-            )
-        };
-        match &self.action {
-            GroupSelectionAction::Exclude(ids) => {
-                check_ids(ids)?;
-                let width = actual.group_count() / actual.selection_partitions();
-                let mut available = vec![width; actual.selection_partitions() as usize];
-                for id in ids {
-                    available[*id as usize / width as usize] -= 1;
-                }
-                available.sort_unstable();
-                ensure(
-                    available
-                        .iter()
-                        .take(actual.selected_groups() as usize)
-                        .sum::<i32>()
-                        >= actual.top_k(),
-                    "exclusion makes grouped top-k infeasible",
-                )?;
-            }
-            GroupSelectionAction::ZeroContribution(ids) => check_ids(ids)?,
-            GroupSelectionAction::Bias { ids, values, .. } => {
-                check_ids(ids)?;
-                ensure(
-                    ids.len() == values.len() && values.iter().all(|v| v.is_finite()),
-                    "routing bias requires one finite value per ID",
-                )?;
-            }
-            GroupSelectionAction::Force(ids) => {
-                ensure(
-                    rows.checked_mul(actual.top_k() as u64) == Some(ids.len() as u64),
-                    "forced IDs differ from selected-token/top-k shape",
-                )?;
-                for row in ids.chunks(actual.top_k() as usize) {
-                    check_ids(row)?;
-                    let width = actual.group_count() / actual.selection_partitions();
-                    let groups: std::collections::BTreeSet<_> =
-                        row.iter().map(|id| *id / width as u32).collect();
-                    ensure(
-                        groups.len() <= actual.selected_groups() as usize,
-                        "forced IDs exceed selected-group count",
-                    )?;
-                }
-            }
-        }
-        Ok(())
+        self.validate_with_workspace(
+            actual,
+            learned_scale,
+            token_rows,
+            validation::ExclusionWorkspace::Ordinary,
+        )
+        .map_err(Error::backend)
     }
 }
 

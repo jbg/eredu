@@ -50,8 +50,8 @@ impl FrequencyScaledRope {
         //   freqs = base ** (mx.arange(0, dims, 2) / dims)
         // which equals base^(2i/dims) for i in 0..half_dims
         let indices = arange::<_, f32>(None, half_dims, None, stream)?;
-        let exponents = indices.multiply(Array::from_f32(2.0 / dims as f32), stream)?;
-        let freqs = Array::from_f32(base).power(&exponents, stream)?;
+        let exponents = indices.multiply(Array::try_from_f32(2.0 / dims as f32)?, stream)?;
+        let freqs = Array::try_from_f32(base)?.power(&exponents, stream)?;
 
         let old_context_len = original_max_position_embeddings as f32;
         let low_freq_wavelen = old_context_len / low_freq_factor;
@@ -64,36 +64,39 @@ impl FrequencyScaledRope {
         //   smooth_factors = (old_context_len / wavelens - low_freq_factor) / (high - low)
         //   smooth_freqs = freqs / ((1 - smooth_factors) / factor + smooth_factors)
         //   freqs = where(is_medium, smooth_freqs, freqs)
-        let two_pi = Array::from_f32(2.0 * std::f32::consts::PI);
+        let two_pi = Array::try_from_f32(2.0 * std::f32::consts::PI)?;
         let wavelens = freqs.multiply(&two_pi, stream)?;
 
         // First pass: scale low frequencies (long wavelengths) by factor
-        let is_low = wavelens.gt(Array::from_f32(low_freq_wavelen), stream)?;
+        let is_low = wavelens.gt(Array::try_from_f32(low_freq_wavelen)?, stream)?;
         let freqs = r#where(
             &is_low,
-            &freqs.multiply(Array::from_f32(factor), stream)?,
+            &freqs.multiply(Array::try_from_f32(factor)?, stream)?,
             &freqs,
             stream,
         )?;
 
         // Second pass: smooth interpolation for medium frequencies
         let is_medium = wavelens
-            .gt(Array::from_f32(high_freq_wavelen), stream)?
+            .gt(Array::try_from_f32(high_freq_wavelen)?, stream)?
             .logical_and(
-                &wavelens.lt(Array::from_f32(low_freq_wavelen), stream)?,
+                &wavelens.lt(Array::try_from_f32(low_freq_wavelen)?, stream)?,
                 stream,
             )?;
 
         let smooth_factors = wavelens
             .reciprocal(stream)?
-            .multiply(Array::from_f32(old_context_len), stream)?
-            .subtract(Array::from_f32(low_freq_factor), stream)?
-            .divide(Array::from_f32(high_freq_factor - low_freq_factor), stream)?;
+            .multiply(Array::try_from_f32(old_context_len)?, stream)?
+            .subtract(Array::try_from_f32(low_freq_factor)?, stream)?
+            .divide(
+                Array::try_from_f32(high_freq_factor - low_freq_factor)?,
+                stream,
+            )?;
 
         // smooth_freqs = freqs / ((1 - smooth_factors) / factor + smooth_factors)
-        let one_minus_smooth = Array::from_f32(1.0).subtract(&smooth_factors, stream)?;
+        let one_minus_smooth = Array::try_from_f32(1.0)?.subtract(&smooth_factors, stream)?;
         let denom = one_minus_smooth
-            .divide(Array::from_f32(factor), stream)?
+            .divide(Array::try_from_f32(factor)?, stream)?
             .add(&smooth_factors, stream)?;
         let smooth_freqs = freqs.divide(&denom, stream)?;
 
@@ -122,23 +125,36 @@ where
         if !self.traditional {
             let seq_len = x.dim(-2);
             let half_dims = self.dimensions / 2;
-            let positions = Array::arange::<_, f32>(Some(offset), offset + seq_len, None, stream)?
-                .try_index_device((.., NewAxis), stream)?;
+            let positions =
+                position_rows(offset, seq_len, stream)?.try_index_device((.., NewAxis), stream)?;
             let freqs = self.freqs.try_index_device(NewAxis, stream)?;
             let angles = positions
                 .divide(&freqs, stream)?
-                .multiply(Array::from_f32(self.scale), stream)?;
+                .multiply(Array::try_from_f32(self.scale)?, stream)?;
             let cos = cos(&angles, stream)?.try_index_device((NewAxis, .., ..), stream)?;
             let sin = sin(&angles, stream)?.try_index_device((NewAxis, .., ..), stream)?;
             let x1 = x.try_index_device((.., .., ..half_dims), stream)?;
-            let x2 = x.try_index_device((.., .., half_dims..), stream)?;
+            let x2 = x.try_index_device((.., .., half_dims..self.dimensions), stream)?;
             let out1 = x1
                 .multiply(&cos, stream)?
                 .subtract(x2.multiply(&sin, stream)?, stream)?;
             let out2 = x2
                 .multiply(cos, stream)?
                 .add(x1.multiply(sin, stream)?, stream)?;
-            return concatenate_axis(&[out1, out2], -1, stream)?.reshape(shape, stream);
+            let output = if self.dimensions < x.dim(-1) {
+                concatenate_axis(
+                    &[
+                        out1,
+                        out2,
+                        x.try_index_device((.., .., self.dimensions..), stream)?,
+                    ],
+                    -1,
+                    stream,
+                )?
+            } else {
+                concatenate_axis(&[out1, out2], -1, stream)?
+            };
+            return output.reshape(shape, stream);
         }
         let x = safemlx::fast::rope(
             x,
@@ -240,6 +256,33 @@ impl YarnRope {
         amplitude: f32,
         truncate: bool,
     ) -> Self {
+        Self::try_new(
+            dims,
+            traditional,
+            base,
+            factor,
+            original_context,
+            beta_fast,
+            beta_slow,
+            amplitude,
+            truncate,
+        )
+        .expect("YaRN RoPE array construction failed")
+    }
+
+    /// Builds the same module while preserving native construction failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new(
+        dims: i32,
+        traditional: bool,
+        base: f32,
+        factor: f32,
+        original_context: f32,
+        beta_fast: f32,
+        beta_slow: f32,
+        amplitude: f32,
+        truncate: bool,
+    ) -> Result<Self, Exception> {
         let values = yarn_inverse_frequency_values(
             dims,
             base,
@@ -249,15 +292,15 @@ impl YarnRope {
             beta_slow,
             truncate,
         );
-        Self {
+        Ok(Self {
             dimensions: dims,
             traditional,
             concentration: amplitude,
-            freqs: Array::from_slice(
+            freqs: Array::try_from_slice(
                 &values.iter().map(|v| 1.0 / v).collect::<Vec<_>>(),
                 &[dims / 2],
-            ),
-        }
+            )?,
+        })
     }
 }
 
@@ -272,7 +315,7 @@ where
         let nn::RopeInput { x, offset } = input.into();
         let shape = x.shape();
         let x = x
-            .multiply(Array::from_f32(self.concentration), stream)?
+            .multiply(Array::try_from_f32(self.concentration)?, stream)?
             .reshape(&[-1, x.dim(-2), x.dim(-1)], stream)?;
         let x = safemlx::fast::rope(
             x,
@@ -320,7 +363,7 @@ impl ProportionalRope {
         _stream: &Stream,
     ) -> Result<Self, Exception> {
         let freqs = proportional_frequency_values(dims, base, factor, proportion);
-        let freqs = Array::from_slice(&freqs, &[dims / 2]);
+        let freqs = Array::try_from_slice(&freqs, &[dims / 2])?;
         Ok(Self {
             dimensions: dims,
             traditional,
@@ -379,7 +422,22 @@ pub(super) struct ElementwiseRotary {
     amplitude: f32,
 }
 
+// Form each absolute coordinate as an integer before casting. Starting from an
+// already-rounded F32 offset can shift later positions above 2^24.
+fn position_rows(offset: i32, length: i32, stream: &Stream) -> Result<Array, Exception> {
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| Exception::custom("rotary position endpoint overflows i32"))?;
+    Array::arange::<_, i32>(Some(offset), end, None, stream)?
+        .as_dtype(safemlx::Dtype::Float32, stream)
+}
+
 impl ElementwiseRotary {
+    /// Visits retained numerical roots without evaluating derived frequencies.
+    pub(super) fn visit_retained_arrays<'a>(&'a self, visitor: &mut dyn FnMut(&'a Array)) {
+        visitor(&self.inverse_frequencies);
+    }
+
     pub(super) fn new(
         spec: eredu_nn::RotarySpec,
         native: &RopeVariant,
@@ -410,7 +468,7 @@ impl ElementwiseRotary {
                     truncate,
                 );
                 (
-                    Array::from_slice(&values, &[spec.dimensions / 2]),
+                    Array::try_from_slice(&values, &[spec.dimensions / 2])?,
                     rope.concentration,
                 )
             }
@@ -426,7 +484,7 @@ impl ElementwiseRotary {
                         (1.0 / spec.base.powf(2.0 * index as f32 / spec.dimensions as f32)) / factor
                     })
                     .collect::<Vec<_>>();
-                (Array::from_slice(&values, &[spec.dimensions / 2]), 1.0)
+                (Array::try_from_slice(&values, &[spec.dimensions / 2])?, 1.0)
             }
         };
         Ok(Self {
@@ -447,10 +505,9 @@ impl ElementwiseRotary {
         let length = input.dim(-2);
         let width = input.dim(-1);
         let x = input.reshape(&[-1, length, width], stream)?;
-        let positions = Array::arange::<_, f32>(Some(offset), offset + length, None, stream)?
-            .expand_dims(-1, stream)?;
+        let positions = position_rows(offset, length, stream)?.expand_dims(-1, stream)?;
         let angles = positions.multiply(&self.inverse_frequencies, stream)?;
-        let amplitude = Array::from_f32(self.amplitude);
+        let amplitude = Array::try_from_f32(self.amplitude)?;
         let cos = cos(&angles, stream)?
             .multiply(&amplitude, stream)?
             .as_dtype(input.dtype(), stream)?;
@@ -523,6 +580,20 @@ where
     }
 }
 
+impl RopeVariant {
+    /// Visits actual frequency storage separately from editable parameters.
+    /// Default RoPE retains only scalar metadata; scaled variants retain their
+    /// denominator arrays even when explicit rotary arithmetic is also selected.
+    pub(super) fn visit_retained_arrays<'a>(&'a self, visitor: &mut dyn FnMut(&'a Array)) {
+        match self {
+            Self::Default(_) => {}
+            Self::FrequencyScaled(rope) => visitor(&rope.freqs),
+            Self::Proportional(rope) => visitor(&rope.freqs),
+            Self::Yarn(rope) => visitor(&rope.freqs),
+        }
+    }
+}
+
 /// Creates the RoPE implementation requested by a model config.
 pub fn initialize_rope(
     dims: i32,
@@ -581,7 +652,7 @@ pub fn initialize_rope(
             amplitude,
             truncate,
         } => {
-            let rope = YarnRope::new(
+            let rope = YarnRope::try_new(
                 dims,
                 traditional,
                 base,
@@ -591,7 +662,7 @@ pub fn initialize_rope(
                 beta_slow,
                 amplitude,
                 truncate,
-            );
+            )?;
             Ok(RopeVariant::Yarn(rope))
         }
     }
@@ -599,3 +670,34 @@ pub fn initialize_rope(
 
 #[cfg(test)]
 mod tests;
+
+// Concrete Rust owner/control frames shared by the cold receipt. Native C
+// handles, Graph/Record storage and frequency payload are priced separately.
+pub(super) fn rotary_control_bytes(explicit_products: bool, batches: usize) -> Option<usize> {
+    use std::mem::size_of;
+    let fixed = size_of::<FrequencyScaledRope>()
+        + size_of::<ElementwiseRotary>()
+        + size_of::<RopeVariant>()
+        + size_of::<eredu_nn::RotarySpec>()
+        + size_of::<[Array; 3]>()
+        + size_of::<[&Array; 3]>()
+        + size_of::<[i32; 8]>()
+        + size_of::<[f32; 8]>()
+        + size_of::<Result<Array, Exception>>()
+        + size_of::<Result<crate::backend::nn::shared::MlxRotary, eredu_nn::Error>>()
+        + size_of::<Result<FrequencyScaledRope, Exception>>()
+        + size_of::<Result<RopeVariant, Exception>>()
+        + size_of::<Result<ElementwiseRotary, Exception>>();
+    if explicit_products {
+        // Native wavelength products have seven basic index calls; the
+        // InputProducts branch has four, including pair-axis removal. Both
+        // operate on the existing rank-three/rank-four reshapes.
+        fixed
+            .checked_add(
+                safemlx::ops::indexing::inline_basic_index_control_bytes()?.checked_mul(7)?,
+            )?
+            .checked_add(safemlx::ops::concatenate_axis_control_bytes()?.checked_mul(2)?)
+    } else {
+        fixed.checked_add(safemlx::fast::rope_control_bytes(batches)?)
+    }
+}

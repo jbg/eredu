@@ -105,6 +105,13 @@ fn write_tensor_plan(
     root: &Path,
     checkpoint: &eredu_checkpoint::schema::SafetensorsCheckpointPlan,
 ) {
+    write_tensor_plan_with_values(root, checkpoint, |_, _| None)
+}
+fn write_tensor_plan_with_values(
+    root: &Path,
+    checkpoint: &eredu_checkpoint::schema::SafetensorsCheckpointPlan,
+    value_override: impl Fn(&str, usize) -> Option<f32>,
+) {
     let mut data = vec![];
     let mut header = serde_json::Map::new();
     for tensor in checkpoint.common_tensors.iter().chain(
@@ -115,8 +122,17 @@ fn write_tensor_plan(
             .flat_map(|variant| &variant.tensors),
     ) {
         let start = data.len();
-        for index in 0..tensor.shape.iter().product::<usize>() {
-            let value = if tensor.key.ends_with(".layer_scalar") {
+        let ordering = tensor.key == "masked_embedding.token_ordering";
+        let count = tensor.shape.iter().product::<usize>();
+        for index in 0..count {
+            if ordering {
+                // A nontrivial exact I32 permutation exercises masked placement.
+                data.extend_from_slice(&i32::try_from(count - 1 - index).unwrap().to_le_bytes());
+                continue;
+            }
+            let value = if let Some(value) = value_override(&tensor.key, index) {
+                value
+            } else if tensor.key.ends_with(".layer_scalar") {
                 1.15f32
             } else if tensor.key.contains("norm") {
                 1.0f32
@@ -127,7 +143,7 @@ fn write_tensor_plan(
         }
         header.insert(
             tensor.key.clone(),
-            serde_json::json!({"dtype":"F32", "shape":tensor.shape,
+            serde_json::json!({"dtype":if ordering { "I32" } else { "F32" }, "shape":tensor.shape,
             "data_offsets":[start,data.len()]}),
         );
     }
@@ -664,3 +680,13 @@ mod fp8_parameters;
 
 #[path = "native_execution_control/capture_failures.rs"]
 mod capture_failures;
+
+#[path = "native_execution_control/prepared_media_copy.rs"]
+mod prepared_media_copy;
+
+#[path = "native_execution_control/prepared_media_capture.rs"]
+mod prepared_media_capture;
+
+#[cfg(all(feature = "mlx", target_vendor = "apple"))]
+#[path = "native_execution_control/managed_plain.rs"]
+mod managed_plain;

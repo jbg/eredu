@@ -88,6 +88,22 @@ pub fn require<B: NeuralBackend>(architecture: &'static str, requirements: C) ->
     B::require_operator_capabilities(architecture, requirements)
 }
 
+/// Same ordered capability predicate with a paid diagnostic for checked construction.
+pub(crate) fn require_with_metadata<B: NeuralBackend>(
+    architecture: &'static str,
+    requirements: C,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<(), Error> {
+    match metadata.context() {
+        None => require::<B>(architecture, requirements),
+        Some(_) => {
+            metadata.controls::<(&str, C)>()?;
+            B::OPERATOR_CAPABILITIES
+                .require_with(architecture, requirements, |text| metadata.error(text))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

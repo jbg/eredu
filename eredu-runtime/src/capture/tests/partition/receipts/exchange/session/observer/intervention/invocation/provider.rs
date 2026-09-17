@@ -190,18 +190,18 @@ fn speculative_collector_binds_live_partition_provider_and_preserves_scoped_repl
                         let record = observer.take_activation_capture().unwrap();
                         assert_eq!(record.invocation, index as u64);
                         assert_eq!(record.completed, !abort);
-                        assert_eq!(record.captures.invocation.unwrap().sequence, rows);
+                        assert_eq!(record.captures.as_step().invocation.unwrap().sequence, rows);
                         assert_eq!(
-                            record.captures.outcome,
+                            record.captures.as_step().outcome,
                             if abort {
                                 CaptureStepOutcome::Aborted
                             } else {
                                 CaptureStepOutcome::Committed
                             }
                         );
-                        assert_eq!(record.captures.records[0].payload.is_some(), keep && !abort);
+                        assert_eq!(record.captures.as_step().records[0].payload.is_some(), keep && !abort);
                         for (operation, active) in
-                            record.captures.interventions.iter().zip([keep, scale])
+                            record.captures.as_step().interventions.iter().zip([keep, scale])
                         {
                             if !abort {
                                 assert_eq!(
@@ -218,15 +218,15 @@ fn speculative_collector_binds_live_partition_provider_and_preserves_scoped_repl
                                 .iter()
                                 .all(|evidence| evidence.payload.is_some() == (active && !abort)));
                         }
-                        assert!(record.captures.cumulative_usage.host_bytes > spent.host_bytes);
-                        spent = record.captures.cumulative_usage;
+                        assert!(record.captures.as_step().cumulative_usage.host_bytes > spent.host_bytes);
+                        spent = record.captures.as_step().cumulative_usage;
                         results.push(record);
                         epoch = epoch.next().unwrap();
                     }
                     for index in [3, 5] {
                         assert_eq!(
-                            results[0].captures.records[0].payload,
-                            results[index].captures.records[0].payload
+                            results[0].captures.as_step().records[0].payload,
+                            results[index].captures.as_step().records[0].payload
                         );
                     }
                     results
@@ -239,11 +239,11 @@ fn speculative_collector_binds_live_partition_provider_and_preserves_scoped_repl
     });
     for rank in &results[1..] {
         for (actual, expected) in rank.iter().zip(&results[0]) {
-            assert_eq!(actual.captures.records, expected.captures.records);
-            assert_eq!(actual.captures.partitions, expected.captures.partitions);
+            assert_eq!(actual.captures.as_step().records, expected.captures.as_step().records);
+            assert_eq!(actual.captures.as_step().partitions, expected.captures.as_step().partitions);
             assert_eq!(
-                actual.captures.cumulative_usage,
-                expected.captures.cumulative_usage
+                actual.captures.as_step().cumulative_usage,
+                expected.captures.as_step().cumulative_usage
             );
         }
     }

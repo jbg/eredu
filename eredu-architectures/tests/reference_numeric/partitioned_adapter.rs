@@ -289,7 +289,7 @@ pub(super) fn composite(
         context,
         context,
         |resources: PreparedPartitionResources<NumericPreparedCommunication>| {
-            let checkpoint = Arc::clone(resources.target());
+            let checkpoint = resources.target().clone();
             let native = resources.into_communication();
             NumericCompositePartitionVisitor {
                 world: native.world,

@@ -14,6 +14,9 @@ use eredu_runtime::{
 
 use crate::linear_format::standard_expert_projection;
 
+mod construction;
+pub(crate) use construction::RoutedPlusSharedSpec;
+
 /// Complete family-neutral assembly policy for one DeepSeek MoE layer.
 #[derive(Debug, Clone)]
 #[allow(missing_docs)]
@@ -59,19 +62,19 @@ pub enum RouteSource<'a, T> {
 #[parameterized(tensor = "B::Tensor")]
 #[allow(missing_docs)]
 pub struct RoutedPlusShared<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     layer: usize,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     expert_count: i32,
     pub router: B::Selector,
     pub experts: B::GatedProductGroups,
     shared_gate: B::Linear,
     shared_up: B::Linear,
     shared_down: B::Linear,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     shared_limit: Option<GatedProductPolicy>,
-    #[parameter(skip)]
-    resident_unit_coordinates: Option<(eredu_core::component::ComponentCoordinateMap, bool)>,
+    #[parameter(skip, metadata)]
+    resident_unit_coordinates: Option<(std::sync::Arc<eredu_core::component::ComponentCoordinateMap>, bool)>,
 }
 
 #[allow(missing_docs)]
@@ -80,6 +83,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         policy: &MoePolicy,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        if B::construction_metadata(context).is_some_and(|metadata| metadata.uses_checked_metadata()) {
+            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+        }
         let expert_spec = expert_bank_spec(policy)?;
         Self::new_with_expert_spec(policy, expert_spec, context)
     }
@@ -90,77 +96,24 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
         expert_spec: eredu_nn::GroupedGatedProductSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let routing = TopKGroupSelectionSpec::new(
-            policy.expert_count,
-            policy.routes_per_token,
-            policy.scoring,
-            policy.normalize_routes,
-        )?
-        .with_groups(policy.expert_groups, policy.selected_groups)?
-        .with_weight_policy(policy.normalization_epsilon, policy.routed_scaling)?;
-        let mut selector = TopKGroupSelectorSpec::new(
-            policy.hidden,
-            parameter(&policy.router_weight)?,
-            crate::linear_format::standard_linear_format(
-                &policy.router_weight,
-                policy.router_format,
-            )?,
-            routing,
-        )?;
-        if let Some(correction_bias) = policy
-            .correction_bias
-            .as_deref()
-            .map(parameter)
-            .transpose()?
-        {
-            selector = selector.with_correction_bias(correction_bias)?;
+        if B::construction_metadata(context).is_some_and(|metadata| metadata.uses_checked_metadata()) {
+            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
         }
-        let router = B::top_k_group_selector(selector, context)?;
-        let experts = B::grouped_gated_product(expert_spec, context)?;
-        let shared = |weight: &str, input, output, format| {
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: parameter(weight)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(weight, format)?,
-                },
-                context,
-            )
-        };
-        Ok(Self {
-            layer: policy.layer,
-            expert_count: policy.expert_count,
-            router,
-            experts,
-            shared_gate: shared(
-                &policy.shared_gate,
-                policy.hidden,
-                policy.shared_width,
-                policy.shared_gate_format,
-            )?,
-            shared_up: shared(
-                &policy.shared_up,
-                policy.hidden,
-                policy.shared_width,
-                policy.shared_up_format,
-            )?,
-            shared_down: shared(
-                &policy.shared_down,
-                policy.shared_width,
-                policy.hidden,
-                policy.shared_down_format,
-            )?,
-            shared_limit: policy.shared_limit,
-            resident_unit_coordinates: None,
-        })
+        RoutedPlusSharedSpec::new(policy, expert_spec)?.instantiate::<B>(context)
     }
 
     /// Binds the scalar order compiled for an independently resident prediction bank.
     pub(crate) fn bind_resident_unit_coordinates(
         &mut self,
         coordinates: eredu_core::component::ComponentCoordinateMap,
+        partitioned: bool,
+    ) {
+        self.bind_shared_resident_unit_coordinates(std::sync::Arc::new(coordinates), partitioned);
+    }
+
+    pub(crate) fn bind_shared_resident_unit_coordinates(
+        &mut self,
+        coordinates: std::sync::Arc<eredu_core::component::ComponentCoordinateMap>,
         partitioned: bool,
     ) {
         self.resident_unit_coordinates = Some((coordinates, partitioned));
@@ -386,8 +339,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
                 pass,
             },
             |request| {
-                eredu_runtime::with_resident_unit_coordinates(
-                    self.resident_unit_coordinates.as_ref(),
+                eredu_runtime::with_borrowed_resident_unit_coordinates(
+                    self.resident_unit_coordinates.as_ref().map(|(coordinates, partitioned)| (coordinates.as_ref(), *partitioned)),
                     request,
                     |request| execute(&mut self.experts, request),
                 )
@@ -447,8 +400,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> RoutedPlusSha
                 pass,
             },
             |request| {
-                eredu_runtime::with_resident_unit_coordinates(
-                    self.resident_unit_coordinates.as_ref(),
+                eredu_runtime::with_borrowed_resident_unit_coordinates(
+                    self.resident_unit_coordinates.as_ref().map(|(coordinates, partitioned)| (coordinates.as_ref(), *partitioned)),
                     request,
                     |request| provider.forward_grouped(&mut self.experts, request, context),
                 )

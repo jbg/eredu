@@ -228,9 +228,9 @@ fn unsupported_owner_binding_fails_preflight_before_any_payload_read() {
         ],
     )
     .unwrap();
-    let sources = ResidencySources {
-        primary: store.clone(),
-        units: BTreeMap::new(),
+    let sources = ResidencySources::Ordinary {
+        primary: store.clone().into(),
+        units: std::iter::empty().collect(),
     };
     let result = preflight_residency_owner_bindings(&sources, &control);
     assert!(matches!(result, Err(ResidencyError::BindingPreflight(_))));
@@ -390,4 +390,168 @@ fn resident_units_batch_direct_reads_across_reordered_parameters() {
         "the unselected matrix is not read"
     );
     assert_eq!(diagnostics.currently_cached_shards, 0);
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn host_units_fill_reordered_final_buffers_and_preserve_local_aliases() {
+    let (_dir, store) = fixture_store();
+    let manager = manager(
+        Arc::clone(&store),
+        OffloadConfig::new(Some(24), Some(24), 1).unwrap(),
+        [spec(
+            "host",
+            24,
+            ResidencyPolicy::Cacheable,
+            MemoryTier::Disk,
+        )],
+        [unit(
+            "host",
+            [
+                binding("first", "c", TensorSelection::Full, 8),
+                binding("second", "a", TensorSelection::Full, 8),
+                binding("third", "b", TensorSelection::Full, 8),
+                WeightBinding::alias("second_alias", "second", 8).unwrap(),
+            ],
+        )],
+    );
+    manager.initialize().unwrap();
+    let host = manager.acquire(&id("host"), MemoryTier::Host).unwrap();
+    for (name, expected) in [
+        ("first", [5, 6]),
+        ("second", [1, 2]),
+        ("second_alias", [1, 2]),
+        ("third", [3, 4]),
+    ] {
+        assert_eq!(host_i32(&host, name), expected);
+    }
+    assert_eq!(
+        host.host_value("second")
+            .unwrap()
+            .allocation_info()
+            .unwrap(),
+        host.host_value("second_alias")
+            .unwrap()
+            .allocation_info()
+            .unwrap(),
+    );
+    let diagnostics = store.source_diagnostics().unwrap();
+    #[cfg(unix)]
+    assert_eq!(diagnostics.physical_reads, 1);
+    assert_eq!(diagnostics.physical_read_bytes, 24);
+    assert_eq!(diagnostics.currently_cached_shards, 0);
+    let capacity = ["first", "second", "third"]
+        .into_iter()
+        .map(|name| host.host_value(name).unwrap().capacity().unwrap() as u64)
+        .sum::<u64>();
+    assert_eq!(
+        manager.retained_storage().unwrap().byte_bound().unwrap(),
+        Some(capacity)
+    );
+    let device = manager.acquire(&id("host"), MemoryTier::Device).unwrap();
+    for (name, expected) in [
+        ("first", [5, 6]),
+        ("second_alias", [1, 2]),
+        ("third", [3, 4]),
+    ] {
+        assert_eq!(
+            device
+                .device_value(name)
+                .unwrap()
+                .evaluated()
+                .unwrap()
+                .as_slice::<i32>(),
+            expected
+        );
+    }
+    assert_eq!(store.source_diagnostics().unwrap().physical_read_bytes, 24);
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn host_units_interleave_direct_reads_with_actual_numeric_recipes() {
+    use eredu_checkpoint::recipe::{DerivedWeightRecipe, RecipeDtype};
+    let (_dir, store) = fixture_store();
+    let converted = DerivedWeightRecipe::Cast {
+        input: Box::new(DerivedWeightRecipe::source("b", TensorSelection::Full)),
+        dtype: RecipeDtype::F32,
+    };
+    let manager = manager(
+        store,
+        OffloadConfig::new(None, Some(24), 1).unwrap(),
+        [spec(
+            "mixed",
+            24,
+            ResidencyPolicy::Cacheable,
+            MemoryTier::Disk,
+        )],
+        [unit(
+            "mixed",
+            [
+                binding("a_direct", "a", TensorSelection::Full, 8),
+                WeightBinding::from_recipe("b_converted", converted, 8).unwrap(),
+                binding("c_direct", "c", TensorSelection::Full, 8),
+            ],
+        )],
+    );
+    manager.initialize().unwrap();
+    let host = manager.acquire(&id("mixed"), MemoryTier::Host).unwrap();
+    assert_eq!(host_i32(&host, "a_direct"), [1, 2]);
+    assert_eq!(host_i32(&host, "c_direct"), [5, 6]);
+    let floats = host
+        .host_value("b_converted")
+        .unwrap()
+        .as_bytes()
+        .unwrap()
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
+        .collect::<Vec<_>>();
+    assert_eq!(floats, [3.0, 4.0]);
+    assert_eq!(
+        host.host_value("b_converted").unwrap().dtype().unwrap(),
+        safemlx::Dtype::Float32
+    );
+}
+
+#[cfg(not(feature = "cuda"))]
+#[test]
+fn failed_direct_host_read_publishes_no_partial_unit_or_residency_charge() {
+    let (dir, store) = cross_shard_store();
+    let manager = manager(
+        store,
+        OffloadConfig::new(None, Some(16), 1).unwrap(),
+        [spec(
+            "pair",
+            16,
+            ResidencyPolicy::Cacheable,
+            MemoryTier::Disk,
+        )],
+        [unit(
+            "pair",
+            [
+                binding("left", "left", TensorSelection::Full, 8),
+                binding("right", "right", TensorSelection::Full, 8),
+            ],
+        )],
+    );
+    manager.initialize().unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("model-00002-of-00002.safetensors"))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    assert!(matches!(
+        manager.acquire(&id("pair"), MemoryTier::Host),
+        Err(ResidencyError::Recipe { .. })
+    ));
+    let report = manager.report().unwrap();
+    assert!(!state(&report, "pair").host_resident());
+    assert_eq!(report.offload().resident_bytes().get(MemoryTier::Host), 0);
+    assert_eq!(
+        manager.retained_storage().unwrap().byte_bound().unwrap(),
+        Some(0)
+    );
 }

@@ -2,10 +2,12 @@
 
 use crate::consensus::{
     agree_deadline_candidates_bounded, agree_disposition_status_bounded,
-    agree_submission_status_bounded, resolve_output_completions_bounded, validate_schedule_bounded,
+    agree_preparation_status_bounded, agree_submission_status_bounded, resolve_output_completions_bounded, validate_schedule_bounded,
     BoundedConsensusTransport, CompletionObservation, CompletionResolution, ScheduledWork,
 };
-use crate::BoundedCompletionWait;
+use crate::{BoundedCompletionWait,HostMetadataFunding,HostMetadataFundingError};
+use crate::consensus::{protocol_vec,reserve_protocol,protocol_string};
+use std::borrow::Cow;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -181,6 +183,11 @@ pub trait WorkDescriptor {
     /// Appends every semantic field in stable wire order.
     fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Self::Error>;
 
+    /// Exact number of words emitted by the ordinary descriptor encoder.
+    /// Unknown descriptors remain usable by ordinary schedulers; source-funded
+    /// turns reject them before constructing an unpriced destination.
+    fn descriptor_words(&self) -> Option<usize> { None }
+
     /// Number of program-defined non-preemptible operations in this transition.
     fn execution_slice_size(&self) -> usize {
         1
@@ -236,6 +243,9 @@ pub trait TransitionOutput {
 
 /// Completed output that can prove rank agreement before distributed publication.
 pub trait DistributedTransitionOutput: TransitionOutput {
+    /// Exact ordinary output-descriptor population once observation completes.
+    fn distributed_output_words(&self) -> Option<usize> { None }
+
     /// Appends every portable output field in stable semantic order.
     fn encode_distributed_output(&self, output: &mut Vec<u32>) -> Result<(), String>;
 }
@@ -261,6 +271,7 @@ struct Prepared<W, B> {
     descriptor: Vec<u32>,
     branch: B,
     deadline: Option<Instant>,
+    _funding: Option<HostMetadataFunding>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -288,6 +299,8 @@ pub struct SchedulerProgress<W, O> {
     pub committed: Vec<(WorkId, W, O)>,
     /// Failed work with structured scheduler context.
     pub failed: Vec<(WorkId, SchedulerError)>,
+    /// Original protocol Host source retained after the result directories.
+    pub metadata_funding: Option<HostMetadataFunding>,
 }
 
 impl<W, O> Default for SchedulerProgress<W, O> {
@@ -296,6 +309,7 @@ impl<W, O> Default for SchedulerProgress<W, O> {
             newly_submitted: 0,
             committed: Vec::new(),
             failed: Vec::new(),
+            metadata_funding: None,
         }
     }
 }
@@ -403,7 +417,10 @@ pub struct Scheduler<W, S: SemanticStateTransaction, O: TransitionOutput> {
     drain_cycles: u64,
     observed_backends: BTreeSet<String>,
     all_outputs_preemptible: bool,
-    poisoned: Option<String>,
+    poisoned: Option<Cow<'static,str>>,
+    prepared_funding: Option<HostMetadataFunding>,
+    submitted_funding: Option<HostMetadataFunding>,
+    diagnostic_funding: Option<HostMetadataFunding>,
 }
 
 impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
@@ -445,6 +462,9 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             observed_backends: BTreeSet::new(),
             all_outputs_preemptible: true,
             poisoned: None,
+            prepared_funding: None,
+            submitted_funding: None,
+            diagnostic_funding: None,
         })
     }
 
@@ -577,6 +597,28 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
     where
         W: WorkDescriptor,
     {
+        self.prepare_bounded_with(limit,now,|_,_,state|state.branch())
+    }
+
+    /// Uses the same fair preparation worker with an explicit pre-branch
+    /// source compiler. The callback receives the actual queued item and
+    /// canonical state before any semantic branch is cloned or constructed.
+    /// It must return that state's unpublished branch; refusal follows the
+    /// existing failed-before-submission lifecycle with no prepared work.
+    pub fn prepare_bounded_with<E>(
+        &mut self,limit:usize,now:Instant,
+        prepare:impl FnMut(WorkId,&W,&S)->Result<S::Branch,E>,
+    )->Result<usize,SchedulerError>
+    where W:WorkDescriptor,E:std::error::Error {
+        self.prepare_bounded_using(limit, now, false, None, prepare)
+    }
+
+    fn prepare_bounded_using<E>(
+        &mut self, limit: usize, now: Instant, retain_refused: bool,
+        funding: Option<&HostMetadataFunding>,
+        mut prepare: impl FnMut(WorkId, &W, &S) -> Result<S::Branch, E>,
+    ) -> Result<usize, SchedulerError>
+    where W: WorkDescriptor, E: std::error::Error {
         self.ensure_ready()?;
         if limit == 0 {
             return Err(SchedulerError::Capacity(
@@ -616,28 +658,38 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             }
             let slice = queued.work.execution_slice_size();
             if slice == 0 || slice > self.limits.execution_slice {
-                self.fail_before_submission(queued.id);
-                return Err(SchedulerError::Descriptor(format!(
+                let error = self.diagnostic(SchedulerError::Descriptor,format_args!(
                     "work {:?} execution slice {slice} exceeds configured bound {}",
                     queued.id, self.limits.execution_slice
-                )));
+                ));
+                self.refuse_preparation(queued, retain_refused);
+                return Err(error);
             }
-            let mut descriptor = Vec::new();
+            let destination: Result<Vec<u32>,SchedulerError> = (|| {
+                self.reserve_prepared_slot(funding)?;
+                if funding.is_some() {
+                    let count = queued.work.descriptor_words().ok_or(HostMetadataFundingError::Unavailable)?;
+                    Ok(protocol_vec(funding,count)?)
+                } else { Ok(Vec::new()) }
+            })();
+            let mut descriptor = match destination {
+                Ok(descriptor) => descriptor,
+                Err(error) => { self.refuse_preparation(queued,retain_refused); return Err(error); }
+            };
             if let Err(error) = queued.work.encode_descriptor(&mut descriptor) {
-                self.fail_before_submission(queued.id);
-                return Err(SchedulerError::Descriptor(error.to_string()));
+                self.refuse_preparation(queued, retain_refused);
+                return Err(self.diagnostic(SchedulerError::Descriptor,format_args!("{error}")));
             }
-            let branch = match self
-                .requests
-                .get(&request)
-                .expect("active request exists")
-                .state
-                .branch()
-            {
+            if funding.is_some() && queued.work.descriptor_words() != Some(descriptor.len()) {
+                self.refuse_preparation(queued,retain_refused);
+                return Err(HostMetadataFundingError::Unavailable.into());
+            }
+            let branch = match prepare(queued.id,&queued.work,
+                &self.requests.get(&request).expect("active request exists").state) {
                 Ok(branch) => branch,
                 Err(error) => {
-                    self.fail_before_submission(queued.id);
-                    return Err(SchedulerError::State(error.to_string()));
+                    self.refuse_preparation(queued, retain_refused);
+                    return Err(self.diagnostic(SchedulerError::State,format_args!("{error}")));
                 }
             };
             self.lifecycle.insert(queued.id, WorkLifecycle::Prepared);
@@ -647,6 +699,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                 descriptor,
                 branch,
                 deadline: queued.deadline,
+                _funding: funding.cloned(),
             });
             count += 1;
         }
@@ -689,11 +742,11 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                     self.failed_work = self.failed_work.saturating_add(1);
                     self.accepted_work = self.accepted_work.saturating_sub(1);
                     self.fail_request(id.request());
-                    let message = discard.map_or_else(
-                        || error.to_string(),
-                        |discard| format!("{error}; branch discard also failed: {discard}"),
-                    );
-                    return Err(SchedulerError::Submission(message));
+                    let failure = match discard {
+                        None=>self.diagnostic(SchedulerError::Submission,format_args!("{error}")),
+                        Some(discard)=>self.diagnostic(SchedulerError::Submission,format_args!("{error}; branch discard also failed: {discard}")),
+                    };
+                    return Err(failure);
                 }
             };
             if let Some(backend) = output.backend_name() {
@@ -800,14 +853,79 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         E: std::error::Error,
         O: DistributedTransitionOutput,
     {
+        self.run_distributed_with_preparation(protocol, transport, wait, now,
+            self.limits.max_new_submissions_per_turn, false,
+            |_, _, state| state.branch(), execute, |_,_|{})
+    }
+
+    /// Runs the same distributed worker with source admission before branching.
+    /// Every rank agrees preparation before model dispatch. Refusal restores
+    /// unsubmitted work and fences further turns while retaining canonical state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_distributed_bounded_with_preparation<T, A, E>(
+        &mut self, protocol: u64, transport: &T, wait: BoundedCompletionWait,
+        now: Instant, maximum_frames: usize,
+        prepare: impl FnMut(WorkId, &W, &S) -> Result<S::Branch, A>,
+        execute: impl FnMut(WorkId, &W, &mut S::Branch) -> Result<O, E>,
+    ) -> Result<SchedulerProgress<W, O>, SchedulerError>
+    where W: WorkDescriptor, T: BoundedConsensusTransport,
+        <T::Completion as crate::Completion>::Error: std::fmt::Display,
+        A: std::error::Error, E: std::error::Error, O: DistributedTransitionOutput {
+        self.run_distributed_bounded_with_preparation_and_errors(protocol,transport,wait,now,
+            maximum_frames,prepare,execute,|_,_|{})
+    }
+
+    /// Lends each owned completion/observation error before consensus resolves
+    /// and may discard its output. The callback must retain its own source;
+    /// it does not prove completion or alter the shared disposition protocol.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_distributed_bounded_with_preparation_and_errors<T, A, E>(
+        &mut self, protocol: u64, transport: &T, wait: BoundedCompletionWait,
+        now: Instant, maximum_frames: usize,
+        prepare: impl FnMut(WorkId, &W, &S) -> Result<S::Branch, A>,
+        execute: impl FnMut(WorkId, &W, &mut S::Branch) -> Result<O, E>,
+        observe_failure: impl FnMut(WorkId,O::Error),
+    ) -> Result<SchedulerProgress<W, O>, SchedulerError>
+    where W: WorkDescriptor, T: BoundedConsensusTransport,
+        <T::Completion as crate::Completion>::Error: std::fmt::Display,
+        A: std::error::Error, E: std::error::Error, O: DistributedTransitionOutput {
+        self.run_distributed_with_preparation(protocol, transport, wait, now,
+            maximum_frames.min(self.limits.max_new_submissions_per_turn), true, prepare, execute, observe_failure)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_distributed_with_preparation<T, A, E>(
+        &mut self, protocol: u64, transport: &T, wait: BoundedCompletionWait,
+        now: Instant, maximum_frames: usize, source_admission: bool,
+        prepare: impl FnMut(WorkId, &W, &S) -> Result<S::Branch, A>,
+        execute: impl FnMut(WorkId, &W, &mut S::Branch) -> Result<O, E>,
+        mut observe_failure: impl FnMut(WorkId,O::Error),
+    ) -> Result<SchedulerProgress<W, O>, SchedulerError>
+    where W: WorkDescriptor, T: BoundedConsensusTransport,
+        <T::Completion as crate::Completion>::Error: std::fmt::Display,
+        A: std::error::Error, E: std::error::Error, O: DistributedTransitionOutput {
+        if self.poisoned.is_none() { self.diagnostic_funding=transport.metadata_funding().cloned(); }
         self.ensure_ready()?;
         self.expire_deadlines_distributed(protocol, transport, wait, now)?;
-        let mut progress = self.poll_distributed(protocol, transport, wait, now)?;
-        self.prepare_bounded(self.limits.max_new_submissions_per_turn, now)?;
-        let plan = self
-            .prepared
-            .iter()
-            .take(
+        let mut progress = self.poll_distributed(protocol, transport, wait, now, &mut observe_failure)?;
+        let funding = transport.metadata_funding();
+        let preparation = self.prepare_bounded_using(maximum_frames, now, source_admission, funding, prepare)
+            .and_then(|count| { self.reserve_submitted_slots(funding, self.prepared.len())?; Ok(count) });
+        if source_admission {
+            let agreed = agree_preparation_status_bounded(transport, protocol, self.drain_cycles,
+                maximum_frames, self.prepared.len(), preparation.is_ok(), wait);
+            if !matches!(agreed, Ok(true)) {
+                let first = preparation.err().unwrap_or_else(|| match agreed {
+                    Err(error) => SchedulerError::from_consensus_with_host_source(self.diagnostic_funding.as_ref(),error),
+                    _ => self.diagnostic(SchedulerError::State,format_args!("source preparation refused or diverged on another rank")),
+                });
+                self.fence_refused_preparation(&first);
+                return Err(first);
+            }
+        }
+        preparation?;
+        let mut plan = protocol_vec(funding, self.prepared.len())?;
+        plan.extend(self.prepared.iter().take(
                 self.limits
                     .max_in_flight_global
                     .saturating_sub(self.submitted.len())
@@ -816,14 +934,13 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             .map(|work| ScheduledWork {
                 id: work.id,
                 descriptor: &work.descriptor,
-            })
-            .collect::<Vec<_>>();
+            }));
         let submission_cycle = self.drain_cycles;
         if let Err(error) =
             validate_schedule_bounded(transport, &plan, submission_cycle, protocol, wait)
         {
-            self.poison(error.to_string(), now);
-            return Err(SchedulerError::Consensus(error.to_string()));
+            self.poison_diagnostic(format_args!("{error}"), now);
+            return Err(SchedulerError::from_consensus_with_host_source(self.diagnostic_funding.as_ref(),error));
         }
         let planned_count = plan.len();
         drop(plan);
@@ -847,16 +964,13 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             }
             Ok(false) => {
                 let reason = "backend submission failed or diverged on at least one rank";
-                self.poison(reason.into(), now);
-                return Err(SchedulerError::DistributedCompletion(reason.into()));
+                self.poison_diagnostic(format_args!("{reason}"), now);
+                return Err(self.diagnostic(SchedulerError::DistributedCompletion,format_args!("{reason}")));
             }
             Err(error) => {
-                let reason = submission.err().map_or_else(
-                    || error.to_string(),
-                    |submission| format!("{error}; local submission also failed: {submission}"),
-                );
-                self.poison(reason.clone(), now);
-                return Err(SchedulerError::Consensus(reason));
+                let first=submission.err().unwrap_or_else(||SchedulerError::from_consensus_with_host_source(self.diagnostic_funding.as_ref(),error));
+                self.poison_diagnostic(format_args!("{first}"), now);
+                return Err(first);
             }
         }
         Ok(progress)
@@ -874,6 +988,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
     where
         <T::Completion as crate::Completion>::Error: std::fmt::Display,
     {
+        if self.poisoned.is_none() { self.diagnostic_funding=transport.metadata_funding().cloned(); }
         self.ensure_ready()?;
         let locally_ready =
             self.requests.contains_key(&request) && !self.terminal.contains_key(&request);
@@ -889,14 +1004,14 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                self.fence(error.to_string());
-                return Err(SchedulerError::Consensus(error.to_string()));
+                self.fence_diagnostic(format_args!("{error}"));
+                return Err(SchedulerError::from_consensus_with_host_source(self.diagnostic_funding.as_ref(),error));
             }
         };
         if !prepared {
             let error = "distributed cancellation preparation failed on at least one rank";
-            self.fence(error.to_string());
-            return Err(SchedulerError::Consensus(error.into()));
+            self.fence_diagnostic(format_args!("{error}"));
+            return Err(self.diagnostic(SchedulerError::Consensus,format_args!("{error}")));
         }
         let committed = agree_disposition_status_bounded(
             transport,
@@ -910,21 +1025,21 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         let committed = match committed {
             Ok(committed) => committed,
             Err(error) => {
-                self.fence(error.to_string());
-                return Err(SchedulerError::Consensus(error.to_string()));
+                self.fence_diagnostic(format_args!("{error}"));
+                return Err(SchedulerError::from_consensus_with_host_source(self.diagnostic_funding.as_ref(),error));
             }
         };
         if !committed {
             let error = "distributed cancellation commit authorization failed";
-            self.fence(error.to_string());
-            return Err(SchedulerError::Consensus(error.into()));
+            self.fence_diagnostic(format_args!("{error}"));
+            return Err(self.diagnostic(SchedulerError::Consensus,format_args!("{error}")));
         }
         let result = self.cancel_internal(request, CancellationCause::Explicit, now);
         if let Err(error) = &result {
             // The disposition is already globally authorized and local
             // cancellation marks every owned work item abandoned before
             // reporting branch-cleanup failure. Fence later scheduler work.
-            self.poison(error.to_string(), now);
+            self.poison_diagnostic(format_args!("{error}"), now);
         }
         result
     }
@@ -964,7 +1079,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             },
         );
         self.finished_requests = self.finished_requests.saturating_add(1);
-        discard_error.map_or(Ok(()), |error| Err(SchedulerError::State(error)))
+        discard_error.map_or(Ok(()), Err)
     }
 
     /// Cancels a request, retaining submitted resources until exact completion.
@@ -1112,9 +1227,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                     self.failed_work = self.failed_work.saturating_add(1);
                     progress.failed.push((
                         submitted.id,
-                        SchedulerError::State(format!(
-                            "failed to discard abandoned state branch: {error}"
-                        )),
+                        self.diagnostic(SchedulerError::State,format_args!("failed to discard abandoned state branch: {error}")),
                     ));
                 }
                 self.abandoned_released_work = self.abandoned_released_work.saturating_add(1);
@@ -1135,9 +1248,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                         self.failed_work = self.failed_work.saturating_add(1);
                         progress.failed.push((
                             submitted.id,
-                            SchedulerError::State(format!(
-                                "failed to discard unpublished state branch: {error}"
-                            )),
+                            self.diagnostic(SchedulerError::State,format_args!("failed to discard unpublished state branch: {error}")),
                         ));
                     } else {
                         self.lifecycle
@@ -1153,7 +1264,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                     self.fail_request(submitted.id.request());
                     progress
                         .failed
-                        .push((submitted.id, SchedulerError::State(error.to_string())));
+                        .push((submitted.id, self.diagnostic(SchedulerError::State,format_args!("{error}"))));
                     return;
                 }
                 self.lifecycle
@@ -1171,14 +1282,10 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                 self.fail_request(submitted.id.request());
                 progress.failed.push((
                     submitted.id,
-                    SchedulerError::DistributedCompletion(discard.map_or_else(
-                        || "backend completion failed on at least one rank".into(),
-                        |error| {
-                            format!(
-                                "backend completion failed on at least one rank; branch discard also failed: {error}"
-                            )
-                        },
-                    )),
+                    match discard {
+                        None=>self.diagnostic(SchedulerError::DistributedCompletion,format_args!("backend completion failed on at least one rank")),
+                        Some(error)=>self.diagnostic(SchedulerError::DistributedCompletion,format_args!("backend completion failed on at least one rank; branch discard also failed: {error}")),
+                    },
                 ));
             }
         }
@@ -1190,21 +1297,27 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         transport: &T,
         wait: BoundedCompletionWait,
         now: Instant,
+        observe_failure: &mut impl FnMut(WorkId,O::Error),
     ) -> Result<SchedulerProgress<W, O>, SchedulerError>
     where
         <T::Completion as crate::Completion>::Error: std::fmt::Display,
         O: DistributedTransitionOutput,
     {
-        let local = self
-            .submitted
-            .iter()
-            .map(|work| {
+        let funding=transport.metadata_funding();
+        let mut local=protocol_vec(funding,self.submitted.len())?;
+        for work in &self.submitted {
                 let (status, output) = match work.output.is_complete() {
                     Ok(false) => (CompletionObservation::Incomplete, [0; 8]),
                     Ok(true) => {
-                        let mut descriptor = Vec::new();
+                        let mut descriptor = if funding.is_some() {
+                            protocol_vec(funding, work.output.distributed_output_words()
+                                .ok_or(HostMetadataFundingError::Unavailable)?)?
+                        } else { Vec::new() };
                         match work.output.encode_distributed_output(&mut descriptor) {
                             Ok(()) => {
+                                if funding.is_some() && work.output.distributed_output_words()!=Some(descriptor.len()) {
+                                    return Err(HostMetadataFundingError::Unavailable.into());
+                                }
                                 let mut digest = Sha256::new();
                                 for word in descriptor {
                                     digest.update(word.to_le_bytes());
@@ -1223,21 +1336,26 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                             Err(_) => (CompletionObservation::Failed, [0; 8]),
                         }
                     }
-                    Err(_) => (CompletionObservation::Failed, [0; 8]),
+                    Err(error) => {
+                        observe_failure(work.id,error);
+                        (CompletionObservation::Failed, [0; 8])
+                    },
                 };
-                (work.id, status, output)
-            })
-            .collect::<Vec<_>>();
+                local.push((work.id, status, output));
+        }
         let global = match resolve_output_completions_bounded(transport, protocol, &local, wait) {
             Ok(global) => global,
             Err(error) => {
-                self.poison(error.to_string(), now);
-                return Err(SchedulerError::Consensus(error.to_string()));
+                self.poison_diagnostic(format_args!("{error}"), now);
+                return Err(SchedulerError::from_consensus_with_host_source(self.diagnostic_funding.as_ref(),error));
             }
         };
 
         let mut progress = SchedulerProgress::default();
-        let mut retained = Vec::with_capacity(self.submitted.len());
+        progress.committed=protocol_vec(funding,self.submitted.len())?;
+        progress.failed=protocol_vec(funding,self.submitted.len())?;
+        progress.metadata_funding=funding.cloned();
+        let mut retained = protocol_vec(funding,self.submitted.len())?;
         for (mut work, status) in std::mem::take(&mut self.submitted).into_iter().zip(global) {
             match status {
                 CompletionResolution::Incomplete => retained.push(work),
@@ -1270,6 +1388,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             }
         }
         self.submitted = retained;
+        self.submitted_funding=funding.cloned();
         self.update_abandoned_resource_peak();
         Ok(progress)
     }
@@ -1306,27 +1425,13 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
     where
         <T::Completion as crate::Completion>::Error: std::fmt::Display,
     {
-        let mut expired = BTreeSet::new();
-        for (request, entry) in &self.requests {
-            if entry
-                .pending
-                .iter()
-                .any(|work| work.deadline.is_some_and(|deadline| deadline <= now))
-            {
-                expired.insert(*request);
-            }
+        let mut local=protocol_vec(transport.metadata_funding(),self.requests.len())?;
+        for (&request,entry) in &self.requests {
+            let expired=entry.pending.iter().any(|work|work.deadline.is_some_and(|deadline|deadline<=now))
+                || self.prepared.iter().any(|work|work.id.request()==request
+                    && work.deadline.is_some_and(|deadline|deadline<=now));
+            local.push((request,expired));
         }
-        for work in &self.prepared {
-            if work.deadline.is_some_and(|deadline| deadline <= now) {
-                expired.insert(work.id.request());
-            }
-        }
-        let local = self
-            .requests
-            .keys()
-            .copied()
-            .map(|request| (request, expired.contains(&request)))
-            .collect::<Vec<_>>();
         let globally_expired = match agree_deadline_candidates_bounded(
             transport,
             protocol,
@@ -1336,8 +1441,8 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         ) {
             Ok(expired) => expired,
             Err(error) => {
-                self.fence(error.to_string());
-                return Err(SchedulerError::Consensus(error.to_string()));
+                self.fence_diagnostic(format_args!("{error}"));
+                return Err(SchedulerError::from_consensus_with_host_source(self.diagnostic_funding.as_ref(),error));
             }
         };
         for request in globally_expired {
@@ -1353,8 +1458,8 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                 ) {
                     Ok(agreed) => agreed,
                     Err(error) => {
-                        self.fence(error.to_string());
-                        return Err(SchedulerError::Consensus(error.to_string()));
+                        self.fence_diagnostic(format_args!("{error}"));
+                        return Err(SchedulerError::from_consensus_with_host_source(self.diagnostic_funding.as_ref(),error));
                     }
                 };
                 if !agreed {
@@ -1363,12 +1468,12 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                     } else {
                         "distributed deadline commit authorization failed"
                     };
-                    self.fence(error.into());
-                    return Err(SchedulerError::Consensus(error.into()));
+                    self.fence_diagnostic(format_args!("{error}"));
+                    return Err(self.diagnostic(SchedulerError::Consensus,format_args!("{error}")));
                 }
             }
             if let Err(error) = self.cancel_internal(request, CancellationCause::Deadline, now) {
-                self.poison(error.to_string(), now);
+                self.poison_diagnostic(format_args!("{error}"), now);
                 return Err(error);
             }
         }
@@ -1383,10 +1488,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
     ) -> Result<(), SchedulerError> {
         self.ensure_ready()?;
         if self.terminal.contains_key(&request) {
-            return Err(SchedulerError::State(format!(
-                "request {} is already terminal",
-                request.value()
-            )));
+            return Err(self.diagnostic(SchedulerError::State,format_args!("request {} is already terminal",request.value())));
         }
         let entry = self
             .requests
@@ -1434,33 +1536,27 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             },
         );
         self.update_abandoned_resource_peak();
-        discard_error.map_or(Ok(()), |error| Err(SchedulerError::State(error)))
+        discard_error.map_or(Ok(()), Err)
     }
 
-    fn discard_prepared_for_request(&mut self, request: RequestId) -> (usize, Option<String>) {
-        let mut retained = VecDeque::with_capacity(self.prepared.len());
-        let mut discarded = 0;
-        let mut errors = Vec::new();
-        for work in std::mem::take(&mut self.prepared) {
-            if work.id.request() == request {
-                discarded += 1;
+    fn discard_prepared_for_request(&mut self, request: RequestId) -> (usize, Option<SchedulerError>) {
+        let mut discarded=0;
+        let mut first=None;
+        for _ in 0..self.prepared.len() {
+            let work=self.prepared.pop_front().expect("fixed prepared iteration");
+            if work.id.request()==request {
+                discarded+=1;
                 match S::discard_branch(work.branch) {
-                    Ok(()) => {
-                        self.lifecycle.insert(work.id, WorkLifecycle::Abandoned);
-                    }
-                    Err(error) => {
-                        self.lifecycle.insert(work.id, WorkLifecycle::Failed);
-                        self.failed_work = self.failed_work.saturating_add(1);
-                        errors.push(format!("work {:?}: {error}", work.id));
+                    Ok(())=>{self.lifecycle.insert(work.id,WorkLifecycle::Abandoned);},
+                    Err(error)=>{
+                        self.lifecycle.insert(work.id,WorkLifecycle::Failed);
+                        self.failed_work=self.failed_work.saturating_add(1);
+                        if first.is_none(){first=Some(self.diagnostic(SchedulerError::State,format_args!("work {:?}: {error}",work.id)));}
                     }
                 }
-            } else {
-                retained.push_back(work);
-            }
+            } else { self.prepared.push_back(work); }
         }
-        self.prepared = retained;
-        let error = (!errors.is_empty()).then(|| errors.join("; "));
-        (discarded, error)
+        (discarded,first)
     }
 
     fn branch_count(&self, request: RequestId) -> usize {
@@ -1473,6 +1569,55 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                 .iter()
                 .filter(|work| work.id.request() == request)
                 .count()
+    }
+
+    fn reserve_prepared_slot(&mut self, funding: Option<&HostMetadataFunding>) -> Result<(),SchedulerError> {
+        let Some(funding)=funding else { return Ok(()) };
+        reserve_protocol(Some(funding), &[std::mem::size_of::<Prepared<W,S::Branch>>()])?;
+        if self.prepared.len()==self.prepared.capacity() {
+            let count=self.prepared.len().checked_add(1).ok_or(HostMetadataFundingError::Overflow)?;
+            reserve_protocol(Some(funding), &[count.checked_mul(std::mem::size_of::<Prepared<W,S::Branch>>())
+                .ok_or(HostMetadataFundingError::Overflow)?])?;
+            self.prepared.try_reserve_exact(1).map_err(|_|HostMetadataFundingError::Unavailable)?;
+            self.prepared_funding=Some(funding.clone());
+        }
+        Ok(())
+    }
+    fn reserve_submitted_slots(&mut self, funding: Option<&HostMetadataFunding>, count: usize) -> Result<(),SchedulerError> {
+        let Some(funding)=funding else { return Ok(()) };
+        let needed=self.submitted.len().checked_add(count).ok_or(HostMetadataFundingError::Overflow)?;
+        if needed>self.submitted.capacity() {
+            reserve_protocol(Some(funding), &[needed.checked_mul(std::mem::size_of::<Submitted<W,S::Branch,O>>())
+                .ok_or(HostMetadataFundingError::Overflow)?])?;
+            self.submitted.try_reserve_exact(count).map_err(|_|HostMetadataFundingError::Unavailable)?;
+            self.submitted_funding=Some(funding.clone());
+        }
+        Ok(())
+    }
+
+    fn restore_unsubmitted(&mut self, queued: Queued<W>) {
+        let request = queued.id.request();
+        self.lifecycle.insert(queued.id, WorkLifecycle::Queued);
+        self.requests.get_mut(&request).expect("unsubmitted work retains canonical state")
+            .pending.push_front(queued);
+        self.ready.retain(|candidate| *candidate != request);
+        self.ready.push_front(request);
+    }
+
+    fn refuse_preparation(&mut self, queued: Queued<W>, retain: bool) {
+        if retain { self.restore_unsubmitted(queued); }
+        else { self.fail_before_submission(queued.id); }
+    }
+
+    fn fence_refused_preparation(&mut self, first: &SchedulerError) {
+        let mut reason=self.diagnostic_reason(format_args!("{first}"));
+        while let Some(work)=self.prepared.pop_back() {
+            if let Err(error)=S::discard_branch(work.branch) {
+                reason=self.diagnostic_reason(format_args!("{reason}; branch discard also failed: {error}"));
+            }
+            self.restore_unsubmitted(Queued{id:work.id,work:work.work,deadline:work.deadline});
+        }
+        self.fence_reason(reason);
     }
 
     fn fail_before_submission(&mut self, id: WorkId) {
@@ -1506,22 +1651,27 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
         self.terminal.insert(request, RequestStatus::Failed);
     }
 
-    fn ensure_ready(&self) -> Result<(), SchedulerError> {
-        self.poisoned.as_ref().map_or(Ok(()), |reason| {
-            Err(SchedulerError::Poisoned(reason.clone()))
-        })
+    fn diagnostic(&self,kind:fn(String)->SchedulerError,arguments:std::fmt::Arguments<'_>)->SchedulerError {
+        SchedulerError::with_host_source(self.diagnostic_funding.as_ref(),kind,arguments)
     }
-
-    fn fence(&mut self, reason: String) {
-        if self.poisoned.is_none() {
-            self.poisoned = Some(reason);
-        }
+    fn diagnostic_reason(&self,arguments:std::fmt::Arguments<'_>)->Cow<'static,str> {
+        protocol_string(self.diagnostic_funding.as_ref(),arguments).map(Cow::Owned)
+            .unwrap_or(Cow::Borrowed("source-funded scheduler diagnostic unavailable"))
     }
-
-    fn poison(&mut self, reason: String, now: Instant) {
-        if self.poisoned.is_some() {
-            return;
-        }
+    fn ensure_ready(&self)->Result<(),SchedulerError> {
+        self.poisoned.as_ref().map_or(Ok(()),|reason|Err(self.diagnostic(SchedulerError::Poisoned,format_args!("{reason}"))))
+    }
+    fn fence_diagnostic(&mut self,arguments:std::fmt::Arguments<'_>) {
+        let reason=self.diagnostic_reason(arguments); self.fence_reason(reason);
+    }
+    fn fence_reason(&mut self,reason:Cow<'static,str>) {
+        if self.poisoned.is_none(){self.poisoned=Some(reason);}
+    }
+    fn poison_diagnostic(&mut self,arguments:std::fmt::Arguments<'_>,now:Instant) {
+        let reason=self.diagnostic_reason(arguments); self.poison_reason_owned(reason,now);
+    }
+    fn poison_reason_owned(&mut self,mut reason:Cow<'static,str>,now:Instant) {
+        if self.poisoned.is_some(){return;}
         let mut discarded = 0usize;
         for (request, entry) in std::mem::take(&mut self.requests) {
             self.terminal.insert(request, RequestStatus::Failed);
@@ -1531,11 +1681,10 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
             }
         }
         self.ready.clear();
-        let mut cleanup_errors = Vec::new();
         for work in std::mem::take(&mut self.prepared) {
             let id = work.id;
             if let Err(error) = S::discard_branch(work.branch) {
-                cleanup_errors.push(format!("work {id:?}: {error}"));
+                reason=self.diagnostic_reason(format_args!("{reason}; prepared branch cleanup failed: work {id:?}: {error}"));
                 self.failed_work = self.failed_work.saturating_add(1);
             }
             self.lifecycle.insert(id, WorkLifecycle::Failed);
@@ -1549,14 +1698,7 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
                 self.lifecycle.insert(work.id, WorkLifecycle::Abandoned);
             }
         }
-        self.poisoned = Some(if cleanup_errors.is_empty() {
-            reason
-        } else {
-            format!(
-                "{reason}; prepared branch cleanup failed: {}",
-                cleanup_errors.join("; ")
-            )
-        });
+        self.poisoned=Some(reason);
         self.update_abandoned_resource_peak();
     }
 
@@ -1578,6 +1720,9 @@ impl<W, S: SemanticStateTransaction, O: TransitionOutput> Scheduler<W, S, O> {
 /// Structured neutral scheduler error.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum SchedulerError {
+    /// Original protocol metadata refused its exact destination before growth.
+    #[error(transparent)]
+    Metadata(#[from] HostMetadataFundingError),
     /// One or more limits were zero.
     #[error("scheduler limits must be positive, got {0:?}")]
     InvalidLimits([usize; 6]),
@@ -1611,6 +1756,33 @@ pub enum SchedulerError {
     /// Unsafe distributed ordering prevents further scheduler mutation.
     #[error("scheduler is poisoned after unsafe distributed ordering: {0}")]
     Poisoned(String),
+}
+
+impl SchedulerError {
+    /// Formats a closed diagnostic with the exact cumulative protocol source.
+    /// The caller retains funding through the returned error's lifetime. Display
+    /// arguments must be borrowed, deterministic and allocation-free themselves.
+    /// Source refusal remains inline and never invokes a fallback formatter.
+    pub fn with_host_source(funding:Option<&HostMetadataFunding>,kind:fn(String)->Self,
+        arguments:std::fmt::Arguments<'_>)->Self {
+        protocol_string(funding,arguments).map_or_else(Self::Metadata,kind)
+    }
+    /// Preserves an inline source refusal while translating protocol context.
+    pub fn from_consensus_with_host_source(funding:Option<&HostMetadataFunding>,cause:crate::consensus::ConsensusError)->Self {
+        match cause {
+            crate::consensus::ConsensusError::Metadata(cause)=>Self::Metadata(cause),
+            cause=>Self::with_host_source(funding,Self::Consensus,format_args!("{cause}")),
+        }
+    }
+}
+
+impl From<crate::consensus::ConsensusError> for SchedulerError {
+    fn from(cause:crate::consensus::ConsensusError)->Self {
+        match cause {
+            crate::consensus::ConsensusError::Metadata(cause)=>Self::Metadata(cause),
+            cause=>Self::Consensus(cause.to_string()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2466,4 +2638,6 @@ mod tests {
             capabilities
         );
     }
+
+    mod source_preparation_tests;
 }

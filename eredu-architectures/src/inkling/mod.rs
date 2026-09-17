@@ -32,7 +32,7 @@ pub use model::{
     LayeredModel, ModelInput, PartitionMtpOutput, PreparedInput, StaticModules, TextPartitionInput,
     Unit, AUDIO_EXECUTION_GROUP, MTP_STATIC_ROLE, TEXT_EXECUTION_GROUP, VISION_EXECUTION_GROUP,
 };
-pub(crate) use mtp::mtp_text_args;
+pub(crate) use mtp::{mtp_text_args,MtpModelSpec};
 pub use mtp::{MtpDepth, MtpModel, MtpOutput, MtpShared};
 pub use parallel::{
     layer_parameter_groups, local_geometry, local_text_args, mtp_parameter_groups,
@@ -105,3 +105,5 @@ pub fn expert_realization_plan<
         .map(Some)
         .map_err(eredu_nn::Error::backend)
 }
+
+pub(crate) use model::RetainedModelSource;

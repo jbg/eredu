@@ -4,6 +4,7 @@ pub(crate) mod block;
 mod checkpoint;
 mod conditional;
 mod config;
+pub(crate) use config::prompt_cache_architecture_fingerprint_with_metadata;
 mod linear_attention;
 mod model;
 mod mtp;
@@ -12,17 +13,39 @@ mod safetensors;
 
 pub(crate) use safetensors::catalog_plan as safetensors_catalog_plan;
 
+/// The same alias declarations feed checkpoint ownership and borrowed policy matching.
+fn text_checkpoint_alias_parts(name: &str) -> impl Iterator<Item = (&'static str, &str)> {
+    let rest = name.strip_prefix("model.");
+    ["model.language_model.", "language_model.", "model.model."]
+        .into_iter()
+        .filter_map(move |prefix| rest.map(|rest| (prefix, rest)))
+}
+
 /// Checkpoint spellings shared by tensor admission and FP8 exclusion policy.
 fn text_checkpoint_aliases(name: &str) -> Vec<String> {
-    name.strip_prefix("model.")
-        .map(|rest| {
-            vec![
-                format!("model.language_model.{rest}"),
-                format!("language_model.{rest}"),
-                format!("model.model.{rest}"),
-            ]
-        })
-        .unwrap_or_default()
+    text_checkpoint_alias_parts(name)
+        .map(|(prefix, rest)| format!("{prefix}{rest}"))
+        .collect()
+}
+
+/// Exact module-boundary match against one borrowed prefix/rest alias. Both
+/// pieces remain with the immutable config/name source; no alias string is born.
+fn alias_within_module(prefix: &str, rest: &str, module: &str) -> bool {
+    let suffix = if module.len() < prefix.len() {
+        let Some(suffix) = prefix.strip_prefix(module) else {
+            return false;
+        };
+        return suffix.starts_with('.');
+    } else {
+        let Some(module_rest) = module.strip_prefix(prefix) else {
+            return false;
+        };
+        let Some(suffix) = rest.strip_prefix(module_rest) else {
+            return false;
+        };
+        suffix
+    };
+    suffix.is_empty() || suffix.starts_with('.')
 }
 
 pub use block::{expert_bank_spec, Block, FeedForward, SharedRoutedGatedProduct, TokenMixer};
@@ -40,19 +63,21 @@ pub use conditional::{
     ConditionalStaticModules, ConditionalUnit, PreparedInput as PreparedConditionalInput,
     VISION_EXECUTION_GROUP,
 };
+pub(crate) use config::conditional_prompt_cache_architecture_fingerprint_with_metadata;
 pub use config::{
     conditional_prompt_cache_architecture_fingerprint, fp8_block_row_widths,
     fused_projection_widths, model_args_from_config_value, model_args_from_gguf_catalog,
-    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_geometry,
-    vision_config_from_gguf_catalog, with_gguf_vision_projector, with_media_token_ids,
-    HybridConfig, HybridConfigError, HybridLayerPolicy, HybridStateGeometry, HybridVariant,
-    ParsedHybridConfig, QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT, TARGET_STATE_SEGMENT,
+    prompt_cache_architecture_fingerprint, state_layout, state_layout_with_metadata,
+    state_layout_with_geometry, vision_config_from_gguf_catalog, with_gguf_vision_projector,
+    with_media_token_ids, HybridConfig, HybridConfigError, HybridLayerPolicy, HybridStateGeometry,
+    HybridVariant, ParsedHybridConfig, QwenFp8QuantizationConfig, PREDICTION_STATE_SEGMENT,
+    TARGET_STATE_SEGMENT,
 };
 pub use linear_attention::LinearAttention;
+pub(crate) use model::state_identity_with_metadata;
 pub use model::{state_identity, ForwardContext, LayeredModel, TargetPartitionInput, Unit};
-pub use mtp::{
-    prompt_token_identity, EmbeddedInput, ForwardMode, PredictionShared, PredictionUnit,
-};
+pub use mtp::{prompt_token_identity, EmbeddedInput, ForwardMode, PredictionShared, PredictionUnit};
+pub(crate) use mtp::{PredictionSharedSpec, PredictionUnitSpec};
 pub(crate) use parallel::routed_conditional_partition_local_geometry;
 pub use parallel::{
     conditional_local_geometry, conditional_partition_local_geometry, local_block_config,
@@ -178,3 +203,6 @@ fn realization_plan(
         .map(Some)
         .map_err(eredu_nn::Error::backend)
 }
+
+
+pub(crate) use conditional::RetainedConditionalUnits;

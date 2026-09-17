@@ -6,6 +6,9 @@ impl CacheResidencyManager {
     /// Creates an empty manager with globally shared finite limits.
     pub fn new(options: PagedCacheOptions) -> Result<Self, CacheResidencyError> {
         if let LiveCacheDiskPolicy::Enabled { directory, .. } = options.live_disk_policy() {
+            // Retain the ordinary process naming source before any original
+            // per-operation destination may borrow it. No file is opened here.
+            LiveCacheBlockPublication::initialize_naming_source();
             fs::create_dir_all(directory).map_err(|source| CacheResidencyError::Io {
                 action: "create live cache directory",
                 path: directory.clone(),
@@ -20,44 +23,22 @@ impl CacheResidencyManager {
         let telemetry = CacheResidencyTelemetry::new(effective_queue_capacity);
         let disk_worker = Some(Arc::new(DiskWorker::new(effective_queue_capacity)?));
         let host_demotion_worker = Arc::new(HostDemotionWorker::new()?);
-        let recent_device_blocks = options.recent_device_blocks();
-        let device_budget_bytes = options.device_budget_bytes();
-        let host_budget_bytes = options.host_budget_bytes();
-        let disk_budget_bytes = match options.live_disk_policy() {
-            LiveCacheDiskPolicy::Disabled => None,
-            LiveCacheDiskPolicy::Enabled { budget_bytes, .. } => Some(*budget_bytes),
-        };
         let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
         let pool = match options.pool().cloned() {
             Some(pool) => pool,
             None => options.create_pool()?,
         };
         let pool_membership = Arc::new(pool.register_manager(session_id)?);
+        let state = CacheManagerState::empty(&options, pool, session_id, telemetry);
         Ok(Self {
             session_id,
             inner: Arc::new(CacheResidencyManagerInner {
                 options,
-                state: Arc::new(Mutex::new(CacheManagerState {
-                    pool,
-                    pool_manager_id: session_id,
-                    generation: 0,
-                    background_disk_error: None,
-                    lifecycle: CacheBlockLifecycle::new(),
-                    blocks: BTreeMap::new(),
-                    history_retentions: Vec::new(),
-                    host_write_reservations: HashMap::new(),
-                    retiring_host_demotions: HashMap::new(),
-                    retiring_disk_reads: HashMap::new(),
-                    transfer_device: None,
-                    telemetry,
-                    recent_device_blocks,
-                    device_budget_bytes,
-                    host_budget_bytes,
-                    disk_budget_bytes,
-                })),
+                state: Arc::new(Mutex::new(state)),
                 host_demotion_worker,
                 disk_worker,
                 pool_membership,
+                _metadata_funding: None,
             }),
         })
     }
@@ -87,11 +68,14 @@ impl CacheResidencyManager {
     /// Includes all catalogued blocks, including blocks currently on host or disk.
     pub(crate) fn isolated_snapshot_bytes(&self) -> Option<u64> {
         let state = self.lock().ok()?;
-        state.blocks.values().try_fold(65536_u64, |total, block| {
-            total
-                .checked_add(block.bytes.checked_mul(2)?)?
-                .checked_add(8192)
-        })
+        snapshot_catalog_bytes(&state)
+    }
+
+    /// Same logical catalog total under an allocation-free nonblocking loan.
+    /// Busy or poisoned catalogs remain unknown; this never reaps or progresses.
+    pub(crate) fn original_isolated_snapshot_bytes(&self) -> Option<u64> {
+        let state = self.inner.state.try_lock().ok()?;
+        snapshot_catalog_bytes(&state)
     }
 
     fn copy_session(
@@ -233,26 +217,25 @@ impl CacheResidencyManager {
         if state.blocks.contains_key(&id) {
             return Err(CacheLifecycleError::DuplicateBlock(id).into());
         }
-        let bytes = arrays.bytes();
-        let record = CacheBlockRecord {
-            shapes: arrays.shapes(),
-            dtypes: arrays.dtypes(),
-            physical: MlxCacheBlockStorage::device(id.clone(), arrays, None),
-            bytes,
-            imported: false,
-        };
-        state
-            .lifecycle
-            .insert(id.clone(), protected_prefix)
-            .map_err(CacheResidencyError::from)?;
-        state.blocks.insert(id.clone(), record);
+        let metadata = CacheBlockMetadata::ordinary(&arrays);
+        let record = metadata.into_record(id.clone(), arrays, false);
+        if let Err((cause, record)) = super::publication::insert_record(
+            &mut state,
+            id.clone(),
+            record,
+            protected_prefix,
+            false,
+        ) {
+            drop(state);
+            drop(record);
+            return Err(cause);
+        }
         drop(state);
         if let Err(error) = self.rebalance(Some(&id), false) {
             let mut state = self.lock()?;
             if let Some(record) = state.blocks.remove(&id) {
                 state.lifecycle.remove(&id)?;
                 cancel_record_operation(&record, &mut state.telemetry.report);
-                remove_ephemeral_file(&record);
             }
             update_report_totals(&mut state);
             return Err(error);
@@ -272,15 +255,17 @@ impl CacheResidencyManager {
         prefix_tokens: i64,
     ) -> Result<Vec<CacheBlockId>, CacheResidencyError> {
         let state = self.lock()?;
+        let selection = eredu_runtime::CacheBlockSelection::new(
+            layer,
+            representation,
+            visible_start,
+            visible_end,
+            prefix_tokens,
+        );
         Ok(state
             .blocks
             .keys()
-            .filter(|id| {
-                id.global_layer == layer
-                    && id.representation == representation
-                    && id.start < visible_end
-                    && (id.end > visible_start || id.start < prefix_tokens)
-            })
+            .filter(|id| selection.includes(id))
             .cloned()
             .collect())
     }
@@ -313,7 +298,6 @@ impl CacheResidencyManager {
             .blocks
             .remove(id)
             .expect("validated cache block still present");
-        remove_ephemeral_file(&record);
         update_report_totals(&mut state);
         drop(state);
         self.retire_tickets(&tickets)?;
@@ -441,6 +425,8 @@ impl CacheResidencyManager {
                 bytes: arrays.bytes(),
                 physical: MlxCacheBlockStorage::device(id.clone(), arrays, None),
                 imported: false,
+                original_discard: None,
+                _metadata_funding: None,
             };
             let previous = state.blocks.insert(id, record);
             debug_assert!(previous.is_none());
@@ -449,9 +435,6 @@ impl CacheResidencyManager {
         update_report_totals(&mut state);
         drop(state);
 
-        for record in &removed {
-            remove_ephemeral_file(record);
-        }
         self.retire_tickets(&tickets)?;
         Ok(())
     }
@@ -500,17 +483,7 @@ impl CacheResidencyManager {
             .blocks
             .iter()
             .filter(|(id, record)| {
-                id.global_layer == layer
-                    && id.representation == representation
-                    && id.end <= visible_start
-                    && id.end > prefix_tokens
-                    && state.lifecycle.lease_count(id).ok() == Some(0)
-                    && !record.imported
-                    && !state.history_retentions.iter().any(|entry| {
-                        entry
-                            .upgrade()
-                            .is_some_and(|retained| retained.contains(id))
-                    })
+                discard_candidate(&state, id, record, layer, representation, visible_start, prefix_tokens)
             })
             .map(|(id, _)| id.clone())
             .collect::<Vec<_>>();
@@ -520,11 +493,7 @@ impl CacheResidencyManager {
             advance_generation_locked(&mut state)
         };
         for id in ids {
-            if let Some(record) = state.blocks.remove(&id) {
-                state.lifecycle.remove(&id)?;
-                remove_ephemeral_file(&record);
-                state.telemetry.report.discarded_sliding_blocks += 1;
-            }
+            let _retired = take_discarded_record(&mut state, &id)?;
         }
         update_report_totals(&mut state);
         drop(state);
@@ -537,9 +506,6 @@ impl CacheResidencyManager {
         let mut state = self.lock()?;
         state.lifecycle.clear()?;
         let tickets = advance_generation_locked(&mut state);
-        for record in state.blocks.values() {
-            remove_ephemeral_file(record);
-        }
         state.blocks.clear();
         update_report_totals(&mut state);
         drop(state);
@@ -650,4 +616,59 @@ fn advance_generation_locked(state: &mut CacheManagerState) -> Vec<PendingCacheO
     state.retiring_host_demotions.extend(demotion_reservations);
     state.retiring_disk_reads.extend(read_reservations);
     tickets
+}
+
+// Shared arithmetic for ordinary and pre-grant immutable catalog inspection.
+fn snapshot_catalog_bytes(state: &CacheManagerState) -> Option<u64> {
+    state.blocks.values().try_fold(65536_u64, |total, block| {
+        total
+            .checked_add(block.bytes.checked_mul(2)?)?
+            .checked_add(8192)
+    })
+}
+
+/// One shared logical policy for ordinary and source-qualified retirement.
+/// A source pin, active demand, imported record or live history owner prevents
+/// removal. The caller owns completion and retires the returned payload.
+pub(super) fn discard_candidate(
+    state: &CacheManagerState,
+    id: &CacheBlockId,
+    record: &CacheBlockRecord,
+    layer: usize,
+    representation: CacheRepresentation,
+    visible_start: i64,
+    prefix_tokens: i64,
+) -> bool {
+    id.global_layer == layer
+        && id.representation == representation
+        && eredu_runtime::cache::CacheBlockSelection::outside_retained_window(
+            id.start, id.end, visible_start, prefix_tokens,
+        )
+        && state.lifecycle.lease_count(id).ok() == Some(0)
+        && !record.imported
+        && !state.history_retentions.iter().any(|entry| {
+            entry.upgrade().is_some_and(|retained| retained.contains(id))
+        })
+}
+
+pub(super) fn take_discarded_record(
+    state: &mut CacheManagerState,
+    id: &CacheBlockId,
+) -> Result<Option<CacheBlockRecord>, CacheResidencyError> {
+    if !state.blocks.contains_key(id) {
+        return Ok(None);
+    }
+    let record = take_unleased_record(state, id)?;
+    if record.is_some() {
+        state.telemetry.report.discarded_sliding_blocks += 1;
+    }
+    Ok(record)
+}
+
+/// One lease-checked removal used by ordinary retirement and original rollback.
+/// The caller must drop the returned native/source payload after unlocking.
+pub(super) fn take_unleased_record(state: &mut CacheManagerState, id: &CacheBlockId)
+    -> Result<Option<CacheBlockRecord>, CacheResidencyError> {
+    state.lifecycle.remove(id)?;
+    Ok(state.blocks.remove(id))
 }

@@ -570,7 +570,11 @@ fn nanbeige_discovery_describes_logical_invocations_and_executable_captures() {
         .map(|pass| {
             let execution = &pass.executions[0];
             assert_eq!(execution.physical_layer_index, 0);
-            graph.node(&execution.node_id).unwrap().observation_paths[1].clone()
+            let node = graph.node(&execution.node_id).unwrap();
+            let path = eredu_core::UnitObservation::Output
+                .path(&format!("model.layers.{}", node.layer_index.unwrap()));
+            assert!(node.observation_paths.contains(&path));
+            path
         })
         .collect::<Vec<_>>();
     assert_eq!(

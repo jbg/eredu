@@ -10,17 +10,17 @@
 use std::cell::RefCell;
 
 #[cfg(not(feature = "cuda"))]
-use safemlx::fast::{CustomKernelConfig, MetalKernel};
-#[cfg(not(feature = "cuda"))]
 use safemlx::DeviceType;
+#[cfg(not(feature = "cuda"))]
+use safemlx::fast::{CustomKernelConfig, MetalKernel};
 use safemlx::{
+    Array, Dtype, Stream,
     error::Exception,
     ops::{
         concatenate_axis, exp,
         indexing::{NewAxis, TryIndexOp},
         sum_axis, zeros,
     },
-    Array, Dtype, Stream,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -37,6 +37,17 @@ const PREFILL_MEDIUM_SCAN_TOKENS: i32 = 16;
 const PREFILL_LONG_SCAN_TOKENS: i32 = 32;
 
 #[cfg(not(feature = "cuda"))]
+pub(super) fn metal_scan_chunk_tokens(length: i32) -> i32 {
+    if length <= PREFILL_SHORT_SCAN_TOKENS {
+        PREFILL_SHORT_SCAN_TOKENS
+    } else if length <= 256 {
+        PREFILL_MEDIUM_SCAN_TOKENS
+    } else {
+        PREFILL_LONG_SCAN_TOKENS
+    }
+}
+
+#[cfg(not(feature = "cuda"))]
 #[derive(Debug)]
 struct RecurrentScanKernel {
     decode: MetalKernel,
@@ -44,149 +55,23 @@ struct RecurrentScanKernel {
 }
 
 #[cfg(not(feature = "cuda"))]
-impl RecurrentScanKernel {
-    fn apply<I, A>(
-        kernel: &MetalKernel,
-        inputs: I,
-        config: &CustomKernelConfig,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception>
-    where
-        I: IntoIterator<Item = A>,
-        A: AsRef<Array>,
-    {
-        let mut outputs = kernel.apply_device(inputs, config, stream)?;
-        if outputs.len() != 2 {
-            return Err(Exception::custom(format!(
-                "gated-delta kernel returned {} outputs, expected 2",
-                outputs.len()
-            )));
-        }
-        let state = outputs.remove(1);
-        let sequence = outputs.remove(0);
-        Ok((sequence, state))
-    }
-
-    fn decode<I, A>(
-        &self,
-        inputs: I,
-        config: &CustomKernelConfig,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception>
-    where
-        I: IntoIterator<Item = A>,
-        A: AsRef<Array>,
-    {
-        Self::apply(&self.decode, inputs, config, stream)
-    }
-
-    fn prefill<I, A>(
-        &self,
-        inputs: I,
-        config: &CustomKernelConfig,
-        stream: &Stream,
-    ) -> Result<(Array, Array), Exception>
-    where
-        I: IntoIterator<Item = A>,
-        A: AsRef<Array>,
-    {
-        Self::apply(&self.prefill, inputs, config, stream)
-    }
-}
-
-#[cfg(not(feature = "cuda"))]
 fn metal_kernels(vector_decay: bool) -> Result<RecurrentScanKernel, Exception> {
-    let decay_index = if vector_decay {
-        "float gate = metal::exp(g[group * KD + kd]);"
-    } else {
-        "float gate = metal::exp(g[group]);"
+    use crate::backend::managed_memory::recurrent_kernel::{ScanKernel, plan};
+    let build = |decode| {
+        let p = plan(ScanKernel::select(decode, vector_decay));
+        MetalKernel::new(
+            p.name,
+            p.inputs,
+            p.outputs,
+            p.source,
+            p.header,
+            p.ensure_row_contiguous,
+            p.atomic_outputs,
+        )
     };
-    let prefill_decay_index = if vector_decay {
-        "float gate = metal::exp(g[gh_idx * KD + kd]);"
-    } else {
-        "float gate = metal::exp(g[gh_idx]);"
-    };
-    let decode_source = format!(
-        concat!(
-            "uint elem = thread_position_in_grid.x;",
-            "uint vd = elem % VD;",
-            "uint group = elem / VD;",
-            "uint state_base = group * KD * VD;",
-            "uint vec_base = group * KD;",
-            "uint value_base = group * VD;",
-            "float kv_mem = 0.0f;",
-            "for (uint kd = 0; kd < KD; ++kd) {{",
-            "  uint state_idx = state_base + kd * VD + vd;",
-            "  {decay_index}",
-            "  kv_mem += float(state[state_idx]) * gate * float(key[vec_base + kd]);",
-            "}}",
-            "float delta = (float(value[value_base + vd]) - kv_mem) * float(beta[group]);",
-            "float acc = 0.0f;",
-            "for (uint kd = 0; kd < KD; ++kd) {{",
-            "  uint state_idx = state_base + kd * VD + vd;",
-            "  {decay_index}",
-            "  float updated = float(state[state_idx]) * gate + float(key[vec_base + kd]) * delta;",
-            "  state_out[state_idx] = updated;",
-            "  acc += updated * float(query[vec_base + kd]);",
-            "}}",
-            "out[value_base + vd] = acc;"
-        ),
-        decay_index = decay_index
-    );
-    let prefill_source = format!(
-        concat!(
-            "uint elem = thread_position_in_grid.x;",
-            "uint vd = elem % VD;",
-            "uint group = elem / VD;",
-            "uint h = group % H;",
-            "uint b = group / H;",
-            "uint state_base = group * KD * VD;",
-            "for (uint t = 0; t < L; ++t) {{",
-            "  uint gh_idx = (b * L + t) * H + h;",
-            "  uint vec_base = gh_idx * KD;",
-            "  uint value_base = gh_idx * VD;",
-            "  float kv_mem = 0.0f;",
-            "  for (uint kd = 0; kd < KD; ++kd) {{",
-            "    uint state_idx = state_base + kd * VD + vd;",
-            "    float prev = (t == 0) ? float(state[state_idx]) : float(state_out[state_idx]);",
-            "    {prefill_decay_index}",
-            "    kv_mem += prev * gate * float(key[vec_base + kd]);",
-            "  }}",
-            "  float delta = (float(value[value_base + vd]) - kv_mem) * float(beta[gh_idx]);",
-            "  float acc = 0.0f;",
-            "  for (uint kd = 0; kd < KD; ++kd) {{",
-            "    uint state_idx = state_base + kd * VD + vd;",
-            "    float prev = (t == 0) ? float(state[state_idx]) : float(state_out[state_idx]);",
-            "    {prefill_decay_index}",
-            "    float updated = prev * gate + float(key[vec_base + kd]) * delta;",
-            "    state_out[state_idx] = updated;",
-            "    acc += updated * float(query[vec_base + kd]);",
-            "  }}",
-            "  out[value_base + vd] = acc;",
-            "}}"
-        ),
-        prefill_decay_index = prefill_decay_index
-    );
-    let suffix = if vector_decay { "vector" } else { "scalar" };
     Ok(RecurrentScanKernel {
-        decode: MetalKernel::new(
-            format!("gated_delta_decode_{suffix}"),
-            ["state", "query", "key", "value", "g", "beta"],
-            ["out", "state_out"],
-            &decode_source,
-            "",
-            true,
-            false,
-        )?,
-        prefill: MetalKernel::new(
-            format!("gated_delta_prefill_{suffix}"),
-            ["state", "query", "key", "value", "g", "beta"],
-            ["out", "state_out"],
-            &prefill_source,
-            "",
-            true,
-            false,
-        )?,
+        decode: build(true)?,
+        prefill: build(false)?,
     })
 }
 
@@ -205,7 +90,7 @@ fn recurrent_step(
         rank => {
             return Err(Exception::custom(format!(
                 "gated-delta step expects rank-2 or rank-3 log decay, got rank {rank}"
-            )))
+            )));
         }
     };
     let state = state.as_dtype(Dtype::Float32, stream)?;
@@ -257,49 +142,106 @@ fn metal_scan_chunk(
     let key_dim = shape[3];
     let value_dim = value.dim(-1);
     let vector_decay = log_decay.ndim() == 4;
+    use crate::backend::managed_memory::recurrent_kernel::{self, ScanKernel};
+    use safemlx::fast::BorrowedKernelOutput;
+    let kind = ScanKernel::select(decode, vector_decay);
+    // Authenticate the prepared source before constructing any native cast.
+    recurrent_kernel::validate_call(kind)?;
+    let grid_width = batch
+        .checked_mul(heads)
+        .and_then(|n| n.checked_mul(value_dim))
+        .ok_or_else(|| match safemlx::OriginalScopeObserver::try_current() {
+            Ok(Some(observer)) => observer.capacity_error(),
+            Err(error) => error,
+            Ok(None) => Exception::custom("gated-delta dispatch dimensions overflow"),
+        })?;
     let state = state.as_dtype(Dtype::Float32, stream)?;
     let query = query.as_dtype(Dtype::Float32, stream)?;
     let key = key.as_dtype(Dtype::Float32, stream)?;
     let value = value.as_dtype(Dtype::Float32, stream)?;
     let log_decay = log_decay.as_dtype(Dtype::Float32, stream)?;
     let beta = beta.as_dtype(Dtype::Float32, stream)?;
+    let sequence_shape = [batch, sequence, heads, value_dim];
+    let state_shape = [batch, heads, key_dim, value_dim];
+    let inputs = [&state, &query, &key, &value, &log_decay, &beta];
+    let outputs = [
+        BorrowedKernelOutput {
+            shape: &sequence_shape,
+            dtype: Dtype::Float32,
+        },
+        BorrowedKernelOutput {
+            shape: &state_shape,
+            dtype: Dtype::Float32,
+        },
+    ];
+    let grid = [grid_width, 1, 1];
+    if safemlx::OriginalScopeObserver::try_current()?.is_some() {
+        let [output, state] = recurrent_kernel::apply(kind, inputs, outputs, grid, stream)?;
+        return Ok((state, output));
+    }
     let run = |cell: &RefCell<Option<RecurrentScanKernel>>| -> Result<_, Exception> {
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(metal_kernels(vector_decay)?);
         }
-        let config = CustomKernelConfig::new()
-            .with_template_arg_int("KD", key_dim)
-            .with_template_arg_int("VD", value_dim)
-            .with_grid([batch * heads * value_dim, 1, 1])
-            .with_thread_group([256, 1, 1])
-            .with_output_arg([batch, sequence, heads, value_dim], Dtype::Float32)
-            .with_output_arg([batch, heads, key_dim, value_dim], Dtype::Float32);
-        let kernel = cell.borrow();
-        let kernel = kernel.as_ref().expect("gated-delta kernels initialized");
-        if decode {
-            kernel.decode(
-                [&state, &query, &key, &value, &log_decay, &beta],
-                &config,
-                stream,
-            )
+        let loan = cell.borrow();
+        let kernels = loan.as_ref().expect("gated-delta kernels initialized");
+        let kernel = if decode {
+            &kernels.decode
         } else {
-            let config = config
-                .with_template_arg_int("L", sequence)
-                .with_template_arg_int("H", heads);
-            kernel.prefill(
-                [&state, &query, &key, &value, &log_decay, &beta],
-                &config,
-                stream,
-            )
+            &kernels.prefill
+        };
+        if MetalKernel::fixed_control_bytes::<6, 2>(0, 4).is_some() {
+            let [output, state] =
+                kernel.apply_fixed_device(inputs, outputs, &[], grid, [256, 1, 1], stream)?;
+            Ok((state, output))
+        } else {
+            // Existing unqualified ordinary compatibility still uses its owning
+            // transport; it cannot enter an original scope or gain source custody.
+            let config = CustomKernelConfig::new()
+                .with_grid(grid)
+                .with_thread_group([256, 1, 1])
+                .with_output_arg(sequence_shape, Dtype::Float32)
+                .with_output_arg(state_shape, Dtype::Float32);
+            let mut outputs = kernel.apply_device(inputs, &config, stream)?;
+            if outputs.len() != 2 {
+                return Err(Exception::custom(
+                    "gated-delta kernel returned an invalid output count",
+                ));
+            }
+            let state = outputs.remove(1);
+            Ok((state, outputs.remove(0)))
         }
     };
-    let output = if vector_decay {
-        VECTOR_KERNELS.with(run)?
+    if vector_decay {
+        VECTOR_KERNELS.with(run)
     } else {
-        SCALAR_KERNELS.with(run)?
-    };
-    let (output, state) = output;
-    Ok((state, output))
+        SCALAR_KERNELS.with(run)
+    }
+}
+
+// Every scan slice retains all axes and uses checked nonnegative bounds. The
+// fixed Slice bridge avoids the general indexing worker's temporary index Vec.
+#[cfg(not(feature = "cuda"))]
+fn metal_sequence_slice(
+    input: &Array,
+    start: i32,
+    end: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    match input.shape() {
+        &[batch, _, heads, width] => input.try_slice(
+            &[0, start, 0, 0],
+            &[batch, end, heads, width],
+            &[1; 4],
+            stream,
+        ),
+        &[batch, _, heads] => {
+            input.try_slice(&[0, start, 0], &[batch, end, heads], &[1; 3], stream)
+        }
+        _ => Err(Exception::custom(
+            "gated-delta sequence slice requires rank 3 or 4",
+        )),
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -316,34 +258,26 @@ fn metal_scan(
     if length == 1 {
         return metal_scan_chunk(&state, query, key, value, log_decay, beta, true, stream);
     }
-    let chunk_tokens = if length <= PREFILL_SHORT_SCAN_TOKENS {
-        PREFILL_SHORT_SCAN_TOKENS
-    } else if length <= 256 {
-        PREFILL_MEDIUM_SCAN_TOKENS
-    } else {
-        PREFILL_LONG_SCAN_TOKENS
-    };
-    let mut outputs = Vec::with_capacity(((length + chunk_tokens - 1) / chunk_tokens) as usize);
+    let chunk_tokens = metal_scan_chunk_tokens(length);
+    let mut outputs = crate::backend::nn::tensor::GroupedChunkOutputs::prepare(
+        (length as usize).div_ceil(chunk_tokens as usize),
+    )?;
     let mut start = 0;
     while start < length {
-        let end = (start + chunk_tokens).min(length);
-        let query = query.try_index_device((.., start..end, .., ..), stream)?;
-        let key = key.try_index_device((.., start..end, .., ..), stream)?;
-        let value = value.try_index_device((.., start..end, .., ..), stream)?;
-        let log_decay = if log_decay.ndim() == 4 {
-            log_decay.try_index_device((.., start..end, .., ..), stream)?
-        } else {
-            log_decay.try_index_device((.., start..end, ..), stream)?
-        };
-        let beta = beta.try_index_device((.., start..end, ..), stream)?;
+        let end = start + (length - start).min(chunk_tokens);
+        let query = metal_sequence_slice(query, start, end, stream)?;
+        let key = metal_sequence_slice(key, start, end, stream)?;
+        let value = metal_sequence_slice(value, start, end, stream)?;
+        let log_decay = metal_sequence_slice(log_decay, start, end, stream)?;
+        let beta = metal_sequence_slice(beta, start, end, stream)?;
         let (next, output) = metal_scan_chunk(
             &state, &query, &key, &value, &log_decay, &beta, false, stream,
         )?;
         state = next;
-        outputs.push(output);
+        outputs.push(output)?;
         start = end;
     }
-    Ok((state, concatenate_axis(&outputs, 1, stream)?))
+    Ok((state, concatenate_axis(outputs.as_slice(), 1, stream)?))
 }
 
 /// Runs a gated-delta scan and returns `(final_state, sequence_output)`.
@@ -374,6 +308,11 @@ pub fn gated_delta_scan(
     let sequence = shape[1];
     let heads = shape[2];
     let key_dim = shape[3];
+    if key.dim(-1) != key_dim {
+        return Err(Exception::custom(
+            "gated-delta query and key widths must match",
+        ));
+    }
     let value_dim = value.dim(-1);
     let expected_decay_rank = if log_decay.ndim() == 3 { 3 } else { 4 };
     if !matches!(log_decay.ndim(), 3 | 4)
@@ -394,8 +333,10 @@ pub fn gated_delta_scan(
         )));
     }
 
-    let mut state =
-        initial_state.unwrap_or(zeros::<f32>(&[batch, heads, key_dim, value_dim], stream)?);
+    let mut state = match initial_state {
+        Some(state) => state,
+        None => zeros::<f32>(&[batch, heads, key_dim, value_dim], stream)?,
+    };
     if state.shape() != [batch, heads, key_dim, value_dim] {
         return Err(Exception::custom(format!(
             "gated-delta state shape {:?} must equal [{batch}, {heads}, {key_dim}, {value_dim}]",
@@ -404,7 +345,7 @@ pub fn gated_delta_scan(
     }
 
     #[cfg(not(feature = "cuda"))]
-    if stream.get_device()?.get_type()? == DeviceType::Gpu {
+    if stream.device_type()? == DeviceType::Gpu {
         let output_dtype = query.dtype();
         let (state, output) = metal_scan(state, query, key, value, log_decay, beta, stream)?;
         return Ok((state, output.as_dtype(output_dtype, stream)?));

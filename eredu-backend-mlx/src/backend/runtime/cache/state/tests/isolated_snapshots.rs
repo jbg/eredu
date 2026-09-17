@@ -24,7 +24,9 @@ fn values(arrays: Vec<&Array>, stream: &Stream) -> Vec<Vec<f32>> {
 }
 
 fn compressed_values(state: &mut MlxHybridState, stream: &Stream) -> Vec<Vec<f32>> {
-    let Some(MlxHybridAttentionState::Compressed(cache)) = &mut state.layers[0].attention else {
+    let Some(MlxHybridAttentionState::Compressed(cache)) =
+        &mut state.layers.slots_mut()[0].attention
+    else {
         panic!("compressed fixture")
     };
     if let Some((latent, rotary)) = cache.arrays() {
@@ -85,7 +87,7 @@ fn isolated_compressed_snapshots_copy_strided_state_and_isolate_paged_catalogs()
             .unwrap()
         };
         let append = |state: &mut MlxHybridState, latent: Array, rotary: Array| {
-            state.layers[0]
+            state.layers.slots_mut()[0]
                 .append(
                     CompressedAttentionState {
                         latent: MlxTensor::from_array(latent),
@@ -110,8 +112,17 @@ fn isolated_compressed_snapshots_copy_strided_state_and_isolate_paged_catalogs()
             let source = source.evaluated().unwrap();
             let copy = copy.evaluated().unwrap();
             assert_ne!(
-                source.as_slice::<f32>().as_ptr(),
-                copy.as_slice::<f32>().as_ptr()
+                source
+                    .as_array()
+                    .allocation_info()
+                    .unwrap()
+                    .unwrap()
+                    .identity(),
+                copy.as_array()
+                    .allocation_info()
+                    .unwrap()
+                    .unwrap()
+                    .identity()
             );
         }
         if paged {
@@ -166,9 +177,9 @@ fn isolated_compressed_snapshots_copy_strided_state_and_isolate_paged_catalogs()
         // Copy a mature catalog after the shared pool has demoted sealed blocks.
         let mut mature = first.isolated_snapshot(&stream).unwrap();
         assert_eq!(compressed_values(&mut mature, &stream), expected[1]);
-        CompressedAttentionCache::clear(&mut parent.layers[0]).unwrap();
+        CompressedAttentionCache::clear(&mut parent.layers.slots_mut()[0]).unwrap();
         assert_eq!(compressed_values(&mut first, &stream), expected[1]);
-        CompressedAttentionCache::clear(&mut first.layers[0]).unwrap();
+        CompressedAttentionCache::clear(&mut first.layers.slots_mut()[0]).unwrap();
         assert_eq!(compressed_values(&mut mature, &stream), expected[1]);
         assert_eq!(compressed_values(&mut second, &stream), expected[2]);
         assert_eq!(compressed_values(&mut saved, &stream), before);
@@ -188,13 +199,14 @@ fn isolated_native_kv_snapshots_preserve_windows_capacity_and_interleaved_siblin
         let layout = StateLayout::new(LayerSchedule::new(1, vec![policy]).unwrap()).unwrap();
         let mut parent = MlxKeyValueState::device(layout).unwrap();
         if window.is_none() {
-            parent.layers[0] = MlxKeyValueLayerState::Device(ConcatKeyValueCache::new_with_step(4));
+            parent.layers.slots_mut()[0] =
+                MlxKeyValueLayerState::Device(ConcatKeyValueCache::new_with_step(4));
         }
         let input = Array::from_slice(
             &(0..10).map(|n| n as f32).collect::<Vec<_>>(),
             &[1, 2, 5, 1],
         );
-        parent.layers[0]
+        parent.layers.slots_mut()[0]
             .update_and_fetch(input.clone(), input, &stream)
             .unwrap();
         let before = values(parent.retained_arrays(), &stream);
@@ -208,7 +220,7 @@ fn isolated_native_kv_snapshots_preserve_windows_capacity_and_interleaved_siblin
         for round in 0..10 {
             for (state, value) in [(&mut parent, 20.), (&mut first, 30.), (&mut second, 40.)] {
                 let next = Array::from_slice(&[value + round as f32, value + 1.], &[1, 2, 1, 1]);
-                state.layers[0]
+                state.layers.slots_mut()[0]
                     .update_and_fetch(next.clone(), next, &stream)
                     .unwrap();
                 assert_eq!(state.offset(), 6 + round);
@@ -263,38 +275,43 @@ fn isolated_native_hybrid_snapshots_copy_strided_recurrent_and_convolution_stora
         let array = Array::from_slice(&[1. + index as f32, 2., 3., 4.], &[2, 2])
             .transpose(&stream)
             .unwrap();
-        parent.layers[0]
-            .fixed
-            .insert(*role, Some(MlxTensor::from_array(array)));
+        *parent.layers.slots_mut()[0].fixed_component(*role).unwrap() =
+            Some(MlxTensor::from_array(array));
     }
-    parent.layers[0].fixed_offset = 7;
+    parent.layers.slots_mut()[0].fixed_offset = 7;
     let saved = parent.isolated_snapshot(&stream).unwrap();
-    assert_eq!(saved.layers[0].fixed_offset, 7);
+    assert_eq!(saved.layers.slots()[0].fixed_offset, 7);
     let before = values(parent.retained_arrays(), &stream);
     assert_eq!(values(saved.retained_arrays(), &stream), before);
     for (source, copied) in parent.retained_arrays().iter().zip(saved.retained_arrays()) {
         let source = source.evaluated().unwrap();
         let copied = copied.evaluated().unwrap();
         assert_ne!(
-            source.as_slice::<f32>().as_ptr(),
-            copied.as_slice::<f32>().as_ptr(),
+            source
+                .as_array()
+                .allocation_info()
+                .unwrap()
+                .unwrap()
+                .identity(),
+            copied
+                .as_array()
+                .allocation_info()
+                .unwrap()
+                .unwrap()
+                .identity(),
             "native fixed storage must be independent, not just its Rust handle"
         );
     }
     let mut child = saved.isolated_snapshot(&stream).unwrap();
     for (state, value) in [(&mut parent, 10.), (&mut child, 20.)] {
         for role in roles {
-            state.layers[0].fixed.insert(
-                role,
-                Some(MlxTensor::from_array(Array::from_slice(
-                    &[value; 4],
-                    &[2, 2],
-                ))),
+            *state.layers.slots_mut()[0].fixed_component(role).unwrap() = Some(
+                MlxTensor::from_array(Array::from_slice(&[value; 4], &[2, 2])),
             );
         }
-        state.layers[0].fixed_offset += 1;
+        state.layers.slots_mut()[0].fixed_offset += 1;
         assert_eq!(values(saved.retained_arrays(), &stream), before);
-        assert_eq!(saved.layers[0].fixed_offset, 7);
+        assert_eq!(saved.layers.slots()[0].fixed_offset, 7);
     }
     assert_ne!(
         values(parent.retained_arrays(), &stream),
@@ -327,7 +344,7 @@ fn isolated_paged_snapshots_copy_strided_tails_and_sealed_blocks_across_branches
         )
         .transpose_axes(&[0, 2, 1, 3], &stream)
         .unwrap();
-        parent.layers[0]
+        parent.layers.slots_mut()[0]
             .update_and_fetch(input.clone(), input.clone(), &stream)
             .unwrap();
         let saved = parent.isolated_snapshot(&stream).unwrap();
@@ -352,7 +369,7 @@ fn isolated_paged_snapshots_copy_strided_tails_and_sealed_blocks_across_branches
                 expected[branch] =
                     safemlx::ops::concatenate_axis(&[&expected[branch], &next], -2, &stream)
                         .unwrap();
-                state.layers[0]
+                state.layers.slots_mut()[0]
                     .update_and_fetch(next.clone(), next, &stream)
                     .unwrap();
                 let expected_array = if let Some(window) = window {
@@ -366,7 +383,7 @@ fn isolated_paged_snapshots_copy_strided_tails_and_sealed_blocks_across_branches
                 let query_values = [0.2_f32, -0.3, 0.7, -0.4];
                 let query = Array::from_slice(&query_values, &[1, 2, 1, 2]);
                 let actual = KeyValueCache::paged_attention(
-                    &mut state.layers[0],
+                    &mut state.layers.slots_mut()[0],
                     &query,
                     0.7,
                     None,

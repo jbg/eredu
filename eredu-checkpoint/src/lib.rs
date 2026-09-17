@@ -12,6 +12,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 pub mod artifact;
 /// Composite model-artifact and component schemas.
 pub mod composite;
+mod encoding_validation;
 /// Backend-neutral logical GGUF storage and portable encoded leases.
 pub mod expert;
 /// Neutral block-FP8 metadata normalization.
@@ -26,6 +27,7 @@ pub mod store;
 /// Header-only validation of declarative SafeTensors and GGUF plans.
 pub mod validation;
 
+pub use encoding_validation::EncodingValidationError;
 pub use recipe::{AtomicMatrixRecipeFamily, MatrixRecipeMember, RecipeAlias};
 
 /// Backend-neutral description of a checkpoint's stored scalar encoding.
@@ -155,24 +157,7 @@ impl AffineQuantization {
 
     /// Validates the portable affine storage geometry.
     pub fn validate(self) -> Result<(), Error> {
-        if self.mode != AffineQuantizationMode::Affine {
-            return Err(Error::invalid(
-                "only affine integer quantization is supported",
-            ));
-        }
-        if self.group_size != 16 && (self.group_size <= 0 || self.group_size % 32 != 0) {
-            return Err(Error::invalid(format!(
-                "group_size must be 16 or a positive multiple of 32, got {}",
-                self.group_size
-            )));
-        }
-        if !matches!(self.bits, 2 | 3 | 4 | 5 | 6 | 8) {
-            return Err(Error::invalid(format!(
-                "bits must be one of 2, 3, 4, 5, 6, or 8, got {}",
-                self.bits
-            )));
-        }
-        Ok(())
+        self.validate_fixed().map_err(Error::from)
     }
 }
 
@@ -243,13 +228,7 @@ impl BlockFp8Format {
 
     /// Validates positive two-dimensional block geometry.
     pub fn validate(self) -> Result<(), Error> {
-        if self.block_rows <= 0 || self.block_columns <= 0 {
-            return Err(Error::invalid(format!(
-                "block-FP8 geometry must be positive, got [{}, {}]",
-                self.block_rows, self.block_columns
-            )));
-        }
-        Ok(())
+        self.validate_fixed().map_err(Error::from)
     }
 }
 
@@ -280,15 +259,7 @@ pub enum LinearFormat {
 impl LinearFormat {
     /// Validates the selected physical encoding and its geometry.
     pub fn validate(self) -> Result<(), Error> {
-        match self {
-            Self::Dense => Ok(()),
-            Self::Affine(config) => config.validate(),
-            Self::MxFp4 => WeightQuantization::MxFp4.validate(),
-            Self::GgufIQuant { ggml_type, endian } => {
-                WeightQuantization::GgufIQuant { ggml_type, endian }.validate()
-            }
-            Self::E4M3BlockFp8(format) => format.validate(),
-        }
+        self.validate_fixed().map_err(Error::from)
     }
 
     /// Returns the packed-quantization descriptor when this format is
@@ -366,14 +337,7 @@ impl WeightQuantization {
 
     /// Validates portable storage geometry.
     pub fn validate(self) -> Result<(), Error> {
-        match self {
-            Self::Affine(config) => config.validate(),
-            Self::MxFp4 => Ok(()),
-            Self::GgufIQuant { ggml_type, .. } => ggml_type
-                .block_and_bytes()
-                .map(|_| ())
-                .map_err(|error| Error::invalid(error.to_string())),
-        }
+        self.validate_fixed().map_err(Error::from)
     }
 }
 
@@ -444,3 +408,6 @@ impl<'de> Deserialize<'de> for WeightQuantization {
         }
     }
 }
+
+/// Allocation-free indexing and retirement of caller-prepared metadata nodes.
+pub mod prepared_index;

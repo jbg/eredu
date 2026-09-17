@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T06:43:40.324362+00:00",
+  "scope": "DeepSeek V3 and V4 ordinary target causal observation rows",
+  "status": "Verified family declarations; full wrapper/native/outer managed composition remains unfinished",
+  "previous_increment": "bounded-publication-causal-attachment-2026-09-14.json",
+  "tests": {
+    "architectures": {
+      "passed": 995,
+      "ignored": 1
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1129,
+  "new_tests": [
+    {
+      "file": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v3_rows.rs",
+      "kind": "Rust",
+      "name": "deepseek_v3_dense_rows_preserve_all_real_hooks_and_complete_compressed_state",
+      "package": "deepseek-v3-causal-prefill"
+    },
+    {
+      "file": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v3_rows.rs",
+      "kind": "Rust",
+      "name": "deepseek_v3_routed_rows_preserve_token_local_experts_and_blockwise_attention",
+      "package": "deepseek-v3-causal-prefill"
+    },
+    {
+      "file": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v3_rows.rs",
+      "kind": "Rust",
+      "name": "deepseek_v3_prepared_paths_bind_actual_sources_and_physical_readout",
+      "package": "deepseek-v3-causal-prefill"
+    },
+    {
+      "file": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v3_rows.rs",
+      "kind": "Rust",
+      "name": "deepseek_v3_body_rows_keep_positions_before_state_only_and_last_position_readout",
+      "package": "deepseek-v3-causal-prefill"
+    },
+    {
+      "file": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v3_rows.rs",
+      "kind": "Rust",
+      "name": "deepseek_v3_target_declarations_preserve_existing_prediction_availability",
+      "package": "deepseek-v3-causal-prefill"
+    },
+    {
+      "file": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v4_rows.rs",
+      "kind": "Rust",
+      "name": "v4_local_indexed_and_compressed_rows_match_uneven_chunks_and_cached_decode",
+      "package": "deepseek-v4-causal-prefill"
+    },
+    {
+      "file": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v4_rows.rs",
+      "kind": "Rust",
+      "name": "v4_populated_ratio128_and_index_topk_branch_preserve_every_causal_row",
+      "package": "deepseek-v4-causal-prefill"
+    },
+    {
+      "file": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v4_rows.rs",
+      "kind": "Rust",
+      "name": "v4_body_rows_keep_full_sequence_before_state_only_or_last_readout",
+      "package": "deepseek-v4-causal-prefill"
+    },
+    {
+      "file": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v4_rows.rs",
+      "kind": "Rust",
+      "name": "v4_actual_catalogue_and_retained_paths_bind_every_target_and_stream_readout",
+      "package": "deepseek-v4-causal-prefill"
+    },
+    {
+      "file": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v4_rows.rs",
+      "kind": "Rust",
+      "name": "v4_target_declarations_do_not_expand_mtp_dspark_or_intervention_policy",
+      "package": "deepseek-v4-causal-prefill"
+    }
+  ],
+  "new_test_count": 10,
+  "checks": {
+    "architectures": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib --test reference_numeric",
+      "started_utc": "2026-09-14T06:40:19.069315+00:00",
+      "elapsed_seconds": 131.512,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-deepseek-causal-prefill-architectures.log",
+      "log_sha256": "c415f7c092da2fca93688631573a7498757c5daf44018401a9ecaab7083880d6"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T06:42:30.582521+00:00",
+      "elapsed_seconds": 38.827,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-deepseek-causal-prefill-portable.log",
+      "log_sha256": "ad3cbee4d02786fe0df8995da88c5c8b513c1363c9efa4e38840743cdb8bd0d9"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T06:43:09.410056+00:00",
+      "elapsed_seconds": 12.184,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-deepseek-causal-prefill-minimal.log",
+      "log_sha256": "4d8f71f718547c28f9bc09e98a006c34146faf887ee1ecb0a06fc80342c46c39"
+    },
+    "native": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal",
+      "started_utc": "2026-09-14T06:43:21.594396+00:00",
+      "elapsed_seconds": 5.237,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-deepseek-causal-prefill-native.log",
+      "log_sha256": "d0b1a7f769b1d5f34ffe3ec59dd8aade6e203d7cb5c0768c48a45926924630d1"
+    }
+  },
+  "source_sha256": {
+    "eredu-architectures/src/deepseek/v3.rs": "f26864e91b6721e3ac16f63ae2baad04d2c7dcf853b49dd874f0123c269a2ec4",
+    "eredu-architectures/src/deepseek/v4.rs": "9796845df1af84f8f61832d2c9ebbebd708fa3ce7db2d34e1c5de0d5c74e48ed",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal.rs": "8edaaf27492bddcdcb2bd0db6dbd3e4603b596a5cb95db2da7da541110828a19",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v3_rows.rs": "02e958fb577c9859b4c6069b9488a5cceea41dca2dc17e73817d977b595016c5",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/deepseek_v4_rows.rs": "11361dc7c927b1a8899eca8815409d06d9cb43d9f044127c97b657c506893f91",
+    "doc/backend-architecture.md": "42f538de6744ab05bf897caa20620e2be237b2272bf1e9511c0359d31ba2d6e9",
+    "doc/execution-control.md": "55a24591f5da1ff8a876b24b4ea936c4fbacbe9734e3fb88e33d8e45df8bfde3",
+    "doc/lm-inspector-execution-control.md": "217cf280f365c269146360855ad9f59daeae5c99c7a275a4e6096f2ab2533d6f",
+    "doc/bounded-inference.md": "c45a1c5d3eefd24c79f6803e5539933e81c593fce8a46fc6924818904e5b156d"
+  },
+  "source_snapshot": "/private/tmp/eredu-deepseek-causal-prefill-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-deepseek-causal-prefill-applied.json": "40f454f4031ad96318e513b1382b3d7a191214f3ca31def9871c8a5f41666c62",
+    "/private/tmp/eredu-deepseek-causal-prefill-apply.py": "4ded98bfda12aa9e52a0a25a35c61615fc9122643d005ca674e5fbfc6172f283",
+    "/private/tmp/eredu-deepseek-causal-prefill-architectures.log": "c415f7c092da2fca93688631573a7498757c5daf44018401a9ecaab7083880d6",
+    "/private/tmp/eredu-deepseek-causal-prefill-checks.json": "0df46b5fb053ad9196c8319b2f222d122c5edeeb52975732a3051f8dbfd231ed",
+    "/private/tmp/eredu-deepseek-causal-prefill-doc-applied.json": "80d5219ff5170e1bcd97364b65f77e9ad1546cba72c1809003ad1937065c55ec",
+    "/private/tmp/eredu-deepseek-causal-prefill-minimal.log": "4d8f71f718547c28f9bc09e98a006c34146faf887ee1ecb0a06fc80342c46c39",
+    "/private/tmp/eredu-deepseek-causal-prefill-native.log": "d0b1a7f769b1d5f34ffe3ec59dd8aade6e203d7cb5c0768c48a45926924630d1",
+    "/private/tmp/eredu-deepseek-causal-prefill-portable.log": "ad3cbee4d02786fe0df8995da88c5c8b513c1363c9efa4e38840743cdb8bd0d9",
+    "/private/tmp/eredu-deepseek-causal-prefill-replay-check.json": "25e56e5729c83ed440a590e96a1a3355cbced810021a7e0967431a6ef71a63ed",
+    "/private/tmp/eredu-deepseek-causal-prefill-review.json": "a1deefb955f7f6390d639004a016d673496e96893ca99c585a5e24b12284ca94",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/FROZEN.json": "bb7eba46e3b10fe9369b9ff439b563cf482eeaef35771f0b5e72d833aae73e47",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/README.md": "b54d075c8e87d068bfba21265ced3eea0441061c2238fc09d25a95e178d6f910",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/TEST-COMMANDS.md": "98ee7a684b3ae93ee97646b298b3111033624970cb38878adac49c9c9cc33321",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/all-changes.patch": "f9aae46c510039ba5f2717ba3e56dfd3e8df0486e48fec307c3db114efac1b75",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/all-files.txt": "db2680b25bb9e464e585309f514944da7cf4820fda54e042901f82f4ca86be7c",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/artifact-hashes.json": "aa51061eddda777cd9e06411ac730da7c476f7ce8509ee71c31d0a00a818d102",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/change.patch": "89a8bf9d6825a738c7e042b34a7455869725a7bdaa24e89328f03372662da306",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/checks.json": "4786f035adc843cfa715c4f7eb1f59b0710df3a5a0ceaaf4820345c7301b8e8d",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v3-causal-prefill-review-sha256.json": "04d7bee1fd473f7d046c4fc229af216d75968cbcfc76d4d7fa560ac0721555d5",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v3-causal-prefill-review.md": "3b0c021327e3b0140f3504541bee91ee617333ab260cce57373ac2c7177727ec",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v3-causal-prefill-root-review.json": "7e5cde333c3cdbae7a029bdb7f4a0958f8c5141033e578a7a39b8c7095b50a98",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v4-causal-prefill-review-sha256.json": "9fc3966a876127d82e1c17adc0f32b2ae7255d97ac4ee552e1daa4d0da7ee796",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v4-causal-prefill-review.md": "c075b341b2e61e90baefc408aaa77c7c760496443e53b12a76278da9d3233d8d",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v4-causal-prefill-root-review.json": "be3550d8fa9609f109709f4b795ea3ffeed1dd822728ec0409c6fd15fc1fab91",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/dependency-hashes.json": "10c2ba08cd9b035809231bc168b06de89ccdfa45f68e0bd3aa6cb787b8594b7b",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/doc-edits.json": "64bce12bc31b2b7358afbd31d8d9bb54c3aef69d9c36ff5218fd8dee8b9441c0",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/doc-manifest.json": "d4ab2c719b94be7160dee664db0f11d6ecb5a0307910c0c937635705a8ab2ebb",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/files.txt": "559a973ae466db31bddd9c20a877767f092427ac1703c21b8ece3735cf7242c4",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/manifest.json": "40f454f4031ad96318e513b1382b3d7a191214f3ca31def9871c8a5f41666c62",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/new-tests.json": "e8c992c58882f9be51ed668dcd83a76d853dda182ad0b5dd3cd5902316aa1ef4",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/packages.json": "c89cba83d4e43c233bbd0b68f54ddff1ece2f112a31f05c31e50a1602be6a03f",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/prepare.py": "186c85ba5672862740c7c51e016982a5dd20653e0de5d954c0c5b1d7a1f0a497",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/provenance.json": "2be2906fe45230fe34b6530113bb09bb1550279e8ac1330097fbebf9a16b7f9c",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/review-hashes.json": "431a67a87974c33de5b02fc88dcdd7e51df7ca70c47b527bbd67f64c65c98d9b",
+    "/private/tmp/eredu-deepseek-causal-prefill-stage/staged-hashes.json": "e885ddac297f5e39f0317339dbb5c4d9b2f3f792f6b4408dfa917ed46d8185ee",
+    "/private/tmp/eredu-deepseek-causal-prefill-validate.py": "96ff5f6bfefc0743511d6bbe22572aaa2bfc40810d7039b35dd62b68cb5e58a3"
+  },
+  "review": {
+    "replay": {
+      "directory": "/private/tmp/eredu-deepseek-causal-prefill-root-replay",
+      "identical_files": 165
+    },
+    "reviews": {
+      "/private/tmp/eredu-deepseek-causal-prefill-replay-check.json": "25e56e5729c83ed440a590e96a1a3355cbced810021a7e0967431a6ef71a63ed",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/FROZEN.json": "bb7eba46e3b10fe9369b9ff439b563cf482eeaef35771f0b5e72d833aae73e47",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/README.md": "b54d075c8e87d068bfba21265ced3eea0441061c2238fc09d25a95e178d6f910",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/TEST-COMMANDS.md": "98ee7a684b3ae93ee97646b298b3111033624970cb38878adac49c9c9cc33321",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/all-changes.patch": "f9aae46c510039ba5f2717ba3e56dfd3e8df0486e48fec307c3db114efac1b75",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/all-files.txt": "db2680b25bb9e464e585309f514944da7cf4820fda54e042901f82f4ca86be7c",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/artifact-hashes.json": "aa51061eddda777cd9e06411ac730da7c476f7ce8509ee71c31d0a00a818d102",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/change.patch": "89a8bf9d6825a738c7e042b34a7455869725a7bdaa24e89328f03372662da306",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/checks.json": "4786f035adc843cfa715c4f7eb1f59b0710df3a5a0ceaaf4820345c7301b8e8d",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v3-causal-prefill-review-sha256.json": "04d7bee1fd473f7d046c4fc229af216d75968cbcfc76d4d7fa560ac0721555d5",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v3-causal-prefill-review.md": "3b0c021327e3b0140f3504541bee91ee617333ab260cce57373ac2c7177727ec",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v3-causal-prefill-root-review.json": "7e5cde333c3cdbae7a029bdb7f4a0958f8c5141033e578a7a39b8c7095b50a98",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v4-causal-prefill-review-sha256.json": "9fc3966a876127d82e1c17adc0f32b2ae7255d97ac4ee552e1daa4d0da7ee796",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v4-causal-prefill-review.md": "c075b341b2e61e90baefc408aaa77c7c760496443e53b12a76278da9d3233d8d",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/dependencies/reviews/eredu-deepseek-v4-causal-prefill-root-review.json": "be3550d8fa9609f109709f4b795ea3ffeed1dd822728ec0409c6fd15fc1fab91",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/dependency-hashes.json": "10c2ba08cd9b035809231bc168b06de89ccdfa45f68e0bd3aa6cb787b8594b7b",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/doc-edits.json": "64bce12bc31b2b7358afbd31d8d9bb54c3aef69d9c36ff5218fd8dee8b9441c0",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/doc-manifest.json": "d4ab2c719b94be7160dee664db0f11d6ecb5a0307910c0c937635705a8ab2ebb",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/files.txt": "559a973ae466db31bddd9c20a877767f092427ac1703c21b8ece3735cf7242c4",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/manifest.json": "40f454f4031ad96318e513b1382b3d7a191214f3ca31def9871c8a5f41666c62",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/new-tests.json": "e8c992c58882f9be51ed668dcd83a76d853dda182ad0b5dd3cd5902316aa1ef4",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/packages.json": "c89cba83d4e43c233bbd0b68f54ddff1ece2f112a31f05c31e50a1602be6a03f",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/prepare.py": "186c85ba5672862740c7c51e016982a5dd20653e0de5d954c0c5b1d7a1f0a497",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/provenance.json": "2be2906fe45230fe34b6530113bb09bb1550279e8ac1330097fbebf9a16b7f9c",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/review-hashes.json": "431a67a87974c33de5b02fc88dcdd7e51df7ca70c47b527bbd67f64c65c98d9b",
+      "/private/tmp/eredu-deepseek-causal-prefill-stage/staged-hashes.json": "e885ddac297f5e39f0317339dbb5c4d9b2f3f792f6b4408dfa917ed46d8185ee"
+    },
+    "root": "Root read both complete source/test/doc patches and independent reviews. Combined projection preserves each exact production/test child and appends precisely the two registrations. Original ordered documentation additions remain verbatim. Root independently replayed preparation using only archived inputs and bases and compared all165 file hashes including sources, metadata, dependencies, checks and reconstruction. Numerical/native execution remains pending; no managed or proposal gate is enlarged."
+  },
+  "behavior": [
+    "Actual family target unit paths feed the shared ordinary causal declaration helper; V4 names its real stream/effective/coefficient readout hooks after position selection.",
+    "V3 sixteen nonzero numerical configurations preserve all real hooks and complete compressed state across resident and blockwise attention, dense/routed experts, direct/low-rank queries and fixed/YaRN rotary.",
+    "V4 five nonzero numerical configurations cover local, indexed ratio-four and ratio-128 compression, full persistent state and saved-state continuation. Raw model slots are loaded before observation/state creation.",
+    "Prepared discovery binds original source/path identity and preserves physical Sequence requirements for Full and Preview(0), without widening MTP/DSpark/intervention policy."
+  ],
+  "limits": [
+    "Neutral synthetic evidence does not replace released-checkpoint or native distributed validation.",
+    "Runtime wrapper forwarding and original native capture inventory/outer-resource/gateway composition are separate unfinished work.",
+    "These declarations add no new funding authority, source publication, snapshot refund or process-memory guarantee."
+  ]
+}

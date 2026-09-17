@@ -31,37 +31,57 @@ pub fn execute_draft_group<S, I, O, E>(
 /// An exact speculative fork retaining both the pre-verification checkpoint
 /// and an independently advanceable draft state.
 ///
-/// Model families supply ordinary cloneable runtime state; proposal,
+/// Model families supply runtime state and its copy mechanism. Proposal,
 /// verification, commit, cancellation, and rejection all use this one neutral
-/// ownership boundary.
+/// ownership boundary; retained state may refuse an independent copy.
 #[derive(Debug, Clone)]
-pub struct DraftStateTransaction<S: Clone> {
+pub struct DraftStateTransaction<S> {
     checkpoint: S,
     draft: S,
+}
+
+impl<S> DraftStateTransaction<S> {
+    /// Uses one fallible storage-copy worker for both independent members.
+    /// A second-copy refusal retires the completed first copy; source is unchanged.
+    pub fn try_fork<E>(
+        state: &S,
+        mut copy: impl FnMut(&S) -> Result<S, E>,
+    ) -> Result<Self, E> {
+        let checkpoint = copy(state)?;
+        let draft = copy(state)?;
+        Ok(Self { checkpoint, draft })
+    }
+
+    /// Independently copies both retained members with the same copy mechanism.
+    pub fn try_copy<E>(
+        &self,
+        mut copy: impl FnMut(&S) -> Result<S, E>,
+    ) -> Result<Self, E> {
+        let checkpoint = copy(&self.checkpoint)?;
+        let draft = copy(&self.draft)?;
+        Ok(Self { checkpoint, draft })
+    }
+
+    /// Borrows the independently advanceable proposal state.
+    pub const fn draft(&self) -> &S { &self.draft }
+
+    /// Mutably borrows the independently advanceable proposal state.
+    pub fn draft_mut(&mut self) -> &mut S { &mut self.draft }
+
+    /// Borrows the exact state from before proposal and verification.
+    pub const fn checkpoint(&self) -> &S { &self.checkpoint }
+
+    /// Keeps target state advanced by verification while retiring both copies.
+    pub fn commit_verified(self) {}
 }
 
 impl<S: Clone> DraftStateTransaction<S> {
     /// Forks draft state and preserves an exact rollback checkpoint.
     pub fn fork(state: &S) -> Self {
-        Self {
-            checkpoint: state.clone(),
-            draft: state.clone(),
+        match Self::try_fork(state, |state| Ok::<_, std::convert::Infallible>(state.clone())) {
+            Ok(value) => value,
+            Err(never) => match never {},
         }
-    }
-
-    /// Borrows the independently advanceable proposal state.
-    pub const fn draft(&self) -> &S {
-        &self.draft
-    }
-
-    /// Mutably borrows the independently advanceable proposal state.
-    pub fn draft_mut(&mut self) -> &mut S {
-        &mut self.draft
-    }
-
-    /// Borrows the exact state from before proposal and verification.
-    pub const fn checkpoint(&self) -> &S {
-        &self.checkpoint
     }
 
     /// Commits the advanced draft fork into canonical state.
@@ -75,14 +95,58 @@ impl<S: Clone> DraftStateTransaction<S> {
         canonical.clone_from(&self.checkpoint);
     }
 
-    /// Keeps target state already advanced by successful verification while
-    /// consuming the unused fork and checkpoint.
-    pub fn commit_verified(self) {}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallible_transaction_retires_completed_prefix_and_retries_without_clone() {
+        use std::{cell::Cell, rc::Rc};
+        #[derive(Debug)]
+        struct State {
+            value: u32,
+            live: Rc<Cell<usize>>,
+        }
+        impl State {
+            fn new(value: u32, live: &Rc<Cell<usize>>) -> Self {
+                live.set(live.get() + 1);
+                Self { value, live: live.clone() }
+            }
+        }
+        impl Drop for State {
+            fn drop(&mut self) { self.live.set(self.live.get() - 1); }
+        }
+        let live = Rc::new(Cell::new(0));
+        let source = State::new(37, &live);
+        let mut attempts = 0;
+        let refused = DraftStateTransaction::try_fork(&source, |source| {
+            attempts += 1;
+            if attempts == 2 { Err("fresh copy capacity exhausted") }
+            else { Ok(State::new(source.value, &source.live)) }
+        });
+        assert_eq!(refused.unwrap_err(), "fresh copy capacity exhausted");
+        assert_eq!(attempts, 2);
+        assert_eq!(source.value, 37);
+        assert_eq!(live.get(), 1);
+        let mut fork = DraftStateTransaction::try_fork(&source, |source| {
+            Ok::<_, std::convert::Infallible>(State::new(source.value, &source.live))
+        }).unwrap();
+        fork.draft_mut().value = 91;
+        let copied = fork.try_copy(|source| {
+            Ok::<_, std::convert::Infallible>(State::new(source.value, &source.live))
+        }).unwrap();
+        assert_eq!(copied.checkpoint().value, 37);
+        assert_eq!(copied.draft().value, 91);
+        assert_eq!(live.get(), 5);
+        drop(fork);
+        assert_eq!(live.get(), 3);
+        drop(copied);
+        assert_eq!(live.get(), 1);
+        drop(source);
+        assert_eq!(live.get(), 0);
+    }
 
     #[test]
     fn one_transaction_owns_fork_commit_and_rollback() {

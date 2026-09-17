@@ -1,0 +1,115 @@
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -509,13 +509,77 @@
+     HostTransferPolicy policy,
+     StreamOrDevice stream) {
+   HostTransferBuffer buffer(source.shape(), source.dtype(), policy);
++  auto transfer = copy_to_host_into(source, buffer, stream);
++  return {std::move(buffer), std::move(transfer.completion)};
++}
++
++DeviceTransfer copy_to_host_into(
++    const array& source,
++    const HostTransferBuffer& destination,
++    StreamOrDevice stream) {
++  const auto controls = submission::current_native_controls();
++  size_t original_controls = 0;
++  if (controls.original) {
++    const Stream selected = to_stream(stream);
++    if (controls.failure != submission::NativeControlFailure::none)
++      throw submission::NativeControlError(controls.failure);
++    if (!controls.graph || !submission::current_scope())
++      throw ScopedEvaluationError(ScopedEvaluation::domain);
++    if (!destination || source.shape() != destination.shape() ||
++        source.dtype() != destination.dtype() ||
++        source.status() != array::Status::available ||
++        destination.policy() != HostTransferPolicy::transfer ||
++        destination.storage_kind() != HostTransferStorageKind::metal_shared ||
++        selected.device.type != Device::gpu ||
++        !original_host_store_control_bytes(source.ndim(), source.dtype(), original_controls))
++      throw ScopedEvaluationError(ScopedEvaluation::unobservable);
++    const auto ready = preflight_original_submission_stream(*submission::current_scope(), selected);
++    if (ready != ScopedEvaluation::complete) throw ScopedEvaluationError(ready);
++    const auto bank = submission::GraphConstruction::validate_nested(
++        *controls.graph, controls.scope_identity, 1);
++    if (bank != submission::GraphFailure{}) throw submission::GraphQuotaError(bank);
++  } else if (!destination || source.shape() != destination.shape() ||
++             source.dtype() != destination.dtype()) {
++    throw std::invalid_argument("[copy_to_host_into] Destination differs from source.");
++  }
++  // The ordinary and prepared paths construct the same contiguous/copy pair.
++  // Prepared ownership supplies the final host allocation before submission.
+   auto output = array(
+-      source.shape(),
+-      source.dtype(),
+-      submission::make_graph_primitive<CopyToHostTransfer>(to_stream(stream), buffer),
++      source.shape(), source.dtype(),
++      submission::make_graph_primitive<CopyToHostTransfer>(to_stream(stream), destination),
+       {contiguous(source, false, stream)});
++  if (controls.original) {
++    submission::GraphNestedEvaluation suspended;
++    const auto bank = submission::GraphConstruction::suspend_nested(
++        *controls.graph, controls.scope_identity, 1, suspended);
++    if (bank != submission::GraphFailure{}) throw submission::GraphQuotaError(bank);
++    if (suspended.limits().streams != 1)
++      throw ScopedEvaluationError(ScopedEvaluation::domain);
++    // Completed source + optional compaction + CopyToHostTransfer. The output
++    // Data aliases the paid host buffer; only compaction can allocate Device.
++    CompletionEvalRecordLayout record;
++    if (!completion_eval_record_layout(3, 1, 3, record))
++      throw ScopedEvaluationError(ScopedEvaluation::unobservable);
++    const CompletionEvalTraversalLimits limits{1, 4, 3, 3, 3, 1, record.capture_slots};
++    Completion completion;
++    const auto result = async_eval_with_completion_scoped_on_stream_prepared(
++        {output}, *submission::current_scope(), completion, output.primitive().stream(), limits);
++    if (result != submission::ScopedProgress::observed)
++      throw ScopedEvaluationError(evaluation_progress(result));
++    return {std::move(output), std::move(completion)};
++  }
+   auto completion = async_eval_with_completion({output});
+-  return {std::move(buffer), std::move(completion)};
++  return {std::move(output), std::move(completion)};
++}
++
++bool original_host_store_control_bytes(size_t rank, Dtype dtype, size_t& out) noexcept {
++  size_t copy = 0;
++  if (!original_host_copy_control_bytes(rank, dtype, copy)) return false;
++  const size_t extra = sizeof(HostTransferBuffer) + sizeof(CopyToHostTransfer) +
++      sizeof(array) + sizeof(Shape) + sizeof(HostTransfer) + sizeof(bool);
++  if (copy > SIZE_MAX - extra) return false;
++  out = copy + extra;
++  return true;
+ }
+ 
+ bool original_host_copy_control_bytes(size_t rank, Dtype dtype, size_t& out) noexcept {
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -177,6 +177,14 @@
+ /** Asynchronously copy a host transfer buffer into a new MLX array. */
+ // Fixed original copy controls; source and Graph/Record/backing stay separate.
+ MLX_API bool original_host_copy_control_bytes(size_t rank, Dtype dtype, size_t& out) noexcept;
++MLX_API bool original_host_store_control_bytes(size_t rank, Dtype dtype, size_t& out) noexcept;
++
++// Shared copy worker. The prepared caller owns exclusive destination storage
++// until the returned completion succeeds; no payload allocation occurs here.
++MLX_API DeviceTransfer copy_to_host_into(
++    const array& source, const HostTransferBuffer& destination,
++    StreamOrDevice stream = {});
++
+ 
+ MLX_API DeviceTransfer copy_from_host(
+     const HostTransferBuffer& source,
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -455,7 +455,7 @@
+       resident_primitive_control<Squeeze>(), resident_primitive_control<ExpandDims>(),
+       resident_primitive_control<Transpose>(), resident_primitive_control<Contiguous>(),
+       resident_primitive_control<Copy>(), resident_primitive_control<Full>(),
+-      resident_primitive_control<CopyFromHostTransfer>(),
++      resident_primitive_control<CopyFromHostTransfer>(), resident_primitive_control<CopyToHostTransfer>(),
+       resident_primitive_control<Gather>(), resident_primitive_control<GatherAxis>(),
+       resident_primitive_control<Scatter>(), resident_primitive_control<ArgSort>(),
+       resident_primitive_control<ScatterAxis>(), resident_primitive_control<Partition>(),

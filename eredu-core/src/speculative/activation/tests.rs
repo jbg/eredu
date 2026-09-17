@@ -298,3 +298,32 @@ fn context_and_fused_scopes_have_distinct_phases_and_admitted_identities() {
         assert!(old_plan.admit(&decoded).is_err());
     }
 }
+
+#[test]
+fn borrowed_activation_source_identity_preserves_escaped_execution_overlay_and_session() {
+    let artifact = artifact::fingerprint_artifact("activation-source", [
+        artifact::ArtifactMemberIdentity::new("weights", 23, [7; 32]),
+    ]).unwrap();
+    let foreign = artifact::fingerprint_artifact("activation-source", [
+        artifact::ArtifactMemberIdentity::new("weights", 23, [8; 32]),
+    ]).unwrap();
+    let execution = r#"selected "quoted" execution\nwith λ"#;
+    for overlay in [None, Some("overlay\\t\\\"雪\\\"")] {
+        let (plan, mut discovery) = fixture();
+        discovery.captures.artifact_identity = artifact.to_string();
+        discovery.interventions.artifact_identity = artifact.to_string();
+        discovery.execution_identity = serde_json::to_string(&(execution, overlay)).unwrap();
+        let admitted = plan.admit(&discovery).unwrap();
+        assert!(admitted.validate_source_identity(artifact, execution, overlay, "realized-11").is_ok());
+        for (a, e, o, session) in [
+            (foreign, execution, overlay, "realized-11"),
+            (artifact, "selected", overlay, "realized-11"),
+            (artifact, execution, Some("different"), "realized-11"),
+            (artifact, execution, overlay, "another-session"),
+            (artifact, execution, overlay, ""),
+        ] {
+            assert_eq!(admitted.validate_source_identity(a,e,o,session),
+                Err(SpeculativeActivationSourceError::Identity));
+        }
+    }
+}

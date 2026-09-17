@@ -17,6 +17,9 @@ where
     fn parameter_parts(&mut self) -> Option<(&mut A, &mut P)> {
         self.runtime.parameter_parts()
     }
+    fn parameter_parts_ref(&self) -> Option<(&A, &P)> {
+        self.runtime.parameter_parts_ref()
+    }
 }
 
 impl<A, B, S, P, Provider, Movement> LayeredParameterOwner<B, S>
@@ -35,6 +38,9 @@ where
     fn parameter_parts(&mut self) -> Option<(&mut A, &mut P)> {
         self.runtime.parameter_parts()
     }
+    fn parameter_parts_ref(&self) -> Option<(&A, &P)> {
+        self.runtime.parameter_parts_ref()
+    }
 }
 
 impl<A, B, S, P, F, U> LayeredParameterOwner<B, S> for PipelinePartitionExecutor<A, B, S, P, F, U>
@@ -51,7 +57,11 @@ where
     type Architecture = A;
     type Policy = P;
     fn parameter_parts(&mut self) -> Option<(&mut A, &mut P)> {
+        self.observation_binding.invalidate();
         Some((&mut self.architecture, &mut self.policy))
+    }
+    fn parameter_parts_ref(&self) -> Option<(&A, &P)> {
+        Some((&self.architecture, &self.policy))
     }
 }
 
@@ -71,6 +81,10 @@ where
     type Architecture = crate::composite_execution::PreparedCompositeArchitecture<A>;
     type Policy = P;
     fn parameter_parts(&mut self) -> Option<(&mut Self::Architecture, &mut P)> {
+        self.observation_binding.invalidate();
         Some((&mut self.architecture, &mut self.policy))
+    }
+    fn parameter_parts_ref(&self) -> Option<(&Self::Architecture, &P)> {
+        Some((&self.architecture, &self.policy))
     }
 }

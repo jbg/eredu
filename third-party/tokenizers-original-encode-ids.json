@@ -1,0 +1,60 @@
+{
+  "boundary": "External crate stays excluded from workspace membership; upstream unsafe boundary and workspace lint inheritance stay unchanged.",
+  "dependency": "external tokenizers 0.23.2",
+  "files": {
+    "Cargo.toml": {
+      "after": "06e3a33ca5ad9799f69e91a31accac31b27485f117819d4e2980673ed3552fd7",
+      "before": "396181975290258f4c220c9159a6657c36c17d14560ccf943fcf0612b1faf4ed"
+    },
+    "Cargo.toml.orig": {
+      "after": "1d2c522b2f2237b61f0c249f2d4a2c8792b29942d4e7b1a82912ffc9b44c5f55",
+      "before": "b404b1ca3b1d21866ddf143fe0c7fd20aff034ab8d37a11936e25d60221610e0"
+    },
+    "src/models/bpe/mod.rs": {
+      "after": "bbef2e626b5cc8d4dcbb1891a52fec04be8c433b1a6d102d3a4e48ae1a38a3d5",
+      "before": "cef14bcad172f54b1190d16d8b639d2966454461d8215f465d7479c2076275b1"
+    },
+    "src/models/bpe/model.rs": {
+      "after": "3a11d37bb309cf806b20bbc2182fe39e07031212ec3a4a4647a3d56d2865288c",
+      "before": "809d8ddb050197cd6f2712703a2581b42b7af5efc91d403e6836adc1c531e6c0"
+    },
+    "src/models/bpe/word.rs": {
+      "after": "4c77849e3d94f9efa2fb0247c7fd2ae5a140b98ad42fe932278b1b5da1d64168",
+      "before": "f98d19a708e42e7deec97edd7aef852a7297d31b6ee2af41c2ff6ec06b4dd5fb"
+    },
+    "src/tokenizer/added_vocabulary.rs": {
+      "after": "90dce6fe656f3ac1d36618a15a3e40064860ebf79dc921d8135b618d2ecd622b",
+      "before": "e00696a53316abb58f4eeb92b83ccdca488db0c70b4539f5b74cf8fe0b3ec7df"
+    },
+    "src/tokenizer/encode_ids.rs": {
+      "after": "69458a945d462ddd2a25cdce72d3490f828decca4b68c15e76aef1fd61ba886d",
+      "before": null
+    },
+    "src/tokenizer/encode_ids/tests.rs": {
+      "after": "9c29b3e991c5bf64e924a096de5e0deda54eeb3b0c55716a9f87434ea343bc3c",
+      "before": null
+    },
+    "src/tokenizer/mod.rs": {
+      "after": "b197f4e2aa5f940117dfcbf37643e7e865314f92f302e39d7919517371a58ead",
+      "before": "7ea51a57e052233786a16fc3393dc51ffebb8c543486a134ab26d4760d788b6b"
+    }
+  },
+  "final_complete_manifest_sha256": "14a75a48017cbd445fa3746c3b97f89f86927873bd47c076fd35045d832f34ad",
+  "patch_sha256": "0ab3be09018bc1bbf8c5d4f1c850b55df062a2bf26e084013c6510af048b17ef",
+  "preceding_patches": [
+    "tokenizers-borrowed-decode.patch",
+    "tokenizers-model-cache-policy.patch",
+    "tokenizers-static-alphabet.patch",
+    "tokenizers-packed-bpe.patch",
+    "tokenizers-packed-bpe-compile-correction.patch",
+    "tokenizers-bpe-residence.patch",
+    "tokenizers-packed-added-vocabulary.patch",
+    "tokenizers-packed-added-prefix-search.patch",
+    "tokenizers-original-aggregate.patch"
+  ],
+  "predecessor": "applied aggregate HF116",
+  "predecessor_complete_manifest_sha256": "eedf65238ad98fde8acdb9ed4305753a92d77809cf6a7078af27f65095e617ce",
+  "publication": "Existing relative path dependencies consume this fork; vanilla crates.io 0.23.2 does not supply these methods. Publication requires upstreaming or a published fork.",
+  "scope": "Existing match/symbol/merge worker factoring, one-attempt identity ID destinations and actual dary_heap extra fallible reserve API. No account in HF, no global cache change or matcher replacement.",
+  "upstream_archive_sha256": "7afbf6e88718afcc138bad01d6ccc3051dbbc3b2ce9793d8b8a3aeb610969cfc"
+}

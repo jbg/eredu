@@ -47,16 +47,30 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         units: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata =
+            B::construction_metadata(context).filter(|context| context.uses_checked_metadata());
+        if let Some(metadata) = metadata {
+            metadata.charge_metadata(
+                size_of::<Self>()
+                    + size_of::<Result<Self, Error>>()
+                    + size_of::<HybridStaticModules<B, ()>>()
+                    + size_of::<HybridExecutionGroups>(),
+            )?;
+        }
         Ok(Self {
             static_modules: HybridStaticModules {
                 base: StaticModules::from_spec(static_spec, context)?,
                 extension: (),
             },
-            groups: HybridExecutionGroups::Target(SequentialGroup::new(
-                TARGET_EXECUTION_GROUP,
-                parameter_root,
-                units,
-            )?),
+            groups: HybridExecutionGroups::Target(match metadata {
+                Some(metadata) => SequentialGroup::new_with_metadata(
+                    TARGET_EXECUTION_GROUP,
+                    parameter_root,
+                    units,
+                    metadata,
+                )?,
+                None => SequentialGroup::new(TARGET_EXECUTION_GROUP, parameter_root, units)?,
+            }),
         })
     }
 
@@ -71,18 +85,29 @@ impl<B: NeuralBackend> HybridDecoder<B> {
         prediction_units: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata =
+            B::construction_metadata(context).filter(|context| context.uses_checked_metadata());
+        if let Some(metadata) = metadata {
+            metadata.charge_metadata(
+                size_of::<Self>()
+                    + size_of::<Result<Self, Error>>()
+                    + size_of::<HybridStaticModules<B, ()>>()
+                    + size_of::<HybridExecutionGroups>(),
+            )?;
+        }
         Ok(Self {
             static_modules: HybridStaticModules {
                 base: StaticModules::from_spec(static_spec, context)?,
                 extension: (),
             },
             groups: HybridExecutionGroups::TargetAndPrediction(
-                SequentialPredictionGroups::new_pattern(
+                SequentialPredictionGroups::new_pattern_with_metadata(
                     target_parameter_root,
                     target_units,
                     prediction_parameter_root,
                     prediction_groups,
                     prediction_units,
+                    metadata,
                 )?,
             ),
         })
@@ -136,6 +161,29 @@ impl<B: NeuralBackend, E> HybridDecoder<B, E> {
         match &self.groups {
             HybridExecutionGroups::Target(group) => group.execution_graph(),
             HybridExecutionGroups::TargetAndPrediction(groups) => groups.execution_graph(),
+        }
+    }
+
+    pub(crate) fn execution_graph_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
+        match &self.groups {
+            HybridExecutionGroups::Target(group) => group.execution_graph_with_metadata(context),
+            HybridExecutionGroups::TargetAndPrediction(groups) => groups.execution_graph_with_metadata(context),
+        }
+    }
+
+    pub(crate) fn group_unit_count_with_metadata(
+        &self,
+        group: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<usize, Error> {
+        match &self.groups {
+            HybridExecutionGroups::Target(target) => {
+                target.unit_count_with_metadata(group, context)
+            }
+            HybridExecutionGroups::TargetAndPrediction(groups) => groups.unit_count_with_metadata(group, context),
         }
     }
 

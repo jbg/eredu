@@ -1,10 +1,67 @@
 use super::MlxSamplingBackend;
 use crate::MlxTensor;
 use eredu_core::TokenFilter;
+use eredu_nn::Tensor;
 use eredu_runtime::{GenerationSampler, MirostatV2Sampler, Sampler, SamplingBackend, TokenDomain};
 use safemlx::{random, transforms::async_eval_with_event, Array, Device, DeviceType};
 
 use crate::backend::{nn::tensor::TokenValidationScope, random::RandomState, ExecutionContext};
+
+#[test]
+#[ignore = "requires native CPU execution"]
+fn mlx_penalty_history_windows_match_independent_counts() {
+    let stream = safemlx::Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+    let values = [-3.0f32, -2.0, 0.0, 1.0, 4.0, 2.0, -1.0, 3.0];
+    let input = MlxTensor::from_array(Array::from_slice(&values, &[2, 4]));
+    let histories: &[&[u32]] = &[&[], &[1], &[2, 2, 0, 3, 2, u32::MAX, 1, 1]];
+    for &history in histories {
+        for window in [-1, 0, 1, 3, 32] {
+            for (repetition, frequency, presence) in [
+                (1.0, 0.0, 0.0),
+                (1.25, 0.0, 0.0),
+                (1.0, 0.5, -0.1),
+                (1.25, 0.5, 0.2),
+            ] {
+                let penalties = eredu_runtime::PenaltyConfig {
+                    repeat_penalty: repetition,
+                    repeat_last_n: window,
+                    frequency_penalty: frequency,
+                    presence_penalty: presence,
+                };
+                let actual =
+                    MlxSamplingBackend::apply_penalties(&input, history, penalties, &stream)
+                        .unwrap()
+                        .to_f32_vec(&stream)
+                        .unwrap();
+                let start = if window < 0 {
+                    0
+                } else {
+                    history.len().saturating_sub(window as usize)
+                };
+                for (index, (&raw, actual)) in values.iter().zip(actual).enumerate() {
+                    let count = history[start..]
+                        .iter()
+                        .filter(|&&id| id as usize == index % 4)
+                        .count();
+                    let expected = if count == 0 {
+                        raw
+                    } else {
+                        (if raw > 0.0 {
+                            raw / repetition
+                        } else {
+                            raw * repetition
+                        }) - frequency * count as f32
+                            - presence
+                    };
+                    assert!(
+                        (actual - expected).abs() < 1e-6,
+                        "history={history:?} window={window} index={index}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+    }
+}
 
 #[test]
 fn token_filter_accepts_a_truncated_output_vocabulary_prefix() {

@@ -61,7 +61,7 @@ impl
     fn visit<A>(
         self,
         prepared: PreparedReplicatedTextArchitecture<A>,
-        _: eredu_checkpoint::store::SharedCheckpointSource,
+        _: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<
@@ -549,9 +549,10 @@ fn replicated_requirement_catalog_matches_authoritative_architecture_parameters(
     let selected =
         eredu_runtime::select_replicated_text_realization(&requirements, &request, &capabilities)
             .unwrap();
-    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+    let store: eredu_checkpoint::store::RetainedCheckpointSource = std::sync::Arc::new(
         eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-    );
+    )
+    .into();
     let logits = visit_replicated_text_architecture::<
         ReferenceBackend,
         DeviceState<ReferenceBackend, ReferenceCache>,
@@ -657,9 +658,10 @@ fn dense_deepseek_v3_constructs_through_the_typed_compressed_visitor() {
 
     let inspection = configuration::inspect_artifact(artifact.path()).unwrap();
     let selected = resident_selection_for(&inspection);
-    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+    let store: eredu_checkpoint::store::RetainedCheckpointSource = std::sync::Arc::new(
         eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-    );
+    )
+    .into();
     let logits = visit_replicated_compressed_only_text_architecture::<
         ReferenceBackend,
         DeviceState<ReferenceBackend, ReferenceCache>,
@@ -1597,7 +1599,7 @@ impl
                 DeviceState<ReferenceBackend, ReferenceCache>,
             >>::Boundary,
         >,
-        _store: eredu_checkpoint::store::SharedCheckpointSource,
+        _store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_architectures::partitioned_execution::TextPartitionArchitecture<
@@ -1881,9 +1883,10 @@ fn authoritative_lfm2_visitor_selects_indexed_tp_pp_partition_and_mixed_state() 
     let selected_base = resident_selection_for(&inspection);
     let communication = resident_partition_communication();
     let topology = eredu_core::ParallelTopology::new(2, 2, 1, 1).unwrap();
-    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+    let store: eredu_checkpoint::store::RetainedCheckpointSource = std::sync::Arc::new(
         eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-    );
+    )
+    .into();
 
     for rank in 0..topology.world_size() {
         let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
@@ -1929,7 +1932,7 @@ fn authoritative_lfm2_visitor_selects_indexed_tp_pp_partition_and_mixed_state() 
             >(
                 &inspection,
                 selected,
-                std::sync::Arc::clone(&store),
+                store.clone(),
                 &(),
                 InspectLlamaPartition,
             )
@@ -2032,9 +2035,10 @@ fn authoritative_kimi_visitor_selects_indexed_tp_pp_partition_and_exact_mixed_st
     let selected_base = resident_selection_for(&inspection);
     let communication = resident_partition_communication();
     let topology = eredu_core::ParallelTopology::new(2, 2, 1, 1).unwrap();
-    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+    let store: eredu_checkpoint::store::RetainedCheckpointSource = std::sync::Arc::new(
         eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-    );
+    )
+    .into();
 
     for rank in 0..topology.world_size() {
         let admission = eredu_architectures::partitioned_execution::dispatch_partitioned_admission(
@@ -2080,7 +2084,7 @@ fn authoritative_kimi_visitor_selects_indexed_tp_pp_partition_and_exact_mixed_st
             >(
                 &inspection,
                 selected,
-                std::sync::Arc::clone(&store),
+                store.clone(),
                 &(),
                 InspectLlamaPartition,
             )
@@ -2394,9 +2398,10 @@ fn authoritative_qwen_visitor_selects_tp_pp_partition_and_exact_mixed_state() {
     )
     .expect_err("PP admission must require explicit failure agreement capability");
     assert!(error.to_string().contains("FailureAgreement"));
-    let store: eredu_checkpoint::store::SharedCheckpointSource = std::sync::Arc::new(
+    let store: eredu_checkpoint::store::RetainedCheckpointSource = std::sync::Arc::new(
         eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-    );
+    )
+    .into();
     let residencies = [
         eredu_runtime::LayerWeightResidency::FullyResident,
         eredu_runtime::LayerWeightResidency::LayerwiseHost(Default::default()),
@@ -2500,7 +2505,7 @@ fn authoritative_qwen_visitor_selects_tp_pp_partition_and_exact_mixed_state() {
         >(
             &inspection,
             transformed,
-            std::sync::Arc::clone(&store),
+            store.clone(),
             &(),
             InspectLlamaPartition,
         )
@@ -2555,7 +2560,7 @@ fn authoritative_qwen_visitor_selects_tp_pp_partition_and_exact_mixed_state() {
             >(
                 &inspection,
                 selected,
-                std::sync::Arc::clone(&store),
+                store.clone(),
                 &(),
                 InspectLlamaPartition,
             )
@@ -2844,6 +2849,50 @@ impl decoder::Config for ProjectionLayoutConfig {
         )
     }
 
+    fn architecture_fingerprint_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<String, Error> {
+        context.charge_metadata(
+            std::mem::size_of::<[(&str, String); 7]>()
+                + eredu_core::cache::PromptCacheArchitectureFingerprint::construction_bytes(),
+        )?;
+        let mut fields = [
+            (
+                "base",
+                decoder::Config::architecture_fingerprint_with_metadata(&self.args, context)?,
+            ),
+            (
+                "fused",
+                context.metadata_string(format_args!("{}", self.fused))?,
+            ),
+            (
+                "empty_field",
+                context.metadata_string(format_args!("{}", self.empty_field))?,
+            ),
+            (
+                "alternate_fields",
+                context.metadata_string(format_args!("{}", self.alternate_fields))?,
+            ),
+            (
+                "attention_bias",
+                context.metadata_string(format_args!("{}", "false"))?,
+            ),
+            (
+                "mlp_bias",
+                context.metadata_string(format_args!("{}", "false"))?,
+            ),
+            (
+                "weight_quantization",
+                context.metadata_string(format_args!("{}", "dense"))?,
+            ),
+        ];
+        let digest = eredu_core::cache::PromptCacheArchitectureFingerprint::new(
+            "reference_projection_layout_decoder",
+            &mut fields,
+        );
+        context.metadata_string(format_args!("{digest}"))
+    }
     fn validate_config(&self) -> Result<(), Error> {
         Ok(())
     }
@@ -4830,12 +4879,8 @@ fn inkling_dense_partition_foundation_owns_optional_vision_text_and_state_exactl
     let state_plan =
         ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(2, 0..2)]);
 
-    let first_ownership = PartitionOwnership::new(
-        true,
-        false,
-        ["vision", "audio", "embedding", "embedding_norm"],
-    )
-    .unwrap();
+    let first_ownership =
+        PartitionOwnership::new(true, false, ["audio", "embedding", "embedding_norm"]).unwrap();
     let first_geometry = inkling::partition_local_geometry(
         &args,
         &layout,
@@ -4867,7 +4912,7 @@ fn inkling_dense_partition_foundation_owns_optional_vision_text_and_state_exactl
         2
     );
     assert_eq!(first.geometry().local_state_layout().unwrap().len(), 1);
-    assert!(first
+    assert!(!first
         .parameter_targets()
         .iter()
         .any(|target| target == "visual.final_norm.weight"));
@@ -4888,8 +4933,12 @@ fn inkling_dense_partition_foundation_owns_optional_vision_text_and_state_exactl
         .iter()
         .any(|target| target.starts_with("model.layers.1.")));
 
-    let last_ownership =
-        PartitionOwnership::new(false, true, ["norm", "output", inkling::MTP_STATIC_ROLE]).unwrap();
+    let last_ownership = PartitionOwnership::new(
+        false,
+        true,
+        ["vision", "norm", "output", inkling::MTP_STATIC_ROLE],
+    )
+    .unwrap();
     let last_geometry = inkling::partition_local_geometry(
         &args,
         &layout,
@@ -4917,8 +4966,12 @@ fn inkling_dense_partition_foundation_owns_optional_vision_text_and_state_exactl
     assert_eq!(last_partition.state().unwrap().global_layer_offset(), 1);
     assert_eq!(
         last.geometry().static_roles(),
-        ["norm", "output", inkling::MTP_STATIC_ROLE]
+        ["vision", "norm", "output", inkling::MTP_STATIC_ROLE]
     );
+    assert!(last
+        .parameter_targets()
+        .iter()
+        .any(|target| target == "visual.final_norm.weight"));
     assert!(last
         .parameter_targets()
         .iter()
@@ -4945,12 +4998,7 @@ fn inkling_dense_partition_foundation_owns_optional_vision_text_and_state_exactl
         &prediction,
         &layout,
         [(inkling::TEXT_EXECUTION_GROUP, 0..1)],
-        &PartitionOwnership::new(
-            true,
-            false,
-            ["vision", "audio", "embedding", "embedding_norm"],
-        )
-        .unwrap(),
+        &PartitionOwnership::new(true, false, ["audio", "embedding", "embedding_norm"]).unwrap(),
     )
     .is_err());
 
@@ -4967,14 +5015,145 @@ fn inkling_dense_partition_foundation_owns_optional_vision_text_and_state_exactl
         &routed,
         &layout,
         [(inkling::TEXT_EXECUTION_GROUP, 0..1)],
-        &PartitionOwnership::new(
-            true,
-            false,
-            ["vision", "audio", "embedding", "embedding_norm"],
-        )
-        .unwrap(),
+        &PartitionOwnership::new(true, false, ["audio", "embedding", "embedding_norm"]).unwrap(),
     )
     .is_err());
+}
+
+#[test]
+fn inkling_partition_foundation_tracks_final_vision_owner_and_absent_media_roles() {
+    for has_vision in [false, true] {
+        for has_audio in [false, true] {
+            let mut args = inkling_partition_args();
+            let schedule = args
+                .text_config
+                .layer_schedule
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            args.text_config.num_hidden_layers = 8;
+            args.text_config.layer_schedule = LayerSchedule::new(
+                8,
+                (0..8)
+                    .map(|index| schedule[index % schedule.len()])
+                    .collect(),
+            )
+            .unwrap();
+            if !has_vision {
+                args.vision_config = None;
+            }
+            args.audio_config = has_audio.then(|| {
+                serde_json::from_value(serde_json::json!({
+                    "text_hidden_size":16,"num_codebooks":2,"codebook_size":4
+                }))
+                .unwrap()
+            });
+            let architecture =
+                inkling::LayeredModel::<ReferenceBackend>::new(args.clone(), &()).unwrap();
+            let parameters = architecture.parameter_description(&()).unwrap();
+            let groups = parameters
+                .groups()
+                .iter()
+                .map(|owned| owned.group().clone())
+                .collect::<Vec<_>>();
+            let layout = partition_test_layout(&groups, 2, 0).unwrap();
+            let target_state = inkling::local_geometry(&args, &layout)
+                .unwrap()
+                .state_layout()
+                .clone();
+            let complete_state = inkling::composite_state_layout(&target_state, None).unwrap();
+            let state_plan =
+                ArchitectureStatePartitionPlan::new([ArchitectureStatePartitionRule::group_units(
+                    2,
+                    0..8,
+                )]);
+            for pp in [1, 2, 4, 8] {
+                for rank in 0..pp {
+                    let text = partition_test_range(8, pp, rank);
+                    let vision = has_vision
+                        .then(|| partition_test_range(4, pp, rank))
+                        .filter(|range| !range.is_empty());
+                    let owns_vision_role = if has_vision {
+                        rank == pp.min(4) - 1
+                    } else {
+                        rank == 0
+                    };
+                    let mut roles = Vec::new();
+                    if owns_vision_role {
+                        roles.push("vision");
+                    }
+                    if rank == 0 {
+                        roles.extend(["audio", "embedding", "embedding_norm"]);
+                    }
+                    if rank == pp - 1 {
+                        roles.extend(["norm", "output", inkling::MTP_STATIC_ROLE]);
+                    }
+                    let ownership =
+                        PartitionOwnership::new(rank == 0, rank == pp - 1, roles.clone()).unwrap();
+                    let ranges = vision
+                        .clone()
+                        .map(|range| (inkling::VISION_EXECUTION_GROUP, range))
+                        .into_iter()
+                        .chain([(inkling::TEXT_EXECUTION_GROUP, text.clone())])
+                        .collect::<Vec<_>>();
+                    let geometry = inkling::partition_local_geometry(
+                        &args,
+                        &layout,
+                        ranges.clone(),
+                        &ownership,
+                    )
+                    .unwrap();
+                    let partition = ArchitecturePartition::from_description(
+                        &parameters,
+                        ranges.clone(),
+                        ownership,
+                        &complete_state,
+                        &state_plan,
+                        geometry,
+                        NoAuxiliaryBoundarySchema::new(args.text_config.hidden_size),
+                    )
+                    .unwrap();
+                    let foundation =
+                        inkling::PartitionLocalFoundation::from_partition(&args, &partition)
+                            .unwrap();
+                    assert_eq!(foundation.geometry().vision_units(), vision);
+                    assert_eq!(foundation.geometry().text_units(), text.clone());
+                    assert_eq!(
+                        foundation.geometry().local_state_layout().unwrap().len(),
+                        text.len()
+                    );
+                    assert_eq!(partition.state().unwrap().global_layer_offset(), text.start);
+                    assert_eq!(
+                        foundation
+                            .parameter_targets()
+                            .iter()
+                            .any(|target| target == "visual.final_norm.weight"),
+                        has_vision && owns_vision_role
+                    );
+                    assert_eq!(
+                        foundation
+                            .parameter_targets()
+                            .iter()
+                            .any(|target| target == "audio.encoder.weight"),
+                        has_audio && rank == 0
+                    );
+                    // Reverse only final-normalization authority, leaving this
+                    // exact model, ranges, state and boundary otherwise intact.
+                    let mut wrong_roles = roles;
+                    if owns_vision_role {
+                        wrong_roles.remove(0);
+                    } else {
+                        wrong_roles.insert(0, "vision");
+                    }
+                    let wrong =
+                        PartitionOwnership::new(rank == 0, rank == pp - 1, wrong_roles).unwrap();
+                    assert!(
+                        inkling::partition_local_geometry(&args, &layout, ranges, &wrong).is_err()
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn deepseek_v3_partition_args() -> deepseek::V3Args {

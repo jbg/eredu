@@ -1,0 +1,58 @@
+diff --git a/mlx/record_quota.h b/mlx/record_quota.h
+--- a/mlx/record_quota.h
++++ b/mlx/record_quota.h
+@@ -56,6 +56,10 @@
+ class MLX_API RecordQuota final {
+  public:
+   static bool minimum_capacity(size_t& out) noexcept;
++  // Exact physical block extent for requests aligned no more strictly than
++  // the arena. Includes Block, back-offset, padding and allocator rounding;
++  // no quota is created or inspected. Fragmented/retained blocks are separate.
++  static bool allocation_extent(size_t requested, size_t align, size_t& out) noexcept;
+   static bool layout(size_t capacity, RecordQuotaLayout& out) noexcept;
+   static RecordQuota* create(
+       size_t capacity, void* owner, void (*retire)(void*));
+diff --git a/mlx/record_quota.cpp b/mlx/record_quota.cpp
+--- a/mlx/record_quota.cpp
++++ b/mlx/record_quota.cpp
+@@ -70,6 +70,27 @@
+   return "submission tracking failure";
+ }
+ 
++namespace {
++bool block_extent(size_t address, size_t header, size_t requested, size_t align,
++    size_t& start, size_t& pointer, size_t& used) noexcept {
++  return add(address, header, start) && align_up(start, align, pointer) &&
++      add(pointer - address, std::max(requested, size_t{1}), used) &&
++      align_up(used, alignment, used);
++}
++} // namespace
++
++bool RecordQuota::allocation_extent(size_t requested, size_t align, size_t& out) noexcept {
++  // Every block begins at an arena-aligned address. For these request
++  // alignments zero has the identical residue as every actual block address.
++  if (!align || (align & (align - 1)) || align > alignment) return false;
++  size_t start, pointer, used;
++  if (!block_extent(0, sizeof(Block) + sizeof(size_t), requested, align,
++          start, pointer, used) || used > std::numeric_limits<ptrdiff_t>::max())
++    return false;
++  out = used;
++  return true;
++}
++
+ bool RecordQuota::minimum_capacity(size_t& out) noexcept {
+   // Same physical block minimum used by every constructor. Not a Record count.
+   return add(sizeof(Block) + sizeof(size_t) + alignment - 1,
+@@ -140,10 +161,8 @@
+       c.entry = block(c.offset);
+       if (!c.entry->free) continue;
+       c.address = reinterpret_cast<uintptr_t>(bytes() + c.offset);
+-      if (!add(c.address, sizeof(Block) + sizeof(size_t), c.start) ||
+-          !align_up(c.start, align, c.pointer) ||
+-          !add(c.pointer - c.address, std::max(requested, size_t{1}), c.used) ||
+-          !align_up(c.used, alignment, c.used) || c.used > c.entry->bytes)
++      if (!block_extent(c.address, sizeof(Block) + sizeof(size_t), requested, align,
++              c.start, c.pointer, c.used) || c.used > c.entry->bytes)
+         continue;
+       c.remainder = c.entry->bytes - c.used;
+       if (c.remainder >= sizeof(Block) + sizeof(size_t) + alignment) {

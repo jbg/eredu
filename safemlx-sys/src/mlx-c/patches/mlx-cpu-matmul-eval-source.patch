@@ -1,0 +1,346 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -61,6 +61,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/fft.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/hadamard.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/matmul.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/matmul_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/gemms/cblas.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/masked_mm.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/primitives.cpp
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -144,9 +144,13 @@
+     const EvalDispatchStorage* dispatch_source, SingleOutputEvalStorage& out) noexcept {
+   return single_output_layout(rank,inputs,tracer,dispatch_source,false,out);
+ }
++bool single_output_raw_task_layout(size_t rank, size_t inputs, bool tracer,
++    const EvalDispatchStorage& dispatch_source, SingleOutputEvalStorage& out) noexcept {
++  return single_output_layout(rank,inputs,tracer,&dispatch_source,true,out);
++}
+ bool single_output_raw_task_layout(size_t rank, bool tracer,
+     const EvalDispatchStorage& dispatch_source, SingleOutputEvalStorage& out) noexcept {
+-  return single_output_layout(rank,1,tracer,&dispatch_source,true,out);
++  return single_output_raw_task_layout(rank,1,tracer,dispatch_source,out);
+ }
+ bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
+     CopyEvalStorage& out) noexcept {
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -18,6 +18,7 @@
+ #include "mlx/backend/cpu/greedy_storage.h"
+ #include "mlx/backend/cpu/reshape_storage.h"
+ #include "mlx/backend/cpu/random_storage.h"
++#include "mlx/backend/cpu/matmul_storage.h"
+ 
+ namespace mlx::core::cpu {
+ 
+@@ -48,8 +49,9 @@
+   const bool fixed_softmax = fixed && cpu::is_softmax_eval_primitive(arr);
+   const bool fixed_greedy = fixed && cpu::is_greedy_eval_primitive(arr);
+   const bool fixed_reshape = fixed && cpu::is_reshape_alias_eval_primitive(arr);
++  const bool fixed_matmul = fixed && cpu::is_bf16_matmul_eval_primitive(arr);
+   const bool fixed_random = fixed && cpu::is_random_bits_eval_primitive(arr);
+-  const bool extended = fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool extended = fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -57,7 +59,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_random
++    const auto failure = fixed_matmul
++        ? submission::GraphConstruction::create_cpu_bf16_matmul_eval(*extended_prologue, extended_bank.value)
++        : fixed_random
+         ? submission::GraphConstruction::create_cpu_random_bits_eval(*extended_prologue, extended_bank.value)
+         : fixed_reshape
+         ? submission::GraphConstruction::create_cpu_reshape_alias_eval(*extended_prologue, extended_bank.value)
+diff --git a/mlx/backend/cpu/eval_storage.h b/mlx/backend/cpu/eval_storage.h
+--- a/mlx/backend/cpu/eval_storage.h
++++ b/mlx/backend/cpu/eval_storage.h
+@@ -18,6 +18,8 @@
+     const EvalDispatchStorage*, SingleOutputEvalStorage&) noexcept;
+ // One-input raw-pointer worker: the encoder/cleanup retains original arrays,
+ // while the task owns no weak array descriptors. Output backing is still real.
++bool single_output_raw_task_layout(size_t rank, size_t inputs, bool tracer,
++    const EvalDispatchStorage&, SingleOutputEvalStorage&) noexcept;
+ bool single_output_raw_task_layout(size_t rank, bool tracer,
+     const EvalDispatchStorage&, SingleOutputEvalStorage&) noexcept;
+ } // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/matmul.cpp b/mlx/backend/cpu/matmul.cpp
+--- a/mlx/backend/cpu/matmul.cpp
++++ b/mlx/backend/cpu/matmul.cpp
+@@ -1,6 +1,7 @@
+ // Copyright © 2023-2024 Apple Inc.
+ 
+ #include <cstring>
++#include <cstdlib>
+ #include "mlx/array.h"
+ #include "mlx/backend/common/utils.h"
+ #include "mlx/backend/cpu/binary.h"
+@@ -8,6 +9,7 @@
+ #include "mlx/backend/cpu/copy.h"
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/backend/cpu/gemm.h"
++#include "mlx/backend/cpu/matmul_storage.h"
+ #include "mlx/primitives.h"
+ 
+ namespace mlx::core {
+@@ -74,6 +76,70 @@
+       out[row * n + col] = sum;
+     }
+   }
++}
++
++template <typename T>
++struct MatmulTask {
++  const T* a_ptr;
++  const T* b_ptr;
++  T* out_ptr;
++  bool a_transposed, b_transposed;
++  size_t lda, ldb, ldc;
++  float alpha, beta;
++  size_t batch_size;
++  Shape a_shape;
++  Strides a_strides;
++  Shape b_shape;
++  Strides b_strides;
++  void operator()() {
++    if constexpr (std::is_same_v<T, bfloat16_t>) {
++      if (alpha == 1.0f && beta == 0.0f) {
++        size_t m = a_shape[a_shape.size() - 2];
++        size_t k = a_shape.back();
++        size_t n = b_shape.back();
++        for (size_t batch = 0; batch < batch_size; ++batch) {
++          bf16_row_matmul(
++              a_ptr + elem_to_loc(m * k * batch, a_shape, a_strides),
++              b_ptr + elem_to_loc(k * n * batch, b_shape, b_strides),
++              out_ptr + m * n * batch, m, n, k, a_transposed ? 1 : lda, a_transposed ? lda : 1, b_transposed ? ldb : 1, b_transposed ? 1 : ldb);
++        }
++        return;
++      }
++    }
++    matmul<T>(
++        a_ptr,
++        b_ptr,
++        out_ptr,
++        a_transposed,
++        b_transposed,
++        lda,
++        ldb,
++        ldc,
++        alpha,
++        beta,
++        batch_size,
++        a_shape,
++        a_strides,
++        b_shape,
++        b_strides);
++  }
++};
++
++namespace cpu {
++bool bf16_matmul_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  DispatchLayout task;
++  if(!CommandEncoder::dispatch_layout<MatmulTask<bfloat16_t>>(task))return false;
++  // Existing row worker has fixed FP32 partial/tail arrays and no heap scratch.
++  // These controls include the dispatch/call copies and all simultaneous local
++  // pointer/index/reduction transports, not an opaque BLAS workspace allowance.
++  const size_t controls=sizeof(EvalDispatchStorage)+sizeof(task)+sizeof(out)+
++      sizeof(MatmulTask<bfloat16_t>)*2+sizeof(float[32])+sizeof(float[4])*2+
++      sizeof(float)*2+sizeof(size_t)*28+sizeof(int)*3+sizeof(long)*2+
++      sizeof(ldiv_t)+sizeof(bfloat16_t*)*6+sizeof(bool)*4+sizeof(Stream)+
++      sizeof(Shape)*2+sizeof(Strides)*2;
++  if(task.controls>SIZE_MAX-controls)return false;
++  out={task.task_bytes,task.task_alignment,0,task.controls+controls};return true;
++}
+ }
+ 
+ template <typename T>
+@@ -97,52 +163,8 @@
+   encoder.set_input_array(a);
+   encoder.set_input_array(b);
+   encoder.set_output_array(out);
+-  encoder.dispatch([a_ptr,
+-                    b_ptr,
+-                    out_ptr,
+-                    a_transposed,
+-                    b_transposed,
+-                    lda,
+-                    ldb,
+-                    ldc,
+-                    alpha,
+-                    beta,
+-                    batch_size,
+-                    a_shape = a.shape(),
+-                    a_strides = a.strides(),
+-                    b_shape = b.shape(),
+-                    b_strides = b.strides()]() {
+-    if constexpr (std::is_same_v<T, bfloat16_t>) {
+-      if (alpha == 1.0f && beta == 0.0f) {
+-        size_t m = a_shape[a_shape.size() - 2];
+-        size_t k = a_shape.back();
+-        size_t n = b_shape.back();
+-        for (size_t batch = 0; batch < batch_size; ++batch) {
+-          bf16_row_matmul(
+-              a_ptr + elem_to_loc(m * k * batch, a_shape, a_strides),
+-              b_ptr + elem_to_loc(k * n * batch, b_shape, b_strides),
+-              out_ptr + m * n * batch, m, n, k, a_transposed ? 1 : lda, a_transposed ? lda : 1, b_transposed ? ldb : 1, b_transposed ? 1 : ldb);
+-        }
+-        return;
+-      }
+-    }
+-    matmul<T>(
+-        a_ptr,
+-        b_ptr,
+-        out_ptr,
+-        a_transposed,
+-        b_transposed,
+-        lda,
+-        ldb,
+-        ldc,
+-        alpha,
+-        beta,
+-        batch_size,
+-        a_shape,
+-        a_strides,
+-        b_shape,
+-        b_strides);
+-  });
++  encoder.dispatch(MatmulTask<T>{a_ptr,b_ptr,out_ptr,a_transposed,b_transposed,
++      lda,ldb,ldc,alpha,beta,batch_size,a.shape(),a.strides(),b.shape(),b.strides()});
+ }
+ 
+ void matmul_general(
+diff --git a/mlx/backend/cpu/matmul_storage.cpp b/mlx/backend/cpu/matmul_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/matmul_storage.cpp
+@@ -0,0 +1,96 @@
++#include "mlx/backend/cpu/matmul_storage.h"
++#include "mlx/backend/cpu/encoder.h"
++#include "mlx/primitives.h"
++#include "mlx/submission.h"
++#include <climits>
++#include <tuple>
++#include <typeinfo>
++namespace mlx::core::cpu {
++namespace {
++bool product(size_t a,size_t b,size_t& out) noexcept {
++  if(b&&a>size_t(PTRDIFF_MAX)/b)return false;out=a*b;return true;
++}
++bool add(size_t& out,size_t more) noexcept {
++  if(more>size_t(PTRDIFF_MAX)-out)return false;out+=more;return true;
++}
++bool matrix_source(const array& value,size_t rank) noexcept {
++  if(value.ndim()!=rank||value.strides().size()!=rank||value.dtype()!=bfloat16||
++      value.itemsize()!=sizeof(bfloat16_t))return false;
++  const auto row=value.strides()[rank-2],column=value.strides()[rank-1];
++  // Exactly the no-copy branches of ordinary matmul_general::check_transpose.
++  if(!((row==value.shape(-1)&&column==1)||(row==1&&column==value.shape(-2))))return false;
++  size_t span=1,extent=0,elements=1,bytes=0;
++  for(size_t i=0;i!=rank;++i) {
++    if(value.shape(i)<=0||value.strides()[i]<0||
++        !product(elements,size_t(value.shape(i)),elements)||
++        !product(size_t(value.shape(i)-1),size_t(value.strides()[i]),extent)||!add(span,extent))return false;
++  }
++  return elements==value.size()&&elements<=size_t(INT_MAX)&&span<=value.data_size()&&
++      product(span,sizeof(bfloat16_t),bytes);
++}
++}
++bool is_bf16_matmul_eval_primitive(const array& out) noexcept {
++  return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
++      typeid(out.primitive())==typeid(Matmul)&&out.dtype()==bfloat16;
++}
++bool bf16_matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,bool tracer,CopyEvalStorage& out) noexcept {
++  if(rank<2||rank>4||!m||!n||!k||!batches||(rank==2&&batches!=1))return false;
++  size_t left=0,right=0,result=0,bytes=0;
++  // elem_to_loc takes int, and ordinary batch_size uses a signed shape product.
++  // Include all matrix/intermediate products before any cast or allocation.
++  if(!product(m,k,left)||!product(k,n,right)||!product(m,n,result)||
++      !product(left,batches,left)||!product(right,batches,right)||
++      !product(result,batches,result)||left>size_t(INT_MAX)||right>size_t(INT_MAX)||
++      result>size_t(INT_MAX)||!product(result,sizeof(bfloat16_t),bytes))return false;
++  EvalDispatchStorage task;SingleOutputEvalStorage common;RetentionLayout retention;
++  if(!bf16_matmul_dispatch_storage(task)||!single_output_raw_task_layout(rank,2,tracer,task,common)||
++      !CommandEncoder::retention_layout(2,0,retention))return false;
++  CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
++  // matmul_general unconditionally publishes its actual (possibly empty)
++  // temporary batch. The same cleanup owns it through CPU callback return.
++  value.request_bytes[9]=retention.temporary_batch.bytes;
++  value.request_alignments[9]=retention.temporary_batch.alignment;
++  value.request_counts[9]=1;
++  const size_t controls=sizeof(value)+sizeof(common)+sizeof(task)+sizeof(retention)+
++      sizeof(rank)+sizeof(m)+sizeof(n)+sizeof(k)+sizeof(batches)+sizeof(tracer)+sizeof(out)+
++      sizeof(size_t)*20+sizeof(bool)*5+sizeof(int64_t)*2+sizeof(const array*)*8+
++      sizeof(array)*2+sizeof(ArrayVector)+sizeof(std::tuple<bool,int64_t,array>)*2+
++      sizeof(Stream)*2+sizeof(float)*2+sizeof(detail::TemporaryOwner)*2+
++      sizeof(detail::TemporaryStorage)+sizeof(detail::TemporaryBatch*)*3+
++      sizeof(submission::GraphAllocator<detail::TemporaryBatch>)*2+
++      sizeof(std::optional<ArrayVector>)+sizeof(submission::GraphAllocator<array>)+
++      sizeof(submission::NativeControlFailure)+sizeof(submission::NativeControlError)+
++      sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+
++      sizeof(submission::GraphQuota*)+sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
++  if(!add(value.named_control_bytes,controls)||!submission::GraphConstruction::complete_layout(value))return false;
++  out=value;return true;
++}
++bool bf16_matmul_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(!is_bf16_matmul_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=2||
++      output.itemsize()!=sizeof(bfloat16_t))return false;
++  const size_t rank=output.ndim();if(rank<2||rank>4)return false;
++  const auto& a=output.inputs()[0];const auto& b=output.inputs()[1];
++  if(!matrix_source(a,rank)||!matrix_source(b,rank)||a.shape(-1)!=b.shape(-2)||
++      output.shape(-2)!=a.shape(-2)||output.shape(-1)!=b.shape(-1))return false;
++  size_t batches=1,result=0;
++  for(size_t i=0;i+2<rank;++i) {
++    if(output.shape(i)<=0||a.shape(i)!=output.shape(i)||b.shape(i)!=output.shape(i)||
++        !product(batches,size_t(output.shape(i)),batches))return false;
++  }
++  if(!product(batches,size_t(output.shape(-2)),result)||
++      !product(result,size_t(output.shape(-1)),result)||result!=output.size())return false;
++  return bf16_matmul_eval_layout(rank,a.shape(-2),b.shape(-1),a.shape(-1),batches,output.is_tracer(),out);
++}
++}
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_bf16_matmul_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record=guard.record();auto* graph=record.graph_quota();auto context=current_graph_construction_context();
++  if(out||!graph||!guard.cpu()||!context.scope||context.worker||context.dispatch!=&record||current_graph_quota()!=graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if(!cpu::bf16_matmul_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
++}
++}
+diff --git a/mlx/backend/cpu/matmul_storage.h b/mlx/backend/cpu/matmul_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/matmul_storage.h
+@@ -0,0 +1,9 @@
++#pragma once
++#include "mlx/backend/cpu/copy_storage.h"
++namespace mlx::core::cpu {
++MLX_API bool bf16_matmul_dispatch_storage(EvalDispatchStorage&) noexcept;
++MLX_API bool bf16_matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool is_bf16_matmul_eval_primitive(const array&) noexcept;
++MLX_API bool bf16_matmul_eval_storage(const array&,CopyEvalStorage&) noexcept;
++}
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -166,6 +166,8 @@
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_greedy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_reshape_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_bf16_matmul_eval(const FixedEvalPrologueGuard&,
++      GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_random_bits_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_softmax_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_slice_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;

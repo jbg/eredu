@@ -24,6 +24,13 @@ cargo test --locked -p safemlx --features metal,accelerate --lib concurrent_safe
 The second command targets only the two SafeMLX concurrency tests. Avoid a
 workspace-wide command when only one crate's tests are needed.
 
+Keep Rust incremental compilation enabled for local development; if a diagnostic
+runner disables it, use `CARGO_INCREMENTAL=1`. Preserve the same features, profile,
+and debug settings between iterations. The first incremental build fills its
+cache, and changed test executables still need linking. Keep clean
+`CARGO_INCREMENTAL=0` builds for final validation and disable incremental storage
+in the bounded CI archive snapshots described below.
+
 ## Reference conformance selection
 
 The custom reference harness accepts Cargo-compatible filters, `--exact`,
@@ -60,6 +67,17 @@ used. CMake still configures the project and tracks compiler flags, sources,
 and the content-identified MLX patches. `cargo clean` does not remove this
 external native directory; remove the selected `.native-build` tree explicitly
 when a completely fresh native build is wanted.
+
+With CMake 3.21 or newer, verified archive extraction and all MLX patches still
+run in the content-addressed preparation tree. Compilation uses a separate
+stable `mlx-compile-src` mirror: unchanged files keep their paths and mtimes,
+changed files are copied, and removed owned files are deleted. Refresh metadata
+stays outside the native source inventory; a failed preparation or refresh
+invalidates its completed identity and fails configuration. Retry repairs any
+partial refresh. CMake 3.16–3.20 keeps the existing preparation-tree build path.
+The mirror does not change compiler flags or bypass vendor/patch checks. Never
+configure its owning build tree while another build or source/archive consumer
+is using it.
 
 The shared CI cache action identifies the installed compiler, CMake, runner
 image, Xcode/Metal or CUDA toolkit, and installed Linux CUDA dependencies.

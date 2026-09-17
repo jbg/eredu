@@ -1,20 +1,61 @@
 //! High-level contract implemented once per execution backend.
 
+mod capture_delivery;
 mod continuation;
+mod controller_workspace;
 mod failure;
+mod host_preparation;
+mod metadata_funding;
+mod packed_filter;
+mod preparation;
+mod prepared_control;
+pub use prepared_control::*;
+mod reset_preparation;
+mod resume;
+mod shared_filter;
+mod shared_storage;
+mod text_step;
 pub use continuation::{
     TextContinuationBoundary, TextContinuationError, TextContinuationIdentity, TextDriverIdentity,
-    TextGenerationContinuation, TextGenerationDriver,
+    TextGenerationContinuation, TextGenerationDriver, TextSnapshotSource,
 };
-pub use failure::{BackendFailure, BackendFailureKind};
+pub use controller_workspace::{TextControllerContract, TextControllerContractError};
+pub use failure::{
+    BackendFailure, BackendFailureKind, GenerationSequenceBankRejection, HostMetadataFundingError,
+    PreparedRequestRejection, SharedBackendFailure, TokenInputRejection,
+};
+pub use host_preparation::HostPreparationAuthority;
+pub use metadata_funding::{HostMetadataAccount, HostMetadataFunding};
+pub use packed_filter::{PackedTokenFilter, PackedTokenFilterError};
+pub use preparation::{
+    GenerationDecoderError, GenerationDecoderInput, GenerationDecoderOutput, GenerationPlainText,
+    GenerationPlainTextEvent, GenerationPlainTextEvents, GenerationPlainTextProjection,
+    GenerationSequenceAdmissionError, GenerationSequenceConsumerLayout,
+    GenerationSequencePreparation, GenerationSequenceRequest, TextGenerationInput,
+    TextPreparationInput, TextPreparationOptions, TokenIdsInputPlan,
+};
+pub use reset_preparation::{
+    PreparedSessionReset, SessionResetPreparationBackend, SessionResetReadiness,
+};
+pub use resume::{OriginalTextResumeKind, TextResumeBackend, text_resume_control_bytes};
+pub use shared_filter::SharedTokenFilter;
+pub(crate) use shared_storage::SharedStorageCustody;
+pub use shared_storage::{
+    ControllerDeclarationData, ErasedSharedStorageOwner, SharedControllerBytes,
+    SharedControllerDeclaration, SharedControllerSource, SharedStorageAttachmentError,
+    SharedStorageDomain, SharedStorageIdentity, SharedStorageOwner, SharedStorageRetirement,
+    SharedTokenFilterIdentity,
+};
+pub use text_step::{TextContextError, TextPolicyIdentity, TextRunIdentity, TextStepContext};
 
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, path::Path};
 
 use crate::{
+    PreparationAdmission,
     artifact::{
-        inspect_artifact, ArtifactError, ArtifactInspection, ModelConfigurationResolver,
-        ModelPreparationPlan,
+        ArtifactError, ArtifactInspection, ModelConfigurationResolver, ModelPreparationPlan,
+        inspect_artifact_with_prepared_gguf_headers,
     },
     capability::{
         CapabilityError, InputTokenCount, ModelCapabilities, RuntimeStateEstimate,
@@ -24,7 +65,6 @@ use crate::{
     generation::{GenerationError, ResolvedGenerationConfig},
     media::TokenizedMultimodalRequest,
     observation::{InspectedOutput, ObservationRequest, ObservationSet},
-    PreparationAdmission,
 };
 
 /// Stable, extensible description of an execution backend.
@@ -584,11 +624,7 @@ impl DistributedCommitEpoch {
 
     /// Creates a positive durable epoch identity.
     pub const fn new(value: u64) -> Option<Self> {
-        if value == 0 {
-            None
-        } else {
-            Some(Self(value))
-        }
+        if value == 0 { None } else { Some(Self(value)) }
     }
 
     /// Stable serialized epoch value.
@@ -855,6 +891,14 @@ pub trait BackendProvider: Sized {
     /// Backend error.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Consumes a backend failure at a public neutral boundary. The default
+    /// preserves ordinary owned-source conversion. An adapter may transfer an
+    /// already-retained source without allocating another wrapper; this grants
+    /// neither completion nor memory authority and must preserve its cause.
+    fn into_backend_failure(error: Self::Error) -> BackendFailure {
+        BackendFailure::from_error(error)
+    }
+
     /// Backend identity.
     fn descriptor(&self) -> BackendDescriptor;
     /// Discovers devices and their fail-closed capabilities.
@@ -999,12 +1043,15 @@ pub enum ModelLoadError<E: std::error::Error + Send + Sync + 'static> {
 /// This is the sole generic artifact-loading entry point. The backend instance
 /// already owns its device, execution queues, transfer queues, and optional
 /// distributed communication state; none are passed separately to loading.
+/// GGUF headers are retained from this initial inspection for later prepared
+/// reads; this does not make tensor payloads immutable or certify a memory bound.
 pub fn load_model<B: ModelLoadingBackend>(
     backend: &B,
     artifact: impl AsRef<Path>,
     options: B::LoadOptions,
 ) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
-    let inspection = inspect_artifact(artifact, backend.configuration_resolver())?;
+    let inspection =
+        inspect_artifact_with_prepared_gguf_headers(artifact, backend.configuration_resolver())?;
     prepare_inspected_model(backend, inspection, options)
 }
 
@@ -1020,12 +1067,32 @@ pub fn prepare_inspected_model<B: ModelLoadingBackend>(
     >,
     options: B::LoadOptions,
 ) -> Result<PreparedModel<B::Model>, ModelLoadError<B::Error>> {
+    let config = prepare_inspected_model_config(backend, inspection, options)?;
+    backend
+        .prepare_model(config)
+        .map_err(ModelLoadError::Backend)
+}
+
+/// Selects and prepares the exact source configuration without native model
+/// materialization. This uses the same admission as [`prepare_inspected_model`].
+/// A backend may borrow this configuration for cold source compilation before
+/// entering its ordinary load path. No native execution or input admission is
+/// conferred by the returned configuration.
+pub fn prepare_inspected_model_config<B: ModelLoadingBackend>(
+    backend: &B,
+    inspection: ArtifactInspection<
+        <B::ConfigurationResolver as ModelConfigurationResolver>::ArtifactPlan,
+    >,
+    options: B::LoadOptions,
+) -> Result<B::ModelConfig, ModelLoadError<B::Error>> {
     let selected = backend
         .select_preparation(&inspection, &options)
         .map_err(ModelLoadError::Backend)?;
     let admission = backend.selected_preparation_admission(&selected);
     let plan = ModelPreparationPlan::from_retained_admission(inspection, admission)?;
-    prepare_selected_model(backend, SelectedModelPreparation::new(plan, selected))
+    backend
+        .model_config(SelectedModelPreparation::new(plan, selected))
+        .map_err(ModelLoadError::Backend)
 }
 
 /// Materializes an already planned artifact with its retained backend selection.
@@ -1069,6 +1136,19 @@ pub trait BackendSession<B: BackendProvider> {
         backend: &B,
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, B::Error>;
+
+    /// Prefill with cooperative cancellation. `None` means cancellation was
+    /// agreed and all submitted work safely settled, without an output. Native
+    /// chunked implementations must check between completed spans. The default
+    /// retains the existing indivisible submission; it cannot cancel mid-call.
+    fn prefill_cancellable(
+        &mut self,
+        backend: &B,
+        input: Self::PrefillInput,
+        _cancellation: &crate::GenerationCancellationToken,
+    ) -> Result<Option<Submission<Self::Output, Self::Completion>>, B::Error> {
+        self.prefill(backend, input).map(Some)
+    }
 
     /// Submits one or more cached decode positions against this session.
     fn decode(
@@ -1212,7 +1292,11 @@ impl<B: BackendProvider> ModelRuntime<B> {
         (&self.backend, &mut self.session)
     }
 
-    fn validate_session_admission(&self) -> Result<(), B::Error> {
+    /// Read-only comparison of this session with its exact retained admission.
+    /// Backend-specific composed operations must call this when using a path
+    /// outside the ordinary runtime submission methods. Success grants no
+    /// submission or native allocation authority and does not rebind admission.
+    pub fn validate_session_admission(&self) -> Result<(), B::Error> {
         self.admission
             .validate(self.session.capabilities())
             .map_err(|error| {
@@ -1233,6 +1317,18 @@ impl<B: BackendProvider> ModelRuntime<B> {
     ) -> Result<SessionSubmission<B>, B::Error> {
         self.validate_session_admission()?;
         self.session.prefill(&self.backend, input)
+    }
+
+    /// Executes cancellable prefill with the same exact session admission.
+    /// Cancellation produces no output and implies safe native settlement.
+    pub fn prefill_cancellable(
+        &mut self,
+        input: <B::Session as BackendSession<B>>::PrefillInput,
+        cancellation: &crate::GenerationCancellationToken,
+    ) -> Result<Option<SessionSubmission<B>>, B::Error> {
+        self.validate_session_admission()?;
+        self.session
+            .prefill_cancellable(&self.backend, input, cancellation)
     }
 
     /// Submits cached decode through the selected backend and session.
@@ -1323,8 +1419,75 @@ impl<B: TextGenerationBackend> ModelRuntime<B> {
         stage: crate::run_preparation::TextPreparationStage,
         status: crate::run_preparation::TextPreparationStatus,
     ) -> Result<crate::run_preparation::TextPreparationOutcome, BackendFailure> {
-        self.admission.validate(self.session.capabilities())?;
-        B::agree_text_preparation(self, stage, status)
+        let admission = self
+            .admission
+            .validate(self.session.capabilities())
+            .map_err(BackendFailure::from);
+        // Invalid local admission still participates in bounded failure
+        // agreement, so ready peers cannot proceed into a stranded prediction.
+        let outcome = B::agree_text_preparation(
+            self,
+            stage,
+            if admission.is_err() {
+                crate::run_preparation::TextPreparationStatus::Failed
+            } else {
+                status
+            },
+        );
+        admission?;
+        outcome
+    }
+
+    pub(crate) fn finish_text_preparation_control<T, E>(
+        &self,
+        control: Option<&B::TextPreparationControl>,
+        stage: crate::run_preparation::TextPreparationStage,
+        local: Result<T, E>,
+        map_backend: impl FnOnce(BackendFailure) -> E,
+    ) -> Result<T, E> {
+        crate::run_preparation::finish_preparation(
+            stage,
+            local,
+            |status| self.agree_text_preparation_control(control, stage, status),
+            map_backend,
+        )
+    }
+    pub(crate) fn finish_text_preparation_control_cancellable<T, E>(
+        &self,
+        control: Option<&B::TextPreparationControl>,
+        stage: crate::run_preparation::TextPreparationStage,
+        local: Result<Option<T>, E>,
+        map_backend: impl FnOnce(BackendFailure) -> E,
+    ) -> Result<Option<T>, E> {
+        crate::run_preparation::finish_preparation_cancellable(
+            stage,
+            local,
+            |status| self.agree_text_preparation_control(control, stage, status),
+            map_backend,
+        )
+    }
+    fn agree_text_preparation_control(
+        &self,
+        control: Option<&B::TextPreparationControl>,
+        stage: crate::run_preparation::TextPreparationStage,
+        status: crate::run_preparation::TextPreparationStatus,
+    ) -> Result<crate::run_preparation::TextPreparationOutcome, BackendFailure> {
+        let admission = self
+            .admission
+            .validate(self.session.capabilities())
+            .map_err(BackendFailure::from);
+        let outcome = B::agree_text_preparation_with_control(
+            self,
+            control,
+            stage,
+            if admission.is_err() {
+                crate::run_preparation::TextPreparationStatus::Failed
+            } else {
+                status
+            },
+        );
+        admission?;
+        outcome
     }
 
     /// Reports session lifetime preparation reservations, unaffected by restore.
@@ -1342,6 +1505,22 @@ impl<B: TextGenerationBackend> ModelRuntime<B> {
     pub fn reset(&mut self) -> Result<(), BackendFailure> {
         self.synchronize()?;
         B::reset_session(&self.backend, &mut self.session)
+    }
+
+    /// Requests an originally funded reset without implicitly waiting for prior work.
+    ///
+    /// The provider must establish exact readiness without unreserved native work,
+    /// or reject before construction. Busy leaves the old session installed and
+    /// does not establish completion. The default provider rejects unsupported
+    /// execution. Ordinary [`Self::reset`] still synchronizes; earlier generation
+    /// funding and numeric reports do not authorize this new operation.
+    pub fn reset_admitted(
+        &mut self,
+        limits: crate::SessionResetLimits,
+    ) -> Result<(), BackendFailure> {
+        self.admission.validate(self.session.capabilities())?;
+        let claim = crate::SessionResetClaim::new(&self.session, &self.admission, limits);
+        B::reset_session_admitted(&self.backend, &mut self.session, claim)
     }
 
     /// Waits for this session's submitted work, including abandoned generation.
@@ -1375,6 +1554,7 @@ pub struct TextGenerationConfig {
     sampling: ResolvedGenerationConfig,
     seed: u64,
     strategy: TextSamplingStrategy,
+    inference: crate::TextInferencePolicy,
 }
 
 /// Backend-neutral token-sampling strategy for one text-generation session.
@@ -1402,6 +1582,12 @@ impl TextGenerationConfig {
             sampling,
             seed: 0,
             strategy: TextSamplingStrategy::Standard,
+            inference: crate::TextInferencePolicy {
+                prefill_chunk_positions: None,
+                managed_memory_capacity_bytes: None,
+                submission_tracking_capacity_bytes: None,
+                graph_metadata_capacity_bytes: None,
+            },
         }
     }
 
@@ -1409,6 +1595,19 @@ impl TextGenerationConfig {
     pub const fn with_seed(mut self, seed: u64) -> Self {
         self.seed = seed;
         self
+    }
+
+    /// Applies the same execution limits to ordinary and controlled startup.
+    /// Admission validates finite output allowance and complete memory bounds
+    /// before native prompt or sampling-state construction.
+    pub const fn with_inference_policy(mut self, policy: crate::TextInferencePolicy) -> Self {
+        self.inference = policy;
+        self
+    }
+
+    /// Requested execution limits, before admission selects a smaller chunk.
+    pub const fn inference_policy(&self) -> crate::TextInferencePolicy {
+        self.inference
     }
 
     /// Selects adaptive Mirostat V2 sampling, requiring positive temperature.
@@ -1509,27 +1708,38 @@ impl TokenFilter {
         }
     }
 
+    /// Validates an executable vocabulary without expanding or copying a mask.
+    pub fn validate_output_width(&self, output_width: usize) -> Result<(), TokenFilterError> {
+        if output_width == 0 {
+            return Err(TokenFilterError::EmptyVocabulary);
+        }
+        if let Some(mask) = self.allowed_mask() {
+            if !mask[..mask.len().min(output_width)]
+                .iter()
+                .any(|allowed| *allowed)
+            {
+                return Err(TokenFilterError::NoExecutableToken { output_width });
+            }
+        }
+        Ok(())
+    }
+
     /// Realizes a closed allow set at the model's actual output width.
     /// Missing IDs are false; a truncated prefix must still allow a token.
     pub fn allowed_mask_for(
         &self,
         output_width: usize,
     ) -> Result<Option<std::borrow::Cow<'_, [bool]>>, TokenFilterError> {
-        if output_width == 0 {
-            return Err(TokenFilterError::EmptyVocabulary);
-        }
+        self.validate_output_width(output_width)?;
         let Some(mask) = self.allowed_mask() else {
             return Ok(None);
         };
         let prefix = &mask[..mask.len().min(output_width)];
-        if !prefix.iter().any(|allowed| *allowed) {
-            return Err(TokenFilterError::NoExecutableToken { output_width });
-        }
         Ok(Some(if mask.len() >= output_width {
             std::borrow::Cow::Borrowed(prefix)
         } else {
-            let mut mask = mask.to_vec();
-            mask.resize(output_width, false);
+            let mut mask = vec![false; output_width];
+            mask[..prefix.len()].copy_from_slice(prefix);
             std::borrow::Cow::Owned(mask)
         }))
     }
@@ -1560,6 +1770,9 @@ pub struct TokenSamplingDecision<'a> {
     filter: TokenFilter,
     pre_override_filter: Option<TokenFilter>,
     tokenizer_validity: Option<&'a TokenFilter>,
+    shared_tokenizer_validity: Option<&'a SharedTokenFilter>,
+    original_tokenizer_validity: Option<OriginalTokenDomainWitness<'a>>,
+    controller_storage: Option<TextControllerStorage<'a>>,
 }
 
 impl<'a> TokenSamplingDecision<'a> {
@@ -1569,13 +1782,73 @@ impl<'a> TokenSamplingDecision<'a> {
             filter,
             pre_override_filter: None,
             tokenizer_validity: None,
+            shared_tokenizer_validity: None,
+            original_tokenizer_validity: None,
+            controller_storage: None,
         }
     }
 
     /// Declares the tokenizer baseline for this exact pre-override filter.
     pub fn with_tokenizer_validity(mut self, validity: &'a TokenFilter) -> Self {
         self.tokenizer_validity = Some(validity);
+        self.shared_tokenizer_validity = None;
+        self.original_tokenizer_validity = None;
         self
+    }
+
+    /// Declares the exact shared owner of the tokenizer domain. Its immutable
+    /// identity lets admitted execution validate lifetime coverage after the
+    /// controller callback as well as before it.
+    pub fn with_shared_tokenizer_validity(mut self, validity: &'a SharedTokenFilter) -> Self {
+        self.tokenizer_validity = Some(validity.as_ref());
+        self.shared_tokenizer_validity = Some(validity);
+        self.original_tokenizer_validity = None;
+        self
+    }
+
+    /// Borrows a separately original token domain. This declaration alone grants
+    /// no reduced bound: the runtime must authenticate its concrete source, the
+    /// exact filter object and the original request before validating ownership.
+    pub fn with_original_tokenizer_validity(
+        mut self,
+        validity: &'a TokenFilter,
+        source: OriginalTokenDomainWitness<'a>,
+    ) -> Self {
+        self.tokenizer_validity = Some(validity);
+        self.shared_tokenizer_validity = None;
+        self.original_tokenizer_validity = Some(source);
+        self
+    }
+
+    /// Actual borrowed source provenance, still requiring runtime authentication.
+    pub fn original_tokenizer_validity(&self) -> Option<OriginalTokenDomainWitness<'a>> {
+        self.original_tokenizer_validity
+    }
+
+    /// Borrowed tokenizer domain, when explicitly supplied by the controller.
+    pub fn tokenizer_validity(&self) -> Option<&'a TokenFilter> {
+        self.tokenizer_validity
+    }
+
+    /// Exact immutable owner of a separately retained tokenizer domain.
+    pub fn shared_tokenizer_validity(&self) -> Option<&'a SharedTokenFilter> {
+        self.shared_tokenizer_validity
+    }
+
+    /// Supplies the complete shared-source inventory after this controller
+    /// callback. The descriptor borrows its owners without copying or owning
+    /// their payloads. Managed submission with declared byte sources requires
+    /// this evidence and checks it against the admitted immutable inventory.
+    /// Legacy filter-only decisions may omit it.
+    pub fn with_controller_storage(mut self, storage: TextControllerStorage<'a>) -> Self {
+        self.controller_storage = Some(storage);
+        self
+    }
+
+    /// Complete post-callback source evidence, when supplied. This declaration
+    /// grants no admission, attachment or permission to replace shared owners.
+    pub fn controller_storage(&self) -> Option<TextControllerStorage<'a>> {
+        self.controller_storage
     }
 
     /// The final filter to apply to native sampling.
@@ -1584,7 +1857,8 @@ impl<'a> TokenSamplingDecision<'a> {
     }
 
     /// Applies an already validated forced choice while retaining the original
-    /// domain for observation. This moves filters rather than copying masks.
+    /// domain for observation and the post-callback source inventory. This
+    /// moves filters rather than copying masks.
     pub fn override_filter(&mut self, filter: TokenFilter) {
         let original = std::mem::replace(&mut self.filter, filter);
         if self.pre_override_filter.is_none() {
@@ -1595,9 +1869,151 @@ impl<'a> TokenSamplingDecision<'a> {
     /// Exact pre-override domain, or explicitly unknown.
     pub fn capture_domain(&self) -> Option<crate::capture::CaptureTokenDomain<'_>> {
         Some(crate::capture::CaptureTokenDomain {
-            filter: self.pre_override_filter.as_ref().unwrap_or(&self.filter),
+            filter: self
+                .pre_override_filter
+                .as_ref()
+                .unwrap_or(&self.filter)
+                .into(),
             tokenizer_validity: self.tokenizer_validity?,
         })
+    }
+}
+
+/// Borrowed concrete source evidence, with no ownership or admission authority.
+/// The runtime must downcast and authenticate the actual closed source against
+/// the original request. A matching type, value or size alone is insufficient.
+///
+/// ```compile_fail
+/// fn escape() -> eredu_core::OriginalTokenDomainWitness<'static> {
+///     let source = 7u8;
+///     eredu_core::OriginalTokenDomainWitness::new(&source)
+/// }
+/// ```
+#[derive(Clone, Copy)]
+pub struct OriginalTokenDomainWitness<'a>(&'a (dyn std::any::Any + Send + Sync));
+impl<'a> OriginalTokenDomainWitness<'a> {
+    /// Borrows an actual immutable source without allocating or invoking it.
+    pub fn new(source: &'a (dyn std::any::Any + Send + Sync)) -> Self {
+        Self(source)
+    }
+    /// Whether both witnesses borrow the same concrete object. This is lexical
+    /// source identity only; it neither authenticates the object nor grants work.
+    pub fn same_borrowed_source(self, other: Self) -> bool {
+        self.0.type_id() == other.0.type_id() && std::ptr::addr_eq(self.0, other.0)
+    }
+    /// Checks the concrete borrowed type; the result still carries no authority.
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&'a T> {
+        self.0.downcast_ref()
+    }
+}
+impl Debug for OriginalTokenDomainWitness<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("OriginalTokenDomainWitness(..)")
+    }
+}
+
+/// Complete lifetime declaration for controller numerical payloads.
+///
+/// Shared sources are included in the ordinary size witness; enumerating them
+/// does not discount that witness or register their storage. All remaining
+/// numerical payload must retire with the controller or its owned decisions,
+/// before run funding retires, without escaping through errors or callbacks.
+#[derive(Debug, Clone, Copy)]
+pub enum TextControllerStorage<'a> {
+    /// No complete storage-lifetime declaration is available.
+    Unknown,
+    /// Every numerical payload covered by the size witness is run-owned.
+    RunOwned,
+    /// One separately original immutable token domain and a run-owned remainder.
+    /// Legacy inventory/pinning cannot accept this declaration. A source-aware
+    /// runtime must authenticate the actual owner and original request; no source
+    /// bytes are credited, adopted or attached to the request account.
+    RunOwnedWithOriginalTokenDomain(OriginalTokenDomainWitness<'a>),
+    /// The enumerated immutable filters have independent shared lifetimes;
+    /// every other numerical payload is run-owned. The inventory must remain
+    /// unchanged throughout the admitted run, including callbacks: every
+    /// enumerated source stays live alongside the run-owned remainder. Their
+    /// capacities are a fixed part of the additional host allowance, beyond
+    /// the final emitted sampling mask. Runtime may independently pin already
+    /// registered identities and credit that fixed contribution. Borrowed
+    /// shared tokenizer domains must preserve their owner in the decision.
+    RunOwnedWithSharedFilters(&'a [SharedTokenFilter]),
+    /// The enumerated immutable filters and byte sources have independent
+    /// shared lifetimes; every other numerical payload is run-owned. All
+    /// sources remain live and unchanged throughout the admitted run and are
+    /// included in the fixed additional host allowance. Byte sources do not
+    /// establish tokenizer-filter provenance.
+    RunOwnedWithSharedStorage {
+        /// Immutable mask sources, including any shared tokenizer domain.
+        filters: &'a [SharedTokenFilter],
+        /// Immutable non-mask source allocations.
+        bytes: &'a [SharedControllerBytes],
+    },
+    /// Complete immutable filter/byte/declaration inventory and a run-owned
+    /// remainder. Every source contributes its exact capacity to the additional
+    /// host allowance; declarations supply no tokenizer-filter provenance.
+    RunOwnedWithSharedDeclarations {
+        /// Immutable filter sources.
+        filters: &'a [SharedTokenFilter],
+        /// Immutable byte sources.
+        bytes: &'a [SharedControllerBytes],
+        /// Immutable independently constructed declaration sources.
+        declarations: &'a [SharedControllerDeclaration],
+    },
+}
+
+impl<'a> TextControllerStorage<'a> {
+    /// Actual source-bearing declaration, never a grant or numeric size witness.
+    pub fn original_token_domain(self) -> Option<OriginalTokenDomainWitness<'a>> {
+        match self {
+            Self::RunOwnedWithOriginalTokenDomain(source) => Some(source),
+            _ => None,
+        }
+    }
+    /// Complete shared inventory expressed only as filters. Returns None when
+    /// ownership is unknown or any non-mask source would be omitted.
+    pub fn shared_filters(self) -> Option<&'a [SharedTokenFilter]> {
+        match self {
+            Self::Unknown | Self::RunOwnedWithOriginalTokenDomain(_) => None,
+            Self::RunOwned => Some(&[]),
+            Self::RunOwnedWithSharedFilters(filters) => Some(filters),
+            Self::RunOwnedWithSharedStorage { filters, bytes } if bytes.is_empty() => Some(filters),
+            Self::RunOwnedWithSharedStorage { .. } => None,
+            Self::RunOwnedWithSharedDeclarations {
+                filters,
+                bytes,
+                declarations,
+            } if bytes.is_empty() && declarations.is_empty() => Some(filters),
+            Self::RunOwnedWithSharedDeclarations { .. } => None,
+        }
+    }
+
+    /// Complete shared source inventory, or None when ownership is unknown.
+    /// Iteration only borrows the declarations; it allocates no source list and
+    /// does not clone, register or attach the numerical owners.
+    pub fn shared_sources(self) -> Option<impl Iterator<Item = SharedControllerSource<'a>>> {
+        let (filters, bytes, declarations): (
+            &'a [SharedTokenFilter],
+            &'a [SharedControllerBytes],
+            &'a [SharedControllerDeclaration],
+        ) = match self {
+            Self::Unknown | Self::RunOwnedWithOriginalTokenDomain(_) => return None,
+            Self::RunOwned => (&[], &[], &[]),
+            Self::RunOwnedWithSharedFilters(filters) => (filters, &[], &[]),
+            Self::RunOwnedWithSharedStorage { filters, bytes } => (filters, bytes, &[]),
+            Self::RunOwnedWithSharedDeclarations {
+                filters,
+                bytes,
+                declarations,
+            } => (filters, bytes, declarations),
+        };
+        Some(
+            filters
+                .iter()
+                .map(SharedControllerSource::Filter)
+                .chain(bytes.iter().map(SharedControllerSource::Bytes))
+                .chain(declarations.iter().map(SharedControllerSource::Declaration)),
+        )
     }
 }
 
@@ -1605,6 +2021,42 @@ impl<'a> TokenSamplingDecision<'a> {
 pub trait TokenFilterController {
     /// Constraint or grammar error.
     type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Describes a complete cold bound through the remaining output allowance.
+    /// Unknown controller/filter growth prevents enforced admission; this must
+    /// not query or advance the current decision. Application controllers may
+    /// supply a bound when their retained state and every emitted filter fit it.
+    fn inference_workspace(
+        &self,
+        _max_output_tokens: u64,
+    ) -> Option<crate::TextControllerWorkspace<'_>> {
+        None
+    }
+
+    /// Certifies the lifetime of opaque numerical payload covered by run funding.
+    ///
+    /// Returning true promises that every such payload described by
+    /// [`Self::inference_workspace`] retires with this controller or its emitted
+    /// decisions, before the backend's run state retires. It must not survive
+    /// through shared clones, callback side effects, returned errors or other
+    /// escapes. Descriptive bookkeeping is not numerical payload.
+    ///
+    /// This is a cold ownership declaration, independent of the size bound.
+    /// Strict admission cannot release run funding using a size witness alone.
+    fn inference_workspace_is_run_owned(&self) -> bool {
+        false
+    }
+
+    /// Declares all shared numerical owners and the run-owned remainder without
+    /// advancing a decision. The default preserves existing wholly run-owned
+    /// controllers; shared or opaque controllers must supply complete evidence.
+    fn inference_storage(&self) -> TextControllerStorage<'_> {
+        if self.inference_workspace_is_run_owned() {
+            TextControllerStorage::RunOwned
+        } else {
+            TextControllerStorage::Unknown
+        }
+    }
 
     /// Returns the filter for the current durable logical prefix.
     fn current_filter(&mut self) -> Result<TokenFilter, Self::Error>;
@@ -1629,6 +2081,96 @@ pub trait TokenFilterController {
 /// durable controller state must not change until [`TokenFilterController::commit_token`]
 /// is called for a target-accepted token.
 pub trait SpeculativeTokenFilterController: TokenFilterController + Clone {
+    /// Actual move-only prepared grammar state, or the uninhabited fixed-source
+    /// type. This association does not authenticate a source or grant execution.
+    type PreparedGrammar: crate::speculative::PreparedGrammarController;
+
+    /// Borrows the complete paid grammar. Unknown and fixed controllers return
+    /// None; they must not supply plain/forbidden and grammar sources together.
+    fn prepared_grammar(&self) -> Option<&Self::PreparedGrammar> { None }
+
+    /// Prospective payment for publishing a copied prepared grammar through
+    /// this complete controller wrapper. The grammar copy is priced separately;
+    /// absent or unknown publication producers return None.
+    fn prepared_grammar_replacement_bytes(&self) -> Option<usize> { None }
+
+    /// Publishes an independently prepared successor, retaining its exact inputs
+    /// and supplied account. All allocation must be paid before construction;
+    /// refusal retains the uninstalled successor. Ordinary Clone is not a copy
+    /// producer for mutable grammar state.
+    fn replace_prepared_grammar(
+        &self, grammar: Self::PreparedGrammar, funding: &crate::HostMetadataFunding,
+    ) -> Result<Self, crate::speculative::PreparedGrammarInstallError<Self::PreparedGrammar>> {
+        Err(crate::speculative::PreparedGrammarInstallError::new(
+            crate::speculative::PreparedGrammarInstallCause::Unknown, grammar, funding,
+        ))
+    }
+
+    /// Actual fixed plain controller state, never an arbitrary callback summary.
+    /// The complete decision semantics must be canonical-prefix validation plus
+    /// this exact tokenizer-validity filter. Unknown/grammar controllers return None.
+    fn prepared_plain_source(&self) -> Option<crate::speculative::PlainControllerSource<'_>> {
+        None
+    }
+
+    /// Exact host copy destinations and controls for the requested capacity.
+    /// Shared source accounting is separate; unknown opaque fields return None.
+    fn prepared_plain_copy_bytes(&self, _capacity: usize) -> Option<usize> {
+        None
+    }
+
+    /// Copies the complete plain controller under prepaid destination custody.
+    /// All copied payload, clones and allocating failures must retain that custody.
+    /// The returned source must preserve the same immutable filter and prefix.
+    fn copy_prepared_plain(
+        &self,
+        _capacity: usize,
+        _host: crate::HostPreparationAuthority,
+    ) -> Result<Self, crate::speculative::PlainControllerError> {
+        Err(crate::speculative::PlainControllerError::Unknown)
+    }
+
+    /// Borrows the actual history named by prepared_plain_source. Prepared
+    /// commitment updates only this fixed destination; it never invokes opaque
+    /// current_filter/commit_token callbacks or grows ordinary storage.
+    fn prepared_plain_history_mut(
+        &mut self,
+    ) -> Option<&mut crate::speculative::PlainControllerHistory> {
+        None
+    }
+
+    /// Actual prepared forbidden-trigger state. It is distinct from plain state:
+    /// candidate validity also depends on the exact current byte-trigger prefix.
+    fn prepared_forbidden_source(
+        &self,
+    ) -> Option<crate::speculative::ForbiddenControllerSource<'_>> {
+        None
+    }
+    /// Exact independent history and fixed controls; immutable paid inputs alias
+    /// their existing owner rather than being adopted into a new account.
+    fn prepared_forbidden_copy_bytes(&self, _capacity: usize) -> Option<usize> {
+        None
+    }
+    /// Copies a complete forbidden controller under paid destination custody.
+    /// The copied source preserves the actual immutable inputs and validity.
+    fn copy_prepared_forbidden(
+        &self,
+        _capacity: usize,
+        _host: crate::HostPreparationAuthority,
+    ) -> Result<Self, crate::speculative::ForbiddenControllerError> {
+        Err(crate::speculative::ForbiddenControllerError::Unknown)
+    }
+    /// Borrows the exact mutable history and prefix named by the forbidden
+    /// source. The returned worker performs atomic, nonallocating commitment.
+    fn prepared_forbidden_mutation(
+        &mut self,
+    ) -> Result<
+        crate::speculative::ForbiddenControllerMutation<'_>,
+        crate::speculative::ForbiddenControllerError,
+    > {
+        Err(crate::speculative::ForbiddenControllerError::Unknown)
+    }
+
     /// Complete bytes retained by an isolated clone, or unknown.
     fn control_snapshot_bytes(&self) -> Option<u64> {
         None
@@ -1656,6 +2198,24 @@ struct FixedTokenFilter(TokenFilter);
 impl TokenFilterController for FixedTokenFilter {
     type Error = std::convert::Infallible;
 
+    fn inference_workspace_is_run_owned(&self) -> bool {
+        // The fixed mask and emitted clones own separate vectors; no callback
+        // exports them and the controller cannot return a payload-bearing error.
+        true
+    }
+
+    fn inference_workspace(&self, _: u64) -> Option<crate::TextControllerWorkspace<'_>> {
+        Some(crate::TextControllerWorkspace {
+            filter: (&self.0).into(),
+            // current_filter clones the fixed source. Sampling already prices
+            // one supplied filter; the source allocation remains alive too.
+            additional_host_bytes: match &self.0 {
+                TokenFilter::All => 0,
+                TokenFilter::Allowed(mask) => mask.capacity() as u64,
+            },
+        })
+    }
+
     fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
         Ok(self.0.clone())
     }
@@ -1677,6 +2237,282 @@ impl TokenFilterController for FixedTokenFilter {
 /// Lifecycle hooks return the common [`BackendFailure`]; preserve the original
 /// error as its source and classify only from known facts, not diagnostic text.
 pub trait TextGenerationBackend: BackendProvider {
+    /// Retained request admission. Clones share its charge and cannot authorize
+    /// another run. Native completions must independently retain unresolved work.
+    type TextPreparation: Clone;
+
+    /// Retained readiness-consensus source for this request. Clones share exact
+    /// source custody and monotone spending, never a fresh model admission.
+    /// Ordinary backends may use ().
+    type TextPreparationControl: Clone;
+
+    /// Borrows the actual accepted request's diagnostics without reserving,
+    /// cloning reports, or inspecting native execution. Report selected geometry
+    /// and the retained successful admission, never the requested policy cap.
+    /// None means this preparation has no available accepted-admission report.
+    fn text_preparation_report(
+        _preparation: &Self::TextPreparation,
+    ) -> Option<crate::TextPreparationReport<'_>> {
+        None
+    }
+
+    /// Move-only authority for one current prediction, separate from retained
+    /// charges. Dropping an unfinished permit must preserve or fence its work;
+    /// native completions independently retain resources through settlement.
+    type TextStepPermit;
+
+    /// Validates the exact current request, policy and input before controller
+    /// callbacks or native prediction work. Historical retained reservations
+    /// alone grant no authority. Rejection must not consume executable authority.
+    fn begin_text_step<C: TokenFilterController>(
+        runtime: &ModelRuntime<Self>,
+        preparation: &Self::TextPreparation,
+        state: &Self::TextGenerationState,
+        controller: &C,
+        input: PendingTextInput<&Self::Prompt, &Self::Token>,
+        context: &TextStepContext,
+    ) -> Result<Self::TextStepPermit, Self::Error>;
+
+    /// Finalizes one successful prediction after any controlled token callback.
+    /// This need not wait for native completion: unresolved native work retains
+    /// its own resources. Failure must leave the run fenced or safely retained.
+    fn finish_text_step(permit: Self::TextStepPermit) -> Result<(), Self::Error>;
+
+    /// Quotes and admits one exact request before prompt/sampler allocation.
+    /// This may inspect metadata and reserve shared capacity, but must not create
+    /// native tensors or advance the controller. Unknown required bounds must
+    /// reject an enforced policy. Explicit unbudgeted policy may return a unit
+    /// owner without claiming memory coverage.
+    fn admit_text_preparation<C: TokenFilterController>(
+        runtime: &ModelRuntime<Self>,
+        input: &TextPreparationInput<'_, Self::Prompt>,
+        config: TextGenerationConfig,
+        controller: &C,
+    ) -> Result<Self::TextPreparation, BackendFailure>;
+
+    /// Admits owned preparation sources before prompt or sampler construction.
+    ///
+    /// An implementation must account for the exact shared source and the whole
+    /// supported capture schedule in this original admission. It must reject
+    /// unknown bounds before creating payloads or invoking controller decisions.
+    /// The default delegates only when both sources are absent; an empty shared plan still
+    /// requires source ownership and is therefore unsupported by this default.
+    fn admit_text_preparation_with_options<C: TokenFilterController>(
+        runtime: &ModelRuntime<Self>,
+        input: &TextPreparationInput<'_, Self::Prompt>,
+        config: TextGenerationConfig,
+        controller: &C,
+        options: &TextPreparationOptions,
+    ) -> Result<Self::TextPreparation, BackendFailure> {
+        if options.capture.is_some() || options.interventions.is_some() {
+            return Err(BackendFailure::new(
+                BackendFailureKind::Unsupported,
+                crate::capture::CaptureError::Unsupported(
+                    "backend has no original-admission shared instrumentation support".into(),
+                ),
+            ));
+        }
+        Self::admit_text_preparation(runtime, input, config, controller)
+    }
+
+    /// Quotes the exact borrowed sequence request with all original preparation.
+    ///
+    /// This opt-in replaces the local admission call, not its quote or readiness
+    /// boundary. Include EOS/max and optional capture in the same original plan.
+    /// No prompt, sampler or token-slot materialization may precede acceptance.
+    /// The default rejects rather than falling back to an unpriced sequence.
+    fn admit_text_preparation_with_sequence<C: TokenFilterController>(
+        _runtime: &ModelRuntime<Self>,
+        _input: &TextPreparationInput<'_, Self::Prompt>,
+        _config: TextGenerationConfig,
+        _controller: &C,
+        _options: Option<&TextPreparationOptions>,
+        _sequence: &GenerationSequencePreparation<'_, '_>,
+    ) -> Result<Self::TextPreparation, BackendFailure> {
+        Err(BackendFailure::new(
+            BackendFailureKind::Unsupported,
+            GenerationSequenceAdmissionError::Unsupported,
+        ))
+    }
+
+    /// Explicit original admission for a sequence with a fixed consumer contribution.
+    ///
+    /// This replaces the local admission hook in the same Admission phase. An
+    /// implementation must seal the actual descriptor in the original quote/bank
+    /// and return its consumed association with the provider. Existing sequence
+    /// support does not opt in implicitly. No late contribution or second grant.
+    fn admit_text_preparation_with_sequence_consumer<C: TokenFilterController>(
+        _runtime: &ModelRuntime<Self>,
+        _input: &TextPreparationInput<'_, Self::Prompt>,
+        _config: TextGenerationConfig,
+        _controller: &C,
+        _options: Option<&TextPreparationOptions>,
+        _sequence: &GenerationSequencePreparation<'_, '_>,
+    ) -> Result<Self::TextPreparation, BackendFailure> {
+        Err(BackendFailure::new(
+            BackendFailureKind::Unsupported,
+            GenerationSequenceAdmissionError::ConsumerUnsupported,
+        ))
+    }
+
+    /// Explicit original admission for a concrete decoder input and optional
+    /// consumer/capture. Take the unique source once before candidate retries;
+    /// seal its actual source, N and policy with the same original sequence bank.
+    /// Existing sequence/consumer hooks do not implicitly opt in. This creates
+    /// no second quote, readiness phase or model operation.
+    fn admit_text_preparation_with_decoder<C: TokenFilterController>(
+        _runtime: &ModelRuntime<Self>,
+        _input: &TextPreparationInput<'_, Self::Prompt>,
+        _config: TextGenerationConfig,
+        _controller: &C,
+        _options: Option<&TextPreparationOptions>,
+        _sequence: &GenerationSequencePreparation<'_, '_>,
+    ) -> Result<Self::TextPreparation, BackendFailure> {
+        Err(BackendFailure::new(
+            BackendFailureKind::Unsupported,
+            GenerationSequenceAdmissionError::DecoderUnsupported,
+        ))
+    }
+
+    /// Explicit admission of one actual decoder plus literal-stop source. The
+    /// same original quote must seal the combined program and returned provider.
+    /// Suffix-only decoder support defaults to rejection before any preparation.
+    fn admit_text_preparation_with_plain_text<C: TokenFilterController>(
+        _runtime: &ModelRuntime<Self>,
+        _input: &TextPreparationInput<'_, Self::Prompt>,
+        _config: TextGenerationConfig,
+        _controller: &C,
+        _options: Option<&TextPreparationOptions>,
+        _sequence: &GenerationSequencePreparation<'_, '_>,
+    ) -> Result<Self::TextPreparation, BackendFailure> {
+        Err(BackendFailure::new(
+            BackendFailureKind::Unsupported,
+            GenerationSequenceAdmissionError::PlainTextUnsupported,
+        ))
+    }
+
+    /// Consumes the same core claim after original run binding, before Admission
+    /// readiness. Extract only the already accepted one-use storage bank; no new
+    /// reservation, quote, source replacement, or bytes-plus-guard attachment.
+    /// Return an initial retained sequence with its exact sorted EOS policy.
+    /// Partial failures must retain their own original custody in the error.
+    /// The later cursor calls prepare_storage before its existing first delivery
+    /// readiness, and submits no model work until that agreement succeeds.
+    fn prepare_generation_sequence_admitted(
+        _runtime: &ModelRuntime<Self>,
+        _preparation: &Self::TextPreparation,
+        _sequence: GenerationSequencePreparation<'_, '_>,
+    ) -> Result<crate::generation::RetainedGenerationSequence, BackendFailure> {
+        Err(BackendFailure::new(
+            BackendFailureKind::Unsupported,
+            GenerationSequenceAdmissionError::Unsupported,
+        ))
+    }
+
+    /// Installs the exact shared source already priced by original admission.
+    ///
+    /// Validate its identity against preparation and the original core-issued
+    /// context. Use only that preparation's account: no second reservation,
+    /// source readmission/copy, policy revision, or late configure hook. Retain
+    /// source custody on any aliases escaping the machine. Finish local work
+    /// before returning; the driver then agrees Instrumentation exactly once.
+    /// Failure/unwind must leave state safely owned through readiness cleanup.
+    fn install_text_capture_admitted(
+        _runtime: &ModelRuntime<Self>,
+        _state: &mut Self::TextGenerationState,
+        _preparation: &Self::TextPreparation,
+        _source: &crate::capture::SharedCapturePlan,
+        _context: &TextStepContext,
+    ) -> Result<(), BackendFailure> {
+        Err(BackendFailure::new(
+            BackendFailureKind::Unsupported,
+            crate::capture::CaptureError::Unsupported(
+                "backend has no admitted shared capture installation".into(),
+            ),
+        ))
+    }
+
+    /// Binds admitted preparation to the machine's original run and policy.
+    ///
+    /// The shared driver calls this once, at attempt zero, before prompt/sampler
+    /// creation or mutable run exposure. It is part of the Admission readiness
+    /// result. This cold hook must not create native values or advance a
+    /// controller. Quoted backends must retain and check this original context;
+    /// the default supports unbudgeted preparation and grants no budget proof.
+    /// Calling admission directly does not construct authentic run evidence.
+    fn bind_text_preparation_run<C: TokenFilterController>(
+        _runtime: &ModelRuntime<Self>,
+        _preparation: &Self::TextPreparation,
+        _controller: &C,
+        _context: &TextStepContext,
+    ) -> Result<(), BackendFailure> {
+        Ok(())
+    }
+
+    /// Acquires lifetime custody before host preparation or destination copying.
+    ///
+    /// Managed backends validate the exact runtime domain and acquire exclusion
+    /// before any host constructor, copy, or callback runs. Acquisition must
+    /// release internal locks before returning. Callers retain clones on every
+    /// escaping payload owner and destroy payloads before their authority,
+    /// including failure and unwind paths. Rejection must precede those writes.
+    ///
+    /// This grants no finite-byte proof or inference permission. The portable
+    /// default supplies no managed-domain evidence. Historical reservations and
+    /// an unmanaged value cannot substitute for a managed backend's acquisition.
+    fn acquire_host_preparation(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Result<HostPreparationAuthority, BackendFailure> {
+        Ok(HostPreparationAuthority::unmanaged())
+    }
+
+    /// Creates an immutable shared filter for a facade-owned tokenizer domain.
+    ///
+    /// Managed backends must obtain resource authority before invoking the
+    /// deferred factory, publish its exact storage, and attach lifetime custody
+    /// before returning. This includes models that never start inference. The
+    /// default supports backends without a managed storage domain and supplies
+    /// no memory-budget evidence. Failure must precede the factory when another
+    /// admitted request excludes new unquoted preparation.
+    fn prepare_shared_token_filter(
+        _runtime: &ModelRuntime<Self>,
+        factory: impl FnOnce() -> TokenFilter,
+    ) -> Result<SharedTokenFilter, BackendFailure> {
+        Ok(SharedTokenFilter::new(factory()))
+    }
+
+    /// Creates one immutable controller source allocation under backend custody.
+    ///
+    /// Size and vocabulary metadata preflight occurs before this hook. Managed
+    /// backends acquire resource authority before invoking the deferred factory,
+    /// then register exact capacity and attach custody before returning. Another
+    /// admitted request must reject construction before the factory runs.
+    ///
+    /// The infallible factory transfers all numerical payload it creates into
+    /// its returned vector; it must not escape additional unaccounted owners.
+    /// Temporary allocations must retire before it returns or unwinds. The
+    /// portable default grants no managed-domain or memory-budget evidence.
+    fn prepare_shared_controller_bytes(
+        _runtime: &ModelRuntime<Self>,
+        factory: impl FnOnce() -> Vec<u8>,
+    ) -> Result<SharedControllerBytes, BackendFailure> {
+        Ok(SharedControllerBytes::new(factory()))
+    }
+
+    /// Creates an immutable declaration under the same source-accounting
+    /// protocol as controller bytes. Managed backends reject before `factory`
+    /// while admitted work excludes construction, then register the exact
+    /// completed capacity before publication. A failed factory may retain a
+    /// partial destination: its error must retain construction custody until
+    /// that destination retires. This cold hook supplies no finite original
+    /// request authority; original copies use their own admitted constructors.
+    fn prepare_shared_controller_declaration<T: ControllerDeclarationData>(
+        _runtime: &ModelRuntime<Self>,
+        factory: impl FnOnce() -> Result<T, BackendFailure>,
+    ) -> Result<SharedControllerDeclaration, BackendFailure> {
+        Ok(SharedControllerDeclaration::new(factory()?))
+    }
+
     /// Opaque prepared prompt, including any backend-owned multimodal values.
     type Prompt;
     /// Backend-owned generated token handle.
@@ -1695,6 +2531,23 @@ pub trait TextGenerationBackend: BackendProvider {
     /// clear an unresolved submission lease or silently recover a poisoned session.
     /// Stateless backends must explicitly implement this as a no-op.
     fn reset_session(backend: &Self, session: &mut Self::Session) -> Result<(), BackendFailure>;
+
+    /// Explicit original-reset opt-in. Validate the genuine claim against this
+    /// exact session, bind selected source/geometry and admit all construction
+    /// before work. The caller has not synchronized. Readiness must not allocate,
+    /// submit, reap or progress native work before its original acceptance; return
+    /// Busy when exact terminal evidence is unavailable. Unknown producer coverage
+    /// is unsupported, not completion. An incomplete provider retains this default.
+    fn reset_session_admitted(
+        _backend: &Self,
+        _session: &mut Self::Session,
+        _claim: crate::SessionResetClaim<'_>,
+    ) -> Result<(), BackendFailure> {
+        Err(BackendFailure::new(
+            BackendFailureKind::Unsupported,
+            crate::SessionResetRejection::Unsupported,
+        ))
+    }
 
     /// Establishes settled, healthy session work without changing request state.
     ///
@@ -1777,6 +2630,17 @@ pub trait TextGenerationBackend: BackendProvider {
         ))
     }
 
+    /// Ordinary shared-source installation against the actual pending prompt.
+    /// This is distinct from original admitted capture and defaults to rejection.
+    fn configure_text_prepared_capture(
+        _runtime: &ModelRuntime<Self>,
+        _state: &mut Self::TextGenerationState,
+        _prompt: &Self::Prompt,
+        _source: crate::capture::SharedCapturePlan,
+    ) -> Result<(), BackendFailure> {
+        Err(PreparedControlInputError::InstrumentationUnavailable.into_backend_failure())
+    }
+
     /// Enables an immutable capture plan before the first submission. Implementations
     /// must validate it against this session and reject unsupported combinations.
     fn configure_text_capture(
@@ -1816,11 +2680,112 @@ pub trait TextGenerationBackend: BackendProvider {
         None
     }
 
+    /// Fallibly moves one completed frame without detaching retained custody.
+    /// The shared driver establishes exact completion before calling this hook.
+    /// Failure must leave undelivered payloads owned by the state. No backend
+    /// may queue additional frames without its own admitted buffering contract.
+    /// Legacy implementors retain their existing raw delivery behavior.
+    fn try_take_text_capture(
+        state: &mut Self::TextGenerationState,
+    ) -> Result<Option<crate::capture::CapturedStepDelivery>, Self::Error> {
+        Ok(Self::take_text_capture(state).map(crate::capture::CapturedStepDelivery::Legacy))
+    }
+
+    /// Whether any capture transaction or undelivered frame remains, including
+    /// failed/aborted work with no ready frame. This read-only query performs no
+    /// completion, allocation, publication or retry. Retained/fallible collectors
+    /// must override it; false is the compatibility default for legacy backends.
+    fn text_capture_pending(_state: &Self::TextGenerationState) -> bool {
+        false
+    }
+
+    /// Explicit opt-in to originally constructed TokenIds, including all other
+    /// source/consumer requirements carried by this same genuine claim.
+    fn admit_text_preparation_with_token_input<C: TokenFilterController>(
+        _runtime: &ModelRuntime<Self>,
+        _input: &TextPreparationInput<'_, Self::Prompt>,
+        _config: TextGenerationConfig,
+        _controller: &C,
+        _options: Option<&TextPreparationOptions>,
+        _claim: &GenerationSequencePreparation<'_, '_>,
+    ) -> Result<Self::TextPreparation, BackendFailure> {
+        Err(TokenInputRejection::Unsupported.into_backend_failure())
+    }
+
+    /// Admits the actual closed prepared source with the same genuine sequence
+    /// claim, controller, decoder/consumer and optional capture contributions.
+    /// The input variant is not authority: implementations must authenticate
+    /// source/selection/pool/current revision before any allocating inspection.
+    /// A missing contribution rejects before native work; no ordinary fallback.
+    fn admit_text_preparation_with_original_prepared<C: TokenFilterController>(
+        _runtime: &ModelRuntime<Self>,
+        _input: &TextPreparationInput<'_, Self::Prompt>,
+        _config: TextGenerationConfig,
+        _controller: &C,
+        _options: Option<&TextPreparationOptions>,
+        _claim: &GenerationSequencePreparation<'_, '_>,
+    ) -> Result<Self::TextPreparation, BackendFailure> {
+        Err(PreparedRequestRejection::Unsupported.into_backend_failure())
+    }
+
+    /// Takes the input already constructed inside genuine sequence extraction.
+    /// No source replacement, allocation permission or extra readiness is supplied.
+    fn prepare_original_text_prompt_admitted(
+        _backend: &Self,
+        _preparation: &Self::TextPreparation,
+    ) -> Result<Self::Prompt, BackendFailure> {
+        Err(TokenInputRejection::Unsupported.into_backend_failure())
+    }
+
     /// Creates backend sampling state for one sequence.
     fn start_text_generation(
         backend: &Self,
         config: TextGenerationConfig,
     ) -> Result<Self::TextGenerationState, Self::Error>;
+
+    /// Initializes sampling within admitted native recovery ownership. A
+    /// nontrivial preparation owner must be retained by unresolved native work.
+    fn start_text_generation_admitted(
+        backend: &Self,
+        config: TextGenerationConfig,
+        _preparation: &Self::TextPreparation,
+    ) -> Result<Self::TextGenerationState, Self::Error> {
+        Self::start_text_generation(backend, config)
+    }
+
+    /// Whether this actual runtime requires an explicit transport source even
+    /// to report failure of original preparation. This is an applicability
+    /// refusal condition, never proof of a bound or permission to communicate.
+    fn requires_original_preparation_control(_runtime: &ModelRuntime<Self>) -> bool {
+        false
+    }
+
+    /// Prepare explicit readiness transport from the genuine original request
+    /// before model admission. This source has its own complete stage accounting;
+    /// later model admission cannot pay for it retroactively. Failure must fence
+    /// unresolved work: the driver never falls back to ordinary consensus then.
+    fn prepare_text_preparation_control(
+        _runtime: &ModelRuntime<Self>,
+        _input: &TextPreparationInput<'_, Self::Prompt>,
+        _config: TextGenerationConfig,
+        _sequence: &GenerationSequencePreparation<'_, '_>,
+    ) -> Result<Option<Self::TextPreparationControl>, BackendFailure> {
+        Ok(None)
+    }
+
+    /// Uses the explicit retained source, authenticated against this runtime.
+    /// None preserves ordinary behavior; a mismatched Some must fail.
+    fn agree_text_preparation_with_control(
+        runtime: &ModelRuntime<Self>,
+        control: Option<&Self::TextPreparationControl>,
+        stage: crate::run_preparation::TextPreparationStage,
+        status: crate::run_preparation::TextPreparationStatus,
+    ) -> Result<crate::run_preparation::TextPreparationOutcome, BackendFailure> {
+        if control.is_some() {
+            return Err(TokenInputRejection::Unsupported.into_backend_failure());
+        }
+        Self::agree_text_preparation(runtime, stage, status)
+    }
 
     /// Completes a cold preparation stage using this session's actual authority.
     /// Distributed implementations must agree exact setup, monotone attempt,
@@ -1855,6 +2820,25 @@ pub trait TextGenerationBackend: BackendProvider {
         prompt_token_ids: Vec<u32>,
     ) -> Result<Self::Prompt, Self::Error>;
 
+    /// Constructs native input under this already admitted request. Backends
+    /// with native allocation retain its owner through failed/unknown completion.
+    fn prepare_text_prompt_admitted(
+        backend: &Self,
+        prompt_token_ids: Vec<u32>,
+        _preparation: &Self::TextPreparation,
+    ) -> Result<Self::Prompt, Self::Error> {
+        Self::prepare_text_prompt(backend, prompt_token_ids)
+    }
+
+    /// Binds both new and externally prepared input to the admitted request.
+    fn bind_text_prompt_preparation(
+        _backend: &Self,
+        prompt: Self::Prompt,
+        _preparation: &Self::TextPreparation,
+    ) -> Result<Self::Prompt, Self::Error> {
+        Ok(prompt)
+    }
+
     /// Submits prompt prefill followed by sampling one token.
     fn submit_text_prefill(
         runtime: &mut ModelRuntime<Self>,
@@ -1880,6 +2864,51 @@ pub trait TextGenerationBackend: BackendProvider {
         state: &mut Self::TextGenerationState,
     ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
         Self::submit_text_prefill(runtime, prompt, decision.filter(), state)
+    }
+
+    /// Cooperatively cancels prefill before sampling or committing a token.
+    /// `None` certifies agreed cancellation and safe settlement of native work.
+    /// Errors remain errors even when cancellation was concurrently requested.
+    /// The default preserves indivisible prefill for existing implementations.
+    fn submit_text_prefill_cancellable_decision(
+        runtime: &mut ModelRuntime<Self>,
+        prompt: Self::Prompt,
+        decision: &TokenSamplingDecision<'_>,
+        state: &mut Self::TextGenerationState,
+        _cancellation: &crate::GenerationCancellationToken,
+    ) -> Result<Option<Submission<Self::Token, Self::TextCompletion>>, Self::Error> {
+        Self::submit_text_prefill_decision(runtime, prompt, decision, state).map(Some)
+    }
+
+    /// Submits prefill under the exact permit acquired before the decision.
+    /// Existing backends can keep their decision/cancellation implementation;
+    /// accounting backends override this hook to use the supplied authority.
+    fn submit_text_prefill_permitted(
+        runtime: &mut ModelRuntime<Self>,
+        prompt: Self::Prompt,
+        decision: &TokenSamplingDecision<'_>,
+        state: &mut Self::TextGenerationState,
+        cancellation: &crate::GenerationCancellationToken,
+        _permit: &mut Self::TextStepPermit,
+    ) -> Result<Option<Submission<Self::Token, Self::TextCompletion>>, Self::Error> {
+        Self::submit_text_prefill_cancellable_decision(
+            runtime,
+            prompt,
+            decision,
+            state,
+            cancellation,
+        )
+    }
+
+    /// Submits decode under the exact permit acquired before the decision.
+    fn submit_text_decode_permitted(
+        runtime: &mut ModelRuntime<Self>,
+        token: Self::Token,
+        decision: &TokenSamplingDecision<'_>,
+        state: &mut Self::TextGenerationState,
+        _permit: &mut Self::TextStepPermit,
+    ) -> Result<Submission<Self::Token, Self::TextCompletion>, Self::Error> {
+        Self::submit_text_decode_decision(runtime, token, decision, state)
     }
 
     /// Decode with the same pre-override domain contract as prefill.
@@ -2031,15 +3060,89 @@ where
     B: TextGenerationBackend,
     C: TokenFilterController,
 {
-    backend_state: B::TextGenerationState,
     controller: C,
     step: Option<PendingTextInput<B::Prompt, B::Token>>,
     completions: Vec<B::TextCompletion>,
+    // A legacy raw drain cannot detach or copy a retained frame.
+    capture_delivery: Option<crate::capture::CapturedStepDelivery>,
     remaining_tokens: Option<usize>,
+    // Core-issued evidence is never copied into a snapshot or a child machine.
+    step_context: TextStepContext,
+    // A backend may keep the run's remaining allocation authority here. Retire
+    // machine-owned controller/input/completion payloads before closing it.
+    // Escaped outputs and unresolved work require independent backend retention.
+    prepared_sequence: preparation::PreparedSequence,
+    backend_state: B::TextGenerationState,
+    // Drop after all ordinary payloads. Unresolved native work independently
+    // retains its own clone in backend completion/recovery resources.
+    preparation: B::TextPreparation,
+    preparation_control: Option<B::TextPreparationControl>,
+    // Exact shared source retires after all machine payload and run custody.
+    // This ownership is not a grant to copy, reserve, or reconfigure capture.
+    capture_source: Option<crate::capture::SharedCapturePlan>,
+    // Fresh host-copy custody outlives every resumed machine field. No run grant.
+    resume_host: Option<HostPreparationAuthority>,
+}
+
+/// Checked fixed controls for the actual shared startup, generation and manual
+/// continuation types instantiated by a backend and controller.
+///
+/// This sums their named constructor/return/error overlaps without constructing
+/// them. It excludes nested backend/controller/source payloads, completion-vector
+/// backing, cancellation/driver identity allocations, and formatting. A concrete
+/// original producer must add those actual populations before the same admission;
+/// this layout alone grants no storage, completeness or execution authority.
+pub fn text_generation_control_bytes<B: TextGenerationBackend, C: TokenFilterController>()
+-> Option<usize> {
+    use std::mem::size_of;
+    [
+        preparation::control_bytes::<B, C>()?,
+        size_of::<TextGenerationMachine<B, C>>(),
+        size_of::<TextGeneration<'_, B>>(),
+        size_of::<TokenSamplingDecision<'_>>(),
+        size_of::<Result<TokenSamplingDecision<'_>, C::Error>>(),
+        size_of::<ControlledTextGeneration<'_, B, C>>(),
+        size_of::<TextGenerationContinuation<B, C>>(),
+        size_of::<TextGenerationDriver<'_, B>>(),
+        size_of::<TextContinuationBoundary<'_, '_, B, C>>(),
+        size_of::<TextSnapshotSource<'_, B, C>>(),
+        size_of::<
+            Result<
+                ControlledTextGeneration<'_, B, C>,
+                ControlledTextGenerationError<B::Error, C::Error>,
+            >,
+        >(),
+        size_of::<
+            Result<
+                TextGenerationContinuation<B, C>,
+                ControlledTextGenerationError<B::Error, C::Error>,
+            >,
+        >(),
+        size_of::<
+            Result<
+                Option<TextGenerationContinuation<B, C>>,
+                ControlledTextGenerationError<B::Error, C::Error>,
+            >,
+        >(),
+        size_of::<ControlledToken<B::Token>>(),
+        size_of::<ControlledGenerationResult<B, C>>(),
+        size_of::<
+            Result<Option<ControlledToken<B::Token>>, TextContinuationError<B::Error, C::Error>>,
+        >(),
+        size_of::<PendingTextInput<B::Prompt, B::Token>>(),
+        size_of::<B::TextStepPermit>(),
+        size_of::<TextStepContext>(),
+        size_of::<crate::GenerationCancellationToken>(),
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
 }
 
 type ControlledGenerationResult<B, C> = Result<
-    <B as TextGenerationBackend>::Token,
+    (
+        <B as TextGenerationBackend>::Token,
+        <B as TextGenerationBackend>::TextStepPermit,
+    ),
     ControlledTextGenerationError<
         <B as BackendProvider>::Error,
         <C as TokenFilterController>::Error,
@@ -2051,6 +3154,12 @@ where
     B: TextGenerationBackend,
     C: TokenFilterController,
 {
+    /// Borrows the selected request geometry and historical admission requirement.
+    /// This reports the same retained preparation as uninterrupted generation.
+    pub fn preparation_report(&self) -> Option<crate::TextPreparationReport<'_>> {
+        self.inner.preparation_report()
+    }
+
     /// Starts controlled generation from portable prompt token ids.
     pub fn new(
         runtime: &'a mut ModelRuntime<B>,
@@ -2058,14 +3167,12 @@ where
         config: TextGenerationConfig,
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
-        let prompt = B::prepare_text_prompt(runtime.backend(), prompt_token_ids)
-            .map_err(ControlledTextGenerationError::Backend);
-        let prompt = runtime.finish_text_preparation(
-            crate::run_preparation::TextPreparationStage::Prompt,
-            prompt,
-            ControlledTextGenerationError::Preparation,
-        )?;
-        Self::from_prompt(runtime, prompt, config, controller)
+        Self::from_input(
+            runtime,
+            TextGenerationInput::TokenIds(prompt_token_ids),
+            config,
+            controller,
+        )
     }
 
     /// Starts controlled generation from an opaque backend-prepared prompt.
@@ -2075,13 +3182,103 @@ where
         config: TextGenerationConfig,
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
-        let inner = TextGenerationMachine::new(runtime, prompt, config, controller)?;
+        Self::from_input(
+            runtime,
+            TextGenerationInput::Prepared(prompt),
+            config,
+            controller,
+        )
+    }
+
+    /// Prepares either host tokens or existing input through the same admission.
+    pub fn from_input(
+        runtime: &'a mut ModelRuntime<B>,
+        input: TextGenerationInput<B::Prompt>,
+        config: TextGenerationConfig,
+        controller: C,
+    ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
+        let inner = TextGenerationMachine::new(runtime, input, config, controller)?;
         Ok(Self { runtime, inner })
+    }
+
+    /// Starts controlled generation with sources included in original admission.
+    pub fn new_with_options(
+        runtime: &'a mut ModelRuntime<B>,
+        prompt_token_ids: Vec<u32>,
+        config: TextGenerationConfig,
+        controller: C,
+        options: TextPreparationOptions,
+    ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
+        Self::from_input_with_options(
+            runtime,
+            TextGenerationInput::TokenIds(prompt_token_ids),
+            config,
+            controller,
+            options,
+        )
+    }
+
+    /// Starts from prepared input with options included in original admission.
+    pub fn from_prompt_with_options(
+        runtime: &'a mut ModelRuntime<B>,
+        prompt: B::Prompt,
+        config: TextGenerationConfig,
+        controller: C,
+        options: TextPreparationOptions,
+    ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
+        Self::from_input_with_options(
+            runtime,
+            TextGenerationInput::Prepared(prompt),
+            config,
+            controller,
+            options,
+        )
+    }
+
+    /// Uses the ordinary preparation runner and completes Instrumentation before
+    /// exposing a machine, including when the options contain no capture plan.
+    pub fn from_input_with_options(
+        runtime: &'a mut ModelRuntime<B>,
+        input: TextGenerationInput<B::Prompt>,
+        config: TextGenerationConfig,
+        controller: C,
+        options: TextPreparationOptions,
+    ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
+        let inner = TextGenerationMachine::new_preparation(
+            runtime,
+            input,
+            config,
+            controller,
+            Some(options),
+        )?;
+        Ok(Self { runtime, inner })
+    }
+
+    /// Queries the existing controller's termination condition without exposing
+    /// mutable policy or revising this run's bound policy identity.
+    ///
+    /// This preserves `TokenFilterController::is_complete` semantics, including
+    /// internal query/cache mutation and its exact error. It grants no step or
+    /// completion authority and does not make the continuation quiescent.
+    pub fn controller_is_complete(&mut self) -> Result<bool, C::Error> {
+        self.inner.controller.is_complete()
     }
 
     /// Mutably borrows the canonical constraint state.
     pub fn controller_mut(&mut self) -> &mut C {
+        self.inner.step_context.revise_policy();
         &mut self.inner.controller
+    }
+
+    /// Advances the ordinary machine with cancellation between predictions and
+    /// at safe completed prefill spans. Cancellation commits no token and
+    /// terminates this source.
+    pub fn next_cancellable(
+        &mut self,
+        cancellation: &crate::GenerationCancellationToken,
+    ) -> Option<Result<ControlledToken<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>>
+    {
+        self.inner.next_committed(self.runtime, cancellation)
     }
 
     /// Completes additional fallible host preparation before advancing this run.
@@ -2091,8 +3288,23 @@ where
         local: Result<T, E>,
         map_backend: impl FnOnce(BackendFailure) -> E,
     ) -> Result<T, E> {
-        self.runtime
-            .finish_text_preparation(stage, local, map_backend)
+        if let Err(error) = self.inner.step_context.validate() {
+            return match local {
+                // Preserve the original local error and its complete custody;
+                // no mapping callback or backend agreement runs in this branch.
+                Err(local_error) => Err(local_error),
+                Ok(value) => {
+                    drop(value);
+                    Err(map_backend(error))
+                }
+            };
+        }
+        self.runtime.finish_text_preparation_control(
+            self.inner.preparation_control.as_ref(),
+            stage,
+            local,
+            map_backend,
+        )
     }
 
     /// Agrees initial cancellation/delivery without advancing this run.
@@ -2102,8 +3314,23 @@ where
         local: Result<Option<T>, E>,
         map_backend: impl FnOnce(BackendFailure) -> E,
     ) -> Result<Option<T>, E> {
-        self.runtime
-            .finish_text_preparation_cancellable(stage, local, map_backend)
+        if let Err(error) = self.inner.step_context.validate() {
+            return match local {
+                // Preserve the original local error and its complete custody;
+                // no mapping callback or backend agreement runs in this branch.
+                Err(local_error) => Err(local_error),
+                Ok(value) => {
+                    drop(value);
+                    Err(map_backend(error))
+                }
+            };
+        }
+        self.runtime.finish_text_preparation_control_cancellable(
+            self.inner.preparation_control.as_ref(),
+            stage,
+            local,
+            map_backend,
+        )
     }
 
     /// Installs capture while preserving the existing sampling/controller state.
@@ -2111,16 +3338,53 @@ where
         &mut self,
         plan: crate::capture::AdmittedCapturePlan,
     ) -> Result<(), crate::run_preparation::TextCaptureSetupError> {
+        self.inner
+            .step_context
+            .validate()
+            .map_err(crate::run_preparation::TextCaptureSetupError::Preparation)?;
         let local = if !matches!(self.inner.step, Some(PendingTextInput::Prefill(_))) {
             Err(crate::capture::CaptureError::Invalid(
                 "capture must be configured before generation".into(),
             ))
         } else {
+            // A backend may mutate instrumentation before a later setup error.
+            self.inner.step_context.revise_policy();
+            self.inner
+                .step_context
+                .validate()
+                .map_err(crate::run_preparation::TextCaptureSetupError::Preparation)?;
             B::configure_text_capture(self.runtime, &mut self.inner.backend_state, plan)
         };
-        self.runtime.finish_text_preparation(
+        self.inner
+            .step_context
+            .validate()
+            .map_err(crate::run_preparation::TextCaptureSetupError::Preparation)?;
+        self.runtime.finish_text_preparation_control(
+            self.inner.preparation_control.as_ref(),
             crate::run_preparation::TextPreparationStage::Instrumentation,
             local.map_err(crate::run_preparation::TextCaptureSetupError::Capture),
+            crate::run_preparation::TextCaptureSetupError::Preparation,
+        )
+    }
+
+    /// Installs one source-bound ordinary prepared-input capture.
+    pub fn enable_prepared_capture(
+        &mut self,
+        source: crate::capture::SharedCapturePlan,
+    ) -> Result<(), crate::run_preparation::TextCaptureSetupError> {
+        self.inner
+            .step_context
+            .validate()
+            .map_err(crate::run_preparation::TextCaptureSetupError::Preparation)?;
+        let local = self.inner.configure_prepared_capture(self.runtime, source);
+        self.inner
+            .step_context
+            .validate()
+            .map_err(crate::run_preparation::TextCaptureSetupError::Preparation)?;
+        self.runtime.finish_text_preparation_control(
+            self.inner.preparation_control.as_ref(),
+            crate::run_preparation::TextPreparationStage::Instrumentation,
+            local.map_err(crate::run_preparation::TextCaptureSetupError::Preparation),
             crate::run_preparation::TextCaptureSetupError::Preparation,
         )
     }
@@ -2131,11 +3395,20 @@ where
         capture: crate::capture::AdmittedCapturePlan,
         plan: crate::intervention::AdmittedInterventionPlan,
     ) -> Result<(), crate::run_preparation::TextCaptureSetupError> {
+        self.inner
+            .step_context
+            .validate()
+            .map_err(crate::run_preparation::TextCaptureSetupError::Preparation)?;
         let local = if !matches!(self.inner.step, Some(PendingTextInput::Prefill(_))) {
             Err(crate::capture::CaptureError::Invalid(
                 "interventions must be configured before generation".into(),
             ))
         } else {
+            self.inner.step_context.revise_policy();
+            self.inner
+                .step_context
+                .validate()
+                .map_err(crate::run_preparation::TextCaptureSetupError::Preparation)?;
             B::configure_text_interventions(
                 self.runtime,
                 &mut self.inner.backend_state,
@@ -2143,18 +3416,24 @@ where
                 plan,
             )
         };
-        self.runtime.finish_text_preparation(
+        self.inner
+            .step_context
+            .validate()
+            .map_err(crate::run_preparation::TextCaptureSetupError::Preparation)?;
+        self.runtime.finish_text_preparation_control(
+            self.inner.preparation_control.as_ref(),
             crate::run_preparation::TextPreparationStage::Instrumentation,
             local.map_err(crate::run_preparation::TextCaptureSetupError::Capture),
             crate::run_preparation::TextCaptureSetupError::Preparation,
         )
     }
 
-    /// Establishes exact completion before delivering this step's host captures.
-    /// The ordinary machine retains authority and handles errors/drop as before.
+    /// Legacy raw delivery after exact completion. A retained frame stays owned
+    /// by this machine and returns None; None therefore does not prove draining.
+    /// Funded callers must use `take_captured_delivery` instead. No shared frame
+    /// is cloned into an unpriced raw DTO.
     pub fn take_captured_step(&mut self) -> Result<Option<crate::capture::CapturedStep>, B::Error> {
-        self.inner.resolve_completions_before_decode()?;
-        Ok(B::take_text_capture(&mut self.inner.backend_state))
+        self.inner.take_legacy_capture()
     }
 }
 
@@ -2163,25 +3442,91 @@ where
     B: TextGenerationBackend,
     C: TokenFilterController,
 {
+    fn preparation_report(&self) -> Option<crate::TextPreparationReport<'_>> {
+        B::text_preparation_report(&self.preparation)
+    }
+
+    fn configure_prepared_capture(
+        &mut self,
+        runtime: &ModelRuntime<B>,
+        source: crate::capture::SharedCapturePlan,
+    ) -> Result<(), BackendFailure> {
+        let Some(PendingTextInput::Prefill(prompt)) = self.step.as_ref() else {
+            return Err(PreparedControlInputError::SourceMismatch.into_backend_failure());
+        };
+        self.step_context.revise_policy();
+        self.step_context.validate()?;
+        B::configure_text_prepared_capture(runtime, &mut self.backend_state, prompt, source)
+    }
+
     fn new(
         runtime: &ModelRuntime<B>,
-        prompt: B::Prompt,
+        input: TextGenerationInput<B::Prompt>,
         config: TextGenerationConfig,
         controller: C,
     ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
-        let backend_state = B::start_text_generation(runtime.backend(), config)
-            .map_err(ControlledTextGenerationError::Backend);
-        let backend_state = runtime.finish_text_preparation(
-            crate::run_preparation::TextPreparationStage::Sampling,
+        Self::new_preparation(runtime, input, config, controller, None)
+    }
+
+    fn new_preparation(
+        runtime: &ModelRuntime<B>,
+        input: TextGenerationInput<B::Prompt>,
+        config: TextGenerationConfig,
+        controller: C,
+        options: Option<TextPreparationOptions>,
+    ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
+        Self::new_preparation_with_sequence(runtime, input, config, controller, options, None)
+    }
+
+    fn new_preparation_with_sequence(
+        runtime: &ModelRuntime<B>,
+        input: TextGenerationInput<B::Prompt>,
+        config: TextGenerationConfig,
+        controller: C,
+        options: Option<TextPreparationOptions>,
+        sequence: Option<GenerationSequenceRequest<'_>>,
+    ) -> Result<Self, ControlledTextGenerationError<B::Error, C::Error>> {
+        // Establish payload-before-source order before even issuing the context.
+        // The runner subsequently owns the payloads while borrowing this source.
+        let mut owned = preparation::InputOwner::<B, C> {
+            controller: Some(controller),
+            input: Some(input),
+            sequence,
+            options,
+        };
+        let step_context = TextStepContext::new();
+        step_context
+            .validate()
+            .map_err(ControlledTextGenerationError::Preparation)?;
+        let (
+            controller,
+            prompt,
             backend_state,
-            ControlledTextGenerationError::Preparation,
+            prepared_sequence,
+            preparation,
+            preparation_control,
+        ) = preparation::prepare(
+            runtime,
+            owned.input.take().expect("owned preparation input"),
+            config,
+            owned.controller.take().expect("owned controller"),
+            &step_context,
+            owned.options.as_ref(),
+            owned.sequence.as_ref(),
         )?;
         Ok(Self {
+            capture_source: owned.options.take().and_then(|options| options.capture),
+            resume_host: None,
+            prepared_sequence,
+            preparation,
+            preparation_control,
             backend_state,
             controller,
             step: Some(PendingTextInput::Prefill(prompt)),
             completions: Vec::new(),
+            capture_delivery: None,
             remaining_tokens: config.sampling().max_new_tokens,
+            step_context,
         })
     }
 
@@ -2208,9 +3553,9 @@ where
     }
 
     fn resolve_completions_before_decode(&mut self) -> Result<(), B::Error> {
-        let existing = std::mem::take(&mut self.completions);
-        let mut remaining = existing.into_iter();
-        while let Some(completion) = remaining.next() {
+        // Keep exact handles on error: an empty list must never manufacture
+        // completion evidence for a subsequent capture drain or retry.
+        for (index, completion) in self.completions.iter().enumerate() {
             let result = match completion.is_complete() {
                 Ok(true) => Ok(()),
                 Ok(false) => completion.wait(),
@@ -2220,12 +3565,13 @@ where
                 }
             };
             if let Err(error) = result {
-                for pending in remaining {
+                for pending in &self.completions[index + 1..] {
                     let _ = pending.wait();
                 }
                 return Err(error);
             }
         }
+        self.completions.clear();
         Ok(())
     }
 
@@ -2233,69 +3579,182 @@ where
     fn next_committed(
         &mut self,
         runtime: &mut ModelRuntime<B>,
+        cancellation: &crate::GenerationCancellationToken,
     ) -> Option<Result<ControlledToken<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>>
     {
-        let token = match self.next_output(runtime)? {
-            Ok(token) => token,
+        let (token, permit) = match self.next_output(runtime, cancellation)? {
+            Ok(output) => output,
             Err(error) => return Some(Err(error)),
         };
-        let token_id = match token.token_id() {
-            Ok(token_id) => token_id,
-            Err(error) => {
-                self.step = None;
-                return Some(Err(ControlledTextGenerationError::Backend(error)));
-            }
-        };
-        if let Err(error) = self.controller.commit_token(token_id) {
+
+        let local = (|| {
+            let token_id = token
+                .token_id()
+                .map_err(ControlledTextGenerationError::Backend)?;
+            // Token observation can settle only its readback while the
+            // retained completion still owns session submission authority.
+            // Controlled commitment requires that exact completion to settle;
+            // the move-only permit stays live through this boundary.
+
+            self.resolve_completions_before_decode()
+                .map_err(ControlledTextGenerationError::Backend)?;
+
+            self.controller
+                .commit_token(token_id)
+                .map_err(ControlledTextGenerationError::Controller)?;
+
+            B::finish_text_step(permit).map_err(ControlledTextGenerationError::Backend)?;
+            Ok(ControlledToken {
+                output: token,
+                token_id,
+            })
+        })();
+
+        let committed = runtime.finish_text_preparation_control(
+            self.preparation_control.as_ref(),
+            crate::run_preparation::TextPreparationStage::Commitment,
+            local,
+            ControlledTextGenerationError::Preparation,
+        );
+        if committed.is_err() {
             self.step = None;
-            return Some(Err(ControlledTextGenerationError::Controller(error)));
         }
-        Some(Ok(ControlledToken {
-            output: token,
-            token_id,
-        }))
+        Some(committed)
     }
 
     fn next_output(
         &mut self,
         runtime: &mut ModelRuntime<B>,
+        cancellation: &crate::GenerationCancellationToken,
     ) -> Option<ControlledGenerationResult<B, C>> {
+        if let Err(error) = self.step_context.validate() {
+            self.step = None;
+            return Some(Err(ControlledTextGenerationError::Preparation(error)));
+        }
         if self.remaining_tokens == Some(0) {
             self.step = None;
             return None;
         }
+
         let step = self.step.take()?;
-        if matches!(step, PendingTextInput::Decode(_)) {
-            if let Err(error) = self.resolve_completions_before_decode() {
-                return Some(Err(ControlledTextGenerationError::Backend(error)));
+        let local = (|| {
+            if matches!(step, PendingTextInput::Decode(_)) {
+                self.resolve_completions_before_decode()
+                    .map_err(ControlledTextGenerationError::Backend)?;
             }
-        }
-        let decision = match self.controller.current_decision() {
+
+            if self.capture_pending() {
+                return Err(ControlledTextGenerationError::Preparation(
+                    BackendFailure::from_error(crate::capture::CaptureDeliveryPending),
+                ));
+            }
+
+            runtime
+                .validate_session_admission()
+                .map_err(ControlledTextGenerationError::Backend)?;
+            if cancellation.is_cancelled() {
+                return Ok(None);
+            }
+
+            let following_context = self.step_context.following_attempt().ok_or_else(|| {
+                ControlledTextGenerationError::Preparation(BackendFailure::from_error(
+                    CapabilityError::ArithmeticOverflow {
+                        operation: "text prediction attempt ordinal",
+                    },
+                ))
+            })?;
+
+            let permit = B::begin_text_step(
+                runtime,
+                &self.preparation,
+                &self.backend_state,
+                &self.controller,
+                step.as_ref(),
+                &self.step_context,
+            )
+            .map_err(ControlledTextGenerationError::Backend)?;
+            // Issuing local authority consumes the attempt even when a peer
+            // subsequently vetoes readiness. Restoration cannot refund it.
+
+            self.step_context = following_context;
+            Ok(Some(permit))
+        })();
+        // Every lane agrees even on local admission/permit failure. Successful
+        // local permits stay alive during agreement and drop on peer rejection.
+
+        let mut permit = match runtime.finish_text_preparation_control_cancellable(
+            self.preparation_control.as_ref(),
+            crate::run_preparation::TextPreparationStage::Prediction,
+            local,
+            ControlledTextGenerationError::Preparation,
+        ) {
+            Ok(Some(ready)) => ready,
+            Ok(None) => {
+                // All lanes use the existing prediction boundary, even when
+                // locally cancelled. A ready peer drops its unused permit;
+                // completed work and local failures retain their disposition.
+                cancellation.cancel();
+                return None;
+            }
+            Err(error) => return Some(Err(error)),
+        };
+
+        let decision = self
+            .controller
+            .current_decision()
+            .map_err(ControlledTextGenerationError::Controller);
+
+        let decision = match runtime.finish_text_preparation_control(
+            self.preparation_control.as_ref(),
+            crate::run_preparation::TextPreparationStage::Decision,
+            decision,
+            ControlledTextGenerationError::Preparation,
+        ) {
             Ok(decision) => decision,
-            Err(error) => return Some(Err(ControlledTextGenerationError::Controller(error))),
+            Err(error) => return Some(Err(error)),
         };
+
         let submission = match step {
-            PendingTextInput::Prefill(prompt) => {
-                B::submit_text_prefill_decision(runtime, prompt, &decision, &mut self.backend_state)
-            }
-            PendingTextInput::Decode(token) => {
-                B::submit_text_decode_decision(runtime, token, &decision, &mut self.backend_state)
-            }
+            PendingTextInput::Prefill(prompt) => B::submit_text_prefill_permitted(
+                runtime,
+                prompt,
+                &decision,
+                &mut self.backend_state,
+                cancellation,
+                &mut permit,
+            ),
+            PendingTextInput::Decode(token) => B::submit_text_decode_permitted(
+                runtime,
+                token,
+                &decision,
+                &mut self.backend_state,
+                &mut permit,
+            )
+            .map(Some),
         };
+
         drop(decision);
         let submission = match submission {
-            Ok(submission) => submission,
+            Ok(Some(submission)) => submission,
+            Ok(None) => {
+                // A peer may have requested cancellation. Publish it locally so
+                // shared commitment reports cancellation rather than exhaustion.
+                cancellation.cancel();
+                return None;
+            }
             Err(error) => return Some(Err(ControlledTextGenerationError::Backend(error))),
         };
+
         let token = submission.output;
         if let Err(error) = self.retain_completion(submission.completion) {
             return Some(Err(ControlledTextGenerationError::Backend(error)));
         }
+
         self.step = Some(PendingTextInput::Decode(token.clone()));
         if let Some(remaining_tokens) = &mut self.remaining_tokens {
             *remaining_tokens -= 1;
         }
-        Some(Ok(token))
+        Some(Ok((token, permit)))
     }
 }
 
@@ -2308,7 +3767,7 @@ where
         Result<ControlledToken<B::Token>, ControlledTextGenerationError<B::Error, C::Error>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next_committed(self.runtime)
+        self.next_cancellable(&crate::GenerationCancellationToken::new())
     }
 }
 
@@ -2338,6 +3797,48 @@ pub struct TextGeneration<'a, B: TextGenerationBackend> {
 }
 
 impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
+    /// Borrows the selected request geometry and historical admission requirement.
+    /// This reports the same retained preparation as controlled generation.
+    pub fn preparation_report(&self) -> Option<crate::TextPreparationReport<'_>> {
+        self.inner.preparation_report()
+    }
+
+    /// Installs ordinary prepared-input capture using the same pending prompt,
+    /// policy revision and Instrumentation agreement as controlled generation.
+    pub fn enable_prepared_capture(
+        &mut self,
+        source: crate::capture::SharedCapturePlan,
+    ) -> Result<(), BackendFailure> {
+        self.inner.step_context.validate()?;
+        let local = self.inner.configure_prepared_capture(self.runtime, source);
+        self.inner.step_context.validate()?;
+        self.runtime.finish_text_preparation_control(
+            self.inner.preparation_control.as_ref(),
+            crate::run_preparation::TextPreparationStage::Instrumentation,
+            local,
+            |error| error,
+        )
+    }
+    /// Advances with cancellation between predictions and at safe completed
+    /// prefill spans, without producing a synthetic token.
+    pub fn next_cancellable(
+        &mut self,
+        cancellation: &crate::GenerationCancellationToken,
+    ) -> Option<Result<B::Token, BackendFailure>> {
+        self.inner
+            .next_output(self.runtime, cancellation)
+            .map(|result| {
+                result
+                    .and_then(|(token, permit)| {
+                        B::finish_text_step(permit).map_err(|error| {
+                            self.inner.step = None;
+                            ControlledTextGenerationError::Backend(error)
+                        })?;
+                        Ok(token)
+                    })
+                    .map_err(unreachable_unconstrained_error::<B>)
+            })
+    }
     /// Starts generation from portable prompt token ids.
     pub fn new(
         runtime: &'a mut ModelRuntime<B>,
@@ -2356,15 +3857,13 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         config: TextGenerationConfig,
         filter: TokenFilter,
     ) -> Result<Self, BackendFailure> {
-        let prompt = B::prepare_text_prompt(runtime.backend(), prompt_token_ids)
-            .map_err(BackendFailure::from_error);
-        let prompt = runtime.finish_text_preparation(
-            crate::run_preparation::TextPreparationStage::Prompt,
-            prompt,
-            std::convert::identity,
-        )?;
-        let inner = TextGenerationMachine::new(runtime, prompt, config, FixedTokenFilter(filter))
-            .map_err(unreachable_unconstrained_error)?;
+        let inner = TextGenerationMachine::new(
+            runtime,
+            TextGenerationInput::TokenIds(prompt_token_ids),
+            config,
+            FixedTokenFilter(filter),
+        )
+        .map_err(unreachable_unconstrained_error::<B>)?;
         Ok(Self { runtime, inner })
     }
 
@@ -2374,21 +3873,89 @@ impl<'a, B: TextGenerationBackend> TextGeneration<'a, B> {
         prompt: B::Prompt,
         config: TextGenerationConfig,
     ) -> Result<Self, BackendFailure> {
-        let inner =
-            TextGenerationMachine::new(runtime, prompt, config, FixedTokenFilter(TokenFilter::All))
-                .map_err(unreachable_unconstrained_error)?;
+        let inner = TextGenerationMachine::new(
+            runtime,
+            TextGenerationInput::Prepared(prompt),
+            config,
+            FixedTokenFilter(TokenFilter::All),
+        )
+        .map_err(unreachable_unconstrained_error::<B>)?;
+        Ok(Self { runtime, inner })
+    }
+    /// Starts ordinary generation with sources included in original admission.
+    pub fn new_with_options(
+        runtime: &'a mut ModelRuntime<B>,
+        prompt_token_ids: Vec<u32>,
+        config: TextGenerationConfig,
+        options: TextPreparationOptions,
+    ) -> Result<Self, BackendFailure> {
+        Self::from_input_with_options(
+            runtime,
+            TextGenerationInput::TokenIds(prompt_token_ids),
+            config,
+            options,
+        )
+    }
+
+    /// Starts ordinary generation from prepared input and owned options.
+    pub fn from_prompt_with_options(
+        runtime: &'a mut ModelRuntime<B>,
+        prompt: B::Prompt,
+        config: TextGenerationConfig,
+        options: TextPreparationOptions,
+    ) -> Result<Self, BackendFailure> {
+        Self::from_input_with_options(
+            runtime,
+            TextGenerationInput::Prepared(prompt),
+            config,
+            options,
+        )
+    }
+
+    /// Prepares either input form through original admission and the single
+    /// Instrumentation readiness stage, even when capture is absent.
+    pub fn from_input_with_options(
+        runtime: &'a mut ModelRuntime<B>,
+        input: TextGenerationInput<B::Prompt>,
+        config: TextGenerationConfig,
+        options: TextPreparationOptions,
+    ) -> Result<Self, BackendFailure> {
+        let inner = TextGenerationMachine::new_preparation(
+            runtime,
+            input,
+            config,
+            FixedTokenFilter(TokenFilter::All),
+            Some(options),
+        )
+        .map_err(unreachable_unconstrained_error::<B>)?;
+        Ok(Self { runtime, inner })
+    }
+
+    /// Starts fixed-filter generation with options included in original admission.
+    pub fn with_token_filter_and_options(
+        runtime: &'a mut ModelRuntime<B>,
+        prompt_token_ids: Vec<u32>,
+        config: TextGenerationConfig,
+        filter: TokenFilter,
+        options: TextPreparationOptions,
+    ) -> Result<Self, BackendFailure> {
+        let inner = TextGenerationMachine::new_preparation(
+            runtime,
+            TextGenerationInput::TokenIds(prompt_token_ids),
+            config,
+            FixedTokenFilter(filter),
+            Some(options),
+        )
+        .map_err(unreachable_unconstrained_error::<B>)?;
         Ok(Self { runtime, inner })
     }
 }
 
-fn unreachable_unconstrained_error<B>(
-    error: ControlledTextGenerationError<B, std::convert::Infallible>,
-) -> BackendFailure
-where
-    B: std::error::Error + Send + Sync + 'static,
-{
+fn unreachable_unconstrained_error<B: BackendProvider>(
+    error: ControlledTextGenerationError<B::Error, std::convert::Infallible>,
+) -> BackendFailure {
     match error {
-        ControlledTextGenerationError::Backend(error) => BackendFailure::from_error(error),
+        ControlledTextGenerationError::Backend(error) => B::into_backend_failure(error),
         ControlledTextGenerationError::Preparation(error) => error,
         ControlledTextGenerationError::Controller(error) => match error {},
     }
@@ -2398,9 +3965,7 @@ impl<B: TextGenerationBackend> Iterator for TextGeneration<'_, B> {
     type Item = Result<B::Token, BackendFailure>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner
-            .next_output(self.runtime)
-            .map(|result| result.map_err(unreachable_unconstrained_error))
+        self.next_cancellable(&crate::GenerationCancellationToken::new())
     }
 }
 
@@ -2477,6 +4042,9 @@ pub trait DistributedBackend: BackendProvider {
 
 #[cfg(test)]
 mod tests {
+    mod capture_delivery_defaults;
+    mod preparation_options_defaults;
+    mod reset_preparation;
     #[test]
     fn closed_token_sets_intersect_and_project_to_executable_output_width() {
         use super::{TokenFilter, TokenFilterError};
@@ -2595,6 +4163,7 @@ mod tests {
     struct LoadingMock {
         selections: std::sync::atomic::AtomicUsize,
         materializations: std::sync::atomic::AtomicUsize,
+        selected_gguf: std::cell::RefCell<Option<eredu_gguf::Checkpoint>>,
     }
     struct LoadingMockSession;
 
@@ -2674,6 +4243,21 @@ mod tests {
             self.materializations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             assert_eq!(plan.inspection().configuration().family(), "llama");
+            if let Some(checkpoint) = plan.inspection().gguf_checkpoint() {
+                let selected = self.selected_gguf.borrow();
+                for (before, after) in selected
+                    .as_ref()
+                    .unwrap()
+                    .shards()
+                    .iter()
+                    .zip(checkpoint.shards())
+                {
+                    assert!(std::ptr::eq(
+                        before.prepared_header().unwrap(),
+                        after.prepared_header().unwrap(),
+                    ));
+                }
+            }
             Ok(PreparedModel::new(
                 model,
                 plan.admitted_session_capabilities(),
@@ -2755,17 +4339,18 @@ mod tests {
 
         fn select_preparation(
             &self,
-            _: &ArtifactInspection,
+            inspection: &ArtifactInspection,
             options: &Self::LoadOptions,
         ) -> Result<Self::SelectedPreparation, Self::Error> {
             self.selections
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *self.selected_gguf.borrow_mut() = inspection.gguf_checkpoint().cloned();
             let policy = crate::PreparationPolicy::default().with_required_session_capabilities(
                 SessionCapabilities::default().with_activation_inspection(*options == 99),
             );
             let request = crate::PreparationAdmissionRequest::new(
                 crate::LoadingProtocol::Model,
-                crate::ArtifactFormat::SafeTensors,
+                inspection.format(),
                 policy,
                 crate::ArchitecturePreparationCapabilities::new(
                     false,
@@ -2859,6 +4444,31 @@ mod tests {
     }
 
     impl TextGenerationBackend for Mock {
+        type TextPreparation = ();
+        type TextPreparationControl = ();
+        type TextStepPermit = ();
+        fn begin_text_step<C: TokenFilterController>(
+            _: &ModelRuntime<Self>,
+            _: &Self::TextPreparation,
+            _: &Self::TextGenerationState,
+            _: &C,
+            _: PendingTextInput<&Self::Prompt, &Self::Token>,
+            _: &TextStepContext,
+        ) -> Result<Self::TextStepPermit, Self::Error> {
+            Ok(())
+        }
+        fn finish_text_step(_: Self::TextStepPermit) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn admit_text_preparation<C: TokenFilterController>(
+            _: &ModelRuntime<Self>,
+            _: &TextPreparationInput<'_, Self::Prompt>,
+            _: TextGenerationConfig,
+            _: &C,
+        ) -> Result<(), BackendFailure> {
+            Ok(())
+        }
         fn reset_session(_: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
             session.tokens.clear();
             Ok(())
@@ -2872,6 +4482,12 @@ mod tests {
         type Token = u32;
         type TextGenerationState = (u32, u64);
         type TextCompletion = Done;
+
+        fn take_text_capture(
+            _: &mut Self::TextGenerationState,
+        ) -> Option<crate::capture::CapturedStep> {
+            capture_delivery_defaults::take()
+        }
 
         fn start_text_generation(
             _: &Self,
@@ -2975,12 +4591,14 @@ mod tests {
                 &crate::StateMemoryLayout::new(
                     crate::LayerSchedule::new(
                         1,
-                        vec![crate::cache::LayerCachePolicy::key_only(
-                            crate::AttentionPolicy::Full,
-                            1,
-                            2,
-                        )
-                        .unwrap()],
+                        vec![
+                            crate::cache::LayerCachePolicy::key_only(
+                                crate::AttentionPolicy::Full,
+                                1,
+                                2,
+                            )
+                            .unwrap(),
+                        ],
                     )
                     .unwrap(),
                     vec![0],
@@ -3050,6 +4668,60 @@ mod tests {
             Err(ModelLoadError::Artifact(ArtifactError::MissingArtifact(path)))
                 if path == missing
         ));
+    }
+
+    #[test]
+    fn generic_path_loader_retains_first_gguf_headers_and_lazy_nonzero_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("model.gguf");
+        let bytes: Vec<u8> = [1.25f32, -3.5]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let metadata = std::collections::BTreeMap::from([(
+            "general.architecture".into(),
+            eredu_gguf::MetadataValue::String("llama".into()),
+        )]);
+        eredu_gguf::Writer::default()
+            .write(
+                std::fs::File::create(&path).unwrap(),
+                &metadata,
+                &[eredu_gguf::TensorInput {
+                    name: "token_embd.weight",
+                    dimensions: &[2],
+                    ggml_type: eredu_gguf::GgmlType::F32,
+                    data: &bytes,
+                }],
+            )
+            .unwrap();
+        let backend = LoadingMock::default();
+        assert_eq!(*load_model(&backend, &path, 41).unwrap(), 41);
+        assert_eq!(
+            backend
+                .selections
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            backend
+                .materializations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        let retained = backend.selected_gguf.borrow_mut().take().unwrap();
+        assert!(
+            retained
+                .shards()
+                .iter()
+                .all(|shard| shard.prepared_header().is_some())
+        );
+        let mut materializer = retained.into_materializer();
+        let converted = materializer.converted_tensor("token_embd.weight").unwrap();
+        let eredu_gguf::ConvertedTensor::Dense(dense) = converted.converted() else {
+            panic!("expected dense fixture");
+        };
+        assert_eq!(dense.shape, [2]);
+        assert_eq!(dense.data, bytes);
     }
 
     #[test]
@@ -3386,10 +5058,12 @@ mod tests {
         let mut state = driver
             .start(vec![1, 2], continuation_config(3), PanickingFilter)
             .unwrap();
-        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            driver.advance(&mut state)
-        }))
-        .is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                driver.advance(&mut state)
+            }))
+            .is_err()
+        );
         driver.take_completed_step(&mut state).unwrap();
         assert!(matches!(
             state.require_quiescent(),
@@ -3567,10 +5241,12 @@ mod tests {
             scope
         );
         assert!(DistributedSessionDescriptor::new(descriptor.world_size(), 6, Vec::new()).is_err());
-        assert!(serde_json::from_str::<DistributedSessionDescriptor>(
-            r#"{"world_size":6,"rank":6,"groups":[]}"#
-        )
-        .is_err());
+        assert!(
+            serde_json::from_str::<DistributedSessionDescriptor>(
+                r#"{"world_size":6,"rank":6,"groups":[]}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

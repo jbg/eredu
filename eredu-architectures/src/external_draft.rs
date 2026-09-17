@@ -41,6 +41,12 @@ pub struct PreparedAutoregressiveDraft {
     tokenizer: TokenizerCompatibilityProof,
 }
 impl PreparedAutoregressiveDraft {
+    /// Borrows the exact selected source for a backend's source preparation.
+    /// The complete source/selection/tokenizer handoff remains owned here.
+    pub fn sources(&self) -> &PreparedModelSources {
+        &self.sources
+    }
+
     /// Consumes the inseparable native materialization handoff.
     pub fn into_parts(
         self,

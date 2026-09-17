@@ -14,6 +14,9 @@ use eredu_core::{
 use serde::{Deserialize, Serialize};
 
 mod session_identity;
+mod retained_source;
+mod retention_copy;
+pub use retained_source::{RetainedCommunicationSource, RetainedCommunicationSourceError};
 pub use session_identity::{
     AgreedCommunicationSession, CommunicationSessionIdentity, establish_communication_session,
 };
@@ -75,6 +78,81 @@ impl<'de> Deserialize<'de> for CommunicationPeerCounts {
         let raw = Raw::deserialize(deserializer)?;
         let group_size = raw.send.len();
         Self::new(raw.send, raw.receive, group_size).map_err(serde::de::Error::custom)
+    }
+}
+
+/// One completed consensus and its optional immutable native source owner.
+/// The matrix view cannot escape the callback. The move-only loan may transfer
+/// its closed source owner into the derived count plan; matching that owner's
+/// type never grants submission authority or replaces request authentication.
+pub struct PreparedPeerCountLoan<'a> {
+    matrix: &'a [i32],
+    funding: &'a eredu_nn::workspace::WorkspaceMetadataFunding,
+    source: Option<eredu_core::ErasedSharedStorageOwner>,
+}
+impl<'a> PreparedPeerCountLoan<'a> {
+    /// The backend prepares all payload and owner storage before lending it.
+    pub fn new(matrix: &'a [i32], funding: &'a eredu_nn::workspace::WorkspaceMetadataFunding,
+        source: Option<eredu_core::ErasedSharedStorageOwner>) -> Self {
+        Self { matrix, funding, source }
+    }
+    /// Checked local rank-major count matrix.
+    pub fn matrix(&self) -> &'a [i32] { self.matrix }
+    /// Cumulative account shared by the source and derived plan.
+    pub fn funding(&self) -> &'a eredu_nn::workspace::WorkspaceMetadataFunding { self.funding }
+    /// Moves custody; no owner clone, allocation or independent source appears.
+    pub fn into_parts(self) -> (&'a [i32], &'a eredu_nn::workspace::WorkspaceMetadataFunding,
+        Option<eredu_core::ErasedSharedStorageOwner>) {
+        (self.matrix, self.funding, self.source)
+    }
+}
+
+/// Borrowed completed peer matrix selected for one variable exchange.
+///
+/// Source and destination positions follow the retained descriptor's member
+/// order. Reverse exchange borrows the transpose without copying the matrix.
+/// This describes geometry only; native submission still needs the explicit
+/// retained context and its independently admitted operation source.
+pub struct CommunicationPeerMatrix<'a> {
+    descriptor: &'a CommunicationGroupDescriptor,
+    values: &'a [usize],
+    transposed: bool,
+    completed_source: Option<&'a eredu_core::ErasedSharedStorageOwner>,
+}
+impl<'a> CommunicationPeerMatrix<'a> {
+    pub(crate) fn checked(descriptor: &'a CommunicationGroupDescriptor, values: &'a [usize],
+        transposed: bool, local: &CommunicationPeerCounts) -> Option<Self> {
+        let peers=descriptor.members().len();
+        let rank=descriptor.local_index()?;
+        if peers==0 || rank>=peers || values.len()!=peers.checked_mul(peers)?
+            || local.group_size()!=peers { return None; }
+        let source=Self { descriptor, values, transposed, completed_source: None };
+        for peer in 0..peers {
+            if source.count(rank,peer)!=Some(local.send()[peer])
+                || source.count(peer,rank)!=Some(local.receive()[peer]) { return None; }
+        }
+        Some(source)
+    }
+    pub(crate) fn with_completed_source(mut self, source: Option<&'a eredu_core::ErasedSharedStorageOwner>) -> Self {
+        self.completed_source = source; self
+    }
+    /// Exact immutable owner moved out of this consensus. The backend must
+    /// authenticate its request, group, completed values and native source.
+    pub fn completed_source(&self) -> Option<&'a eredu_core::ErasedSharedStorageOwner> {
+        self.completed_source
+    }
+    /// Exact ordered group whose count consensus supplied this matrix.
+    pub fn descriptor(&self)->&CommunicationGroupDescriptor { self.descriptor }
+    /// Source-major matrix from the completed forward count consensus.
+    pub fn forward_counts(&self)->&[usize] { self.values }
+    /// Whether this operation returns rows in the inverse direction.
+    pub fn transposed(&self)->bool { self.transposed }
+    /// Exact row count at one logical source/destination position.
+    pub fn count(&self,source:usize,destination:usize)->Option<usize> {
+        let peers=self.descriptor.members().len();
+        if source>=peers || destination>=peers { return None; }
+        let (source,destination)=if self.transposed {(destination,source)}else{(source,destination)};
+        self.values.get(source.checked_mul(peers)?.checked_add(destination)?).copied()
     }
 }
 
@@ -929,54 +1007,9 @@ fn boundary_frame_header(
     ordinal: usize,
     role: &BoundaryRoleContract,
 ) -> Result<Vec<u8>, CommunicationManifestError> {
-    let exact_shape = role
-        .shape
-        .iter()
-        .map(|dimension| match dimension {
-            BoundaryDimensionContract::Fixed(value) => Ok(*value),
-            BoundaryDimensionContract::Variable { .. } => {
-                Err(CommunicationManifestError::InvalidBoundaryContract)
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let payload_elements = exact_shape
-        .iter()
-        .try_fold(1usize, |value, dimension| value.checked_mul(*dimension))
-        .ok_or(CommunicationManifestError::InvalidBoundaryContract)?;
-    let payload_bytes = payload_elements
-        .checked_mul(
-            tensor_dtype_width(&role.dtype)
-                .ok_or(CommunicationManifestError::InvalidBoundaryContract)?,
-        )
-        .ok_or(CommunicationManifestError::InvalidBoundaryContract)?;
-    let ordinal =
-        u32::try_from(ordinal).map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?;
-    let schema_len = u32::try_from(schema.len())
-        .map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?;
-    let role_len = u32::try_from(role.role.len())
-        .map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?;
-    let rank = u32::try_from(exact_shape.len())
-        .map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?;
-    let payload_bytes = u64::try_from(payload_bytes)
-        .map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?;
-    let mut header = b"EREDUBND".to_vec();
-    header.extend_from_slice(&1u16.to_le_bytes());
-    header.extend_from_slice(&route.value().to_le_bytes());
-    header.extend_from_slice(&ordinal.to_le_bytes());
-    header.push(dtype_tag(&role.dtype)?);
-    header.extend_from_slice(&schema_len.to_le_bytes());
-    header.extend_from_slice(schema.as_bytes());
-    header.extend_from_slice(&role_len.to_le_bytes());
-    header.extend_from_slice(role.role.as_bytes());
-    header.extend_from_slice(&rank.to_le_bytes());
-    for dimension in &exact_shape {
-        header.extend_from_slice(
-            &u64::try_from(*dimension)
-                .map_err(|_| CommunicationManifestError::InvalidBoundaryContract)?
-                .to_le_bytes(),
-        );
-    }
-    header.extend_from_slice(&payload_bytes.to_le_bytes());
+    let layout=boundary_frames::Header::new(route,schema,ordinal,role)?;
+    let mut header=Vec::with_capacity(layout.bytes());
+    layout.write(&mut header);
     Ok(header)
 }
 
@@ -1173,11 +1206,39 @@ impl CommunicationManifest {
     /// world-backed native collective ordinal. Routes without that proof stay
     /// in singleton waves and retain ordinary sequential point-to-point order.
     pub(crate) fn route_submission_waves(&self) -> Vec<Range<usize>> {
-        let mut waves = Vec::new();
+        let mut waves = Vec::with_capacity(self.routes.len());
+        let mut endpoints = vec![false; self.world_size];
+        self.write_route_submission_waves(&mut waves, &mut endpoints);
+        waves
+    }
+
+    /// Runs the same canonical route-wave validator with exact paid wave and
+    /// endpoint destinations. This describes the retained manifest only; native
+    /// participation, layout and transport still require their own sources.
+    pub fn route_submission_waves_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Vec<Range<usize>>, eredu_nn::Error> {
+        context.charge_metadata(std::mem::size_of::<(
+            &Self, &eredu_nn::workspace::WorkspaceContext,
+            Vec<Range<usize>>, Vec<bool>, Result<Vec<Range<usize>>, eredu_nn::Error>,
+            std::iter::RepeatN<bool>, std::slice::Iter<'_, bool>,
+            (usize, usize, &CommunicationRouteDescriptor, &CommunicationRouteDescriptor),
+        )>())?;
+        let mut waves = context.metadata_vec(self.routes.len())?;
+        let mut endpoints = context.metadata_vec(self.world_size)?;
+        endpoints.extend(std::iter::repeat_n(false, self.world_size));
+        self.write_route_submission_waves(&mut waves, &mut endpoints);
+        Ok(waves)
+    }
+
+    fn write_route_submission_waves(&self, waves: &mut Vec<Range<usize>>, endpoints: &mut [bool]) {
+        // Both callers allocate the full finite destinations before entry.
+        // Every iteration consumes at least one route, so push cannot grow.
         let mut start = 0;
         while start < self.routes.len() {
             let reference = &self.routes[start];
-            let mut endpoints = vec![false; self.world_size];
+            endpoints.fill(false);
             let mut end = start;
             while end < self.routes.len() {
                 let route = &self.routes[end];
@@ -1201,7 +1262,6 @@ impl CommunicationManifest {
             waves.push(start..end);
             start = end;
         }
-        waves
     }
 
     /// Selected bounded-completion policy, if this manifest requires one.
@@ -3326,3 +3386,10 @@ mod tests {
         assert_eq!(routes.len(), calls.get());
     }
 }
+
+mod operation_contract;
+pub use operation_contract::{CommunicationGroupOperation, CommunicationGroupOperationError,
+    CommunicationTensorContractError};
+
+mod boundary_frames;
+pub use boundary_frames::{PreparedBoundarySource,PreparedBoundaryFrames,PreparedBoundaryFrameError,PreparedBoundaryFrameCause};

@@ -763,13 +763,13 @@ fn write_semantic_event(
     reasoning_output: ReasoningOutput,
 ) -> Result<()> {
     let visible = match event {
-        SemanticEvent::TextDelta(text) => Some(text.clone()),
+        SemanticEvent::TextDelta(text) => Some(text.as_str().to_owned()),
         SemanticEvent::ToolCallStart { index, id, name } => Some(format!(
             "\n{{\"tool_call\":{{\"index\":{index},\"id\":{},\"name\":{},\"arguments\":",
             serde_json::to_string(id)?,
             serde_json::to_string(name)?,
         )),
-        SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => Some(json_fragment.clone()),
+        SemanticEvent::ToolArgumentsDelta { json_fragment, .. } => Some(json_fragment.as_str().to_owned()),
         SemanticEvent::ToolCallEnd => Some("}}\n".into()),
         SemanticEvent::ReasoningDelta(text) => {
             reasoning_stream.write_delta(stderr, text, reasoning_output)?;
@@ -2404,6 +2404,7 @@ fn main() -> Result<()> {
             } else {
                 eredu::api::TextSamplingStrategy::Standard
             },
+            ..Default::default()
         };
         let mut semantic_error = None;
         if drafting.is_enabled() {
@@ -2446,8 +2447,8 @@ fn main() -> Result<()> {
             }?;
             output_ids = output.token_ids().to_vec();
             time_to_first_token = output.timing().time_to_first_token();
-            speculative_stats = Some(output.stats().clone());
             prepared_finish_reason = Some(output.finish_reason());
+            speculative_stats = Some(output.into_stats());
         } else {
             let cancellation = GenerationCancellationToken::new();
             let cancel_on_error = cancellation.clone();

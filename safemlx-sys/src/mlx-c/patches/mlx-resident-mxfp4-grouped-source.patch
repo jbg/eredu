@@ -1,0 +1,37 @@
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -466,7 +466,7 @@
+       resident_primitive_control<Slice>(), resident_primitive_control<SliceUpdate>(),
+       resident_primitive_control<ArgReduce>(), resident_primitive_control<ArgPartition>(),
+       resident_primitive_control<Matmul>(), resident_primitive_control<AddMM>(),
+-      resident_primitive_control<QuantizedMatmul>(),
++      resident_primitive_control<QuantizedMatmul>(), resident_primitive_control<GatherQMM>(),
+       resident_primitive_control<fast::Quantize>(),
+       resident_primitive_control<fast::CustomKernel>(),
+       resident_primitive_control<Sqrt>(), resident_primitive_control<Sigmoid>(),
+diff --git a/mlx/backend/metal/selector_controls.cpp b/mlx/backend/metal/selector_controls.cpp
+--- a/mlx/backend/metal/selector_controls.cpp
++++ b/mlx/backend/metal/selector_controls.cpp
+@@ -52,6 +52,12 @@
+ // values are integers; mode and dtype strings fit inline storage.
+ constexpr size_t quantized_vector = text("affine_qmv_wide__gs__b__nv__kl__batch_1") +
+     source_type + 4 * integer;
++// Explicit-index MXFP4 grouped rows have M=1 and both sorted flags false;
++// get_qmv_batch_limit is >=6 on every selected Metal architecture. Thus the
++// same existing gather_qmv fast/general selector runs, with reserve(64), no
++// function constants, and the existing precompiled wrapper's early return.
++constexpr size_t quantized_gather = text("mxfp4_gather_qmv_fast__gs__b_") +
++    dtype_tag + 2 * integer;
+ constexpr size_t quantized_quad = text("affine_qmv_quad__gs__b__d__batch_1") +
+     source_type + 3 * integer;
+ constexpr size_t quantized_matrix = text("affine_qmm_t_nax__gs__b__bm_bn_bk_wm_wn_alN_false_batch_1") +
+@@ -66,7 +72,7 @@
+ constexpr size_t convolution_separable = text("depthwise_conv_1d__large") + dtype_tag;
+ constexpr size_t maximum_name = std::max({gemm_specialized, gemm_split, gemv,
+     attention, vector_attention, reduce, indexing, gather_axis, scatter_axis, scan, single_index, sort_name, gathered_rhs,
+-    pointwise, rope, normalization, quantized_vector, quantized_quad,
++    pointwise, rope, normalization, quantized_vector, quantized_gather, quantized_quad,
+     quantized_matrix, quantized_split, quantized_vector_split,
+     convolution_implicit, convolution_depthwise, convolution_separable});
+ 

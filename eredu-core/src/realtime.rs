@@ -5,7 +5,8 @@ use crate::{
     scheduler::{SchedulerError, SemanticStateTransaction, WorkDescriptor, WorkId},
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+mod slot_table;
+pub use slot_table::RealtimeSlotTable;
 
 /// Largest admitted text or audio delay in one portable realtime schedule.
 ///
@@ -72,6 +73,29 @@ impl<'de> Deserialize<'de> for RealtimeSpeechConfig {
 }
 
 impl RealtimeSpeechConfig {
+    /// Concrete host destination for copying this exact normalized schedule.
+    /// The enclosing state retains the supplied account with the copied value.
+    pub fn host_clone_bytes(&self)->Option<usize> {
+        let frames=[std::mem::size_of::<Self>(),std::mem::size_of::<Vec<usize>>(),
+            std::mem::size_of::<Result<Self,crate::HostMetadataFundingError>>(),
+            std::mem::size_of::<std::collections::TryReserveError>(),
+            crate::HostMetadataFunding::reservation_control_bytes()];
+        frames.into_iter().try_fold(std::mem::size_of_val(&frames)
+            .checked_add(std::alloc::Layout::array::<usize>(self.delays.len()).ok()?.size())?,usize::checked_add)
+    }
+    /// Pays and constructs a copy before allocating its delay vector.
+    pub fn try_clone_with_host_source(&self,funding:&crate::HostMetadataFunding)
+        ->Result<Self,crate::HostMetadataFundingError> {
+        funding.reserve_metadata(self.host_clone_bytes().ok_or(crate::HostMetadataFundingError::Overflow)?)?;
+        let mut delays=Vec::new();
+        delays.try_reserve_exact(self.delays.len()).map_err(|_|crate::HostMetadataFundingError::Unavailable)?;
+        delays.extend_from_slice(&self.delays);
+        Ok(Self{total_audio_codebooks:self.total_audio_codebooks,input_audio_codebooks:self.input_audio_codebooks,
+            generated_audio_codebooks:self.generated_audio_codebooks,depth_audio_codebooks:self.depth_audio_codebooks,
+            text_padding_token:self.text_padding_token,audio_padding_token:self.audio_padding_token,
+            frame_convention:self.frame_convention,delays})
+    }
+
     /// Creates and validates portable realtime codec geometry.
     #[allow(clippy::too_many_arguments)] // Public codec geometry is intentionally explicit.
     pub fn new(
@@ -499,7 +523,7 @@ impl RealtimeFrameTransition {
 pub struct RealtimeFrameScheduleState {
     schedule: RealtimeSpeechConfig,
     frontier: usize,
-    occupied: BTreeMap<RealtimeSlotCoordinate, RealtimeSlotOccupancy>,
+    occupied: RealtimeSlotTable<RealtimeSlotOccupancy>,
 }
 
 impl RealtimeFrameScheduleState {
@@ -508,7 +532,7 @@ impl RealtimeFrameScheduleState {
         Self {
             schedule,
             frontier: 0,
-            occupied: BTreeMap::new(),
+            occupied: RealtimeSlotTable::new(),
         }
     }
 
@@ -539,6 +563,41 @@ impl RealtimeFrameScheduleState {
         }
     }
 
+    /// Copies exact schedule and occupied coordinates under a caller-retained
+    /// host account. The surrounding transaction retains that account until
+    /// both the copied state and all returned transition records retire.
+    pub fn try_clone_with_host_source(&self,funding:&crate::HostMetadataFunding)
+        ->Result<Self,crate::HostMetadataFundingError> {
+        self.clone_with_host_capacity(0,funding)
+    }
+
+    /// Full ordinary schedule/coordinate clone destination. Payload-free
+    /// occupied rows use the same concrete copier as the paid constructor.
+    pub fn host_clone_bytes(&self)->Option<usize> {self.host_clone_bytes_with_capacity(0)}
+    fn host_clone_bytes_with_capacity(&self,additional:usize)->Option<usize> {
+        let map=clone_occupied as fn(&RealtimeSlotOccupancy)->Result<RealtimeSlotOccupancy,crate::HostMetadataFundingError>;
+        (std::mem::size_of::<Self>()*2+std::mem::size_of::<Result<Self,crate::HostMetadataFundingError>>())
+            .checked_add(self.schedule.host_clone_bytes()?)?
+            .checked_add(self.occupied.map_control_bytes::<RealtimeSlotOccupancy,crate::HostMetadataFundingError,_>(additional,&map)?)
+    }
+    fn clone_with_host_capacity(&self,additional:usize,funding:&crate::HostMetadataFunding)
+        ->Result<Self,crate::HostMetadataFundingError> {
+        funding.reserve_metadata(std::mem::size_of::<Self>()*2
+            +std::mem::size_of::<Result<Self,crate::HostMetadataFundingError>>())?;
+        let schedule=self.schedule.try_clone_with_host_source(funding)?;
+        let occupied=self.occupied.try_clone_with(additional,funding,
+            clone_occupied as fn(&RealtimeSlotOccupancy)->Result<RealtimeSlotOccupancy,crate::HostMetadataFundingError>)?;
+        Ok(Self{schedule,frontier:self.frontier,occupied})
+    }
+
+    /// Advances the ordinary scheduling worker with paid host destinations.
+    /// The supplied account must outlive the state and returned transition.
+    pub fn advance_with_host_source(&mut self,schedule:&RealtimeSpeechConfig,
+        forcing:&RealtimeFrameForcing,funding:&crate::HostMetadataFunding)
+        ->Result<RealtimeFrameTransition,RealtimeScheduleError> {
+        self.advance_in(schedule,forcing,Some(funding))
+    }
+
     /// Accepts one input frame, resolves all portable coordinates, records
     /// target occupancy, and advances this transaction-local branch.
     ///
@@ -549,6 +608,55 @@ impl RealtimeFrameScheduleState {
         schedule: &RealtimeSpeechConfig,
         forcing: &RealtimeFrameForcing,
     ) -> Result<RealtimeFrameTransition, RealtimeScheduleError> {
+        if self.occupied.is_prepared() {return Err(RealtimeScheduleError::HostSourceRequired);}
+        self.advance_in(schedule,forcing,None)
+    }
+
+    fn advance_control_bytes()->usize {
+        std::mem::size_of::<RealtimeFrameTransition>()*2
+            +std::mem::size_of::<Result<RealtimeFrameTransition,RealtimeScheduleError>>()
+            +std::mem::size_of::<(usize,usize,usize)>()
+    }
+    fn advance_additional(&self,forced:usize,forced_text:bool)->Result<usize,RealtimeScheduleError> {
+                let target_count=checked_add(1,self.schedule.depth_audio_codebooks)?;
+                let additional=match self.schedule.frame_convention {
+                    RealtimeFrameConvention::FeedbackAlignedHistory=>{
+                        let text=usize::from(self.frontier>=self.schedule.text_delay());
+                        let generated=self.schedule.audio_delays().iter()
+                            .take(self.schedule.generated_audio_codebooks.min(self.schedule.depth_audio_codebooks))
+                            .filter(|delay|self.frontier>=**delay).count();
+                        checked_add(checked_add(self.schedule.input_audio_codebooks,forced)?,checked_add(text,generated)?)?
+                    }
+                    RealtimeFrameConvention::AbsoluteDelayedSlots=>{
+                        let warmup=self.schedule.delays.iter().filter(|delay|self.frontier<=**delay).count();
+                        checked_add(checked_add(self.schedule.input_audio_codebooks,checked_add(forced,usize::from(forced_text))?)?,
+                            checked_add(warmup,if self.frontier==0 {0}else{target_count})?)?
+                    }
+                };
+        Ok(additional)
+    }
+    /// Exact host schedule worker population for its already validated transition.
+    /// This reads the original state and forcing population; it does not advance it.
+    pub fn advance_host_bytes(&self,forced_audio:usize,forced_text:bool,
+        transition:&RealtimeFrameTransition)->Option<usize> {
+        if transition.frontier()!=self.frontier || forced_audio>self.schedule.generated_audio_codebooks {return None;}
+        let forced=forced_audio.checked_add(usize::from(forced_text))?;
+        let mut bytes=Self::advance_control_bytes().checked_add(self.host_clone_bytes_with_capacity(
+            self.advance_additional(forced_audio,forced_text).ok()?)?)?;
+        for part in [schedule_vec_bytes::<RealtimeSlotCoordinate>(self.schedule.input_audio_codebooks)?,
+            schedule_vec_bytes::<RealtimeSlotCoordinate>(forced)?,
+            schedule_vec_bytes::<RealtimeTemporalSource>(transition.temporal_inputs.len())?,
+            schedule_vec_bytes::<RealtimeTargetDecision>(transition.targets.len())?] {bytes=bytes.checked_add(part)?;}
+        if self.schedule.frame_convention==RealtimeFrameConvention::AbsoluteDelayedSlots {
+            bytes=bytes.checked_add(schedule_vec_bytes::<RealtimeSlotCoordinate>(transition.warmup_padding.len())?)?;
+        }
+        if let Some(output)=&transition.output {bytes=bytes.checked_add(schedule_vec_bytes::<RealtimeSlotCoordinate>(output.len())?)?;}
+        Some(bytes)
+    }
+
+    fn advance_in(&mut self,schedule:&RealtimeSpeechConfig,forcing:&RealtimeFrameForcing,
+        funding:Option<&crate::HostMetadataFunding>)
+        ->Result<RealtimeFrameTransition,RealtimeScheduleError> {
         self.validate_schedule(schedule)?;
         if forcing.generated_audio.len() != schedule.generated_audio_codebooks {
             return Err(RealtimeScheduleError::ForcingCount {
@@ -556,10 +664,20 @@ impl RealtimeFrameScheduleState {
                 actual: forcing.generated_audio.len(),
             });
         }
-        let mut branch = self.clone();
+        let mut branch = match funding {
+            None=>self.clone(),
+            Some(funding)=>{
+                // Capacity follows this worker's actual insertion loops. A
+                // duplicate coordinate may replace a row, but cannot exceed
+                // this explicitly allocated upper bound.
+                let additional=self.advance_additional(forcing.generated_audio.iter().filter(|v|**v).count(),forcing.text)?;
+                funding.reserve_metadata(Self::advance_control_bytes())?;
+                self.clone_with_host_capacity(additional,funding)?
+            }
+        };
         let transition = match schedule.frame_convention {
-            RealtimeFrameConvention::FeedbackAlignedHistory => branch.advance_feedback(forcing)?,
-            RealtimeFrameConvention::AbsoluteDelayedSlots => branch.advance_absolute(forcing)?,
+            RealtimeFrameConvention::FeedbackAlignedHistory => branch.advance_feedback(forcing,funding)?,
+            RealtimeFrameConvention::AbsoluteDelayedSlots => branch.advance_absolute(forcing,funding)?,
         };
         *self = branch;
         Ok(transition)
@@ -568,30 +686,31 @@ impl RealtimeFrameScheduleState {
     fn advance_feedback(
         &mut self,
         forcing: &RealtimeFrameForcing,
+        funding:Option<&crate::HostMetadataFunding>,
     ) -> Result<RealtimeFrameTransition, RealtimeScheduleError> {
         let schedule = &self.schedule;
         let frontier = self.frontier;
         let next_frontier = checked_add(frontier, 1)?;
         let generated = schedule.generated_audio_codebooks;
-        let mut input_placements = Vec::with_capacity(schedule.input_audio_codebooks);
+        let mut input_placements = schedule_vec(schedule.input_audio_codebooks,funding)?;
         for codebook in generated..schedule.total_audio_codebooks {
             let coordinate = coordinate(frontier, RealtimeFrameSlot::Audio(codebook));
             self.occupied
-                .insert(coordinate, RealtimeSlotOccupancy::Input);
+                .insert_checked(coordinate, RealtimeSlotOccupancy::Input).map_err(|(cause,_)|RealtimeScheduleError::HostMetadata(cause))?;
             input_placements.push(coordinate);
         }
 
-        let mut forced_placements = Vec::new();
+        let mut forced_placements = schedule_vec(checked_add(forcing.generated_audio.iter().filter(|v|**v).count(),usize::from(forcing.text))?,funding)?;
         for (codebook, forced) in forcing.generated_audio.iter().copied().enumerate() {
             if forced {
                 let coordinate = coordinate(frontier, RealtimeFrameSlot::Audio(codebook));
                 self.occupied
-                    .insert(coordinate, RealtimeSlotOccupancy::Forced);
+                    .insert_checked(coordinate, RealtimeSlotOccupancy::Forced).map_err(|(cause,_)|RealtimeScheduleError::HostMetadata(cause))?;
                 forced_placements.push(coordinate);
             }
         }
 
-        let mut temporal_inputs = Vec::with_capacity(schedule.delays.len());
+        let mut temporal_inputs = schedule_vec(schedule.delays.len(),funding)?;
         for slot in slots(schedule.total_audio_codebooks) {
             let delay = schedule.delays[slot.index()];
             let source = frontier
@@ -610,7 +729,7 @@ impl RealtimeFrameScheduleState {
             }
         }
 
-        let mut targets = Vec::with_capacity(1 + schedule.depth_audio_codebooks);
+        let mut targets = schedule_vec(checked_add(1,schedule.depth_audio_codebooks)?,funding)?;
         let text_coordinate = frontier
             .checked_sub(schedule.text_delay())
             .map(|position| coordinate(position, RealtimeFrameSlot::Text));
@@ -620,14 +739,14 @@ impl RealtimeFrameScheduleState {
             RealtimeTargetSource::Sampled
         };
         if let Some(coordinate) = text_coordinate {
-            self.occupied.insert(
+            self.occupied.insert_checked(
                 coordinate,
                 if forcing.text {
                     RealtimeSlotOccupancy::Forced
                 } else {
                     RealtimeSlotOccupancy::Sampled
                 },
-            );
+            ).map_err(|(cause,_)|RealtimeScheduleError::HostMetadata(cause))?;
             if forcing.text {
                 forced_placements.push(coordinate);
             }
@@ -645,14 +764,14 @@ impl RealtimeFrameScheduleState {
                     .map(|position| coordinate(position, slot));
                 let forced = forcing.generated_audio[codebook];
                 if let Some(coordinate) = target_coordinate {
-                    self.occupied.insert(
+                    self.occupied.insert_checked(
                         coordinate,
                         if forced {
                             RealtimeSlotOccupancy::Forced
                         } else {
                             RealtimeSlotOccupancy::Sampled
                         },
-                    );
+                    ).map_err(|(cause,_)|RealtimeScheduleError::HostMetadata(cause))?;
                 }
                 targets.push(RealtimeTargetDecision {
                     slot,
@@ -676,7 +795,7 @@ impl RealtimeFrameScheduleState {
 
         let output = frontier
             .checked_sub(schedule.max_delay())
-            .map(|position| self.output_at_same_position(position))
+            .map(|position| self.output_at_same_position(position,funding))
             .transpose()?;
         self.frontier = next_frontier;
         self.prune_before(frontier.saturating_sub(schedule.max_delay()));
@@ -696,26 +815,27 @@ impl RealtimeFrameScheduleState {
     fn advance_absolute(
         &mut self,
         forcing: &RealtimeFrameForcing,
+        funding:Option<&crate::HostMetadataFunding>,
     ) -> Result<RealtimeFrameTransition, RealtimeScheduleError> {
         let schedule = &self.schedule;
         let frontier = self.frontier;
         let next_frontier = checked_add(frontier, 1)?;
         let generated = schedule.generated_audio_codebooks;
-        let mut input_placements = Vec::with_capacity(schedule.input_audio_codebooks);
+        let mut input_placements = schedule_vec(schedule.input_audio_codebooks,funding)?;
         for codebook in generated..schedule.total_audio_codebooks {
             let position = checked_add(frontier, schedule.audio_delays()[codebook])?;
             let coordinate = coordinate(position, RealtimeFrameSlot::Audio(codebook));
             self.occupied
-                .insert(coordinate, RealtimeSlotOccupancy::Input);
+                .insert_checked(coordinate, RealtimeSlotOccupancy::Input).map_err(|(cause,_)|RealtimeScheduleError::HostMetadata(cause))?;
             input_placements.push(coordinate);
         }
 
-        let mut forced_placements = Vec::new();
+        let mut forced_placements = schedule_vec(checked_add(forcing.generated_audio.iter().filter(|v|**v).count(),usize::from(forcing.text))?,funding)?;
         if forcing.text {
             let position = checked_add(frontier, schedule.text_delay())?;
             let coordinate = coordinate(position, RealtimeFrameSlot::Text);
             self.occupied
-                .insert(coordinate, RealtimeSlotOccupancy::Forced);
+                .insert_checked(coordinate, RealtimeSlotOccupancy::Forced).map_err(|(cause,_)|RealtimeScheduleError::HostMetadata(cause))?;
             forced_placements.push(coordinate);
         }
         for (codebook, forced) in forcing.generated_audio.iter().copied().enumerate() {
@@ -723,28 +843,27 @@ impl RealtimeFrameScheduleState {
                 let position = checked_add(frontier, schedule.audio_delays()[codebook])?;
                 let coordinate = coordinate(position, RealtimeFrameSlot::Audio(codebook));
                 self.occupied
-                    .insert(coordinate, RealtimeSlotOccupancy::Forced);
+                    .insert_checked(coordinate, RealtimeSlotOccupancy::Forced).map_err(|(cause,_)|RealtimeScheduleError::HostMetadata(cause))?;
                 forced_placements.push(coordinate);
             }
         }
 
-        let mut warmup_padding = Vec::new();
+        let mut warmup_padding = schedule_vec(schedule.delays.iter().filter(|delay|frontier<=**delay).count(),funding)?;
         for slot in slots(schedule.total_audio_codebooks) {
             if frontier <= schedule.delays[slot.index()] {
                 let coordinate = coordinate(frontier, slot);
                 self.occupied
-                    .insert(coordinate, RealtimeSlotOccupancy::Padding);
+                    .insert_checked(coordinate, RealtimeSlotOccupancy::Padding).map_err(|(cause,_)|RealtimeScheduleError::HostMetadata(cause))?;
                 warmup_padding.push(coordinate);
             }
         }
 
-        let mut temporal_inputs = Vec::new();
-        let mut targets = Vec::new();
+        let mut temporal_inputs = schedule_vec(if frontier==0 {0}else{schedule.delays.len()},funding)?;
+        let mut targets = schedule_vec(if frontier==0 {0}else{checked_add(1,schedule.depth_audio_codebooks)?},funding)?;
         let output = if frontier == 0 {
             None
         } else {
             let input_position = frontier - 1;
-            temporal_inputs.reserve(schedule.delays.len());
             for slot in slots(schedule.total_audio_codebooks) {
                 let coordinate = coordinate(input_position, slot);
                 let occupancy = self.required_occupancy(coordinate)?;
@@ -753,7 +872,6 @@ impl RealtimeFrameScheduleState {
                     occupancy,
                 });
             }
-            targets.reserve(1 + schedule.depth_audio_codebooks);
             for slot in std::iter::once(RealtimeFrameSlot::Text)
                 .chain((0..schedule.depth_audio_codebooks).map(RealtimeFrameSlot::Audio))
             {
@@ -769,7 +887,7 @@ impl RealtimeFrameScheduleState {
                         RealtimeSlotOccupancy::Sampled,
                     ),
                 };
-                self.occupied.insert(coordinate, occupancy);
+                self.occupied.insert_checked(coordinate, occupancy).map_err(|(cause,_)|RealtimeScheduleError::HostMetadata(cause))?;
                 targets.push(RealtimeTargetDecision {
                     slot,
                     coordinate: Some(coordinate),
@@ -780,14 +898,13 @@ impl RealtimeFrameScheduleState {
                 None
             } else {
                 let base = frontier - schedule.max_delay();
-                let coordinates = (0..generated)
-                    .map(|codebook| {
-                        let position = checked_add(base, schedule.audio_delays()[codebook])?;
-                        let coordinate = coordinate(position, RealtimeFrameSlot::Audio(codebook));
-                        self.required_occupancy(coordinate)?;
-                        Ok(coordinate)
-                    })
-                    .collect::<Result<Vec<_>, RealtimeScheduleError>>()?;
+                let mut coordinates=schedule_vec(generated,funding)?;
+                for codebook in 0..generated {
+                    let position=checked_add(base,schedule.audio_delays()[codebook])?;
+                    let coordinate=coordinate(position,RealtimeFrameSlot::Audio(codebook));
+                    self.required_occupancy(coordinate)?;
+                    coordinates.push(coordinate);
+                }
                 Some(coordinates)
             }
         };
@@ -820,14 +937,15 @@ impl RealtimeFrameScheduleState {
     fn output_at_same_position(
         &self,
         position: usize,
+        funding:Option<&crate::HostMetadataFunding>,
     ) -> Result<Vec<RealtimeSlotCoordinate>, RealtimeScheduleError> {
-        (0..self.schedule.generated_audio_codebooks)
-            .map(|codebook| {
-                let coordinate = coordinate(position, RealtimeFrameSlot::Audio(codebook));
-                self.required_occupancy(coordinate)?;
-                Ok(coordinate)
-            })
-            .collect()
+        let mut output=schedule_vec(self.schedule.generated_audio_codebooks,funding)?;
+        for codebook in 0..self.schedule.generated_audio_codebooks {
+            let coordinate=coordinate(position,RealtimeFrameSlot::Audio(codebook));
+            self.required_occupancy(coordinate)?;
+            output.push(coordinate);
+        }
+        Ok(output)
     }
 
     fn prune_before(&mut self, minimum: usize) {
@@ -841,6 +959,7 @@ impl SemanticStateTransaction for RealtimeFrameScheduleState {
     type Error = RealtimeScheduleError;
 
     fn branch(&self) -> Result<Self::Branch, Self::Error> {
+        if self.occupied.is_prepared() {return Err(RealtimeScheduleError::HostSourceRequired);}
         Ok(self.clone())
     }
 
@@ -855,6 +974,12 @@ impl SemanticStateTransaction for RealtimeFrameScheduleState {
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeScheduleError {
+    /// A paid state must use its admitted copy/advance source.
+    #[error("realtime schedule requires its admitted host source")]
+    HostSourceRequired,
+    /// The exact host source cannot fund a schedule destination.
+    #[error(transparent)]
+    HostMetadata(#[from] crate::HostMetadataFundingError),
     /// State belongs to a different normalized schedule.
     #[error("realtime frame schedule state does not match the normalized schedule")]
     ScheduleMismatch,
@@ -875,6 +1000,17 @@ pub enum RealtimeScheduleError {
     /// Frontier plus delay exceeded portable integer coordinates.
     #[error("realtime frame coordinate overflowed")]
     CoordinateOverflow,
+}
+
+fn schedule_vec<T>(capacity:usize,funding:Option<&crate::HostMetadataFunding>)
+    ->Result<Vec<T>,RealtimeScheduleError> {
+    if let Some(funding)=funding {
+        let bytes=schedule_vec_bytes::<T>(capacity).ok_or(crate::HostMetadataFundingError::Overflow)?;
+        funding.reserve_metadata(bytes)?;
+    }
+    let mut values=Vec::new();
+    values.try_reserve_exact(capacity).map_err(|_|crate::HostMetadataFundingError::Unavailable)?;
+    Ok(values)
 }
 
 fn checked_add(left: usize, right: usize) -> Result<usize, RealtimeScheduleError> {
@@ -1088,49 +1224,76 @@ impl RealtimeInputFrame {
 
 impl WorkDescriptor for RealtimeInputFrame {
     type Error = RealtimeInputDescriptorError;
-
+    fn descriptor_words(&self) -> Option<usize> {
+        let mut count = RealtimeDescriptorCount(0);
+        self.write_descriptor(&mut count).ok()?;
+        Some(count.0)
+    }
     fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Self::Error> {
-        output.push(descriptor_len(self.batch)?);
+        self.write_descriptor(output)
+    }
+}
+impl RealtimeInputFrame {
+    fn write_descriptor<W: RealtimeDescriptorWords>(&self, output: &mut W) -> Result<(),RealtimeInputDescriptorError> {
+        output.push_word(descriptor_len(self.batch)?)?;
         encode_i32_descriptor(&self.input_audio_tokens, output)?;
         encode_optional_i32_descriptor(self.forced_generated_audio_tokens.as_deref(), output)?;
         match self.forced_generated_audio_codebooks.as_deref() {
             Some(mask) => {
-                output.push(1);
-                output.push(descriptor_len(mask.len())?);
-                output.extend(mask.iter().copied().map(u32::from));
+                output.push_word(1)?;
+                output.push_word(descriptor_len(mask.len())?)?;
+                output.extend_words(mask.iter().copied().map(u32::from))?;
             }
-            None => output.push(0),
+            None => output.push_word(0)?,
         }
         encode_optional_i32_descriptor(self.forced_text_tokens.as_deref(), output)?;
-        output.push(u32::from(self.retain_diagnostics));
+        output.push_word(u32::from(self.retain_diagnostics))?;
         Ok(())
     }
 }
 
-fn encode_i32_descriptor(
+trait RealtimeDescriptorWords {
+    fn push_word(&mut self, word: u32) -> Result<(),RealtimeInputDescriptorError>;
+    fn extend_words(&mut self, words: impl IntoIterator<Item=u32>) -> Result<(),RealtimeInputDescriptorError> {
+        for word in words { self.push_word(word)?; }
+        Ok(())
+    }
+}
+impl RealtimeDescriptorWords for Vec<u32> {
+    fn push_word(&mut self, word: u32) -> Result<(),RealtimeInputDescriptorError> { self.push(word); Ok(()) }
+}
+struct RealtimeDescriptorCount(usize);
+impl RealtimeDescriptorWords for RealtimeDescriptorCount {
+    fn push_word(&mut self, _: u32) -> Result<(),RealtimeInputDescriptorError> {
+        self.0 = self.0.checked_add(1).ok_or(RealtimeInputDescriptorError { value: usize::MAX })?;
+        Ok(())
+    }
+}
+
+fn encode_i32_descriptor<W: RealtimeDescriptorWords>(
     values: &[i32],
-    output: &mut Vec<u32>,
+    output: &mut W,
 ) -> Result<(), RealtimeInputDescriptorError> {
-    output.push(descriptor_len(values.len())?);
-    output.extend(
+    output.push_word(descriptor_len(values.len())?)?;
+    output.extend_words(
         values
             .iter()
             .map(|value| u32::from_ne_bytes(value.to_ne_bytes())),
-    );
+    )?;
     Ok(())
 }
 
-fn encode_optional_i32_descriptor(
+fn encode_optional_i32_descriptor<W: RealtimeDescriptorWords>(
     values: Option<&[i32]>,
-    output: &mut Vec<u32>,
+    output: &mut W,
 ) -> Result<(), RealtimeInputDescriptorError> {
     match values {
         Some(values) => {
-            output.push(1);
+            output.push_word(1)?;
             encode_i32_descriptor(values, output)
         }
         None => {
-            output.push(0);
+            output.push_word(0)?;
             Ok(())
         }
     }
@@ -1188,8 +1351,10 @@ impl RealtimeDecisionDiagnostics {
     }
 }
 
+mod output_source;
+
 /// Portable host observation of one completed realtime output frame.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug)]
 pub struct RealtimeOutputFrame {
     batch: usize,
     text_tokens: Vec<i32>,
@@ -1197,6 +1362,8 @@ pub struct RealtimeOutputFrame {
     sampled_audio_tokens: Vec<i32>,
     output_audio_tokens: Option<Vec<i32>>,
     diagnostics: Vec<RealtimeDecisionDiagnostics>,
+    // Original host account retires after every owned output payload.
+    host_funding: Option<crate::HostMetadataFunding>,
 }
 
 impl RealtimeOutputFrame {
@@ -1216,6 +1383,7 @@ impl RealtimeOutputFrame {
             sampled_audio_tokens,
             output_audio_tokens,
             diagnostics,
+            host_funding: None,
         }
     }
     /// Batch dimension.
@@ -1246,22 +1414,31 @@ impl RealtimeOutputFrame {
 
 impl WorkDescriptor for RealtimeOutputFrame {
     type Error = RealtimeInputDescriptorError;
-
+    fn descriptor_words(&self) -> Option<usize> {
+        let mut count = RealtimeDescriptorCount(0);
+        self.write_descriptor(&mut count).ok()?;
+        Some(count.0)
+    }
     fn encode_descriptor(&self, output: &mut Vec<u32>) -> Result<(), Self::Error> {
-        output.push(descriptor_len(self.batch)?);
+        self.write_descriptor(output)
+    }
+}
+impl RealtimeOutputFrame {
+    fn write_descriptor<W: RealtimeDescriptorWords>(&self, output: &mut W) -> Result<(),RealtimeInputDescriptorError> {
+        output.push_word(descriptor_len(self.batch)?)?;
         encode_i32_descriptor(&self.text_tokens, output)?;
         encode_i32_descriptor(&self.decision_audio_tokens, output)?;
         encode_i32_descriptor(&self.sampled_audio_tokens, output)?;
         encode_optional_i32_descriptor(self.output_audio_tokens.as_deref(), output)?;
-        output.push(descriptor_len(self.diagnostics.len())?);
+        output.push_word(descriptor_len(self.diagnostics.len())?)?;
         for diagnostic in &self.diagnostics {
-            output.push(descriptor_len(diagnostic.prediction())?);
-            output.push(descriptor_len(diagnostic.shape().len())?);
+            output.push_word(descriptor_len(diagnostic.prediction())?)?;
+            output.push_word(descriptor_len(diagnostic.shape().len())?)?;
             for &dimension in diagnostic.shape() {
-                output.push(descriptor_len(dimension)?);
+                output.push_word(descriptor_len(dimension)?)?;
             }
-            output.push(descriptor_len(diagnostic.logits().len())?);
-            output.extend(diagnostic.logits().iter().map(|value| value.to_bits()));
+            output.push_word(descriptor_len(diagnostic.logits().len())?)?;
+            output.extend_words(diagnostic.logits().iter().map(|value| value.to_bits()))?;
         }
         Ok(())
     }
@@ -1577,4 +1754,15 @@ mod tests {
             .unwrap();
         assert_ne!(descriptor, changed);
     }
+}
+
+fn clone_occupied(value:&RealtimeSlotOccupancy)->Result<RealtimeSlotOccupancy,crate::HostMetadataFundingError> {Ok(*value)}
+
+fn schedule_vec_bytes<T>(capacity:usize)->Option<usize> {
+    let frames=[std::mem::size_of::<Vec<T>>(),
+        std::mem::size_of::<Result<Vec<T>,RealtimeScheduleError>>(),
+        std::mem::size_of::<std::collections::TryReserveError>(),
+        crate::HostMetadataFunding::reservation_control_bytes()];
+    frames.into_iter().try_fold(std::mem::size_of_val(&frames)
+        .checked_add(std::alloc::Layout::array::<T>(capacity).ok()?.size())?,usize::checked_add)
 }

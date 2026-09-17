@@ -752,8 +752,41 @@ fn write_gemma4_component_fixture(directory: &Path, sparse: bool, quantizable: b
             "pooling_kernel_size":2, "position_embedding_size":4, "rms_norm_eps":0.00001
         }
     });
+    write_gemma4_nonzero_config(directory, &config);
+}
+
+pub(crate) fn write_gemma4_original_media_fixture(directory: &Path) {
+    let config = serde_json::json!({
+        "model_type":"gemma4_unified", "tie_word_embeddings":false,
+        "image_token_id":30, "audio_token_id":31,
+        "text_config":{
+            "model_type":"gemma4_text", "hidden_size":16, "num_hidden_layers":2,
+            "intermediate_size":16, "num_attention_heads":4, "num_key_value_heads":2,
+            "head_dim":4, "rms_norm_eps":0.00001, "vocab_size":32,
+            "max_position_embeddings":128, "attention_k_eq_v":false,
+            "layer_types":["full_attention","sliding_attention"], "sliding_window":8
+        },
+        "vision_config":{
+            "hidden_size":16, "intermediate_size":16, "num_hidden_layers":1,
+            "num_attention_heads":4, "num_key_value_heads":2, "head_dim":4,
+            "patch_size":4, "pooling_kernel_size":2, "position_embedding_size":4,
+            "rms_norm_eps":0.00001
+        },
+        "audio_config":{
+            "hidden_size":16, "num_hidden_layers":1, "num_attention_heads":4,
+            "output_proj_dims":8, "conv_kernel_size":3, "attention_chunk_size":4,
+            "attention_context_left":5, "attention_context_right":0,
+            "attention_invalid_logits_value":-1000000000.0, "attention_logit_cap":50.0,
+            "residual_weight":0.5, "rms_norm_eps":0.00001,
+            "subsampling_conv_channels":[4,8]
+        }
+    });
+    write_gemma4_nonzero_config(directory, &config);
+}
+
+fn write_gemma4_nonzero_config(directory: &Path, config: &serde_json::Value) {
     let family = eredu_architectures::gemma4::FamilyConfig::from_hf_json(
-        &serde_json::to_vec(&config).unwrap(),
+        &serde_json::to_vec(config).unwrap(),
     )
     .unwrap();
     let schema = eredu_architectures::gemma4::safetensors_plan(&family).unwrap();

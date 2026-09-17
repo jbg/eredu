@@ -1,20 +1,46 @@
 use super::*;
 
+mod original_copy;
+pub(crate) use original_copy::{
+    OriginalCopyEnvironment, OriginalCopyEnvironmentError, RetainedOriginalCopyEnvironment,
+    PreparedOriginalCopyEnvironment, PreparedOriginalCopyEnvironmentError,
+};
+
 /// MLX backend selected for a complete model/session.
 pub struct MlxBackend<'a> {
-    stream: Stream,
-    weights_stream: Stream,
+    streams: BackendStreams,
     realized_device: Option<MlxDeviceIdentity>,
     world: Option<&'a safemlx::distributed::Group>,
+    memory_pool: eredu_runtime::working_memory::WorkingMemoryPool,
+}
+
+enum BackendStreams {
+    Ordinary { stream: Stream, weights: Stream },
+    Prepared(crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams),
 }
 
 impl MlxBackend<'static> {
+    pub(crate) fn for_prepared_execution_plan(
+        streams: crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams,
+        realized_device: MlxDeviceIdentity,
+    ) -> Self {
+        Self {
+            streams: BackendStreams::Prepared(streams),
+            realized_device: Some(realized_device),
+            world: None,
+            memory_pool: crate::backend::managed_memory::domain(),
+        }
+    }
+
     pub(crate) fn new(stream: &Stream, weights_stream: &Stream) -> Self {
         Self {
-            stream: stream.clone(),
-            weights_stream: weights_stream.clone(),
+            streams: BackendStreams::Ordinary {
+                stream: stream.clone(),
+                weights: weights_stream.clone(),
+            },
             realized_device: None,
             world: None,
+            memory_pool: crate::backend::managed_memory::domain(),
         }
     }
 
@@ -24,37 +50,99 @@ impl MlxBackend<'static> {
         realized_device: MlxDeviceIdentity,
     ) -> Self {
         Self {
-            stream: stream.clone(),
-            weights_stream: weights_stream.clone(),
+            streams: BackendStreams::Ordinary {
+                stream: stream.clone(),
+                weights: weights_stream.clone(),
+            },
             realized_device: Some(realized_device),
             world: None,
+            memory_pool: crate::backend::managed_memory::domain(),
         }
     }
 }
 
 impl<'a> MlxBackend<'a> {
+    pub(crate) fn with_prepared_distributed_world(
+        streams: crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams,
+        world: &'a safemlx::distributed::Group,
+    ) -> Self {
+        Self {
+            streams: BackendStreams::Prepared(streams),
+            realized_device: None,
+            world: Some(world),
+            memory_pool: crate::backend::managed_memory::domain(),
+        }
+    }
+
     pub(crate) fn with_distributed_world(
         stream: &Stream,
         weights_stream: &Stream,
         world: &'a safemlx::distributed::Group,
     ) -> Self {
         Self {
-            stream: stream.clone(),
-            weights_stream: weights_stream.clone(),
+            streams: BackendStreams::Ordinary {
+                stream: stream.clone(),
+                weights: weights_stream.clone(),
+            },
             realized_device: None,
             world: Some(world),
+            memory_pool: crate::backend::managed_memory::domain(),
         }
     }
-    pub(crate) const fn stream(&self) -> &Stream {
-        &self.stream
+    pub(crate) fn stream(&self) -> &Stream {
+        match &self.streams {
+            BackendStreams::Ordinary { stream, .. } => stream,
+            BackendStreams::Prepared(streams) => streams.execution(),
+        }
+    }
+    pub(crate) fn weights_stream(&self) -> &Stream {
+        match &self.streams {
+            BackendStreams::Ordinary { weights, .. } => weights,
+            BackendStreams::Prepared(streams) => streams.source(),
+        }
+    }
+    pub(crate) fn validate_original_stream_owners(&self) -> Result<(), Error> {
+        match &self.streams {
+            BackendStreams::Prepared(streams) => streams
+                .validate_pool(&self.memory_pool)
+                .map_err(Error::GpuStreamOwnership),
+            BackendStreams::Ordinary { .. } => Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            )),
+        }
     }
 
-    pub(crate) const fn weights_stream(&self) -> &Stream {
-        &self.weights_stream
+    pub(crate) fn observe_original_streams_idle(
+        &self,
+    ) -> Result<(), crate::backend::managed_memory::gpu_stream::MlxStreamOwnershipError> {
+        use crate::backend::managed_memory::gpu_stream::MlxStreamOwnershipError;
+        match &self.streams {
+            BackendStreams::Prepared(streams) => streams.observe_idle(&self.memory_pool),
+            BackendStreams::Ordinary { .. } => Err(MlxStreamOwnershipError::Accounting(
+                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            )),
+        }
+    }
+
+    pub(crate) fn memory_pool(&self) -> &eredu_runtime::working_memory::WorkingMemoryPool {
+        &self.memory_pool
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_memory_pool(
+        mut self,
+        pool: eredu_runtime::working_memory::WorkingMemoryPool,
+    ) -> Self {
+        self.memory_pool = pool;
+        self
+    }
+
+    pub(crate) fn matches_prepared_target(&self, target: &MlxPreparedTarget) -> bool {
+        target.matches(self.stream(), self.world)
     }
 
     pub(crate) fn validate_prepared_target(&self, target: &MlxPreparedTarget) -> Result<(), Error> {
-        target.validate(&self.stream, self.world)
+        target.validate(self.stream(), self.world)
     }
 
     fn realize_selected_communication(
@@ -80,10 +168,45 @@ impl<'a> MlxBackend<'a> {
                 "distributed model preparation requires native::distributed_backend".into(),
             )
         })?;
-        rank.validate_execution_stream(&self.stream)?;
+        rank.validate_execution_stream(self.stream())?;
         #[cfg(test)]
         crate::tests::support::path_instrumentation::manifest_communication_realization_attempt();
-        MlxDistributedSession::from_manifest(manifest, world, &self.stream).map(Some)
+        MlxDistributedSession::from_manifest(manifest, world, self.stream()).map(Some)
+    }
+
+    fn prepare_layerwise_source(
+        &self,
+        sources: &eredu_architectures::prepared_sources::PreparedModelSources,
+    ) -> Result<Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>, Error>
+    {
+        // A safely retired previous model must release its unquoted exclusion
+        // before the new source initializer attempts admission. Still-live model
+        // owners remain authoritative; this never forces their retirement.
+        crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+        crate::backend::runtime::execution::generic::prepare_layerwise_manager(
+            sources,
+            self.memory_pool(),
+            self.weights_stream(),
+            self.stream(),
+        )
+    }
+
+    /// Explicit prepared foreground source entry for the disk operation join.
+    /// The ordinary/public path does not select it until request slots and native
+    /// disk capacity are complete. The existing move-only loading transport can
+    /// carry its returned manager without retaining incoming source caches.
+    pub(in crate::backend) fn prepare_foreground_layerwise_source(
+        &self,
+        sources: &eredu_architectures::prepared_sources::PreparedModelSources,
+    ) -> Result<Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>, Error>
+    {
+        crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
+        crate::backend::runtime::execution::generic::prepare_foreground_layerwise_manager(
+            sources,
+            self.memory_pool(),
+            self.weights_stream(),
+            self.stream(),
+        )
     }
 
     pub(in crate::backend) fn materialize_after_communication(
@@ -97,13 +220,47 @@ impl<'a> MlxBackend<'a> {
         // native allocations. Retire a previous executable here rather than
         // keeping its weights until the replacement session is constructed.
         crate::backend::nn::shared::MlxNeuralBackend::reclaim_retired_resources();
-        let distributed = self.realize_selected_communication(manifest, rank)?;
-        materialize(distributed).map(|model| PreparedModel::new(model, capabilities))
+        let memory =
+            crate::backend::managed_memory::NativeMemoryOwner::acquire(self.memory_pool())?;
+        crate::backend::submission_recovery::detached_retained(memory.clone(), || {
+            let distributed = self.realize_selected_communication(manifest, rank)?;
+            materialize(distributed)
+                .and_then(|model| model.with_memory_owner(memory))
+                .map(|model| PreparedModel::new(model, capabilities))
+        })
+    }
+
+    /// Ordinary model construction while a cold semantic owner borrows the exact
+    /// selected configuration. The additional source/selection copy occurs only
+    /// inside the existing load owner's recovery scope. It is ordinary load cost,
+    /// not part of original prepared-media semantic residence or managed loading.
+    pub fn prepare_model_borrowed(
+        &self,
+        config: &crate::composition::mlx::loading::MlxModelConfig,
+    ) -> Result<PreparedModel<MlxModel>, Error> {
+        let layerwise_manager = self.prepare_layerwise_source(&config.sources)?;
+        let addressable_manager = crate::composition::mlx::loading::prepare_addressable_source(
+            &config.sources, self.memory_pool(), self.weights_stream(), self.stream())?;
+        self.materialize_after_communication(
+            config.sources.selected().session_capabilities(),
+            config.sources.selected().communication_manifest(),
+            config.rank_context,
+            |distributed| {
+                crate::composition::mlx::loading::materialize_model_plan_with_layerwise_manager(
+                    config.sources.clone(),
+                    distributed,
+                    self.stream(),
+                    self.weights_stream(),
+                    layerwise_manager,
+            addressable_manager,
+        )
+            },
+        )
     }
 
     /// Waits for all work submitted to this backend's execution queue.
     pub fn synchronize(&self) -> Result<(), Error> {
-        self.stream.synchronize().map_err(Into::into)
+        self.stream().synchronize().map_err(Into::into)
     }
 }
 
@@ -113,12 +270,16 @@ impl<'a> BackendProvider for MlxBackend<'a> {
     type Session = MlxModelSession;
     type Error = Error;
 
+    fn into_backend_failure(error: Self::Error) -> eredu_core::BackendFailure {
+        error.into_backend_failure()
+    }
+
     fn descriptor(&self) -> BackendDescriptor {
         BackendDescriptor::new("mlx", env!("CARGO_PKG_VERSION"))
     }
 
     fn devices(&self) -> Result<Vec<(DeviceDescriptor, DeviceCapabilities)>, Self::Error> {
-        let device = self.stream.get_device()?;
+        let device = self.stream().get_device()?;
         let identity = match &self.realized_device {
             Some(identity) => {
                 identity.validate_device(&device)?;
@@ -136,16 +297,21 @@ impl<'a> BackendProvider for MlxBackend<'a> {
         &self,
         config: Self::ModelConfig,
     ) -> Result<PreparedModel<Self::Model>, Self::Error> {
+        let layerwise_manager = self.prepare_layerwise_source(&config.sources)?;
+        let addressable_manager = crate::composition::mlx::loading::prepare_addressable_source(
+            &config.sources, self.memory_pool(), self.weights_stream(), self.stream())?;
         let capabilities = config.sources.selected().session_capabilities();
         let rank = config.rank_context;
         let manifest = config.sources.selected().communication_manifest().cloned();
         self.materialize_after_communication(capabilities, manifest.as_ref(), rank, |distributed| {
-            crate::composition::mlx::loading::materialize_model_plan(
+            crate::composition::mlx::loading::materialize_model_plan_with_layerwise_manager(
                 config.sources,
                 distributed,
-                &self.stream,
-                &self.weights_stream,
-            )
+                self.stream(),
+                self.weights_stream(),
+                layerwise_manager,
+            addressable_manager,
+        )
         })
     }
 

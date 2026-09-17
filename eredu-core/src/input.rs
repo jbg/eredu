@@ -6,6 +6,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::TensorDtype;
 
+mod fixed_map;
+pub use fixed_map::InputIdentityMap;
+
+mod text_descriptor;
+pub use text_descriptor::TextTokenInputDescriptorPlan;
+mod word_writer;
+pub use word_writer::InputWordWriteError;
+
+#[cfg(test)]
+mod capacity_tests;
+
 /// Modality of one ordered model-input part.
 #[derive(Debug, Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -153,23 +164,10 @@ impl InputExtent {
         self.wire_tag()
     }
 
-    fn encode_words(self, output: &mut Vec<u32>) -> Result<(), PreparedInputError> {
-        output.push(self.wire_tag());
-        let values: &[usize] = match &self {
-            Self::PatchGrid {
-                time,
-                height,
-                width,
-            } => &[*time, *height, *width],
-            Self::AudioValidFrames(frames) => &[*frames],
-        };
-        for value in values {
-            output.push(
-                u32::try_from(*value)
-                    .map_err(|_| PreparedInputError::WireValueOverflow("input extent"))?,
-            );
-        }
-        Ok(())
+    /// Stable canonical key used by the prepared-input descriptor map.
+    /// This describes the existing extent; it grants no construction authority.
+    pub const fn identity_key(self) -> u32 {
+        self.key()
     }
 
     fn decode_words(cursor: &mut WordCursor<'_>) -> Result<Self, PreparedInputError> {
@@ -246,19 +244,39 @@ impl InputTensorIdentity {
         &self.shape
     }
 
-    fn encode_words(&self, output: &mut Vec<u32>) -> Result<(), PreparedInputError> {
-        encode_dtype(&self.dtype, output)?;
-        output.push(
-            u32::try_from(self.shape.len())
-                .map_err(|_| PreparedInputError::WireValueOverflow("tensor rank"))?,
-        );
-        for dimension in &self.shape {
-            output.push(
-                u32::try_from(*dimension)
-                    .map_err(|_| PreparedInputError::WireValueOverflow("tensor dimension"))?,
-            );
-        }
-        Ok(())
+    /// Exact retained inline and owned shape/name capacity, excluding allocator
+    /// bookkeeping. Inspection neither encodes nor clones the identity.
+    pub fn capacity_bytes(&self) -> Option<u64> {
+        u64::try_from(std::mem::size_of::<Self>())
+            .ok()?
+            .checked_add(self.heap_capacity_bytes()?)
+    }
+
+    fn heap_capacity_bytes(&self) -> Option<u64> {
+        let shape = u64::try_from(
+            self.shape
+                .capacity()
+                .checked_mul(std::mem::size_of::<usize>())?,
+        )
+        .ok()?;
+        let name = match &self.dtype {
+            TensorDtype::Encoded(name) => u64::try_from(name.capacity()).ok()?,
+            TensorDtype::Bool
+            | TensorDtype::F32
+            | TensorDtype::F16
+            | TensorDtype::Bf16
+            | TensorDtype::I8
+            | TensorDtype::U8
+            | TensorDtype::U16
+            | TensorDtype::U32
+            | TensorDtype::U64
+            | TensorDtype::I16
+            | TensorDtype::I32
+            | TensorDtype::I64
+            | TensorDtype::F64
+            | TensorDtype::Complex64 => 0,
+        };
+        shape.checked_add(name)
     }
 
     fn decode_words(cursor: &mut WordCursor<'_>) -> Result<Self, PreparedInputError> {
@@ -280,11 +298,57 @@ pub struct InputPartDescriptor {
     modality: InputModality,
     payload_kind: InputPayloadKind,
     payload: InputTensorIdentity,
-    metadata: BTreeMap<InputMetadataKey, InputTensorIdentity>,
-    extents: BTreeMap<u32, InputExtent>,
+    metadata: InputIdentityMap<InputMetadataKey, InputTensorIdentity>,
+    extents: InputIdentityMap<u32, InputExtent>,
 }
 
 impl InputPartDescriptor {
+    /// Validates already allocated canonical metadata/extent entries without
+    /// constructing a tree, cloning shapes, or allocating another collection.
+    /// The caller retains the prior construction authority for owned inputs.
+    pub fn from_fixed_entries(
+        modality: InputModality,
+        payload_kind: InputPayloadKind,
+        payload: InputTensorIdentity,
+        metadata: InputIdentityMap<InputMetadataKey, InputTensorIdentity>,
+        extents: InputIdentityMap<u32, InputExtent>,
+    ) -> Result<Self, PreparedInputError> {
+        if !payload_kind.accepts(modality) {
+            return Err(PreparedInputError::IncompatiblePayload {
+                modality,
+                payload: payload_kind,
+            });
+        }
+        for (key, _) in &metadata {
+            if !key.accepts(modality) {
+                return Err(PreparedInputError::IncompatibleMetadata {
+                    modality,
+                    key: *key,
+                });
+            }
+        }
+        for (key, extent) in &extents {
+            if !extent.accepts(modality) {
+                return Err(PreparedInputError::IncompatibleExtent {
+                    modality,
+                    extent: *extent,
+                });
+            }
+            if *key != extent.key() {
+                return Err(PreparedInputError::InvalidWireValue {
+                    field: "extent key",
+                    value: *key,
+                });
+            }
+        }
+        Ok(Self {
+            modality,
+            payload_kind,
+            payload,
+            metadata,
+            extents,
+        })
+    }
     /// Validates modality/payload compatibility and unique typed metadata.
     pub fn new(
         modality: InputModality,
@@ -331,8 +395,8 @@ impl InputPartDescriptor {
             modality,
             payload_kind,
             payload,
-            metadata: typed_metadata,
-            extents: typed_extents,
+            metadata: InputIdentityMap::from_map(typed_metadata),
+            extents: InputIdentityMap::from_map(typed_extents),
         })
     }
 
@@ -352,7 +416,7 @@ impl InputPartDescriptor {
     }
 
     /// Typed metadata identities in stable key order.
-    pub const fn metadata(&self) -> &BTreeMap<InputMetadataKey, InputTensorIdentity> {
+    pub const fn metadata(&self) -> &InputIdentityMap<InputMetadataKey, InputTensorIdentity> {
         &self.metadata
     }
 
@@ -364,6 +428,27 @@ impl InputPartDescriptor {
     /// Looks up one typed metadata identity.
     pub fn metadata_value(&self, key: InputMetadataKey) -> Option<&InputTensorIdentity> {
         self.metadata.get(&key)
+    }
+
+    /// Exact retained inline and owned descriptor capacity. Fixed entry arrays,
+    /// tensor shapes and encoded dtype names are counted once; no tensor payload
+    /// or allocator bookkeeping is included.
+    pub fn capacity_bytes(&self) -> Option<u64> {
+        u64::try_from(std::mem::size_of::<Self>())
+            .ok()?
+            .checked_add(self.heap_capacity_bytes()?)
+    }
+
+    fn heap_capacity_bytes(&self) -> Option<u64> {
+        let mut total = self
+            .payload
+            .heap_capacity_bytes()?
+            .checked_add(self.metadata.capacity_bytes()?)?
+            .checked_add(self.extents.capacity_bytes()?)?;
+        for tensor in self.metadata.values() {
+            total = total.checked_add(tensor.heap_capacity_bytes()?)?;
+        }
+        Some(total)
     }
 
     /// Requires metadata selected by family policy.
@@ -400,6 +485,26 @@ impl PreparedInputIdentity {
     /// Ordered input-part descriptors.
     pub fn parts(&self) -> &[InputPartDescriptor] {
         &self.parts
+    }
+
+    /// Exact retained inline and owned allocation capacity of this description.
+    /// Includes spare part/shape vector capacity, fixed metadata/extent entries
+    /// and encoded dtype string capacity. Excludes allocator bookkeeping and
+    /// native tensors. This read-only measurement grants no allocation authority.
+    pub fn capacity_bytes(&self) -> Option<u64> {
+        let parts = u64::try_from(
+            self.parts
+                .capacity()
+                .checked_mul(std::mem::size_of::<InputPartDescriptor>())?,
+        )
+        .ok()?;
+        let mut total = u64::try_from(std::mem::size_of::<Self>())
+            .ok()?
+            .checked_add(parts)?;
+        for part in &self.parts {
+            total = total.checked_add(part.heap_capacity_bytes()?)?;
+        }
+        Some(total)
     }
 
     /// Logical host storage for this payload-free description, including shapes,
@@ -445,29 +550,14 @@ impl PreparedInputIdentity {
     /// Encodes the identity for backend-independent rank agreement.
     pub fn encode_words(&self) -> Result<Vec<u32>, PreparedInputError> {
         let mut output = Vec::new();
-        output.push(
-            u32::try_from(self.parts.len())
-                .map_err(|_| PreparedInputError::WireValueOverflow("part count"))?,
-        );
-        for part in &self.parts {
-            output.extend_from_slice(&[part.modality.wire_tag(), part.payload_kind.wire_tag()]);
-            part.payload.encode_words(&mut output)?;
-            output.push(
-                u32::try_from(part.metadata.len())
-                    .map_err(|_| PreparedInputError::WireValueOverflow("metadata count"))?,
-            );
-            for (key, identity) in &part.metadata {
-                output.push(key.wire_tag());
-                identity.encode_words(&mut output)?;
-            }
-            output.push(
-                u32::try_from(part.extents.len())
-                    .map_err(|_| PreparedInputError::WireValueOverflow("extent count"))?,
-            );
-            for extent in part.extents.values().copied() {
-                extent.encode_words(&mut output)?;
-            }
-        }
+        self.visit_encoded_words(|word| {
+            output.push(word);
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .map_err(|error| match error {
+            InputWordWriteError::Encoding(error) => error,
+            InputWordWriteError::Sink(never) => match never {},
+        })?;
         Ok(output)
     }
 
@@ -640,7 +730,7 @@ impl WordCursor<'_> {
     }
 }
 
-fn encode_dtype(dtype: &TensorDtype, output: &mut Vec<u32>) -> Result<(), PreparedInputError> {
+fn dtype_wire_tag(dtype: &TensorDtype) -> Result<u32, PreparedInputError> {
     let tag = match dtype {
         TensorDtype::Bool => 0,
         TensorDtype::U8 => 1,
@@ -660,8 +750,7 @@ fn encode_dtype(dtype: &TensorDtype, output: &mut Vec<u32>) -> Result<(), Prepar
             return Err(PreparedInputError::EncodedRuntimeDtype(name.clone()))
         }
     };
-    output.push(tag);
-    Ok(())
+    Ok(tag)
 }
 
 fn decode_dtype(cursor: &mut WordCursor<'_>) -> Result<TensorDtype, PreparedInputError> {

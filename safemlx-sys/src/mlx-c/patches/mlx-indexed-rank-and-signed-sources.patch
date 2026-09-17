@@ -1,0 +1,91 @@
+diff --git a/mlx/backend/metal/indexing.cpp b/mlx/backend/metal/indexing.cpp
+--- a/mlx/backend/metal/indexing.cpp
++++ b/mlx/backend/metal/indexing.cpp
+@@ -155,7 +155,7 @@
+   std::string lib_name = kernel_name;
+ 
+   const bool original = d.original_precompiled_kernel_required();
+-  if (original && !(nidx == 1 && idx_ndim == 1 &&
++  if (original && !(nidx == 1 && idx_ndim >= 1 && idx_ndim <= 3 &&
+       single_index_precompiled(out.dtype(), inputs[1].dtype())))
+     throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
+   auto lib = original ? d.precompiled_library() : d.get_library_borrowed(lib_name, [&]() {
+@@ -601,7 +601,7 @@
+   if (original && (reduce_type_ != ScatterAxis::None ||
+       (out.dtype() != float32 && out.dtype() != float16 && out.dtype() != bfloat16 &&
+        out.dtype() != bool_) ||
+-      idx.dtype() != uint32))
++      (idx.dtype() != int32 && idx.dtype() != uint32)))
+     throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
+   auto lib = original ? d.precompiled_library() : d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+diff --git a/mlx/backend/metal/kernels/indexing/single_index.metal b/mlx/backend/metal/kernels/indexing/single_index.metal
+--- a/mlx/backend/metal/kernels/indexing/single_index.metal
++++ b/mlx/backend/metal/kernels/indexing/single_index.metal
+@@ -1,12 +1,12 @@
+ // Copyright © 2023-2025 Apple Inc.
+-// Precompiled wrappers of the existing generic rank-one, one-index workers.
++// Precompiled one-index Gather ranks 1..3 and the existing rank-one Scatter.
+ #include "mlx/backend/metal/kernels/utils.h"
+ #include "mlx/backend/metal/kernels/atomic.h"
+ #include "mlx/backend/metal/kernels/reduction/ops.h"
+ #include "mlx/backend/metal/kernels/indexing/gather.h"
+ #include "mlx/backend/metal/kernels/indexing/scatter.h"
+ 
+-template <typename T, typename IdxT, typename LocT>
++template <typename T, typename IdxT, typename LocT, int IndexNDim>
+ 
+ [[kernel]] void single_index_gather(
+     const device T* src [[buffer(0)]],
+@@ -26,7 +26,7 @@
+   Indices<IdxT, 1> idxs{
+     { idx0 }, idx_shapes, idx_strides, idx_contigs, idx_ndim};
+ 
+-  return gather_impl<T, IdxT, 1, 1, LocT>(
++  return gather_impl<T, IdxT, 1, IndexNDim, LocT>(
+       src,
+       out,
+       src_shape,
+@@ -78,7 +78,9 @@
+ }
+ 
+ #define SINGLE_INDEX_WIDTH(tname, type, iname, index, lname, location) \
+-  instantiate_kernel("gather" #tname #iname "_1_1_" #lname, single_index_gather, type, index, location) \
++  instantiate_kernel("gather" #tname #iname "_1_1_" #lname, single_index_gather, type, index, location, 1) \
++  instantiate_kernel("gather" #tname #iname "_1_2_" #lname, single_index_gather, type, index, location, 2) \
++  instantiate_kernel("gather" #tname #iname "_1_3_" #lname, single_index_gather, type, index, location, 3) \
+   instantiate_kernel("scatter" #tname #iname "_none_1_updc_true_nwork1_" #lname, single_index_scatter, type, index, true, location) \
+   instantiate_kernel("scatter" #tname #iname "_none_1_updc_false_nwork1_" #lname, single_index_scatter, type, index, false, location)
+ #define SINGLE_INDEX_TYPES(tname, type, iname, index) \
+diff --git a/mlx/backend/metal/kernels/indexing/scatter_axis.metal b/mlx/backend/metal/kernels/indexing/scatter_axis.metal
+--- a/mlx/backend/metal/kernels/indexing/scatter_axis.metal
++++ b/mlx/backend/metal/kernels/indexing/scatter_axis.metal
+@@ -1,17 +1,20 @@
+ // Copyright © 2025 Apple Inc.
+-// Existing overwrite worker for floating scores/Bool masks and UInt32 indices.
++// Existing overwrite worker for floating scores/Bool masks and signed/unsigned indices.
+ #include "mlx/backend/metal/kernels/utils.h"
+ #include "mlx/backend/metal/kernels/atomic.h"
+ #include "mlx/backend/metal/kernels/reduction/ops.h"
+ #include "mlx/backend/metal/kernels/indexing/scatter_axis.h"
+-#define SCATTER_AXIS_WIDTH(tname, type, lname, location) \
+-  instantiate_kernel("scatter_axis" #tname "uint32_none_" #lname "cc", scatter_axis, type, uint32_t, location, None, true, true) \
+-  instantiate_kernel("scatter_axis" #tname "uint32_none_" #lname "cnc", scatter_axis, type, uint32_t, location, None, true, false) \
+-  instantiate_kernel("scatter_axis" #tname "uint32_none_" #lname "ncc", scatter_axis, type, uint32_t, location, None, false, true) \
+-  instantiate_kernel("scatter_axis" #tname "uint32_none_" #lname "ncnc", scatter_axis, type, uint32_t, location, None, false, false)
++#define SCATTER_AXIS_WIDTH(tname, type, iname, index, lname, location) \
++  instantiate_kernel("scatter_axis" #tname #iname "_none_" #lname "cc", scatter_axis, type, index, location, None, true, true) \
++  instantiate_kernel("scatter_axis" #tname #iname "_none_" #lname "cnc", scatter_axis, type, index, location, None, true, false) \
++  instantiate_kernel("scatter_axis" #tname #iname "_none_" #lname "ncc", scatter_axis, type, index, location, None, false, true) \
++  instantiate_kernel("scatter_axis" #tname #iname "_none_" #lname "ncnc", scatter_axis, type, index, location, None, false, false)
++#define SCATTER_AXIS_INDEX(tname, type, iname, index) \
++  SCATTER_AXIS_WIDTH(tname, type, iname, index, int, int) \
++  SCATTER_AXIS_WIDTH(tname, type, iname, index, int64_t, int64_t)
+ #define SCATTER_AXIS_TYPE(tname, type) \
+-  SCATTER_AXIS_WIDTH(tname, type, int, int) \
+-  SCATTER_AXIS_WIDTH(tname, type, int64_t, int64_t)
++  SCATTER_AXIS_INDEX(tname, type, int32, int32_t) \
++  SCATTER_AXIS_INDEX(tname, type, uint32, uint32_t)
+ SCATTER_AXIS_TYPE(float32, float)
+ SCATTER_AXIS_TYPE(float16, half)
+ SCATTER_AXIS_TYPE(bfloat16, bfloat16_t)

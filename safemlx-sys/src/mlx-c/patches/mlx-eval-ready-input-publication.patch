@@ -1,0 +1,28 @@
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -720,7 +720,13 @@
+         if (scoped_outcome) {
+           const auto observation = in.status() == array::Status::available
+               ? EventObservation::ready : in.event().observe();
+-          if (observation == EventObservation::ready) in.detach_event();
++          if (observation == EventObservation::ready) {
++            // Publish the completed descriptor before lending this input to a
++            // later role. Dropping its ready event alone leaves a stale
++            // evaluated/event-free state, which is not a completion witness.
++            in.detach_event();
++            in.set_status(array::Status::available);
++          }
+           else if (observation == EventObservation::pending) {
+             if (in.event().stream() != stream) in.event().wait(stream);
+           } else {
+@@ -734,7 +740,9 @@
+             return std::nullopt;
+           }
+         } else if (in.event().is_signaled()) {
++          // Same ready-input transition as the scoped branch above.
+           in.detach_event();
++          in.set_status(array::Status::available);
+         } else if (in.event().stream() != stream) {
+           // Use event to wait across async eval
+           in.event().wait(stream);

@@ -1,0 +1,121 @@
+diff --git a/mlx/backend/cpu/softmax.cpp b/mlx/backend/cpu/softmax.cpp
+--- a/mlx/backend/cpu/softmax.cpp
++++ b/mlx/backend/cpu/softmax.cpp
+@@ -151,6 +151,31 @@
+   if(task.controls>SIZE_MAX-controls)return false;
+   out={task.task_bytes,task.task_alignment,0,task.controls+controls};return true;
+ }
++namespace {
++template<typename T>
++bool precise_half_softmax_dispatch(EvalDispatchStorage& out) noexcept {
++  static_assert(sizeof(T)==2);
++  DispatchLayout task;
++  if(!CommandEncoder::dispatch_layout<SoftmaxTask<T,float>>(task))return false;
++  constexpr int N=std::min(simd::max_size<float>,simd::max_size<T>);
++  // Exact existing precise worker: half loads/stores, F32 reductions and the
++  // shared SIMD exp polynomial, including its integer exponent/mask controls.
++  // No task for the nonprecise half accumulator is selected by this source.
++  using Mask=decltype(simd::Simd<float,N>(0.0f)<-88.0f);
++  const size_t controls=sizeof(EvalDispatchStorage)+sizeof(task)+sizeof(out)+
++      sizeof(SoftmaxTask<T,float>)*2+sizeof(const T*)*2+sizeof(T*)*2+
++      sizeof(int)*7+sizeof(size_t)*3+sizeof(float)*20+sizeof(bool)*2+
++      sizeof(simd::Simd<float,N>)*12+sizeof(simd::Simd<T,N>)*4+
++      sizeof(simd::Simd<int,N>)*2+sizeof(Mask)*3+sizeof(Dtype);
++  if(task.controls>SIZE_MAX-controls)return false;
++  out={task.task_bytes,task.task_alignment,0,task.controls+controls};return true;
++}
++}
++bool precise_half_softmax_dispatch_storage(Dtype dtype,EvalDispatchStorage& out) noexcept {
++  if(dtype==float16&&dtype.size()==2)return precise_half_softmax_dispatch<float16_t>(out);
++  if(dtype==bfloat16&&dtype.size()==2)return precise_half_softmax_dispatch<bfloat16_t>(out);
++  return false;
++}
+ }
+ 
+ void Softmax::eval_cpu(const ArrayVector& inputs, array& out) {
+diff --git a/mlx/backend/cpu/softmax_storage.cpp b/mlx/backend/cpu/softmax_storage.cpp
+--- a/mlx/backend/cpu/softmax_storage.cpp
++++ b/mlx/backend/cpu/softmax_storage.cpp
+@@ -14,13 +14,18 @@
+   return output.has_primitive()&&output.primitive().stream().device==Device::cpu&&
+       typeid(output.primitive())==typeid(Softmax);
+ }
+-bool softmax_eval_layout(size_t rank,size_t columns,size_t rows,bool tracer,
+-    CopyEvalStorage& out) noexcept {
++bool softmax_typed_eval_layout(Dtype dtype,bool precise,size_t rank,size_t columns,
++    size_t rows,bool tracer,CopyEvalStorage& out) noexcept {
+   if(rank<2||rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5||!columns||!rows||columns>size_t(INT_MAX)||rows>size_t(INT_MAX)/columns)return false;
+   CopyEvalStorage value;EvalDispatchStorage task;
+   // The existing optional contiguous_copy_cpu owns one backing and its weak
+   // copy task. The direct branch allocates the same single output backing.
+-  if(!copy_eval_layout(rank,1,true,tracer,value)||!softmax_dispatch_storage(task))return false;
++  if(!copy_eval_layout(rank,1,true,tracer,value))return false;
++  if(dtype==float32&&dtype.size()==sizeof(float)) {
++    if(!softmax_dispatch_storage(task))return false;
++  }else {
++    if(!precise||!precise_half_softmax_dispatch_storage(dtype,task))return false;
++  }
+   submission::GraphQuota::Request descriptor[5]{};size_t count=0;
+   if(!PreparedInputLeaf::append_array_requests(rank,descriptor,count)||count!=3)return false;
+   // Optional x_copy has one extra direct descriptor; Data is the already
+@@ -34,7 +39,7 @@
+   value.request_bytes[9]=task.task_bytes;value.request_alignments[9]=task.task_alignment;
+   value.request_counts[9]=1;
+   const size_t controls=sizeof(value)+sizeof(task)+sizeof(descriptor)+sizeof(count)+
+-      sizeof(rank)+sizeof(columns)+sizeof(rows)+sizeof(tracer)+sizeof(out)+
++      sizeof(dtype)*2+sizeof(precise)+sizeof(rank)+sizeof(columns)+sizeof(rows)+sizeof(tracer)+sizeof(out)+
+       sizeof(array)*4+sizeof(ArrayVector)+sizeof(Shape)+sizeof(Strides)+
+       sizeof(std::shared_ptr<Primitive>)+sizeof(Stream)*2+sizeof(array::Flags)+
+       sizeof(size_t)*5+sizeof(const array*)*3+sizeof(const Softmax*)+
+@@ -45,11 +50,21 @@
+       !submission::GraphConstruction::complete_layout(value))return false;
+   out=value;return true;
+ }
++bool softmax_eval_layout(size_t rank,size_t columns,size_t rows,bool tracer,
++    CopyEvalStorage& out) noexcept {
++  CopyEvalStorage value;
++  if(!softmax_typed_eval_layout(float32,true,rank,columns,rows,tracer,value))return false;
++  const size_t controls=sizeof(value)+sizeof(rank)+sizeof(columns)+sizeof(rows)+
++      sizeof(tracer)+sizeof(out)+sizeof(Dtype)+sizeof(bool)+sizeof(size_t);
++  if(!add(value.named_control_bytes,controls))return false;
++  out=value;return true;
++}
+ bool softmax_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   if(!is_softmax_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1||
+-      output.dtype()!=float32||output.itemsize()!=sizeof(float))return false;
++      !((output.dtype()==float32&&output.itemsize()==sizeof(float))||
++        ((output.dtype()==float16||output.dtype()==bfloat16)&&output.itemsize()==2)))return false;
+   const auto& input=output.inputs()[0];
+-  if(input.dtype()!=float32||input.itemsize()!=sizeof(float)||input.shape()!=output.shape())return false;
++  if(input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||input.shape()!=output.shape())return false;
+   const size_t rank=input.ndim();
+   if(rank<2||rank>5)return false;
+   size_t rows=1;
+@@ -64,7 +79,8 @@
+   // size. Both loop populations must fit the same actual int worker.
+   if(input.flags().contiguous&&input.strides().back()==1&&
+       (input.data_size()%columns||input.data_size()>output.size()))return false;
+-  return softmax_eval_layout(rank,columns,rows,output.is_tracer(),out);
++  return softmax_typed_eval_layout(output.dtype(),
++      static_cast<const Softmax&>(output.primitive()).state(),rank,columns,rows,output.is_tracer(),out);
+ }
+ }
+ namespace mlx::core::submission {
+diff --git a/mlx/backend/cpu/softmax_storage.h b/mlx/backend/cpu/softmax_storage.h
+--- a/mlx/backend/cpu/softmax_storage.h
++++ b/mlx/backend/cpu/softmax_storage.h
+@@ -1,9 +1,12 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-// The existing precise/nonprecise F32 worker is the same source. Other dtypes
+-// retain their ordinary path until separately qualified.
++// F32 precise/nonprecise share a worker. Half sources select only the actual
++// precise F32-accumulating task, preserving the native half output type.
+ MLX_API bool softmax_dispatch_storage(EvalDispatchStorage&) noexcept;
++MLX_API bool precise_half_softmax_dispatch_storage(Dtype,EvalDispatchStorage&) noexcept;
++MLX_API bool softmax_typed_eval_layout(Dtype,bool precise,size_t rank,size_t columns,
++    size_t rows,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool softmax_eval_layout(size_t rank,size_t columns,size_t rows,bool tracer,
+     CopyEvalStorage&) noexcept;
+ MLX_API bool is_softmax_eval_primitive(const array&) noexcept;

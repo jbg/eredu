@@ -204,10 +204,14 @@ fn cold_failure_and_cancellation_are_agreed_before_corrected_retry() {
     ranks(Fault::None, |rank, transport, owner| {
         for stage in [
             TextPreparationStage::Request,
+            TextPreparationStage::Admission,
             TextPreparationStage::Prompt,
             TextPreparationStage::Sampling,
             TextPreparationStage::Instrumentation,
             TextPreparationStage::Delivery,
+            TextPreparationStage::Prediction,
+            TextPreparationStage::Decision,
+            TextPreparationStage::Commitment,
         ] {
             let failed = owner
                 .agree(
@@ -241,13 +245,13 @@ fn cold_failure_and_cancellation_are_agreed_before_corrected_retry() {
             );
         }
         let usage = owner.usage().unwrap();
-        assert_eq!(usage.attempts, 15);
+        assert_eq!(usage.attempts, 27);
         assert_eq!(
             usage.retained_bytes,
-            15 * owner.per_attempt().retained_bytes
+            27 * owner.per_attempt().retained_bytes
         );
-        assert_eq!(usage.host_bytes, 15 * owner.per_attempt().host_bytes);
-        assert_eq!(transport.calls.load(Ordering::SeqCst), 30);
+        assert_eq!(usage.host_bytes, 27 * owner.per_attempt().host_bytes);
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 54);
         assert!(!transport.fenced.load(Ordering::SeqCst));
     });
 }
@@ -513,6 +517,58 @@ fn speculative_scheduler_exchange_failures_are_confirmed_before_return() {
                 owner.usage().unwrap().attempts,
                 if fault == Fault::CandidateFlags { 2 } else { 1 }
             );
+        });
+    }
+}
+
+
+#[test]
+fn readiness_validation_borrows_completed_word_custody_through_both_exchanges() {
+    struct Borrowed<'a> { inner:&'a Transport, active:AtomicBool, loans:AtomicUsize, checks:AtomicUsize }
+    impl ConsensusTransport for Borrowed<'_> {
+        type Error=std::io::Error;
+        fn participant_count(&self)->usize {self.inner.participant_count()}
+        fn all_gather_words(&self,_:&[u32])->Result<Vec<u32>,Self::Error> {
+            panic!("readiness uses the bounded completed-word loan")
+        }
+    }
+    impl BoundedConsensusTransport for Borrowed<'_> {
+        type Completion=Done;
+        type GatherOutput=(usize,Vec<u32>);
+        fn submit_all_gather_words(&self,words:&[u32])->Result<Submission<Self::GatherOutput,Done>,Self::Error> {
+            self.inner.submit_all_gather_words(words)
+        }
+        fn resolve_all_gather_words(&self,_:Self::GatherOutput)->Result<Vec<u32>,Self::Error> {
+            panic!("the retained destination cannot be extracted without its custody")
+        }
+        fn with_resolved_all_gather_words<T,E,F>(&self,output:Self::GatherOutput,validate:F)
+            ->Result<Result<T,E>,Self::Error> where F:FnOnce(&[u32])->Result<T,E> {
+            struct Loan<'a>(&'a AtomicBool);
+            impl Drop for Loan<'_> {fn drop(&mut self){assert!(self.0.swap(false,Ordering::SeqCst));}}
+            let words=self.inner.resolve_all_gather_words(output)?;
+            assert!(!self.active.swap(true,Ordering::SeqCst));
+            let _loan=Loan(&self.active);
+            self.loans.fetch_add(1,Ordering::SeqCst);
+            Ok(validate(&words))
+        }
+    }
+    impl TextPreparationTransport for Borrowed<'_> {
+        fn preparation_rank(&self)->usize {
+            if self.active.load(Ordering::SeqCst) {self.checks.fetch_add(1,Ordering::SeqCst);}
+            self.inner.preparation_rank()
+        }
+        fn ensure_preparation_active(&self)->Result<(),BackendFailure>{self.inner.ensure_preparation_active()}
+        fn fail_preparation(&self,error:&TextPreparationAgreementError){self.inner.fail_preparation(error)}
+    }
+    for fault in [Fault::None,Fault::Short] {
+        ranks(fault,|_,transport,owner| {
+            let borrowed=Borrowed{inner:transport,active:AtomicBool::new(false),loans:AtomicUsize::new(0),checks:AtomicUsize::new(0)};
+            let result=owner.agree(&borrowed,TextPreparationStage::Admission,TextPreparationStatus::Ready);
+            assert_eq!(result.is_ok(),fault==Fault::None);
+            assert!(!borrowed.active.load(Ordering::SeqCst));
+            assert_eq!(borrowed.loans.load(Ordering::SeqCst),2);
+            assert!(borrowed.checks.load(Ordering::SeqCst)>0);
+            assert_eq!(owner.usage().unwrap().attempts,1);
         });
     }
 }

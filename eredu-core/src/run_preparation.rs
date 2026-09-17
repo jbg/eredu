@@ -1,4 +1,4 @@
-//! Readiness and bounded accounting before a distributed text run starts.
+//! Readiness and bounded accounting for distributed text setup and prediction.
 
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +16,14 @@ pub enum TextPreparationStage {
     Instrumentation,
     /// Host record delivery and cancellation at setup or a committed-token boundary.
     Delivery,
+    /// Exact request reservation before native prompt and sampling construction.
+    Admission,
+    /// Current prediction authority before controller decisions or native input.
+    Prediction,
+    /// Controller decision readiness before native prediction submission.
+    Decision,
+    /// Controlled token observation, controller commit and permit finalization.
+    Commitment,
 }
 
 /// Local disposition supplied even when preparation failed or was cancelled.

@@ -47,6 +47,7 @@ use crate::{
 
 mod completion;
 mod frame_execution;
+pub(crate) mod input_source;
 mod observation;
 mod selection_loading;
 
@@ -65,3 +66,21 @@ use selection_loading::{
 mod completion_ownership_tests;
 #[cfg(test)]
 pub(crate) mod tests;
+
+mod frame_trace;
+
+mod retained_frame_source;
+mod source_program;
+
+mod original_observation;
+
+mod original_completion;
+
+mod original_execution;
+
+mod original_branch;
+
+mod original_admission;
+pub use original_execution::PreparedOriginalRealtimeFrame as MlxRealtimeFramePreparation;
+pub use original_branch::OriginalRealtimeSessionState as MlxManagedRealtimeSessionState;
+pub use original_admission::{MlxManagedRealtimeScheduler,MlxManagedFrameSessionBranch};

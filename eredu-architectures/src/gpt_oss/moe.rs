@@ -50,7 +50,7 @@ fn inferred_pass<T: Tensor>(input: &T) -> ExpertPass {
 #[parameterized(tensor = "B::Tensor")]
 pub struct RoutedMlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Global layer identity used by runtime expert providers.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub layer: usize,
     /// Learned biased router.
     pub router: B::Selector,

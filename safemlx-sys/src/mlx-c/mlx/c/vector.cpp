@@ -42,11 +42,11 @@ extern "C" mlx_vector_array mlx_vector_array_new_data(
     const mlx_array* data,
     size_t size) {
   try {
-    auto vec = mlx_vector_array_new();
+    mlx::core::ArrayVector values;
     for (size_t i = 0; i < size; i++) {
-      mlx_vector_array_get_(vec).push_back(mlx_array_get_(data[i]));
+      values.push_back(mlx_array_get_(data[i]));
     }
-    return vec;
+    return mlx_vector_array_new_(std::move(values));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return mlx_vector_array_new_();
@@ -67,7 +67,7 @@ extern "C" int mlx_vector_array_set_data(
     const mlx_array* data,
     size_t size) {
   try {
-    std::vector<mlx::core::array> cpp_arrs;
+    mlx::core::ArrayVector cpp_arrs;
     for (size_t i = 0; i < size; i++) {
       cpp_arrs.push_back(mlx_array_get_(data[i]));
     }
@@ -84,7 +84,7 @@ extern "C" int mlx_vector_array_set_value(
     const mlx_array val) {
   try {
     mlx_vector_array_set_(
-        *vec_, std::vector<mlx::core::array>({mlx_array_get_(val)}));
+        *vec_, mlx::core::ArrayVector({mlx_array_get_(val)}));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
@@ -201,7 +201,7 @@ extern "C" int mlx_vector_vector_array_set_data(
     const mlx_vector_array* data,
     size_t size) {
   try {
-    std::vector<std::vector<mlx::core::array>> cpp_arrs;
+    std::vector<mlx::core::ArrayVector> cpp_arrs;
     for (size_t i = 0; i < size; i++) {
       cpp_arrs.push_back(mlx_vector_array_get_(data[i]));
     }
@@ -219,7 +219,7 @@ extern "C" int mlx_vector_vector_array_set_value(
   try {
     mlx_vector_vector_array_set_(
         *vec_,
-        std::vector<std::vector<mlx::core::array>>(
+        std::vector<mlx::core::ArrayVector>(
             {mlx_vector_array_get_(val)}));
   } catch (std::exception& e) {
     mlx_error(e.what());
@@ -528,4 +528,19 @@ extern "C" size_t mlx_vector_string_size(mlx_vector_string vec) {
     mlx_error(e.what());
     return 0;
   }
+}
+
+extern "C" size_t mlx_vector_array_control_bytes(void) {
+#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus >= 202002L
+  // The heap header, the empty new() temporary and concatenate's by-value
+  // vector header coexist as possible construction-prefix owners. Its moved
+  // element backing is Graph storage, not another host payload charge.
+  return 3 * sizeof(mlx::core::ArrayVector) + sizeof(mlx::core::Shape) +
+      sizeof(mlx::core::StreamOrDevice) + sizeof(mlx::core::Dtype) +
+      sizeof(mlx::core::array) + 4 * sizeof(mlx_vector_array) +
+      sizeof(mlx_array) + sizeof(mlx_array*) + sizeof(mlx_stream) +
+      2 * sizeof(int) + sizeof(size_t);
+#else
+  return 0;
+#endif
 }

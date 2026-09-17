@@ -1,9 +1,58 @@
 use super::*;
 use super::{
-    model_session::{ScopeRetention, SubmissionResources},
-    recovery::Recovery,
+    model_session::{
+        CompletionRootsOwner, ObservationRoots, ScopeRetention, SubmissionResourcesOwner,
+    },
+    recovery::{Probe, Recovery, Retention},
 };
-use std::{cell::RefCell, rc::Rc};
+use eredu_runtime::working_memory::{
+    InferenceStateRevision, InferenceTextStepReceipt, WorkingMemoryError,
+};
+use std::cell::RefCell;
+
+mod observation;
+pub(in crate::composition::mlx::session) mod scalar;
+pub(in crate::composition::mlx::session) use observation::token_control_bytes as token_observation_control_bytes;
+pub(super) use observation::Observation;
+use observation::TokenObservationOwner;
+pub(in crate::composition::mlx::session) use scalar::control_bytes as token_scalar_control_bytes;
+
+// Return the extracted owner only after the slot loan ends. Finalization and
+// Drop may reenter the completion; they must never run under its RefMut.
+fn take_recovery<T: Retention, P: Probe>(
+    slot: &RefCell<Option<Recovery<T, P>>>,
+) -> Option<Recovery<T, P>> {
+    slot.borrow_mut().take()
+}
+
+// The owning recovery is detached for progress as well as final retirement.
+// Its callbacks may reenter the completion; the caller's observation gate
+// rejects that reentry while this slot temporarily has no owner.
+fn progress_recovery<T: Retention, P: Probe>(
+    slot: &RefCell<Option<Recovery<T, P>>>,
+) -> Option<super::recovery::Status> {
+    let recovery = take_recovery(slot);
+    let status = recovery.as_ref().map(Recovery::progress);
+    let previous = slot.replace(recovery);
+    debug_assert!(previous.is_none());
+    drop(previous);
+    status
+}
+
+// Cached output and owner health are Rust-side facts. Replaying them does not
+// require the native retirement lock, even when another thread holds it.
+fn cached_observation<T: Copy>(
+    observation: &observation::Loan<'_, T>,
+    owner: &SubmissionResourcesOwner,
+) -> Option<Result<T, Error>> {
+    observation.cached().map(|result| match result {
+        Ok(value) => match owner.ensure_healthy() {
+            Ok(()) => Ok(value),
+            Err(error) => observation.complete(Err(error)),
+        },
+        Err(error) => Err(error),
+    })
+}
 
 /// Backend-owned output of one MLX model-session submission.
 ///
@@ -40,42 +89,154 @@ pub struct MlxSessionCompletion {
 pub struct MlxTextToken {
     pub(super) value: Array,
     pub(super) stream: Stream,
-    pub(super) owner: Rc<SubmissionResources>,
+    // Exact output evidence only. Clones share the original runtime authority;
+    // neither token values nor retained request charges can create a receipt.
+    step_receipt: Option<InferenceTextStepReceipt>,
+    // Snapshot the producing operation's resulting branch, independently of
+    // any later state change or request retention on the shared owner.
+    state_revision: Option<InferenceStateRevision>,
+    observation: TokenObservationOwner,
+    pub(super) owner: SubmissionResourcesOwner,
+}
+
+impl MlxTextToken {
+    pub(super) fn new_with_sampling_source(
+        value: Array,
+        stream: Stream,
+        owner: SubmissionResourcesOwner,
+        role: Option<crate::backend::submission_recovery::prediction::PredictionRole>,
+        host: Option<eredu_core::HostPreparationAuthority>,
+        source: Option<crate::backend::SamplingEventSource>,
+    ) -> Self {
+        Self::new_with_sources(value, stream, owner, role, host, source)
+    }
+
+    pub(super) fn new(value: Array, stream: Stream, owner: SubmissionResourcesOwner) -> Self {
+        // Ordinary/copied tokens keep fresh observation state and acquire no
+        // original role from their retained producing owner.
+        Self::new_with_scalar_scope(value, stream, owner, None)
+    }
+
+    pub(super) fn new_with_scalar_scope(
+        value: Array,
+        stream: Stream,
+        owner: SubmissionResourcesOwner,
+        role: Option<crate::backend::submission_recovery::prediction::PredictionRole>,
+    ) -> Self {
+        Self::new_with_scalar_scope_and_capture(value, stream, owner, role, None)
+    }
+    pub(super) fn new_with_scalar_scope_and_capture(
+        value: Array,
+        stream: Stream,
+        owner: SubmissionResourcesOwner,
+        role: Option<crate::backend::submission_recovery::prediction::PredictionRole>,
+        host: Option<eredu_core::HostPreparationAuthority>,
+    ) -> Self {
+        Self::new_with_sources(value, stream, owner, role, host, None)
+    }
+    fn new_with_sources(
+        value: Array,
+        stream: Stream,
+        owner: SubmissionResourcesOwner,
+        role: Option<crate::backend::submission_recovery::prediction::PredictionRole>,
+        host: Option<eredu_core::HostPreparationAuthority>,
+        source: Option<crate::backend::SamplingEventSource>,
+    ) -> Self {
+        let state_revision = owner.state_revision();
+        Self {
+            value,
+            stream,
+            step_receipt: None,
+            state_revision,
+            observation: TokenObservationOwner::new_with_sources(owner.clone(), role, host, source),
+            owner,
+        }
+    }
+
+    pub(super) fn ordinary_error_custody(&self) -> Option<&eredu_core::HostPreparationAuthority> {
+        self.observation.value.ordinary_error_custody()
+    }
+    pub(super) fn step_receipt(&self) -> Option<&InferenceTextStepReceipt> {
+        self.step_receipt.as_ref()
+    }
+
+    pub(super) fn state_revision(&self) -> Option<&InferenceStateRevision> {
+        self.state_revision.as_ref()
+    }
+
+    pub(super) fn attach_step_receipt(
+        &mut self,
+        receipt: InferenceTextStepReceipt,
+    ) -> Result<(), WorkingMemoryError> {
+        if self.step_receipt.is_some() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        self.step_receipt = Some(receipt);
+        Ok(())
+    }
 }
 
 impl TokenOutput for MlxTextToken {
     type Error = Error;
 
     fn token_id(&self) -> Result<u32, Self::Error> {
-        self.owner.ensure_healthy()?;
-        let mut recovery = self.owner.observation_recovery(vec![self.value.clone()])?;
-        let _unwind = self.owner.poison_on_unwind();
-        let result = self
-            .value
-            .clone()
-            .try_item::<u32>(&self.stream)
-            .map_err(Into::into);
-        recovery.seal();
-        // A successful scalar read can precede safe retirement of its observation
-        // scope. In particular, another thread holding the runtime lock makes
-        // progress() report unsettled even after native completion. Establish the
-        // exact successful boundary; failures retain the nonblocking recovery path.
-        let status = if result.is_ok() {
-            recovery.finish()
-        } else {
-            recovery.progress()
-        };
-        if !status.settled || status.failed || status.blocked {
-            self.owner.reject_unresolved();
-            return Err(Error::ArchitectureModel(
-                "native token read is unresolved or failed".into(),
-            ));
+        if self.observation.original_controls.is_some() {
+            return scalar::token_id(&self.value, &self.stream, &self.owner, &self.observation);
         }
-        if result.is_err() {
-            self.owner.reject_unresolved();
+        let observation = self.observation.value.enter()?;
+        if let Some(result) = cached_observation(&observation, &self.owner) {
+            return result;
         }
-        result
+        // Only this first attempt may convert/evaluate the exact scalar. Token
+        // clones share its state; a copied token constructor gets fresh state.
+        let result = (|| {
+            self.owner.ensure_healthy()?;
+            let _unwind = self.owner.poison_on_unwind();
+            let role = self.observation.take_scope()?;
+            read_ordinary_token_scalar(&self.value, &self.stream, &self.owner, role)
+        })();
+        observation.complete(result)
     }
+}
+
+// Shared ordinary conversion/evaluation worker. Both callers own the observation
+// loan, health check and unwind guard before transferring the same optional role.
+fn read_ordinary_token_scalar(
+    value: &Array,
+    stream: &Stream,
+    owner: &SubmissionResourcesOwner,
+    role: Option<crate::backend::submission_recovery::prediction::PredictionRole>,
+) -> Result<u32, Error> {
+    #[cfg(test)]
+    crate::backend::submission_recovery::prediction::test_counts::record(4, role.is_some());
+    let mut recovery = owner.observation_recovery_with_prediction(
+        ObservationRoots::Scalar {
+            _array: value.clone(),
+        },
+        role,
+    )?;
+    let result = value.clone().try_item::<u32>(stream).map_err(Error::from);
+    recovery.seal();
+    // Keep the first successful read's exact finish boundary. Runtime
+    // contention is pending ownership; native failures retain recovery.
+    let status = if result.is_ok() {
+        recovery.finish()
+    } else {
+        recovery.progress()
+    };
+    if !status.settled || status.failed || status.blocked {
+        owner.reject_unresolved();
+        return match result {
+            Err(error) => Err(error),
+            Ok(_) => Err(Error::ArchitectureModel(
+                "native token read is unresolved or failed".into(),
+            )),
+        };
+    }
+    if result.is_err() {
+        owner.reject_unresolved();
+    }
+    result
 }
 
 /// Exact completion retaining both model execution and sampled token output.
@@ -84,20 +245,21 @@ pub struct MlxTextCompletion {
     pub(super) token: MlxCompletion,
     pub(super) model: MlxSessionCompletion,
     pub(super) recovery: RefCell<Option<Recovery<ScopeRetention>>>,
+    pub(super) observation: Observation<bool>,
 }
 
 impl Completion for MlxTextCompletion {
     type Error = Error;
 
     fn resources_releasable(&self) -> bool {
+        let Ok(_loan) = self.observation.enter() else {
+            return false;
+        };
         safemlx::try_with_submission_retirement(|| {
-            let settled = self
-                .recovery
-                .borrow()
-                .as_ref()
-                .is_none_or(|scope| scope.progress().settled);
+            let settled = progress_recovery(&self.recovery).is_none_or(|scope| scope.settled);
             if settled {
-                self.recovery.borrow_mut().take();
+                let retired = take_recovery(&self.recovery);
+                drop(retired);
             }
             let token = self.token.resources_releasable();
             let model = self.model.resources_releasable();
@@ -107,76 +269,88 @@ impl Completion for MlxTextCompletion {
     }
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
-        safemlx::try_with_submission_retirement(|| {
-            self.observe(false, || {
-                token_then_model_is_complete(&self.token, &self.model)
-            })
-        })
-        .unwrap_or(Ok(false))
+        // This method accepts no arbitrary callback. It queries only the exact
+        // submitted token/model roots and the already-existing sampling scope.
+        let observation = self.observation.enter()?;
+        if let Some(result) = cached_observation(&observation, self.model.owner()) {
+            return result;
+        }
+        safemlx::try_with_submission_retirement(|| self.observe(false, &observation))
+            .unwrap_or(Ok(false))
     }
 
     fn wait(&self) -> Result<(), Self::Error> {
-        self.observe(true, || {
-            token_then_model_wait(&self.token, &self.model).map(|()| true)
-        })
-        .and_then(|complete| {
+        let observation = self.observation.enter()?;
+        if let Some(result) = cached_observation(&observation, self.model.owner()) {
+            return result.map(|_| ());
+        }
+        self.observe(true, &observation).and_then(|complete| {
             if complete {
                 Ok(())
             } else {
-                Err(Error::ArchitectureModel(
-                    "sampled output still has unresolved native work".into(),
-                ))
+                observation
+                    .complete(Err(Error::ArchitectureModel(
+                        "sampled output still has unresolved native work".into(),
+                    )))
+                    .map(|_| ())
             }
         })
     }
 }
 
 impl MlxTextCompletion {
-    pub(super) fn observe(
+    fn observe(
         &self,
         wait: bool,
-        operation: impl FnOnce() -> Result<bool, Error>,
+        observation: &observation::Loan<'_, bool>,
     ) -> Result<bool, Error> {
-        self.model.owner().ensure_healthy()?;
-        let mut observation = self.model.owner().recovery()?;
-        let _unwind = self.model.owner().poison_on_unwind();
-        let result = operation();
-        observation.seal();
-        // A successful wait includes retirement of every observation/sampling
-        // ticket. Runtime-lock contention is temporary pending ownership, not
-        // failure. Polling and actual errors retain the nonblocking path.
-        let status = if wait && result.is_ok() {
-            observation.finish()
+        let result = (|| {
+            self.model.owner().ensure_healthy()?;
+            let _unwind = self.model.owner().poison_on_unwind();
+            // These fixed operations only inspect submitted event roots. Model
+            // finalization owns its separate one-shot validation observation.
+            // There is no outer Scope per poll and no callback extension point.
+            let result = if wait {
+                token_then_model_wait(&self.token, &self.model).map(|()| true)
+            } else {
+                token_then_model_is_complete(&self.token, &self.model)
+            };
+            let sampling = if wait && matches!(result, Ok(true)) {
+                let sampling = take_recovery(&self.recovery);
+                sampling.map(Recovery::finish)
+            } else {
+                progress_recovery(&self.recovery)
+            };
+            let sampling_settled = sampling.is_none_or(|status| status.settled);
+            if sampling_settled && !matches!(result, Ok(false)) {
+                let retired = take_recovery(&self.recovery);
+                drop(retired);
+            }
+            if sampling.is_some_and(|status| status.failed || status.blocked) {
+                self.model.owner().reject_unresolved();
+                return match result {
+                    Err(error) => Err(error),
+                    Ok(_) => Err(Error::ArchitectureModel(
+                        "native sampled output failed or is unobservable".into(),
+                    )),
+                };
+            }
+            if result.is_err() {
+                self.model.owner().reject_unresolved();
+            }
+            result.and_then(|complete| {
+                // Retiring the last sampling scope can publish model storage.
+                // Surface that callback's failure before caching completion or
+                // allowing the machine to submit its next decode.
+                self.model.owner().ensure_healthy()?;
+                Ok(complete && sampling_settled)
+            })
+        })();
+        if matches!(result, Ok(false)) {
+            result // Pending queries leave their existing owners in place.
         } else {
-            observation.progress()
-        };
-        if status.failed || status.blocked || (!status.settled && result.is_err()) {
-            self.model.owner().reject_unresolved();
-            return Err(Error::ArchitectureModel(
-                "native token observation did not establish safe completion".into(),
-            ));
+            observation.complete(result)
         }
-        let sampling = if wait && matches!(result, Ok(true)) {
-            self.recovery.borrow_mut().take().map(Recovery::finish)
-        } else {
-            self.recovery
-                .borrow()
-                .as_ref()
-                .map(|scope| scope.progress())
-        };
-        let sampling_settled = sampling.is_none_or(|status| status.settled);
-        if sampling_settled && !matches!(result, Ok(false)) {
-            self.recovery.borrow_mut().take();
-        }
-        if sampling.is_some_and(|status| status.failed || status.blocked) {
-            return Err(Error::ArchitectureModel(
-                "native sampled output failed or is unobservable".into(),
-            ));
-        }
-        if result.is_err() {
-            self.model.owner().reject_unresolved();
-        }
-        result.map(|complete| complete && status.settled && sampling_settled)
     }
 }
 
@@ -213,73 +387,87 @@ pub(super) fn token_then_model_wait(
 
 pub(super) enum MlxSessionCompletionKind {
     Model {
-        token_validations: TokenValidationBatch,
-        _retained: Vec<Array>,
-        owner: Rc<SubmissionResources>,
+        roots: CompletionRootsOwner,
+        owner: SubmissionResourcesOwner,
         recovery: RefCell<Option<Recovery<ScopeRetention>>>,
-        observation_error: RefCell<Option<String>>,
+        observation: Observation<()>,
+        _funding_retirement: Option<super::model_session::text_funding::RetireFundedCompletion>,
     },
 }
 
 impl MlxSessionCompletion {
-    pub(super) fn owner(&self) -> &Rc<SubmissionResources> {
+    pub(super) fn retain_ordinary_capture(
+        &mut self,
+        host: Option<eredu_core::HostPreparationAuthority>,
+    ) {
+        let MlxSessionCompletionKind::Model { observation, .. } = &mut self.inner;
+        observation.retain_ordinary_capture(host);
+    }
+    pub(super) fn owner(&self) -> &SubmissionResourcesOwner {
         match &self.inner {
             MlxSessionCompletionKind::Model { owner, .. } => owner,
         }
     }
 
+    // Called only while the local observation gate is held, after its cached
+    // result and original execution status have been checked.
     fn resolve(&self) -> Result<(), Error> {
-        let MlxSessionCompletionKind::Model {
-            observation_error, ..
-        } = &self.inner;
-        if let Some(error) = observation_error.borrow().as_ref() {
-            return Err(Error::ArchitectureModel(error.clone()));
-        }
         self.owner().ensure_healthy()?;
-        match &self.inner {
-            MlxSessionCompletionKind::Model {
-                token_validations,
-                owner,
-                recovery,
-                _retained: retained,
-                ..
-            } => {
-                let status = recovery.borrow().as_ref().map(|scope| scope.progress());
-                if status.is_some_and(|status| status.failed || status.blocked) {
-                    owner.request_release();
-                    recovery.borrow_mut().take();
-                    return Err(Error::ArchitectureModel(
-                        "model submission failed or became unobservable".into(),
-                    ));
-                }
-                if status.is_some_and(|status| !status.settled) {
-                    return Err(Error::ArchitectureModel(
-                        "model submission has unresolved native work".into(),
-                    ));
-                }
-                // Host/token observations may themselves submit eager work.
-                // Arm their independent scope before releasing the first one.
-                let mut observation = owner.observation_recovery(retained.clone())?;
-                let _unwind = owner.poison_on_unwind();
-                recovery.borrow_mut().take();
-                let result = token_validations.validate_completed().map_err(Error::from);
-                observation.seal();
-                let status = observation.progress();
-                owner.request_release();
-                if !status.settled || status.failed || status.blocked {
-                    owner.reject_unresolved();
-                    return Err(Error::ArchitectureModel(
-                        "model output observation failed or is unresolved".into(),
-                    ));
-                }
-                drop(observation);
-                if let Err(error) = &result {
-                    observation_error.replace(Some(error.to_string()));
-                    owner.reject_unresolved();
-                }
-                result
-            }
+        let MlxSessionCompletionKind::Model {
+            roots,
+            owner,
+            recovery,
+            ..
+        } = &self.inner;
+        // Preserve independent ownership before taking execution recovery.
+        // This native validation scope is constructed at most once per result.
+        let _unwind = owner.poison_on_unwind();
+        let retirement = owner.model_retirement_observer().map_err(|cause| {
+            owner.reject_unresolved();
+            cause
+        })?;
+        let role = owner.take_model_validation_scope()?;
+        #[cfg(test)]
+        crate::backend::submission_recovery::prediction::test_counts::record(3, role.is_some());
+        let mut observation = owner.observation_recovery_with_prediction(
+            ObservationRoots::Model {
+                roots: roots.clone(),
+            },
+            role,
+        )?;
+        let retired = take_recovery(recovery);
+        drop(retired);
+        let result = roots.validate_completed().map_err(Error::from);
+        observation.seal();
+        let status = observation.progress();
+        owner.request_release();
+        if !status.settled || status.failed || status.blocked {
+            owner.reject_unresolved();
+            return match result {
+                Err(error) => Err(error),
+                Ok(()) => Err(Error::ArchitectureModel(
+                    "model output observation failed or is unresolved".into(),
+                )),
+            };
         }
+        drop(observation);
+        if result.is_err() {
+            owner.reject_unresolved();
+        }
+        // Dropping observation above may be the final scope retirement and may
+        // discover an invalid retained backing during publication. Only after
+        // both validation and publication succeed may original Record payloads
+        // retire. Busy/error fences the owner before a success can be cached.
+        let result = result.and_then(|()| owner.ensure_healthy()).and_then(|()| {
+            if let Some(observer) = &retirement {
+                crate::backend::submission_recovery::retirement::complete(observer)?;
+            }
+            Ok(())
+        });
+        if result.is_err() {
+            owner.reject_unresolved();
+        }
+        result
     }
 }
 
@@ -287,17 +475,19 @@ impl Completion for MlxSessionCompletion {
     type Error = Error;
 
     fn resources_releasable(&self) -> bool {
+        let MlxSessionCompletionKind::Model { observation, .. } = &self.inner;
+        let Ok(_loan) = observation.enter() else {
+            return false;
+        };
         safemlx::try_with_submission_retirement(|| {
             crate::backend::submission_recovery::reap();
             let MlxSessionCompletionKind::Model {
                 recovery, owner, ..
             } = &self.inner;
-            let settled = recovery
-                .borrow()
-                .as_ref()
-                .is_none_or(|scope| scope.progress().settled);
+            let settled = progress_recovery(recovery).is_none_or(|scope| scope.settled);
             if settled {
-                recovery.borrow_mut().take();
+                let retired = take_recovery(recovery);
+                drop(retired);
             }
             settled && owner.resources_releasable()
         })
@@ -305,23 +495,29 @@ impl Completion for MlxSessionCompletion {
     }
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
+        let MlxSessionCompletionKind::Model { observation, .. } = &self.inner;
+        let observation = observation.enter()?;
+        if let Some(result) = cached_observation(&observation, self.owner()) {
+            return result.map(|()| true);
+        }
         safemlx::try_with_submission_retirement(|| {
-            match &self.inner {
-                MlxSessionCompletionKind::Model { recovery, .. } => {
-                    if let Some(status) = recovery.borrow().as_ref().map(|scope| scope.progress()) {
-                        if status.failed || status.blocked {
-                            return Err(Error::ArchitectureModel(
-                                "model submission failed or became unobservable".into(),
-                            ));
-                        }
-                        if !status.settled {
-                            return Ok(false);
-                        }
-                    }
+            let MlxSessionCompletionKind::Model {
+                recovery, owner, ..
+            } = &self.inner;
+            if let Some(status) = progress_recovery(recovery) {
+                if status.failed || status.blocked {
+                    return observation
+                        .complete(Err(Error::ArchitectureModel(
+                            "model submission failed or became unobservable".into(),
+                        )))
+                        .map(|()| true);
+                }
+                if !status.settled {
+                    return Ok(false);
                 }
             }
-            self.resolve()?;
-            Ok(true)
+            let _unwind = owner.poison_on_unwind();
+            observation.complete(self.resolve()).map(|()| true)
         })
         .unwrap_or(Ok(false))
     }
@@ -343,8 +539,17 @@ impl Drop for MlxSessionCompletion {
                 owner, recovery, ..
             } => {
                 owner.request_release();
-                recovery.borrow_mut().take();
+                let retired = take_recovery(recovery);
+                drop(retired);
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "output_completion/recovery_slot_tests.rs"]
+mod recovery_slot_tests;
+
+#[cfg(test)]
+#[path = "output_completion/once_tests.rs"]
+mod once_tests;

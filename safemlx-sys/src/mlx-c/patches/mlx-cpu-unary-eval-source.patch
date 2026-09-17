@@ -1,0 +1,571 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -74,6 +74,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/inverse.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/cholesky.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/unary.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/unary_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
+           ${CMAKE_CURRENT_BINARY_DIR}/compiled_preamble.cpp)
+ 
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -1,4 +1,5 @@
+ #include "mlx/backend/cpu/copy_storage.h"
++#include "mlx/backend/cpu/eval_storage.h"
+ #include "mlx/backend/cpu/copy.h"
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/primitives.h"
+@@ -20,7 +21,7 @@
+   if (b && a > size_t(PTRDIFF_MAX) / b) return false;
+   out = a * b; return true;
+ }
+-bool append(CopyEvalStorage& out, size_t slot, size_t bytes, size_t alignment,
++bool append(SingleOutputEvalStorage& out, size_t slot, size_t bytes, size_t alignment,
+     size_t count) noexcept {
+   if (!count) return true;
+   if (!bytes || !alignment || (alignment & (alignment - 1)) ||
+@@ -32,8 +33,8 @@
+ bool exact_contiguous(const array& output) noexcept {
+   return output.has_primitive() && typeid(output.primitive()) == typeid(Contiguous);
+ }
+-size_t source_controls() noexcept {
+-  return sizeof(const array*) * 3 + sizeof(CopyEvalStorage) * 2 +
++size_t single_output_controls() noexcept {
++  return sizeof(const array*) * 3 + sizeof(SingleOutputEvalStorage) * 2 +
+       sizeof(bool) * 5 + sizeof(size_t) * 7 + sizeof(int) * 2 + sizeof(Dtype) * 2 +
+       sizeof(submission::FixedEvalPrologueGuard*) + sizeof(submission::Record*) +
+       sizeof(submission::GraphQuota*) + sizeof(submission::GraphConstruction*) +
+@@ -44,14 +45,15 @@
+   return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
+       (exact_contiguous(output) || is_completion_synchronizer(output));
+ }
+-bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
+-    CopyEvalStorage& out) noexcept {
++bool single_output_eval_layout(size_t rank, size_t inputs, bool tracer,
++    const EvalDispatchStorage* dispatch_source, SingleOutputEvalStorage& out) noexcept {
++  const bool copy = dispatch_source != nullptr;
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+   if (rank > size_t(INT_MAX) || (copy && inputs != 1) || (!copy && rank != 0)) return false;
+-  CopyEvalStorage value;
+-  value.rank = rank; value.inputs = inputs; value.copy = copy; value.tracer = tracer;
++  SingleOutputEvalStorage value;
++  value.rank = rank; value.inputs = inputs; value.tracer = tracer;
+   submission::CpuEvalCleanupLayout cleanup;
+   if (!submission::cpu_eval_cleanup_layout(inputs, 0, cleanup)) return false;
+   for (size_t i = 0; i != 2; ++i)
+@@ -62,9 +64,9 @@
+   size_t input_bytes;
+   if (!multiply(std::max(size_t{1}, inputs), sizeof(array), input_bytes) ||
+       !append(value, 2, input_bytes, alignof(array), 1 + size_t(tracer && inputs))) return false;
+-  value.named_control_bytes = source_controls() + sizeof(CopyEvalStorage) +
++  value.named_control_bytes = single_output_controls() + sizeof(SingleOutputEvalStorage) +
+       sizeof(submission::CpuEvalCleanupLayout) + sizeof(size_t) * 9 + sizeof(bool) * 3 +
+-      sizeof(CopyEvalStorage*) + sizeof(ArrayVector) * 3 +
++      sizeof(SingleOutputEvalStorage*) + sizeof(ArrayVector) * 3 +
+       sizeof(submission::GraphAllocator<array>) * 3 + sizeof(Stream) +
+       sizeof(std::optional<submission::FixedEvalPrologueGuard>) +
+       sizeof(submission::GraphConstruction*) + sizeof(submission::GraphFailure) +
+@@ -73,15 +75,15 @@
+       sizeof(scheduler::TaskOwner);
+   if (!add(value.named_control_bytes, cleanup.named_control_bytes)) return false;
+   if (copy) {
+-    CpuCopyDispatchStorage dispatch;
++    const auto& dispatch = *dispatch_source;
+     WeakCopyStorage weak;
+     submission::OriginalBufferRoutingLayout routing;
+     size_t allocation_controls = 0;
+-    if (!contiguous_copy_dispatch_storage(rank, dispatch) ||
+-        !PreparedInputLeaf::weak_copy_storage(rank, weak) || weak.count < 3 ||
++    if (!PreparedInputLeaf::weak_copy_storage(rank, weak) ||
++        (weak.count != 3 && weak.count != 6) ||
+         !submission::original_buffer_routing_layout(routing) ||
+         !allocator::original_buffer_allocation_control_bytes(allocation_controls)) return false;
+-    // One possible General output allocation plus two no-op weak Data owners.
++    // One possible fresh output allocation plus two no-op weak Data owners.
+     // Lazy flags and donation cannot reduce the declared bound. The existing
+     // primitive may alias instead; no fresh output descriptor is then created.
+     if (!append(value, 3, weak.requests[2].bytes, weak.requests[2].alignment, 3) ||
+@@ -96,11 +98,11 @@
+     if (weak.count > 3 && !append(value, 8, weak.requests[4].bytes,
+                                 weak.requests[4].alignment, 1)) return false;
+     value.backing_births = 1;
+-    value.worker_graph_extents = dispatch.worker_graph_extent_bound;
++    value.worker_graph_extents = dispatch.worker_graph_extents;
+     const auto adoption = array::buffer_adoption_layout();
+-    const size_t controls = sizeof(CpuCopyDispatchStorage) + sizeof(WeakCopyStorage) +
++    const size_t controls = sizeof(EvalDispatchStorage) + sizeof(WeakCopyStorage) +
+         sizeof(submission::OriginalBufferRoutingLayout) + sizeof(array::BufferAdoptionLayout) +
+-        sizeof(std::function<allocator::Buffer(size_t)>) * 2 + sizeof(CopyType) +
++        sizeof(std::function<allocator::Buffer(size_t)>) * 2 + sizeof(EvalDispatchStorage*) +
+         sizeof(allocator::Buffer) * 2 + sizeof(array::Flags) + sizeof(Shape) + sizeof(Strides) * 2 +
+         sizeof(bool) * 2 + sizeof(size_t) * 3 + sizeof(submission::CaptureSlot) +
+         sizeof(std::shared_ptr<array::Data>) + sizeof(submission::GraphAllocator<array::Data>) +
+@@ -114,6 +116,25 @@
+   out = value; return true;
+ #endif
+ }
++bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
++    CopyEvalStorage& out) noexcept {
++  CpuCopyDispatchStorage actual;
++  EvalDispatchStorage dispatch;
++  if (copy) {
++    if (!contiguous_copy_dispatch_storage(rank, actual)) return false;
++    dispatch = {actual.task_bytes, actual.task_alignment,
++        actual.worker_graph_extent_bound, actual.controls};
++  }
++  SingleOutputEvalStorage common;
++  if (!single_output_eval_layout(rank, inputs, tracer, copy ? &dispatch : nullptr, common)) return false;
++  CopyEvalStorage value;
++  static_cast<SingleOutputEvalStorage&>(value) = common;
++  value.copy = copy;
++  if (!add(value.named_control_bytes, sizeof(actual) + sizeof(dispatch) + sizeof(common) +
++      sizeof(value) + sizeof(rank) + sizeof(inputs) + sizeof(copy) + sizeof(tracer) + sizeof(out))) return false;
++  out = value; return true;
++}
++
+ bool copy_eval_storage(const array& output, CopyEvalStorage& out) noexcept {
+   if (!is_copy_eval_primitive(output) || !output.siblings().empty()) return false;
+   const bool copy = exact_contiguous(output);
+diff --git a/mlx/backend/cpu/copy_storage.h b/mlx/backend/cpu/copy_storage.h
+--- a/mlx/backend/cpu/copy_storage.h
++++ b/mlx/backend/cpu/copy_storage.h
+@@ -1,15 +1,13 @@
+ #pragma once
+ #include "mlx/array.h"
+-#include "mlx/graph_construction.h"
++#include "mlx/backend/cpu/eval_storage.h"
+ 
+ namespace mlx::core::cpu {
+ // Existing Contiguous copy branch or the private completion no-op. These are
+ // host/worker request populations only; backing, events and source custody are
+ // separate. Physical bank installation requires the actual accepted primitive.
+-struct CopyEvalStorage : submission::GraphConstructionLayout {
+-  size_t rank{0}, inputs{0}, backing_births{0};
+-  size_t worker_graph_extents{0};
+-  bool copy{false}, tracer{false};
++struct CopyEvalStorage : SingleOutputEvalStorage {
++  bool copy{false};
+ };
+ MLX_API bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
+     CopyEvalStorage&) noexcept;
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -11,6 +11,7 @@
+ #include "mlx/backend/cpu/argpartition.h"
+ #include "mlx/backend/cpu/distributed_storage.h"
+ #include "mlx/backend/cpu/copy_storage.h"
++#include "mlx/backend/cpu/unary_storage.h"
+ 
+ namespace mlx::core::cpu {
+ 
+@@ -35,7 +36,8 @@
+       arr.inputs()[0].ndim() == 2 && arr.siblings().empty() &&
+       partition->state().second == 1;
+   const bool fixed_copy = fixed && cpu::is_copy_eval_primitive(arr);
+-  const bool extended = fixed_partition || fixed_distributed || fixed_copy;
++  const bool fixed_unary = fixed && cpu::is_unary_eval_primitive(arr);
++  const bool extended = fixed_partition || fixed_distributed || fixed_copy || fixed_unary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -47,7 +49,9 @@
+         ? submission::GraphConstruction::create_cpu_distributed(*extended_prologue, extended_bank.value)
+         : fixed_copy
+             ? submission::GraphConstruction::create_cpu_copy_eval(*extended_prologue, extended_bank.value)
+-            : submission::GraphConstruction::create_cpu_argpartition(*extended_prologue, extended_bank.value);
++            : fixed_unary
++                ? submission::GraphConstruction::create_cpu_unary_eval(*extended_prologue, extended_bank.value)
++                : submission::GraphConstruction::create_cpu_argpartition(*extended_prologue, extended_bank.value);
+     if (failure != submission::GraphFailure{}) throw submission::GraphQuotaError(failure);
+   }
+   auto cleanup = [&] {
+diff --git a/mlx/backend/cpu/eval_storage.h b/mlx/backend/cpu/eval_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/eval_storage.h
+@@ -0,0 +1,19 @@
++#pragma once
++#include "mlx/graph_construction.h"
++
++namespace mlx::core::cpu {
++// Empty fixed destinations for one output, its ordinary cleanup and optional
++// two-weak-array task. The caller supplies an exact task query; only a private
++// actual-primitive constructor can install this bank in an Eval prologue.
++struct EvalDispatchStorage {
++  size_t task_bytes{0}, task_alignment{0};
++  size_t worker_graph_extents{0}, controls{0};
++};
++struct SingleOutputEvalStorage : submission::GraphConstructionLayout {
++  size_t rank{0}, inputs{0}, backing_births{0};
++  size_t worker_graph_extents{0};
++  bool tracer{false};
++};
++bool single_output_eval_layout(size_t rank, size_t inputs, bool tracer,
++    const EvalDispatchStorage*, SingleOutputEvalStorage&) noexcept;
++} // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/unary.cpp b/mlx/backend/cpu/unary.cpp
+--- a/mlx/backend/cpu/unary.cpp
++++ b/mlx/backend/cpu/unary.cpp
+@@ -236,3 +236,106 @@
+ }
+ 
+ } // namespace mlx::core
++
++#include "mlx/backend/cpu/unary_storage.h"
++#include "mlx/prepared_input.h"
++#include <climits>
++
++namespace mlx::core::cpu {
++namespace {
++bool unary_add(size_t& value, size_t more) noexcept {
++  if (more > SIZE_MAX - value) return false;
++  value += more; return true;
++}
++template<class Vector>
++bool unary_small_extent(size_t rank, size_t& out) noexcept {
++  if (rank <= Vector::inline_capacity) { out = 0; return true; }
++  const size_t capacity = std::max(rank, 2 * Vector::inline_capacity);
++  if (capacity > size_t(PTRDIFF_MAX) / sizeof(typename Vector::value_type)) return false;
++  return submission::GraphQuota::allocation_extent(capacity * sizeof(typename Vector::value_type),
++      alignof(typename Vector::value_type), out);
++}
++template<class Task>
++bool unary_task_storage(size_t rank, EvalDispatchStorage& out) noexcept {
++  if (rank > size_t(INT_MAX)) return false;
++  DispatchLayout task;
++  WeakCopyStorage weak;
++  if (!CommandEncoder::dispatch_layout<Task>(task) ||
++      !PreparedInputLeaf::weak_copy_storage(rank, weak)) return false;
++  EvalDispatchStorage value{task.task_bytes, task.task_alignment, 0, 0};
++  value.controls = sizeof(EvalDispatchStorage) + sizeof(DispatchLayout) + sizeof(WeakCopyStorage) +
++      sizeof(Task) * 2 + sizeof(array) * 4 + sizeof(Stream) * 2 +
++      sizeof(ContiguousIterator) + sizeof(Shape) * 3 + sizeof(Strides) * 2 +
++      sizeof(size_t) * 10 + sizeof(int) * 5 + sizeof(bool) * 2 + sizeof(const void*) * 4 +
++      // Source-derived maximum input/output SIMD shell across the unchanged
++      // scalar switch. No vector width is inferred from a runtime device.
++      std::max({sizeof(simd::Simd<bool, simd::max_size<bool>>),
++        sizeof(simd::Simd<int8_t, simd::max_size<int8_t>>),
++        sizeof(simd::Simd<int16_t, simd::max_size<int16_t>>),
++        sizeof(simd::Simd<int32_t, simd::max_size<int32_t>>),
++        sizeof(simd::Simd<int64_t, simd::max_size<int64_t>>),
++        sizeof(simd::Simd<uint8_t, simd::max_size<uint8_t>>),
++        sizeof(simd::Simd<uint16_t, simd::max_size<uint16_t>>),
++        sizeof(simd::Simd<uint32_t, simd::max_size<uint32_t>>),
++        sizeof(simd::Simd<uint64_t, simd::max_size<uint64_t>>),
++        sizeof(simd::Simd<float16_t, simd::max_size<float16_t>>),
++        sizeof(simd::Simd<bfloat16_t, simd::max_size<bfloat16_t>>),
++        sizeof(simd::Simd<float, simd::max_size<float>>),
++        sizeof(simd::Simd<double, simd::max_size<double>>),
++        sizeof(simd::Simd<complex64_t, simd::max_size<complex64_t>>)}) * 2;
++  if (!unary_add(value.controls, task.controls) ||
++      !unary_add(value.controls, weak.controls) || !unary_add(value.controls, weak.controls)) return false;
++  if (rank > 1) {
++    const size_t prefix = rank - 1;
++    size_t shape, strides;
++    CollapseStorageLayout collapse;
++    if (!collapse_single_dims_layout(prefix, collapse) ||
++        !unary_small_extent<Shape>(prefix, shape) || !unary_small_extent<Strides>(prefix, strides) ||
++        !unary_add(value.worker_graph_extents, shape) ||
++        !unary_add(value.worker_graph_extents, strides) ||
++        !unary_add(value.worker_graph_extents, collapse.graph_extent_sum) ||
++        !unary_add(value.worker_graph_extents, shape) ||
++        !unary_add(value.controls, sizeof(CollapseStorageLayout) + sizeof(prefix) + sizeof(shape) + sizeof(strides)) ||
++        !unary_add(value.controls, collapse.borrowed_view_bytes) ||
++        !unary_add(value.controls, collapse.result_control_bytes) ||
++        !unary_add(value.controls, collapse.layout_control_bytes)) return false;
++  }
++  out = value; return true;
++}
++bool floating_dtype(Dtype dtype, bool real) noexcept {
++  return dtype == float16 || dtype == bfloat16 || dtype == float32 || dtype == float64 ||
++      (!real && dtype == complex64);
++}
++bool all_dtype(Dtype dtype) noexcept {
++  return floating_dtype(dtype, false) || dtype == bool_ || dtype == int8 || dtype == int16 ||
++      dtype == int32 || dtype == int64 || dtype == uint8 || dtype == uint16 ||
++      dtype == uint32 || dtype == uint64;
++}
++} // namespace
++bool unary_dispatch_storage(UnaryEvalKind selected, Dtype dtype, size_t rank,
++    EvalDispatchStorage& out) noexcept {
++  switch (selected) {
++#define FLOATING(Kind, Op) case UnaryEvalKind::Kind: return floating_dtype(dtype, false) && unary_task_storage<UnaryFloatingTask<::mlx::core::detail::Op>>(rank, out);
++    FLOATING(exponential, Exp)
++    FLOATING(expm1, Expm1)
++    FLOATING(log, Log)
++    FLOATING(log2, Log2)
++    FLOATING(log10, Log10)
++    FLOATING(log1p, Log1p)
++    FLOATING(sigmoid, Sigmoid)
++    FLOATING(tanh, Tanh)
++    FLOATING(sine, Sin)
++    FLOATING(cosine, Cos)
++    FLOATING(sqrt, Sqrt)
++    FLOATING(rsqrt, Rsqrt)
++#undef FLOATING
++    case UnaryEvalKind::square:
++      return all_dtype(dtype) && unary_task_storage<UnaryTask<::mlx::core::detail::Square>>(rank, out);
++    case UnaryEvalKind::negative:
++      return all_dtype(dtype) && unary_task_storage<UnaryTask<::mlx::core::detail::Negative>>(rank, out);
++    case UnaryEvalKind::erf:
++      return floating_dtype(dtype, true) && unary_task_storage<UnaryRealTask<::mlx::core::detail::Erf>>(rank, out);
++  }
++  return false;
++}
++} // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/unary.h b/mlx/backend/cpu/unary.h
+--- a/mlx/backend/cpu/unary.h
++++ b/mlx/backend/cpu/unary.h
+@@ -53,14 +53,10 @@
+ }
+ 
+ template <typename Op>
+-void unary(const array& a, array& out, Op op, Stream stream) {
+-  set_unary_output_data(a, out);
+-  auto& encoder = cpu::get_command_encoder(stream);
+-  encoder.set_input_array(a);
+-  encoder.set_output_array(out);
+-  encoder.dispatch([a = array::unsafe_weak_copy(a),
+-                    out = array::unsafe_weak_copy(out),
+-                    op = op]() mutable {
++struct UnaryTask {
++  array a, out;
++  Op op;
++  void operator()() {
+     switch (out.dtype()) {
+       case bool_:
+         unary_op<bool>(a, out, op);
+@@ -105,18 +101,24 @@
+         unary_op<complex64_t>(a, out, op);
+         break;
+     }
+-  });
+-}
+-
+-template <typename Op>
+-void unary_real_fp(const array& a, array& out, Op op, Stream stream) {
+-  set_unary_output_data(a, out);
+-  auto& encoder = cpu::get_command_encoder(stream);
+-  encoder.set_input_array(a);
+-  encoder.set_output_array(out);
+-  encoder.dispatch([a = array::unsafe_weak_copy(a),
+-                    out = array::unsafe_weak_copy(out),
+-                    op = op]() mutable {
++  }
++};
++
++template <typename Op>
++void unary(const array& a, array& out, Op op, Stream stream) {
++  set_unary_output_data(a, out);
++  auto& encoder = cpu::get_command_encoder(stream);
++  encoder.set_input_array(a);
++  encoder.set_output_array(out);
++  encoder.dispatch(UnaryTask<Op>{array::unsafe_weak_copy(a),
++      array::unsafe_weak_copy(out), op});
++}
++
++template <typename Op>
++struct UnaryRealTask {
++  array a, out;
++  Op op;
++  void operator()() {
+     switch (out.dtype()) {
+       case bfloat16:
+         unary_op<bfloat16_t>(a, out, op);
+@@ -135,17 +137,23 @@
+         err << "[unary_real] Does not support " << out.dtype();
+         throw std::runtime_error(err.str());
+     }
+-  });
+-}
+-template <typename Op>
+-void unary_fp(const array& a, array& out, Op op, Stream stream) {
+-  set_unary_output_data(a, out);
+-  auto& encoder = cpu::get_command_encoder(stream);
+-  encoder.set_input_array(a);
+-  encoder.set_output_array(out);
+-  encoder.dispatch([a = array::unsafe_weak_copy(a),
+-                    out = array::unsafe_weak_copy(out),
+-                    op = op]() mutable {
++  }
++};
++
++template <typename Op>
++void unary_real_fp(const array& a, array& out, Op op, Stream stream) {
++  set_unary_output_data(a, out);
++  auto& encoder = cpu::get_command_encoder(stream);
++  encoder.set_input_array(a);
++  encoder.set_output_array(out);
++  encoder.dispatch(UnaryRealTask<Op>{array::unsafe_weak_copy(a),
++      array::unsafe_weak_copy(out), op});
++}
++template <typename Op>
++struct UnaryFloatingTask {
++  array a, out;
++  Op op;
++  void operator()() {
+     switch (out.dtype()) {
+       case bfloat16:
+         unary_op<bfloat16_t>(a, out, op);
+@@ -167,7 +175,17 @@
+         err << "[unary_fp] Does not support " << out.dtype();
+         throw std::runtime_error(err.str());
+     }
+-  });
++  }
++};
++
++template <typename Op>
++void unary_fp(const array& a, array& out, Op op, Stream stream) {
++  set_unary_output_data(a, out);
++  auto& encoder = cpu::get_command_encoder(stream);
++  encoder.set_input_array(a);
++  encoder.set_output_array(out);
++  encoder.dispatch(UnaryFloatingTask<Op>{array::unsafe_weak_copy(a),
++      array::unsafe_weak_copy(out), op});
+ }
+ 
+ template <typename Op>
+diff --git a/mlx/backend/cpu/unary_storage.cpp b/mlx/backend/cpu/unary_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/unary_storage.cpp
+@@ -0,0 +1,93 @@
++#include "mlx/backend/cpu/unary_storage.h"
++#include "mlx/primitives.h"
++#include "mlx/submission.h"
++#include <climits>
++#include <typeinfo>
++
++namespace mlx::core::cpu {
++namespace {
++bool add(size_t& value, size_t more) noexcept {
++  if (more > SIZE_MAX - value) return false;
++  value += more; return true;
++}
++bool kind(const Primitive& primitive, UnaryEvalKind& out) noexcept {
++#define SIMPLE(Type, Kind) if (typeid(primitive) == typeid(Type)) { out = UnaryEvalKind::Kind; return true; }
++  SIMPLE(Exp, exponential)
++  SIMPLE(Expm1, expm1)
++  SIMPLE(Log1p, log1p)
++  SIMPLE(Sigmoid, sigmoid)
++  SIMPLE(Tanh, tanh)
++  SIMPLE(Sin, sine)
++  SIMPLE(Cos, cosine)
++  SIMPLE(Square, square)
++  SIMPLE(Negative, negative)
++  SIMPLE(Erf, erf)
++#undef SIMPLE
++  if (typeid(primitive) == typeid(Sqrt)) {
++    out = static_cast<const Sqrt&>(primitive).state() ? UnaryEvalKind::rsqrt : UnaryEvalKind::sqrt;
++    return true;
++  }
++  if (typeid(primitive) == typeid(Log)) {
++    switch (static_cast<const Log&>(primitive).state()) {
++      case Log::Base::e: out = UnaryEvalKind::log; return true;
++      case Log::Base::two: out = UnaryEvalKind::log2; return true;
++      case Log::Base::ten: out = UnaryEvalKind::log10; return true;
++    }
++  }
++  return false;
++}
++} // namespace
++bool is_unary_eval_primitive(const array& output) noexcept {
++  UnaryEvalKind selected;
++  return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
++      kind(output.primitive(), selected);
++}
++bool unary_eval_layout(UnaryEvalKind selected, Dtype dtype, size_t rank, bool tracer,
++    UnaryEvalStorage& out) noexcept {
++  EvalDispatchStorage dispatch;
++  SingleOutputEvalStorage common;
++  if (!unary_dispatch_storage(selected, dtype, rank, dispatch) ||
++      !single_output_eval_layout(rank, 1, tracer, &dispatch, common)) return false;
++  UnaryEvalStorage value;
++  static_cast<SingleOutputEvalStorage&>(value) = common;
++  value.kind = selected; value.dtype = dtype;
++  const size_t controls = sizeof(UnaryEvalStorage) * 2 + sizeof(EvalDispatchStorage) +
++      sizeof(SingleOutputEvalStorage) + sizeof(UnaryEvalKind) * 3 + sizeof(Dtype) * 3 +
++      sizeof(size_t) * 5 + sizeof(bool) * 3 + sizeof(const array*) * 3 +
++      sizeof(const Primitive*) + sizeof(submission::FixedEvalPrologueGuard*) +
++      sizeof(submission::GraphConstruction*) + sizeof(submission::GraphConstructionContext) +
++      sizeof(submission::GraphFailure) + sizeof(submission::Record*) + sizeof(submission::GraphQuota*);
++  if (!add(value.named_control_bytes, controls)) return false;
++  out = value; return true;
++}
++bool unary_eval_storage(const array& output, UnaryEvalStorage& out) noexcept {
++  UnaryEvalKind selected;
++  if (!is_unary_eval_primitive(output) || !kind(output.primitive(), selected) ||
++      !output.siblings().empty() || output.inputs().size() != 1) return false;
++  const auto& input = output.inputs()[0];
++  if (input.dtype() != output.dtype() || input.shape() != output.shape()) return false;
++  size_t size = 1;
++  for (auto dimension : input.shape()) {
++    if (dimension < 0 || (dimension && size > size_t(PTRDIFF_MAX) / size_t(dimension))) return false;
++    size *= size_t(dimension);
++  }
++  if (size != input.size() || size != output.size() ||
++      size > size_t(PTRDIFF_MAX) / output.itemsize() ||
++      input.data_size() > size_t(PTRDIFF_MAX) / output.itemsize()) return false;
++  return unary_eval_layout(selected, output.dtype(), output.ndim(), output.is_tracer(), out);
++}
++} // namespace mlx::core::cpu
++
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_unary_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record = guard.record();
++  auto* graph = record.graph_quota();
++  const auto context = current_graph_construction_context();
++  if (out || !graph || !guard.cpu() || !context.scope || context.worker ||
++      context.dispatch != &record || current_graph_quota() != graph) return GraphFailure::foreign_parent;
++  cpu::UnaryEvalStorage actual;
++  if (!cpu::unary_eval_storage(guard.current(), actual)) return GraphFailure::invalid_layout;
++  return create_layout(*graph, context.scope, &record, actual, out, true);
++}
++} // namespace mlx::core::submission
+diff --git a/mlx/backend/cpu/unary_storage.h b/mlx/backend/cpu/unary_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/unary_storage.h
+@@ -0,0 +1,23 @@
++#pragma once
++#include "mlx/array.h"
++#include "mlx/backend/cpu/eval_storage.h"
++
++namespace mlx::core::cpu {
++// Descriptive source selectors for the existing named worker, not an execution
++// permission. Native construction matches the actual primitive, dtype and shape.
++enum class UnaryEvalKind {
++  exponential, expm1, log, log2, log10, log1p, sigmoid, tanh, sine, cosine,
++  sqrt, rsqrt, square, negative, erf
++};
++struct UnaryEvalStorage : SingleOutputEvalStorage {
++  UnaryEvalKind kind{UnaryEvalKind::exponential};
++  Dtype dtype{float32};
++};
++MLX_API bool unary_eval_layout(UnaryEvalKind, Dtype, size_t rank, bool tracer,
++    UnaryEvalStorage&) noexcept;
++MLX_API bool is_unary_eval_primitive(const array&) noexcept;
++MLX_API bool unary_eval_storage(const array&, UnaryEvalStorage&) noexcept;
++// Defined beside the actual template instantiations in unary.cpp.
++bool unary_dispatch_storage(UnaryEvalKind, Dtype, size_t rank,
++    EvalDispatchStorage&) noexcept;
++} // namespace mlx::core::cpu
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -165,6 +165,7 @@
+   static GraphFailure create_cpu_argpartition(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_copy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_unary_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   // Configure only an untouched resident bank in its actual current Scope.
+   // A finite attempt is consumed before nested construction starts, even on failure.
+   GraphFailure configure_nested(const NestedGraphEvaluationLimits&, size_t attempts) noexcept;

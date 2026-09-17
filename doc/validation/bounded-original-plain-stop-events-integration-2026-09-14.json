@@ -1,0 +1,346 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T11:11:20.291210+00:00",
+  "scope": "Original immutable literal-stop source, fixed visible-text destination and borrowed events through the shared cursor",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-borrowed-decode-compiler-integration-2026-09-14.json",
+  "tests": {
+    "text": {
+      "passed": 63,
+      "ignored": 3
+    },
+    "docs": {
+      "passed": 5,
+      "ignored": 0
+    },
+    "core": {
+      "passed": 449,
+      "ignored": 0
+    },
+    "core_docs": {
+      "passed": 6,
+      "ignored": 0
+    },
+    "runtime": {
+      "passed": 1232,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 238,
+      "ignored": 2
+    },
+    "portable": {
+      "passed": 26,
+      "ignored": 1
+    },
+    "conformance": {
+      "passed": 109,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 399,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 2527,
+  "new_tests": [
+    {
+      "check": "facade",
+      "name": "borrowed_plain_events_match_actual_hf_legacy_steps_and_pointer_preserving_result",
+      "path": "eredu/src/runtime/generation/streaming/cursor_storage/tests/decoder/plain_text.rs"
+    },
+    {
+      "check": "facade",
+      "name": "borrowed_plain_stop_wins_callback_cancel_and_nonterminal_cancel_does_not_flush",
+      "path": "eredu/src/runtime/generation/streaming/cursor_storage/tests/decoder/plain_text.rs"
+    },
+    {
+      "check": "facade",
+      "name": "plain_readiness_errors_zero_and_peer_cancel_preserve_owning_disposition",
+      "path": "eredu/src/runtime/generation/streaming/cursor_storage/tests/decoder/plain_text.rs"
+    },
+    {
+      "check": "facade",
+      "name": "borrowed_plain_callback_and_partial_preparation_unwind_retire_exact_provider",
+      "path": "eredu/src/runtime/generation/streaming/cursor_storage/tests/decoder/plain_text.rs"
+    },
+    {
+      "check": "core",
+      "name": "original_plain_projection_defaults_to_rejection_in_the_original_admission_phase",
+      "path": "eredu-core/src/backend/text_step/tests/sequence_preparation/plain_text.rs"
+    },
+    {
+      "check": "core",
+      "name": "accepting_a_decoder_identity_does_not_authorize_a_missing_plain_projection",
+      "path": "eredu-core/src/backend/text_step/tests/sequence_preparation/plain_text.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "actual_plain_source_admission_and_borrowed_stop_output_share_all_three_routes",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/plain_text.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_stop_extents_have_exact_admission_delta_and_minus_one_rejects_before_work",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/plain_text.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "foreign_combined_source_stays_cold_and_original_error_retains_only_its_own_bank",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/plain_text.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_plain_dormant_cancel_and_failed_preparation_keep_consuming_custody",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/plain_text.rs"
+    },
+    {
+      "check": "text",
+      "name": "fixed_literal_stops_preserve_unicode_ties_and_frontiers_at_every_split",
+      "path": "eredu-text/src/stop_storage/tests.rs"
+    },
+    {
+      "check": "text",
+      "name": "stop_destinations_reject_exact_minus_one_and_oversize_before_mutation",
+      "path": "eredu-text/src/stop_storage/tests.rs"
+    },
+    {
+      "check": "text",
+      "name": "empty_program_borrows_input_and_nonterminal_calls_reuse_only_lookbehind",
+      "path": "eredu-text/src/stop_storage/tests.rs"
+    },
+    {
+      "check": "text",
+      "name": "packed_stop_source_preserves_first_entry_and_partial_preparation_cannot_retry",
+      "path": "eredu-text/src/stop_storage/tests.rs"
+    }
+  ],
+  "new_test_count": 14,
+  "checks": {
+    "text": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-text --no-default-features --lib",
+      "started_utc": "2026-09-14T11:06:26.446511+00:00",
+      "elapsed_seconds": 2.75,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-plain-stop-events-integration-text.log",
+      "log_sha256": "2b928b29c19cbc6ec71754264c42aaff2ade3c28e7c1720d46acd7eac3183a15"
+    },
+    "docs": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-text --no-default-features --doc",
+      "started_utc": "2026-09-14T11:06:29.197761+00:00",
+      "elapsed_seconds": 0.963,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-plain-stop-events-integration-docs.log",
+      "log_sha256": "e0d1f0e70c858ecca2a331501655a4ecb73d431a27db5f85af2d7aa4de3f845e"
+    },
+    "core": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib",
+      "started_utc": "2026-09-14T11:06:30.161323+00:00",
+      "elapsed_seconds": 16.497,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-plain-stop-events-integration-core.log",
+      "log_sha256": "7e6cda6f5fc170cfe763793a3b2335d8745d10b1833689a5948212c05e23e97e"
+    },
+    "core_docs": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core --doc",
+      "started_utc": "2026-09-14T11:06:46.659937+00:00",
+      "elapsed_seconds": 6.625,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-plain-stop-events-integration-core_docs.log",
+      "log_sha256": "556f3c77ea2a65d5ebea12ef4b4c9c37f1d56bbb32a348fb035f0cf433f7e257"
+    },
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T11:06:53.285747+00:00",
+      "elapsed_seconds": 25.734,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-plain-stop-events-integration-runtime.log",
+      "log_sha256": "5a9da7bb38663b9027965677eeea09ee77d9f33ed3572584a9decfd618703ee5"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib",
+      "started_utc": "2026-09-14T11:07:19.020872+00:00",
+      "elapsed_seconds": 43.114,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-plain-stop-events-integration-facade.log",
+      "log_sha256": "c90318fcf45d9219408f205e3b34a4367cbb8c2c830f8ba0e12147e7d157ceb3"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade",
+      "started_utc": "2026-09-14T11:08:02.135970+00:00",
+      "elapsed_seconds": 14.982,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-plain-stop-events-integration-portable.log",
+      "log_sha256": "18ff1beb274c43730362e1129ec743c9544a191bb6c82c3432410f4912a354fe"
+    },
+    "conformance": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test backend_conformance",
+      "started_utc": "2026-09-14T11:08:17.119131+00:00",
+      "elapsed_seconds": 5.473,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-plain-stop-events-integration-conformance.log",
+      "log_sha256": "be7755aa163115f9b829a08a25c1a183c3c6dd875996b1c3285c2baf8315180c"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T11:08:22.592975+00:00",
+      "elapsed_seconds": 125.401,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-plain-stop-events-integration-session.log",
+      "log_sha256": "36c03704b1c3efe4b0a7533d50e5bc9c8b51eb54011182ceb06faf0b3be8b71f"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T11:10:27.995249+00:00",
+      "elapsed_seconds": 19.708,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-plain-stop-events-integration-minimal.log",
+      "log_sha256": "86e3028d927b02df14a8113349defd93e6ab2b2fb2d50551ed49d15364908f80"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T11:10:47.703553+00:00",
+      "elapsed_seconds": 20.702,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-plain-stop-events-integration-features.log",
+      "log_sha256": "edf7c7992fe886973b97ffb5b0177061362355fc19148af4a32198787a4c9ba0"
+    }
+  },
+  "source_sha256": {
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "ce16bddf799dd6f21437085fbcc595aa42075a2e946e707740216e6a5fffbca8",
+    "eredu-core/src/backend/preparation/sequence.rs": "e1fdbc226f2ca3d738f95bf026036c2f68cee5dd02ed04a65415e568bd9066b7",
+    "eredu-runtime/src/working_memory/residual/span_workspace/text_controls/sequence/decoder.rs": "67dcc52746865be399987e0c070a1a486c5220a9d709996678c4bdabc31f04fa",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/harness.rs": "fe993bb6b2b7c8123b929f1b20dba5505d920558e3aeda2af3601182746b3d4f",
+    "eredu-core/src/lib.rs": "aa869c9718c5e8075a854bf8d6e6047c13b9e56d6ae8a7d9a13319bad39b78da",
+    "eredu-core/src/backend/preparation.rs": "4f994b2eded8c7b8436e36a3d07f7eba1a1120a51ffbc373eeaed0427668e2e3",
+    "eredu-core/src/backend/preparation/sequence/consumer.rs": "3fa98018fb6fa8c5fdf875c833ce316887103eb4f9e42659b1bf9eb516de64dc",
+    "eredu/src/runtime/generation/streaming/cursor_storage/tests/decoder/plain_text.rs": "8bcf0b9ff4780ebaa866e87a83f80c1aab4cdb14c8491c5675c7f9eab5d2ec76",
+    "doc/backend-architecture.md": "238d544513ca1085cab08628af8cd9be5e7bd5969ba400f2809442d32ebedd1a",
+    "eredu-core/src/backend/text_step/tests/sequence_preparation.rs": "efce9a5853ac6bf2177a5c65f6d6551756e754c04a7cb6dc2e5b00643683355a",
+    "doc/execution-control.md": "58f97af699ee9466cd8b3977105eaa8f8ea1c6e5a2a1259c448dddb3546c2275",
+    "eredu/src/runtime/generation/streaming/cursor_storage/consumer.rs": "52bd006323a623e52e48ba16d7d6c1f06d742ad7fe6649cae5c5cb0ea46f1562",
+    "eredu-core/src/backend/preparation/sequence/decoder.rs": "0757675e073f8d4b31b8cf931c967b9cb26fb693cbc9cd0b1fc8ff5ecb889249",
+    "eredu-core/src/backend.rs": "b89e7a65ff3cb3f8283fdce05f99cab658518df862dd06f3570a71efbf9e23ca",
+    "eredu/src/runtime/generation/streaming/cursor_storage/tests/decoder.rs": "ba3c8f9e650bae0cfb1489cfd1bb444b0c37fc5f40fe5650850614e8a8722f9c",
+    "eredu/src/runtime/generation/streaming/pipeline.rs": "73f082a814ddaeb7bab0bf15b07b75084e302bdf88ab41768e7a3cc0fa363f3a",
+    "eredu-runtime/src/working_memory/residual/span_workspace/text_controls/sequence/storage.rs": "fd59bc92aa6745aeac4ca3322f486d5d410bba8a45143a86c5b8f857024f9cef",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence.rs": "c9189940ce7cdf83d996786547cdf5729c7708bd6058b51c2de68db984df2ee1",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/decoder.rs": "b7f883708b8d45e848e92342475a0a7b8c3e8bf918b33d998c80777682d9e83c",
+    "eredu-text/src/stop_storage.rs": "40d93e0a163297c562326450959e1dc442847a1a200599586a851236bb035db9",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/plain_text.rs": "fd8f0c451663dfc89f86a2db0a64f4843ec744774637d7ce1b586977cbb0a063",
+    "eredu-text/src/stop_storage/tests.rs": "76d9dfb0036c9f6e945dc2c9c12eb86c7483151ed6086b0500768f2023e0f2ab",
+    "doc/bounded-inference.md": "fc80a7a083ce93fb393d3702936dd7cb676d394dd67b4bddb33c9f5f56bdcfcd",
+    "eredu/src/runtime/generation/streaming.rs": "e96c95cde8f1dbf3d9c80cba1af22eb49ed78f39b8b5cc447cb29989f6647cad",
+    "eredu-text/src/lib.rs": "f1bbbe9ef0a616931df68998fe82eb84264c367841def7a7bfcd2ae89025f0f1",
+    "eredu-core/src/backend/text_step/tests/sequence_preparation/plain_text.rs": "6c0ca12d4bdcc9a56ecf713a911b988d6fbeb3fd4ccc0ad6b5e6ac8bac7587a6",
+    "eredu-core/src/generation/sequence_storage.rs": "3c12c33edec62ec758df480769e4dd5862ec88227415089906b025cabbc1a30c"
+  },
+  "source_snapshot": "/private/tmp/eredu-original-plain-stop-events-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-borrowed-decode-compiler-integration-2026-09-14.json": "fb4f2e2a144cd796c2524a79aed4f0f049c110632e8cb2fc41366c0b115eb34f",
+    "/private/tmp/eredu-original-plain-stop-events-doc-additions.json": "b8cd88e6c75eb46d6ccdb509afd4ebc7265c1dd857861495a5bbc7f283ec3362",
+    "/private/tmp/eredu-original-plain-stop-events-final-root-review.json": "0f9d5d45b24aa136b23988e931c7479aaff01a0312000e246b565fc60feff5d5",
+    "/private/tmp/eredu-original-plain-stop-events-integration-applied.json": "e27198763899829e9dc9ee9a7f3cc0e0b3b19ed1356516d6d04bf9fbe0a52020",
+    "/private/tmp/eredu-original-plain-stop-events-integration-apply.py": "1bfd131ab1a06cd40575d81fcd9018fb56b523e7ffdf3c8c3738694203d33db7",
+    "/private/tmp/eredu-original-plain-stop-events-integration-checks.json": "8f3ff5c93fe98b19503aa2fb3e10d0739cad36fdc4080817a23301dbb5e8fa39",
+    "/private/tmp/eredu-original-plain-stop-events-integration-conformance.log": "be7755aa163115f9b829a08a25c1a183c3c6dd875996b1c3285c2baf8315180c",
+    "/private/tmp/eredu-original-plain-stop-events-integration-core.log": "7e6cda6f5fc170cfe763793a3b2335d8745d10b1833689a5948212c05e23e97e",
+    "/private/tmp/eredu-original-plain-stop-events-integration-core_docs.log": "556f3c77ea2a65d5ebea12ef4b4c9c37f1d56bbb32a348fb035f0cf433f7e257",
+    "/private/tmp/eredu-original-plain-stop-events-integration-doc-applied.json": "fc02fcc101eccc6b4bcd5f1626d2f761672df20864bf4c8afc26f15271cfc1c8",
+    "/private/tmp/eredu-original-plain-stop-events-integration-docs.log": "e0d1f0e70c858ecca2a331501655a4ecb73d431a27db5f85af2d7aa4de3f845e",
+    "/private/tmp/eredu-original-plain-stop-events-integration-facade.log": "c90318fcf45d9219408f205e3b34a4367cbb8c2c830f8ba0e12147e7d157ceb3",
+    "/private/tmp/eredu-original-plain-stop-events-integration-features.log": "edf7c7992fe886973b97ffb5b0177061362355fc19148af4a32198787a4c9ba0",
+    "/private/tmp/eredu-original-plain-stop-events-integration-minimal.log": "86e3028d927b02df14a8113349defd93e6ab2b2fb2d50551ed49d15364908f80",
+    "/private/tmp/eredu-original-plain-stop-events-integration-portable.log": "18ff1beb274c43730362e1129ec743c9544a191bb6c82c3432410f4912a354fe",
+    "/private/tmp/eredu-original-plain-stop-events-integration-review.json": "f3e0fede4a7c8cdefea5ab8e16da883cf56033164ad251c72273d79788c228c6",
+    "/private/tmp/eredu-original-plain-stop-events-integration-root-review.json": "897af47c08d8c799e8d9c5a3797a835fd6bd1cd6b5c8bdae6ed66f1ad3af1a04",
+    "/private/tmp/eredu-original-plain-stop-events-integration-runtime.log": "5a9da7bb38663b9027965677eeea09ee77d9f33ed3572584a9decfd618703ee5",
+    "/private/tmp/eredu-original-plain-stop-events-integration-session.log": "36c03704b1c3efe4b0a7533d50e5bc9c8b51eb54011182ceb06faf0b3be8b71f",
+    "/private/tmp/eredu-original-plain-stop-events-integration-spec.json": "fb6610b32ffdea09d3cdd369b6023b5c933d335ad075363dbc2b66e9c148f3c0",
+    "/private/tmp/eredu-original-plain-stop-events-integration-spec.pending.json": "bc89af1428292464fd53058ed39587b9753a9d3f119df91f013c411ee97a5e60",
+    "/private/tmp/eredu-original-plain-stop-events-integration-stage/all.patch": "dc3e81933810fedaef417cd3253f1e7256b3e9574d652b471328bb17568d3d41",
+    "/private/tmp/eredu-original-plain-stop-events-integration-stage/change.patch": "703df1116bc834319f360343236ea594b3f983f26b2e36f95b226e4a8ebe0c0f",
+    "/private/tmp/eredu-original-plain-stop-events-integration-stage/manifest.json": "e27198763899829e9dc9ee9a7f3cc0e0b3b19ed1356516d6d04bf9fbe0a52020",
+    "/private/tmp/eredu-original-plain-stop-events-integration-stage/staged-hashes.json": "da99b63de0a06d0553e037b6f4b7638a8ef1de7c985f1695ccef317deb9adff3",
+    "/private/tmp/eredu-original-plain-stop-events-integration-text.log": "2b928b29c19cbc6ec71754264c42aaff2ade3c28e7c1720d46acd7eac3183a15",
+    "/private/tmp/eredu-original-plain-stop-events-integration-validate.py": "97f71ea35ecdbed11b225ad3fce0758db182f431276bf89cdb353c87e5025933",
+    "/private/tmp/eredu-original-plain-stop-events-integration-validation-config.json": "a0a9270236966bbf7a7ac1e390b4cddc456d7845a4c0bb83fd7043b092d6991a",
+    "/private/tmp/eredu-original-plain-stop-events-normalized-manifest.json": "e27198763899829e9dc9ee9a7f3cc0e0b3b19ed1356516d6d04bf9fbe0a52020",
+    "/private/tmp/eredu-original-plain-stop-events-stage/AUDIT.md": "07222178552f78906d7efb534a73471c5a3a7d69684289f2d7e0b25e4e4833b5",
+    "/private/tmp/eredu-original-plain-stop-events-stage/FROZEN.json": "0810725cf3402a7babe56aacce9fea54603a87ea89376d03dfcc637882d0a2e3",
+    "/private/tmp/eredu-original-plain-stop-events-stage/PRICING.md": "4cc26d9f54fb463cf48018fdcb02faa190e0b0fae23f2a46636c3256ab14f0e4",
+    "/private/tmp/eredu-original-plain-stop-events-stage/README.md": "db2dd92e672cd5a5a32fc425e5a2b7e328021e9b95cfe567cde96526546feb2d",
+    "/private/tmp/eredu-original-plain-stop-events-stage/all.patch": "710691f070199b885337ff730393807504f6910217a37496bec3b19439880a48",
+    "/private/tmp/eredu-original-plain-stop-events-stage/artifact-hashes.json": "3b617aa76c725a0becbf61d6c9ec357ab3911f937b563887ef0632a1aea6f650",
+    "/private/tmp/eredu-original-plain-stop-events-stage/backend-architecture-snippet.md": "7d7e4dcaf63b97831ba495ce8c4b6562b7bb7deebcba51db0105ba9d71acfb9d",
+    "/private/tmp/eredu-original-plain-stop-events-stage/base-hashes.json": "8c2157c81103b5665987f05db30cbbbf34e2af064added8c78b32dbfd044b223",
+    "/private/tmp/eredu-original-plain-stop-events-stage/bounded-inference-snippet.md": "091eaefaa1afbd061ef93fc0a3370d1f45e0bc05db0d6256a0a2e0dfc0434096",
+    "/private/tmp/eredu-original-plain-stop-events-stage/change.patch": "092f3de8419657feb6938dfa39f20730074bb19ffa33cefc02a2d114221ebe5b",
+    "/private/tmp/eredu-original-plain-stop-events-stage/checks.json": "4d28175c5b3f598e2666126de7b7c4f228c18be05a36bfea820941dd25cf43ff",
+    "/private/tmp/eredu-original-plain-stop-events-stage/dependencies.json": "fffa9d7b017bf3ed4e3bc12a3ef803e7aa288caf36f4852664bfb5573e3bb1a2",
+    "/private/tmp/eredu-original-plain-stop-events-stage/execution-control-snippet.md": "13dd14d49ac1cf7e99dc0374e27dc5613110a8b84fd859c8a4913bc514f1b704",
+    "/private/tmp/eredu-original-plain-stop-events-stage/files.txt": "4d13f0828c0151baf4f42b1f7b5dcaf0d959907325a39172fbb5e740d1b96e7c",
+    "/private/tmp/eredu-original-plain-stop-events-stage/initial-bases.json": "1350541eed210512edc3183a05458f622752f26a0f3f8d802c3d84fa0ba4d1ba",
+    "/private/tmp/eredu-original-plain-stop-events-stage/manifest.json": "65b89f96c7132d1440adca512703ca1a78277f44da0c5c20be69a05882fc7294",
+    "/private/tmp/eredu-original-plain-stop-events-stage/merge-ledger.json": "a0770b3021d1f4d381cf7338daba57b0043f9a938e425a4e8a2ddd03fcd0e88b",
+    "/private/tmp/eredu-original-plain-stop-events-stage/new-tests.json": "e23994f95e9e05f19eb8badc7f58ba5038e48234e4a80756ac4afb77426f2ba3",
+    "/private/tmp/eredu-original-plain-stop-events-stage/package.py": "717579571c3661fd50d04e37ebf15cd3935359e096b9af06ce0b65205ba0d1ff",
+    "/private/tmp/eredu-original-plain-stop-events-stage/prepare.py": "9517f4614c7b903587341d58de5ec1290caedba17573ccac298fd43536ddd046",
+    "/private/tmp/eredu-original-plain-stop-events-stage/replay.py": "ec751ede583f2de4a0938753831d43ad06ed890f37fb91e5f6df554e1be86e9e",
+    "/private/tmp/eredu-original-plain-stop-events-stage/source-basis.json": "308fe1235cf79355038c50618677fec86d0cb026f88ca9bd6fe92930350c7a52",
+    "/private/tmp/eredu-original-plain-stop-events-stage/staged-hashes.json": "d279fc2fbba379de992119311ab50d48faeb29bad6342d6e9523b5c7a14951a7"
+  },
+  "review": {
+    "full_manifest_sha256": "da99b63de0a06d0553e037b6f4b7638a8ef1de7c985f1695ccef317deb9adff3",
+    "full_patch_sha256": "dc3e81933810fedaef417cd3253f1e7256b3e9574d652b471328bb17568d3d41",
+    "patch_sha256": "703df1116bc834319f360343236ea594b3f983f26b2e36f95b226e4a8ebe0c0f",
+    "replay": "/private/tmp/eredu-original-plain-stop-events-integration-stage/replay",
+    "review": "Root fully reviewed the 2675-line source/test delta and concrete ownership/driver context; verified 117 artifacts, 31 source-basis and 17 dependency pins, seven freeze pins, 24 exact live baselines, source/full replay and scoped formatting. Compiler final source layout is an explicit prerequisite; docs append to the current state.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-borrowed-decode-compiler-integration-2026-09-14.json": "fb4f2e2a144cd796c2524a79aed4f0f049c110632e8cb2fc41366c0b115eb34f",
+      "/private/tmp/eredu-original-plain-stop-events-doc-additions.json": "b8cd88e6c75eb46d6ccdb509afd4ebc7265c1dd857861495a5bbc7f283ec3362",
+      "/private/tmp/eredu-original-plain-stop-events-final-root-review.json": "0f9d5d45b24aa136b23988e931c7479aaff01a0312000e246b565fc60feff5d5",
+      "/private/tmp/eredu-original-plain-stop-events-integration-root-review.json": "897af47c08d8c799e8d9c5a3797a835fd6bd1cd6b5c8bdae6ed66f1ad3af1a04",
+      "/private/tmp/eredu-original-plain-stop-events-integration-spec.json": "fb6610b32ffdea09d3cdd369b6023b5c933d335ad075363dbc2b66e9c148f3c0",
+      "/private/tmp/eredu-original-plain-stop-events-normalized-manifest.json": "e27198763899829e9dc9ee9a7f3cc0e0b3b19ed1356516d6d04bf9fbe0a52020",
+      "/private/tmp/eredu-original-plain-stop-events-stage/AUDIT.md": "07222178552f78906d7efb534a73471c5a3a7d69684289f2d7e0b25e4e4833b5",
+      "/private/tmp/eredu-original-plain-stop-events-stage/FROZEN.json": "0810725cf3402a7babe56aacce9fea54603a87ea89376d03dfcc637882d0a2e3",
+      "/private/tmp/eredu-original-plain-stop-events-stage/PRICING.md": "4cc26d9f54fb463cf48018fdcb02faa190e0b0fae23f2a46636c3256ab14f0e4",
+      "/private/tmp/eredu-original-plain-stop-events-stage/README.md": "db2dd92e672cd5a5a32fc425e5a2b7e328021e9b95cfe567cde96526546feb2d",
+      "/private/tmp/eredu-original-plain-stop-events-stage/all.patch": "710691f070199b885337ff730393807504f6910217a37496bec3b19439880a48",
+      "/private/tmp/eredu-original-plain-stop-events-stage/artifact-hashes.json": "3b617aa76c725a0becbf61d6c9ec357ab3911f937b563887ef0632a1aea6f650",
+      "/private/tmp/eredu-original-plain-stop-events-stage/backend-architecture-snippet.md": "7d7e4dcaf63b97831ba495ce8c4b6562b7bb7deebcba51db0105ba9d71acfb9d",
+      "/private/tmp/eredu-original-plain-stop-events-stage/base-hashes.json": "8c2157c81103b5665987f05db30cbbbf34e2af064added8c78b32dbfd044b223",
+      "/private/tmp/eredu-original-plain-stop-events-stage/bounded-inference-snippet.md": "091eaefaa1afbd061ef93fc0a3370d1f45e0bc05db0d6256a0a2e0dfc0434096",
+      "/private/tmp/eredu-original-plain-stop-events-stage/change.patch": "092f3de8419657feb6938dfa39f20730074bb19ffa33cefc02a2d114221ebe5b",
+      "/private/tmp/eredu-original-plain-stop-events-stage/checks.json": "4d28175c5b3f598e2666126de7b7c4f228c18be05a36bfea820941dd25cf43ff",
+      "/private/tmp/eredu-original-plain-stop-events-stage/dependencies.json": "fffa9d7b017bf3ed4e3bc12a3ef803e7aa288caf36f4852664bfb5573e3bb1a2",
+      "/private/tmp/eredu-original-plain-stop-events-stage/execution-control-snippet.md": "13dd14d49ac1cf7e99dc0374e27dc5613110a8b84fd859c8a4913bc514f1b704",
+      "/private/tmp/eredu-original-plain-stop-events-stage/files.txt": "4d13f0828c0151baf4f42b1f7b5dcaf0d959907325a39172fbb5e740d1b96e7c",
+      "/private/tmp/eredu-original-plain-stop-events-stage/initial-bases.json": "1350541eed210512edc3183a05458f622752f26a0f3f8d802c3d84fa0ba4d1ba",
+      "/private/tmp/eredu-original-plain-stop-events-stage/manifest.json": "65b89f96c7132d1440adca512703ca1a78277f44da0c5c20be69a05882fc7294",
+      "/private/tmp/eredu-original-plain-stop-events-stage/merge-ledger.json": "a0770b3021d1f4d381cf7338daba57b0043f9a938e425a4e8a2ddd03fcd0e88b",
+      "/private/tmp/eredu-original-plain-stop-events-stage/new-tests.json": "e23994f95e9e05f19eb8badc7f58ba5038e48234e4a80756ac4afb77426f2ba3",
+      "/private/tmp/eredu-original-plain-stop-events-stage/package.py": "717579571c3661fd50d04e37ebf15cd3935359e096b9af06ce0b65205ba0d1ff",
+      "/private/tmp/eredu-original-plain-stop-events-stage/prepare.py": "9517f4614c7b903587341d58de5ec1290caedba17573ccac298fd43536ddd046",
+      "/private/tmp/eredu-original-plain-stop-events-stage/replay.py": "ec751ede583f2de4a0938753831d43ad06ed890f37fb91e5f6df554e1be86e9e",
+      "/private/tmp/eredu-original-plain-stop-events-stage/source-basis.json": "308fe1235cf79355038c50618677fec86d0cb026f88ca9bd6fe92930350c7a52",
+      "/private/tmp/eredu-original-plain-stop-events-stage/staged-hashes.json": "d279fc2fbba379de992119311ab50d48faeb29bad6342d6e9523b5c7a14951a7"
+    },
+    "source_manifest_sha256": "e27198763899829e9dc9ee9a7f3cc0e0b3b19ed1356516d6d04bf9fbe0a52020"
+  },
+  "behavior": [
+    "The common UTF-8 literal matcher preserves earliest match, stop ordering and proper-prefix withholding for legacy and fixed storage.",
+    "An explicit original PlainText claim binds decoder/M/skip/stops through one combined-source take and an independent returned-provider mode check.",
+    "One fixed L+max(K-1,0) destination retains current visible text and pending lookbehind until the next mutation; no-stop input borrows the decoder suffix.",
+    "The private borrowed two-event consumer uses the same preparation/readiness, token commitment and final settlement algorithm as ordinary events.",
+    "Stop termination precedes callbacks; ordinary cancellation does not flush and successful decoder finish precedes pending stop-text delivery.",
+    "Partial preparation, source mismatch and callback unwind preserve actual provider ownership, while terminal extraction keeps the same token result pointer."
+  ],
+  "limits": [
+    "Cold stop packing and prior HF/compiler/input ownership are not admitted by this unit.",
+    "Public owning events, Delivery/history/records/transcripts, tool parser normalization and snapshot/copy destinations remain separate requirements.",
+    "No public managed activation, new native family numerics or distributed hardware measurement."
+  ]
+}

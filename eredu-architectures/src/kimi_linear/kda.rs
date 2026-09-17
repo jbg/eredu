@@ -15,9 +15,9 @@ use crate::decoder::ComponentInstrumentation;
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct KimiDeltaAttention<B: NeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     num_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dim: i32,
     q_proj: B::Linear,
     k_proj: B::Linear,
@@ -184,11 +184,17 @@ impl<B: NeuralBackend> KimiDeltaAttention<B> {
         .enumerate()
         {
             let role = StateTensorRole::Convolution { slot: slot as u32 };
-            let output = {
+            let output = if conv.history_len() == 0 {
+                // Width one is the same pointwise convolution equation with no
+                // carried history; the architecture declares only recurrent state.
+                conv.forward(value, None, context)?
+            } else {
                 let history = state.fixed_component(role).map_err(Error::backend)?;
                 conv.forward(value, history.as_ref(), context)?
             };
-            *state.fixed_component(role).map_err(Error::backend)? = output.history;
+            if conv.history_len() > 0 {
+                *state.fixed_component(role).map_err(Error::backend)? = output.history;
+            }
             if instrumentation.enabled() {
                 let suffix = ["query", "key", "value"][slot];
                 instrumentation

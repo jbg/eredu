@@ -2,6 +2,15 @@
 
 use crate::{Error, Tensor};
 
+mod construction;
+pub use construction::{assemble_ordered_inputs_with_metadata, multi_axis_rotary_embeddings_with_metadata};
+mod prepared_rotary;
+pub use prepared_rotary::{
+    fill_rotary_axis_frequencies, multi_axis_rotary_embeddings_prepared,
+    reference_multi_axis_rotary_embeddings_prepared, MultiAxisRotarySpecRef,
+    PreparedMultiAxisRotary, RotaryTableError,
+};
+
 /// One ordered token/embedding segment at decoder ingress.
 #[derive(Debug, Clone, Copy)]
 pub struct OrderedInputPart<'a, T> {
@@ -26,47 +35,7 @@ pub fn assemble_ordered_inputs<T: Tensor>(
     hidden_size: i32,
     context: &T::Context,
 ) -> Result<OrderedModelInput<T>, Error> {
-    if parts.is_empty() || hidden_size <= 0 {
-        return Err(Error::backend(
-            "ordered input assembly requires parts and a positive hidden size",
-        ));
-    }
-    let batch = parts[0].token_ids.shape().first().copied().unwrap_or(0);
-    for (index, part) in parts.iter().enumerate() {
-        let tokens = part.token_ids.shape();
-        let embeddings = part.embeddings.shape();
-        if tokens.len() != 2
-            || embeddings.len() != 3
-            || tokens[0] != batch
-            || embeddings[0] != batch
-            || tokens[1] != embeddings[1]
-            || embeddings[2] != hidden_size
-        {
-            return Err(Error::backend(format!(
-                "ordered input part {index} has incompatible token/embedding shapes {tokens:?} and {embeddings:?}; expected batch {batch} and hidden {hidden_size}"
-            )));
-        }
-    }
-    let token_ids = T::concatenate(
-        &parts
-            .iter()
-            .map(|part| part.token_ids.clone())
-            .collect::<Vec<_>>(),
-        1,
-        context,
-    )?;
-    let embeddings = T::concatenate(
-        &parts
-            .iter()
-            .map(|part| part.embeddings.clone())
-            .collect::<Vec<_>>(),
-        1,
-        context,
-    )?;
-    Ok(OrderedModelInput {
-        token_ids,
-        embeddings,
-    })
+    construction::assemble(parts, hidden_size, context, None)
 }
 
 /// Selected-vocabulary output projection request.
@@ -82,38 +51,22 @@ pub struct MaskedOutputProjectionInput<'a, T> {
     pub token_ordering: &'a T,
     /// Selected centroid count.
     pub top_centroids: i32,
-    /// Amount subtracted from the smallest selected logit for masked rows.
+    /// Amount subtracted from each position's smallest selected logit for its
+    /// masked vocabulary entries. Other positions cannot affect this floor.
     pub mask_margin: f32,
 }
 
 impl<T: Tensor> MaskedOutputProjectionInput<'_, T> {
     /// Validates all exact, non-broadcast geometry.
     pub fn validate(&self) -> Result<(), Error> {
-        let hidden = self.hidden.shape();
-        let weight = self.output_weight.shape();
-        let centroids = self.centroid_logits.shape();
-        let ordering = self.token_ordering.shape();
-        if hidden.len() != 3
-            || weight.len() != 2
-            || centroids.len() != 3
-            || ordering.len() != 1
-            || hidden[0] != centroids[0]
-            || hidden[1] != centroids[1]
-            || hidden[2] != weight[1]
-            || ordering[0] != weight[0]
-            || centroids[2] <= 0
-            || weight[0] % centroids[2] != 0
-            || self.top_centroids <= 0
-            || self.top_centroids > centroids[2]
-            || !self.mask_margin.is_finite()
-            || self.mask_margin <= 0.0
-        {
-            return Err(Error::backend(format!(
-                "invalid masked-output geometry: hidden={hidden:?} weight={weight:?} centroids={centroids:?} ordering={ordering:?} top={} margin={}",
-                self.top_centroids, self.mask_margin
-            )));
-        }
-        Ok(())
+        crate::operation_geometry::validate_masked_output_geometry(
+            self.hidden.shape(),
+            self.output_weight.shape(),
+            self.centroid_logits.shape(),
+            self.token_ordering.shape(),
+            self.top_centroids,
+            self.mask_margin,
+        )
     }
 }
 
@@ -258,7 +211,8 @@ pub enum MultiAxisRotaryLayout {
     SplitHalves,
     /// Global frequencies select axes round-robin while each axis has an
     /// explicit section width; exhausted secondary sections fall back to the
-    /// first axis, and the completed half is repeated.
+    /// first axis, and the completed half is repeated. Zero-width sections
+    /// retain their coordinate positions; the total width must stay positive.
     RoundRobinSections,
 }
 
@@ -286,23 +240,38 @@ pub struct MultiAxisRotarySpec {
 }
 
 impl MultiAxisRotarySpec {
+    /// Borrows the complete policy without allocating an axis collection.
+    pub fn as_ref(&self) -> MultiAxisRotarySpecRef<'_> {
+        MultiAxisRotarySpecRef {
+            axes: &self.axes,
+            base: self.base,
+            minimum_position: self.minimum_position,
+            layout: self.layout,
+        }
+    }
     /// Validates the policy and returns the total rotated width.
     pub fn dimensions(&self) -> Result<i32, Error> {
-        if self.axes.is_empty() || !self.base.is_finite() || self.base <= 0.0 {
-            return Err(Error::backend(format!(
+        self.dimensions_with_diagnostic(|message| Error::backend(message), Error::backend_source)
+    }
+
+    /// Uses the same borrowed policy validator and ordinary detailed diagnostics
+    /// with caller-owned text and typed-cause construction. The callbacks run
+    /// only on failure; this method itself allocates no diagnostic storage.
+    pub fn dimensions_with_diagnostic(
+        &self,
+        mut diagnostic: impl FnMut(std::fmt::Arguments<'_>) -> Error,
+        source: impl FnOnce(RotaryTableError) -> Error,
+    ) -> Result<i32, Error> {
+        self.as_ref().dimensions().map_err(|cause| match cause {
+            RotaryTableError::EmptyAxes | RotaryTableError::InvalidBase => diagnostic(format_args!(
                 "multi-axis rotary requires axes and a finite positive base, got {self:?}"
-            )));
-        }
-        self.axes.iter().try_fold(0_i32, |total, axis| {
-            if axis.dimensions <= 0 || axis.dimensions % 2 != 0 {
-                return Err(Error::backend(format!(
-                    "rotary axis dimensions must be positive and even, got {}",
-                    axis.dimensions
-                )));
-            }
-            total
-                .checked_add(axis.dimensions)
-                .ok_or_else(|| Error::backend("multi-axis rotary dimensions overflowed i32"))
+            )),
+            RotaryTableError::InvalidAxis { dimensions, .. } => diagnostic(format_args!(
+                "rotary axis dimensions must be even and nonnegative (zero requires round-robin sections), got {dimensions}"
+            )),
+            RotaryTableError::ZeroDimensions => diagnostic(format_args!("multi-axis rotary total width must be positive")),
+            RotaryTableError::Overflow => diagnostic(format_args!("multi-axis rotary dimensions overflowed i32")),
+            other => source(other),
         })
     }
 }
@@ -313,15 +282,7 @@ pub fn multi_axis_rotary_embeddings<T: Tensor>(
     spec: &MultiAxisRotarySpec,
     context: &T::Context,
 ) -> Result<(T, T), Error> {
-    let _ = spec.dimensions()?;
-    let shape = position_ids.shape();
-    if shape.len() < 2 || shape.last().copied() != Some(spec.axes.len() as i32) {
-        return Err(Error::backend(format!(
-            "multi-axis position IDs must end in {} axes, got {shape:?}",
-            spec.axes.len()
-        )));
-    }
-    T::multi_axis_rotary_embeddings(position_ids, spec, context)
+    construction::rotary(position_ids, spec, context, None)
 }
 
 /// Scalar reference for flattened patch projection.
@@ -486,15 +447,15 @@ pub fn reference_masked_output_projection(
     top_centroids: usize,
     mask_margin: f32,
 ) -> Result<Vec<f32>, Error> {
-    if rows == 0
-        || hidden_size == 0
+    if hidden_size == 0
+        || vocabulary == 0
         || centroids == 0
         || !vocabulary.is_multiple_of(centroids)
         || top_centroids == 0
         || top_centroids > centroids
-        || hidden.len() != rows * hidden_size
-        || output_weight.len() != vocabulary * hidden_size
-        || centroid_logits.len() != rows * centroids
+        || Some(hidden.len()) != rows.checked_mul(hidden_size)
+        || Some(output_weight.len()) != vocabulary.checked_mul(hidden_size)
+        || Some(centroid_logits.len()) != rows.checked_mul(centroids)
         || token_ordering.len() != vocabulary
         || !mask_margin.is_finite()
         || mask_margin <= 0.0
@@ -502,7 +463,10 @@ pub fn reference_masked_output_projection(
         return Err(Error::backend("invalid scalar masked-output geometry"));
     }
     let per_centroid = vocabulary / centroids;
-    let mut output = Vec::with_capacity(rows * vocabulary);
+    let output_size = rows
+        .checked_mul(vocabulary)
+        .ok_or_else(|| Error::backend("scalar masked-output size overflow"))?;
+    let mut output = Vec::with_capacity(output_size);
     for row in 0..rows {
         let mut ranked = (0..centroids).collect::<Vec<_>>();
         ranked.sort_by(|left, right| {
@@ -725,5 +689,137 @@ mod tests {
         };
         assert!(spec.dimensions().is_err());
         assert!(reference_multi_axis_rotary_embeddings(&[], 1, &spec).is_err());
+    }
+    #[test]
+    fn masked_output_reference_has_position_local_floors_and_empty_rows() {
+        let hidden = [2., 1., -3., 4., 1., -5.];
+        let weights = [1., 0., 0., 1., 1., 1., -1., 1.];
+        let centroids = [0.1, 0.9, 0.8, 0.2, -0.3, 0.4];
+        let run = |h: &[f32], c: &[f32]| {
+            reference_masked_output_projection(
+                h,
+                h.len() / 2,
+                2,
+                &weights,
+                4,
+                c,
+                2,
+                &[2, 0, 3, 1],
+                1,
+                1.,
+            )
+            .unwrap()
+        };
+        let full = run(&hidden, &centroids);
+        assert_eq!(
+            full,
+            [-2., 1., -2., -1., -3., -4., 1., -4., -7., -5., -7., -6.]
+        );
+        let chunks = hidden
+            .chunks(2)
+            .zip(centroids.chunks(2))
+            .flat_map(|(h, c)| run(h, c))
+            .collect::<Vec<_>>();
+        assert_eq!(full, chunks);
+        assert!(run(&[], &[]).is_empty());
+        assert!(reference_masked_output_projection(
+            &[],
+            usize::MAX,
+            2,
+            &weights,
+            4,
+            &[],
+            2,
+            &[2, 0, 3, 1],
+            1,
+            1.,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn round_robin_zero_sections_keep_original_coordinates_and_global_frequencies() {
+        // Explicit selectors independently encode the published T base + H/W
+        // overwrite semantics. A zero T section does not delete the T fallback.
+        for (sections, selected) in [
+            ([4, 0, 0], vec![0, 0, 0, 0]),
+            ([0, 4, 0], vec![0, 1, 0, 0]),
+            ([0, 0, 4], vec![0, 0, 2, 0]),
+            ([0, 2, 2], vec![0, 1, 2, 0]),
+            ([2, 0, 2], vec![0, 0, 2, 0]),
+            ([2, 2, 0], vec![0, 1, 0, 0]),
+            ([1, 1, 2], vec![0, 1, 2, 0]),
+            ([2, 1, 6], vec![0, 1, 2, 0, 0, 2, 0, 0, 2]),
+            ([2, 0, 7], vec![0, 0, 2, 0, 0, 2, 0, 0, 2]),
+        ] {
+            let spec = MultiAxisRotarySpec {
+                axes: sections
+                    .iter()
+                    .map(|n| RotaryAxisSpec {
+                        dimensions: 2 * n,
+                        position_offset: 0,
+                    })
+                    .collect(),
+                base: 100.0,
+                minimum_position: 0,
+                layout: MultiAxisRotaryLayout::RoundRobinSections,
+            };
+            assert_eq!(spec.axes.len(), 3);
+            let (cos, sin) =
+                reference_multi_axis_rotary_embeddings(&[2, 5, 9, 3, 7, 11], 2, &spec).unwrap();
+            let half = selected.len();
+            assert_eq!(cos.len(), 4 * half);
+            for (row, coordinates) in [[2., 5., 9.], [3., 7., 11.]].iter().enumerate() {
+                for (frequency, axis) in selected.iter().enumerate() {
+                    let angle = coordinates[*axis] / 100_f64.powf(frequency as f64 / half as f64);
+                    for offset in [0, half] {
+                        let i = row * 2 * half + offset + frequency;
+                        assert!((f64::from(cos[i]) - angle.cos()).abs() < 2e-6);
+                        assert!((f64::from(sin[i]) - angle.sin()).abs() < 2e-6);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn zero_sections_require_round_robin_and_positive_checked_total() {
+        let make = |dimensions: &[i32], layout| MultiAxisRotarySpec {
+            axes: dimensions
+                .iter()
+                .map(|n| RotaryAxisSpec {
+                    dimensions: *n,
+                    position_offset: 0,
+                })
+                .collect(),
+            base: 100.0,
+            minimum_position: 0,
+            layout,
+        };
+        for dimensions in [
+            vec![],
+            vec![0, 0, 0],
+            vec![-2, 2, 8],
+            vec![1, 1, 6],
+            vec![i32::MAX - 1, 2, 0],
+        ] {
+            assert!(make(&dimensions, MultiAxisRotaryLayout::RoundRobinSections)
+                .dimensions()
+                .is_err());
+        }
+        for layout in [
+            MultiAxisRotaryLayout::IndependentAxes,
+            MultiAxisRotaryLayout::SplitHalves,
+        ] {
+            assert!(make(&[0, 4, 4], layout).dimensions().is_err());
+            assert_eq!(make(&[2, 2, 4], layout).dimensions().unwrap(), 8);
+        }
+        let spec = make(&[0, 4, 4], MultiAxisRotaryLayout::RoundRobinSections);
+        assert!(reference_multi_axis_rotary_embeddings(&[1, 2], 1, &spec).is_err());
+        for base in [0., -1., f32::NAN, f32::INFINITY] {
+            let mut spec = spec.clone();
+            spec.base = base;
+            assert!(spec.dimensions().is_err());
+        }
     }
 }

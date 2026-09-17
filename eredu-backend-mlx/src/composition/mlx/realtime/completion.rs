@@ -5,14 +5,65 @@ use std::{
     rc::Rc,
 };
 
+/// Exact ordinary or source-funded frame completion used by the same scheduler.
+#[derive(Clone)]
+pub struct MlxRealtimeCompletion {
+    kind:CompletionKind,
+}
+#[derive(Clone)]
+enum CompletionKind {
+    Ordinary(OrdinaryRealtimeCompletion),
+    Original(super::original_completion::OriginalRealtimeCompletion),
+}
+impl MlxRealtimeCompletion {
+    #[cfg(test)]
+    pub(super) fn submit_retained(retained:Vec<Array>,validations:TokenValidationBatch)->Result<Self,Error> {
+        OrdinaryRealtimeCompletion::submit_retained(retained,validations)
+            .map(|value|Self{kind:CompletionKind::Ordinary(value)})
+    }
+    pub(super) fn from_original(value:super::original_completion::OriginalRealtimeCompletion)->Self {
+        Self {kind:CompletionKind::Original(value)}
+    }
+    pub(super) fn submit_retained_with_resources(retained:Vec<Array>,validations:TokenValidationBatch,
+        resources:Option<Arc<neutral_moshi::SelectedRealtimeResources>>)
+        ->Result<Self,RealtimeCompletionCreationError<Self,Error>> {
+        match OrdinaryRealtimeCompletion::submit_retained_with_resources(retained,validations,resources) {
+            Ok(value)=>Ok(Self{kind:CompletionKind::Ordinary(value)}),
+            Err(RealtimeCompletionCreationError::BeforeSubmission(cause))=>Err(RealtimeCompletionCreationError::BeforeSubmission(cause)),
+            Err(RealtimeCompletionCreationError::AfterSubmission{error,completion})=>
+                Err(RealtimeCompletionCreationError::AfterSubmission{error,completion:Self{kind:CompletionKind::Ordinary(completion)}}),
+        }
+    }
+    /// Actual arrays retained by the selected completion owner.
+    pub fn retained_resources(&self)->usize {match &self.kind {
+        CompletionKind::Ordinary(value)=>value.retained_resources(),
+        CompletionKind::Original(value)=>value.retained_resources(),
+    }}
+}
+impl std::fmt::Debug for MlxRealtimeCompletion {
+    fn fmt(&self,f:&mut std::fmt::Formatter<'_>)->std::fmt::Result {
+        f.debug_struct("MlxRealtimeCompletion").field("retained_resources",&self.retained_resources()).finish()
+    }
+}
+impl Completion for MlxRealtimeCompletion {
+    type Error=Error;
+    fn is_complete(&self)->Result<bool,Error>{match &self.kind {
+        CompletionKind::Ordinary(value)=>value.is_complete(),CompletionKind::Original(value)=>value.is_complete(),
+    }}
+    fn resources_releasable(&self)->bool{match &self.kind {
+        CompletionKind::Ordinary(value)=>value.resources_releasable(),CompletionKind::Original(value)=>value.resources_releasable(),
+    }}
+    fn wait(&self)->Result<(),Error>{while !self.is_complete()?{std::thread::yield_now();}Ok(())}
+}
+
 /// Exact MLX completion retaining the frame's arrays and native ownership.
 /// Dropping a pending or failed completion never waits or retries evaluation.
 #[derive(Clone)]
-pub struct MlxRealtimeCompletion {
-    inner: Rc<MlxRealtimeCompletionInner>,
+pub(super) struct OrdinaryRealtimeCompletion {
+    inner: Rc<OrdinaryRealtimeCompletionInner>,
 }
 
-struct MlxRealtimeCompletionInner {
+struct OrdinaryRealtimeCompletionInner {
     recovery: Recovery<RealtimeCompletionResources>,
     observations: Cell<usize>,
 }
@@ -37,16 +88,16 @@ impl Retention for RealtimeCompletionResources {
     }
 }
 
-impl Retention for MlxRealtimeCompletionInner {
+impl Retention for OrdinaryRealtimeCompletionInner {
     fn observe(&self, status: Status) {
         self.recovery.retention().observe(status);
     }
 }
 
-struct ObservationTicket(Rc<MlxRealtimeCompletionInner>);
+struct ObservationTicket(Rc<OrdinaryRealtimeCompletionInner>);
 
 impl ObservationTicket {
-    fn new(inner: &Rc<MlxRealtimeCompletionInner>) -> Result<Self, Error> {
+    fn new(inner: &Rc<OrdinaryRealtimeCompletionInner>) -> Result<Self, Error> {
         let count = inner.observations.get().checked_add(1).ok_or_else(|| {
             Error::Parallel("MLX realtime observation ticket count exhausted".into())
         })?;
@@ -91,15 +142,15 @@ pub(super) fn submission_failure<C, E>(
     }
 }
 
-impl std::fmt::Debug for MlxRealtimeCompletion {
+impl std::fmt::Debug for OrdinaryRealtimeCompletion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MlxRealtimeCompletion")
+        f.debug_struct("OrdinaryRealtimeCompletion")
             .field("retained_resources", &self.retained_resources())
             .finish_non_exhaustive()
     }
 }
 
-impl MlxRealtimeCompletion {
+impl OrdinaryRealtimeCompletion {
     #[cfg(test)]
     pub(super) fn submit_retained(
         retained: Vec<Array>,
@@ -145,7 +196,7 @@ impl MlxRealtimeCompletion {
         };
         recovery.retention().submission_failed.set(error.is_some());
         let completion = Self {
-            inner: Rc::new(MlxRealtimeCompletionInner {
+            inner: Rc::new(OrdinaryRealtimeCompletionInner {
                 recovery,
                 observations: Cell::new(0),
             }),
@@ -177,7 +228,7 @@ impl MlxRealtimeCompletion {
     }
 }
 
-impl Completion for MlxRealtimeCompletion {
+impl Completion for OrdinaryRealtimeCompletion {
     type Error = Error;
 
     fn resources_releasable(&self) -> bool {
@@ -248,9 +299,9 @@ mod observation_tests {
         }
     }
 
-    fn completion() -> MlxRealtimeCompletion {
+    fn completion() -> OrdinaryRealtimeCompletion {
         let validations = TokenValidationScope::begin().unwrap().finish();
-        MlxRealtimeCompletion::submit_retained(Vec::new(), validations).unwrap()
+        OrdinaryRealtimeCompletion::submit_retained(Vec::new(), validations).unwrap()
     }
 
     #[test]

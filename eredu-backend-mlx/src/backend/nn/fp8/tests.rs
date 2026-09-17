@@ -705,3 +705,6 @@ fn actual_fp8_projection_input_cpu() {
 fn actual_fp8_projection_input_metal() {
     verify_actual_fp8_projection_input(DeviceType::Gpu);
 }
+
+#[cfg(all(target_vendor = "apple", feature = "metal", not(feature = "cuda")))]
+mod projection_observation;

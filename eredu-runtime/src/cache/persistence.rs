@@ -1,8 +1,8 @@
 //! Backend-neutral prompt-cache catalog validation and durable publication.
 
 use eredu_core::cache::{
-    CacheBlockId, CacheRepresentation, PromptCacheBlock, PromptCacheError, PromptCacheManifest,
-    PromptCacheStateTensor, PromptCacheTopology, PROMPT_CACHE_SCHEMA_VERSION,
+    CacheBlockId, CacheRepresentation, PROMPT_CACHE_SCHEMA_VERSION, PromptCacheBlock,
+    PromptCacheError, PromptCacheManifest, PromptCacheStateTensor, PromptCacheTopology,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -10,8 +10,8 @@ use std::{
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
-        OnceLock,
+        Arc, OnceLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -98,6 +98,15 @@ pub enum PromptCachePersistenceError {
 /// Filesystem failure while publishing one ephemeral live-cache block.
 #[derive(Debug, thiserror::Error)]
 pub enum LiveCachePublicationError {
+    /// The completed published file could not establish its exact source version.
+    #[error("failed to inspect live cache file {path}: {source}")]
+    Source {
+        /// Already owned publication path.
+        path: PathBuf,
+        /// Unchanged fixed or operating-system inspection cause.
+        #[source]
+        source: eredu_checkpoint::artifact::ArtifactFileReadError,
+    },
     /// A filesystem operation failed.
     #[error("failed to {action} at {path}: {source}")]
     Io {
@@ -111,6 +120,60 @@ pub enum LiveCachePublicationError {
     },
 }
 
+/// Shared ownership of a file published by the live-cache writer.
+///
+/// Clones retain the same immutable file. The final owner removes only that
+/// unique ephemeral path, after manager records, queued tasks and escaped
+/// results have released it. This does not authorize a read or native transfer.
+#[derive(Debug, Clone)]
+pub struct LiveCacheBlockSource {
+    inner: Arc<LiveCacheBlockFile>,
+    // Each clone retires its actual file/Arc before the final funding alias.
+    funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+}
+
+#[derive(Debug)]
+struct LiveCacheBlockFile {
+    path: PathBuf,
+    published: AtomicBool,
+    version: Option<eredu_checkpoint::artifact::ArtifactFileVersion>,
+    layout: Option<CacheShardLayout>,
+    // File removal in Drop precedes release of its actual Disk reservation.
+    storage: Option<super::CachePoolReservation>,
+}
+
+impl Drop for LiveCacheBlockFile {
+    fn drop(&mut self) {
+        if self.published.load(Ordering::Acquire) {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+impl LiveCacheBlockSource {
+    /// Exact uniquely published path, borrowed under this file owner.
+    pub fn path(&self) -> &Path {
+        &self.inner.path
+    }
+
+    /// Immutable header/layout emitted by this publication's shared cache writer.
+    /// Missing layout denotes an older/external caller requiring ordinary parsing.
+    pub fn writer_layout(&self) -> Option<&CacheShardLayout> {
+        self.inner.layout.as_ref()
+    }
+
+    /// Whether this actual shared file owns its independently admitted Disk
+    /// occupancy. Manager reports must not charge that same reservation again.
+    pub fn owns_disk_reservation(&self) -> bool {
+        self.inner.storage.is_some()
+    }
+
+    /// Whether two source loans retain the same actual file lifetime.
+    pub fn same_source(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
 /// Runtime-owned unique staging and atomic publication for one live-cache block.
 #[derive(Debug)]
 pub struct LiveCacheBlockPublication {
@@ -122,40 +185,23 @@ pub struct LiveCacheBlockPublication {
 impl LiveCacheBlockPublication {
     /// Reserves unique paths derived from the complete block and rank identity.
     pub fn begin(directory: &Path, id: &CacheBlockId) -> Self {
-        let process_namespace = LIVE_CACHE_PROCESS_NAMESPACE.get_or_init(|| {
-            let started = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos();
-            format!("p{:08x}-t{started:032x}", std::process::id())
-        });
+        let namespace = Self::initialize_naming_source();
         let publication_id = NEXT_LIVE_CACHE_PUBLICATION_ID.fetch_add(1, Ordering::Relaxed);
-        let representation = match id.representation {
-            CacheRepresentation::KeyValue => "kv",
-            CacheRepresentation::CompressedLatentRotary => "mla",
-        };
-        let rank_component =
-            |rank: Option<usize>| rank.map_or_else(|| "x".to_string(), |rank| rank.to_string());
-        let rank = id.rank.map_or_else(
-            || "rank-px-tx-ex".to_string(),
-            |rank| {
-                format!(
-                    "rank-p{}-t{}-e{}",
-                    rank_component(rank.stage_rank()),
-                    rank_component(rank.shard_rank()),
-                    rank_component(rank.addressable_rank())
-                )
-            },
-        );
-        let base = format!(
-            "live-{process_namespace}-w{publication_id:016x}-s{:016x}-layer-{:05}-{representation}-{rank}-{}-{}",
-            id.session_id, id.global_layer, id.start, id.end
-        );
-        Self {
-            destination: directory.join(format!("{base}.safetensors")),
-            staging: directory.join(format!(".{base}.tmp.safetensors")),
-            committed: false,
-        }
+        live_prepared::ordinary_paths(directory, id, namespace, publication_id)
+    }
+
+    /// Initializes the same immutable process naming source during ordinary
+    /// manager setup. It creates no path, file, or read/write permission.
+    pub fn initialize_naming_source() -> &'static str {
+        LIVE_CACHE_PROCESS_NAMESPACE
+            .get_or_init(|| {
+                let started = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                format!("p{:08x}-t{started:032x}", std::process::id())
+            })
+            .as_str()
     }
 
     /// Unique temporary path into which the backend serializes native storage.
@@ -170,23 +216,93 @@ impl LiveCacheBlockPublication {
 
     /// Atomically publishes the staged file without replacing an existing path.
     pub fn commit(mut self) -> Result<PathBuf, LiveCachePublicationError> {
-        fs::hard_link(&self.staging, &self.destination).map_err(|source| {
-            LiveCachePublicationError::Io {
-                action: "publish uniquely named live cache block",
-                path: self.destination.clone(),
-                source,
+        self.publish()?;
+        Ok(std::mem::take(&mut self.destination))
+    }
+
+    /// Publishes through the same writer and transfers file retirement to the
+    /// actual shared source owner, rather than a particular manager record.
+    pub fn commit_owned(self) -> Result<LiveCacheBlockSource, LiveCachePublicationError> {
+        self.commit_owned_inner(None)
+    }
+    /// Publishes and retains the actual writer's immutable schema/extent.
+    pub fn commit_owned_with_layout(
+        self,
+        layout: CacheShardLayout,
+    ) -> Result<LiveCacheBlockSource, LiveCachePublicationError> {
+        self.commit_owned_inner(Some(layout))
+    }
+    fn commit_owned_inner(
+        mut self,
+        layout: Option<CacheShardLayout>,
+    ) -> Result<LiveCacheBlockSource, LiveCachePublicationError> {
+        // Keep the actual staging handle across hard-link publication. A later
+        // path replacement must not become this source's captured file version.
+        let file = File::open(&self.staging).map_err(|source| LiveCachePublicationError::Io {
+            action: "open completed live cache source",
+            path: self.staging.clone(),
+            source,
+        })?;
+        self.publish()?;
+        let version = match eredu_checkpoint::artifact::ArtifactFileVersion::capture(&file) {
+            Ok(version) => version,
+            Err(source) => {
+                let _ = fs::remove_file(&self.destination);
+                return Err(LiveCachePublicationError::Source {
+                    path: std::mem::take(&mut self.destination),
+                    source,
+                });
             }
+        };
+        if layout
+            .as_ref()
+            .is_some_and(|layout| layout.file_bytes() != version.byte_len())
+        {
+            let _ = fs::remove_file(&self.destination);
+            return Err(LiveCachePublicationError::Source {
+                path: std::mem::take(&mut self.destination),
+                source: eredu_checkpoint::artifact::ArtifactFileReadError::DestinationLength,
+            });
+        }
+        Ok(LiveCacheBlockSource {
+            inner: Arc::new(LiveCacheBlockFile {
+                path: std::mem::take(&mut self.destination),
+                published: AtomicBool::new(true),
+                version: Some(version),
+                layout,
+                storage: None,
+            }),
+            funding: None,
+        })
+    }
+
+    fn publish(&mut self) -> Result<(), LiveCachePublicationError> {
+        self.publish_raw()
+            .map_err(|cause| LiveCachePublicationError::Io {
+                action: cause.action.description(),
+                path: match cause.action {
+                    live_prepared::PublicationAction::Publish => self.destination.clone(),
+                    live_prepared::PublicationAction::RemoveStaging
+                    | live_prepared::PublicationAction::OpenSource => self.staging.clone(),
+                },
+                source: cause.source,
+            })
+    }
+    fn publish_raw(&mut self) -> Result<(), live_prepared::PublicationIo> {
+        use live_prepared::{PublicationAction, PublicationIo};
+        fs::hard_link(&self.staging, &self.destination).map_err(|source| PublicationIo {
+            action: PublicationAction::Publish,
+            source,
         })?;
         if let Err(source) = fs::remove_file(&self.staging) {
             let _ = fs::remove_file(&self.destination);
-            return Err(LiveCachePublicationError::Io {
-                action: "remove published live cache temporary file",
-                path: self.staging.clone(),
+            return Err(PublicationIo {
+                action: PublicationAction::RemoveStaging,
                 source,
             });
         }
         self.committed = true;
-        Ok(self.destination.clone())
+        Ok(())
     }
 }
 
@@ -1101,7 +1217,7 @@ mod tests {
         PromptCacheTopology,
     };
     use eredu_core::{AttentionPolicy, LayerSchedule};
-    use safetensors::tensor::{serialize_to_file, Dtype, TensorView};
+    use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
     use std::collections::HashMap;
 
     fn manifest(shard: &Path) -> PromptCacheManifest {
@@ -1337,10 +1453,12 @@ mod tests {
         let first = LiveCacheBlockPublication::begin(directory.path(), &id);
         let second = LiveCacheBlockPublication::begin(directory.path(), &id);
         assert_ne!(first.destination_path(), second.destination_path());
-        assert!(first
-            .destination_path()
-            .to_string_lossy()
-            .contains("layer-00003-kv-rank-p1-t2-ex-4-8"));
+        assert!(
+            first
+                .destination_path()
+                .to_string_lossy()
+                .contains("layer-00003-kv-rank-p1-t2-ex-4-8")
+        );
 
         fs::write(first.staging_path(), b"block").unwrap();
         let destination = first.commit().unwrap();
@@ -1372,3 +1490,18 @@ mod tests {
         assert_eq!(fs::read(destination).unwrap(), b"existing");
     }
 }
+
+#[path = "persistence/live_prepared.rs"]
+mod live_prepared;
+pub use live_prepared::{PreparedLiveCachePublication, PreparedLiveCachePublicationFailure};
+
+#[path = "persistence/live_read.rs"]
+mod live_read;
+pub use live_read::{LiveCacheReadFailure, PreparedLiveCacheRead};
+
+#[path = "persistence/shard.rs"]
+mod shard;
+pub use shard::{
+    CacheShardError, CacheShardLayout, CacheShardMetadata, CacheShardTensor,
+    cache_shard_tensor_names,
+};

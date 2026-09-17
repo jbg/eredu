@@ -30,7 +30,7 @@ where
     F: ReplicatedExecutableFinalizer<A, S>,
 {
     let (identity, capability, model_type, residency) = facts.into_parts();
-    let banks = session.execution_strategy().parameter_banks();
+    let banks = session.execution_strategy().parameter_banks()?;
     finalizer.finish(
         CompletedReplicatedText::from_session(
             session, identity, capability, model_type, residency, None, None, None, true, stream,
@@ -41,23 +41,25 @@ where
 
 pub(super) fn selected_addressable_bank(
     members: &[eredu_runtime::AddressableBankMember],
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     options: eredu_runtime::ParameterBankLoadOptions,
     weights_stream: &Stream,
     stream: &Stream,
+    addressable_manager: Option<&AddressableManagerSlot>,
 ) -> Result<crate::backend::runtime::residency::parameter_bank::AddressableParameterBank, Error> {
     let selected =
         crate::backend::runtime::residency::parameter_bank::entries_from_selected_members(
             members,
             store.as_ref(),
         )?;
-    crate::backend::runtime::residency::parameter_bank::AddressableParameterBank::new_selected_shared(
+    crate::backend::runtime::residency::parameter_bank::AddressableParameterBank::new_selected_shared_with_manager(
         store,
         selected,
         options,
         weights_stream.clone(),
         stream.clone(),
-    )
+            addressable_manager.and_then(std::cell::Cell::take),
+        )
     .map_err(Into::into)
 }
 
@@ -67,10 +69,11 @@ pub(super) fn selected_addressable_banks(
         eredu_runtime::RoutedBankId,
         eredu_architectures::routed_text::SelectedRoutedBank,
     >,
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     options: eredu_runtime::ParameterBankLoadOptions,
     weights_stream: &Stream,
     stream: &Stream,
+    addressable_manager: Option<&AddressableManagerSlot>,
 ) -> Result<
     std::collections::BTreeMap<
         eredu_runtime::RoutedBankId,
@@ -91,22 +94,20 @@ pub(super) fn selected_addressable_banks(
         options,
         weights_stream,
         stream,
-    )?);
+            addressable_manager,
+        )?);
     banks
         .keys()
         .map(|id| {
-            Ok((
-                *id,
-                (
-                    pool.scoped(id.value() as usize)?,
-                    crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                ),
-            ))
+            let bank = pool.scoped(id.value() as usize)?;
+            let movement = crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement::for_bank(
+                bank.clone(), options);
+            Ok((*id, (bank, movement)))
         })
         .collect()
 }
 
-pub(super) fn shard_addressable_members(
+pub(crate) fn shard_addressable_members(
     members: &[eredu_runtime::AddressableBankMember],
     store: &dyn CheckpointSource,
     layout: &eredu_runtime::LocalModelLayout,
@@ -165,11 +166,12 @@ pub(super) fn shard_addressable_members(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn selected_addressable_partition_bank(
     members: &[eredu_runtime::AddressableBankMember],
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     options: eredu_runtime::ParameterBankLoadOptions,
     layout: &eredu_runtime::LocalModelLayout,
     weights_stream: &Stream,
     stream: &Stream,
+    addressable_manager: Option<&AddressableManagerSlot>,
 ) -> Result<
     (
         std::collections::BTreeMap<eredu_runtime::ParameterBankKey, u64>,
@@ -178,7 +180,9 @@ pub(super) fn selected_addressable_partition_bank(
     Error,
 > {
     let members = shard_addressable_members(members, store.as_ref(), layout)?;
-    let bank = selected_addressable_bank(&members, store, options, weights_stream, stream)?;
+    let bank = selected_addressable_bank(&members, store, options, weights_stream, stream,
+            addressable_manager,
+        )?;
     let selected_member_bytes = members
         .iter()
         .map(|member| {
@@ -195,8 +199,10 @@ pub(super) fn selected_addressable_partition_bank(
 
 #[derive(Clone, Copy)]
 pub(in crate::composition::mlx) struct Relu2RoutedBindingVisitor<'a> {
+    pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) stream: &'a Stream,
     pub(in crate::composition::mlx) weights_stream: &'a Stream,
+    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
 }
 
 impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, MlxHybridState>
@@ -213,7 +219,7 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
     fn visit<A>(
         self,
         prepared: eredu_architectures::PreparedRoutedTextArchitecture<A>,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
@@ -222,8 +228,11 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        let mechanisms: MlxReplicatedTextMechanisms<A, MlxHybridState> =
-            MlxReplicatedTextMechanisms::new(Arc::clone(&store), self.stream, self.weights_stream);
+        let mut mechanisms: MlxReplicatedTextMechanisms<A, MlxHybridState> =
+            MlxReplicatedTextMechanisms::new(store.clone(), self.stream, self.weights_stream)?;
+        mechanisms.set_prepared_layerwise_manager(
+            self.layerwise_manager.and_then(std::cell::Cell::take),
+        );
         #[cfg(test)]
         crate::tests::support::path_instrumentation::constructor();
         eredu_architectures::prepared_execution::construct_selected_routed_session(
@@ -233,11 +242,12 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
             |banks, options| {
                 super::routed::selected_addressable_banks(
                     banks,
-                    Arc::clone(&store),
+                    store.clone(),
                     options,
                     self.weights_stream,
                     self.stream,
-                )
+            self.addressable_manager,
+        )
             },
             (self.stream, OrdinaryReplicatedFinalizer),
             finish_routed_session,
@@ -249,21 +259,27 @@ impl eredu_architectures::Relu2RoutedTextArchitectureVisitor<MlxNeuralBackend, M
 
 #[derive(Clone, Copy)]
 pub(in crate::composition::mlx) struct RoutedBindingVisitor<'a> {
+    pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) stream: &'a Stream,
     pub(in crate::composition::mlx) weights_stream: &'a Stream,
+    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
 }
 
 #[derive(Clone, Copy)]
 pub(in crate::composition::mlx) struct PoolingRoutedBindingVisitor<'a> {
+    pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
     pub(in crate::composition::mlx) stream: &'a Stream,
     pub(in crate::composition::mlx) weights_stream: &'a Stream,
+    pub(in crate::composition::mlx) layerwise_manager: Option<&'a LayerwiseManagerSlot>,
 }
 
 pub(super) fn bind_prepared_routed<A, S>(
     prepared: eredu_architectures::PreparedRoutedTextArchitecture<A>,
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     stream: &Stream,
     weights_stream: &Stream,
+    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
+    addressable_manager: Option<&AddressableManagerSlot>,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
@@ -273,8 +289,9 @@ where
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
-    let mechanisms: MlxReplicatedTextMechanisms<A, S> =
-        MlxReplicatedTextMechanisms::new(Arc::clone(&store), stream, weights_stream);
+    let mut mechanisms: MlxReplicatedTextMechanisms<A, S> =
+        MlxReplicatedTextMechanisms::new(store.clone(), stream, weights_stream)?;
+    mechanisms.set_prepared_layerwise_manager(layerwise_manager);
     #[cfg(test)]
     crate::tests::support::path_instrumentation::constructor();
     eredu_architectures::prepared_execution::construct_selected_routed_session(
@@ -284,11 +301,12 @@ where
         |banks, options| {
             super::routed::selected_addressable_banks(
                 banks,
-                Arc::clone(&store),
+                store.clone(),
                 options,
                 weights_stream,
                 stream,
-            )
+            addressable_manager,
+        )
         },
         (stream, OrdinaryReplicatedFinalizer),
         finish_routed_session,
@@ -302,9 +320,11 @@ pub(super) fn bind_prepared_routed_prediction<A, S, P>(
     extension: P,
     selected: eredu_runtime::SelectedSpeculativeRealization,
     capability: eredu_architectures::capability::CapabilityEstimate,
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     stream: &Stream,
     weights_stream: &Stream,
+    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
+    addressable_manager: Option<&AddressableManagerSlot>,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
@@ -320,7 +340,8 @@ where
         > + 'static,
 {
     let mut mechanisms =
-        MlxReplicatedTextMechanisms::<A, S>::new(Arc::clone(&store), stream, weights_stream);
+        MlxReplicatedTextMechanisms::<A, S>::new(store.clone(), stream, weights_stream)?;
+    mechanisms.set_prepared_layerwise_manager(layerwise_manager);
     let mut prediction = SelectedPrediction {
         extension,
         selected,
@@ -337,11 +358,12 @@ where
         |banks, options| {
             super::routed::selected_addressable_banks(
                 banks,
-                Arc::clone(&store),
+                store.clone(),
                 options,
                 weights_stream,
                 stream,
-            )
+            addressable_manager,
+        )
         },
         (
             stream,
@@ -374,7 +396,7 @@ where
         extension: <A as eredu_architectures::prediction_extension::MaterializedPredictionTarget<
             MlxNeuralBackend,
         >>::Extension<MlxEmbeddedPredictionMaterializer>,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: ReplicatedTextArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>
@@ -393,6 +415,8 @@ where
             store,
             self.stream,
             self.weights_stream,
+            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.addressable_manager,
         )
     }
 }
@@ -411,7 +435,7 @@ impl eredu_architectures::RoutedTextArchitectureVisitor<MlxNeuralBackend, MlxPoo
     fn visit<A>(
         self,
         prepared: eredu_architectures::PreparedRoutedTextArchitecture<A>,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: ReplicatedTextArchitecture<
@@ -423,7 +447,10 @@ impl eredu_architectures::RoutedTextArchitectureVisitor<MlxNeuralBackend, MlxPoo
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        bind_prepared_routed(prepared, store, self.stream, self.weights_stream)
+        bind_prepared_routed(prepared, store, self.stream, self.weights_stream,
+            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.addressable_manager,
+        )
     }
 }
 
@@ -441,7 +468,7 @@ impl eredu_architectures::RoutedTextArchitectureVisitor<MlxNeuralBackend, MlxHyb
     fn visit<A>(
         self,
         prepared: eredu_architectures::PreparedRoutedTextArchitecture<A>,
-        store: Arc<dyn CheckpointSource>,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: ReplicatedTextArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
@@ -450,6 +477,9 @@ impl eredu_architectures::RoutedTextArchitectureVisitor<MlxNeuralBackend, MlxHyb
         A::StaticModules: Clone,
         A::Error: std::fmt::Display,
     {
-        bind_prepared_routed(prepared, store, self.stream, self.weights_stream)
+        bind_prepared_routed(prepared, store, self.stream, self.weights_stream,
+            self.layerwise_manager.and_then(std::cell::Cell::take),
+            self.addressable_manager,
+        )
     }
 }

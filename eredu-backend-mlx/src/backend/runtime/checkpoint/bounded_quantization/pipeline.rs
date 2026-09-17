@@ -15,7 +15,7 @@ use super::{
 /// transformed keys use bounded in-memory leases; all other keys delegate to
 /// the original store.
 pub struct BoundedQuantizedWeightStore {
-    source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+    source: eredu_checkpoint::store::RetainedCheckpointSource,
     transformed: MemoryWeightStore,
     transformed_keys: BTreeSet<String>,
     materialized_source_keys: BTreeSet<String>,
@@ -50,10 +50,11 @@ impl BoundedQuantizedWeightStore {
     /// A second same-device stream is used only when two minimum tiles fit the
     /// admitted bound.
     pub fn create(
-        source: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        source: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
         plan: BoundedQuantizationPlan,
         conversion_stream: &Stream,
     ) -> Result<Self, Error> {
+        let source = source.into();
         if !cfg!(target_endian = "little") {
             return Err(quantization_error(
                 "bounded SafeTensors quantization requires a little-endian host",
@@ -144,6 +145,86 @@ impl BoundedQuantizedWeightStore {
 }
 
 impl CheckpointSource for BoundedQuantizedWeightStore {
+    fn prepare_encoded_read(
+        &self,
+        keys: &[String],
+    ) -> Result<Option<eredu_checkpoint::store::EncodedReadBatch>, StoreError> {
+        // A batch has one exact retained source, matching the existing composed
+        // source contract. Per-binding materialization reaches one of these.
+        if keys.iter().all(|key| self.is_transformed(key)) {
+            self.transformed.prepare_encoded_read(keys)
+        } else if keys.iter().all(|key| !self.is_transformed(key)) {
+            self.source.prepare_encoded_read(keys)
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn source_lease_controls<'a>(
+        &'a self,
+        key: &'a str,
+    ) -> Result<
+        eredu_checkpoint::store::SourceLeaseControls<'a>,
+        eredu_checkpoint::store::LeaseControlBorrowError<'a>,
+    > {
+        if self.is_transformed(key) {
+            self.transformed.source_lease_controls(key)
+        } else {
+            self.source.source_lease_controls(key)
+        }
+    }
+
+    fn source_metadata_borrowed(
+        &self,
+        key: &str,
+    ) -> eredu_checkpoint::store::SourceMetadataLoan<'_> {
+        if self.is_transformed(key) {
+            self.transformed.source_metadata_borrowed(key)
+        } else {
+            self.source.source_metadata_borrowed(key)
+        }
+    }
+    fn source_key_authority_borrowed(
+        &self,
+        key: &str,
+    ) -> Result<
+        eredu_checkpoint::store::SourceKeyAuthority,
+        eredu_checkpoint::store::SourceMetadataBorrowError<'_>,
+    > {
+        use eredu_checkpoint::store::SourceKeyAuthority;
+        Ok(if self.is_transformed(key) {
+            SourceKeyAuthority::Materialized
+        } else {
+            SourceKeyAuthority::Ordinary
+        })
+    }
+
+    fn source_storage_slot_bound(&self) -> Result<Option<usize>, StoreError> {
+        match (self.source.source_storage_slot_bound()?, self.transformed.source_storage_slot_bound()?) {
+            (Some(source), Some(transformed)) => source.checked_add(transformed).map(Some)
+                .ok_or_else(|| StoreError::Overflow { context: "transformed source storage slots".into() }),
+            _ => Ok(None),
+        }
+    }
+
+    fn visit_source_storage(
+        &self,
+        visitor: &mut dyn FnMut(eredu_checkpoint::store::SourceStorageRef<'_>),
+    ) -> Result<bool, StoreError> {
+        // Hidden original owners remain live beneath the overlay. Visit both
+        // physical branches even when one reports incomplete coverage.
+        let source = self.source.visit_source_storage(visitor)?;
+        let transformed = self.transformed.visit_source_storage(visitor)?;
+        Ok(source && transformed)
+    }
+
+    fn source_storage(&self) -> Result<Option<eredu_checkpoint::store::SourceStorage>, StoreError> {
+        eredu_checkpoint::store::SourceStorage::collect([
+            self.source.as_ref(),
+            &self.transformed as &dyn CheckpointSource,
+        ])
+    }
+
     fn source_keys(&self) -> Vec<String> {
         self.source
             .source_keys()
@@ -188,6 +269,17 @@ impl CheckpointSource for BoundedQuantizedWeightStore {
             CheckpointSource::source_metadata(&self.transformed, key)
         } else {
             self.source.source_metadata(key)
+        }
+    }
+
+    fn source_provenance(
+        &self,
+        key: &str,
+    ) -> Result<eredu_checkpoint::store::TensorSourceProvenance, StoreError> {
+        if self.is_transformed(key) {
+            self.transformed.source_provenance(key)
+        } else {
+            self.source.source_provenance(key)
         }
     }
 
@@ -761,4 +853,209 @@ fn write_tile(
     }
     destination.copy_from_slice(&evaluated.to_native_bytes());
     Ok(())
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    #[test]
+    fn borrowed_overlay_metadata_keeps_real_materialized_authority_through_resolved_view() {
+        use eredu_checkpoint::{
+            schema::{
+                CatalogPolicy, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
+                StoredDtypeConstraint,
+            },
+            store::{ResolvedCheckpointSource, SourceKeyAuthority, SourceMetadataBorrowError},
+            validation::resolve_safetensors_plan,
+            StoredDtype,
+        };
+        let source: eredu_checkpoint::store::RetainedCheckpointSource = (Arc::new(
+            MemoryWeightStore::from_safetensors([
+                (
+                    "weight".into(),
+                    SafeDtype::F32,
+                    vec![1],
+                    0.75f32.to_le_bytes().to_vec(),
+                ),
+                (
+                    "unchanged".into(),
+                    SafeDtype::F32,
+                    vec![1],
+                    (-2.5f32).to_le_bytes().to_vec(),
+                ),
+            ])
+            .unwrap(),
+        ))
+        .into();
+        let plan = SafetensorsCheckpointPlan::new(
+            "selected",
+            vec![SafetensorsTensorConstraint::required(
+                "unchanged",
+                vec![1],
+                StoredDtypeConstraint::Exact(StoredDtype::F32),
+            )],
+            Vec::new(),
+            CatalogPolicy::non_strict(),
+        )
+        .unwrap();
+        let contract = resolve_safetensors_plan(source.as_ref(), &plan).unwrap();
+        let overlay = Arc::new(BoundedQuantizedWeightStore {
+            source,
+            transformed: MemoryWeightStore::from_safetensors([(
+                "packed".into(),
+                SafeDtype::U32,
+                vec![1],
+                0x76543210u32.to_le_bytes().to_vec(),
+            )])
+            .unwrap(),
+            transformed_keys: BTreeSet::from(["packed".into()]),
+            materialized_source_keys: BTreeSet::new(),
+            materialized_source_shards: BTreeSet::new(),
+            report: WeightMaterializationReport::default(),
+        });
+        let resolved = ResolvedCheckpointSource::new(overlay.clone(), contract);
+        // This exact transformed memory source must qualify the same original
+        // manager reader; no file descriptor or ordinary lease is substituted.
+        let packed_read = DerivedWeightRecipe::source("packed", TensorSelection::Full)
+            .prepare_encoded_read(&resolved)
+            .unwrap()
+            .unwrap();
+        let mut packed_bytes = [0; 4];
+        eredu_checkpoint::recipe::EncodedRecipeRead::read_many_borrowed_into(
+            std::iter::once(&packed_read),
+            &mut [&mut packed_bytes],
+        )
+        .unwrap();
+        assert_eq!(packed_bytes, 0x76543210u32.to_le_bytes());
+        let unchanged_read = DerivedWeightRecipe::source("unchanged", TensorSelection::Full)
+            .prepare_encoded_read(&resolved)
+            .unwrap()
+            .unwrap();
+        let mut unchanged_bytes = [0; 4];
+        eredu_checkpoint::recipe::EncodedRecipeRead::read_many_borrowed_into(
+            std::iter::once(&unchanged_read),
+            &mut [&mut unchanged_bytes],
+        )
+        .unwrap();
+        assert_eq!(unchanged_bytes, (-2.5f32).to_le_bytes());
+        let packed = overlay
+            .transformed
+            .source_metadata_borrowed("packed")
+            .unwrap();
+        assert!(std::ptr::eq(
+            packed,
+            resolved.source_metadata_borrowed("packed").unwrap()
+        ));
+        let packed_loan = resolved.source_lease_controls("packed").unwrap();
+        assert!(
+            packed_loan.same_entry(&overlay.transformed.source_lease_controls("packed").unwrap())
+        );
+        assert!(!packed_loan.same_entry(&overlay.source.source_lease_controls("weight").unwrap()));
+        assert!(resolved
+            .source_lease_controls("unchanged")
+            .unwrap()
+            .same_entry(&overlay.source.source_lease_controls("unchanged").unwrap()));
+        assert!(matches!(
+            resolved.source_lease_controls("weight"),
+            Err(eredu_checkpoint::store::LeaseControlBorrowError::Source(
+                SourceMetadataBorrowError::UnauthorizedTensor
+            ))
+        ));
+        assert_eq!(packed.stored_dtype, StoredDtype::U32);
+        assert_eq!(resolved.source_metadata("packed").unwrap(), *packed);
+        assert_eq!(
+            resolved.source_key_authority_borrowed("packed").unwrap(),
+            SourceKeyAuthority::Materialized
+        );
+        let unchanged = overlay
+            .source
+            .source_metadata_borrowed("unchanged")
+            .unwrap();
+        assert!(std::ptr::eq(
+            unchanged,
+            resolved.source_metadata_borrowed("unchanged").unwrap()
+        ));
+        for key in ["weight", "absent"] {
+            assert!(matches!(
+                resolved.source_metadata_borrowed(key),
+                Err(SourceMetadataBorrowError::UnauthorizedTensor)
+            ));
+            assert!(matches!(
+                resolved.source_metadata(key),
+                Err(StoreError::UnauthorizedTensor { .. })
+            ));
+        }
+    }
+
+    struct Renamed(MemoryWeightStore);
+    impl CheckpointSource for Renamed {
+        fn source_keys(&self) -> Vec<String> {
+            self.0.source_keys()
+        }
+        fn source_metadata(
+            &self,
+            key: &str,
+        ) -> Result<eredu_checkpoint::store::TensorMetadata, StoreError> {
+            self.0.source_metadata(key)
+        }
+        fn acquire_lease(&self, request: TensorReadRequest) -> Result<CheckpointLease, StoreError> {
+            self.0.acquire_lease(request)
+        }
+        fn source_diagnostics(&self) -> Result<WeightStoreDiagnostics, StoreError> {
+            self.0.source_diagnostics()
+        }
+        fn source_provenance(
+            &self,
+            key: &str,
+        ) -> Result<eredu_checkpoint::store::TensorSourceProvenance, StoreError> {
+            let mut provenance = self.0.source_provenance(key)?;
+            provenance.physical_tensor = format!("checkpoint.prefix.{key}");
+            provenance.output = format!("selected.{key}");
+            Ok(provenance)
+        }
+    }
+    #[test]
+    fn bounded_overlay_preserves_original_passthrough_and_actual_output_provenance() {
+        let source: eredu_checkpoint::store::RetainedCheckpointSource = (Arc::new(Renamed(
+            MemoryWeightStore::from_safetensors(["weight", "unchanged"].map(|key| {
+                (
+                    key.to_owned(),
+                    SafeDtype::F32,
+                    vec![1],
+                    0.75f32.to_le_bytes().to_vec(),
+                )
+            }))
+            .unwrap(),
+        )))
+        .into();
+        let transformed = MemoryWeightStore::from_safetensors([(
+            "weight".to_owned(),
+            SafeDtype::U32,
+            vec![1],
+            0x76543210u32.to_le_bytes().to_vec(),
+        )])
+        .unwrap();
+        let expected_output = transformed.source_provenance("weight").unwrap();
+        let expected_passthrough = source.source_provenance("unchanged").unwrap();
+        let overlay = BoundedQuantizedWeightStore {
+            source,
+            transformed,
+            transformed_keys: BTreeSet::from(["weight".to_owned()]),
+            materialized_source_keys: BTreeSet::new(),
+            materialized_source_shards: BTreeSet::new(),
+            report: WeightMaterializationReport::default(),
+        };
+        assert_eq!(
+            overlay.source_provenance("unchanged").unwrap(),
+            expected_passthrough
+        );
+        assert_eq!(
+            overlay.source_provenance("weight").unwrap(),
+            expected_output
+        );
+        assert_eq!(
+            overlay.source_provenance("weight").unwrap().source_encoding,
+            eredu_checkpoint::SourceTensorEncoding::Safetensors(eredu_checkpoint::StoredDtype::U32)
+        );
+    }
 }

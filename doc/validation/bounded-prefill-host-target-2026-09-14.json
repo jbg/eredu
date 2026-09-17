@@ -1,0 +1,208 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T02:28:40.608321+00:00",
+  "scope": "Persistent single-buffer partial prefill targets in the original scheduled capture bank",
+  "status": "Verified host target construction and retained delivery; native fragment integration and bounded inference remain unfinished",
+  "previous_increment": "bounded-capture-source-segment-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 1054,
+      "ignored": 0
+    },
+    "runtime_integration": {
+      "passed": 68,
+      "ignored": 0
+    },
+    "backend_integration": {
+      "passed": 102,
+      "ignored": 0
+    },
+    "native_observation": {
+      "passed": 10,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 230,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1598,
+  "new_tests": [
+    "exact_original_h_covers_all_target_controls_and_rejects_one_short_before_allocation",
+    "interleaved_targets_scatter_into_one_buffer_and_final_aliases_keep_original_h",
+    "identity_order_duplicate_and_missing_target_reject_without_partial_row_advance",
+    "incomplete_initialized_data_cannot_seal_and_abort_keeps_same_partial_payload",
+    "parent_close_and_unwind_retain_partial_payload_without_refilling_or_certifying",
+    "global_preview_zero_needs_real_empty_claim_but_skips_all_fragment_values",
+    "wrong_geometry_and_unsupported_axis_spend_only_the_original_frame_claim",
+    "closure_or_quarantine_during_fill_poison_target_and_preserve_original_buffer",
+    "zero_full_shape_has_zero_coverage_but_still_requires_initial_claim_and_all_chunks",
+    "inactive_prefill_row_checks_full_inference_frontier_before_construction"
+  ],
+  "new_test_count": 10,
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T02:24:38.358270+00:00",
+      "elapsed_seconds": 17.717,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-host-target-runtime.log",
+      "log_sha256": "33bde88f59173d064fd4433e05568ee2112a5e8d52d5065316667138b5ef51da"
+    },
+    "runtime_integration": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test bounded_prefill",
+      "started_utc": "2026-09-14T02:24:56.075528+00:00",
+      "elapsed_seconds": 7.648,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-host-target-runtime_integration.log",
+      "log_sha256": "cb8473ea269db1e976bc3baf46988237a27f9f3acdf6840ddd9f801dae0c2685"
+    },
+    "backend_integration": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence",
+      "started_utc": "2026-09-14T02:25:03.724241+00:00",
+      "elapsed_seconds": 3.405,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-host-target-backend_integration.log",
+      "log_sha256": "e490af7db0db2914578db9aee182af92de7bb81755f9ed5d83021940c324e849"
+    },
+    "native_observation": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::observation:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T02:25:07.130309+00:00",
+      "elapsed_seconds": 95.548,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-host-target-native_observation.log",
+      "log_sha256": "0bd82ca1dfe26c05100fe0b26a886e552f60635a446ca0f46c57aafdc6e0d0f3"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::model_session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T02:26:42.679420+00:00",
+      "elapsed_seconds": 14.389,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-host-target-session.log",
+      "log_sha256": "af270f6a878af8148ead2e8299012ef86562c87dcd6fefe1524ce799b74c0d06"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T02:26:57.068454+00:00",
+      "elapsed_seconds": 42.831,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-host-target-portable.log",
+      "log_sha256": "23b60a527276976b2ffe7aec8606fae851c8b5aff4d29d0c9fa4e937eeef77e8"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T02:27:39.900347+00:00",
+      "elapsed_seconds": 14.82,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-host-target-minimal.log",
+      "log_sha256": "72c279f413a7416e2f0f06d15f0aad61ceae4ea07c8f2a3c4ac5ba1b69f975ee"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T02:27:54.721153+00:00",
+      "elapsed_seconds": 15.774,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-host-target-features.log",
+      "log_sha256": "2ae682955b6975dbd4682f8c359d2ccd3e4e07b7da38cace25557cb2f5fe6b26"
+    }
+  },
+  "source_sha256": {
+    "eredu-runtime/src/working_memory.rs": "dc77b4fd2c0b588839841e61cd3fc06a01e43af8b7b7eafe63f62f49b0fa39dc",
+    "eredu-runtime/src/working_memory/capture_run.rs": "b3aa4d2e0070e20926167cc7df2d62973dd0ec646abf27f4ecd4a4ad4ed7e631",
+    "eredu-runtime/src/working_memory/capture_run/claims.rs": "6bcb9fc78950da75a85fbba3329abe4b7b52021116979b8697e2dda52b14aa9d",
+    "eredu-runtime/src/working_memory/capture_run/claims/prefill.rs": "59a5c6eef7279fc2c7120a68b6c10c333afcb7613b6710f10ae2ca26145db242",
+    "eredu-runtime/src/working_memory/capture_run/plan.rs": "dee5e02a572848849e4002990bb7582ff5c04ee7a3a450422aea10fa9d79c238",
+    "eredu-runtime/src/working_memory/capture_run/tests.rs": "35f969038c1d358d04dd42115d93d4ebed46731837206b095f00bc0f7a110eea",
+    "eredu-runtime/src/working_memory/capture_run/tests/prefill.rs": "a30d13f2b375d949d883e5cab5db2f5ce17dfa8012e65e4f92ac70fe1f5a4214",
+    "eredu-runtime/src/working_memory/capture_step/builder.rs": "d8833052ec824a87e313fa81e5c524c37fd42d8b5a5143acdba72945d4537720",
+    "eredu-runtime/src/working_memory/capture_step/builder/delivery.rs": "5b6959f83226c2b9fcfedcd6b634081062e70a1fee435a419abcec8014b45f0f",
+    "eredu-runtime/src/working_memory/capture_step/builder/pending.rs": "8740c25e2aea937b8ebf97ecec1846c28ccb4302a37cfb243734d45ab5eac2d8",
+    "eredu-runtime/src/working_memory/capture_tensor.rs": "f4add85ea9b7f05bda344046ae83e910c732f437e0770d92d422f81ab68d7ddd",
+    "eredu-runtime/src/working_memory/capture_tensor/prefill.rs": "b6c6943c069435b8e4e22cd0e8225bb8d553061c9dce1c233913fe77139fb494",
+    "doc/backend-architecture.md": "1aef97bb35c0dbba5b29a567aa34406f229ecdc31086d971e98510960f0a1543",
+    "doc/execution-control.md": "617d42868842807b307749524bcae1e98df05efce7bdfe45bdad9c727e128f4c",
+    "doc/bounded-inference.md": "9f1907c84b01128a33f8845cbb4935ed03fe9521384e959e0415b7def827852c"
+  },
+  "source_snapshot": "/private/tmp/eredu-prefill-host-target-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-prefill-host-target-applied.json": "44c41bc545754b93ae834924a674eadb3c442cf061e0afb8da831aec11a9034a",
+    "/private/tmp/eredu-prefill-host-target-backend_integration.log": "e490af7db0db2914578db9aee182af92de7bb81755f9ed5d83021940c324e849",
+    "/private/tmp/eredu-prefill-host-target-checks.json": "06612e362236d97a1e96c8955831bdab9d8065109325a7dd2bbce24e33b2012c",
+    "/private/tmp/eredu-prefill-host-target-doc-map.json": "4dacbff39a413fce8130d5990bf4584e9f393d30a7cad248f755d8ea3758c198",
+    "/private/tmp/eredu-prefill-host-target-features.log": "2ae682955b6975dbd4682f8c359d2ccd3e4e07b7da38cace25557cb2f5fe6b26",
+    "/private/tmp/eredu-prefill-host-target-files.txt": "9345b1253b4dcb54da97fb99fe8b9cfab2aa327b70ca3227d6860605bddd2073",
+    "/private/tmp/eredu-prefill-host-target-frontier-stage/README.md": "dd644ad4026aec421e12b8b755e7ed163ceb319280d7a5c190bcdf5f6066356d",
+    "/private/tmp/eredu-prefill-host-target-frontier-stage/base-hashes.json": "e2fee2e1f5a38fe3ad850e9deb9fdc7699863883f844f379cd4f53056551a4f6",
+    "/private/tmp/eredu-prefill-host-target-frontier-stage/change.patch": "8978c12e2210bacc43c5c511e1464266e941cd70b5d7ac6ecd41a87ddddb92e8",
+    "/private/tmp/eredu-prefill-host-target-frontier-stage/checks.json": "1435e642c9281ae308e8ae21d2dd6fff6f507fec6e9e27c876f1b0999ce0e2a1",
+    "/private/tmp/eredu-prefill-host-target-frontier-stage/combined-staged-hashes.json": "11c5184e5bfb8a6e9c54345cc1a5d32dcb808dcfaa8b968ea0031a2f4aa9e640",
+    "/private/tmp/eredu-prefill-host-target-frontier-stage/dependency-hashes.json": "ef9bdc60f8bafce0e218f1fceed055d43b5f103dcf629fc4a908b13fb09d4c3d",
+    "/private/tmp/eredu-prefill-host-target-frontier-stage/files.txt": "a6d8a52d6fad6f5322351fd5d035030bb2f6ac07a4f21b2bdafe19ae60fce3e5",
+    "/private/tmp/eredu-prefill-host-target-frontier-stage/staged-hashes.json": "22ffc73ae188fc726122317e86fff8cd9614660c1d238f8c721fd7092d981e71",
+    "/private/tmp/eredu-prefill-host-target-minimal.log": "72c279f413a7416e2f0f06d15f0aad61ceae4ea07c8f2a3c4ac5ba1b69f975ee",
+    "/private/tmp/eredu-prefill-host-target-native_observation.log": "0bd82ca1dfe26c05100fe0b26a886e552f60635a446ca0f46c57aafdc6e0d0f3",
+    "/private/tmp/eredu-prefill-host-target-new-tests.json": "3b8ba42640f8bc3757e9fcb3fdd0d0db2863205e40ca1b8c5fe2eae6d0dbd9b2",
+    "/private/tmp/eredu-prefill-host-target-portable.log": "23b60a527276976b2ffe7aec8606fae851c8b5aff4d29d0c9fa4e937eeef77e8",
+    "/private/tmp/eredu-prefill-host-target-review-before-frontier.md": "9957d4fbb2b1d535b3b1ac46b30e991a642e46e0e2a9a3a945978b3fe0a9a895",
+    "/private/tmp/eredu-prefill-host-target-review-sha256.json": "4a441ed7b90a01d79a3353362c78b2177c537c7091618e1567ef55de5d034c5e",
+    "/private/tmp/eredu-prefill-host-target-review.json": "f8376652cb7701330d31f89d4900bd45a8f3fbf271c17ec60a25b59880abd71c",
+    "/private/tmp/eredu-prefill-host-target-review.md": "0a8d84cf167ac9558706351b9d9ed5ff6c46135aab7174165c60dabaee890c6a",
+    "/private/tmp/eredu-prefill-host-target-runtime.log": "33bde88f59173d064fd4433e05568ee2112a5e8d52d5065316667138b5ef51da",
+    "/private/tmp/eredu-prefill-host-target-runtime_integration.log": "cb8473ea269db1e976bc3baf46988237a27f9f3acdf6840ddd9f801dae0c2685",
+    "/private/tmp/eredu-prefill-host-target-session.log": "af270f6a878af8148ead2e8299012ef86562c87dcd6fefe1524ce799b74c0d06",
+    "/private/tmp/eredu-prefill-host-target-stage/README.md": "868d10f8813185a231e416eaaf475f06c39cbb62e8979415e0f2901acaa47b9f",
+    "/private/tmp/eredu-prefill-host-target-stage/base-hashes.json": "8295af37fd769287fc56377c84cb11077ccb71c7319670a79ddeeb19c8c3fb74",
+    "/private/tmp/eredu-prefill-host-target-stage/change.patch": "c976a12916c1ae5ed7a9c31921ce66749d97f421693685a0d118fc1a5c64540b",
+    "/private/tmp/eredu-prefill-host-target-stage/checks.json": "b4a613c2bbb3f1776c457c2163a38050e226a54f066e7dd4e08312a97339e495",
+    "/private/tmp/eredu-prefill-host-target-stage/dependency-hashes.json": "e7c4c322ca025647c2024dc924c036c516c9002ebe1d0e582fe4192fa0009a8d",
+    "/private/tmp/eredu-prefill-host-target-stage/doc-additions/backend-architecture.md": "1b8339c1a1ec3ddf3622941f682a74c745851d3687bf94ab568f00e9a6eb9f02",
+    "/private/tmp/eredu-prefill-host-target-stage/doc-additions/execution-control.md": "ba83518572f9d6939386808228f5d3732def6cc48017ce6073d55a8090750bef",
+    "/private/tmp/eredu-prefill-host-target-stage/doc-additions/working-memory.md": "7c7e2d4ecaef0a8ef5d65d7779b52380e5e18535b3745869715b92912252740b",
+    "/private/tmp/eredu-prefill-host-target-stage/files.txt": "9345b1253b4dcb54da97fb99fe8b9cfab2aa327b70ca3227d6860605bddd2073",
+    "/private/tmp/eredu-prefill-host-target-stage/full-dependency-hashes.json": "b47c602b55207c8c0090dca06c7ba7dee15912e12b0b1d07a32495825f81ef1b",
+    "/private/tmp/eredu-prefill-host-target-stage/original46-base-hashes.json": "dcda4ab3e7a17a54f1a6093e5448812f3741f63dcc7bbc588ccfdc0131927bf2",
+    "/private/tmp/eredu-prefill-host-target-stage/staged-hashes.json": "1d784121eb44ddd69e73f6dd13268b1244df7b4cac4cf3892297c0a6c4d87949",
+    "/private/tmp/eredu-prefill-host-target-validate.py": "092164d53681b9f1e29fabecc1a2d1bf5869847621f9da8b0272b9774d1a738a"
+  },
+  "review": {
+    "review": "Root read all twelve production/test changes and all ten new tests. Independent exact-source TX review found all-inactive frontier gap; root and TX reviewed the separate corrected overlay, preserving frozen original.",
+    "independent_review": "/private/tmp/eredu-prefill-host-target-review.md",
+    "independent_review_sha256": "0a8d84cf167ac9558706351b9d9ed5ff6c46135aab7174165c60dabaee890c6a",
+    "behavior": [
+      "Exact admission/selection/geometry/chunk association precedes fragment borrowing; no arbitrary indices or buffers are exported.",
+      "One full destination remains stable across chunks. Coverage is distinct from initialized length; failed/overlong/dropped writers poison targets.",
+      "Whole-row preflight prevents partial advancement; zero targets require a genuine initial empty writer.",
+      "Full usage and physical claim are spent once; skip/failure retain partial data until frame retirement.",
+      "Final attachment moves original buffers and keeps an alias across fallible record mutation. Aborted pending delivery retains the same partial sidecar and original H."
+    ],
+    "correction": "Unconditional checked F+P+M validation rejects real all-inactive admission with overflowing inference frontier before target/frame construction.",
+    "application_note": "Source overlay applied and verified. Staged working-memory.md snippet was then explicitly mapped to existing doc/bounded-inference.md; no new working-memory document created.",
+    "limits": [
+      "Host scalar placement only; no native/source read authority, canonical completion, source-pin retirement or causal semantic proof.",
+      "Original source/native scratch/host facade envelopes and logical quota reservation remain independently required.",
+      "No selected-prefill production gate changes. No new native numerical/reference measurement."
+    ]
+  },
+  "behavior": [
+    "The original bank constructs fixed target slots and checks exact admission, selection, inference geometry and next chunk before fragment borrowing.",
+    "One initialized full F32 destination is allocated per logical target. Checked scatter maps place scalar input; coverage is distinct from initialized length.",
+    "Logical usage and physical claim are spent once. Whole-row preflight prevents partial advancement; zero targets still require an actual finished empty writer.",
+    "Failed, overlong or dropped writers poison the target. Aborted pending delivery retains the same partial sidecar and original H.",
+    "Successful attachment moves original buffers into shared observations and retains a private alias across fallible record mutation."
+  ],
+  "corrections": [
+    "Independent review found that all-inactive p0 targets bypassed checked F+P+M validation. The preserved two-file overlay adds an unconditional check and a real-admission exact-frontier/overflow regression.",
+    "The stage working-memory.md addition is mapped to existing doc/bounded-inference.md. Root removed extra appended EOF blank lines before scoped validation."
+  ],
+  "limits": [
+    "This constructor establishes host placement and ownership only. Native source identity, fragment transfer, canonical completion and source-pin retirement remain separate unfinished work.",
+    "No logical quota reservation, causal row-assembly proof, selected-prefill activation or new execution authority is introduced.",
+    "New tests use neutral scalar input. Existing native session tests check compatibility; no new native numerical/reference/process-memory measurement is claimed.",
+    "Complete facade host envelopes and snapshot/resume accounting remain unfinished."
+  ]
+}

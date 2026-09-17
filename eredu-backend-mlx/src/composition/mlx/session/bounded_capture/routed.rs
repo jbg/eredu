@@ -28,8 +28,13 @@ fn estimate_storage(
     slice: &ResolvedCaptureSlice,
     partitioned: bool,
 ) -> Result<CaptureUsage, CaptureError> {
+    estimate_storage_shape(shape, &slice.shape, partitioned)
+}
+fn estimate_storage_shape(
+    shape: &[u64], selected: &[u64], partitioned: bool,
+) -> Result<CaptureUsage, CaptureError> {
     if shape.len() != 3
-        || slice.shape.len() != 3
+        || selected.len() != 3
         || shape.iter().any(|n| *n > i32::MAX as u64)
         || elements(shape)? > i32::MAX as u64
     {
@@ -38,12 +43,12 @@ fn estimate_storage(
         ));
     }
     let all_routes = mul(shape[0], shape[1])?;
-    let routes = if partitioned && slice.shape[2] == 0 {
+    let routes = if partitioned && selected[2] == 0 {
         0
     } else {
-        mul(slice.shape[0], slice.shape[1])?
+        mul(selected[0], selected[1])?
     };
-    let values = mul(routes, slice.shape[2])?;
+    let values = mul(routes, selected[2])?;
     if routes == 0 {
         return Ok(CaptureUsage {
             captures: 1,
@@ -78,6 +83,18 @@ fn estimate_storage(
             )?,
         )?,
     })
+}
+
+/// Fixed borrowed coordinates use the exact same ordinary logical cost policy.
+pub(super) fn estimate_geometry(
+    geometry: &eredu_core::capture::CaptureRoutedUnitsGeometry<'_>,
+) -> Result<CaptureUsage, CaptureError> {
+    if geometry.strides().iter().any(|n| *n > i32::MAX as u64) {
+        return Err(CaptureError::Unsupported("MLX routed-unit capture stride".into()));
+    }
+    let source = std::array::from_fn::<_, 3, _>(|index| geometry.source_shape()[index] as u64);
+    let selected = std::array::from_fn::<_, 3, _>(|index| geometry.shape()[index] as u64);
+    estimate_storage_shape(&source, &selected, false)
 }
 
 pub(super) fn capture(
@@ -206,10 +223,14 @@ fn capture_inner(
         .as_array()
         .as_dtype(Dtype::Uint32, stream)?;
     let selections = selection_array.evaluated()?;
-    let token_ids = tokens.as_slice::<u32>();
-    let selection_ids = selections.as_slice::<u32>();
-    let mut groups_at = Vec::with_capacity(token_ids.len());
-    for (&token, &selection) in token_ids.iter().zip(selection_ids) {
+    let token_ids = tokens
+        .try_iter::<u32>()
+        .map_err(eredu_nn::Error::backend_source)?;
+    let token_count = token_ids.len();
+    let selection_ids = selections
+        .try_iter::<u32>()
+        .map_err(eredu_nn::Error::backend_source)?;
+    for (token, selection) in token_ids.zip(selection_ids) {
         if u64::from(token) >= coefficient_shape[0] as u64
             || u64::from(selection) / native_routes != u64::from(token)
         {
@@ -222,19 +243,19 @@ fn capture_inner(
         if original >= source_shape[0] as u64 {
             return Err(invalid());
         }
-        let index = original
-            .checked_mul(native_routes)
-            .and_then(|n| n.checked_add(u64::from(selection) % native_routes))
-            .and_then(|n| i32::try_from(n).ok())
-            .ok_or_else(invalid)?;
-        groups_at.push(index);
     }
-    let group_indices = Array::from_slice(&groups_at, &[groups_at.len() as i32]);
+    // Selection indices already name the chunk-local flattened route. Slice the
+    // provider's original group table to that same chunk before the shared
+    // gather, preserving its exact group identity without a host index vector
+    // or a second native index upload.
+    let group_start = i32::try_from(source.token_offset).map_err(|_| invalid())?;
+    let group_end = i32::try_from(end).map_err(|_| invalid())?;
     let group_array = source
         .source_groups
         .as_array()
+        .try_index_device((group_start..group_end, ..), stream)?
         .reshape(&[-1], stream)?
-        .take(&group_indices, stream)?
+        .take(source.selection_indices.as_array(), stream)?
         .as_dtype(Dtype::Uint32, stream)?;
     let groups = group_array.evaluated()?;
     let coefficient_array = source
@@ -246,7 +267,7 @@ fn capture_inner(
     let coefficients = coefficient_array.evaluated()?;
     #[cfg(test)]
     for _ in 0..4 {
-        record_host_read(token_ids.len());
+        record_host_read(token_count);
     }
     let unit_indices = if let Some((partition_source, _)) = partition {
         let indices = (0..slice.shape[2])
@@ -259,19 +280,28 @@ fn capture_inner(
                     .ok_or_else(invalid)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Some(Array::from_slice(&indices, &[indices.len() as i32]))
+        Some(Array::try_from_slice(&indices, &[indices.len() as i32])?)
     } else {
         None
     };
     let mut rows = Vec::new();
-    for (index, ((&token, &selection), (&group, &coefficient))) in token_ids
-        .iter()
-        .zip(selection_ids)
+    for (index, ((token, selection), (group, coefficient))) in tokens
+        .try_iter::<u32>()
+        .map_err(eredu_nn::Error::backend_source)?
+        .zip(
+            selections
+                .try_iter::<u32>()
+                .map_err(eredu_nn::Error::backend_source)?,
+        )
         .zip(
             groups
-                .as_slice::<u32>()
-                .iter()
-                .zip(coefficients.as_slice::<f32>()),
+                .try_iter::<u32>()
+                .map_err(eredu_nn::Error::backend_source)?
+                .zip(
+                    coefficients
+                        .try_iter::<f32>()
+                        .map_err(eredu_nn::Error::backend_source)?,
+                ),
         )
         .enumerate()
     {

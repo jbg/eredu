@@ -34,11 +34,16 @@ pub(crate) fn pipeline_with_output_state(
 
 /// Standard pipeline-balanced text-decoder transport.
 pub(crate) fn decoder() -> ArchitectureGroupTransport {
-    ArchitectureGroupTransport {
+    decoder_declaration().into_owned()
+}
+
+pub(crate) fn decoder_declaration() -> eredu_runtime::ArchitectureGroupTransportDeclaration<'static>
+{
+    eredu_runtime::ArchitectureGroupTransportDeclaration {
         placement: ArchitectureGroupPlacement::Pipeline,
         kind: ArchitectureGroupKind::Decoder,
-        first_owner_static_roles: vec!["embedding".into()],
-        last_owner_static_roles: vec!["norm".into(), "output".into()],
+        first_owner_static_roles: &["embedding"],
+        last_owner_static_roles: &["norm", "output"],
         merge_destination: ArchitectureMergeDestination::LastOwner,
         parallel_subgroup: Some(ArchitectureParallelSubgroup::Decoder),
         request_optional: false,
@@ -47,13 +52,32 @@ pub(crate) fn decoder() -> ArchitectureGroupTransport {
 
 /// Output-owner embedded-prediction transport without pinned modules.
 pub(crate) fn prediction() -> ArchitectureGroupTransport {
-    ArchitectureGroupTransport {
+    prediction_declaration().into_owned()
+}
+
+pub(crate) fn prediction_declaration()
+-> eredu_runtime::ArchitectureGroupTransportDeclaration<'static> {
+    eredu_runtime::ArchitectureGroupTransportDeclaration {
         placement: ArchitectureGroupPlacement::OutputOwner,
         kind: ArchitectureGroupKind::Prediction,
-        first_owner_static_roles: Vec::new(),
-        last_owner_static_roles: Vec::new(),
+        first_owner_static_roles: &[],
+        last_owner_static_roles: &[],
         merge_destination: ArchitectureMergeDestination::OutputOwner,
         parallel_subgroup: Some(ArchitectureParallelSubgroup::Decoder),
         request_optional: false,
+    }
+}
+
+/// Shared conditional vision encoder followed by decoder ingress.
+pub(crate) fn vision_declaration() -> eredu_runtime::ArchitectureGroupTransportDeclaration<'static>
+{
+    eredu_runtime::ArchitectureGroupTransportDeclaration {
+        placement: ArchitectureGroupPlacement::Pipeline,
+        kind: ArchitectureGroupKind::VisionEncoder,
+        first_owner_static_roles: &["vision"],
+        last_owner_static_roles: &[],
+        merge_destination: ArchitectureMergeDestination::FirstPipelineOwner,
+        parallel_subgroup: Some(ArchitectureParallelSubgroup::TensorSharded),
+        request_optional: true,
     }
 }

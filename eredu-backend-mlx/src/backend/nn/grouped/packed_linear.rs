@@ -124,3 +124,38 @@ pub fn packed_grouped_linear_with_options(
     )?
     .reshape(&[selections, out_features], stream)
 }
+
+
+/// Fixed call frames of the three shared packed adapters and their actual
+/// explicit-index MXFP4 call. Empty optional C handles own no heap allocation.
+pub(crate) fn mxfp4_projection_control_bytes() -> Option<usize> {
+    packed_adapter_control_bytes(safemlx::ops::mxfp4_gather_control_bytes()?)
+}
+
+fn packed_adapter_control_bytes(native: usize) -> Option<usize> {
+    use std::mem::size_of;
+    native.checked_add(size_of::<&Array>().checked_mul(5 * 3)?)?
+        .checked_add(size_of::<Option<&Array>>().checked_mul(3)?)?
+        .checked_add(size_of::<&Stream>().checked_mul(3)?)?
+        .checked_add(size_of::<WeightQuantization>().checked_mul(3)?)?
+        .checked_add(size_of::<bool>().checked_mul(4)?)?
+        .checked_add(size_of::<i32>().checked_mul(3 + 3 + 2)?)?
+        .checked_add(size_of::<QuantizationMode>())?
+        .checked_add(size_of::<Array>().checked_mul(4)?)?
+        .checked_add(size_of::<Result<Array, Exception>>().checked_mul(3)?)
+}
+
+/// Same packed adapters with the actual affine row selection alternative.
+pub(crate) fn affine_projection_control_bytes(selected: bool) -> Option<usize> {
+    use std::mem::size_of;
+    let controls = packed_adapter_control_bytes(safemlx::ops::affine_grouped_control_bytes(selected)?)?;
+    if !selected { return Some(controls); }
+    // The selected-bank branch retains two gathered arrays, optional gathered
+    // biases, and map/transpose result wrappers while constructing its QMM.
+    controls.checked_add(size_of::<Array>().checked_mul(2)?)?
+        .checked_add(size_of::<Option<Array>>())?
+        .checked_add(size_of::<Option<Result<Array,Exception>>>())?
+        .checked_add(size_of::<Result<Option<Array>,Exception>>())?
+        .checked_add(size_of::<(&Array,&Stream)>())?
+        .checked_add(size_of::<[i32;3]>())
+}

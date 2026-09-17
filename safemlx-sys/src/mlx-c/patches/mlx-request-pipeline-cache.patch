@@ -1,0 +1,1272 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -213,7 +213,8 @@
+     message(STATUS "Building for macOS ${CMAKE_OSX_DEPLOYMENT_TARGET}")
+ 
+     # Get Metal version.
+-    set(XCRUN_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}")
++    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/metal-probe-module-cache")
++    set(XCRUN_FLAGS "-mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET} -fmodules-cache-path=\"${CMAKE_CURRENT_BINARY_DIR}/metal-probe-module-cache\"")
+     execute_process(
+       COMMAND
+         zsh "-c"
+diff --git a/mlx/backend/common/CMakeLists.txt b/mlx/backend/common/CMakeLists.txt
+--- a/mlx/backend/common/CMakeLists.txt
++++ b/mlx/backend/common/CMakeLists.txt
+@@ -5,6 +5,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/common.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/load.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/metal_kernel.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/pipeline_cache.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/reduce.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/slicing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp)
+diff --git a/mlx/backend/common/pipeline_cache.cpp b/mlx/backend/common/pipeline_cache.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/common/pipeline_cache.cpp
+@@ -0,0 +1,77 @@
++#include "mlx/backend/common/pipeline_cache.h"
++#include "mlx/graph_quota.h"
++#include <algorithm>
++#include <cassert>
++#include <limits>
++#include <new>
++
++namespace mlx::core::fast {
++namespace {
++constexpr size_t alignment = std::max(alignof(PreparedPipelineCache), alignof(PreparedPipeline));
++constexpr size_t row_offset = (sizeof(PreparedPipelineCache) + alignment - 1) & ~(alignment - 1);
++struct Retirement { void* memory; void* owner; void (*retire)(void*); size_t rows; };
++}
++PipelineCacheStatus PreparedPipelineCache::layout(size_t attempts, PipelineCacheLayout& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return PipelineCacheStatus::unknown_layout;
++#else
++  static_assert(std::atomic<size_t>::is_always_lock_free);
++  static_assert(std::atomic<const submission::GraphQuota*>::is_always_lock_free);
++  size_t platform;
++  if (!pipeline_cache_platform_controls(attempts, platform)) return PipelineCacheStatus::unknown_layout;
++  constexpr auto limit = size_t(std::numeric_limits<ptrdiff_t>::max());
++  if (attempts > (limit - row_offset) / sizeof(PreparedPipeline)) return PipelineCacheStatus::overflow;
++  const size_t controls = sizeof(PipelineCacheLayout) * 2 + sizeof(Retirement) +
++      sizeof(PreparedPipelineCache*) * 3 + sizeof(PreparedPipeline*) +
++      sizeof(PipelineCacheRef) * 2 + sizeof(size_t) * 8 + sizeof(PipelineCacheStatus) * 2 + sizeof(PipelineCacheError) +
++      submission::GraphQuota::pipeline_cache_control_bytes();
++  if (platform > limit - controls) return PipelineCacheStatus::overflow;
++  out = {row_offset + attempts * sizeof(PreparedPipeline), alignment, controls + platform};
++  return PipelineCacheStatus::success;
++#endif
++}
++PreparedPipelineCache::PreparedPipelineCache(size_t capacity, void* owner, void (*retire)(void*)) noexcept
++    : capacity_(capacity), owner_(owner), retire_(retire) {}
++PreparedPipeline* PreparedPipelineCache::rows() noexcept {
++  return reinterpret_cast<PreparedPipeline*>(reinterpret_cast<char*>(this) + row_offset);
++}
++PipelineCacheStatus PreparedPipelineCache::create(size_t attempts, void* owner,
++    void (*retire)(void*), PreparedPipelineCache*& output) noexcept {
++  if (!owner || !retire || output) return PipelineCacheStatus::invalid;
++  PipelineCacheLayout facts;
++  const auto cause = layout(attempts, facts);
++  if (cause != PipelineCacheStatus::success) return cause;
++  auto* memory = ::operator new(facts.allocation_bytes, std::align_val_t(alignment), std::nothrow);
++  if (!memory) return PipelineCacheStatus::allocation_failed;
++  // Qualified libc++ mutex construction is noexcept. No callback or throwing
++  // operation follows allocation before the complete owner is handed off.
++  static_assert(std::is_nothrow_default_constructible_v<PreparedPipeline>);
++  auto* value = ::new (memory) PreparedPipelineCache(attempts, owner, retire);
++  for (size_t i = 0; i < attempts; ++i) ::new (value->rows() + i) PreparedPipeline{};
++  output = value;
++  return PipelineCacheStatus::success;
++}
++void PreparedPipelineCache::retain() noexcept {
++  if (references_.fetch_add(1, std::memory_order_relaxed) == std::numeric_limits<size_t>::max()) std::terminate();
++}
++void PreparedPipelineCache::release() noexcept {
++  if (references_.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
++  const Retirement retired{this, owner_, retire_, capacity_};
++  for (size_t i = retired.rows; i; --i) rows()[i - 1].~PreparedPipeline();
++  this->~PreparedPipelineCache();
++  ::operator delete(retired.memory, std::align_val_t(alignment));
++  retired.retire(retired.owner); // no Graph/Scope/Record ownership in this source
++}
++bool PreparedPipelineCache::bind(const submission::GraphQuota* graph) noexcept {
++  if (!graph || used_.load(std::memory_order_acquire)) return false;
++  const submission::GraphQuota* absent = nullptr;
++  return bound_.compare_exchange_strong(absent, graph, std::memory_order_release, std::memory_order_relaxed);
++}
++PreparedPipeline& PreparedPipelineCache::next() {
++  auto used = used_.load(std::memory_order_relaxed);
++  do {
++    if (used >= capacity_) throw PipelineCacheError(PipelineCacheStatus::exhausted);
++  } while (!used_.compare_exchange_weak(used, used + 1, std::memory_order_acq_rel, std::memory_order_relaxed));
++  return rows()[used];
++}
++} // namespace mlx::core::fast
+diff --git a/mlx/backend/common/pipeline_cache.h b/mlx/backend/common/pipeline_cache.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/common/pipeline_cache.h
+@@ -0,0 +1,66 @@
++#pragma once
++#include <atomic>
++#include <cstddef>
++#include <exception>
++#include <type_traits>
++#include <utility>
++#include "mlx/api.h"
++#include "mlx/backend/common/prepared_kernel.h"
++
++namespace mlx::core::submission { class GraphQuota; }
++namespace mlx::core::fast {
++enum class PipelineCacheStatus : unsigned {
++  success = 0, unknown_layout, invalid, overflow, allocation_failed,
++  already_bound, exhausted,
++};
++class PipelineCacheError final : public std::exception {
++ public:
++  explicit PipelineCacheError(PipelineCacheStatus cause) noexcept : cause_(cause) {}
++  PipelineCacheStatus cause() const noexcept { return cause_; }
++  const char* what() const noexcept override { return "prepared Metal pipeline destinations exhausted"; }
++ private:
++  PipelineCacheStatus cause_;
++};
++struct PipelineCacheLayout {
++  size_t allocation_bytes, alignment, control_bytes;
++};
++// Platform compiler/driver storage is excluded. This query names the actual
++// managed handles and call frames used by the precompiled selector worker.
++MLX_API bool pipeline_cache_platform_controls(size_t attempts, size_t& output) noexcept;
++class MLX_API PreparedPipelineCache final {
++ public:
++  static PipelineCacheStatus layout(size_t attempts, PipelineCacheLayout&) noexcept;
++  static PipelineCacheStatus create(size_t attempts, void* owner,
++      void (*retire)(void*), PreparedPipelineCache*& output) noexcept;
++  void retain() noexcept;
++  void release() noexcept;
++  // Each actual selector attempt consumes one destination before platform work.
++  // The resulting handles stay here through the same request's final aliases.
++  PreparedPipeline& next();
++  size_t capacity() const noexcept { return capacity_; }
++ private:
++  friend class submission::GraphQuota;
++  bool bind(const submission::GraphQuota*) noexcept;
++  PreparedPipelineCache(size_t, void*, void (*)(void*)) noexcept;
++  ~PreparedPipelineCache() = default;
++  PreparedPipeline* rows() noexcept;
++  std::atomic<size_t> references_{1};
++  std::atomic<size_t> used_{0};
++  std::atomic<const submission::GraphQuota*> bound_{nullptr}; // identity only
++  size_t capacity_;
++  void* owner_;
++  void (*retire_)(void*);
++};
++class PipelineCacheRef {
++ public:
++  explicit PipelineCacheRef(PreparedPipelineCache* value = nullptr) noexcept : value_(value) {
++    if (value_) value_->retain();
++  }
++  PipelineCacheRef(const PipelineCacheRef& value) noexcept : PipelineCacheRef(value.value_) {}
++  PipelineCacheRef(PipelineCacheRef&& value) noexcept : value_(std::exchange(value.value_, nullptr)) {}
++  PipelineCacheRef& operator=(const PipelineCacheRef&) = delete;
++  ~PipelineCacheRef() { if (value_) value_->release(); }
++ private:
++  PreparedPipelineCache* value_;
++};
++} // namespace mlx::core::fast
+diff --git a/mlx/backend/metal/CMakeLists.txt b/mlx/backend/metal/CMakeLists.txt
+--- a/mlx/backend/metal/CMakeLists.txt
++++ b/mlx/backend/metal/CMakeLists.txt
+@@ -146,6 +146,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/custom_kernel.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/device.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/selector_controls.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/event.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/eval.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/fence.cpp
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1,3 +1,4 @@
++#include "mlx/backend/metal/selector_controls.h"
+ // Copyright © 2023-2024 Apple Inc.
+ 
+ #include <compression.h>
+@@ -23,6 +24,7 @@
+ #include "mlx/backend/metal/utils.h"
+ #include "mlx/utils.h"
+ #include "mlx/submission.h"
++#include "mlx/graph_quota.h"
+ 
+ namespace std {
+ 
+@@ -1278,12 +1280,22 @@
+ class PreparedKernelError final : public std::exception {
+  public:
+   PreparedKernelError(const char* stage, NS::Error* error, const fast::PreparedKernelBorrow& source)
+-      : stage_(stage), error_(NS::RetainPtr(error)), source_(source) {}
++      : stage_(stage), source_(source), error_(NS::RetainPtr(error)) {}
+   const char* what() const noexcept override { return stage_; }
+  private:
+   const char* stage_;
++  fast::PreparedKernelBorrow source_;
+   NS::SharedPtr<NS::Error> error_;
+-  fast::PreparedKernelBorrow source_;
++};
++class PreparedPipelineError final : public std::exception {
++ public:
++  PreparedPipelineError(const char* stage, NS::Error* error, fast::PreparedPipelineCache* request)
++      : stage_(stage), request_(request), error_(NS::RetainPtr(error)) {}
++  const char* what() const noexcept override { return stage_; }
++ private:
++  const char* stage_;
++  fast::PipelineCacheRef request_;
++  NS::SharedPtr<NS::Error> error_;
+ };
+ void retire_prepared_pipeline(void* library, void* pipeline) noexcept {
+   if (pipeline) static_cast<MTL::ComputePipelineState*>(pipeline)->release();
+@@ -1297,6 +1309,64 @@
+       sizeof(MTL::CompileOptions*) + sizeof(NS::Error*) * 2 +
+       sizeof(std::unique_lock<std::mutex>) + sizeof(CompileOptions) +
+       sizeof(fast::PreparedKernelBorrow) * 2 + sizeof(void*) * 5;
++}
++bool Device::prepared_pipeline_control_bytes(size_t attempts, size_t& out) noexcept {
++#if defined(MLX_MANAGED_PRECOMPILED_KERNELS) && MLX_MANAGED_PRECOMPILED_KERNELS
++  auto* actual = prepared_device(mlx::core::Device::gpu);
++  if (!actual) return false;
++#if !defined(MLX_MANAGED_PRECOMPILED_NAX) || !MLX_MANAGED_PRECOMPILED_NAX
++  // Ordinary JIT may select NAX even when this build cannot contain its
++  // deployment-gated precompiled symbols. Never certify absent coverage.
++  if (__builtin_available(macOS 26.2, iOS 26.2, tvOS 26.2, visionOS 26.2, *)) {
++    if (actual->get_architecture_gen() >= (actual->architecture_suffix() == 'p' ? 18 : 17)) return false;
++  }
++#endif
++  size_t selector;
++  if (!resident_selector_control_bytes(attempts, selector)) return false;
++  const size_t fixed = sizeof(PreparedPipelineError) + sizeof(fast::PipelineCacheRef) * 2 +
++      sizeof(NS::SharedPtr<MTL::Library>) + sizeof(NS::SharedPtr<MTL::Function>) * 2 +
++      sizeof(NS::SharedPtr<MTL::LinkedFunctions>) * 2 +
++      sizeof(NS::SharedPtr<MTL::ComputePipelineState>) * 2 +
++      sizeof(decltype(new_scoped_memory_pool())) * 4 +
++      sizeof(MTL::FunctionDescriptor*) + sizeof(MTL::FunctionConstantValues*) +
++      sizeof(MTL::ComputePipelineDescriptor*) + sizeof(NS::String*) * 2 +
++      sizeof(NS::Error*) * 3 + sizeof(NS::Array*) + sizeof(MTL::LinkedFunctions*) +
++      sizeof(submission::NativeControlBinding) * 2 + sizeof(const std::string*) * 4 +
++      sizeof(std::tuple<const void*, MTL::DataType, NS::UInteger>) +
++      sizeof(void*) * 8 + sizeof(size_t) * 4;
++  if (selector > size_t(PTRDIFF_MAX) - fixed) return false;
++  out = selector + fixed;
++  return true;
++#else
++  return false;
++#endif
++}
++bool Device::original_precompiled_kernel_required() const {
++  const auto controls = submission::current_native_controls();
++  if (controls.failure != submission::NativeControlFailure::none)
++    throw submission::NativeControlError(controls.failure);
++  if (!controls.original) return false;
++  if (!controls.graph || !controls.graph->pipeline_cache())
++    throw submission::NativeControlError(submission::NativeControlFailure::missing_graph);
++  return true;
++}
++MTL::ComputePipelineState* Device::get_request_kernel_(
++    fast::PreparedPipelineCache& request, const std::string& base_name,
++    MTL::Library* library, const std::string& specialized_name,
++    const MTLFCList& constants, const std::vector<MTL::Function*>& linked) {
++  if (!library || library != default_library_.get())
++    throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
++  auto& slot = request.next(); // debit actual finite destination before platform work
++  slot.device = this;
++  slot.retire = retire_prepared_pipeline;
++  slot.library = library->retain();
++  // The same native constructors consume the exact caller loans synchronously.
++  // No key/hash identity reuse, ordinary cache hit, or generated source escapes.
++  auto function = get_function_(base_name, specialized_name, constants, library, &request);
++  auto links = get_linked_functions_(linked);
++  auto pipeline = get_kernel_(specialized_name, function.get(), links.get(), &request);
++  slot.pipeline = pipeline->retain();
++  return pipeline.get();
+ }
+ MTL::ComputePipelineState* Device::get_prepared_kernel(
+     const fast::PreparedKernelBorrow& source, const CompileOptions& options) {
+@@ -1374,7 +1444,8 @@
+     const std::string& name,
+     const std::string& specialized_name,
+     const MTLFCList& func_consts,
+-    MTL::Library* mtl_lib) {
++    MTL::Library* mtl_lib,
++    fast::PreparedPipelineCache* prepared) {
+   if (func_consts.empty() && (specialized_name == name)) {
+     return get_function_(name, mtl_lib);
+   }
+@@ -1402,6 +1473,7 @@
+ 
+   // Throw error if unable to build metal function
+   if (!mtl_function) {
++    if (prepared) throw PreparedPipelineError("unable to load prepared Metal function", error, prepared);
+     std::ostringstream msg;
+     msg << "[metal::Device] Unable to load function " << name << "\n";
+     if (error) {
+@@ -1419,7 +1491,8 @@
+   return get_kernel_(name.c_str(), mtl_function, nullptr);
+ }
+ NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(const char* name,
+-    const MTL::Function* mtl_function, const fast::PreparedKernelBorrow* prepared) {
++    const MTL::Function* mtl_function, const fast::PreparedKernelBorrow* prepared,
++    fast::PreparedPipelineCache* request) {
+   // Compile kernel to compute pipeline
+   NS::Error* error = nullptr;
+   NS::SharedPtr<MTL::ComputePipelineState> kernel;
+@@ -1431,6 +1504,7 @@
+ 
+   // Throw error if unable to compile metal function
+   if (!mtl_function || !kernel) {
++    if (request) throw PreparedPipelineError("unable to build prepared Metal pipeline", error, request);
+     if (prepared) throw PreparedKernelError("unable to build prepared Metal pipeline", error, *prepared);
+     std::ostringstream msg;
+     msg << "[metal::Device] Unable to load kernel " << name << "\n";
+@@ -1446,13 +1520,15 @@
+ NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
+     const std::string& name,
+     const MTL::Function* mtl_function,
+-    const MTL::LinkedFunctions* linked_functions) {
++    const MTL::LinkedFunctions* linked_functions,
++    fast::PreparedPipelineCache* request) {
+   // Check inputs
+   if (!linked_functions) {
+-    return get_kernel_(name, mtl_function);
++    return get_kernel_(name.c_str(), mtl_function, nullptr, request);
+   }
+ 
+   if (!mtl_function) {
++    if (request) throw PreparedPipelineError("unable to load prepared linked Metal function", nullptr, request);
+     std::ostringstream msg;
+     msg << "[metal::Device] Unable to load kernel " << name << "\n";
+     throw std::runtime_error(msg.str());
+@@ -1472,6 +1548,7 @@
+ 
+   // Throw error if unable to compile metal function
+   if (!kernel) {
++    if (request) throw PreparedPipelineError("unable to build prepared linked Metal pipeline", error, request);
+     std::ostringstream msg;
+     msg << "[metal::Device] Unable to load kernel " << name << "\n";
+     if (error) {
+@@ -1501,6 +1578,8 @@
+     const std::string& name,
+     const CompileOptions& compile_options,
+     LibraryBuilder builder) {
++  if (original_precompiled_kernel_required())
++    throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
+   {
+     std::shared_lock rlock(library_mtx_);
+     if (auto it = library_map_.find(name); it != library_map_.end()) {
+@@ -1579,6 +1658,11 @@
+     const MTLFCList& func_consts /* = {} */,
+     const std::vector<MTL::Function*>& linked_functions /* = {} */) {
+   const auto& kname = hash_name.empty() ? base_name : hash_name;
++  if (original_precompiled_kernel_required()) {
++    const auto controls = submission::current_native_controls();
++    return get_request_kernel_(*controls.graph->pipeline_cache(), base_name,
++        mtl_lib, kname, func_consts, linked_functions);
++  }
+   {
+     // Multiple readers allowed
+     std::shared_lock lock(kernel_mtx_);
+@@ -1804,6 +1888,11 @@
+ 
+ } // namespace mlx::core::metal
+ 
++namespace mlx::core::fast {
++bool pipeline_cache_platform_controls(size_t attempts, size_t& output) noexcept {
++  return metal::Device::prepared_pipeline_control_bytes(attempts, output);
++}
++} // namespace mlx::core::fast
+ #include "mlx/graph_construction.h"
+ #include "mlx/prepared_input.h"
+ #include "mlx/fast.h"
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -14,6 +14,7 @@
+ #include <type_traits>
+ #include <unordered_map>
+ #include "mlx/backend/common/prepared_kernel.h"
++#include "mlx/backend/common/pipeline_cache.h"
+ #include <unordered_set>
+ 
+ #include "mlx/array.h"
+@@ -347,6 +348,10 @@
+   MTL::ComputePipelineState* get_prepared_kernel(const fast::PreparedKernelBorrow&,
+       const CompileOptions& compile_options);
+   static size_t prepared_kernel_control_bytes() noexcept;
++  static bool prepared_pipeline_control_bytes(size_t attempts, size_t&) noexcept;
++  bool original_precompiled_kernel_required() const;
++  MTL::Library* precompiled_library() const noexcept { return default_library_.get(); }
++
+ 
+   ResidencySet& residency_set() {
+     return residency_set_;
+@@ -381,7 +386,8 @@
+       const std::string& name,
+       const std::string& specialized_name,
+       const MTLFCList& func_consts,
+-      MTL::Library* mtl_lib);
++      MTL::Library* mtl_lib,
++      fast::PreparedPipelineCache* prepared = nullptr);
+ 
+   NS::SharedPtr<MTL::LinkedFunctions> get_linked_functions_(
+       const std::vector<MTL::Function*>& funcs);
+@@ -390,11 +396,13 @@
+       const std::string& name,
+       const MTL::Function* mtl_function);
+   NS::SharedPtr<MTL::ComputePipelineState> get_kernel_(const char* name,
+-      const MTL::Function*, const fast::PreparedKernelBorrow*);
++      const MTL::Function*, const fast::PreparedKernelBorrow*,
++      fast::PreparedPipelineCache* request = nullptr);
+   NS::SharedPtr<MTL::ComputePipelineState> get_kernel_(
+       const std::string& name,
+       const MTL::Function* mtl_function,
+-      const MTL::LinkedFunctions* linked_functions);
++      const MTL::LinkedFunctions* linked_functions,
++      fast::PreparedPipelineCache* request = nullptr);
+ 
+   MTL::ComputePipelineState* get_kernel_(
+       const std::string& base_name,
+@@ -402,6 +410,10 @@
+       const std::string& hash_name,
+       const MTLFCList& func_consts = {},
+       const std::vector<MTL::Function*>& linked_functions = {});
++
++  MTL::ComputePipelineState* get_request_kernel_(
++      fast::PreparedPipelineCache&, const std::string&, MTL::Library*,
++      const std::string&, const MTLFCList&, const std::vector<MTL::Function*>&);
+ 
+   NS::SharedPtr<MTL::Device> device_;
+   ResidencySet residency_set_;
+diff --git a/mlx/backend/metal/indexing.cpp b/mlx/backend/metal/indexing.cpp
+--- a/mlx/backend/metal/indexing.cpp
++++ b/mlx/backend/metal/indexing.cpp
+@@ -97,7 +97,9 @@
+         work_per_thread);
+     std::string lib_name = kernel_name;
+ 
+-    auto lib = d.get_library_borrowed(lib_name, [&]() {
++    auto lib = d.original_precompiled_kernel_required()
++        ? d.precompiled_library()
++        : d.get_library_borrowed(lib_name, [&]() {
+       std::string kernel_source = metal::utils();
+       kernel_source += metal::gather_front();
+       kernel_source += get_template_definition(
+diff --git a/mlx/backend/metal/jit_kernels.cpp b/mlx/backend/metal/jit_kernels.cpp
+--- a/mlx/backend/metal/jit_kernels.cpp
++++ b/mlx/backend/metal/jit_kernels.cpp
+@@ -12,6 +12,7 @@
+     metal::Device& d,
+     const std::string& kernel_name,
+     const array& out) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   auto lib = d.get_library_borrowed(kernel_name, [&]() {
+     std::string kernel_source = metal::utils();
+     kernel_source += metal::arange();
+@@ -28,6 +29,7 @@
+     Dtype in_type,
+     Dtype out_type,
+     const char* op) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     auto in_t = get_type_string(in_type);
+@@ -107,6 +109,7 @@
+     Dtype in_type,
+     Dtype out_type,
+     const char* op) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+@@ -124,6 +127,7 @@
+     Dtype in_type,
+     Dtype out_type,
+     const char* op) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+@@ -139,6 +143,7 @@
+     const std::string& kernel_name,
+     Dtype type,
+     const char* op) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     auto t_str = get_type_string(type);
+@@ -196,6 +201,7 @@
+     const std::string& kernel_name,
+     const array& in,
+     const array& out) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+@@ -260,6 +266,7 @@
+     const std::string& kernel_name,
+     const array& in,
+     const array& out) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+@@ -292,6 +299,7 @@
+     const std::string& kernel_name,
+     bool precise,
+     const array& out) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+   auto lib = d.get_library_borrowed(lib_name, [&] {
+     std::string kernel_source = metal::utils();
+@@ -311,6 +319,7 @@
+     metal::Device& d,
+     const std::string& kernel_name,
+     const array& out) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+   auto lib = d.get_library_borrowed(lib_name, [&] {
+     auto t_str = get_type_string(out.dtype());
+@@ -334,6 +343,7 @@
+     const std::string& reduce_type,
+     const array& in,
+     const array& out) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     auto out_type = get_type_string(out.dtype());
+@@ -368,6 +378,7 @@
+     const array& out,
+     int bn,
+     int tn) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -406,6 +417,7 @@
+     const array& idx,
+     int bn,
+     int tn) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   std::string lib_name = kernel_name.substr(kernel_name.find("_") + 1);
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -435,6 +447,7 @@
+     const std::string& func_name,
+     const std::string& op_name,
+     const Dtype& out_type) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   auto lib = d.get_library_borrowed(kernel_name, [&]() {
+     std::string op_type = op_name;
+     op_type[0] = std::toupper(op_name[0]);
+@@ -460,6 +473,7 @@
+     int ndim /* = -1 */,
+     int bm /* = -1 */,
+     int bn /* = -1 */) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   auto lib = d.get_library_borrowed(kernel_name, [&]() {
+     std::string op_type = op_name;
+     op_type[0] = std::toupper(op_name[0]);
+@@ -497,6 +511,7 @@
+     int bk,
+     int wm,
+     int wn) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -532,6 +547,7 @@
+     int wn,
+     bool mn_aligned,
+     bool k_aligned) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -562,6 +578,7 @@
+     const array& in,
+     const array& out,
+     bool axbpy) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -593,6 +610,7 @@
+     int wn,
+     bool mn_aligned,
+     bool k_aligned) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -637,6 +655,7 @@
+     int wm,
+     int wn,
+     bool rhs) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+@@ -674,6 +693,7 @@
+     int bk,
+     int wm,
+     int wn) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+@@ -711,6 +731,7 @@
+     int tn,
+     bool nc,
+     bool axpby) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -743,6 +764,7 @@
+     int sn,
+     int tm,
+     int tn) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -776,6 +798,7 @@
+     int tm,
+     int tn,
+     bool contiguous) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -814,6 +837,7 @@
+     int wn,
+     int n_channel_specialization,
+     bool small_filter) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -844,6 +868,7 @@
+     int wm,
+     int wn,
+     bool small_filter) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -874,6 +899,7 @@
+     int bk,
+     int wm,
+     int wn) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -899,6 +925,7 @@
+     const std::string& hash_name,
+     const metal::MTLFCList& func_consts,
+     const std::string& template_def) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -914,6 +941,7 @@
+     const std::string& kernel_name,
+     const std::string& template_def,
+     const std::string& mode) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+@@ -944,6 +972,7 @@
+     int wm,
+     int wn,
+     bool transpose) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+@@ -983,6 +1012,7 @@
+     int bk,
+     int wm,
+     int wn) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -1018,6 +1048,7 @@
+     int wm,
+     int wn,
+     bool rhs) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+@@ -1055,6 +1086,7 @@
+     int bk,
+     int wm,
+     int wn) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -1089,6 +1121,7 @@
+     int bk,
+     int wm,
+     int wn) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::ostringstream kernel_source;
+@@ -1115,6 +1148,7 @@
+     const std::string& kernel_name,
+     const std::string& template_def,
+     const std::string& mode) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+@@ -1145,6 +1179,7 @@
+     int wm,
+     int wn,
+     bool transpose) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+@@ -1186,6 +1221,7 @@
+     int wm,
+     int wn,
+     const array& m) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+@@ -1220,6 +1256,7 @@
+     int wm,
+     int wn,
+     const array& m) {
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(kernel_name, hash_name, func_consts);
+   const auto& lib_name = kernel_name;
+   auto lib = d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source;
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -155,7 +155,13 @@
+     steel/attn/params.h
+     steel/attn/kernels/steel_attention_nax.h)
+ 
+-if(NOT MLX_METAL_JIT)
++# Managed requests may select the same precompiled instantiations while ordinary
++# calls retain their configured JIT path. The embedded-library producer prices
++# the actual resulting archive, not an assumed symbol inventory.
++option(MLX_MANAGED_PRECOMPILED_KERNELS
++       "Build standard kernels for admitted request-local pipeline caches" ON)
++if(NOT MLX_METAL_JIT OR MLX_MANAGED_PRECOMPILED_KERNELS)
++  build_kernel(indexing/gather_front indexing/indexing.h indexing/gather_front.h)
+   build_kernel(arange arange.h)
+   build_kernel(binary binary.h binary_ops.h)
+   build_kernel(binary_two binary_two.h)
+@@ -207,10 +213,16 @@
+     build_kernel(steel/attn/kernels/steel_attention_nax
+                  ${STEEL_NAX_ATTN_HEADERS})
+ 
++    target_compile_definitions(mlx PRIVATE MLX_MANAGED_PRECOMPILED_NAX=1)
+   else()
+-    target_compile_definitions(mlx PRIVATE MLX_METAL_NO_NAX)
+-  endif()
+-
++    if(NOT MLX_METAL_JIT)
++      target_compile_definitions(mlx PRIVATE MLX_METAL_NO_NAX)
++    endif()
++    target_compile_definitions(mlx PRIVATE MLX_MANAGED_PRECOMPILED_NAX=0)
++  endif()
++  target_compile_definitions(mlx PRIVATE MLX_MANAGED_PRECOMPILED_KERNELS=1)
++else()
++  target_compile_definitions(mlx PRIVATE MLX_MANAGED_PRECOMPILED_KERNELS=0 MLX_MANAGED_PRECOMPILED_NAX=0)
+ endif()
+ 
+ set(METAL_LINK_FLAGS)
+diff --git a/mlx/backend/metal/kernels/indexing/gather_front.metal b/mlx/backend/metal/kernels/indexing/gather_front.metal
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/metal/kernels/indexing/gather_front.metal
+@@ -0,0 +1,35 @@
++// Copyright © 2025 Apple Inc.
++// Exact existing gather_front worker: all native data/index types, both offset
++// widths, and the two actual work-per-thread choices. No alternate equation.
++#include "mlx/backend/metal/kernels/utils.h"
++#include "mlx/backend/metal/kernels/indexing/gather_front.h"
++
++#define GATHER_FRONT_WIDTH(tname, type, iname, index, n) \
++  instantiate_kernel("gather_front" #tname "_" #iname "_int_" #n, gather_front, type, index, int, n) \
++  instantiate_kernel("gather_front" #tname "_" #iname "_int64_t_" #n, gather_front, type, index, int64_t, n)
++#define GATHER_FRONT_INDICES(tname, type, n) \
++  GATHER_FRONT_WIDTH(tname, type, bool_, bool, n) \
++  GATHER_FRONT_WIDTH(tname, type, uint8, uint8_t, n) \
++  GATHER_FRONT_WIDTH(tname, type, uint16, uint16_t, n) \
++  GATHER_FRONT_WIDTH(tname, type, uint32, uint32_t, n) \
++  GATHER_FRONT_WIDTH(tname, type, uint64, uint64_t, n) \
++  GATHER_FRONT_WIDTH(tname, type, int8, int8_t, n) \
++  GATHER_FRONT_WIDTH(tname, type, int16, int16_t, n) \
++  GATHER_FRONT_WIDTH(tname, type, int32, int32_t, n) \
++  GATHER_FRONT_WIDTH(tname, type, int64, int64_t, n)
++#define GATHER_FRONT_SMALL(tname, type) \
++  GATHER_FRONT_INDICES(tname, type, 1) \
++  GATHER_FRONT_INDICES(tname, type, 2)
++GATHER_FRONT_SMALL(bool_, bool)
++GATHER_FRONT_SMALL(uint8, uint8_t)
++GATHER_FRONT_SMALL(uint16, uint16_t)
++GATHER_FRONT_SMALL(int8, int8_t)
++GATHER_FRONT_SMALL(int16, int16_t)
++GATHER_FRONT_SMALL(float16, half)
++GATHER_FRONT_SMALL(bfloat16, bfloat16_t)
++GATHER_FRONT_INDICES(uint32, uint32_t, 1)
++GATHER_FRONT_INDICES(uint64, uint64_t, 1)
++GATHER_FRONT_INDICES(int32, int32_t, 1)
++GATHER_FRONT_INDICES(int64, int64_t, 1)
++GATHER_FRONT_INDICES(float32, float, 1)
++GATHER_FRONT_INDICES(complex64, complex64_t, 1)
+diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
+--- a/mlx/backend/metal/matmul.cpp
++++ b/mlx/backend/metal/matmul.cpp
+@@ -213,19 +213,11 @@
+     wm = 2;
+   }
+ 
+-  // Prepare kernel name
+-  std::ostringstream kname;
+-
+-  // clang-format off
+-  kname << "steel_gemm_fused_nax_"
+-        << (transpose_a ? 't' : 'n')
+-        << (transpose_b ? 't' : 'n')
+-        << "_" << type_to_name(a)
+-        << "_" << type_to_name(out)
+-        << "_bm" << bm << "_bn" << bn << "_bk" << bk
+-        << "_wm" << wm << "_wn" << wn; // clang-format on
+-
+-  std::string base_name = kname.str();
++  // These selectors format only source-fixed tags and bounded integers.
++  std::string base_name = fmt::format(
++      "steel_gemm_fused_nax_{}{}_{}_{}_bm{}_bn{}_bk{}_wm{}_wn{}",
++      transpose_a ? 't' : 'n', transpose_b ? 't' : 'n',
++      type_to_name(a), type_to_name(out), bm, bn, bk, wm, wn);
+ 
+   const bool has_batch = (batch_shape.size() > 1);
+   const bool use_out_source = CHECK_AB && (alpha != 0.0f || beta != 1.0f);
+@@ -243,15 +235,11 @@
+       {&align_K, MTL::DataType::DataTypeBool, 202},
+   };
+ 
+-  // clang-format off
+-  kname << "_has_batch_" << (has_batch ? 't' : 'n')
+-        << "_use_out_source_" << (use_out_source ? 't' : 'n')
+-        << "_do_axpby_" << (do_axpby ? 't' : 'n')
+-        << "_align_M_" << (align_M ? 't' : 'n')
+-        << "_align_N_" << (align_N ? 't' : 'n')
+-        << "_align_K_" << (align_K ? 't' : 'n'); // clang-format on
+-
+-  std::string hash_name = kname.str();
++  std::string hash_name = fmt::format(
++      "{}_has_batch_{}_use_out_source_{}_do_axpby_{}_align_M_{}_align_N_{}_align_K_{}",
++      base_name, has_batch ? 't' : 'n', use_out_source ? 't' : 'n',
++      do_axpby ? 't' : 'n', align_M ? 't' : 'n',
++      align_N ? 't' : 'n', align_K ? 't' : 'n');
+ 
+   // Encode and dispatch kernel
+   auto& compute_encoder = metal::get_command_encoder(s);
+@@ -372,19 +360,11 @@
+   char devc = d.architecture_suffix();
+   GEMM_TPARAM_MACRO(devc)
+ 
+-  // Prepare kernel name
+-  std::ostringstream kname;
+-
+-  // clang-format off
+-  kname << "steel_gemm_fused_"
+-        << (transpose_a ? 't' : 'n')
+-        << (transpose_b ? 't' : 'n')
+-        << "_" << type_to_name(a)
+-        << "_" << type_to_name(out)
+-        << "_bm" << bm << "_bn" << bn << "_bk" << bk
+-        << "_wm" << wm << "_wn" << wn; // clang-format on
+-
+-  std::string base_name = kname.str();
++  // These selectors format only source-fixed tags and bounded integers.
++  std::string base_name = fmt::format(
++      "steel_gemm_fused_{}{}_{}_{}_bm{}_bn{}_bk{}_wm{}_wn{}",
++      transpose_a ? 't' : 'n', transpose_b ? 't' : 'n',
++      type_to_name(a), type_to_name(out), bm, bn, bk, wm, wn);
+ 
+   const bool has_batch = (batch_shape.size() > 1);
+   const bool use_out_source = CHECK_AB && (alpha != 0.0f || beta != 1.0f);
+@@ -402,15 +382,11 @@
+       {&align_K, MTL::DataType::DataTypeBool, 202},
+   };
+ 
+-  // clang-format off
+-  kname << "_has_batch_" << (has_batch ? 't' : 'n')
+-        << "_use_out_source_" << (use_out_source ? 't' : 'n')
+-        << "_do_axpby_" << (do_axpby ? 't' : 'n')
+-        << "_align_M_" << (align_M ? 't' : 'n')
+-        << "_align_N_" << (align_N ? 't' : 'n')
+-        << "_align_K_" << (align_K ? 't' : 'n'); // clang-format on
+-
+-  std::string hash_name = kname.str();
++  std::string hash_name = fmt::format(
++      "{}_has_batch_{}_use_out_source_{}_do_axpby_{}_align_M_{}_align_N_{}_align_K_{}",
++      base_name, has_batch ? 't' : 'n', use_out_source ? 't' : 'n',
++      do_axpby ? 't' : 'n', align_M ? 't' : 'n',
++      align_N ? 't' : 'n', align_K ? 't' : 'n');
+ 
+   // Encode and dispatch kernel
+   auto& compute_encoder = metal::get_command_encoder(s);
+@@ -544,24 +520,17 @@
+ 
+   bool mn_aligned = M % bm == 0 && N % bn == 0;
+   bool k_aligned = K % bk == 0;
+-  std::ostringstream kname;
+-
+-  // clang-format off
+-  kname << "steel_gemm_splitk_"
+-        << (transpose_a ? 't' : 'n')
+-        << (transpose_b ? 't' : 'n')
+-        << "_" << type_to_name(a)
+-        << "_" << type_to_name(C_split)
+-        << "_bm" << bm << "_bn" << bn << "_bk" << bk
+-        << "_wm" << wm << "_wn" << wn
+-        << "_MN_" << (mn_aligned ? "t" : "n") << "aligned"
+-        << "_K_" << (k_aligned ? "t" : "n") << "aligned"; // clang-format on
++  std::string kernel_name = fmt::format(
++      "steel_gemm_splitk_{}{}_{}_{}_bm{}_bn{}_bk{}_wm{}_wn{}_MN_{}aligned_K_{}aligned",
++      transpose_a ? 't' : 'n', transpose_b ? 't' : 'n',
++      type_to_name(a), type_to_name(C_split), bm, bn, bk, wm, wn,
++      mn_aligned ? 't' : 'n', k_aligned ? 't' : 'n');
+ 
+   // Encode and dispatch gemm kernel
+   auto& compute_encoder = metal::get_command_encoder(s);
+   auto kernel = get_steel_gemm_splitk_kernel(
+       /* metal::Device& d = */ d,
+-      /* const std::string& kernel_name = */ kname.str(),
++      /* const std::string& kernel_name = */ kernel_name,
+       /* const array& in = */ a,
+       /* const array& out = */ C_split,
+       /* bool transpose_a = */ transpose_a,
+@@ -711,25 +680,13 @@
+       {&align_M, MTL::DataType::DataTypeBool, 200},
+       {&align_N, MTL::DataType::DataTypeBool, 201}};
+ 
+-  std::ostringstream kname;
+-
+-  // clang-format off
+-  kname << "steel_gemm_splitk_nax_"
+-        << (transpose_a ? 't' : 'n')
+-        << (transpose_b ? 't' : 'n')
+-        << "_" << type_to_name(a)
+-        << "_" << type_to_name(C_split)
+-        << "_bm" << bm << "_bn" << bn << "_bk" << bk
+-        << "_wm" << wm << "_wn" << wn; // clang-format on
+-
+-  std::string base_name = kname.str();
+-
+-  // clang-format off
+-  kname << "_align_M_" << (align_M ? 't' : 'n')
+-        << "_align_N_" << (align_N ? 't' : 'n')
+-        << "_align_K_" << (align_K ? 't' : 'n'); // clang-format on
+-
+-  std::string hash_name = kname.str();
++  std::string base_name = fmt::format(
++      "steel_gemm_splitk_nax_{}{}_{}_{}_bm{}_bn{}_bk{}_wm{}_wn{}",
++      transpose_a ? 't' : 'n', transpose_b ? 't' : 'n',
++      type_to_name(a), type_to_name(C_split), bm, bn, bk, wm, wn);
++  std::string hash_name = fmt::format(
++      "{}_align_M_{}_align_N_{}_align_K_{}", base_name,
++      align_M ? 't' : 'n', align_N ? 't' : 'n', align_K ? 't' : 'n');
+ 
+   auto& compute_encoder = metal::get_command_encoder(s);
+   auto kernel = get_steel_gemm_splitk_nax_kernel(
+@@ -1086,7 +1043,7 @@
+   int sm = 1, sn = 32;
+   int bm = 1, bn = 1;
+   int n_out_per_tgp;
+-  std::ostringstream kname;
++  const char* kernel_prefix;
+ 
+   if (transpose_mat) {
+     if (in_vector_len >= 8192 && out_vector_len >= 2048) {
+@@ -1109,7 +1066,7 @@
+     tn = out_vector_len < tn ? 1 : tn;
+ 
+     n_out_per_tgp = bn * sn * tn;
+-    kname << "gemv_t_" << type_to_name(out);
++    kernel_prefix = "gemv_t_";
+ 
+   } else {
+     bm = out_vector_len >= 4096 ? 8 : 4;
+@@ -1128,23 +1085,21 @@
+     tm = out_vector_len < tm ? 1 : tm;
+ 
+     n_out_per_tgp = bm * sm * tm;
+-    kname << "gemv_" << type_to_name(out);
++    kernel_prefix = "gemv_";
+   }
+ 
+   const bool do_axpby = CHECK_AB && (alpha != 1.0f || beta != 0.0f);
+ 
+-  // clang-format off
+-  kname << "_bm" << bm << "_bn" << bn
+-        << "_sm" << sm << "_sn" << sn
+-        << "_tm" << tm << "_tn" << tn
+-        << "_nc" << !contiguous_kernel
+-        << "_axpby" << do_axpby; // clang-format on
++  std::string kernel_name = fmt::format(
++      "{}{}_bm{}_bn{}_sm{}_sn{}_tm{}_tn{}_nc{}_axpby{}",
++      kernel_prefix, type_to_name(out), bm, bn, sm, sn, tm, tn,
++      int(!contiguous_kernel), int(do_axpby));
+ 
+   // Encode and dispatch kernel
+   auto& compute_encoder = metal::get_command_encoder(s);
+   auto kernel = get_gemv_kernel(
+       d,
+-      kname.str(),
++      kernel_name,
+       out,
+       transpose_mat,
+       bm,
+diff --git a/mlx/backend/metal/no_metal.cpp b/mlx/backend/metal/no_metal.cpp
+--- a/mlx/backend/metal/no_metal.cpp
++++ b/mlx/backend/metal/no_metal.cpp
+@@ -55,3 +55,5 @@
+ namespace mlx::core::fast {
+ PreparedKernelPlatformLayout prepared_kernel_platform_layout() noexcept { return {}; }
+ }
++
++namespace mlx::core::fast { bool pipeline_cache_platform_controls(size_t, size_t&) noexcept { return false; } }
+diff --git a/mlx/backend/metal/selector_controls.cpp b/mlx/backend/metal/selector_controls.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/metal/selector_controls.cpp
+@@ -0,0 +1,115 @@
++#include "mlx/backend/metal/selector_controls.h"
++#include "mlx/backend/metal/device.h"
++#include <algorithm>
++#include <array>
++#include <limits>
++#include <string>
++#include <utility>
++#include <fmt/format.h>
++
++namespace mlx::core::metal {
++namespace {
++template <size_t N> constexpr size_t text(const char (&)[N]) { return N - 1; }
++// type_to_name and get_type_string_view are closed Dtype switches. All type
++// and individual integer conversions fit the qualified string's inline room.
++constexpr size_t dtype_tag = text("complex64");
++constexpr size_t source_type = text("complex64_t");
++constexpr size_t integer = std::numeric_limits<int>::digits10 + 2;
++constexpr size_t size_integer = std::numeric_limits<size_t>::digits10 + 1;
++constexpr size_t gemm_base = text("steel_gemm_splitk_nax_") + 2 +
++    2 * (1 + dtype_tag) + text("_bm_bn_bk_wm_wn") + 5 * integer;
++constexpr size_t gemm_specialized = gemm_base +
++    text("_has_batch__use_out_source__do_axpby__align_M__align_N__align_K_") + 6;
++constexpr size_t gemm_split = gemm_base + text("_MN_aligned_K_aligned") + 2;
++constexpr size_t gemv = text("gemv_t_") + dtype_tag +
++    text("_bm_bn_sm_sn_tm_tn_nc_axpby") + 6 * integer + 2;
++constexpr size_t attention_base = text("steel_attention_") + 2 * dtype_tag +
++    text("_bq_bk_bd_wm_wn_mask") + 5 * integer;
++constexpr size_t attention = attention_base +
++    text("_align_Q__align_K__has_mask__do_causal__has_sinks_") + 5;
++constexpr size_t vector_attention = text("sdpa_vector_2pass_1_") + source_type +
++    2 * (1 + integer) + text("_floatmask_qnt_nc_nosinks_") + integer;
++constexpr size_t reduce = text("col_reduce_longcolumn_large___reduce_") +
++    3 * integer + text("prod") + dtype_tag;
++constexpr size_t indexing = text("gather_front___") + 2 * dtype_tag +
++    text("int64_t") + integer;
++constexpr size_t pointwise = text("ggnlarge_") + size_integer +
++    text("BitwiseRightShift") + 2 * dtype_tag;
++constexpr size_t rope = text("rope_single_freqs_large__vjp_traditional_transpose") + dtype_tag;
++constexpr size_t normalization = text("layer_norm_looped") + dtype_tag;
++constexpr size_t maximum_name = std::max({gemm_specialized, gemm_split, gemv,
++    attention, vector_attention, reduce, indexing, pointwise, rope, normalization});
++
++// The widest formatting call is split-K: two transpose chars, two dtype tags,
++// five integer tile values and two alignment chars. Other formatting calls use
++// no more storage; append-based selectors use the same finite name bound.
++using FormatArguments = decltype(fmt::make_format_args(
++    std::declval<char&>(), std::declval<char&>(),
++    std::declval<std::string&>(), std::declval<std::string&>(),
++    std::declval<int&>(), std::declval<int&>(), std::declval<int&>(),
++    std::declval<int&>(), std::declval<int&>(),
++    std::declval<char&>(), std::declval<char&>()));
++
++// libc++ 210106 __recommend rounds (requested+1) to eight. Each append
++// growth requests max(new_size,2*old_capacity), then recommendation; C++20's
++// default allocator returns that exact count. Summing every requested buffer
++// in a monotone name's geometric sequence (including a failed final request)
++// is below twice its final requested count. That count is at most
++// round_up(2*maximum_name+1,8). Explicit reserve(64) in SDPA is below this
++// source bound. Copies and fmt results each request at most one such buffer.
++constexpr size_t name_request = ((2 * maximum_name + 1 + 7) / 8) * 8;
++constexpr size_t name_sequence = 2 * name_request;
++// Largest simultaneously entered name population: SDPA base, specialized name
++// and concatenate's by-value base loan. The two-pass reduction keeps its first
++// and second names plus function-name owner. Dense GEMM has two fmt results;
++// gather_front has kernel/lib copies. No JIT builder body runs in this profile.
++constexpr size_t name_owners = 3;
++// SDPA's first two-pass kernel has six boolean constants plus blocks (integer).
++// Dense GEMM has six; RoPE three. All are direct vector initializer lists,
++// never growing inserts, with the exact actual tuple element representation.
++constexpr size_t constants = 7;
++}
++
++bool resident_selector_layout(ResidentSelectorLayout& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || \
++    __cplusplus != 202002L || FMT_VERSION != 120100
++  return false;
++#else
++  static_assert(sizeof(std::string) == 3 * sizeof(void*));
++  static_assert(size_integer < 23 && integer < 23 && source_type < 23);
++  static_assert(maximum_name < fmt::inline_buffer_size);
++  // All selected calls use the default empty linked-function vector. This is
++  // a derived zero for these source call sites, not general Device coverage.
++  constexpr size_t linked = 0;
++  constexpr size_t allocation = name_owners * name_sequence +
++      constants * sizeof(MTLFCList::value_type);
++  // The longest concatenate call has 14 arguments (attention base); each
++  // recursive frame retains its by-value suffix: 14+13+...+1 parameters.
++  // Every parameter is string, pointer, char or int, no larger than string.
++  // Only base_name can exceed inline storage and it is the first argument
++  // of its separate hash call, so this recursion adds no hidden long copies.
++  constexpr size_t concatenate_arguments = 14;
++  constexpr size_t concatenate_parameters =
++      concatenate_arguments * (concatenate_arguments + 1) / 2;
++  constexpr size_t controls = sizeof(ResidentSelectorLayout) * 2 +
++      sizeof(fmt::memory_buffer) + sizeof(FormatArguments) + sizeof(fmt::format_args) +
++      sizeof(std::string) * (name_owners + concatenate_parameters) +
++      sizeof(MTLFCList) + sizeof(MTLFCList::value_type) * constants +
++      sizeof(std::vector<MTL::Function*>) +
++      sizeof(std::string*) * concatenate_arguments;
++  out = {allocation, controls, maximum_name, constants, linked};
++  return true;
++#endif
++}
++bool resident_selector_control_bytes(size_t attempts, size_t& output) noexcept {
++  ResidentSelectorLayout layout;
++  if (!resident_selector_layout(layout)) return false;
++  constexpr auto limit = size_t(std::numeric_limits<ptrdiff_t>::max());
++  if (layout.control_bytes_per_lookup > limit - layout.allocation_bytes_per_lookup)
++    return false;
++  const size_t per_lookup = layout.allocation_bytes_per_lookup + layout.control_bytes_per_lookup;
++  if (attempts > limit / per_lookup) return false;
++  output = attempts * per_lookup;
++  return true;
++}
++} // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/selector_controls.h b/mlx/backend/metal/selector_controls.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/metal/selector_controls.h
+@@ -0,0 +1,17 @@
++#pragma once
++#include <cstddef>
++#include "mlx/api.h"
++
++namespace mlx::core::metal {
++// Transient caller-owned storage of the closed dense resident selectors.
++// Persistent pipelines and platform-private compiler objects are separate.
++struct ResidentSelectorLayout {
++  size_t allocation_bytes_per_lookup;
++  size_t control_bytes_per_lookup;
++  size_t maximum_name_bytes;
++  size_t maximum_function_constants;
++  size_t linked_functions;
++};
++MLX_API bool resident_selector_layout(ResidentSelectorLayout&) noexcept;
++MLX_API bool resident_selector_control_bytes(size_t attempts, size_t& output) noexcept;
++} // namespace mlx::core::metal
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -1,3 +1,4 @@
++#include "mlx/backend/common/pipeline_cache.h"
+ #include "mlx/original_buffer.h"
+ #include "mlx/graph_quota.h"
+ #include "mlx/graph_construction.h"
+@@ -45,6 +46,7 @@
+   void* owner;
+   void (*retire)(void*);
+   bool direct;
++  fast::PreparedPipelineCache* pipelines;
+ };
+ } // namespace
+ 
+@@ -114,11 +116,25 @@
+   // Every allocator, including empty containers, and every allocated block
+   // owns a reference. Block return precedes releasing its allocation reference.
+   assert(occupied_ == 0);
+-  const ArenaRetirement retirement{this, owner_, retire_, direct_allocation_};
++  const ArenaRetirement retirement{this, owner_, retire_, direct_allocation_, pipeline_cache_.load(std::memory_order_acquire)};
+   this->~GraphQuota();
+   if (retirement.direct) std::free(retirement.allocation);
+   else ::operator delete(retirement.allocation, std::align_val_t(alignment));
++  if (retirement.pipelines) retirement.pipelines->release();
+   if (retirement.retire) retirement.retire(retirement.owner);
++}
++size_t GraphQuota::pipeline_cache_control_bytes() noexcept {
++  return sizeof(Loan) + sizeof(fast::PreparedPipelineCache*) * 2 + sizeof(GraphQuota*) +
++      sizeof(size_t) * 2 + sizeof(bool) * 2;
++}
++bool GraphQuota::install_pipeline_cache(fast::PreparedPipelineCache* cache) noexcept {
++  if (!cache) return false;
++  const Loan loan(*this);
++  if (pipeline_cache_.load(std::memory_order_relaxed) || references_.load(std::memory_order_acquire) != 1 ||
++      occupied_ || construction_ || preparing_ || !cache->bind(this)) return false;
++  cache->retain(); // atomic only; no destruction or callback inside the loan
++  pipeline_cache_.store(cache, std::memory_order_release);
++  return true;
+ }
+ size_t GraphQuota::occupied_bytes() const noexcept {
+   const Loan loan(*this);
+diff --git a/mlx/graph_quota.h b/mlx/graph_quota.h
+--- a/mlx/graph_quota.h
++++ b/mlx/graph_quota.h
+@@ -10,6 +10,8 @@
+ #include <utility>
+ #include <vector>
+ #include "mlx/api.h"
++
++namespace mlx::core::fast { class PreparedPipelineCache; }
+ 
+ namespace mlx::core::submission {
+ 
+@@ -64,6 +66,11 @@
+   void* try_allocate(size_t, size_t) noexcept;
+   void retain() noexcept;
+   void release() noexcept;
++  // Install only while this newly constructed arena has one owner and no
++  // allocations. The cache retains raw host custody, never this arena.
++  bool install_pipeline_cache(fast::PreparedPipelineCache*) noexcept;
++  static size_t pipeline_cache_control_bytes() noexcept;
++  fast::PreparedPipelineCache* pipeline_cache() const noexcept { return pipeline_cache_.load(std::memory_order_acquire); }
+   size_t capacity() const noexcept { return capacity_; }
+   size_t occupied_bytes() const noexcept;
+   void* allocate(size_t, size_t);
+@@ -71,6 +78,7 @@
+  private:
+   friend class GraphConstruction;
+   GraphConstruction* construction_{nullptr};
++  std::atomic<fast::PreparedPipelineCache*> pipeline_cache_{nullptr};
+   struct Block;
+   static size_t minimum_split_bytes() noexcept;
+   static constexpr size_t prepared_limit = 8;

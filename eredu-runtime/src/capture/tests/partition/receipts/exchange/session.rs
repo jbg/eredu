@@ -1,8 +1,10 @@
 use super::*;
 use eredu_core::DistributedCommitEpoch;
+mod host_authority;
 mod invocation;
 mod observer;
 mod routed;
+mod shared_source;
 
 fn discovery(plan: &AdmittedCapturePlan) -> CaptureDiscovery {
     let (_, _, mut support, capabilities) = fixture(CaptureTransform::Slice);

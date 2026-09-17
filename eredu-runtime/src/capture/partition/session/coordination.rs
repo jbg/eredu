@@ -8,7 +8,6 @@ const WORDS: usize = 16;
 /// It freezes local preparation before the shared all-rank preparation vote.
 /// Even a forward with no scheduled selections participates in one fixed frame.
 pub struct SessionPartitionCoordination<'a, T: PartitionCaptureTransport> {
-    owner: Arc<()>,
     epoch: DistributedCommitEpoch,
     transport: &'a T,
     wait: BoundedCompletionWait,
@@ -16,6 +15,8 @@ pub struct SessionPartitionCoordination<'a, T: PartitionCaptureTransport> {
     rank: usize,
     digest: [u8; 32],
     reserved: CaptureUsage,
+    // Last: all retained plan/work payloads retire before preparation custody.
+    owner: Arc<crate::capture::CaptureHostOwner>,
 }
 
 impl<T: PartitionCaptureTransport> SessionPartitionCoordination<'_, T> {
@@ -230,34 +231,44 @@ where
     <T::Completion as Completion>::Error: Send + Sync + 'static,
 {
     fn exchange(&self) -> Result<(), PartitionCaptureExchangeError> {
-        self.transport.ensure_capture_active()?;
+        exchange_coordination(self.transport, self.wait, self.rank, self.participants,
+            self.epoch, &self.digest)
+    }
+}
+
+// Both receipt owners use the identical reached frame and comparison worker.
+pub(in crate::capture::partition) fn exchange_coordination<T: PartitionCaptureTransport>(
+    transport: &T, wait: BoundedCompletionWait, rank: usize, participants: usize,
+    epoch: DistributedCommitEpoch, digest: &[u8; 32],
+) -> Result<(), PartitionCaptureExchangeError>
+where T::Error: Send + Sync + 'static,
+    <T::Completion as Completion>::Error: Send + Sync + 'static,
+{
+        transport.ensure_capture_active()?;
         let mut frame = [0u32; WORDS];
         frame[..6].copy_from_slice(&[
             MAGIC,
             2,
-            self.rank as u32,
-            self.participants as u32,
-            self.epoch.value() as u32,
-            (self.epoch.value() >> 32) as u32,
+            rank as u32,
+            participants as u32,
+            epoch.value() as u32,
+            (epoch.value() >> 32) as u32,
         ]);
-        for (word, bytes) in frame[6..14].iter_mut().zip(self.digest.chunks_exact(4)) {
+        for (word, bytes) in frame[6..14].iter_mut().zip(digest.chunks_exact(4)) {
             *word = u32::from_le_bytes(bytes.try_into().expect("digest word"));
         }
-        let gathered = super::super::exchange::gather_capture_words(
-            self.transport,
-            self.wait,
-            self.participants,
-            &frame,
-        )?;
+        let source = PartitionCaptureFrame::new(PartitionCaptureFrameKind::Coordination,
+            rank, participants, &frame, WORDS)?;
+        let gathered = super::super::exchange::gather_capture_words(transport, wait, &source)?;
         for (rank, peer) in gathered.chunks_exact(WORDS).enumerate() {
             if peer[..6]
                 != [
                     MAGIC,
                     2,
                     rank as u32,
-                    self.participants as u32,
-                    self.epoch.value() as u32,
-                    (self.epoch.value() >> 32) as u32,
+                    participants as u32,
+                    epoch.value() as u32,
+                    (epoch.value() >> 32) as u32,
                 ]
                 || peer[14..] != [0, 0]
             {
@@ -278,5 +289,4 @@ where
             });
         }
         Ok(())
-    }
 }

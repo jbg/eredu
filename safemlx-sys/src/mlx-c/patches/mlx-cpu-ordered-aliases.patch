@@ -1,0 +1,45 @@
+diff --git a/mlx/backend/cpu/greedy_storage.cpp b/mlx/backend/cpu/greedy_storage.cpp
+--- a/mlx/backend/cpu/greedy_storage.cpp
++++ b/mlx/backend/cpu/greedy_storage.cpp
+@@ -29,7 +29,7 @@
+   out=value;return true;
+ }
+ bool squeeze_eval_layout(size_t rank,bool tracer,CopyEvalStorage& out) noexcept {
+-  if(rank<1||rank>4)return false;
++  if(rank<1||rank>5||rank>Shape::inline_capacity||rank>Strides::inline_capacity)return false;
+   CopyEvalStorage value;
+   if(!copy_eval_layout(0,1,false,tracer,value))return false;
+   value.rank=rank;
+@@ -43,10 +43,10 @@
+ bool greedy_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   if(!is_greedy_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
+   const auto& input=output.inputs()[0];const size_t rank=input.ndim();
+-  if(rank<1||rank>4||!input.size()||!output.size())return false;
++  if(rank<1||rank>5||!input.size()||!output.size())return false;
+   if(typeid(output.primitive())==typeid(ArgReduce)) {
+     const auto [kind,axis]=static_cast<const ArgReduce&>(output.primitive()).state();
+-    if((kind!=ArgReduce::ArgMin&&kind!=ArgReduce::ArgMax)||axis<0||size_t(axis)>=rank||
++    if(rank>4||(kind!=ArgReduce::ArgMin&&kind!=ArgReduce::ArgMax)||axis<0||size_t(axis)>=rank||
+         input.dtype()!=float32||input.itemsize()!=sizeof(float)||output.dtype()!=uint32||
+         output.itemsize()!=sizeof(uint32_t)||output.ndim()!=rank)return false;
+     if(input.strides().size()!=rank)return false;
+@@ -63,7 +63,7 @@
+   }
+   const auto& axes=static_cast<const Squeeze&>(output.primitive()).axes_ref();
+   if(axes.empty()||axes.size()>rank||output.ndim()!=rank-axes.size()||input.dtype()!=output.dtype()||
+-      (input.dtype()!=bool_&&input.dtype()!=uint32&&input.dtype()!=float32&&input.dtype()!=bfloat16)||
++      (input.dtype()!=bool_&&input.dtype()!=int32&&input.dtype()!=uint32&&input.dtype()!=float32&&input.dtype()!=bfloat16)||
+       input.itemsize()!=output.itemsize()||input.size()!=output.size())return false;
+   size_t elements=0;if(!alias_input_geometry(input,elements))return false;
+   size_t selected=0,target=0;
+diff --git a/mlx/backend/cpu/reshape_storage.cpp b/mlx/backend/cpu/reshape_storage.cpp
+--- a/mlx/backend/cpu/reshape_storage.cpp
++++ b/mlx/backend/cpu/reshape_storage.cpp
+@@ -39,6 +39,7 @@
+       input.size()==0||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
+       !((input.dtype()==float32&&input.itemsize()==sizeof(float))||
+         (input.dtype()==uint32&&input.itemsize()==sizeof(uint32_t))||
++        (input.dtype()==int32&&input.itemsize()==sizeof(int32_t))||
+         (input.dtype()==float16&&input.itemsize()==2)||
+         (input.dtype()==bfloat16&&input.itemsize()==2)))return false;
+   size_t source_elements=0;

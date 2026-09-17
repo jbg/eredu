@@ -1,0 +1,750 @@
+{
+  "new_test_execution_sources": [
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_qwen_vl_matches_all_states_and_three_cached_decodes_across_residencies",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs",
+      "execution_scope": "historical",
+      "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-backend_cpu.log",
+      "log_sha256": "8941ea245d6fbcff5d7f857cc589387c7773c2373fddb746e0507f86a16720f2"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_conditional_qwen_matches_all_states_and_three_cached_decodes_across_residencies",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs",
+      "execution_scope": "historical",
+      "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-backend_cpu.log",
+      "log_sha256": "8941ea245d6fbcff5d7f857cc589387c7773c2373fddb746e0507f86a16720f2"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_both_selected_families_use_same_iterator_and_manual_driver",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs",
+      "execution_scope": "historical",
+      "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-backend_cpu.log",
+      "log_sha256": "8941ea245d6fbcff5d7f857cc589387c7773c2373fddb746e0507f86a16720f2"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_exact_short_foreign_and_partial_constructor_preserve_b",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs",
+      "execution_scope": "historical",
+      "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-backend_cpu.log",
+      "log_sha256": "8941ea245d6fbcff5d7f857cc589387c7773c2373fddb746e0507f86a16720f2"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_cache_ordinary_publication_authenticates_residence_without_duplicate_registration",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs",
+      "execution_scope": "historical",
+      "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-backend_cpu.log",
+      "log_sha256": "8941ea245d6fbcff5d7f857cc589387c7773c2373fddb746e0507f86a16720f2"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_binding_rejects_substitution_busy_poison_and_stale_frontier_without_refund",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs",
+      "execution_scope": "historical",
+      "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-backend_cpu.log",
+      "log_sha256": "8941ea245d6fbcff5d7f857cc589387c7773c2373fddb746e0507f86a16720f2"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_frontier_error_representation_retains_actual_box_until_b_retirement",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs",
+      "execution_scope": "historical",
+      "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-backend_cpu.log",
+      "log_sha256": "8941ea245d6fbcff5d7f857cc589387c7773c2373fddb746e0507f86a16720f2"
+    },
+    {
+      "check": "core",
+      "name": "sorted_map_rejection_returns_same_nonclone_values_and_allocation",
+      "path": "eredu-core/src/input/fixed_map.rs",
+      "execution_scope": "historical",
+      "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-core.log",
+      "log_sha256": "d14e9091919caa0fb543ba152bb941eacc50e1a1fc68aa5066c97a9a260f56ba"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_storage_exact_short_foreign_and_unquoted_compare_before_constructor",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs",
+      "execution_scope": "fresh",
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime.log",
+      "log_sha256": "00c25c542c1d6a10500aaa6f71f049a0a237a301fba699132e12d5501663111f"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_storage_matches_ordinary_order_descriptors_and_cache_equation",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs",
+      "execution_scope": "fresh",
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime.log",
+      "log_sha256": "00c25c542c1d6a10500aaa6f71f049a0a237a301fba699132e12d5501663111f"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_cache_all_aliases_branch_before_provider_and_keep_final_identity_custody",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs",
+      "execution_scope": "fresh",
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime.log",
+      "log_sha256": "00c25c542c1d6a10500aaa6f71f049a0a237a301fba699132e12d5501663111f"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_views_and_cache_concurrent_final_aliases_retire_the_complete_account",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs",
+      "execution_scope": "fresh",
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime.log",
+      "log_sha256": "00c25c542c1d6a10500aaa6f71f049a0a237a301fba699132e12d5501663111f"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_failed_late_slot_retains_real_prefix_and_source_without_retry",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs",
+      "execution_scope": "fresh",
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime.log",
+      "log_sha256": "00c25c542c1d6a10500aaa6f71f049a0a237a301fba699132e12d5501663111f"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_host_failure_keeps_committed_prefix_and_tears_down_values_before_account",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs",
+      "execution_scope": "fresh",
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime.log",
+      "log_sha256": "00c25c542c1d6a10500aaa6f71f049a0a237a301fba699132e12d5501663111f"
+    }
+  ],
+  "historical_new_test_count": 8,
+  "fresh_new_test_count": 6,
+  "historical_rust_evidence": {
+    "checks": {
+      "backend_cpu": {
+        "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-b2-input-identity-map-export-successor/check.py backend_cpu",
+        "elapsed_seconds": 139.865,
+        "exit_code": 0,
+        "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-backend_cpu.log",
+        "log_sha256": "8941ea245d6fbcff5d7f857cc589387c7773c2373fddb746e0507f86a16720f2",
+        "started_utc": "2026-09-14T21:05:18.985736+00:00"
+      },
+      "backend_metal": {
+        "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-b2-input-identity-map-export-successor/check.py backend_metal",
+        "elapsed_seconds": 117.874,
+        "exit_code": 0,
+        "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-backend_metal.log",
+        "log_sha256": "95ea51bd110f2b9ffe60b8479c9d77a787c62a0177e198cf6a95ecf2176c4ac8",
+        "started_utc": "2026-09-14T21:07:39.980271+00:00"
+      },
+      "copy_cpu": {
+        "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-b2-input-identity-map-export-successor/check.py copy_cpu",
+        "elapsed_seconds": 0.625,
+        "exit_code": 0,
+        "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-copy_cpu.log",
+        "log_sha256": "2e025ea305a01f35238ef3dd7c909e714763a4c3bf73a57fd82262bc5798c987",
+        "started_utc": "2026-09-14T21:09:39.100150+00:00"
+      },
+      "copy_metal": {
+        "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-b2-input-identity-map-export-successor/check.py copy_metal",
+        "elapsed_seconds": 0.712,
+        "exit_code": 0,
+        "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-copy_metal.log",
+        "log_sha256": "b217d995ea27a681cee041de18bc255906c2fd311283e1d7dcc2bee60e35474a",
+        "started_utc": "2026-09-14T21:09:40.927733+00:00"
+      },
+      "core": {
+        "command": "CARGO_INCREMENTAL=0 env -u DOCS_RS -u SAFEMLX_SYS_GENERATE_BINDINGS -u SAFEMLX_METALLIB_OUTPUT_DIR SAFEMLX_NATIVE_BUILD_ROOT=/private/tmp/eredu-b2-input-identity-map-export-successor/execution/cargo-native CMAKE_GENERATOR=Unix Makefiles CMAKE_EXPORT_COMPILE_COMMANDS=ON cargo test --locked --offline --target-dir /private/tmp/eredu-b2-input-identity-map-export-successor/execution/cargo-target -p eredu-core --lib",
+        "elapsed_seconds": 21.52,
+        "exit_code": 0,
+        "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-core.log",
+        "log_sha256": "d14e9091919caa0fb543ba152bb941eacc50e1a1fc68aa5066c97a9a260f56ba",
+        "started_utc": "2026-09-14T21:09:46.534296+00:00"
+      },
+      "target_cpu": {
+        "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-b2-input-identity-map-export-successor/check.py target_cpu",
+        "elapsed_seconds": 0.614,
+        "exit_code": 0,
+        "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-target_cpu.log",
+        "log_sha256": "a0141ce5175906aa5b70c618d8a5ec355d2b8381465fd12c64264116572cd73f",
+        "started_utc": "2026-09-14T21:09:42.864213+00:00"
+      },
+      "target_metal": {
+        "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-b2-input-identity-map-export-successor/check.py target_metal",
+        "elapsed_seconds": 0.685,
+        "exit_code": 0,
+        "log": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-target_metal.log",
+        "log_sha256": "212231ab1c80195e1f32221292d6c6cc1d30dcbf09ce1946611bd4c2b47b9bf9",
+        "started_utc": "2026-09-14T21:09:44.687362+00:00"
+      }
+    },
+    "classification": "historical previously verified Rust gates; reverified read-only",
+    "counts": {
+      "backend_cpu": {
+        "ignored": 0,
+        "passed": 26
+      },
+      "backend_metal": {
+        "ignored": 0,
+        "passed": 26
+      },
+      "copy_cpu": {
+        "ignored": 0,
+        "passed": 4
+      },
+      "copy_metal": {
+        "ignored": 0,
+        "passed": 5
+      },
+      "core": {
+        "ignored": 0,
+        "passed": 471
+      },
+      "target_cpu": {
+        "ignored": 0,
+        "passed": 2
+      },
+      "target_metal": {
+        "ignored": 0,
+        "passed": 2
+      }
+    },
+    "failed_runtime_tests_executed": 0,
+    "fresh_credit": 0,
+    "introduced_cases": [
+      {
+        "check": "backend_cpu",
+        "name": "full_original_input_qwen_vl_matches_all_states_and_three_cached_decodes_across_residencies",
+        "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+      },
+      {
+        "check": "backend_cpu",
+        "name": "full_original_input_conditional_qwen_matches_all_states_and_three_cached_decodes_across_residencies",
+        "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+      },
+      {
+        "check": "backend_cpu",
+        "name": "full_original_input_both_selected_families_use_same_iterator_and_manual_driver",
+        "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+      },
+      {
+        "check": "backend_cpu",
+        "name": "full_original_input_exact_short_foreign_and_partial_constructor_preserve_b",
+        "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+      },
+      {
+        "check": "backend_cpu",
+        "name": "full_original_cache_ordinary_publication_authenticates_residence_without_duplicate_registration",
+        "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+      },
+      {
+        "check": "backend_cpu",
+        "name": "full_original_input_binding_rejects_substitution_busy_poison_and_stale_frontier_without_refund",
+        "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+      },
+      {
+        "check": "backend_cpu",
+        "name": "full_original_input_frontier_error_representation_retains_actual_box_until_b_retirement",
+        "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+      },
+      {
+        "check": "core",
+        "name": "sorted_map_rejection_returns_same_nonclone_values_and_allocation",
+        "path": "eredu-core/src/input/fixed_map.rs"
+      }
+    ],
+    "native_linked_receipts": {
+      "backend_cpu": {
+        "path": "/private/tmp/eredu-b2-input-identity-map-export-successor/verified-backend_cpu.json",
+        "result": {
+          "ignored": 0,
+          "immediate_fresh_verification": "PASS",
+          "managed_activation": false,
+          "mode": "backend_cpu",
+          "native_files": 949,
+          "passed": 26,
+          "patches": 33,
+          "result_sha256": "a3e2fddf1e09012978f8493a031977407cb4a6fe3ea3fd5d6cf559e9962ff57b",
+          "source_files": 202
+        },
+        "sha256": "945cd8da028e5a4fa4ebe0c3189d327c492c035956341a9a67230d82cb998ff2"
+      },
+      "backend_metal": {
+        "path": "/private/tmp/eredu-b2-input-identity-map-export-successor/verified-backend_metal.json",
+        "result": {
+          "ignored": 0,
+          "immediate_fresh_verification": "PASS",
+          "managed_activation": false,
+          "mode": "backend_metal",
+          "native_files": 949,
+          "passed": 26,
+          "patches": 33,
+          "result_sha256": "8e0284f355ceb93ae14de3aef9b3e9074417a74e0e570f94359fc2923cb6c5b7",
+          "source_files": 202
+        },
+        "sha256": "ff23ee0b7f843a551393af0524759a6b1b66eea958745742e6298e0a67f418d4"
+      },
+      "copy_cpu": {
+        "path": "/private/tmp/eredu-b2-input-identity-map-export-successor/verified-copy_cpu.json",
+        "result": {
+          "ignored": 0,
+          "immediate_fresh_verification": "PASS",
+          "managed_activation": false,
+          "mode": "copy_cpu",
+          "native_files": 949,
+          "passed": 4,
+          "patches": 33,
+          "result_sha256": "55f76be2970cdf34473a2f67f0346fb4b9a64b618e6c74d5865f49812d9bc970",
+          "source_files": 202
+        },
+        "sha256": "4637d33c9afd5422792b2a3127a3b075e445994729c528ed268b77c796fb4b87"
+      },
+      "copy_metal": {
+        "path": "/private/tmp/eredu-b2-input-identity-map-export-successor/verified-copy_metal.json",
+        "result": {
+          "ignored": 0,
+          "immediate_fresh_verification": "PASS",
+          "managed_activation": false,
+          "mode": "copy_metal",
+          "native_files": 949,
+          "passed": 5,
+          "patches": 33,
+          "result_sha256": "b1d5a5242d83cd5742a6e4cbaf95dd39afebeb9f57410c357d81bff825b0248c",
+          "source_files": 202
+        },
+        "sha256": "f4278dc572d5ae1fb040bb6ad4821dd91538401c1814c05d453a1dc517d7d79b"
+      },
+      "target_cpu": {
+        "path": "/private/tmp/eredu-b2-input-identity-map-export-successor/verified-target_cpu.json",
+        "result": {
+          "ignored": 0,
+          "immediate_fresh_verification": "PASS",
+          "managed_activation": false,
+          "mode": "target_cpu",
+          "native_files": 949,
+          "passed": 2,
+          "patches": 33,
+          "result_sha256": "86637d7d4ec0884ac9aee158875e432d813bbcae3d07dd9ab667f76792b29c92",
+          "source_files": 202
+        },
+        "sha256": "5a7d206af7eb76a8d440cc62517cc94d4ce1f2b763d8a20b446b05cacec8c890"
+      },
+      "target_metal": {
+        "path": "/private/tmp/eredu-b2-input-identity-map-export-successor/verified-target_metal.json",
+        "result": {
+          "ignored": 0,
+          "immediate_fresh_verification": "PASS",
+          "managed_activation": false,
+          "mode": "target_metal",
+          "native_files": 949,
+          "passed": 2,
+          "patches": 33,
+          "result_sha256": "b5c338d0fb2f7daace0a2aab93f6a73be2f2e94dc738bc3b12a06804013f6f2d",
+          "source_files": 202
+        },
+        "sha256": "224778376973bcbd108319fc0fb882b02858e2f95e56ca86587d5f65630500af"
+      }
+    },
+    "passed_executions": 536,
+    "prefix": "/private/tmp/eredu-b2-input-identity-map-export-successor"
+  },
+  "historical_native_evidence": {
+    "b1_record_sha256": "8f38ab7c14d7b25b107ca84c85dd4b282d35cf01c844269f0690cf41aa9c56ab",
+    "classification": "historical pre-export-fix B2; freshly reverified read-only",
+    "failed_backend_cpu_tests_executed": 0,
+    "fresh_native_prepared_positive_bodies": 0,
+    "fresh_native_regression_executions": 0,
+    "historical_safe_tests_excluded_from_fresh_totals": true,
+    "modes": {
+      "bindings": {
+        "generated_items": 15,
+        "generated_sha256": "f58e469903ee00ae05c3299b0961dfbf83c5b6cfe092200ee9c2554fe7cbde75",
+        "immediate_fresh_verification": "PASS",
+        "managed_activation": false,
+        "mode": "bindings",
+        "native_files": 949,
+        "patches": 33,
+        "result_sha256": "2a99dcb07d402bbcb0437a6f76dc2983031b0ca55e9f2a638d9a1118e5ac5e9e",
+        "source_files": 202
+      },
+      "cpu": {
+        "immediate_fresh_verification": "PASS",
+        "managed_activation": false,
+        "mode": "cpu",
+        "named_conditional_bodies": 8,
+        "native_files": 949,
+        "new_native_bodies": 3,
+        "patches": 33,
+        "positive_executed_bodies": 8,
+        "regression_doctest_executions": 91,
+        "result_sha256": "bbee47e9788a72fe8deb672a7c20f6ab3627b6396d3cb43529e72bcdefc1c0bd",
+        "source_files": 202,
+        "wired_set": "NOT_COMPILED_CPU"
+      },
+      "metal": {
+        "immediate_fresh_verification": "PASS",
+        "managed_activation": false,
+        "mode": "metal",
+        "named_conditional_bodies": 9,
+        "native_files": 949,
+        "new_native_bodies": 3,
+        "patches": 33,
+        "positive_executed_bodies": 9,
+        "regression_doctest_executions": 92,
+        "result_sha256": "85e02fcf2d587fdeb621dd9642d82448ab8ca1cdc30e4a77b773d244e11c724e",
+        "source_files": 202,
+        "wired_set": "EXECUTED"
+      },
+      "prepare": {
+        "immediate_fresh_verification": "PASS",
+        "managed_activation": false,
+        "mode": "prepare",
+        "native_files": 949,
+        "patches": 33,
+        "result_sha256": "f9180246e4d48f8c3eed941fe97719006e54a4d85e6f8d9c5ee6297498e9f12d",
+        "source_files": 202
+      },
+      "safe_cpu": {
+        "ignored": 0,
+        "immediate_fresh_verification": "PASS",
+        "managed_activation": false,
+        "mode": "safe_cpu",
+        "native_files": 949,
+        "passed": 3,
+        "patches": 33,
+        "result_sha256": "7255c173aa9943ed43985c283a1febe8a784a93360f5d8faa03bcb34e0c7efb3",
+        "source_files": 202
+      },
+      "safe_metal": {
+        "ignored": 0,
+        "immediate_fresh_verification": "PASS",
+        "managed_activation": false,
+        "mode": "safe_metal",
+        "native_files": 949,
+        "passed": 3,
+        "patches": 33,
+        "result_sha256": "04fceb01fad35fc678ae0bdfc2daf03a0ba5da294714270c2d55e2677994a032",
+        "source_files": 202
+      }
+    },
+    "prefix": "/private/tmp/eredu-b2-host-transfer-policy-successor",
+    "reused_native_prepared_positive_bodies": 17,
+    "reused_native_regression_executions": 183,
+    "reused_safemlx_Rust_executions": 6
+  },
+  "fresh_native_prepared_positive_bodies": 0,
+  "fresh_native_regression_executions": 0,
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T21:22:21.551995+00:00",
+  "scope": "Complete original model-input B2 with the shared-identity test adaptation; authenticate thirteen historical gates, retain applied source/docs once, and run runtime plus the nine remaining gates freshly.",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-original-native-prepared-input-integration-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 1431,
+      "ignored": 0
+    },
+    "runtime_docs": {
+      "passed": 19,
+      "ignored": 0
+    },
+    "backend_docs": {
+      "passed": 4,
+      "ignored": 0
+    },
+    "architectures": {
+      "passed": 656,
+      "ignored": 1
+    },
+    "portable": {
+      "passed": 26,
+      "ignored": 1
+    },
+    "conformance": {
+      "passed": 117,
+      "ignored": 0
+    },
+    "architectures_docs": {
+      "passed": 5,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 2258,
+  "new_tests": [
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_qwen_vl_matches_all_states_and_three_cached_decodes_across_residencies",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_conditional_qwen_matches_all_states_and_three_cached_decodes_across_residencies",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_both_selected_families_use_same_iterator_and_manual_driver",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_exact_short_foreign_and_partial_constructor_preserve_b",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_cache_ordinary_publication_authenticates_residence_without_duplicate_registration",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_binding_rejects_substitution_busy_poison_and_stale_frontier_without_refund",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+    },
+    {
+      "check": "backend_cpu",
+      "name": "full_original_input_frontier_error_representation_retains_actual_box_until_b_retirement",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs"
+    },
+    {
+      "check": "core",
+      "name": "sorted_map_rejection_returns_same_nonclone_values_and_allocation",
+      "path": "eredu-core/src/input/fixed_map.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_storage_exact_short_foreign_and_unquoted_compare_before_constructor",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_storage_matches_ordinary_order_descriptors_and_cache_equation",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_cache_all_aliases_branch_before_provider_and_keep_final_identity_custody",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_views_and_cache_concurrent_final_aliases_retire_the_complete_account",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_failed_late_slot_retains_real_prefix_and_source_without_retry",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prepared_host_failure_keeps_committed_prefix_and_tears_down_values_before_account",
+      "path": "eredu-runtime/src/input/original_storage/tests.rs"
+    }
+  ],
+  "new_test_count": 14,
+  "compile_fail_examples": {
+    "runtime_docs": [
+      "test eredu-runtime/src/working_memory/original_prepared_native_input.rs - working_memory::original_prepared_native_input::OriginalPreparedInputCustody (line 85) - compile fail ... ok",
+      "test eredu-runtime/src/working_memory/original_prepared_native_input.rs - working_memory::original_prepared_native_input::OriginalPreparedInputMaterialization (line 151) - compile fail ... ok",
+      "test eredu-runtime/src/input/original_storage.rs - input::original_storage::PreparedModelInputOwner (line 23) - compile fail ... ok"
+    ],
+    "backend_docs": [
+      "test eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native.rs - composition::mlx::session::model_session::original_host_input::native::MlxOriginalPreparedNativeInput (line 231) - compile fail ... ok",
+      "test eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input.rs - composition::mlx::session::model_session::original_host_input::native::model_input::MlxOriginalPreparedModelInput (line 172) - compile fail ... ok"
+    ],
+    "architectures_docs": [
+      "test eredu-architectures/src/processor_execution/host_input.rs - processor_execution::host_input::OriginalHostLowering (line 125) - compile fail ... ok"
+    ]
+  },
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 env -u DOCS_RS -u SAFEMLX_SYS_GENERATE_BINDINGS -u SAFEMLX_METALLIB_OUTPUT_DIR SAFEMLX_NATIVE_BUILD_ROOT=/private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-native CMAKE_GENERATOR=Unix Makefiles CMAKE_EXPORT_COMPILE_COMMANDS=ON cargo test --locked --offline --target-dir /private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-target -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T21:16:54.244552+00:00",
+      "elapsed_seconds": 36.93,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime.log",
+      "log_sha256": "00c25c542c1d6a10500aaa6f71f049a0a237a301fba699132e12d5501663111f"
+    },
+    "runtime_docs": {
+      "command": "CARGO_INCREMENTAL=0 env -u DOCS_RS -u SAFEMLX_SYS_GENERATE_BINDINGS -u SAFEMLX_METALLIB_OUTPUT_DIR SAFEMLX_NATIVE_BUILD_ROOT=/private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-native CMAKE_GENERATOR=Unix Makefiles CMAKE_EXPORT_COMPILE_COMMANDS=ON cargo test --locked --offline --target-dir /private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-target -p eredu-runtime --doc",
+      "started_utc": "2026-09-14T21:17:32.747329+00:00",
+      "elapsed_seconds": 8.626,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime_docs.log",
+      "log_sha256": "a9321f8136f7d55346d8b741724a8586afae38a36e75ec210711b443d4f4bc43"
+    },
+    "backend_docs": {
+      "command": "CARGO_INCREMENTAL=0 env -u DOCS_RS -u SAFEMLX_SYS_GENERATE_BINDINGS -u SAFEMLX_METALLIB_OUTPUT_DIR SAFEMLX_NATIVE_BUILD_ROOT=/private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-native CMAKE_GENERATOR=Unix Makefiles CMAKE_EXPORT_COMPILE_COMMANDS=ON cargo test --locked --offline --target-dir /private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-target -p eredu-backend-mlx --no-default-features --doc",
+      "started_utc": "2026-09-14T21:17:42.949526+00:00",
+      "elapsed_seconds": 90.351,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-backend_docs.log",
+      "log_sha256": "1bef881a1b008d233a4783fd0621d66051bebf22f90808851abd587fd3a2d014"
+    },
+    "runtime_check": {
+      "command": "CARGO_INCREMENTAL=0 env -u DOCS_RS -u SAFEMLX_SYS_GENERATE_BINDINGS -u SAFEMLX_METALLIB_OUTPUT_DIR SAFEMLX_NATIVE_BUILD_ROOT=/private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-native CMAKE_GENERATOR=Unix Makefiles CMAKE_EXPORT_COMPILE_COMMANDS=ON cargo check --locked --offline --target-dir /private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-target -p eredu-runtime",
+      "started_utc": "2026-09-14T21:19:14.874728+00:00",
+      "elapsed_seconds": 10.512,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime_check.log",
+      "log_sha256": "124edcd63f3e68516879c28e6ab0d48089362cd6f8857dfe2e62244c3d58b5a4"
+    },
+    "architectures": {
+      "command": "CARGO_INCREMENTAL=0 env -u DOCS_RS -u SAFEMLX_SYS_GENERATE_BINDINGS -u SAFEMLX_METALLIB_OUTPUT_DIR SAFEMLX_NATIVE_BUILD_ROOT=/private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-native CMAKE_GENERATOR=Unix Makefiles CMAKE_EXPORT_COMPILE_COMMANDS=ON cargo test --locked --offline --target-dir /private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-target -p eredu-architectures --lib",
+      "started_utc": "2026-09-14T21:19:26.955244+00:00",
+      "elapsed_seconds": 32.066,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-architectures.log",
+      "log_sha256": "3426908d4e21e27fd8b4f7b1697d93fdd87fb451f119c64c8bc931d570c70909"
+    },
+    "backend": {
+      "command": "CARGO_INCREMENTAL=0 env -u DOCS_RS -u SAFEMLX_SYS_GENERATE_BINDINGS -u SAFEMLX_METALLIB_OUTPUT_DIR SAFEMLX_NATIVE_BUILD_ROOT=/private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-native CMAKE_GENERATOR=Unix Makefiles CMAKE_EXPORT_COMPILE_COMMANDS=ON cargo check --locked --offline --target-dir /private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-target -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T21:20:00.597159+00:00",
+      "elapsed_seconds": 17.763,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-backend.log",
+      "log_sha256": "055881d5d3d1e2a0a0bfc7ffa4e334ade9701bca5751bd8d6acc9407791503d7"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 env -u DOCS_RS -u SAFEMLX_SYS_GENERATE_BINDINGS -u SAFEMLX_METALLIB_OUTPUT_DIR SAFEMLX_NATIVE_BUILD_ROOT=/private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-native CMAKE_GENERATOR=Unix Makefiles CMAKE_EXPORT_COMPILE_COMMANDS=ON cargo test --locked --offline --target-dir /private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-target -p eredu --no-default-features --test portable_facade",
+      "started_utc": "2026-09-14T21:20:19.935629+00:00",
+      "elapsed_seconds": 48.166,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-portable.log",
+      "log_sha256": "25a68df30a945c0ade70641a7c1792abeffcc68fab831fbc40e80158007dc7ed"
+    },
+    "conformance": {
+      "command": "CARGO_INCREMENTAL=0 env -u DOCS_RS -u SAFEMLX_SYS_GENERATE_BINDINGS -u SAFEMLX_METALLIB_OUTPUT_DIR SAFEMLX_NATIVE_BUILD_ROOT=/private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-native CMAKE_GENERATOR=Unix Makefiles CMAKE_EXPORT_COMPILE_COMMANDS=ON cargo test --locked --offline --target-dir /private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-target -p eredu --no-default-features --test backend_conformance",
+      "started_utc": "2026-09-14T21:21:09.672654+00:00",
+      "elapsed_seconds": 5.505,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-conformance.log",
+      "log_sha256": "de203eefda5eeedb471aa7178a453d32687dcb857c66eb5ba83ce465a908682b"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 env -u DOCS_RS -u SAFEMLX_SYS_GENERATE_BINDINGS -u SAFEMLX_METALLIB_OUTPUT_DIR SAFEMLX_NATIVE_BUILD_ROOT=/private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-native CMAKE_GENERATOR=Unix Makefiles CMAKE_EXPORT_COMPILE_COMMANDS=ON cargo check --locked --offline --target-dir /private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-target -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T21:21:16.747923+00:00",
+      "elapsed_seconds": 27.479,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-features.log",
+      "log_sha256": "e7ecc90725b0718cd6c1517c648597f00ee4a06927d568e145ad4fa61fb88621"
+    },
+    "architectures_docs": {
+      "command": "CARGO_INCREMENTAL=0 env -u DOCS_RS -u SAFEMLX_SYS_GENERATE_BINDINGS -u SAFEMLX_METALLIB_OUTPUT_DIR SAFEMLX_NATIVE_BUILD_ROOT=/private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-native CMAKE_GENERATOR=Unix Makefiles CMAKE_EXPORT_COMPILE_COMMANDS=ON cargo test --locked --offline --target-dir /private/tmp/eredu-b2-shared-identity-test-successor/execution/cargo-target -p eredu-architectures --doc",
+      "started_utc": "2026-09-14T21:21:45.837105+00:00",
+      "elapsed_seconds": 22.4,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-architectures_docs.log",
+      "log_sha256": "64609e13f058d4c638b7b24ad2bbc2299626f1bdf7d83b8169b3e0ee4c08e70d"
+    }
+  },
+  "source_sha256": {
+    "safemlx-sys/src/bindings.rs": "f0bdb4879d06ba93f4a40e41f1e718f443bf74efa8a222668d66dcbef3f677e1",
+    "doc/bounded-inference.md": "079fa03e17455c6c252fae96988738f93cdbbe253023b1c093b8a6e1f5d85d22",
+    "safemlx-sys/src/mlx-c/mlx/c/array.h": "3782cddf8d571ce700464cb90388b946e9c14feaf92e8339475a3e9d9449a1ba",
+    "eredu-runtime/src/input/original_storage.rs": "b3914939988c744929b649233ad62ce4eb28a584f3899bc10b3a1ef54836a99d",
+    "eredu-runtime/src/working_memory/original_prepared_native_input.rs": "1a6b667359a3aa43896dac7927d91c0ce8087b05a6f006251a2a371e59c916a5",
+    "eredu-core/src/input/fixed_map.rs": "5d32f8104bf09798215e821c21afd5fcc1682fd927db20f8a4a6b396cde73b9d",
+    "safemlx-sys/src/mlx-c/patches/mlx-original-model-input-handle.patch": "509a2c75a708ff0ec3f0931e0486861acd107f4db23a17048209ac2a34f9d90b",
+    "eredu-backend-mlx/src/backend/managed_memory.rs": "051b848cefdbf25bbb5d145d1a5f82bcab110603d520339c51590fb34f63e20b",
+    "eredu-backend-mlx/src/backend/adapter/target.rs": "ed72a15bcc5c348ee30470b06a7514cf7a34b73dbd2633089f80dae14e66b413",
+    "eredu-backend-mlx/src/composition/mlx/mod.rs": "708fb62cb9bebb9945c1cf5ce4325f15e0ab1c701b63014e6dfadcdbfe936b1b",
+    "eredu-core/src/input.rs": "18792fb6385eacdf3b1e4cb4e2dc98cf699c5dd5b20dfb204474e6f9f0e721fd",
+    "safemlx-sys/src/mlx-c/tests/prepared_input_tests.cpp": "8b31f2dbc5e47a896594f92a6e931622a277785792065d3e9119c0fb6f2a1171",
+    "eredu-runtime/src/input/shared_identity/tests.rs": "f5b2dfeed60eda7ce2f7af4b11a4dbb21d2c2c253739387a629c683ed17957d7",
+    "safemlx/src/stream.rs": "5083126bda17684f7963700068cc92348a858bb827bf97c1c80708a86c0fe6e6",
+    "safemlx-sys/src/mlx-c/CMakeLists.txt": "a56feb19b7af08b736b11378bb44bda9dafa6f538e2daba5f7bb6f2bb51723ba",
+    "eredu-runtime/src/host_metadata.rs": "203b13f2387192518f136d0f4a2ec080c7b9684282545739f73f2c5f84c040e4",
+    "eredu-backend-mlx/src/lib.rs": "ec088a93e9989caf9285a44ccc3f87e6f741e90bbe98714ba184ec9bcc59b889",
+    "eredu-runtime/src/input/shared_identity.rs": "bdcab7d09960e7c4bdf243d77ecf795ea02d3e771d7e6aa9511d25fe131e4206",
+    "eredu-runtime/src/input/text_identity.rs": "418ae991d0b1c6c530e2eade47c26c3aebdaa6b11f25e7ffa645908654683657",
+    "eredu-backend-mlx/src/backend/runtime/media/input/original_semantics.rs": "a236d6ddc0da165bb5506e15b47ebd6b9865b31eb1d69f7c726da7bb4e8a40d5",
+    "safemlx-sys/src/mlx-c/mlx/c/prepared_input.cpp": "b7ab752fe93904f11d88725f74d0abe49b9adbbfb7eb0934ece70bdf2a657939",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction.rs": "5e33d0c5b9d440d1fb37c2c3c8cb092f74ce5c9aa0568f50ebb596f0cd948495",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input.rs": "00139f9cb697901b88c63186f56276702d7bc6aaee27f11614474c411233991b",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "3a0f7dfbd973094dcc9d8f71d58ec04f5e29ca71b272c72c32d22abb2f26146f",
+    "eredu-architectures/src/qwen/hybrid/conditional/media_prefill.rs": "129de2705a1ef40574842c52511250d18abdc80c849ac0c2b4229315a3ad1252",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native.rs": "f5ac9ca374621db66da6b21f9e0e1ec8bfca859450a3667d13db1344811d8de2",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication.rs": "6f8381c6fa8ed6a7db9ac86f39426b9fe1013b13cc0a70427172b4231f9409f0",
+    "safemlx-sys/src/mlx-c/mlx/c/private/array.h": "2bd72659ae3d3e3cb235d1b117bb7e98852f9168ada260523da8c9a9a974e4ad",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission.rs": "26963b8153fcc3d14269b8d17705a14e9a3a2a8ddef669505b6423e1bf2479bf",
+    "eredu-runtime/src/working_memory.rs": "f902ede282067977e9070885c95a86033e533a7def8e6e71c3a5f30130421b0f",
+    "safemlx-sys/src/mlx-c/patches/mlx-original-model-input-handle.json": "a9fb08ca09631e2174a26838fbc6d8f6ad343e93bb3b9e985745bdf5d3cea6f1",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/tests.rs": "7534f36c9f0af44734242d0cd24b5a89d6e63d290a8fbfba12360eb168b2dd5b",
+    "eredu-architectures/src/qwen/vl/model/media_prefill.rs": "691422d9e3f8039108f1ae301b15741b1de64b6265e9c3e2e4f529600a3f8974",
+    "safemlx-sys/src/mlx-c/mlx/c/prepared_input.h": "cc628eb759127243ef56107fbf143906e0b20bc1bfa68e057ed67d9c025442f9",
+    "doc/execution-control.md": "285c589c7ad19ca9cbea3a7f7d2805d161ccc59940fe0f1370a2a48442bc4339",
+    "eredu-architectures/src/processor_execution/host_input.rs": "1e0f0b4451763b64c1e5e17d50bae26cc038ecbbd5decffd6c692e2e077aea27",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/composite.rs": "54d0489883359678c0e79fc1b5c0bd1ae9ea2de86b3c4aa22ed966e122ca3145",
+    "eredu-backend-mlx/src/backend/adapter/provider.rs": "dd07bce8b9aaa0870b98dd93b0f8ab4eef8e30388b28808918702a372bac409e",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input.rs": "1d4cd01958857fd3afca13afdbfed7264793bd49bf557a6a8d47d3e59bf13855",
+    "eredu-runtime/src/input.rs": "c1b714ce9cc6bd2437e660fad99f75789a5a5057e7efc2ef2d611ef941a56548",
+    "eredu-runtime/src/input/original_storage/tests.rs": "d9e713c5bf9f59ab9f3734bbcc2bdeeeb40429b87072a447ec664864fd50a017",
+    "safemlx-sys/src/mlx-c/python/type_private_generator.py": "583be0126a830ffbfcc3ee2227b03d3402ede5eef8353dfcb02875493ad9e4d5",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/original_host_input/native/model_input/tests.rs": "19b06205335b9c4c5143581abd89a72393cf309fc98219130f84b362488a5803",
+    "eredu-core/src/lib.rs": "b3b0506ef6a3374bfc0af42cfc4e3b81151d7883980f82416e1e8b9208afd941",
+    "eredu-backend-mlx/src/composition/mlx/session.rs": "c66bd6de5c830fbb1332c8d1184693d6a512f47e11fa58ad44654f2c08d3d5b9",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/pending_prompt.rs": "21e2188d0814981b2df77b1dfc314fe85bff13d89a70a6af36182aaf0dc00e15",
+    "safemlx-sys/src/mlx-c/mlx/c/private/prepared_array_output.h": "9e8bcf3fbb115d0c1c4160388616b8529a5ca71afbe0a315e41c5cd447eeb865",
+    "doc/backend-architecture.md": "f64012614d4b3a043286bbcffef5af3dfb39b672e06c1690349467da0d348165",
+    "eredu-runtime/src/host_metadata/identity.rs": "7905171eb7997a2338cd24f46274b7d1b57e476545e4e02adb371b393855d16b",
+    "safemlx/src/prepared_input.rs": "2cd394925c6331a4a738e5c2ee3e9a9e04030b69f2f9d25ff88729818029e5ee"
+  },
+  "source_snapshot": "/private/tmp/eredu-b2-shared-identity-test-successor/integration-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-b2-shared-identity-test-successor/HASHES.json": "9d840aae45244e699a26602ef9ff925c899dfae94b6a085a6cda4b9f301e0e58",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/PLAN.md": "4345fe72e56886fcea4a9fa85a88f40c42ef01907c432daa8ee5df14cbd1adc6",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/correction/REVIEW.md": "d2b24efa6b8b08c96a72a64fbca652d0f627397b8f8c7659393cf1c832ef23f9",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/correction/manifest.json": "8cc6602f7f180832366480ac570e7800ca03136ddb1728c5c4a57dffad86f991",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/diagnostic.json": "633bcab0f9333ff7bd02aaf78d8a1cd1156453c1314fc76ee0b3e0d06b6e7a1c",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/historical-evidence.json": "24212c03b6f45f032de99332a69dc75b68c4029d7aed5ba7e26bb90df945923c",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/historical-pins.json": "087358b246d8eee60526f34cd1fc330b3453be858391120f1cf745a1fff10178",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/historical-rust-evidence.json": "062d2a1855f94fdce141407feaa9bc8ebc1678ec1c8c85e516c7a4e230590553",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/history.json": "39c26bf78dc7618203f87136ff996e4f10a0670621f935dc7ffed328742d51cb",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-applied.json": "93131ba2262ee695123eb2ecebe656a66788d3ef1ce685ae3d6749c2fcd8ed90",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-architectures.log": "3426908d4e21e27fd8b4f7b1697d93fdd87fb451f119c64c8bc931d570c70909",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-architectures_docs.log": "64609e13f058d4c638b7b24ad2bbc2299626f1bdf7d83b8169b3e0ee4c08e70d",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-backend.log": "055881d5d3d1e2a0a0bfc7ffa4e334ade9701bca5751bd8d6acc9407791503d7",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-backend_docs.log": "1bef881a1b008d233a4783fd0621d66051bebf22f90808851abd587fd3a2d014",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-checks.json": "ebdfc890678b0a39abae04edc6ec07fea33dec58153ff5e5a0d883f62471feb5",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-conformance.log": "de203eefda5eeedb471aa7178a453d32687dcb857c66eb5ba83ce465a908682b",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-doc-applied.json": "7f68433bf27d02a00950054031ed4dab9ac41a382510497b3f63e1e2e4c80e29",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-features.log": "e7ecc90725b0718cd6c1517c648597f00ee4a06927d568e145ad4fa61fb88621",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-portable.log": "25a68df30a945c0ade70641a7c1792abeffcc68fab831fbc40e80158007dc7ed",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-review.json": "e2113c7c5827ef12d8865e069e18e3c2273b092f23bab2a422ba30a5882d505f",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime.log": "00c25c542c1d6a10500aaa6f71f049a0a237a301fba699132e12d5501663111f",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime_check.log": "124edcd63f3e68516879c28e6ab0d48089362cd6f8857dfe2e62244c3d58b5a4",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-runtime_docs.log": "a9321f8136f7d55346d8b741724a8586afae38a36e75ec210711b443d4f4bc43",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-stage/change.patch": "bed52f4b52dd5f47880f31df7aaea4f3c3e9e6bdcb046c14f90403233073a1c0",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-stage/docs.json": "fecceef5d9499b2cee49282ff9ad197ae18e6607f4575c2af4605a78f864e618",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-stage/manifest.json": "93131ba2262ee695123eb2ecebe656a66788d3ef1ce685ae3d6749c2fcd8ed90",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-stage/staged-hashes.json": "93131ba2262ee695123eb2ecebe656a66788d3ef1ce685ae3d6749c2fcd8ed90",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-validate.py": "55a98876e6b432dc45898f53f58b25914b1824fc923fe7b08974d5e189e7f693",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/integration-validation-config.json": "7459ee63fd06c101de2d780193a672ef23b29946b799e2497fcf36c12815a2ba",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/prepared.json": "450810f3728f416f68c2e81bb2001e9a7656c223fa2f4b3d6b1adae431836ee7",
+    "/private/tmp/eredu-b2-shared-identity-test-successor/previous-verification.json": "62b2b9ab0fd444183a9a6d24a237a7b0b983f28bdee466a38c19e5f9c6ee184f"
+  },
+  "review": {
+    "only_live_delta": "/private/tmp/eredu-b2-shared-identity-test-successor/correction/change.patch",
+    "retained_applied_docs": "/private/tmp/eredu-b2-input-identity-map-export-successor/integration-doc-applied.json",
+    "reviews": {
+      "/private/tmp/eredu-b2-shared-identity-test-successor/HASHES.json": "9d840aae45244e699a26602ef9ff925c899dfae94b6a085a6cda4b9f301e0e58",
+      "/private/tmp/eredu-b2-shared-identity-test-successor/PLAN.md": "4345fe72e56886fcea4a9fa85a88f40c42ef01907c432daa8ee5df14cbd1adc6",
+      "/private/tmp/eredu-b2-shared-identity-test-successor/correction/REVIEW.md": "d2b24efa6b8b08c96a72a64fbca652d0f627397b8f8c7659393cf1c832ef23f9",
+      "/private/tmp/eredu-b2-shared-identity-test-successor/diagnostic.json": "633bcab0f9333ff7bd02aaf78d8a1cd1156453c1314fc76ee0b3e0d06b6e7a1c",
+      "/private/tmp/eredu-b2-shared-identity-test-successor/historical-pins.json": "087358b246d8eee60526f34cd1fc330b3453be858391120f1cf745a1fff10178",
+      "/private/tmp/eredu-b2-shared-identity-test-successor/history.json": "39c26bf78dc7618203f87136ff996e4f10a0670621f935dc7ffed328742d51cb"
+    }
+  },
+  "behavior": [
+    "One full B recipe precedes the genuine original comparison; parts/maps/extents/cache/native handles/packet and the one bind attempt retain exact source/account custody.",
+    "Both selected families compare nonzero scores and full state across three residencies and three decodes, with shared iterator/manual parity.",
+    "The unchanged native949/33/C202/ABI15 source and six earlier native/safemlx gates remain authenticated historical evidence. Seven subsequently completed Rust gates retain536 historical executions; only ten remaining gates execute freshly.",
+    "Retain all14 introduced test cases across the authenticated continuation chain: eight already passed historical cases and six fresh runtime cases; no new test is introduced by this fixture correction."
+  ],
+  "limits": [
+    "B2 only: B3 encoder/private workspace, C driver/context/graph/completion, D complete request admission, E original V2/copy/capture remain mandatory; no managed activation.",
+    "Ordinary runtime initialization/reclaimer and test revision setup remain outside B. No invented complete operation bound.",
+    "Exact B1 record/verifier SHA are required inputs; stale source or any new B1 correction requires a reviewed successor, not automatic merge.",
+    "Standalone native/CMake/bindgen results are historical from the immutable passed prefix. Fresh Rust uses new cargo/native target roots; never overwrite or rerun the old prefix. No native pass counts are relabelled fresh.",
+    "Two new compile-fail gates plus the three existing B1 and one existing host-lowering gate execute; new Rust/C counts remain separate."
+  ]
+}

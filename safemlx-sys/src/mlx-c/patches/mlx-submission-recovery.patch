@@ -314,7 +314,7 @@ new file mode 100644
 index 00000000..13a2fb67
 --- /dev/null
 +++ b/mlx/submission.cpp
-@@ -0,0 +1,523 @@
+@@ -0,0 +1,633 @@
 +#include "mlx/submission.h"
 +
 +#include <algorithm>
@@ -343,8 +343,28 @@ index 00000000..13a2fb67
 +};
 +// No static teardown: unresolved native callbacks and their owners may outlive
 +// the submitting thread, all C handles, and ordinary static destruction.
++// Constant initialization avoids a C++ guarded-static wait on the first scope.
++// Supported hosts must not implement these scope/publication atomics with locks.
++static_assert(std::atomic<Registry*>::is_always_lock_free);
++static_assert(std::atomic<size_t>::is_always_lock_free);
++static_assert(std::atomic<bool>::is_always_lock_free);
++constinit std::atomic<Registry*> registry_owner{nullptr};
 +Registry& registry() {
-+  static auto* value = new Registry;
++  auto* value = registry_owner.load(std::memory_order_acquire);
++  if (!value) {
++    auto* candidate = new Registry;
++    if (registry_owner.compare_exchange_strong(
++            value,
++            candidate,
++            std::memory_order_acq_rel,
++            std::memory_order_acquire)) {
++      value = candidate;
++    } else {
++      // Another initializer published the immortal registry. The unused local
++      // candidate has no records or waiters; destroy it outside every lock.
++      delete candidate;
++    }
++  }
 +  return *value;
 +}
 +
@@ -366,9 +386,13 @@ index 00000000..13a2fb67
 +};
 +} // namespace
 +
-+Scope::Scope() : owner_(prepare_owner_identity()), parent_(active_scope) {
++Scope::Scope(void* retained_owner, void (*retire_owner)(void*))
++    : owner_(prepare_owner_identity()), parent_(active_scope) {
 +  // Prepare global ownership before the first possible submission.
 +  (void)registry();
++  // All fallible setup precedes both owner transfer and ancestry mutation.
++  retained_owner_ = retained_owner;
++  retire_owner_ = retire_owner;
 +  if (parent_) {
 +    parent_->retain();
 +    parent_->record_started();
@@ -378,10 +402,18 @@ index 00000000..13a2fb67
 +  active_scope = this;
 +}
 +
-+Scope::~Scope() {
-+  if (parent_) {
-+    parent_->release();
-+  }
++Scope::~Scope() = default;
++
++namespace {
++struct ScopeRetirement {
++  Scope* parent;
++  void* owner;
++  void (*retire)(void*);
++};
++} // namespace
++
++size_t scope_retirement_control_bytes() noexcept {
++  return sizeof(ScopeRetirement);
 +}
 +
 +bool Scope::on_owner_thread() const noexcept {
@@ -394,7 +426,20 @@ index 00000000..13a2fb67
 +
 +void Scope::release() noexcept {
 +  if (references_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
++    const ScopeRetirement retirement{parent_, retained_owner_, retire_owner_};
++    parent_ = nullptr;
++    retained_owner_ = nullptr;
++    retire_owner_ = nullptr;
 +    delete this;
++    // Child storage is gone before an ancestor can release its own custody.
++    if (retirement.parent) {
++      retirement.parent->release();
++    }
++    // The closed wrapper supplies only a nonthrowing, allocation-free enqueue.
++    // Arbitrary owner destruction must occur later on an unlocked host thread.
++    if (retirement.retire) {
++      retirement.retire(retirement.owner);
++    }
 +  }
 +}
 +
@@ -427,6 +472,16 @@ index 00000000..13a2fb67
 +                                                         : Activity::none),
 +      failed_.load(std::memory_order_acquire),
 +      blocked_.load(std::memory_order_acquire)};
++}
++
++RecordStatus Scope::query_records() const noexcept {
++  // The owner thread cannot concurrently enter another record in this ancestry.
++  // A worker may publish terminal evidence: its release decrement follows all
++  // sticky failure stores. Observing an older pending value is conservative.
++  const auto pending = pending_records_.load(std::memory_order_acquire);
++  return {pending != 0,
++          failed_.load(std::memory_order_acquire),
++          blocked_.load(std::memory_order_acquire)};
 +}
 +
 +void Scope::progress() noexcept {
@@ -463,6 +518,32 @@ index 00000000..13a2fb67
 +  }
 +}
 +
++void Scope::accepted_record_started() noexcept {
++  record_started(); // Preserve the original structural/lifetime counter.
++  for (auto* scope = this; scope; scope = scope->parent_) {
++    const auto value = scope->pending_records_.load(std::memory_order_relaxed);
++    if (value >= std::numeric_limits<size_t>::max() - 1) {
++      scope->failed_.store(true, std::memory_order_release);
++      scope->blocked_.store(true, std::memory_order_release);
++      scope->pending_records_.store(
++          std::numeric_limits<size_t>::max(), std::memory_order_release);
++    } else {
++      scope->pending_records_.store(value + 1, std::memory_order_release);
++    }
++  }
++}
++
++void Scope::accepted_record_finished(bool activity, bool failed, bool blocked) noexcept {
++  record_finished(activity, failed, blocked);
++  for (auto* scope = this; scope; scope = scope->parent_) {
++    const auto value = scope->pending_records_.load(std::memory_order_relaxed);
++    if (value != std::numeric_limits<size_t>::max()) {
++      // Exactly one terminal transition follows each successful Record::enter.
++      scope->pending_records_.store(value - 1, std::memory_order_release);
++    }
++  }
++}
++
 +Record::Record() : owner_(prepare_owner_identity()) {
 +  captures_.reserve(8);
 +  (void)registry();
@@ -474,7 +555,7 @@ index 00000000..13a2fb67
 +  scope_ = active_scope;
 +  if (scope_) {
 +    scope_->retain();
-+    scope_->record_started();
++    scope_->accepted_record_started();
 +  }
 +  if (owners.tail) {
 +    owners.tail->next_ = this;
@@ -680,7 +761,7 @@ index 00000000..13a2fb67
 +  if (terminal) {
 +    settled_ = true;
 +    if (scope_) {
-+      scope_->record_finished(activity_, failed_, blocked_);
++      scope_->accepted_record_finished(activity_, failed_, blocked_);
 +    }
 +  }
 +  return terminal;
@@ -716,15 +797,19 @@ index 00000000..13a2fb67
 +  }
 +}
 +
-+void retire_records() {
++RetirementPass try_retire_records() {
 +  Record* retired = nullptr;
 +  {
 +    auto& owners = registry();
 +    std::unique_lock<std::mutex> lock(owners.mutex, std::try_to_lock);
 +    if (!lock.owns_lock()) {
-+      return;
++      return RetirementPass::busy;
 +    }
-+    auto count = std::min<size_t>(owners.size, 64);
++    // Ordinary retirement must inspect the entire entry-time registry. A
++    // second 64-record rotation can repeatedly miss this thread's settled
++    // owners when bounded progress rotates the same list first. No polling,
++    // backend work or resource destruction occurs while holding this lock.
++    auto count = owners.size;
 +    while (count--) {
 +      auto* record = owners.head;
 +      owners.head = record->next_;
@@ -749,8 +834,21 @@ index 00000000..13a2fb67
 +  while (retired) {
 +    auto* record = retired;
 +    retired = record->next_;
++    // Transfer the entered record's existing reference before deleting it.
++    // Its base vectors and allocation outlive the destructor body; a final
++    // Scope release may enqueue custody for immediate foreign-host retirement.
++    auto* scope = record->scope_;
++    record->scope_ = nullptr;
 +    delete record;
++    if (scope) {
++      scope->release();
++    }
 +  }
++  return RetirementPass::complete_snapshot;
++}
++
++void retire_records() {
++  (void)try_retire_records();
 +}
 +
 +bool stream_failed(Stream stream) noexcept {
@@ -855,7 +953,7 @@ new file mode 100644
 index 00000000..c32fdb89
 --- /dev/null
 +++ b/mlx/submission.h
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,167 @@
 +#pragma once
 +
 +#include <atomic>
@@ -877,16 +975,27 @@ index 00000000..c32fdb89
 +  bool blocked;
 +};
 +
++// A cold record-only observation. This excludes structural child scopes and
++// does not establish lifetime settlement, graph retirement or future exclusion.
++struct RecordStatus {
++  bool pending;
++  bool failed;
++  bool blocked;
++};
++
 +// The handle owns an observation, not the lifetime of accepted work. Records
 +// retain it independently until every exact native frontier is terminal.
 +class MLX_API Scope {
 + public:
-+  Scope();
++  // Constructor-only owner handoff. On failure the caller still owns payload.
++  Scope(void* retained_owner = nullptr, void (*retire_owner)(void*) = nullptr);
 +  Scope(const Scope&) = delete;
 +  Scope& operator=(const Scope&) = delete;
 +  bool on_owner_thread() const noexcept;
 +  void seal() noexcept;
 +  Status query() const noexcept;
++  // Owner-thread only; no progress or resource-lifetime authority.
++  RecordStatus query_records() const noexcept;
 +  void progress() noexcept;
 +  void release() noexcept;
 +
@@ -897,8 +1006,13 @@ index 00000000..c32fdb89
 +  void record_started() noexcept;
 +  void record_finished(bool activity, bool failed, bool blocked) noexcept;
 +  void record_failed(bool blocked) noexcept;
++  void accepted_record_started() noexcept;
++  void accepted_record_finished(bool activity, bool failed, bool blocked) noexcept;
 +  std::atomic<size_t> references_{1};
 +  std::atomic<size_t> pending_{0};
++  // Only entered Records, not live child scopes. Writers hold Registry::mutex.
++  // SIZE_MAX is a sticky conservative saturation sentinel.
++  std::atomic<size_t> pending_records_{0};
 +  std::atomic<bool> activity_{false};
 +  std::atomic<bool> failed_{false};
 +  std::atomic<bool> blocked_{false};
@@ -907,14 +1021,26 @@ index 00000000..c32fdb89
 +  Scope* previous_{nullptr};
 +  Scope* next_{nullptr};
 +  bool active_{true};
++  void* retained_owner_{nullptr};
++  void (*retire_owner_)(void*){nullptr};
 +};
++
++// Exact named final-release controls, excluding allocator/registry costs.
++MLX_API size_t scope_retirement_control_bytes() noexcept;
 +
 +// Establish DLL linkage before the friend declarations in Record. MSVC
 +// rejects adding dllexport/dllimport after an undecorated friend declaration.
 +MLX_API void progress_records(bool allow_backend_progress = true) noexcept;
-+// Ordinary host operations may explicitly reclaim terminal records. Arbitrary
-+// primitive/resource destructors run outside the registry lock, never in
-+// scope progress/free, worker observation or thread-local teardown.
++// Ordinary host operations inspect one complete registry snapshot and reclaim
++// only settled records on their original owner thread. This traversal is not
++// bounded polling. Arbitrary primitive/resource destructors run outside the
++// registry lock, never in scope progress/free, worker observation or TLS teardown.
++enum class RetirementPass : uint8_t { complete_snapshot, busy };
++// Reports whether the full entry-time scan ran. Even a complete scan is not
++// completion evidence or proof that all owners/backing allocations retired.
++// Busy leaves every record unchanged; no progress, waits or retries occur.
++MLX_API RetirementPass try_retire_records();
++// Existing ordinary callers retain their best-effort retirement behavior.
 +MLX_API void retire_records();
 +MLX_API bool stream_failed(Stream) noexcept;
 +
@@ -951,6 +1077,7 @@ index 00000000..c32fdb89
 + private:
 +  friend void progress_records(bool) noexcept;
 +  friend void retire_records();
++  friend RetirementPass try_retire_records();
 +  friend bool stream_failed(Stream) noexcept;
 +  friend bool failed_work_pending() noexcept;
 +  struct PhysicalPin {

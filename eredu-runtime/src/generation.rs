@@ -2,10 +2,40 @@
 
 use crate::execution_control::TokenChoiceController;
 use eredu_core::{
-    generation::ResolvedGenerationConfig, SpeculativeTokenFilterController, TokenFilter,
-    TokenFilterController,
+    SpeculativeTokenFilterController, TokenFilter, TokenFilterController,
+    generation::ResolvedGenerationConfig,
 };
 use eredu_nn::Tensor;
+
+mod prepared_choice;
+pub use prepared_choice::{
+    PreparedCategoricalPolicy, PreparedGreedyError, PreparedGreedyPolicy,
+    SpeculativeCategoricalProgram, SpeculativeGreedyProgram,
+};
+mod prepared_logits;
+pub use prepared_logits::{
+    LogitProgramError, PreparedLogitPolicy, PreparedLogitPolicyError, SpeculativeLogitProgram,
+};
+mod prepared_grammar;
+pub use prepared_grammar::{PreparedGrammarSampler, PreparedGrammarLogits, PreparedGrammarSamplerCause, PreparedGrammarSamplerError};
+mod prepared_controller;
+pub use prepared_controller::{
+    PreparedControlledChoiceError, PreparedControlledLogits, PreparedControllerChoice,
+    PreparedControllerError, PreparedSpeculativeController,
+};
+mod adaptive_commit;
+pub use adaptive_commit::{PreparedAdaptiveCommit, PreparedAdaptiveCommitError};
+mod speculative_copy;
+pub use speculative_copy::PreparedSpeculativeSamplerCopy;
+mod history;
+pub(crate) use history::next_history_capacity;
+#[cfg(test)]
+pub(crate) use history::payload_copy_count;
+mod text_sampler;
+pub use text_sampler::{
+    ConfiguredTextSampler, SamplerCopyError, SamplerCopyPlan, SamplerProjectionError,
+    SamplerWorkspaceProjection,
+};
 
 /// Monomorphized causal model used by generation sessions.
 pub trait CausalModel<S> {
@@ -83,6 +113,26 @@ pub trait SamplingBackend {
 
     /// Creates a backend error for a portable policy or constraint failure.
     fn error(message: String) -> Self::Error;
+
+    /// Copies an actual token descriptor under its retained host account.
+    fn clone_token_with_host_source(_value:&Self::Token,_funding:&eredu_core::HostMetadataFunding,
+        _context:&Self::Context)->Result<Self::Token,eredu_core::BackendFailure> {
+        Err(eredu_core::HostMetadataFundingError::Unavailable.into())
+    }
+    /// Copies an actual logits descriptor under its retained host account.
+    fn clone_logits_with_host_source(_value:&Self::Logits,_funding:&eredu_core::HostMetadataFunding,
+        _context:&Self::Context)->Result<Self::Logits,eredu_core::BackendFailure> {
+        Err(eredu_core::HostMetadataFundingError::Unavailable.into())
+    }
+
+    /// Copies the actual random owner under an admitted host source.
+    /// A backend must qualify its native child copy separately.
+    fn clone_random_with_host_source(
+        _value:&Self::RandomState,_funding:&eredu_core::HostMetadataFunding,
+        _context:&Self::Context,
+     )->Result<Self::RandomState,eredu_core::BackendFailure> {
+        Err(eredu_core::HostMetadataFundingError::Unavailable.into())
+    }
 
     /// Validates a native token tensor against one architecture-selected domain.
     ///
@@ -211,6 +261,61 @@ impl Default for PenaltyConfig {
 
 /// Sampling policy suitable for lossless speculative decoding.
 pub trait SpeculativeSampler<B: SamplingBackend> {
+    /// Actual associated dynamic grammar state, or the uninhabited fixed type.
+    /// This alone supplies neither a source nor numerical authority.
+    type PreparedGrammar: eredu_core::speculative::PreparedGrammarController;
+
+    /// Exact typed grammar, policy and provisional-copy worker. The native
+    /// consumer must authenticate its source and supply paid operation funding.
+    fn prepared_grammar_controller(&self) -> Option<PreparedGrammarSampler<'_, Self, Self::PreparedGrammar>>
+    where Self: Sized { None }
+
+    /// Source-bound fixed-controller decision and paid provisional transaction.
+    /// This is separate from immutable grammar-free host copying. Unknown
+    /// callbacks and controllers never enter through that simpler projection.
+    fn prepared_controller(&self) -> Option<PreparedSpeculativeController<'_, Self>>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// Closed copy of an actual known speculative policy. Unknown
+    /// callbacks return None; ordinary Clone remains independent of this hook.
+    fn prepared_host_copy(&self) -> Option<PreparedSpeculativeSamplerCopy<'_, Self>>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// Source-bound provisional adaptive commit. Unknown mutable callbacks
+    /// provide no witness and remain outside admitted execution.
+    fn prepared_adaptive_commit(&self) -> Option<PreparedAdaptiveCommit<'_, Self>>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// Closed projection of this policy's exact categorical worker, independently
+    /// of processing, random-key provenance, and commit behavior.
+    fn prepared_categorical_policy(&self) -> Option<PreparedCategoricalPolicy<'_>> {
+        None
+    }
+
+    /// Independent closed projection of greedy choice and unchanged commit.
+    /// A logit-processing projection never certifies either callback.
+    fn prepared_greedy_policy(&self) -> Option<PreparedGreedyPolicy<'_>> {
+        None
+    }
+
+    /// Immutable projection of a known deterministic worker. Unknown callbacks
+    /// return None; this never certifies or invokes their `process_logits` body.
+    fn prepared_logit_policy(&self) -> Option<PreparedLogitPolicy<'_>> {
+        None
+    }
+
     /// Whether prospective sampling is supported, and whether zero temperature is forbidden.
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         None
@@ -315,6 +420,19 @@ pub trait SpeculativeSampler<B: SamplingBackend> {
 
 /// Strategy for choosing a token from model logits.
 pub trait Sampler<B: SamplingBackend> {
+    /// Copies exact sampler storage before using the ordinary decision worker.
+    fn clone_with_host_source(&self,_funding:&eredu_core::HostMetadataFunding)
+        ->Result<Self,eredu_core::HostMetadataFundingError> where Self:Sized {
+        Err(eredu_core::HostMetadataFundingError::Unavailable)
+    }
+
+    /// Reserves this policy's actual host mutation before one ordinary sample.
+    fn reserve_sample_with_host_source(&self,_funding:&eredu_core::HostMetadataFunding)
+        ->Result<(),eredu_core::HostMetadataFundingError> {
+        Err(eredu_core::HostMetadataFundingError::Unavailable)
+    }
+
+
     /// Whether loaded checkpoint defaults should wrap this policy.
     fn uses_checkpoint_defaults(&self) -> bool {
         false
@@ -334,6 +452,17 @@ pub trait Sampler<B: SamplingBackend> {
 pub struct ConstrainedSampler<S, C> {
     policy: S,
     controller: TokenChoiceController<C>,
+}
+
+fn commit_components<P, C, E>(
+    policy: &mut P,
+    controller: &mut C,
+    token: u32,
+    commit_policy: impl FnOnce(&mut P, u32) -> Result<(), E>,
+    commit_controller: impl FnOnce(&mut C, u32) -> Result<(), E>,
+) -> Result<(), E> {
+    commit_policy(policy, token)?;
+    commit_controller(controller, token)
 }
 
 struct ConstraintCheckpoint<S, C> {
@@ -390,6 +519,16 @@ where
     S: SpeculativeSampler<B> + Clone,
     C: SpeculativeTokenFilterController,
 {
+    type PreparedGrammar = C::PreparedGrammar;
+    fn prepared_grammar_controller(&self) -> Option<PreparedGrammarSampler<'_, Self, Self::PreparedGrammar>> {
+        prepared_grammar::constrained::<B, S, C>(self)
+    }
+    fn prepared_controller(&self) -> Option<PreparedSpeculativeController<'_, Self>> {
+        prepared_controller::constrained::<B, S, C>(self)
+    }
+    fn prepared_adaptive_commit(&self) -> Option<PreparedAdaptiveCommit<'_, Self>> {
+        adaptive_commit::constrained::<B, S, C>(self)
+    }
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         self.policy.control_requires_positive_temperature()
     }
@@ -501,15 +640,17 @@ where
         context: &B::Context,
     ) -> Result<(), B::Error> {
         let checkpoint = self.checkpoint();
-        if let Err(error) = self
-            .policy
-            .commit_token(processed_logits, token, context)
-            .and_then(|()| {
-                self.controller
+        if let Err(error) = commit_components(
+            &mut self.policy,
+            &mut self.controller,
+            token,
+            |policy, token| policy.commit_token(processed_logits, token, context),
+            |controller, token| {
+                controller
                     .commit_token(token)
                     .map_err(|error| B::error(error.to_string()))
-            })
-        {
+            },
+        ) {
             self.policy = checkpoint.policy;
             self.controller = checkpoint.controller;
             return Err(error);
@@ -553,6 +694,19 @@ where
 pub struct DefaultSampler;
 
 impl<B: SamplingBackend> SpeculativeSampler<B> for DefaultSampler {
+    type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
+    fn prepared_host_copy(&self) -> Option<PreparedSpeculativeSamplerCopy<'_, Self>> {
+        Some(speculative_copy::default(self))
+    }
+    fn prepared_categorical_policy(&self) -> Option<PreparedCategoricalPolicy<'_>> {
+        Some(PreparedCategoricalPolicy::default(self))
+    }
+    fn prepared_greedy_policy(&self) -> Option<PreparedGreedyPolicy<'_>> {
+        Some(PreparedGreedyPolicy::default(self))
+    }
+    fn prepared_logit_policy(&self) -> Option<PreparedLogitPolicy<'_>> {
+        Some(PreparedLogitPolicy::default(self))
+    }
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         Some(false)
     }
@@ -571,11 +725,7 @@ impl<B: SamplingBackend> SpeculativeSampler<B> for DefaultSampler {
         _history: &[u32],
         context: &B::Context,
     ) -> Result<B::Logits, B::Error> {
-        if temperature == 0.0 {
-            Ok(logits.clone())
-        } else {
-            B::scale_temperature(logits, temperature, context)
-        }
+        prepared_logits::default_process::<B>(logits, temperature, context)
     }
 }
 
@@ -612,7 +762,7 @@ pub struct GenerationSampler {
     pub frequency_penalty: f32,
     /// One-time presence penalty.
     pub presence_penalty: f32,
-    generated_tokens: Vec<u32>,
+    generated_tokens: history::TokenHistory,
 }
 
 impl Default for GenerationSampler {
@@ -625,7 +775,7 @@ impl Default for GenerationSampler {
             repeat_last_n: 64,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
-            generated_tokens: Vec::new(),
+            generated_tokens: history::TokenHistory::default(),
         }
     }
 }
@@ -652,7 +802,7 @@ impl GenerationSampler {
 
     /// Seeds accepted-token history.
     pub fn with_generated_tokens(mut self, tokens: impl IntoIterator<Item = u32>) -> Self {
-        self.generated_tokens = tokens.into_iter().collect();
+        self.generated_tokens = history::TokenHistory::from_tokens(tokens);
         self
     }
 
@@ -691,12 +841,12 @@ impl GenerationSampler {
 
     /// Returns accepted-token history.
     pub fn generated_tokens(&self) -> &[u32] {
-        &self.generated_tokens
+        self.generated_tokens.as_slice()
     }
 
     /// Replaces accepted-token history.
     pub fn set_generated_tokens(&mut self, tokens: impl IntoIterator<Item = u32>) {
-        self.generated_tokens = tokens.into_iter().collect();
+        self.generated_tokens = history::TokenHistory::from_tokens(tokens);
     }
 
     /// Records a token accepted outside this sampler.
@@ -725,14 +875,37 @@ impl GenerationSampler {
         history: &[u32],
         context: &B::Context,
     ) -> Result<B::Logits, B::Error> {
-        let logits = B::apply_penalties(logits, history, self.penalty_config(), context)?;
-        let logits = B::apply_top_k(logits, self.top_k, context)?;
-        let logits = B::apply_top_p(logits, self.top_p, context)?;
-        B::apply_min_p(logits, self.min_p, context)
+        self.process_with::<B>(logits, context, |logits, penalties, context| {
+            B::apply_penalties(logits, history, penalties, context)
+        })
+    }
+
+    // The numerical sampler and extent-only workspace projection share filter
+    // ordering. Only the closed penalty primitive differs in its history input.
+    pub(crate) fn process_with<B: SamplingBackend>(
+        &self,
+        logits: &B::Logits,
+        context: &B::Context,
+        penalties: impl FnOnce(&B::Logits, PenaltyConfig, &B::Context) -> Result<B::Logits, B::Error>,
+    ) -> Result<B::Logits, B::Error> {
+        prepared_logits::Standard::from_source(self).process::<B>(logits, context, penalties)
     }
 }
 
 impl<B: SamplingBackend> SpeculativeSampler<B> for GenerationSampler {
+    type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
+    fn prepared_host_copy(&self) -> Option<PreparedSpeculativeSamplerCopy<'_, Self>> {
+        speculative_copy::standard(self)
+    }
+    fn prepared_categorical_policy(&self) -> Option<PreparedCategoricalPolicy<'_>> {
+        Some(PreparedCategoricalPolicy::standard(self))
+    }
+    fn prepared_greedy_policy(&self) -> Option<PreparedGreedyPolicy<'_>> {
+        Some(PreparedGreedyPolicy::standard(self))
+    }
+    fn prepared_logit_policy(&self) -> Option<PreparedLogitPolicy<'_>> {
+        Some(PreparedLogitPolicy::standard(self))
+    }
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         Some(false)
     }
@@ -748,15 +921,46 @@ impl<B: SamplingBackend> SpeculativeSampler<B> for GenerationSampler {
         context: &B::Context,
     ) -> Result<B::Logits, B::Error> {
         let logits = self.process_for::<B>(logits, history, context)?;
-        if temperature == 0.0 {
-            Ok(logits)
-        } else {
-            B::scale_temperature(&logits, temperature, context)
-        }
+        prepared_logits::finish_standard::<B>(logits, temperature, context)
+    }
+}
+
+impl GenerationSampler {
+    /// Exact one-sample history growth used by the paid ordinary sampler.
+    pub fn host_sample_bytes(&self)->Option<usize> {
+        let backing=usize::try_from(self.generated_tokens.push_payload_bytes()?).ok()?;
+        let parts=[std::mem::size_of::<Box<[u32]>>(),std::mem::size_of::<Vec<u32>>(),
+            std::mem::size_of::<(usize,u32)>(),eredu_core::HostMetadataFunding::reservation_control_bytes()];
+        parts.into_iter().try_fold(std::mem::size_of_val(&parts).checked_add(backing)?,usize::checked_add)
+    }
+    /// Source-derived exact history-copy and sampler-shell population used by
+    /// the shared paid clone hook. This query creates no history destination.
+    pub fn host_clone_bytes(&self)->Option<usize> {
+        let source=self.generated_tokens.prepare_copy()?;
+        let parts=[std::mem::size_of::<Self>()*2,
+            std::mem::size_of::<history::TokenHistoryCopy<'_>>(),
+            std::mem::size_of::<Result<Self,eredu_core::HostMetadataFundingError>>(),
+            eredu_core::HostMetadataFunding::reservation_control_bytes()];
+        parts.into_iter().try_fold(std::mem::size_of_val(&parts)
+            .checked_add(usize::try_from(source.bytes()).ok()?)?,usize::checked_add)
     }
 }
 
 impl<B: SamplingBackend> Sampler<B> for GenerationSampler {
+    fn clone_with_host_source(&self,funding:&eredu_core::HostMetadataFunding)
+        ->Result<Self,eredu_core::HostMetadataFundingError> {
+        let source=self.generated_tokens.prepare_copy().ok_or(eredu_core::HostMetadataFundingError::Overflow)?;
+        let bytes=self.host_clone_bytes().ok_or(eredu_core::HostMetadataFundingError::Overflow)?;
+        funding.reserve_metadata(bytes)?;
+        Ok(self.copy_with_history(source.copy()))
+    }
+
+    fn reserve_sample_with_host_source(&self,funding:&eredu_core::HostMetadataFunding)
+        ->Result<(),eredu_core::HostMetadataFundingError> {
+        funding.reserve_metadata(self.host_sample_bytes()
+            .ok_or(eredu_core::HostMetadataFundingError::Overflow)?)
+    }
+
     fn sample(
         &mut self,
         logits: &B::Logits,
@@ -764,7 +968,7 @@ impl<B: SamplingBackend> Sampler<B> for GenerationSampler {
         random: Option<&mut B::RandomState>,
         context: &B::Context,
     ) -> Result<B::Token, B::Error> {
-        let logits = self.process_for::<B>(logits, &self.generated_tokens, context)?;
+        let logits = self.process_for::<B>(logits, self.generated_tokens.as_slice(), context)?;
         let token = B::sample_raw(&logits, temperature, random, context)?;
         self.generated_tokens.push(B::token_id(&token, context)?);
         Ok(token)
@@ -847,14 +1051,8 @@ impl MirostatV2Sampler {
         token: u32,
         probability: f32,
     ) -> Result<(), SamplingConfigurationError> {
-        if !probability.is_finite() || probability <= 0.0 || probability > 1.0 {
-            return Err(SamplingConfigurationError::Invalid(
-                "accepted Mirostat V2 token probability must be finite and in (0, 1]".into(),
-            ));
-        }
-        self.update_mu(-probability.log2());
-        self.penalties.accept_token(token);
-        Ok(())
+        self.accept_token_fixed(token, probability)
+            .map_err(|cause| SamplingConfigurationError::Invalid(cause.to_string()))
     }
 
     /// Resets adaptive state and history.
@@ -863,8 +1061,28 @@ impl MirostatV2Sampler {
         self.penalties.clear_generated_tokens();
     }
 
-    fn update_mu(&mut self, observed_surprise: f32) {
-        self.mu -= self.eta * (observed_surprise - self.tau);
+    pub(crate) fn next_mu(
+        &self,
+        mu: f32,
+        probability: f32,
+    ) -> Result<f32, SamplingConfigurationError> {
+        self.next_mu_fixed(mu, probability)
+            .map_err(|cause| SamplingConfigurationError::Invalid(cause.to_string()))
+    }
+
+    fn next_mu_fixed(&self, mu: f32, probability: f32) -> Result<f32, PreparedAdaptiveCommitError> {
+        adaptive_commit::validate_probability(probability)?;
+        Ok(mu - self.eta * (-probability.log2() - self.tau))
+    }
+
+    fn accept_token_fixed(
+        &mut self,
+        token: u32,
+        probability: f32,
+    ) -> Result<(), PreparedAdaptiveCommitError> {
+        self.mu = self.next_mu_fixed(self.mu, probability)?;
+        self.penalties.accept_token(token);
+        Ok(())
     }
 
     fn process_for<B: SamplingBackend>(
@@ -874,18 +1092,38 @@ impl MirostatV2Sampler {
         history: &[u32],
         context: &B::Context,
     ) -> Result<B::Logits, B::Error> {
-        if !temperature.is_finite() || temperature <= 0.0 {
-            return Err(B::error(
-                "Mirostat V2 requires a finite temperature greater than zero".into(),
-            ));
-        }
-        B::apply_mirostat(
+        self.process_with::<B>(
             logits,
-            history,
-            self.penalties.penalty_config(),
             temperature,
             self.mu,
             context,
+            |logits, penalties, temperature, mu, context| {
+                B::apply_mirostat(logits, history, penalties, temperature, mu, context)
+            },
+        )
+    }
+
+    pub(crate) fn process_with<B: SamplingBackend>(
+        &self,
+        logits: &B::Logits,
+        temperature: f32,
+        mu: f32,
+        context: &B::Context,
+        cutoff: impl FnOnce(
+            &B::Logits,
+            PenaltyConfig,
+            f32,
+            f32,
+            &B::Context,
+        ) -> Result<B::Logits, B::Error>,
+    ) -> Result<B::Logits, B::Error> {
+        prepared_logits::adaptive_process::<B>(
+            logits,
+            self.penalties.penalty_config(),
+            temperature,
+            mu,
+            context,
+            cutoff,
         )
     }
 
@@ -922,6 +1160,24 @@ impl<B: SamplingBackend> Sampler<B> for MirostatV2Sampler {
 }
 
 impl<B: SamplingBackend> SpeculativeSampler<B> for MirostatV2Sampler {
+    type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
+    fn prepared_host_copy(&self) -> Option<PreparedSpeculativeSamplerCopy<'_, Self>> {
+        speculative_copy::adaptive(self)
+    }
+    fn prepared_adaptive_commit(&self) -> Option<PreparedAdaptiveCommit<'_, Self>> {
+        adaptive_commit::adaptive(self)
+    }
+    fn control_snapshot_bytes(&self) -> Option<u64> {
+        u64::try_from(std::mem::size_of::<Self>())
+            .ok()?
+            .checked_add(self.penalties.generated_tokens.prepare_copy()?.bytes())
+    }
+    fn prepared_categorical_policy(&self) -> Option<PreparedCategoricalPolicy<'_>> {
+        Some(PreparedCategoricalPolicy::adaptive(self))
+    }
+    fn prepared_logit_policy(&self) -> Option<PreparedLogitPolicy<'_>> {
+        Some(PreparedLogitPolicy::adaptive(self))
+    }
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         Some(true)
     }
@@ -989,3 +1245,12 @@ mod tests {
         assert!(sampler.generated_tokens().is_empty());
     }
 }
+
+mod token_mask;
+pub use token_mask::{TokenMaskError, TokenMaskPlan};
+
+mod synchronization;
+pub use synchronization::{
+    SamplingSynchronizationDriver, SamplingSynchronizationError, SamplingSynchronizationPlan,
+    SynchronizedSampling, synchronize_sampling,
+};

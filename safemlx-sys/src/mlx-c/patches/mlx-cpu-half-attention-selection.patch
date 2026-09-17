@@ -1,0 +1,113 @@
+diff --git a/mlx/backend/cpu/select.cpp b/mlx/backend/cpu/select.cpp
+--- a/mlx/backend/cpu/select.cpp
++++ b/mlx/backend/cpu/select.cpp
+@@ -92,16 +92,16 @@
+ } // namespace
+ 
+ namespace cpu {
+-static bool select_task_storage(size_t rank,bool general,EvalDispatchStorage& out) noexcept {
++static bool select_task_storage(Dtype dtype,size_t rank,bool general,EvalDispatchStorage& out) noexcept {
+   if(rank>(general?5:4)||(general&&rank==0))return false;
+   DispatchLayout task;WeakCopyStorage weak;
+   using Body=SelectTask<::mlx::core::detail::Select>;
+   if(!CommandEncoder::dispatch_layout<Body>(task)||!PreparedInputLeaf::weak_copy_storage(rank,weak))return false;
+   EvalDispatchStorage value{task.task_bytes,task.task_alignment,0,0};
+   const size_t controls[]={task.controls,weak.controls,weak.controls,weak.controls,weak.controls,
+-      sizeof(value)+sizeof(out)+sizeof(rank)+sizeof(general)+sizeof(task)+sizeof(weak)+sizeof(Body)*2+
++      sizeof(value)+sizeof(out)+sizeof(dtype)+sizeof(rank)+sizeof(general)+sizeof(task)+sizeof(weak)+sizeof(Body)*2+
+       sizeof(array)*5+sizeof(TernaryOpType)*3+sizeof(Stream)+sizeof(CommandEncoder*)+
+-      sizeof(::mlx::core::detail::Select)*2+sizeof(size_t)*8+sizeof(void*)*8+sizeof(bool)*5+sizeof(float)*4+
++      sizeof(::mlx::core::detail::Select)*2+sizeof(size_t)*8+sizeof(void*)*8+sizeof(bool)*5+dtype.size()*4+
+       sizeof(std::function<allocator::Buffer(size_t)>)+sizeof(array::Flags)+sizeof(Strides)};
+   value.controls=sizeof(controls);
+   for(size_t control:controls) {
+@@ -140,10 +140,16 @@
+   out=value;return true;
+ }
+ bool select_dispatch_storage(size_t rank,EvalDispatchStorage& out) noexcept {
+-  return select_task_storage(rank,false,out);
++  return select_task_storage(float32,rank,false,out);
+ }
+ bool select_broadcast_dispatch_storage(size_t rank,EvalDispatchStorage& out) noexcept {
+-  return select_task_storage(rank,true,out);
++  return select_task_storage(float32,rank,true,out);
++}
++bool typed_select_broadcast_dispatch_storage(Dtype dtype,size_t rank,EvalDispatchStorage& out) noexcept {
++  if(!((dtype==float32&&dtype.size()==sizeof(float))||
++       (dtype==float16&&dtype.size()==sizeof(float16_t))||
++       (dtype==bfloat16&&dtype.size()==sizeof(bfloat16_t))))return false;
++  return select_task_storage(dtype,rank,true,out);
+ }
+ } // namespace cpu
+ 
+diff --git a/mlx/backend/cpu/selection_storage.cpp b/mlx/backend/cpu/selection_storage.cpp
+--- a/mlx/backend/cpu/selection_storage.cpp
++++ b/mlx/backend/cpu/selection_storage.cpp
+@@ -120,17 +120,17 @@
+   return full?scalar_full_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out):
+       select_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out);
+ }
+-// An additive source for the existing F32 Select over stored or broadcast
++// An additive source for the existing F32/F16/BF16 Select over stored or broadcast
+ // operands. Rank five is the actual GQA mask expansion; the legacy row source
+ // and scalar Full contracts remain unchanged.
+-bool select_broadcast_eval_layout(size_t rank,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
++bool typed_select_broadcast_eval_layout(Dtype dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
+   size_t bytes=0;
+-  if(!rank||rank>5||!elements||elements>size_t(INT_MAX)||!product(elements,sizeof(float),bytes))return false;
++  if(!rank||rank>5||!elements||elements>size_t(INT_MAX)||!product(elements,dtype.size(),bytes))return false;
+   EvalDispatchStorage dispatch;SingleOutputEvalStorage common;
+-  if(!select_broadcast_dispatch_storage(rank,dispatch)||
++  if(!typed_select_broadcast_dispatch_storage(dtype,rank,dispatch)||
+       !single_output_eval_layout(rank,3,tracer,&dispatch,common))return false;
+   CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
+-  const size_t controls=sizeof(rank)+sizeof(elements)+sizeof(tracer)+sizeof(out)+sizeof(bytes)+
++  const size_t controls=sizeof(dtype)+sizeof(rank)+sizeof(elements)+sizeof(tracer)+sizeof(out)+sizeof(bytes)+
+       sizeof(dispatch)+sizeof(common)+sizeof(value)+sizeof(const array*)*5+sizeof(size_t)*18+
+       sizeof(int)*3+sizeof(bool)*5+sizeof(Dtype)*3+sizeof(submission::FixedEvalPrologueGuard*)+
+       sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
+@@ -138,14 +138,21 @@
+   if(!add(value.named_control_bytes,controls))return false;
+   out=value;return true;
+ }
++bool select_broadcast_eval_layout(size_t rank,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
++  return typed_select_broadcast_eval_layout(float32,rank,elements,tracer,out);
++}
+ static bool broadcast_selection_source(const array& output,CopyEvalStorage& out) noexcept {
+   if(!is_selection_eval_primitive(output)||typeid(output.primitive())!=typeid(Select)||
+-      !output.siblings().empty()||output.inputs().size()!=3||output.dtype()!=float32)return false;
++      !output.siblings().empty()||output.inputs().size()!=3||
++      !((output.dtype()==float32&&output.itemsize()==sizeof(float))||
++        (output.dtype()==float16&&output.itemsize()==sizeof(float16_t))||
++        (output.dtype()==bfloat16&&output.itemsize()==sizeof(bfloat16_t))))return false;
+   size_t elements=0;if(!shape(output,elements,5)||output.ndim()==0)return false;
+   for(size_t i=0;i!=3;++i) {
+     const auto& input=output.inputs()[i];size_t actual=0,span=1;
+     if(input.shape()!=output.shape()||!shape(input,actual,5)||actual!=elements||
+-        input.dtype()!=(i==0?bool_:float32)||!canonical(input.dtype())||
++        input.dtype()!=(i==0?bool_:output.dtype())||
++        input.itemsize()!=(i==0?sizeof(bool):output.itemsize())||
+         !input.data_size()||input.data_size()>elements)return false;
+     for(size_t axis=0;axis!=size_t(input.ndim());++axis) {
+       size_t offset=0;
+@@ -154,7 +161,7 @@
+     }
+     if(span>input.data_size())return false;
+   }
+-  return select_broadcast_eval_layout(output.ndim(),elements,output.is_tracer(),out);
++  return typed_select_broadcast_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out);
+ }
+ bool selection_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   return row_selection_eval_storage(output,out)||broadcast_selection_source(output,out);
+diff --git a/mlx/backend/cpu/selection_storage.h b/mlx/backend/cpu/selection_storage.h
+--- a/mlx/backend/cpu/selection_storage.h
++++ b/mlx/backend/cpu/selection_storage.h
+@@ -3,6 +3,8 @@
+ namespace mlx::core::cpu {
+ MLX_API bool select_broadcast_dispatch_storage(size_t rank,EvalDispatchStorage&) noexcept;
+ MLX_API bool select_broadcast_eval_layout(size_t rank,size_t elements,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool typed_select_broadcast_dispatch_storage(Dtype,size_t rank,EvalDispatchStorage&) noexcept;
++MLX_API bool typed_select_broadcast_eval_layout(Dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool select_dispatch_storage(size_t rank,EvalDispatchStorage&) noexcept;
+ MLX_API bool select_eval_layout(Dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool scalar_full_eval_layout(Dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage&) noexcept;

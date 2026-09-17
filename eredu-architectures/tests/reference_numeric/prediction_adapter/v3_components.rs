@@ -243,6 +243,7 @@ fn v3_typed_extension_hooks_preserve_scope_state_and_retry() {
                 }
             };
             let mut extension = fresh();
+            retained_resources::verify::<deepseek::v3::Model<NumericBackend>, _>(&mut extension, 0);
             let mut ordinary = fresh();
             let mut state =
                 V3State::create(deepseek::v3::state_layout(&target_args).unwrap(), |_, _| {

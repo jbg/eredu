@@ -1,0 +1,64 @@
+diff --git a/mlx/backend/cpu/alias_storage.cpp b/mlx/backend/cpu/alias_storage.cpp
+--- a/mlx/backend/cpu/alias_storage.cpp
++++ b/mlx/backend/cpu/alias_storage.cpp
+@@ -37,7 +37,7 @@
+ }
+ bool is_alias_eval_primitive(const array& out) noexcept {
+   return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
+-      (typeid(out.primitive())==typeid(Transpose)||typeid(out.primitive())==typeid(Broadcast));
++      (typeid(out.primitive())==typeid(Transpose)||typeid(out.primitive())==typeid(Broadcast)||typeid(out.primitive())==typeid(ExpandDims));
+ }
+ bool alias_eval_layout(AliasOperation operation,size_t rank,size_t output_rank,
+     bool tracer,CopyEvalStorage& out) noexcept {
+@@ -45,6 +45,7 @@
+   switch(operation) {
+     case AliasOperation::Transpose:if(rank!=output_rank)return false;break;
+     case AliasOperation::Broadcast:if(rank>output_rank)return false;break;
++    case AliasOperation::ExpandDims:if(rank>=output_rank)return false;break;
+     default:return false;
+   }
+   CopyEvalStorage value;
+@@ -82,6 +83,20 @@
+           output.shape(axis)!=input.shape(selected))return false;
+       seen[selected]=true;
+     }
++  } else if(typeid(output.primitive())==typeid(ExpandDims)) {
++    operation=AliasOperation::ExpandDims;
++    const auto& axes=static_cast<const ExpandDims&>(output.primitive()).axes_ref();
++    if(rank>=output_rank||axes.size()!=output_rank-rank||input_elements!=output_elements)return false;
++    size_t selected=0,source=0;
++    for(size_t axis=0;axis!=output_rank;++axis) {
++      if(selected<axes.size()&&axes[selected]==int(axis)) {
++        if(output.shape(axis)!=1)return false;
++        ++selected;
++      } else {
++        if(source>=rank||output.shape(axis)!=input.shape(source++))return false;
++      }
++    }
++    if(selected!=axes.size()||source!=rank)return false;
+   } else {
+     operation=AliasOperation::Broadcast;
+     const auto& shape=static_cast<const Broadcast&>(output.primitive()).shape_ref();
+diff --git a/mlx/backend/cpu/alias_storage.h b/mlx/backend/cpu/alias_storage.h
+--- a/mlx/backend/cpu/alias_storage.h
++++ b/mlx/backend/cpu/alias_storage.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-enum class AliasOperation : unsigned { Transpose = 0, Broadcast = 1 };
++enum class AliasOperation : unsigned { Transpose = 0, Broadcast = 1, ExpandDims = 2 };
+ // Common alias workers inspect only fixed inline shape/stride state. These
+ // queries grant neither source storage nor permission to evaluate a primitive.
+ MLX_API bool alias_input_geometry(const array&, size_t& elements) noexcept;
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -1131,6 +1131,7 @@
+ 
+   static Shape output_shape(const array& input, const std::vector<int>& axes);
+   static Shape output_shape_owned(const array& input, const Shape& axes);
++  const Shape& axes_ref() const noexcept { return axes_; }
+   auto state() const {
+     return std::vector<int>(axes_.begin(), axes_.end());
+   }

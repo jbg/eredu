@@ -1,28 +1,47 @@
 //! Backend-neutral Gemma 4 decoder equations.
 
+mod sparse_construction;
+
 use std::collections::HashMap;
 
 use eredu_core::AttentionPolicy;
 use eredu_nn::{
     AttentionCache, AttentionRequest, AttentionStateSource, AttentionValueSource, Error,
-    GatedProductGroupLayout, GroupScoring, GroupSelectionOperator, GroupedGatedProductSpec,
+    GatedProductGroupLayout, GroupSelectionOperator, GroupedGatedProductSpec,
     GroupedNeuralBackend, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
     NormalizationOperator, Parameter, ParameterSpec, Parameterized, RotaryOperator, RotaryPosition,
-    RotarySpec, RotarySubspace, SelectorInputTransformSpec, Tensor, TopKGroupSelectionSpec,
-    TopKGroupSelectorSpec,
+    RotarySpec, RotarySubspace, Tensor,
 };
 use eredu_runtime::{
     ExpertPass, ResidentExpertProvider, RoutedExpertProvider, RoutedExpertRequest,
     TensorParallelRoutedExpertProvider,
 };
 
-use crate::decoder::ComponentInstrumentation;
-use crate::linear_format::standard_expert_projection;
+use crate::decoder::{ComponentInstrumentation, ModuleMetadata};
 
 use super::{FeedForwardPolicy, LayerPolicy, ModelArgs};
 
 /// Shared normalized key/value states keyed by exact attention policy.
 pub type SharedAttentionStates<T> = HashMap<AttentionPolicy, (T, T)>;
+
+/// Borrowed shared K/V access used by the same attention equation. A source-bound
+/// cold projection supplies its actual finite entries without constructing a
+/// second hash table. Publication remains fallible for closed source views.
+pub trait SharedAttentionStore<T> {
+    /// Borrows the pair selected by the architecture's exact attention policy.
+    fn get(&self, policy: &AttentionPolicy) -> Option<&(T, T)>;
+    /// Publishes an actual state-owning layer's pair.
+    fn publish(&mut self, policy: AttentionPolicy, values: (T, T)) -> Result<(), Error>;
+}
+impl<T> SharedAttentionStore<T> for SharedAttentionStates<T> {
+    fn get(&self, policy: &AttentionPolicy) -> Option<&(T, T)> {
+        HashMap::get(self, policy)
+    }
+    fn publish(&mut self, policy: AttentionPolicy, values: (T, T)) -> Result<(), Error> {
+        self.insert(policy, values);
+        Ok(())
+    }
+}
 
 /// Stateful attention request for one Gemma 4 block.
 pub struct AttentionInput<'a, T, C> {
@@ -34,7 +53,7 @@ pub struct AttentionInput<'a, T, C> {
     /// publisher/receiver cache for a shared-state consumer.
     pub cache: Option<&'a mut C>,
     /// Shared publications from earlier compatible layers.
-    pub shared: &'a mut SharedAttentionStates<T>,
+    pub shared: &'a mut dyn SharedAttentionStore<T>,
     /// Optional caller-provided explicit rotary positions.
     pub rotary_position: Option<RotaryPosition<'a, T>>,
 }
@@ -43,15 +62,15 @@ pub struct AttentionInput<'a, T, C> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     query_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     key_value_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     rotary_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     policy: AttentionPolicy,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     state_source: AttentionStateSource,
     /// Query projection.
     pub query: B::Linear,
@@ -88,25 +107,33 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         layer_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{layer_root}.{layer}.self_attn");
+        let metadata = ModuleMetadata::new::<B>(context);
+        metadata.controls::<(
+            Self,
+            LinearSpec,
+            NormalizationConstructionSpec,
+            RotarySpec,
+            Option<ParameterSpec>,
+            Result<Self, Error>,
+            &ModelArgs,
+            &str,
+            usize,
+        )>()?;
+        let prefix = metadata.text(format_args!("{layer_root}.{layer}.self_attn"))?;
         let head_dim = policy.head_dim.get() as i32;
         let kv_heads = policy.num_key_value_heads.get() as i32;
         let linear = |field: &str, input: i32, output: i32| {
-            let weight_name = format!("{prefix}.{field}.weight");
+            let weight_name = metadata.text(format_args!("{prefix}.{field}.weight"))?;
             B::linear(
                 LinearSpec {
                     input,
                     output,
-                    weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(&weight_name)?,
                     bias: args
                         .attention_bias
-                        .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
-                        .transpose()
-                        .map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight_name,
-                        args.linear_format_for(&weight_name),
-                    )?,
+                        .then(|| metadata.named_parameter(format_args!("{prefix}.{field}.bias")))
+                        .transpose()?,
+                    format: metadata.format(&weight_name, args.linear_format_for(&weight_name))?,
                 },
                 context,
             )
@@ -140,8 +167,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
                 NormalizationConstructionSpec::learned(
                     head_dim,
                     args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.q_norm.weight"))
-                        .map_err(Error::backend)?,
+                    metadata.named_parameter(format_args!("{prefix}.q_norm.weight"))?,
                 ),
                 context,
             )?,
@@ -151,8 +177,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
                         NormalizationConstructionSpec::learned(
                             head_dim,
                             args.rms_norm_eps,
-                            ParameterSpec::trainable(format!("{prefix}.k_norm.weight"))
-                                .map_err(Error::backend)?,
+                            metadata.named_parameter(format_args!("{prefix}.k_norm.weight"))?,
                         ),
                         context,
                     )
@@ -164,10 +189,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
                     dimensions: partial_dimensions,
                     base: args.rope_theta_for(policy.attention),
                     traditional: false,
-                    algorithm: crate::rotary::normalize_algorithm(
+                    algorithm: crate::rotary::normalize_algorithm_with(
                         args.rope_scaling_for(policy.attention),
-                    )
-                    .expect("validated Gemma 4 RoPE algorithm"),
+                        |args| metadata.error(args),
+                    )?,
                 },
                 context,
             )?,
@@ -268,12 +293,46 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
             if self.state_source.publishes_state() {
                 input
                     .shared
-                    .insert(self.policy, (keys.clone(), values.clone()));
+                    .publish(self.policy, (keys.clone(), values.clone()))?;
             }
             (keys, values)
         };
+        // A sliding contiguous cache returns its actual retained past plus this
+        // submission. Its width can be shorter than the absolute prefix; use
+        // the shared window-aware operation instead of a prefix-wide mask.
+        // A shared consumer sees the publisher/receiver's already advanced
+        // cache and must not append or advance it a second time.
+        if let Some(window) = self.policy.window().filter(|_| {
+            input.mask.is_none()
+                && sequence > 1
+                && !cache.as_ref().is_some_and(|c| c.uses_blockwise_attention())
+        }) {
+            let query_offset = cache
+                .as_ref()
+                .map_or(keys.dim(2), |cache| cache.offset())
+                .checked_sub(sequence)
+                .filter(|offset| *offset >= 0)
+                .ok_or_else(|| Error::backend("Gemma sliding history precedes its queries"))?;
+            return B::sliding_window_attention_with_sinks(
+                AttentionRequest {
+                    arithmetic: eredu_nn::AttentionArithmetic::Fused,
+                    queries,
+                    keys,
+                    values,
+                    scale: 1.0,
+                    mask: None,
+                    softcap: None,
+                    sinks: None,
+                },
+                window.get() as i32,
+                query_offset,
+                context,
+            );
+        }
         // A paged publication contains only this submission's tensors. Its
         // older history remains owned by the publisher or pipeline receiver.
+        // That cache supplies its own causal/window geometry. Explicit caller
+        // masks keep the original path and are never silently discarded.
         let attended = match cache {
             Some(cache) => cache.attention(
                 AttentionRequest {
@@ -391,19 +450,28 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
         layer_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{layer_root}.{layer}.mlp");
+        let metadata = ModuleMetadata::new::<B>(context);
+        metadata.controls::<(
+            Self,
+            LinearSpec,
+            NormalizationConstructionSpec,
+            RotarySpec,
+            Option<ParameterSpec>,
+            Result<Self, Error>,
+            &ModelArgs,
+            &str,
+            usize,
+        )>()?;
+        let prefix = metadata.text(format_args!("{layer_root}.{layer}.mlp"))?;
         let linear = |field: &str, input, output| {
-            let weight_name = format!("{prefix}.{field}.weight");
+            let weight_name = metadata.text(format_args!("{prefix}.{field}.weight"))?;
             B::linear(
                 LinearSpec {
                     input,
                     output,
-                    weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(&weight_name)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight_name,
-                        args.linear_format_for(&weight_name),
-                    )?,
+                    format: metadata.format(&weight_name, args.linear_format_for(&weight_name))?,
                 },
                 context,
             )
@@ -442,7 +510,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct DenseBlock<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     layer: usize,
     /// Stateful self attention.
     pub attention: Attention<B>,
@@ -485,7 +553,7 @@ pub struct BlockInput<'a, T, C> {
     /// Optional state-owner cache.
     pub cache: Option<&'a mut C>,
     /// Pass-local shared KV publications.
-    pub shared: &'a mut SharedAttentionStates<T>,
+    pub shared: &'a mut dyn SharedAttentionStore<T>,
     /// Optional per-layer prepared media embedding.
     pub per_layer_input: Option<&'a T>,
     /// Optional explicit rotary positions.
@@ -519,33 +587,41 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
         routed_spec: Option<GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = ModuleMetadata::new::<B>(context);
+        metadata.controls::<(
+            Self,
+            LinearSpec,
+            NormalizationConstructionSpec,
+            RotarySpec,
+            Option<ParameterSpec>,
+            Result<Self, Error>,
+            &ModelArgs,
+            &str,
+            usize,
+        )>()?;
         let policy = args
             .layer_policy(layer)
-            .ok_or_else(|| Error::backend(format!("missing Gemma 4 layer policy {layer}")))?;
-        let prefix = format!("{layer_root}.{layer}");
+            .ok_or_else(|| metadata.error(format_args!("missing Gemma 4 layer policy {layer}")))?;
+        let prefix = metadata.text(format_args!("{layer_root}.{layer}"))?;
         let norm = |field: &str, dimensions| {
             B::normalization(
                 NormalizationConstructionSpec::learned(
                     dimensions,
                     args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
+                    metadata.named_parameter(format_args!("{prefix}.{field}.weight"))?,
                 ),
                 context,
             )
         };
         let media_linear = |field: &str, input, output| {
-            let weight_name = format!("{prefix}.{field}.weight");
+            let weight_name = metadata.text(format_args!("{prefix}.{field}.weight"))?;
             B::linear(
                 LinearSpec {
                     input,
                     output,
-                    weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(&weight_name)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight_name,
-                        args.linear_format_for(&weight_name),
-                    )?,
+                    format: metadata.format(&weight_name, args.linear_format_for(&weight_name))?,
                 },
                 context,
             )
@@ -553,44 +629,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
         let media_width = args.hidden_size_per_layer_input;
         let sparse = policy.feed_forward == FeedForwardPolicy::DenseWithSparseMoe;
         let (router, experts) = if sparse {
-            let expert_count = args
-                .num_experts
-                .ok_or_else(|| Error::backend("Gemma 4 sparse block has no expert count"))?;
-            let top_k = args
-                .top_k_experts
-                .ok_or_else(|| Error::backend("Gemma 4 sparse block has no top-k count"))?;
-            let router_prefix = format!("{prefix}.router");
-            let router_weight = format!("{router_prefix}.proj.weight");
-            let selector = TopKGroupSelectorSpec::new(
-                args.hidden_size,
-                ParameterSpec::trainable(&router_weight).map_err(Error::backend)?,
-                crate::linear_format::standard_linear_format(
-                    &router_weight,
-                    args.linear_format_for(&router_weight),
-                )?,
-                TopKGroupSelectionSpec::new(
-                    expert_count,
-                    top_k,
-                    GroupScoring::SelectedSoftmax,
-                    false,
-                )?,
-            )?
-            .with_input_transform(SelectorInputTransformSpec::new(
-                args.rms_norm_eps,
-                ParameterSpec::trainable(format!("{router_prefix}.scale"))
-                    .map_err(Error::backend)?,
-                true,
-            )?)
-            .with_coefficient_scale(
-                ParameterSpec::trainable(format!("{router_prefix}.per_expert_scale"))
-                    .map_err(Error::backend)?,
-            );
-            let router = B::top_k_group_selector(selector, context)?;
-            let spec = match routed_spec {
-                Some(spec) => spec,
-                None => expert_bank_spec_at(args, &format!("{prefix}.experts.switch_glu"))?,
-            };
-            let experts = B::grouped_gated_product(spec, context)?;
+            let (router, experts) = Self::construct_sparse(args, &prefix, routed_spec, context)?;
             (Some(router), Some(experts))
         } else {
             (None, None)
@@ -630,8 +669,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DenseBlock<B>
                 .then(|| norm("post_per_layer_input_norm", args.hidden_size))
                 .transpose()?,
             layer_scalar: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.layer_scalar"))
-                    .map_err(Error::backend)?,
+                metadata.named_parameter(format_args!("{prefix}.layer_scalar"))?,
                 &[1],
                 context,
             )?,
@@ -1008,14 +1046,22 @@ fn expert_bank_spec_at(
     args: &ModelArgs,
     experts_prefix: &str,
 ) -> Result<GroupedGatedProductSpec, Error> {
+    expert_bank_spec_at_with(args, experts_prefix, ModuleMetadata::ordinary())
+}
+fn expert_bank_spec_at_with(
+    args: &ModelArgs,
+    experts_prefix: &str,
+    metadata: ModuleMetadata<'_>,
+) -> Result<GroupedGatedProductSpec, Error> {
+    metadata.controls::<GroupedGatedProductSpec>()?;
     let expert_count = args
         .num_experts
-        .ok_or_else(|| Error::backend("Gemma 4 sparse layer has no expert count"))?;
+        .ok_or_else(|| metadata.error(format_args!("Gemma 4 sparse layer has no expert count")))?;
     let expert_width = args
         .moe_intermediate_size
-        .ok_or_else(|| Error::backend("Gemma 4 sparse layer has no expert width"))?;
-    let gate_up_name = format!("{experts_prefix}.gate_up_proj");
-    let down_name = format!("{experts_prefix}.down_proj");
+        .ok_or_else(|| metadata.error(format_args!("Gemma 4 sparse layer has no expert width")))?;
+    let gate_up_name = metadata.text(format_args!("{experts_prefix}.gate_up_proj"))?;
+    let down_name = metadata.text(format_args!("{experts_prefix}.down_proj"))?;
     GroupedGatedProductSpec::new(
         expert_count,
         args.hidden_size,
@@ -1023,12 +1069,18 @@ fn expert_bank_spec_at(
         args.hidden_size,
         eredu_nn::GatedProductPolicy::ordinary_gelu_approximate(),
         GatedProductGroupLayout::Packed {
-            gate_up: standard_expert_projection(
+            gate_up: crate::linear_format::standard_expert_projection_with(
                 &gate_up_name,
                 None,
                 args.linear_format_for(&gate_up_name),
+                metadata,
             )?,
-            down: standard_expert_projection(&down_name, None, args.linear_format_for(&down_name))?,
+            down: crate::linear_format::standard_expert_projection_with(
+                &down_name,
+                None,
+                args.linear_format_for(&down_name),
+                metadata,
+            )?,
         },
     )
 }

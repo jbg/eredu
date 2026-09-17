@@ -15,7 +15,8 @@ mod communication_tests;
 pub(crate) use group::{
     all_gather, all_gather_for, all_gather_unchecked, all_sum, all_sum_for, all_to_all_v,
     payload_free_all_sum_for, recv, recv_like, send, Group,
+    LogicalExchangePlan, LogicalVariableRoute, LogicalVariableRoutePlan,
 };
 
 #[cfg(test)]
-pub(crate) use group::{contracted_collective_submissions, reset_native_collective_submissions};
+pub(crate) use group::{contracted_collective_submissions, original_model_collective_submissions, reset_native_collective_submissions};

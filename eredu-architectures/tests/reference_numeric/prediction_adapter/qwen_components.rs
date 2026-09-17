@@ -176,6 +176,7 @@ where
     E: MaterializedPredictionExecutor<A, NumericBackend, Materializer>,
 {
     use eredu_core::component::ComponentResidualBase;
+    super::retained_resources::verify::<A, E>(extension, 1);
     let mut parameters = Parameters(BTreeMap::new());
     extension.visit_modules(&mut parameters).unwrap();
     assert_eq!(scopes.len(), extension.depth());

@@ -1,5 +1,10 @@
 //! Architecture-owned execution of retained media processor plans.
 
+mod host_input;
+pub use host_input::{
+    lower_original_prepared_host_input, lower_prepared_host_input, OriginalHostLowering,
+};
+
 use eredu_core::{
     checkpoint::TensorDtype, InputExtent, InputMetadataKey, InputModality, InputTensorIdentity,
     Media, PreparedInputError, RgbImage, TokenizedMultimodalRequest, TokenizedMultimodalSegment,
@@ -350,7 +355,34 @@ enum ProcessorKind {
     Qwen(QwenProcessorPlan),
 }
 
+/// Storage actually retained by a completed processor policy. Request-created
+/// input parts, feature buffers and tensors belong to their own preparation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreparedProcessorStorage {
+    /// The exhaustive policy fields contain only inline scalar metadata.
+    /// The enclosing object accounts for these bytes; there is no independently
+    /// allocated payload or executable native owner to register here.
+    Inline {
+        /// Exact inline representation of the retained processor policy.
+        bytes: usize,
+    },
+}
+
 impl PreparedProcessor {
+    /// Declares retained storage from the actual sealed policy fields. Every
+    /// nested field is classified in the architecture's scalar-only worker;
+    /// adding an owner requires a new declaration before this can compile.
+    pub fn retained_storage(&self) -> PreparedProcessorStorage {
+        use crate::processor_plan::retained_storage::InlineProcessorMetadata;
+        let Self { kind } = self;
+        match kind {
+            ProcessorKind::Gemma4(plan) => plan.validate_inline(),
+            ProcessorKind::Inkling(plan) => plan.validate_inline(),
+            ProcessorKind::Muse(plan) => plan.validate_inline(),
+            ProcessorKind::Qwen(plan) => plan.validate_inline(),
+        }
+        PreparedProcessorStorage::Inline { bytes: std::mem::size_of::<Self>() }
+    }
     /// Selects architecture-owned processor semantics without backend inspection.
     pub fn from_artifact(plan: &ArtifactArchitecturePlan) -> Option<Self> {
         if let Some(plan) = plan.qwen().cloned() {
@@ -477,30 +509,6 @@ fn host_execution_error<E: std::fmt::Display, M: std::fmt::Display>(
     }
 }
 
-fn lower_host_tensor<M, E>(
-    tensor: &HostTensor,
-    mechanisms: &mut M,
-) -> Result<M::Tensor, ProcessorExecutionError<E, M::Error>>
-where
-    M: ProcessorMechanisms,
-    E: std::fmt::Display,
-{
-    match tensor {
-        HostTensor::U32 { values, shape } => mechanisms
-            .tensor_u32(values, shape)
-            .map_err(ProcessorExecutionError::Mechanism),
-        HostTensor::F32 { values, shape } => mechanisms
-            .tensor_f32(values, shape)
-            .map_err(ProcessorExecutionError::Mechanism),
-        HostTensor::I32 { values, shape } => mechanisms
-            .tensor_i32(values, shape)
-            .map_err(ProcessorExecutionError::Mechanism),
-        HostTensor::Bool { values, shape } => mechanisms
-            .tensor_bool(values, shape)
-            .map_err(optional_mechanism_error),
-    }
-}
-
 fn lower_host_input<M, E>(
     host: PreparedModelInput<HostTensor>,
     mechanisms: &mut M,
@@ -509,49 +517,10 @@ where
     M: ProcessorMechanisms,
     E: std::fmt::Display,
 {
-    if host.parts().iter().any(|part| {
-        !matches!(
-            part.payload(),
-            PreparedInputPayload::TokenIds(_)
-                | PreparedInputPayload::Tensor(_)
-                | PreparedInputPayload::Embeddings(_)
-        )
-    }) {
-        return Err(ProcessorExecutionError::Plan(
-            "host processor emitted an unsupported payload kind".into(),
-        ));
-    }
-    let mut parts = Vec::with_capacity(host.len());
-    for part in host.parts() {
-        let payload = match part.payload() {
-            PreparedInputPayload::TokenIds(value) => {
-                PreparedInputPayload::TokenIds(lower_host_tensor(value, mechanisms)?)
-            }
-            PreparedInputPayload::Tensor(value) => {
-                PreparedInputPayload::Tensor(lower_host_tensor(value, mechanisms)?)
-            }
-            PreparedInputPayload::Embeddings(value) => {
-                PreparedInputPayload::Embeddings(lower_host_tensor(value, mechanisms)?)
-            }
-            _ => unreachable!("payload kinds were preflighted before native lowering"),
-        };
-        let metadata = part
-            .metadata()
-            .iter()
-            .map(|(key, tensor)| lower_host_tensor(tensor, mechanisms).map(|tensor| (*key, tensor)))
-            .collect::<Result<Vec<_>, _>>()?;
-        parts.push(
-            PreparedInputPart::new_with_extents(
-                part.modality(),
-                payload,
-                metadata,
-                part.extents().iter().copied(),
-            )
-            .map_err(ProcessorExecutionError::Prepared)?,
-        );
-    }
-    PreparedModelInput::new(parts, |tensor| mechanisms.identity(tensor))
-        .map_err(ProcessorExecutionError::Prepared)
+    lower_prepared_host_input(
+        host.parts().iter().map(host_input::ProcessorPart),
+        mechanisms,
+    )
 }
 
 /// Failure from architecture processor semantics, text encoding, or a mechanism.

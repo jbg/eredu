@@ -4,6 +4,9 @@ use std::collections::{btree_map::Entry, BTreeMap};
 
 use serde::{Deserialize, Serialize};
 
+mod shared_tensor;
+pub use shared_tensor::SharedTensorObservation;
+
 /// Canonical observation path for a model's output logits.
 ///
 /// Every execution mode uses this path so resident, layerwise, tensor-parallel,
@@ -91,6 +94,28 @@ impl TensorObservation {
     /// Materialized row-major values.
     pub const fn data(&self) -> &TensorObservationData {
         &self.data
+    }
+
+    /// Actual retained host payload capacity, including this inline DTO and
+    /// both owned vector capacities. Allocator/control bookkeeping is excluded.
+    /// This is inspection only, not proof of funding or permission to copy.
+    pub fn retained_payload_bytes(&self) -> Option<u64> {
+        let data = match &self.data {
+            TensorObservationData::F32(v) => v.capacity().checked_mul(std::mem::size_of::<f32>())?,
+            TensorObservationData::I64(v) => v.capacity().checked_mul(std::mem::size_of::<i64>())?,
+            TensorObservationData::U64(v) => v.capacity().checked_mul(std::mem::size_of::<u64>())?,
+            TensorObservationData::Bool(v) => {
+                v.capacity().checked_mul(std::mem::size_of::<bool>())?
+            }
+        };
+        let shape = self
+            .shape
+            .capacity()
+            .checked_mul(std::mem::size_of::<usize>())?;
+        let bytes = std::mem::size_of::<Self>()
+            .checked_add(shape)?
+            .checked_add(data)?;
+        u64::try_from(bytes).ok()
     }
 
     /// Consumes this observation into its shape and values.

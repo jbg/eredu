@@ -7,6 +7,8 @@
 #include "mlx/c/error.h"
 #include "mlx/c/private/mlx.h"
 #include "mlx/einsum.h"
+#include "mlx/backend/common/utils.h"
+#include "mlx/primitives.h"
 
 extern "C" int mlx_abs(mlx_array* res, const mlx_array a, const mlx_stream s) {
   try {
@@ -1468,6 +1470,55 @@ extern "C" int mlx_gather_mm(
   }
   return 0;
 }
+static bool mlx_packed_grouped_control_bytes_(bool affine, bool selected, size_t* output) {
+#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+  return false;
+#else
+  if (!output) return false;
+  using namespace mlx::core;
+  CollapseStorageLayout collapse;
+  if (!collapse_contiguous_dims_layout(2, 1, true, collapse)) return false;
+  // C adapter and gather_qmm keep borrowed operands, three optional aliases,
+  // two index values, output shape and the packed initializer. Shape rank
+  // is at most three. All source strings and scalar conversions stay inline.
+  // Arange/reshape constructor allocations use the resident Graph separately.
+  // eval_gpu retains x/w/scales and optional bias; the selected qmv path has
+  // one output, six borrowed arrays and the fixed collapse result above.
+  *output = sizeof(mlx_array) * 6 + sizeof(mlx_array*) + sizeof(mlx_stream) +
+      sizeof(mlx_optional_int) * 2 + sizeof(std::optional<array>) * 7 +
+      sizeof(array) * (2 + 5 + 3) + sizeof(ArrayVector) * 3 +
+      sizeof(Shape) * 2 + sizeof(std::string) * 3 + sizeof(Stream) * 2 +
+      sizeof(array*) * (6 + 6) + sizeof(int) * (6 + 12) + sizeof(bool) * 6 +
+      sizeof(Dtype) + sizeof(QuantizationMode) + sizeof(std::pair<int, int>) * 2 +
+      collapse.borrowed_view_bytes + collapse.fixed_reference_bytes +
+      collapse.result_control_bytes + collapse.marker_control_bytes +
+      collapse.layout_control_bytes + collapse.fixed_reference_view_bytes +
+      sizeof(output) + sizeof(collapse) + sizeof(affine) + sizeof(selected);
+  if (affine) {
+    // Affine GatherQMM's sixth initializer entry, two extra floating cast
+    // temporaries and promotion operands. Bias optionals themselves are
+    // already present in the shared gather/qmv fixed frames above.
+    *output += sizeof(array) * 3 + sizeof(Dtype) * 2 + sizeof(array*) * 2;
+  }
+  if (selected) {
+    // Group16 enters quantized_matmul by value after the three row gathers.
+    // Include its owning x/w/scales arguments, optional bias copies and the
+    // four-way batch broadcast's fixed shape/vector/axis wrappers. Graph
+    // allocation and every gathered array are counted by native node sources.
+    *output += sizeof(array) * 3 + sizeof(std::optional<array>) * 2 +
+        sizeof(ArrayVector) + sizeof(Shape) * 3 + sizeof(int) * 6 + sizeof(bool) * 3;
+  }
+  return true;
+#endif
+}
+
+extern "C" bool mlx_mxfp4_gather_control_bytes(size_t* output) {
+  return mlx_packed_grouped_control_bytes_(false, false, output);
+}
+extern "C" bool mlx_affine_grouped_control_bytes(bool selected, size_t* output) {
+  return mlx_packed_grouped_control_bytes_(true, selected, output);
+}
+
 extern "C" int mlx_gather_qmm(
     mlx_array* res,
     const mlx_array x,
@@ -2369,9 +2420,9 @@ extern "C" int mlx_pad(
   try {
     mlx_array_set_(
         *res,
-        mlx::core::pad(
+        mlx::core::pad_axes(
             mlx_array_get_(a),
-            std::vector<int>(axes, axes + axes_num),
+            mlx::core::Shape(axes, axes + axes_num),
             mlx::core::Shape(low_pad_size, low_pad_size + low_pad_size_num),
             mlx::core::Shape(high_pad_size, high_pad_size + high_pad_size_num),
             mlx_array_get_(pad_value),

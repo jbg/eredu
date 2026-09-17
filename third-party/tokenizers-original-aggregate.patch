@@ -1,0 +1,1204 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -52,6 +52,8 @@
+ all-features = true
+ 
+ [features]
++# Development-only real constructor reserve fault selection; disabled by default.
++tokenizer-compiler-test-support = ["packed-bpe-test-support"]
+ # Development-only actual capacity-overflow injection; disabled by default.
+ packed-bpe-test-support = []
+ default = [
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -103,6 +103,8 @@
+ compact_str = { version = "0.9", features = ["serde"] }
+ 
+ [features]
++# Development-only real constructor reserve fault selection; disabled by default.
++tokenizer-compiler-test-support = ["packed-bpe-test-support"]
+ # Development-only actual capacity-overflow injection; disabled by default.
+ packed-bpe-test-support = []
+ default = ["progressbar", "onig", "esaxx_fast"]
+--- a/src/models/bpe/compile.rs
++++ b/src/models/bpe/compile.rs
+@@ -263,32 +263,33 @@
+             self.flags,
+         ))
+     }
+-    fn reserve(&self, stage: usize) -> Result<(), Cause> {
++    fn requested_capacity(&self, stage: usize, requested: usize) -> usize {
+         #[cfg(any(test, feature = "packed-bpe-test-support"))]
+         if self.fail_at == Some(stage) {
+-            return Err(Cause::Allocation(
+-                Vec::<u8>::new().try_reserve_exact(usize::MAX).unwrap_err(),
+-            ));
++            return usize::MAX;
+         }
+         let _ = stage;
+-        Ok(())
++        requested
+     }
+     fn fill(&self, p: &mut Partial) -> Result<(), Cause> {
+         let q = self.requirements;
+-        self.reserve(0)?;
+-        p.packed.entries.try_reserve_exact(q.slots)?;
+-        self.reserve(1)?;
+-        p.packed.bytes.try_reserve_exact(q.bytes)?;
+-        self.reserve(2)?;
+-        p.packed.ids.try_reserve_exact(q.slots)?;
+-        self.reserve(3)?;
+-        p.packed.merges.try_reserve_exact(q.merges)?;
++        p.packed
++            .entries
++            .try_reserve_exact(self.requested_capacity(0, q.slots))?;
++        p.packed
++            .bytes
++            .try_reserve_exact(self.requested_capacity(1, q.bytes))?;
++        p.packed
++            .ids
++            .try_reserve_exact(self.requested_capacity(2, q.slots))?;
++        p.packed
++            .merges
++            .try_reserve_exact(self.requested_capacity(3, q.merges))?;
+         for (i, source) in self.strings.iter().enumerate() {
+             if let Some(source) = source {
+                 p.strings[i] = Some(String::new());
+-                self.reserve(4 + i)?;
+                 let value = p.strings[i].as_mut().expect("installed string");
+-                value.try_reserve_exact(q.strings[i])?;
++                value.try_reserve_exact(self.requested_capacity(4 + i, q.strings[i]))?;
+                 write_string(*source, value);
+             }
+         }
+--- a/src/tokenizer/added_vocabulary.rs
++++ b/src/tokenizer/added_vocabulary.rs
+@@ -98,6 +98,7 @@
+ mod access;
+ mod packed;
+ pub use access::AddedTokenRef;
++pub(crate) use packed::AddedVocabularyRecipe;
+ pub use packed::{
+     AddedVocabularyCompileError, AddedVocabularyCompileErrorKind, AddedVocabularyCompileFailure,
+     AddedVocabularyCompilePlan, AddedVocabularyCompileRequirements,
+--- a/src/tokenizer/added_vocabulary/packed.rs
++++ b/src/tokenizer/added_vocabulary/packed.rs
+@@ -143,6 +143,91 @@
+         self.total
+     }
+ }
++/// Private source geometry; binding still checks the actual normalizer and model.
++#[derive(Debug)]
++pub(crate) struct AddedVocabularyRecipe<'a> {
++    input: &'a str,
++    root: Span,
++    requirements: AddedVocabularyCompileRequirements,
++    first_normalized: Option<usize>,
++}
++impl<'a> AddedVocabularyRecipe<'a> {
++    pub(crate) fn prepare_json(
++        input: &'a [u8],
++        normalizer: Option<&NormalizerWrapper>,
++    ) -> Result<Self, Error> {
++        let input =
++            std::str::from_utf8(input).map_err(|e| error(Kind::InvalidUtf8, e.valid_up_to()))?;
++        let mut r = Reader::new(
++            input,
++            Span {
++                start: 0,
++                end: input.len(),
++            },
++        );
++        let root = r.value()?;
++        r.finish()?;
++        let mut a = Reader::new(input, root).array()?;
++        let mut n = 0usize;
++        let mut first_normalized = None;
++        let mut b = 0usize;
++        while let Some(span) = a.next()? {
++            let token = token(input, span)?;
++            n = checked_add(n, 1)?;
++            b = checked_add(b, token.content.len())?;
++            if token.content.len() != 0 {
++                if token.flags & (SINGLE | LEFT | RIGHT) != 0 {
++                    return Err(error(Kind::WordOrStripProfile, span.start));
++                }
++                if token.flags & NORMALIZED != 0 {
++                    first_normalized.get_or_insert(span.start);
++                    if normalizer.is_some() {
++                        return Err(error(Kind::NormalizationProfile, span.start));
++                    }
++                }
++            }
++        }
++        Ok(Self {
++            input,
++            root,
++            requirements: requirements(n, b)?,
++            first_normalized,
++        })
++    }
++    pub(crate) fn requirements(&self) -> AddedVocabularyCompileRequirements {
++        self.requirements
++    }
++    pub(crate) fn validate_normalizer(
++        &self,
++        normalizer: Option<&NormalizerWrapper>,
++    ) -> Result<(), Error> {
++        if let Some(offset) = self.first_normalized.filter(|_| normalizer.is_some()) {
++            Err(error(Kind::NormalizationProfile, offset))
++        } else {
++            Ok(())
++        }
++    }
++    pub(crate) fn bind<'m>(
++        self,
++        model: &'m BPE,
++        normalizer: Option<&'m NormalizerWrapper>,
++    ) -> Result<AddedVocabularyCompilePlan<'m>, Error>
++    where
++        'a: 'm,
++    {
++        self.validate_normalizer(normalizer)?;
++        Ok(AddedVocabularyCompilePlan {
++            input: self.input,
++            root: self.root,
++            model,
++            normalizer,
++            requirements: self.requirements,
++            #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++            fail_at: None,
++        })
++    }
++}
++
+ /// One attempt, borrowing the actual immutable model and normalizer configuration.
+ /// No identity boolean, caller byte fact, fresh model/normalizer argument at compile,
+ /// tokenizer construction or funding authority is accepted.
+@@ -174,7 +259,7 @@
+     model: &'a BPE,
+     normalizer: Option<&'a NormalizerWrapper>,
+     requirements: AddedVocabularyCompileRequirements,
+-    #[cfg(test)]
++    #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
+     fail_at: Option<usize>,
+ }
+ impl<'a> AddedVocabularyCompilePlan<'a> {
+@@ -186,42 +271,7 @@
+         model: &'a BPE,
+         normalizer: Option<&'a NormalizerWrapper>,
+     ) -> Result<Self, Error> {
+-        let input =
+-            std::str::from_utf8(input).map_err(|e| error(Kind::InvalidUtf8, e.valid_up_to()))?;
+-        let mut r = Reader::new(
+-            input,
+-            Span {
+-                start: 0,
+-                end: input.len(),
+-            },
+-        );
+-        let root = r.value()?;
+-        r.finish()?;
+-        let mut a = Reader::new(input, root).array()?;
+-        let mut n = 0usize;
+-        let mut b = 0usize;
+-        while let Some(span) = a.next()? {
+-            let token = token(input, span)?;
+-            n = checked_add(n, 1)?;
+-            b = checked_add(b, token.content.len())?;
+-            if token.content.len() != 0 {
+-                if token.flags & (SINGLE | LEFT | RIGHT) != 0 {
+-                    return Err(error(Kind::WordOrStripProfile, span.start));
+-                }
+-                if token.flags & NORMALIZED != 0 && normalizer.is_some() {
+-                    return Err(error(Kind::NormalizationProfile, span.start));
+-                }
+-            }
+-        }
+-        Ok(Self {
+-            input,
+-            root,
+-            model,
+-            normalizer,
+-            requirements: requirements(n, b)?,
+-            #[cfg(test)]
+-            fail_at: None,
+-        })
++        AddedVocabularyRecipe::prepare_json(input, normalizer)?.bind(model, normalizer)
+     }
+     pub fn requirements(&self) -> AddedVocabularyCompileRequirements {
+         self.requirements
+@@ -252,14 +302,14 @@
+             storage: Storage::Packed(partial),
+         })
+     }
+-    #[cfg(test)]
+-    fn fail_reservation(mut self, stage: usize) -> Self {
++    #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++    pub(crate) fn fail_reservation(mut self, stage: usize) -> Self {
+         assert!(stage < 4);
+         self.fail_at = Some(stage);
+         self
+     }
+     fn requested_capacity(&self, stage: usize, requested: usize) -> usize {
+-        #[cfg(test)]
++        #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
+         if self.fail_at == Some(stage) {
+             return usize::MAX;
+         }
+@@ -423,6 +473,8 @@
+         size_of::<json::Bytes<'_>>(),
+         json::stack_bytes(),
+         size_of::<json::Error>(),
++        size_of::<AddedVocabularyRecipe<'_>>(),
++        size_of::<Result<AddedVocabularyRecipe<'_>, Error>>(),
+         size_of::<AddedVocabularyCompilePlan<'_>>(),
+         size_of::<Result<AddedVocabularyCompilePlan<'_>, Error>>(),
+         size_of::<AddedVocabularyCompileRequirements>(),
+--- /dev/null
++++ b/src/tokenizer/compile.rs
+@@ -0,0 +1,681 @@
++//! Exact borrowed root planning and fresh aggregate HF construction. No account.
++use super::{
++    added_vocabulary::AddedVocabularyRecipe, AddedVocabulary, AddedVocabularyCompileError,
++    AddedVocabularyCompileFailure, Tokenizer, TokenizerImpl,
++};
++use crate::{
++    decoders::{sequence::Sequence as DecodeSequence, DecoderWrapper},
++    models::{
++        bpe::{BpeCompileError, BpeCompileFailure, BpeCompilePlan, BPE},
++        ModelWrapper,
++    },
++    normalizers::{NormalizerWrapper, NFC},
++    pre_tokenizers::{
++        byte_level::ByteLevel, digits::Digits, sequence::Sequence as PreSequence,
++        PreTokenizerWrapper,
++    },
++    processors::{sequence::Sequence as PostSequence, PostProcessorWrapper},
++    utils::borrowed_json::{self as json, Reader, Span},
++};
++use std::{alloc::Layout, collections::TryReserveError, fmt, mem::size_of};
++
++/// Fixed source validation categories for the current aggregate constructor.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum TokenizerCompileErrorKind {
++    /// Input is not UTF-8.
++    InvalidUtf8,
++    /// Input is not valid JSON for the selected field.
++    InvalidJson,
++    /// JSON nesting exceeds the fixed parser stack.
++    DepthLimit,
++    /// A required field is absent.
++    MissingField,
++    /// A recognized field occurs more than once.
++    DuplicateField,
++    /// A field has no constructor lowering yet.
++    UnsupportedField,
++    /// The tokenizer format version is not 1.0.
++    Version,
++    /// The selected pretokenizer requires unfinished regex construction.
++    RegexProfile,
++    /// The selected component or settings lack complete construction support.
++    ComponentProfile,
++    /// An actual reserved capacity exceeds its accepted source extent.
++    CapacityExceeded,
++    /// A checked host extent overflowed.
++    Overflow,
++}
++/// Fixed root error or exact borrowed component diagnostic; no allocated message.
++#[derive(Debug, Clone, Copy)]
++pub enum TokenizerCompileError {
++    /// Root or selected pipeline component validation failed.
++    Root {
++        /// Fixed validation category.
++        kind: TokenizerCompileErrorKind,
++        /// Byte offset in the complete root input.
++        offset: usize,
++    },
++    /// Model planning diagnostic; its offset is relative to the model object.
++    Model(BpeCompileError),
++    /// Added-array planning diagnostic; its offset is relative to that array.
++    Added(AddedVocabularyCompileError),
++}
++impl TokenizerCompileError {
++    /// Root category, or ComponentProfile for a component-specific source.
++    pub fn kind(&self) -> TokenizerCompileErrorKind {
++        match self {
++            Self::Root { kind, .. } => *kind,
++            _ => TokenizerCompileErrorKind::ComponentProfile,
++        }
++    }
++}
++impl fmt::Display for TokenizerCompileError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        write!(f, "tokenizer construction {self:?}")
++    }
++}
++impl std::error::Error for TokenizerCompileError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Model(e) => Some(e),
++            Self::Added(e) => Some(e),
++            _ => None,
++        }
++    }
++}
++impl From<json::Error> for TokenizerCompileError {
++    fn from(e: json::Error) -> Self {
++        err(
++            match e.kind {
++                json::Kind::InvalidJson => K::InvalidJson,
++                json::Kind::DepthLimit => K::DepthLimit,
++            },
++            e.offset,
++        )
++    }
++}
++impl From<BpeCompileError> for TokenizerCompileError {
++    fn from(e: BpeCompileError) -> Self {
++        Self::Model(e)
++    }
++}
++impl From<AddedVocabularyCompileError> for TokenizerCompileError {
++    fn from(e: AddedVocabularyCompileError) -> Self {
++        Self::Added(e)
++    }
++}
++type Error = TokenizerCompileError;
++type K = TokenizerCompileErrorKind;
++fn err(kind: K, offset: usize) -> Error {
++    Error::Root { kind, offset }
++}
++fn add(a: usize, b: usize) -> Result<usize, Error> {
++    a.checked_add(b).ok_or(err(K::Overflow, 0))
++}
++fn fields<const N: usize>(
++    input: &str,
++    span: Span,
++    names: [&str; N],
++) -> Result<[Option<Span>; N], Error> {
++    let mut out = [None; N];
++    let mut object = Reader::new(input, span).object()?;
++    while let Some((key, value)) = object.next()? {
++        let i = names
++            .iter()
++            .position(|n| key.is(n))
++            .ok_or(err(K::UnsupportedField, key.offset))?;
++        if out[i].replace(value).is_some() {
++            return Err(err(K::DuplicateField, key.offset));
++        }
++    }
++    Ok(out)
++}
++fn required(value: Option<Span>, at: usize) -> Result<Span, Error> {
++    value.ok_or(err(K::MissingField, at))
++}
++fn text_is(input: &str, span: Span, expected: &str) -> Result<bool, Error> {
++    let mut r = Reader::new(input, span);
++    let t = r.string()?;
++    r.finish()?;
++    Ok(t.is(expected))
++}
++fn boolean(input: &str, value: Option<Span>, default: bool) -> Result<bool, Error> {
++    match value {
++        None => Ok(default),
++        Some(s) => match &input[s.start..s.end] {
++            "true" => Ok(true),
++            "false" => Ok(false),
++            _ => Err(err(K::InvalidJson, s.start)),
++        },
++    }
++}
++fn absent(input: &str, value: Option<Span>) -> Option<Span> {
++    value.filter(|s| &input[s.start..s.end] != "null")
++}
++#[derive(Debug, Clone, Copy)]
++enum Role {
++    Pre,
++    Post,
++    Decode,
++}
++#[derive(Debug, Clone, Copy)]
++enum Inline {
++    Byte(ByteLevel),
++    Digits(bool),
++}
++fn inline(input: &str, span: Span, role: Role) -> Result<Inline, Error> {
++    // First select the actual type without building serde strings/components.
++    let mut r = Reader::new(input, span).object()?;
++    let mut typ = None;
++    while let Some((key, value)) = r.next()? {
++        if key.is("type") {
++            if typ.replace(value).is_some() {
++                return Err(err(K::DuplicateField, key.offset));
++            }
++        }
++    }
++    let typ = required(typ, span.start)?;
++    if text_is(input, typ, "Split")? {
++        return Err(err(K::RegexProfile, span.start));
++    }
++    if text_is(input, typ, "ByteLevel")? {
++        let f = fields(
++            input,
++            span,
++            ["type", "add_prefix_space", "trim_offsets", "use_regex"],
++        )?;
++        let value = ByteLevel::new(
++            boolean(input, f[1], true)?,
++            boolean(input, f[2], true)?,
++            boolean(input, f[3], true)?,
++        );
++        if matches!(role, Role::Pre) && value.use_regex {
++            return Err(err(K::RegexProfile, span.start));
++        }
++        Ok(Inline::Byte(value))
++    } else if matches!(role, Role::Pre) && text_is(input, typ, "Digits")? {
++        let f = fields(input, span, ["type", "individual_digits"])?;
++        Ok(Inline::Digits(boolean(input, f[1], false)?))
++    } else {
++        Err(err(K::ComponentProfile, span.start))
++    }
++}
++#[derive(Debug, Clone, Copy)]
++struct Component {
++    value: Option<Span>,
++    array: Option<Span>,
++    count: usize,
++    role: Role,
++}
++impl Component {
++    fn plan(input: &str, value: Option<Span>, role: Role) -> Result<Self, Error> {
++        let value = absent(input, value);
++        let mut result = Self {
++            value,
++            array: None,
++            count: 0,
++            role,
++        };
++        let Some(span) = value else {
++            if matches!(role, Role::Decode) {
++                return Err(err(K::ComponentProfile, 0));
++            }
++            return Ok(result);
++        };
++        let mut object = Reader::new(input, span).object()?;
++        let mut typ = None;
++        while let Some((k, v)) = object.next()? {
++            if k.is("type") {
++                if typ.replace(v).is_some() {
++                    return Err(err(K::DuplicateField, k.offset));
++                }
++            }
++        }
++        if text_is(input, required(typ, span.start)?, "Sequence")? {
++            let member = match role {
++                Role::Pre => "pretokenizers",
++                Role::Post => "processors",
++                Role::Decode => "decoders",
++            };
++            let f = fields(input, span, ["type", member])?;
++            let array = required(f[1], span.start)?;
++            let mut a = Reader::new(input, array).array()?;
++            while let Some(item) = a.next()? {
++                inline(input, item, role)?;
++                result.count = add(result.count, 1)?;
++            }
++            if matches!(role, Role::Decode) && result.count != 1 {
++                return Err(err(K::ComponentProfile, array.start));
++            }
++            result.array = Some(array);
++        } else {
++            inline(input, span, role)?;
++        }
++        Ok(result)
++    }
++    fn bytes(&self) -> Result<usize, Error> {
++        let layout = match self.role {
++            Role::Pre => Layout::array::<PreTokenizerWrapper>(self.count),
++            Role::Post => Layout::array::<PostProcessorWrapper>(self.count),
++            Role::Decode => Layout::array::<DecoderWrapper>(self.count),
++        };
++        layout.map(|l| l.size()).map_err(|_| err(K::Overflow, 0))
++    }
++}
++/// Checked compiler buffers, named controls and the borrowed decoder envelope.
++#[derive(Debug, Clone, Copy)]
++pub struct TokenizerCompileRequirements {
++    buffers: usize,
++    controls: usize,
++    total: usize,
++    decoder_ids: usize,
++    decoder_bytes: usize,
++}
++impl TokenizerCompileRequirements {
++    /// Simultaneous model, added and pipeline destination capacities.
++    pub fn buffer_bytes(&self) -> usize {
++        self.buffers
++    }
++    /// Named compiler, partial, error and return representations.
++    pub fn control_bytes(&self) -> usize {
++        self.controls
++    }
++    /// Checked sum of buffers and controls; not an allocation grant.
++    pub fn required_bytes(&self) -> usize {
++        self.total
++    }
++    /// Maximum actual model-plus-added ID visits, independent of largest ID.
++    pub fn decoder_id_slots(&self) -> usize {
++        self.decoder_ids
++    }
++    /// ByteLevel raw spelling envelope including added-ID shadowing.
++    pub fn decoder_piece_bytes(&self) -> usize {
++        self.decoder_bytes
++    }
++}
++/// One source borrow, one fresh complete inline-profile tokenizer construction.
++///
++/// ```compile_fail
++/// use tokenizers::TokenizerCompilePlan;
++/// fn repeat(plan:TokenizerCompilePlan<'_>){let _=plan.compile();let _=plan.compile();}
++/// ```
++#[derive(Debug)]
++pub struct TokenizerCompilePlan<'a> {
++    input: &'a str,
++    model: BpeCompilePlan<'a>,
++    added: AddedVocabularyRecipe<'a>,
++    normalizer: Option<NormalizerWrapper>,
++    pre: Component,
++    post: Component,
++    decoder: Component,
++    requirements: TokenizerCompileRequirements,
++    #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++    fail_at: Option<usize>,
++    #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++    added_failure: Option<usize>,
++}
++impl<'a> TokenizerCompilePlan<'a> {
++    /// Borrows and validates one complete root without allocating destinations.
++    pub fn prepare_json(bytes: &'a [u8]) -> Result<Self, Error> {
++        let input = std::str::from_utf8(bytes).map_err(|e| err(K::InvalidUtf8, e.valid_up_to()))?;
++        let mut r = Reader::new(
++            input,
++            Span {
++                start: 0,
++                end: input.len(),
++            },
++        );
++        let root = r.value()?;
++        r.finish()?;
++        let f = fields(
++            input,
++            root,
++            [
++                "version",
++                "truncation",
++                "padding",
++                "added_tokens",
++                "normalizer",
++                "pre_tokenizer",
++                "post_processor",
++                "decoder",
++                "model",
++            ],
++        )?;
++        if let Some(version) = f[0] {
++            if !text_is(input, version, "1.0")? {
++                return Err(err(K::Version, version.start));
++            }
++        }
++        for span in [f[1], f[2]].into_iter().flatten() {
++            if &input[span.start..span.end] != "null" {
++                return Err(err(K::ComponentProfile, span.start));
++            }
++        }
++        // Selected execution components are rejected before model planning/admission.
++        let pre = Component::plan(input, f[5], Role::Pre)?;
++        let post = Component::plan(input, f[6], Role::Post)?;
++        let decoder = Component::plan(input, f[7], Role::Decode)?;
++        let normalizer = if let Some(span) = absent(input, f[4]) {
++            let n = fields(input, span, ["type"])?;
++            if !text_is(input, required(n[0], span.start)?, "NFC")? {
++                return Err(err(K::ComponentProfile, span.start));
++            }
++            Some(NormalizerWrapper::NFC(NFC))
++        } else {
++            None
++        };
++        let span = required(f[8], root.start)?;
++        let model = BpeCompilePlan::prepare_model_json(&bytes[span.start..span.end])?;
++        let added_bytes = f[3].map_or(b"[]".as_slice(), |s| &bytes[s.start..s.end]);
++        let added = AddedVocabularyRecipe::prepare_json(added_bytes, normalizer.as_ref())?;
++        let m = model.requirements();
++        let a = added.requirements();
++        let buffers = add(
++            add(m.buffer_bytes(), a.buffer_bytes())?,
++            add(add(pre.bytes()?, post.bytes()?)?, decoder.bytes()?)?,
++        )?;
++        let controls = [
++            m.control_bytes(),
++            a.control_bytes(),
++            size_of::<Self>(),
++            size_of::<Result<Self, Error>>(),
++            size_of::<TokenizerCompileRequirements>(),
++            size_of::<Component>(),
++            size_of::<[Component; 3]>(),
++            size_of::<Result<Inline, Error>>(),
++            size_of::<Result<[Option<Span>; 9], Error>>(),
++            size_of::<Result<[Option<Span>; 4], Error>>(),
++            size_of::<Result<[Option<Span>; 2], Error>>(),
++            size_of::<Inline>(),
++            size_of::<Partial>(),
++            size_of::<Tokenizer>(),
++            size_of::<
++                TokenizerImpl<
++                    ModelWrapper,
++                    NormalizerWrapper,
++                    PreTokenizerWrapper,
++                    PostProcessorWrapper,
++                    DecoderWrapper,
++                >,
++            >(),
++            size_of::<TokenizerCompileFailure>(),
++            size_of::<Cause>(),
++            size_of::<Error>(),
++            size_of::<Result<Tokenizer, TokenizerCompileFailure>>(),
++            size_of::<Result<(), Cause>>(),
++            size_of::<Result<(), TryReserveError>>(),
++            size_of::<Result<AddedVocabulary, AddedVocabularyCompileFailure>>(),
++            size_of::<Option<Span>>() * 9,
++            size_of::<json::Object<'_>>(),
++            size_of::<json::Array<'_>>(),
++            size_of::<Reader<'_>>(),
++            json::stack_bytes(),
++        ]
++        .iter()
++        .try_fold(0usize, |sum, &n| sum.checked_add(n))
++        .ok_or(err(K::Overflow, 0))?;
++        let requirements = TokenizerCompileRequirements {
++            buffers,
++            controls,
++            total: add(buffers, controls)?,
++            decoder_ids: add(m.vocabulary_slots(), a.raw_slots())?,
++            decoder_bytes: add(
++                m.spelling_bytes(),
++                a.content_bytes()
++                    .checked_mul(2)
++                    .ok_or(err(K::Overflow, 0))?,
++            )?,
++        };
++        Ok(Self {
++            input,
++            model,
++            added,
++            normalizer,
++            pre,
++            post,
++            decoder,
++            requirements,
++            #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++            fail_at: None,
++            #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++            added_failure: None,
++        })
++    }
++    /// Returns the sealed source-derived requirements without construction.
++    pub fn requirements(&self) -> TokenizerCompileRequirements {
++        self.requirements
++    }
++    /// Development-only capacity overflow on actual sequence destination reserves.
++    #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++    #[doc(hidden)]
++    pub fn fail_reservation(mut self, stage: usize) -> Self {
++        assert!(stage < 3);
++        self.fail_at = Some(stage);
++        self
++    }
++    /// Development-only capacity overflow on the actual selected model reserve.
++    #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++    #[doc(hidden)]
++    pub fn fail_model_reservation(mut self, stage: usize) -> Self {
++        self.model = self.model.fail_reservation(stage);
++        self
++    }
++    /// Development-only capacity overflow on the actual selected added reserve.
++    #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++    #[doc(hidden)]
++    pub fn fail_added_reservation(mut self, stage: usize) -> Self {
++        assert!(stage < 4);
++        self.added_failure = Some(stage);
++        self
++    }
++    /// Consumes the root once and constructs every component fresh.
++    pub fn compile(self) -> Result<Tokenizer, TokenizerCompileFailure> {
++        let mut partial = Partial::default();
++        let fail_at = {
++            #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++            {
++                self.fail_at
++            }
++            #[cfg(not(any(test, feature = "tokenizer-compiler-test-support")))]
++            {
++                None::<usize>
++            }
++        };
++        let result = (|| -> Result<(), Cause> {
++            partial.model = Some(self.model.compile().map_err(Cause::Model)?);
++            partial.normalizer = self.normalizer;
++            fill_components(
++                self.input,
++                self.pre,
++                self.post,
++                self.decoder,
++                fail_at,
++                &mut partial,
++            )?;
++            let plan = self.added.bind(
++                partial.model.as_ref().expect("constructed model"),
++                partial.normalizer.as_ref(),
++            )?;
++            #[cfg(any(test, feature = "tokenizer-compiler-test-support"))]
++            let plan = if let Some(stage) = self.added_failure {
++                plan.fail_reservation(stage)
++            } else {
++                plan
++            };
++            partial.added = Some(plan.compile().map_err(Cause::Added)?);
++            Ok(())
++        })();
++        if let Err(cause) = result {
++            return Err(TokenizerCompileFailure { cause, partial });
++        }
++        Ok(Tokenizer(TokenizerImpl {
++            model: ModelWrapper::BPE(partial.model.take().expect("model")),
++            normalizer: partial.normalizer.take(),
++            pre_tokenizer: partial.pre.take(),
++            post_processor: partial.post.take(),
++            decoder: partial.decoder.take(),
++            added_vocabulary: partial.added.take().expect("added"),
++            truncation: None,
++            padding: None,
++        }))
++    }
++}
++#[derive(Debug, Default)]
++struct Partial {
++    model: Option<BPE>,
++    added: Option<AddedVocabulary>,
++    normalizer: Option<NormalizerWrapper>,
++    pre: Option<PreTokenizerWrapper>,
++    post: Option<PostProcessorWrapper>,
++    decoder: Option<DecoderWrapper>,
++    pre_items: Vec<PreTokenizerWrapper>,
++    post_items: Vec<PostProcessorWrapper>,
++    decode_items: Vec<DecoderWrapper>,
++}
++fn requested(stage: usize, n: usize, fail: Option<usize>) -> usize {
++    if fail == Some(stage) {
++        usize::MAX
++    } else {
++        n
++    }
++}
++fn fill_components(
++    input: &str,
++    pre: Component,
++    post: Component,
++    decoder: Component,
++    fail: Option<usize>,
++    p: &mut Partial,
++) -> Result<(), Cause> {
++    for component in [pre, post, decoder] {
++        let Some(span) = component.value else {
++            continue;
++        };
++        if let Some(array) = component.array {
++            match component.role {
++                Role::Pre => p
++                    .pre_items
++                    .try_reserve_exact(requested(0, component.count, fail))?,
++                Role::Post => {
++                    p.post_items
++                        .try_reserve_exact(requested(1, component.count, fail))?
++                }
++                Role::Decode => {
++                    p.decode_items
++                        .try_reserve_exact(requested(2, component.count, fail))?
++                }
++            };
++            let actual = match component.role {
++                Role::Pre => p.pre_items.capacity(),
++                Role::Post => p.post_items.capacity(),
++                Role::Decode => p.decode_items.capacity(),
++            };
++            if actual > component.count {
++                return Err(err(K::CapacityExceeded, array.start).into());
++            }
++            let mut a = Reader::new(input, array).array().map_err(Error::from)?;
++            while let Some(item) = a.next().map_err(Error::from)? {
++                let item = inline(input, item, component.role)?;
++                match (component.role, item) {
++                    (Role::Pre, Inline::Byte(b)) => p.pre_items.push(b.into()),
++                    (Role::Pre, Inline::Digits(d)) => p.pre_items.push(Digits::new(d).into()),
++                    (Role::Post, Inline::Byte(b)) => p.post_items.push(b.into()),
++                    (Role::Decode, Inline::Byte(b)) => p.decode_items.push(b.into()),
++                    _ => return Err(err(K::ComponentProfile, span.start).into()),
++                }
++            }
++            match component.role {
++                Role::Pre => {
++                    p.pre = Some(PreSequence::new(std::mem::take(&mut p.pre_items)).into())
++                }
++                Role::Post => {
++                    p.post = Some(PostSequence::new(std::mem::take(&mut p.post_items)).into())
++                }
++                Role::Decode => {
++                    p.decoder =
++                        Some(DecodeSequence::new(std::mem::take(&mut p.decode_items)).into())
++                }
++            }
++        } else {
++            match (component.role, inline(input, span, component.role)?) {
++                (Role::Pre, Inline::Byte(b)) => p.pre = Some(b.into()),
++                (Role::Pre, Inline::Digits(d)) => p.pre = Some(Digits::new(d).into()),
++                (Role::Post, Inline::Byte(b)) => p.post = Some(b.into()),
++                (Role::Decode, Inline::Byte(b)) => p.decoder = Some(b.into()),
++                _ => return Err(err(K::ComponentProfile, span.start).into()),
++            }
++        }
++    }
++    Ok(())
++}
++#[derive(Debug)]
++enum Cause {
++    Source(Error),
++    Model(BpeCompileFailure),
++    Added(AddedVocabularyCompileFailure),
++    Reserve(TryReserveError),
++}
++impl From<Error> for Cause {
++    fn from(e: Error) -> Self {
++        Self::Source(e)
++    }
++}
++impl From<AddedVocabularyCompileError> for Cause {
++    fn from(e: AddedVocabularyCompileError) -> Self {
++        Self::Source(e.into())
++    }
++}
++impl From<TryReserveError> for Cause {
++    fn from(e: TryReserveError) -> Self {
++        Self::Reserve(e)
++    }
++}
++/// Owns every completed component and the actual failing constructor prefix.
++#[derive(Debug)]
++pub struct TokenizerCompileFailure {
++    cause: Cause,
++    partial: Partial,
++}
++impl TokenizerCompileFailure {
++    /// Whether a successfully constructed model is retained by this failure.
++    pub fn completed_model(&self) -> bool {
++        self.partial.model.is_some()
++    }
++    /// Borrows a fixed root construction diagnostic, when present.
++    pub fn source_error(&self) -> Option<&Error> {
++        match &self.cause {
++            Cause::Source(e) => Some(e),
++            _ => None,
++        }
++    }
++    /// Borrows the actual pipeline destination reserve failure, when present.
++    pub fn allocation_error(&self) -> Option<&TryReserveError> {
++        match &self.cause {
++            Cause::Reserve(e) => Some(e),
++            _ => None,
++        }
++    }
++}
++impl fmt::Display for TokenizerCompileFailure {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match &self.cause {
++            Cause::Source(e) => fmt::Display::fmt(e, f),
++            Cause::Model(e) => fmt::Display::fmt(e, f),
++            Cause::Added(e) => fmt::Display::fmt(e, f),
++            Cause::Reserve(e) => fmt::Display::fmt(e, f),
++        }
++    }
++}
++impl std::error::Error for TokenizerCompileFailure {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match &self.cause {
++            Cause::Source(e) => Some(e),
++            Cause::Model(e) => Some(e),
++            Cause::Added(e) => Some(e),
++            Cause::Reserve(e) => Some(e),
++        }
++    }
++}
++#[cfg(test)]
++mod tests;
+--- /dev/null
++++ b/src/tokenizer/compile/tests.rs
+@@ -0,0 +1,222 @@
++use super::*;
++use crate::Model;
++use serde_json::{json, Value};
++
++fn added(content: &str, normalized: bool, special: bool) -> Value {
++    json!({"id":9999,"content":content,"single_word":false,"lstrip":false,"rstrip":false,"normalized":normalized,"special":special})
++}
++fn source() -> Value {
++    let mut alphabet: Vec<_> = ByteLevel::alphabet().into_iter().collect();
++    alphabet.sort_unstable();
++    let mut vocab = serde_json::Map::new();
++    for (id, c) in alphabet.into_iter().enumerate() {
++        vocab.insert(c.to_string(), json!(id));
++    }
++    vocab.insert("hi".into(), json!(256));
++    let byte =
++        json!({"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false});
++    json!({"version":"1.0","truncation":null,"padding":null,
++        "added_tokens":[added("<S>",false,true),added("HI",true,false)],
++        "normalizer":null,
++        "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Digits","individual_digits":true},byte.clone()]},
++        "post_processor":{"type":"Sequence","processors":[byte.clone()]},
++        "decoder":{"type":"Sequence","decoders":[byte]},
++        "model":{"type":"BPE","vocab":vocab,"merges":[["h","i"]]}})
++}
++fn compare(actual: &Tokenizer, legacy: &Tokenizer, text: &str) {
++    for special in [false, true] {
++        let a = actual.encode(text, special).unwrap();
++        let b = legacy.encode(text, special).unwrap();
++        assert_eq!(a.get_ids(), b.get_ids(), "{text:?}");
++        assert_eq!(a.get_tokens(), b.get_tokens(), "{text:?}");
++        assert_eq!(a.get_offsets(), b.get_offsets(), "{text:?}");
++        assert_eq!(a.get_attention_mask(), b.get_attention_mask());
++        assert_eq!(a.get_special_tokens_mask(), b.get_special_tokens_mask());
++        for skip in [false, true] {
++            assert_eq!(
++                actual.decode(a.get_ids(), skip).unwrap(),
++                legacy.decode(b.get_ids(), skip).unwrap()
++            );
++        }
++    }
++}
++#[test]
++fn fresh_inline_aggregate_matches_legacy_nonzero_encoding_offsets_and_decode() {
++    for nfc in [false, true] {
++        let mut value = source();
++        if nfc {
++            value["normalizer"] = json!({"type":"NFC"});
++            value["added_tokens"][1]["normalized"] = json!(false);
++        }
++        let input = value.to_string();
++        let actual = TokenizerCompilePlan::prepare_json(input.as_bytes())
++            .unwrap()
++            .compile()
++            .unwrap();
++        let legacy = Tokenizer::from_bytes(input.as_bytes()).unwrap();
++        drop(input);
++        for text in [
++            "hi HI <S> hi",
++            "é e\u{301} 🦀",
++            " 12\t345\nhi",
++            "<S><S>HIhi",
++            "",
++            "\0\u{7f}",
++        ] {
++            compare(&actual, &legacy, text);
++        }
++        let bytes: String = (0u8..=255).map(char::from).collect();
++        compare(&actual, &legacy, &bytes);
++        let a = actual.encode(("hi 12", "é <S>"), true).unwrap();
++        let b = legacy.encode(("hi 12", "é <S>"), true).unwrap();
++        assert_eq!(a.get_ids(), b.get_ids());
++        assert_eq!(a.get_offsets(), b.get_offsets());
++        assert_eq!(a.get_type_ids(), b.get_type_ids());
++        assert!(actual.token_to_id("hi").is_some());
++        // Compatibility copies remain ordinary HF work; no aggregate owner exposes these APIs.
++        let cloned = actual.clone();
++        compare(&cloned, &legacy, "HIhi<S>");
++        let restored =
++            Tokenizer::from_bytes(serde_json::to_string(&actual).unwrap().as_bytes()).unwrap();
++        compare(&restored, &legacy, "hi é HI");
++    }
++}
++#[test]
++fn selected_regex_and_actual_normalizer_authority_reject_before_construction() {
++    for pre in [
++        json!({"type":"ByteLevel","use_regex":true}),
++        json!({"type":"Split","pattern":{"Regex":"\\w+"},"behavior":"Isolated","invert":false}),
++    ] {
++        let mut value = source();
++        value["pre_tokenizer"] = pre;
++        // Invalid model demonstrates selected regex is rejected before even model planning.
++        value["model"] = json!(false);
++        let input = value.to_string();
++        assert_eq!(
++            TokenizerCompilePlan::prepare_json(input.as_bytes())
++                .unwrap_err()
++                .kind(),
++            K::RegexProfile
++        );
++    }
++    let mut value = source();
++    value["normalizer"] = json!({"type":"NFC"});
++    let input = value.to_string();
++    assert!(matches!(
++        TokenizerCompilePlan::prepare_json(input.as_bytes()),
++        Err(Error::Added(_))
++    ));
++    for field in ["single_word", "lstrip", "rstrip"] {
++        let mut value = source();
++        value["added_tokens"][0][field] = json!(true);
++        assert!(matches!(
++            TokenizerCompilePlan::prepare_json(value.to_string().as_bytes()),
++            Err(Error::Added(_))
++        ));
++    }
++    for input in [
++        b"{}".as_slice(),
++        b"{\"model\":{},\"model\":{}}",
++        b"{\"unknown\":null}",
++        b"[]",
++        b"\xff",
++    ] {
++        assert!(TokenizerCompilePlan::prepare_json(input).is_err());
++    }
++    assert_eq!(add(usize::MAX, 1).unwrap_err().kind(), K::Overflow);
++}
++#[test]
++fn all_sequence_reserve_failures_retain_the_actual_completed_model_and_prior_components() {
++    for stage in 0..3 {
++        let input = source().to_string();
++        let error = TokenizerCompilePlan::prepare_json(input.as_bytes())
++            .unwrap()
++            .fail_reservation(stage)
++            .compile()
++            .unwrap_err();
++        drop(input);
++        assert!(error.allocation_error().is_some());
++        assert!(error.completed_model());
++        assert_eq!(
++            error.partial.model.as_ref().unwrap().token_to_id("hi"),
++            Some(256)
++        );
++        assert_eq!(error.partial.pre.is_some(), stage > 0);
++        assert_eq!(error.partial.post.is_some(), stage > 1);
++        assert!(error.partial.decoder.is_none());
++        assert!(error.partial.added.is_none());
++        assert_eq!(error.partial.pre_items.capacity(), 0);
++        assert_eq!(error.partial.post_items.capacity(), 0);
++        assert_eq!(error.partial.decode_items.capacity(), 0);
++    }
++}
++#[test]
++fn every_model_and_added_target_reserve_preserves_its_real_prefix_in_the_root_failure() {
++    let mut value = source();
++    value["model"] = json!({"type":"BPE","vocab":{"a":0,"##b</w>":1,"ab</w>":2,"[UNK]":3},"merges":[["a","##b</w>"]],"unk_token":"[UNK]","continuing_subword_prefix":"##","end_of_word_suffix":"</w>"});
++    for stage in 0..7 {
++        let input = value.to_string();
++        let error = TokenizerCompilePlan::prepare_json(input.as_bytes())
++            .unwrap()
++            .fail_model_reservation(stage)
++            .compile()
++            .unwrap_err();
++        drop(input);
++        let Cause::Model(failure) = &error.cause else {
++            panic!("actual BPE failure");
++        };
++        assert!(failure.allocation_error().is_some());
++        assert!(!error.completed_model());
++        let caps = failure.buffer_capacities();
++        assert!(caps[..stage].iter().all(|&n| n > 0));
++        assert!(caps[stage..].iter().all(|&n| n == 0));
++    }
++    for stage in 0..4 {
++        let input = source().to_string();
++        let error = TokenizerCompilePlan::prepare_json(input.as_bytes())
++            .unwrap()
++            .fail_added_reservation(stage)
++            .compile()
++            .unwrap_err();
++        drop(input);
++        let Cause::Added(failure) = &error.cause else {
++            panic!("actual added failure");
++        };
++        assert!(failure.allocation_error().is_some());
++        assert!(error.completed_model());
++        assert!(
++            error.partial.pre.is_some()
++                && error.partial.post.is_some()
++                && error.partial.decoder.is_some()
++        );
++        let caps = failure.buffer_capacities();
++        assert!(caps[..stage].iter().all(|&n| n > 0));
++        assert!(caps[stage..].iter().all(|&n| n == 0));
++    }
++}
++#[test]
++fn late_added_collision_retains_complete_components_without_rebinding_a_foreign_model() {
++    let mut value = source();
++    value["model"] = json!({"type":"BPE","vocab":{"a":0,"b":2},"merges":[]});
++    value["added_tokens"] = json!([added("new", false, true), added("b", false, false)]);
++    let input = value.to_string();
++    let plan = TokenizerCompilePlan::prepare_json(input.as_bytes()).unwrap();
++    let expected = plan.added.requirements().buffer_bytes();
++    let error = plan.compile().unwrap_err();
++    drop(input);
++    let Cause::Added(failure) = &error.cause else {
++        panic!("actual late collision");
++    };
++    assert!(failure.source_error().is_some());
++    assert_eq!(failure.allocated_bytes(), Some(expected));
++    assert!(error.completed_model());
++    assert_eq!(
++        error.partial.model.as_ref().unwrap().token_to_id("b"),
++        Some(2)
++    );
++    assert!(
++        error.partial.pre.is_some()
++            && error.partial.post.is_some()
++            && error.partial.decoder.is_some()
++    );
++}
+--- a/src/tokenizer/mod.rs
++++ b/src/tokenizer/mod.rs
+@@ -25,6 +25,11 @@
+ use crate::utils::progress::{ProgressBar, ProgressStyle};
+ 
+ mod added_vocabulary;
++mod compile;
++pub use compile::{
++    TokenizerCompileError, TokenizerCompileErrorKind, TokenizerCompileFailure,
++    TokenizerCompilePlan, TokenizerCompileRequirements,
++};
+ mod cache_policy;
+ mod encoding;
+ pub mod normalizer;
+@@ -461,12 +466,12 @@
+     added: &'a AddedVocabulary,
+ }
+ 
+-impl DecodeVocabulary<'_> {
++impl<'a> DecodeVocabulary<'a> {
+     /// Iterates model forward-vocabulary IDs followed by added reverse-map IDs.
+     /// Duplicates and unspecified order are preserved. The iterator borrows
+     /// model maps or packed tables directly; it allocates nothing and invokes
+     /// no user callback.
+-    pub fn ids(&self) -> impl Iterator<Item = u32> + '_ {
++    pub fn ids(&self) -> impl Iterator<Item = u32> + 'a {
+         self.model.decode_ids().chain(self.added.ids())
+     }
+ 
+@@ -480,7 +485,7 @@
+     }
+ 
+     /// Borrows the canonical decoding spelling, including normalized added tokens.
+-    pub fn id_to_token(&self, id: u32) -> Option<&str> {
++    pub fn id_to_token(&self, id: u32) -> Option<&'a str> {
+         self.added
+             .decode_token_ref(id)
+             .or_else(|| self.model.decode_token_ref(id))

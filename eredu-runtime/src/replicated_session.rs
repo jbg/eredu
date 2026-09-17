@@ -2,12 +2,19 @@
 
 #![allow(clippy::type_complexity)]
 
+mod contract_metadata;
+pub use contract_metadata::PreparedTextContractError;
+use contract_metadata::{ContractMetadata, DebugRows, ValidatedParameterCatalog};
+mod materialization_source;
+pub use materialization_source::PreparedContractMaterialization;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
     path::Path,
 };
 
+use crate::working_memory::InferenceStateRetention;
 use eredu_core::cache::{
     PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
     PromptCacheOptions, PromptCacheTopology, validate_prompt_cache_model_identity,
@@ -16,8 +23,29 @@ use eredu_core::{DistributedCommitEpoch, DistributedCommitOutcome, DistributedCo
 use eredu_nn::{NeuralBackend, Tensor};
 
 mod control;
+mod execution_inspection;
+mod parallel_context;
+mod parallel_control;
+pub use parallel_control::{ParallelControlEvent, ParallelControlIdentity, ParallelControlCursor, ParallelControlClaim};
+pub use parallel_context::{PreparedParallelContextCause, PreparedParallelContextFailure};
+pub use execution_inspection::RuntimeInspectionBoundary;
+mod media_semantic_binding;
+pub(crate) mod observation_paths;
+mod resident_reset;
+pub use media_semantic_binding::{MediaSemanticBindingError, OriginalMediaBindingError};
+pub use observation_paths::PreparedSessionObservationError;
+mod media_prefill;
 mod prediction;
-pub use control::{ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms};
+pub use prediction::PublishedPredictionPrefill;
+mod prefill;
+pub use control::{
+    PreparedControlBindingError, PreparedControlExchangeError, ReplicatedTextControlOrigin,
+    ReplicatedTextControlState, ReplicatedTextSnapshotMechanisms,
+};
+pub use prefill::{
+    MediaPrefillSpan, OrdinaryPrefillSpan, PrefillScoreLayout, PrefillSourceOutcome, PrefillSourceProgress,
+    PrefillSpanOperation, PreparedPrefillSource, SessionPrefill, SettledPrefillCompletion,
+};
 
 use crate::{
     ActivationObserver, ArchitecturePartition, CommunicationManifest, ExecutionResidency,
@@ -26,8 +54,8 @@ use crate::{
     ReplicatedTextArchitecture, ReplicatedTextMaterializationTask, ReplicatedTextOutputCompanion,
     ReplicatedTextOutputSelection, ReplicatedTextParameterPresence, RoutedExpertProvider,
     RoutedLayeredArchitecture, RuntimeState, SelectedReplicatedTextRealization,
-    SelectedStateRealization, StateError, SubmissionBackend, WeightLoweringKind,
-    observe_model_logits, partitioned_replicated_text_materialization_tasks,
+    SelectedStateRealization, SharedPreparedInputCacheIdentity, StateError, SubmissionBackend,
+    WeightLoweringKind, observe_model_logits, partitioned_replicated_text_materialization_tasks,
     plan_local_replicated_text_materialization_tasks, replicated_text_materialization_tasks,
 };
 
@@ -48,6 +76,170 @@ where
     Self::ResidentPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
     Self::BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>,
 {
+    /// Lends a prepared backend context only around the existing selected
+    /// numerical forward. The outer session keeps admission, checkpoint,
+    /// agreement, publication and failure recovery. Ordinary mechanisms call
+    /// the same closure directly. A context owner must outlive enclosing native
+    /// completion; restoring a context does not claim completion or refund.
+    fn with_execution_parallel<T,E,F>(
+        &self, context:&<B::Tensor as Tensor>::Context, run:F,
+    )->Result<Result<T,E>,Self::Error>
+    where F:FnOnce(Option<(&mut B::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E>,
+    {
+        let _=context;
+        Ok(run(None))
+    }
+
+    /// Reborrows the enclosing numerical invocation for its quoted output
+    /// publication after forward. This does not rebind or reopen the invocation.
+    fn with_execution_parallel_publication<T,E,F>(&self,context:&<B::Tensor as Tensor>::Context,run:F)
+        ->Result<Result<T,E>,Self::Error>
+    where F:FnOnce(Option<(&B::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E> {
+        let _=context;Ok(run(None))
+    }
+
+    /// Lends a control-only request context around the existing numerical
+    /// forward. This is independent of the architecture's optional neural TP
+    /// context and retains no authority to alter tensor-parallel selection.
+    fn with_execution_parallel_control_context<T, E, F>(
+        &self, context: &<B::Tensor as Tensor>::Context, run: F,
+    ) -> Result<Result<T, E>, Self::Error>
+    where F: FnOnce(Option<(&mut Option<Box<B::ParallelContext>>,
+        &eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+    {
+        let _ = context;
+        Ok(run(None))
+    }
+
+    /// Lends the exact request-owned control context for this actual lifecycle
+    /// event. This includes phases before the numerical forward. Ordinary
+    /// mechanisms pass None; prepared contexts must never fall back to ordinary
+    /// communication. Native errors retain their source through BackendFailure.
+    fn with_execution_parallel_control<T, E, F>(
+        &self, event: ParallelControlEvent, context: &<B::Tensor as Tensor>::Context, run: F,
+    ) -> Result<Result<T, E>, eredu_core::BackendFailure>
+    where F: FnOnce(Option<(&B::ParallelContext, &eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+    {
+        let _ = (event, context);
+        Ok(run(None))
+    }
+
+    /// Reads the retained decoder frontier in the architecture-selected state
+    /// realization without native allocation or submission. `None` is reserved
+    /// for an explicit stateless rank; unknown stateful positions are errors.
+    fn prefill_state_frontier(&self, state: &Self::State) -> Result<Option<u64>, Self::Error>;
+
+    /// Allocation-free original-request inspection of the same actual selected
+    /// frontier. This companion must not format, box errors, initialize state or
+    /// settle native work. The default preserves the missing mechanism as a
+    /// temporary admission gap, not an architectural restriction.
+    fn original_prefill_state_frontier(
+        &self,
+        _state: &Self::State,
+    ) -> Result<Option<u64>, crate::working_memory::WorkingMemoryError> {
+        Err(crate::working_memory::WorkingMemoryError::UnknownBound)
+    }
+
+    /// Owns the admitted reservation through native preparation, completion,
+    /// failure recovery and teardown. Dropping an unresolved guard must retain
+    /// the reservation until independent native release evidence exists. Failure
+    /// Drop must be nonblocking; it must not use successful-completion waiting.
+    type PrefillReservationGuard;
+
+    /// Opens native reservation retention with one bounded, nonblocking attempt
+    /// before input preparation or an admitted transaction. Err accepted no work
+    /// under this attempt; older work must keep its independent owners. A failed
+    /// attempt cannot retain or authorize a new agreement vote.
+    fn begin_prefill_reservation(
+        &mut self,
+        reservation: crate::working_memory::InferenceRequest,
+    ) -> Result<Self::PrefillReservationGuard, Self::Error>;
+
+    /// Names the exact shared-prefill role before its existing scope begins.
+    /// Ordinary implementations delegate unchanged. An installed original bank
+    /// must validate the request/source and consume its corresponding fixed slot
+    /// before any constructor; it must never fall back to ordinary allocation.
+    fn begin_prefill_control(
+        &mut self,
+        reservation: crate::working_memory::InferenceRequest,
+        _role: crate::prefill::PrefillControlRole,
+    ) -> Result<Self::PrefillReservationGuard, Self::Error> {
+        self.begin_prefill_reservation(reservation)
+    }
+
+    /// Coordinates caller access before the one-shot reservation entry.
+    ///
+    /// The default immediately uses the existing bounded entry. A backend may
+    /// serialize ordinary constructor access here, retaining the same request
+    /// and a real runtime loan through that single attempt. It must release the
+    /// loan before replacing old roots, invoking callbacks, preparing inputs,
+    /// voting, executing or waiting for native work. Installed original roles
+    /// must keep their existing bounded attempt and exact slot ownership.
+    /// This is not a retry of a failed entry, an admission or a completion proof.
+    /// Shared cancellation boundaries sample their token after this call.
+    fn coordinate_prefill_entry(
+        &mut self,
+        reservation: crate::working_memory::InferenceRequest,
+        role: Option<crate::prefill::PrefillControlRole>,
+    ) -> Result<Self::PrefillReservationGuard, Self::Error> {
+        match role {
+            Some(role) => self.begin_prefill_control(reservation, role),
+            None => self.begin_prefill_reservation(reservation),
+        }
+    }
+
+    /// Settles successful preparation/execution and closes its retention scope.
+    /// An error must preserve unresolved retention through the guard's teardown.
+    fn finish_prefill_reservation(
+        &mut self,
+        guard: Self::PrefillReservationGuard,
+    ) -> Result<(), Self::Error>;
+
+    /// Opts into the guarded current-source boundary before each input chunk.
+    /// The default performs no source traversal and never calls the hook below.
+    fn requires_prefill_opening_sources(&self) -> bool {
+        false
+    }
+
+    /// Borrows the actual state and selected execution after the observer begins
+    /// the chunk, before observer opening/retention and input preparation. The
+    /// original preparation guard remains live; an error enters the existing
+    /// input agreement as a mechanism failure before model/state work.
+    ///
+    /// Neither source access nor the canonical context grants memory or native
+    /// work authority. Implementations must account for any inventory they build,
+    /// validate its completeness and preserve unresolved resources on failure.
+    /// The loans end before the observer or input source runs; no model lookup or
+    /// second session loan is needed. Opting in does not activate a capture gate.
+    fn prepare_prefill_opening_sources(
+        &mut self,
+        _state: &Self::State,
+        _context: &crate::inspection::PrefillChunkRetentionContext<'_>,
+        _execution: &crate::inspection::PrefillOpeningExecution<'_, B::Tensor>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Require validation of the actual stored prepared runtime token before
+    /// either source callback. Defaults preserve legacy source traversal.
+    fn requires_prepared_prefill_sources(&self) -> bool {
+        false
+    }
+
+    /// Borrows the same session's completed state and current execution after
+    /// canonical chunk completion and before observer source retirement. The
+    /// existing cancellation-retention guard is live. Errors participate in its
+    /// existing readiness vote and preserve the original cause; no extra vote,
+    /// completion certificate or storage authority is issued by this callback.
+    fn prepare_prefill_retirement_sources(
+        &mut self,
+        _state: &Self::State,
+        _ticket: &crate::inspection::SettledPrefillChunkRetention,
+        _execution: &crate::inspection::PrefillOpeningExecution<'_, B::Tensor>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Exact slot facts retained at selected materialization preparation.
     /// Empty means that this mechanism does not expose prepared slot metadata.
     fn prepared_parameter_slots(&self) -> &[crate::parameter_operations::PreparedParameterSlot] {
@@ -58,7 +250,7 @@ where
         &[]
     }
     /// Concrete mutable-state realization paired with the architecture.
-    type State: RuntimeState<B>;
+    type State: RuntimeState<B> + crate::working_memory::InferenceStateRetention;
     /// Shared failure type for resident and bounded runtime policies.
     type PolicyError;
     /// Concrete policy that owns fully resident bound units.
@@ -66,7 +258,7 @@ where
     /// Concrete policy used for host-windowed or disk-streamed traversal.
     type BoundedPolicy: LayerwisePolicy<B, A::Unit, Error = Self::PolicyError>;
     /// Opaque state checkpoint owned by the backend mechanism.
-    type StateCheckpoint;
+    type StateCheckpoint: InferenceStateRetention;
     /// Backend-native mutable-state residency report.
     type StateReport;
     /// Backend-native parameter/runtime residency report.
@@ -178,20 +370,63 @@ where
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error>;
 
-    /// Captures an opaque checkpoint of every live state component.
-    fn checkpoint_state(
+    /// Copies checkpoint storage; the shared wrapper attaches backing charges.
+    fn copy_checkpoint_state(
         &mut self,
         state: &Self::State,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<Self::StateCheckpoint, Self::Error>;
 
-    /// Restores every component from an opaque checkpoint.
-    fn restore_state(
+    /// Captures every live component and retains its exact inference charges.
+    fn checkpoint_state(
+        &mut self,
+        state: &Self::State,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<Self::StateCheckpoint, Self::Error> {
+        let mut checkpoint = self.copy_checkpoint_state(state, context)?;
+        checkpoint.inherit_inference_retention(state);
+        Ok(checkpoint)
+    }
+
+    /// Restores storage after the shared wrapper has retained both charge sets.
+    fn restore_checkpoint_state(
         &mut self,
         state: &mut Self::State,
         checkpoint: Self::StateCheckpoint,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<(), Self::Error>;
+
+    /// Restores every component from an opaque checkpoint.
+    fn restore_state(
+        &mut self,
+        state: &mut Self::State,
+        mut checkpoint: Self::StateCheckpoint,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<(), Self::Error> {
+        // Preserve current charges even if the mechanism replaces all state,
+        // and imported charges even if native restoration fails partway through.
+        // Empty branches have no charges/admission to transfer. Avoid creating
+        // transient revision identities which restore_admission and the final
+        // guard immediately invalidate; the same restore worker still runs.
+        if !state.inference_retention().is_empty() || !checkpoint.inference_retention().is_empty() {
+            state.inherit_inference_retention(&checkpoint);
+            checkpoint.inherit_inference_retention(state);
+        }
+        state
+            .inference_retention_mut()
+            .restore_admission(checkpoint.inference_retention());
+        // A mechanism can replace the whole state with its checkpoint, including
+        // the checkpoint's old revision. Invalidate the final installed owner on
+        // success, error or unwind so equal-frontier restoration cannot revive it.
+        struct Restoring<'a, S: InferenceStateRetention>(&'a mut S);
+        impl<S: InferenceStateRetention> Drop for Restoring<'_, S> {
+            fn drop(&mut self) {
+                self.0.inference_retention_mut().invalidate_revision();
+            }
+        }
+        let restoring = Restoring(state);
+        self.restore_checkpoint_state(&mut *restoring.0, checkpoint, context)
+    }
 
     /// Forks canonical state for one independently advanceable prediction lane.
     ///
@@ -243,10 +478,31 @@ where
         bounded: Option<&Self::BoundedPolicy>,
     ) -> Result<Self::ExecutionReport, Self::Error>;
 
-    /// Retains final output and mutable state through exact completion.
+    /// Complete retained future media roots in addition to ordinary output/state.
+    /// Defaults reject the media protocol before source work; implementations
+    /// must not infer completion of unused roots from the current span output.
+    fn supports_media_ingress_completion(&self) -> bool {
+        false
+    }
+
+    /// Exact ordinary completion over a closed borrowed retained-root source.
+    /// `None` means unavailable; no implicit fallback or newly funded work.
+    fn complete_media_ingress(
+        &mut self,
+        _output: Option<&B::Tensor>,
+        _state: &Self::State,
+        _roots: &crate::media_prefill::RetainedMediaRoots<'_, B::Tensor>,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Option<Result<(), Self::Error>> {
+        None
+    }
+
+    /// Retains optional final output and all mutable state through exact completion.
+    /// A state-only chunk supplies no vocabulary output; state/token-validation
+    /// dependencies still have to settle before the next chunk may start.
     fn complete(
         &mut self,
-        output: &B::Tensor,
+        output: Option<&B::Tensor>,
         state: &Self::State,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<(), Self::Error>;
@@ -265,6 +521,18 @@ where
 {
     /// Operation result retained by the prediction adapter.
     type Output;
+
+    /// Whether this operation preserves target geometry, parameter topology and
+    /// observation declarations on success, error and unwind. Stateful neural
+    /// execution may update its supplied lane and module execution state. It
+    /// must not replace the architecture or change those declarations.
+    ///
+    /// The default invalidates prepared bindings before exposing the target.
+    /// Closed architecture-owned prediction operations opt in; this is a
+    /// semantic execution contract, not source or allocation authority.
+    fn preserves_architecture_declarations(&self) -> bool {
+        false
+    }
 
     /// Executes against the exact architecture and mutable state owned by the neutral session.
     fn apply(
@@ -413,14 +681,34 @@ where
         }
     }
 
+    /// Borrows the actual selected static aggregate without loading a unit.
+    /// The aggregate is a component source, not complete architecture storage.
+    pub fn static_modules_ref(&self) -> &A::StaticModules {
+        match &self.kind {
+            ReplicatedTextRuntimeKind::Resident(runtime) => runtime.architecture().static_modules(),
+            ReplicatedTextRuntimeKind::Bounded(runtime) => runtime.architecture().static_modules(),
+        }
+    }
+
+    /// Visits the exact currently retained ordinary runtime owners. No unit
+    /// acquisition, state mutation or native work is authorized. False preserves
+    /// incomplete coverage even after a known prefix has been visited.
+    pub fn visit_retained_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        match &self.kind {
+            ReplicatedTextRuntimeKind::Resident(runtime) => runtime.visit_retained_values(visitor),
+            ReplicatedTextRuntimeKind::Bounded(runtime) => runtime.visit_retained_values(visitor),
+        }
+    }
+
     fn forward_with_observer<'a, O>(
         &mut self,
         input: A::Input<'a>,
         state: &mut S,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
+        demand: eredu_core::OutputDemand,
     ) -> Result<
-        (B::Tensor, A::ForwardContext),
+        (Option<B::Tensor>, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     >
     where
@@ -428,10 +716,14 @@ where
     {
         match &mut self.kind {
             ReplicatedTextRuntimeKind::Resident(runtime) => runtime
-                .forward_with_observer_and_context(input, state, context, observer)
+                .forward_with_observer_and_context_with_readout(
+                    input, state, context, observer, demand,
+                )
                 .map_err(map_layerwise_error),
             ReplicatedTextRuntimeKind::Bounded(runtime) => runtime
-                .forward_with_observer_and_context(input, state, context, observer)
+                .forward_with_observer_and_context_with_readout(
+                    input, state, context, observer, demand,
+                )
                 .map_err(map_layerwise_error),
         }
     }
@@ -444,8 +736,9 @@ where
         provider: &mut Provider,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut Observer,
+        demand: eredu_core::OutputDemand,
     ) -> Result<
-        (B::Tensor, A::ForwardContext),
+        (Option<B::Tensor>, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     >
     where
@@ -457,15 +750,22 @@ where
     {
         match &mut self.kind {
             ReplicatedTextRuntimeKind::Resident(runtime) => runtime
-                .forward_with_provider_and_observer_and_context(
-                    input, state, pass, provider, context, observer,
+                .forward_with_provider_and_observer_and_context_with_readout(
+                    input, state, pass, provider, context, observer, demand,
                 )
                 .map_err(map_layerwise_error),
             ReplicatedTextRuntimeKind::Bounded(runtime) => runtime
-                .forward_with_provider_and_observer_and_context(
-                    input, state, pass, provider, context, observer,
+                .forward_with_provider_and_observer_and_context_with_readout(
+                    input, state, pass, provider, context, observer, demand,
                 )
                 .map_err(map_layerwise_error),
+        }
+    }
+
+    fn resident_policy(&self) -> Option<&R> {
+        match &self.kind {
+            ReplicatedTextRuntimeKind::Resident(runtime) => Some(runtime.policy()),
+            ReplicatedTextRuntimeKind::Bounded(_) => None,
         }
     }
 
@@ -495,10 +795,10 @@ where
     {
         match &mut self.kind {
             ReplicatedTextRuntimeKind::Resident(runtime) => {
-                operation.apply(runtime.architecture_mut(), state, None, context)
+                runtime.apply_prediction_target_operation(operation, state, None, context)
             }
             ReplicatedTextRuntimeKind::Bounded(runtime) => {
-                operation.apply(runtime.architecture_mut(), state, None, context)
+                runtime.apply_prediction_target_operation(operation, state, None, context)
             }
         }
     }
@@ -523,8 +823,79 @@ where
     /// Whether control phases use a selected bounded all-rank agreement.
     const DISTRIBUTED_PHASE_AGREEMENT: bool = false;
 
+    /// Whether the selected strategy invokes the architecture's ordinary unit
+    /// equations. Provider and partition strategies must supply their own exact
+    /// workspace adapter; matching residency or shapes alone is insufficient.
+    /// This is a descriptive mechanism fact, not execution authority.
+    const ORDINARY_UNIT_EQUATIONS: bool = false;
+
+    /// Equation-parity fact for the actual retained execution strategy.
+    /// The default preserves existing statically declared ordinary strategies;
+    /// provider strategies may forward their selected provider's closed fact.
+    /// This descriptive query constructs, submits and acquires nothing.
+    fn uses_ordinary_unit_equations(&self) -> bool {
+        Self::ORDINARY_UNIT_EQUATIONS
+    }
+
     /// Concrete execution runtime paired before the shared session lifecycle begins.
     type Runtime;
+
+    /// Exchanges a caller-owned context loan with the selected runtime. A
+    /// successful exchange promises the same allocation-free inverse. No new
+    /// context is copied or retained by this hook.
+    fn exchange_parallel_context(_runtime:&mut Self::Runtime,_context:&mut B::ParallelContext)->bool { false }
+
+    /// Executes the same forward under a lexical context loan and restores
+    /// both values on return, failure or unwind. This creates no source grant.
+    fn with_borrowed_parallel_context<T,F>(
+        runtime:&mut Self::Runtime,context:&mut B::ParallelContext,
+        funding:&eredu_nn::workspace::WorkspaceMetadataFunding,run:F,
+    )->Result<T,PreparedParallelContextCause>
+    where F:FnOnce(&mut Self::Runtime)->T {
+        parallel_context::with_borrowed_runtime(runtime,context,funding,Self::exchange_parallel_context,run)
+    }
+
+    /// Exchanges only the runtime's request-control slot. Success promises
+    /// allocation-free restoration and leaves neural parallel selection intact.
+    fn exchange_parallel_control_context(
+        _runtime: &mut Self::Runtime, _context: &mut Option<Box<B::ParallelContext>>,
+    ) -> bool { false }
+
+    /// Reuses the scoped restoration worker for a separate control-only loan.
+    fn with_borrowed_parallel_control_context<T, F>(
+        runtime: &mut Self::Runtime, context: &mut Option<Box<B::ParallelContext>>,
+        funding: &eredu_nn::workspace::WorkspaceMetadataFunding, run: F,
+    ) -> Result<T, PreparedParallelContextCause>
+    where F: FnOnce(&mut Self::Runtime) -> T,
+    {
+        parallel_context::with_borrowed_runtime(
+            runtime, context, funding, Self::exchange_parallel_control_context, run)
+    }
+
+    /// Replaces only the selected executor's opaque parallel context. Success
+    /// returns its exact prior value and must remain reversible until restored.
+    /// Refusal returns `replacement` unchanged before mutation. No source,
+    /// completion, allocation or communication authority is created here.
+    fn replace_parallel_context(_runtime:&mut Self::Runtime,replacement:B::ParallelContext)
+        -> Result<B::ParallelContext,B::ParallelContext>
+    where B::ParallelContext:Sized { Err(replacement) }
+
+    /// Temporarily lends one already prepared backend context to the actual
+    /// selected runtime. Callers own source/admission and completion custody;
+    /// this shared worker guarantees restoration on return, error or unwind.
+    fn with_prepared_parallel_context<T,F>(
+        runtime:&mut Self::Runtime, context:B::ParallelContext,
+        funding:&eredu_nn::workspace::WorkspaceMetadataFunding, run:F,
+    )->Result<T,PreparedParallelContextFailure<B::ParallelContext>>
+    where B::ParallelContext:Sized, F:FnOnce(&mut Self::Runtime)->T,
+    {
+        parallel_context::with_runtime(runtime,context,funding,Self::replace_parallel_context,run)
+    }
+
+    /// Permanently fences this strategy's retained communication incarnations.
+    /// This required operation submits, allocates, waits and retires nothing.
+    /// The enclosing session stores the phase; existing epochs remain unchanged.
+    fn mark_terminal_failure(runtime: &Self::Runtime, phase: crate::DistributedExecutionPhase);
 
     /// Exact hook coverage of the retained executor, including specialized unit calls.
     fn observation_hooks(_runtime: &Self::Runtime) -> crate::inspection::ObservationHookSupport {
@@ -538,6 +909,60 @@ where
         _visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
     ) -> bool {
         false
+    }
+
+    /// Borrows the declared static aggregate of this retained execution.
+    /// None is unavailable coverage, not an empty aggregate. No construction,
+    /// replacement, source resolution, completion or native work is authorized.
+    /// Extra architecture fields and policy units remain separate owners.
+    fn static_modules_ref(_runtime: &Self::Runtime) -> Option<&A::StaticModules> {
+        None
+    }
+
+    /// Borrows exact parameter declarations/values from this retained strategy.
+    /// The default uses its static/resident pair; specialized executors lend
+    /// their actual policy through the same source worker. A partial traversal
+    /// never authorizes source installation or any parameter/native operation.
+    fn visit_parameter_sources<V>(
+        runtime: &Self::Runtime,
+        visitor: &mut V,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<bool, eredu_nn::Error>
+    where
+        V: for<'source> eredu_nn::ParameterSourceVisitor<'source, B::Tensor>,
+    {
+        context.charge_metadata(std::mem::size_of::<(
+            &Self::Runtime,
+            &mut V,
+            &eredu_nn::workspace::WorkspaceContext,
+            Option<&A::StaticModules>,
+            Option<&R>,
+            Result<bool, eredu_nn::Error>,
+        )>())?;
+        let (Some(static_modules), Some(policy)) = (
+            Self::static_modules_ref(runtime),
+            Self::resident_policy(runtime),
+        ) else {
+            return Ok(false);
+        };
+        crate::parameter_operations::visit_parameter_sources_in_parts::<B, A::Unit, R, V>(
+            static_modules,
+            policy,
+            visitor,
+            context,
+        )
+    }
+
+    /// Traverses retained parameters and numerical helpers through the paired owner,
+    /// without replacement access, reloading, evaluation or completion polling.
+    /// False means incomplete coverage, possibly after visiting known values.
+    fn visit_retained_values(runtime: &Self::Runtime, visitor: &mut dyn FnMut(&B::Tensor)) -> bool;
+
+    /// Checked ceiling from this actual retained runtime topology. Unknown is
+    /// never inferred from a traversal count. The default leaves strategy-local
+    /// inventory binding unfinished and grants no acquisition or storage rights.
+    fn retained_value_slot_bound(_runtime: &Self::Runtime) -> Option<usize> {
+        None
     }
 
     /// Performs parameter work inside one selected residency owner.
@@ -563,6 +988,12 @@ where
         Ok(false)
     }
 
+    /// Borrows the actual permanently resident policy without changing selection.
+    /// Specialized strategies expose it only when this is their installed owner.
+    fn resident_policy(_runtime: &Self::Runtime) -> Option<&R> {
+        None
+    }
+
     /// Returns bounded residency state for the shared session report.
     fn bounded_policy(runtime: &Self::Runtime) -> Option<&P>;
 
@@ -571,6 +1002,65 @@ where
         runtime: &Self::Runtime,
         selected: &SelectedReplicatedTextRealization,
     ) -> ExecutionResidency;
+
+    /// Build this strategy's exact immutable observation source during initial
+    /// loading. None means that its prepared traversal has no source producer.
+    /// Source publication and finite execution permission remain separate.
+    fn prepare_observation_paths(
+        _runtime: &Self::Runtime,
+    ) -> Result<Option<crate::PreparedLayeredObservationPaths>,
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
+        Ok(None)
+    }
+
+    /// Coldly bind an existing physical source during authorized preparation.
+    /// Default rejection prevents a specialized executor from silently falling
+    /// back to an allocating traversal when a prepared observer is required.
+    fn bind_observation_paths(
+        _runtime: &Self::Runtime,
+        _source: &crate::SharedLayeredObservationPaths,
+    ) -> Result<
+        crate::PreparedLayeredObservationPaths,
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    > {
+        Err(ReplicatedTextSessionError::PreparedObservation(
+            PreparedSessionObservationError::Unavailable,
+        ))
+    }
+
+    /// Check the existing runtime binding without allocating or model work.
+    fn validate_observation_paths(
+        _runtime: &Self::Runtime,
+        _paths: &crate::PreparedLayeredObservationPaths,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
+        Err(ReplicatedTextSessionError::PreparedObservation(
+            PreparedSessionObservationError::Unavailable,
+        ))
+    }
+
+    /// Execute through the prepared ordinary hook after shared input agreement.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_prepared_observer<'a, O>(
+        &mut self,
+        _runtime: &mut Self::Runtime,
+        _input: A::Input<'a>,
+        _state: &mut S,
+        _pass: ExpertPass,
+        _context: &<B::Tensor as Tensor>::Context,
+        _observer: &mut O,
+        _paths: &crate::PreparedLayeredObservationPaths,
+        _demand: eredu_core::OutputDemand,
+    ) -> Result<
+        (Option<B::Tensor>, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    >
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        Err(ReplicatedTextSessionError::PreparedObservation(
+            PreparedSessionObservationError::Unavailable,
+        ))
+    }
 
     /// Executes one complete layered pass through the selected unit strategy.
     #[allow(clippy::too_many_arguments)]
@@ -582,8 +1072,9 @@ where
         pass: ExpertPass,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
+        demand: eredu_core::OutputDemand,
     ) -> Result<
-        (B::Tensor, A::ForwardContext),
+        (Option<B::Tensor>, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     >
     where
@@ -613,6 +1104,16 @@ where
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>>
     {
         Ok(output)
+    }
+
+    /// Publishes through the same policy using a retained native occurrence.
+    /// Strategies without that producer refuse an explicitly prepared context.
+    fn publish_observed_output_with_parallel(runtime:&mut Self::Runtime,output:B::Tensor,
+        context:&<B::Tensor as Tensor>::Context,
+        prepared:Option<(&B::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)
+        ->Result<B::Tensor,ReplicatedTextSessionError<A::Error,R::Error,std::convert::Infallible>> {
+        if prepared.is_some(){return Err(ReplicatedTextSessionError::ParallelContext(PreparedParallelContextCause::Unsupported));}
+        Self::publish_observed_output(runtime,output,context)
     }
 
     /// Resolves the rank-local tensor used by an additive prediction extension.
@@ -657,6 +1158,12 @@ where
         Ok(None)
     }
 
+    /// Exact native operation selected for this actual control event.
+    /// None is a local phase and must not create a native control claim.
+    fn parallel_control_operation(
+        _runtime: &Self::Runtime, _event: ParallelControlEvent,
+    ) -> Option<crate::CommunicationOperation> { None }
+
     /// Performs strategy-specific distributed commit only after output
     /// intervention and exact mechanism completion have succeeded.
     fn commit_after_completion(
@@ -665,6 +1172,31 @@ where
         _context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> DistributedCommitOutcome {
         DistributedCommitOutcome::Committed(epoch)
+    }
+
+    /// Final decision under an exact prepared control context. The default
+    /// preserves ordinary behavior and explicitly refuses an unconsumed context.
+    fn commit_after_completion_with_parallel(
+        runtime: &mut Self::Runtime, epoch: DistributedCommitEpoch,
+        context: &<B::Tensor as Tensor>::Context,
+        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::WorkspaceMetadataFunding)>,
+    ) -> Result<DistributedCommitOutcome, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
+        if prepared.is_some() {
+            return Err(ReplicatedTextSessionError::ParallelContext(PreparedParallelContextCause::Unsupported));
+        }
+        Ok(Self::commit_after_completion(runtime, epoch, context))
+    }
+
+    /// Same phase policy with an explicit prepared communication context.
+    fn agree_distributed_phase_with_parallel(
+        runtime: &mut Self::Runtime, phase: crate::DistributedExecutionPhase,
+        local_success: bool, context: &<B::Tensor as Tensor>::Context,
+        prepared: Option<(&B::ParallelContext, &eredu_nn::workspace::WorkspaceMetadataFunding)>,
+    ) -> Result<bool, ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
+        if prepared.is_some() {
+            return Err(ReplicatedTextSessionError::ParallelContext(PreparedParallelContextCause::Unsupported));
+        }
+        Self::agree_distributed_phase(runtime, phase, local_success, context)
     }
 
     /// Propagates one local shared-session phase result before the lifecycle
@@ -712,7 +1244,60 @@ where
     A::Error: std::fmt::Display,
     P::Error: std::fmt::Display,
 {
+    fn mark_terminal_failure(_runtime: &Self::Runtime, _phase: crate::DistributedExecutionPhase) {}
+
+    const ORDINARY_UNIT_EQUATIONS: bool = true;
+
     type Runtime = ReplicatedTextRuntime<A, B, S, R, P>;
+
+    fn bind_observation_paths(
+        runtime: &Self::Runtime,
+        source: &crate::SharedLayeredObservationPaths,
+    ) -> Result<
+        crate::PreparedLayeredObservationPaths,
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    > {
+        runtime.bind_observation_paths(source)
+    }
+
+    fn validate_observation_paths(
+        runtime: &Self::Runtime,
+        paths: &crate::PreparedLayeredObservationPaths,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
+        runtime.validate_observation_paths(paths)
+    }
+
+    fn forward_with_prepared_observer<'a, O>(
+        &mut self,
+        runtime: &mut Self::Runtime,
+        input: A::Input<'a>,
+        state: &mut S,
+        _pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        paths: &crate::PreparedLayeredObservationPaths,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<
+        (Option<B::Tensor>, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    >
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        runtime.forward_with_prepared_observer(input, state, context, observer, paths, demand)
+    }
+
+    fn static_modules_ref(runtime: &Self::Runtime) -> Option<&A::StaticModules> {
+        Some(runtime.static_modules_ref())
+    }
+
+    fn visit_retained_values(runtime: &Self::Runtime, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        runtime.visit_retained_values(visitor)
+    }
+
+    fn retained_value_slot_bound(runtime: &Self::Runtime) -> Option<usize> {
+        runtime.retained_value_slot_bound()
+    }
 
     fn visit_loaded_parameters(
         runtime: &mut Self::Runtime,
@@ -742,6 +1327,10 @@ where
         runtime.publish_parameter_replacements(values, active)
     }
 
+    fn resident_policy(runtime: &Self::Runtime) -> Option<&R> {
+        runtime.resident_policy()
+    }
+
     fn bounded_policy(runtime: &Self::Runtime) -> Option<&P> {
         runtime.bounded_policy()
     }
@@ -761,14 +1350,15 @@ where
         _pass: ExpertPass,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
+        demand: eredu_core::OutputDemand,
     ) -> Result<
-        (B::Tensor, A::ForwardContext),
+        (Option<B::Tensor>, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     >
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        runtime.forward_with_observer(input, state, context, observer)
+        runtime.forward_with_observer(input, state, context, observer, demand)
     }
 
     fn prediction_target_capture(
@@ -847,7 +1437,74 @@ where
     A::Error: std::fmt::Display,
     P::Error: std::fmt::Display,
 {
+    fn mark_terminal_failure(_runtime: &Self::Runtime, _phase: crate::DistributedExecutionPhase) {}
+
+    // The retained provider type supplies this descriptive fact. Addressable
+    // and custom providers cannot borrow a resident equation quote by matching
+    // the target layout or selecting the same residency enum.
+    fn uses_ordinary_unit_equations(&self) -> bool {
+        <Provider as RoutedExpertProvider<B>>::resident_unit_equations()
+    }
+
     type Runtime = ReplicatedTextRuntime<A, B, S, R, P>;
+
+    fn bind_observation_paths(
+        runtime: &Self::Runtime,
+        source: &crate::SharedLayeredObservationPaths,
+    ) -> Result<
+        crate::PreparedLayeredObservationPaths,
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    > {
+        runtime.bind_observation_paths(source)
+    }
+
+    fn validate_observation_paths(
+        runtime: &Self::Runtime,
+        paths: &crate::PreparedLayeredObservationPaths,
+    ) -> Result<(), ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>> {
+        runtime.validate_observation_paths(paths)
+    }
+
+    fn forward_with_prepared_observer<'a, O>(
+        &mut self,
+        runtime: &mut Self::Runtime,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        paths: &crate::PreparedLayeredObservationPaths,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<
+        (Option<B::Tensor>, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
+    >
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        runtime.forward_with_prepared_provider_observer(
+            input,
+            state,
+            pass,
+            &mut self.provider,
+            context,
+            observer,
+            paths,
+            demand,
+        )
+    }
+
+    fn static_modules_ref(runtime: &Self::Runtime) -> Option<&A::StaticModules> {
+        Some(runtime.static_modules_ref())
+    }
+
+    fn visit_retained_values(runtime: &Self::Runtime, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        runtime.visit_retained_values(visitor)
+    }
+
+    fn retained_value_slot_bound(runtime: &Self::Runtime) -> Option<usize> {
+        runtime.retained_value_slot_bound()
+    }
 
     fn visit_loaded_parameters(
         runtime: &mut Self::Runtime,
@@ -877,6 +1534,10 @@ where
         runtime.publish_parameter_replacements(values, active)
     }
 
+    fn resident_policy(runtime: &Self::Runtime) -> Option<&R> {
+        runtime.resident_policy()
+    }
+
     fn bounded_policy(runtime: &Self::Runtime) -> Option<&P> {
         runtime.bounded_policy()
     }
@@ -896,8 +1557,9 @@ where
         pass: ExpertPass,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
+        demand: eredu_core::OutputDemand,
     ) -> Result<
-        (B::Tensor, A::ForwardContext),
+        (Option<B::Tensor>, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, R::Error, std::convert::Infallible>,
     >
     where
@@ -910,6 +1572,7 @@ where
             &mut self.provider,
             context,
             observer,
+            demand,
         )
     }
 
@@ -999,18 +1662,24 @@ where
     selected: SelectedReplicatedTextRealization,
     selected_state: SessionStateRealization,
     execution: D::Runtime,
+    // The runtime owns its private binding; metadata projections bind this
+    // same physical source independently during their own cold preparation.
+    observation_paths: Option<crate::PreparedLayeredObservationPaths>,
     driver: D,
     state: M::State,
     mechanisms: M,
     materialization_report: Option<crate::WeightMaterializationReport>,
     partition_parameters: Option<std::sync::Arc<crate::ArchitectureParameterDescription>>,
     prompt_cache_identity: Option<PromptCacheModelIdentity>,
-    committed_prompt_input_identity: Option<PreparedInputCacheIdentity>,
+    committed_prompt_input_identity: Option<SharedPreparedInputCacheIdentity>,
     next_commit_epoch: DistributedCommitEpoch,
     active_commit_epoch: Option<DistributedCommitEpoch>,
     last_commit_outcome: Option<DistributedCommitOutcome>,
     successful_state_restorations: Option<u64>,
     control_identity: std::sync::Arc<()>,
+    prefill_identity: crate::working_memory::InferenceExecutionIdentity,
+    inference_guard: Option<M::PrefillReservationGuard>,
+    active_prefill_control: Option<crate::prefill::PrefillControlRole>,
     control_fence: Option<crate::DistributedExecutionPhase>,
     output_selection: ReplicatedTextOutputSelection,
     backend: PhantomData<fn() -> B>,
@@ -1190,47 +1859,16 @@ where
 {
     let (mut architecture, partition, communication, tasks) = input.into_parts();
     let global_layout = partition.unit_layout().clone();
-    let addresses = match scope {
-        PartitionedUnitScope::All => (0..global_layout.len())
-            .map(|ordinal| {
-                global_layout.address(ordinal).ok_or_else(|| {
-                    PartitionedRuntimeConstructionError::Contract(format!(
-                        "global unit ordinal {ordinal} has no canonical address"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-        PartitionedUnitScope::Owned => partition.units().collect::<Vec<_>>(),
-    };
-    if addresses.is_empty() {
-        return Err(PartitionedRuntimeConstructionError::Contract(
-            "partition owns no execution units".into(),
-        ));
-    }
+    let addresses=partitioned_materialization_addresses(&partition,scope)
+        .map_err(PartitionedRuntimeConstructionError::Contract)?;
     let task_partition =
         plan_local_replicated_text_materialization_tasks(&tasks, &global_layout, &addresses)
             .map_err(|error| PartitionedRuntimeConstructionError::Contract(error.to_string()))?;
-    let mut units = addresses
-        .iter()
-        .map(|address| {
-            architecture
-                .build_unit(address.group(), address.index(), context)
-                .map_err(|error| PartitionedRuntimeConstructionError::Architecture(error))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut source_units = source_architecture
-        .as_ref()
-        .map(|source| {
-            addresses
-                .iter()
-                .map(|address| {
-                    source
-                        .build_unit(address.group(), address.index(), context)
-                        .map_err(|error| PartitionedRuntimeConstructionError::Architecture(error))
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .transpose()?;
+    let mut units=crate::layered::ordinary_addressed_units::<A,B,M::State>(&architecture,&addresses,context)
+        .map_err(PartitionedRuntimeConstructionError::Architecture)?;
+    let mut source_units=source_architecture.as_ref().map(|source|
+        crate::layered::ordinary_addressed_units::<A,B,M::State>(source,&addresses,context)
+            .map_err(PartitionedRuntimeConstructionError::Architecture)).transpose()?;
     let local_state = partition.state().ok_or_else(|| {
         PartitionedRuntimeConstructionError::Contract(
             "partition owns no local mutable state".into(),
@@ -1296,6 +1934,33 @@ where
         bounded_policy,
         state,
     })
+}
+
+/// Exact unit addresses consumed by the existing partition materializer.
+/// The architecture-selected scope preserves global parameter names while its
+/// local residency policy assigns slots in this order.
+pub fn partitioned_materialization_addresses<G,W>(
+    partition:&ArchitecturePartition<G,W>, scope:PartitionedUnitScope,
+)->Result<Vec<crate::ExecutionUnitAddress>,String> {
+    let layout=partition.unit_layout();
+    let addresses=match scope {
+        PartitionedUnitScope::All => (0..layout.len()).map(|ordinal|layout.address(ordinal)
+            .ok_or_else(||format!("global unit ordinal {ordinal} has no canonical address")))
+            .collect::<Result<Vec<_>,_>>()?,
+        PartitionedUnitScope::Owned => partition.units().collect(),
+    };
+    if addresses.is_empty(){return Err("partition owns no execution units".into());}
+    Ok(addresses)
+}
+
+/// The policy-local unit layout of the same ordered global partition addresses.
+/// This is descriptive construction metadata, not source or native authority.
+pub fn partitioned_materialization_unit_layout(
+    graph:&crate::ExecutionGraph, addresses:&[crate::ExecutionUnitAddress],
+)->Result<crate::ExecutionUnitLayout,String> {
+    let counts=(0..graph.groups().len()).map(|group|addresses.iter()
+        .filter(|address|address.group()==group).count()).collect::<Vec<_>>();
+    crate::ExecutionUnitLayout::new(graph,counts).map_err(|cause|cause.to_string())
 }
 
 /// Failure while consuming architecture authority into a rank-local runtime.
@@ -1493,7 +2158,7 @@ impl SessionStateRealization {
 /// Complete transactional checkpoint including composite prompt-input identity.
 pub struct ReplicatedTextSessionCheckpoint<C> {
     state: C,
-    prompt_input_identity: Option<PreparedInputCacheIdentity>,
+    prompt_input_identity: Option<SharedPreparedInputCacheIdentity>,
     next_commit_epoch: DistributedCommitEpoch,
     last_commit_outcome: Option<DistributedCommitOutcome>,
 }
@@ -1506,9 +2171,27 @@ pub struct DistributedStateCheckpoint<C> {
 /// Complete rank-local checkpoint whose presence was agreed by a partitioned session.
 pub struct DistributedSessionCheckpoint<C> {
     state: Option<C>,
-    prompt_input_identity: Option<PreparedInputCacheIdentity>,
+    prompt_input_identity: Option<SharedPreparedInputCacheIdentity>,
     next_commit_epoch: DistributedCommitEpoch,
     last_commit_outcome: Option<DistributedCommitOutcome>,
+}
+
+/// Fixed shared prediction-target preparation refusal. Original destinations
+/// retain it without allocating the ordinary contract diagnostic String.
+#[derive(Debug,Clone,Copy,PartialEq,thiserror::Error)]
+pub enum PredictionTargetPreparationError {
+    /// Existing commit/fence boundary, retained without legacy formatting.
+    #[error(transparent)]
+    Boundary(#[from] RuntimeInspectionBoundary),
+    /// Stateless selection cannot produce a prediction lane cache.
+    #[error("stateless session cannot prepare prediction target state")]
+    Stateless,
+    /// Copied state must retain the exact selected layout.
+    #[error("realized state layout differs from selection")]
+    Layout,
+    /// All ranks must accept their local destination before it escapes.
+    #[error("another rank could not prepare prediction target lane state")]
+    Peer,
 }
 
 /// Cold-path failure from replicated-text construction or session control.
@@ -1521,6 +2204,16 @@ where
 {
     /// The prepared architecture disagreed with its selected realization.
     Contract(String),
+    /// Graph submission or dependency ordering failed with retained source custody.
+    Submission(eredu_core::BackendFailure),
+    /// Required borrowed observation traversal is unavailable or stale.
+    PreparedObservation(PreparedSessionObservationError),
+    /// A prepared backend context could not be installed before forward.
+    ParallelContext(PreparedParallelContextCause),
+    /// Native control-source preparation or binding failed with retained custody.
+    ParallelControl(eredu_core::BackendFailure),
+    /// Shared inference working-memory admission rejected the request.
+    WorkingMemory(crate::working_memory::WorkingMemoryError),
     /// Portable distributed execution or agreement failed.
     Partition(crate::PartitionExecutionError),
     /// Architecture construction or execution failed.
@@ -1556,6 +2249,11 @@ impl<A: std::fmt::Display, P: std::fmt::Display, M: std::fmt::Display> std::fmt:
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Contract(error) => write!(f, "replicated text contract mismatch: {error}"),
+            Self::Submission(error) => std::fmt::Display::fmt(error, f),
+            Self::PreparedObservation(error) => std::fmt::Display::fmt(error, f),
+            Self::ParallelContext(error) => std::fmt::Display::fmt(error, f),
+            Self::ParallelControl(error) => std::fmt::Display::fmt(error, f),
+            Self::WorkingMemory(error) => std::fmt::Display::fmt(error, f),
             Self::Partition(error) => std::fmt::Display::fmt(error, f),
             Self::Architecture(error) => write!(f, "replicated text architecture failed: {error}"),
             Self::Policy(error) => write!(f, "replicated text residency failed: {error}"),
@@ -1585,6 +2283,11 @@ where
 {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Submission(error) => Some(error),
+            Self::PreparedObservation(error) => Some(error),
+            Self::ParallelContext(error) => Some(error),
+            Self::ParallelControl(error) => Some(error),
+            Self::WorkingMemory(error) => Some(error),
             Self::Partition(error) => Some(error),
             Self::Architecture(error) => Some(error),
             Self::Policy(error) => Some(error),
@@ -1630,13 +2333,56 @@ pub struct ReplicatedTextSessionReport<E, S> {
 /// The value can only be created by [`prepare_replicated_text_contract`].
 pub struct PreparedReplicatedTextContract {
     selected: SelectedReplicatedTextRealization,
-    tasks: Vec<ReplicatedTextMaterializationTask>,
-    addressable_parameters: Vec<String>,
+    // Completed ordinary construction retains its exact filtered task source.
+    // Checked plain quotes can borrow the full selection without another owner.
+    materialization: Option<PreparedContractMaterialization>,
     prompt_cache_identity: PromptCacheModelIdentity,
     output_selection: ReplicatedTextOutputSelection,
 }
 
+/// Move-only graph and unit layout from a validated text construction or the
+/// actual completed workspace unit builder. This is descriptive metadata only;
+/// it retains no native source, readiness or submission authority.
+pub struct PreparedReplicatedTextExecutionGeometry {
+    source: PreparedTextGeometrySource,
+}
+enum PreparedTextGeometrySource {
+    Selected(SelectedReplicatedTextRealization),
+    Workspace {graph:crate::ExecutionGraph, units:crate::ExecutionUnitLayout},
+}
+impl PreparedReplicatedTextExecutionGeometry {
+    /// The exact graph compared with or emitted by the architecture constructor.
+    pub fn graph(&self) -> &crate::ExecutionGraph {
+        match &self.source {
+            PreparedTextGeometrySource::Selected(selected)=>selected.requirements().execution_graph(),
+            PreparedTextGeometrySource::Workspace{graph,..}=>graph,
+        }
+    }
+    /// Canonical group/unit layout of the same completed constructor.
+    pub fn units(&self) -> &crate::ExecutionUnitLayout {
+        match &self.source {
+            PreparedTextGeometrySource::Selected(selected)=>selected.requirements().execution_units(),
+            PreparedTextGeometrySource::Workspace{units,..}=>units,
+        }
+    }
+    pub(crate) fn from_workspace_units(
+        graph:crate::ExecutionGraph, counts:&[usize],
+        context:&eredu_nn::workspace::WorkspaceContext,
+    )->Result<Self,eredu_nn::Error> {
+        context.charge_metadata(std::mem::size_of::<(Self,Result<Self,eredu_nn::Error>)>())?;
+        let units=crate::ExecutionUnitLayout::new_with_metadata(&graph,counts,context)?;
+        Ok(Self{source:PreparedTextGeometrySource::Workspace{graph,units}})
+    }
+}
+
 impl PreparedReplicatedTextContract {
+    /// Consumes the validated contract and retains its same immutable selected
+    /// graph and unit layout without cloning names, declarations or topology.
+    pub fn into_execution_geometry(self) -> PreparedReplicatedTextExecutionGeometry {
+        PreparedReplicatedTextExecutionGeometry {
+            source: PreparedTextGeometrySource::Selected(self.selected),
+        }
+    }
     /// Returns the authoritative selected realization.
     pub const fn selected(&self) -> &SelectedReplicatedTextRealization {
         &self.selected
@@ -1644,7 +2390,22 @@ impl PreparedReplicatedTextContract {
 
     /// Returns the validated exact materialization tasks.
     pub fn materialization_tasks(&self) -> &[ReplicatedTextMaterializationTask] {
-        &self.tasks
+        self.materialization.as_ref()
+            .map(PreparedContractMaterialization::tasks)
+            .unwrap_or_else(|| self.selected.materialization_tasks())
+    }
+
+    /// Exact destinations assigned to independently addressable storage.
+    /// Both cold and native binding exclude this same validated population.
+    pub fn addressable_parameters(&self) -> &[String] {
+        self.materialization.as_ref()
+            .map(PreparedContractMaterialization::addressable).unwrap_or(&[])
+    }
+
+    /// Successful source-owned task/exclusion result, available after initial
+    /// ordinary construction or reuse of an exact retained materialization.
+    pub fn materialization_source(&self) -> Option<&PreparedContractMaterialization> {
+        self.materialization.as_ref()
     }
 
     /// Returns the architecture-derived identity coupled to this proof.
@@ -1666,10 +2427,15 @@ impl PreparedReplicatedTextContract {
         PromptCacheModelIdentity,
         ReplicatedTextOutputSelection,
     ) {
+        // A native consuming constructor still receives owned tasks. The
+        // checked quote path consumes into_execution_geometry instead.
+        let (tasks, addressable_parameters) = self.materialization
+            .map(PreparedContractMaterialization::into_parts)
+            .unwrap_or_else(|| (self.selected.materialization_tasks().to_vec(), Vec::new()));
         (
             self.selected,
-            self.tasks,
-            self.addressable_parameters,
+            tasks,
+            addressable_parameters,
             self.prompt_cache_identity,
             self.output_selection,
         )
@@ -1778,14 +2544,121 @@ where
     A: LayeredArchitecture<B, S>,
     A::Error: std::fmt::Display,
 {
-    let mut addressable_parameters = addressable_parameters
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<BTreeSet<_>>();
-    validate_selected_state(&selected)?;
-    validate_architecture_geometry::<A, B, S>(architecture, &selected)?;
+    prepare_layered_text_contract_impl::<A, B, S>(
+        architecture,
+        source_architecture,
+        selected,
+        expected_prompt_cache_architecture_identity,
+        output_selection,
+        addressable_parameters,
+        None,
+        context,
+        ContractMetadata::new(None),
+    )
+    .map_err(PreparedTextContractError::into_legacy)
+}
+
+/// Uses the same contract worker with this realization's optional host metadata
+/// destination. Typed capacity failures remain owned errors without formatting.
+pub fn prepare_layered_text_contract_with_metadata<'a, A, B, S>(
+    architecture: &A,
+    source_architecture: Option<&A>,
+    selected: SelectedReplicatedTextRealization,
+    expected_prompt_cache_architecture_identity: &str,
+    output_selection: ReplicatedTextOutputSelection,
+    addressable_parameters: impl IntoIterator<Item = &'a str>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<PreparedReplicatedTextContract, PreparedTextContractError>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: LayeredArchitecture<B, S>,
+    A::Error: std::fmt::Display,
+{
+    prepare_layered_text_contract_impl::<A, B, S>(
+        architecture,
+        source_architecture,
+        selected,
+        expected_prompt_cache_architecture_identity,
+        output_selection,
+        addressable_parameters,
+        None,
+        context,
+        ContractMetadata::new(B::construction_metadata(context)),
+    )
+}
+
+/// Revalidates the same architecture and companions while reusing a completed
+/// exact selected materialization. A changed selection or exclusion set refuses
+/// before parameter construction or source work.
+pub fn prepare_layered_text_contract_with_materialization<'a, A, B, S>(
+    architecture: &A,
+    source_architecture: Option<&A>,
+    selected: SelectedReplicatedTextRealization,
+    expected_prompt_cache_architecture_identity: &str,
+    output_selection: ReplicatedTextOutputSelection,
+    addressable_parameters: impl IntoIterator<Item = &'a str>,
+    materialization: &PreparedContractMaterialization,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<PreparedReplicatedTextContract, PreparedTextContractError>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: LayeredArchitecture<B, S>,
+    A::Error: std::fmt::Display,
+{
+    prepare_layered_text_contract_impl::<A, B, S>(
+        architecture,
+        source_architecture,
+        selected,
+        expected_prompt_cache_architecture_identity,
+        output_selection,
+        addressable_parameters,
+        Some(materialization),
+        context,
+        ContractMetadata::new(B::construction_metadata(context)),
+    )
+}
+
+fn prepare_layered_text_contract_impl<'a, A, B, S>(
+    architecture: &A,
+    source_architecture: Option<&A>,
+    selected: SelectedReplicatedTextRealization,
+    expected_prompt_cache_architecture_identity: &str,
+    output_selection: ReplicatedTextOutputSelection,
+    addressable_parameters: impl IntoIterator<Item = &'a str>,
+    materialization: Option<&PreparedContractMaterialization>,
+    context: &<B::Tensor as Tensor>::Context,
+    metadata: ContractMetadata<'_>,
+) -> Result<PreparedReplicatedTextContract, PreparedTextContractError>
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+    A: LayeredArchitecture<B, S>,
+    A::Error: std::fmt::Display,
+{
+    let mut declarations = addressable_parameters.into_iter();
+    metadata.controls::<(Option<&PreparedContractMaterialization>, BTreeSet<String>,
+        Option<Vec<String>>, Option<PreparedContractMaterialization>)>()?;
+    let mut addressable_parameters = if let Some(source) = materialization {
+        source.validate(&selected, declarations, metadata)?;
+        BTreeSet::new()
+    } else if metadata.is_checked() {
+        if declarations.next().is_some() {
+            return Err(PreparedTextContractError::Metadata(
+                eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+            ));
+        }
+        BTreeSet::new()
+    } else {
+        declarations.map(str::to_owned).collect::<BTreeSet<_>>()
+    };
+    let declared = (materialization.is_none() && !metadata.is_checked())
+        .then(|| addressable_parameters.iter().cloned().collect::<Vec<_>>());
+    validate_selected_state(&selected, metadata)?;
+    validate_architecture_geometry::<A, B, S>(architecture, &selected, metadata)?;
     if let Some(source) = source_architecture {
-        validate_architecture_geometry::<A, B, S>(source, &selected)?;
+        validate_architecture_geometry::<A, B, S>(source, &selected, metadata)?;
     }
     let has_transform = selected.parameters().iter().any(|parameter| {
         matches!(
@@ -1794,109 +2667,121 @@ where
         )
     });
     if has_transform != source_architecture.is_some() {
-        return Err(
-            "selected transform tasks and source-format architecture ownership disagree".into(),
-        );
+        return Err(metadata.message(format_args!(
+            "selected transform tasks and source-format architecture ownership disagree"
+        )));
     }
     if let Some(source) = source_architecture {
-        validate_architecture_parameters::<A, B, S>(source, &selected, false, context)?;
+        validate_architecture_parameters::<A, B, S>(source, &selected, false, context, metadata)?;
     }
-    let mut constructed_companions =
-        validate_architecture_parameters::<A, B, S>(architecture, &selected, true, context)?;
-    let mut tasks =
-        replicated_text_materialization_tasks(&selected).map_err(|error| error.to_string())?;
-    let selected_parameter_names = tasks
-        .iter()
-        .flat_map(|task| {
-            std::iter::once(task.name().to_owned()).chain(
-                task.output_companions()
-                    .iter()
-                    .map(|companion| companion.name().to_owned()),
-            )
-        })
-        .collect::<BTreeSet<_>>();
-    if !addressable_parameters.is_subset(&selected_parameter_names) {
-        return Err(format!(
-            "addressable parameter catalog contains unknown selected parameters: {:?}",
-            addressable_parameters
-                .difference(&selected_parameter_names)
-                .collect::<Vec<_>>()
-        ));
+    let constructed_companions = validate_architecture_parameters::<A, B, S>(
+        architecture,
+        &selected,
+        true,
+        context,
+        metadata,
+    )?;
+    use std::borrow::Cow;
+    metadata.controls::<Cow<'_, [ReplicatedTextMaterializationTask]>>()?;
+    if !selected.has_authoritative_materialization_tasks() {
+        return Err(metadata.message(format_args!(
+            "invalid replicated text contract: selected realization omitted its authoritative materialization tasks"
+        )));
     }
-    let addressable_companions = addressable_parameters
-        .iter()
-        .filter_map(|name| tasks.iter().find(|task| task.name() == name))
-        .flat_map(|task| task.output_companions())
-        .map(|companion| companion.name().to_owned())
-        .collect::<Vec<_>>();
-    addressable_parameters.extend(addressable_companions);
-    for task in &tasks {
-        let mut actual = constructed_companions
-            .remove(task.name())
-            .unwrap_or_default();
-        actual.sort_by(|left, right| {
-            left.role()
-                .cmp(&right.role())
-                .then_with(|| left.name().cmp(right.name()))
-        });
+    let tasks: Cow<'_, [ReplicatedTextMaterializationTask]> = if metadata.is_checked() || materialization.is_some()
+    {
+        Cow::Borrowed(selected.materialization_tasks())
+    } else {
+        Cow::Owned(
+            replicated_text_materialization_tasks(&selected).map_err(|error| error.to_string())?,
+        )
+    };
+    // Empty exclusions cannot introduce unknown names or companion exclusions.
+    // Avoid rebuilding a selected-name catalog in the ordinary plain case too.
+    if !addressable_parameters.is_empty() {
+        let selected_parameter_names = tasks
+            .iter()
+            .flat_map(|task| {
+                std::iter::once(task.name().to_owned()).chain(
+                    task.output_companions()
+                        .iter()
+                        .map(|companion| companion.name().to_owned()),
+                )
+            })
+            .collect::<BTreeSet<_>>();
+        if !addressable_parameters.is_subset(&selected_parameter_names) {
+            return Err(PreparedTextContractError::Contract(format!(
+                "addressable parameter catalog contains unknown selected parameters: {:?}",
+                addressable_parameters
+                    .difference(&selected_parameter_names)
+                    .collect::<Vec<_>>()
+            )));
+        }
+        let addressable_companions = addressable_parameters
+            .iter()
+            .filter_map(|name| tasks.iter().find(|task| task.name() == name))
+            .flat_map(|task| task.output_companions())
+            .map(|companion| companion.name().to_owned())
+            .collect::<Vec<_>>();
+        addressable_parameters.extend(addressable_companions);
+    }
+    for task in tasks.iter() {
+        let actual = constructed_companions.for_primary(task.name());
         let expected = task.output_companions();
         let agrees = actual.len() == expected.len()
-            && actual.iter().zip(expected).all(|(actual, expected)| {
+            && actual.clone().zip(expected).all(|(actual, expected)| {
                 actual.name() == expected.name()
                     && actual.role() == expected.role()
                     && actual.logical_shape() == expected.logical_shape()
                     && actual.owner().refines_storage_owner(expected.owner())
             });
         if !agrees {
-            return Err(format!(
+            return Err(metadata.message(format_args!(
                 "constructed output companions for {:?} differ from authoritative selection: lowering={:?}, executable={:?}, constructed={:?}, selected={:?}, retained={:?}",
-                task.name(),
-                task.lowering(),
-                task.executable(),
-                actual
-                    .iter()
-                    .map(|companion| (
-                        companion.name(),
-                        companion.role(),
-                        companion.logical_shape(),
-                        companion.owner()
-                    ))
-                    .collect::<Vec<_>>(),
-                expected
-                    .iter()
-                    .map(|companion| (
-                        companion.name(),
-                        companion.role(),
-                        companion.logical_shape(),
-                        companion.owner()
-                    ))
-                    .collect::<Vec<_>>(),
-                selected
-                    .requirements()
-                    .parameters()
-                    .iter()
-                    .filter_map(|parameter| {
-                        parameter
-                            .linear_companion()
-                            .filter(|(_, primary)| *primary == task.name())
-                            .map(|(role, primary)| (parameter.name(), role, primary))
-                    })
-                    .collect::<Vec<_>>(),
-            ));
+                task.name(), task.lowering(), task.executable(),
+                DebugRows(actual.map(|companion| (companion.name(), companion.role(),
+                    companion.logical_shape(), companion.owner()))),
+                DebugRows(expected.iter().map(|companion| (companion.name(), companion.role(),
+                    companion.logical_shape(), companion.owner()))),
+                DebugRows(selected.requirements().parameters().iter().filter_map(|parameter| {
+                    parameter.linear_companion().filter(|(_, primary)| *primary == task.name())
+                        .map(|(role, primary)| (parameter.name(), role, primary))
+                })),
+            )));
         }
     }
-    if !constructed_companions.is_empty() {
-        return Err(format!(
+    let unknown = constructed_companions.unknown_primaries(&tasks);
+    if unknown.clone().next().is_some() {
+        return Err(metadata.message(format_args!(
             "output companion catalog contains unknown materialization tasks: {:?}",
-            constructed_companions.keys().collect::<Vec<_>>()
-        ));
+            DebugRows(unknown),
+        )));
     }
-    tasks.retain(|task| !addressable_parameters.contains(task.name()));
-    let state = PartitionState::new(selected.state().layout().clone(), 0)
-        .map_err(|error| error.to_string())?;
-    let prompt_cache_identity = state
-        .prompt_cache_identity::<B, A>(architecture, Default::default())
-        .map_err(|error| error.to_string())?;
+
+    drop(unknown);
+
+    let prompt_cache_identity = if let Some(context) = metadata.context() {
+        metadata.controls::<PartitionState>()?;
+        let state = PartitionState::new(selected.state().layout().clone_workspace(context)?, 0)
+            .map_err(|error| metadata.message(format_args!("{error}")))?;
+        // The architecture still supplies its actual validated configuration identity.
+        let identity = <A as crate::ArchitectureParameters<B>>::state_identity_with_metadata(
+            architecture,
+            &state,
+            Default::default(),
+            context,
+        )
+        .map_err(|error| {
+            metadata.architecture_error(error, "neutral architecture state is invalid: ")
+        })?;
+        identity.into_prompt_cache_identity_workspace(state.layout(), context)?
+    } else {
+        let state = PartitionState::new(selected.state().layout().clone(), 0)
+            .map_err(|error| error.to_string())?;
+        state
+            .prompt_cache_identity::<B, A>(architecture, Default::default())
+            .map_err(|error| error.to_string())?
+    };
     if prompt_cache_identity.architecture_fingerprint()
         != expected_prompt_cache_architecture_identity
         || prompt_cache_identity.layer_count() != selected.state().layout().len()
@@ -1904,14 +2789,23 @@ where
         || prompt_cache_identity.global_layer_end() != selected.state().layout().len()
         || prompt_cache_identity.topology() != &Default::default()
     {
-        return Err("architecture prompt-cache identity differs from selection".into());
+        return Err(metadata.message(format_args!(
+            "architecture prompt-cache identity differs from selection"
+        )));
     }
+    let materialization = match (materialization, tasks) {
+        (Some(source), _) => Some(source.clone()),
+        (None, Cow::Borrowed(_)) => None,
+        (None, Cow::Owned(mut tasks)) => {
+            tasks.retain(|task| !addressable_parameters.contains(task.name()));
+            Some(PreparedContractMaterialization::new(
+                selected.clone(), tasks, declared.unwrap_or_default(),
+                addressable_parameters.into_iter().collect(),
+            ))
+        }
+    };
     Ok(PreparedReplicatedTextContract {
-        selected,
-        tasks,
-        addressable_parameters: addressable_parameters.into_iter().collect(),
-        prompt_cache_identity,
-        output_selection,
+        selected, materialization, prompt_cache_identity, output_selection,
     })
 }
 
@@ -2055,10 +2949,19 @@ where
             }
         }
     };
+    let observation_paths = Some(execution.prepare_observation_paths().map_err(
+        |error| match error {
+            crate::PreparedLayeredObservationError::Execution(error) => {
+                ReplicatedTextSessionError::Architecture(error)
+            }
+            other => ReplicatedTextSessionError::Contract(other.to_string()),
+        },
+    )?);
     Ok(ReplicatedTextSession {
         selected,
         selected_state,
         execution,
+        observation_paths,
         driver,
         state,
         mechanisms,
@@ -2071,6 +2974,9 @@ where
         last_commit_outcome: None,
         successful_state_restorations: Some(0),
         control_identity: std::sync::Arc::new(()),
+        prefill_identity: Default::default(),
+        inference_guard: None,
+        active_prefill_control: None,
         control_fence: None,
         output_selection,
         backend: PhantomData,
@@ -2152,10 +3058,13 @@ where
     let materialization_report = mechanisms
         .take_materialization_report()
         .map_err(ReplicatedTextSessionError::Mechanism)?;
+    let observation_paths = D::prepare_observation_paths(&runtime)
+        .map_err(widen_infallible)?;
     Ok(ReplicatedTextSession {
         selected,
         selected_state,
         execution: runtime,
+        observation_paths,
         driver,
         state,
         mechanisms,
@@ -2168,6 +3077,9 @@ where
         last_commit_outcome: None,
         successful_state_restorations: Some(0),
         control_identity: std::sync::Arc::new(()),
+        prefill_identity: Default::default(),
+        inference_guard: None,
+        active_prefill_control: None,
         control_fence: None,
         output_selection,
         backend: PhantomData,
@@ -2266,6 +3178,23 @@ where
         D::visit_loaded_parameters(&mut self.execution, visitor)
     }
 
+    /// Borrows retained module numerical values at a resolved session boundary. The
+    /// traversal does not grant native completion, mutation or submission
+    /// authority. Physical storage and future allocation must be priced by the
+    /// selected backend; values may still have unknown native backing.
+    pub fn visit_retained_values(
+        &self,
+        visitor: &mut dyn FnMut(&B::Tensor),
+    ) -> Result<bool, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.ensure_commit_resolved()?;
+        if self.active_commit_epoch.is_some() {
+            return Err(ReplicatedTextSessionError::Contract(
+                "cannot inspect retained values during an active transaction".into(),
+            ));
+        }
+        Ok(D::visit_retained_values(&self.execution, visitor))
+    }
+
     /// Performs bounded work while the selected static or unit owner is retained.
     pub fn with_parameter_slots(
         &mut self,
@@ -2342,15 +3271,170 @@ where
         pass: ExpertPass,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        let (output, checkpoint, forward_context) =
-            self.execute_input_with_observer(input, pass, context, &mut crate::NoopObserver)?;
-        self.publish(
-            output,
-            checkpoint,
-            forward_context,
+        self.with_observation_transaction(&mut crate::NoopObserver, |session, observer| {
+            let (output, checkpoint, forward_context) =
+                session.execute_input_with_observer(input, pass, context, observer)?;
+            session.publish(output, checkpoint, forward_context, context, observer)
+        })
+    }
+
+    /// Runs the same sequence transaction with an exact caller-owned completion
+    /// producer. Completion still precedes the shared agreement, rollback and
+    /// commit worker; the callback may retain additional readout roots.
+    pub fn sequence_logits_with_completion<'a, F>(
+        &mut self,
+        input: A::Input<'a>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        complete: F,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        F: FnOnce(&B::Tensor, &M::State, &<B::Tensor as Tensor>::Context) -> Result<(), M::Error>,
+    {
+        self.sequence_logits_with_optional_checkpoint(input, pass, context, None, complete)
+    }
+
+    /// Uses a caller-prepared checkpoint at the existing checkpoint agreement
+    /// phase. The caller must supply the complete copy of this current state;
+    /// completion, rollback and commit follow the same sequence transaction.
+    pub fn sequence_logits_with_checkpoint_and_completion<'a, F>(
+        &mut self,
+        input: A::Input<'a>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        checkpoint: M::StateCheckpoint,
+        complete: F,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        F: FnOnce(&B::Tensor, &M::State, &<B::Tensor as Tensor>::Context) -> Result<(), M::Error>,
+    {
+        self.sequence_logits_with_optional_checkpoint(
+            input,
+            pass,
             context,
-            &mut crate::NoopObserver,
+            Some(checkpoint),
+            complete,
         )
+    }
+
+    fn sequence_logits_with_optional_checkpoint<'a, F>(
+        &mut self,
+        input: A::Input<'a>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        checkpoint: Option<M::StateCheckpoint>,
+        complete: F,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        F: FnOnce(&B::Tensor, &M::State, &<B::Tensor as Tensor>::Context) -> Result<(), M::Error>,
+    {
+        self.output_with_optional_checkpoint_and_completion(
+            input,
+            pass,
+            eredu_core::OutputDemand::Sequence,
+            context,
+            checkpoint,
+            |output, state, context| {
+                complete(output.expect("sequence output checked"), state, context)
+            },
+            || {
+                ReplicatedTextSessionError::Contract(
+                    "score-producing session received state-only output".into(),
+                )
+            },
+        )
+        .map(|output| output.expect("sequence publication preserves output"))
+    }
+
+    /// Runs one selected prefill span with its exact readout demand and a
+    /// caller-prepared rollback copy. State-only draft spans never construct
+    /// vocabulary output. The same publication/completion/agreement worker
+    /// commits the span only after the supplied exact completion succeeds.
+    pub fn prefill_span_with_checkpoint_and_completion<'a, F>(
+        &mut self,
+        input: A::Input<'a>,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+        checkpoint: M::StateCheckpoint,
+        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        complete: F,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        M::Error: From<eredu_nn::workspace::WorkspaceMetadataFundingError>,
+        F: FnOnce(
+            Option<&B::Tensor>,
+            &M::State,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<(), M::Error>,
+    {
+        let controls = [
+            std::mem::size_of::<F>(),
+            std::mem::size_of::<Option<M::StateCheckpoint>>(),
+            std::mem::size_of::<Option<B::Tensor>>(),
+            std::mem::size_of::<Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>>(),
+            std::mem::size_of::<Result<(Option<B::Tensor>, M::StateCheckpoint, A::ForwardContext), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>>(),
+            std::mem::size_of::<(&mut Self, A::Input<'a>, eredu_core::OutputDemand, &<B::Tensor as Tensor>::Context, M::StateCheckpoint, &eredu_nn::workspace::WorkspaceMetadataFunding, F)>(),
+        ];
+        let bytes = controls.into_iter()
+            .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+            .ok_or_else(|| ReplicatedTextSessionError::Mechanism(
+                eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow.into(),
+            ))?;
+        funding.reserve_metadata(bytes).map_err(|cause| ReplicatedTextSessionError::Mechanism(cause.into()))?;
+        self.output_with_optional_checkpoint_and_completion(
+            input,
+            ExpertPass::Prefill,
+            demand,
+            context,
+            Some(checkpoint),
+            complete,
+            || {
+                ReplicatedTextSessionError::WorkingMemory(
+                    crate::working_memory::WorkingMemoryError::IdentityMismatch,
+                )
+            },
+        )
+    }
+
+    fn output_with_optional_checkpoint_and_completion<'a, F, E>(
+        &mut self,
+        input: A::Input<'a>,
+        pass: ExpertPass,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+        checkpoint: Option<M::StateCheckpoint>,
+        complete: F,
+        output_error: E,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        F: FnOnce(
+            Option<&B::Tensor>,
+            &M::State,
+            &<B::Tensor as Tensor>::Context,
+        ) -> Result<(), M::Error>,
+        E: FnOnce() -> ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    {
+        self.with_observation_transaction(&mut crate::NoopObserver, |session, observer| {
+            let (output, checkpoint, forward) = session
+                .execute_input_result_before_publication_with_readout(
+                    Ok(input),
+                    pass,
+                    context,
+                    observer,
+                    demand,
+                    checkpoint,
+                )?;
+            if output.is_some() != (demand != eredu_core::OutputDemand::StateOnly) {
+                return session.rollback_failure(checkpoint, output_error(), context);
+            }
+            let (output, checkpoint, forward) = session
+                .publish_observed_output_transaction_with_readout(
+                    output, checkpoint, forward, context,
+                )?;
+            let completion = complete(output.as_ref(), &session.state, context)
+                .map_err(ReplicatedTextSessionError::Mechanism);
+            session.finish_publication(output, checkpoint, forward, context, observer, completion)
+        })
     }
 
     /// Runs prompt processing and selects the architecture-declared text output.
@@ -2449,69 +3533,9 @@ where
     {
         let (output, checkpoint, forward_context) =
             self.execute_input_before_publication(input, pass, context, observer)?;
-        let capture = D::prediction_target_capture(&mut self.execution, &forward_context, context)
-            .map_err(widen_infallible);
-        let local_success = matches!(&capture, Ok(Some(_)));
-        let agreed = match D::agree_distributed_phase(
-            &mut self.execution,
-            crate::DistributedExecutionPhase::PredictionTargetCapture,
-            local_success,
-            context,
-        ) {
-            Ok(agreed) => agreed,
-            Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context);
-            }
-        };
-        let capture = match capture {
-            Ok(Some(capture)) if agreed => capture,
-            Ok(Some(_)) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Contract(
-                        "another rank could not prepare the prediction target capture".into(),
-                    ),
-                    context,
-                );
-            }
-            Ok(None) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Contract(
-                        "prediction target pass did not retain its declared hidden capture".into(),
-                    ),
-                    context,
-                );
-            }
+        let capture = match self.prepare_prediction_target_capture(&forward_context, context) {
+            Ok(capture) => capture,
             Err(error) => return self.rollback_failure(checkpoint, error, context),
-        };
-        let capture_publication =
-            D::publish_prediction_target_capture(&mut self.execution, capture, context);
-        let capture_publication_agreed = match D::agree_distributed_phase(
-            &mut self.execution,
-            crate::DistributedExecutionPhase::PredictionTargetCapturePublication,
-            capture_publication.is_ok(),
-            context,
-        ) {
-            Ok(agreed) => agreed,
-            Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context);
-            }
-        };
-        let capture = match capture_publication {
-            Ok(capture) if capture_publication_agreed => capture,
-            Ok(_) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Contract(
-                        "another rank failed to publish the prediction target capture".into(),
-                    ),
-                    context,
-                );
-            }
-            Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context);
-            }
         };
         let (output, checkpoint, forward_context) =
             self.publish_observed_output_transaction(output, checkpoint, forward_context, context)?;
@@ -2588,6 +3612,8 @@ where
 
     /// Runs composite prompt processing and commits its cache-relevant input identity only after
     /// successful state publication and exact completion.
+    /// This legacy owned-value adapter may allocate shared ownership metadata;
+    /// already shared inputs use [`Self::prefill_input_with_shared_cache_identity`].
     pub fn prefill_input_with_cache_identity<'a>(
         &mut self,
         input: A::Input<'a>,
@@ -2603,11 +3629,47 @@ where
     }
 
     /// Runs observed prompt processing and commits its exact prepared-input identity on success.
+    /// This legacy adapter may allocate; use the shared variant to preserve an
+    /// existing allocation owner and its custody.
     pub fn prefill_input_with_observer_and_cache_identity<'a, O>(
         &mut self,
         input: A::Input<'a>,
         identity: PreparedInputCacheIdentity,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.prefill_input_with_observer_and_shared_cache_identity(
+            input,
+            SharedPreparedInputCacheIdentity::new(identity),
+            context,
+            observer,
+        )
+    }
+
+    /// Commits an existing shared input identity without copying its metadata.
+    pub fn prefill_input_with_shared_cache_identity<'a>(
+        &mut self,
+        input: A::Input<'a>,
+        identity: SharedPreparedInputCacheIdentity,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.prefill_input_with_observer_and_shared_cache_identity(
+            input,
+            identity,
+            context,
+            &mut crate::NoopObserver,
+        )
+    }
+
+    /// Observes prompt processing while preserving the actual input-identity owner.
+    pub fn prefill_input_with_observer_and_shared_cache_identity<'a, O>(
+        &mut self,
+        input: A::Input<'a>,
+        identity: SharedPreparedInputCacheIdentity,
+        context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     where
@@ -2638,11 +3700,33 @@ where
     /// observer. Failed preparation consumes the transaction epoch but preserves
     /// installed state and the previously committed prompt identity. Local native
     /// work remains subject to the backend's ordinary completion/recovery owner.
+    /// Wrapping a supplied raw identity may allocate; shared sources use
+    /// [`Self::prefill_input_result_with_shared_identity`] directly.
     pub fn prefill_input_result_with_observer<'a, O>(
         &mut self,
         input: Result<A::Input<'a>, A::Error>,
         identity: Option<PreparedInputCacheIdentity>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.prefill_input_result_with_shared_identity(
+            input,
+            identity.map(SharedPreparedInputCacheIdentity::new),
+            context,
+            observer,
+        )
+    }
+
+    /// Agrees prepared input and commits its shared identity after exact completion.
+    /// No identity payload is copied or newly wrapped by this entrypoint.
+    pub fn prefill_input_result_with_shared_identity<'a, O>(
+        &mut self,
+        input: Result<A::Input<'a>, A::Error>,
+        identity: Option<SharedPreparedInputCacheIdentity>,
+        context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     where
@@ -2654,7 +3738,7 @@ where
     fn prefill_input_result_transaction<'a, O>(
         &mut self,
         input: Result<A::Input<'a>, A::Error>,
-        identity: Option<PreparedInputCacheIdentity>,
+        identity: Option<SharedPreparedInputCacheIdentity>,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
         require_input_agreement: bool,
@@ -2686,6 +3770,134 @@ where
                 }
             };
             session.publish(output, checkpoint, forward_context, context, observer)
+        })?;
+        if let Some(identity) = identity {
+            self.committed_prompt_input_identity = Some(identity);
+        }
+        Ok(output)
+    }
+
+    /// Executes one prepared decoder span with explicit readout demand and exact
+    /// completion, using the ordinary session transaction. The caller owns
+    /// semantic input preparation and request reservation; this method neither
+    /// slices media nor schedules another chunk. Returned score axes are retained.
+    /// A sequence observer can promote demand on every participating rank.
+    pub fn prefill_input_with_readout<'a, O>(
+        &mut self,
+        input: A::Input<'a>,
+        identity: Option<PreparedInputCacheIdentity>,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.prefill_input_result_with_readout(Ok(input), identity, demand, context, observer)
+    }
+
+    /// Propagates a local span-preparation failure to participating ranks before
+    /// any state mutation, with the same completion and readout contract.
+    /// This raw-identity adapter may allocate shared ownership metadata. It is
+    /// not an allocation-bound proof for a finite request.
+    pub fn prefill_input_result_with_readout<'a, O>(
+        &mut self,
+        input: Result<A::Input<'a>, A::Error>,
+        identity: Option<PreparedInputCacheIdentity>,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.prefill_input_result_with_shared_identity_and_readout(
+            input,
+            identity.map(SharedPreparedInputCacheIdentity::new),
+            demand,
+            context,
+            observer,
+        )
+    }
+
+    /// Executes a decoder span with explicit readout and an existing shared
+    /// prompt-identity owner. The owner is installed only on successful commit.
+    pub fn prefill_input_with_shared_identity_and_readout<'a, O>(
+        &mut self,
+        input: A::Input<'a>,
+        identity: Option<SharedPreparedInputCacheIdentity>,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.prefill_input_result_with_shared_identity_and_readout(
+            Ok(input),
+            identity,
+            demand,
+            context,
+            observer,
+        )
+    }
+
+    /// Agrees span preparation before execution, retaining the supplied shared
+    /// identity through publication without allocating a replacement payload.
+    pub fn prefill_input_result_with_shared_identity_and_readout<'a, O>(
+        &mut self,
+        input: Result<A::Input<'a>, A::Error>,
+        identity: Option<SharedPreparedInputCacheIdentity>,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.prefill_typed_input_with_shared_identity_and_readout(
+            input.map_err(ReplicatedTextSessionError::Architecture),
+            identity,
+            demand,
+            context,
+            observer,
+        )
+    }
+
+    // Internal preparation failures (including exact retention association) enter
+    // the same original input agreement and transaction as architecture errors.
+    fn prefill_typed_input_with_shared_identity_and_readout<'a, O>(
+        &mut self,
+        input: Result<A::Input<'a>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>,
+        identity: Option<SharedPreparedInputCacheIdentity>,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        if !self.selected.exact_completion_available() {
+            return Err(ReplicatedTextSessionError::Contract(
+                "bounded prefill requires exact state completion".into(),
+            ));
+        }
+        let output = self.with_observation_transaction(observer, |session, observer| {
+            session.require_input_result_agreement(true)?;
+            let (output, checkpoint, forward) = session
+                .execute_input_result_before_publication_with_readout(
+                    input,
+                    ExpertPass::Prefill,
+                    context,
+                    observer,
+                    demand,
+                    None,
+                )?;
+            let (output, checkpoint, forward) = session
+                .publish_observed_output_transaction_with_readout(
+                    output, checkpoint, forward, context,
+                )?;
+            session.publish_with_readout(output, checkpoint, forward, context, observer, true)
         })?;
         if let Some(identity) = identity {
             self.committed_prompt_input_identity = Some(identity);
@@ -2880,13 +4092,13 @@ where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
         self.with_observation_transaction(observer, |session, observer| {
-            let (output, checkpoint, forward_context) = session.execute_with_observer(
-                tokens,
-                None,
-                ExpertPass::Decode,
-                context,
-                observer,
-            )?;
+            let (output, checkpoint, forward_context) = session
+                .execute_input_result_with_observer(
+                    Ok(A::text_input(tokens, None)),
+                    ExpertPass::Decode,
+                    context,
+                    observer,
+                )?;
             let sequence_index = session.output_selection.sequence_index();
             let output = match session
                 .mechanisms
@@ -2946,12 +4158,12 @@ where
             )),
         };
         let phase = crate::DistributedExecutionPhase::PredictionTargetStatePreparation;
-        let agreed =
-            D::agree_distributed_phase(&mut self.execution, phase, validation.is_ok(), context)
-                .map_err(widen_infallible)?;
+        let agreed = self
+            .agree_execution_phase(phase, validation.is_ok(), context)
+            .map_err(widen_infallible)?;
         match validation {
             Ok(()) if agreed => {
-                std::mem::swap(&mut self.state, replacement);
+                crate::working_memory::exchange_inference_state(&mut self.state, replacement);
                 Ok(())
             }
             Ok(()) => Err(ReplicatedTextSessionError::Contract(
@@ -2980,7 +4192,7 @@ where
         })?;
         validate_realized_state(&self.state, selected)?;
         validate_realized_state(replacement, selected)?;
-        std::mem::swap(&mut self.state, replacement);
+        crate::working_memory::exchange_inference_state(&mut self.state, replacement);
         Ok(())
     }
 
@@ -2993,33 +4205,55 @@ where
         &mut self,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<M::State, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        self.ensure_commit_resolved()?;
-        let provisional = self.selected_state.state().map_or_else(
-            || {
-                Err(ReplicatedTextSessionError::Contract(
-                    "stateless session cannot prepare prediction target state".into(),
-                ))
+        self.prepare_prediction_target_state_with(
+            context,
+            |mechanisms, source, selected| {
+                let mut state=mechanisms.fork_prediction_target_state(source,selected,context)
+                    .map_err(ReplicatedTextSessionError::Mechanism)?;
+                state.inherit_inference_retention(source);
+                Ok(state)
             },
-            |selected| {
-                self.mechanisms
-                    .fork_prediction_target_state(&self.state, selected, context)
-                    .map_err(ReplicatedTextSessionError::Mechanism)
-                    .and_then(|state| {
-                        validate_realized_state(&state, selected)?;
-                        Ok(state)
-                    })
+            |state|state,
+            |error|error,
+            |cause|match cause {
+                PredictionTargetPreparationError::Boundary(cause)=>cause.into_legacy(),
+                cause=>ReplicatedTextSessionError::Contract(cause.to_string()),
             },
-        );
-        let phase = crate::DistributedExecutionPhase::PredictionTargetStatePreparation;
-        let agreed =
-            D::agree_distributed_phase(&mut self.execution, phase, provisional.is_ok(), context)
-                .map_err(widen_infallible)?;
+        )
+    }
+
+    /// Shared state-preparation mutation boundary for an actual paid destination.
+    /// The callback may copy native state under its separately admitted copy
+    /// authority. Unlike read-only inspection, this is the existing preparation
+    /// transaction: commit resolution, local copy/layout check and rank agreement
+    /// complete before any destination is returned. The callback must preserve
+    /// the exact inherited storage/account custody required by its state type.
+    pub fn prepare_prediction_target_state_with<T,E>(
+        &mut self,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        prepare: impl FnOnce(&mut M,&M::State,&SelectedStateRealization)->Result<T,E>,
+        state: impl FnOnce(&T)->&M::State,
+        session_error: impl Fn(ReplicatedTextSessionError<A::Error,M::PolicyError,M::Error>)->E,
+        contract_error: impl Fn(PredictionTargetPreparationError)->E,
+    )->Result<T,E> {
+        RuntimeInspectionBoundary::resolved(self.control_fence,self.last_commit_outcome)
+            .map_err(|cause|contract_error(PredictionTargetPreparationError::Boundary(cause)))?;
+        let provisional=match self.selected_state.state() {
+            None=>Err(contract_error(PredictionTargetPreparationError::Stateless)),
+            Some(selected)=>prepare(&mut self.mechanisms,&self.state,selected).and_then(|prepared| {
+                if !realized_state_layout_matches::<B,M::State>(state(&prepared),selected) {
+                    return Err(contract_error(PredictionTargetPreparationError::Layout));
+                }
+                Ok(prepared)
+            }),
+        };
+        let phase=crate::DistributedExecutionPhase::PredictionTargetStatePreparation;
+        let agreed=self.agree_execution_phase(phase,provisional.is_ok(),context)
+            .map_err(|cause|session_error(widen_infallible(cause)))?;
         match provisional {
-            Ok(state) if agreed => Ok(state),
-            Ok(_) => Err(ReplicatedTextSessionError::Contract(
-                "another rank could not prepare prediction target lane state".into(),
-            )),
-            Err(error) => Err(error),
+            Ok(prepared) if agreed=>Ok(prepared),
+            Ok(_)=>Err(contract_error(PredictionTargetPreparationError::Peer)),
+            Err(cause)=>Err(cause),
         }
     }
 
@@ -3037,12 +4271,34 @@ where
     {
         self.ensure_commit_resolved()?;
         let checkpoint = self.checkpoint_observed_state(context)?;
-        let execution = D::apply_prediction_target_operation(
-            &mut self.execution,
-            &mut self.state,
-            operation,
-            context,
-        )
+        let execution = {
+            // The typed operation may replace the complete state, or unwind
+            // after doing so. Preserve the original backing owners and invalidate
+            // the final revision before another cold inspection is possible.
+            struct Mutating<'a, S: InferenceStateRetention> {
+                state: &'a mut S,
+                retained: crate::working_memory::InferenceRetention,
+            }
+            impl<S: InferenceStateRetention> Drop for Mutating<'_, S> {
+                fn drop(&mut self) {
+                    let retention = self.state.inference_retention_mut();
+                    retention.extend_from(&self.retained);
+                    retention.invalidate_revision();
+                }
+            }
+            let retained = self.state.inference_retention().clone();
+            self.state.inference_retention_mut().invalidate_revision();
+            let mutating = Mutating {
+                state: &mut self.state,
+                retained,
+            };
+            D::apply_prediction_target_operation(
+                &mut self.execution,
+                &mut *mutating.state,
+                operation,
+                context,
+            )
+        }
         .map_err(widen_infallible)
         .and_then(|output| {
             output.ok_or_else(|| {
@@ -3052,23 +4308,26 @@ where
             })
         });
         let phase = crate::DistributedExecutionPhase::PredictionExtensionExecution;
-        let agreed =
-            D::agree_distributed_phase(&mut self.execution, phase, execution.is_ok(), context)
-                .map_err(widen_infallible);
+        let agreed = self
+            .agree_execution_phase(phase, execution.is_ok(), context)
+            .map_err(widen_infallible);
         match (execution, agreed) {
             (Ok(output), Ok(true)) => Ok(output),
             (execution, agreement) => {
+                let error = match (execution, agreement) {
+                    (Err(error), _) | (_, Err(error)) => error,
+                    (Ok(_), Ok(false)) => ReplicatedTextSessionError::Contract(
+                        "another rank failed during prediction-extension execution".into(),
+                    ),
+                    (Ok(_), Ok(true)) => unreachable!("successful extension returned above"),
+                };
+                if self.control_fence.is_some() {
+                    return Err(error);
+                }
                 self.mechanisms
                     .restore_state(&mut self.state, checkpoint, context)
                     .map_err(ReplicatedTextSessionError::Mechanism)?;
-                match (execution, agreement) {
-                    (_, Err(error)) => Err(error),
-                    (Err(error), _) => Err(error),
-                    (Ok(_), Ok(false)) => Err(ReplicatedTextSessionError::Contract(
-                        "another rank failed during prediction-extension execution".into(),
-                    )),
-                    (Ok(_), Ok(true)) => unreachable!("successful extension returned above"),
-                }
+                Err(error)
             }
         }
     }
@@ -3112,7 +4371,7 @@ where
             None if agreed => None,
             Some(Ok(_)) | None => return self.fence_remote_cache_control_failure(phase),
             Some(Err(error)) => {
-                self.control_fence = Some(phase);
+                self.control_fence.get_or_insert(phase);
                 return Err(error);
             }
         };
@@ -3218,10 +4477,11 @@ where
             None if agreed => {}
             Some(Ok(_)) | None => return self.fence_remote_cache_control_failure(phase),
             Some(Err(error)) => {
-                self.control_fence = Some(phase);
+                self.control_fence.get_or_insert(phase);
                 return Err(error);
             }
         }
+        self.state.inference_retention_mut().invalidate_revision();
         self.committed_prompt_input_identity = None;
         Ok(())
     }
@@ -3244,6 +4504,7 @@ where
                 "stateless session owns a stateful mechanism realization".into(),
             ));
         }
+        self.state.inference_retention_mut().invalidate_revision();
         self.committed_prompt_input_identity = None;
         Ok(())
     }
@@ -3279,22 +4540,26 @@ where
         manifest.validate_compatibility(expected, prefix_token_ids)?;
         validate_realized_state(&state, selected_state)?;
         self.state = state;
+        self.state.inference_retention_mut().invalidate_revision();
         self.committed_prompt_input_identity = None;
         self.restore_distributed_commit(manifest.distributed_commit)?;
         Ok(manifest)
     }
 
     /// Opens a prompt cache only when its content identity matches the admitted prepared input.
+    /// A shared identity retains its existing payload/custody; a raw identity is
+    /// moved into one shared owner before validation.
     pub fn load_prompt_cache_for_input(
         &mut self,
         directory: &Path,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-        input_identity: PreparedInputCacheIdentity,
+        input_identity: impl Into<SharedPreparedInputCacheIdentity>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     {
-        self.validate_prompt_input_descriptor(expected, &input_identity)?;
+        let input_identity = input_identity.into();
+        self.validate_prompt_input_descriptor(expected, input_identity.as_ref())?;
         let manifest = self.load_prompt_cache(directory, expected, prefix_token_ids, context)?;
         self.committed_prompt_input_identity = Some(input_identity);
         Ok(manifest)
@@ -3326,12 +4591,13 @@ where
     }
 
     /// Atomically loads partition state after all ranks validate one prepared input.
+    /// An existing shared identity is installed without copying its payload.
     pub fn load_prompt_cache_for_input_distributed(
         &mut self,
         directory: &Path,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-        input_identity: PreparedInputCacheIdentity,
+        input_identity: impl Into<SharedPreparedInputCacheIdentity>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<
         Option<PromptCacheManifest>,
@@ -3341,7 +4607,7 @@ where
             directory,
             expected,
             prefix_token_ids,
-            Some(input_identity),
+            Some(input_identity.into()),
             context,
         )
     }
@@ -3386,7 +4652,7 @@ where
     ) -> Result<PromptCacheManifest, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     {
         self.validate_prompt_input_descriptor(&descriptor, input_identity)?;
-        if self.committed_prompt_input_identity.as_ref() != Some(input_identity) {
+        if self.committed_prompt_input_identity() != Some(input_identity) {
             return Err(ReplicatedTextSessionError::Contract(
                 "prompt-cache prepared-input identity differs from the committed prompt".into(),
             ));
@@ -3399,7 +4665,7 @@ where
         directory: &Path,
         expected: &PromptCacheDescriptor,
         prefix_token_ids: &[u32],
-        input_identity: Option<PreparedInputCacheIdentity>,
+        input_identity: Option<SharedPreparedInputCacheIdentity>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<
         Option<PromptCacheManifest>,
@@ -3409,7 +4675,7 @@ where
         self.require_cache_control_agreement()?;
         let preflight = (|| {
             if let Some(input_identity) = input_identity.as_ref() {
-                self.validate_prompt_input_descriptor(expected, input_identity)?;
+                self.validate_prompt_input_descriptor(expected, input_identity.as_ref())?;
             }
             match (
                 self.selected_state.state(),
@@ -3437,7 +4703,7 @@ where
             (Ok(_), Ok(false)) => return self.fence_remote_cache_control_failure(phase),
             (Ok(_), Err(error)) => return Err(error),
             (Err(error), _) => {
-                self.control_fence = Some(phase);
+                self.control_fence.get_or_insert(phase);
                 return Err(error);
             }
         };
@@ -3471,12 +4737,13 @@ where
             }
             (Some(Ok(_)) | None, Err(error)) => return Err(error),
             (Some(Err(error)), _) => {
-                self.control_fence = Some(phase);
+                self.control_fence.get_or_insert(phase);
                 return Err(error);
             }
         };
         let manifest = provisional.map(|(state, manifest)| {
             self.state = state;
+            self.state.inference_retention_mut().invalidate_revision();
             self.committed_prompt_input_identity = input_identity;
             self.active_commit_epoch = None;
             self.last_commit_outcome = manifest.distributed_commit;
@@ -3489,6 +4756,9 @@ where
             }
             manifest
         });
+        if manifest.is_none() {
+            self.state.inference_retention_mut().invalidate_revision();
+        }
         Ok(manifest)
     }
 
@@ -3496,7 +4766,7 @@ where
         &mut self,
         checkpoint: Option<M::StateCheckpoint>,
         metadata: Option<(
-            Option<PreparedInputCacheIdentity>,
+            Option<SharedPreparedInputCacheIdentity>,
             DistributedCommitEpoch,
             Option<DistributedCommitOutcome>,
         )>,
@@ -3538,12 +4808,12 @@ where
             None if agreed => None,
             Some(Ok(_)) | None => return self.fence_remote_cache_control_failure(phase),
             Some(Err(error)) => {
-                self.control_fence = Some(phase);
+                self.control_fence.get_or_insert(phase);
                 return Err(error);
             }
         };
         if !metadata_valid {
-            self.control_fence = Some(phase);
+            self.control_fence.get_or_insert(phase);
             return Err(ReplicatedTextSessionError::Contract(
                 "distributed checkpoint commit metadata is inconsistent".into(),
             ));
@@ -3551,6 +4821,7 @@ where
         if let Some(state) = provisional {
             self.state = state;
         }
+        self.state.inference_retention_mut().invalidate_revision();
         match metadata {
             Some((identity, next, outcome)) => {
                 self.committed_prompt_input_identity = identity;
@@ -3564,8 +4835,41 @@ where
     }
 
     /// Returns the prepared-input identity associated with the currently committed prompt state.
-    pub const fn committed_prompt_input_identity(&self) -> Option<&PreparedInputCacheIdentity> {
+    pub fn committed_prompt_input_identity(&self) -> Option<&PreparedInputCacheIdentity> {
+        self.committed_prompt_input_identity
+            .as_ref()
+            .map(AsRef::as_ref)
+    }
+
+    /// Borrows the actual committed identity owner for shared storage inventory.
+    pub fn committed_shared_prompt_input_identity(
+        &self,
+    ) -> Option<&SharedPreparedInputCacheIdentity> {
         self.committed_prompt_input_identity.as_ref()
+    }
+
+    /// Projects the current state through a read-only backend inspection.
+    /// An unresolved commit or fenced control transaction cannot be quoted as
+    /// a stable starting state. This grants no native completion or submission
+    /// authority; inspectors must preserve unknown allocation/completion facts.
+    /// A returned view may borrow this exact state. The shared borrow prevents
+    /// state replacement; native work still needs its independent submission
+    /// authority after the inspector returns.
+    pub fn inspect_runtime_state<'source, T>(
+        &'source self,
+        inspect: impl FnOnce(&'source M::State) -> Result<T, M::Error>,
+    ) -> Result<T, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.inspect_runtime(|_, state| inspect(state))
+    }
+
+    /// Inspects retained backend mechanisms and state at the same quiescent
+    /// session boundary. This does not grant submission or completion authority;
+    /// an inspector must not load, evaluate, poll, or mutate native resources.
+    pub fn inspect_runtime<'source, T>(
+        &'source self,
+        inspect: impl FnOnce(&'source M, &'source M::State) -> Result<T, M::Error>,
+    ) -> Result<T, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        self.inspect_runtime_execution(|mechanisms, state, _| inspect(mechanisms, state))
     }
 
     /// Returns one coherent execution and state residency report.
@@ -3594,6 +4898,67 @@ where
         })
     }
 
+    fn fence_terminal(&mut self, phase: crate::DistributedExecutionPhase) {
+        self.control_fence.get_or_insert(phase);
+        D::mark_terminal_failure(&self.execution, phase);
+    }
+
+    fn agree_execution_phase(
+        &mut self,
+        phase: crate::DistributedExecutionPhase,
+        local_success: bool,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<bool, ReplicatedTextSessionError<A::Error, M::PolicyError, std::convert::Infallible>>
+    {
+        // Terminal errors must never enter a recovery vote or native follow-up.
+        if self.control_fence.is_some() {
+            return Err(ReplicatedTextSessionError::Partition(
+                crate::PartitionExecutionError::CommunicationTerminal,
+            ));
+        }
+        let execution = &mut self.execution;
+        let event = ParallelControlEvent::Phase(phase);
+        let result = if D::parallel_control_operation(execution, event).is_some() {
+            self.mechanisms.with_execution_parallel_control(
+                event, context,
+                |prepared| D::agree_distributed_phase_with_parallel(
+                    execution, phase, local_success, context, prepared),
+            ).map_err(ReplicatedTextSessionError::ParallelControl).and_then(|result| result)
+        } else {
+            D::agree_distributed_phase(execution, phase, local_success, context)
+        };
+        if result.is_err() {
+            self.fence_terminal(phase);
+        }
+        result
+    }
+
+    fn finish_terminal_unwind<T>(
+        &mut self,
+        phase: crate::DistributedExecutionPhase,
+        result: std::thread::Result<T>,
+    ) -> T {
+        match result {
+            Ok(value) => value,
+            Err(payload) => {
+                // All operation loans have unwound before cleanup. The mark and
+                // unresolved guard Drop perform no new work or completion wait.
+                self.fence_terminal(phase);
+                drop(self.inference_guard.take());
+                std::panic::resume_unwind(payload);
+            }
+        }
+    }
+
+    fn with_terminal_unwind<T>(
+        &mut self,
+        phase: crate::DistributedExecutionPhase,
+        operation: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| operation(self)));
+        self.finish_terminal_unwind(phase, result)
+    }
+
     fn with_observation_transaction<O, V>(
         &mut self,
         observer: &mut O,
@@ -3610,8 +4975,37 @@ where
     {
         let guard =
             crate::inspection::ObservationTransactionGuard::new(observer, self.next_commit_epoch);
-        let result = operation(self, guard.observer);
-        guard.finish(result.is_ok());
+        let result = self.with_terminal_unwind(
+            crate::DistributedExecutionPhase::InferenceWorkspace,
+            |session| operation(session, guard.observer),
+        );
+        let result = if let Some(retention) = self.inference_guard.take() {
+            match result {
+                Err(error) => {
+                    // A host error or deadline is not native completion. Drop
+                    // transfers the already owned request into recovery without
+                    // spinning on a still-pending collective, even when nested.
+                    drop(retention);
+                    Err(error)
+                }
+                Ok(output) => match self.with_terminal_unwind(
+                    crate::DistributedExecutionPhase::InferenceWorkspace,
+                    |session| session.mechanisms.finish_prefill_reservation(retention),
+                ) {
+                    Ok(()) => Ok(output),
+                    Err(error) => {
+                        self.fence_terminal(crate::DistributedExecutionPhase::InferenceWorkspace);
+                        Err(ReplicatedTextSessionError::Mechanism(error))
+                    }
+                },
+            }
+        } else {
+            result
+        };
+        self.with_terminal_unwind(
+            crate::DistributedExecutionPhase::ObservationDelivery,
+            |_| guard.finish(result.is_ok()),
+        );
         result
     }
 
@@ -3636,15 +5030,32 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<M::StateCheckpoint, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
     {
-        let checkpoint = self.mechanisms.checkpoint_state(&self.state, context);
-        let checkpoint_agreed = match D::agree_distributed_phase(
-            &mut self.execution,
+        self.checkpoint_observed_state_with_prepared(context, None)
+    }
+
+    fn checkpoint_observed_state_with_prepared(
+        &mut self,
+        context: &<B::Tensor as Tensor>::Context,
+        prepared: Option<M::StateCheckpoint>,
+    ) -> Result<M::StateCheckpoint, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    {
+        let checkpoint = match prepared {
+            Some(checkpoint) => Ok(checkpoint),
+            None => self.mechanisms.checkpoint_state(&self.state, context),
+        };
+        let checkpoint_agreed = match self.agree_execution_phase(
             crate::DistributedExecutionPhase::StateCheckpoint,
             checkpoint.is_ok(),
             context,
         ) {
             Ok(agreed) => agreed,
-            Err(error) => return self.abort_without_rollback(widen_infallible(error)),
+            Err(error) => {
+                let error = match checkpoint {
+                    Err(prior) => ReplicatedTextSessionError::Mechanism(prior),
+                    Ok(_) => widen_infallible(error),
+                };
+                return self.abort_without_rollback(error);
+            }
         };
         let checkpoint = match checkpoint {
             Ok(checkpoint) if checkpoint_agreed => checkpoint,
@@ -3675,23 +5086,15 @@ where
             let active = observer.transactional();
             // All ranks execute the first vote, even if their observer is absent.
             // A mixed configuration must fail before a callback enters a collective.
-            let absent = D::agree_distributed_phase(
-                &mut self.execution,
-                Phase::ObservationParticipation,
-                !active,
-                context,
-            )
-            .map_err(widen_infallible)?;
+            let absent = self
+                .agree_execution_phase(Phase::ObservationParticipation, !active, context)
+                .map_err(widen_infallible)?;
             if absent {
                 return Ok(());
             }
-            let present = D::agree_distributed_phase(
-                &mut self.execution,
-                Phase::ObservationParticipationRequired,
-                active,
-                context,
-            )
-            .map_err(widen_infallible)?;
+            let present = self
+                .agree_execution_phase(Phase::ObservationParticipationRequired, active, context)
+                .map_err(widen_infallible)?;
             if !present || !active || (D::PARTITIONED_SESSION && !D::DISTRIBUTED_PHASE_AGREEMENT) {
                 return Err(ReplicatedTextSessionError::Contract(
                     "transactional observation requires agreeing participation on every rank"
@@ -3715,13 +5118,9 @@ where
                         .coordinate_transaction(epoch)
                         .map_err(ReplicatedTextSessionError::Architecture)
                 };
-                let agreed = D::agree_distributed_phase(
-                    &mut self.execution,
-                    phase,
-                    prepared.is_ok(),
-                    context,
-                )
-                .map_err(widen_infallible);
+                let agreed = self
+                    .agree_execution_phase(phase, prepared.is_ok(), context)
+                    .map_err(widen_infallible);
                 match (prepared, agreed) {
                     (Err(error), _) | (_, Err(error)) => return Err(error),
                     (Ok(()), Ok(true)) => (),
@@ -3792,8 +5191,13 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let (output, checkpoint, forward_context) =
-            self.execute_input_result_before_publication(input, pass, context, observer)?;
+        let (output, checkpoint, forward_context) = self.execute_input_result_before_publication(
+            input,
+            pass,
+            context,
+            observer,
+            eredu_core::OutputDemand::LastPosition,
+        )?;
         self.publish_observed_output_transaction(output, checkpoint, forward_context, context)
     }
 
@@ -3810,7 +5214,13 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.execute_input_result_before_publication(Ok(input), pass, context, observer)
+        self.execute_input_result_before_publication(
+            Ok(input),
+            pass,
+            context,
+            observer,
+            eredu_core::OutputDemand::Sequence,
+        )
     }
 
     fn execute_input_result_before_publication<'a, O>(
@@ -3819,6 +5229,7 @@ where
         pass: ExpertPass,
         context: &<B::Tensor as Tensor>::Context,
         observer: &mut O,
+        demand: eredu_core::OutputDemand,
     ) -> Result<
         (B::Tensor, M::StateCheckpoint, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
@@ -3826,19 +5237,177 @@ where
     where
         O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let epoch = self.begin_commit_epoch()?;
-        let agreement = D::agree_distributed_phase(
-            &mut self.execution,
-            crate::DistributedExecutionPhase::InputPreparation,
-            input.is_ok(),
+        let (output, checkpoint, forward) = self
+            .execute_input_result_before_publication_with_readout(
+                input.map_err(ReplicatedTextSessionError::Architecture),
+                pass,
+                context,
+                observer,
+                demand,
+                None,
+            )?;
+        match output {
+            Some(output) => Ok((output, checkpoint, forward)),
+            None => self.rollback_failure(
+                checkpoint,
+                ReplicatedTextSessionError::Contract(
+                    "score-producing session received state-only output".into(),
+                ),
+                context,
+            ),
+        }
+    }
+
+    fn execute_input_result_before_publication_with_readout<'a, O>(
+        &mut self,
+        input: Result<A::Input<'a>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        demand: eredu_core::OutputDemand,
+        checkpoint: Option<M::StateCheckpoint>,
+    ) -> Result<
+        (Option<B::Tensor>, M::StateCheckpoint, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.execute_input_operation_before_publication(
+            input,
+            pass,
             context,
+            observer,
+            demand,
+            checkpoint,
+            A::inference_input_shape,
+            |session, input, observer, demand, prepared_traversal| {
+                session.mechanisms.with_execution_parallel_control_context(context, |control| {
+                    let execute = |execution: &mut D::Runtime| {
+                session.mechanisms.with_execution_parallel(context,|parallel| {
+                    let run = |runtime: &mut D::Runtime| {
+                if prepared_traversal {
+                    session.driver.forward_with_prepared_observer(
+                        runtime,
+                        input,
+                        &mut session.state,
+                        pass,
+                        context,
+                        observer,
+                        session
+                            .observation_paths
+                            .as_ref()
+                            .expect("binding checked before input agreement"),
+                        demand,
+                    )
+                } else {
+                    session.driver.forward_with_observer(
+                        runtime,
+                        input,
+                        &mut session.state,
+                        pass,
+                        context,
+                        observer,
+                        demand,
+                    )
+                }
+                .map_err(widen_infallible)
+                    };
+                    match parallel {
+                        Some((parallel,funding)) => D::with_borrowed_parallel_context(
+                            execution,parallel,funding,run,
+                        ).map_err(ReplicatedTextSessionError::ParallelContext)?,
+                        None => run(execution),
+                    }
+                }).map_err(ReplicatedTextSessionError::Mechanism)?
+                    };
+                    match control {
+                        Some((control, funding)) =>
+                            D::with_borrowed_parallel_control_context(
+                                &mut session.execution, control, funding, execute,
+                            ).map_err(ReplicatedTextSessionError::ParallelContext)?,
+                        None => execute(&mut session.execution),
+                    }
+                }).map_err(ReplicatedTextSessionError::Mechanism)?
+            },
         )
-        .map_err(widen_infallible);
+    }
+
+    fn execute_input_operation_before_publication<O, I, Shape, Execute>(
+        &mut self,
+        input: Result<I, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>,
+        pass: ExpertPass,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        demand: eredu_core::OutputDemand,
+        checkpoint: Option<M::StateCheckpoint>,
+        shape: Shape,
+        execute: Execute,
+    ) -> Result<
+        (Option<B::Tensor>, M::StateCheckpoint, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    >
+    where
+        Shape: FnOnce(&I) -> Result<Option<[u64; 2]>, A::Error>,
+        Execute: FnOnce(
+            &mut Self,
+            I,
+            &mut O,
+            eredu_core::OutputDemand,
+            bool,
+        ) -> Result<
+            (Option<B::Tensor>, A::ForwardContext),
+            ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+        >,
+        O: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        let epoch = self.begin_commit_epoch()?;
+        let retention = match self.state.inference_retention().admission() {
+            Some(admission) => self
+                .mechanisms
+                .coordinate_prefill_entry(admission.request().clone(), self.active_prefill_control)
+                .map(Some),
+            None => Ok(None),
+        };
+        let input = match retention {
+            Ok(retention) => {
+                self.inference_guard = retention;
+                input
+            }
+            Err(error) => {
+                self.fence_terminal(crate::DistributedExecutionPhase::InputPreparation);
+                // Input preparation may already have failed before this attempt.
+                // Keep that first cause; neither cause authorizes a false vote.
+                return Err(match input {
+                    Err(prior) => prior,
+                    Ok(_) => ReplicatedTextSessionError::Mechanism(error),
+                });
+            }
+        };
+        let prepared_traversal = observer.requires_prepared_traversal();
+        let input = input.and_then(|input| {
+            if prepared_traversal {
+                let paths = self.observation_paths.as_ref().ok_or(
+                    ReplicatedTextSessionError::PreparedObservation(
+                        PreparedSessionObservationError::Unavailable,
+                    ),
+                )?;
+                D::validate_observation_paths(&self.execution, paths).map_err(widen_infallible)?;
+            }
+            Ok(input)
+        });
+        let agreement = self
+            .agree_execution_phase(
+                crate::DistributedExecutionPhase::InputPreparation,
+                input.is_ok(),
+                context,
+            )
+            .map_err(widen_infallible);
         let input = match (input, agreement) {
             (Ok(input), Ok(true)) => input,
             (input, agreement) => {
                 let error = match (input, agreement) {
-                    (Err(error), _) => ReplicatedTextSessionError::Architecture(error),
+                    (Err(error), _) => error,
                     (_, Err(error)) => error,
                     _ => ReplicatedTextSessionError::Contract(
                         "another rank rejected input preparation".into(),
@@ -3849,21 +5418,108 @@ where
                 );
             }
         };
-        self.prepare_observation_transaction(observer, epoch, pass, context)?;
-        let checkpoint = self.checkpoint_observed_state(context)?;
-        let execution = self
-            .driver
-            .forward_with_observer(
-                &mut self.execution,
-                input,
-                &mut self.state,
-                pass,
+        let selective = self.agree_execution_phase(
+            crate::DistributedExecutionPhase::ReadoutSelection,
+            demand != eredu_core::OutputDemand::Sequence && !observer.requires_sequence_readout(),
+            context,
+        );
+        let demand = match selective {
+            Ok(true) => match self.agree_execution_phase(
+                crate::DistributedExecutionPhase::StateOnlyReadout,
+                demand == eredu_core::OutputDemand::StateOnly,
                 context,
-                observer,
+            ) {
+                Ok(true) => eredu_core::OutputDemand::StateOnly,
+                Ok(false) => eredu_core::OutputDemand::LastPosition,
+                Err(error) => {
+                    return self.abort_without_rollback(
+                        ReplicatedTextSessionError::BeforeStateMutation(Box::new(
+                            widen_infallible(error),
+                        )),
+                    );
+                }
+            },
+            Ok(false) => eredu_core::OutputDemand::Sequence,
+            Err(error) => {
+                return self.abort_without_rollback(
+                    ReplicatedTextSessionError::BeforeStateMutation(Box::new(widen_infallible(
+                        error,
+                    ))),
+                );
+            }
+        };
+        let span_end = match self.state.inference_retention().admission() {
+            Some(admission) => shape(&input)
+                .map_err(ReplicatedTextSessionError::Architecture)
+                .and_then(|shape| {
+                    let position = self
+                        .mechanisms
+                        .prefill_state_frontier(&self.state)
+                        .map_err(ReplicatedTextSessionError::Mechanism)?;
+                    admission
+                        .validate_span(
+                            &self.prefill_identity,
+                            shape,
+                            pass == ExpertPass::Prefill,
+                            demand,
+                            position,
+                        )
+                        .map(Some)
+                        .map_err(ReplicatedTextSessionError::WorkingMemory)
+                }),
+            None => Ok(None),
+        };
+        let workspace_agreed = self
+            .agree_execution_phase(
+                crate::DistributedExecutionPhase::InferenceWorkspace,
+                span_end.is_ok(),
+                context,
             )
             .map_err(widen_infallible);
-        let execution_agreed = match D::agree_distributed_phase(
-            &mut self.execution,
+        let span_end = match (span_end, workspace_agreed) {
+            (Ok(end), Ok(true)) => end,
+            (local, agreement) => {
+                let error = match (local, agreement) {
+                    (Err(error), _) | (_, Err(error)) => error,
+                    _ => ReplicatedTextSessionError::Contract(
+                        "another rank rejected inference workspace admission".into(),
+                    ),
+                };
+                return self.abort_without_rollback(
+                    ReplicatedTextSessionError::BeforeStateMutation(Box::new(error)),
+                );
+            }
+        };
+        self.prepare_observation_transaction(observer, epoch, pass, context)?;
+        let checkpoint = self.checkpoint_observed_state_with_prepared(context, checkpoint)?;
+        let execution = execute(self, input, observer, demand, prepared_traversal).and_then(
+            |(output, forward)| {
+                if let Some(expected) = span_end {
+                    if let Some(actual) = self
+                        .mechanisms
+                        .prefill_state_frontier(&self.state)
+                        .map_err(ReplicatedTextSessionError::Mechanism)?
+                    {
+                        if actual != expected {
+                            return Err(ReplicatedTextSessionError::WorkingMemory(
+                                crate::working_memory::WorkingMemoryError::StateFrontierMismatch {
+                                    expected,
+                                    actual,
+                                },
+                            ));
+                        }
+                    }
+                }
+                if output.is_some() == (demand != eredu_core::OutputDemand::StateOnly) {
+                    Ok((output, forward))
+                } else {
+                    Err(ReplicatedTextSessionError::Contract(
+                        "execution output presence differs from agreed readout demand".into(),
+                    ))
+                }
+            },
+        );
+        let execution_agreed = match self.agree_execution_phase(
             crate::DistributedExecutionPhase::Execution,
             execution.is_ok(),
             context,
@@ -3878,7 +5534,7 @@ where
             }
         };
         let (output, forward_context) = match execution {
-            Ok(output) if execution_agreed => output,
+            Ok((output, forward)) if execution_agreed => (output, forward),
             Ok(_) => {
                 return self.rollback_failure(
                     checkpoint,
@@ -3892,16 +5548,29 @@ where
             }
             Err(error) => return self.rollback_failure(checkpoint, error, context),
         };
-        let observation = D::observe_output(&mut self.execution, &output, observer, context);
-        let observation_agreed = match D::agree_distributed_phase(
-            &mut self.execution,
+        if let Some(end) = span_end {
+            self.state.inference_retention_mut().commit_span(end);
+        } else {
+            // Branch identity follows numerical execution even when no request
+            // reservation supplies a logical admission frontier.
+            self.state.inference_retention_mut().invalidate_revision();
+        }
+        let observation = output
+            .as_ref()
+            .map(|output| D::observe_output(&mut self.execution, output, observer, context))
+            .transpose();
+        let observation_agreed = match self.agree_execution_phase(
             crate::DistributedExecutionPhase::OutputObservation,
             observation.is_ok(),
             context,
         ) {
             Ok(agreed) => agreed,
             Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context);
+                return self.rollback_failure(
+                    checkpoint,
+                    widen_infallible(observation.err().unwrap_or(error)),
+                    context,
+                );
             }
         };
         let output = match observation {
@@ -3932,16 +5601,45 @@ where
         (B::Tensor, M::StateCheckpoint, A::ForwardContext),
         ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     > {
-        let publication = D::publish_observed_output(&mut self.execution, output, context);
-        let publication_agreement = D::agree_distributed_phase(
-            &mut self.execution,
+        self.publish_observed_output_transaction_with_readout(
+            Some(output),
+            checkpoint,
+            forward_context,
+            context,
+        )
+        .map(|(output, checkpoint, forward)| {
+            (
+                output.expect("score publication preserves output"),
+                checkpoint,
+                forward,
+            )
+        })
+    }
+
+    fn publish_observed_output_transaction_with_readout(
+        &mut self,
+        output: Option<B::Tensor>,
+        checkpoint: M::StateCheckpoint,
+        forward_context: A::ForwardContext,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+    ) -> Result<
+        (Option<B::Tensor>, M::StateCheckpoint, A::ForwardContext),
+        ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
+    > {
+        let publication = output.map(|output| {
+            self.mechanisms.with_execution_parallel_publication(context,|prepared| {
+                D::publish_observed_output_with_parallel(&mut self.execution,output,context,prepared)
+                    .map_err(widen_infallible)
+            }).map_err(ReplicatedTextSessionError::Mechanism).and_then(|result|result)
+        }).transpose();
+        let publication_agreement = self.agree_execution_phase(
             crate::DistributedExecutionPhase::OutputPublication,
             publication.is_ok(),
             context,
         );
         let output = match (publication, publication_agreement) {
             (Err(error), _) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context);
+                return self.rollback_failure(checkpoint, error, context);
             }
             (Ok(_), Err(error)) => {
                 return self.rollback_failure(checkpoint, widen_infallible(error), context);
@@ -3964,22 +5662,105 @@ where
         &mut self,
         output: B::Tensor,
         checkpoint: M::StateCheckpoint,
-        _forward_context: A::ForwardContext,
+        forward_context: A::ForwardContext,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
         observer: &mut O,
     ) -> Result<B::Tensor, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        let completion = (self.selected.exact_completion() || observer.transactional())
-            .then(|| self.mechanisms.complete(&output, &self.state, context))
-            .transpose();
-        let completion_agreed = match D::agree_distributed_phase(
-            &mut self.execution,
+        self.publish_with_readout(
+            Some(output),
+            checkpoint,
+            forward_context,
+            context,
+            observer,
+            false,
+        )
+        .map(|output| output.expect("score publication preserves output"))
+    }
+
+    fn publish_with_readout<O: ActivationObserver<B::Tensor, A::Error> + ?Sized>(
+        &mut self,
+        output: Option<B::Tensor>,
+        checkpoint: M::StateCheckpoint,
+        _forward_context: A::ForwardContext,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+        force_completion: bool,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    {
+        self.publish_with_media_roots(
+            output,
+            checkpoint,
+            _forward_context,
+            context,
+            observer,
+            force_completion,
+            None,
+        )
+    }
+
+    fn publish_with_media_roots<O: ActivationObserver<B::Tensor, A::Error> + ?Sized>(
+        &mut self,
+        output: Option<B::Tensor>,
+        checkpoint: M::StateCheckpoint,
+        _forward_context: A::ForwardContext,
+        context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
+        observer: &mut O,
+        force_completion: bool,
+        roots: Option<&crate::media_prefill::RetainedMediaRoots<'_, B::Tensor>>,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    {
+        let completion = if let Some(roots) = roots {
+            self.mechanisms
+                .complete_media_ingress(output.as_ref(), &self.state, roots, context)
+                .ok_or_else(|| {
+                    ReplicatedTextSessionError::Contract(
+                        "retained media completion is unavailable".into(),
+                    )
+                })
+                .and_then(|result| result.map_err(ReplicatedTextSessionError::Mechanism))
+        } else if force_completion
+            || self.inference_guard.is_some()
+            || self.selected.exact_completion()
+            || observer.transactional()
+        {
+            self.mechanisms
+                .complete(output.as_ref(), &self.state, context)
+                .map_err(ReplicatedTextSessionError::Mechanism)
+        } else {
+            Ok(())
+        };
+        self.finish_publication(
+            output,
+            checkpoint,
+            _forward_context,
+            context,
+            observer,
+            completion,
+        )
+    }
+
+    fn finish_publication<O: ActivationObserver<B::Tensor, A::Error> + ?Sized>(
+        &mut self,
+        output: Option<B::Tensor>,
+        checkpoint: M::StateCheckpoint,
+        _forward_context: A::ForwardContext,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        completion: Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>,
+    ) -> Result<Option<B::Tensor>, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>>
+    {
+        let completion_agreed = match self.agree_execution_phase(
             crate::DistributedExecutionPhase::MechanismCompletion,
             completion.is_ok(),
             context,
         ) {
             Ok(agreed) => agreed,
             Err(error) => {
-                return self.rollback_failure(checkpoint, widen_infallible(error), context);
+                let error = match completion {
+                    Err(prior) => prior,
+                    Ok(_) => widen_infallible(error),
+                };
+                return self.rollback_failure(checkpoint, error, context);
             }
         };
         match completion {
@@ -3994,11 +5775,7 @@ where
                 );
             }
             Err(error) => {
-                return self.rollback_failure(
-                    checkpoint,
-                    ReplicatedTextSessionError::Mechanism(error),
-                    context,
-                );
+                return self.rollback_failure(checkpoint, error, context);
             }
         }
         self.commit_observation_transaction(checkpoint, context, observer)?;
@@ -4020,13 +5797,13 @@ where
             let delivered = observer
                 .complete_transaction(epoch)
                 .map_err(ReplicatedTextSessionError::Architecture);
-            let agreed = D::agree_distributed_phase(
-                &mut self.execution,
-                crate::DistributedExecutionPhase::ObservationDelivery,
-                delivered.is_ok(),
-                context,
-            )
-            .map_err(widen_infallible);
+            let agreed = self
+                .agree_execution_phase(
+                    crate::DistributedExecutionPhase::ObservationDelivery,
+                    delivered.is_ok(),
+                    context,
+                )
+                .map_err(widen_infallible);
             let delivery = match (delivered, agreed) {
                 (Err(error), _) | (_, Err(error)) => Err(error),
                 (Ok(()), Ok(true)) => Ok(()),
@@ -4038,7 +5815,28 @@ where
                 return self.rollback_failure(checkpoint, error, context);
             }
         }
-        match D::commit_after_completion(&mut self.execution, epoch, context) {
+        let execution = &mut self.execution;
+        let outcome = if D::parallel_control_operation(execution, ParallelControlEvent::Commit).is_some() {
+            self.mechanisms.with_execution_parallel_control(
+                ParallelControlEvent::Commit, context,
+                |prepared| D::commit_after_completion_with_parallel(execution, epoch, context, prepared),
+            ).map_err(ReplicatedTextSessionError::ParallelControl)
+                .and_then(|result| result.map_err(widen_infallible))
+        } else {
+            Ok(D::commit_after_completion(execution, epoch, context))
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.last_commit_outcome = Some(DistributedCommitOutcome::Indeterminate {
+                    epoch, phase: DistributedCommitPhase::DecisionSubmission,
+                });
+                self.active_commit_epoch = None;
+                self.fence_terminal(crate::DistributedExecutionPhase::Commit);
+                return Err(error);
+            }
+        };
+        match outcome {
             DistributedCommitOutcome::Committed(committed) if committed == epoch => {
                 self.last_commit_outcome = Some(DistributedCommitOutcome::Committed(epoch));
                 self.active_commit_epoch = None;
@@ -4083,6 +5881,12 @@ where
         error: ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<T, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
+        if self.control_fence.is_some() {
+            // Neither local restoration nor a fabricated Aborted epoch is a
+            // valid follow-up to failed terminal communication. Native recovery
+            // retains submitted graph ownership while the checkpoint drops.
+            return Err(error);
+        }
         self.restore_failed_work(checkpoint, context)?;
         Err(error)
     }
@@ -4126,24 +5930,15 @@ where
     fn ensure_commit_resolved(
         &self,
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        self.ensure_control_unfenced()?;
-        if let Some(DistributedCommitOutcome::Indeterminate { epoch, phase }) =
-            self.last_commit_outcome
-        {
-            return Err(ReplicatedTextSessionError::CommitIndeterminate { epoch, phase });
-        }
-        Ok(())
+        RuntimeInspectionBoundary::resolved(self.control_fence, self.last_commit_outcome)
+            .map_err(RuntimeInspectionBoundary::into_legacy)
     }
 
     fn ensure_control_unfenced(
         &self,
     ) -> Result<(), ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        if let Some(phase) = self.control_fence {
-            return Err(ReplicatedTextSessionError::Contract(format!(
-                "distributed session is fenced after failed cache control at {phase:?}"
-            )));
-        }
-        Ok(())
+        RuntimeInspectionBoundary::unfenced(self.control_fence)
+            .map_err(RuntimeInspectionBoundary::into_legacy)
     }
 
     fn agree_cache_control_phase(
@@ -4152,9 +5947,11 @@ where
         local_success: bool,
         context: &<<B as NeuralBackend>::Tensor as Tensor>::Context,
     ) -> Result<bool, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        D::agree_distributed_phase(&mut self.execution, phase, local_success, context)
+        self.agree_execution_phase(phase, local_success, context)
             .map_err(widen_infallible)
-            .inspect_err(|_| self.control_fence = Some(phase))
+            .inspect_err(|_| {
+                self.control_fence.get_or_insert(phase);
+            })
     }
 
     fn require_cache_control_agreement(
@@ -4172,7 +5969,7 @@ where
         &mut self,
         phase: crate::DistributedExecutionPhase,
     ) -> Result<T, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        self.control_fence = Some(phase);
+        self.control_fence.get_or_insert(phase);
         Err(ReplicatedTextSessionError::Contract(format!(
             "another rank failed distributed cache control at {phase:?}"
         )))
@@ -4182,8 +5979,10 @@ where
         &mut self,
         error: ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>,
     ) -> Result<T, ReplicatedTextSessionError<A::Error, M::PolicyError, M::Error>> {
-        if let Some(epoch) = self.active_commit_epoch.take() {
-            self.last_commit_outcome = Some(DistributedCommitOutcome::Aborted(epoch));
+        if self.control_fence.is_none() {
+            if let Some(epoch) = self.active_commit_epoch.take() {
+                self.last_commit_outcome = Some(DistributedCommitOutcome::Aborted(epoch));
+            }
         }
         Err(error)
     }
@@ -4311,7 +6110,7 @@ where
         let preflight = (|| {
             if let Some(input_identity) = input_identity {
                 self.validate_prompt_input_descriptor(&descriptor, input_identity)?;
-                if self.committed_prompt_input_identity.as_ref() != Some(input_identity) {
+                if self.committed_prompt_input_identity() != Some(input_identity) {
                     return Err(ReplicatedTextSessionError::Contract(
                         "prompt-cache prepared-input identity differs from the committed prompt"
                             .into(),
@@ -4348,7 +6147,7 @@ where
             (Ok(_), Ok(false)) => return self.fence_remote_cache_control_failure(phase),
             (Ok(_), Err(error)) => return Err(error),
             (Err(error), _) => {
-                self.control_fence = Some(phase);
+                self.control_fence.get_or_insert(phase);
                 return Err(error);
             }
         };
@@ -4387,7 +6186,7 @@ where
             }
             (None, Err(error)) => return Err(error),
             (Some(Err(error)), _) => {
-                self.control_fence = Some(phase);
+                self.control_fence.get_or_insert(phase);
                 return Err(error);
             }
         };
@@ -4405,7 +6204,7 @@ where
                         .take()
                         .expect("failed publication retains its transaction"),
                 );
-                self.control_fence = Some(phase);
+                self.control_fence.get_or_insert(phase);
                 return Err(ReplicatedTextSessionError::Mechanism(error));
             }
             (Some(Ok(())) | None, Err(error)) => {
@@ -4449,7 +6248,8 @@ where
 fn validate_architecture_geometry<A, B, S>(
     architecture: &A,
     selected: &SelectedReplicatedTextRealization,
-) -> Result<(), String>
+    metadata: ContractMetadata<'_>,
+) -> Result<(), PreparedTextContractError>
 where
     B: NeuralBackend,
     S: RuntimeState<B>,
@@ -4457,47 +6257,68 @@ where
     A::Error: std::fmt::Display,
 {
     let requirements = selected.requirements();
-    let graph = architecture
-        .execution_graph()
-        .map_err(|error| error.to_string())?;
-    if &graph != requirements.execution_graph() {
-        return Err("architecture execution graph differs from selection".into());
+    metadata.controls::<(
+        crate::ArchitectureExecutionGraph<'_>,
+        crate::ArchitectureGroupTransportDeclaration<'_>,
+        usize,
+        bool,
+    )>()?;
+    let graph = match metadata.context() {
+        Some(context) => architecture.execution_graph_with_metadata(context),
+        None => architecture
+            .execution_graph()
+            .map(crate::ArchitectureExecutionGraph::owned),
     }
-    if requirements.execution_units().group_count() != graph.groups().len() {
-        return Err("selected execution-unit groups differ from architecture graph".into());
+    .map_err(|error| metadata.architecture_error(error, ""))?;
+    if !graph.matches(requirements.execution_graph()) {
+        return Err(metadata.message(format_args!(
+            "architecture execution graph differs from selection"
+        )));
     }
-    for group in 0..graph.groups().len() {
-        let actual = architecture
-            .group_unit_count(group)
-            .map_err(|error| error.to_string())?;
+    if requirements.execution_units().group_count() != graph.group_count() {
+        return Err(metadata.message(format_args!(
+            "selected execution-unit groups differ from architecture graph"
+        )));
+    }
+    for group in 0..graph.group_count() {
+        let actual = match metadata.context() {
+            Some(context) => architecture.group_unit_count_with_metadata(group, context),
+            None => architecture.group_unit_count(group),
+        }
+        .map_err(|error| metadata.architecture_error(error, ""))?;
         let expected = requirements
             .execution_units()
             .group_range(group)
             .expect("validated requirement exposes every graph group")
             .len();
         if actual != expected
-            || architecture.group_transport(group) != requirements.group_transports()[group]
+            || !architecture.group_transport_matches(group, &requirements.group_transports()[group])
         {
-            return Err(format!(
+            return Err(metadata.message(format_args!(
                 "architecture execution group {group} differs from selection"
-            ));
+            )));
         }
     }
-    let layout = architecture
-        .state_layout()
-        .map_err(|error| error.to_string())?;
+    let layout = match metadata.context() {
+        Some(context) => architecture.state_layout_with_metadata(context),
+        None => architecture.state_layout(),
+    }
+    .map_err(|error| metadata.architecture_error(error, ""))?;
     if &layout != selected.state().layout() {
-        return Err("architecture state layout differs from selection".into());
+        return Err(metadata.message(format_args!(
+            "architecture state layout differs from selection"
+        )));
     }
     Ok(())
 }
 
-fn validate_architecture_parameters<A, B, S>(
-    architecture: &A,
+fn validate_architecture_parameters<'model, A, B, S>(
+    architecture: &'model A,
     selected: &SelectedReplicatedTextRealization,
     selected_formats: bool,
     context: &<B::Tensor as Tensor>::Context,
-) -> Result<BTreeMap<String, Vec<ReplicatedTextOutputCompanion>>, String>
+    metadata: ContractMetadata<'_>,
+) -> Result<ValidatedParameterCatalog<'model>, PreparedTextContractError>
 where
     B: NeuralBackend,
     S: RuntimeState<B>,
@@ -4506,73 +6327,91 @@ where
 {
     let requirements = selected.requirements();
     let description = architecture
-        .parameter_description(context)
-        .map_err(|error| error.to_string())?;
-    let mut actual = BTreeMap::<String, (Vec<usize>, ParameterGroupOwner)>::new();
-    let mut companions = Vec::new();
-    for group in description.groups() {
-        for member in group.group().members() {
+        .parameter_description_with_metadata(context)
+        .map_err(|error| metadata.architecture_error(error, ""))?;
+    type Row<'a> = (&'a str, &'a [usize], &'a ParameterGroupOwner);
+    type Companion<'a> = (
+        (usize, usize),
+        Row<'a>,
+        eredu_nn::LinearCompanionRole,
+        &'a str,
+    );
+    metadata.controls::<(Vec<Row<'_>>, Vec<Companion<'_>>, Vec<&str>)>()?;
+    let rows = description
+        .groups()
+        .iter()
+        .map(|group| group.group().members().len())
+        .try_fold(0usize, usize::checked_add)
+        .ok_or_else(|| {
+            PreparedTextContractError::Metadata(
+                eredu_nn::workspace::WorkspaceMetadataError::Overflow.into(),
+            )
+        })?;
+    let mut actual = metadata.vector::<Row<'_>>(rows)?;
+    let mut companions = metadata.vector::<Companion<'_>>(rows)?;
+    for (group_index, group) in description.groups().iter().enumerate() {
+        for (member_index, member) in group.group().members().iter().enumerate() {
+            let row = (member.target(), member.global_shape(), group.owner());
             match (member.linear_companion(), member.linear_companion_of()) {
-                (None, None) => {
-                    if actual
-                        .insert(
-                            member.target().to_owned(),
-                            (member.global_shape().to_vec(), group.owner().clone()),
-                        )
-                        .is_some()
-                    {
-                        return Err(format!(
+                (None, None) => match actual.binary_search_by_key(&row.0, |value| value.0) {
+                    Ok(_) => {
+                        return Err(metadata.message(format_args!(
                             "constructed architecture repeats primary parameter {:?}",
-                            member.target()
-                        ));
+                            row.0
+                        )));
                     }
+                    Err(index) => actual.insert(index, row),
+                },
+                (Some(role), Some(primary)) => {
+                    companions.push(((group_index, member_index), row, role, primary))
                 }
-                (Some(role), Some(primary)) => companions.push((
-                    member.target().to_owned(),
-                    member.global_shape().to_vec(),
-                    group.owner().clone(),
-                    role,
-                    primary.to_owned(),
-                )),
                 _ => {
-                    return Err(format!(
+                    return Err(metadata.message(format_args!(
                         "constructed parameter {:?} has incomplete linear companion metadata",
-                        member.target()
-                    ));
+                        row.0
+                    )));
                 }
             }
         }
     }
-    let expected = requirements
-        .parameters()
-        .iter()
-        .filter(|parameter| {
-            !matches!(
-                parameter.presence(),
-                ReplicatedTextParameterPresence::OptionalAbsent
-                    | ReplicatedTextParameterPresence::Tied { .. }
-            ) && parameter.role() != crate::ReplicatedTextParameterRole::FormatCompanion
-        })
-        .map(|parameter| parameter.name())
-        .collect::<BTreeSet<_>>();
-    for (name, shape, owner, _, _) in &companions {
-        if expected.contains(name.as_str())
-            && actual
-                .insert(name.clone(), (shape.clone(), owner.clone()))
-                .is_some()
-        {
-            return Err(format!(
-                "constructed architecture repeats selected parameter {name:?}"
-            ));
+    let expected_rows = || {
+        requirements
+            .parameters()
+            .iter()
+            .filter(|parameter| {
+                !matches!(
+                    parameter.presence(),
+                    ReplicatedTextParameterPresence::OptionalAbsent
+                        | ReplicatedTextParameterPresence::Tied { .. }
+                ) && parameter.role() != crate::ReplicatedTextParameterRole::FormatCompanion
+            })
+            .map(|parameter| parameter.name())
+    };
+    let mut expected = metadata.vector(expected_rows().count())?;
+    expected.extend(expected_rows());
+    expected.sort_unstable();
+    expected.dedup();
+    for &(_, row, _, _) in &companions {
+        if expected.binary_search(&row.0).is_ok() {
+            match actual.binary_search_by_key(&row.0, |value| value.0) {
+                Ok(_) => {
+                    return Err(metadata.message(format_args!(
+                        "constructed architecture repeats selected parameter {:?}",
+                        row.0
+                    )));
+                }
+                Err(index) => actual.insert(index, row),
+            }
         }
     }
-    let actual_names = actual.keys().map(String::as_str).collect::<BTreeSet<_>>();
-    if expected != actual_names {
-        return Err(format!(
+    if !expected.iter().copied().eq(actual.iter().map(|row| row.0)) {
+        return Err(metadata.message(format_args!(
             "selected parameter catalog differs from constructed architecture: missing {:?}, unexpected {:?}",
-            expected.difference(&actual_names).collect::<Vec<_>>(),
-            actual_names.difference(&expected).collect::<Vec<_>>()
-        ));
+            DebugRows(expected.iter().copied().filter(|name|
+                actual.binary_search_by_key(name, |row| row.0).is_err())),
+            DebugRows(actual.iter().map(|row| row.0).filter(|name|
+                expected.binary_search(name).is_err())),
+        )));
     }
     for parameter in requirements.parameters().iter().filter(|parameter| {
         !matches!(
@@ -4581,15 +6420,15 @@ where
                 | ReplicatedTextParameterPresence::Tied { .. }
         ) && parameter.role() != crate::ReplicatedTextParameterRole::FormatCompanion
     }) {
-        let (shape, owner) = actual
-            .get(parameter.name())
-            .expect("equal parameter-name sets contain every requirement");
+        let (_, shape, owner) = actual[actual
+            .binary_search_by_key(&parameter.name(), |row| row.0)
+            .expect("equal parameter-name sets contain every requirement")];
         let expected_owner = parameter
             .owner()
             .parameter_group_owner()
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| metadata.message(format_args!("{error}")))?;
         let owner_matches = owner.refines_storage_owner(&expected_owner);
-        let mut expected_shape = parameter.logical_shape().to_vec();
+        let mut expected_shape = parameter.logical_shape();
         let realization = selected_formats
             .then(|| {
                 selected
@@ -4618,8 +6457,7 @@ where
         {
             expected_shape = parameter
                 .physical_shape()
-                .expect("direct native realization has admitted physical geometry")
-                .to_vec();
+                .expect("direct native realization has admitted physical geometry");
         }
         // Architecture descriptions remain semantic and may therefore expose
         // the logical module geometry. Backends whose constructed module owns
@@ -4629,152 +6467,177 @@ where
         let selected_lowering = realization.map_or(crate::WeightLoweringKind::Direct, |selected| {
             selected.lowering()
         });
-        let selected_executable_shape = Some((|| {
-            let descriptor = parameter
-                .lowering_descriptor(executable)
-                .map_err(|error| error.to_string())?;
-            let mut packed = descriptor.logical_shape().to_vec();
-            let Some(axis) = descriptor.packed_axis() else {
-                return Ok(packed);
-            };
-            let bits = match executable {
-                eredu_checkpoint::LinearFormat::Affine(config) => usize::try_from(config.bits)
-                    .map_err(|_| {
-                        format!(
-                            "selected parameter {:?} has invalid affine packing bits",
-                            parameter.name()
-                        )
-                    })?,
-                eredu_checkpoint::LinearFormat::MxFp4 => 4,
-                eredu_checkpoint::LinearFormat::Dense
-                | eredu_checkpoint::LinearFormat::E4M3BlockFp8(_) => return Ok(packed),
-                eredu_checkpoint::LinearFormat::GgufIQuant { ggml_type, .. } => {
-                    if matches!(
-                        selected_lowering,
-                        crate::WeightLoweringKind::Transform
-                            | crate::WeightLoweringKind::DerivedTransform
-                    ) {
-                        return Err(format!(
-                            "selected parameter {:?} cannot apply a load-time GGUF transform",
-                            parameter.name()
-                        ));
-                    }
-                    let (block, bytes) = ggml_type
-                        .block_and_bytes()
-                        .map_err(|error| error.to_string())?;
-                    let block = usize::try_from(block)
-                        .map_err(|_| "GGUF block width is not representable".to_owned())?;
-                    let bytes = usize::try_from(bytes)
-                        .map_err(|_| "GGUF block bytes are not representable".to_owned())?;
-                    let packed_bytes = packed[axis]
-                        .checked_mul(bytes)
-                        .ok_or_else(|| "GGUF executable geometry overflowed".to_owned())?;
-                    if !packed_bytes.is_multiple_of(block) {
-                        return Err(format!(
+        let selected_executable_shape = Some(
+            (|| -> Result<Vec<usize>, PreparedTextContractError> {
+                let descriptor =
+                    parameter
+                        .lowering_descriptor_view(executable)
+                        .map_err(|error| {
+                            metadata
+                                .message(format_args!("invalid replicated text contract: {error}"))
+                        })?;
+                let mut packed = metadata.vector(descriptor.logical_shape().len())?;
+                packed.extend_from_slice(descriptor.logical_shape());
+                let Some(axis) = descriptor.packed_axis() else {
+                    return Ok(packed);
+                };
+                let bits = match executable {
+                    eredu_checkpoint::LinearFormat::Affine(config) => usize::try_from(config.bits)
+                        .map_err(|_| {
+                            metadata.message(format_args!(
+                                "selected parameter {:?} has invalid affine packing bits",
+                                parameter.name()
+                            ))
+                        })?,
+                    eredu_checkpoint::LinearFormat::MxFp4 => 4,
+                    eredu_checkpoint::LinearFormat::Dense
+                    | eredu_checkpoint::LinearFormat::E4M3BlockFp8(_) => return Ok(packed),
+                    eredu_checkpoint::LinearFormat::GgufIQuant { ggml_type, .. } => {
+                        if matches!(
+                            selected_lowering,
+                            crate::WeightLoweringKind::Transform
+                                | crate::WeightLoweringKind::DerivedTransform
+                        ) {
+                            return Err(metadata.message(format_args!(
+                                "selected parameter {:?} cannot apply a load-time GGUF transform",
+                                parameter.name()
+                            )));
+                        }
+                        let (block, bytes) = ggml_type
+                            .block_and_bytes()
+                            .map_err(|error| metadata.message(format_args!("{error}")))?;
+                        let block = usize::try_from(block).map_err(|_| {
+                            metadata.message(format_args!("GGUF block width is not representable"))
+                        })?;
+                        let bytes = usize::try_from(bytes).map_err(|_| {
+                            metadata.message(format_args!("GGUF block bytes are not representable"))
+                        })?;
+                        let packed_bytes = packed[axis].checked_mul(bytes).ok_or_else(|| {
+                            metadata.message(format_args!("GGUF executable geometry overflowed"))
+                        })?;
+                        if !packed_bytes.is_multiple_of(block) {
+                            return Err(metadata.message(format_args!(
                             "selected parameter {:?} GGUF executable geometry is not block aligned",
                             parameter.name()
-                        ));
+                        )));
+                        }
+                        packed[axis] = packed_bytes / block;
+                        return Ok(packed);
                     }
-                    packed[axis] = packed_bytes / block;
-                    return Ok(packed);
-                }
-            };
-            let packed_bits = packed[axis].checked_mul(bits).ok_or_else(|| {
-                format!(
-                    "selected parameter {:?} executable geometry overflowed",
-                    parameter.name()
-                )
-            })?;
-            if !packed_bits.is_multiple_of(32) {
-                return Err(format!(
+                };
+                let packed_bits = packed[axis].checked_mul(bits).ok_or_else(|| {
+                    metadata.message(format_args!(
+                        "selected parameter {:?} executable geometry overflowed",
+                        parameter.name()
+                    ))
+                })?;
+                if !packed_bits.is_multiple_of(32) {
+                    return Err(metadata.message(format_args!(
                     "selected parameter {:?} executable geometry {}x{} bits is not U32 aligned (logical {:?}, physical {:?})",
                     parameter.name(),
                     packed[axis],
                     bits,
                     descriptor.logical_shape(),
                     descriptor.physical_shape()
-                ));
-            }
-            packed[axis] = packed_bits / 32;
-            Ok(packed)
-        })()?);
-        let shape_matches = shape == &expected_shape
+                )));
+                }
+                packed[axis] = packed_bits / 32;
+                Ok(packed)
+            })()?,
+        );
+        let shape_matches = shape == expected_shape
             || selected_executable_shape
                 .as_ref()
-                .is_some_and(|selected| shape == selected);
+                .is_some_and(|selected| shape == selected.as_slice());
         if !shape_matches || !owner_matches {
-            return Err(format!(
+            return Err(metadata.message(format_args!(
                 "selected parameter {:?} expects logical shape {expected_shape:?} or selected executable shape {selected_executable_shape:?} and owner {:?}, constructed shape {shape:?} and owner {owner:?}",
                 parameter.name(),
                 parameter.owner()
-            ));
+            )));
         }
     }
 
-    let mut output_companions = BTreeMap::<String, Vec<ReplicatedTextOutputCompanion>>::new();
-    for (name, shape, owner, role, primary) in companions {
-        if name == primary || !expected.contains(primary.as_str()) {
-            return Err(format!(
+    let mut output_companions = metadata.vector(if selected_formats {
+        companions.len()
+    } else {
+        0
+    })?;
+    for (index, (name, shape, _owner), _role, primary) in companions {
+        if name == primary || expected.binary_search(&primary).is_err() {
+            return Err(metadata.message(format_args!(
                 "constructed companion {name:?} names unselected primary {primary:?}"
-            ));
+            )));
         }
         if selected_formats {
-            let recipe = selected.requirements().derived_recipes().get(&name);
-            let output = selected.requirements().derived_recipe_outputs().get(&name);
-            let companion = match (recipe, output) {
-                (Some(recipe), Some(output)) => {
-                    ReplicatedTextOutputCompanion::new(name, role, shape, owner).map(|companion| {
-                        companion.with_derived_recipe(recipe.clone(), output.clone())
-                    })
-                }
-                (None, None) => ReplicatedTextOutputCompanion::new(name, role, shape, owner),
-                _ => {
-                    return Err(format!(
-                        "constructed companion {name:?} has incomplete derived metadata"
-                    ));
-                }
+            let recipe = requirements.derived_recipes().get(name);
+            let output = requirements.derived_recipe_outputs().get(name);
+            if recipe.is_some() != output.is_some() {
+                return Err(metadata.message(format_args!(
+                    "constructed companion {name:?} has incomplete derived metadata"
+                )));
             }
-            .map_err(|error| error.to_string())?;
-            let companion = match requirements
-                .parameters()
-                .iter()
-                .find(|parameter| parameter.name() == companion.name())
-            {
-                Some(parameter)
-                    if matches!(
+            if !ReplicatedTextOutputCompanion::valid_identity(name, shape) {
+                return Err(metadata.message(format_args!(
+                    "invalid replicated text contract: materialization output companion identity or geometry is invalid"
+                )));
+            }
+            if let Some(parameter) = requirements.parameters().iter().find(|parameter| {
+                parameter.name() == name
+                    && matches!(
                         parameter.source_encoding(),
                         Some(eredu_checkpoint::SourceTensorEncoding::Gguf { .. })
-                    ) =>
-                {
-                    let [source] = parameter.physical_sources() else {
-                        return Err(format!(
-                            "translated catalog companion {:?} has ambiguous provenance",
-                            companion.name()
-                        ));
-                    };
-                    companion.with_catalog_source(source.clone())
+                    )
+            }) {
+                if !matches!(parameter.physical_sources(), [_]) {
+                    return Err(metadata.message(format_args!(
+                        "translated catalog companion {name:?} has ambiguous provenance"
+                    )));
                 }
-                _ => companion,
-            };
-            output_companions
-                .entry(primary)
-                .or_default()
-                .push(companion);
+            }
+            output_companions.push(index);
         }
     }
-    Ok(output_companions)
+    drop(actual);
+    drop(expected);
+    metadata.controls::<ValidatedParameterCatalog<'_>>()?;
+    let mut catalog = ValidatedParameterCatalog {
+        description,
+        companions: output_companions,
+    };
+    // Sorting indices is allocation-free. Descriptions have unique target names,
+    // so an unstable sort preserves the previous primary/role/name ordering.
+    let description = &catalog.description;
+    catalog.companions.sort_unstable_by_key(|&(group, member)| {
+        let member = &description.groups()[group].group().members()[member];
+        (
+            member
+                .linear_companion_of()
+                .expect("validated companion primary"),
+            member.linear_companion().expect("validated companion role"),
+            member.target(),
+        )
+    });
+    Ok(catalog)
 }
 
-fn validate_selected_state(selected: &SelectedReplicatedTextRealization) -> Result<(), String> {
+fn validate_selected_state(
+    selected: &SelectedReplicatedTextRealization,
+    metadata: ContractMetadata<'_>,
+) -> Result<(), PreparedTextContractError> {
     use eredu_core::cache::StateResidencyClass;
 
     if !selected.topology().is_replicated() {
-        return Err("selected replicated-text topology is not replicated".into());
+        return Err(metadata.message(format_args!(
+            "selected replicated-text topology is not replicated"
+        )));
     }
     if selected.state().layout() != selected.requirements().state_layout()
         || selected.state().access() != selected.requirements().state_access()
     {
-        return Err("selected state contract differs from architecture requirements".into());
+        return Err(metadata.message(format_args!(
+            "selected state contract differs from architecture requirements"
+        )));
     }
     let mut cursor = 0;
     for layer in 0..selected.state().layout().len() {
@@ -4785,12 +6648,14 @@ fn validate_selected_state(selected: &SelectedReplicatedTextRealization) -> Resu
             .expect("validated state layout exposes every layer")
         {
             let component = selected.state().components().get(cursor).ok_or_else(|| {
-                format!("selected state omits component {cursor} at layer {layer}")
+                metadata.message(format_args!(
+                    "selected state omits component {cursor} at layer {layer}"
+                ))
             })?;
             if component.layer() != layer || component.component() != expected {
-                return Err(format!(
+                return Err(metadata.message(format_args!(
                     "selected state component {cursor} differs from layer {layer} requirements"
-                ));
+                )));
             }
             let expected_placement = match selected.state().policy() {
                 crate::CacheResidencyPolicy::Device => crate::StateComponentPlacement::Device,
@@ -4803,31 +6668,47 @@ fn validate_selected_state(selected: &SelectedReplicatedTextRealization) -> Resu
                 },
             };
             if component.placement() != expected_placement {
-                return Err(format!(
+                return Err(metadata.message(format_args!(
                     "selected state component {cursor} has {:?} placement, expected {expected_placement:?}",
                     component.placement()
-                ));
+                )));
             }
             cursor += 1;
         }
     }
     if cursor != selected.state().components().len() {
-        return Err("selected state contains components beyond its architecture layout".into());
+        return Err(metadata.message(format_args!(
+            "selected state contains components beyond its architecture layout"
+        )));
     }
     if !selected.state().checkpoint() || !selected.state().rollback() || !selected.state().reset() {
-        return Err("selected state omits a required transactional lifecycle facility".into());
+        return Err(metadata.message(format_args!(
+            "selected state omits a required transactional lifecycle facility"
+        )));
     }
     if selected.state().prompt_cache() != selected.prompt_cache()
         || selected.state().observation_retention()
             != (selected.session().output_observation()
                 || selected.session().activation_inspection())
     {
-        return Err("selected state lifecycle differs from selected session facilities".into());
+        return Err(metadata.message(format_args!(
+            "selected state lifecycle differs from selected session facilities"
+        )));
     }
     if selected.grouped_operations() != selected.requirements().grouped_operations() {
-        return Err("selected grouped operations differ from architecture requirements".into());
+        return Err(metadata.message(format_args!(
+            "selected grouped operations differ from architecture requirements"
+        )));
     }
     Ok(())
+}
+
+fn realized_state_layout_matches<B, S>(state: &S, selected: &SelectedStateRealization) -> bool
+where
+    B: NeuralBackend,
+    S: RuntimeState<B>,
+{
+    state.optional_layout() == Some(selected.layout())
 }
 
 fn validate_realized_state<A, P, M, B, S>(
@@ -4841,7 +6722,7 @@ where
     B: NeuralBackend,
     S: RuntimeState<B>,
 {
-    if state.layout() != selected.layout() {
+    if !realized_state_layout_matches::<B, S>(state, selected) {
         return Err(ReplicatedTextSessionError::Contract(
             "realized state layout differs from selection".into(),
         ));
@@ -4865,7 +6746,7 @@ where
             ReplicatedTextSessionError::Contract(error.to_string())
         }
         LayerwiseRuntimeError::Policy(error) => ReplicatedTextSessionError::Policy(error),
-        LayerwiseRuntimeError::Submission(error) => ReplicatedTextSessionError::Contract(error),
+        LayerwiseRuntimeError::Submission(error) => ReplicatedTextSessionError::Submission(error),
     }
 }
 
@@ -4878,6 +6759,21 @@ where
     M: std::fmt::Display,
 {
     match error {
+        ReplicatedTextSessionError::WorkingMemory(error) => {
+            ReplicatedTextSessionError::WorkingMemory(error)
+        }
+        ReplicatedTextSessionError::PreparedObservation(error) => {
+            ReplicatedTextSessionError::PreparedObservation(error)
+        }
+        ReplicatedTextSessionError::ParallelContext(error) => {
+            ReplicatedTextSessionError::ParallelContext(error)
+        }
+        ReplicatedTextSessionError::ParallelControl(error) => {
+            ReplicatedTextSessionError::ParallelControl(error)
+        }
+        ReplicatedTextSessionError::Submission(error) => {
+            ReplicatedTextSessionError::Submission(error)
+        }
         ReplicatedTextSessionError::Contract(error) => ReplicatedTextSessionError::Contract(error),
         ReplicatedTextSessionError::Partition(error) => {
             ReplicatedTextSessionError::Partition(error)

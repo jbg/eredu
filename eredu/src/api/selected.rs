@@ -38,6 +38,20 @@ impl super::LoadedModel<eredu_backend_mlx::backend::MlxBackend<'_>> {
             })
     }
 
+    /// Returns portable cache occupancy and actual transfer counters for this
+    /// selected MLX session. Canonical occupancy is distinct from shared-pool
+    /// physical custody retained by saved, in-flight or completed owners.
+    pub fn cache_residency_telemetry(
+        &self,
+    ) -> Result<Option<eredu_runtime::CacheResidencyReport>, BackendFailure> {
+        self.runtime
+            .session()
+            .cache_residency_report()
+            .map_err(|error| {
+                BackendFailure::from_error(error).with_operation("cache residency telemetry")
+            })
+    }
+
     /// Returns portable weight-residency telemetry when available.
     pub fn residency_telemetry(&self) -> Result<Option<crate::ResidencyTelemetry>, BackendFailure> {
         self.runtime
@@ -498,8 +512,8 @@ pub fn benchmark_local_expert_cache(
 #[cfg(test)]
 mod tests {
     use super::{
-        default_local_device, local_device_plan, validate_expert_cache_benchmark_prompt,
-        DevicePlanError, ExpertCacheBenchmarkError, LocalDevice,
+        DevicePlanError, ExpertCacheBenchmarkError, LocalDevice, default_local_device,
+        local_device_plan, validate_expert_cache_benchmark_prompt,
     };
 
     #[test]

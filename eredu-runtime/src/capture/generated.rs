@@ -29,6 +29,18 @@ pub fn generated_capture_source(
     }
 }
 
+// Shared logical quota only. Actual physical construction is priced by the
+// selected generated operation program and original native admission.
+pub(super) fn generated_usage(
+    usage: CaptureUsage,
+    source: &GeneratedCaptureSource,
+) -> Result<CaptureUsage, CaptureError> {
+    usage.checked_add(CaptureUsage {
+        retained_bytes: source.creation_bytes,
+        ..Default::default()
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub(super) enum GeneratedFailure<E: std::error::Error + 'static> {
     #[error(transparent)]
@@ -70,12 +82,11 @@ impl<B: CaptureBackend> CaptureBackend for GeneratedCapture<'_, B> {
         selection: &CaptureSelection,
         slice: &ResolvedCaptureSlice,
     ) -> Result<CaptureUsage, CaptureError> {
-        self.backend
-            .estimate_generated(prototype, self.source, selection, slice)?
-            .checked_add(CaptureUsage {
-                retained_bytes: self.source.creation_bytes,
-                ..Default::default()
-            })
+        generated_usage(
+            self.backend
+                .estimate_generated(prototype, self.source, selection, slice)?,
+            self.source,
+        )
     }
     fn transform(
         &mut self,
@@ -138,6 +149,33 @@ impl CaptureSession {
         generate: &mut dyn FnMut() -> Result<B::Tensor, E>,
         map_error: &impl Fn(CaptureExecutionError<B::Error>) -> E,
     ) -> Result<(), E> {
+        if self.window_reductions
+            && self.invocation_window.is_some()
+            && self.records.as_ref().is_some_and(|records| {
+                self.plan
+                    .plan()
+                    .selections
+                    .iter()
+                    .zip(records)
+                    .any(|(selection, record)| {
+                        selection.path == path
+                            && record.outcome == CaptureOutcome::Missing
+                            && matches!(
+                                selection.transform,
+                                CaptureTransform::Summary
+                                    | CaptureTransform::Histogram { .. }
+                                    | CaptureTransform::Preview { .. }
+                            )
+                    })
+            })
+        {
+            return Err(map_error(
+                CaptureError::Unsupported(
+                    "generated aggregate window requires its own factory composition".into(),
+                )
+                .into(),
+            ));
+        }
         capture_generated(backend, source, generate, map_error, |generated| {
             self.observe_classified(generated, path, prototype, classify_generated_failure)
         })

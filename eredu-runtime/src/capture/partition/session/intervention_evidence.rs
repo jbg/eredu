@@ -85,9 +85,13 @@ impl CaptureSession {
                 Some(bounds) => {
                     evidence.admit_invocations(&catalog, &support, &support.capture, bounds)?
                 }
-                None => {
-                    evidence.admit(&catalog, &support, &support.capture, self.plan.request())?
-                }
+                None => evidence.admit_with_text_origin(
+                    &catalog,
+                    &support,
+                    &support.capture,
+                    self.plan.request(),
+                    self.plan.text_origin().expect("ordinary capture origin"),
+                )?,
             }));
         }
         let mut work = Vec::with_capacity(plans.len());
@@ -149,7 +153,7 @@ impl CaptureSession {
             drop(native_selection);
             work.push(self.prepare_partition_selection(
                 transport,
-                plan,
+                plan.into(),
                 PartitionCaptureKey::InterventionEvidence {
                     operation,
                     evidence,

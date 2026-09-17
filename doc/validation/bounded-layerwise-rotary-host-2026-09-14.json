@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-13T22:47:27.492682+00:00",
+  "scope": "Explicit one-buffer F32 host initialization and actual layerwise V4 constructor accounting",
+  "status": "Verified focused host allocation and resident/host/disk parity; full bounded-inference goal remains incomplete",
+  "previous_increment": "bounded-native-resume-construction-2026-09-14.json",
+  "tests": {
+    "nn": {
+      "passed": 5,
+      "ignored": 0
+    },
+    "architectures": {
+      "passed": 2,
+      "ignored": 0
+    },
+    "reference": {
+      "passed": 305,
+      "ignored": 0
+    },
+    "workspace": {
+      "passed": 96,
+      "ignored": 0
+    },
+    "native": {
+      "passed": 170,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 127,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 705,
+  "new_tests": {
+    "nn_fixed_worker": 5,
+    "architecture_frequency": 2,
+    "native_initialization": 3,
+    "native_v4_layerwise": 2
+  },
+  "checks": {
+    "nn": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-nn --all-features --lib f32_initialization",
+      "started_utc": "2026-09-13T22:39:26.155949+00:00",
+      "elapsed_seconds": 1.989,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-layerwise-rotary-host-nn.log",
+      "log_sha256": "bea8f844be083e6afc6e62b30151db6c6e35d5503e0847b6b7ad454e2dfd9639"
+    },
+    "architectures": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib deepseek::attention::v4::frequency_tests",
+      "started_utc": "2026-09-13T22:39:28.146095+00:00",
+      "elapsed_seconds": 28.69,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-layerwise-rotary-host-architectures.log",
+      "log_sha256": "0bc0a2db38f427471fc5e9efa764dc93245be1dced626d7cf96f2538035abcda"
+    },
+    "reference": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric",
+      "started_utc": "2026-09-13T22:39:56.837506+00:00",
+      "elapsed_seconds": 120.09,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-layerwise-rotary-host-reference.log",
+      "log_sha256": "5a4eb66f646f3586bd34976e71eb5ca4ad7f509ecd2ce856382728ff802c6d98"
+    },
+    "workspace": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::nn::workspace:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T22:41:56.929042+00:00",
+      "elapsed_seconds": 214.868,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-layerwise-rotary-host-workspace.log",
+      "log_sha256": "46ca15c46f63b46b1fdb395e43b2d278e078738b153699ff45a1b06bf7f6f543"
+    },
+    "native": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::model_session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T22:45:31.825511+00:00",
+      "elapsed_seconds": 9.512,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-layerwise-rotary-host-native.log",
+      "log_sha256": "1e52cde6e8b80cb5691b84364511c9bd43c28f688ec8c334bcbe146d880c1a6f"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-13T22:45:41.337882+00:00",
+      "elapsed_seconds": 41.888,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-layerwise-rotary-host-portable.log",
+      "log_sha256": "7e1521ae4942630ee2bef29e47c59cc52c1a151a75eefd205f2b29c075e976df"
+    },
+    "nnfeatures": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-nn --all-features",
+      "started_utc": "2026-09-13T22:46:23.227390+00:00",
+      "elapsed_seconds": 0.955,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-layerwise-rotary-host-nnfeatures.log",
+      "log_sha256": "aa37102b451ad52944dcf6e4c93fc5a0a028881d883ced4b099b4341982b7e97"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-13T22:46:24.182656+00:00",
+      "elapsed_seconds": 14.794,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-layerwise-rotary-host-minimal.log",
+      "log_sha256": "4a20331f7a2802f4b946be68e0326ae7d96db623a153afcb1558be8fd754965c"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-13T22:46:38.977669+00:00",
+      "elapsed_seconds": 15.664,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-layerwise-rotary-host-features.log",
+      "log_sha256": "17a6409f31ce813b7519f27607bbf54a4e9bfd9b7fdbaa96864ba366666f5113"
+    }
+  },
+  "source_sha256": {
+    "eredu-architectures/src/deepseek/attention/v4.rs": "377a57d1dc5ecafea3d9fa823000923e2f6f41c1cb549eb9b286ecf087880909",
+    "eredu-architectures/src/deepseek/attention/v4/frequency_tests.rs": "58826d59e6e0db328d80d72a4d79f69e5e0c774fc97539e34d9173578edc27d4",
+    "eredu-backend-mlx/src/backend/nn/workspace/basic.rs": "c4f568f0a491b03c845ac7656d5a0bbc3bf5dc515eba358b16cd89a158f70461",
+    "eredu-backend-mlx/src/backend/nn/workspace/host.rs": "8cb620b98831d4536d1799ae545b2936695dccb5d5bc042d359dd8b4d65fa28d",
+    "eredu-backend-mlx/src/backend/nn/workspace/host/f32_initialization_tests.rs": "0bc6c33721770ee821a36518372a44275d02500a5a8960ea1e326c5cf7751fa7",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/host_layerwise_tests.rs": "179dfbbe5580dcd07bc91df725a798af2399c0eae5a97413320beaad024b4146",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/host_layerwise_tests/rotary.rs": "6fd9f31d989708f2589c9610f5a46734f141a3269c74c1b5b604f9b07ce2ff3e",
+    "eredu-nn/src/f32_initialization.rs": "c68f490a4769352c6799dea6e2fb40d20a917e81a7aefa7c360cc1415a80c009",
+    "eredu-nn/src/f32_initialization/tests.rs": "eed0996fe8289120b3de4bae2b5fb28529064f32642462fa672a75d0304f5037",
+    "eredu-nn/src/lib.rs": "58435e8ecadeac435d915d42f8f716e5adcebd0cb3f04d12d6ac3e1e1b033a40",
+    "eredu-nn/src/workspace.rs": "b8c735ff5cfd3042b55c3028e23ab926c67f4aede1b1acfd8aa0e64c0b568fa3",
+    "eredu-nn/src/workspace/tensor.rs": "ceba95f5f7127ebf9106025ef5006dd87941d666fee152b36d7da63baa39e7f2",
+    "doc/backend-architecture.md": "1a8b8acd21360573e52ce17d99ea008d153d4a4f521fa7d26ac8eb61a8b55756",
+    "doc/execution-control.md": "4b7607e9bd016780633de2ec03258c3407c4e2bf331d5f77cb1c7b94b2a38138",
+    "doc/bounded-inference.md": "9d382931405b9fcd16672f9a52afc9c7aa7576002c38d4812f32d98c656123ad"
+  },
+  "source_snapshot": "/private/tmp/eredu-layerwise-rotary-host-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-layerwise-rotary-host-apply.py": "4370869b0439d127ad7d4952b1088dafe75ebbeb1c03fef6d205d0ebb5022ad5",
+    "/private/tmp/eredu-layerwise-rotary-host-validate.py": "d3e0921bc2280234c7baeb5733c548a4c12c0fab27f8ace1acc9c05890d778b2",
+    "/private/tmp/eredu-layerwise-rotary-host-root-reviewed.json": "11705e6c61bcc4b966c5791bdcc7c100de98f390fbdc10b8e3385e0db971bbb5",
+    "/private/tmp/eredu-layerwise-rotary-host-allocation-basis.md": "f9f03c2acc58db836e4a5fdde41f16c5ef3dcf96d3fda11dadcacf2822357ba8",
+    "/private/tmp/eredu-layerwise-rotary-host-format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/private/tmp/eredu-layerwise-rotary-host-frozen-rust.json": "11705e6c61bcc4b966c5791bdcc7c100de98f390fbdc10b8e3385e0db971bbb5",
+    "/private/tmp/eredu-layerwise-rotary-host-stage/README.md": "7ab86f4b07423855b24874f1d166efff04162a285e1f3c1e89d4a3b37663eb89",
+    "/private/tmp/eredu-layerwise-rotary-host-stage/change.patch": "562faba7b191c91686c62e601ffb2ab7f4dfc49040d64010d6f42b54ea562ab2",
+    "/private/tmp/eredu-layerwise-rotary-host-stage/checks.json": "22efad7691fdae6efc0d7f7c7a71b22801d3309b1f9759696bad7991ad089be3",
+    "/private/tmp/eredu-layerwise-rotary-host-stage/base-hashes.json": "2ed0f3662275c76e25bc5c6b8a2eaac15ba1843192ed48f8c238373ad9171511",
+    "/private/tmp/eredu-layerwise-rotary-host-stage/staged-hashes.json": "11705e6c61bcc4b966c5791bdcc7c100de98f390fbdc10b8e3385e0db971bbb5"
+  },
+  "behavior": [
+    "A shared checked F32 initializer owns exactly one preallocated vector and fills it without growth. The explicit scalar-expression contract excludes arbitrary allocation, native work and external effects.",
+    "Metadata execution validates geometry without invoking scalar code, emits a distinct operation, and retains unknown host coverage when the selected mechanism supplies no fact.",
+    "The Metal mechanism separates the fixed Rust host buffer from the existing conservative native source/copy envelope, using the same exact arity/dtype/shape predicate for both facts.",
+    "V4 scalar frequency and YaRN expressions stay private architecture semantics. Bitwise tests preserve the old F32 expression order across multiple widths, bases, scales and correction boundaries.",
+    "Existing architecture execution traversal visits actual selected unit constructors, so every invocation and conservative completed-span overlap contributes without a backend family branch or duplicated scheduler.",
+    "Actual public-load V4 resident/host/disk tests cover ordinary and controlled execution, exact capacity/one-byte-short prework rejection, pooling-boundary prompt and three cached decodes, bounded residency and retirement."
+  ],
+  "review_findings": [
+    "Root reviewed all twelve frozen source files and their exact repository bases before application.",
+    "Pinned Rust allocation source was inspected in addition to behavioral actual-capacity checks; no production source-text test or unsafe allocation exception was introduced.",
+    "Host buffer accounting prices the actual worker rather than assuming an arbitrary borrowed caller vector is covered by tensor upload.",
+    "The scalar-expression requirement is explicit; this API supplies no general callback-wide completeness guarantee."
+  ],
+  "limits": [
+    "This increment fixes a concrete constructor-owned host vector and does not establish total-process memory bounds, allocator overhead bounds or arbitrary callback accounting.",
+    "Fresh native resume integration, hybrid/paged saved construction, managed capture/intervention, speculation, media and remaining distributed paths remain incomplete.",
+    "Tests use nonzero synthetic released-schema fixtures. No new pinned released-checkpoint reference, process-memory measurement or native distributed hardware run was performed."
+  ]
+}

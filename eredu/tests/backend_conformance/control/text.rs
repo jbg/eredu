@@ -435,9 +435,9 @@ fn text_admission_never_discards_requested_tools_or_explicit_thinking() {
 
 #[test]
 fn text_sampling_and_forcing_exclude_sparse_and_padded_ids() {
-    let base = unicode_model_with_template(None, 64, TEMPLATE);
+    let tokenizer = unicode_tokenizer(None, 64);
     let mut value: serde_json::Value =
-        serde_json::from_str(&base.tokenizer().to_string(false).unwrap()).unwrap();
+        serde_json::from_str(&tokenizer.to_string(false).unwrap()).unwrap();
     let vocab = value["model"]["vocab"].as_object_mut().unwrap();
     vocab.remove("ordinary_1"); // Hole at ID 2.
     vocab.insert("<|im_end|>".into(), serde_json::json!(65));
@@ -453,7 +453,8 @@ fn text_sampling_and_forcing_exclude_sparse_and_padded_ids() {
             eos_token_ids: vec![65],
             checkpoint_generation_config: None,
         },
-    );
+    )
+    .unwrap();
     let chat = model.prepare_chat(request()).unwrap();
     let prepared = prepare(
         &model,
@@ -489,9 +490,9 @@ fn text_sampling_and_forcing_exclude_sparse_and_padded_ids() {
 
 #[test]
 fn text_skips_non_eos_special_tokens_and_delivers_protocol_like_text_literally() {
-    let base = unicode_model_with_template(None, 64, TEMPLATE);
+    let tokenizer = unicode_tokenizer(None, 64);
     let mut value: serde_json::Value =
-        serde_json::from_str(&base.tokenizer().to_string(false).unwrap()).unwrap();
+        serde_json::from_str(&tokenizer.to_string(false).unwrap()).unwrap();
     let vocab = value["model"]["vocab"].as_object_mut().unwrap();
     for (id, token) in [(1, "<think>literal"), (2, "<tool_call>"), (3, "<hidden>")] {
         vocab.remove(&format!("ordinary_{}", id - 1));
@@ -513,7 +514,8 @@ fn text_skips_non_eos_special_tokens_and_delivers_protocol_like_text_literally()
             eos_token_ids: vec![eos],
             checkpoint_generation_config: None,
         },
-    );
+    )
+    .unwrap();
     let chat = model.prepare_chat(request()).unwrap();
     let prepared = prepare(&model, &chat, Default::default(), 0);
     let mut records = vec![];

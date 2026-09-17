@@ -43,6 +43,11 @@ impl Embedding {
     /// Use this for example when input embedding and output projection
     /// weights are tied.
     pub fn as_linear(&self, x: &Array, stream: &crate::Stream) -> Result<Array, Exception> {
+        if let Some(output) =
+            super::super::matrix::bf16_row_projection(x, &self.weight.value, None, stream)?
+        {
+            return Ok(output);
+        }
         crate::ops::matmul(x, self.weight.value.transpose(stream)?, stream)
     }
 }

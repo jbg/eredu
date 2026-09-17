@@ -23,6 +23,9 @@
 extern "C" {
 #endif
 
+/** Named controls for the explicit-key Standard sampling constructors. */
+size_t mlx_random_standard_sampling_control_bytes(void);
+
 /**
  * \defgroup random Random number operations
  */

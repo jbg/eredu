@@ -47,9 +47,8 @@ impl PreparedExternalAssistantExecution {
         let assistant = self.source.visit(visitor)?;
         Ok(MaterializedExternalAssistantExecution {
             assistant,
-            selected: self.selected,
+            source: super::ExternalSelectionSource::new(self.selected,capture),
             tokenizer: self.tokenizer,
-            capture,
         })
     }
 }
@@ -57,9 +56,8 @@ impl PreparedExternalAssistantExecution {
 /// A typed materialized assistant paired with its admitted execution contract.
 pub struct MaterializedExternalAssistantExecution<V: ExternalAssistantPreparationVisitor> {
     assistant: MaterializedExternalAssistant<V>,
-    selected: SelectedSpeculativeRealization,
+    source: super::ExternalSelectionSource,
     tokenizer: TokenizerCompatibilityProof,
-    capture: ExternalPredictionCaptureRequest,
 }
 
 impl<V: ExternalAssistantPreparationVisitor> MaterializedExternalAssistantExecution<V> {
@@ -68,9 +66,30 @@ impl<V: ExternalAssistantPreparationVisitor> MaterializedExternalAssistantExecut
         self.assistant.visit(visitor)
     }
 
+    /// Lends the actual retained selection and capture beside the concrete
+    /// assistant. No clone, reconstruction or replacement of either authority
+    /// occurs, and a visitor cannot extend their loan beyond this invocation.
+    pub fn visit_selected<W: SelectedExternalAssistantVisitor<V>>(&mut self, visitor: W) -> W::Output {
+        self.assistant.visit(SelectedVisit {
+            visitor, source: &self.source,
+        })
+    }
+
+    /// Concrete transport storage for `visit_selected`, with no payload/source
+    /// clone. Callers with admitted metadata pay it before entering the visitor.
+    pub fn selected_visit_control_bytes<W: SelectedExternalAssistantVisitor<V>>() -> Option<usize> {
+        let parts = [
+            std::mem::size_of::<SelectedVisit<'_, W>>(),
+            std::mem::size_of::<W::Output>(),
+            std::mem::size_of::<(&mut Self, W)>(),
+            std::mem::size_of::<&super::ExternalSelectionSource>(),
+        ];
+        parts.into_iter().try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+    }
+
     /// Returns the exact realization retained before source and native construction.
-    pub const fn selected(&self) -> &SelectedSpeculativeRealization {
-        &self.selected
+    pub fn selected(&self) -> &SelectedSpeculativeRealization {
+        self.source.selected()
     }
 
     /// Returns the tokenizer proof retained by this construction.
@@ -79,8 +98,42 @@ impl<V: ExternalAssistantPreparationVisitor> MaterializedExternalAssistantExecut
     }
 
     /// Returns the target capture selected by architecture compatibility.
-    pub const fn capture(&self) -> &ExternalPredictionCaptureRequest {
-        &self.capture
+    pub fn capture(&self) -> &ExternalPredictionCaptureRequest {
+        self.source.capture()
+    }
+}
+
+
+/// Family-blind continuation borrowing the inseparable assistant selection,
+/// architecture capture request and actual typed materialized assistant.
+pub trait SelectedExternalAssistantVisitor<V: ExternalAssistantPreparationVisitor> {
+    /// Result after all selected-source loans end.
+    type Output;
+    /// Runs with the selection and capture that preceded this materialization.
+    fn visit<A: super::ExternalAssistantArchitecture>(
+        self,
+        assistant: &mut V::Output<A>,
+        selected: &SelectedSpeculativeRealization,
+        capture: &ExternalPredictionCaptureRequest,
+    ) -> Self::Output;
+    /// Lends the actual immutable loaded declaration owner when the consumer
+    /// needs to retain it beyond this synchronous operation loan.
+    fn visit_source<A:super::ExternalAssistantArchitecture>(self,assistant:&mut V::Output<A>,source:&super::ExternalSelectionSource)->Self::Output where Self:Sized {
+        self.visit::<A>(assistant,source.selected(),source.capture())
+    }
+}
+struct SelectedVisit<'a, W> {
+    visitor: W,
+    source: &'a super::ExternalSelectionSource,
+}
+impl<V, W> MaterializedExternalAssistantVisitor<V> for SelectedVisit<'_, W>
+where
+    V: ExternalAssistantPreparationVisitor,
+    W: SelectedExternalAssistantVisitor<V>,
+{
+    type Output = W::Output;
+    fn visit<A: super::ExternalAssistantArchitecture>(self, assistant: &mut V::Output<A>) -> Self::Output {
+        self.visitor.visit_source::<A>(assistant,self.source)
     }
 }
 

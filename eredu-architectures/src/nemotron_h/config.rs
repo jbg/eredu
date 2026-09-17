@@ -9,8 +9,8 @@ use std::{
 use eredu_checkpoint::{AffineQuantization, WeightQuantization};
 use eredu_core::{
     cache::{
-        derive_prompt_cache_architecture_fingerprint, LayerCachePolicy, MutableStateResidency,
-        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
+        LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
+        StateTensorPolicy, StateTensorRole,
     },
     AttentionPolicy, LayerSchedule,
 };
@@ -41,12 +41,19 @@ pub enum LayerPolicy {
 
 impl LayerPolicy {
     fn from_marker(marker: char, attention: AttentionPolicy) -> Result<Self, ConfigError> {
+        Self::from_marker_with(marker, attention, |message| invalid(message.to_string()))
+    }
+    fn from_marker_with<E>(
+        marker: char,
+        attention: AttentionPolicy,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         match marker {
             'M' => Ok(Self::Mamba),
             '*' => Ok(Self::SelfAttention(attention)),
             '-' => Ok(Self::DenseMlp),
             'E' => Ok(Self::SparseMoe),
-            marker => Err(invalid(format!(
+            marker => Err(error(format_args!(
                 "hybrid_override_pattern contains unsupported marker {marker:?}"
             ))),
         }
@@ -252,8 +259,14 @@ impl ModelArgs {
 
     /// Validates the normalized target, MTP, recurrent, attention, and expert geometry.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with_diagnostic(|text| invalid(text.to_string()))
+    }
+    pub(crate) fn validate_with_diagnostic<E>(
+        &self,
+        error: impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
         if self.model_type != "nemotron_h" {
-            return Err(invalid(format!(
+            return Err(error(format_args!(
                 "unsupported model_type {:?}",
                 self.model_type
             )));
@@ -276,7 +289,7 @@ impl ModelArgs {
             ("num_experts_per_tok", self.num_experts_per_tok),
         ] {
             if value <= 0 {
-                return Err(invalid(format!("{name} must be positive, got {value}")));
+                return Err(error(format_args!("{name} must be positive, got {value}")));
             }
         }
         if self.layer_schedule.len() != self.num_hidden_layers as usize
@@ -287,33 +300,64 @@ impl ModelArgs {
             || self.topk_group > self.n_group
             || self.num_experts_per_tok > self.topk_group * (self.n_routed_experts / self.n_group)
         {
-            return Err(invalid("invalid Nemotron-H schedule/head/expert geometry"));
+            return Err(error(format_args!(
+                "invalid Nemotron-H schedule/head/expert geometry"
+            )));
         }
         if self.n_shared_experts != 1
             || self.mlp_hidden_act != "relu2"
             || self.mamba_hidden_act != "silu"
         {
-            return Err(invalid(
-                "Nemotron-H requires one shared expert, relu2 MLP, and silu Mamba",
-            ));
+            return Err(error(format_args!(
+                "Nemotron-H requires one shared expert, relu2 MLP, and silu Mamba"
+            )));
         }
         if self.num_nextn_predict_layers < 0 {
-            return Err(invalid("num_nextn_predict_layers cannot be negative"));
+            return Err(error(format_args!(
+                "num_nextn_predict_layers cannot be negative"
+            )));
         }
-        self.mtp_policies()?;
+        self.visit_mtp_policies(|_| (), &error)?;
         Ok(())
     }
 
     /// Expands the repeated MTP operator pattern into physical unit policies.
     pub fn mtp_policies(&self) -> Result<Vec<LayerPolicy>, ConfigError> {
+        let mut policies = Vec::new();
+        self.visit_mtp_policies(
+            |policy| policies.push(policy),
+            |message| invalid(message.to_string()),
+        )?;
+        Ok(policies)
+    }
+    pub(super) fn mtp_policy_count_with<E>(
+        &self,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<usize, E> {
+        let mut count = Some(0usize);
+        self.visit_mtp_policies(
+            |_| count = count.and_then(|value| value.checked_add(1)),
+            &mut error,
+        )?;
+        count.ok_or_else(|| error(format_args!("MTP policy count overflowed")))
+    }
+    fn visit_mtp_policies<E>(
+        &self,
+        mut visit: impl FnMut(LayerPolicy),
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
         if self.num_nextn_predict_layers == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let pattern = self
             .mtp_hybrid_override_pattern
             .as_deref()
             .filter(|pattern| !pattern.is_empty())
-            .ok_or_else(|| invalid("MTP weights require a nonempty MTP operator pattern"))?;
+            .ok_or_else(|| {
+                error(format_args!(
+                    "MTP weights require a nonempty MTP operator pattern"
+                ))
+            })?;
         let attention = self
             .layer_schedule
             .iter()
@@ -322,20 +366,28 @@ impl ModelArgs {
                 _ => None,
             })
             .unwrap_or(AttentionPolicy::Full);
-        let mut policies = Vec::new();
         for _ in 0..self.num_nextn_predict_layers {
             for marker in pattern.chars() {
-                let policy = LayerPolicy::from_marker(marker, attention)?;
+                let policy = LayerPolicy::from_marker_with(marker, attention, &mut error)?;
                 if !matches!(
                     policy,
                     LayerPolicy::SelfAttention(_) | LayerPolicy::SparseMoe
                 ) {
-                    return Err(invalid("MTP pattern supports only attention and MoE units"));
+                    return Err(error(format_args!(
+                        "MTP pattern supports only attention and MoE units"
+                    )));
                 }
-                policies.push(policy);
+                visit(policy);
             }
         }
-        Ok(policies)
+        Ok(())
+    }
+
+    fn mtp_contains_sparse_moe(&self) -> bool {
+        let mut found = false;
+        self.visit_mtp_policies(|policy| found |= policy == LayerPolicy::SparseMoe, |_| ())
+            .is_ok()
+            && found
     }
 
     /// Returns whether target or prediction groups contain sparse experts.
@@ -343,9 +395,7 @@ impl ModelArgs {
         self.layer_schedule
             .iter()
             .any(|policy| *policy == LayerPolicy::SparseMoe)
-            || self
-                .mtp_policies()
-                .is_ok_and(|policies| policies.contains(&LayerPolicy::SparseMoe))
+            || self.mtp_contains_sparse_moe()
     }
 
     /// Resolves the physical encoding for one canonical parameter identity.
@@ -798,10 +848,27 @@ fn gguf_optional_f32(
 
 /// Declares global state for every target and appended prediction unit.
 pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, ConfigError> {
-    let mut geometry = args
-        .layer_schedule
-        .iter()
-        .map(|policy| match policy {
+    state_layout_destination(args, &crate::state_geometry::Ordinary(invalid))
+}
+
+/// Constructs the same actual state geometry using counted metadata destinations.
+pub fn state_layout_with_metadata(
+    args: &ModelArgs,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<StateLayout, eredu_nn::Error> {
+    if !context.uses_checked_metadata() {
+        return state_layout(args).map_err(eredu_nn::Error::backend);
+    }
+    state_layout_destination(args, &crate::state_geometry::Counted::new(context, invalid))
+}
+
+fn state_layout_destination<D: crate::state_geometry::Destination>(
+    args: &ModelArgs,
+    destination: &D,
+) -> Result<StateLayout, D::Error> {
+    destination.controls::<(StateLayout, &ModelArgs)>()?;
+    let mut geometry =
+        destination.collect_values(args.layer_schedule.iter().map(|policy| match policy {
             LayerPolicy::Mamba => LayerGeometry::Mamba {
                 heads: args.mamba_num_heads,
                 groups: args.n_groups,
@@ -817,20 +884,24 @@ pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, ConfigError> {
                 routed: args.moe_intermediate_size,
                 shared: args.moe_shared_expert_intermediate_size,
             },
+        }))?;
+    for geometry_part in mtp_policies_destination(args, destination)?
+        .into_iter()
+        .map(|policy| match policy {
+            LayerPolicy::SelfAttention(_) => LayerGeometry::Attention {
+                query_heads: args.num_attention_heads,
+                kv_heads: args.num_key_value_heads,
+            },
+            LayerPolicy::SparseMoe => LayerGeometry::SparseMoe {
+                routed: args.moe_intermediate_size,
+                shared: args.moe_shared_expert_intermediate_size,
+            },
+            _ => unreachable!("validated MTP policies contain only attention and MoE"),
         })
-        .collect::<Vec<_>>();
-    geometry.extend(args.mtp_policies()?.into_iter().map(|policy| match policy {
-        LayerPolicy::SelfAttention(_) => LayerGeometry::Attention {
-            query_heads: args.num_attention_heads,
-            kv_heads: args.num_key_value_heads,
-        },
-        LayerPolicy::SparseMoe => LayerGeometry::SparseMoe {
-            routed: args.moe_intermediate_size,
-            shared: args.moe_shared_expert_intermediate_size,
-        },
-        _ => unreachable!("validated MTP policies contain only attention and MoE"),
-    }));
-    state_layout_with_geometry(args, &geometry)
+    {
+        destination.push(&mut geometry, geometry_part)?;
+    }
+    state_layout_with_geometry_destination(args, &geometry, destination)
 }
 
 /// Declares rank-local state from placement-resolved unit geometry.
@@ -838,137 +909,200 @@ pub fn state_layout_with_geometry(
     args: &ModelArgs,
     geometry: &[LayerGeometry],
 ) -> Result<StateLayout, ConfigError> {
-    let mut schedule = args.layer_schedule.iter().copied().collect::<Vec<_>>();
-    schedule.extend(args.mtp_policies()?);
+    state_layout_with_geometry_destination(
+        args,
+        geometry,
+        &crate::state_geometry::Ordinary(invalid),
+    )
+}
+
+fn state_layout_with_geometry_destination<D: crate::state_geometry::Destination>(
+    args: &ModelArgs,
+    geometry: &[LayerGeometry],
+    destination: &D,
+) -> Result<StateLayout, D::Error> {
+    destination.controls::<(StateLayout, &ModelArgs, &[LayerGeometry])>()?;
+    let mut schedule = destination.collect_values(args.layer_schedule.iter().copied())?;
+    for policy in mtp_policies_destination(args, destination)? {
+        destination.push(&mut schedule, policy)?;
+    }
     if geometry.len() != schedule.len() {
-        return Err(invalid(
-            "state geometry does not match the target plus MTP physical schedule",
-        ));
+        return Err(destination.error(format_args!(
+            "state geometry does not match the target plus MTP physical schedule"
+        )));
     }
     let history = args.conv_kernel - 1;
-    let fixed = |value| StateTensorDimension::fixed(value).map_err(|e| invalid(e.to_string()));
-    let policies = schedule
-        .iter()
-        .zip(geometry)
-        .map(|(policy, geometry)| match (*policy, *geometry) {
-            (LayerPolicy::Mamba, LayerGeometry::Mamba { heads, groups }) => {
-                let conv_width = heads * args.mamba_head_dim + 2 * groups * args.ssm_state_size;
-                let mut tensors = Vec::new();
-                if history > 0 {
-                    tensors.push(
-                        StateTensorPolicy::new(
+    let fixed = |value| destination.fixed(value);
+    let policies =
+        destination.collect(schedule.iter().zip(geometry).map(|(policy, geometry)| {
+            match (*policy, *geometry) {
+                (LayerPolicy::Mamba, LayerGeometry::Mamba { heads, groups }) => {
+                    let conv_width = heads * args.mamba_head_dim + 2 * groups * args.ssm_state_size;
+                    let mut tensors = destination.vector(1 + usize::from(history > 0))?;
+                    if history > 0 {
+                        tensors.push(destination.tensor(
                             StateTensorRole::Convolution { slot: 0 },
-                            vec![
+                            destination.values([
                                 StateTensorDimension::Batch,
                                 fixed(history)?,
                                 fixed(conv_width)?,
-                            ],
+                            ])?,
                             StateTensorDtype::Floating,
                             MutableStateResidency::AlwaysDeviceMutable,
-                        )
-                        .map_err(|e| invalid(e.to_string()))?,
-                    );
-                }
-                tensors.push(
-                    StateTensorPolicy::new(
+                        )?);
+                    }
+                    tensors.push(destination.tensor(
                         StateTensorRole::Recurrent,
-                        vec![
+                        destination.values([
                             StateTensorDimension::Batch,
                             fixed(heads)?,
                             fixed(args.mamba_head_dim)?,
                             fixed(args.ssm_state_size)?,
-                        ],
+                        ])?,
                         StateTensorDtype::Float32,
                         MutableStateResidency::LayerScopedOffloadable,
-                    )
-                    .map_err(|e| invalid(e.to_string()))?,
-                );
-                LayerCachePolicy::fixed_only(tensors).map_err(|e| invalid(e.to_string()))
+                    )?);
+                    destination.fixed_only(tensors)
+                }
+                (
+                    LayerPolicy::SelfAttention(attention),
+                    LayerGeometry::Attention { kv_heads, .. },
+                ) => destination.key_value(attention, kv_heads, args.head_dim),
+                (LayerPolicy::DenseMlp, LayerGeometry::DenseMlp { .. })
+                | (LayerPolicy::SparseMoe, LayerGeometry::SparseMoe { .. }) => {
+                    Ok(LayerCachePolicy::NoState)
+                }
+                _ => Err(destination.error(format_args!(
+                    "state geometry does not match its scheduled operator"
+                ))),
             }
-            (LayerPolicy::SelfAttention(attention), LayerGeometry::Attention { kv_heads, .. }) => {
-                LayerCachePolicy::key_value(attention, kv_heads, args.head_dim)
-                    .map_err(|e| invalid(e.to_string()))
-            }
-            (LayerPolicy::DenseMlp, LayerGeometry::DenseMlp { .. })
-            | (LayerPolicy::SparseMoe, LayerGeometry::SparseMoe { .. }) => {
-                Ok(LayerCachePolicy::NoState)
-            }
-            _ => Err(invalid(
-                "state geometry does not match its scheduled operator",
-            )),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        }))?;
     let target_layers = args.layer_schedule.len();
     let prediction_layers = policies.len() - target_layers;
-    let mut segments = vec![StateSegmentSpec::new(
+    let mut segments = destination.vector(1 + usize::from(prediction_layers > 0))?;
+    segments.push(destination.segment(
         TARGET_STATE_SEGMENT,
         0..target_layers,
         StateSegmentLifetime::Persistent,
         0,
-    )
-    .map_err(|error| invalid(error.to_string()))?];
+    )?);
     if prediction_layers > 0 {
-        segments.push(
-            StateSegmentSpec::new(
-                PREDICTION_STATE_SEGMENT,
-                target_layers..target_layers + prediction_layers,
-                StateSegmentLifetime::Persistent,
-                -1,
-            )
-            .map_err(|error| invalid(error.to_string()))?,
-        );
+        segments.push(destination.segment(
+            PREDICTION_STATE_SEGMENT,
+            target_layers..target_layers + prediction_layers,
+            StateSegmentLifetime::Persistent,
+            -1,
+        )?);
     }
-    StateLayout::segmented(
-        LayerSchedule::new(policies.len(), policies).map_err(|e| invalid(e.to_string()))?,
-        segments,
-    )
-    .map_err(|e| invalid(e.to_string()))
+    destination.segmented(destination.schedule(policies.len(), policies)?, segments)
+}
+
+fn mtp_policies_destination<D: crate::state_geometry::Destination>(
+    args: &ModelArgs,
+    destination: &D,
+) -> Result<Vec<LayerPolicy>, D::Error> {
+    let count = args.mtp_policy_count_with(|text| destination.error(text))?;
+    let mut policies = destination.vector(count)?;
+    args.visit_mtp_policies(
+        |policy| policies.push(policy),
+        |text| destination.error(text),
+    )?;
+    Ok(policies)
+}
+
+struct PolicyFingerprint<'a>(&'a LayerPolicy);
+impl std::fmt::Display for PolicyFingerprint<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            LayerPolicy::Mamba => output.write_str("m"),
+            LayerPolicy::SelfAttention(AttentionPolicy::Full) => output.write_str("af"),
+            LayerPolicy::SelfAttention(AttentionPolicy::Sliding { window }) => {
+                write!(output, "as{}", window.get())
+            }
+            LayerPolicy::DenseMlp => output.write_str("d"),
+            LayerPolicy::SparseMoe => output.write_str("e"),
+        }
+    }
 }
 
 /// Returns the stable prompt-cache fingerprint of state-affecting policy.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    derive_prompt_cache_architecture_fingerprint(
-        "nemotron_h",
-        [
-            ("model_type", args.model_type.clone()),
-            ("hidden", args.hidden_size.to_string()),
+    prompt_cache_architecture_fingerprint_with_metadata(
+        args,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary fingerprint formatting is infallible")
+}
+pub(crate) fn prompt_cache_architecture_fingerprint_with_metadata(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    metadata.fingerprint("nemotron_h", || {
+        Ok([
+            ("model_type", metadata.text(&args.model_type)?),
+            (
+                "hidden",
+                metadata.format(format_args!("{}", args.hidden_size))?,
+            ),
             (
                 "schedule",
-                args.layer_schedule
-                    .iter()
-                    .map(|p| match p {
-                        LayerPolicy::Mamba => "m".into(),
-                        LayerPolicy::SelfAttention(AttentionPolicy::Full) => "af".into(),
-                        LayerPolicy::SelfAttention(AttentionPolicy::Sliding { window }) => {
-                            format!("as{}", window.get())
-                        }
-                        LayerPolicy::DenseMlp => "d".into(),
-                        LayerPolicy::SparseMoe => "e".into(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(","),
+                metadata.format(format_args!(
+                    "{}",
+                    crate::cache_identity::Joined(
+                        || args.layer_schedule.iter().map(PolicyFingerprint),
+                        ","
+                    )
+                ))?,
             ),
-            ("mamba_state", args.ssm_state_size.to_string()),
-            ("mamba_heads", args.mamba_num_heads.to_string()),
-            ("mamba_groups", args.n_groups.to_string()),
-            ("mamba_head_dim", args.mamba_head_dim.to_string()),
-            ("mamba_conv", args.conv_kernel.to_string()),
-            ("residual_f32", args.residual_in_fp32.to_string()),
+            (
+                "mamba_state",
+                metadata.format(format_args!("{}", args.ssm_state_size))?,
+            ),
+            (
+                "mamba_heads",
+                metadata.format(format_args!("{}", args.mamba_num_heads))?,
+            ),
+            (
+                "mamba_groups",
+                metadata.format(format_args!("{}", args.n_groups))?,
+            ),
+            (
+                "mamba_head_dim",
+                metadata.format(format_args!("{}", args.mamba_head_dim))?,
+            ),
+            (
+                "mamba_conv",
+                metadata.format(format_args!("{}", args.conv_kernel))?,
+            ),
+            ("residual_f32", metadata.format(format_args!("{}", args.residual_in_fp32))?),
             (
                 "mtp",
-                args.mtp_hybrid_override_pattern.clone().unwrap_or_default(),
+                metadata.text(
+                    args.mtp_hybrid_override_pattern
+                        .as_deref()
+                        .unwrap_or_default(),
+                )?,
             ),
-            ("quantization", format!("{:?}", args.weight_quantization)),
+            (
+                "quantization",
+                metadata.format(format_args!("{:?}", args.weight_quantization))?,
+            ),
             (
                 "quantized_weights",
-                crate::cache_identity::string_set(args.quantized_weights.as_ref()),
+                crate::cache_identity::string_set_with_metadata(
+                    args.quantized_weights.as_ref(),
+                    metadata,
+                )?,
             ),
             (
                 "quantized_weight_configs",
-                crate::cache_identity::debug_map(args.quantized_weight_configs.as_ref()),
+                crate::cache_identity::debug_map_with_metadata(
+                    args.quantized_weight_configs.as_ref(),
+                    metadata,
+                )?,
             ),
-        ],
-    )
+        ])
+    })
 }
 
 /// Invalid or unsupported Nemotron-H configuration.

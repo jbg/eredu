@@ -1,11 +1,11 @@
 //! Semantic tensor-parallel placement for Qwen decoder blocks.
 
 use eredu_nn::{GroupedNeuralBackend, NeuralBackend};
-use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole,
-};
+use eredu_runtime::{MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole};
 
+use crate::decoder::parameter_metadata::{
+    DeclarationDestination as Destination, ParameterGroupError as GroupError,
+};
 use crate::decoder::{block_common_parallel_parameter_groups, dense_mlp_parallel_parameter_group};
 
 use super::{FeedForward, ModelArgs, RoutedTransformerBlock, TransformerBlock};
@@ -208,62 +208,106 @@ pub fn routed_layer_parallel_parameter_groups<
     args: &ModelArgs,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = block_common_parallel_parameter_groups(block, args, layer)?;
+    routed_groups(block, args, layer, Destination(None)).map_err(GroupError::ordinary)
+}
+
+pub(crate) fn routed_layer_parallel_parameter_groups_with_metadata<
+    B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
+    block: &RoutedTransformerBlock<B>,
+    args: &ModelArgs,
+    layer: usize,
+    context: Option<&eredu_nn::workspace::WorkspaceContext>,
+) -> Result<Vec<ParameterGroupSpec>, eredu_nn::Error> {
+    routed_groups(block, args, layer, Destination(context)).map_err(GroupError::into_neural)
+}
+
+fn routed_groups<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>(
+    block: &RoutedTransformerBlock<B>,
+    args: &ModelArgs,
+    layer: usize,
+    destination: Destination<'_>,
+) -> Result<Vec<ParameterGroupSpec>, GroupError> {
+    destination.controls::<(Vec<ParameterGroupSpec>, Vec<std::ops::Range<usize>>, String)>()?;
+    let mut groups = crate::decoder::block_common_parallel_parameter_groups_with(
+        block,
+        args,
+        layer,
+        destination,
+    )?;
     match &block.mlp {
         FeedForward::Dense(mlp) => {
-            groups.push(dense_mlp_parallel_parameter_group(mlp, args, layer)?);
+            let group = crate::decoder::dense_mlp_parallel_parameter_group_with(
+                mlp,
+                args,
+                layer,
+                destination,
+            )?;
+            destination.reserve(&mut groups, 1)?;
+            groups.push(group);
         }
         FeedForward::Routed(moe) => {
-            let prefix = format!("{}.layers.{layer}.mlp", args.parameter_root);
-            groups.push(module_parameter_group::<B::Tensor, _>(
-                format!("{prefix}.gate"),
+            let prefix =
+                destination.text(format_args!("{}.layers.{layer}.mlp", args.parameter_root))?;
+            destination.reserve(&mut groups, 1)?;
+            groups.push(destination.module::<B::Tensor, _>(
+                format_args!("{prefix}.gate"),
                 ParameterRole::Replicated,
                 &moe.router,
-                |_, _| Ok(MemberSharding::Replicated),
+                |_| Ok(MemberSharding::Replicated),
             )?);
             let intermediate = usize::try_from(args.moe_intermediate_size).map_err(|_| {
-                ParallelPlanError::InvalidGroup("Qwen expert width exceeds usize".into())
+                destination.group_error(format_args!("Qwen expert width exceeds usize"))
             })?;
             let alignment = args
-                .weight_quantization_for(&format!("{prefix}.experts.down_proj"))
+                .weight_quantization_for(
+                    &destination.text(format_args!("{prefix}.experts.down_proj"))?,
+                )
                 .map_or(Ok(1), |quantization| {
                     usize::try_from(quantization.group_size()).map_err(|_| {
-                        ParallelPlanError::InvalidGroup(
-                            "Qwen expert quantization group exceeds usize".into(),
-                        )
+                        destination.group_error(format_args!(
+                            "Qwen expert quantization group exceeds usize"
+                        ))
                     })
                 })?;
-            let units =
-                aligned_partition_units(&format!("{prefix}.experts"), intermediate, 1, alignment)?;
-            let segments = vec![0..intermediate, intermediate..2 * intermediate];
-            groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-                format!("{prefix}.experts.intermediate"),
+            let units = destination.aligned(
+                &destination.text(format_args!("{prefix}.experts"))?,
+                intermediate,
+                1,
+                alignment,
+            )?;
+            let mut segments = destination.vector(2)?;
+            segments.extend([0..intermediate, intermediate..2 * intermediate]);
+            destination.reserve(&mut groups, 1)?;
+            groups.push(destination.partitioned_module_named::<B::Tensor, _>(
+                format_args!("{prefix}.experts.intermediate"),
                 ParameterRole::ExpertIntermediate,
                 units,
                 &moe.experts,
-                |metadata, shape| {
-                    let name = metadata.id.as_str();
+                |name, shape| {
                     if name.contains("gate_up_proj") {
                         if shape.len() < 3 {
-                            return Err(ParallelPlanError::InvalidTensor(format!(
+                            return Err(destination.tensor_error(format_args!(
                                 "packed Qwen gate/up expert parameter {name} has rank {}",
                                 shape.len()
                             )));
                         }
+                        let mut owned = destination.vector(segments.len())?;
+                        owned.extend(segments.iter().cloned());
                         Ok(MemberSharding::PartitionedSegments {
                             axis: 1,
-                            segments: segments.clone(),
+                            segments: owned,
                         })
                     } else if name.contains("down_proj") {
                         if shape.len() < 3 {
-                            return Err(ParallelPlanError::InvalidTensor(format!(
+                            return Err(destination.tensor_error(format_args!(
                                 "packed Qwen down expert parameter {name} has rank {}",
                                 shape.len()
                             )));
                         }
                         Ok(MemberSharding::Partitioned { axis: 2 })
                     } else {
-                        Err(ParallelPlanError::InvalidTensor(format!(
+                        Err(destination.tensor_error(format_args!(
                             "unexpected Qwen expert-bank parameter {name}"
                         )))
                     }

@@ -1,3 +1,4 @@
+mod windows;
 use super::*;
 use eredu_nn::{GroupScoring, GroupSelection, TopKGroupSelectionSpec};
 use std::io::{Error, Result};

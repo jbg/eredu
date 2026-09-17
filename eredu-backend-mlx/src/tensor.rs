@@ -1,3 +1,17 @@
+mod rotary;
+pub(crate) mod narrow;
+pub(crate) mod clip;
+pub(crate) use rotary::PreparedRotaryProfile;
+mod masked_readout;
+pub(crate) use masked_readout::control_bytes as masked_readout_control_bytes;
+mod workspace_input;
+#[cfg(test)]
+pub(crate) use rotary::{
+    prepared_calls as prepared_rotary_calls, reset_prepared_calls as reset_prepared_rotary_calls,
+};
+#[cfg(test)]
+pub(crate) use workspace_input::{reset_workspace_slot_projections, workspace_slot_projections};
+
 use crate::nn;
 use eredu_core::checkpoint::TensorDtype;
 use eredu_nn::{
@@ -9,7 +23,7 @@ use safemlx::{
     argmin_axis,
     fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask},
     ops::{
-        addmm, argpartition_axis, concatenate_axis, conv1d, conv2d, conv_transpose1d, full,
+        addmm, argpartition_axis, concatenate_axis, conv_transpose1d, full,
         indexing::{put_along_axis, ArrayIndex, ArrayIndexOp, NewAxis, TryIndexOp},
         matmul, maximum, pad, softmax_axis, stack_axis, sum_axis, PadMode as MlxPadMode,
     },
@@ -38,7 +52,7 @@ pub(crate) fn portable_dtype(dtype: Dtype) -> TensorDtype {
 }
 
 fn backend<T>(result: Result<T, safemlx::error::Exception>) -> Result<T, Error> {
-    result.map_err(Error::backend)
+    result.map_err(Error::backend_source)
 }
 
 /// Backend-native MLX tensor handle used at Eredu's neutral tensor boundary.
@@ -115,7 +129,11 @@ impl Tensor for MlxTensor {
         shape: &[i32],
         context: &Self::Context,
     ) -> Result<Self, Error> {
-        tensor(Array::from_slice(values, shape).copy(context))
+        tensor(
+            Array::try_from_slice(values, shape)
+                .map_err(Error::backend_source)?
+                .copy(context),
+        )
     }
 
     fn from_i32_slice(
@@ -123,7 +141,11 @@ impl Tensor for MlxTensor {
         shape: &[i32],
         context: &Self::Context,
     ) -> Result<Self, Error> {
-        tensor(Array::from_slice(values, shape).copy(context))
+        tensor(
+            Array::try_from_slice(values, shape)
+                .map_err(Error::backend_source)?
+                .copy(context),
+        )
     }
 
     fn to_f32_vec(&self, context: &Self::Context) -> Result<Vec<f32>, Error> {
@@ -138,7 +160,7 @@ impl Tensor for MlxTensor {
         }
         backend(array.evaluated())?
             .try_to_vec::<f32>()
-            .map_err(Error::backend)
+            .map_err(Error::backend_source)
     }
 
     fn to_i32_vec(&self, context: &Self::Context) -> Result<Vec<i32>, Error> {
@@ -151,15 +173,23 @@ impl Tensor for MlxTensor {
         if array.size() == 0 {
             return Ok(Vec::new());
         }
-        evaluated.try_to_vec::<i32>().map_err(Error::backend)
+        evaluated.try_to_vec::<i32>().map_err(Error::backend_source)
     }
 
     fn full_f32(value: f32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
-        tensor(Array::full::<f32>(shape, Array::from_f32(value), context))
+        tensor(Array::full::<f32>(
+            shape,
+            Array::try_from_f32(value).map_err(Error::backend_source)?,
+            context,
+        ))
     }
 
     fn full_i32(value: i32, shape: &[i32], context: &Self::Context) -> Result<Self, Error> {
-        tensor(Array::full::<i32>(shape, Array::from_int(value), context))
+        tensor(Array::full::<i32>(
+            shape,
+            Array::try_from_int(value).map_err(Error::backend_source)?,
+            context,
+        ))
     }
 
     fn add(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error> {
@@ -177,7 +207,7 @@ impl Tensor for MlxTensor {
     fn multiply_scalar(&self, rhs: f32, context: &Self::Context) -> Result<Self, Error> {
         tensor(Array::multiply(
             self.as_array(),
-            Array::from_f32(rhs),
+            Array::try_from_f32(rhs).map_err(Error::backend_source)?,
             context,
         ))
     }
@@ -197,7 +227,7 @@ impl Tensor for MlxTensor {
     fn maximum_scalar(&self, rhs: f32, context: &Self::Context) -> Result<Self, Error> {
         tensor(safemlx::ops::maximum(
             self.as_array(),
-            Array::from_f32(rhs),
+            Array::try_from_f32(rhs).map_err(Error::backend_source)?,
             context,
         ))
     }
@@ -205,17 +235,13 @@ impl Tensor for MlxTensor {
     fn maximum_i32(&self, rhs: i32, context: &Self::Context) -> Result<Self, Error> {
         tensor(safemlx::ops::maximum(
             self.as_array(),
-            Array::from_int(rhs),
+            Array::try_from_int(rhs).map_err(Error::backend_source)?,
             context,
         ))
     }
 
     fn clip(&self, minimum: &Self, maximum: &Self, context: &Self::Context) -> Result<Self, Error> {
-        tensor(safemlx::ops::clip(
-            self.as_array(),
-            (minimum.as_array(), maximum.as_array()),
-            context,
-        ))
+        clip::run(self, minimum, maximum, context)
     }
 
     fn softmax_axis(
@@ -270,8 +296,12 @@ impl Tensor for MlxTensor {
         )
     }
 
+    fn narrow_axis(&self, axis: usize, start: i32, end: i32, context: &Self::Context) -> Result<Self, Error> {
+        narrow::execute(self,axis,start,end,context)
+    }
+
     fn take_axis(&self, indexes: &Self, axis: i32, context: &Self::Context) -> Result<Self, Error> {
-        let rank = i32::try_from(self.as_array().ndim()).map_err(Error::backend)?;
+        let rank = i32::try_from(self.as_array().ndim()).map_err(Error::backend_source)?;
         let normalized = if axis < 0 { axis + rank } else { axis };
         if !(0..rank).contains(&normalized) {
             return Err(Error::backend("gather axis is outside tensor rank"));
@@ -281,7 +311,7 @@ impl Tensor for MlxTensor {
             self.as_array().dim(normalized),
             context,
         )
-        .map_err(Error::backend)?;
+        .map_err(Error::backend_source)?;
         tensor(Array::take_axis(self.as_array(), &indexes, axis, context))
     }
 
@@ -290,7 +320,10 @@ impl Tensor for MlxTensor {
     }
 
     fn equal_i32(&self, value: i32, context: &Self::Context) -> Result<Self, Error> {
-        tensor(self.as_array().eq(Array::from_int(value), context))
+        tensor(self.as_array().eq(
+            Array::try_from_int(value).map_err(Error::backend_source)?,
+            context,
+        ))
     }
 
     fn logical_or(&self, rhs: &Self, context: &Self::Context) -> Result<Self, Error> {
@@ -423,15 +456,9 @@ impl Tensor for MlxTensor {
         groups: i32,
         context: &Self::Context,
     ) -> Result<Self, Error> {
-        tensor(conv1d(
-            input.as_array(),
-            weight.as_array(),
-            stride,
-            padding,
-            dilation,
-            groups,
-            context,
-        ))
+        crate::backend::nn::convolution::original::conv1d(
+            input, weight, stride, padding, dilation, groups, context,
+        )
     }
 
     fn conv2d(
@@ -443,15 +470,9 @@ impl Tensor for MlxTensor {
         groups: i32,
         context: &Self::Context,
     ) -> Result<Self, Error> {
-        tensor(conv2d(
-            input.as_array(),
-            weight.as_array(),
-            Some(stride),
-            Some(padding),
-            Some(dilation),
-            Some(groups),
-            context,
-        ))
+        crate::backend::nn::convolution::original::conv2d(
+            input, weight, stride, padding, dilation, groups, context,
+        )
     }
 
     fn conv_transpose1d(
@@ -464,6 +485,47 @@ impl Tensor for MlxTensor {
         groups: i32,
         context: &Self::Context,
     ) -> Result<Self, Error> {
+        if input.shape().len() == 3
+            && output_padding >= 0
+            && crate::backend::nn::convolution::transpose_1d_needs_output_crop(
+                weight.shape(),
+                stride,
+                padding,
+                dilation,
+            )
+        {
+            // MLX implements negative transpose padding by slicing the input
+            // before input dilation. A removed input position then removes
+            // `stride` output positions, violating the transposed equation.
+            // Crop the expanded result instead; the view retains that complete
+            // backing buffer, which the selected workspace fact also prices.
+            let full_positions = (i128::from(input.shape()[1]) - 1) * i128::from(stride)
+                + i128::from(dilation) * (i128::from(weight.shape()[1]) - 1)
+                + i128::from(output_padding)
+                + 1;
+            let full_positions = i32::try_from(full_positions)
+                .ok()
+                .filter(|&n| i64::from(n) > 2 * i64::from(padding))
+                .ok_or_else(|| Error::backend("invalid transposed convolution output extent"))?;
+            let full = tensor(conv_transpose1d(
+                input.as_array(),
+                weight.as_array(),
+                stride,
+                0,
+                dilation,
+                output_padding,
+                groups,
+                context,
+            ))?;
+            return full.index(
+                &[
+                    Index::Full,
+                    Index::Range(padding, full_positions - padding),
+                    Index::Full,
+                ],
+                context,
+            );
+        }
         tensor(conv_transpose1d(
             input.as_array(),
             weight.as_array(),
@@ -484,6 +546,32 @@ impl Tensor for MlxTensor {
     ) -> Result<Self, Error> {
         let weight = backend(weight.as_array().transpose(context))?;
         match bias {
+            Some(bias)
+                if input.shape().len() > 2
+                    && input.shape().last() == Some(&0)
+                    && weight.ndim() == 2 =>
+            {
+                // MLX addmm flattens a batched input with [-1, K]. For K=0
+                // that inferred dimension is ambiguous, even though all row
+                // dimensions are known here. Preserve its promotion and bias
+                // behavior with an explicit two-dimensional empty product.
+                let mut shape = input.shape().to_vec();
+                let rows = shape[..shape.len() - 1]
+                    .iter()
+                    .try_fold(1i32, |rows, &n| rows.checked_mul(n))
+                    .ok_or_else(|| Error::backend("empty linear row count overflow"))?;
+                let flat = input.reshape(&[rows, 0], context)?;
+                let output = backend(addmm(
+                    bias.as_array(),
+                    flat.as_array(),
+                    &weight,
+                    None,
+                    None,
+                    context,
+                ))?;
+                *shape.last_mut().expect("batched input") = weight.dim(-1);
+                tensor(output.reshape(&shape, context))
+            }
             Some(bias) => tensor(addmm(
                 bias.as_array(),
                 input.as_array(),
@@ -546,160 +634,28 @@ impl Tensor for MlxTensor {
         spec: &MultiAxisRotarySpec,
         context: &Self::Context,
     ) -> Result<(Self, Self), Error> {
-        let dimensions = spec.dimensions()?;
-        let position_shape = position_ids.shape();
-        let axes = spec.axes.len() as i32;
-        let rows = position_shape[..position_shape.len() - 1].iter().try_fold(
-            1_i32,
-            |rows, dimension| {
-                rows.checked_mul(*dimension)
-                    .ok_or_else(|| Error::backend("multi-axis position dimensions overflowed i32"))
-            },
-        )?;
-        let positions = backend(position_ids.as_array().reshape(&[rows, axes], context))?;
-        let mut axis_angles = Vec::with_capacity(spec.axes.len());
-        for (axis_index, axis) in spec.axes.iter().enumerate() {
-            let inv = (0..axis.dimensions)
-                .step_by(2)
-                .map(|index| 1.0 / spec.base.powf(index as f32 / axis.dimensions as f32))
-                .collect::<Vec<_>>();
-            let inv = backend(Array::from_slice(&inv, &[1, inv.len() as i32]).copy(context))?;
-            let positions = backend(positions.try_index_device((.., axis_index as i32), context))?;
-            let positions = backend(positions.add(Array::from_int(axis.position_offset), context))?;
-            let positions = backend(maximum(
-                positions,
-                Array::from_int(spec.minimum_position),
-                context,
-            ))?;
-            let positions = backend(positions.as_dtype(Dtype::Float32, context))?;
-            let positions = backend(positions.expand_dims(-1, context))?;
-            axis_angles.push(backend(positions.multiply(inv, context))?);
-        }
-        let angles = match spec.layout {
-            MultiAxisRotaryLayout::IndependentAxes => {
-                let mut expanded = Vec::with_capacity(axis_angles.len());
-                for angles in axis_angles {
-                    expanded.push(backend(concatenate_axis(
-                        &[angles.clone(), angles],
-                        -1,
-                        context,
-                    ))?);
-                }
-                backend(concatenate_axis(&expanded, -1, context))?
-            }
-            MultiAxisRotaryLayout::SplitHalves => {
-                let half = backend(concatenate_axis(&axis_angles, -1, context))?;
-                backend(concatenate_axis(&[half.clone(), half], -1, context))?
-            }
-            MultiAxisRotaryLayout::RoundRobinSections => {
-                let half = dimensions / 2;
-                let axis_count = spec.axes.len();
-                let mut selected = Vec::with_capacity(half as usize);
-                for frequency in 0..half {
-                    let candidate = frequency as usize % axis_count;
-                    let section = spec.axes[candidate].dimensions / 2;
-                    let axis = if candidate != 0 && frequency < section * axis_count as i32 {
-                        candidate
-                    } else {
-                        0
-                    };
-                    let positions =
-                        backend(positions.try_index_device((.., axis as i32), context))?;
-                    let positions = backend(
-                        positions.add(Array::from_int(spec.axes[axis].position_offset), context),
-                    )?;
-                    let positions = backend(maximum(
-                        positions,
-                        Array::from_int(spec.minimum_position),
-                        context,
-                    ))?;
-                    selected.push(backend(positions.expand_dims(-1, context))?);
-                }
-                let selected = backend(concatenate_axis(&selected, -1, context))?;
-                let inv = (0..half)
-                    .map(|index| 1.0 / spec.base.powf(2.0 * index as f32 / dimensions as f32))
-                    .collect::<Vec<_>>();
-                let inv = backend(Array::from_slice(&inv, &[1, half]).copy(context))?;
-                let selected = backend(selected.as_dtype(Dtype::Float32, context))?;
-                let half = backend(selected.multiply(inv, context))?;
-                backend(concatenate_axis(&[half.clone(), half], -1, context))?
-            }
-        };
-        let mut output_shape = position_shape[..position_shape.len() - 1].to_vec();
-        output_shape.push(dimensions);
-        let cosine = backend(angles.cos(context))?;
-        let cosine = backend(cosine.reshape(&output_shape, context))?;
-        let sine = backend(angles.sin(context))?;
-        let sine = backend(sine.reshape(&output_shape, context))?;
-        Ok((MlxTensor::from_array(cosine), MlxTensor::from_array(sine)))
+        let _ = spec.dimensions()?;
+        rotary::execute(position_ids, spec.as_ref(), None, context)
+    }
+
+    fn multi_axis_rotary_embeddings_prepared(
+        position_ids: &Self,
+        prepared: eredu_nn::multimodal::PreparedMultiAxisRotary<'_>,
+        context: &Self::Context,
+    ) -> Result<(Self, Self), Error> {
+        rotary::execute(
+            position_ids,
+            prepared.spec(),
+            Some(prepared.frequencies()),
+            context,
+        )
     }
 
     fn masked_output_projection(
         input: MaskedOutputProjectionInput<'_, Self>,
         context: &Self::Context,
     ) -> Result<Self, Error> {
-        let hidden_shape = input.hidden.shape();
-        let batch = hidden_shape[0];
-        let sequence = hidden_shape[1];
-        let hidden_size = hidden_shape[2];
-        let vocabulary = input.output_weight.shape()[0];
-        let centroids = input.centroid_logits.shape()[2];
-        let per_centroid = vocabulary / centroids;
-        let top_indices = backend(argpartition_axis(
-            input.centroid_logits.as_array(),
-            -input.top_centroids,
-            -1,
-            context,
-        ))?;
-        let top_indices =
-            backend(top_indices.try_index_device((.., .., -input.top_centroids..), context))?;
-        let ordering = backend(
-            input
-                .token_ordering
-                .as_array()
-                .reshape(&[centroids, per_centroid], context),
-        )?;
-        let selected_tokens = backend(ordering.try_index_device(&top_indices, context))?;
-        let flat_tokens = backend(selected_tokens.reshape(&[-1], context))?;
-        let selected_weight = backend(
-            input
-                .output_weight
-                .as_array()
-                .try_index_device(&flat_tokens, context),
-        )?;
-        let selected_weight = backend(selected_weight.reshape(
-            &[
-                batch,
-                sequence,
-                input.top_centroids * per_centroid,
-                hidden_size,
-            ],
-            context,
-        ))?;
-        let hidden = backend(
-            input
-                .hidden
-                .as_array()
-                .try_index_device((.., .., NewAxis, ..), context),
-        )?;
-        let selected_weight = backend(selected_weight.transpose_axes(&[0, 1, 3, 2], context))?;
-        let selected_logits = backend(matmul(hidden, selected_weight, context))?;
-        let selected_logits = backend(selected_logits.squeeze_axes(&[-2], context))?;
-        let minimum = backend(selected_logits.min(None, context))?;
-        let masked_value = backend(minimum.subtract(Array::from_f32(input.mask_margin), context))?;
-        let output = backend(full::<f32>(
-            &[batch, sequence, vocabulary],
-            masked_value,
-            context,
-        ))?;
-        let scatter_indices = backend(selected_tokens.reshape(&[batch, sequence, -1], context))?;
-        tensor(put_along_axis(
-            output,
-            scatter_indices,
-            selected_logits,
-            -1,
-            context,
-        ))
+        masked_readout::execute(input, context)
     }
 
     fn scaled_dot_product_attention(
@@ -731,3 +687,5 @@ impl Tensor for MlxTensor {
 
 #[cfg(test)]
 mod tests;
+
+mod host_alias;

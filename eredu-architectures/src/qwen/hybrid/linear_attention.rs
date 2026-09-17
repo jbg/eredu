@@ -15,17 +15,17 @@ use crate::decoder::ComponentInstrumentation;
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct LinearAttention<B: NeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     key_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     value_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     key_head_dim: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     value_head_dim: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     key_width: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     value_width: i32,
     input_qkv: B::Linear,
     input_gate: B::Linear,
@@ -66,34 +66,39 @@ impl<B: NeuralBackend> LinearAttention<B> {
         value_heads: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &HybridConfig, usize, i32, i32, String, LinearSpec,
+            CausalDepthwiseConvolutionSpec, ParameterSpec, [i32; 1],
+            &<B::Tensor as Tensor>::Context)>()?;
         if key_heads <= 0 || value_heads <= 0 || value_heads % key_heads != 0 {
-            return Err(Error::backend(format!(
+            return Err(metadata.error(format_args!(
                 "invalid rank-local recurrent heads: key={key_heads}, value={value_heads}"
             )));
         }
         let key_width = key_heads
             .checked_mul(config.linear_key_head_dim)
-            .ok_or_else(|| Error::backend("recurrent key width overflowed"))?;
+            .ok_or_else(|| metadata.error(format_args!("recurrent key width overflowed")))?;
         let value_width = value_heads
             .checked_mul(config.linear_value_head_dim)
-            .ok_or_else(|| Error::backend("recurrent value width overflowed"))?;
+            .ok_or_else(|| metadata.error(format_args!("recurrent value width overflowed")))?;
         let qkv_width = key_width
             .checked_mul(2)
             .and_then(|width| width.checked_add(value_width))
-            .ok_or_else(|| Error::backend("recurrent QKV width overflowed"))?;
-        let prefix = format!("model.layers.{layer}.linear_attn");
+            .ok_or_else(|| metadata.error(format_args!("recurrent QKV width overflowed")))?;
+        let prefix = metadata.text(format_args!("model.layers.{layer}.linear_attn"))?;
         let parameter = |suffix: &str| {
-            ParameterSpec::trainable(format!("{prefix}.{suffix}")).map_err(Error::backend)
+            metadata.named_parameter(format_args!("{prefix}.{suffix}"))
         };
         let linear = |suffix: &str, input: i32, output: i32, force_dense: bool| {
-            let weight = format!("{prefix}.{suffix}.weight");
+            let weight = metadata.text(format_args!("{prefix}.{suffix}.weight"))?;
+            metadata.controls::<LinearSpec>()?;
             B::linear(
                 LinearSpec {
                     input,
                     output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(&weight)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
+                    format: metadata.format(
                         &weight,
                         if force_dense {
                             eredu_checkpoint::LinearFormat::Dense
@@ -105,6 +110,8 @@ impl<B: NeuralBackend> LinearAttention<B> {
                 context,
             )
         };
+        metadata.borrowed_controls(&parameter)?;
+        metadata.borrowed_controls(&linear)?;
         let dense_ba = config.variant == HybridVariant::Qwen3Next && config.fp8.is_some();
         Ok(Self {
             key_heads,
@@ -190,7 +197,11 @@ impl<B: NeuralBackend> LinearAttention<B> {
         let (batch, sequence) = (shape[0], shape[1]);
         let projected = self.input_qkv.forward(input, context)?;
         instrumentation.observe("mixer.qkv.projected", &projected)?;
-        let projected = {
+        let projected = if self.convolution.history_len() == 0 {
+            // The declared width-one state has no convolution history role.
+            // Recurrence replacement and frontier advance below are unchanged.
+            self.convolution.forward(&projected, None, context)?.output
+        } else {
             let history = state
                 .fixed_component(StateTensorRole::Convolution { slot: 0 })
                 .map_err(Error::backend)?;

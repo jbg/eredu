@@ -379,6 +379,48 @@ pub fn gather_qmm_with_mode(
     }
 }
 
+/// Fixed source controls for the existing explicit-index rank-three MXFP4
+/// grouped call. Allocating graph/worker destinations are quoted independently.
+pub fn mxfp4_gather_control_bytes() -> Option<usize> {
+    let mut native = 0;
+    if !unsafe { safemlx_sys::mlx_mxfp4_gather_control_bytes(&mut native) } { return None; }
+    gathered_projection_controls(native)
+}
+
+fn gathered_projection_controls(native: usize) -> Option<usize> {
+    use std::mem::size_of;
+    native.checked_add(size_of::<&Array>().checked_mul(3)?)?
+        .checked_add(size_of::<Option<&Array>>().checked_mul(3)?)?
+        .checked_add(size_of::<safemlx_sys::mlx_array>().checked_mul(3)?)?
+        .checked_add(size_of::<safemlx_sys::mlx_optional_int>().checked_mul(2)?)?
+        .checked_add(size_of::<i32>().checked_mul(2)?)?
+        .checked_add(size_of::<bool>().checked_mul(2)?)?
+        .checked_add(size_of::<QuantizationMode>())?
+        .checked_add(size_of::<&Stream>())?
+        .checked_add(size_of::<Result<Array>>())
+}
+
+/// Fixed native/Rust controls of the existing affine grouped projection.
+/// `selected` identifies group16's selected-bank QMM; false identifies the
+/// explicit-index GatherQMM. Neither query creates a graph or native grant.
+pub fn affine_grouped_control_bytes(selected: bool) -> Option<usize> {
+    use std::mem::size_of;
+    let mut native = 0;
+    if !unsafe { safemlx_sys::mlx_affine_grouped_control_bytes(selected, &mut native) } {
+        return None;
+    }
+    if !selected { return gathered_projection_controls(native); }
+    // quantized_matmul_with_mode's actual borrowed argument and result frames.
+    native.checked_add(size_of::<&Array>().checked_mul(3)?)?
+        .checked_add(size_of::<Option<&Array>>())?
+        .checked_add(size_of::<safemlx_sys::mlx_optional_int>().checked_mul(2)?)?
+        .checked_add(size_of::<i32>().checked_mul(2)?)?
+        .checked_add(size_of::<bool>())?
+        .checked_add(size_of::<QuantizationMode>())?
+        .checked_add(size_of::<&Stream>())?
+        .checked_add(size_of::<Result<Array>>())
+}
+
 /// Quantized matrix multiplication with quantization of both inputs.
 ///
 /// Performs matrix multiplication where `x` is dynamically quantized and `w` is pre-quantized.

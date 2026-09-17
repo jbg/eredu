@@ -51,7 +51,7 @@ pub use parallel::{
 pub use projector::{
     family_from_gguf_metadata, translate_mmproj_weight_name, validate_projector_identity,
 };
-pub use text::{Attention, AttentionInput, BlockInput, DenseBlock, SharedAttentionStates};
+pub use text::{Attention, AttentionInput, BlockInput, DenseBlock, SharedAttentionStates, SharedAttentionStore};
 pub use vision::{
     ClippedLinear, PatchEmbedder, VisionConfig, VisionConfigError, VisionInput, VisionLayer,
     VisionState, VisionStatic, VisionTower,

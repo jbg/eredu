@@ -2,12 +2,13 @@
 
 use eredu_nn::NeuralBackend;
 use eredu_runtime::{
-    aligned_partition_units, module_parameter_group, partitioned_module_parameter_group,
-    partitioned_projection_group, MemberSharding, ParallelPlanError, ParameterGroupSpec,
-    ParameterRole, ProjectionSharding,
+    MemberSharding, ParallelPlanError, ParameterGroupSpec, ParameterRole, ProjectionSharding,
 };
 
 use super::{VisionBlock, VisionConfig, VisionStatic};
+use crate::decoder::parameter_metadata::{
+    DeclarationDestination as Destination, ParameterGroupError as GroupError,
+};
 
 fn tensor<'a>(
     layout: &'a eredu_runtime::LocalModelLayout,
@@ -53,87 +54,124 @@ pub fn block_parallel_parameter_groups<B: NeuralBackend + eredu_nn::DistributedN
     root: &str,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let prefix = rooted(root, &format!("blocks.{layer}"));
+    block_groups(block, config, root, layer, Destination(None)).map_err(GroupError::ordinary)
+}
+
+pub(crate) fn block_parallel_parameter_groups_with_metadata<
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
+    block: &VisionBlock<B>,
+    config: &VisionConfig,
+    root: &str,
+    layer: usize,
+    context: Option<&eredu_nn::workspace::WorkspaceContext>,
+) -> Result<Vec<ParameterGroupSpec>, eredu_nn::Error> {
+    block_groups(block, config, root, layer, Destination(context)).map_err(GroupError::into_neural)
+}
+
+fn block_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
+    block: &VisionBlock<B>,
+    config: &VisionConfig,
+    root: &str,
+    layer: usize,
+    destination: Destination<'_>,
+) -> Result<Vec<ParameterGroupSpec>, GroupError> {
+    destination.controls::<(
+        String,
+        Vec<std::ops::Range<usize>>,
+        Vec<ParameterGroupSpec>,
+        [(&B::Linear, ProjectionSharding); 2],
+    )>()?;
+    let prefix = if root.is_empty() {
+        destination.text(format_args!("blocks.{layer}"))?
+    } else {
+        destination.text(format_args!("{root}.blocks.{layer}"))?
+    };
     let hidden = usize::try_from(config.hidden_size)
-        .map_err(|_| ParallelPlanError::InvalidGroup("vision hidden width exceeds usize".into()))?;
+        .map_err(|_| destination.group_error(format_args!("vision hidden width exceeds usize")))?;
     let heads = usize::try_from(config.num_heads)
-        .map_err(|_| ParallelPlanError::InvalidGroup("vision heads exceed usize".into()))?;
-    let segments = vec![0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden];
-    Ok(vec![
-        module_parameter_group::<B::Tensor, _>(
-            format!("{prefix}.norm1"),
-            ParameterRole::Replicated,
-            &block.norm1,
-            |_, _| Ok(MemberSharding::Replicated),
+        .map_err(|_| destination.group_error(format_args!("vision heads exceed usize")))?;
+    let mut segments = destination.vector(3)?;
+    segments.extend([0..hidden, hidden..2 * hidden, 2 * hidden..3 * hidden]);
+    let mut groups = destination.vector(4)?;
+    groups.push(destination.module::<B::Tensor, _>(
+        format_args!("{prefix}.norm1"),
+        ParameterRole::Replicated,
+        &block.norm1,
+        |_| Ok(MemberSharding::Replicated),
+    )?);
+    groups.push(destination.module::<B::Tensor, _>(
+        format_args!("{prefix}.norm2"),
+        ParameterRole::Replicated,
+        &block.norm2,
+        |_| Ok(MemberSharding::Replicated),
+    )?);
+    groups.push(destination.partitioned_module_named::<B::Tensor, _>(
+        format_args!("{prefix}.attention.heads"),
+        ParameterRole::AttentionHeads,
+        heads,
+        &block.attention,
+        |name, shape| {
+            if name.contains("qkv") {
+                let mut owned = destination.vector(segments.len())?;
+                owned.extend(segments.iter().cloned());
+                Ok(MemberSharding::PartitionedSegments {
+                    axis: 0,
+                    segments: owned,
+                })
+            } else if name.contains("proj") && shape.len() >= 2 {
+                Ok(MemberSharding::Partitioned { axis: 1 })
+            } else {
+                Ok(MemberSharding::Replicated)
+            }
+        },
+    )?);
+    groups.push(destination.projections::<B::Tensor, B::Linear>(
+        format_args!("{prefix}.mlp.intermediate"),
+        ParameterRole::FeedForwardIntermediate,
+        &[
+            (&block.fc1, ProjectionSharding::Column),
+            (&block.fc2, ProjectionSharding::Row),
+        ],
+        destination.aligned(
+            &prefix,
+            usize::try_from(config.intermediate_size).map_err(|_| {
+                destination.group_error(format_args!("vision intermediate width exceeds usize"))
+            })?,
+            1,
+            1,
         )?,
-        module_parameter_group::<B::Tensor, _>(
-            format!("{prefix}.norm2"),
-            ParameterRole::Replicated,
-            &block.norm2,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-        partitioned_module_parameter_group::<B::Tensor, _>(
-            format!("{prefix}.attention.heads"),
-            ParameterRole::AttentionHeads,
-            heads,
-            &block.attention,
-            |metadata, shape| {
-                let name = metadata.id.as_str();
-                if name.contains("qkv") {
-                    Ok(MemberSharding::PartitionedSegments {
-                        axis: 0,
-                        segments: segments.clone(),
-                    })
-                } else if name.contains("proj") && shape.len() >= 2 {
-                    Ok(MemberSharding::Partitioned { axis: 1 })
-                } else {
-                    Ok(MemberSharding::Replicated)
-                }
-            },
-        )?,
-        partitioned_projection_group::<B::Tensor, B::Linear>(
-            format!("{prefix}.mlp.intermediate"),
-            ParameterRole::FeedForwardIntermediate,
-            &[
-                (&block.fc1, ProjectionSharding::Column),
-                (&block.fc2, ProjectionSharding::Row),
-            ],
-            aligned_partition_units(
-                &prefix,
-                usize::try_from(config.intermediate_size).map_err(|_| {
-                    ParallelPlanError::InvalidGroup(
-                        "vision intermediate width exceeds usize".into(),
-                    )
-                })?,
-                1,
-                1,
-            )?,
-        )?,
-    ])
+    )?);
+    Ok(groups)
 }
 
 fn merger_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     merger: &super::model::Merger<B>,
     root: &str,
     width: usize,
-) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    Ok(vec![
-        module_parameter_group::<B::Tensor, _>(
-            format!("{root}.norm"),
-            ParameterRole::Replicated,
-            &merger.norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-        partitioned_projection_group::<B::Tensor, B::Linear>(
-            format!("{root}.intermediate"),
-            ParameterRole::FeedForwardIntermediate,
-            &[
-                (&merger.fc1, ProjectionSharding::Column),
-                (&merger.fc2, ProjectionSharding::Row),
-            ],
-            aligned_partition_units(root, width, 1, 1)?,
-        )?,
-    ])
+    destination: Destination<'_>,
+) -> Result<Vec<ParameterGroupSpec>, GroupError> {
+    destination.controls::<(
+        Vec<ParameterGroupSpec>,
+        [(&B::Linear, ProjectionSharding); 2],
+    )>()?;
+    let mut groups = destination.vector(2)?;
+    groups.push(destination.module::<B::Tensor, _>(
+        format_args!("{root}.norm"),
+        ParameterRole::Replicated,
+        &merger.norm,
+        |_| Ok(MemberSharding::Replicated),
+    )?);
+    groups.push(destination.projections::<B::Tensor, B::Linear>(
+        format_args!("{root}.intermediate"),
+        ParameterRole::FeedForwardIntermediate,
+        &[
+            (&merger.fc1, ProjectionSharding::Column),
+            (&merger.fc2, ProjectionSharding::Row),
+        ],
+        destination.aligned(root, width, 1, 1)?,
+    )?);
+    Ok(groups)
 }
 
 /// Declares replicated patch/position modules and TP merger channels.
@@ -151,7 +189,7 @@ pub fn static_parallel_parameter_groups<B: NeuralBackend + eredu_nn::Distributed
         "vision",
     )?
     .into_iter()
-    .map(|owned| owned.group().clone())
+    .map(eredu_runtime::OwnedParameterGroupSpec::into_group)
     .collect())
 }
 
@@ -167,67 +205,150 @@ pub fn owned_static_parallel_parameter_groups<
     execution_group: eredu_runtime::ExecutionGroupId,
     role: &str,
 ) -> Result<Vec<eredu_runtime::OwnedParameterGroupSpec>, ParallelPlanError> {
+    owned_static_groups(
+        modules,
+        config,
+        root,
+        execution_group,
+        role,
+        Destination(None),
+    )
+    .map_err(GroupError::ordinary)
+}
+
+pub(crate) fn owned_static_parallel_parameter_groups_with_metadata<
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
+>(
+    modules: &VisionStatic<B>,
+    config: &VisionConfig,
+    root: &str,
+    execution_group: eredu_runtime::ExecutionGroupId,
+    role: &str,
+    context: Option<&eredu_nn::workspace::WorkspaceContext>,
+) -> Result<Vec<eredu_runtime::OwnedParameterGroupSpec>, eredu_nn::Error> {
+    owned_static_groups(
+        modules,
+        config,
+        root,
+        execution_group,
+        role,
+        Destination(context),
+    )
+    .map_err(GroupError::into_neural)
+}
+
+fn owned_static_groups<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
+    modules: &VisionStatic<B>,
+    config: &VisionConfig,
+    root: &str,
+    execution_group: eredu_runtime::ExecutionGroupId,
+    role: &str,
+    destination: Destination<'_>,
+) -> Result<Vec<eredu_runtime::OwnedParameterGroupSpec>, GroupError> {
+    use eredu_runtime::{OwnedParameterGroupSpec, ParameterGroupOwner};
+    destination.controls::<(
+        Vec<ParameterGroupSpec>,
+        Vec<OwnedParameterGroupSpec>,
+        ParameterGroupOwner,
+        String,
+    )>()?;
     let last_unit = config.layer_count().checked_sub(1).ok_or_else(|| {
-        ParallelPlanError::InvalidGroup("vision projection has no consuming unit".into())
+        destination.group_error(format_args!("vision projection has no consuming unit"))
     })?;
-    let ingress = vec![
-        module_parameter_group::<B::Tensor, _>(
-            format!("{root}.position"),
-            ParameterRole::Replicated,
-            &modules.position,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-        module_parameter_group::<B::Tensor, _>(
-            format!("{root}.patch"),
-            ParameterRole::Replicated,
-            &modules.patch,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-    ];
-    let mut groups = ingress
-        .into_iter()
-        .map(|group| {
-            eredu_runtime::OwnedParameterGroupSpec::new(
-                eredu_runtime::ParameterGroupOwner::static_role(role),
-                group,
-            )
-        })
-        .collect::<Vec<_>>();
-    let consumer = |unit| {
-        eredu_runtime::ParameterGroupOwner::static_unit_consumers(
-            role,
-            [(execution_group.clone(), unit)],
-        )
-    };
+    let mut ingress = destination.vector(2)?;
+    ingress.push(destination.module::<B::Tensor, _>(
+        format_args!("{root}.position"),
+        ParameterRole::Replicated,
+        &modules.position,
+        |_| Ok(MemberSharding::Replicated),
+    )?);
+    ingress.push(destination.module::<B::Tensor, _>(
+        format_args!("{root}.patch"),
+        ParameterRole::Replicated,
+        &modules.patch,
+        |_| Ok(MemberSharding::Replicated),
+    )?);
+    let mut groups = destination.vector(ingress.len())?;
+    for group in ingress {
+        let owner = ParameterGroupOwner::static_role(destination.text(format_args!("{role}"))?);
+        groups.push(OwnedParameterGroupSpec::new(owner, group));
+    }
     let width =
         usize::try_from(config.hidden_size * config.spatial_merge_size * config.spatial_merge_size)
             .map_err(|_| {
-                ParallelPlanError::InvalidGroup("vision merger width exceeds usize".into())
+                destination.group_error(format_args!("vision merger width exceeds usize"))
             })?;
-    groups.extend(
-        merger_groups(&modules.merger, &rooted(root, "merger"), width)?
-            .into_iter()
-            .map(|group| {
-                eredu_runtime::OwnedParameterGroupSpec::new(
-                    consumer(last_unit),
-                    group,
-                )
-            }),
-    );
+    let name = rooted_with(root, format_args!("merger"), destination)?;
+    let emitted = merger_groups(&modules.merger, &name, width, destination)?;
+    append_consumers(
+        &mut groups,
+        emitted,
+        role,
+        &execution_group,
+        last_unit,
+        destination,
+    )?;
     for (index, merger) in modules.deepstack_mergers.iter().enumerate() {
         let unit = usize::try_from(config.deepstack_layers()[index])
-            .map_err(|_| ParallelPlanError::InvalidGroup("negative DeepStack consumer".into()))?;
-        groups.extend(
-            merger_groups(
-                merger,
-                &rooted(root, &format!("deepstack_merger_list.{index}")),
-                width,
-            )?
-            .into_iter()
-            .map(|group| eredu_runtime::OwnedParameterGroupSpec::new(consumer(unit), group)),
-        );
+            .map_err(|_| destination.group_error(format_args!("negative DeepStack consumer")))?;
+        let name = rooted_with(
+            root,
+            format_args!("deepstack_merger_list.{index}"),
+            destination,
+        )?;
+        let emitted = merger_groups(merger, &name, width, destination)?;
+        append_consumers(
+            &mut groups,
+            emitted,
+            role,
+            &execution_group,
+            unit,
+            destination,
+        )?;
     }
     Ok(groups)
+}
+
+fn append_consumers(
+    groups: &mut Vec<eredu_runtime::OwnedParameterGroupSpec>,
+    emitted: Vec<ParameterGroupSpec>,
+    role: &str,
+    execution_group: &eredu_runtime::ExecutionGroupId,
+    unit: usize,
+    destination: Destination<'_>,
+) -> Result<(), GroupError> {
+    use eredu_runtime::{ExecutionGroupId, OwnedParameterGroupSpec, ParameterGroupOwner};
+    destination.controls::<(
+        ParameterGroupOwner,
+        Vec<(ExecutionGroupId, usize)>,
+        OwnedParameterGroupSpec,
+    )>()?;
+    destination.reserve(groups, emitted.len())?;
+    for group in emitted {
+        let mut consumers = destination.vector(1)?;
+        let id =
+            ExecutionGroupId::new(destination.text(format_args!("{}", execution_group.as_str()))?)
+                .map_err(|cause| destination.group_error(format_args!("{cause}")))?;
+        consumers.push((id, unit));
+        let owner = ParameterGroupOwner::StaticUnitConsumers {
+            role: destination.text(format_args!("{role}"))?,
+            consumers,
+        };
+        groups.push(OwnedParameterGroupSpec::new(owner, group));
+    }
+    Ok(())
+}
+
+fn rooted_with(
+    root: &str,
+    relative: std::fmt::Arguments<'_>,
+    destination: Destination<'_>,
+) -> Result<String, GroupError> {
+    if root.is_empty() {
+        destination.text(relative)
+    } else {
+        destination.text(format_args!("{root}.{relative}"))
+    }
 }
 
 /// Resolves local main/deepstack merger intermediate widths.

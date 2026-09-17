@@ -1,0 +1,100 @@
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -68,7 +68,8 @@
+ } // namespace
+ bool is_copy_eval_primitive(const array& output) noexcept {
+   return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
+-      (exact_contiguous(output) || exact_cast(output) || exact_static_update(output) || is_completion_synchronizer(output));
++      (exact_contiguous(output) || exact_cast(output) || exact_static_update(output) ||
++       typeid(output.primitive())==typeid(View) || is_completion_synchronizer(output));
+ }
+ static bool single_output_layout(size_t rank, size_t inputs, bool tracer,
+     const EvalDispatchStorage* dispatch_source, bool raw_task, SingleOutputEvalStorage& out) noexcept {
+@@ -205,6 +206,65 @@
+   out=value;return true;
+ }
+ 
++namespace {
++bool byte_view_dtype(Dtype dtype) noexcept {
++  return (dtype==uint8&&dtype.size()==1)||
++      ((dtype==int32||dtype==uint32||dtype==float32)&&dtype.size()==4)||
++      ((dtype==float16||dtype==bfloat16)&&dtype.size()==2);
++}
++}
++bool byte_view_eval_layout(Dtype source,Dtype destination,size_t rank,size_t bytes,
++    bool copy,bool tracer,CopyEvalStorage& out) noexcept {
++  if(!byte_view_dtype(source)||!byte_view_dtype(destination)||source==destination||
++      rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5||!bytes||
++      bytes%source.size()||bytes%destination.size()||bytes/source.size()>size_t(INT_MAX)||
++      bytes/destination.size()>size_t(INT_MAX)||
++      (!rank&&source.size()!=destination.size())||
++      (copy&&source.size()==destination.size()))return false;
++  CopyEvalStorage value;
++  // One existing View Eval. Its optional temporary owns one descriptor/Data,
++  // one General-copy task and backing; it has no second Eval or cleanup.
++  if(!copy_eval_layout(0,1,false,tracer,value))return false;
++  value.rank=rank;
++  if(copy&&!append_copy_temporary_layout(rank,value))return false;
++  const size_t controls=sizeof(source)+sizeof(destination)+sizeof(rank)+sizeof(bytes)+
++      sizeof(copy)+sizeof(tracer)+sizeof(out)+sizeof(value)+sizeof(Strides)*3+
++      sizeof(array::Flags)*2+sizeof(array)+sizeof(const array*)*4+sizeof(const View*)+
++      sizeof(Dtype)*2+sizeof(size_t)*17+sizeof(int)*3+sizeof(int64_t)*3+sizeof(bool)*5+
++      sizeof(Shape::const_iterator)*3+sizeof(CopyType)+sizeof(Stream)+
++      sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+
++      sizeof(submission::GraphQuota*)+sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
++  if(!add(value.named_control_bytes,controls)||!submission::GraphConstruction::complete_layout(value))return false;
++  out=value;return true;
++}
++static bool byte_view_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(output.inputs().size()!=1)return false;
++  const auto& input=output.inputs()[0];const size_t rank=input.ndim();
++  const auto source=input.dtype(),destination=output.dtype();
++  if(rank>5||rank!=size_t(output.ndim())||input.strides().size()!=rank||
++      !byte_view_dtype(source)||!byte_view_dtype(destination)||
++      input.itemsize()!=source.size()||output.itemsize()!=destination.size()||
++      static_cast<const View&>(output.primitive()).state()!=destination)return false;
++  size_t elements=1,output_elements=1,span=1,delta=0,bytes=0,output_bytes=0,scaled_stride=0;
++  for(size_t axis=0;axis<rank;++axis) {
++    if(input.shape(axis)<=0||output.shape(axis)<=0||input.strides()[axis]<0||
++        !multiply(elements,size_t(input.shape(axis)),elements)||
++        !multiply(output_elements,size_t(output.shape(axis)),output_elements)||
++        !multiply(size_t(input.shape(axis)-1),size_t(input.strides()[axis]),delta)||
++        !add(span,delta)||span>size_t(PTRDIFF_MAX)||
++        (axis+1<rank&&(input.shape(axis)!=output.shape(axis)||
++         !multiply(size_t(input.strides()[axis]),source.size(),scaled_stride))))return false;
++  }
++  if(elements!=input.size()||output_elements!=output.size()||span>input.data_size()||
++      !multiply(elements,source.size(),bytes)||!multiply(output_elements,destination.size(),output_bytes)||
++      bytes!=output_bytes||!multiply(span,source.size(),delta)||
++      !multiply(input.data_size(),source.size(),delta))return false;
++  // Exact unchanged View::eval_cpu branch, including same-width aliases.
++  const bool copy=source.size()!=destination.size()&&
++      !(destination.size()<source.size()&&rank&&input.strides().back()==1)&&!input.flags().row_contiguous;
++  return byte_view_eval_layout(source,destination,rank,bytes,copy,output.is_tracer(),out);
++}
++
+ bool cast_eval_layout(size_t rank, Dtype source, Dtype destination,
+     size_t elements, bool tracer, CopyEvalStorage& out) noexcept {
+   // General-copy loops include an int product over the last three dimensions.
+@@ -278,6 +338,7 @@
+ bool copy_eval_storage(const array& output, CopyEvalStorage& out) noexcept {
+   if (!is_copy_eval_primitive(output) || !output.siblings().empty()) return false;
+   if (exact_static_update(output)) return static_update_eval_storage(output,out);
++  if (typeid(output.primitive())==typeid(View))return byte_view_eval_storage(output,out);
+   const bool cast = exact_cast(output);
+   const bool copy = exact_contiguous(output) || cast;
+   if (copy) {
+diff --git a/mlx/backend/cpu/copy_storage.h b/mlx/backend/cpu/copy_storage.h
+--- a/mlx/backend/cpu/copy_storage.h
++++ b/mlx/backend/cpu/copy_storage.h
+@@ -11,6 +11,9 @@
+ };
+ MLX_API bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
+     CopyEvalStorage&) noexcept;
++// Actual View reinterpretation: an alias or one ordinary General-copy temporary.
++MLX_API bool byte_view_eval_layout(Dtype source,Dtype destination,size_t rank,size_t bytes,
++    bool copy,bool tracer,CopyEvalStorage&) noexcept;
+ // Cast shares the same copy worker and bank; geometry/dtypes describe the
+ // actual source and output, while native Eval still authenticates the primitive.
+ MLX_API bool cast_eval_layout(size_t rank, Dtype source, Dtype destination,

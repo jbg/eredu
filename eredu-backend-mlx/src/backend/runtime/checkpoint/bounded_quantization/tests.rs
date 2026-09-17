@@ -175,6 +175,56 @@ fn assert_mxfp4_outputs_match_reference(
 }
 
 #[test]
+fn source_storage_includes_dense_memory_and_quantized_overlay_without_reconversion() {
+    let mut bytes = Vec::with_capacity(4096);
+    bytes.extend(float_bytes(&matrix_values(1, 8, 64)));
+    let source_capacity = bytes.capacity() as u64;
+    let source: Arc<dyn CheckpointSource> = Arc::new(
+        MemoryWeightStore::from_safetensors([(
+            "model.proj.weight".into(),
+            SafeDtype::F32,
+            vec![8, 64],
+            bytes,
+        )])
+        .unwrap(),
+    );
+    let context = cpu_context();
+    let plan = BoundedQuantizationPlan::new(
+        AffineQuantization::default(),
+        320,
+        [direct_test_target("model.proj.weight")],
+    )
+    .unwrap();
+    let transformed =
+        BoundedQuantizedWeightStore::create(source.clone(), plan, context.stream()).unwrap();
+    let before = transformed.report().clone();
+    let storage = eredu_checkpoint::store::SourceStorage::collect([
+        source.as_ref(),
+        &transformed as &dyn CheckpointSource,
+        &transformed,
+    ])
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        storage.owner_count(),
+        4,
+        "dense source plus weight/scale/bias outputs"
+    );
+    assert!(storage.bytes().unwrap() >= source_capacity + before.output_bytes);
+    assert_eq!(transformed.report(), &before);
+    let view = eredu_checkpoint::store::RestrictedCheckpointSource::including(
+        Arc::new(transformed),
+        "weight only",
+        std::collections::BTreeSet::from(["model.proj.weight".into()]),
+    )
+    .unwrap();
+    assert_eq!(
+        view.source_storage().unwrap().unwrap().bytes().unwrap(),
+        storage.bytes().unwrap()
+    );
+}
+
+#[test]
 fn affine_conversion_is_row_bounded_and_matches_the_canonical_quantizer() {
     let (_directory, source, values) = direct_fixture();
     let context = cpu_context();

@@ -10,6 +10,8 @@ use std::{
 };
 
 use crate::{ResidencyReport, WeightMaterializationReport};
+mod prepared;
+pub use prepared::{DenseStreamTelemetryPlan, DenseTelemetryPreparationError};
 
 /// Stable dense-stream observations combining residency and worker state.
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -484,6 +486,7 @@ struct DensePassState {
     active: Option<DensePassActivity>,
     prefill: DensePassReport,
     decode: DensePassReport,
+    background: BackgroundPrefetchReport,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -517,7 +520,8 @@ pub struct DenseStreamTelemetry {
     pinned_static_device_bytes: u64,
     transfer_stream_index: i32,
     groups: Vec<DenseExecutionGroupPlan>,
-    group_activity: Mutex<BTreeMap<String, DenseExecutionGroupState>>,
+    group_activity: Mutex<Vec<DenseExecutionGroupState>>,
+    prepared: bool,
     pass: Mutex<DensePassState>,
 }
 
@@ -535,10 +539,7 @@ impl DenseStreamTelemetry {
             .into_iter()
             .map(|(id, units)| DenseExecutionGroupPlan { id, units })
             .collect::<Vec<_>>();
-        let group_activity = groups
-            .iter()
-            .map(|group| (group.id.clone(), DenseExecutionGroupState::default()))
-            .collect();
+        let group_activity = vec![DenseExecutionGroupState::default(); groups.len()];
         Self {
             planned_layer_count,
             planned_layer_bytes,
@@ -547,10 +548,12 @@ impl DenseStreamTelemetry {
             transfer_stream_index,
             groups,
             group_activity: Mutex::new(group_activity),
+            prepared: false,
             pass: Mutex::new(DensePassState {
                 active: None,
                 prefill: DensePassReport::default(),
                 decode: DensePassReport::default(),
+                background: BackgroundPrefetchReport::default(),
             }),
         }
     }
@@ -585,40 +588,61 @@ impl DenseStreamTelemetry {
         prefill: bool,
         units: &[UnitResidencyReport],
     ) -> Result<(), DenseStreamTelemetryError> {
-        let plan = self
-            .groups
+        self.observe_usage(
+            group,
+            prefill,
+            units.iter().map(|unit| {
+                Ok(prepared::Usage {
+                    id: unit.id(),
+                    host: unit.host_resident().then_some(unit.host_allocated_bytes()),
+                    device: unit
+                        .device_resident()
+                        .then_some(unit.device_allocated_bytes()),
+                })
+            }),
+        )
+    }
+
+    fn group_index(&self, group: &str) -> Result<usize, DenseStreamTelemetryError> {
+        self.groups
             .iter()
-            .find(|candidate| candidate.id == group)
-            .ok_or_else(|| DenseStreamTelemetryError::UnknownExecutionGroup(group.to_string()))?;
-        let ids = plan.units.iter().collect::<BTreeSet<_>>();
-        let group_units = units
-            .iter()
-            .filter(|unit| ids.contains(unit.id()))
-            .collect::<Vec<_>>();
-        let (host_layers, host_bytes, device_layers, device_bytes) = occupancy(&group_units);
+            .position(|candidate| candidate.id == group)
+            .ok_or_else(|| {
+                if self.prepared {
+                    DenseStreamTelemetryError::UnknownPreparedExecutionGroup
+                } else {
+                    DenseStreamTelemetryError::UnknownExecutionGroup(group.to_string())
+                }
+            })
+    }
+    fn observe_usage<'a>(
+        &self,
+        group: &str,
+        prefill: bool,
+        units: impl Iterator<Item = Result<prepared::Usage<'a>, DenseStreamTelemetryError>> + Clone,
+    ) -> Result<(), DenseStreamTelemetryError> {
+        let index = self.group_index(group)?;
+        let plan = &self.groups[index];
+        let (host_layers, host_bytes, device_layers, device_bytes) =
+            prepared::occupancy(units.clone(), |id| plan.units.iter().any(|unit| unit == id))?;
         let mut activity = self
             .group_activity
             .lock()
             .map_err(|_| DenseStreamTelemetryError::StatePoisoned)?;
         let state = activity
-            .get_mut(group)
-            .ok_or_else(|| DenseStreamTelemetryError::UnknownExecutionGroup(group.to_string()))?;
+            .get_mut(index)
+            .ok_or(DenseStreamTelemetryError::UnknownPreparedExecutionGroup)?;
         state.peak_host_layers = state.peak_host_layers.max(host_layers);
         state.peak_host_bytes = state.peak_host_bytes.max(host_bytes);
         state.peak_device_layers = state.peak_device_layers.max(device_layers);
         state.peak_device_bytes = state.peak_device_bytes.max(device_bytes);
         drop(activity);
-
-        let streamed = self
-            .groups
-            .iter()
-            .flat_map(|group| group.units.iter())
-            .collect::<BTreeSet<_>>();
-        let streamed_units = units
-            .iter()
-            .filter(|unit| streamed.contains(unit.id()))
-            .collect::<Vec<_>>();
-        let (host_layers, host_bytes, device_layers, device_bytes) = occupancy(&streamed_units);
+        let (host_layers, host_bytes, device_layers, device_bytes) =
+            prepared::occupancy(units, |id| {
+                self.groups
+                    .iter()
+                    .any(|group| group.units.iter().any(|unit| unit == id))
+            })?;
         let mut pass = self
             .pass
             .lock()
@@ -649,9 +673,10 @@ impl DenseStreamTelemetry {
             .group_activity
             .lock()
             .map_err(|_| DenseStreamTelemetryError::StatePoisoned)?;
+        let index = self.group_index(group)?;
         let state = activity
-            .get_mut(group)
-            .ok_or_else(|| DenseStreamTelemetryError::UnknownExecutionGroup(group.to_string()))?;
+            .get_mut(index)
+            .ok_or(DenseStreamTelemetryError::UnknownPreparedExecutionGroup)?;
         state.completed_executions = state.completed_executions.saturating_add(1);
         Ok(())
     }
@@ -689,6 +714,14 @@ impl DenseStreamTelemetry {
         if let Ok(mut state) = self.pass.lock() {
             state.active = None;
         }
+    }
+
+    /// Records a disjoint, retired worker generation once. This updates only
+    /// observations under the existing pass mutex; it establishes no retirement
+    /// proof and never substitutes for the worker's actual completion boundary.
+    pub fn record_background(&self, report: BackgroundPrefetchReport) -> Result<(), DenseStreamTelemetryError> {
+        self.pass.lock().map_err(|_| DenseStreamTelemetryError::StatePoisoned)?.background.accumulate(report);
+        Ok(())
     }
 
     /// Builds a stable report from a coherent residency and worker snapshot.
@@ -770,7 +803,13 @@ impl DenseStreamTelemetry {
                     .iter()
                     .filter_map(|id| units.get(id).copied())
                     .collect::<Vec<_>>();
-                let observed = activity.get(&group.id).copied().unwrap_or_default();
+                let observed = self
+                    .groups
+                    .iter()
+                    .position(|candidate| candidate.id == group.id)
+                    .and_then(|index| activity.get(index))
+                    .copied()
+                    .unwrap_or_default();
                 let (host_layers, host_bytes, device_layers, device_bytes) =
                     occupancy(&group_units);
                 DenseExecutionGroupReport::new(
@@ -793,6 +832,8 @@ impl DenseStreamTelemetry {
             .pass
             .lock()
             .map_err(|_| DenseStreamTelemetryError::StatePoisoned)?;
+        let mut background = background;
+        background.accumulate(pass.background);
         let host_layers = tier_report(MemoryTier::Host);
         let device_layers = tier_report(MemoryTier::Device);
         Ok(DenseDiskStreamReport::new(
@@ -840,6 +881,12 @@ pub enum DenseStreamTelemetryError {
     /// The requested execution group was not declared.
     #[error("unknown dense streaming execution group {0}")]
     UnknownExecutionGroup(String),
+    /// An undeclared group was requested through a finite prepared owner.
+    #[error("unknown prepared dense streaming execution group")]
+    UnknownPreparedExecutionGroup,
+    /// The supplied ledger does not contain the selected unit state.
+    #[error("dense streaming ledger identity mismatch")]
+    InvalidLedger,
 }
 
 #[cfg(test)]

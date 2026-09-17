@@ -688,3 +688,53 @@ fn accepts_hugging_face_snapshot_symlinks_into_repository_blobs() {
     let value = materialized.evaluated().unwrap();
     assert_eq!(value.as_slice::<i32>(), &[7]);
 }
+
+#[test]
+fn gguf_shared_context_distinguishes_artifacts_and_coalesces_store_aliases() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_path = directory.path().join("first.gguf");
+    let second_path = directory.path().join("second.gguf");
+    write_dense_gguf(&first_path, "value.weight", 1.25);
+    write_dense_gguf(&second_path, "value.weight", -7.5);
+    let first = open_gguf_checkpoint_source_for_test(
+        GgufCheckpoint::open(first_path).unwrap(),
+        str::to_owned,
+    )
+    .unwrap();
+    let second = open_gguf_checkpoint_source_for_test(
+        GgufCheckpoint::open(second_path).unwrap(),
+        str::to_owned,
+    )
+    .unwrap();
+    let first_alias = first.clone();
+    let second_alias = second.clone();
+    let stream = cpu_stream();
+    let context = MlxParameterMaterializationContext::new(&stream, &stream);
+    let mut pending = Vec::new();
+    // Keep both first groups live while the shared cache sees the other store
+    // and a clone of each. Equal local checkpoint/name/selection is intentional.
+    for source in [&first, &second, &first_alias, &second_alias] {
+        pending.push(
+            acquire_with_context(
+                source,
+                "value.weight",
+                TensorSelection::Full,
+                WeightReadPolicy::RequireBounded,
+                &context,
+            )
+            .unwrap()
+            .prepare_materialization(&stream, &stream)
+            .unwrap(),
+        );
+    }
+    for source in [&first, &second] {
+        let diagnostics = source.source_diagnostics().unwrap();
+        assert_eq!(diagnostics.physical_reads, 1);
+        assert_eq!(diagnostics.physical_read_bytes, 4);
+        assert_eq!(diagnostics.coalesced_group_hits, 1);
+    }
+    for (value, expected) in pending.into_iter().zip([1.25_f32, -7.5, 1.25, -7.5]) {
+        let output = value.finish().unwrap();
+        assert_eq!(output.evaluated().unwrap().as_slice::<f32>(), &[expected]);
+    }
+}

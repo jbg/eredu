@@ -1,0 +1,254 @@
+diff --git a/mlx/backend/common/utils.cpp b/mlx/backend/common/utils.cpp
+--- a/mlx/backend/common/utils.cpp
++++ b/mlx/backend/common/utils.cpp
+@@ -1,6 +1,7 @@
+ // Copyright © 2023-2024 Apple Inc.
+ 
+ #include <dlfcn.h>
++#include <climits>
+ 
+ #include "mlx/backend/common/utils.h"
+ 
+@@ -174,12 +175,32 @@
+   return std::make_tuple(std::move(out_shape), std::move(out_strides));
+ }
+ 
++bool collapse_single_dims_layout(size_t rank,CollapseStorageLayout& out) noexcept {
++  if (rank > size_t(INT_MAX)) return false;
++  CollapseStorageLayout value;
++  value.operands=1;value.rank=rank;
++  value.borrowed_view_bytes=sizeof(const Shape*)+sizeof(const Strides*);
++  value.result_control_bytes=sizeof(std::pair<Shape,Strides>);
++  value.layout_control_bytes=sizeof(CollapseStorageLayout);
++  if (!collapse_small_request<Shape>(1,rank,value.output_shape) ||
++      !collapse_small_request<Strides>(1,rank,value.output_strides)) return false;
++  if (value.output_strides.bytes_each > SIZE_MAX-value.output_shape.bytes_each ||
++      value.output_strides.graph_extent_each > SIZE_MAX-value.output_shape.graph_extent_each) return false;
++  value.requested_bytes=value.output_shape.bytes_each+value.output_strides.bytes_each;
++  value.graph_extent_sum=value.output_shape.graph_extent_each+value.output_strides.graph_extent_each;
++  out=value;return true;
++}
+ std::pair<Shape, Strides> collapse_contiguous_dims(
+     const Shape& shape,
+     const Strides& strides,
+     int64_t size_cap) {
++  CollapseStorageLayout layout;
++  if (!collapse_single_dims_layout(shape.size(),layout))
++    throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
+   Shape collapsed_shape;
+   Strides collapsed_strides;
++  collapsed_shape.reserve(shape.size());
++  collapsed_strides.reserve(shape.size());
+ 
+   if (shape.size() > 0) {
+     collapsed_shape.push_back(shape[0]);
+@@ -199,7 +220,7 @@
+     }
+   }
+ 
+-  return std::make_pair(collapsed_shape, collapsed_strides);
++  return std::make_pair(std::move(collapsed_shape), std::move(collapsed_strides));
+ }
+ 
+ std::pair<Shape, Strides> collapse_contiguous_dims(
+diff --git a/mlx/backend/common/utils.h b/mlx/backend/common/utils.h
+--- a/mlx/backend/common/utils.h
++++ b/mlx/backend/common/utils.h
+@@ -101,6 +101,9 @@
+   size_t requested_bytes{0}, graph_extent_sum{0};
+   CollapseStorageRequest output_headers, markers, output_shape, output_strides;
+ };
++// Exact fresh destinations for the existing one-stride collapse worker.
++// Results reserve from the borrowed input rank before their first push.
++bool collapse_single_dims_layout(size_t rank, CollapseStorageLayout& out) noexcept;
+ // Pure layout arithmetic. fixed_references describes the actual fixed-operand
+ // adapter's stack reference list; dynamic ArrayVector/vector loans use false.
+ bool collapse_contiguous_dims_layout(
+diff --git a/mlx/backend/cpu/copy.cpp b/mlx/backend/cpu/copy.cpp
+--- a/mlx/backend/cpu/copy.cpp
++++ b/mlx/backend/cpu/copy.cpp
+@@ -1,6 +1,8 @@
+ // Copyright © 2023-2024 Apple Inc.
+ 
+ #include <numeric>
++#include <climits>
++#include "mlx/prepared_input.h"
+ 
+ #include "mlx/allocator.h"
+ #include "mlx/backend/common/utils.h"
+@@ -294,8 +296,73 @@
+   }
+ }
+ 
++// This is the existing fixed copy dispatch, now named so its exact bound
++// TaskNode can be queried without allocating or constructing weak arrays.
++struct InplaceCopyTask {
++  array src,dst;
++  CopyType ctype;
++  void operator()(){copy_inplace_dispatch(src,dst,ctype);}
++};
++bool copy_add(size_t value,size_t& total) noexcept {
++  if(value>SIZE_MAX-total)return false;total+=value;return true;
++}
++bool copy_repeat(size_t count,size_t each,size_t& total) noexcept {
++  if(count&&each>SIZE_MAX/count)return false;return copy_add(count*each,total);
++}
++bool copy_small_extent(size_t rank,size_t item_bytes,size_t alignment,size_t& extent) noexcept {
++  if(rank<=10){extent=0;return true;}
++  const size_t capacity=std::max(rank,size_t{20});
++  if(capacity>size_t(PTRDIFF_MAX)/item_bytes)return false;
++  return submission::GraphQuota::allocation_extent(capacity*item_bytes,alignment,extent);
++}
+ } // namespace
+ 
++bool contiguous_copy_dispatch_storage(const array& input,CpuCopyDispatchStorage& out) noexcept {
++  const auto rank=input.ndim();
++  if(rank>size_t(INT_MAX))return false;
++  WeakCopyStorage weak;
++  cpu::DispatchLayout dispatch;
++  if(!PreparedInputLeaf::weak_copy_storage(rank,weak) ||
++      !cpu::CommandEncoder::dispatch_layout<InplaceCopyTask>(dispatch))return false;
++  CpuCopyDispatchStorage value;
++  value.rank=rank;value.weak_wrappers=2;value.data_captures=2;
++  value.task_bytes=dispatch.task_bytes;value.task_alignment=dispatch.task_alignment;
++  value.task_graph_extent=dispatch.graph_extent;
++  if(!copy_repeat(2,weak.graph_extent_sum,value.weak_graph_extent_sum))return false;
++  // General first creates contiguous output strides even for an empty rank.
++  size_t stride_extent;
++  if(!copy_small_extent(rank,sizeof(Strides::value_type),alignof(Strides::value_type),stride_extent) ||
++      !copy_add(stride_extent,value.worker_graph_extent_bound))return false;
++  value.controls=sizeof(CpuCopyDispatchStorage)+sizeof(WeakCopyStorage)+sizeof(cpu::DispatchLayout)+
++      sizeof(InplaceCopyTask)*2+sizeof(CopyType)*2+sizeof(array)*4+sizeof(Stream)*2+
++      sizeof(size_t)*12+sizeof(bool)*3+sizeof(const void*)*12+sizeof(int64_t)*8+
++      sizeof(std::optional<array>)*4+sizeof(Shape)*2+sizeof(Strides)*2;
++  if(!copy_add(dispatch.controls,value.controls) || !copy_repeat(2,weak.controls,value.controls))return false;
++  if(rank) {
++    CollapseStorageLayout collapse;
++    if(!collapse_contiguous_dims_layout(2,rank,true,collapse) ||
++        !copy_add(collapse.graph_extent_sum,value.worker_graph_extent_bound) ||
++        !copy_add(collapse.borrowed_view_bytes+collapse.fixed_reference_bytes+collapse.result_control_bytes+
++            collapse.marker_control_bytes+collapse.layout_control_bytes+collapse.fixed_reference_view_bytes,value.controls))return false;
++  }
++  // The shared worker may create two iterators over a collapsed prefix. Its
++  // rank is at most input rank-3. This is a declared bound, not an assertion
++  // that every source needs those allocations or that arena space is free.
++  if(rank>3) {
++    const size_t prefix=rank-3;
++    CollapseStorageLayout collapse;
++    size_t shape_extent;
++    if(!collapse_single_dims_layout(prefix,collapse) ||
++        !copy_small_extent(prefix,sizeof(Shape::value_type),alignof(Shape::value_type),shape_extent) ||
++        !copy_small_extent(prefix,sizeof(Strides::value_type),alignof(Strides::value_type),stride_extent) ||
++        !copy_repeat(2,collapse.graph_extent_sum,value.worker_graph_extent_bound) ||
++        !copy_repeat(4,shape_extent,value.worker_graph_extent_bound) ||
++        !copy_repeat(2,stride_extent,value.worker_graph_extent_bound) ||
++        !copy_repeat(2,sizeof(ContiguousIterator)+collapse.borrowed_view_bytes+
++            collapse.result_control_bytes+collapse.layout_control_bytes,value.controls))return false;
++  }
++  out=value;return true;
++}
+ void copy_cpu_inplace(
+     const array& src,
+     array& dst,
+@@ -304,10 +371,8 @@
+   auto& encoder = cpu::get_command_encoder(stream);
+   encoder.set_input_array(src);
+   encoder.set_output_array(dst);
+-  encoder.dispatch(
+-      [src = array::unsafe_weak_copy(src),
+-       dst = array::unsafe_weak_copy(dst),
+-       ctype]() mutable { copy_inplace_dispatch(src, dst, ctype); });
++  encoder.dispatch(InplaceCopyTask{
++      array::unsafe_weak_copy(src),array::unsafe_weak_copy(dst),ctype});
+ }
+ 
+ void copy_cpu(const array& src, array& dst, CopyType ctype, Stream stream) {
+diff --git a/mlx/backend/cpu/copy.h b/mlx/backend/cpu/copy.h
+--- a/mlx/backend/cpu/copy.h
++++ b/mlx/backend/cpu/copy.h
+@@ -10,6 +10,15 @@
+ 
+ namespace mlx::core {
+ 
++// Bound for the actual General-copy dispatch used by contiguous_copy_cpu.
++// Includes two weak metadata/Data captures and one FIFO task; excludes the
++// destination array/backing, parent Eval cleanup and communicator storage.
++struct CpuCopyDispatchStorage {
++  size_t rank{0}, weak_wrappers{0}, data_captures{0};
++  size_t task_bytes{0},task_alignment{0},task_graph_extent{0};
++  size_t weak_graph_extent_sum{0},worker_graph_extent_bound{0},controls{0};
++};
++MLX_API bool contiguous_copy_dispatch_storage(const array&,CpuCopyDispatchStorage&) noexcept;
+ void copy_cpu(const array& src, array& dst, CopyType ctype, Stream stream);
+ void copy_cpu_inplace(
+     const array& src,
+diff --git a/mlx/prepared_input.cpp b/mlx/prepared_input.cpp
+--- a/mlx/prepared_input.cpp
++++ b/mlx/prepared_input.cpp
+@@ -1,5 +1,6 @@
+ #include "mlx/prepared_input.h"
+ #include "mlx/primitives.h"
++#include "mlx/submission.h"
+ #include <algorithm>
+ #include <climits>
+ #include <initializer_list>
+@@ -81,6 +82,40 @@
+   out[0] = {sizeof(array::ArrayDesc), alignof(array::ArrayDesc)};
+   out[1] = {sizeof(Control), alignof(Control)};
+   return true;
++#endif
++}
++bool PreparedInputLeaf::weak_copy_storage(size_t rank,WeakCopyStorage& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  if (rank > size_t(INT_MAX) || rank > Shape::max_size() || rank > Strides::max_size()) return false;
++  WeakCopyStorage value;
++  // Same ArrayDesc, descriptor control and Data control as set_data. The weak
++  // wrapper owns no backing and its no-op deleter stays inline in std::function.
++  if (!append_array_requests(0,value.requests,value.count) || value.count != 3) return false;
++  if (rank > Shape::inline_capacity) {
++    size_t shape,initial_strides,copied_strides;
++    if (!multiply(rank,sizeof(Shape::value_type),shape) ||
++        !multiply(std::max(rank,2*Strides::inline_capacity),sizeof(Strides::value_type),initial_strides) ||
++        !multiply(rank,sizeof(Strides::value_type),copied_strides)) return false;
++    value.requests[value.count++]={shape,alignof(Shape::value_type)};
++    value.requests[value.count++]={initial_strides,alignof(Strides::value_type)};
++    value.requests[value.count++]={copied_strides,alignof(Strides::value_type)};
++  }
++  for(size_t i=0;i<value.count;++i) {
++    size_t extent;
++    if (!Quota::allocation_extent(value.requests[i].bytes,value.requests[i].alignment,extent) ||
++        !add(value.graph_extent_sum,extent,value.graph_extent_sum)) return false;
++  }
++  const auto adoption=array::buffer_adoption_layout();
++  value.controls=sizeof(WeakCopyStorage)+sizeof(array)*3+sizeof(Shape)*4+sizeof(Strides)*4+
++      sizeof(ArrayVector)*3+sizeof(std::shared_ptr<Primitive>)*3+sizeof(Deleter)*2+
++      sizeof(array::BufferAdoptionLayout)+adoption.incoming_bytes+adoption.scratch_owner_bytes+
++      sizeof(allocator::Buffer)+sizeof(array::Flags)+sizeof(size_t)*8+sizeof(bool)*2+
++      sizeof(submission::CaptureSlot)+sizeof(submission::NativeControlBinding)+
++      sizeof(submission::GraphQuotaRef)+sizeof(std::shared_ptr<array::Data>)*3+
++      descriptor_shared_control_bytes()+descriptor_allocator_control_bytes();
++  out=value;return true;
+ #endif
+ }
+ bool PreparedInputLeaf::pointwise_graph_layout(size_t operations, size_t rank,
+diff --git a/mlx/prepared_input.h b/mlx/prepared_input.h
+--- a/mlx/prepared_input.h
++++ b/mlx/prepared_input.h
+@@ -37,8 +37,15 @@
+   array value_;
+   submission::GraphQuota* quota_;
+ };
++// The existing unsafe weak-copy producer's own metadata and no-op Data
++// wrapper. Physical backing stays borrowed and must be retained by its caller.
++struct WeakCopyStorage {
++  submission::GraphQuota::Request requests[6]{};
++  size_t count{0}, graph_extent_sum{0}, controls{0};
++};
+ class MLX_API PreparedInputLeaf final {
+  public:
++  static bool weak_copy_storage(size_t rank, WeakCopyStorage&) noexcept;
+   // Shared pure descriptor/Data geometry, inside array's existing friend.
+   // Caller retains its prefix and supplies room for at most five requests.
+   // No descriptor type, native object, allocator or authority is exposed.

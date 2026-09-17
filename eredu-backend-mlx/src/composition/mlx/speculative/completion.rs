@@ -13,6 +13,62 @@ impl Retention for SpeculativeRetention {
 
 /// Exact completion for one retained MLX speculative verification.
 pub struct MlxSpeculativeCompletion {
+    kind: CompletionKind,
+}
+enum CompletionKind {
+    Ordinary(OrdinarySpeculativeCompletion),
+    // Created only from an output whose parent, views and state roots completed
+    // successfully while its exact original role was still installed.
+    Original(eredu_runtime::working_memory::OriginalSpeculativeRole),
+    Embedded {
+        _evidence: eredu_architectures::speculative_execution::PreparedEmbeddedEvidence,
+        _funding: eredu_nn::workspace::WorkspaceMetadataFunding,
+    },
+}
+impl MlxSpeculativeCompletion {
+    pub fn submit<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<Self, Exception> {
+        OrdinarySpeculativeCompletion::submit(outputs).map(|value| Self {
+            kind: CompletionKind::Ordinary(value),
+        })
+    }
+    pub(super) fn completed(
+        output: &super::autoregressive::MlxAutoregressiveOutput,
+    ) -> Option<Self> {
+        output.completed_role().map(|role| Self {
+            kind: CompletionKind::Original(role.clone()),
+        })
+    }
+    #[cfg(test)]
+    pub(super) fn retained(&self) -> &[Array] {
+        match &self.kind {
+            CompletionKind::Ordinary(value) => value.retained(),
+            CompletionKind::Original(_) | CompletionKind::Embedded { .. } => &[],
+        }
+    }
+}
+impl Completion for MlxSpeculativeCompletion {
+    type Error = Exception;
+    fn resources_releasable(&self) -> bool {
+        match &self.kind {
+            CompletionKind::Ordinary(value) => value.resources_releasable(),
+            CompletionKind::Original(_) | CompletionKind::Embedded { .. } => true,
+        }
+    }
+    fn is_complete(&self) -> Result<bool, Exception> {
+        match &self.kind {
+            CompletionKind::Ordinary(value) => value.is_complete(),
+            CompletionKind::Original(_) | CompletionKind::Embedded { .. } => Ok(true),
+        }
+    }
+    fn wait(&self) -> Result<(), Exception> {
+        match &self.kind {
+            CompletionKind::Ordinary(value) => value.wait(),
+            CompletionKind::Original(_) | CompletionKind::Embedded { .. } => Ok(()),
+        }
+    }
+}
+
+struct OrdinarySpeculativeCompletion {
     recovery: Recovery<SpeculativeRetention>,
     observations: Rc<SpeculativeObservations>,
 }
@@ -63,7 +119,7 @@ impl Drop for ObservationUnwind<'_> {
     }
 }
 
-impl MlxSpeculativeCompletion {
+impl OrdinarySpeculativeCompletion {
     /// Submits all retained verification outputs as one exact completion.
     pub fn submit<'a>(outputs: impl IntoIterator<Item = &'a Array>) -> Result<Self, Exception> {
         let arrays = outputs.into_iter().cloned().collect::<Vec<_>>();
@@ -92,7 +148,7 @@ impl MlxSpeculativeCompletion {
     }
 }
 
-impl Completion for MlxSpeculativeCompletion {
+impl Completion for OrdinarySpeculativeCompletion {
     type Error = Exception;
 
     fn resources_releasable(&self) -> bool {
@@ -243,5 +299,109 @@ mod observation_scope_tests {
         crate::backend::submission_recovery::wait_for_retirement(|| state.active.get() == 0);
         assert_eq!(state.active.get(), 0);
         assert!(state.failed.get());
+    }
+}
+
+// Same completion and quarantine worker, with the selected typed error boundary.
+pub(crate) struct TypedSpeculativeCompletion(MlxSpeculativeCompletion);
+impl TypedSpeculativeCompletion {
+    pub(crate) fn new(value: MlxSpeculativeCompletion) -> Self {
+        Self(value)
+    }
+    /// Retains an exact, already-settled external source produced by the shared
+    /// completed-root projection. No event, root clone or role is created here.
+    pub(crate) fn completed_external(
+        evidence:eredu_architectures::speculative_execution::PreparedEmbeddedEvidence,
+        sources:&OriginalSpeculativeNumericalSources,
+        environment:&crate::backend::OriginalCopyEnvironment<'_>,
+    )->Result<Self,Error>{
+        use std::mem::{size_of,size_of_val};
+        let parts=[size_of::<Self>(),size_of::<MlxSpeculativeCompletion>(),size_of::<CompletionKind>(),
+            size_of::<Result<Self,Error>>(),size_of::<eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>()];
+        sources.metadata_funding().reserve_metadata(parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
+            .ok_or(Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?).map_err(Error::WorkspacePlanning)?;
+        super::tensor_sources::validate_tensor_sources(&[&evidence],sources,environment)?;
+        Ok(Self(MlxSpeculativeCompletion{kind:CompletionKind::Embedded{_evidence:evidence,_funding:sources.metadata_funding().clone()}}))
+    }
+    /// The target phase has already settled every declared output root before
+    /// publishing this exact source. Validate the actual score/capture aliases
+    /// and retain that proof instead of submitting a second ordinary event.
+    pub(crate) fn completed_embedded(
+        logits: &Array,
+        capture: &Array,
+        evidence: &eredu_architectures::speculative_execution::PreparedEmbeddedEvidence,
+        sources: &OriginalSpeculativeNumericalSources,
+        environment: &crate::backend::OriginalCopyEnvironment<'_>,
+    ) -> Result<Self, Error> {
+        use crate::backend::runtime::cache::state::CompletedResidentSource;
+        use eredu_nn::workspace::{WorkspaceMetadataFunding, WorkspaceMetadataFundingError};
+        use eredu_runtime::working_memory::{SpeculativeNumericalSource, WorkingMemoryError};
+        use std::mem::{size_of, size_of_val};
+        let invalid = || Error::PrefillControl(WorkingMemoryError::IdentityMismatch);
+        let overflow = || Error::WorkspacePlanning(WorkspaceMetadataFundingError::Overflow);
+        sources.validate_environment(environment)?;
+        let completed = evidence
+            .get::<CompletedResidentSource>()
+            .ok_or_else(invalid)?;
+        let parts = [
+            size_of::<Self>(),
+            size_of::<MlxSpeculativeCompletion>(),
+            size_of::<CompletionKind>(),
+            size_of::<Result<Self, Error>>(),
+            size_of::<WorkspaceMetadataFunding>(),
+            size_of::<eredu_architectures::speculative_execution::PreparedEmbeddedEvidence>(),
+            size_of::<[&Array; 2]>(),
+            CompletedResidentSource::array_source_control_bytes()
+                .and_then(|n| n.checked_mul(2))
+                .ok_or_else(overflow)?,
+            completed
+                .completed_stream_control_bytes()
+                .ok_or_else(invalid)?,
+        ];
+        let funding = sources.metadata_funding();
+        funding
+            .reserve_metadata(
+                parts
+                    .into_iter()
+                    .try_fold(size_of_val(&parts), usize::checked_add)
+                    .ok_or_else(overflow)?,
+            )
+            .map_err(Error::WorkspacePlanning)?;
+        completed.validate_completed_stream(environment.stream())?;
+        for array in [logits, capture] {
+            let (_, account) = completed.array_source(array, funding)?;
+            if !SpeculativeNumericalSource::Model(account).belongs_to_request(sources.request()) {
+                return Err(invalid());
+            }
+        }
+        Ok(Self(MlxSpeculativeCompletion {
+            kind: CompletionKind::Embedded {
+                _evidence: evidence.clone(),
+                _funding: funding.clone(),
+            },
+        }))
+    }
+}
+impl Completion for TypedSpeculativeCompletion {
+    type Error = Error;
+    fn resources_releasable(&self) -> bool {
+        self.0.resources_releasable()
+    }
+    fn is_complete(&self) -> Result<bool, Error> {
+        self.0.is_complete().map_err(Error::from)
+    }
+    fn wait(&self) -> Result<(), Error> {
+        self.0.wait().map_err(Error::from)
+    }
+}
+impl BoundedCompletion for TypedSpeculativeCompletion {
+    fn supports_cancellation(mode: CompletionCancellationMode) -> bool {
+        MlxSpeculativeCompletion::supports_cancellation(mode)
+    }
+    fn wait_bounded(
+        self,
+        policy: BoundedCompletionWait,
+    ) -> Result<BoundedCompletionOutcome, Error> {
+        self.0.wait_bounded(policy).map_err(Error::from)
     }
 }

@@ -1,0 +1,82 @@
+diff --git a/mlx/array.h b/mlx/array.h
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -232,6 +232,10 @@
+   struct Data {
+     allocator::Buffer buffer;
+     Deleter d;
++    // Opaque allocation owners do not replace the certified buffer/deleter.
++    // Mutation is serialized by the embedding runtime before exposing aliases.
++    // Members retire after the destructor frees native backing.
++    std::vector<std::shared_ptr<void>> allocation_owners;
+     // Physical-only submission pins never expose a logical array value. They
+     // preserve allocation lifetime without preventing ordered buffer donation.
+     std::atomic<size_t> recovery_pins{0};
+@@ -241,7 +245,10 @@
+     // Not copyable
+     Data(const Data& d) = delete;
+     Data& operator=(const Data& d) = delete;
+-    Data(Data&& o) : buffer(o.buffer), d(o.d) {
++    Data(Data&& o)
++        : buffer(o.buffer),
++          d(o.d),
++          allocation_owners(std::move(o.allocation_owners)) {
+       o.buffer = allocator::Buffer(nullptr);
+       o.d = [](allocator::Buffer) {};
+     }
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -28,6 +28,11 @@
+ /** Cold inspection of certified host-transfer backing; never evaluates/polls. */
+ MLX_API std::optional<HostTransferAllocationInfo> host_transfer_allocation_info(
+     const array& value);
++
++/** Retain an opaque owner with certified physical storage, including host aliases.
++ * Caller serializes attachment. Does not evaluate or alter the buffer/deleter. */
++MLX_API bool retain_host_transfer_allocation_owner(
++    const array& value, std::shared_ptr<void> owner);
+ 
+ struct MLX_API HostTransferMemoryStats {
+   size_t active_bytes;
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -87,6 +87,10 @@
+     record_host_transfer_free(storage_kind_, capacity_);
+   }
+ 
++  void retain_allocation_owner(std::shared_ptr<void> owner) {
++    allocation_owners_.push_back(std::move(owner));
++  }
++
+   HostTransferStorage(const HostTransferStorage&) = delete;
+   HostTransferStorage& operator=(const HostTransferStorage&) = delete;
+ 
+@@ -108,6 +112,8 @@
+   HostTransferPolicy policy_;
+   HostTransferStorageKind storage_kind_;
+   size_t capacity_;
++  // Released after free_host_transfer and the physical accounting update.
++  std::vector<std::shared_ptr<void>> allocation_owners_;
+ };
+ 
+ namespace {
+@@ -140,6 +146,17 @@
+   }
+   return HostTransferAllocationInfo{
+       retained->owner.get(), retained->owner->capacity()};
++}
++
++bool retain_host_transfer_allocation_owner(
++    const array& value, std::shared_ptr<void> owner) {
++  if (!host_transfer_allocation_info(value)) {
++    return false;
++  }
++  const auto* retained =
++      value.data_shared_ptr()->d.target<HostTransferArrayDeleter>();
++  retained->owner->retain_allocation_owner(std::move(owner));
++  return true;
+ }
+ 
+ HostTransferMemoryStats host_transfer_memory_stats(

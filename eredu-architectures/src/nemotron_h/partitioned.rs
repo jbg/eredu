@@ -455,6 +455,14 @@ where
         Ok(self.parameters.clone())
     }
 
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_nn::Parameterized::visit_retained_values(&self.static_modules, visitor)
+    }
+
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
     where
         V: eredu_runtime::StaticParameterVisitor<B>,
@@ -495,6 +503,14 @@ where
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     type Input<'a> = EmbeddedInput<'a, B::Tensor>;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        match input {
+            EmbeddedInput::Target { tokens, .. } => crate::prefill::token_shape(*tokens).map(Some),
+            _ => Ok(None),
+        }
+    }
+
     type StaticModules = PartitionStaticModules<B>;
     type Unit = super::Block<B>;
     type ForwardContext = PartitionedForwardContext<B::Tensor>;
@@ -712,6 +728,16 @@ where
             forward.tokens.dim(1),
             self.args.hidden_size,
         ]))
+    }
+
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        crate::readout::select_readout_positions(hidden, demand, 1, context)
     }
 
     fn finish_forward(

@@ -5,8 +5,8 @@ use std::{collections::HashMap, io::Read};
 use eredu_checkpoint::WeightQuantization;
 use eredu_core::{
     cache::{
-        derive_prompt_cache_architecture_fingerprint, LayerCachePolicy, MutableStateResidency,
-        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
+        LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
+        StateTensorPolicy, StateTensorRole,
     },
     AttentionPolicy, LayerSchedule,
 };
@@ -370,8 +370,14 @@ impl ModelArgs {
     }
     /// Validates all normalized geometry and admitted semantic policies.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_with_diagnostic(|text| invalid(text.to_string()))
+    }
+    pub(crate) fn validate_with_diagnostic<E>(
+        &self,
+        error: impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
         if self.model_type != "kimi_linear" {
-            return Err(invalid(format!(
+            return Err(error(format_args!(
                 "unsupported model type {:?}",
                 self.model_type
             )));
@@ -401,13 +407,15 @@ impl ModelArgs {
             ),
         ] {
             if value <= 0 {
-                return Err(invalid(format!(
+                return Err(error(format_args!(
                     "Kimi Linear {name} must be positive, got {value}"
                 )));
             }
         }
         if !self.mla_use_nope {
-            return Err(invalid("Kimi Linear currently requires mla_use_nope=true"));
+            return Err(error(format_args!(
+                "Kimi Linear currently requires mla_use_nope=true"
+            )));
         }
         if self.q_lora_rank.is_some_and(|v| v <= 0)
             || self.rms_norm_eps <= 0.0
@@ -419,22 +427,29 @@ impl ModelArgs {
             || self.num_experts_per_token
                 > self.topk_group * (self.num_experts / self.num_expert_group)
         {
-            return Err(invalid("invalid Kimi Linear MLA/MoE dimensions"));
+            return Err(error(format_args!(
+                "invalid Kimi Linear MLA/MoE dimensions"
+            )));
         }
         if self.num_shared_experts != 1 {
-            return Err(invalid("Kimi Linear currently requires one shared expert"));
+            return Err(error(format_args!(
+                "Kimi Linear currently requires one shared expert"
+            )));
         }
         if self.moe_router_activation_func != "sigmoid" {
-            return Err(invalid("Kimi Linear requires sigmoid routing"));
+            return Err(error(format_args!("Kimi Linear requires sigmoid routing")));
         }
         if self.num_nextn_predict_layers != 0 {
-            return Err(invalid("Kimi Linear MTP layers are not implemented"));
+            return Err(error(format_args!(
+                "Kimi Linear MTP layers are not implemented"
+            )));
         }
         if self.layer_schedule.len() != self.num_hidden_layers as usize {
-            return Err(invalid("Kimi Linear schedule length mismatch"));
+            return Err(error(format_args!("Kimi Linear schedule length mismatch")));
         }
         if let Some(q) = self.weight_quantization {
-            q.validate().map_err(|e| invalid(e.to_string()))?;
+            q.validate_fixed()
+                .map_err(|cause| error(format_args!("{cause}")))?;
         }
         Ok(())
     }
@@ -657,14 +672,30 @@ pub struct LayerCacheGeometry {
 
 /// Declares global heterogeneous state geometry for all physical layers.
 pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, ConfigError> {
-    let geometry = args
-        .layer_schedule
-        .iter()
-        .map(|p| LayerCacheGeometry {
+    state_layout_destination(args, &crate::state_geometry::Ordinary(invalid))
+}
+
+/// Constructs the same actual state geometry using counted metadata destinations.
+pub fn state_layout_with_metadata(
+    args: &ModelArgs,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<StateLayout, eredu_nn::Error> {
+    if !context.uses_checked_metadata() {
+        return state_layout(args).map_err(eredu_nn::Error::backend);
+    }
+    state_layout_destination(args, &crate::state_geometry::Counted::new(context, invalid))
+}
+
+fn state_layout_destination<D: crate::state_geometry::Destination>(
+    args: &ModelArgs,
+    destination: &D,
+) -> Result<StateLayout, D::Error> {
+    destination.controls::<(StateLayout, &ModelArgs)>()?;
+    let geometry =
+        destination.collect_values(args.layer_schedule.iter().map(|p| LayerCacheGeometry {
             kda_heads: (p.attention == AttentionKind::Kda).then_some(args.kda_config.num_heads),
-        })
-        .collect::<Vec<_>>();
-    state_layout_with_geometry(args, &geometry)
+        }))?;
+    state_layout_with_geometry_destination(args, &geometry, destination)
 }
 
 /// Declares heterogeneous state using placement-resolved KDA head counts.
@@ -672,114 +703,169 @@ pub fn state_layout_with_geometry(
     args: &ModelArgs,
     geometry: &[LayerCacheGeometry],
 ) -> Result<StateLayout, ConfigError> {
+    state_layout_with_geometry_destination(
+        args,
+        geometry,
+        &crate::state_geometry::Ordinary(invalid),
+    )
+}
+
+fn state_layout_with_geometry_destination<D: crate::state_geometry::Destination>(
+    args: &ModelArgs,
+    geometry: &[LayerCacheGeometry],
+    destination: &D,
+) -> Result<StateLayout, D::Error> {
+    destination.controls::<(StateLayout, &ModelArgs, &[LayerCacheGeometry])>()?;
     if geometry.len() != args.layer_schedule.len() {
-        return Err(invalid("Kimi Linear state geometry length mismatch"));
+        return Err(destination.error(format_args!("Kimi Linear state geometry length mismatch")));
     }
     let history = args.kda_config.short_conv_kernel_size - 1;
-    let fixed = |v| StateTensorDimension::fixed(v).map_err(|e| invalid(e.to_string()));
-    let policies = args
-        .layer_schedule
-        .iter()
-        .zip(geometry)
-        .enumerate()
-        .map(
+    let fixed = |v| destination.fixed(v);
+    let policies =
+        destination.collect(args.layer_schedule.iter().zip(geometry).enumerate().map(
             |(layer, (policy, local))| match (policy.attention, local.kda_heads) {
                 (AttentionKind::Kda, Some(heads)) => {
                     let width = heads
                         .checked_mul(args.kda_config.head_dim)
-                        .ok_or_else(|| invalid("KDA width overflow"))?;
-                    let mut tensors = (0..3)
-                        .map(|slot| {
-                            StateTensorPolicy::new(
+                        .ok_or_else(|| destination.error(format_args!("KDA width overflow")))?;
+                    // Width one has no carried convolution samples; recurrence
+                    // remains stateful and is declared below for every KDA layer.
+                    let mut tensors = destination.vector(1 + 3 * usize::from(history != 0))?;
+                    for slot in 0..3 {
+                        if history != 0 {
+                            tensors.push(destination.tensor(
                                 StateTensorRole::Convolution { slot },
-                                vec![StateTensorDimension::Batch, fixed(history)?, fixed(width)?],
+                                destination.values([
+                                    StateTensorDimension::Batch,
+                                    fixed(history)?,
+                                    fixed(width)?,
+                                ])?,
                                 StateTensorDtype::Floating,
                                 MutableStateResidency::AlwaysDeviceMutable,
-                            )
-                            .map_err(|e| invalid(e.to_string()))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    tensors.push(
-                        StateTensorPolicy::new(
-                            StateTensorRole::Recurrent,
-                            vec![
-                                StateTensorDimension::Batch,
-                                fixed(heads)?,
-                                fixed(args.kda_config.head_dim)?,
-                                fixed(args.kda_config.head_dim)?,
-                            ],
-                            StateTensorDtype::Float32,
-                            MutableStateResidency::LayerScopedOffloadable,
-                        )
-                        .map_err(|e| invalid(e.to_string()))?,
-                    );
-                    LayerCachePolicy::fixed_only(tensors).map_err(|e| invalid(e.to_string()))
+                            )?);
+                        }
+                    }
+                    tensors.push(destination.tensor(
+                        StateTensorRole::Recurrent,
+                        destination.values([
+                            StateTensorDimension::Batch,
+                            fixed(heads)?,
+                            fixed(args.kda_config.head_dim)?,
+                            fixed(args.kda_config.head_dim)?,
+                        ])?,
+                        StateTensorDtype::Float32,
+                        MutableStateResidency::LayerScopedOffloadable,
+                    )?);
+                    destination.fixed_only(tensors)
                 }
-                (AttentionKind::Mla, None) => LayerCachePolicy::compressed_latent_rotary(
+                (AttentionKind::Mla, None) => destination.compressed(
                     AttentionPolicy::Full,
                     args.kv_lora_rank,
                     args.qk_rope_head_dim,
-                )
-                .map_err(|e| invalid(e.to_string())),
-                _ => Err(invalid(format!(
+                ),
+                _ => Err(destination.error(format_args!(
                     "Kimi Linear state geometry mismatch at layer {layer}"
                 ))),
             },
-        )
-        .collect::<Result<Vec<_>, _>>()?;
-    let schedule =
-        LayerSchedule::new(policies.len(), policies).map_err(|e| invalid(e.to_string()))?;
-    StateLayout::new(schedule).map_err(|e| invalid(e.to_string()))
+        ))?;
+    let schedule = destination.schedule(policies.len(), policies)?;
+    destination.layout(schedule)
+}
+
+struct PolicyFingerprint<'a>(&'a LayerPolicy);
+impl std::fmt::Display for PolicyFingerprint<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.write_str(if self.0.attention == AttentionKind::Kda {
+            "k"
+        } else {
+            "m"
+        })?;
+        output.write_str(if self.0.feed_forward == FeedForwardPolicy::Dense {
+            "d"
+        } else {
+            "e"
+        })
+    }
 }
 
 /// Derives stable prompt-cache architecture identity from normalized policy.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    derive_prompt_cache_architecture_fingerprint(
-        "kimi-linear",
-        [
-            ("model_type", args.model_type.clone()),
-            ("hidden_size", args.hidden_size.to_string()),
-            ("num_hidden_layers", args.num_hidden_layers.to_string()),
-            ("num_attention_heads", args.num_attention_heads.to_string()),
-            ("kv_lora_rank", args.kv_lora_rank.to_string()),
-            ("qk_nope_head_dim", args.qk_nope_head_dim.to_string()),
-            ("qk_rope_head_dim", args.qk_rope_head_dim.to_string()),
-            ("v_head_dim", args.v_head_dim.to_string()),
-            ("kda_num_heads", args.kda_config.num_heads.to_string()),
-            ("kda_head_dim", args.kda_config.head_dim.to_string()),
+    prompt_cache_architecture_fingerprint_with_metadata(
+        args,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary fingerprint formatting is infallible")
+}
+pub(crate) fn prompt_cache_architecture_fingerprint_with_metadata(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    metadata.fingerprint("kimi-linear", || {
+        Ok([
+            ("model_type", metadata.text(&args.model_type)?),
+            (
+                "hidden_size",
+                metadata.format(format_args!("{}", args.hidden_size))?,
+            ),
+            (
+                "num_hidden_layers",
+                metadata.format(format_args!("{}", args.num_hidden_layers))?,
+            ),
+            (
+                "num_attention_heads",
+                metadata.format(format_args!("{}", args.num_attention_heads))?,
+            ),
+            (
+                "kv_lora_rank",
+                metadata.format(format_args!("{}", args.kv_lora_rank))?,
+            ),
+            (
+                "qk_nope_head_dim",
+                metadata.format(format_args!("{}", args.qk_nope_head_dim))?,
+            ),
+            (
+                "qk_rope_head_dim",
+                metadata.format(format_args!("{}", args.qk_rope_head_dim))?,
+            ),
+            (
+                "v_head_dim",
+                metadata.format(format_args!("{}", args.v_head_dim))?,
+            ),
+            (
+                "kda_num_heads",
+                metadata.format(format_args!("{}", args.kda_config.num_heads))?,
+            ),
+            (
+                "kda_head_dim",
+                metadata.format(format_args!("{}", args.kda_config.head_dim))?,
+            ),
             (
                 "kda_conv_kernel",
-                args.kda_config.short_conv_kernel_size.to_string(),
+                metadata.format(format_args!("{}", args.kda_config.short_conv_kernel_size))?,
             ),
             (
                 "layer_schedule",
-                args.layer_schedule
-                    .iter()
-                    .map(|p| {
-                        format!(
-                            "{}{}",
-                            if p.attention == AttentionKind::Kda {
-                                "k"
-                            } else {
-                                "m"
-                            },
-                            if p.feed_forward == FeedForwardPolicy::Dense {
-                                "d"
-                            } else {
-                                "e"
-                            }
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(","),
+                metadata.format(format_args!(
+                    "{}",
+                    crate::cache_identity::Joined(
+                        || args.layer_schedule.iter().map(PolicyFingerprint),
+                        ","
+                    )
+                ))?,
             ),
-            ("quantization", format!("{:?}", args.weight_quantization)),
+            (
+                "quantization",
+                metadata.format(format_args!("{:?}", args.weight_quantization))?,
+            ),
             (
                 "quantized_weight_configs",
-                crate::cache_identity::debug_map(args.quantized_weight_configs.as_ref()),
+                crate::cache_identity::debug_map_with_metadata(
+                    args.quantized_weight_configs.as_ref(),
+                    metadata,
+                )?,
             ),
-        ],
-    )
+        ])
+    })
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ pub use config::{
 pub use depth::DepthSlice;
 pub use model::{
     observation_points, state_layout, DecisionBoundary, ForwardContext, Input, LayeredModel,
-    ObservationPoint, StaticModules, Unit, DEPTH_STATE_SEGMENT, TEMPORAL_STATE_SEGMENT,
+    ObservationPoint, StaticModules, Unit, MoshiRealtimeModelSource, DEPTH_STATE_SEGMENT, TEMPORAL_STATE_SEGMENT,
 };
 pub use parallel::{
     collective_count, forward_temporal_block_parallel, local_geometry, parameter_contract,
@@ -32,11 +32,18 @@ pub use parallel::{
     MoshiMatrixContract, MoshiParallelSelection, MoshiParameterContract,
 };
 pub use realtime::{
-    execute_detached_partitioned_moshi_realtime, execute_detached_replicated_moshi_realtime,
-    execute_replicated_moshi_realtime, inspect_moshi_realtime,
-    moshi_realtime_request_from_normalized, prepare_selected_moshi_realtime_source,
-    realtime_decision_execution, realtime_generation_samplers, realtime_ingress_contract,
-    select_inspected_moshi_realtime, select_moshi_realtime, selected_moshi_lowering_summary,
+    execute_moshi_workspace_frame, PreparedMoshiWorkspaceFrame, MoshiWorkspaceFrameExecutor,
+    execute_layerwise_moshi_realtime_with_observation,
+    execute_detached_partitioned_moshi_frame, execute_detached_partitioned_moshi_frame_with_parallel, execute_detached_partitioned_moshi_realtime,
+    execute_detached_partitioned_moshi_realtime_with_readout,
+    execute_detached_replicated_moshi_frame, execute_detached_replicated_moshi_realtime,
+    execute_detached_replicated_moshi_realtime_with_observer,
+    execute_detached_replicated_moshi_realtime_with_observer_and_readout,
+    execute_detached_replicated_moshi_realtime_with_readout, execute_replicated_moshi_realtime,
+    inspect_moshi_realtime, moshi_realtime_request_from_normalized,
+    prepare_selected_moshi_realtime_source, realtime_decision_execution,
+    realtime_generation_samplers, realtime_ingress_contract, select_inspected_moshi_realtime,
+    select_moshi_realtime, selected_moshi_lowering_summary,
     visit_selected_moshi_realtime_architecture, InspectedMoshiRealtime,
     MoshiPreparedRealtimeFrameExecutor, MoshiRealtimeArchitectureVisitor,
     MoshiRealtimeDispatchError, MoshiRealtimeExecution, MoshiRealtimeExecutionArchitecture,
@@ -45,3 +52,7 @@ pub use realtime::{
     MoshiWeightLoweringSummary, PreparedMoshiRealtime, PreparedMoshiRealtimeArchitecture,
     PreparedMoshiRealtimeSource,
 };
+
+#[cfg(test)]
+#[path = "../../tests/support/personaplex_numeric.rs"]
+mod personaplex_numeric;

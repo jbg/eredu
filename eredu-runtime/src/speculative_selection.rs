@@ -90,6 +90,16 @@ impl SpeculativeCaptureEntry {
         &self.bounded_dimensions
     }
 
+    /// Compares a borrowed physical shape with this exact declared entry.
+    /// No shape vector or instantiated schema is constructed.
+    pub fn matches_dimensions(&self,rank:usize,mut dimension:impl FnMut(usize)->Option<usize>)->bool{
+        rank==self.shape.len() && self.shape.iter().enumerate().all(|(i,maximum)|{
+            dimension(i).is_some_and(|actual|actual>0 && if self.bounded_dimensions.contains(&i){
+                actual<=*maximum
+            }else{actual==*maximum})
+        })
+    }
+
     /// Returns the rank or component that owns publication.
     pub const fn owner(&self) -> &SpeculativeIdentity {
         &self.owner
@@ -173,16 +183,7 @@ impl SpeculativeCaptureSchema {
         }
         let mut entries = Vec::with_capacity(self.entries.len());
         for (expected, shape) in self.entries.iter().zip(shapes) {
-            if shape.len() != expected.shape.len()
-                || shape.contains(&0)
-                || shape.iter().enumerate().any(|(dimension, actual)| {
-                    let maximum = expected.shape[dimension];
-                    if expected.bounded_dimensions.contains(&dimension) {
-                        *actual > maximum
-                    } else {
-                        *actual != maximum
-                    }
-                })
+            if !expected.matches_dimensions(shape.len(),|i|shape.get(i).copied())
             {
                 return Err(SpeculativeCaptureError::ShapeMismatch);
             }
@@ -892,6 +893,39 @@ impl SpeculativeLaneIdentity {
     }
 }
 
+mod lane_identity_sealed {
+    pub trait Sealed {}
+    impl Sealed for super::SpeculativeLaneIdentity {}
+    impl Sealed for super::SpeculativeLaneIdentityRef<'_> {}
+}
+/// Common read-only identity contract. Both owning ordinary and borrowed
+/// prepared identities use the same capture comparison worker.
+pub trait SpeculativeLaneIdentityView: lane_identity_sealed::Sealed {
+    /// Exact selected model-level identity and placement.
+    fn realization(&self) -> &SelectedSpeculativeState;
+    /// Exact prepared-input identity.
+    fn prepared_input(&self) -> &SpeculativeIdentity;
+    /// Current target capture generation.
+    fn capture_generation(&self) -> u64;
+}
+impl SpeculativeLaneIdentityView for SpeculativeLaneIdentity {
+    fn realization(&self) -> &SelectedSpeculativeState { &self.realization }
+    fn prepared_input(&self) -> &SpeculativeIdentity { &self.prepared_input }
+    fn capture_generation(&self) -> u64 { self.capture_generation }
+}
+/// Allocation-free view borrowed from the actual selected and input owners.
+#[derive(Debug, Clone, Copy)]
+pub struct SpeculativeLaneIdentityRef<'a> {
+    realization: &'a SelectedSpeculativeState,
+    prepared_input: &'a SpeculativeIdentity,
+    capture_generation: u64,
+}
+impl SpeculativeLaneIdentityView for SpeculativeLaneIdentityRef<'_> {
+    fn realization(&self) -> &SelectedSpeculativeState { self.realization }
+    fn prepared_input(&self) -> &SpeculativeIdentity { self.prepared_input }
+    fn capture_generation(&self) -> u64 { self.capture_generation }
+}
+
 impl SelectedSpeculativeState {
     /// Returns exact architecture and artifact identity ingredients.
     pub const fn identity(&self) -> &SpeculativeStateCacheIdentityIngredients {
@@ -953,16 +987,49 @@ impl SelectedSpeculativeRealization {
         }
     }
 
+    /// Borrows exact lane identity without cloning selected source metadata.
+    pub fn lane_identity_ref<'a>(
+        &'a self, prepared_input: &'a SpeculativeIdentity, capture_generation: u64,
+    ) -> SpeculativeLaneIdentityRef<'a> {
+        SpeculativeLaneIdentityRef { realization: &self.state, prepared_input, capture_generation }
+    }
+
+    /// Validates values emitted in the retained capture declaration's order.
+    /// The repeatable borrowed iterator preserves count-before-shape rejection.
+    /// Foreign envelopes must still use validate_capture to compare their schema.
+    pub fn validate_capture_values<'a,T:'a,I,E>(
+        &self,lane:&(impl SpeculativeLaneIdentityView+?Sized),generation:u64,
+        mut values:impl FnMut()->I,
+        mut matches:impl FnMut(&T,&SpeculativeCaptureEntry)->Result<bool,E>,
+        refusal:impl Fn(SpeculativeCaptureError)->E,
+    )->Result<(),E>
+    where I:Iterator<Item=&'a T> {
+        if lane.realization()!=&self.state {
+            return Err(refusal(SpeculativeCaptureError::RealizationMismatch));
+        }
+        let actual=values().count();let expected=self.requirements.capture.entries.len();
+        if actual!=expected{return Err(refusal(SpeculativeCaptureError::ValueCount{expected,actual}));}
+        for (value,entry) in values().zip(&self.requirements.capture.entries){
+            if !matches(value,entry)?{return Err(refusal(SpeculativeCaptureError::ShapeMismatch));}
+        }
+        if generation!=lane.capture_generation(){
+            return Err(refusal(SpeculativeCaptureError::GenerationMismatch{
+                expected:lane.capture_generation(),actual:generation,
+            }));
+        }
+        Ok(())
+    }
+
     /// Validates an actual target capture at the lane boundary.
     pub fn validate_capture<T>(
         &self,
-        lane: &SpeculativeLaneIdentity,
+        lane: &(impl SpeculativeLaneIdentityView + ?Sized),
         capture: &SpeculativeCaptureEnvelope<T>,
     ) -> Result<(), SpeculativeCaptureError> {
-        if lane.realization != self.state {
+        if lane.realization() != &self.state {
             return Err(SpeculativeCaptureError::RealizationMismatch);
         }
-        capture.validate_against(&self.requirements.capture, lane.capture_generation)
+        capture.validate_against(&self.requirements.capture, lane.capture_generation())
     }
 }
 
@@ -1838,6 +1905,10 @@ mod tests {
         )
         .unwrap();
         selected.validate_capture(&lane, &envelope).unwrap();
+        let borrowed = selected.lane_identity_ref(lane.prepared_input(), 11);
+        selected.validate_capture(&borrowed, &envelope).unwrap();
+        assert_eq!(borrowed.prepared_input(), lane.prepared_input());
+        assert_eq!(borrowed.capture_generation(), lane.capture_generation());
         assert_eq!(lane.prepared_input().as_str(), "prepared-input-42");
         assert_eq!(lane.capture_generation(), 11);
 
@@ -1851,5 +1922,40 @@ mod tests {
             other.validate_capture(&lane, &envelope),
             Err(SpeculativeCaptureError::RealizationMismatch)
         );
+        assert_eq!(
+            other.validate_capture(&borrowed, &envelope),
+            Err(SpeculativeCaptureError::RealizationMismatch)
+        );
     }
+    #[test]
+    fn borrowed_capture_values_preserve_schema_bounds_failure_order_and_generation() {
+        let mut requirements=requirements(SpeculativeStrategyClass::EmbeddedSequential);
+        requirements.capture.entries[0].bounded_dimensions.insert(1);
+        let selected=select_speculative_realization(&requirements,
+            &request(&requirements,SpeculativePlacementRequest::Single),&capabilities()).unwrap();
+        let input=id("borrowed-shape-input");
+        let lane=selected.lane_identity_ref(&input,11);
+        let shapes=[[1usize,1,8],[1,2,8]];
+        let compare=|shape:&[usize;3],entry:&SpeculativeCaptureEntry|
+            Ok::<_,SpeculativeCaptureError>(entry.matches_dimensions(shape.len(),|i|shape.get(i).copied()));
+        selected.validate_capture_values(&lane,11,||shapes.iter(),compare,|e|e).unwrap();
+        let ordinary=requirements.capture.instantiate(shapes.iter().map(|s|s.to_vec())).unwrap();
+        let envelope=SpeculativeCaptureEnvelope::new(SpeculativeCaptureMetadata::new(ordinary,11),vec![7,19]).unwrap();
+        selected.validate_capture(&lane,&envelope).unwrap();
+        assert!(matches!(selected.validate_capture_values(&lane,12,||shapes.iter(),compare,|e|e),
+            Err(SpeculativeCaptureError::GenerationMismatch{expected:11,actual:12})));
+        let calls=Cell::new(0);
+        assert!(matches!(selected.validate_capture_values(&lane,11,||shapes[..1].iter(),
+            |_,_|{calls.set(calls.get()+1);Ok::<_,SpeculativeCaptureError>(true)},|e|e),
+            Err(SpeculativeCaptureError::ValueCount{expected:2,actual:1})));
+        assert_eq!(calls.get(),0,"cardinality refuses before shape inspection");
+        for bad in [[[1,0,8],[1,2,8]],[[1,3,8],[1,2,8]],[[1,1,8],[1,1,8]]] {
+            assert!(matches!(selected.validate_capture_values(&lane,11,||bad.iter(),compare,|e|e),
+                Err(SpeculativeCaptureError::ShapeMismatch)));
+        }
+        assert!(matches!(selected.validate_capture_values(&lane,11,||shapes.iter(),
+            |_,_|Err::<bool,_>(SpeculativeCaptureError::RealizationMismatch),|e|e),
+            Err(SpeculativeCaptureError::RealizationMismatch)));
+    }
+
 }

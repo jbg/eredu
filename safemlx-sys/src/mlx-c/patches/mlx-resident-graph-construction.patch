@@ -1,0 +1,180 @@
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -25,6 +25,18 @@
+ };
+ MLX_API bool pointwise_graph_layout(size_t operations, size_t maximum_rank,
+     PointwiseGraphLayout&) noexcept;
++
++// Closed resident lowerings: scalar/full, unary/binary/ternary, metadata
++// views/static slice, dense strict embedding including its validation graph,
++// dense/affine/direct packed matrix, normalization, reduction and rotary controls.
++// Ordinary std::vector/set axis storage is outside this Graph-only recipe.
++struct ResidentGraphLayout : GraphConstructionLayout {
++  size_t primitives{0}, seeds{0}, maximum_rank{0}, maximum_operands{4};
++};
++MLX_API bool resident_graph_layout(size_t primitives, size_t seeds,
++    size_t maximum_rank, ResidentGraphLayout&) noexcept;
++MLX_API bool resident_graph_layout_with_operands(size_t primitives, size_t seeds,
++    size_t maximum_rank, size_t maximum_operands, ResidentGraphLayout&) noexcept;
+ 
+ // Four fixed-Eval host requests; no Data, worker or stream-frontier owners.
+ struct EvalGraphLayout : GraphConstructionLayout {
+@@ -64,6 +76,8 @@
+   static bool complete_layout(GraphConstructionLayout&) noexcept;
+   static GraphFailure create(GraphQuota&, uint64_t scope,
+       const PointwiseGraphLayout&, GraphConstruction*&) noexcept;
++  static GraphFailure create_resident(GraphQuota&, uint64_t scope,
++      const ResidentGraphLayout&, GraphConstruction*&) noexcept;
+   static GraphFailure create_eval(GraphQuota&, uint64_t scope,
+       const Record& dispatch, GraphConstruction*&) noexcept;
+   static GraphFailure create_gpu_prologue(const GpuEvalPrologueGuard&, GraphConstruction*&) noexcept;
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -1,6 +1,10 @@
+ #include "mlx/graph_quota.h"
+ #include "mlx/graph_construction.h"
+ #include "mlx/submission.h"
++#include "mlx/prepared_input.h"
++#include "mlx/primitives.h"
++#include "mlx/fast_primitives.h"
++#include <climits>
+ 
+ #include <algorithm>
+ #include <cassert>
+@@ -324,6 +328,134 @@
+     return GraphFailure::invalid_layout;
+   return create_layout(quota, scope, nullptr, actual, output);
+ }
++namespace {
++template<class T> size_t resident_primitive_control() noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++  using Control = std::__shared_ptr_emplace<T, GraphAllocator<T>>;
++  static_assert(alignof(Control) <= alignof(std::max_align_t));
++  return sizeof(Control);
++#else
++  return 0;
++#endif
++}
++bool resident_multiply(size_t a, size_t b, size_t& output) noexcept {
++  if (b && a > std::numeric_limits<size_t>::max() / b) return false;
++  output = a * b; return true;
++}
++}
++bool resident_graph_layout(size_t primitives, size_t seeds, size_t rank,
++    ResidentGraphLayout& output) noexcept {
++  return resident_graph_layout_with_operands(primitives, seeds, rank, 4, output);
++}
++bool resident_graph_layout_with_operands(size_t primitives, size_t seeds, size_t rank,
++    size_t maximum_operands, ResidentGraphLayout& output) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  if (rank > size_t(INT_MAX) || maximum_operands < 4) return false;
++  size_t descriptors;
++  if (!add(primitives, seeds, descriptors)) return false;
++  GraphQuota::Request leaf[5]{}; size_t leaf_count = 0;
++  if (!PreparedInputLeaf::append_array_requests(0, leaf, leaf_count) || leaf_count != 3) return false;
++  const size_t control = std::max({leaf[2].bytes,
++      resident_primitive_control<AsType>(), resident_primitive_control<Broadcast>(),
++      resident_primitive_control<Add>(), resident_primitive_control<Subtract>(),
++      resident_primitive_control<Multiply>(), resident_primitive_control<Divide>(),
++      resident_primitive_control<LogicalOr>(), resident_primitive_control<LogicalAnd>(),
++      resident_primitive_control<LogicalNot>(), resident_primitive_control<GreaterEqual>(),
++      resident_primitive_control<Less>(), resident_primitive_control<Equal>(),
++      resident_primitive_control<Maximum>(), resident_primitive_control<Select>(),
++      resident_primitive_control<Square>(), resident_primitive_control<Exp>(),
++      resident_primitive_control<Tanh>(), resident_primitive_control<Reshape>(),
++      resident_primitive_control<Squeeze>(), resident_primitive_control<ExpandDims>(),
++      resident_primitive_control<Transpose>(), resident_primitive_control<Contiguous>(),
++      resident_primitive_control<Copy>(), resident_primitive_control<Full>(),
++      resident_primitive_control<Gather>(), resident_primitive_control<Reduce>(),
++      resident_primitive_control<Slice>(), resident_primitive_control<SliceUpdate>(),
++      resident_primitive_control<ArgReduce>(),
++      resident_primitive_control<Matmul>(), resident_primitive_control<AddMM>(),
++      resident_primitive_control<QuantizedMatmul>(),
++      resident_primitive_control<fast::CustomKernel>(),
++      resident_primitive_control<Sqrt>(), resident_primitive_control<Sigmoid>(),
++      resident_primitive_control<Negative>(),
++      resident_primitive_control<Softmax>(), resident_primitive_control<StopGradient>(),
++      resident_primitive_control<Arange>(), resident_primitive_control<Cos>(),
++      resident_primitive_control<Sin>(), resident_primitive_control<Concatenate>(),
++      resident_primitive_control<fast::RMSNorm>(), resident_primitive_control<fast::LayerNorm>(),
++      resident_primitive_control<fast::RoPE>(),
++      resident_primitive_control<fast::ScaledDotProductAttention>()});
++  ResidentGraphLayout value;
++  value.primitives = primitives; value.seeds = seeds; value.maximum_rank = rank;
++  value.maximum_operands = maximum_operands;
++  value.request_bytes[0] = leaf[0].bytes;
++  value.request_bytes[1] = leaf[1].bytes;
++  value.request_bytes[2] = control;
++  // Fixed-operand paths reserve their original capacity four. A real batched
++  // RoPE concatenate can grow its input list geometrically: every allocation
++  // has capacity below twice the actual operand count, including its copy.
++  size_t vector_elements;
++  if (maximum_operands == 4) vector_elements = 4;
++  else if (!resident_multiply(maximum_operands, 2, vector_elements)) return false;
++  if (!resident_multiply(vector_elements, sizeof(array), value.request_bytes[3])) return false;
++  value.request_alignments[0] = leaf[0].alignment;
++  value.request_alignments[1] = leaf[1].alignment;
++  value.request_alignments[2] = alignof(std::max_align_t);
++  value.request_alignments[3] = alignof(array);
++  value.request_counts[0] = value.request_counts[1] = value.request_counts[2] = descriptors;
++  // Closed scalar/matrix lowerings use at most three ArrayVector requests
++  // per potential primitive. Batched concatenate contributes one cast per
++  // operand, covering its geometric input-list growth within 3P. CustomKernel's single-output
++  // path includes source-list growth (<=3), one copied input list, one output
++  // vector and one sibling-prefix vector; cast/reshape vectors bring its
++  // three-node prefix to <=8 requests. Matmul/affine use fewer than 3P.
++  if (!resident_multiply(primitives, 3, value.request_counts[3])) return false;
++  if (rank > Shape::inline_capacity) {
++    size_t doubled;
++    if (!resident_multiply(rank, 2, doubled) ||
++        !resident_multiply(std::max(doubled, 2 * Shape::inline_capacity),
++            sizeof(Shape::value_type), value.request_bytes[4]) ||
++        !resident_multiply(descriptors, 6, value.request_counts[4])) return false;
++    value.request_alignments[4] = alignof(Shape::value_type);
++  }
++  // Six Shape requests per node cover Slice's three C inputs, normalize's
++  // return copy and descriptor copy. Other closed cases use fewer. Reserving
++  // the maximum extent covers both copy-exact and copy-then-insert doubling;
++  // high-rank Gather/ExpandDims do not use the fresh-vector growth rule.
++  if (rank > Strides::inline_capacity) {
++    if (!resident_multiply(std::max(rank, 2 * Strides::inline_capacity),
++        sizeof(Strides::value_type), value.request_bytes[5])) return false;
++    value.request_alignments[5] = alignof(Strides::value_type);
++    value.request_counts[5] = descriptors;
++  }
++  // Operation-result shells have one term per potential constructor, including
++  // elided primitives. Independent Rust/Array clone transports are not derived
++  // from P+S: their admitted population remains a separate caller obligation.
++  // The physical bank refuses an unaccounted request; it grants no whole-fit
++  // success promise for a semantic program containing additional alias copies.
++  value.request_bytes[6] = sizeof(PreparedInputArray);
++  value.request_alignments[6] = alignof(PreparedInputArray);
++  value.request_counts[6] = descriptors;
++  for (size_t i = 0; i < GraphConstructionLayout::classes; ++i) {
++    if (value.request_bytes[i] > size_t(PTRDIFF_MAX)) return false;
++    if (!value.request_alignments[i]) value.request_alignments[i] = 1;
++  }
++  value.named_control_bytes = sizeof(value) + sizeof(leaf) + sizeof(leaf_count) +
++      sizeof(primitives) + sizeof(seeds) + sizeof(rank) + sizeof(descriptors) + sizeof(control) +
++      sizeof(maximum_operands) + sizeof(vector_elements);
++  if (!GraphConstruction::complete_layout(value)) return false;
++  output = value; return true;
++#endif
++}
++GraphFailure GraphConstruction::create_resident(GraphQuota& quota, uint64_t scope,
++    const ResidentGraphLayout& layout, GraphConstruction*& output) noexcept {
++  const auto context = current_graph_construction_context();
++  if (output || !scope || context.worker || context.dispatch || context.scope != scope ||
++      current_graph_quota() != &quota) return GraphFailure::foreign_parent;
++  ResidentGraphLayout actual;
++  if (!resident_graph_layout_with_operands(layout.primitives, layout.seeds, layout.maximum_rank, layout.maximum_operands, actual))
++    return GraphFailure::invalid_layout;
++  return create_layout(quota, scope, nullptr, actual, output);
++}
+ GraphFailure GraphConstruction::create_eval(GraphQuota& quota, uint64_t scope,
+     const Record& dispatch, GraphConstruction*& output) noexcept {
+   const auto context = current_graph_construction_context();

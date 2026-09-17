@@ -132,7 +132,7 @@ impl PartitionCaptureContext {
 
 /// One locally transformed fragment. Exact placement comes from retained
 /// producer admission, not from untrusted coordinates in a received message.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionCaptureFragmentRecord {
     /// Ordinal in this producer's original validated projection.
@@ -144,7 +144,7 @@ pub struct PartitionCaptureFragmentRecord {
 /// Explicit receipt from one expected producer, including an empty selection.
 /// Native failures/completion are established separately by the forward owner;
 /// receipt arrival alone cannot prove a native forward has completed safely.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PartitionCaptureProducerRecord {
     /// Exact supported host-record version.
@@ -162,4 +162,59 @@ pub struct PartitionCaptureProducerRecord {
     pub source_dtype: Option<crate::checkpoint::TensorDtype>,
     /// Every expected local fragment, each appearing exactly once.
     pub fragments: Vec<PartitionCaptureFragmentRecord>,
+}
+
+/// Borrowed view of the same canonical fragment record. Construction supplies
+/// no provenance, native completion, or allocation authority.
+#[derive(Debug, Serialize)]
+pub struct BorrowedPartitionCaptureFragmentRecord<'a, R: ?Sized = CaptureRecord> {
+    /// Ordinal in the original validated producer projection.
+    pub fragment_index: usize,
+    /// Existing completed record; its payload is never cloned by this view. The
+    /// shared cold counter may instead lend a fixed null sentinel to measure the
+    /// same envelope independently of its separately bounded record body.
+    pub record: &'a R,
+}
+
+/// Borrowed fields for the canonical producer receipt serializer. `fragments`
+/// is the exact ordered fragment sequence supplied by the shared runtime; this
+/// view does not validate or grant capture/source authority.
+#[derive(Debug, Serialize)]
+pub struct BorrowedPartitionCaptureProducerRecord<'a, F> {
+    /// Exact existing host-record version.
+    pub schema_version: u32,
+    /// Retained assembly equation.
+    pub combination: PartitionCaptureCombination,
+    /// Original retained receipt identity.
+    pub receipt_plan_identity: &'a str,
+    /// Original retained execution context.
+    pub context: &'a PartitionCaptureContext,
+    /// Independently known sender rank.
+    pub producer_rank: usize,
+    /// Actual source precision, including an empty selection.
+    pub source_dtype: Option<&'a crate::checkpoint::TensorDtype>,
+    /// Existing fragment records in their validated order.
+    pub fragments: F,
+}
+
+impl Serialize for PartitionCaptureFragmentRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        BorrowedPartitionCaptureFragmentRecord {
+            fragment_index: self.fragment_index,
+            record: &self.record,
+        }.serialize(serializer)
+    }
+}
+impl Serialize for PartitionCaptureProducerRecord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        BorrowedPartitionCaptureProducerRecord {
+            schema_version: self.schema_version,
+            combination: self.combination,
+            receipt_plan_identity: &self.receipt_plan_identity,
+            context: &self.context,
+            producer_rank: self.producer_rank,
+            source_dtype: self.source_dtype.as_ref(),
+            fragments: &self.fragments,
+        }.serialize(serializer)
+    }
 }

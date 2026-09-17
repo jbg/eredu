@@ -4,6 +4,8 @@ use crate::{capture::*, intervention::*};
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
 mod tests;
+mod source;
+pub use source::SpeculativeActivationSourceError;
 
 /// Wire version for internal speculative capture plans and discovery.
 pub const SPECULATIVE_ACTIVATION_SCHEMA_VERSION: u32 = 2;

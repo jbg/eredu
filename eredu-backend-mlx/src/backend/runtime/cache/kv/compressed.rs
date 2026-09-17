@@ -2,6 +2,11 @@
 
 use super::*;
 
+mod prepared_copy;
+pub(crate) use prepared_copy::InvalidResidentCopy;
+pub(crate) use prepared_copy::PreparedCompressedCopy;
+mod workspace;
+
 const COMPRESSED_LATENT_CACHE_STEP: i32 = 256;
 
 /// Compressed attention cache that stores one latent KV vector and one rotary
@@ -40,6 +45,13 @@ impl Default for CompressedLatentCache {
 }
 
 impl CompressedLatentCache {
+    /// Cold allocation granularity of the default resident realization. This
+    /// reports a mechanism fact without constructing a cache, device or tensor.
+    pub const fn default_resident_capacity_step() -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(COMPRESSED_LATENT_CACHE_STEP as u32)
+            .expect("resident compressed cache step is positive")
+    }
+
     /// Creates an empty compressed latent cache.
     pub fn new() -> Self {
         Self::default()
@@ -65,6 +77,9 @@ impl CompressedLatentCache {
     /// continuation accounting separately includes future chunk allocation.
     /// Paged callers must bind the copied tail to an independently copied manager.
     pub(crate) fn isolated_snapshot(&self, stream: &Stream) -> Result<Self, Exception> {
+        if self.paged.is_none() {
+            return self.prepare_isolated_copy()?.copy(stream);
+        }
         let copy = |array: &Option<Array>| {
             array
                 .as_ref()
@@ -75,14 +90,20 @@ impl CompressedLatentCache {
         if let Some(paged) = snapshot.paged.as_deref_mut() {
             paged.tail_latent = copy(&paged.tail_latent)?;
             paged.tail_rotary = copy(&paged.tail_rotary)?;
-        } else {
-            snapshot.latent_storage = copy(&self.latent)?;
-            snapshot.rotary_key_storage = copy(&self.rotary_key)?;
-            snapshot.latent = snapshot.latent_storage.clone();
-            snapshot.rotary_key = snapshot.rotary_key_storage.clone();
-            snapshot.capacity = snapshot.length;
         }
         Ok(snapshot)
+    }
+
+    /// Borrows the exact logical operands of the resident isolated-copy program.
+    /// Paged storage needs its separate manager-copy mechanism.
+    pub(crate) fn prepare_isolated_copy(&self) -> Result<PreparedCompressedCopy<'_>, Exception> {
+        PreparedCompressedCopy::new(self)
+    }
+
+    pub(crate) fn prepare_isolated_copy_fixed(
+        &self,
+    ) -> Result<PreparedCompressedCopy<'_>, prepared_copy::InvalidResidentCopy> {
+        PreparedCompressedCopy::new_fixed(self)
     }
 
     /// Forks mutable cache state while retaining the immutable paging catalog.
@@ -203,15 +224,34 @@ impl CompressedLatentCache {
         Some((self.latent.as_ref()?, self.rotary_key.as_ref()?))
     }
 
+    /// All held resident backing and logical views, or the mutable paged tail.
+    /// A checkpoint may give stores and views independent backing. Physical
+    /// inventories deduplicate aliases; numerical copy operands stay separate.
     pub fn retained_arrays(&self) -> Vec<&Array> {
+        self.borrowed_retained_arrays().collect()
+    }
+
+    fn borrowed_retained_arrays(&self) -> impl Iterator<Item = &Array> {
         match self.paged.as_deref() {
-            Some(paged) => paged
-                .tail_latent
-                .iter()
-                .chain(paged.tail_rotary.iter())
-                .collect(),
-            None => self.latent.iter().chain(self.rotary_key.iter()).collect(),
+            Some(paged) => [
+                paged.tail_latent.as_ref(),
+                paged.tail_rotary.as_ref(),
+                None,
+                None,
+            ],
+            None => [
+                self.latent_storage.as_ref(),
+                self.rotary_key_storage.as_ref(),
+                self.latent.as_ref(),
+                self.rotary_key.as_ref(),
+            ],
         }
+        .into_iter()
+        .flatten()
+    }
+
+    pub(crate) fn borrowed_retained_values(&self) -> impl Iterator<Item = &MlxTensor> {
+        self.borrowed_retained_arrays().map(retained_tensor)
     }
 
     #[cfg(test)]
@@ -422,6 +462,12 @@ impl CompressedLatentCache {
 impl eredu_runtime::RuntimeLayerState<MlxNeuralBackend> for CompressedLatentCache {
     type RetainedValues<'a> = RetainedArrayVecIter<'a>;
 
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) {
+        for value in self.borrowed_retained_values() {
+            visitor(value);
+        }
+    }
+
     fn retained_values(&self) -> Self::RetainedValues<'_> {
         self.retained_arrays().into_iter().map(retained_tensor)
     }
@@ -450,7 +496,7 @@ impl CompressedAttentionCache<MlxTensor> for CompressedLatentCache {
                 state.rotary.into_array(),
                 context,
             )
-            .map_err(ComputeError::backend)?;
+            .map_err(ComputeError::backend_source)?;
         if self.is_paged() {
             Ok(CompressedAttentionView::Paged { appended })
         } else {
@@ -476,15 +522,15 @@ impl CompressedAttentionCache<MlxTensor> for CompressedLatentCache {
             .paged
             .as_deref_mut()
             .ok_or_else(|| ComputeError::backend("compressed block scan requires paged state"))?;
-        let block_ids = paged.block_ids().map_err(ComputeError::backend)?;
+        let block_ids = paged.block_ids().map_err(ComputeError::backend_source)?;
         let manager = paged.manager.clone();
         let global_layer = paged.global_layer;
         let tail = paged.tail_block();
         let mut scan = CompressedAttentionScan::default();
         let mut blocks = manager
             .prefetch_blocks(block_ids, context)
-            .map_err(ComputeError::backend)?;
-        while let Some(lease) = blocks.next_block().map_err(ComputeError::backend)? {
+            .map_err(ComputeError::backend_source)?;
+        while let Some(lease) = blocks.next_block().map_err(ComputeError::backend_source)? {
             let id = lease.id();
             let state = match lease.arrays() {
                 CacheBlockArrays::CompressedLatentRotary { latent, rotary_key } => {
@@ -532,7 +578,7 @@ impl CompressedAttentionCache<MlxTensor> for CompressedLatentCache {
                 scan.bytes,
                 scan.reconstruction_scratch_bytes,
             )
-            .map_err(ComputeError::backend)?;
+            .map_err(ComputeError::backend_source)?;
         Ok(scan)
     }
 
@@ -546,15 +592,15 @@ impl CompressedAttentionCache<MlxTensor> for CompressedLatentCache {
         context: &Stream,
     ) -> Result<(), ComputeError> {
         self.restore_checkpoint(checkpoint, context)
-            .map_err(ComputeError::backend)
+            .map_err(ComputeError::backend_source)
     }
 
     fn finalize(&mut self) -> Result<(), ComputeError> {
-        CompressedLatentCache::finalize(self).map_err(ComputeError::backend)
+        CompressedLatentCache::finalize(self).map_err(ComputeError::backend_source)
     }
 
     fn clear(&mut self) -> Result<(), ComputeError> {
-        CompressedLatentCache::clear(self).map_err(ComputeError::backend)
+        CompressedLatentCache::clear(self).map_err(ComputeError::backend_source)
     }
 }
 
@@ -675,11 +721,19 @@ impl PagedCompressedLatentCache {
             let latent_part = latent.try_index_device((.., input_start..input_end, ..), stream)?;
             let rotary_part = rotary.try_index_device((.., input_start..input_end, ..), stream)?;
             let candidate_latent = match &self.tail_latent {
-                Some(previous) => concatenate_axis(&[previous.clone(), latent_part], 1, stream)?,
+                Some(previous) => {
+                    let joined = concatenate_axis(&[previous, &latent_part], 1, stream);
+                    drop(latent_part);
+                    joined?
+                }
                 None => latent_part,
             };
             let candidate_rotary = match &self.tail_rotary {
-                Some(previous) => concatenate_axis(&[previous.clone(), rotary_part], 1, stream)?,
+                Some(previous) => {
+                    let joined = concatenate_axis(&[previous, &rotary_part], 1, stream);
+                    drop(rotary_part);
+                    joined?
+                }
                 None => rotary_part,
             };
             let candidate_bytes =

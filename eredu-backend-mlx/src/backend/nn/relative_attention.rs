@@ -31,7 +31,6 @@ impl RelativeAttentionKernel {
         let end = input
             .query_offset
             .checked_add(query_len)
-            .and_then(|value| value.checked_add(1))
             .ok_or_else(|| Exception::custom("relative query position overflow"))?;
         if input.query_offset < 0 {
             return Err(Exception::custom("negative relative query position"));
@@ -40,15 +39,18 @@ impl RelativeAttentionKernel {
             input
                 .log_scaling_floor
                 .map(|floor| {
-                    let positions = arange::<i32, i32>(input.query_offset + 1, end, 1, stream)?;
+                    // The largest admitted position plus one still fits I32;
+                    // its exclusive arange endpoint need not fit after shifting.
+                    let positions = arange::<i32, i32>(input.query_offset, end, 1, stream)?
+                        .add(Array::try_from_int(1)?, stream)?;
                     let ratio = positions
                         .as_dtype(Dtype::Float32, stream)?
-                        .divide(Array::from_f32(floor as f32), stream)?;
-                    let ratio = maximum(ratio, Array::from_f32(1.0), stream)?;
+                        .divide(Array::try_from_f32(floor as f32)?, stream)?;
+                    let ratio = maximum(ratio, Array::try_from_f32(1.0)?, stream)?;
                     let tau = ratio
                         .log(stream)?
-                        .multiply(Array::from_f32(input.log_scaling_alpha), stream)?;
-                    tau.add(Array::from_f32(1.0), stream)?
+                        .multiply(Array::try_from_f32(input.log_scaling_alpha)?, stream)?;
+                    tau.add(Array::try_from_f32(1.0)?, stream)?
                         .reshape(&[1, 1, query_len, 1], stream)
                 })
                 .transpose()?
@@ -99,9 +101,9 @@ impl RelativeAttentionKernel {
         )?;
         let bias = take_along_axis(&self.profiles, &gather, -1, stream)?;
         let valid = distances
-            .ge(Array::from_int(0), stream)?
-            .logical_and(&distances.lt(Array::from_int(extent), stream)?, stream)?;
-        let bias = r#where(&valid, bias, Array::from_f32(0.0), stream)?;
+            .ge(Array::try_from_int(0)?, stream)?
+            .logical_and(&distances.lt(Array::try_from_int(extent)?, stream)?, stream)?;
+        let bias = r#where(&valid, bias, Array::try_from_f32(0.0)?, stream)?;
         match &self.scaling {
             Some(scale) => bias.multiply(scale, stream),
             None => Ok(bias),
@@ -114,4 +116,50 @@ impl RelativeAttentionKernel {
             .as_ref()
             .map_or(0, |scale| (scale.nbytes() + self.queries.nbytes()) as u64)
     }
+}
+
+/// Owning safe-wrapper transports in the existing constructor and bias worker.
+/// Each count follows an actual call or immutable clone; nested primitive
+/// descriptors are independently counted by the source recipe.
+pub(crate) fn returned_handles(repeated: bool, scaled: bool, windowed: bool) -> Option<usize> {
+    // Outer coordinates6 + scalar1, kernel query/profile clones2,
+    // bias calls15 + scalars5, final attention calls7 + scalars2.
+    38usize.checked_add(if repeated { 6 } else { 2 })?
+        .checked_add(16 * usize::from(scaled))?
+        .checked_add(3 * usize::from(windowed))
+}
+
+pub(crate) fn control_bytes(repeated: bool, scaled: bool, windowed: bool) -> Option<usize> {
+    use std::mem::{size_of, size_of_val};
+    use eredu_nn::Error;
+    let calls = returned_handles(repeated, scaled, windowed)?;
+    let frames = [
+        size_of::<RelativeAttentionInput<'_, MlxTensor>>() * 2,
+        size_of::<RelativeAttentionKernel>() * 2,
+        size_of::<Result<RelativeAttentionKernel, Exception>>(),
+        size_of::<(&RelativeAttentionInput<'_, MlxTensor>, &Stream)>(),
+        size_of::<(&RelativeAttentionKernel, i64, i64, &Stream)>(),
+        size_of::<(&Array, &Stream, i32, i32, i32, i32, i32)>(),
+        size_of::<(&RelativeAttentionInput<'_, MlxTensor>, &Stream, i32, i32)>(),
+        size_of::<[&[i32]; 4]>(),
+        size_of::<[i32; 5]>() * 2,
+        size_of::<[i32; 4]>() * 4,
+        size_of::<[i32; 2]>() * 4,
+        size_of::<[i32; 10]>(),
+        size_of::<[&Array; 8]>(),
+        size_of::<[&Stream; 4]>(),
+        size_of::<Option<Array>>() * 2,
+        size_of::<Option<Result<Array, Exception>>>(),
+        size_of::<Result<Option<Array>, Exception>>(),
+        size_of::<Result<MlxTensor, Error>>(),
+        size_of::<Result<(), Error>>() * 2,
+        size_of::<Result<(), Exception>>(),
+        calls.checked_mul(size_of::<Array>())?,
+        calls.checked_mul(size_of::<Result<Array, Exception>>())?,
+        calls.checked_mul(size_of::<Result<Array, Error>>())?,
+        safemlx::Array::as_dtype_control_bytes()?,
+        crate::tensor::clip::control_bytes()?,
+        safemlx::OriginalScopeObserver::control_bytes()?,
+    ];
+    frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
 }

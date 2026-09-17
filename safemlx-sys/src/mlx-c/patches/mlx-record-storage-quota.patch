@@ -1,0 +1,778 @@
+diff --git a/mlx/CMakeLists.txt b/mlx/CMakeLists.txt
+--- a/mlx/CMakeLists.txt
++++ b/mlx/CMakeLists.txt
+@@ -17,6 +17,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/scheduler.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/stream.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/submission.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/record_quota.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/timing.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/transforms.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/utils.cpp
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -223,10 +223,20 @@
+ }
+ 
+ void array::set_data(allocator::Buffer buffer, Deleter d) {
++  // Take immediate ownership of the incoming buffer before a quota refusal.
++  // Data construction transfers this same owner; failure never orphans it.
++  struct IncomingBuffer {
++    allocator::Buffer buffer;
++    Deleter& deleter;
++    bool armed{true};
++    ~IncomingBuffer() { if (armed) deleter(buffer); }
++  } incoming{buffer, d};
++  auto slot = submission::prepare_capture();
+   auto data = std::make_shared<Data>(buffer, d);
++  incoming.armed = false;
++  slot.commit(data);
+   publish_deferred_allocation_owners(data, array_desc_->deferred_allocation_owners);
+   array_desc_->data = std::move(data);
+-  submission::capture_data(array_desc_->data);
+   array_desc_->offset = 0;
+   array_desc_->data_size = size();
+   array_desc_->flags.contiguous = true;
+@@ -242,10 +252,20 @@
+     Flags flags,
+     int64_t offset,
+     Deleter d) {
++  // Take immediate ownership of the incoming buffer before a quota refusal.
++  // Data construction transfers this same owner; failure never orphans it.
++  struct IncomingBuffer {
++    allocator::Buffer buffer;
++    Deleter& deleter;
++    bool armed{true};
++    ~IncomingBuffer() { if (armed) deleter(buffer); }
++  } incoming{buffer, d};
++  auto slot = submission::prepare_capture();
+   auto data = std::make_shared<Data>(buffer, d);
++  incoming.armed = false;
++  slot.commit(data);
+   publish_deferred_allocation_owners(data, array_desc_->deferred_allocation_owners);
+   array_desc_->data = std::move(data);
+-  submission::capture_data(array_desc_->data);
+   array_desc_->offset = offset;
+   array_desc_->data_size = data_size;
+   array_desc_->strides = std::move(strides);
+diff --git a/mlx/record_quota.cpp b/mlx/record_quota.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/record_quota.cpp
+@@ -0,0 +1,179 @@
++#include "mlx/record_quota.h"
++
++#include <algorithm>
++#include <cassert>
++#include <cstring>
++#include <limits>
++#include <new>
++#include <thread>
++
++namespace mlx::core::submission {
++namespace {
++constexpr size_t alignment = alignof(std::max_align_t);
++constexpr size_t absent = std::numeric_limits<size_t>::max();
++
++bool add(size_t a, size_t b, size_t& out) noexcept {
++  if (a > absent - b) return false;
++  out = a + b;
++  return true;
++}
++bool align_up(size_t value, size_t align, size_t& out) noexcept {
++  if (!align || (align & (align - 1))) return false;
++  if (!add(value, align - 1, out)) return false;
++  out &= ~(align - 1);
++  return true;
++}
++size_t header_bytes() noexcept {
++  return (sizeof(RecordQuota) + alignment - 1) & ~(alignment - 1);
++}
++struct ArenaConstruction {
++  RecordQuotaLayout facts;
++  void* memory;
++};
++struct ArenaRetirement {
++  void* allocation;
++  void* owner;
++  void (*retire)(void*);
++};
++} // namespace
++
++struct alignas(std::max_align_t) RecordQuota::Block {
++  size_t bytes;
++  size_t previous;
++  size_t next;
++  bool free;
++};
++struct RecordQuota::Loan {
++  const RecordQuota& quota;
++  explicit Loan(const RecordQuota& value) noexcept : quota(value) {
++    // Arithmetic/link updates only; never constructors/destructors/callbacks.
++    while (quota.loan_.test_and_set(std::memory_order_acquire))
++      std::this_thread::yield();
++  }
++  ~Loan() { quota.loan_.clear(std::memory_order_release); }
++};
++
++const char* RecordQuotaError::what() const noexcept {
++  switch (cause_) {
++    case QuotaFailure::exhausted: return "submission tracking capacity exhausted";
++    case QuotaFailure::invalid_layout: return "invalid submission tracking layout";
++    case QuotaFailure::foreign_parent: return "submission tracking parent mismatch";
++    case QuotaFailure::unbound_record: return "record requires its bounded factory";
++  }
++  return "submission tracking failure";
++}
++
++bool RecordQuota::layout(size_t capacity, RecordQuotaLayout& out) noexcept {
++  size_t total;
++  // This is the minimum physical allocator block, not a graph-fit assertion.
++  size_t minimum;
++  if (!add(sizeof(Block) + sizeof(size_t) + alignment - 1, minimum_record_object_bytes(), minimum) ||
++      capacity < minimum ||
++      capacity > std::numeric_limits<ptrdiff_t>::max() ||
++      !add(header_bytes(), capacity, total)) {
++    return false;
++  }
++  out = {capacity, total, alignment,
++      sizeof(ArenaRetirement) + sizeof(ArenaConstruction) + sizeof(Loan)};
++  return true;
++}
++
++RecordQuota::RecordQuota(size_t capacity, void* owner, void (*retire)(void*)) noexcept
++    : capacity_(capacity), owner_(owner), retire_(retire) {
++  ::new (bytes()) Block{capacity, absent, absent, true};
++}
++
++RecordQuota* RecordQuota::create(size_t capacity, void* owner, void (*retire)(void*)) {
++  ArenaConstruction construction{};
++  if (!layout(capacity, construction.facts))
++    throw RecordQuotaError(QuotaFailure::invalid_layout);
++  construction.memory = ::operator new(construction.facts.allocation_bytes, std::align_val_t(alignment));
++  // No failure or owner callback follows allocation before handoff.
++  return ::new (construction.memory) RecordQuota(capacity, owner, retire);
++}
++
++void RecordQuota::retain() noexcept {
++  const auto prior = references_.fetch_add(1, std::memory_order_relaxed);
++  if (prior == std::numeric_limits<size_t>::max()) std::terminate();
++}
++void RecordQuota::release() noexcept {
++  if (references_.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
++  // Every record/scope/resource borrower has a native strong owner. Block
++  // return happens before that owner releases; no live allocation remains.
++  assert(occupied_ == 0);
++  const ArenaRetirement retirement{this, owner_, retire_};
++  this->~RecordQuota();
++  ::operator delete(retirement.allocation, std::align_val_t(alignment));
++  if (retirement.retire) retirement.retire(retirement.owner);
++}
++size_t RecordQuota::occupied_bytes() const noexcept {
++  const Loan loan(*this);
++  return occupied_;
++}
++std::byte* RecordQuota::bytes() noexcept {
++  return reinterpret_cast<std::byte*>(this) + header_bytes();
++}
++RecordQuota::Block* RecordQuota::block(size_t offset) noexcept {
++  return reinterpret_cast<Block*>(bytes() + offset);
++}
++
++void* RecordQuota::allocate(size_t requested, size_t align) {
++  void* result = nullptr;
++  {
++    const Loan loan(*this);
++    auto& c = scratch_;
++    c.result = nullptr;
++    for (c.offset = 0; c.offset != absent; c.offset = block(c.offset)->next) {
++      c.entry = block(c.offset);
++      if (!c.entry->free) continue;
++      c.address = reinterpret_cast<uintptr_t>(bytes() + c.offset);
++      if (!add(c.address, sizeof(Block) + sizeof(size_t), c.start) ||
++          !align_up(c.start, align, c.pointer) ||
++          !add(c.pointer - c.address, std::max(requested, size_t{1}), c.used) ||
++          !align_up(c.used, alignment, c.used) || c.used > c.entry->bytes)
++        continue;
++      c.remainder = c.entry->bytes - c.used;
++      if (c.remainder >= sizeof(Block) + sizeof(size_t) + alignment) {
++        c.next = c.offset + c.used;
++        ::new (bytes() + c.next) Block{c.remainder, c.offset, c.entry->next, true};
++        if (c.entry->next != absent) block(c.entry->next)->previous = c.next;
++        c.entry->next = c.next;
++        c.entry->bytes = c.used;
++      }
++      c.entry->free = false;
++      occupied_ += c.entry->bytes; // disjoint physical blocks, total <= capacity
++      c.result = reinterpret_cast<void*>(c.pointer);
++      // memcpy avoids imposing an alignment requirement on the back-offset.
++      std::memcpy(reinterpret_cast<std::byte*>(c.result) - sizeof(size_t), &c.offset, sizeof(c.offset));
++      break;
++    }
++    result = c.result;
++    // No scratch pointer is an owning reference or consulted outside this loan.
++  }
++  if (!result) throw RecordQuotaError(QuotaFailure::exhausted);
++  return result;
++}
++
++void RecordQuota::deallocate(void* pointer, size_t, size_t) noexcept {
++  const Loan loan(*this);
++  auto& c = scratch_;
++  std::memcpy(&c.offset, reinterpret_cast<std::byte*>(pointer) - sizeof(size_t), sizeof(c.offset));
++  c.entry = block(c.offset);
++  assert(!c.entry->free);
++  occupied_ -= c.entry->bytes;
++  c.entry->free = true;
++  if (c.entry->next != absent && block(c.entry->next)->free) {
++    c.adjacent = block(c.entry->next);
++    c.entry->bytes += c.adjacent->bytes;
++    c.entry->next = c.adjacent->next;
++    if (c.entry->next != absent) block(c.entry->next)->previous = c.offset;
++  }
++  if (c.entry->previous != absent && block(c.entry->previous)->free) {
++    c.adjacent = block(c.entry->previous);
++    c.adjacent->bytes += c.entry->bytes;
++    c.adjacent->next = c.entry->next;
++    if (c.entry->next != absent) block(c.entry->next)->previous = c.entry->previous;
++  }
++}
++
++} // namespace mlx::core::submission
+diff --git a/mlx/record_quota.h b/mlx/record_quota.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/record_quota.h
+@@ -0,0 +1,130 @@
++#pragma once
++
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <exception>
++#include <deque>
++#include <map>
++#include <memory>
++#include <set>
++#include <unordered_map>
++#include <vector>
++#include <limits>
++
++#include "mlx/api.h"
++
++namespace mlx::core::submission {
++
++// A component ceiling, never a prediction that an evaluation graph will fit.
++enum class QuotaFailure : uint8_t {
++  exhausted = 1,
++  invalid_layout = 2,
++  foreign_parent = 3,
++  unbound_record = 4,
++};
++
++class MLX_API RecordQuotaError final : public std::exception {
++ public:
++  explicit RecordQuotaError(QuotaFailure cause) noexcept : cause_(cause) {}
++  const char* what() const noexcept override;
++  QuotaFailure cause() const noexcept { return cause_; }
++ private:
++  QuotaFailure cause_;
++};
++
++// Minimum concrete Record object block, supplied by the actual Eval class.
++// Its containers and future graph may still exhaust a larger admitted ceiling.
++MLX_API size_t minimum_record_object_bytes() noexcept;
++
++struct RecordQuotaLayout {
++  size_t capacity;
++  size_t allocation_bytes;
++  size_t alignment;
++  size_t retirement_controls;
++};
++
++// One allocation: this resource followed by its physical arena. All block
++// headers live inside capacity. No grow/reset/upstream/fallback operation exists.
++// The constructor owner is consumed only on success. Its callback is invoked
++// after the complete allocation is freed, and must only enqueue owned retirement.
++class MLX_API RecordQuota final {
++ public:
++  static bool layout(size_t capacity, RecordQuotaLayout& out) noexcept;
++  static RecordQuota* create(
++      size_t capacity, void* owner, void (*retire)(void*));
++  void retain() noexcept;
++  void release() noexcept;
++  size_t capacity() const noexcept { return capacity_; }
++  // Diagnostic only. Allocation/deallocation, not status/progress, changes it.
++  size_t occupied_bytes() const noexcept;
++  void* allocate(size_t, size_t);
++  void deallocate(void*, size_t, size_t) noexcept;
++
++ private:
++  struct Block;
++  struct Loan;
++  // One serialized allocator scratch representation is part of this exact
++  // header allocation, rather than an unpriced population of heap controls.
++  struct Scratch {
++    void* result = nullptr;
++    Block* entry = nullptr;
++    Block* adjacent = nullptr;
++    size_t offset = 0, start = 0, pointer = 0, used = 0;
++    size_t address = 0, remainder = 0, next = 0;
++  } scratch_;
++  RecordQuota(size_t, void*, void (*)(void*)) noexcept;
++  ~RecordQuota() = default;
++  std::byte* bytes() noexcept;
++  Block* block(size_t) noexcept;
++  std::atomic<size_t> references_{1};
++  mutable std::atomic_flag loan_ = ATOMIC_FLAG_INIT;
++  size_t capacity_;
++  size_t occupied_{0};
++  void* owner_;
++  void (*retire_)(void*);
++};
++
++// Allocator state is one borrowed pointer. The containing Record owns the
++// arena through object deallocation, including construction failure. Scratch
++// containers are lexically nested inside that same entered Record lifetime.
++// No global/default resource or upstream fallback exists for a non-null quota.
++template<class T> class RecordAllocator {
++ public:
++  using value_type = T;
++  RecordAllocator(RecordQuota* value = nullptr) noexcept : quota(value) {}
++  template<class U> RecordAllocator(const RecordAllocator<U>& other) noexcept : quota(other.quota) {}
++  T* allocate(size_t count) {
++    if (count > std::numeric_limits<size_t>::max() / sizeof(T))
++      throw RecordQuotaError(QuotaFailure::invalid_layout);
++    if (quota) return static_cast<T*>(quota->allocate(count * sizeof(T), alignof(T)));
++    return std::allocator<T>{}.allocate(count);
++  }
++  void deallocate(T* pointer, size_t count) noexcept {
++    if (quota) quota->deallocate(pointer, count * sizeof(T), alignof(T));
++    else std::allocator<T>{}.deallocate(pointer, count);
++  }
++  template<class U> bool operator==(const RecordAllocator<U>& other) const noexcept { return quota == other.quota; }
++  template<class U> bool operator!=(const RecordAllocator<U>& other) const noexcept { return quota != other.quota; }
++  RecordQuota* quota;
++};
++template<class T> using RecordVector = std::vector<T, RecordAllocator<T>>;
++template<class T> using RecordDeque = std::deque<T, RecordAllocator<T>>;
++template<class K, class V> using RecordMap = std::unordered_map<K, V, std::hash<K>, std::equal_to<K>, RecordAllocator<std::pair<const K, V>>>;
++template<class T> using RecordSet = std::set<T, std::less<T>, RecordAllocator<T>>;
++
++// Native-only reference. No callback runs while the arena allocator loan lives.
++class RecordQuotaRef {
++ public:
++  explicit RecordQuotaRef(RecordQuota* value = nullptr) noexcept : value_(value) {
++    if (value_) value_->retain();
++  }
++  RecordQuotaRef(const RecordQuotaRef& other) noexcept : RecordQuotaRef(other.value_) {}
++  RecordQuotaRef& operator=(const RecordQuotaRef&) = delete;
++  ~RecordQuotaRef() { if (value_) value_->release(); }
++  RecordQuota* get() const noexcept { return value_; }
++ private:
++  RecordQuota* value_;
++};
++
++} // namespace mlx::core::submission
+diff --git a/mlx/submission.cpp b/mlx/submission.cpp
+--- a/mlx/submission.cpp
++++ b/mlx/submission.cpp
+@@ -69,10 +69,17 @@
+ };
+ } // namespace
+ 
+-Scope::Scope(void* retained_owner, void (*retire_owner)(void*))
++Scope::Scope(void* retained_owner, void (*retire_owner)(void*), RecordQuota* quota)
+     : owner_(prepare_owner_identity()), parent_(active_scope) {
+   // Prepare global ownership before the first possible submission.
+   (void)registry();
++  // A nested ordinary scope inherits the same arena. An explicit foreign
++  // arena cannot replace the parent's original physical capacity.
++  auto* inherited = current_record_quota();
++  if (inherited && quota && inherited != quota)
++    throw RecordQuotaError(QuotaFailure::foreign_parent);
++  quota_ = inherited ? inherited : quota;
++  if (quota_) quota_->retain();
+   // All fallible setup precedes both owner transfer and ancestry mutation.
+   retained_owner_ = retained_owner;
+   retire_owner_ = retire_owner;
+@@ -90,6 +97,7 @@
+ namespace {
+ struct ScopeRetirement {
+   Scope* parent;
++  RecordQuota* quota;
+   void* owner;
+   void (*retire)(void*);
+ };
+@@ -109,8 +117,9 @@
+ 
+ void Scope::release() noexcept {
+   if (references_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+-    const ScopeRetirement retirement{parent_, retained_owner_, retire_owner_};
++    const ScopeRetirement retirement{parent_, quota_, retained_owner_, retire_owner_};
+     parent_ = nullptr;
++    quota_ = nullptr;
+     retained_owner_ = nullptr;
+     retire_owner_ = nullptr;
+     delete this;
+@@ -118,6 +127,7 @@
+     if (retirement.parent) {
+       retirement.parent->release();
+     }
++    if (retirement.quota) retirement.quota->release();
+     // The closed wrapper supplies only a nonthrowing, allocation-free enqueue.
+     // Arbitrary owner destruction must occur later on an unlocked host thread.
+     if (retirement.retire) {
+@@ -227,9 +237,31 @@
+   }
+ }
+ 
+-Record::Record() : owner_(prepare_owner_identity()) {
++RecordQuota* current_record_quota() noexcept {
++  if (active_scope && active_scope->record_quota()) return active_scope->record_quota();
++  return active_capture ? active_capture->record_quota() : nullptr;
++}
++
++void* Record::operator new(size_t bytes) {
++  if (current_record_quota()) throw RecordQuotaError(QuotaFailure::unbound_record);
++  return ::operator new(bytes);
++}
++void Record::operator delete(void* value) noexcept { ::operator delete(value); }
++Record::Allocation Record::legacy_allocation() {
++  if (current_record_quota()) throw RecordQuotaError(QuotaFailure::unbound_record);
++  return Allocation(nullptr);
++}
++Record::Record() : Record(legacy_allocation()) {}
++Record::Record(Allocation allocation)
++    : quota_(allocation.quota), streams_(resource()), captures_(resource()),
++      outputs_(resource()), owner_(prepare_owner_identity()) {
+   captures_.reserve(8);
+   (void)registry();
++}
++
++void Record::destroy() noexcept {
++  if (destroy_) destroy_(this);
++  else delete this;
+ }
+ 
+ void Record::enter() {
+@@ -261,6 +293,11 @@
+       })) {
+     return;
+   }
++  // Refuse Record-owned storage before creating/publishing a native receipt.
++  // Shared receipt moves below cannot allocate once this capacity is reserved.
++  if (streams_.size() == streams_.max_size())
++    throw RecordQuotaError(QuotaFailure::exhausted);
++  streams_.reserve(streams_.size() + 1);
+   StreamReceipt receipt{stream, {}, {}};
+   if (stream.device == Device::cpu) {
+     receipt.cpu = scheduler::prepare_cpu_stream(stream);
+@@ -337,14 +374,21 @@
+   captures_.clear();
+ }
+ 
+-void Record::capture(const std::shared_ptr<array::Data>& data) {
+-  captures_.push_back(data);
+-}
+-
+-void capture_data(const std::shared_ptr<array::Data>& data) {
+-  if (active_capture) {
+-    active_capture->capture(data);
+-  }
++size_t Record::prepare_capture() {
++  const auto index = captures_.size();
++  captures_.emplace_back(); // reservation/refusal before Data publication
++  return index;
++}
++void Record::commit_capture(size_t index, const std::shared_ptr<array::Data>& data) noexcept {
++  captures_[index] = data; // empty reserved slot, no allocation or old owner drop
++}
++CaptureSlot prepare_capture() {
++  auto* record = active_capture;
++  return CaptureSlot(record, record ? record->prepare_capture() : 0);
++}
++void CaptureSlot::commit(const std::shared_ptr<array::Data>& data) noexcept {
++  if (record_) record_->commit_capture(index_, data);
++  record_ = nullptr;
+ }
+ 
+ void Record::mark_failure() noexcept {
+@@ -522,7 +566,7 @@
+     // Scope release may enqueue custody for immediate foreign-host retirement.
+     auto* scope = record->scope_;
+     record->scope_ = nullptr;
+-    delete record;
++    record->destroy();
+     if (scope) {
+       scope->release();
+     }
+diff --git a/mlx/submission.h b/mlx/submission.h
+--- a/mlx/submission.h
++++ b/mlx/submission.h
+@@ -7,6 +7,9 @@
+ #include <vector>
+ 
+ #include "mlx/array.h"
++#include "mlx/record_quota.h"
++#include <new>
++#include <utility>
+ #include "mlx/backend/gpu/eval.h"
+ #include "mlx/scheduler.h"
+ 
+@@ -32,9 +35,11 @@
+ class MLX_API Scope {
+  public:
+   // Constructor-only owner handoff. On failure the caller still owns payload.
+-  Scope(void* retained_owner = nullptr, void (*retire_owner)(void*) = nullptr);
++  Scope(void* retained_owner = nullptr, void (*retire_owner)(void*) = nullptr,
++        RecordQuota* quota = nullptr);
+   Scope(const Scope&) = delete;
+   Scope& operator=(const Scope&) = delete;
++  RecordQuota* record_quota() const noexcept { return quota_; }
+   bool on_owner_thread() const noexcept;
+   void seal() noexcept;
+   Status query() const noexcept;
+@@ -65,9 +70,13 @@
+   Scope* previous_{nullptr};
+   Scope* next_{nullptr};
+   bool active_{true};
++  RecordQuota* quota_{nullptr};
+   void* retained_owner_{nullptr};
+   void (*retire_owner_)(void*){nullptr};
+ };
++
++// Borrowed from the active scope or primitive; cannot manufacture an arena.
++MLX_API RecordQuota* current_record_quota() noexcept;
+ 
+ // Exact named final-release controls, excluding allocator/registry costs.
+ MLX_API size_t scope_retirement_control_bytes() noexcept;
+@@ -94,7 +103,54 @@
+ // records on their exact original owner thread.
+ class MLX_API Record {
+  public:
++  // Legacy extension construction remains ordinary outside an arena. Inside a
++  // bounded context allocation must use create(), including derived objects.
++  static void* operator new(size_t);
++  static void operator delete(void*) noexcept;
+   Record();
++  class Allocation {
++   public:
++    Allocation(const Allocation&) = default;
++   private:
++    friend class Record;
++    explicit Allocation(RecordQuota* value) : quota(value) {}
++    RecordQuota* quota;
++  };
++  struct Deleter {
++    void operator()(Record* value) const noexcept { value->destroy(); }
++  };
++  template<class T, class... Args>
++  static std::unique_ptr<T, Deleter> create(Args&&... args) {
++    auto* quota = current_record_quota();
++    if (quota) quota->retain(); // protects object construction and its failure
++    void* storage = nullptr;
++    try {
++      storage = quota ? quota->allocate(sizeof(T), alignof(T))
++                      : ::operator new(sizeof(T), std::align_val_t(alignof(T)));
++      auto* value = ::new (storage) T(Allocation(quota), std::forward<Args>(args)...);
++      value->destroy_ = [](Record* record) noexcept {
++        auto* concrete = static_cast<T*>(record);
++        auto* arena = record->quota_;
++        concrete->~T();
++        if (arena) {
++          arena->deallocate(concrete, sizeof(T), alignof(T));
++          arena->release();
++        } else {
++          ::operator delete(concrete, std::align_val_t(alignof(T)));
++        }
++      };
++      return std::unique_ptr<T, Deleter>(value);
++    } catch (...) {
++      if (storage) {
++        if (quota) quota->deallocate(storage, sizeof(T), alignof(T));
++        else ::operator delete(storage, std::align_val_t(alignof(T)));
++      }
++      if (quota) quota->release();
++      throw;
++    }
++  }
++  RecordQuota* record_quota() const noexcept { return quota_; }
++  RecordQuota* resource() const noexcept { return quota_; }
+   virtual ~Record();
+   Record(const Record&) = delete;
+   Record& operator=(const Record&) = delete;
+@@ -107,9 +163,12 @@
+   void finish(bool failed) noexcept;
+   void begin_primitive() noexcept;
+   void end_primitive() noexcept;
+-  void capture(const std::shared_ptr<array::Data>&);
++  // An index remains reserved even if nested work appends more captures.
++  size_t prepare_capture();
++  void commit_capture(size_t, const std::shared_ptr<array::Data>&) noexcept;
+ 
+  protected:
++  explicit Record(Allocation);
+   virtual bool recover_event(Stream) noexcept { return true; }
+   virtual bool side_effects_terminal() const noexcept { return true; }
+   virtual bool side_effects_failed() const noexcept { return false; }
+@@ -141,14 +200,18 @@
+     uint64_t end{0};
+     bool event_recovered{false};
+   };
++  static Allocation legacy_allocation();
++  void destroy() noexcept;
+   bool progress(bool) noexcept;
+   void mark_failure() noexcept;
++  RecordQuota* quota_{nullptr};
++  void (*destroy_)(Record*) noexcept{nullptr};
+   Scope* scope_{nullptr};
+   Record* next_{nullptr};
+   std::atomic<bool> frozen_{false};
+-  std::vector<StreamReceipt> streams_;
+-  std::vector<std::shared_ptr<array::Data>> captures_;
+-  std::vector<PhysicalPin> outputs_;
++  RecordVector<StreamReceipt> streams_;
++  RecordVector<std::shared_ptr<array::Data>> captures_;
++  RecordVector<PhysicalPin> outputs_;
+   Record* previous_capture_{nullptr};
+   bool capture_active_{false};
+   bool failed_{false};
+@@ -161,7 +224,18 @@
+ // Only active inside one primitive until its ordinary backend retention has
+ // been published. This closes partial-primitive temporary lifetime holes while
+ // restoring normal donation before the next primitive.
+-MLX_API void capture_data(const std::shared_ptr<array::Data>&);
++class MLX_API CaptureSlot {
++ public:
++  CaptureSlot(const CaptureSlot&) = delete;
++  CaptureSlot& operator=(const CaptureSlot&) = delete;
++  void commit(const std::shared_ptr<array::Data>&) noexcept;
++ private:
++  friend CaptureSlot prepare_capture();
++  CaptureSlot(Record* record, size_t index) noexcept : record_(record), index_(index) {}
++  Record* record_;
++  size_t index_;
++};
++MLX_API CaptureSlot prepare_capture();
+ MLX_API void wait_for_event(const Event&);
+ 
+ } // namespace mlx::core::submission
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -18,6 +18,7 @@
+ #include "mlx/primitives.h"
+ #include "mlx/scheduler.h"
+ #include "mlx/submission.h"
++#include <limits>
+ #include "mlx/transforms.h"
+ #include "mlx/transforms_impl.h"
+ #include "mlx/utils.h"
+@@ -81,12 +82,15 @@
+ 
+ namespace {
+ struct EvalSubmissionRecord : submission::Record {
+-  std::deque<array> tape;
++  explicit EvalSubmissionRecord(Allocation allocation)
++      : Record(allocation), tape(resource()), primitive_owners(resource()),
++        fences(resource()), events(resource()) {}
++  submission::RecordDeque<array> tape;
+   std::optional<array> synchronizer;
+   std::optional<array> current;
+-  std::vector<std::shared_ptr<Primitive>> primitive_owners;
+-  std::unordered_map<uint32_t, Fence> fences;
+-  std::unordered_map<uint32_t, Event> events;
++  submission::RecordVector<std::shared_ptr<Primitive>> primitive_owners;
++  submission::RecordMap<uint32_t, Fence> fences;
++  submission::RecordMap<uint32_t, Event> events;
+   bool failed_record{false};
+ 
+   ~EvalSubmissionRecord() override {
+@@ -157,6 +161,10 @@
+   }
+ };
+ } // namespace
++
++size_t submission::minimum_record_object_bytes() noexcept {
++  return sizeof(EvalSubmissionRecord);
++}
+ 
+ array eval_impl(
+     std::vector<array> outputs,
+@@ -164,7 +172,7 @@
+     DeviceTimer* timer = nullptr) {
+   submission::progress_records();
+   submission::retire_records();
+-  auto prepared_recovery = std::make_unique<EvalSubmissionRecord>();
++  auto prepared_recovery = submission::Record::create<EvalSubmissionRecord>();
+   prepared_recovery->enter();
+   auto* recovery = prepared_recovery.release();
+   try {
+@@ -183,7 +191,7 @@
+   }
+ 
+   // Map of array id that needs fence and stream it's computed on
+-  std::unordered_map<uintptr_t, std::pair<uint32_t, bool>> needs_fence;
++  submission::RecordMap<uintptr_t, std::pair<uint32_t, bool>> needs_fence(recovery->resource());
+ 
+   recovery->synchronizer.emplace(
+       Shape{}, bool_, std::make_shared<Synchronizer>(stream), std::move(outputs));
+@@ -203,9 +211,10 @@
+ 
+   {
+     // Record the degree of each input
+-    std::unordered_map<std::uintptr_t, int> cache;
+-
+-    std::stack<std::pair<std::reference_wrapper<array>, int>> dfs;
++    submission::RecordMap<std::uintptr_t, int> cache(recovery->resource());
++
++    using DfsEntry = std::pair<std::reference_wrapper<array>, int>;
++    std::stack<DfsEntry, submission::RecordDeque<DfsEntry>> dfs{submission::RecordDeque<DfsEntry>{recovery->resource()}};
+     dfs.emplace(synchronizer, 0);
+     while (!dfs.empty()) {
+       auto& [a_ref, idx] = dfs.top();
+@@ -273,7 +282,8 @@
+ 
+     // Build the tape in BFS order with a width limit
+     int max_width = env::bfs_max_width();
+-    dfs = std::stack<std::pair<std::reference_wrapper<array>, int>>();
++    // Empty after DFS; retain the same allocator instead of constructing a
++    // default-allocator replacement.
+     tape.push_back(synchronizer);
+     for (int i = 0; !cache.empty() && (i < tape.size() || !dfs.empty());) {
+       auto& a = (i >= tape.size()) ? dfs.top().first.get() : tape[i];
+@@ -325,11 +335,13 @@
+   for (const auto& arr : tape) {
+     recovery->prepare_stream(arr.primitive().stream());
+     recovery->primitive_owners.push_back(arr.primitive_ptr());
++    if (arr.siblings().size() >= std::numeric_limits<size_t>::max() - output_count)
++      throw submission::RecordQuotaError(submission::QuotaFailure::invalid_layout);
+     output_count += 1 + arr.siblings().size();
+   }
+   recovery->reserve_outputs(output_count);
+ 
+-  std::set<Stream> open_streams;
++  submission::RecordSet<Stream> open_streams(recovery->resource());
+   if (timer) {
+     recovery->prepare_stream(timer->stream());
+     open_streams.insert(timer->stream());
+@@ -545,7 +557,7 @@
+     throw std::invalid_argument(message.str());
+   }
+   struct WaitRecord : submission::Record {
+-    explicit WaitRecord(const Event& value) : owner(value) {}
++    explicit WaitRecord(Allocation allocation, const Event& value) : Record(allocation), owner(value) {}
+     Event owner;
+     bool side_effects_terminal() const noexcept override {
+       return owner.side_effects_terminal();
+@@ -557,7 +569,7 @@
+       owner.progress_side_effects();
+     }
+   };
+-  auto prepared = std::make_unique<WaitRecord>(*event_);
++  auto prepared = submission::Record::create<WaitRecord>(*event_);
+   prepared->enter();
+   auto* recovery = prepared.release();
+   try {

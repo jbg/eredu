@@ -1,0 +1,20 @@
+{
+  "description": "B2 source-arena-owned C wrapper; no numerical leaf/source change",
+  "no_build_execution": true,
+  "patch_sha256": "509a2c75a708ff0ec3f0931e0486861acd107f4db23a17048209ac2a34f9d90b",
+  "position": 32,
+  "predecessor_manifest": "/private/tmp/eredu-prepared-media-native-materialization-stage/native-work-manifest.json",
+  "predecessor_sha256": "ce6d86cef340ad9b90a42cdf1de9fcb00f221334c16244ef7fcfa8380a641c88",
+  "sources": {
+    "mlx/prepared_input.cpp": {
+      "after": "09893264526c8fb1f176dcf5e102189b4aae9c3ce24c084dd78a25e27c0658e9",
+      "before": "da5efdb16b3e640feb9fac6b78f15c728873a2c574dd6e2a3e077c39c716e2d6"
+    },
+    "mlx/prepared_input.h": {
+      "after": "f0a5e5bfd969ca203bc61ae92938ca9cacc00c7862bc403e913275a8952e3b5e",
+      "before": "45ab7e5cc245bd9f5ac60f44e58de7b0067c11bb1a0dc503ce028e9184f6f154"
+    }
+  },
+  "upstream_archive": "/Users/jbg/dev/eredu/safemlx-sys/vendor/mlx-v0.32.0.tar.gz",
+  "upstream_sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec"
+}

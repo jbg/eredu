@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-13T23:34:40.314367+00:00",
+  "scope": "Closed parent-account capture destination and original no-decoder Prompt construction",
+  "status": "Verified prerequisites; complete bounded inference remains unfinished",
+  "previous_increment": "bounded-resume-capture-accounting-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 916,
+      "ignored": 0
+    },
+    "neutral": {
+      "passed": 87,
+      "ignored": 0
+    },
+    "cache": {
+      "passed": 86,
+      "ignored": 0
+    },
+    "native": {
+      "passed": 190,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 127,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1406,
+  "new_tests": {
+    "parent_capture_runtime": 8,
+    "no_decoder_runtime": 5,
+    "no_decoder_native": 3,
+    "quarantine_union_runtime": 6
+  },
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-13T23:30:28.264366+00:00",
+      "elapsed_seconds": 16.448,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parent-capture-no-decoder-runtime.log",
+      "log_sha256": "6df1eddabb0ed87616d24f29619dba949a4bad1fc032922ec0f8340569070ba9"
+    },
+    "neutral": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence",
+      "started_utc": "2026-09-13T23:30:44.709235+00:00",
+      "elapsed_seconds": 9.007,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parent-capture-no-decoder-neutral.log",
+      "log_sha256": "10c3bd76d0b0cd50f6f88603f67fbb57090187352eed3e0f718630b7c851ab3b"
+    },
+    "cache": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::runtime::cache::state:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T23:32:04.122797+00:00",
+      "elapsed_seconds": 70.398,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parent-capture-no-decoder-cache.log",
+      "log_sha256": "7d734691aaabb67fa678e0b5d3688746adfa0442a5d95da670ee332af5c3d3e8"
+    },
+    "native": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::model_session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T23:33:14.523002+00:00",
+      "elapsed_seconds": 11.5,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parent-capture-no-decoder-native.log",
+      "log_sha256": "5c1517d7a631834a4048e7584a59387277aa3d20b9912c1aa9eae6f96123a395"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-13T23:33:26.023626+00:00",
+      "elapsed_seconds": 41.092,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parent-capture-no-decoder-portable.log",
+      "log_sha256": "400976df0b3a0b481196cb85b76b0dcb5058f2b5284441de3ea4bd217f9a839c"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-13T23:34:07.116653+00:00",
+      "elapsed_seconds": 14.582,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parent-capture-no-decoder-minimal.log",
+      "log_sha256": "b24c5fdc9eee394bf594eebb1a594336c13818c0b474be0a6d957f4786bf7111"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-13T23:34:21.699746+00:00",
+      "elapsed_seconds": 15.412,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parent-capture-no-decoder-features.log",
+      "log_sha256": "c3a7bb0985938cdf975d277aaecac726c4a2dd087b3316105af76b2478eb60cf"
+    }
+  },
+  "source_sha256": {
+    "eredu-backend-mlx/src/backend/runtime/cache/state/resident_copy/stateless.rs": "ab1258b92da0c1a82c9399a2d16c504e8951ffafd01424948eda72fd6a30b2c7",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/resident_copy/stateless/prompt.rs": "4fa2e7b1b66b3d4b92367f856af09cc616237a4884cce93d8c88a2decc61ecfc",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/resident_copy/stateless/prompt/tests.rs": "efbd6299006af0a8007413532d642cf6f921899829c7a723c7cc32c53f6e7215",
+    "eredu-runtime/src/working_memory/capture_tensor.rs": "5b0c9e267f81676af823da249c7685d202c2461d286de9f5f08ed87a2afdd15a",
+    "eredu-runtime/src/working_memory/capture_tensor/parent_account.rs": "c12185374cbbba8c7a5bf7af83abbe638634174aa8d1676865ab6a42f81bd99c",
+    "eredu-runtime/src/working_memory/capture_tensor/tests.rs": "2cd36bdc08133e86cda3590c3f9f2b15c6920a5f68b4815e3cf71544769127ef",
+    "eredu-runtime/src/working_memory/capture_tensor/tests/parent_account.rs": "c4b8d294f9632387e86f69da1da0653a99699b5d6eb39e6978b75d2c51d0a1df",
+    "eredu-runtime/src/working_memory/funding.rs": "d9dc0d78d0a38e9283085b1ad52c47129be794f085acc7dc134956215639e222",
+    "eredu-runtime/src/working_memory/funding/capture_tensor.rs": "d0dcac232ad2b96b8dd282412156a77d7e4a66eab92d20a1f60aedf793b23072",
+    "eredu-runtime/src/working_memory/funding/no_decoder_prompt.rs": "da4242bc939444c06157a39581be213c05369526e6eebcd8a6c22e09afd6e872",
+    "eredu-runtime/src/working_memory/funding/tests.rs": "2c99c506ff3aa13f902dec88f4be36da6f5e706a29b682b675c3ccc5a70c12cb",
+    "eredu-runtime/src/working_memory/funding/tests/quarantine_pins.rs": "9200dbea509b8908fdd6981be31a8660212e1888828f53336e5a10be0169f9b3",
+    "eredu-runtime/src/working_memory/residual/tests.rs": "0acb6b22a910f4fbbde3293943550ca0c73f6279e0f58278ab59f14afde40049",
+    "eredu-runtime/src/working_memory/residual/tests/quarantine_pins.rs": "b443dd3f54e9e001c36198420ababb9bdb03c86d696a3cb51865d10d295ba512",
+    "eredu-runtime/src/working_memory/text_preparation.rs": "14601d9ed237f0e849ea7294b3f923424d24ce496d31111d5f7275092bd75b2a",
+    "eredu-runtime/src/working_memory/text_preparation/no_decoder.rs": "91ecae802ca03d74a4d098890727f05a1e0dadf5c4bf1a9cb1096054385e0a0d",
+    "eredu-runtime/src/working_memory/text_preparation/no_decoder/tests.rs": "53c5a5fe7a85abeeab5d74b024812d8f0691ec20cee8a65f149484dabb4373b5",
+    "doc/backend-architecture.md": "a790552eaf1bf5b624eb23fb54e7013527416fa728b89cd6879dc8deb9b3531d",
+    "doc/execution-control.md": "49a29971372bd33b283582ea7b178d608a74074b5e2f5996dceeceaeb5d9d1cd",
+    "doc/bounded-inference.md": "d6b9d3935e11e59ba1396914239951310f3c005e17ccfb9985067cd37c0f0c23",
+    "doc/model-support.md": "23cf7d3210bfdf7eb9b745f470e600ae7fa27b47dc0ea534d0b686d010868370",
+    "doc/parallel-execution.md": "f7d3cb76ae188ee9e91607238b813b38435b91792694ab35234ba93c29489498",
+    "doc/component-analysis.md": "b9fd50baa2fd3cc2c7cff27cfc25963114417ca3c438a6445d5aff0dfc9d5155"
+  },
+  "source_snapshot": "/private/tmp/eredu-parent-capture-no-decoder-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-parent-capture-no-decoder-apply.py": "10e2272ddae10433d197d3689892440f0cae27b3c0ff451a2adf9b1aa8ff390a",
+    "/private/tmp/eredu-parent-capture-no-decoder-applied.json": "8282bcbb87d379a5a5a7e2e90257ced005ff1db2de4e673ccea75c9d8bef54a9",
+    "/private/tmp/eredu-parent-capture-no-decoder-validate.py": "15779aaf198cfa2c3a8867e68f4356b3e444bd29f5a95315787f248b5475638c",
+    "/private/tmp/eredu-parent-capture-no-decoder-format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/private/tmp/eredu-parent-capture-no-decoder-base-hashes.json": "f35f797f3388576346b1aa032dbf3d7ab8f2e4143b07801f9bd889cff7792744",
+    "/private/tmp/eredu-parent-capture-no-decoder-doc-additions.json": "19de713e8aee5ce27680b7df27d2af5f436dc9387fce2d1ba433f61cad42184a",
+    "/private/tmp/eredu-parent-capture-no-decoder-frozen-rust.json": "5e9ed74ceb37df296e7c54d5ac74d7830c3284c563b49bcae39488f5fea67b44",
+    "/private/tmp/eredu-parent-capture-no-decoder-guide-links.py": "18303fd08d7f04e3a9538d49fd364f78492e1a3110a56202d346d058b3e52e4e",
+    "/private/tmp/eredu-parent-capture-no-decoder-guide-links.patch": "22f57d329a07c44d31880773691017f1a4c5e65d995e6696381a8c7dc81e5518",
+    "/private/tmp/eredu-capture-parent-account-stage/README.md": "7a80aaa032b73960f881d666275fd88da34393fa4a847f3bbcf061b3020e372f",
+    "/private/tmp/eredu-capture-parent-account-stage/change.patch": "5bcd5fe6c84e8796fea88d9158d053acab505c4e89d8ea01e7d76a61a3a443b2",
+    "/private/tmp/eredu-capture-parent-account-stage/base-hashes.json": "05b6d2c847cb18a2d69c95f0a0db6177b70e2654d9d8a905e8fa664420ab3b85",
+    "/private/tmp/eredu-capture-parent-account-stage/staged-hashes.json": "173b8a9168879afc9a4128cd6db58a93b34866c16d23b92bcb9e83e3dd58d30c",
+    "/private/tmp/eredu-capture-parent-account-stage/checks.json": "699892909374431510ce57ca9e4b778e2ebef146429677884d01ddc979a0a39f",
+    "/private/tmp/eredu-capture-parent-account-root-reviewed.json": "6cf421eeabb57bf08fb1ba86722919e1b20fcdbe6550e588130ab24cd05db996",
+    "/private/tmp/eredu-capture-parent-account-review.md": "0dc117547b3b2e929e29d56b0b95cd5c4d881f55d4e5a448c49a1a9130670f2a",
+    "/private/tmp/eredu-no-decoder-prompt-stage/README.md": "10ae78820d4e398f73a429aa5276fd54f99b33b9e3b03b9243e17eea47cb1e02",
+    "/private/tmp/eredu-no-decoder-prompt-stage/change.patch": "2dbd08cfd21911a135890c22fe415e7257558914d0f7b3906c5e09f1032cb0d0",
+    "/private/tmp/eredu-no-decoder-prompt-stage/base-hashes.json": "a82e42812e238d392ff7c065cb7e41ccb990f881868e095c2043c9eeb447839a",
+    "/private/tmp/eredu-no-decoder-prompt-stage/staged-hashes.json": "cd44a6ba5f820f6183dcb6825c1ae80a04335116b91d3563fdecaa031517f99c",
+    "/private/tmp/eredu-no-decoder-prompt-stage/checks.json": "55b74c4ffa3cd8b37466ab4dcb40ffb86af718e1c626be58dee0842d68c7995d",
+    "/private/tmp/eredu-no-decoder-prompt-root-reviewed.json": "b6681dbacd39a31090d892f190c0fa8dd24198589e50aa1d2914d0b94d365e7f",
+    "/private/tmp/eredu-no-decoder-prompt-review.md": "adb98283ed0e59a8cd387c67573a69ad102140f87208d6bd2a6e5dc46024891b",
+    "/private/tmp/eredu-capture-parent-account-stage/native-transform-audit.md": "604a202d360e36b4bf98cb4649a7a2417db20ff321cf60ddff766aabf99e874c",
+    "/private/tmp/eredu-parent-capture-no-decoder-red.py": "72749f79d980ae61bc35038f888ed06aaf7f6e84e2acef222c98ec87734bc023",
+    "/private/tmp/eredu-parent-capture-no-decoder-quarantine-red.json": "8faa5882fb9ed978dff291ad8e4bd92282f1b12824cf494e7cc762ce56ba0abb",
+    "/private/tmp/eredu-parent-capture-no-decoder-quarantine-red.log": "746dce97d7b3b15627b4b67792cef9245f0b18594aad963251069468d772a2f4",
+    "/private/tmp/eredu-parent-capture-no-decoder-integrate-quarantine.py": "b9fe064c8242e198010b5da9e8e47e41f12c61ef3f2ffe858c53874e4e1536c8",
+    "/private/tmp/eredu-parent-capture-no-decoder-quarantine-integrated.json": "0f82cdb6dd7bf7c944698471f415e95415cac92a54eaba9e5513dbc9177bfa6a",
+    "/private/tmp/eredu-quarantine-source-pins-stage/README.md": "54b29c9cdb274a8347f6d88de05cdbbbf412de5406dfb0c6884a7efff76c5e5d",
+    "/private/tmp/eredu-quarantine-source-pins-stage/change.patch": "b385450b66919af283693550caff7fe7ba4039f2a556612f589b6ca870bac8dc",
+    "/private/tmp/eredu-quarantine-source-pins-stage/base-hashes.json": "8e62b7921878e5d1b59b05488b9b9843ff6d37dd097228ab8fbe8a5c09865a51",
+    "/private/tmp/eredu-quarantine-source-pins-stage/staged-hashes.json": "ac774c6603adfb8f10257a7497eb872aefe20466b6c74d01aec40779a5324035",
+    "/private/tmp/eredu-quarantine-source-pins-stage/checks.json": "371482c2a839ead9573826c87dfcfb1e541c55bab0e85348976680363e27d33d",
+    "/private/tmp/eredu-quarantine-source-pins-stage/documentation-note.md": "4b418fed1b3da88b86e44b10b25d1043d5227a363cfa24fffc21e5fc0555b229",
+    "/private/tmp/eredu-quarantine-source-pins-root-reviewed.json": "d2e2242a2a6c4d6032799e7e96a22d73bb071b3c63882e4c1c003bab72e338eb",
+    "/private/tmp/eredu-parent-capture-no-decoder-cache.log.evaluated-array-fixture": "73781d65dcee477d173a363257289751c13f0851ab85ac69588c51532f310718",
+    "/private/tmp/eredu-parent-capture-no-decoder-evaluated-array-fixture.patch": "c53490aea9ca346fb58a17216d289e91cfc0c714ed1ce15d907b12e4df598b2e",
+    "/private/tmp/eredu-parent-capture-no-decoder-correction-artifacts.json": "0783fc4146575dec6150b76df126de9fa58113042026703778adfee27bda946e",
+    "/private/tmp/eredu-parent-capture-no-decoder-cache.log.prevalidation": "73781d65dcee477d173a363257289751c13f0851ab85ac69588c51532f310718"
+  },
+  "behavior": [
+    "Every abandoned native scope transfers all its registered source pins into permanent linked quarantine custody. Successful certification releases only its own pins after unlocking. This fixes the explicitly recorded previous increment limitation.",
+    "Capture host construction protects geometry-derived P within the original exact run/reservation, atomically excluding native adoption and sibling host destinations. No second reservation or native scope is minted.",
+    "Parent account health precedes allocation, scalar fill and finish. Completed read-only aliases retain private host custody after run retirement; partial errors and unwind retire payload before the host hold. Cleanup cannot certify native work.",
+    "No-decoder construction consumes the original Prompt claim, validates complete source origins atomically and adds exactly one native scope with source pins. It creates no host table or payload allowance.",
+    "The native adapter preserves actual live/saved None-table identity and fresh empty retention. Exact key/pending numerical copies in mechanism tests keep outputs and recovery through explicit settlement."
+  ],
+  "review_findings": [
+    "Native compilation corrected one test-only host-read helper to obtain EvaluatedArray before try_to_vec; no production change or assertion was removed. Exact correction and failed log are retained.",
+    "Independent no-decoder review exposed inherited first-scope-only quarantine pin retention. New tests reproduced the old failure before applying linked custody for every abandoned inventory; all original logs and exact source hashes are retained.",
+    "Root and independent reviews checked exact identity, atomic accounting, complete source health and pinning, payload drop order, and separation of host cleanup from native settlement.",
+    "The two construction packages and shared quarantine correction were applied against exact frozen bases and validated together."
+  ],
+  "limits": [
+    "No public managed capture/intervention gate or selected absent-state resume gate was lowered. Native capture source/transform/transfer, record and quota composition remain unfinished.",
+    "Actual rank-local absence requires selected-state control/quote and applicable distributed agreements; an ordinary layout containing NoState layers remains a different representation.",
+    "Broader facade snapshots, host/disk saved resume, paging, media/speculation/distributed managed execution and mutable policy repricing remain unfinished.",
+    "No released-checkpoint numerical or process-memory measurement added; existing bookkeeping and allocator exclusions remain."
+  ]
+}

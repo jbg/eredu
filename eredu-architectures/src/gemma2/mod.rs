@@ -2,15 +2,13 @@
 
 use crate::decoder::{AttentionProjection, BlockParameterFields, Config};
 use eredu_checkpoint::{
+    WeightQuantization,
     schema::{
         GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint, SafetensorsCheckpointPlan,
         SafetensorsTensorConstraint, StoredDtypeConstraint, TensorOperation,
     },
-    WeightQuantization,
 };
-use eredu_core::{
-    cache::derive_prompt_cache_architecture_fingerprint, AttentionPolicy, LayerSchedule,
-};
+use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_gguf::MetadataValue;
 use eredu_nn::{Error, GatedProductPolicy, RotarySpec};
 use serde::Deserialize;
@@ -50,29 +48,36 @@ impl ModelArgs {
     }
     /// Validates all geometry and numerical policies.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        self.dense
-            .validate()
-            .map_err(|e| ConfigError::Invalid(e.to_string()))?;
+        self.validate_with_diagnostic(|text| ConfigError::Invalid(text.to_string()))
+    }
+
+    fn validate_with_diagnostic<E>(
+        &self,
+        invalid: impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
+        self.dense.validate_with_diagnostic(&invalid)?;
         for (name, value) in [
             ("rms_norm_eps", self.dense.rms_norm_eps),
             ("rope_theta", self.dense.rope_theta),
             ("query_pre_attn_scalar", self.query_pre_attn_scalar),
         ] {
-            positive(name, value)?;
+            positive_with(name, value, &invalid)?;
         }
         for (name, cap) in [
             ("attn_logit_softcapping", self.attn_logit_softcapping),
             ("final_logit_softcapping", self.final_logit_softcapping),
         ] {
             if let Some(cap) = cap {
-                positive(name, cap)?;
+                positive_with(name, cap, &invalid)?;
             }
         }
         if self.dense.head_dim % 2 != 0 {
-            return Err(invalid("head_dim must be even"));
+            return Err(invalid(format_args!("head_dim must be even")));
         }
         if self.dense.mlp_bias {
-            return Err(invalid("Gemma 2 feed-forward projections have no biases"));
+            return Err(invalid(format_args!(
+                "Gemma 2 feed-forward projections have no biases"
+            )));
         }
         Ok(())
     }
@@ -80,11 +85,15 @@ impl ModelArgs {
 fn invalid(detail: impl Into<String>) -> ConfigError {
     ConfigError::Invalid(detail.into())
 }
-fn positive(name: &str, value: f32) -> Result<(), ConfigError> {
+fn positive_with<E>(
+    name: &str,
+    value: f32,
+    invalid: &impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     if value.is_finite() && value > 0.0 {
         Ok(())
     } else {
-        Err(invalid(format!("{name} must be finite and positive")))
+        Err(invalid(format_args!("{name} must be finite and positive")))
     }
 }
 fn default_query_scale() -> f32 {
@@ -326,6 +335,54 @@ pub fn model_args_from_gguf_catalog(
 }
 
 impl Config for ModelArgs {
+    fn weight_quantization_with_metadata(
+        &self,
+        name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<WeightQuantization>, eredu_nn::Error> {
+        Ok(self.weight_quantization_for(name))
+    }
+
+    fn linear_format_with_metadata(
+        &self,
+        name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        Ok(self.linear_format(name))
+    }
+
+    fn parameter_alias_with_metadata(
+        &self,
+        _name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn block_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn rotary_spec_with_metadata(
+        &self,
+        dimensions: i32,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<RotarySpec, eredu_nn::Error> {
+        self.dense.rotary_spec_with_metadata(dimensions, context)
+    }
+
+    fn attention_value_format_with_metadata(
+        &self,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        crate::decoder::parameter_metadata::default_attention_value_format_with_metadata(
+            self, layer, context,
+        )
+    }
+
     fn model_family(&self) -> &'static str {
         "gemma2"
     }
@@ -335,8 +392,25 @@ impl Config for ModelArgs {
     fn architecture_fingerprint(&self) -> String {
         prompt_cache_architecture_fingerprint(self)
     }
+    fn architecture_fingerprint_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<String, eredu_nn::Error> {
+        prompt_cache_architecture_fingerprint_with_metadata(
+            self,
+            crate::decoder::identity::Metadata::new(Some(context)),
+        )
+    }
     fn validate_config(&self) -> Result<(), Error> {
         self.validate().map_err(Error::backend)
+    }
+    fn validate_config_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), Error> {
+        self.validate_with_diagnostic(|text| {
+            context.metadata_error(format_args!("invalid Gemma 2 configuration: {text}"))
+        })
     }
     fn hidden_size(&self) -> i32 {
         self.dense.hidden_size
@@ -390,14 +464,34 @@ impl Config for ModelArgs {
         self.normalization_offset
     }
     fn attention_output_normalization(&self, layer: usize) -> Option<String> {
-        Some(format!(
-            "model.layers.{layer}.post_attention_layernorm.weight"
-        ))
+        Some(output_normalization_name(layer, "post_attention_layernorm").to_string())
     }
     fn feed_forward_output_normalization(&self, layer: usize) -> Option<String> {
-        Some(format!(
-            "model.layers.{layer}.post_feedforward_layernorm.weight"
-        ))
+        Some(output_normalization_name(layer, "post_feedforward_layernorm").to_string())
+    }
+    fn attention_output_normalization_with_metadata(
+        &self,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, Error> {
+        context
+            .metadata_string(format_args!(
+                "{}",
+                output_normalization_name(layer, "post_attention_layernorm")
+            ))
+            .map(Some)
+    }
+    fn feed_forward_output_normalization_with_metadata(
+        &self,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, Error> {
+        context
+            .metadata_string(format_args!(
+                "{}",
+                output_normalization_name(layer, "post_feedforward_layernorm")
+            ))
+            .map(Some)
     }
     fn embedding_scale(&self) -> f32 {
         (self.dense.hidden_size as f32).sqrt()
@@ -428,20 +522,29 @@ pub use crate::decoder::{dense_parameter_description, state_layout};
 
 /// Identity includes all equation, schedule, format and normalization policies.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    derive_prompt_cache_architecture_fingerprint(
-        "gemma2",
-        [(
+    prompt_cache_architecture_fingerprint_with_metadata(
+        args,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary fingerprint formatting is infallible")
+}
+fn prompt_cache_architecture_fingerprint_with_metadata(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    metadata.fingerprint("gemma2", || {
+        Ok([(
             "equations",
-            format!(
+            metadata.format(format_args!(
                 "gemma2:v1:{}:{:08x}:{:?}:{:?}:{:08x}",
-                crate::llama::prompt_cache_architecture_fingerprint(&args.dense),
+                metadata.configured(&args.dense)?,
                 args.query_pre_attn_scalar.to_bits(),
                 args.attn_logit_softcapping.map(f32::to_bits),
                 args.final_logit_softcapping.map(f32::to_bits),
                 args.normalization_offset.to_bits()
-            ),
-        )],
-    )
+            ))?,
+        )])
+    })
 }
 /// Applies the exact selected matrix encodings without changing model equations.
 pub fn with_checkpoint_formats(
@@ -509,3 +612,15 @@ pub fn translate_gguf_weight_name(name: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+
+fn output_normalization_name(
+    layer: usize,
+    field: &str,
+) -> crate::decoder::parameter_metadata::LayerParameterName<'_> {
+    crate::decoder::parameter_metadata::LayerParameterName {
+        root: "model",
+        layer,
+        module: None,
+        field,
+    }
+}

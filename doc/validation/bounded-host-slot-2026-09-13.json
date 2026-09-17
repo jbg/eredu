@@ -1,0 +1,348 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-13",
+  "created_utc": "2026-09-13T20:55:57.284572+00:00",
+  "scope": "Actual mutable host table source ownership and native source publication",
+  "status": "verified_increment_full_goal_incomplete",
+  "tests": {
+    "publication": {
+      "passed": 9,
+      "ignored": 0
+    },
+    "fixed": {
+      "passed": 12,
+      "ignored": 0
+    },
+    "layout": {
+      "passed": 3,
+      "ignored": 0
+    },
+    "cache": {
+      "passed": 142,
+      "ignored": 0
+    },
+    "idle": {
+      "passed": 3,
+      "ignored": 0
+    },
+    "prototype": {
+      "passed": 2,
+      "ignored": 0
+    },
+    "preparation": {
+      "passed": 10,
+      "ignored": 0
+    },
+    "model_ops": {
+      "passed": 12,
+      "ignored": 0
+    },
+    "metadata": {
+      "passed": 5,
+      "ignored": 0
+    },
+    "prediction": {
+      "passed": 5,
+      "ignored": 0
+    },
+    "bounded": {
+      "passed": 8,
+      "ignored": 0
+    },
+    "native_copy": {
+      "passed": 11,
+      "ignored": 0
+    },
+    "conformance": {
+      "passed": 81,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 127,
+      "ignored": 1
+    },
+    "runtime": {
+      "passed": 779,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 1209,
+  "distinct_passed_tests": {
+    "native": 209,
+    "conformance": 81,
+    "portable": 127,
+    "runtime": 779
+  },
+  "distinct_passed_total": 1196,
+  "new_tests": {
+    "runtime_slot_owner": 9,
+    "device_state_owner": 2,
+    "fixed_role_owner": 2,
+    "slot_publication": 9,
+    "key_value_owner": 3,
+    "hybrid_layer_owner": 2,
+    "loaded_model_tables": 1
+  },
+  "checks": {
+    "publication": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib slot_metadata_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:43:14.253473+00:00",
+      "elapsed_seconds": 87.881,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-publication.log",
+      "log_sha256": "1b889cbbe2964cfaf7b48f8006ed10ee6762e9f38bb2bfc48bdd256896c0419d"
+    },
+    "fixed": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib hybrid::fixed_slots -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:44:42.136753+00:00",
+      "elapsed_seconds": 0.309,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-fixed.log",
+      "log_sha256": "fa530ab11da074450bdc5184b27e7ef2cd2af228ab7c244387ceec5e20d0bd4d"
+    },
+    "layout": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib layout_publication_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:52:25.339820+00:00",
+      "elapsed_seconds": 65.136,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-layout.log",
+      "log_sha256": "53fd1e94cf6a735c85c9c33c6fda492a2b3fe289954c9b0afc0ffa96928091dc"
+    },
+    "cache": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::runtime::cache:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:53:30.476334+00:00",
+      "elapsed_seconds": 4.91,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-cache.log",
+      "log_sha256": "d3df4e340a7c09b3fe3477ca89ad2fc385a283a9920e204da991d0faf8275e91"
+    },
+    "idle": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib idle_storage::tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:53:35.386964+00:00",
+      "elapsed_seconds": 0.354,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-idle.log",
+      "log_sha256": "844cef7e1fd3178e50310b386d8feb3aad7ecf78e0ae6e82b449af2ba39476c0"
+    },
+    "prototype": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib prediction::parameters::storage_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:53:35.740941+00:00",
+      "elapsed_seconds": 0.305,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-prototype.log",
+      "log_sha256": "67fcda7b7ae65d72e3a59606317481177c97d4cf42b2ed3ce3f56d7790e97c4b"
+    },
+    "preparation": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib preparation_memory_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:53:36.046331+00:00",
+      "elapsed_seconds": 0.344,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-preparation.log",
+      "log_sha256": "1e01a8919e1d801cd353b09cb998f0e6737debca935af9de72b4eaa63eef52c7"
+    },
+    "model_ops": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib operation_ -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:53:36.390719+00:00",
+      "elapsed_seconds": 0.36,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-model_ops.log",
+      "log_sha256": "8ee8cba59ca33f2fb8ae429b160fcb9458275f4a733f732ffc8e6aa471f3815c"
+    },
+    "metadata": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib publication::metadata_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:53:36.750890+00:00",
+      "elapsed_seconds": 0.111,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-metadata.log",
+      "log_sha256": "a2977c5d67fe4772bd613b9d8d0fd7cfbd0b95e411f0e5aaa7f95fef0c30bf8b"
+    },
+    "prediction": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::replicated_text::prediction::memory_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:53:36.861816+00:00",
+      "elapsed_seconds": 0.292,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-prediction.log",
+      "log_sha256": "8164f526cb540b296a97ed1205c2a79e67f45f515522a1524dcb8b6259ac0492"
+    },
+    "bounded": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib host_layerwise -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:53:37.154075+00:00",
+      "elapsed_seconds": 2.901,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-bounded.log",
+      "log_sha256": "10cb5c542cf7a759ad9c8a8a915dc934c75034b47a6267037c54d9a178144924"
+    },
+    "native_copy": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib saved_array_copy -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T20:53:40.055645+00:00",
+      "elapsed_seconds": 0.548,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-native_copy.log",
+      "log_sha256": "1b54d1022dd7ab5e78f1bbbb74e6e2acfce0a50d4aa5e91d09d0f2e35a0a671e"
+    },
+    "conformance": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence",
+      "started_utc": "2026-09-13T20:53:40.604545+00:00",
+      "elapsed_seconds": 8.828,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-conformance.log",
+      "log_sha256": "4c650706a281165a3f25fd9f738484eff13de28ff4516965f436db9a69eee4de"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-13T20:53:49.433795+00:00",
+      "elapsed_seconds": 14.313,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-minimal.log",
+      "log_sha256": "0d5f94cec83270f6ce6d6d1be5dd32872c69e5d8a3489400d200b62b69233dd2"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-13T20:54:03.747043+00:00",
+      "elapsed_seconds": 15.144,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-features.log",
+      "log_sha256": "84292c4730b2b46814bcbd044535b164565142ae19ea5b1dcf8952296081deb9"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-13T20:54:18.891760+00:00",
+      "elapsed_seconds": 41.44,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-portable.log",
+      "log_sha256": "faf5cacecd686db6b8305df3c0fa658ff2c766b53e6498f84dd4e873a87e48e2"
+    },
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-host-slot-runtime-initial.log",
+      "log_sha256": "e3c74afdbceb6dfaa1849a5cb53b7a2c65ab523e4ee26e07ccb55b7719307d47",
+      "note": "Executed after runtime owner and DeviceState migration, before native-only changes. No runtime source changed afterward."
+    }
+  },
+  "source_sha256": {
+    "doc/backend-architecture.md": "376f5aff7ae1cd3224ab31326b1b77b011132b6eb83cb07ab93140dcbfa39f37",
+    "doc/bounded-inference.md": "1043f9da85182335cfb082fccef62c6ac2e9b2bae9693d416fa476d89e83d15e",
+    "doc/execution-control.md": "eac3b92122a29577323c2419f54000df2b96330f3448c2f96d5dd7901b81a9ba",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid.rs": "20d27f75122c9ad5d6c65d884b27879301e359607b2bf4869d2e608795157dd8",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid/fixed_slots.rs": "25d9df22e7a528325b27f69c3b8280bfc441b137e0c1da2f62b7bae5a205a9fd",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid/fixed_slots/prepared_copy.rs": "23d8220abefc55cd2d89caa5d61fd5be47bf6670417d5f264ace1f03b852ce5e",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid/fixed_slots/prepared_copy/tests.rs": "1f8c532cb1c1751607fb55315ec6f7477ebdbd417f4686b70dd4367f79702ab9",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid/fixed_slots/tests.rs": "13c0da18645d8434391808000ea3dbad7e88c433d1f975d8a3446b17db3499bb",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid/fixed_slots/tests/metadata.rs": "6b179483f3d2af9c4a56bb630a9efdbf69d1975173347342aa80929c3ee5ed2e",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid/slot_owner_tests.rs": "a622f60f5b425d5f3777c527814bc7f5abe7ce36cc2d770694fa1533ef6a2ff4",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid/workspace.rs": "a7bfde66885f367183a63f07a34a381df46f36d412e3927bd8060d8aa48f299c",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid/workspace/tests.rs": "590ccbe1f451ed8f793a5f54f87b9e61e6da9ed48a8588e6d96b5251c6668df9",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/key_value.rs": "bb3b0345496c1c18070b69f9d6a4fa14760b73f5a4f2768bbb3fd38d9dcaae92",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/key_value/slot_tests.rs": "e224b3f8936991540f673b4b3f876f34a399485843b65be9dfdc84c5d4b12c47",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/key_value/workspace.rs": "c7a8462758b06fb22f0a06d7c9be33b6e4d43228756a5171492a7d6bff4f007a",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/tests/isolated_snapshots.rs": "6de616a15d3ef2f3777d9a0b4c193148cacbcb189bd60756f9c6d6520b561897",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/tests/semantic_transactions.rs": "9cfaee5d55f22c78c26bb2e5ec2d671fd24607bf47a5b78559781a4e3312981b",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage.rs": "f1a88b0edcf33611f1803808a734c60d7ed8eac7e96dbb5bcee25cc4a18ecd23",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission.rs": "67992483975f465aca3fa4afdb440bb6887376174b85ac82c6cbfd26ba92c46a",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication.rs": "2471ff9661ea08643caf90e146bd0035d65ce1ecb430652186a57a69a9874002",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication/slot_metadata_tests.rs": "95ab034f0f601f681d9c1e017f5e9453d68f6f040c43ecf40c9b49bf25704025",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction/parameters.rs": "164ef7d5dd911551c0b6440ca5f97f7f044a95e1a8fa8e5dac5a9aa2aafa1016",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction/parameters/storage_tests.rs": "1dbc1620edbba887b25e87638544f72052f19624554d220df8e7792c48181a34",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/composite.rs": "23ddf584017ad83383c6b99bbb079dbdd4f63257cb499eb7b1aa6e271797e8a5",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/replicated.rs": "583d40e86d72c4b41780fa9b1885ecbceb26111bcd04c506282e1117fd759e4f",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/state.rs": "bfa9f6a2152e74bcdbf17d53d70fae7c80105b88724a04462e09bc64a12cac1c",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/tests/mod.rs": "86358cfe7e9cc244793143364b06cd4667b4c8a0f0a2721b2ca6868701d0dfe5",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/layout_publication_tests.rs": "d241ea6d34b8ede57812dee56b0d746dcfb0606eea221b10280fda2cd100a849",
+    "eredu-runtime/src/host_metadata.rs": "64f5ef9175938098eeea35d9f21d7b5ac231bdea68d90dc6c1e71fe39ea4eb2e",
+    "eredu-runtime/src/host_metadata/slots.rs": "88ff207b2d2f993c89e113021ee7c3eed1563026d6d5c6c9b2ed397eaeb0b727",
+    "eredu-runtime/src/host_metadata/slots/tests.rs": "b3c9e257222949517144a5074a95dd4f335d3f0dfb28f74c50360b5827baa44e",
+    "eredu-runtime/src/lib.rs": "c9186ec54c791a96c03b15117fa21eefb04d40d76bd4e46c8fc5523a4cde78fe",
+    "eredu-runtime/src/state.rs": "8ca010b2bfbd3306ee5b26ece0cbcdfa5d7b680b7e33fb641f08b12c9bbd66f2",
+    "eredu-runtime/src/state/shared_construction_tests.rs": "15e7938b302bb0bcf40d0f3580f36af8f8f9c63ee88d8f4921edf6ca5268a8b6"
+  },
+  "artifacts": {
+    "/private/tmp/eredu-host-slot-checks.py": {
+      "sha256": "ef522a064eadd90df8ba57759c66e26ce557741958cf5995ef4a64733072601c"
+    },
+    "/private/tmp/eredu-host-slot-format.log": {
+      "sha256": "1fc4826c1c434c7b888f03ecce95e98aa49e46e4f282a655cad746662c5feaf5"
+    },
+    "/private/tmp/eredu-host-slot-review.md": {
+      "sha256": "9b79d7302afa901ab9150bdd60b970c88f28000a91675721107bb391b24b86fb"
+    },
+    "/private/tmp/eredu-host-slot-review-sha256.json": {
+      "sha256": "7af5259e8056861bc2acec517fa15cf7001bf26ff3a3edf6733b2052fd83a28f"
+    },
+    "/private/tmp/eredu-host-slot-frozen-rust-sha256.json": {
+      "sha256": "7af5259e8056861bc2acec517fa15cf7001bf26ff3a3edf6733b2052fd83a28f"
+    },
+    "/private/tmp/eredu-host-slot-source-files.txt": {
+      "sha256": "e04d7b98f49ed8a218ad7325f7723ef8817aa589c3a7ca34189f6d9aff680e9d"
+    },
+    "/private/tmp/eredu-decoder-host-copy-design.md": {
+      "sha256": "b04066a76f9440e4ce899a6387eb413ecc15f80e29d9808bc5be4e09b8b7efb2"
+    },
+    "/private/tmp/eredu-host-slot-cache.log.attempt5": {
+      "sha256": "6a11839981987197bad0a5ebf497f8c99427c15dd8a3f7af8172686c7c076b47"
+    },
+    "/private/tmp/eredu-host-slot-checks.json.attempt1": {
+      "sha256": "a196645b5f3bf81ac9186482834ef0b3e84f3f206ae88a0a2fdfacf0e1fba380"
+    },
+    "/private/tmp/eredu-host-slot-checks.json.attempt2": {
+      "sha256": "aabc21f6443fe28a1c0ea807d929842b23fac0c5540b3bd76bc42bc59eb1a483"
+    },
+    "/private/tmp/eredu-host-slot-checks.json.attempt3": {
+      "sha256": "0c33c19c7941754fbfb310a5cb912b22bb7e2ced08f8beb35852e5b91068b09b"
+    },
+    "/private/tmp/eredu-host-slot-checks.json.attempt4": {
+      "sha256": "5096d1c5eea440c07f280ab44345671e29c4e78d3ec82b2f9f75079dbe2f1391"
+    },
+    "/private/tmp/eredu-host-slot-checks.json.attempt5": {
+      "sha256": "75d9f6057665b3b7e71fb3df4d8a1964b1261a6d2cb35e0ac3ce04b0726deabe"
+    },
+    "/private/tmp/eredu-host-slot-layout.log.attempt1": {
+      "sha256": "f3e8aac92d925faba11eaf47e702fe1ab95f6aa7c9cf162efdc31663dc7cf118"
+    },
+    "/private/tmp/eredu-host-slot-layout.log.attempt2": {
+      "sha256": "59e336a0289095a84d871aeb71cd96210de9fbfddaf4c136e97b0755ab147b14"
+    },
+    "/private/tmp/eredu-host-slot-layout.log.attempt3": {
+      "sha256": "78eaf2c371a639e160427f068a0f0e2b6ae4be850e24c3e4b4f68798ba525886"
+    },
+    "/private/tmp/eredu-host-slot-layout.log.attempt4": {
+      "sha256": "f8023dc00c8b4dd28491dcff14801d1a411844e7a3b7a0237f3676986eb7cb69"
+    },
+    "/private/tmp/eredu-host-slot-loaded-diagnostic.log": {
+      "sha256": "29424829949ec237d379a2ec95a5f6ea9f73085806de4716c081333492bf06f6"
+    },
+    "/private/tmp/eredu-host-slot-owner-initial.log": {
+      "sha256": "c4d5b055fcee09a040016bde57934b5d725a8fea174d955c60a0a89474670ff4"
+    },
+    "/private/tmp/eredu-host-slot-runtime-initial.log": {
+      "sha256": "e3c74afdbceb6dfaa1849a5cb53b7a2c65ab523e4ee26e07ccb55b7719307d47"
+    }
+  },
+  "previous_increment": "doc/validation/bounded-native-state-copy-2026-09-13.json",
+  "behavior": [
+    "HostSlotTable directly owns an actual boxed extent; its separate metadata token contains no pointer to elements and cannot grant source-data access.",
+    "Cold attachment and retirement serialize without locking hot mutable values. Retirement fences new attachments before payload destruction; elements and charge destructors run outside locks. Escaped tokens conservatively retain earlier charges.",
+    "DeviceState and native key/value, hybrid layer and hybrid fixed-role storage preserve borrowed access, numerical clone semantics and existing replacement-versus-reuse behavior while giving real new tables independent identities.",
+    "Native inventory includes exact table identity and inline capacity through required state visitors. Initial and final operation publication attach actual source charges before relinquishing existing authority. Partial publication preserves prior attachments and source authority or quarantine.",
+    "Dormant hybrid prediction prototypes contribute their actual shared layout and layer/fixed tables alongside independently deduplicated native storage.",
+    "Loaded Llama and Qwen fixtures verify complete initial publication. DeepSeek V4 retains Unknown/loading authority for lazy rotary helper copies; only its known table inventory is separately published under that authority for the source-lifetime test.",
+    "Exchange tests preserve the original table charge when it moves into a saved state, until that saved state or its final accounting token retires."
+  ],
+  "initial_findings": [
+    "Staged test compile errors included two obsolete SharedStorageDomain constructors, a missed mutable slice access, and a missing RuntimeStateComponents import; corrected.",
+    "An attention-backed prototype cannot call advance_fixed; its attention append already advances its frontier. Removed the invalid call.",
+    "Two new recurrent-role fixtures incorrectly requested AlwaysDeviceMutable; corrected to the required LayerScopedOffloadable policy.",
+    "The prior layout-only exchange assertion omitted the newly tracked original table that moved into saved state; corrected its lifetime expectation.",
+    "An unconditional loaded-model retirement assertion incorrectly treated DeepSeek lazy retained rotary copies as known. The final test explicitly preserves whole-model Unknown and loading authority, with a separate exact table publication.",
+    "Final escaped-token checks choose a positive-capacity table so empty fixed-role boxes cannot make the final charge assertion vacuous.",
+    "Independent review found no remaining owner/publication or transaction defect. Repeated fixed-role and overlapping operation tests are counted once in the distinct-test total."
+  ],
+  "limits": [
+    "Only actual inline source tables are certified. Nested native arrays are separately inventoried; paged catalogs, transfer namespaces, enclosing prediction vectors, inference-retention payload, collector/construction scratch and bookkeeping remain separate.",
+    "Exact source capacity does not bound destination initialization or authorize a copy. A future closed copy plan must borrow the actual table and authenticate all source origins under one aggregate account.",
+    "Complete saved decoder/sampler admission, exact destination host construction, partial-failure coverage and fresh resumed-run authority remain unfinished.",
+    "DeepSeek retained rotary helper copies still need a complete cold physical inventory before whole-model strict admission; no eager evaluation was added to inspection.",
+    "Complete facade parser/controller/decoder/capture/delivery accounting and the full family/path strict-admission matrix remain unfinished.",
+    "No new released-checkpoint, distributed numerical, hardware, allocator-peak or process-memory measurement was performed."
+  ]
+}

@@ -31,6 +31,8 @@ use super::layers::{relu2, silu};
 /// The packed weight and its metadata keep the group dimension leading, so
 /// this is usable by any checkpoint layout once split groups have been
 /// assembled into `[groups, output, input]` banks.
+mod construction;
+pub(crate) use construction::{ParameterFactory, UnloadedParameters, parameter_factory_control_bytes};
 mod gated_product;
 mod packed_linear;
 mod relu2;
@@ -40,10 +42,17 @@ use units::observe_units;
 pub(crate) use units::NativeGroupedUnitObserver;
 
 pub use gated_product::PackedGatedProductGroups;
+pub(crate) use gated_product::{
+    GROUPED_PROJECTION_CHUNK_THRESHOLD, GROUPED_PROJECTION_CHUNK_TOKENS,
+};
 pub use packed_linear::packed_grouped_linear;
+pub(crate) use packed_linear::{mxfp4_projection_control_bytes, affine_projection_control_bytes};
 pub use relu2::PackedRelu2Groups;
 pub(crate) use selection::{weighted_group_sum, GroupSelectionOutput};
 pub use selection::{TopKGroupScoring, TopKGroupSelector, TopKGroupSelectorConfig};
 
 #[cfg(test)]
 mod tests;
+
+mod joint;
+pub(crate) use joint::{joint_selection, joint_selection_control_bytes};

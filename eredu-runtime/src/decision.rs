@@ -1,7 +1,9 @@
 //! Backend-neutral sequential prediction decisions and layered traversal handoff.
 
+use crate::host_metadata::funded_vec;
 use std::marker::PhantomData;
 
+use eredu_core::OutputDemand;
 use eredu_nn::{NeuralBackend, Tensor};
 
 use crate::{
@@ -18,6 +20,43 @@ pub enum SequentialDecisionMode {
     Autoregressive,
     /// Forced and sampler-selected predictions are interleaved.
     PartiallyForced,
+}
+
+/// Explicit observation contract at sequential decision boundaries.
+///
+/// Opportunistic tracing receives only values required by another consumer;
+/// it does not require execution of a wholly forced tail.
+#[derive(Debug, Default, Clone, Copy, Eq, PartialEq)]
+pub enum SequentialDecisionObservation {
+    /// Preserve tracing of values that execution already produces.
+    #[default]
+    Opportunistic,
+    /// Require a real final-position value, including for forced decisions.
+    RequiredLastPosition,
+    /// Require every position, including for forced decisions.
+    RequiredSequence,
+}
+
+impl SequentialDecisionObservation {
+    /// Vocabulary demand of the observation itself.
+    pub const fn demand(self) -> OutputDemand {
+        match self {
+            Self::Opportunistic => OutputDemand::StateOnly,
+            Self::RequiredLastPosition => OutputDemand::LastPosition,
+            Self::RequiredSequence => OutputDemand::Sequence,
+        }
+    }
+}
+
+/// Combines independently required output geometries before projection.
+pub const fn merge_output_demand(left: OutputDemand, right: OutputDemand) -> OutputDemand {
+    match (left, right) {
+        (OutputDemand::Sequence, _) | (_, OutputDemand::Sequence) => OutputDemand::Sequence,
+        (OutputDemand::LastPosition, _) | (_, OutputDemand::LastPosition) => {
+            OutputDemand::LastPosition
+        }
+        _ => OutputDemand::StateOnly,
+    }
 }
 
 /// One prediction's forcing directive.
@@ -44,7 +83,13 @@ impl<T> SequentialDecisionPlan<T> {
         retain_diagnostics: bool,
         allow_fully_forced_tail_skip: bool,
     ) -> Result<Self, SequentialDecisionPlanError> {
-        let directives = directives.into_iter().collect::<Vec<_>>();
+        Self::from_directives(directives.into_iter().collect(),retain_diagnostics,allow_fully_forced_tail_skip)
+    }
+
+    /// Adopts an already constructed ordered destination without another copy.
+    pub fn from_directives(directives:Vec<PredictionDirective<T>>,
+        retain_diagnostics:bool,allow_fully_forced_tail_skip:bool)
+        ->Result<Self,SequentialDecisionPlanError> {
         if directives.is_empty() {
             return Err(SequentialDecisionPlanError::EmptyPlan);
         }
@@ -179,6 +224,8 @@ where
     random: Option<B::RandomState>,
     decisions: Vec<SequentialDecision<B::Token>>,
     diagnostics: Vec<SequentialDecisionDiagnostic<B::Logits>>,
+    // Returned sampling state is adopted by the enclosing funded transaction.
+    host_funding: Option<eredu_core::HostMetadataFunding>,
 }
 
 /// Sampler instances and optional backend randomness advanced by one decision pass.
@@ -196,6 +243,20 @@ where
         temperatures: Vec<f32>,
         random: Option<B::RandomState>,
     ) -> Result<Self, SequentialDecisionPlanError> {
+        Self::new_in(plan,samplers,temperatures,random,None)
+    }
+
+    /// Uses the same decision driver with paid result and diagnostic storage.
+    /// Supplied policies, tokens and random state already carry their child sources.
+    pub fn new_with_host_source(plan:SequentialDecisionPlan<B::Token>,samplers:Vec<S>,
+        temperatures:Vec<f32>,random:Option<B::RandomState>,funding:&eredu_core::HostMetadataFunding)
+        ->Result<Self,SequentialDecisionPlanError> {
+        Self::new_in(plan,samplers,temperatures,random,Some(funding.clone()))
+    }
+
+    fn new_in(plan:SequentialDecisionPlan<B::Token>,samplers:Vec<S>,
+        temperatures:Vec<f32>,random:Option<B::RandomState>,
+        host_funding:Option<eredu_core::HostMetadataFunding>)->Result<Self,SequentialDecisionPlanError> {
         if samplers.len() != plan.len() {
             return Err(SequentialDecisionPlanError::SamplerCountMismatch {
                 predictions: plan.len(),
@@ -219,14 +280,34 @@ where
                 bits: temperature.to_bits(),
             });
         }
-        Ok(Self {
-            plan,
-            samplers,
-            temperatures,
-            random,
-            decisions: Vec::new(),
-            diagnostics: Vec::new(),
-        })
+        let (decisions,diagnostics)=if let Some(funding)=&host_funding {
+            funding.reserve_metadata(Self::host_header_bytes())?;
+            (funded_vec(plan.len(),Some(funding))?,
+                funded_vec(if plan.retain_diagnostics {plan.len()}else{0},Some(funding))?)
+        } else {(Vec::new(),Vec::new())};
+        Ok(Self {plan,samplers,temperatures,random,decisions,diagnostics,host_funding})
+    }
+
+    fn clone_token(&self,value:&B::Token,context:&B::Context)->Result<B::Token,SequentialDecisionError<B::Error>> {
+        match self.host_funding.as_ref() {
+            Some(funding)=>B::clone_token_with_host_source(value,funding,context).map_err(SequentialDecisionError::HostClone),
+            None=>Ok(value.clone()),
+        }
+    }
+    pub(crate) fn host_header_bytes()->usize {
+        std::mem::size_of::<Self>()*2+std::mem::size_of::<Result<Self,SequentialDecisionPlanError>>()
+    }
+    pub(crate) fn host_source_bytes(predictions:usize,diagnostics:bool,forced_tail:usize)->Option<usize> {
+        use crate::host_metadata::funded_vec_bytes as vector;
+        let mut bytes=Self::host_header_bytes()
+            .checked_add(vector::<SequentialDecision<B::Token>>(predictions)?)?
+            .checked_add(vector::<SequentialDecisionDiagnostic<B::Logits>>(if diagnostics {predictions}else{0})?)?;
+        // The existing traversal can accept at most one terminal forced tail.
+        if forced_tail!=0 {
+            bytes=bytes.checked_add(vector::<TokenDomain>(forced_tail)?.checked_mul(2)?)?
+                .checked_add(vector::<B::Token>(forced_tail)?)?;
+        }
+        Some(bytes)
     }
 
     /// Borrows the validated decision plan.
@@ -290,7 +371,13 @@ where
         {
             return Err(SequentialDecisionError::InvalidTailSkip { prediction, count });
         }
-        let domains = domains.into_iter().collect::<Vec<_>>();
+        let mut source=domains.into_iter();
+        let mut domains=funded_vec(count,self.host_funding.as_ref())?;
+        for domain in source.by_ref() {
+            if domains.len()==count {return Err(SequentialDecisionError::TokenDomainCountMismatch {
+                prediction,expected:count,actual:count.saturating_add(1)});}
+            domains.push(domain);
+        }
         if domains.len() != count {
             return Err(SequentialDecisionError::TokenDomainCountMismatch {
                 prediction,
@@ -298,15 +385,16 @@ where
                 actual: domains.len(),
             });
         }
-        self.plan.directives[prediction..prediction + count]
-            .iter()
-            .zip(domains)
-            .map(|(directive, domain)| match directive {
-                PredictionDirective::Force(token) => B::validate_token(token, domain, context)
-                    .map_err(SequentialDecisionError::Backend),
-                PredictionDirective::Sample => unreachable!("tail was proven fully forced"),
-            })
-            .collect()
+        let mut tokens=funded_vec(count,self.host_funding.as_ref())?;
+        for (directive,domain) in self.plan.directives[prediction..prediction+count].iter().zip(domains) {
+            let token=match directive {
+                PredictionDirective::Force(token)=>B::validate_token(token,domain,context)
+                    .map_err(SequentialDecisionError::Backend)?,
+                PredictionDirective::Sample=>unreachable!("tail was proven fully forced"),
+            };
+            tokens.push(token);
+        }
+        Ok(tokens)
     }
 
     /// Records a proven and architecture-accepted forced tail.
@@ -336,6 +424,26 @@ where
         Ok(())
     }
 
+    /// Demand of the actual next directive and diagnostic consumer.
+    pub fn readout_demand(
+        &self,
+        prediction: usize,
+    ) -> Result<OutputDemand, SequentialDecisionError<B::Error>> {
+        self.require_next(prediction)?;
+        Ok(
+            if self.plan.retain_diagnostics
+                || matches!(
+                    self.plan.directives[prediction],
+                    PredictionDirective::Sample
+                )
+            {
+                OutputDemand::Sequence
+            } else {
+                OutputDemand::StateOnly
+            },
+        )
+    }
+
     /// Resolves one executed prediction from backend-native logits.
     pub fn resolve(
         &mut self,
@@ -344,13 +452,40 @@ where
         domain: TokenDomain,
         context: &B::Context,
     ) -> Result<B::Token, SequentialDecisionError<B::Error>> {
-        self.require_next(prediction)?;
+        self.resolve_optional(
+            prediction,
+            Some(logits),
+            domain,
+            OutputDemand::StateOnly,
+            context,
+        )
+    }
+
+    /// Resolves a decision without manufacturing logits for an unobserved
+    /// forced token. Missing required scores fail before sampling or token work.
+    pub fn resolve_optional(
+        &mut self,
+        prediction: usize,
+        logits: Option<&B::Logits>,
+        domain: TokenDomain,
+        observation: OutputDemand,
+        context: &B::Context,
+    ) -> Result<B::Token, SequentialDecisionError<B::Error>> {
+        let demand = merge_output_demand(self.readout_demand(prediction)?, observation);
+        if logits.is_none() && demand != OutputDemand::StateOnly {
+            return Err(SequentialDecisionError::MissingLogits { prediction });
+        }
+        if matches!(self.plan.directives[prediction],PredictionDirective::Sample) {
+            if let Some(funding)=&self.host_funding {
+                self.samplers[prediction].reserve_sample_with_host_source(funding)?;
+            }
+        }
         let (token, source) = match &self.plan.directives[prediction] {
-            PredictionDirective::Force(token) => (token.clone(), SequentialDecisionSource::Forced),
+            PredictionDirective::Force(token) => (self.clone_token(token,context)?, SequentialDecisionSource::Forced),
             PredictionDirective::Sample => (
                 self.samplers[prediction]
                     .sample(
-                        logits,
+                        logits.expect("sampled decisions require logits"),
                         self.temperatures[prediction],
                         self.random.as_mut(),
                         context,
@@ -364,13 +499,17 @@ where
         if self.plan.retain_diagnostics {
             self.diagnostics.push(SequentialDecisionDiagnostic {
                 prediction,
-                logits: logits.clone(),
+                logits: match self.host_funding.as_ref() {
+                    Some(funding)=>B::clone_logits_with_host_source(logits.expect("diagnostic decisions require logits"),funding,context)
+                        .map_err(SequentialDecisionError::HostClone)?,
+                    None=>logits.expect("diagnostic decisions require logits").clone(),
+                },
             });
         }
         self.decisions.push(SequentialDecision {
             prediction,
             source,
-            token: token.clone(),
+            token: self.clone_token(&token,context)?,
         });
         Ok(token)
     }
@@ -419,6 +558,32 @@ where
     /// Returns the prediction ordinal at this traversal point, if any.
     fn prediction_at(&self, point: LayeredTraversalPoint, forward: &C) -> Option<usize>;
 
+    /// Installs merged demand before this boundary's unit/group executes.
+    fn prepare_logits(
+        &mut self,
+        _prediction: usize,
+        _point: LayeredTraversalPoint,
+        _demand: OutputDemand,
+        _forward: &mut C,
+        _context: &B::Context,
+    ) -> Result<(), E> {
+        Ok(())
+    }
+
+    /// Borrows an optional projection produced by a demand-aware boundary.
+    /// Existing boundaries continue producing their ordinary scores.
+    fn optional_logits(
+        &mut self,
+        prediction: usize,
+        point: LayeredTraversalPoint,
+        value: &B::Logits,
+        forward: &mut C,
+        context: &B::Context,
+    ) -> Result<Option<B::Logits>, E> {
+        self.logits(prediction, point, value, forward, context)
+            .map(Some)
+    }
+
     /// Produces backend-native logits for one target or predictor boundary.
     fn logits(
         &mut self,
@@ -460,6 +625,7 @@ where
 {
     driver: &'a mut SequentialDecisionDriver<B, S>,
     boundary: &'a mut D,
+    observation: SequentialDecisionObservation,
     marker: PhantomData<fn(C) -> E>,
 }
 
@@ -474,8 +640,37 @@ where
         Self {
             driver,
             boundary,
+            observation: SequentialDecisionObservation::Opportunistic,
             marker: PhantomData,
         }
+    }
+
+    /// Requires actual decision observations independently of tracing geometry.
+    pub const fn with_observation(mut self, observation: SequentialDecisionObservation) -> Self {
+        self.observation = observation;
+        self
+    }
+
+    fn prepare(
+        &mut self,
+        point: LayeredTraversalPoint,
+        forward: &mut C,
+        context: &B::Context,
+    ) -> Result<(), E> {
+        let Some(prediction) = self.boundary.prediction_at(point, forward) else {
+            return Ok(());
+        };
+        let demand = self
+            .driver
+            .readout_demand(prediction)
+            .map_err(|error| self.boundary.decision_error(error))?;
+        self.boundary.prepare_logits(
+            prediction,
+            point,
+            merge_output_demand(demand, self.observation.demand()),
+            forward,
+            context,
+        )
     }
 
     fn process(
@@ -490,11 +685,17 @@ where
         };
         let logits = self
             .boundary
-            .logits(prediction, point, value, forward, context)?;
+            .optional_logits(prediction, point, value, forward, context)?;
         let domain = self.boundary.token_domain(prediction, point, forward)?;
         let token = self
             .driver
-            .resolve(prediction, &logits, domain, context)
+            .resolve_optional(
+                prediction,
+                logits.as_ref(),
+                domain,
+                self.observation.demand(),
+                context,
+            )
             .map_err(|error| self.boundary.decision_error(error))?;
         self.boundary
             .accept(prediction, point, &token, forward, context)
@@ -509,6 +710,16 @@ where
     S: Sampler<B>,
     D: SequentialDecisionBoundary<B, C, E>,
 {
+    fn after_group_begin(
+        &mut self,
+        group: usize,
+        _value: &mut NB::Tensor,
+        forward: &mut C,
+        context: &<NB::Tensor as Tensor>::Context,
+    ) -> Result<(), E> {
+        self.prepare(LayeredTraversalPoint::Group { group }, forward, context)
+    }
+
     fn before_unit(
         &mut self,
         group: usize,
@@ -522,6 +733,10 @@ where
         let Some(prediction) = self.boundary.prediction_at(point, forward) else {
             return Ok(LayeredUnitAction::Execute);
         };
+        self.prepare(point, forward, context)?;
+        if self.observation != SequentialDecisionObservation::Opportunistic {
+            return Ok(LayeredUnitAction::Execute);
+        }
         let tail = self
             .driver
             .fully_forced_tail_decision(prediction, remaining_units)
@@ -529,7 +744,8 @@ where
         let FullyForcedTailDecision::Skip { predictions } = tail else {
             return Ok(LayeredUnitAction::Execute);
         };
-        let mut domains = Vec::with_capacity(predictions);
+        let mut domains = funded_vec(predictions,self.driver.host_funding.as_ref())
+            .map_err(|cause|self.boundary.decision_error(SequentialDecisionError::HostMetadata(cause)))?;
         for offset in 0..predictions {
             let skipped_point = LayeredTraversalPoint::Unit {
                 group,
@@ -602,6 +818,9 @@ where
 /// Invalid construction of a sequential decision plan or driver.
 #[derive(Debug, Clone, Eq, PartialEq, thiserror::Error)]
 pub enum SequentialDecisionPlanError {
+    /// Exact host source refused construction before allocation.
+    #[error(transparent)]
+    HostMetadata(#[from] eredu_core::HostMetadataFundingError),
     /// No target or predictor decisions were declared.
     #[error("sequential decision plan must contain at least one prediction")]
     EmptyPlan,
@@ -638,6 +857,18 @@ pub enum SequentialDecisionPlanError {
 /// Failure while resolving an ordered sequential decision chain.
 #[derive(Debug, thiserror::Error)]
 pub enum SequentialDecisionError<E> {
+    /// The exact retained native descriptor copy failed.
+    #[error(transparent)]
+    HostClone(eredu_core::BackendFailure),
+    /// Exact host source refused the next actual decision destination.
+    #[error(transparent)]
+    HostMetadata(#[from] eredu_core::HostMetadataFundingError),
+    /// An actual sampler, diagnostic, or required observation lacked scores.
+    #[error("sequential decision {prediction} requires logits")]
+    MissingLogits {
+        /// Prediction rejected before any sampling or token validation.
+        prediction: usize,
+    },
     /// The sampler or sampling backend failed.
     #[error("sequential decision backend failed: {0}")]
     Backend(E),
@@ -1042,5 +1273,56 @@ mod tests {
             Err(SequentialDecisionError::Backend(_))
         ));
         assert!(tail.decisions().is_empty());
+    }
+    #[test]
+    fn absent_scores_reject_before_sampling_and_only_unobserved_forcing_can_proceed() {
+        for (directive, diagnostics, observation) in [
+            (PredictionDirective::Sample, false, OutputDemand::StateOnly),
+            (PredictionDirective::Force(7), true, OutputDemand::StateOnly),
+            (
+                PredictionDirective::Force(7),
+                false,
+                OutputDemand::LastPosition,
+            ),
+            (PredictionDirective::Force(7), false, OutputDemand::Sequence),
+        ] {
+            let plan = SequentialDecisionPlan::new([directive], diagnostics, true).unwrap();
+            let mut driver = SequentialDecisionDriver::<Backend, _>::new(
+                plan,
+                vec![OffsetSampler(0)],
+                vec![0.0],
+                Some(19),
+            )
+            .unwrap();
+            assert!(matches!(
+                driver.resolve_optional(0, None, TokenDomain::new(10), observation, &()),
+                Err(SequentialDecisionError::MissingLogits { prediction: 0 })
+            ));
+            assert_eq!(driver.random_state(), Some(&19));
+            assert!(driver.decisions().is_empty() && driver.diagnostics().is_empty());
+            assert!(driver.finish().is_err());
+            driver
+                .resolve_optional(0, Some(&3), TokenDomain::new(10), observation, &())
+                .unwrap();
+            driver.finish().unwrap();
+        }
+        let plan =
+            SequentialDecisionPlan::new([PredictionDirective::Force(7)], false, false).unwrap();
+        let mut driver = SequentialDecisionDriver::<Backend, _>::new(
+            plan,
+            vec![OffsetSampler(0)],
+            vec![0.0],
+            Some(19),
+        )
+        .unwrap();
+        assert_eq!(
+            driver
+                .resolve_optional(0, None, TokenDomain::new(10), OutputDemand::StateOnly, &())
+                .unwrap(),
+            7
+        );
+        assert_eq!(driver.random_state(), Some(&19));
+        assert!(driver.diagnostics().is_empty());
+        driver.finish().unwrap();
     }
 }

@@ -114,6 +114,14 @@ def generate(code, name, rcpptype, cpptypes):
     code = code.replace("RCARGS", rcargs)
     code = code.replace("CARGS", cargs)
 
+    # Graph refusal can occur after other callback argument/result handles exist.
+    for ctype, scope in [("mlx_vector_array", "ArrayVectorScope"), ("mlx_array", "ArrayScope"), ("mlx_vector_int", "IntVectorScope"), ("mlx_map_string_to_array", "ArrayMapScope")]:
+        names = set(regex.findall(r"auto (\w+) = " + ctype + r"_new_\([^;]*\);", code))
+        code = regex.sub(r"(auto (\w+) = " + ctype + r"_new_\([^;]*\);)", r"\1\n" + scope + r" own_\2(\2);", code)
+        for local in names:
+            # Tuple cleanup can end with two semicolons. Remove only the owned
+            # handle's exact free statement, retaining any trailing no-op.
+            code = regex.sub(r"^[ \t]*" + ctype + r"_free\(" + regex.escape(local) + r"\);(?=[ \t;]*(?:\n|$))", "", code, flags=regex.M)
     return code
 
 
@@ -256,6 +264,24 @@ impl_begin = r"""/* Copyright © 2023-2024 Apple Inc.                   */
 #include "mlx/c/closure.h"
 #include "mlx/c/error.h"
 #include "mlx/c/private/mlx.h"
+
+namespace {
+// Only the concrete temporary handles used by these callback bridges.
+// The slots stay valid until this local owner runs; no allocation or callback
+// is performed by construction, and no handle escapes on a failed conversion.
+template<class Handle, auto Destroy>
+struct CallbackHandleScope {
+  Handle& slot;
+  explicit CallbackHandleScope(Handle& value) noexcept : slot(value) {}
+  CallbackHandleScope(const CallbackHandleScope&) = delete;
+  ~CallbackHandleScope() { Destroy(slot); }
+};
+using ArrayVectorScope = CallbackHandleScope<mlx_vector_array, mlx_vector_array_free_>;
+using ArrayScope = CallbackHandleScope<mlx_array, mlx_array_free_>;
+using IntVectorScope = CallbackHandleScope<mlx_vector_int, mlx_vector_int_free_>;
+using ArrayMapScope = CallbackHandleScope<mlx_map_string_to_array, mlx_map_string_to_array_free_>;
+} // namespace
+
 """
 
 impl_end = """
@@ -297,8 +323,8 @@ print(
     generate(
         code,
         "mlx_closure",
-        "std::vector<mlx::core::array>",
-        ["std::vector<mlx::core::array>"],
+        "mlx::core::ArrayVector",
+        ["mlx::core::ArrayVector"],
     )
 )
 if args.implementation:
@@ -307,20 +333,19 @@ if args.implementation:
 extern "C" mlx_closure mlx_closure_new_unary(
     int (*fun)(mlx_array*, const mlx_array)) {
   try {
-    auto cpp_closure = [fun](const std::vector<mlx::core::array>& cpp_input) {
+    auto cpp_closure = [fun](const mlx::core::ArrayVector& cpp_input) {
       if (cpp_input.size() != 1) {
         throw std::runtime_error("closure: expected unary input");
       }
       auto input = mlx_array_new_(cpp_input[0]);
+      ArrayScope own_input(input);
       auto res = mlx_array_new_();
+      ArrayScope own_res(res);
       auto status = fun(&res, input);
       if(status) {
-        mlx_array_free_(res);
         throw std::runtime_error("mlx_closure returned a non-zero value");
       }
-      mlx_array_free(input);
-      std::vector<mlx::core::array> cpp_res = {mlx_array_get_(res)};
-      mlx_array_free(res);
+      mlx::core::ArrayVector cpp_res = {mlx_array_get_(res)};
       return cpp_res;
     };
     return mlx_closure_new_(cpp_closure);
@@ -343,9 +368,9 @@ print(
     generate(
         code,
         "mlx_closure_kwargs",
-        "std::vector<mlx::core::array>",
+        "mlx::core::ArrayVector",
         [
-            "std::vector<mlx::core::array>",
+            "mlx::core::ArrayVector",
             "std::unordered_map<std::string, mlx::core::array>",
         ],
     )
@@ -354,26 +379,26 @@ print(
     generate(
         code,
         "mlx_closure_value_and_grad",
-        "std::pair<std::vector<mlx::core::array>, std::vector<mlx::core::array>>",
-        ["std::vector<mlx::core::array>"],
+        "std::pair<mlx::core::ArrayVector, mlx::core::ArrayVector>",
+        ["mlx::core::ArrayVector"],
     )
 )
 print(
     generate(
         code,
         "mlx_closure_custom",
-        "std::vector<mlx::core::array>",
-        ["std::vector<mlx::core::array>"] * 3,
+        "mlx::core::ArrayVector",
+        ["mlx::core::ArrayVector"] * 3,
     )
 )
 print(
     generate(
         code,
         "mlx_closure_custom_jvp",
-        "std::vector<mlx::core::array>",
+        "mlx::core::ArrayVector",
         [
-            "std::vector<mlx::core::array>",
-            "std::vector<mlx::core::array>",
+            "mlx::core::ArrayVector",
+            "mlx::core::ArrayVector",
             "std::vector<int>",
         ],
     )
@@ -382,8 +407,8 @@ print(
     generate(
         code,
         "mlx_closure_custom_vmap",
-        "std::pair<std::vector<mlx::core::array>, @std::vector<int>>",
-        ["std::vector<mlx::core::array>", "std::vector<int>"],
+        "std::pair<mlx::core::ArrayVector, @std::vector<int>>",
+        ["mlx::core::ArrayVector", "std::vector<int>"],
     )
 )
 if args.private:

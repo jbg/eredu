@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use eredu_architectures::{
-    prepared_sources::{prepare_model_sources, PreparedModelSources},
+    prepared_sources::{PreparedModelSources, prepare_model_sources},
     processor_plan::ArtifactArchitecturePlan,
 };
 use safemlx::Stream;
@@ -12,24 +12,28 @@ use safemlx::Stream;
 use crate::composition::mlx::ModelProcessor;
 
 use crate::{
-    backend::error::Error,
-    backend::MlxModel,
-    composition::{mlx::Executable, MlxNeuralBackend},
     MlxLoadRequest,
+    backend::MlxModel,
+    backend::error::Error,
+    composition::{MlxNeuralBackend, mlx::Executable},
 };
 
 mod materialization;
+mod addressable;
+pub(crate) use addressable::prepare_addressable_source;
 mod selection;
 
-pub(crate) use materialization::materialize_model_plan;
 #[cfg(test)]
 pub(super) use materialization::{bind_replicated_text, prepared_safetensors_architecture};
+pub(crate) use materialization::{
+    materialize_model_plan, materialize_model_plan_with_layerwise_manager,
+};
 #[cfg(test)]
 pub(crate) use selection::prepare_selected_sources;
 #[cfg(test)]
 pub(crate) use selection::select_preparation_with_grouped_capabilities;
-pub(crate) use selection::{select_preparation, MlxPreparationMechanisms};
 pub use selection::{MlxModelConfig, MlxSelectedPreparation};
+pub(crate) use selection::{MlxPreparationMechanisms, select_preparation};
 
 #[cfg(test)]
 use materialization::{inspected_floating_state_dtype_bytes, mlx_floating_state_dtype_bytes};

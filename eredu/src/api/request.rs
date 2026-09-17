@@ -3,20 +3,22 @@
 use std::num::NonZeroUsize;
 
 use eredu_core::{
+    SharedTokenFilter, SpeculativeDraft, SpeculativeOutputError, SpeculativeSchedulerOptions,
+    SpeculativeSemanticState, SpeculativeTokenFilterController, TokenFilter, TokenFilterController,
     generation::{
         FinishReason, GenerationCancellationToken, GenerationConfigOverrides, SemanticEvent,
     },
-    SpeculativeDraft, SpeculativeOutputError, SpeculativeSchedulerOptions,
-    SpeculativeSemanticState, TokenFilter, TokenFilterController,
 };
 use eredu_text::tokenizer::{ChatTemplateIdentity, ModelChatTemplate, Tokenizer as ChatTokenizer};
 
 use super::{ConstraintError, TextDecoderError, TextModelError};
 use crate::api::TextDecoder;
-use crate::runtime::chat::constraints::{ConstraintCompiler, ConstraintController};
+use crate::runtime::chat::constraints::{
+    ConstraintCompiler, ConstraintController, ConstraintPreparationError,
+};
 use crate::runtime::chat::{
-    prepare_format_profile, resolve_structural_tokens, CapabilitySupport, ChatCapabilities,
-    ChatTemplateRequest, NativeToolSupport, PreparedChat, SemanticSupport, ToolChoice,
+    CapabilitySupport, ChatCapabilities, ChatTemplateRequest, NativeToolSupport, PreparedChat,
+    SemanticSupport, ToolChoice, prepare_format_profile, resolve_structural_tokens,
 };
 use crate::runtime::generation::streaming::{
     CommittedTokenPipeline, CommittedTokenSource, RawTokenDecoder, TokenDecoderBackend,
@@ -24,6 +26,8 @@ use crate::runtime::generation::streaming::{
 use std::collections::HashMap;
 
 mod ifm;
+pub(crate) mod probes;
+pub(crate) mod profile;
 
 /// Model sampling and stopping settings for one prepared chat generation.
 #[derive(Debug, Clone, Copy, Default)]
@@ -41,6 +45,8 @@ pub struct PreparedChatGenerationSettings {
     pub strategy: eredu_core::TextSamplingStrategy,
     /// Deterministic root seed used by the selected backend for stochastic sampling.
     pub seed: u64,
+    /// Shared prefill and enforced managed-memory policy for this request.
+    pub inference: eredu_core::TextInferencePolicy,
 }
 
 /// Explicit prompt source for semantic or text generation from a [`PreparedChat`].
@@ -179,10 +185,21 @@ impl From<eredu_core::run_preparation::TextCaptureSetupError> for PreparedChatEr
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum PreparedChatSetupError {
+    #[error("shared controller storage preparation failed: {0}")]
+    Backend(#[source] eredu_core::BackendFailure),
     #[error(transparent)]
     Constraint(#[from] ConstraintError),
     #[error("{0}")]
     Semantic(String),
+}
+
+impl From<ConstraintPreparationError> for PreparedChatSetupError {
+    fn from(error: ConstraintPreparationError) -> Self {
+        match error {
+            ConstraintPreparationError::Constraint(error) => Self::Constraint(error),
+            ConstraintPreparationError::Backend(error) => Self::Backend(error),
+        }
+    }
 }
 
 /// Speculative-decoding controls for one prepared-chat request.
@@ -206,9 +223,17 @@ impl Default for PreparedChatSpeculativeGenerationOptions {
 /// Failure while the facade prepares or a backend executes speculative chat.
 #[derive(Debug, thiserror::Error)]
 pub enum PreparedChatSpeculativeError {
+    /// The selected target/draft path does not accept the requested chunk policy,
+    /// or speculative preparation lacks the requested memory/control admission.
+    #[error(
+        "prepared speculative inference does not yet implement the requested prefill or managed-memory policy: {0:?}"
+    )]
+    InferencePolicyUnavailable(eredu_core::TextInferencePolicy),
     /// A sampling strategy is unavailable for prepared speculative generation.
     /// Retained for source compatibility; all current strategies are supported.
-    #[error("prepared-chat speculative generation does not support sampling strategy {0:?}; use ordinary prepared-chat generation")]
+    #[error(
+        "prepared-chat speculative generation does not support sampling strategy {0:?}; use ordinary prepared-chat generation"
+    )]
     UnsupportedSamplingStrategy(eredu_core::TextSamplingStrategy),
     /// The selected backend failed prompt preparation or speculative execution.
     #[error("selected backend failed prepared-chat speculative generation: {0}")]
@@ -311,6 +336,17 @@ impl PreparedChatSpeculativeConstraint {
 impl TokenFilterController for PreparedChatSpeculativeConstraint {
     type Error = ConstraintError;
 
+    fn inference_storage(&self) -> eredu_core::TextControllerStorage<'_> {
+        self.controller.inference_storage()
+    }
+
+    fn inference_workspace(
+        &self,
+        max_output_tokens: u64,
+    ) -> Option<eredu_core::TextControllerWorkspace<'_>> {
+        self.controller.inference_workspace(max_output_tokens)
+    }
+
     fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
         self.controller.current_filter()
     }
@@ -329,6 +365,78 @@ impl TokenFilterController for PreparedChatSpeculativeConstraint {
 }
 
 impl eredu_core::SpeculativeTokenFilterController for PreparedChatSpeculativeConstraint {
+    type PreparedGrammar = crate::runtime::chat::constraints::OriginalPreparedGrammarController;
+    fn prepared_grammar(&self) -> Option<&Self::PreparedGrammar> { self.controller.prepared_grammar() }
+    fn prepared_grammar_replacement_bytes(&self) -> Option<usize> {
+        self.controller.prepared_grammar_replacement_bytes()?.checked_add(
+            eredu_core::speculative::PreparedGrammarInstallError::<Self::PreparedGrammar>::wrapper_control_bytes::<Self>()?)
+    }
+    fn replace_prepared_grammar(
+        &self, grammar: Self::PreparedGrammar, funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<Self, eredu_core::speculative::PreparedGrammarInstallError<Self::PreparedGrammar>> {
+        let reserve = eredu_core::speculative::PreparedGrammarInstallError::<Self::PreparedGrammar>::wrapper_control_bytes::<Self>()
+            .ok_or(eredu_core::HostMetadataFundingError::Overflow).and_then(|n| funding.reserve_metadata(n));
+        if let Err(cause) = reserve {
+            return Err(eredu_core::speculative::PreparedGrammarInstallError::new(cause.into(), grammar, funding));
+        }
+        self.controller.replace_prepared_grammar(grammar, funding).map(|controller| Self { controller })
+    }
+
+    fn prepared_plain_source(&self) -> Option<eredu_core::speculative::PlainControllerSource<'_>> {
+        self.controller.prepared_plain_source()
+    }
+    fn prepared_plain_copy_bytes(&self, capacity: usize) -> Option<usize> {
+        self.controller
+            .prepared_plain_copy_bytes(capacity)?
+            .checked_add(std::mem::size_of::<Self>())?
+            .checked_add(std::mem::size_of::<
+                Result<Self, eredu_core::speculative::PlainControllerError>,
+            >())
+    }
+    fn copy_prepared_plain(
+        &self,
+        capacity: usize,
+        host: eredu_core::HostPreparationAuthority,
+    ) -> Result<Self, eredu_core::speculative::PlainControllerError> {
+        self.controller
+            .copy_prepared_plain(capacity, host)
+            .map(|controller| Self { controller })
+    }
+    fn prepared_plain_history_mut(
+        &mut self,
+    ) -> Option<&mut eredu_core::speculative::PlainControllerHistory> {
+        self.controller.prepared_plain_history_mut()
+    }
+    fn prepared_forbidden_source(
+        &self,
+    ) -> Option<eredu_core::speculative::ForbiddenControllerSource<'_>> {
+        self.controller.prepared_forbidden_source()
+    }
+    fn prepared_forbidden_copy_bytes(&self, capacity: usize) -> Option<usize> {
+        self.controller
+            .prepared_forbidden_copy_bytes(capacity)?
+            .checked_add(std::mem::size_of::<Self>())?
+            .checked_add(std::mem::size_of::<
+                Result<Self, eredu_core::speculative::ForbiddenControllerError>,
+            >())
+    }
+    fn copy_prepared_forbidden(
+        &self,
+        capacity: usize,
+        host: eredu_core::HostPreparationAuthority,
+    ) -> Result<Self, eredu_core::speculative::ForbiddenControllerError> {
+        self.controller
+            .copy_prepared_forbidden(capacity, host)
+            .map(|controller| Self { controller })
+    }
+    fn prepared_forbidden_mutation(
+        &mut self,
+    ) -> Result<
+        eredu_core::speculative::ForbiddenControllerMutation<'_>,
+        eredu_core::speculative::ForbiddenControllerError,
+    > {
+        self.controller.prepared_forbidden_mutation()
+    }
     fn control_snapshot_bytes(&self) -> Option<u64> {
         eredu_runtime::execution_control::SnapshotTokenController::snapshot_storage_bytes(
             &self.controller,
@@ -390,15 +498,18 @@ impl TokenDecoderBackend for PreparedChatTokenDecoder {
 }
 
 pub(super) struct PreparedChatControlRuntime {
+    // Map payload retires before the controller/parser lifetime owners, including
+    // a prepared request discarded by a peer before this aggregate is split.
+    pub(super) structural_tokens: HashMap<u32, String>,
     pub(super) controller: ConstraintController,
     pub(super) parser: crate::runtime::generation::streaming::ToolRuntimeParser,
-    pub(super) structural_tokens: HashMap<u32, String>,
 }
 
 pub(super) struct PreparedChatSemanticState {
     pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
     token_ids: Vec<u32>,
     events: Vec<SemanticEvent>,
+    authority: eredu_core::HostPreparationAuthority,
 }
 
 impl PreparedChatSemanticState {
@@ -407,6 +518,7 @@ impl PreparedChatSemanticState {
         parser: crate::runtime::generation::streaming::ToolRuntimeParser,
         structural_tokens: HashMap<u32, String>,
     ) -> Self {
+        let authority = parser.host_preparation().clone();
         Self {
             pipeline: CommittedTokenPipeline::new(
                 RawTokenDecoder::with_structural_tokens(decoder, structural_tokens),
@@ -414,6 +526,7 @@ impl PreparedChatSemanticState {
             ),
             token_ids: Vec::new(),
             events: Vec::new(),
+            authority,
         }
     }
 }
@@ -437,6 +550,7 @@ impl SpeculativeSemanticState for PreparedChatSemanticState {
             pipeline,
             token_ids: self.token_ids.clone(),
             events: Vec::new(),
+            authority: self.authority.clone(),
         }))
     }
 
@@ -460,8 +574,8 @@ impl SpeculativeSemanticState for PreparedChatSemanticState {
         Ok(())
     }
 
-    fn take_events(&mut self) -> Vec<SemanticEvent> {
-        std::mem::take(&mut self.events)
+    fn take_events(&mut self) -> eredu_core::SpeculativeBuffer<SemanticEvent> {
+        std::mem::take(&mut self.events).into()
     }
 }
 
@@ -472,24 +586,32 @@ pub(super) enum PreparedGenerationMode {
 }
 
 impl PreparedGenerationMode {
-    pub(super) fn prepare_control(
+    pub(super) fn prepare_control<B: eredu_core::TextGenerationBackend>(
         self,
+        runtime: &eredu_core::ModelRuntime<B>,
         prepared_chat: &PreparedChat,
         caller_stop_sequences: &[String],
-        validity: std::sync::Arc<TokenFilter>,
+        validity: SharedTokenFilter,
     ) -> Result<PreparedChatControlRuntime, PreparedChatSetupError> {
-        let prepare = match self {
-            Self::Semantic => prepared_chat_control_runtime,
-            Self::Text => prepared_text_control_runtime,
-        };
-        prepare(prepared_chat, caller_stop_sequences, validity)
+        match self {
+            Self::Semantic => prepared_chat_control_runtime(
+                runtime,
+                prepared_chat,
+                caller_stop_sequences,
+                validity,
+            ),
+            Self::Text => {
+                prepared_text_control_runtime(prepared_chat, caller_stop_sequences, validity)
+            }
+        }
     }
 }
 
-pub(super) fn prepared_chat_control_runtime(
+fn prepared_chat_control_runtime<B: eredu_core::TextGenerationBackend>(
+    runtime: &eredu_core::ModelRuntime<B>,
     prepared_chat: &PreparedChat,
     caller_stop_sequences: &[String],
-    validity: std::sync::Arc<TokenFilter>,
+    validity: SharedTokenFilter,
 ) -> Result<PreparedChatControlRuntime, PreparedChatSetupError> {
     let semantic_plan = match prepared_chat.semantic_support() {
         SemanticSupport::Supported => prepared_chat
@@ -504,10 +626,16 @@ pub(super) fn prepared_chat_control_runtime(
     let generation_plan = prepared_chat
         .generation_runtime_plan()
         .expect("supported prepared chats carry a generation runtime plan");
+    let authority =
+        B::acquire_host_preparation(runtime).map_err(PreparedChatSetupError::Backend)?;
     let controller =
-        ConstraintController::from_generation_plan(generation_plan)?.with_validity(validity);
+        ConstraintController::from_generation_plan(generation_plan, runtime, &authority)?
+            .with_validity(validity);
     let parser = semantic_plan
-        .create_parser_with_stops(caller_stop_sequences.iter().map(String::as_str))
+        .create_parser_with_stops_under_authority(
+            caller_stop_sequences.iter().map(String::as_str),
+            &authority,
+        )
         .map_err(PreparedChatSetupError::Semantic)?;
     let structural_tokens = semantic_plan
         .structural_tokens()
@@ -523,7 +651,7 @@ pub(super) fn prepared_chat_control_runtime(
 pub(super) fn prepared_text_control_runtime(
     prepared_chat: &PreparedChat,
     caller_stop_sequences: &[String],
-    validity: std::sync::Arc<TokenFilter>,
+    validity: SharedTokenFilter,
 ) -> Result<PreparedChatControlRuntime, PreparedChatSetupError> {
     if let CapabilitySupport::Unsupported { reason } = prepared_chat.text_generation_support() {
         return Err(PreparedChatSetupError::Semantic(reason.clone()));
@@ -537,24 +665,26 @@ pub(super) fn prepared_text_control_runtime(
     })
 }
 
-pub(super) struct BackendGenerationTokenSource<'a, B>
+pub(super) struct BackendGenerationTokenSource<'a, B, C = ConstraintController>
 where
     B: eredu_core::TextGenerationBackend,
+    C: TokenFilterController,
 {
-    pub(super) generator: eredu_core::ControlledTextGeneration<'a, B, ConstraintController>,
-    pub(super) on_token:
-        Option<&'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStep>, f64)>,
+    pub(super) generator: eredu_core::ControlledTextGeneration<'a, B, C>,
+    pub(super) on_token: Option<
+        &'a mut dyn FnMut(Option<u32>, Option<eredu_core::capture::CapturedStepDelivery>, f64),
+    >,
     pub(super) delivery_failure: Option<&'a dyn Fn() -> Option<eredu_core::capture::CaptureError>>,
-    pub(super) capture_enabled: bool,
     pub(super) generation_started: std::time::Instant,
     pub(super) time_to_first_token: Option<std::time::Duration>,
 }
 
-impl<B> CommittedTokenSource for BackendGenerationTokenSource<'_, B>
+impl<B, C> CommittedTokenSource for BackendGenerationTokenSource<'_, B, C>
 where
     B: eredu_core::TextGenerationBackend,
+    C: TokenFilterController,
 {
-    type Error = eredu_core::ControlledTextGenerationError<B::Error, ConstraintError>;
+    type Error = eredu_core::ControlledTextGenerationError<B::Error, C::Error>;
 
     fn finish_step<T, E>(
         &mut self,
@@ -577,26 +707,30 @@ where
         self.delivery_failure.and_then(|failure| failure())
     }
 
-    fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
+    fn next_token(
+        &mut self,
+        cancellation: &eredu_core::GenerationCancellationToken,
+    ) -> Result<Option<u32>, Self::Error> {
         let started = self.on_token.as_ref().map(|_| std::time::Instant::now());
         let result = self
             .generator
-            .next()
+            .next_cancellable(cancellation)
             .transpose()
             .map(|token| token.map(|token| token.token_id()));
         let token = match result {
             Ok(token) => token,
             Err(error) => {
-                if self.capture_enabled {
-                    if let (Some(callback), Ok(Some(capture))) =
-                        (&mut self.on_token, self.generator.take_captured_step())
-                    {
-                        callback(
-                            None,
-                            Some(capture),
-                            started.unwrap().elapsed().as_secs_f64(),
-                        );
-                    }
+                // Empty capture plans still have terminal bookkeeping and
+                // completion ownership. Always attempt the shared drain, while
+                // preserving the original execution error if draining fails.
+                if let (Some(callback), Ok(Some(capture))) =
+                    (&mut self.on_token, self.generator.take_captured_delivery())
+                {
+                    callback(
+                        None,
+                        Some(capture),
+                        started.unwrap().elapsed().as_secs_f64(),
+                    );
                 }
                 return Err(error);
             }
@@ -608,22 +742,22 @@ where
         // this run has no capture plan. Empty capture draining allocates none.
         let capture = self
             .generator
-            .take_captured_step()
+            .take_captured_delivery()
             .map_err(eredu_core::ControlledTextGenerationError::Backend)?;
-        if let (Some(token), Some(callback)) = (token, &mut self.on_token) {
-            callback(
-                Some(token),
-                capture,
-                started.unwrap().elapsed().as_secs_f64(),
-            );
+        if let Some(callback) = &mut self.on_token {
+            // A completed cancellation may have a terminal frame without a
+            // committed token. Deliver it through the same existing callback;
+            // the callback cannot replace this result or clear cancellation.
+            if token.is_some() || capture.is_some() {
+                callback(token, capture, started.unwrap().elapsed().as_secs_f64());
+            }
         }
         Ok(token)
     }
 
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
         self.generator
-            .controller_mut()
-            .grammar_is_complete()
+            .controller_is_complete()
             .map_err(eredu_core::ControlledTextGenerationError::Controller)
     }
 }
@@ -643,238 +777,37 @@ fn validate_tagged_history(
     parameter_suffix: &str,
     profile: &str,
 ) -> Result<(), TextModelError> {
-    for (message_index, message) in messages.iter().enumerate() {
-        let Some(tool_calls) = message
-            .get("tool_calls")
-            .and_then(serde_json::Value::as_array)
-        else {
-            continue;
-        };
-        for (call_index, call) in tool_calls.iter().enumerate() {
-            let function = call.get("function").unwrap_or(call);
-            let Some(arguments) = function.get("arguments") else {
-                continue;
-            };
-            let arguments = arguments.as_object().ok_or_else(|| {
-                TextModelError::ToolConstraint(format!(
-                    "messages[{message_index}].tool_calls[{call_index}].function.arguments must be a mapping for {profile} tagged-parameter templates; serialized strings are unsupported"
-                ))
-            })?;
-            for (name, value) in arguments {
-                if name.is_empty()
-                    || name
-                        .chars()
-                        .any(|character| matches!(character, '<' | '>' | '\r' | '\n'))
-                {
-                    return Err(TextModelError::ToolConstraint(format!(
-                        "messages[{message_index}].tool_calls[{call_index}] contains unsafe tagged parameter name {name:?}"
-                    )));
-                }
-                if value
-                    .as_str()
-                    .is_some_and(|value| value.contains(parameter_suffix))
-                {
-                    return Err(TextModelError::ToolConstraint(format!(
-                        "messages[{message_index}].tool_calls[{call_index}] parameter {name:?} contains the unescaped tagged-parameter closing delimiter"
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
+    profile::tagged::validate(messages, parameter_suffix)
+        .map_err(|cause| cause.ordinary(messages, profile))
 }
 
-fn recognize_gemma_protocol(
-    tokenizer: &mut ChatTokenizer,
-    selected_template: &ModelChatTemplate,
-    model_id: &str,
-) -> Option<crate::runtime::chat::PreparedFormatProfile> {
+fn gemma_profile(
+    recognition: probes::gemma::Recognition,
+) -> crate::runtime::chat::PreparedFormatProfile {
     use crate::runtime::chat::{
-        dialect::{DialectParameters, GenerationPromptBehavior},
-        gemma::{
-            self, CHANNEL_CLOSE, CHANNEL_OPEN, STRING_DELIMITER, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
-            TOOL_RESPONSE_OPEN, TURN_CLOSE,
-        },
         GEMMA4_STRUCTURAL_TOOL_SPEC,
+        dialect::{DialectParameters, GenerationPromptBehavior},
+        gemma::{self, TOOL_RESPONSE_OPEN, TURN_CLOSE},
     };
 
-    let channel_tokens = [CHANNEL_OPEN.to_owned(), CHANNEL_CLOSE.to_owned()];
-    let channel_ids = match resolve_structural_tokens(tokenizer, &channel_tokens) {
-        Ok(ids) => ids,
-        Err(_) => return None,
-    };
-    let tools = vec![serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "eredu_probe",
-            "description": "protocol probe",
-            "parameters": {
-                "type": "object",
-                "properties": {"value": {"type": "string"}},
-                "required": ["value"]
-            }
-        }
-    })];
-    let reasoning_sentinel = "__eredu_reasoning_probe_7c91__";
-    let visible_sentinel = "__eredu_visible_probe_28ad__";
-    let probe_messages = vec![
-        serde_json::json!({"role": "user", "content": "__eredu_user_probe__"}),
-        serde_json::json!({
-            "role": "assistant",
-            "reasoning_content": reasoning_sentinel,
-            "content": visible_sentinel,
-            "tool_calls": [{
-                "id": "reasoning-probe-call",
-                "type": "function",
-                "function": {
-                    "name": "eredu_probe",
-                    "arguments": {"value": "reasoning-probe"}
-                }
-            }]
-        }),
-    ];
-    let rendered = match tokenizer.apply_chat_template_json(
-        selected_template.clone(),
-        [probe_messages],
-        Some(&tools),
-        model_id,
-        false,
-        None,
-    ) {
-        Ok(rendered) => rendered.into_iter().next()?,
-        Err(_) => return None,
-    };
-    let reasoning_frame = format!("{CHANNEL_OPEN}thought\n{reasoning_sentinel}\n{CHANNEL_CLOSE}");
-    if !rendered.contains(&reasoning_frame) || !rendered.contains(visible_sentinel) {
-        return None;
-    }
-    debug_assert_eq!(channel_ids.len(), 2);
-
-    let mut thinking_on = serde_json::Map::new();
-    thinking_on.insert("enable_thinking".into(), serde_json::Value::Bool(true));
-    let mut thinking_off = serde_json::Map::new();
-    thinking_off.insert("enable_thinking".into(), serde_json::Value::Bool(false));
-    let generation_messages =
-        vec![serde_json::json!({"role": "user", "content": "__eredu_prompt_probe__"})];
-    for kwargs in [&thinking_on, &thinking_off] {
-        let with_prompt = match tokenizer.apply_chat_template_json(
-            selected_template.clone(),
-            [generation_messages.clone()],
-            Some(&[]),
-            model_id,
-            true,
-            Some(kwargs),
-        ) {
-            Ok(rendered) => rendered.into_iter().next()?,
-            Err(_) => return None,
-        };
-        if !with_prompt.contains("<|turn>model\n") {
-            return None;
-        }
-    }
-
-    let mut semantic_tokens = channel_tokens.to_vec();
+    let mut semantic_tokens = probes::gemma::CHANNELS.map(str::to_owned).to_vec();
     let mut semantic_stops = Vec::new();
-    for spelling in [TOOL_RESPONSE_OPEN, TURN_CLOSE] {
-        if resolve_structural_tokens(tokenizer, &[spelling.to_owned()]).is_ok() {
+    for (present, spelling) in [
+        (recognition.response_token, TOOL_RESPONSE_OPEN),
+        (recognition.turn_token, TURN_CLOSE),
+    ] {
+        if present {
             semantic_tokens.push(spelling.to_owned());
             semantic_stops.push(spelling.to_owned());
         }
     }
-
-    let full_tool_tokens = [
-        CHANNEL_OPEN,
-        CHANNEL_CLOSE,
-        TOOL_CALL_OPEN,
-        TOOL_CALL_CLOSE,
-        STRING_DELIMITER,
-        TOOL_RESPONSE_OPEN,
-        TURN_CLOSE,
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .collect::<Vec<_>>();
-    let tool_tokens_valid = resolve_structural_tokens(tokenizer, &full_tool_tokens).is_ok();
-    let mapping_tool_messages = vec![
-        serde_json::json!({"role": "user", "content": "probe"}),
-        serde_json::json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "probe-call",
-                "type": "function",
-                "function": {
-                    "name": "eredu_probe",
-                    "arguments": {"value": "probe-value"}
-                }
-            }]
-        }),
-        serde_json::json!({
-            "role": "tool",
-            "tool_call_id": "probe-call",
-            "content": "probe-response"
-        }),
-    ];
-    let mapping_tool_arguments = tool_tokens_valid
-        && tokenizer
-            .apply_chat_template_json(
-                selected_template.clone(),
-                [mapping_tool_messages],
-                Some(&tools),
-                model_id,
-                true,
-                Some(&thinking_on),
-            )
-            .ok()
-            .and_then(|rendered| rendered.into_iter().next())
-            .is_some_and(|rendered| {
-                rendered.contains(&format!("{TOOL_CALL_OPEN}call:eredu_probe{{"))
-                    && rendered.contains(TOOL_CALL_CLOSE)
-                    && rendered.contains(TOOL_RESPONSE_OPEN)
-                    && rendered.contains("probe-response")
-            });
-    let string_tool_messages = vec![
-        serde_json::json!({"role": "user", "content": "probe"}),
-        serde_json::json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "probe-call",
-                "type": "function",
-                "function": {
-                    "name": "eredu_probe",
-                    "arguments": "{\"value\":\"probe-value\"}"
-                }
-            }]
-        }),
-        serde_json::json!({
-            "role": "tool",
-            "tool_call_id": "probe-call",
-            "content": "probe-response"
-        }),
-    ];
-    let string_tool_arguments = tool_tokens_valid
-        && tokenizer
-            .apply_chat_template_json(
-                selected_template.clone(),
-                [string_tool_messages],
-                Some(&tools),
-                model_id,
-                true,
-                Some(&thinking_on),
-            )
-            .ok()
-            .and_then(|rendered| rendered.into_iter().next())
-            .is_some_and(|rendered| {
-                rendered.contains(&format!("{TOOL_CALL_OPEN}call:eredu_probe{{"))
-                    && rendered.contains(TOOL_CALL_CLOSE)
-                    && rendered.contains(TOOL_RESPONSE_OPEN)
-                    && rendered.contains("probe-response")
-            });
+    let full_tool_tokens = probes::gemma::TOOLS.map(str::to_owned).to_vec();
+    let mapping_tool_arguments = recognition.mapping_tool_arguments;
+    let string_tool_arguments = recognition.string_tool_arguments;
     let tool_output_protocol = mapping_tool_arguments || string_tool_arguments;
     let tool_input_rendering = tool_output_protocol;
 
-    Some(crate::runtime::chat::PreparedFormatProfile {
+    crate::runtime::chat::PreparedFormatProfile {
         identity: Some("gemma.channels.v1".into()),
         dialect: Some(&gemma::GEMMA_CHANNEL_DIALECT),
         dialect_parameters: Some(gemma::parameters()),
@@ -901,135 +834,25 @@ fn recognize_gemma_protocol(
             Vec::new()
         },
         stop_sequences: semantic_stops,
-    })
+    }
 }
 
-fn recognize_inkling_protocol(
-    tokenizer: &mut ChatTokenizer,
-    selected_template: &ModelChatTemplate,
-    model_id: &str,
-) -> Option<crate::runtime::chat::PreparedFormatProfile> {
+fn inkling_profile(
+    recognition: probes::inkling::Recognition,
+) -> crate::runtime::chat::PreparedFormatProfile {
     use crate::runtime::chat::{
-        dialect::GenerationPromptBehavior,
-        inkling::{
-            self, CONTENT_INVOKE_TOOL_JSON, CONTENT_TEXT, CONTENT_THINKING, END_MESSAGE,
-            END_SAMPLING, MESSAGE_MODEL,
-        },
         ReasoningTemplateControl,
+        dialect::GenerationPromptBehavior,
+        inkling::{self, END_SAMPLING},
     };
 
-    let structural_tokens = [
-        MESSAGE_MODEL,
-        CONTENT_TEXT,
-        CONTENT_THINKING,
-        END_MESSAGE,
-        END_SAMPLING,
-    ]
-    .map(str::to_owned)
-    .to_vec();
-    resolve_structural_tokens(tokenizer, &structural_tokens).ok()?;
-
-    let reasoning_sentinel = "__eredu_inkling_reasoning_probe_7c91__";
-    let visible_sentinel = "__eredu_inkling_visible_probe_28ad__";
-    let rendered = tokenizer
-        .apply_chat_template_json(
-            selected_template.clone(),
-            [vec![
-                serde_json::json!({"role": "user", "content": "__eredu_inkling_user_probe__"}),
-                serde_json::json!({
-                    "role": "assistant",
-                    "reasoning_content": reasoning_sentinel,
-                    "content": visible_sentinel,
-                }),
-            ]],
-            Some(&[]),
-            model_id,
-            false,
-            None,
-        )
-        .ok()?
-        .into_iter()
-        .next()?;
-    let assistant_frames = format!(
-        "{MESSAGE_MODEL}{CONTENT_THINKING}{reasoning_sentinel}{END_MESSAGE}{MESSAGE_MODEL}{CONTENT_TEXT}{visible_sentinel}{END_MESSAGE}{END_SAMPLING}"
-    );
-    if !rendered.contains(&assistant_frames) {
-        return None;
-    }
-
-    let generation_messages =
-        vec![serde_json::json!({"role": "user", "content": "__eredu_inkling_prompt_probe__"})];
-    for (effort, expected) in [("none", "0"), ("high", "0.9")] {
-        let kwargs = serde_json::Map::from_iter([(
-            "reasoning_effort".into(),
-            serde_json::Value::String(effort.into()),
-        )]);
-        let with_prompt = tokenizer
-            .apply_chat_template_json(
-                selected_template.clone(),
-                [generation_messages.clone()],
-                Some(&[]),
-                model_id,
-                true,
-                Some(&kwargs),
-            )
-            .ok()?
-            .into_iter()
-            .next()?;
-        let effort_frame = format!(
-            "<|message_system|>{CONTENT_TEXT}Thinking effort level: {expected}{END_MESSAGE}"
-        );
-        if !with_prompt.contains(&effort_frame) || !with_prompt.ends_with(MESSAGE_MODEL) {
-            return None;
-        }
-    }
-
-    let tool_structural_tokens = [
-        MESSAGE_MODEL,
-        CONTENT_TEXT,
-        CONTENT_THINKING,
-        CONTENT_INVOKE_TOOL_JSON,
-        END_MESSAGE,
-        END_SAMPLING,
-    ]
-    .map(str::to_owned)
-    .to_vec();
-    let tool_tokens_valid = resolve_structural_tokens(tokenizer, &tool_structural_tokens).is_ok();
-    let mapping_tool_arguments = tool_tokens_valid
-        && render_protocol_probe(
-            tokenizer,
-            selected_template,
-            model_id,
-            serde_json::json!({"value": "probe-value"}),
-        )
-        .is_some_and(|rendered| {
-            rendered.contains(concat!(
-                "<|message_system|>tool_declare<|content_xml|>",
-                "[{\"description\":\"protocol recognition probe\",\"name\":",
-                "\"eredu_probe_7c91\",\"parameters\":"
-            )) && rendered.contains(concat!(
-                "<|message_model|>eredu_probe_7c91<|content_invoke_tool_json|>",
-                "{\"name\":\"eredu_probe_7c91\",\"args\":{\"value\":\"probe-value\"}}",
-                "<|end_message|>"
-            )) && rendered.contains(concat!(
-                "<|message_tool|>eredu_probe_7c91<|content_text|>",
-                "\"__eredu_tool_result_probe__\"<|end_message|>"
-            ))
-        });
-    let string_tool_arguments = tool_tokens_valid
-        && render_protocol_probe(
-            tokenizer,
-            selected_template,
-            model_id,
-            serde_json::Value::String("{\"value\":\"probe-value\"}".into()),
-        )
-        .is_some_and(|rendered| {
-            rendered.contains(CONTENT_INVOKE_TOOL_JSON)
-                && rendered.contains("__eredu_tool_result_probe__")
-        });
+    let structural_tokens = probes::inkling::STRUCTURAL.map(str::to_owned).to_vec();
+    let tool_structural_tokens = probes::inkling::TOOL_STRUCTURAL.map(str::to_owned).to_vec();
+    let mapping_tool_arguments = recognition.mapping_tool_arguments;
+    let string_tool_arguments = recognition.string_tool_arguments;
     let tool_output_protocol = mapping_tool_arguments || string_tool_arguments;
 
-    Some(crate::runtime::chat::PreparedFormatProfile {
+    crate::runtime::chat::PreparedFormatProfile {
         identity: Some("inkling.messages.v1".into()),
         dialect: Some(&inkling::INKLING_MESSAGE_DIALECT),
         dialect_parameters: Some(inkling::parameters()),
@@ -1058,79 +881,22 @@ fn recognize_inkling_protocol(
             Vec::new()
         },
         stop_sequences: vec![END_SAMPLING.into()],
-    })
+    }
 }
 
-fn recognize_muse_atem_protocol(
-    tokenizer: &mut ChatTokenizer,
-    selected_template: &ModelChatTemplate,
-    model_id: &str,
-) -> Option<crate::runtime::chat::PreparedFormatProfile> {
+fn muse_profile(
+    recognition: probes::muse::Recognition,
+) -> crate::runtime::chat::PreparedFormatProfile {
     use crate::runtime::chat::{
-        atem::{self, EOM, EOT, MESSAGE, START},
-        dialect::GenerationPromptBehavior,
         ReasoningEffortControl, ReasoningTemplateControl,
+        atem::{self, EOT},
+        dialect::GenerationPromptBehavior,
     };
 
-    let structural_tokens = [START, MESSAGE, EOM, EOT].map(str::to_owned).to_vec();
-    resolve_structural_tokens(tokenizer, &structural_tokens).ok()?;
+    let structural_tokens = probes::muse::STRUCTURAL.map(str::to_owned).to_vec();
+    let mapping_tool_arguments = recognition.mapping_tool_arguments;
 
-    let rendered = render_reasoning_protocol_probe(tokenizer, selected_template, model_id)?;
-    let expected = concat!(
-        "<|start|>assistant to=self<|message|>__eredu_reasoning_probe__<|eom|>",
-        "<|start|>assistant to=user<|message|>__eredu_visible_probe__<|eot|>"
-    );
-    if !rendered.contains(expected) {
-        return None;
-    }
-
-    let generation_messages =
-        vec![serde_json::json!({"role": "user", "content": "__eredu_atem_prompt__"})];
-    for strength in ["low", "medium", "high", "xhigh"] {
-        let kwargs = serde_json::Map::from_iter([(
-            "reasoning_strength".into(),
-            serde_json::Value::String(strength.into()),
-        )]);
-        let prompt = tokenizer
-            .apply_chat_template_json(
-                selected_template.clone(),
-                [generation_messages.clone()],
-                Some(&[]),
-                model_id,
-                true,
-                Some(&kwargs),
-            )
-            .ok()?
-            .into_iter()
-            .next()?;
-        if !prompt.contains(&format!("Reasoning strength: {strength}."))
-            || !prompt.ends_with("<|start|>assistant")
-        {
-            return None;
-        }
-    }
-
-    let mapping = render_protocol_probe(
-        tokenizer,
-        selected_template,
-        model_id,
-        serde_json::json!({"value": "probe-value"}),
-    );
-    let mapping_tool_arguments = mapping.as_deref().is_some_and(|rendered| {
-        [
-            "<|start|>assistant to=self<|message|>__eredu_reasoning_probe__<|eom|>",
-            "<|start|>assistant to=eredu_probe_7c91<|message|>",
-            "<atem:function_calls>",
-            "<atem:invoke name=\"eredu_probe_7c91\">",
-            "<atem:parameter name=\"value\">probe-value</atem:parameter>",
-            "<|start|>tool eredu_probe_7c91<|message|><tool_output name=\"eredu_probe_7c91\">",
-            "__eredu_tool_result_probe__",
-        ]
-        .iter()
-        .all(|marker| rendered.contains(marker))
-    });
-
-    Some(crate::runtime::chat::PreparedFormatProfile {
+    crate::runtime::chat::PreparedFormatProfile {
         identity: Some("muse-glimmer.atem.v1".into()),
         dialect: Some(&atem::ATEM_DIALECT),
         dialect_parameters: Some(atem::parameters()),
@@ -1161,68 +927,21 @@ fn recognize_muse_atem_protocol(
             Vec::new()
         },
         stop_sequences: vec![EOT.into()],
-    })
+    }
 }
 
 fn render_protocol_probe(
     tokenizer: &mut ChatTokenizer,
     selected_template: &ModelChatTemplate,
     model_id: &str,
-    arguments: serde_json::Value,
+    arguments: probes::records::Arguments<'_>,
 ) -> Option<String> {
-    let tools = vec![serde_json::json!({
-        "type": "function",
-        "function": {
-            "name": "eredu_probe_7c91",
-            "description": "protocol recognition probe",
-            "parameters": {
-                "type": "object",
-                "properties": {"value": {"type": "string"}},
-                "required": ["value"],
-                "additionalProperties": false
-            }
-        }
-    })];
-    let messages = vec![
-        serde_json::json!({"role": "user", "content": "__eredu_user_probe__"}),
-        serde_json::json!({
-            "role": "assistant",
-            "content": "",
-            "reasoning_content": "__eredu_reasoning_probe__",
-            "thinking": "__eredu_reasoning_probe__",
-            "tool_calls": [{
-                "id": "abc123456",
-                "type": "function",
-                "function": {
-                    "name": "eredu_probe_7c91",
-                    "arguments": arguments
-                }
-            }]
-        }),
-        serde_json::json!({
-            "role": "tool",
-            "name": "eredu_probe_7c91",
-            "tool_call_id": "abc123456",
-            "content": "\"__eredu_tool_result_probe__\""
-        }),
-        serde_json::json!({
-            "role": "assistant",
-            "content": "__eredu_intermediate_assistant_probe__"
-        }),
-        serde_json::json!({"role": "user", "content": "__eredu_followup_probe__"}),
-    ];
-    tokenizer
-        .apply_chat_template_json(
-            selected_template.clone(),
-            [messages],
-            Some(&tools),
-            model_id,
-            true,
-            None,
-        )
-        .ok()?
-        .into_iter()
-        .next()
+    probes::Ordinary {
+        tokenizer,
+        selected_template,
+        model_id,
+    }
+    .render(probes::Probe::tool_input(arguments))
 }
 
 fn render_reasoning_protocol_probe(
@@ -1230,54 +949,38 @@ fn render_reasoning_protocol_probe(
     selected_template: &ModelChatTemplate,
     model_id: &str,
 ) -> Option<String> {
-    tokenizer
-        .apply_chat_template_json(
-            selected_template.clone(),
-            [vec![
-                serde_json::json!({"role": "user", "content": "__eredu_user_probe__"}),
-                serde_json::json!({
-                    "role": "assistant",
-                    "reasoning_content": "__eredu_reasoning_probe__",
-                    "content": "__eredu_visible_probe__"
-                }),
-            ]],
-            Some(&[]),
-            model_id,
-            false,
-            None,
-        )
-        .ok()?
-        .into_iter()
-        .next()
+    probes::Ordinary {
+        tokenizer,
+        selected_template,
+        model_id,
+    }
+    .render(probes::Probe::ReasoningHistory.construct())
 }
 
 fn recognized_dialect_profile(
-    tokenizer: &ChatTokenizer,
     identity: &'static str,
     dialect: &'static dyn crate::runtime::chat::dialect::FormatDialect,
     parameters: crate::runtime::chat::dialect::DialectParameters,
+    declaration: crate::runtime::chat::dialect::ProfileDeclaration,
     mapping_tool_arguments: bool,
     string_tool_arguments: bool,
-) -> Option<crate::runtime::chat::PreparedFormatProfile> {
-    let generation_prompt_behavior = dialect.generation_prompt_behavior(parameters).ok()?;
-    let reasoning_template_kwarg = dialect.reasoning_template_kwarg(parameters).ok()?;
-    let supports_tool_reasoning = dialect.supports_tool_reasoning(parameters).ok()?;
-    let required_structural_tokens = dialect
-        .required_structural_tokens(parameters)
-        .ok()?
+) -> crate::runtime::chat::PreparedFormatProfile {
+    let generation_prompt_behavior = declaration.generation;
+    let reasoning_template_kwarg = declaration.reasoning_kwarg;
+    let supports_tool_reasoning = declaration.tool_reasoning;
+    let required_structural_tokens = declaration
+        .structural
         .iter()
         .map(|token| (*token).to_owned())
         .collect::<Vec<_>>();
-    let stop_sequences = dialect
-        .stop_sequences(parameters)
-        .ok()?
+    let stop_sequences = declaration
+        .stops
         .iter()
         .map(|stop| (*stop).to_owned())
         .collect::<Vec<_>>();
-    resolve_structural_tokens(tokenizer, &required_structural_tokens).ok()?;
     let supports_tool_input_rendering = mapping_tool_arguments || string_tool_arguments;
 
-    Some(crate::runtime::chat::PreparedFormatProfile {
+    crate::runtime::chat::PreparedFormatProfile {
         identity: Some(identity.into()),
         dialect: Some(dialect),
         dialect_parameters: Some(parameters),
@@ -1287,7 +990,7 @@ fn recognized_dialect_profile(
         reasoning_template_control:
             crate::runtime::chat::ReasoningTemplateControl::Boolean(reasoning_template_kwarg),
         reasoning_effort_control: None,
-        supports_reasoning_parsing: dialect.supports_reasoning_parsing(parameters),
+        supports_reasoning_parsing: declaration.reasoning_parsing,
         supports_tool_reasoning,
         supports_tool_input_rendering,
         supports_mapping_tool_arguments: mapping_tool_arguments,
@@ -1300,330 +1003,70 @@ fn recognized_dialect_profile(
         required_structural_tokens: required_structural_tokens.clone(),
         tool_required_structural_tokens: required_structural_tokens,
         stop_sequences,
-    })
+    }
 }
 
-fn recognize_remaining_protocols(
-    tokenizer: &mut ChatTokenizer,
-    selected_template: &ModelChatTemplate,
-    model_id: &str,
-) -> Option<crate::runtime::chat::PreparedFormatProfile> {
-    use crate::runtime::chat::{
-        dialect::{DialectParameters, DECLARATIVE_DIALECT},
-        harmony::{GPT_OSS_HARMONY_PARAMETERS, HARMONY_DIALECT},
-        lfm2::{LFM2_DIALECT, LFM2_PARAMETERS},
-        DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC, DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC,
-        KIMI_K2_NATIVE_TOOL_SPEC, LLAMA3_JSON_TOOL_SPEC, LLAMA4_JSON_TOOL_SPEC,
-        MINISTRAL_JSON_LIST_TOOL_SPEC, MISTRAL_JSON_LIST_TOOL_SPEC,
-        NEMOTRON_NANO_JSON_LIST_TOOL_SPEC, NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC,
-        QWEN3_XML_TOOL_SPEC, QWEN_XML_TOOL_SPEC,
-    };
-
-    let mapping = render_protocol_probe(
-        tokenizer,
-        selected_template,
-        model_id,
-        serde_json::json!({"value": "__eredu_mapping_argument_probe__"}),
-    );
-    let string = render_protocol_probe(
-        tokenizer,
-        selected_template,
-        model_id,
-        serde_json::Value::String(r#"{"value":"__eredu_string_argument_probe__"}"#.into()),
-    );
-    let supports = |rendered: &Option<String>, required: &[&str]| {
-        rendered
-            .as_deref()
-            .is_some_and(|rendered| required.iter().all(|part| rendered.contains(part)))
-    };
-
-    let kimi_markers = [
-        "<|tool_calls_section_begin|>",
-        "<|tool_call_begin|>",
-        "<|tool_call_argument_begin|>",
-        "<|tool_call_end|>",
-        "<|tool_calls_section_end|>",
-        "## Return of abc123456",
-        "__eredu_tool_result_probe__",
-    ];
-    let kimi_mapping = supports(&mapping, &kimi_markers);
-    let kimi_string = supports(&string, &kimi_markers);
-    if kimi_mapping || kimi_string {
-        return recognized_dialect_profile(
-            tokenizer,
-            "kimi-k2.native-tools.v1",
-            &DECLARATIVE_DIALECT,
-            DialectParameters::Declarative(&KIMI_K2_NATIVE_TOOL_SPEC),
-            kimi_mapping,
-            kimi_string,
-        );
-    }
-
-    let harmony_markers = [
-        "assistant to=functions.eredu_probe_7c91",
-        "<|message|>",
-        "<|call|>",
-        "functions.eredu_probe_7c91 to=assistant",
-        "__eredu_tool_result_probe__",
-    ];
-    let harmony_mapping = supports(&mapping, &harmony_markers);
-    let harmony_string = supports(&string, &harmony_markers);
-    if harmony_mapping || harmony_string {
-        return recognized_dialect_profile(
-            tokenizer,
-            "harmony.channels.v1",
-            &HARMONY_DIALECT,
-            DialectParameters::Custom(&GPT_OSS_HARMONY_PARAMETERS),
-            harmony_mapping,
-            harmony_string,
-        );
-    }
-
-    let deepseek_common = [
-        "<｜tool▁calls▁begin｜>",
-        "<｜tool▁call▁begin｜>",
-        "<｜tool▁sep｜>",
-        "eredu_probe_7c91",
-        "<｜tool▁call▁end｜>",
-        "<｜tool▁calls▁end｜>",
-        "__eredu_tool_result_probe__",
-    ];
-    let deepseek_mapping = supports(&mapping, &deepseek_common);
-    let deepseek_string = supports(&string, &deepseek_common);
-    if deepseek_mapping || deepseek_string {
-        let rendered = mapping.as_deref().or(string.as_deref())?;
-        let (identity, spec) = if rendered
-            .contains("<｜tool▁call▁begin｜>function<｜tool▁sep｜>eredu_probe_7c91\n```json\n")
-        {
-            (
-                "deepseek.structural-json-tools.v1",
-                &DEEPSEEK_STRUCTURAL_JSON_TOOL_SPEC,
+fn selected_profile(
+    selected: probes::selection::Selected,
+    request: &ChatTemplateRequest,
+) -> crate::runtime::chat::PreparedFormatProfile {
+    use probes::selection::Selected;
+    let policy = profile::selected::Policy::from_selected(selected);
+    let mut profile = match selected {
+        Selected::Ifm {
+            behavior,
+            declaration,
+        } => {
+            let spec = crate::runtime::chat::ifm::spec(
+                behavior.format.spelling(),
+                behavior.effort.spelling(),
+                request.add_generation_prompt,
+                behavior.disabled,
             )
-        } else if rendered.contains("<｜tool▁call▁begin｜>eredu_probe_7c91<｜tool▁sep｜>")
-        {
-            (
-                "deepseek.structural-json-tools.v2",
-                &DEEPSEEK31_STRUCTURAL_JSON_TOOL_SPEC,
-            )
-        } else {
-            return None;
-        };
-        return recognized_dialect_profile(
-            tokenizer,
-            identity,
-            &DECLARATIVE_DIALECT,
-            DialectParameters::Declarative(spec),
-            deepseek_mapping,
-            deepseek_string,
-        );
-    }
-
-    let lfm2_markers = [
-        "<|tool_call_start|>",
-        "eredu_probe_7c91(",
-        "<|tool_call_end|>",
-        "__eredu_tool_result_probe__",
-    ];
-    let lfm2_mapping = supports(&mapping, &lfm2_markers);
-    let lfm2_string = supports(&string, &lfm2_markers);
-    if lfm2_mapping || lfm2_string {
-        return recognized_dialect_profile(
-            tokenizer,
-            "lfm2.python-tools.v1",
-            &LFM2_DIALECT,
-            DialectParameters::Custom(&LFM2_PARAMETERS),
-            lfm2_mapping,
-            lfm2_string,
-        );
-    }
-
-    let qwen_markers = [
-        "<tool_call>",
-        "eredu_probe_7c91",
-        "<tool_response>",
-        "__eredu_tool_result_probe__",
-    ];
-    let qwen_mapping = supports(&mapping, &qwen_markers);
-    let qwen_string = supports(&string, &qwen_markers);
-    if qwen_mapping || qwen_string {
-        let tagged_mapping = mapping.as_deref().is_some_and(|rendered| {
-            rendered.contains(
-                "<tool_call>\n<function=eredu_probe_7c91>\n<parameter=value>\n__eredu_mapping_argument_probe__\n</parameter>\n</function>\n</tool_call>",
-            )
-        });
-        let tagged_string = string.as_deref().is_some_and(|rendered| {
-            rendered.contains("<function=eredu_probe_7c91>\n<parameter=value>")
-                && rendered.contains("__eredu_string_argument_probe__")
-        });
-        if tagged_mapping || tagged_string {
-            let mut effort_kwargs = serde_json::Map::new();
-            effort_kwargs.insert("reasoning_effort".into(), serde_json::json!("low"));
-            let qwen38 = tokenizer
-                .apply_chat_template_json(
-                    selected_template.clone(),
-                    [vec![serde_json::json!({
-                        "role": "user",
-                        "content": "__eredu_effort_probe__"
-                    })]],
-                    Some(&[]),
-                    model_id,
-                    false,
-                    Some(&effort_kwargs),
-                )
-                .ok()
-                .and_then(|rendered| rendered.into_iter().next())
-                .is_some_and(|rendered| rendered.contains("Reasoning effort is set to low."));
-            let identity = if qwen38 {
-                "qwen3.8.tagged-parameter-tools.v1"
-            } else {
-                "qwen3.6.tagged-parameter-tools.v1"
-            };
+            .expect("shared IFM controls were validated");
             let mut profile = recognized_dialect_profile(
-                tokenizer,
-                identity,
-                &DECLARATIVE_DIALECT,
-                DialectParameters::Declarative(
-                    &crate::runtime::chat::QWEN_TAGGED_TOOL_SPEC_GENERATED_REASONING,
-                ),
-                tagged_mapping,
+                "ifm.tools.v1",
+                &crate::runtime::chat::dialect::DECLARATIVE_DIALECT,
+                crate::runtime::chat::dialect::DialectParameters::Declarative(spec),
+                declaration,
+                true,
                 false,
-            )?;
-            if qwen38 {
+            );
+            profile.reasoning_effort_control = Some(crate::runtime::chat::ReasoningEffortControl {
+                kwarg: "reasoning_effort",
+                supported: &["high", "medium", "low"],
+            });
+            profile
+        }
+        Selected::Muse(behavior) => muse_profile(behavior),
+        Selected::Gemma(behavior) => gemma_profile(behavior),
+        Selected::Inkling(behavior) => inkling_profile(behavior),
+        Selected::Remaining {
+            behavior,
+            declaration,
+        } => {
+            let (identity, dialect, parameters) = behavior.kind.declaration();
+            let mut profile = recognized_dialect_profile(
+                identity,
+                dialect,
+                parameters,
+                declaration,
+                behavior.mapping,
+                behavior.string,
+            );
+            if behavior.kind == probes::remaining::Kind::Qwen38 {
                 profile.reasoning_effort_control =
                     Some(crate::runtime::chat::ReasoningEffortControl {
                         kwarg: "reasoning_effort",
                         supported: &["low", "medium", "xhigh"],
                     });
             }
-            return Some(profile);
+            profile
         }
-        let json_in_xml = |rendered: &Option<String>| {
-            rendered.as_deref().is_some_and(|rendered| {
-                rendered.contains("\"name\": \"eredu_probe_7c91\"")
-                    && rendered.contains("\"arguments\":")
-            })
-        };
-        let qwen_mapping = qwen_mapping && json_in_xml(&mapping);
-        let qwen_string = qwen_string && json_in_xml(&string);
-        if !qwen_mapping && !qwen_string {
-            return None;
-        }
-        let reasoning = render_reasoning_protocol_probe(tokenizer, selected_template, model_id)
-            .is_some_and(|rendered| {
-                rendered.contains(
-                    "<think>\n__eredu_reasoning_probe__\n</think>\n\n__eredu_visible_probe__",
-                )
-            });
-        let (identity, spec) = if reasoning {
-            ("qwen.xml-tools.reasoning.v1", &QWEN3_XML_TOOL_SPEC)
-        } else {
-            ("xml-tools.v1", &QWEN_XML_TOOL_SPEC)
-        };
-        return recognized_dialect_profile(
-            tokenizer,
-            identity,
-            &DECLARATIVE_DIALECT,
-            DialectParameters::Declarative(spec),
-            qwen_mapping,
-            qwen_string,
-        );
-    }
-
-    let mistral_markers = [
-        "[TOOL_CALLS]",
-        "eredu_probe_7c91",
-        "abc123456",
-        "[TOOL_RESULTS]",
-        "__eredu_tool_result_probe__",
-    ];
-    let mistral_mapping = supports(&mapping, &mistral_markers);
-    let mistral_string = supports(&string, &mistral_markers);
-    if mistral_mapping || mistral_string {
-        let rendered = mapping.as_deref().or(string.as_deref())?;
-        let (identity, spec) = if rendered.contains("[TOOL_CALLS] [") {
-            ("mistral.json-list-tools.v1", &MISTRAL_JSON_LIST_TOOL_SPEC)
-        } else if rendered.contains("[TOOL_CALLS][") {
-            (
-                "mistral.json-list-tools.compact.v1",
-                &MINISTRAL_JSON_LIST_TOOL_SPEC,
-            )
-        } else {
-            return None;
-        };
-        return recognized_dialect_profile(
-            tokenizer,
-            identity,
-            &DECLARATIVE_DIALECT,
-            DialectParameters::Declarative(spec),
-            mistral_mapping,
-            mistral_string,
-        );
-    }
-
-    let nemotron_markers = [
-        "<TOOLCALL>[",
-        "eredu_probe_7c91",
-        "<TOOL_RESPONSE>[",
-        "__eredu_tool_result_probe__",
-    ];
-    let nemotron_mapping = supports(&mapping, &nemotron_markers);
-    let nemotron_string = supports(&string, &nemotron_markers);
-    if nemotron_mapping || nemotron_string {
-        let v2 = resolve_structural_tokens(tokenizer, &["<SPECIAL_12>".into()]).is_ok();
-        let (identity, spec) = if v2 {
-            (
-                "nemotron.json-list-tools.reasoning.v1",
-                &NEMOTRON_NANO_V2_JSON_LIST_TOOL_SPEC,
-            )
-        } else {
-            (
-                "nemotron.json-list-tools.v1",
-                &NEMOTRON_NANO_JSON_LIST_TOOL_SPEC,
-            )
-        };
-        return recognized_dialect_profile(
-            tokenizer,
-            identity,
-            &DECLARATIVE_DIALECT,
-            DialectParameters::Declarative(spec),
-            nemotron_mapping,
-            nemotron_string,
-        );
-    }
-
-    let llama_markers = [
-        "eredu_probe_7c91",
-        "\"parameters\"",
-        "__eredu_tool_result_probe__",
-    ];
-    let llama_mapping = supports(&mapping, &llama_markers);
-    let llama_string = supports(&string, &llama_markers);
-    if llama_mapping || llama_string {
-        let llama4 = resolve_structural_tokens(
-            tokenizer,
-            &[
-                "<|python_start|>".into(),
-                "<|python_end|>".into(),
-                "<|eot|>".into(),
-            ],
-        )
-        .is_ok();
-        let (identity, spec) = if llama4 {
-            ("llama.python-channel-tools.v1", &LLAMA4_JSON_TOOL_SPEC)
-        } else {
-            ("llama.json-tools.v1", &LLAMA3_JSON_TOOL_SPEC)
-        };
-        return recognized_dialect_profile(
-            tokenizer,
-            identity,
-            &DECLARATIVE_DIALECT,
-            DialectParameters::Declarative(spec),
-            llama_mapping,
-            llama_string,
-        );
-    }
-
-    None
+        Selected::Unregistered => prepare_format_profile(""),
+    };
+    policy.apply_to(&mut profile);
+    profile
 }
 
 pub(crate) fn prepare_chat_from_parts(
@@ -1644,80 +1087,20 @@ pub(crate) fn prepare_chat_from_parts(
     };
     let mut profile = prepare_format_profile(selected.template());
     if profile.dialect.is_none() {
-        if let Some(recognized) = ifm::recognize(tokenizer, &selected_template, model_id, &request)?
-        {
-            profile = recognized;
-        }
+        let selected = probes::selection::select(
+            &mut ifm::Ordinary(probes::Ordinary {
+                tokenizer,
+                selected_template: &selected_template,
+                model_id,
+            }),
+            &request,
+        )?;
+        profile = selected_profile(selected, &request);
     }
-    if profile.dialect.is_none() {
-        if let Some(recognized) =
-            recognize_muse_atem_protocol(tokenizer, &selected_template, model_id)
-                .or_else(|| recognize_gemma_protocol(tokenizer, &selected_template, model_id))
-                .or_else(|| recognize_inkling_protocol(tokenizer, &selected_template, model_id))
-                .or_else(|| recognize_remaining_protocols(tokenizer, &selected_template, model_id))
-        {
-            profile = recognized;
-        }
-    }
-    if profile
-        .identity
-        .as_deref()
-        .is_some_and(|identity| identity.starts_with("qwen3.6."))
-        && request.reasoning_effort.is_none()
-        && request
-            .extra_template_kwargs
-            .contains_key("reasoning_effort")
-    {
-        return Err(TextModelError::ToolConstraint(
-            "Qwen3.6 does not expose reasoning_effort control".into(),
-        ));
-    }
-    let extra_reasoning_effort = if request.reasoning_effort.is_none() {
-        profile
-            .reasoning_effort_control
-            .and_then(|control| {
-                request
-                    .extra_template_kwargs
-                    .get(control.kwarg)
-                    .map(|value| (control, value))
-            })
-            .map(|(control, value)| {
-                value.as_str().map(|value| (control, value)).ok_or_else(|| {
-                    TextModelError::ToolConstraint(format!(
-                        "{} must be a string for format profile {:?}",
-                        control.kwarg,
-                        profile.identity.as_deref().unwrap_or("unregistered")
-                    ))
-                })
-            })
-            .transpose()?
-    } else {
-        None
-    };
-    if let Some(reasoning_effort) = request
-        .reasoning_effort
-        .as_deref()
-        .or_else(|| extra_reasoning_effort.map(|(_, value)| value))
-    {
-        if request.enable_thinking == Some(false) {
-            return Err(TextModelError::ToolConstraint(
-                "reasoning_effort cannot be combined with enable_thinking=false".into(),
-            ));
-        }
-        let control = profile.reasoning_effort_control.ok_or_else(|| {
-            TextModelError::ToolConstraint(format!(
-                "format profile {:?} does not expose reasoning_effort control",
-                profile.identity.as_deref().unwrap_or("unregistered")
-            ))
-        })?;
-        if !control.supported.contains(&reasoning_effort) {
-            return Err(TextModelError::ToolConstraint(format!(
-                "unsupported reasoning_effort {reasoning_effort:?} for format profile {:?}; expected {}",
-                profile.identity.as_deref().unwrap_or("unregistered"),
-                control.supported.join(", ")
-            )));
-        }
-    }
+    let profile_controls = profile::ProfileRequestControls::from_profile(&profile);
+    profile_controls
+        .validate_effort(&request)
+        .map_err(|cause| cause.ordinary(&profile, &request))?;
     let add_generation_prompt = profile
         .generation_prompt_behavior
         .resolve(request.add_generation_prompt);
@@ -1741,26 +1124,9 @@ pub(crate) fn prepare_chat_from_parts(
         profile.supports_reasoning_parsing = request.enable_thinking != Some(false);
         validate_tagged_history(&request.messages, "</parameter>", "Qwen")?;
     }
-    if profile.identity.as_deref() == Some("muse-glimmer.atem.v1") {
-        if request.enable_thinking == Some(false) {
-            return Err(TextModelError::ToolConstraint(
-                "Muse-Glimmer does not expose a reasoning-disable control; enable_thinking=false is not supported".into(),
-            ));
-        }
-        if let Some(value) = request.extra_template_kwargs.get("reasoning_strength") {
-            let Some(strength) = value.as_str() else {
-                return Err(TextModelError::ToolConstraint(
-                    "Muse-Glimmer reasoning_strength must be one of low, medium, high, or xhigh"
-                        .into(),
-                ));
-            };
-            if !matches!(strength, "low" | "medium" | "high" | "xhigh") {
-                return Err(TextModelError::ToolConstraint(format!(
-                    "unsupported Muse-Glimmer reasoning_strength {strength:?}; expected low, medium, high, or xhigh"
-                )));
-            }
-        }
-    }
+    profile_controls
+        .validate_strength(&request)
+        .map_err(|cause| cause.ordinary(&profile, &request))?;
     if request.tool_choice != ToolChoice::None
         && request.enable_thinking == Some(true)
         && !request.tools.is_empty()
@@ -1777,16 +1143,11 @@ pub(crate) fn prepare_chat_from_parts(
         .unwrap_or_else(|| "no semantic protocol was recognized".into());
     let tool_surface_requested =
         !request.tools.is_empty() || request.tool_choice == ToolChoice::Required;
-    let text_generation_support = if tool_surface_requested {
-        CapabilitySupport::Unsupported {
-            reason: "text generation does not support tool declarations or required tool calls; prepare a request without tools".into(),
-        }
-    } else if request.enable_thinking == Some(true) && !request.allow_unparsed_reasoning {
-        CapabilitySupport::Unsupported {
-            reason: "text generation does not parse explicit thinking; set allow_unparsed_reasoning to opt into raw output".into(),
-        }
-    } else {
-        CapabilitySupport::Supported
+    let text_generation_support = match text_chat_eligibility(&request) {
+        Ok(()) => CapabilitySupport::Supported,
+        Err(reason) => CapabilitySupport::Unsupported {
+            reason: reason.to_string(),
+        },
     };
     let tool_protocol_available = profile.tool_dialect.is_some()
         && profile.tool_dialect_parameters.is_some()
@@ -1921,13 +1282,17 @@ pub(crate) fn prepare_chat_from_parts(
         ),
     };
 
+    let mapped_controls = profile_controls
+        .bindings(&request)
+        .map_err(|cause| cause.ordinary(&profile, &request))?
+        .into_owned();
     let ChatTemplateRequest {
         messages,
         tools,
         tool_choice,
         parallel_tool_calls: _,
-        enable_thinking,
-        reasoning_effort,
+        enable_thinking: _,
+        reasoning_effort: _,
         allow_unparsed_reasoning: _,
         add_generation_prompt,
         mut extra_template_kwargs,
@@ -1941,24 +1306,8 @@ pub(crate) fn prepare_chat_from_parts(
         .generation_prompt_behavior
         .resolve(add_generation_prompt);
 
-    if let Some(enable_thinking) = enable_thinking {
-        let explicit_muse_strength = profile.identity.as_deref() == Some("muse-glimmer.atem.v1")
-            && extra_template_kwargs.contains_key("reasoning_strength");
-        if !explicit_muse_strength {
-            let (kwarg, value) = profile
-                .reasoning_template_control
-                .template_entry(enable_thinking);
-            extra_template_kwargs.insert(kwarg.into(), value);
-        }
-    }
-    if let Some(reasoning_effort) = reasoning_effort {
-        let control = profile
-            .reasoning_effort_control
-            .expect("reasoning effort was validated against the recognized profile");
-        extra_template_kwargs.insert(
-            control.kwarg.into(),
-            serde_json::Value::String(reasoning_effort),
-        );
+    for (kwarg, value) in mapped_controls.into_iter().flatten() {
+        extra_template_kwargs.insert(kwarg, value);
     }
 
     let without_generation_prompt = tokenizer
@@ -2009,4 +1358,29 @@ pub(crate) fn prepare_chat_from_parts(
         preserved_structural_token_ids,
         profile_stop_sequences: profile.stop_sequences,
     })
+}
+
+/// The ordinary text-request eligibility predicate, factored without allocating
+/// so original chat preparation can preserve the same semantic exclusions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum TextChatEligibilityError {
+    #[error(
+        "text generation does not support tool declarations or required tool calls; prepare a request without tools"
+    )]
+    Tools,
+    #[error(
+        "text generation does not parse explicit thinking; set allow_unparsed_reasoning to opt into raw output"
+    )]
+    Thinking,
+}
+pub(crate) fn text_chat_eligibility(
+    request: &ChatTemplateRequest,
+) -> Result<(), TextChatEligibilityError> {
+    if !request.tools.is_empty() || request.tool_choice == ToolChoice::Required {
+        Err(TextChatEligibilityError::Tools)
+    } else if request.enable_thinking == Some(true) && !request.allow_unparsed_reasoning {
+        Err(TextChatEligibilityError::Thinking)
+    } else {
+        Ok(())
+    }
 }

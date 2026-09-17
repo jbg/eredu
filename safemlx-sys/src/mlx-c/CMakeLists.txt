@@ -85,7 +85,166 @@ else()
       mlx-cpu-softmax-reduction.patch
       mlx-cpu-argpartition-equal-keys.patch
       mlx-gpu-submission-progress.patch
-      mlx-submission-recovery.patch)
+      mlx-submission-recovery.patch
+      mlx-retained-sdpa-settings.patch
+      mlx-host-transfer-allocation-identity.patch
+      mlx-allocation-owner-retention.patch
+      mlx-allocation-lifetime-generations.patch
+      mlx-deferred-allocation-owner-retention.patch
+      mlx-view-descriptor-normalization.patch
+      mlx-distributed-terminal.patch
+      mlx-prepared-allocation-owner.patch
+      mlx-record-storage-quota.patch
+      mlx-arraydesc-retirement.patch
+      mlx-graph-metadata-quota.patch
+      mlx-cpu-f32-argsort-inplace.patch
+      mlx-original-prepared-input.patch
+      mlx-host-transfer-policy-test.patch
+      mlx-original-model-input-handle.patch
+      mlx-prefill-root-descriptor-bound.patch
+      mlx-prefill-scoped-completion.patch
+      mlx-original-event-task-controls.patch
+      mlx-original-scoped-evaluation.patch
+      mlx-original-operation-observation.patch
+      mlx-original-prompt-input.patch
+      mlx-resident-graph-construction.patch
+      mlx-resident-view-axes.patch
+      mlx-resident-reduction-axes.patch
+      mlx-custom-kernel-borrowed-call.patch
+      mlx-metal-library-builder.patch
+      mlx-resident-gated-product.patch
+      mlx-resident-softplus.patch
+      mlx-resident-grouped-axes.patch
+      mlx-resident-convolution-axes.patch
+      mlx-resident-constant-pad.patch
+      mlx-record-capacity-causes.patch
+      mlx-record-request-extent.patch
+      mlx-custom-kernel-fixed-invocation.patch
+      mlx-resident-router.patch
+      mlx-prepared-metal-definition.patch
+      mlx-record-lifetime-fit.patch
+      mlx-admitted-gpu-stream.patch
+      mlx-prepared-kernel-family.patch
+      mlx-stream-sync-retirement.patch
+      mlx-graph-lifetime-fit.patch
+      mlx-resident-dispatch-graph.patch
+      mlx-concatenate-worker-graph.patch
+      mlx-request-pipeline-cache.patch
+      mlx-kernel-family-64.patch
+      mlx-resident-hybrid-dispatch.patch
+      mlx-resident-grouped-dispatch.patch
+      mlx-grouped-indexed-sources.patch
+      mlx-resident-router-dispatch.patch
+      mlx-sampling-filter-sources.patch
+      mlx-standard-sampling-random.patch
+      mlx-resident-nested-completion.patch
+      mlx-resident-reset-readiness.patch
+      mlx-mirostat-mask-source.patch
+      mlx-original-worker-borrow.patch
+      mlx-resident-host-copy.patch
+      mlx-original-host-source.patch
+      mlx-quantized-supplied-stream.patch
+      mlx-resident-cumulative-frontiers.patch
+      mlx-graph-quota-next-fit.patch
+      mlx-original-buffer-contention.patch
+      mlx-packed-embedding-fallback.patch
+      mlx-graph-construction-class-index.patch
+      mlx-pooled-mask-gather.patch
+      mlx-implicit-convolution-receipt.patch
+      mlx-fence-header-guard.patch
+      mlx-distributed-storage-inventory.patch
+      mlx-ring-socket-tasks.patch
+      mlx-ring-captured-graph.patch
+      mlx-ring-pool-tasks.patch
+      mlx-ring-reduction-plan.patch
+      mlx-ring-worker-storage.patch
+      mlx-ring-outer-dispatch.patch
+      mlx-distributed-original-constructor.patch
+      mlx-cpu-copy-storage-source.patch
+      mlx-distributed-worker-graph-loan.patch
+      mlx-distributed-cpu-eval-source.patch
+      mlx-distributed-persistent-source.patch
+      mlx-distributed-persistent-managed-boundary.patch
+      mlx-distributed-cold-operation-source.patch
+      mlx-distributed-workspace-layout-source.patch
+      mlx-distributed-retained-buffer-source.patch
+      mlx-prepared-host-destination.patch
+      mlx-original-control-child-scope.patch
+      mlx-distributed-resident-constructor-loan.patch
+      mlx-indexed-rank-and-signed-sources.patch
+      mlx-cpu-copy-eval-source.patch
+      mlx-cpu-unary-eval-source.patch
+      mlx-cpu-binary-eval-source.patch
+      mlx-cpu-cast-eval-source.patch
+      mlx-cpu-slice-eval-source.patch
+      mlx-cpu-softmax-eval-source.patch
+      mlx-cpu-greedy-eval-source.patch
+      mlx-cpu-reshape-eval-source.patch
+      mlx-cpu-random-bits-eval-source.patch
+      mlx-cpu-matmul-eval-source.patch
+      mlx-prepared-input-scalars.patch
+      mlx-cpu-matmul-selection.patch
+      mlx-cpu-matmul-selected-dtype.patch
+      mlx-cpu-alias-eval-source.patch
+      mlx-resident-byte-view-source.patch
+      mlx-cpu-matmul-selected-empty.patch
+      mlx-cpu-pointwise-logical-source.patch
+      mlx-cpu-gather-source.patch
+      mlx-cpu-reduction-source.patch
+      mlx-cpu-lookup-source.patch
+      mlx-cpu-rms-source.patch
+      mlx-cpu-view-alias.patch
+      mlx-cpu-concatenate-source.patch
+      mlx-cpu-gemma-rope.patch
+      mlx-cpu-arange-promotion.patch
+      mlx-cpu-gemma-attention.patch
+      mlx-cpu-ordered-partition.patch
+      mlx-cpu-ordered-gather.patch
+      mlx-cpu-ordered-mask.patch
+      mlx-cpu-ordered-scatter.patch
+      mlx-cpu-ordered-aliases.patch
+      mlx-cpu-reshape-inference.patch
+      mlx-cpu-all-sum-source.patch
+      mlx-cpu-causal-mask-source.patch
+      mlx-cpu-broadcast-select-source.patch
+      mlx-cpu-masked-attention-source.patch
+      mlx-cpu-strided-row-reduction.patch
+      mlx-cpu-matmul-copy-source.patch
+      mlx-cpu-reshape-copy-source.patch
+      mlx-eval-ready-input-publication.patch
+      mlx-cpu-preview-slice-source.patch
+      mlx-cpu-positive-slice-source.patch
+      mlx-host-transfer-nested-stream-capacity.patch
+      mlx-cpu-flat-reduction-source.patch
+      mlx-cpu-token-update-source.patch
+      mlx-cpu-candidate-sort-source.patch
+      mlx-cpu-static-update-source.patch
+      mlx-cpu-i32-static-update-source.patch
+      mlx-cpu-half-gather-source.patch
+      mlx-cpu-half-squeeze-source.patch
+      mlx-cpu-half-softmax-source.patch
+      mlx-cpu-bf16-matmul-copy-source.patch
+      mlx-cpu-f16-selected-matmul.patch
+      mlx-cpu-half-attention-selection.patch
+      mlx-cpu-byte-view-source.patch
+      mlx-cpu-byte-frame-source.patch
+      mlx-cpu-shard-selection-source.patch
+      mlx-cpu-member-concatenate-source.patch
+      mlx-cpu-f16-rms-source.patch
+      mlx-cpu-half-row-sum-source.patch
+      mlx-prepared-input-boolean-source.patch
+      mlx-cpu-sampling-filter-leaves.patch
+      mlx-cpu-sampling-gather-axis.patch
+      mlx-cpu-sampling-argsort-axis.patch
+      mlx-ring-variable-source.patch
+      mlx-cpu-strided-select-source.patch
+      mlx-broadcast-result-reservation.patch
+      mlx-resident-mxfp4-grouped-source.patch
+      mlx-eval-record-capacity-attribution.patch
+      mlx-ring-variable-envelope.patch
+    mlx-prepared-zero-source.patch
+      mlx-scatter-axis-sum-source.patch
+      mlx-cpu-flat-scatter-source.patch)
   set(mlx_patch_applier "${CMAKE_CURRENT_LIST_DIR}/patches/apply-idempotent.cmake")
   file(SHA256 "${mlx_patch_applier}" mlx_patch_identity)
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_patch_applier}")
@@ -102,14 +261,149 @@ else()
          ${CMAKE_COMMAND} "-DPATCH_FILE=${mlx_patch_path}" -P "${mlx_patch_applier}")
   endforeach()
   string(SHA256 mlx_patch_set_hash "${mlx_patch_identity}")
+  set(mlx_archive_hash
+      8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec)
+  set(mlx_prepared_source "${FETCHCONTENT_BASE_DIR}/mlx-${mlx_patch_set_hash}-src")
+  set(mlx_population_options)
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+    # SOURCE_SUBDIR prevents MakeAvailable from adding the native project before
+    # its verified after-images have reached their stable compilation paths.
+    set(mlx_compile_source "${FETCHCONTENT_BASE_DIR}/mlx-compile-src")
+    set(mlx_compile_state "${FETCHCONTENT_BASE_DIR}/mlx-compile-state")
+    # Invalidate before archive/patch preparation too. A failed configure must
+    # never leave a completed marker for the attempted compilation revision.
+    file(REMOVE "${mlx_compile_state}/completed.txt")
+    set(mlx_population_subdir "__safemlx_population_only")
+    if(EXISTS "${mlx_prepared_source}/${mlx_population_subdir}")
+      message(FATAL_ERROR "MLX population-only subdirectory unexpectedly exists")
+    endif()
+    list(APPEND mlx_population_options SOURCE_SUBDIR "${mlx_population_subdir}")
+  endif()
   safemlx_declare_vendored(
-    mlx mlx-v0.32.0.tar.gz
-    8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec
-    SOURCE_DIR "${FETCHCONTENT_BASE_DIR}/mlx-${mlx_patch_set_hash}-src"
+    mlx mlx-v0.32.0.tar.gz "${mlx_archive_hash}"
+    SOURCE_DIR "${mlx_prepared_source}"
     SUBBUILD_DIR "${FETCHCONTENT_BASE_DIR}/mlx-${mlx_patch_set_hash}-subbuild"
     BINARY_DIR "${FETCHCONTENT_BASE_DIR}/mlx-build"
-    PATCH_COMMAND ${mlx_patch_commands})
+    PATCH_COMMAND ${mlx_patch_commands} ${mlx_population_options})
   FetchContent_MakeAvailable(mlx)
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.21)
+    if(NOT mlx_SOURCE_DIR STREQUAL mlx_prepared_source OR
+       EXISTS "${mlx_SOURCE_DIR}/${mlx_population_subdir}")
+      message(FATAL_ERROR "MLX mirror requires the verified vendored preparation")
+    endif()
+    set(mlx_mirror_helper "${CMAKE_CURRENT_LIST_DIR}/cmake/sync-mlx-source.cmake")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${mlx_mirror_helper}")
+    file(SHA256 "${mlx_mirror_helper}" mlx_mirror_helper_hash)
+    string(SHA256 mlx_compile_identity
+           "${mlx_archive_hash}\n${mlx_patch_set_hash}\n${mlx_mirror_helper_hash}")
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} "-DSOURCE_DIR=${mlx_SOURCE_DIR}"
+              "-DDESTINATION_DIR=${mlx_compile_source}"
+              "-DSTATE_DIR=${mlx_compile_state}" "-DIDENTITY=${mlx_compile_identity}"
+              -P "${mlx_mirror_helper}"
+      RESULT_VARIABLE mlx_mirror_result)
+    if(NOT mlx_mirror_result STREQUAL "0")
+      message(FATAL_ERROR "MLX compilation source refresh failed")
+    endif()
+    set(mlx_SOURCE_DIR "${mlx_compile_source}")
+    add_subdirectory("${mlx_SOURCE_DIR}" "${mlx_BINARY_DIR}")
+  endif()
+  if(APPLE AND MLX_BUILD_METAL)
+    # The vendored embedded-metallib worker lives in mlx itself. Every static
+    # consumer must inherit its libcompression dependency, including new tools.
+    target_link_libraries(mlx PUBLIC compression)
+  endif()
+endif()
+
+# Explicit cold test target; not built or installed with production artifacts.
+if(NOT MLX_C_USE_SYSTEM_MLX)
+  add_executable(mlx-operation-observer-allocation-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/operation_observer_allocation_test.cpp)
+  target_link_libraries(mlx-operation-observer-allocation-test PRIVATE mlxc mlx)
+  add_executable(mlx-cpu-argsort-benchmark EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/cpu_argsort_benchmark.cpp)
+  target_link_libraries(mlx-cpu-argsort-benchmark PRIVATE mlx)
+  add_executable(mlx-arraydesc-retirement-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/arraydesc_retirement_test.cpp)
+  target_link_libraries(mlx-arraydesc-retirement-test PRIVATE mlx)
+  add_executable(mlx-cold-sdpa-settings-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/sdpa_settings_test.cpp)
+  target_link_libraries(mlx-cold-sdpa-settings-test PRIVATE mlx)
+  add_executable(mlx-allocation-generations-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/allocation_generations_test.cpp)
+  target_link_libraries(mlx-allocation-generations-test PRIVATE mlxc mlx)
+  add_executable(mlx-prepared-allocation-owner-test EXCLUDE_FROM_ALL
+    ${CMAKE_CURRENT_LIST_DIR}/tests/prepared_allocation_owner_test.cpp)
+  target_link_libraries(mlx-prepared-allocation-owner-test PRIVATE mlxc mlx)
+  add_executable(mlx-deferred-allocation-owner-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/deferred_allocation_owner_test.cpp)
+  target_link_libraries(mlx-deferred-allocation-owner-test PRIVATE mlxc mlx)
+  # Isolated process: exact registry geometry must not inherit other tests.
+  add_executable(mlx-submission-retirement-fairness-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/submission_retirement_fairness_test.cpp)
+  target_link_libraries(mlx-submission-retirement-fairness-test PRIVATE mlx)
+  add_executable(mlx-submission-retirement-pass-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/submission_retirement_pass_test.cpp)
+  target_link_libraries(mlx-submission-retirement-pass-test PRIVATE mlxc mlx)
+  add_executable(mlx-distributed-terminal-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/distributed_terminal_test.cpp)
+  target_link_libraries(mlx-distributed-terminal-test PRIVATE mlxc mlx)
+  add_executable(mlx-distributed-original-ring-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/distributed_original_ring_test.cpp)
+  target_link_libraries(mlx-distributed-original-ring-test PRIVATE mlxc mlx)
+  add_executable(mlx-distributed-variable-original-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/distributed_variable_original_test.cpp)
+  target_link_libraries(mlx-distributed-variable-original-test PRIVATE mlxc mlx)
+  add_executable(mlx-shared-metal-device-init-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/shared_metal_device_init_test.cpp)
+  target_link_libraries(mlx-shared-metal-device-init-test PRIVATE mlxc mlx)
+  if(MLX_BUILD_METAL)
+    target_compile_definitions(mlx-shared-metal-device-init-test PRIVATE MLX_C_PATCH_TEST_METAL)
+  endif()
+  add_executable(mlx-shared-scheduler-init-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/shared_scheduler_init_test.cpp)
+  target_link_libraries(mlx-shared-scheduler-init-test PRIVATE mlxc mlx)
+  add_executable(mlx-stream-registration-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/stream_registration_test.cpp)
+  target_link_libraries(mlx-stream-registration-test PRIVATE mlxc mlx)
+  add_executable(mlx-cpu-worker-startup-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/cpu_worker_startup_test.cpp)
+  target_link_libraries(mlx-cpu-worker-startup-test PRIVATE mlxc mlx ${CMAKE_DL_LIBS})
+  add_executable(mlx-cpu-worker-directory-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/cpu_worker_directory_test.cpp)
+  target_link_libraries(mlx-cpu-worker-directory-test PRIVATE mlxc mlx)
+  if(MLX_BUILD_METAL)
+    target_compile_definitions(mlx-shared-scheduler-init-test PRIVATE MLX_C_PATCH_TEST_METAL)
+  endif()
+  add_executable(mlx-shared-input-allocator-init-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/shared_input_allocator_init_test.cpp)
+  target_link_libraries(mlx-shared-input-allocator-init-test PRIVATE mlxc mlx)
+  if(MLX_BUILD_METAL)
+    target_compile_definitions(mlx-shared-input-allocator-init-test PRIVATE MLX_C_PATCH_TEST_METAL)
+  endif()
+  add_executable(mlx-submission-registry-init-test EXCLUDE_FROM_ALL
+                 ${CMAKE_CURRENT_LIST_DIR}/tests/submission_registry_init_test.cpp)
+  target_link_libraries(mlx-submission-registry-init-test PRIVATE mlxc mlx)
+  if(APPLE AND MLX_BUILD_METAL)
+    target_link_libraries(mlx-operation-observer-allocation-test PRIVATE compression)
+    target_link_libraries(mlx-cpu-argsort-benchmark PRIVATE compression)
+    target_link_libraries(mlx-arraydesc-retirement-test PRIVATE compression)
+    target_link_libraries(mlx-cold-sdpa-settings-test PRIVATE compression)
+    target_link_libraries(mlx-allocation-generations-test PRIVATE compression)
+    target_link_libraries(mlx-deferred-allocation-owner-test PRIVATE compression)
+    target_link_libraries(mlx-prepared-allocation-owner-test PRIVATE compression)
+    target_link_libraries(mlx-submission-retirement-fairness-test PRIVATE compression)
+    target_link_libraries(mlx-submission-retirement-pass-test PRIVATE compression)
+    target_link_libraries(mlx-submission-registry-init-test PRIVATE compression)
+    target_link_libraries(mlx-shared-input-allocator-init-test PRIVATE compression)
+    target_link_libraries(mlx-shared-metal-device-init-test PRIVATE compression)
+    target_link_libraries(mlx-shared-scheduler-init-test PRIVATE compression)
+    target_link_libraries(mlx-stream-registration-test PRIVATE compression)
+    target_link_libraries(mlx-cpu-worker-directory-test PRIVATE compression)
+    target_link_libraries(mlx-cpu-worker-startup-test PRIVATE compression)
+    target_link_libraries(mlx-distributed-terminal-test PRIVATE compression)
+    target_link_libraries(mlx-distributed-original-ring-test PRIVATE compression)
+  endif()
 endif()
 
 if(MLX_C_BUILD_PATCH_TESTS)
@@ -117,6 +411,21 @@ if(MLX_C_BUILD_PATCH_TESTS)
     mlx-patch-test-binary
     ${CMAKE_CURRENT_LIST_DIR}/tests/event_submission_tests.cpp
     ${CMAKE_CURRENT_LIST_DIR}/tests/submission_recovery_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/submission_record_readiness_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/submission_scope_owner_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/submission_record_quota_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/graph_metadata_quota_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/prepared_input_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/input_allocator_slot_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/original_buffer_owner_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/prefill_roots_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/scoped_observation_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/scoped_roots_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/native_controls_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/operation_observer_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/array_descriptor_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/cpu_argsort_tests.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/tests/intrusive_index_tests.cpp
     ${mlx_SOURCE_DIR}/tests/tests.cpp
     ${mlx_SOURCE_DIR}/tests/completion_tests.cpp
     ${mlx_SOURCE_DIR}/tests/distributed_all_to_all_v_tests.cpp
@@ -124,15 +433,45 @@ if(MLX_C_BUILD_PATCH_TESTS)
   target_sources(mlx-patch-test-binary PRIVATE
                  ${mlx_SOURCE_DIR}/tests/scheduler_recovery_tests.cpp
                  ${mlx_SOURCE_DIR}/tests/gpu_submission_progress_tests.cpp)
+  if(MLX_BUILD_METAL)
+    target_compile_definitions(mlx-patch-test-binary PRIVATE MLX_C_PATCH_TEST_METAL)
+    target_sources(mlx-patch-test-binary PRIVATE
+                   ${CMAKE_CURRENT_LIST_DIR}/tests/prepared_input_metal_tests.cpp
+                   ${CMAKE_CURRENT_LIST_DIR}/tests/scoped_failure_metal_tests.cpp
+                   ${CMAKE_CURRENT_LIST_DIR}/tests/metal_receipt_controls_tests.cpp
+                   ${CMAKE_CURRENT_LIST_DIR}/tests/metal_persistent_storage_tests.cpp)
+  endif()
   target_link_libraries(mlx-patch-test-binary PRIVATE mlxc mlx doctest)
+  if(APPLE AND MLX_BUILD_METAL)
+    target_link_libraries(mlx-patch-test-binary PRIVATE compression)
+  endif()
 
   add_custom_target(
     mlx-patch-tests
     COMMAND
       ${CMAKE_COMMAND} -E env DEVICE=cpu
+      $<TARGET_FILE:mlx-arraydesc-retirement-test>
+    COMMAND
+      ${CMAKE_COMMAND} -E env DEVICE=cpu
       $<TARGET_FILE:mlx-patch-test-binary>
-      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*,*CPU recovery*,*GPU recovery*,*submission recovery*"
-    DEPENDS mlx-patch-test-binary
+      "--test-case=*completion*,*failed CPU event*,*all_to_all_v*,*host transfer*,*CPU recovery*,*GPU recovery*,*submission recovery*,*graph quota*,*prepared input*,*persistent encoder lists*,*persistent encoder index*,*CPU argsort*"
+    # Separate process: the fairness regression requires an initially empty
+    # submission registry and must not share the doctest binary's history.
+    COMMAND
+      ${CMAKE_COMMAND} -E env DEVICE=cpu
+      $<TARGET_FILE:mlx-submission-retirement-fairness-test>
+    COMMAND
+      ${CMAKE_COMMAND} -E env DEVICE=cpu
+      $<TARGET_FILE:mlx-submission-retirement-pass-test>
+    COMMAND
+      ${CMAKE_COMMAND} -E env DEVICE=cpu
+      $<TARGET_FILE:mlx-submission-registry-init-test>
+    COMMAND
+      ${CMAKE_COMMAND} -E env DEVICE=cpu
+      $<TARGET_FILE:mlx-distributed-terminal-test>
+    DEPENDS mlx-arraydesc-retirement-test mlx-patch-test-binary mlx-submission-retirement-fairness-test
+            mlx-submission-retirement-pass-test mlx-submission-registry-init-test
+            mlx-distributed-terminal-test
     USES_TERMINAL
     COMMENT "Running tests carried by Eredu's vendored MLX patches")
 endif()
@@ -151,12 +490,22 @@ endif()
 
 set(mlxc-src
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/array.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/prepared_input.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/device_initialization.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/scheduler_initialization.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/original_buffer.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/owned_host_copy.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/prefill_roots.cpp
+    mlx/c/prefill_failure.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/closure.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/compile.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/cuda.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/device.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/distributed.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/distributed_group.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/distributed_eval.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/distributed_completion.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/distributed_persistent.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/error.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/event.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/export.cpp
@@ -174,11 +523,16 @@ set(mlxc-src
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/ops.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/random.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/stream.cpp
+  ${CMAKE_CURRENT_LIST_DIR}/mlx/c/stream_copy.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/stream_registration.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/gpu_stream_registration.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/cpu_worker.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/submission.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/string.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/transforms.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/transforms_impl.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/vector.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/mlx/c/graph_rows.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mlx/c/version.cpp)
 
 add_library(mlxc ${mlxc-src})

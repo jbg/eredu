@@ -354,21 +354,18 @@ impl ComponentPartitionLayouts {
             return Err(invalid("routed producer bound is zero"));
         }
         let point = &plan.points()[index];
-        let first = self
-            .layouts
-            .first()
-            .and_then(|layout| layout.routed.get(&selection.path))
-            .ok_or_else(|| CaptureError::MissingPath(selection.path.clone()))?;
+        let source = self.routed_capture_source(&selection.path)
+            .map_err(|cause| cause.legacy(&selection.path))?;
         if !matches!(
             selection.transform,
             eredu_core::capture::CaptureTransform::RoutedUnits
         ) || point.position
-            != if first.effective {
+            != if source.effective() {
                 eredu_core::ObservationPosition::AfterIntervention
             } else {
                 eredu_core::ObservationPosition::BeforeIntervention
             }
-            || !matches!(&point.value_type, eredu_core::ObservationValueType::RoutedUnits { routing, geometry } if routing == &first.routing && geometry == &first.geometry)
+            || !matches!(&point.value_type, eredu_core::ObservationValueType::RoutedUnits { routing, geometry } if routing == source.routing() && geometry == &source.geometry())
         {
             return Err(invalid("routed capture differs from the retained bank"));
         }
@@ -381,8 +378,8 @@ impl ComponentPartitionLayouts {
         if shape.len() != 3
             || shape[1..]
                 != [
-                    first.geometry.routes_per_token,
-                    first.geometry.units_per_expert,
+                    source.geometry().routes_per_token,
+                    source.geometry().units_per_expert,
                 ]
         {
             return Err(invalid("routed capture axes differ from the selected bank"));
@@ -390,35 +387,17 @@ impl ComponentPartitionLayouts {
         let slice = eredu_core::capture::resolve_slice(point, selection, &shape)?;
         let mut sources = Vec::new();
         let mut producers = Vec::new();
-        let mut coordinates = Vec::new();
         let mut fragments = 0usize;
-        for (rank, layout) in self.layouts.iter().enumerate() {
-            let observation = layout
-                .routed
-                .get(&selection.path)
-                .ok_or_else(|| CaptureError::MissingPath(selection.path.clone()))?;
-            if observation.routing != first.routing
-                || observation.effective != first.effective
-                || observation.geometry != first.geometry
-                || observation.input_width != first.input_width
-            {
-                return Err(invalid(
-                    "routed invocation declarations disagree between ranks",
-                ));
-            }
-            let Some(ownership) = &observation.ownership else {
-                continue;
-            };
+        for rank in 0..source.world_size() {
+            let Some(local) = source.rank(rank) else { continue; };
+            let ownership = local.ownership;
             sources.push(PartitionRoutedCaptureSource {
                 rank,
                 ownership: ownership.clone(),
-                input_width: observation.input_width,
+                input_width: source.input_width(),
             });
+            if !local.produces { continue; }
             let map = &ownership.coordinates;
-            let empty = map.experts().local_count() == 0 || map.units().local_count() == 0;
-            if !empty && coordinates.contains(&map) {
-                continue;
-            }
             if producers.len() == limits.max_producers {
                 return Err(invalid("routed producer count exceeds its bound"));
             }
@@ -435,7 +414,6 @@ impl ComponentPartitionLayouts {
             if fragments > limits.max_fragments {
                 return Err(invalid("routed fragment count exceeds its bound"));
             }
-            coordinates.push(map);
             producers.push(PartitionRoutedCaptureProducer {
                 rank,
                 projection,
@@ -446,8 +424,8 @@ impl ComponentPartitionLayouts {
             return Err(invalid("routed capture has no selected invocation owner"));
         }
         Ok(PartitionRoutedCapturePlacement {
-            routing: first.routing.clone(),
-            effective: first.effective,
+            routing: source.routing().into(),
+            effective: source.effective(),
             producers,
             sources,
         })

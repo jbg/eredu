@@ -7,6 +7,8 @@ use std::panic::Location;
 use std::sync::Once;
 use std::{cell::Cell, cell::RefCell, ffi::c_char};
 use thiserror::Error;
+mod retained;
+use retained::ExceptionSource;
 
 /// Type alias for a `Result` with an `Exception` error type.
 pub type Result<T> = std::result::Result<T, Exception>;
@@ -64,11 +66,7 @@ impl From<Infallible> for IoError {
 impl From<RawException> for IoError {
     #[track_caller]
     fn from(e: RawException) -> Self {
-        let exception = Exception {
-            what: e.what,
-            location: Location::caller(),
-            source: None,
-        };
+        let exception = Exception::from(e);
         Self::Exception(exception)
     }
 }
@@ -76,6 +74,14 @@ impl From<RawException> for IoError {
 /// Error associated with `Array::try_as_slice()`
 #[derive(Debug, PartialEq, Error)]
 pub enum AsSliceError {
+    /// A borrowed Rust slice cannot represent a strided or broadcast view.
+    #[error("The array is not contiguous in logical row order.")]
+    NonContiguous,
+
+    /// Shape and stride metadata do not describe a valid logical array.
+    #[error("The array has invalid shape or stride metadata.")]
+    InvalidLayout,
+
     /// The underlying data pointer is null.
     ///
     /// This is likely because the array has not been evaluated yet.
@@ -136,8 +142,163 @@ cfg_safetensors! {
     }
 }
 
+/// Enforced submission tracking ceiling failure. This does not imply completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum SubmissionTrackingFailure {
+    /// The same original arena could not reserve the requested physical block.
+    #[error("submission tracking capacity exhausted")]
+    Exhausted,
+    /// Concrete capacity/alignment arithmetic was invalid.
+    #[error("invalid submission tracking layout")]
+    InvalidLayout,
+    /// A nested scope attempted to substitute another arena.
+    #[error("submission tracking parent mismatch")]
+    ParentMismatch,
+    /// An extension attempted an unbound Record allocation inside a quota.
+    #[error("record requires its bounded factory")]
+    UnboundRecord,
+}
+impl SubmissionTrackingFailure {
+    fn from_native(code: u32) -> Option<Self> {
+        match code {
+            1 => Some(Self::Exhausted),
+            2 => Some(Self::InvalidLayout),
+            3 => Some(Self::ParentMismatch),
+            4 => Some(Self::UnboundRecord),
+            _ => None,
+        }
+    }
+}
+/// Enforced graph metadata ceiling failure. This does not imply completion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum GraphMetadataFailure {
+    /// The same original arena could not reserve the requested physical block.
+    #[error("graph metadata capacity exhausted")]
+    Exhausted,
+    /// Concrete capacity/alignment arithmetic was invalid.
+    #[error("invalid graph metadata layout")]
+    InvalidLayout,
+    /// A nested scope attempted to substitute another arena.
+    #[error("graph metadata parent mismatch")]
+    ParentMismatch,
+}
+impl GraphMetadataFailure {
+    fn from_native(code: u32) -> Option<Self> {
+        match code {
+            1 => Some(Self::Exhausted),
+            2 => Some(Self::InvalidLayout),
+            3 => Some(Self::ParentMismatch),
+            _ => None,
+        }
+    }
+}
 pub(crate) struct RawException {
     pub(crate) what: String,
+    tracking: Option<SubmissionTrackingFailure>,
+    graph: Option<GraphMetadataFailure>,
+}
+
+/// Fixed result from original scoped synchronous evaluation. This is not
+/// completion or recovery authority; native source storage remains retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum ScopedEvaluationCause {
+    /// The borrowed native value or transport was invalid.
+    #[error("invalid scoped evaluation")]
+    Invalid,
+    /// A fixed original capacity refused the operation.
+    #[error("scoped evaluation capacity exhausted")]
+    Capacity,
+    /// A native allocation failed before completion.
+    #[error("scoped evaluation allocation failed")]
+    Allocation,
+    /// Scope, event or original quota identity does not match.
+    #[error("scoped evaluation domain mismatch")]
+    Domain,
+    /// The source operation was already consumed.
+    #[error("scoped evaluation is spent")]
+    Spent,
+    /// Work remains pending; this does not establish safe release.
+    #[error("scoped evaluation remains pending")]
+    Pending,
+    /// The actual native cause is retained by the same prepaid carrier.
+    #[error("scoped evaluation retained native failure")]
+    Failed,
+    /// Progress requires a separately funded operation.
+    #[error("scoped evaluation requires funded progress")]
+    NeedsFundedProgress,
+    /// The exact native frontier cannot be observed by this operation.
+    #[error("scoped evaluation is unobservable")]
+    Unobservable,
+    /// Runtime or failure publication is currently busy.
+    #[error("scoped evaluation runtime busy")]
+    RuntimeBusy,
+    /// Preserve an unexpected ABI value without allocating a diagnostic.
+    #[error("invalid scoped evaluation status {0}")]
+    InvalidStatus(u32),
+}
+impl ScopedEvaluationCause {
+    pub(crate) fn from_status(value: u32) -> Self {
+        match value {
+            1 => Self::Invalid,
+            2 => Self::Capacity,
+            3 => Self::Allocation,
+            4 => Self::Domain,
+            5 => Self::Spent,
+            6 => Self::Pending,
+            7 => Self::Failed,
+            8 => Self::NeedsFundedProgress,
+            9 => Self::Unobservable,
+            10 => Self::RuntimeBusy,
+            other => Self::InvalidStatus(other),
+        }
+    }
+    fn message(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid scoped evaluation",
+            Self::Capacity => "scoped evaluation capacity exhausted",
+            Self::Allocation => "scoped evaluation allocation failed",
+            Self::Domain => "scoped evaluation domain mismatch",
+            Self::Spent => "scoped evaluation is spent",
+            Self::Pending => "scoped evaluation remains pending",
+            Self::Failed => "scoped evaluation retained native failure",
+            Self::NeedsFundedProgress => "scoped evaluation requires funded progress",
+            Self::Unobservable => "scoped evaluation is unobservable",
+            Self::RuntimeBusy => "scoped evaluation runtime busy",
+            Self::InvalidStatus(_) => "invalid scoped evaluation status",
+        }
+    }
+}
+#[derive(Debug)]
+pub(crate) struct ScopedEvaluationFailure {
+    cause: ScopedEvaluationCause,
+    // Source retires before its independent custody alias. An unpublished
+    // carrier is custody only and never masquerades as a native error source.
+    source: Option<crate::PrefillNativeError>,
+    custody: Option<crate::RetainedPrefillFailure>,
+}
+impl PartialEq for ScopedEvaluationFailure {
+    fn eq(&self, other: &Self) -> bool {
+        self.cause == other.cause
+            && match (&self.custody, &other.custody) {
+                (Some(a), Some(b)) => a.raw().ctx == b.raw().ctx,
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+impl std::fmt::Display for ScopedEvaluationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.cause, f)?;
+        if let Some(source) = &self.source {
+            write!(f, ": {source}")?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for ScopedEvaluationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.as_ref().map(|source| source as _)
+    }
 }
 
 /// Exception. Most will come from the C API.
@@ -145,18 +306,33 @@ pub(crate) struct RawException {
 pub struct Exception {
     pub(crate) what: String,
     pub(crate) location: &'static Location<'static>,
-    pub(crate) source: Option<std::sync::Arc<dyn std::error::Error + Send + Sync>>,
+    pub(crate) source: Option<ExceptionSource>,
+    // Inline fixed native classification adds no new error-source allocation.
+    pub(crate) tracking: Option<SubmissionTrackingFailure>,
+    pub(crate) graph: Option<GraphMetadataFailure>,
+    pub(crate) scoped: Option<ScopedEvaluationFailure>,
 }
 
 impl std::fmt::Display for Exception {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(scoped) = &self.scoped {
+            return write!(formatter, "{scoped} at {}", self.location);
+        }
+        if let Some(source) = self.source.as_ref().filter(|source| source.retained()) {
+            return write!(formatter, "{} at {}", source.source(), self.location);
+        }
         write!(formatter, "{:?} at {}", self.what, self.location)
     }
 }
 
 impl std::error::Error for Exception {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.source.as_deref().map(|source| source as _)
+        self.source
+            .as_ref()
+            .map(|source| source.source() as _)
+            .or_else(|| self.tracking.as_ref().map(|source| source as _))
+            .or_else(|| self.graph.as_ref().map(|source| source as _))
+            .or_else(|| self.scoped.as_ref().map(|source| source as _))
     }
 }
 
@@ -164,9 +340,12 @@ impl PartialEq for Exception {
     fn eq(&self, other: &Self) -> bool {
         self.what == other.what
             && self.location == other.location
+            && self.tracking == other.tracking
+            && self.graph == other.graph
+            && self.scoped == other.scoped
             && match (&self.source, &other.source) {
                 (None, None) => true,
-                (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+                (Some(a), Some(b)) => a == b,
                 _ => false,
             }
     }
@@ -175,7 +354,39 @@ impl PartialEq for Exception {
 impl Exception {
     /// The error message.
     pub fn what(&self) -> &str {
-        &self.what
+        if self.source.as_ref().is_some_and(ExceptionSource::retained) {
+            return "retained Rust error source";
+        }
+        self.scoped
+            .as_ref()
+            .map_or(self.what.as_str(), |value| value.cause.message())
+    }
+
+    /// Fixed original evaluation result, when this exception owns scoped custody.
+    pub fn scoped_evaluation_cause(&self) -> Option<ScopedEvaluationCause> {
+        self.scoped.as_ref().map(|value| value.cause)
+    }
+
+    #[track_caller]
+    pub(crate) fn from_scoped_evaluation(
+        cause: ScopedEvaluationCause,
+        custody: Option<crate::RetainedPrefillFailure>,
+    ) -> Self {
+        let source = custody
+            .as_ref()
+            .and_then(crate::RetainedPrefillFailure::error);
+        Self {
+            what: String::new(),
+            location: Location::caller(),
+            source: None,
+            tracking: None,
+            graph: None,
+            scoped: Some(ScopedEvaluationFailure {
+                cause,
+                source,
+                custody,
+            }),
+        }
     }
 
     /// The location of the error.
@@ -194,6 +405,9 @@ impl Exception {
             what: what.into(),
             location: Location::caller(),
             source: None,
+            tracking: None,
+            graph: None,
+            scoped: None,
         }
     }
 
@@ -204,7 +418,10 @@ impl Exception {
         Self {
             what: error.to_string(),
             location: Location::caller(),
-            source: Some(std::sync::Arc::new(error)),
+            source: Some(ExceptionSource::Ordinary(std::sync::Arc::new(error))),
+            tracking: None,
+            graph: None,
+            scoped: None,
         }
     }
 }
@@ -216,6 +433,9 @@ impl From<RawException> for Exception {
             what: e.what,
             location: Location::caller(),
             source: None,
+            tracking: e.tracking,
+            graph: e.graph,
+            scoped: None,
         }
     }
 }
@@ -227,6 +447,9 @@ impl From<&str> for Exception {
             what: what.to_string(),
             location: Location::caller(),
             source: None,
+            tracking: None,
+            graph: None,
+            scoped: None,
         }
     }
 }
@@ -239,28 +462,51 @@ impl From<Infallible> for Exception {
 
 impl From<Exception> for String {
     fn from(e: Exception) -> Self {
-        e.what
+        if e.scoped.is_some() || e.source.as_ref().is_some_and(ExceptionSource::retained) {
+            // Explicit caller-requested materialization is ordinary. Keep the
+            // retained cause and custody alive until formatting completes.
+            e.to_string()
+        } else {
+            e.what
+        }
     }
 }
 
 thread_local! {
     static CLOSURE_ERROR: Cell<Option<Exception>> = const { Cell::new(None) };
-    static LAST_MLX_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    static LAST_MLX_ERROR: RefCell<Option<RawException>> = const { RefCell::new(None) };
 }
 
 static INIT_ERR_HANDLER: Once = Once::new();
+
+pub(crate) fn static_storage_bytes() -> usize {
+    std::mem::size_of_val(&INIT_ERR_HANDLER)
+}
 
 #[no_mangle]
 extern "C" fn default_mlx_error_handler(msg: *const c_char, _data: *mut std::ffi::c_void) {
     let message = unsafe { CStr::from_ptr(msg) }
         .to_string_lossy()
         .into_owned();
+    // SAFETY: the native synchronous error handler classified its caught
+    // exception before invoking us. No query/progress or textual parsing occurs.
+    let tracking = SubmissionTrackingFailure::from_native(unsafe {
+        safemlx_sys::mlx_error_submission_tracking_failure()
+    });
+    // Same synchronous caught-exception classification, independent of Record.
+    let graph = GraphMetadataFailure::from_native(unsafe {
+        safemlx_sys::mlx_error_graph_metadata_failure()
+    });
     LAST_MLX_ERROR.with(|last_error| {
-        last_error.replace(Some(message));
+        last_error.replace(Some(RawException {
+            what: message,
+            tracking,
+            graph,
+        }));
     });
 }
 
-fn take_last_mlx_error() -> Option<String> {
+fn take_last_mlx_error() -> Option<RawException> {
     LAST_MLX_ERROR.with(|last_error| last_error.borrow_mut().take())
 }
 
@@ -284,7 +530,22 @@ fn setup_mlx_error_handler() {
 }
 
 pub(crate) fn ensure_mlx_error_handler() {
+    #[cfg(test)]
+    HANDLER_INITIALIZATION_ENTRIES.with(|entries| entries.set(entries.get() + 1));
     INIT_ERR_HANDLER.call_once(setup_mlx_error_handler);
+}
+
+#[cfg(test)]
+thread_local! {
+    static HANDLER_INITIALIZATION_ENTRIES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn mlx_error_handler_state_for_test() -> (bool, usize) {
+    (
+        INIT_ERR_HANDLER.is_completed(),
+        HANDLER_INITIALIZATION_ENTRIES.with(Cell::get),
+    )
 }
 
 pub(crate) fn set_closure_error(err: Exception) {
@@ -297,7 +558,7 @@ pub(crate) fn get_and_clear_closure_error() -> Option<Exception> {
 
 #[track_caller]
 pub(crate) fn get_and_clear_last_mlx_error() -> Option<RawException> {
-    take_last_mlx_error().map(|what| RawException { what })
+    take_last_mlx_error()
 }
 
 /// The dtype is not a float-point type

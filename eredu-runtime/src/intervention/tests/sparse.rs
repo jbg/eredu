@@ -1,3 +1,4 @@
+mod windows;
 use super::*;
 
 fn geometry() -> RoutedUnitGeometry {
@@ -686,4 +687,152 @@ fn independent_cached_invocations_edit_sparse_units_using_physical_token_rows() 
             .completed_tokens,
         2
     );
+}
+
+#[test]
+fn original_sparse_rows_share_lowering_and_retain_source_and_partial_funding() {
+    use crate::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+    use eredu_nn::workspace::WorkspaceContext;
+    let source_pool=WorkingMemoryPool::new(1<<22,11).unwrap();
+    let (_,plan)=plans_for(vec![mask(vec![3,4],false),InterventionAction::Scale{
+        dtype:InterventionDtype::Float32,factor:-2.0}]);
+    let source=source_pool.compile_intervention_source(PreparedInterventionPlanCopy::inspect(&plan).unwrap()).unwrap();
+    let host_pool=WorkingMemoryPool::new(1<<22,17).unwrap();
+    let execution=InferenceExecutionIdentity::default();
+    let funding=host_pool.prepare_workspace_metadata(&execution,1<<22).unwrap();
+    let initial=host_pool.used_bytes().unwrap();
+    let mut escaped=Vec::new();
+    for index in 0..2 {
+        let declared=&plan.plan().operations[index].action;
+        let ordinary=lower_routed_intervention(geometry(),&locations(),&full(),declared).unwrap();
+        let before=host_pool.used_bytes().unwrap();
+        let bound=PreparedRoutedInterventionRows::required_bytes(&source,index,4).unwrap() as u64;
+        let mut rows=PreparedRoutedInterventionRows::prepare(&source,index,CapturePhase::Prefill,0,
+            None,None,2,[0,2],4,funding.clone()).unwrap();
+        for row in locations().rows {rows.push_row(row).unwrap();}
+        let prepared=rows.finish().unwrap();
+        assert_eq!(prepared.indices(),ordinary.indices);
+        assert_eq!(prepared.action(),ordinary.action.as_ref());
+        assert_eq!(prepared.coordinates(),(index,CapturePhase::Prefill,0));
+        assert!(prepared.source().same_source(&source));
+        assert!(host_pool.used_bytes().unwrap()-before<=bound);
+        escaped.push(prepared);
+    }
+    let mut bad=PreparedRoutedInterventionRows::prepare(&source,0,CapturePhase::Prefill,0,
+        None,None,2,[0,2],4,funding.clone()).unwrap();
+    let mut row=locations().rows[0];row.token=2;
+    assert!(bad.push_row(row).is_err());
+    assert!(bad.push_row(locations().rows[0]).is_err(),"a failed writer cannot be retried");
+    let failed=bad.finish().unwrap_err();
+    let source_charge=source_pool.used_bytes().unwrap();
+    let host_charge=host_pool.used_bytes().unwrap();
+    assert!(source_charge>11 && host_charge>initial);
+    drop(source);drop(plan);drop(funding);drop(escaped);
+    assert_eq!(source_pool.used_bytes().unwrap(),source_charge);
+    assert_eq!(host_pool.used_bytes().unwrap(),host_charge);
+    drop(failed);
+    assert_eq!(source_pool.used_bytes().unwrap(),11);
+    assert_eq!(host_pool.used_bytes().unwrap(),17);
+
+    // The same immutable source can be retained by a refused second allocation.
+    let (_,plan)=plans_for(vec![mask(vec![3],false)]);
+    let source=source_pool.compile_intervention_source(PreparedInterventionPlanCopy::inspect(&plan).unwrap()).unwrap();
+    let capacity=initial+PreparedRoutedInterventionRows::control_bytes().unwrap() as u64
+        + WorkspaceContext::metadata_vec_bytes::<u64>(2).unwrap() as u64;
+    let partial=WorkingMemoryPool::new(capacity,17).unwrap();
+    let funding=partial.prepare_workspace_metadata(&execution,capacity).unwrap();
+    assert_eq!(partial.used_bytes().unwrap(),initial);
+    let failure=PreparedRoutedInterventionRows::prepare(&source,0,CapturePhase::Prefill,0,
+        None,None,2,[0,2],4,funding).unwrap_err();
+    assert_eq!(partial.used_bytes().unwrap(),capacity);
+    drop(source);drop(plan);
+    assert!(source_pool.used_bytes().unwrap()>11);
+    drop(failure);
+    assert_eq!(partial.used_bytes().unwrap(),17);
+    assert_eq!(source_pool.used_bytes().unwrap(),11);
+}
+
+#[test]
+fn known_token_counts_match_actual_sparse_lowering_including_empty_windows() {
+    let geometry = geometry();
+    let action = InterventionAction::Scale {
+        dtype: InterventionDtype::Float32,
+        factor: -0.5,
+    };
+    for token_stride in [1, 2, 3] {
+        for component_stride in [1, 2, 3] {
+            let slice = ResolvedCaptureSlice {
+                starts: vec![1, 0],
+                ends: vec![5, 6],
+                strides: vec![token_stride, component_stride],
+                shape: vec![
+                    4_u64.div_ceil(token_stride),
+                    6_u64.div_ceil(component_stride),
+                ],
+            };
+            for range in [[0, 2], [2, 4], [4, 5]] {
+                let mut rows = Vec::new();
+                for token in range[0]..range[1] {
+                    for slot in 0..geometry.routes_per_token {
+                        rows.push(RoutedUnitLocation {
+                            source_peer: None,
+                            token,
+                            slot,
+                            expert: (token + slot) % geometry.experts,
+                        });
+                    }
+                }
+                rows.reverse(); // The actual native order need not be token order.
+                let source = RoutedUnitLocations {
+                    source_token_range: range,
+                    rows,
+                };
+                let lowered =
+                    lower_routed_intervention(geometry, &source, &slice, &action).unwrap();
+                let expected: Vec<_> = source
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .flat_map(|(index, row)| {
+                        (0..geometry.units_per_expert).filter_map(move |unit| {
+                            let component = row.expert * geometry.units_per_expert + unit;
+                            (row.token >= 1
+                                && row.token < 5
+                                && (row.token - 1) % token_stride == 0
+                                && component % component_stride == 0)
+                                .then_some(index as u64 * geometry.units_per_expert + unit)
+                        })
+                    })
+                    .collect();
+                assert_eq!(lowered.indices, expected);
+                assert_eq!(lowered.action.is_none(), expected.is_empty());
+                let count =
+                    routed_intervention_full_component_count(geometry, &slice, range).unwrap();
+                if component_stride == 1 {
+                    assert_eq!(count, Some(expected.len()));
+                } else {
+                    assert_eq!(
+                        count, None,
+                        "actual expert-dependent selection remains unknown"
+                    );
+                }
+            }
+        }
+    }
+    let mut slice = full();
+    slice.starts[0] = 1;
+    slice.ends[0] = 5;
+    slice.strides[0] = 2;
+    slice.shape[0] = 2;
+    assert_eq!(
+        routed_intervention_full_component_count(geometry, &slice, [4, 5]).unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        routed_intervention_full_component_count(geometry, &slice, [2, 2]).unwrap(),
+        Some(0)
+    );
+    assert!(routed_intervention_full_component_count(geometry, &slice, [3, 2]).is_err());
+    slice.strides[0] = 0;
+    assert!(routed_intervention_full_component_count(geometry, &slice, [0, 2]).is_err());
 }

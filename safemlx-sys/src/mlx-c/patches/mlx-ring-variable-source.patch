@@ -1,0 +1,829 @@
+diff --git a/mlx/distributed/variable_plan.h b/mlx/distributed/variable_plan.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/distributed/variable_plan.h
+@@ -0,0 +1,117 @@
++#pragma once
++
++#include "mlx/distributed/tensor_layout.h"
++#include "mlx/graph_quota.h"
++
++namespace mlx::core::distributed {
++class VariableAllToAllPlan;
++
++// Borrowed complete semantic count matrix. No native ownership, caller bytes,
++// capacities or communication permission are encoded by this checked geometry.
++class VariableAllToAllGeometry {
++ public:
++  static std::optional<VariableAllToAllGeometry> checked(
++      const GroupTensorLayout& input, int members, int rank,
++      std::span<const size_t> matrix, bool transposed) noexcept {
++    if (members <= 0 || rank < 0 || rank >= members || !input.ndim()) return std::nullopt;
++    const size_t world = size_t(members);
++    if (world > size_t(PTRDIFF_MAX) / sizeof(size_t) / world ||
++        matrix.size() != world * world) return std::nullopt;
++    size_t row_bytes = input.itemsize();
++    for (size_t d = 1; d < input.ndim(); ++d) {
++      const size_t dimension = size_t(input.shape()[d]);
++      if (dimension && row_bytes > size_t(PTRDIFF_MAX) / dimension) return std::nullopt;
++      row_bytes *= dimension;
++    }
++    VariableAllToAllGeometry value(matrix, transposed, world, size_t(rank), row_bytes);
++    // Every forwarded packet and every source/destination extent is checked,
++    // including rows owned by peers that this rank only routes through.
++    for (size_t source = 0; source < world; ++source) {
++      size_t sent = 0, received = 0;
++      for (size_t destination = 0; destination < world; ++destination) {
++        const size_t a = value.count(source, destination);
++        const size_t b = value.count(destination, source);
++        if (a > size_t(INT_MAX) - sent || b > size_t(INT_MAX) - received) return std::nullopt;
++        sent += a; received += b;
++      }
++      if (row_bytes && (sent > size_t(PTRDIFF_MAX) / row_bytes ||
++                        received > size_t(PTRDIFF_MAX) / row_bytes)) return std::nullopt;
++      if (source == size_t(rank)) {
++        if (sent != size_t(input.shape()[0])) return std::nullopt;
++        value.input_rows_ = sent; value.output_rows_ = received;
++      }
++    }
++    return value;
++  }
++  std::span<const size_t> matrix() const noexcept { return matrix_; }
++  bool transposed() const noexcept { return transposed_; }
++  size_t members() const noexcept { return members_; }
++  size_t rank() const noexcept { return rank_; }
++  size_t row_bytes() const noexcept { return row_bytes_; }
++  size_t input_rows() const noexcept { return input_rows_; }
++  size_t output_rows() const noexcept { return output_rows_; }
++  size_t output_bytes() const noexcept { return output_rows_ * row_bytes_; }
++  size_t count(size_t source, size_t destination) const noexcept {
++    return matrix_[transposed_ ? destination * members_ + source : source * members_ + destination];
++  }
++  size_t bytes(size_t source, size_t destination) const noexcept {
++    return count(source, destination) * row_bytes_;
++  }
++  size_t send_offset(size_t destination) const noexcept {
++    size_t offset = 0;
++    for (size_t peer = 0; peer < destination; ++peer) offset += bytes(rank_, peer);
++    return offset;
++  }
++  size_t receive_offset(size_t source) const noexcept {
++    size_t offset = 0;
++    for (size_t peer = 0; peer < source; ++peer) offset += bytes(peer, rank_);
++    return offset;
++  }
++  size_t hop_source(size_t hop) const noexcept { return (rank_ + members_ - hop) % members_; }
++  size_t hop_destination(size_t distance, size_t hop) const noexcept {
++    return (hop_source(hop) + distance) % members_;
++  }
++  size_t hop_bytes(size_t distance, size_t hop) const noexcept {
++    return bytes(hop_source(hop), hop_destination(distance, hop));
++  }
++  static constexpr size_t inspection_controls() noexcept {
++    return sizeof(VariableAllToAllGeometry) * 2 + sizeof(std::optional<VariableAllToAllGeometry>) +
++        sizeof(GroupTensorLayout) + sizeof(std::span<const size_t>) + sizeof(size_t) * 12 +
++        sizeof(int) * 2 + sizeof(bool) * 2;
++  }
++ private:
++  friend class VariableAllToAllPlan;
++  VariableAllToAllGeometry(std::span<const size_t> matrix, bool transposed,
++      size_t members, size_t rank, size_t row_bytes) noexcept
++      : matrix_(matrix), transposed_(transposed), members_(members), rank_(rank), row_bytes_(row_bytes) {}
++  std::span<const size_t> matrix_;
++  bool transposed_;
++  size_t members_, rank_, row_bytes_, input_rows_{0}, output_rows_{0};
++};
++
++// Each asynchronous owner copies the checked matrix into its own counted
++// destination. A task never borrows a primitive's potentially retired storage.
++class VariableAllToAllPlan {
++ public:
++  VariableAllToAllPlan() = default;
++  explicit VariableAllToAllPlan(const VariableAllToAllGeometry& source)
++      : matrix_(source.matrix().begin(), source.matrix().end()),
++        transposed_(source.transposed()), members_(source.members()), rank_(source.rank()),
++        row_bytes_(source.row_bytes()), input_rows_(source.input_rows()), output_rows_(source.output_rows()) {}
++  VariableAllToAllPlan(VariableAllToAllPlan&&) = default;
++  VariableAllToAllPlan& operator=(VariableAllToAllPlan&&) = default;
++  VariableAllToAllPlan(const VariableAllToAllPlan&) = delete;
++  VariableAllToAllPlan& operator=(const VariableAllToAllPlan&) = delete;
++  bool prepared() const noexcept { return members_ != 0; }
++  VariableAllToAllGeometry geometry() const noexcept {
++    VariableAllToAllGeometry result(std::span<const size_t>(matrix_.data(), matrix_.size()),
++        transposed_, members_, rank_, row_bytes_);
++    result.input_rows_ = input_rows_; result.output_rows_ = output_rows_;
++    return result;
++  }
++ private:
++  submission::GraphVector<size_t> matrix_;
++  bool transposed_{false};
++  size_t members_{0}, rank_{0}, row_bytes_{0}, input_rows_{0}, output_rows_{0};
++};
++} // namespace mlx::core::distributed
+diff --git a/mlx/distributed/distributed.h b/mlx/distributed/distributed.h
+--- a/mlx/distributed/distributed.h
++++ b/mlx/distributed/distributed.h
+@@ -9,6 +9,7 @@
+ #include "mlx/api.h"
+ #include "mlx/array.h"
+ #include "mlx/distributed/tensor_layout.h"
++#include "mlx/distributed/variable_plan.h"
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core::distributed {
+@@ -45,7 +46,7 @@
+ // These partial worker destinations are not a whole-operation or communicator
+ // bound. The CPU encoder/primitive/event and persistent transport owner remain
+ // separate producers even when every worker field below is qualified.
+-enum class GroupWorkerOperation : unsigned { sum, maximum, minimum, gather, send, recv };
++enum class GroupWorkerOperation : unsigned { sum, maximum, minimum, gather, send, recv, variable };
+ struct GroupWorkerStorage {
+   size_t pool_jobs{0}, socket_attempts{0}, destination_arrays{0};
+   size_t task_graph_extent{0}, destination_graph_extent{0}, controls{0};
+@@ -109,6 +110,10 @@
+   bool worker_storage(GroupWorkerOperation, const GroupTensorLayout&, int peer,
+                       GroupWorkerStorage& out) const noexcept;
+ 
++  // Complete borrowed matrix for the actual retained implementation's worker.
++  bool variable_storage(const GroupTensorLayout&, std::span<const size_t>, bool transposed,
++      GroupDispatchStorage&, GroupWorkerStorage&) const noexcept;
++
+   int rank() const;
+   int size() const;
+ 
+diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
+--- a/mlx/distributed/distributed_impl.h
++++ b/mlx/distributed/distributed_impl.h
+@@ -47,6 +47,13 @@
+                               GroupWorkerStorage&) const noexcept { return false; }
+   virtual bool worker_storage(GroupWorkerOperation, const GroupTensorLayout&, int,
+       GroupWorkerStorage&) const noexcept { return false; }
++
++  virtual bool variable_storage(const GroupTensorLayout&, std::span<const size_t>, bool,
++      GroupDispatchStorage&, GroupWorkerStorage&) const noexcept { return false; }
++  virtual void all_to_all_v_prepared(const array&, array&,
++      const VariableAllToAllGeometry&, Stream) {
++    throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++  }
+ 
+   // Choose the stream this communication group can operate on
+   virtual Stream communication_stream(StreamOrDevice s = {}) = 0;
+diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
+--- a/mlx/distributed/distributed.cpp
++++ b/mlx/distributed/distributed.cpp
+@@ -271,6 +271,11 @@
+ bool Group::dispatch_storage(GroupWorkerOperation operation, const GroupTensorLayout& input,
+     int peer, GroupDispatchStorage& out) const noexcept {
+   return group_ && group_->dispatch_storage(operation, input, peer, out);
++}
++
++bool Group::variable_storage(const GroupTensorLayout& input, std::span<const size_t> matrix,
++    bool transposed, GroupDispatchStorage& dispatch, GroupWorkerStorage& worker) const noexcept {
++  return group_ && group_->variable_storage(input, matrix, transposed, dispatch, worker);
+ }
+ 
+ size_t Group::worker_storage_inspection_controls() const noexcept {
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -408,6 +408,32 @@
+     int peer;
+     submission::GraphQuotaRef allocation;
+     void operator()() const { owner->execute_recv(output, bytes, peer, allocation.get()); }
++  };
++  struct VariablePacketHeader {
++    uint64_t bytes;
++    uint32_t source;
++    uint32_t destination;
++  };
++  struct VariableDispatch {
++    RingGroup* owner;
++    const char* input;
++    char* output;
++    ::mlx::core::distributed::detail::ByteLayout send, receive;
++    VariableAllToAllPlan prepared;
++    submission::GraphQuotaRef allocation;
++    void operator()() const { owner->execute_variable(*this); }
++    size_t send_bytes(size_t peer) const noexcept {
++      return prepared.prepared() ? prepared.geometry().bytes(size_t(owner->rank_), peer) : send.sizes[peer];
++    }
++    size_t receive_bytes(size_t peer) const noexcept {
++      return prepared.prepared() ? prepared.geometry().bytes(peer, size_t(owner->rank_)) : receive.sizes[peer];
++    }
++    size_t send_offset(size_t peer) const noexcept {
++      return prepared.prepared() ? prepared.geometry().send_offset(peer) : send.offsets[peer];
++    }
++    size_t receive_offset(size_t peer) const noexcept {
++      return prepared.prepared() ? prepared.geometry().receive_offset(peer) : receive.offsets[peer];
++    }
+   };
+   template<class T, class ReduceOp> struct ReduceDispatch {
+     RingGroup* owner;
+@@ -575,6 +601,28 @@
+       else if (operation == GroupWorkerOperation::maximum) qualified = reduction_storage<T, detail::MaxOp<T>>(input.size(), out);
+       else if (operation == GroupWorkerOperation::minimum) qualified = reduction_storage<T, detail::MinOp<T>>(input.size(), out));
+     return qualified;
++  }
++
++  bool variable_storage(const GroupTensorLayout& input, std::span<const size_t> matrix,
++      bool transposed, GroupDispatchStorage& dispatch_out,
++      GroupWorkerStorage& worker_out) const noexcept override {
++    if (size_ <= 1 || rank_ < 0 || rank_ >= size_ || sockets_right_.empty() ||
++        sockets_right_.size() != sockets_left_.size()) return false;
++    const auto source = VariableAllToAllGeometry::checked(input, size_, rank_, matrix, transposed);
++    GroupDispatchStorage dispatch;
++    GroupWorkerStorage worker;
++    WorkerStorageCounter counter;
++    if (!source || !dispatch_layout<VariableDispatch>(dispatch)) return false;
++    for (size_t distance = 1; distance < source->members(); ++distance) {
++      if (!counter.vector<char>(source->hop_bytes(distance, 0))) return false;
++      for (size_t hop = 1; hop <= distance; ++hop)
++        if (!counter.sockets(4) || !counter.vector<char>(source->hop_bytes(distance, hop))) return false;
++    }
++    if (!counter.finish(VariableAllToAllGeometry::inspection_controls() +
++        sizeof(VariableDispatch) * 2 + sizeof(VariablePacketHeader) * 2 + sizeof(SocketFuture) * 4 +
++        sizeof(submission::GraphVector<char>) * 2 + sizeof(submission::GraphAllocator<char>) * 2 +
++        sizeof(submission::GraphQuotaRef) + sizeof(size_t) * 15 + sizeof(void*) * 4, worker)) return false;
++    dispatch_out = dispatch; worker_out = worker; return true;
+   }
+ 
+   void storage_inventory(GroupStorageInventory& out) const noexcept override {
+@@ -787,107 +835,96 @@
+   }
+ 
+   void all_to_all_v(
+-      const array& input,
+-      array& output,
++      const array& input, array& output,
+       const std::vector<size_t>& send_counts,
+-      const std::vector<size_t>& recv_counts,
+-      Stream stream) override {
++      const std::vector<size_t>& recv_counts, Stream stream) override {
+     auto send = ::mlx::core::distributed::detail::all_to_all_v_layout(input, send_counts, "send_counts");
+-    auto recv = ::mlx::core::distributed::detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
+-    if (send.sizes[rank_] != recv.sizes[rank_]) {
+-      throw std::invalid_argument(
+-          "[ring::all_to_all_v] Self send and receive byte counts must match.");
+-    }
+-
+-    auto* input_ptr = input.data<char>();
+-    auto* output_ptr = output.data<char>();
++    auto receive = ::mlx::core::distributed::detail::all_to_all_v_layout(output, recv_counts, "recv_counts");
++    if (send.sizes[rank_] != receive.sizes[rank_])
++      throw std::invalid_argument("[ring::all_to_all_v] Self send and receive byte counts must match.");
+     auto& encoder = cpu::get_command_encoder(stream);
+     encoder.set_input_array(input);
+     encoder.set_output_array(output);
+-    encoder.dispatch([input_ptr,
+-                      output_ptr,
+-                      send = std::move(send),
+-                      recv = std::move(recv),
+-                      allocation = submission::GraphQuotaRef(submission::current_graph_quota()),
+-                      this]() {
+-      auto* graph = allocation.get();
+-      struct PacketHeader {
+-        uint64_t bytes;
+-        uint32_t source;
+-        uint32_t destination;
+-      };
+-
+-      if (send.sizes[rank_] != 0) {
+-        std::memcpy(
+-            output_ptr + recv.offsets[rank_],
+-            input_ptr + send.offsets[rank_],
+-            send.sizes[rank_]);
+-      }
+-
+-      for (int distance = 1; distance < size_; ++distance) {
+-        int destination = (rank_ + distance) % size_;
+-        PacketHeader current_header{
+-            static_cast<uint64_t>(send.sizes[destination]),
+-            static_cast<uint32_t>(rank_),
+-            static_cast<uint32_t>(destination)};
+-        std::vector<char> current(current_header.bytes);
+-        if (!current.empty()) {
+-          std::memcpy(
+-              current.data(),
+-              input_ptr + send.offsets[destination],
+-              current.size());
++    encoder.dispatch(VariableDispatch{this, input.data<char>(), output.data<char>(),
++        std::move(send), std::move(receive), VariableAllToAllPlan{},
++        submission::GraphQuotaRef(submission::current_graph_quota())});
++  }
++
++  void all_to_all_v_prepared(const array& input, array& output,
++      const VariableAllToAllGeometry& selected, Stream stream) override {
++    const auto layout = GroupTensorLayout::checked(input);
++    const auto source = layout ? VariableAllToAllGeometry::checked(*layout, size_, rank_,
++        selected.matrix(), selected.transposed()) : std::nullopt;
++    if (!source || output.dtype() != input.dtype() || output.ndim() != input.ndim() ||
++        output.shape(0) != int(source->output_rows()) || output.nbytes() != source->output_bytes())
++      throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++    for (size_t axis = 1; axis < input.ndim(); ++axis)
++      if (input.shape(axis) != output.shape(axis))
++        throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++    auto& encoder = cpu::get_command_encoder(stream);
++    encoder.set_input_array(input);
++    encoder.set_output_array(output);
++    // The task owns a second counted matrix; it cannot outlive a borrowed span.
++    encoder.dispatch(VariableDispatch{this, input.data<char>(), output.data<char>(), {}, {},
++        VariableAllToAllPlan(*source), submission::GraphQuotaRef(submission::current_graph_quota())});
++  }
++
++ private:
++  void execute_variable(const VariableDispatch& operation) {
++    auto* graph = operation.allocation.get();
++    const bool prepared = operation.prepared.prepared();
++    const size_t self = size_t(rank_);
++    if (operation.send_bytes(self)) {
++      std::memcpy(operation.output + operation.receive_offset(self),
++          operation.input + operation.send_offset(self), operation.send_bytes(self));
++    }
++    for (int distance = 1; distance < size_; ++distance) {
++      const int destination = (rank_ + distance) % size_;
++      VariablePacketHeader current_header{uint64_t(operation.send_bytes(size_t(destination))),
++          uint32_t(rank_), uint32_t(destination)};
++      submission::GraphVector<char> current(size_t(current_header.bytes),
++          submission::GraphAllocator<char>(graph));
++      if (!current.empty()) std::memcpy(current.data(),
++          operation.input + operation.send_offset(size_t(destination)), current.size());
++      for (int hop = 1; hop <= distance; ++hop) {
++        VariablePacketHeader incoming_header{};
++        auto recv_header = comm_.recv(sockets_left_[0], &incoming_header, size_t(1), graph);
++        auto send_header = comm_.send(sockets_right_[0], &current_header, size_t(1), graph);
++        recv_header.get(); send_header.get();
++        if (prepared) {
++          const auto source = operation.prepared.geometry();
++          if (incoming_header.bytes != source.hop_bytes(size_t(distance), size_t(hop)) ||
++              incoming_header.source != source.hop_source(size_t(hop)) ||
++              incoming_header.destination != source.hop_destination(size_t(distance), size_t(hop)))
++            throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++        } else if (incoming_header.bytes > uint64_t(std::numeric_limits<size_t>::max())) {
++          throw std::overflow_error("[ring::all_to_all_v] Routed packet exceeds size_t.");
+         }
+-
+-        for (int hop = 1; hop <= distance; ++hop) {
+-          PacketHeader incoming_header{};
+-          auto recv_header =
+-              comm_.recv(sockets_left_[0], &incoming_header, size_t(1), graph);
+-          auto send_header =
+-              comm_.send(sockets_right_[0], &current_header, size_t(1), graph);
+-          recv_header.get();
+-          send_header.get();
+-
+-          if (incoming_header.bytes >
+-              static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
+-            throw std::overflow_error(
+-                "[ring::all_to_all_v] Routed packet exceeds size_t.");
+-          }
+-          std::vector<char> incoming(
+-              static_cast<size_t>(incoming_header.bytes));
+-          auto recv_payload =
+-              comm_.recv(sockets_left_[0], incoming.data(), incoming.size(), graph);
+-          auto send_payload =
+-              comm_.send(sockets_right_[0], current.data(), current.size(), graph);
+-          recv_payload.get();
+-          send_payload.get();
+-          current_header = incoming_header;
+-          current = std::move(incoming);
+-        }
+-
+-        if (current_header.destination != static_cast<uint32_t>(rank_) ||
+-            current_header.source >= static_cast<uint32_t>(size_)) {
+-          throw std::runtime_error(
+-              "[ring::all_to_all_v] Received invalid routing metadata.");
+-        }
+-        size_t source = current_header.source;
+-        if (current.size() != recv.sizes[source]) {
+-          std::ostringstream msg;
+-          msg << "[ring::all_to_all_v] Received " << current.size()
+-              << " bytes from source " << source << ", expected "
+-              << recv.sizes[source] << ".";
+-          throw std::runtime_error(msg.str());
+-        }
+-        if (!current.empty()) {
+-          std::memcpy(
+-              output_ptr + recv.offsets[source],
+-              current.data(),
+-              current.size());
+-        }
+-      }
+-    });
+-  }
+-
+- private:
++        submission::GraphVector<char> incoming(size_t(incoming_header.bytes),
++            submission::GraphAllocator<char>(graph));
++        auto recv_payload = comm_.recv(sockets_left_[0], incoming.data(), incoming.size(), graph);
++        auto send_payload = comm_.send(sockets_right_[0], current.data(), current.size(), graph);
++        recv_payload.get(); send_payload.get();
++        current_header = incoming_header;
++        current = std::move(incoming);
++      }
++      if (current_header.destination != uint32_t(rank_) || current_header.source >= uint32_t(size_)) {
++        if (prepared) throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++        throw std::runtime_error("[ring::all_to_all_v] Received invalid routing metadata.");
++      }
++      const size_t source = current_header.source;
++      if (current.size() != operation.receive_bytes(source)) {
++        if (prepared) throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++        std::ostringstream msg;
++        msg << "[ring::all_to_all_v] Received " << current.size() << " bytes from source " << source
++            << ", expected " << operation.receive_bytes(source) << ".";
++        throw std::runtime_error(msg.str());
++      }
++      if (!current.empty()) std::memcpy(operation.output + operation.receive_offset(source),
++          current.data(), current.size());
++    }
++  }
++
+   template <typename T, typename ReduceOp>
+   void all_reduce(
+       const array& input,
+diff --git a/mlx/distributed/primitives.h b/mlx/distributed/primitives.h
+--- a/mlx/distributed/primitives.h
++++ b/mlx/distributed/primitives.h
+@@ -197,10 +197,15 @@
+     return recv_counts_;
+   }
+ 
++  AllToAllV(Stream stream, Group group, const VariableAllToAllGeometry& source)
++      : DistPrimitive(stream, group), prepared_(source) {}
++  const VariableAllToAllPlan& prepared_plan() const noexcept { return prepared_; }
++
+   DEFINE_NAME(AllToAllV);
+ 
+  private:
+   std::vector<size_t> send_counts_;
+   std::vector<size_t> recv_counts_;
++  VariableAllToAllPlan prepared_;
+ };
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/ops.h b/mlx/distributed/ops.h
+--- a/mlx/distributed/ops.h
++++ b/mlx/distributed/ops.h
+@@ -62,4 +62,9 @@
+     std::optional<Group> group = std::nullopt,
+     StreamOrDevice s = {});
+ 
++// Source-bound constructor; input shape and every count are rechecked against
++// this actual group before the same AllToAllV primitive is constructed.
++MLX_API array all_to_all_v_prepared(const array&, std::span<const size_t>, bool transposed,
++    const Group&, StreamOrDevice = {});
++
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/ops.cpp b/mlx/distributed/ops.cpp
+--- a/mlx/distributed/ops.cpp
++++ b/mlx/distributed/ops.cpp
+@@ -301,4 +301,23 @@
+           stream, group, std::move(send_rows), std::move(recv_rows)),
+       {x});
+ }
++array all_to_all_v_prepared(const array& input, std::span<const size_t> matrix,
++    bool transposed, const Group& group, StreamOrDevice stream) {
++  group.ensure_submission_available();
++  GroupStorageInventory inventory;
++  if (!group.storage_inventory(inventory) ||
++      (inventory.kind != GroupStorageKind::ring && inventory.kind != GroupStorageKind::empty) ||
++      input.is_tracer())
++    throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++  const auto layout = GroupTensorLayout::checked(input);
++  const auto source = layout ? VariableAllToAllGeometry::checked(*layout, group.size(),
++      group.rank(), matrix, transposed) : std::nullopt;
++  if (!source) throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++  if (source->members() == 1) return input;
++  auto shape = input.shape();
++  shape[0] = int(source->output_rows());
++  return array(std::move(shape), input.dtype(),
++      submission::make_graph_primitive<AllToAllV>(
++          detail::communication_stream(group, stream), group, *source), {input});
++}
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/constructor.h b/mlx/distributed/constructor.h
+--- a/mlx/distributed/constructor.h
++++ b/mlx/distributed/constructor.h
+@@ -12,4 +12,6 @@
+ MLX_API bool constructor_storage(const Group&, const GroupTensorLayout&,
+     GroupWorkerOperation, int peer, GroupConstructorStorage&) noexcept;
+ MLX_API size_t constructor_storage_inspection_controls() noexcept;
++MLX_API bool variable_constructor_storage(const Group&, const GroupTensorLayout&,
++    std::span<const size_t>, bool transposed, GroupConstructorStorage&) noexcept;
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/constructor.cpp b/mlx/distributed/constructor.cpp
+--- a/mlx/distributed/constructor.cpp
++++ b/mlx/distributed/constructor.cpp
+@@ -29,11 +29,14 @@
+       sizeof(GroupWorkerOperation) + sizeof(int) * 3 + sizeof(size_t) * 9 + sizeof(bool) * 4 +
+       sizeof(GroupTensorLayout)+sizeof(std::optional<GroupTensorLayout>)+
+       sizeof(std::span<const int>)+sizeof(Dtype)+sizeof(size_t)*4+
++      VariableAllToAllGeometry::inspection_controls() + sizeof(VariableAllToAllPlan) * 2 +
+       GraphConstruction::layout_control_bytes() +
+       // Shared exact-source helper, optional resident association and lexical
+       // restoration guard. These are controls, not added native capacity.
+       GraphConstruction::distributed_resident_loan_control_bytes();
+ }
++static bool constructor_storage_impl(const Group&, const GroupTensorLayout&,
++    GroupWorkerOperation, int, const VariableAllToAllGeometry*, GroupConstructorStorage&) noexcept;
+ bool constructor_storage(const Group& group, const array& input,
+     GroupWorkerOperation operation, int peer, GroupConstructorStorage& out) noexcept {
+   const auto layout=GroupTensorLayout::checked(input);
+@@ -41,10 +44,24 @@
+ }
+ bool constructor_storage(const Group& group, const GroupTensorLayout& input,
+     GroupWorkerOperation operation, int peer, GroupConstructorStorage& out) noexcept {
++  return constructor_storage_impl(group, input, operation, peer, nullptr, out);
++}
++bool variable_constructor_storage(const Group& group, const GroupTensorLayout& input,
++    std::span<const size_t> matrix, bool transposed, GroupConstructorStorage& out) noexcept {
++  GroupStorageInventory inventory;
++  if (!group.storage_inventory(inventory) ||
++      (inventory.kind != GroupStorageKind::ring && inventory.kind != GroupStorageKind::empty)) return false;
++  const auto source = VariableAllToAllGeometry::checked(input, group.size(), group.rank(), matrix, transposed);
++  return source && constructor_storage_impl(group, input, GroupWorkerOperation::variable, 0, &*source, out);
++}
++static bool constructor_storage_impl(const Group& group, const GroupTensorLayout& input,
++    GroupWorkerOperation operation, int peer, const VariableAllToAllGeometry* variable,
++    GroupConstructorStorage& out) noexcept {
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+-  if (static_cast<unsigned>(operation) > 5 || group.terminal_submission()) return false;
++  if (group.terminal_submission() ||
++      (variable ? operation != GroupWorkerOperation::variable : static_cast<unsigned>(operation) > 5)) return false;
+   GroupStorageInventory inventory;
+   // Only these concrete implementations have the qualified scalar rank/size
+   // readers. Requested backend and geometry never qualify another native type.
+@@ -60,7 +77,7 @@
+   // Reject overflowing output geometry before ordinary all_gather multiplies
+   // its leading signed extent. Zero-dimensional gather produces [members].
+   for (size_t i = 0; i < input.ndim(); ++i) {
+-    const auto dimension = input.shape()[i];
++    const auto dimension = variable && i == 0 ? int(variable->output_rows()) : input.shape()[i];
+     if (dimension < 0 || !multiply(value.output_elements,size_t(dimension),value.output_elements)) return false;
+   }
+   if (operation == GroupWorkerOperation::gather && members > 1) {
+@@ -97,6 +114,7 @@
+       case GroupWorkerOperation::gather: primitive=primitive_request<AllGather>(); break;
+       case GroupWorkerOperation::send: primitive=primitive_request<Send>(); break;
+       case GroupWorkerOperation::recv: primitive=primitive_request<Recv>(); break;
++      case GroupWorkerOperation::variable: primitive=primitive_request<AllToAllV>(); break;
+       default: return false;
+     }
+     value.request_bytes[3]=primitive.bytes;
+@@ -107,6 +125,12 @@
+     value.request_bytes[4]=sizeof(array);
+     value.request_alignments[4]=alignof(array);
+     value.request_counts[4]=value.input_edges;
++    if (variable) {
++      if (!multiply(variable->matrix().size(), sizeof(size_t), value.request_bytes[7])) return false;
++      value.request_alignments[7] = alignof(size_t); value.request_counts[7] = 1;
++      value.named_control_bytes += sizeof(VariableAllToAllPlan) * 2 +
++          sizeof(submission::GraphVector<size_t>) * 3 + sizeof(GraphAllocator<size_t>) * 3;
++    }
+     if (value.output_rank > 10) {
+       // Ordinary Shape copy allocates exact rank; subsequent moves share the
+       // same current Graph and steal it. ArrayDesc::init grows Strides from 10.
+diff --git a/mlx/backend/cpu/distributed.cpp b/mlx/backend/cpu/distributed.cpp
+--- a/mlx/backend/cpu/distributed.cpp
++++ b/mlx/backend/cpu/distributed.cpp
+@@ -109,8 +109,13 @@
+ 
+   auto [in, copied] = ensure_row_contiguous(inputs[0], stream());
+   outputs[0].allocate_data(outputs[0].nbytes());
+-  distributed::detail::all_to_all_v(
+-      group(), in, outputs[0], send_counts(), recv_counts(), stream());
++  if (prepared_plan().prepared()) {
++    const auto source = prepared_plan().geometry();
++    group().raw_group()->all_to_all_v_prepared(in, outputs[0], source, stream());
++  } else {
++    distributed::detail::all_to_all_v(
++        group(), in, outputs[0], send_counts(), recv_counts(), stream());
++  }
+   if (copied) {
+     auto& enc = cpu::get_command_encoder(stream());
+     enc.add_temporary(in);
+diff --git a/mlx/backend/cpu/distributed_storage.h b/mlx/backend/cpu/distributed_storage.h
+--- a/mlx/backend/cpu/distributed_storage.h
++++ b/mlx/backend/cpu/distributed_storage.h
+@@ -29,4 +29,6 @@
+     GroupWorkerOperation, int peer, CpuDistributedStorage&) noexcept;
+ MLX_API bool cpu_distributed_source_storage(const Group&, const GroupTensorLayout&,
+     GroupWorkerOperation, int peer, CpuDistributedStorage&) noexcept;
++MLX_API bool cpu_distributed_variable_source_storage(const Group&, const GroupTensorLayout&,
++    std::span<const size_t>, bool transposed, CpuDistributedStorage&) noexcept;
+ } // namespace mlx::core::distributed
+diff --git a/mlx/backend/cpu/distributed_storage.cpp b/mlx/backend/cpu/distributed_storage.cpp
+--- a/mlx/backend/cpu/distributed_storage.cpp
++++ b/mlx/backend/cpu/distributed_storage.cpp
+@@ -20,6 +20,7 @@
+   const DistPrimitive* primitive{nullptr};
+   GroupWorkerOperation operation{GroupWorkerOperation::sum};
+   int peer{0};
++  const VariableAllToAllPlan* variable{nullptr};
+ };
+ bool source(const array& value, Source& out) noexcept {
+   if (!value.has_primitive() || value.primitive().stream().device != Device::cpu) return false;
+@@ -37,6 +38,11 @@
+   } else if(typeid(primitive)==typeid(AllGather)) {
+     selected.primitive=&static_cast<const AllGather&>(primitive);
+     selected.operation=GroupWorkerOperation::gather;
++  } else if(typeid(primitive)==typeid(AllToAllV)) {
++    const auto& variable=static_cast<const AllToAllV&>(primitive);
++    if (!variable.prepared_plan().prepared() || value.is_tracer()) return false;
++    selected.primitive=&variable; selected.operation=GroupWorkerOperation::variable;
++    selected.variable=&variable.prepared_plan();
+   } else if(typeid(primitive)==typeid(Send)) {
+     const auto& send=static_cast<const Send&>(primitive);
+     selected.primitive=&send;selected.operation=GroupWorkerOperation::send;selected.peer=send.destination();
+@@ -85,22 +91,28 @@
+       sizeof(GroupWorkerOperation)+sizeof(int)+sizeof(size_t)*4+sizeof(bool)+
+       sizeof(GroupTensorLayout)+sizeof(std::optional<GroupTensorLayout>)+
+       sizeof(std::span<const int>)+sizeof(Dtype)+sizeof(size_t)*4+
++      VariableAllToAllGeometry::inspection_controls() + sizeof(VariableAllToAllPlan) * 2 +
++      sizeof(submission::GraphVector<size_t>) * 3 + sizeof(submission::GraphAllocator<size_t>) * 3 +
+       GraphConstruction::layout_control_bytes();
+ }
+ bool prepare_storage(const Group& group,const GroupTensorLayout& input,
+     GroupWorkerOperation operation,int peer,size_t output_rank,size_t input_bytes,
+-    size_t output_bytes,bool tracer,size_t inspection_controls,CpuDistributedStorage& out) noexcept {
++    size_t output_bytes,bool tracer,size_t inspection_controls,CpuDistributedStorage& out,
++    const VariableAllToAllGeometry* variable=nullptr) noexcept {
+   const bool receive=operation==GroupWorkerOperation::recv;
+   const bool send=operation==GroupWorkerOperation::send;
+-  const bool gather=operation==GroupWorkerOperation::gather;
++  const bool gather=operation==GroupWorkerOperation::gather || variable;
+   const size_t inputs=receive?0:1;
+   CpuDistributedStorage value;
+   value.operation=operation;value.peer=peer;
+   value.input_rank=input.ndim();value.output_rank=output_rank;value.inputs=inputs;
+   value.tracer=tracer;value.possible_copy=inputs!=0;
+   GroupDispatchStorage dispatch;
+-  if(!group.dispatch_storage(operation,input,peer,dispatch) ||
+-      !group.worker_storage(operation,input,peer,value.communication))return false;
++  if (variable) {
++    if (operation != GroupWorkerOperation::variable || tracer ||
++        !group.variable_storage(input, variable->matrix(), variable->transposed(), dispatch, value.communication)) return false;
++  } else if (!group.dispatch_storage(operation,input,peer,dispatch) ||
++      !group.worker_storage(operation,input,peer,value.communication)) return false;
+   submission::CpuEvalCleanupLayout cleanup;
+   cpu::RetentionLayout retention;
+   submission::OriginalBufferRoutingLayout routing;
+@@ -142,6 +154,13 @@
+       if(!append(value,8,weak.requests[i].bytes,weak.requests[i].alignment,2+(i<5?1:0)))return false;
+     value.copy_worker_graph_extent=copy.worker_graph_extent_bound;
+   }
++  // Dispatch owns its matrix independently of the primitive. This allocation
++  // occurs on the CPU encoding thread under this exact fixed Eval bank.
++  if (variable) {
++    size_t matrix_bytes;
++    if (!multiply(variable->matrix().size(), sizeof(size_t), matrix_bytes) ||
++        !append(value,8,matrix_bytes,alignof(size_t),1)) return false;
++  }
+   value.communication_worker_graph_extent=value.communication.task_graph_extent;
+   if(!add(value.communication_worker_graph_extent,value.communication.destination_graph_extent))return false;
+   const auto adoption=array::buffer_adoption_layout();
+@@ -215,10 +234,22 @@
+       if(input.shape()[0]>INT_MAX/members || output.shape()[0]!=input.shape()[0]*members)return false;
+       for(size_t d=1;d<input.ndim();++d)if(input.shape()[d]!=output.shape()[d])return false;
+     } else if(output.shape()[0]!=members)return false;
++  } else if (selected.variable) {
++    const auto variable=selected.variable->geometry();
++    if(output.ndim()!=input.ndim() || !input.ndim() ||
++        output.shape(0)!=int(variable.output_rows()) || output_bytes!=variable.output_bytes())return false;
++    for(size_t axis=1;axis<input.ndim();++axis)if(input.shape(axis)!=output.shape(axis))return false;
+   } else if(input.shape()!=output.shape() || input_bytes!=output_bytes)return false;
+ 
+   const auto layout=GroupTensorLayout::checked(input);
+   if(!layout)return false;
++  if(selected.variable) {
++    const auto captured=selected.variable->geometry();
++    const auto variable=VariableAllToAllGeometry::checked(*layout,members,rank,
++        captured.matrix(),captured.transposed());
++    return variable && prepare_storage(group,*layout,selected.operation,selected.peer,output.ndim(),
++        input_bytes,output_bytes,output.is_tracer(),cpu_distributed_storage_inspection_controls(output),out,&*variable);
++  }
+   return prepare_storage(group,*layout,selected.operation,selected.peer,output.ndim(),
+       input_bytes,output_bytes,output.is_tracer(),cpu_distributed_storage_inspection_controls(output),out);
+ #endif
+@@ -254,6 +285,19 @@
+   return prepare_storage(group,input,operation,peer,construction.output_rank,
+       input_bytes,output_bytes,false,controls,out);
+ }
++bool cpu_distributed_variable_source_storage(const Group& group, const GroupTensorLayout& input,
++    std::span<const size_t> matrix, bool transposed, CpuDistributedStorage& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  GroupConstructorStorage constructor;
++  if (!variable_constructor_storage(group, input, matrix, transposed, constructor) ||
++      constructor.primitives != 1 || constructor.input_edges != 1) return false;
++  const auto source=VariableAllToAllGeometry::checked(input,group.size(),group.rank(),matrix,transposed);
++  return source && prepare_storage(group,input,GroupWorkerOperation::variable,0,input.ndim(),
++      input.nbytes(),source->output_bytes(),false,cpu_distributed_source_inspection_controls(group),out,&*source);
++#endif
++}
+ } // namespace mlx::core::distributed
+ 
+ namespace mlx::core::submission {
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -1,4 +1,5 @@
+ #pragma once
++#include <span>
+ #include "mlx/graph_quota.h"
+ namespace mlx::core { class array; namespace distributed { class Group; enum class GroupWorkerOperation : unsigned; } }
+ 
+@@ -159,6 +160,9 @@
+   static GraphFailure create_distributed_with_resident_loan(GraphQuota&, uint64_t scope,
+       const distributed::Group&, const array&, distributed::GroupWorkerOperation,
+       int peer, GraphConstruction*&, GraphNestedConstruction&) noexcept;
++  static GraphFailure create_distributed_variable_with_resident_loan(GraphQuota&, uint64_t scope,
++      const distributed::Group&, const array&, std::span<const size_t>, bool transposed,
++      GraphConstruction*&, GraphNestedConstruction&) noexcept;
+   static GraphFailure create_resident(GraphQuota&, uint64_t scope,
+       const ResidentGraphLayout&, GraphConstruction*&) noexcept;
+   static GraphFailure create_eval(GraphQuota&, uint64_t scope,
+@@ -205,6 +209,9 @@
+   static GraphFailure create_distributed_bound(GraphQuota&, uint64_t scope,
+       const distributed::Group&, const array&, distributed::GroupWorkerOperation,
+       int peer, GraphConstruction*&, GraphNestedConstruction*) noexcept;
++  // Private trusted-layout join for the two exact native distributed sources.
++  static GraphFailure create_distributed_layout_bound(GraphQuota&, uint64_t scope,
++      const GraphConstructionLayout&, GraphConstruction*&, GraphNestedConstruction*) noexcept;
+   void resume_nested() noexcept;
+   struct Slot { void* pointer; size_t bytes; };
+   // Recipes allocate contiguous runs. Consumed slots never re-enter a run,
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -658,12 +658,28 @@
+     const distributed::Group& group,const array& input,
+     distributed::GroupWorkerOperation operation,int peer,GraphConstruction*& output,
+     GraphNestedConstruction* parent) noexcept {
++  distributed::GroupConstructorStorage actual;
++  if (!distributed::constructor_storage(group,input,operation,peer,actual)) return GraphFailure::invalid_layout;
++  return create_distributed_layout_bound(quota,scope,actual,output,parent);
++}
++GraphFailure GraphConstruction::create_distributed_variable_with_resident_loan(GraphQuota& quota,
++    uint64_t scope,const distributed::Group& group,const array& input,
++    std::span<const size_t> matrix,bool transposed,GraphConstruction*& output,
++    GraphNestedConstruction& parent) noexcept {
++  const auto layout=distributed::GroupTensorLayout::checked(input);
++  distributed::GroupConstructorStorage actual;
++  if (input.is_tracer() || !layout ||
++      !distributed::variable_constructor_storage(group,*layout,matrix,transposed,actual))
++    return GraphFailure::invalid_layout;
++  return create_distributed_layout_bound(quota,scope,actual,output,&parent);
++}
++GraphFailure GraphConstruction::create_distributed_layout_bound(GraphQuota& quota,uint64_t scope,
++    const GraphConstructionLayout& actual,GraphConstruction*& output,
++    GraphNestedConstruction* parent) noexcept {
+   const auto context=current_graph_construction_context();
+   if (output || !scope || context.worker || context.dispatch || context.scope != scope ||
+       current_graph_quota() != &quota) return GraphFailure::foreign_parent;
+   if (parent && parent->owner_) return GraphFailure::construction_busy;
+-  distributed::GroupConstructorStorage actual;
+-  if (!distributed::constructor_storage(group,input,operation,peer,actual)) return GraphFailure::invalid_layout;
+   if (parent) {
+     const GraphQuota::Loan loan(quota);
+     if (quota.preparing_) return GraphFailure::construction_busy;
+diff --git a/mlx/distributed/primitives.cpp b/mlx/distributed/primitives.cpp
+--- a/mlx/distributed/primitives.cpp
++++ b/mlx/distributed/primitives.cpp
+@@ -108,6 +108,11 @@
+ std::pair<ArrayVector, std::vector<int>> AllToAllV::vmap(
+     const ArrayVector& inputs,
+     const std::vector<int>& axes) {
++  // Prepared request sources are non-tracer. Transforming them would require
++  // a newly admitted matrix/output source, never empty legacy count vectors.
++  if (prepared_plan().prepared())
++    throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++
+   auto& in = inputs[0];
+   auto ax = axes[0];
+   if (ax == 0) {
+@@ -134,6 +139,11 @@
+     const ArrayVector& primals,
+     const ArrayVector& tangents,
+     const std::vector<int>&) {
++  // Prepared request sources are non-tracer. Transforming them would require
++  // a newly admitted matrix/output source, never empty legacy count vectors.
++  if (prepared_plan().prepared())
++    throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++
+   return {all_to_all_v(
+       tangents[0],
+       signed_counts(send_counts_),
+@@ -147,6 +157,11 @@
+     const ArrayVector& cotangents,
+     const std::vector<int>&,
+     const ArrayVector&) {
++  // Prepared request sources are non-tracer. Transforming them would require
++  // a newly admitted matrix/output source, never empty legacy count vectors.
++  if (prepared_plan().prepared())
++    throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++
+   return {all_to_all_v(
+       cotangents[0],
+       signed_counts(recv_counts_),

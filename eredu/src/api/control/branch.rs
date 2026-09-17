@@ -44,15 +44,16 @@ pub struct GenerationBranchMetadata {
 /// Inactive continuation for serial exchange with one exclusively borrowed model.
 /// After an exchange this handle holds the previously active run. Dropping a
 /// handle releases that inactive state; the active child's lease follows its run.
-pub struct ControlledGenerationBranch<B: TextSnapshotBackend> {
+pub struct ControlledGenerationBranch<B: TextSnapshotBackend, M: ControlRecordMode = LegacyText> {
     continuation: TextContinuationBranch<B, ControlConstraints>,
     cursor: CommittedGenerationCursor,
     pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
     lifecycle: GenerationLifecycle,
-    delivery: Delivery,
+    delivery: Delivery<M>,
+    host_preparation: HostPreparationAuthority,
 }
 
-impl<B: TextSnapshotBackend> ControlledGenerationBranch<B> {
+impl<B: TextSnapshotBackend, M: ControlRecordMode> ControlledGenerationBranch<B, M> {
     /// Identity of the run currently held by this inactive slot.
     pub fn run_id(&self) -> &str {
         &self.delivery.template.run_id
@@ -71,16 +72,18 @@ impl<B: TextSnapshotBackend> ControlledGenerationBranch<B> {
     }
 }
 
-impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
+impl<B: TextSnapshotBackend + TextSamplingControlBackend, M: ControlRecordMode>
+    ControlledGenerationSession<'_, B, M>
+{
     /// Forks a complete saved boundary without installing it, replaying input or
     /// loading weights. The emitted BranchStarted belongs to the child and
     /// contains its inherited semantic prefix. Children execute through `exchange`.
     pub fn fork(
         &mut self,
-        snapshot: &ControlledGenerationSnapshot<B>,
+        snapshot: &ControlledGenerationSnapshot<B, M>,
         options: GenerationBranchOptions,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationBranch<B>, ControlledGenerationError> {
+        emit: impl FnMut(M::Record) -> ControlFlow<()>,
+    ) -> Result<ControlledGenerationBranch<B, M>, ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.fork_inner(snapshot, options, emit)
         })) {
@@ -94,10 +97,10 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
 
     fn fork_inner(
         &mut self,
-        snapshot: &ControlledGenerationSnapshot<B>,
+        snapshot: &ControlledGenerationSnapshot<B, M>,
         options: GenerationBranchOptions,
-        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationBranch<B>, ControlledGenerationError> {
+        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
+    ) -> Result<ControlledGenerationBranch<B, M>, ControlledGenerationError> {
         self.lifecycle.checkpoint()?;
         if self.delivery.control.cancellation().is_cancelled() {
             return Err(CaptureError::Invalid(
@@ -105,14 +108,15 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
             )
             .into());
         }
-        if snapshot.metadata.tokenizer_identity != self.tokenizer_identity {
+        if snapshot.info.tokenizer_identity != self.tokenizer_identity {
             return Err(TextSnapshotError::<eredu_core::BackendFailure>::IncompatibleRun.into());
         }
         let budget = self.require_snapshot_budget()?;
         let max_predictions = snapshot.cursor.max_predictions();
         let native_growth = snapshot
             .continuation
-            .native_continuation_growth(self.driver.runtime(), max_predictions)?;
+            .native_continuation_growth(self.driver.runtime(), max_predictions)
+            .map_err(provider_snapshot_error::<B>)?;
         let host_growth = snapshot
             .pipeline
             .continuation_storage_bytes(max_predictions)
@@ -137,16 +141,20 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
         let growth = native_growth
             .checked_add(host_growth)
             .ok_or(ExecutionControlError::Overflow)?;
+        let host_preparation = HostPreparationAuthority::retain((
+            snapshot.host_preparation.clone(),
+            self.acquire_snapshot_host()?,
+        ));
         let run_id = new_identity("run");
         let session_id = new_identity("branch-session");
         // The complete source reservation covers each inherited host component.
         // Add the owned override DTO and fixed child identity/delivery storage.
         let host = snapshot
-            .metadata
+            .info
             .retained_bytes
             .checked_mul(3)
             .and_then(|bytes| {
-                bytes.checked_add(std::mem::size_of::<ControlledGenerationBranch<B>>() as u64)
+                bytes.checked_add(std::mem::size_of::<ControlledGenerationBranch<B, M>>() as u64)
             })
             .and_then(|bytes| bytes.checked_add((run_id.len() + session_id.len()) as u64))
             .and_then(|bytes| {
@@ -162,8 +170,9 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
             .intervention
             .as_ref()
             .map(|plan| plan.schema_version);
-        let (continuation, (pipeline, cursor, mut delivery, lineage)) =
-            snapshot.continuation.fork_with(
+        let (continuation, (pipeline, cursor, mut delivery, lineage)) = snapshot
+            .continuation
+            .fork_with(
                 &mut self.state.boundary(&mut self.driver)?,
                 &budget,
                 TextBranchRequest {
@@ -188,10 +197,10 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                             })?;
                     }
                     let capture = B::capture_run(generation);
-                    let lineage = GenerationBranchMetadata {
+                    let lineage = BranchInfo {
                         schema_version: EXECUTION_CONTROL_SCHEMA_VERSION,
                         run_id: run_id.clone(),
-                        parent: snapshot.metadata.clone(),
+                        parent: snapshot.info.clone(),
                         inherited_capture_usage: snapshot
                             .continuation
                             .capture_checkpoint()
@@ -212,38 +221,33 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                                 })
                         }),
                     };
-                    let template = ObservedGenerationRecord {
-                        schema_version: CAPTURE_SCHEMA_VERSION,
+                    let template = RecordContext {
                         run_id: run_id.clone(),
-                        artifact_identity: snapshot.metadata.artifact_identity.clone(),
+                        artifact_identity: snapshot.info.artifact_identity.clone(),
                         parameter_overlay_id: B::active_parameter_overlay(runtime)
                             .map(str::to_owned),
                         session_id: session_id.clone(),
                         capture_plan_id: capture.map_or_else(
-                            || snapshot.metadata.capture_plan_id.clone(),
-                            |run| run.plan().identity().into(),
+                            || snapshot.info.capture_plan_id.clone(),
+                            |run| Some(run.plan().identity().into()),
                         ),
                         intervention_plan_id: capture
                             .and_then(|run| run.intervention_plan())
                             .map(|plan| plan.identity().into()),
-                        event: ObservedGenerationEvent::Lifecycle {
-                            status: snapshot.metadata.status,
-                            next_prediction: snapshot.metadata.output.next_prediction,
-                        },
                     };
                     Ok((
                         snapshot.pipeline.fork().map_err(TextSnapshotError::Host)?,
                         snapshot.cursor.clone(),
-                        Delivery {
-                            configuration_identity: snapshot.metadata.configuration_identity,
+                        Delivery::<M> {
+                            configuration_identity: snapshot.info.configuration_identity,
                             template,
                             budget: TraceBudget::new(options.trace_limits),
                             control: GenerationControlHandle::default(),
                             sequence: 0,
                             epoch: 0,
-                            prediction: snapshot.metadata.output.next_prediction,
-                            prompt_length: self.delivery.prompt_length,
-                            prompt_token_ids: std::sync::Arc::clone(&snapshot.prompt_token_ids),
+                            prediction: snapshot.info.output.next_prediction,
+                            prompt: snapshot.prompt.clone(),
+                            mode: std::marker::PhantomData,
                             started: Instant::now(),
                             preparation_elapsed: std::time::Duration::ZERO,
                             timing: GenerationTiming::default(),
@@ -254,11 +258,11 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
                         lineage,
                     ))
                 },
-            )?;
+            )
+            .map_err(provider_snapshot_error::<B>)?;
         delivery.send(
-            ObservedGenerationEvent::BranchStarted {
+            ControlEvent::BranchStarted {
                 lineage,
-                prompt_token_ids: snapshot.prompt_token_ids.to_vec(),
                 inherited_token_ids: snapshot.cursor.token_ids().to_vec(),
                 inherited_semantics: snapshot.semantic_prefix.clone(),
             },
@@ -273,18 +277,19 @@ impl<B: TextSnapshotBackend + TextSamplingControlBackend> ControlledGenerationSe
             cursor,
             lifecycle: GenerationLifecycle::fork(&snapshot.lifecycle),
             delivery,
+            host_preparation,
         })
     }
 }
 
-impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
+impl<B: TextSnapshotBackend, M: ControlRecordMode> ControlledGenerationSession<'_, B, M> {
     /// Exchanges the active run with a saved branch slot. Native state, semantic
     /// buffers, lifecycle, identity, cancellation and cumulative budgets move
     /// together. No prediction, copy, random draw or semantic replay occurs.
     pub fn exchange(
         &mut self,
-        branch: &mut ControlledGenerationBranch<B>,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        branch: &mut ControlledGenerationBranch<B, M>,
+        emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.exchange_inner(branch, emit)
@@ -309,16 +314,18 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
 
     fn exchange_inner(
         &mut self,
-        branch: &mut ControlledGenerationBranch<B>,
-        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        branch: &mut ControlledGenerationBranch<B, M>,
+        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         branch
             .continuation
-            .exchange(&mut self.driver, &mut self.state)?;
+            .exchange(&mut self.driver, &mut self.state)
+            .map_err(provider_continuation_error::<B>)?;
         std::mem::swap(&mut self.pipeline, &mut branch.pipeline);
         std::mem::swap(&mut self.cursor, &mut branch.cursor);
         std::mem::swap(&mut self.lifecycle, &mut branch.lifecycle);
         std::mem::swap(&mut self.delivery, &mut branch.delivery);
+        std::mem::swap(&mut self.host_preparation, &mut branch.host_preparation);
         self.lifecycle_record(&mut emit);
         self.delivery_result()
     }

@@ -3,8 +3,10 @@ use super::*;
 
 mod origins;
 mod partition;
+mod validation;
+pub use validation::{RoutedUnitAssemblyError,RoutedUnitRowIdentity, RoutedUnitValidationError};
 pub use origins::{RoutedUnitOrigin, RoutedUnitOrigins};
-pub use partition::{PartitionRoutedUnitCaptureRequest, PartitionRoutedUnitCaptureSource};
+pub use partition::{PartitionRoutedUnitCaptureLayout, PartitionRoutedUnitCaptureRequest, PartitionRoutedUnitCaptureSource};
 
 /// Retained placement for one sparse producer. These host facts describe
 /// ownership; creating or deserializing them grants no execution authority.
@@ -22,19 +24,40 @@ impl RoutedUnitCaptureOwnership {
     /// Checks placement against global capture geometry, without native work.
     pub fn validate(&self, geometry: RoutedUnitGeometry) -> Result<(), CaptureError> {
         geometry.components()?;
-        if self.coordinates.experts().global_count() as u64 != geometry.experts
-            || self.coordinates.units().global_count() as u64 != geometry.units_per_expert
-            || self.source_peers == 0
-            || match self.source_peer {
-                Some(peer) => peer >= self.source_peers,
-                None => self.source_peers != 1,
-            }
+        if !self.matches_geometry(geometry)
         {
             return Err(CaptureError::Invalid(
                 "invalid sparse producer ownership".into(),
             ));
         }
         Ok(())
+    }
+    fn matches_geometry(&self, geometry: RoutedUnitGeometry) -> bool {
+        self.coordinates.experts().global_count() as u64 == geometry.experts
+            && self.coordinates.units().global_count() as u64 == geometry.units_per_expert
+            && self.source_peers > 0
+            && match self.source_peer {
+                Some(peer) => peer < self.source_peers,
+                None => self.source_peers == 1,
+            }
+    }
+    /// The same ownership predicate with an allocation-free typed cause.
+    pub fn validate_geometry(&self, geometry: RoutedUnitGeometry) -> Result<(), RoutedUnitValidationError> {
+        use RoutedUnitValidationError as E;
+        if geometry.experts == 0 || geometry.units_per_expert == 0 || geometry.routes_per_token == 0 {
+            return Err(E::Empty);
+        }
+        geometry.experts.checked_mul(geometry.units_per_expert).ok_or(E::Overflow)?;
+        if !self.matches_geometry(geometry) { return Err(E::Ownership); }
+        Ok(())
+    }
+    /// Exact same conservative row bound, without allocating an error string.
+    pub fn maximum_source_rows_checked(&self, source_tokens: u64, routes: u64)
+        -> Result<u64, RoutedUnitValidationError> {
+        if self.source_peer.is_some() {
+            source_tokens.checked_mul(routes).and_then(|n| n.checked_mul(self.source_peers))
+                .ok_or(RoutedUnitValidationError::Overflow)
+        } else { Ok(source_tokens) }
     }
     /// Conservative receive-order token-row bound, including unexported source
     /// peers. Exchange expands each original route to one native input row.
@@ -43,11 +66,7 @@ impl RoutedUnitCaptureOwnership {
         source_tokens: u64,
         routes: u64,
     ) -> Result<u64, CaptureError> {
-        if self.source_peer.is_some() {
-            mul(mul(source_tokens, routes)?, self.source_peers)
-        } else {
-            Ok(source_tokens)
-        }
+        self.maximum_source_rows_checked(source_tokens, routes).map_err(Into::into)
     }
 }
 
@@ -80,33 +99,17 @@ impl RoutedUnitGeometry {
         mul(self.experts, self.units_per_expert)
     }
 
+    /// Validate borrowed sparse axes without allocating a slice descriptor.
+    /// This is geometry validation only and grants no construction authority.
+    pub fn validate_axes(self, starts: &[u64], ends: &[u64], strides: &[u64], shape: &[u64])
+        -> Result<(), RoutedUnitValidationError> {
+        validation::validate_axes(self, starts, ends, strides, shape)
+    }
+
     /// Selection in original `[token, route, component]` order. Native sorting
     /// and chunking never change these application coordinates.
     pub fn validate_slice(self, slice: &ResolvedCaptureSlice) -> Result<(), CaptureError> {
-        self.components()?;
-        if slice.starts.len() != 3
-            || slice.ends.len() != 3
-            || slice.strides.len() != 3
-            || slice.shape.len() != 3
-            || slice.ends[1] > self.routes_per_token
-            || slice.ends[2] > self.units_per_expert
-        {
-            return Err(CaptureError::Invalid(
-                "invalid routed-unit slice rank or extent".into(),
-            ));
-        }
-        for axis in 0..3 {
-            if slice.strides[axis] == 0
-                || slice.starts[axis] > slice.ends[axis]
-                || slice.shape[axis]
-                    != (slice.ends[axis] - slice.starts[axis]).div_ceil(slice.strides[axis])
-            {
-                return Err(CaptureError::Invalid(
-                    "invalid routed-unit slice geometry".into(),
-                ));
-            }
-        }
-        Ok(())
+        validation::validate_slice(self, slice).map_err(Into::into)
     }
 }
 
@@ -146,73 +149,6 @@ pub struct RoutedUnitCapture {
     pub source_token_ranges: Vec<[u64; 2]>,
     /// Original route rows; unselected experts have no row.
     pub rows: Vec<RoutedUnitCaptureRow>,
-}
-
-impl RoutedUnitCapture {
-    /// Checks selected-unit geometry and route uniqueness. Completeness is checked
-    /// separately so independently bounded native chunks can be accumulated.
-    pub fn validate_rows(&self, slice: &ResolvedCaptureSlice) -> Result<(), CaptureError> {
-        self.geometry.validate_slice(slice)?;
-        let mut seen = std::collections::BTreeSet::new();
-        for row in &self.rows {
-            if !row.coefficient.is_finite()
-                || row.token < slice.starts[0]
-                || row.token >= slice.ends[0]
-                || !(row.token - slice.starts[0]).is_multiple_of(slice.strides[0])
-                || row.expert >= self.geometry.experts
-                || row.slot < slice.starts[1]
-                || row.slot >= slice.ends[1]
-                || !(row.slot - slice.starts[1]).is_multiple_of(slice.strides[1])
-                || !seen.insert((row.source_peer, row.token, row.slot))
-            {
-                return Err(CaptureError::Invalid(
-                    "invalid or duplicate routed-unit receipt".into(),
-                ));
-            }
-            let (start, stride, count) = (slice.starts[2], slice.strides[2], slice.shape[2]);
-            if row.unit_start != start
-                || row.unit_stride != stride
-                || row.values.shape()
-                    != [usize::try_from(count).map_err(|_| CaptureError::Overflow)?]
-                || !matches!(row.values.data(), crate::TensorObservationData::F32(_))
-            {
-                return Err(CaptureError::Invalid(
-                    "routed-unit receipt differs from selection".into(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Finishes an ordinary invocation only after every selected token/route has
-    /// arrived. Exchanged rows require their separate distributed ownership proof.
-    pub fn finish_ordinary(
-        &mut self,
-        slice: &ResolvedCaptureSlice,
-        source_tokens: u64,
-    ) -> Result<(), CaptureError> {
-        self.validate_rows(slice)?;
-        self.source_token_ranges.sort_unstable();
-        let mut end = 0;
-        for range in &self.source_token_ranges {
-            if range[0] != end || range[1] <= range[0] || range[1] > source_tokens {
-                return Err(CaptureError::Invalid(
-                    "duplicate or incomplete routed-unit chunks".into(),
-                ));
-            }
-            end = range[1];
-        }
-        if self.rows.iter().any(|row| row.source_peer.is_some())
-            || end != source_tokens
-            || self.rows.len() as u64 != mul(slice.shape[0], slice.shape[1])?
-        {
-            return Err(CaptureError::Invalid(
-                "incomplete ordinary routed-unit capture".into(),
-            ));
-        }
-        self.rows.sort_by_key(|row| (row.token, row.slot));
-        Ok(())
-    }
 }
 
 /// Borrowed native inputs needed to resolve sorted/chunked routes. Only an

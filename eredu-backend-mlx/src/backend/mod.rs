@@ -1,11 +1,14 @@
 //! MLX backend adapter.
 
+pub(crate) mod array_copy;
 pub(crate) mod compaction;
 /// Session-owned MLX communicators, transfers, and collectives.
 pub mod distributed;
 /// Errors produced by MLX model loading and execution.
 pub mod error;
 mod execution;
+pub(crate) mod managed_memory;
+pub(crate) mod initialized_input;
 #[cfg(any(feature = "image", feature = "audio"))]
 mod media;
 /// Reusable MLX neural-network building blocks.
@@ -43,11 +46,16 @@ use crate::{
 mod adapter;
 
 pub use adapter::completion::MlxCompletion;
+pub(crate) use adapter::completion::SamplingEventSource;
 #[cfg(test)]
 use adapter::device::device_capabilities;
 pub(crate) use adapter::device::{MlxAcceleratorFamily, MlxDeviceIdentity};
 pub use adapter::model::MlxModel;
 pub use adapter::provider::MlxBackend;
+pub(crate) use adapter::provider::{
+    OriginalCopyEnvironment, OriginalCopyEnvironmentError, RetainedOriginalCopyEnvironment,
+    PreparedOriginalCopyEnvironment, PreparedOriginalCopyEnvironmentError,
+};
 pub(crate) use adapter::target::{validate_native_execution_target, MlxPreparedTarget};
 
 #[cfg(test)]

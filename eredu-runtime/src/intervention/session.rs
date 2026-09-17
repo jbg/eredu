@@ -153,6 +153,33 @@ where
         }
         Ok(Some(self))
     }
+    fn requires_prepared_traversal(&self) -> bool {
+        // Decode still uses the installed source. The p0-only predicate would
+        // select the custom-callback path and invalidate its prepared binding.
+        self.session.ordinary_prefill_source_binding().is_some()
+    }
+    fn requires_sequence_readout(&self) -> bool {
+        self.session
+            .ordinary_prefill_capture()
+            .map_or(true, |capture| capture.requires_sequence())
+    }
+    fn supports_prefill_spans(&self) -> bool {
+        self.session.ordinary_prefill_capture().is_some()
+    }
+    fn ordinary_prefill_capture(&self) -> Option<&crate::capture::OrdinaryPrefillCapture> {
+        self.session.ordinary_prefill_capture()
+    }
+    fn begin_prefill_chunk(&mut self, chunk: &crate::prefill::PrefillChunk) -> Result<(), E> {
+        if self.session.ordinary_prefill_capture().is_some() {
+            self.session
+                .begin_ordinary_prefill(chunk)
+                .map_err(|error| (self.map_error)(error.into()))?;
+        }
+        Ok(())
+    }
+    fn finish_prefill(&mut self, committed: bool) {
+        self.session.finish_ordinary_prefill(committed);
+    }
     fn transactional(&self) -> bool {
         true
     }
@@ -161,6 +188,13 @@ where
         epoch: eredu_core::DistributedCommitEpoch,
         pass: crate::ExpertPass,
     ) -> Result<(), E> {
+        if self.session.ordinary_prefill_capture().is_some() {
+            self.next_prediction.take();
+            return self
+                .session
+                .prepare_ordinary_prefill(epoch, pass)
+                .map_err(|error| (self.map_error)(error.into()));
+        }
         match self.next_prediction.take() {
             Some(prediction) => self
                 .session
@@ -170,12 +204,22 @@ where
         .map_err(|error| (self.map_error)(error.into()))
     }
     fn complete_transaction(&mut self, epoch: eredu_core::DistributedCommitEpoch) -> Result<(), E> {
+        if self.session.ordinary_prefill_capture().is_some() {
+            return self
+                .session
+                .complete_ordinary_prefill(epoch)
+                .map_err(|error| (self.map_error)(error.into()));
+        }
         self.session
             .complete_transaction(epoch)
             .map_err(|error| (self.map_error)(error.into()))
     }
     fn finish_transaction(&mut self, epoch: eredu_core::DistributedCommitEpoch, committed: bool) {
-        self.session.finish_transaction(epoch, committed)
+        if self.session.ordinary_prefill_capture().is_some() {
+            self.session.finish_ordinary_chunk(epoch, committed);
+        } else {
+            self.session.finish_transaction(epoch, committed)
+        }
     }
     fn observe(&mut self, path: &str, value: &B::Tensor) -> Result<(), E> {
         self.session
@@ -212,6 +256,19 @@ where
             .routing_control(path, rows)
             .map_err(|error| (self.map_error)(error.into()))
     }
+    fn routing_unmodified_interest(&self, path: &str) -> crate::RoutingUnmodifiedInterest {
+        self.session.routing_unmodified_interest(path)
+    }
+    fn routing_unmodified(
+        &mut self,
+        path: &str,
+        effective: crate::RoutingDecision<'_, B::Tensor>,
+    ) -> Result<(), E> {
+        self.session
+            .routing_unmodified(&mut self.backend, path, effective)
+            .map_err(&self.map_error)
+    }
+
     fn routing_applied(
         &mut self,
         path: &str,

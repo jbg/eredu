@@ -94,7 +94,7 @@ pub(super) fn native_grouped_linear_cpu(
                 dot_f32(input_row, &weights);
         }
     }
-    Array::from_slice(&output, &[routes, weight.rows]).copy(stream)
+    Array::try_from_slice(&output, &[routes, weight.rows])?.copy(stream)
 }
 
 pub(super) fn decode_q4k_view(

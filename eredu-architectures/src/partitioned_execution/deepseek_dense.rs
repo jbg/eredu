@@ -11,7 +11,7 @@ pub(super) fn prepare<B, S, V>(
         eredu_runtime::SelectedReplicatedTextRealization,
         eredu_runtime::ReplicatedTextRequirements,
     >,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, DenseDecoderPartitionedDispatchError<V::Error>>

@@ -1,0 +1,62 @@
+{
+  "base": "upstream -> borrowed-decode -> model-cache-policy -> static-alphabet -> packed-bpe -> compile-correction -> bpe-residence",
+  "dependency": "external tokenizers 0.23.2",
+  "files": {
+    "Cargo.toml": {
+      "after": "144e5aa059c5ba03316b6406f688fcef55ce0970c2ab1c9904411da66211813b",
+      "before": "e514ac884cfc51d42fb7f6ffac71125cca85e8b6176e00a1bcccaec064cdd583"
+    },
+    "Cargo.toml.orig": {
+      "after": "ae03af84c9e8495750b7e975ac231d9e7eed656405a2761403c0354daae12af9",
+      "before": "a7550a462a6e4da8f6ff6aa3420f25f189c5e7ec7303485e9e7e31c20aa6f3e3"
+    },
+    "src/models/bpe/compile.rs": {
+      "after": "88d1d903fc85223ef981c9d45e6ea568641ab7ef0f3a232ae8b703d3fd37bdd0",
+      "before": "2feb2d1c53f638995b84ac303208694a17813ec768b086e6bc6bdbe07db9152b"
+    },
+    "src/models/bpe/mod.rs": {
+      "after": "cef14bcad172f54b1190d16d8b639d2966454461d8215f465d7479c2076275b1",
+      "before": "d4fa10e858034e709b672794d23b448a474d8bf09932557f5f3361c53d30b501"
+    },
+    "src/models/bpe/model.rs": {
+      "after": "809d8ddb050197cd6f2712703a2581b42b7af5efc91d403e6836adc1c531e6c0",
+      "before": "ed9a11fdc995aa6c96c27bc8f725fce64544d88f7493f8619e3909f5776fbe7a"
+    },
+    "src/models/bpe/readonly.rs": {
+      "after": "5e634eaae0c0cc507fc02e691247d9bf937eec769fda2673b29952a5dd88bb34",
+      "before": null
+    }
+  },
+  "final_complete_manifest_sha256": "c3117d5fb35a26a39b3e7ff659509f7ad59f1220d3616c4250bc9c070607e80b",
+  "limits": [
+    "Borrowed vocabulary and disabled development failure selector only; no full tokenizer claim.",
+    "Source ownership/accounting stays in runtime through non-Clone text adapters, not HF.",
+    "Relative Cargo paths consume external fork; vanilla crates.io 0.23.2 lacks these APIs.",
+    "No workspace, default feature, registry or unsafe-boundary change."
+  ],
+  "patch_sha256": "7a5d9a5c398c3357b0b4d045e031a50de359ea8c7a032414e88d1e4bdf5f95b7",
+  "predecessor_complete_manifest_sha256": "1fa7514facc835c74b2be694f132e3022bcf36f9fd4ee27ce06de73c6b296d90",
+  "predecessor_patches": [
+    {
+      "path": "dependencies/07-09-tokenizers-borrowed-decode.patch",
+      "sha256": "ebe704a037d685a549daeffdea08faabf1e98fe62e8f8cde0ae6fd6af1ffb468"
+    },
+    {
+      "path": "dependencies/08-07-tokenizers-model-cache-policy.patch",
+      "sha256": "a48e25e79f60b7f100a5b3c6fb4a4332c4753dded93b63a6254eb52e62887f34"
+    },
+    {
+      "path": "dependencies/09-04-tokenizers-static-alphabet.patch",
+      "sha256": "072779a52ef812887567ae5ff4c5ed7bc4e056b64489b71c3bef66c01d2740c9"
+    },
+    {
+      "path": "dependencies/06-tokenizers-packed-bpe.patch",
+      "sha256": "5b170af52d3490b09ea898d9643307a6468a8579749dcc9006bb6f1a36f9c3f7"
+    },
+    {
+      "path": "dependencies/13-tokenizers-packed-bpe-compile-correction.patch",
+      "sha256": "1ae2a3d4da59600825bd080a9b30d98649e312806cca34ac1eb95ebb3ad81c81"
+    }
+  ],
+  "upstream_archive_sha256": "7afbf6e88718afcc138bad01d6ccc3051dbbc3b2ce9793d8b8a3aeb610969cfc"
+}

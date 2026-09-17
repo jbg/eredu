@@ -1,0 +1,173 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted retained-state inference charge ownership and shared checkpoint retention",
+  "source_sha256": {
+    "eredu-runtime/src/working_memory.rs": "5143e3d168cfe608da9c0ad1cc41151eec727e26a539d5c505a601058f6e7953",
+    "eredu-runtime/src/working_memory/retention.rs": "443d0744fa4db7b136cd93e0afdc80f212703f48032d2ea57f33f98194f11c4a",
+    "eredu-runtime/src/state.rs": "1d6b1b6169bf550db964dcfb85e1de82a6a792035475b44076b57b493cfdaf53",
+    "eredu-runtime/src/replicated_session.rs": "d158906768ffb87364fffb7ea2f44eb2bef58e6ae03663e68a1dd94b6055f139",
+    "eredu-runtime/src/replicated_session/prefill.rs": "952d39289da80105852c14b285b600a9f3667667b83a49b03e4dd97fcd2a20db",
+    "eredu-runtime/src/replicated_session/control.rs": "cd662a9a88e8c59680a52e067727349b6de929e41c82e3d016dd1890cf85b5e2",
+    "eredu-runtime/tests/bounded_prefill.rs": "daabf2a1820363e202403af44e824ff81a9e7dccf8cebf52306ca2d809cebc1c",
+    "eredu-runtime/tests/backend_independence.rs": "c922e464b4b1e6c5e8023b1012952d5d81a2b12c7e85b00191c84e7011290456",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/key_value.rs": "2016db392c646e0fc96e9b6e731becfb1b2b24bca56c093a25ddb3968c758c80",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid.rs": "962d639dfe776e00ec69a0b12dfe51ea4f06a483d423ea98f10de8a58c381970",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/pooling.rs": "9716ef1bbbd3b7e91e0051955026698ed8eee841063092b71304ba49836d2ede",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/tests/isolated_snapshots.rs": "1fcbc4a7d70b202abed6bee6b32e3ac112eaff99a17ce4a4858e6b15658b86fd",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/state.rs": "32f8ca9dcf21ed3a277a863d9e7b3677645bce74553a4605cef1fbd87baa95eb",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/mechanisms.rs": "bd7e0a123ee53aa615cf8b7fbccff1a49059dd7553a4f99e103ce423ea6f2ef2",
+    "eredu-architectures/tests/reference_numeric.rs": "db5d1b908f86c87ce864b6e05bfb3a353fe9aa070b26695d21b7574de35dc680",
+    "eredu-architectures/tests/reference_numeric/bounded_readout.rs": "66ce202dfeb67ae89f835d582e20a1cb62170a7b509044d3e7646f93f91e3a67",
+    "eredu-architectures/tests/support/reference_composite.rs": "47bf5738f4bd753412fdd95cff84f3251b6c212b7c19735fa22f31d5d47d61ce",
+    "eredu-core/src/capability.rs": "a39c7b078287a5db9b3bd95f24ea3e13599fe469ec2edd0d3e93134528278b3c",
+    "eredu-core/src/inference.rs": "238b6b738c6006b3ef3885200df88d243bfe07cc6571f0943062b7b5a0d75871",
+    "doc/backend-architecture.md": "646b9870b8efa47dda08e71a9f3b892b7241963e1efc62f84281f19afad493b2",
+    "doc/execution-control.md": "ac14e1a76b1eecdd4cecdd7867c70c00e926aede44e996a50eba56ddb37f5069",
+    "doc/bounded-inference.md": "b5eaa1772535354e2f0feab0cc5ac8f8df7efcd6685635174d2d97357e7492f2"
+  },
+  "coverage": {
+    "unique_tests_passed": 203,
+    "family_configurations": 9,
+    "weight_residencies": [
+      "resident",
+      "host-layerwise",
+      "disk-streamed"
+    ],
+    "reserved_trajectories": 432,
+    "chunks": [
+      1,
+      2,
+      3,
+      5
+    ],
+    "cached_prefix_positions": [
+      0,
+      2
+    ],
+    "drivers": [
+      "run",
+      "step"
+    ],
+    "cached_decodes_per_trajectory": 3,
+    "cancellation_or_preparation_failure_trajectories": 54,
+    "stale_frontier_rejections": 27,
+    "native_retention_owners": [
+      "device key/value",
+      "device fixed hybrid with strided recurrent state",
+      "device pooling owner with a local key-only window"
+    ],
+    "native_copy_kinds": [
+      "rollback checkpoint",
+      "independent snapshot",
+      "prediction-state fork"
+    ],
+    "native_snapshot_regressions": 5
+  },
+  "behavior": [
+    "Attach a reserved request to state before span preparation; dropping the driver or caller reservation does not refund live cache state.",
+    "Deduplicate aliases of the same request while preserving different requests with equal geometry. Unbudgeted work adds no retained charge metadata.",
+    "Shared checkpoint wrappers inherit charge owners and merge saved/current charges before any fallible restore, including mechanisms that replace state wholesale.",
+    "A mock failure after whole-state replacement preserves both charge owners; dropping the final state releases them without rewinding the pool peak.",
+    "Native direct checkpoints, snapshots, prediction forks, hybrid segment import and key/value transaction publication preserve request retention.",
+    "Control-state and prediction-state preparation inherit retention before publication; state exchange moves retention with its storage.",
+    "Copied native state prices the logical out-of-line retention-handle storage separately from shared request and pool allocations."
+  ],
+  "validation": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test bounded_prefill",
+      "result": "pass",
+      "tests_passed": 16,
+      "test_suites_passed": [
+        16
+      ],
+      "ignored_tests": 0,
+      "log": "/private/tmp/eredu-inference-retention-runtime.log",
+      "log_sha256": "0dcda18220313822a42a32ee4789776aa3d905ca4f35aa6094f1fedc21622bde"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence",
+      "result": "pass",
+      "tests_passed": 77,
+      "test_suites_passed": [
+        77
+      ],
+      "ignored_tests": 0,
+      "log": "/private/tmp/eredu-inference-retention-session.log",
+      "log_sha256": "79031dd22116898b410d5bdcc9cd395608493ea746ea4f9eff03af1868c49b24"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric bounded_readout::prepared_sessions_complete_state_only_chunks_in_all_weight_residencies",
+      "result": "pass",
+      "tests_passed": 1,
+      "test_suites_passed": [
+        1
+      ],
+      "ignored_tests": 0,
+      "log": "/private/tmp/eredu-inference-retention-families.log",
+      "log_sha256": "da35641b1e89f638a115b2bcf7daf6f6c52a074c0c46e8b742f0ad243da4507e"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --lib --features metal,accelerate prefill_reservation_tests -- --include-ignored --test-threads=1",
+      "result": "pass",
+      "tests_passed": 2,
+      "test_suites_passed": [
+        2
+      ],
+      "ignored_tests": 0,
+      "log": "/private/tmp/eredu-inference-retention-native.log",
+      "log_sha256": "22af9d3bde328b612c170225a62c7fb575b14e516955d2ca4636d3bfac76f429"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --lib --features metal,accelerate backend::runtime::cache::state::hybrid::isolated_snapshot_tests -- --test-threads=1",
+      "result": "pass",
+      "tests_passed": 5,
+      "test_suites_passed": [
+        5
+      ],
+      "ignored_tests": 0,
+      "log": "/private/tmp/eredu-inference-retention-snapshots.log",
+      "log_sha256": "d8b81df66a985127bcfe8ddc96350a0bd73d9b676cc3c3d66c070cb930c4d44d"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "result": "pass",
+      "tests_passed": 102,
+      "test_suites_passed": [
+        83,
+        19
+      ],
+      "ignored_tests": 1,
+      "log": "/private/tmp/eredu-inference-retention-facade.log",
+      "log_sha256": "e41ad304560a85ed99e635ccdc6105e3076763a22e69fafdff5537cb3f528a5c"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --tests --features metal,accelerate",
+      "result": "pass",
+      "tests_passed": 0,
+      "test_suites_passed": [],
+      "ignored_tests": 0,
+      "log": "/private/tmp/eredu-inference-retention-backend.log",
+      "log_sha256": "58961a17af46641240409997d375cf1e5d4526e5de7302bffcaa3c6346509a3c"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "result": "pass",
+      "tests_passed": 0,
+      "test_suites_passed": [],
+      "ignored_tests": 0,
+      "log": "/private/tmp/eredu-inference-retention-portable.log",
+      "log_sha256": "572c1c81a62eec25681144fc3314398f322c51045fb39642f994ae01e05f3728"
+    }
+  ],
+  "measurement_scope": "Lifetime and value-preservation evidence. Synthetic accounting witnesses verify exact lease ownership, not native allocation upper bounds. No new native allocation-peak, process-memory or released-checkpoint measurements.",
+  "limitations": [
+    "Default facade inference preflight and complete native request quote construction remain unfinished.",
+    "Decode request identity, geometry and output-allowance enforcement remain unfinished; retention alone does not authorize arbitrary future work.",
+    "Independent state copies and future branch growth still require additional capacity admission against the same physical working-memory pool. Inheriting a lease does not reserve their new storage.",
+    "Native completion/recovery retains its own authority; state retention does not establish native completion.",
+    "Inputs, outputs and other resources retained outside these state/completion owners still require request-lifetime composition.",
+    "Media, speculation, observation, parallel paths and the full family/mechanism matrix remain incomplete for end-to-end budgets.",
+    "The pre-existing portable LFM checkpoint test remains ignored because its external fixture was not selected for this run."
+  ]
+}

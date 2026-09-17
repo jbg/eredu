@@ -5,17 +5,37 @@
 //! completion object. Copy mechanisms finish through the backend's existing owner.
 
 use super::{SnapshotBudget, SnapshotReservation};
+mod host_copy;
+mod resume;
 use crate::capture::{
     CaptureCheckpoint, CaptureForkRequest, CaptureSession, InterventionForkRequest,
 };
+use crate::working_memory::WorkspaceCopyLimits;
 use eredu_core::{
+    BackendFailure, HostPreparationAuthority, ModelRuntime, PendingTextInput,
+    TextContinuationBoundary, TextContinuationIdentity, TextSnapshotSource, TokenFilterController,
     capture::CaptureError,
     execution_control::{
         ExecutionControlError, NativeTextStateBackend, SnapshotEstimate, SnapshotResourceKind,
     },
-    ModelRuntime, PendingTextInput, TextContinuationBoundary, TextContinuationIdentity,
-    TokenFilterController,
 };
+use host_copy::CallbackHostCopy;
+pub use host_copy::{PreparedTextHostCopy, TextHostCopyError};
+pub use resume::PendingSnapshotResumeRetention;
+
+/// Allocation policy for the complete saved component requested by a hook.
+/// A sampling-only hook covers sampler/input; a paired hook also covers decoder
+/// state. Neither scope includes controller or facade state, and saved copy
+/// custody never authorizes resuming a generation run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SamplingCopyPolicy {
+    /// Use actual backend unquoted allocation authority. This never bypasses a
+    /// managed domain's exclusion of unquoted work during finite reservations.
+    Unquoted,
+    /// Require complete authenticated component sources and a checked physical
+    /// copy bound before allocating any destination payload.
+    Bounded(WorkspaceCopyLimits),
+}
 
 /// Native ordinary-generation mechanisms used by the portable snapshot driver.
 /// Capture/intervention ownership stays in the shared `CaptureSession`; adapters
@@ -24,6 +44,256 @@ pub trait TextSnapshotBackend: NativeTextStateBackend {
     /// Sampling parameters, penalties/history, adaptive state, exact RNG and
     /// absolute next-prediction position. Copies must have isolated mutable state.
     type SamplingState;
+
+    /// Independently owned, immutable sampler and pending input. This is saved
+    /// numerical data, not a runnable sampler or a replayable execution grant.
+    /// Duplication goes through `copy_saved_sampling`, not an allocating Clone.
+    type SavedSamplingState;
+
+    /// One opaque immutable decoder/sampler/input pair from a checked source.
+    /// Its implementation must prevent independently replacing either component
+    /// or extracting an installable native slot. This is saved data and custody,
+    /// never a live run, prediction permit, or restoration authority. Independent
+    /// duplication uses the paired copy hook, not an allocating Clone.
+    type SavedTextComponents;
+
+    /// Same backend domain used by the concrete original host-copy provider.
+    /// This immutable loan grants neither bytes nor native submission authority.
+    fn original_snapshot_host_pool(
+        _runtime: &ModelRuntime<Self>,
+    ) -> Option<&crate::working_memory::WorkingMemoryPool> {
+        None
+    }
+
+    /// Allocation-free logical estimates for the exact live decoder, sampler,
+    /// and pending input, in that order. This pre-grant query must not allocate
+    /// inventories, clone native handles, format diagnostics, reap, or submit
+    /// work. Unknown facts or an unavailable immutable source loan return None.
+    /// These logical costs neither qualify physical copy fit nor grant bytes.
+    /// The default deliberately does not invoke the ordinary estimate hooks.
+    fn original_snapshot_estimates(
+        _runtime: &ModelRuntime<Self>,
+        _sampling: &Self::SamplingState,
+        _input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
+    ) -> Option<[SnapshotEstimate; 3]> {
+        None
+    }
+
+    /// Complete native saved-copy preparation storage while borrowing this exact
+    /// live sampler/input and installed decoder. This query must allocate no
+    /// metadata or diagnostic and mutate no source. Include every temporary
+    /// projection/registry/program Vec/map, descriptor shape, fixed call frame,
+    /// and error prefix created before the separate native copy admission.
+    /// The original host provider admits these bytes before invoking the shared
+    /// saved-copy worker and retains custody on escaping native failures.
+    /// Pre-grant refusals remain fixed neutral facts; backend error construction
+    /// and erasure are permitted only after their enclosing host admission.
+    fn original_saved_components_preparation_bytes(
+        _runtime: &ModelRuntime<Self>,
+        _sampling: &Self::SamplingState,
+        _input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
+    ) -> Result<Option<u64>, crate::working_memory::WorkingMemoryError> {
+        Ok(None)
+    }
+
+    /// Same pre-grant estimates with the actual complete generation state. A
+    /// backend-owned funded capture checkpoint contributes its fixed destination
+    /// here; the shared snapshot budget reserves it before any copy begins.
+    fn original_generation_snapshot_estimates(
+        runtime: &ModelRuntime<Self>,
+        state: &Self::TextGenerationState,
+        input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
+    ) -> Option<[SnapshotEstimate; 3]> {
+        Self::original_snapshot_estimates(runtime, Self::sampling_state(state), input)
+    }
+
+    /// Complete original preparation for the actual generation source, including
+    /// any backend-owned funded capture checkpoint. The default preserves the
+    /// sampling-only contract and does not infer a capture source from custody.
+    fn original_saved_generation_preparation_bytes(
+        runtime: &ModelRuntime<Self>,
+        state: &Self::TextGenerationState,
+        input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
+    ) -> Result<Option<u64>, crate::working_memory::WorkingMemoryError> {
+        Self::original_saved_components_preparation_bytes(
+            runtime,
+            Self::sampling_state(state),
+            input,
+        )
+    }
+
+    /// Allocation-free constructor contribution for a fresh original run from
+    /// this exact immutable pair. Include cold planning, native preparation and
+    /// escaped failure controls not covered by the new execution account. H is
+    /// accepted independently before calling the original resume admission hook.
+    fn original_saved_components_resume_preparation_bytes<C: TokenFilterController>(
+        _runtime: &ModelRuntime<Self>,
+        _saved: &Self::SavedTextComponents,
+        _config: eredu_core::TextGenerationConfig,
+        _controller: &C,
+    ) -> Result<Option<u64>, crate::working_memory::WorkingMemoryError> {
+        Ok(None)
+    }
+
+    /// Allocation-free logical destination copy estimate for that same fresh
+    /// resume. Future execution is admitted separately; unknown stays unknown.
+    fn original_saved_components_resume_estimate(
+        _runtime: &ModelRuntime<Self>,
+        _saved: &Self::SavedTextComponents,
+        _config: eredu_core::TextGenerationConfig,
+    ) -> Option<SnapshotEstimate> {
+        None
+    }
+
+    /// Captures decoder, sampler and pending input as one checked pair without
+    /// advancing or invalidating the borrowed live source. Bounded implementations
+    /// must admit every component before any destination allocation; an incomplete
+    /// paired route must reject, never fall back to separate unquoted workers.
+    /// The caller's host authority still covers enclosing controller/facade work.
+    fn capture_saved_components(
+        runtime: &mut ModelRuntime<Self>,
+        sampling: &Self::SamplingState,
+        input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
+        policy: SamplingCopyPolicy,
+    ) -> Result<Self::SavedTextComponents, Self::Error>;
+
+    /// Same paired copy worker with the enclosing accepted host preparation
+    /// lifetime. Source-carrier metadata that may survive through recovery must
+    /// retain this authority. It grants no numerical copy or new request; those
+    /// still require the separate bounded copy admission.
+    fn capture_saved_components_with_host(
+        runtime: &mut ModelRuntime<Self>,
+        sampling: &Self::SamplingState,
+        input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
+        policy: SamplingCopyPolicy,
+        _host: &HostPreparationAuthority,
+    ) -> Result<Self::SavedTextComponents, Self::Error> {
+        Self::capture_saved_components(runtime, sampling, input, policy)
+    }
+
+    /// Same saved-pair transaction, borrowing the complete source while copying
+    /// its funded capture checkpoint. An implementation must derive that source
+    /// from this state, validate its exact frontier, and retain its original
+    /// cumulative authority. Host custody alone cannot qualify a capture source.
+    fn capture_saved_generation_components_with_host(
+        runtime: &mut ModelRuntime<Self>,
+        state: &Self::TextGenerationState,
+        input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
+        policy: SamplingCopyPolicy,
+        host: &HostPreparationAuthority,
+    ) -> Result<Self::SavedTextComponents, Self::Error> {
+        Self::capture_saved_components_with_host(
+            runtime,
+            Self::sampling_state(state),
+            input,
+            policy,
+            host,
+        )
+    }
+
+    /// Independently duplicates one immutable saved pair. Its source provenance
+    /// is the saved owner, not the original live frontier or request lifetime.
+    /// Bounded copying requires a complete paired route before either part copies.
+    fn copy_saved_components(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &Self::SavedTextComponents,
+        policy: SamplingCopyPolicy,
+    ) -> Result<Self::SavedTextComponents, Self::Error>;
+
+    /// Borrows immutable sampling/input diagnostics from the exact saved pair.
+    /// This gives no mutable extraction, native installation or run permission.
+    fn saved_sampling(saved: &Self::SavedTextComponents) -> &Self::SavedSamplingState;
+
+    /// Checks the saved pair's exact source/domain compatibility without copying,
+    /// allocating native data or changing either the saved or installed state.
+    fn validate_saved_components(
+        runtime: &ModelRuntime<Self>,
+        saved: &Self::SavedTextComponents,
+    ) -> Result<(), Self::Error>;
+
+    /// Combined logical copy cost of this decoder/sampler/input pair. Unknown
+    /// remains unknown; this estimate is not physical allocation permission.
+    fn estimate_saved_components(
+        runtime: &ModelRuntime<Self>,
+        saved: &Self::SavedTextComponents,
+    ) -> Result<Option<SnapshotEstimate>, Self::Error>;
+
+    /// Decoder-only growth for future input tokens from this exact saved pair.
+    /// Shared policy separately adds saved sampler/input growth and host costs.
+    fn estimate_saved_native_growth(
+        runtime: &ModelRuntime<Self>,
+        saved: &Self::SavedTextComponents,
+        input_tokens: u64,
+    ) -> Result<Option<u64>, Self::Error>;
+
+    /// Stages independent runnable decoder/sampler/input state together without
+    /// installation. All fallible copying finishes before returning the tuple.
+    /// The backend must establish fresh authority: frozen copy custody and
+    /// historical grants alone cannot authorize a resumed run. Funded saved
+    /// sources reject until that complete fresh resume contract exists.
+    #[allow(clippy::type_complexity)]
+    fn prepare_saved_components_resume(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &Self::SavedTextComponents,
+    ) -> Result<
+        (
+            Self::NativeTextState,
+            Self::SamplingState,
+            Option<PendingTextInput<Self::Prompt, Self::Token>>,
+        ),
+        Self::Error,
+    >;
+
+    /// Captures sampler and pending input together under one copy policy, without
+    /// advancing, mutating or invalidating the borrowed live source. Bounded
+    /// implementations admit the complete component before either part is copied.
+    fn capture_saved_sampling(
+        runtime: &mut ModelRuntime<Self>,
+        sampling: &Self::SamplingState,
+        input: Option<PendingTextInput<&Self::Prompt, &Self::Token>>,
+        policy: SamplingCopyPolicy,
+    ) -> Result<Self::SavedSamplingState, Self::Error>;
+    /// Independently copies an immutable saved component. Advancing or retiring
+    /// its original live source must not invalidate its saved numerical contents.
+    fn copy_saved_sampling(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &Self::SavedSamplingState,
+        policy: SamplingCopyPolicy,
+    ) -> Result<Self::SavedSamplingState, Self::Error>;
+    /// Absolute next prediction represented by this saved component.
+    fn saved_sampling_prediction(saved: &Self::SavedSamplingState) -> u64;
+    /// Combined logical copy cost of saved sampler and pending input. This is not
+    /// a physical copy certificate or allocation permission.
+    fn estimate_saved_sampling(
+        runtime: &ModelRuntime<Self>,
+        saved: &Self::SavedSamplingState,
+    ) -> Result<Option<SnapshotEstimate>, Self::Error>;
+    /// Input tokens submitted by the next decisions from this saved component.
+    fn saved_input_tokens(saved: &Self::SavedSamplingState, predictions: u64) -> Option<u64>;
+    /// Additional sampler/input retention through those future decisions.
+    fn estimate_saved_sampling_growth(
+        runtime: &ModelRuntime<Self>,
+        saved: &Self::SavedSamplingState,
+        predictions: u64,
+    ) -> Result<Option<u64>, Self::Error>;
+    /// Stages one independent runnable sampler/input copy without installing it
+    /// or changing the saved source. The backend must establish fresh authority;
+    /// saved copy custody and historical grants do not authorize a resumed run.
+    /// Funded sources must fail until a checked fresh resume contract is available.
+    /// Existing unquoted callers retain their whole-host preparation authority
+    /// through staging and installation. Escaping component payloads require
+    /// custody from their owner; the logical snapshot budget grants none.
+    #[allow(clippy::type_complexity)]
+    fn prepare_saved_sampling_resume(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &Self::SavedSamplingState,
+    ) -> Result<
+        (
+            Self::SamplingState,
+            Option<PendingTextInput<Self::Prompt, Self::Token>>,
+        ),
+        Self::Error,
+    >;
 
     /// Borrows the native sampling component without changing it.
     fn sampling_state(state: &Self::TextGenerationState) -> &Self::SamplingState;
@@ -36,6 +306,20 @@ pub trait TextSnapshotBackend: NativeTextStateBackend {
         sampling: Self::SamplingState,
         capture: Option<CaptureSession>,
     ) -> Self::TextGenerationState;
+    /// Authenticate a copied pending prompt against the actual saved capture
+    /// checkpoint and destination run before either restore or fork publishes it.
+    /// This host-only hook must retain copied-source custody on failure. It may
+    /// rebind only the derived ordinary capture source; it grants no new original
+    /// allocation authority and never refunds copy or capture consumption.
+    fn rebind_pending_capture(
+        _runtime: &ModelRuntime<Self>,
+        _saved: Option<&CaptureCheckpoint>,
+        _capture: Option<&CaptureSession>,
+        _pending: &mut Option<PendingTextInput<Self::Prompt, Self::Token>>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
     /// Absolute next prediction, including the inherited prefix.
     fn sampling_prediction(sampling: &Self::SamplingState) -> u64;
     /// Complete known logical sampling-state copy cost, without native allocation.
@@ -97,6 +381,10 @@ pub trait TextSnapshotBackend: NativeTextStateBackend {
 
 /// Explicit independent-copy contract for the canonical constraint owner. A
 /// shallow `Clone` of grammar or mutable handles does not provide this guarantee.
+/// Implementations must retain host custody on independently escaping aliases,
+/// including copies obtained through a borrowed controller. The enclosing
+/// snapshot's authority protects only payloads that retire with that snapshot;
+/// its logical storage estimate does not provide physical allocation permission.
 pub trait SnapshotTokenController: TokenFilterController + Sized {
     /// Complete logical controller storage, including mutable grammar state.
     /// Unknown state costs disable snapshots before any copying occurs.
@@ -104,20 +392,74 @@ pub trait SnapshotTokenController: TokenFilterController + Sized {
     /// Copies without committing tokens, changing the source or sharing mutable
     /// parser state. Errors preserve the source and all existing snapshots.
     fn fork_snapshot(&self) -> Result<Self, String>;
+
+    /// Logical inline storage for a source-retained immutable controller copy.
+    /// The default leaves original capture unsupported. Implementations must
+    /// copy no mutable/deep payload and retain every immutable source alias.
+    fn original_snapshot_storage_bytes(&self) -> Option<u64> {
+        None
+    }
+    /// Copies only the immutable owner described above, without allocation or
+    /// formatting. Destination inline controls are prepaid by the host provider.
+    fn fork_original_snapshot(&self) -> Option<Self> {
+        None
+    }
+}
+
+/// Native copy failure retaining its independently accepted host preparation
+/// account. The cause cannot be detached from custody; mapping it preserves the
+/// same owner and runs while that owner still protects any diagnostic allocation.
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+pub struct RetainedSnapshotBackendError<E: std::error::Error + 'static> {
+    #[source]
+    cause: E,
+    _custody: HostPreparationAuthority,
+}
+impl<E: std::error::Error + 'static> RetainedSnapshotBackendError<E> {
+    /// Translates only the error representation while preserving exact custody.
+    pub fn map_cause<F: std::error::Error + 'static>(
+        self,
+        convert: impl FnOnce(E) -> F,
+    ) -> RetainedSnapshotBackendError<F> {
+        let cause = convert(self.cause);
+        RetainedSnapshotBackendError {
+            cause,
+            _custody: self._custody,
+        }
+    }
 }
 
 /// Failure before or during native/portable snapshot composition.
 #[derive(Debug, thiserror::Error)]
 pub enum TextSnapshotError<E: std::error::Error + 'static> {
+    /// Exact original destination account refusal; logical copy work remains spent.
+    #[error("host continuation copy admission failed: {0}")]
+    HostAdmission(#[source] crate::working_memory::WorkingMemoryError),
+    /// Exact backend-domain host preparation was rejected before copying and
+    /// before consuming any logical snapshot budget.
+    #[error("snapshot host preparation failed: {0}")]
+    HostPreparation(#[source] BackendFailure),
     /// The owning facade could not independently copy its complete semantic state.
     #[error("host continuation snapshot failed: {0}")]
     Host(String),
+    /// A prepared host copy retained its exact typed source and partial custody.
+    #[error("host continuation copy failed: {0}")]
+    HostCopy(#[source] BackendFailure),
     /// The canonical host constraint owner could not be copied independently.
     #[error("constraint snapshot failed: {0}")]
     Controller(String),
     /// Exact native copy, completion or compatibility error.
     #[error("snapshot backend operation failed: {0}")]
     Backend(#[source] E),
+    /// A bounded native copy failed after its host preparation account accepted.
+    /// Any planner/error payload remains protected until the final cause retires.
+    #[error(transparent)]
+    RetainedBackend(#[from] RetainedSnapshotBackendError<E>),
+    /// Fresh original resume failed after independent host admission. The
+    /// erased original backend/controller cause retains its destination custody.
+    #[error("snapshot resume failed: {0}")]
+    Resume(#[source] BackendFailure),
     /// Portable capture/admission state is not a valid boundary.
     #[error(transparent)]
     Capture(#[from] CaptureError),
@@ -133,6 +475,16 @@ pub enum TextSnapshotError<E: std::error::Error + 'static> {
     /// Configuration lacks a required continuation mechanism or retained admission.
     #[error("unsupported continuation: {0}")]
     Unsupported(&'static str),
+}
+
+impl<E: std::error::Error + 'static> From<TextHostCopyError> for TextSnapshotError<E> {
+    fn from(error: TextHostCopyError) -> Self {
+        match error {
+            TextHostCopyError::Admission(error) => Self::HostAdmission(error),
+            TextHostCopyError::Message(message) => Self::Host(message),
+            TextHostCopyError::Source(source) => Self::HostCopy(source),
+        }
+    }
 }
 
 /// Explicit child admission and logical storage bounds. Future model/host growth
@@ -157,8 +509,9 @@ pub struct TextBranchRequest<'a> {
 /// Independently prepared branch slot. Exchange is serial and moves the previous
 /// installed continuation into this slot; immutable weights stay in one runtime.
 pub struct TextContinuationBranch<B: TextSnapshotBackend, C: TokenFilterController> {
-    continuation: ManagedTextContinuation<B, C>,
     native: B::NativeTextState,
+    // The continuation's final host authority outlives the native slot too.
+    continuation: ManagedTextContinuation<B, C>,
 }
 
 /// Ordinary continuation plus its logical branch-retention ownership. Moving or
@@ -178,6 +531,15 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
             reservation: None,
         }
     }
+    /// Uses the exact continuation source for a shared preparation/delivery
+    /// agreement. Snapshot storage does not create or reset this protocol owner.
+    pub fn finish_text_preparation_cancellable<T,E>(
+        &self,driver:&eredu_core::TextGenerationDriver<'_,B>,
+        stage:eredu_core::run_preparation::TextPreparationStage,local:Result<Option<T>,E>,
+        map_backend:impl FnOnce(eredu_core::BackendFailure)->E,
+    )->Result<Option<T>,E> {
+        driver.finish_text_preparation_cancellable(&self.state,stage,local,map_backend)
+    }
     /// Advances the installed continuation using the existing ordinary driver.
     #[allow(clippy::type_complexity)]
     pub fn advance(
@@ -189,6 +551,18 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     > {
         driver.advance(&mut self.state)
     }
+    /// Advances with the caller's live cancellation token, outside snapshots.
+    #[allow(clippy::type_complexity)]
+    pub fn advance_cancellable(
+        &mut self,
+        driver: &mut eredu_core::TextGenerationDriver<'_, B>,
+        cancellation: &eredu_core::GenerationCancellationToken,
+    ) -> Result<
+        Option<eredu_core::ControlledToken<B::Token>>,
+        eredu_core::TextContinuationError<B::Error, C::Error>,
+    > {
+        driver.advance_cancellable(&mut self.state, cancellation)
+    }
     /// Settles and drains this continuation's bounded record step.
     pub fn take_completed_step(
         &mut self,
@@ -198,6 +572,19 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
         eredu_core::TextContinuationError<B::Error, C::Error>,
     > {
         driver.take_completed_step(&mut self.state)
+    }
+    /// Settles exact completion and moves either legacy or shared capture ownership.
+    /// Shared frames keep their original custody; this adds no allocation or
+    /// authority and never clears an earlier execution or drain failure.
+    /// A failed drain preserves the pending frame for a later delivery attempt.
+    pub fn take_completed_delivery(
+        &mut self,
+        driver: &mut eredu_core::TextGenerationDriver<'_, B>,
+    ) -> Result<
+        Option<eredu_core::capture::CapturedStepDelivery>,
+        eredu_core::TextContinuationError<B::Error, C::Error>,
+    > {
+        driver.take_completed_delivery(&mut self.state)
     }
     /// Lends a completed boundary while retaining this run's branch reservation.
     pub fn boundary<'d, 's>(
@@ -213,7 +600,13 @@ impl<B: eredu_core::TextGenerationBackend, C: TokenFilterController> ManagedText
     pub fn controller(&self) -> &C {
         self.state.controller()
     }
-    /// Mutable constraint queries used by the ordinary facade semantic driver.
+    /// Queries termination through the same core controller without revising
+    /// its bound policy. Errors and internal query mutation remain unchanged;
+    /// no mutable controller, new step or completed boundary is exposed.
+    pub fn controller_is_complete(&mut self) -> Result<bool, C::Error> {
+        self.state.controller_is_complete()
+    }
+    /// Mutably borrows constraint policy, invalidating its previous identity.
     pub fn controller_mut(&mut self) -> &mut C {
         self.state.controller_mut()
     }
@@ -244,16 +637,16 @@ impl<B: TextSnapshotBackend, C: TokenFilterController> TextContinuationBranch<B,
 /// pairs this with its semantic/output/lifecycle checkpoint before exposing a full
 /// generation snapshot. Native state is never serialized or shallow-cloned.
 pub struct TextContinuationSnapshot<B: TextSnapshotBackend, C: TokenFilterController> {
-    driver: eredu_core::TextDriverIdentity,
+    driver: Option<eredu_core::TextDriverIdentity>,
     identity: TextContinuationIdentity,
-    native: B::NativeTextState,
-    sampling: B::SamplingState,
-    pending: Option<PendingTextInput<B::Prompt, B::Token>>,
+    saved: B::SavedTextComponents,
     controller: C,
     remaining_tokens: Option<usize>,
     capture: Option<CaptureCheckpoint>,
     host_bytes: u64,
     _reservation: SnapshotReservation,
+    // Must retire after controller/capture/sampler/pending/native payloads.
+    _host_preparation: HostPreparationAuthority,
 }
 
 impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapshot<B, C> {
@@ -263,7 +656,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
     }
     /// Absolute next decision represented by this reusable snapshot.
     pub fn next_prediction(&self) -> u64 {
-        B::sampling_prediction(&self.sampling)
+        B::saved_sampling_prediction(B::saved_sampling(&self.saved))
     }
 
     /// Immutable canonical constraint state for facade-specific growth facts.
@@ -287,15 +680,13 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         let predictions = max_predictions
             .checked_sub(self.next_prediction())
             .ok_or(TextSnapshotError::InconsistentState)?;
-        let input = B::continuation_input_tokens(
-            self.pending.as_ref().map(PendingTextInput::as_ref),
-            predictions,
-        )
-        .ok_or(ExecutionControlError::UnknownEstimate)?;
-        let native = B::estimate_native_text_growth(runtime, &self.native, input)
+        let saved_sampling = B::saved_sampling(&self.saved);
+        let input = B::saved_input_tokens(saved_sampling, predictions)
+            .ok_or(ExecutionControlError::UnknownEstimate)?;
+        let native = B::estimate_saved_native_growth(runtime, &self.saved, input)
             .map_err(TextSnapshotError::Backend)?
             .ok_or(ExecutionControlError::UnknownEstimate)?;
-        let sampling = B::estimate_sampling_growth(runtime, &self.sampling, predictions)
+        let sampling = B::estimate_saved_sampling_growth(runtime, saved_sampling, predictions)
             .map_err(TextSnapshotError::Backend)?
             .ok_or(ExecutionControlError::UnknownEstimate)?;
         native
@@ -303,19 +694,165 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             .ok_or_else(|| ExecutionControlError::Overflow.into())
     }
 
-    /// Saves a complete ordinary continuation after reserving native, portable
-    /// capture and caller-owned host state. `host_bytes` covers facade semantic/
-    /// output checkpoint storage; the controller supplies its own known estimate.
+    /// Saves an ordinary continuation after acquiring independent backend host
+    /// authority and reserving logical native, capture and caller-owned host
+    /// storage. `host_bytes` covers facade semantic/output checkpoint storage;
+    /// the controller supplies its own logical estimate. Neither estimate proves
+    /// a finite physical bound. Separately exported host state needs its own
+    /// custody from the owning composition.
     pub fn capture(
         boundary: &mut TextContinuationBoundary<'_, '_, B, C>,
         budget: &SnapshotBudget,
         host_bytes: Option<u64>,
     ) -> Result<Self, TextSnapshotError<B::Error>> {
-        let host_bytes = host_bytes.ok_or(ExecutionControlError::UnknownEstimate)?;
+        Self::capture_host(
+            boundary,
+            budget,
+            CallbackHostCopy::new(host_bytes, |_| Ok(())),
+        )
+        .map(|(snapshot, ())| snapshot)
+    }
+
+    /// Copies a borrowed complete host plan inside the same snapshot transaction.
+    /// Logical budget is consumed before either host or native destination copy.
+    /// The ordinary host authority covers construction and failure cleanup; an
+    /// original provider still needs its separately authenticated physical grant.
+    pub fn capture_host<H: PreparedTextHostCopy>(
+        boundary: &mut TextContinuationBoundary<'_, '_, B, C>,
+        budget: &SnapshotBudget,
+        host: H,
+    ) -> Result<(Self, H::Copied), TextSnapshotError<B::Error>> {
+        Self::capture_source(
+            &mut boundary.snapshot_source(),
+            budget,
+            host,
+            SamplingCopyPolicy::Unquoted,
+        )
+    }
+
+    /// Captures an original borrowed source using independent native and host
+    /// copy admission. No ordinary host exclusion or inferred driver identity is
+    /// introduced. Captured/intervened sources require their own bounded host
+    /// checkpoint producer through the complete-generation source hook.
+    pub fn capture_original_host<H: PreparedTextHostCopy>(
+        source: &mut TextSnapshotSource<'_, B, C>,
+        budget: &SnapshotBudget,
+        host: H,
+        limits: WorkspaceCopyLimits,
+    ) -> Result<(Self, H::Copied), TextSnapshotError<B::Error>> {
+        let (runtime, state, pending) = source.parts();
+        let preparation = B::original_saved_generation_preparation_bytes(runtime, state, pending)
+            .map_err(TextSnapshotError::HostAdmission)?
+            .ok_or(TextSnapshotError::Unsupported(
+                "original native copy preparation",
+            ))?;
+        if host
+            .original_preparation_bytes()
+            .is_none_or(|bytes| bytes < preparation)
+        {
+            return Err(TextSnapshotError::Unsupported(
+                "original native preparation storage",
+            ));
+        }
+        let required = Self::original_capture_control_bytes::<H::Copied>()
+            .ok_or(ExecutionControlError::Overflow)?;
+        if host
+            .original_control_bytes()
+            .is_none_or(|bytes| bytes < required)
+        {
+            return Err(TextSnapshotError::Unsupported(
+                "original snapshot host controls",
+            ));
+        }
+        Self::capture_source(source, budget, host, SamplingCopyPolicy::Bounded(limits))
+    }
+
+    /// Fixed capture transaction frames, excluding source-derived host/native
+    /// payloads and provider-owned admission/custody allocations.
+    pub fn original_capture_control_bytes<H>() -> Option<usize> {
+        use std::mem::size_of;
+        [
+            super::PendingSnapshotReservation::control_bytes()?,
+            size_of::<Self>(),
+            size_of::<C>(),
+            size_of::<Option<C>>(),
+            size_of::<TextSnapshotSource<'_, B, C>>(),
+            size_of::<[Option<SnapshotEstimate>; 3]>(),
+            size_of::<Option<[SnapshotEstimate; 3]>>(),
+            size_of::<SnapshotEstimate>(),
+            size_of::<SnapshotReservation>(),
+            size_of::<HostPreparationAuthority>(),
+            size_of::<Option<HostPreparationAuthority>>(),
+            size_of::<SamplingCopyPolicy>(),
+            size_of::<TextSnapshotError<B::Error>>(),
+            size_of::<RetainedSnapshotBackendError<B::Error>>(),
+            BackendFailure::source_retention_peak_bytes::<B::Error>()?,
+            size_of::<Result<(Self, H), TextSnapshotError<B::Error>>>(),
+            size_of::<Result<(H, HostPreparationAuthority), TextHostCopyError>>(),
+            size_of::<Result<B::SavedTextComponents, B::Error>>(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+    }
+
+    fn capture_source<H: PreparedTextHostCopy>(
+        boundary: &mut TextSnapshotSource<'_, B, C>,
+        budget: &SnapshotBudget,
+        host: H,
+        policy: SamplingCopyPolicy,
+    ) -> Result<(Self, H::Copied), TextSnapshotError<B::Error>> {
+        let original = matches!(policy, SamplingCopyPolicy::Bounded(_));
+        let host_bytes = host
+            .storage_bytes()
+            .ok_or(ExecutionControlError::UnknownEstimate)?;
         let identity = boundary.identity();
-        let driver = boundary.driver_identity();
+        let driver = if original {
+            None
+        } else {
+            boundary.driver_identity()
+        };
         let remaining_tokens = boundary.remaining_tokens();
         let (runtime, state, pending) = boundary.parts();
+        let native_estimates = if original {
+            B::original_generation_snapshot_estimates(runtime, state, pending)
+                .ok_or(ExecutionControlError::UnknownEstimate)?
+                .map(Some)
+        } else {
+            [
+                B::estimate_native_text_state(runtime, None).map_err(TextSnapshotError::Backend)?,
+                B::estimate_sampling_state(runtime, B::sampling_state(state))
+                    .map_err(TextSnapshotError::Backend)?,
+                B::estimate_pending_input(runtime, pending).map_err(TextSnapshotError::Backend)?,
+            ]
+        };
+        let host_storage = host_bytes
+            .checked_add(
+                (if original {
+                    boundary.controller().original_snapshot_storage_bytes()
+                } else {
+                    boundary.controller().snapshot_storage_bytes()
+                })
+                .ok_or(ExecutionControlError::UnknownEstimate)?,
+            )
+            .ok_or(ExecutionControlError::Overflow)?;
+        // Validate known estimates before authority acquisition; owned discovery
+        // and estimator metadata below may allocate even though they are cold.
+        combine_estimates(
+            native_estimates,
+            host_storage,
+            0,
+            std::mem::size_of::<Self>(),
+        )?;
+        if original && B::capture_run(state).is_some() {
+            return Err(TextSnapshotError::Unsupported(
+                "original capture checkpoint producer",
+            ));
+        }
+        let preparation = if original {
+            None
+        } else {
+            Some(B::acquire_host_preparation(runtime).map_err(TextSnapshotError::HostPreparation)?)
+        };
         let discovery = B::capture_run(state)
             .map(|_| B::capture_discovery(runtime))
             .transpose()?;
@@ -326,57 +863,90 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             _ => 0,
         };
         let estimate = combine_estimates(
-            [
-                B::estimate_native_text_state(runtime, None).map_err(TextSnapshotError::Backend)?,
-                B::estimate_sampling_state(runtime, B::sampling_state(state))
-                    .map_err(TextSnapshotError::Backend)?,
-                B::estimate_pending_input(runtime, pending).map_err(TextSnapshotError::Backend)?,
-            ],
-            host_bytes
-                .checked_add(
-                    boundary
-                        .controller()
-                        .snapshot_storage_bytes()
-                        .ok_or(ExecutionControlError::UnknownEstimate)?,
-                )
-                .ok_or(ExecutionControlError::Overflow)?,
+            native_estimates,
+            host_storage,
             capture_bytes,
             std::mem::size_of::<Self>(),
         )?;
-        let reservation = budget.reserve(SnapshotResourceKind::Snapshot, Some(estimate))?;
-        // Everything below is admitted. Failures consume copy allowance but do
-        // not change the source or any existing reusable snapshot.
-        let controller = boundary
-            .controller()
-            .fork_snapshot()
-            .map_err(TextSnapshotError::Controller)?;
-        let (runtime, state, pending) = boundary.mechanism_parts();
+        let reservation = budget.reserve_pending(SnapshotResourceKind::Snapshot, Some(estimate))?;
+        // Host exclusion precedes copying; the reservation is logical accounting,
+        // not a finite physical proof. The local guard outlives failure cleanup.
+        // Failures consume copy allowance without changing reusable snapshots.
+        // Declare destination custody first so every copied host/controller
+        // prefix retires before it on each later failure, including ordinary
+        // callbacks whose output relies on this enclosing exclusion authority.
+        let host_preparation;
+        let copied_host;
+        match preparation {
+            Some(authority) => {
+                host_preparation = authority;
+                copied_host = host.copy(estimate.retained_bytes)?;
+            }
+            None => {
+                let (copied, authority) = host.copy_original(estimate.retained_bytes)?;
+                host_preparation = authority;
+                copied_host = copied;
+            }
+        }
+        // The shared reservation Rc is born only while the accepted destination
+        // host account (or ordinary exclusion) covers its exact control layout.
+        let reservation = reservation.publish();
+        let controller = if original {
+            boundary
+                .controller()
+                .fork_original_snapshot()
+                .ok_or(TextSnapshotError::Unsupported("original controller copy"))?
+        } else {
+            boundary
+                .controller()
+                .fork_snapshot()
+                .map_err(TextSnapshotError::Controller)?
+        };
+        let (runtime, state, pending) = boundary.copy_mechanism_parts();
         let capture = match (B::capture_run(state), discovery.as_ref()) {
             (Some(run), Some(discovery)) => Some(run.checkpoint(discovery)?),
             _ => None,
         };
+        if let Some(capture) = &capture {
+            capture.retain_host_preparation(&host_preparation)?;
+        }
         if capture.as_ref().is_some_and(|capture| {
             capture.next_prediction() != B::sampling_prediction(B::sampling_state(state))
         }) {
             return Err(TextSnapshotError::InconsistentState);
         }
-        let pending =
-            B::copy_pending_input(runtime, pending).map_err(TextSnapshotError::Backend)?;
-        let sampling = B::copy_sampling_state(runtime, B::sampling_state(state))
-            .map_err(TextSnapshotError::Backend)?;
-        let native = B::capture_native_text_state(runtime).map_err(TextSnapshotError::Backend)?;
-        Ok(Self {
-            driver,
-            identity,
-            native,
-            sampling,
+        let saved = match B::capture_saved_generation_components_with_host(
+            runtime,
+            state,
             pending,
-            controller,
-            remaining_tokens,
-            capture,
-            host_bytes,
-            _reservation: reservation,
-        })
+            policy,
+            &host_preparation,
+        ) {
+            Ok(saved) => saved,
+            Err(cause) if original => {
+                return Err(TextSnapshotError::RetainedBackend(
+                    RetainedSnapshotBackendError {
+                        cause,
+                        _custody: host_preparation,
+                    },
+                ));
+            }
+            Err(cause) => return Err(TextSnapshotError::Backend(cause)),
+        };
+        Ok((
+            Self {
+                driver,
+                identity,
+                saved,
+                controller,
+                remaining_tokens,
+                capture,
+                host_bytes,
+                _reservation: reservation,
+                _host_preparation: host_preparation,
+            },
+            copied_host,
+        ))
     }
 
     fn copy_estimate(
@@ -384,17 +954,8 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         runtime: &ModelRuntime<B>,
     ) -> Result<SnapshotEstimate, TextSnapshotError<B::Error>> {
         combine_estimates(
-            [
-                B::estimate_native_text_state(runtime, Some(&self.native))
-                    .map_err(TextSnapshotError::Backend)?,
-                B::estimate_sampling_state(runtime, &self.sampling)
-                    .map_err(TextSnapshotError::Backend)?,
-                B::estimate_pending_input(
-                    runtime,
-                    self.pending.as_ref().map(PendingTextInput::as_ref),
-                )
-                .map_err(TextSnapshotError::Backend)?,
-            ],
+            [B::estimate_saved_components(runtime, &self.saved)
+                .map_err(TextSnapshotError::Backend)?],
             self.host_bytes
                 .checked_add(
                     self.controller
@@ -425,43 +986,86 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         self.restore_with(boundary, budget, || Ok(()))
     }
 
-    /// Stages the facade's semantic/cursor copy within the complete reservation,
+    /// Stages the facade's semantic/cursor copy under backend host authority and
+    /// within the logical reservation,
     /// before any native installation. `prepare_host` must preserve its source;
     /// its cost must have been included in the snapshot's `host_bytes`. The
     /// returned host state is installed infallibly by the owning composition.
+    /// Arbitrary `H`, callback exports and error payloads must retain their own
+    /// custody if they can outlive the installed continuation; the callback does
+    /// not receive transferable allocation permission from the logical estimate.
     pub fn restore_with<H>(
         &self,
         boundary: &mut TextContinuationBoundary<'_, '_, B, C>,
         budget: &SnapshotBudget,
         prepare_host: impl FnOnce() -> Result<H, String>,
     ) -> Result<H, TextSnapshotError<B::Error>> {
+        self.restore_host(
+            boundary,
+            budget,
+            CallbackHostCopy::new(Some(self.host_bytes), |_| prepare_host()),
+        )
+    }
+
+    /// Stages the exact borrowed host source before native installation, using
+    /// the same nonrefundable restore reservation and existing exchange worker.
+    /// A prepared plan cannot exceed the host amount retained by this snapshot.
+    /// Its logical estimate conveys no physical allocation authority.
+    pub fn restore_host<H: PreparedTextHostCopy>(
+        &self,
+        boundary: &mut TextContinuationBoundary<'_, '_, B, C>,
+        budget: &SnapshotBudget,
+        host: H,
+    ) -> Result<H::Copied, TextSnapshotError<B::Error>> {
+        let host_bytes = host
+            .storage_bytes()
+            .ok_or(ExecutionControlError::UnknownEstimate)?;
+        if host_bytes > self.host_bytes {
+            return Err(TextSnapshotError::InconsistentState);
+        }
+        if self.driver.is_none() {
+            return Err(TextSnapshotError::Unsupported(
+                "original snapshot fresh resume",
+            ));
+        }
         if boundary.identity() != self.identity {
             return Err(TextSnapshotError::IncompatibleRun);
         }
         let (runtime, state, _) = boundary.parts();
-        B::validate_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
+        B::validate_saved_components(runtime, &self.saved).map_err(TextSnapshotError::Backend)?;
         match (B::capture_run(state), &self.capture) {
             (Some(run), Some(saved)) => run.validate_restore(saved)?,
             (None, None) => {}
             _ => return Err(TextSnapshotError::InconsistentState),
         }
-        let _reservation = budget.reserve(
-            SnapshotResourceKind::Restore,
-            Some(self.copy_estimate(runtime)?),
-        )?;
-        let host = prepare_host().map_err(TextSnapshotError::Host)?;
+        let estimate = self.copy_estimate(runtime)?;
+        let host_preparation =
+            B::acquire_host_preparation(runtime).map_err(TextSnapshotError::HostPreparation)?;
+        let _reservation = budget.reserve(SnapshotResourceKind::Restore, Some(estimate))?;
+        let host = host.copy(estimate.retained_bytes)?;
         let controller = self
             .controller
             .fork_snapshot()
             .map_err(TextSnapshotError::Controller)?;
-        let (runtime, state, _) = boundary.mechanism_parts();
-        let pending =
-            B::copy_pending_input(runtime, self.pending.as_ref().map(PendingTextInput::as_ref))
+        let (runtime, _, _) = boundary.copy_mechanism_parts();
+        let (mut native, sampling, mut pending) =
+            B::prepare_saved_components_resume(runtime, &self.saved)
                 .map_err(TextSnapshotError::Backend)?;
-        let sampling =
-            B::copy_sampling_state(runtime, &self.sampling).map_err(TextSnapshotError::Backend)?;
-        let mut native =
-            B::copy_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
+        // Installation may unwind after a payload has moved into the active
+        // state. Retain first, and keep the local clone until all displaced
+        // payloads retire. This custody does not certify successful settlement.
+        boundary.retain_host_preparation(host_preparation.clone());
+        let (runtime, state, _) = boundary.mechanism_parts();
+        if let Some(run) = B::capture_run(state) {
+            run.retain_host_preparation(&host_preparation)?;
+        }
+        B::rebind_pending_capture(
+            runtime,
+            self.capture.as_ref(),
+            B::capture_run(state),
+            &mut pending,
+        )
+        .map_err(TextSnapshotError::Backend)?;
         let capture_restore = match (B::capture_run_mut(state), &self.capture) {
             (Some(run), Some(saved)) => Some(run.prepare_restore(saved)?),
             (None, None) => None,
@@ -490,9 +1094,12 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
     }
 
     /// Stages complete facade state and optional prospective sampler changes
-    /// under the branch reservation. Preparation receives the independently
+    /// under independent backend host authority and the logical branch
+    /// reservation. Preparation receives the independently
     /// copied child sampler and re-admitted capture owner; it cannot replace the
     /// installed parent continuation. On failure no runnable child is published.
+    /// The owning composition must retain custody for arbitrary `H`, callback
+    /// exports or error payloads that can outlive the returned branch.
     #[allow(clippy::type_complexity)]
     pub fn fork_with<H>(
         &self,
@@ -504,7 +1111,7 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             &mut B::TextGenerationState,
         ) -> Result<H, TextSnapshotError<B::Error>>,
     ) -> Result<(TextContinuationBranch<B, C>, H), TextSnapshotError<B::Error>> {
-        if self.driver != boundary.driver_identity() {
+        if self.driver.as_ref() != Some(&boundary.driver_identity()) {
             return Err(TextSnapshotError::IncompatibleRun);
         }
         if request.session_id.is_empty() || request.max_predictions < self.next_prediction() {
@@ -519,12 +1126,17 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
         let remaining = usize::try_from(request.max_predictions - self.next_prediction())
             .map_err(|_| ExecutionControlError::Overflow)?;
         let (runtime, _, _) = boundary.parts();
-        B::validate_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
+        B::validate_saved_components(runtime, &self.saved).map_err(TextSnapshotError::Backend)?;
         if self.capture.is_none() && request.intervention.is_some() {
             return Err(TextSnapshotError::Unsupported(
                 "adding interventions requires retained request admission geometry",
             ));
         }
+        let mut estimate = self.copy_estimate(runtime)?;
+        let host_preparation =
+            B::acquire_host_preparation(runtime).map_err(TextSnapshotError::HostPreparation)?;
+        // These cold discovery/estimator constructors can own allocated host
+        // metadata, so they must run under the destination's fresh exclusion.
         let discovery = self
             .capture
             .as_ref()
@@ -565,7 +1177,6 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
                 .ok_or(ExecutionControlError::UnknownEstimate)?,
             _ => 0,
         };
-        let mut estimate = self.copy_estimate(runtime)?;
         let extra = host_bytes
             .checked_add(child_bytes)
             .ok_or(ExecutionControlError::Overflow)?;
@@ -585,21 +1196,28 @@ impl<B: TextSnapshotBackend, C: SnapshotTokenController> TextContinuationSnapsho
             })?),
             _ => None,
         };
+        if let Some(capture) = &capture {
+            capture.retain_host_preparation(&host_preparation)?;
+        }
         let controller = self
             .controller
             .fork_snapshot()
             .map_err(TextSnapshotError::Controller)?;
-        let (runtime, _, _) = boundary.mechanism_parts();
-        let pending =
-            B::copy_pending_input(runtime, self.pending.as_ref().map(PendingTextInput::as_ref))
+        let (runtime, _, _) = boundary.copy_mechanism_parts();
+        let (native, sampling, mut pending) =
+            B::prepare_saved_components_resume(runtime, &self.saved)
                 .map_err(TextSnapshotError::Backend)?;
-        let sampling =
-            B::copy_sampling_state(runtime, &self.sampling).map_err(TextSnapshotError::Backend)?;
-        let native =
-            B::copy_native_text_state(runtime, &self.native).map_err(TextSnapshotError::Backend)?;
+        B::rebind_pending_capture(
+            runtime,
+            self.capture.as_ref(),
+            capture.as_ref(),
+            &mut pending,
+        )
+        .map_err(TextSnapshotError::Backend)?;
         let mut generation = B::assemble_generation_state(sampling, capture);
         let host = prepare(runtime, &mut generation)?;
-        let state = boundary.fork_host_state(generation, controller, pending, Some(remaining));
+        let mut state = boundary.fork_host_state(generation, controller, pending, Some(remaining));
+        state.retain_host_preparation(host_preparation);
         Ok((
             TextContinuationBranch {
                 continuation: ManagedTextContinuation {

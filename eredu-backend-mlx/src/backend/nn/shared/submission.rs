@@ -1,6 +1,20 @@
+#[path = "submission/prepared_collectives.rs"]
+mod prepared_collectives;
+pub(crate) use prepared_collectives::control_bytes as value_completion_control_bytes;
 use super::*;
 use crate::backend::submission_recovery::{Recovery, Retention, Status};
+use safemlx::OperationEvent;
+use crate::backend::runtime::distributed::completion::MlxNeuralCommunicationCompletion;
 use std::{cell::Cell, rc::Rc};
+
+mod original;
+pub(crate) use original::{
+    NeuralSubmissionShape, OriginalArraySubmissionCause, OriginalArraySubmissionFailure,
+    OriginalNeuralSubmissionCompletion, OriginalObservationFailure, OriginalObservationSite,
+    OriginalSubmissionFailure, PointwisePreparationFailure, PointwiseSubmissionPlan,
+    PreparedNeuralSubmission, PreparedPointwiseSubmission, SubmissionPreparationCause,
+    SubmissionPreparationError,
+};
 
 struct HostResourceNode {
     values: Vec<Box<dyn Send>>,
@@ -108,12 +122,15 @@ impl MlxNeuralBackend {
                 }
             }
             crate::backend::ordinary_retirement::reclaim();
+            // Dropping retired arrays can enqueue the last physical allocation
+            // owner. Publish that retirement before the next domain admission.
+            safemlx::reclaim_allocation_owners();
         });
     }
 }
 
 struct SubmissionResources {
-    event: RefCell<Option<Rc<Event>>>,
+    event: RefCell<Option<Rc<OperationEvent>>>,
     _arrays: Vec<Array>,
     additional: RefCell<HostResources>,
     children: Cell<usize>,
@@ -172,12 +189,12 @@ impl Drop for ConsumerUnwind<'_> {
 
 /// Exact MLX completion retaining every Rust-side submission resource.
 pub struct MlxSubmissionCompletion {
-    event: Rc<Event>,
+    event: Rc<OperationEvent>,
     retained: Recovery<Rc<SubmissionResources>>,
 }
 
 impl MlxSubmissionCompletion {
-    fn new(event: Event, retained: Recovery<Rc<SubmissionResources>>) -> Self {
+    fn new(event: OperationEvent, retained: Recovery<Rc<SubmissionResources>>) -> Self {
         let event = Rc::new(event);
         *retained.retention().event.borrow_mut() = Some(Rc::clone(&event));
         Self { event, retained }
@@ -291,7 +308,9 @@ impl SubmissionBackend for MlxNeuralBackend {
             children: Cell::new(0),
             failed: Cell::new(false),
         }))?;
-        let event = safemlx::transforms::async_eval_with_event(retained.retention()._arrays.iter());
+        let event = safemlx::transforms::async_eval_with_operation_event(
+            retained.retention()._arrays.iter(),
+        );
         retained.seal();
         let completion = MlxSubmissionCompletion::new(event?, retained);
         completion.check_native_status()?;
@@ -558,10 +577,155 @@ fn collective_completion(
 }
 
 impl CommunicationBackend for MlxNeuralBackend {
+    fn with_expert_inactive_wave<E,F>(source:Option<eredu_nn::workspace::WorkspaceExpertInactiveWave>,
+        context:Option<&Group>,executor:&Stream,run:F)->Result<Result<(),E>,Self::CommunicationError>
+    where F:FnOnce()->Result<(),E>{
+        let Some(context)=context else{return Ok(run());};
+        Self::with_parallel_control_context(context,|bound|{
+            if bound.is_none(){return Ok(run());}
+            let source=source.ok_or_else(||crate::backend::error::Error::Neural(context.model_source_missing()))?;
+            context.original_control_request().ok_or_else(||crate::backend::error::Error::Neural(context.model_source_missing()))?
+                .with_expert_inactive_wave(source,context,executor,run)
+        })?
+    }
+    fn with_expert_provider_wave<E,F>(source:eredu_nn::workspace::WorkspaceExpertProviderWave,
+        context:Option<&Group>,executor:&Stream,run:F)->Result<Result<(),E>,Self::CommunicationError>
+    where F:FnOnce()->Result<(),E>{
+        let Some(context)=context else{return Ok(run());};
+        Self::with_parallel_control_context(context,|bound|{
+            if bound.is_none(){return Ok(run());}
+            context.original_control_request().ok_or_else(||crate::backend::error::Error::Neural(context.model_source_missing()))?
+                .with_expert_provider_wave(source,context,executor,run)
+        })?
+    }
+    fn with_expert_route_region<P,E,F>(source:eredu_nn::workspace::WorkspaceExpertRegionView<'_>,bank:&mut P,
+        input:&MlxTensor,routes:&eredu_nn::GroupSelection<MlxTensor>,context:Option<&Group>,executor:&Stream,run:F)
+        ->Result<Result<eredu_runtime::RoutedExpertTensorParallelOutput<MlxTensor>,E>,Self::CommunicationError>
+    where P:eredu_nn::Parameterized<MlxTensor>,F:FnOnce(&mut P,Option<eredu_runtime::PreparedExpertMovementLoan<'_>>)->Result<eredu_runtime::RoutedExpertTensorParallelOutput<MlxTensor>,E> {
+        let _=(input,routes);
+        let Some(context)=context else{return Ok(run(bank,None));};
+        Self::with_parallel_control_context(context,|bound| {
+            if bound.is_none(){return Ok(run(bank,None));}
+            context.original_control_request().ok_or_else(||crate::backend::error::Error::Neural(context.model_source_missing()))?
+                .with_expert_region(source,bank,context,executor,run)
+        })?
+    }
+    fn with_expert_route_local<P,E,F>(source:eredu_nn::workspace::WorkspaceExpertRegionView<'_>,bank:&mut P,
+        input:&MlxTensor,scores:&MlxTensor,coefficients:&MlxTensor,completed:&eredu_core::ErasedSharedStorageOwner,
+        local_rows:&[usize],context:&Group,executor:&Stream,run:F)
+        ->Result<Result<eredu_runtime::RoutedExpertTensorParallelOutput<MlxTensor>,E>,Self::CommunicationError>
+    where P:eredu_nn::Parameterized<MlxTensor>,F:FnOnce(&mut P)->Result<eredu_runtime::RoutedExpertTensorParallelOutput<MlxTensor>,E> {
+        context.original_control_request().ok_or_else(||crate::backend::error::Error::Neural(context.model_source_missing()))?
+            .with_expert_local(source,bank,input,scores,coefficients,completed,local_rows,context,executor,run)
+    }
+
+    fn prepare_expert_route_input(values: &[i32], source: &eredu_core::ErasedSharedStorageOwner,
+        context: &Group, executor: &Stream)
+        -> Result<Option<MlxTensor>, Self::CommunicationError> {
+        Self::with_parallel_control_context(context, |prepared| {
+            let Some(_) = prepared else { return Ok(None); };
+            context.original_control_request()
+                .ok_or_else(|| crate::backend::error::Error::Neural(context.model_source_missing()))?
+                .prepare_expert_route_input(values, source, context, executor)
+                .map(|value| Some(MlxTensor::from_array(value)))
+        })?
+    }
+
+    fn with_prepared_expert_route_indices<T,E,F>(value:&MlxTensor,context:&Group,
+        executor:&Stream,run:F)->Result<Result<T,E>,Self::CommunicationError>
+    where F:for<'loan> FnOnce(Option<(&'loan[i32],
+        &'loan eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E> {
+        prepared_collectives::expert_input::with_indices(value,context,executor,run)
+    }
+    fn with_prepared_peer_count_consensus<T, E, F>(
+        local: &[i32], group: &Group, context: &Group, executor: &Stream, run: F,
+    ) -> Result<Result<T, E>, Self::CommunicationError>
+    where F: for<'loan> FnOnce(Option<(&'loan [i32],
+        &'loan eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+    {
+        Self::with_parallel_control_context(context, |source| {
+            let Some(_) = source else { return Ok(run(None)); };
+            let projection = context.original_control_request()
+                .ok_or_else(|| crate::backend::error::Error::Neural(context.model_source_missing()))?;
+            projection.with_peer_count_consensus(local, group, context, executor, run)
+        })?
+    }
+    fn with_prepared_peer_count_source<T, E, F>(
+        local: &[i32], group: &Group, context: &Group, executor: &Stream, run: F,
+    ) -> Result<Result<T, E>, Self::CommunicationError>
+    where F: for<'loan> FnOnce(Option<eredu_runtime::PreparedPeerCountLoan<'loan>>) -> Result<T, E> {
+        Self::with_parallel_control_context(context, |source| {
+            let Some(_) = source else { return Ok(run(None)); };
+            let projection = context.original_control_request()
+                .ok_or_else(|| crate::backend::error::Error::Neural(context.model_source_missing()))?;
+            projection.with_peer_count_source(local, group, context, executor, run)
+        })?
+    }
+    fn complete_model_dependencies(values:&[&MlxTensor],context:&Group,executor:&Stream)
+        ->Result<Option<()>,Self::CommunicationError>{
+        prepared_collectives::complete(values,context,executor)
+    }
+    fn submit_prepared_boundary_dependencies(
+        values:&[eredu_runtime::ArchitectureBoundaryValue<MlxTensor>],
+        source:&eredu_runtime::PreparedBoundarySource,route:&CommunicationRouteRealization,
+        context:&Group,executor:&Stream,
+    )->Result<Option<Submission<(),Self::CommunicationCompletion>>,Self::CommunicationError>{
+        let request=context.original_control_request().ok_or_else(||
+            crate::backend::error::Error::Neural(context.model_source_missing()))?;
+        let completion=request.submit_boundary_dependencies(context,values,source,route,executor)?;
+        Ok(Some(Submission{output:(),completion:completion.into()}))
+    }
+
+    fn prepare_boundary_source(prepared:&Group,route:&CommunicationRouteRealization)
+        ->Result<Option<eredu_runtime::PreparedBoundarySource>,eredu_core::BackendFailure>{
+        if let Some(request)=prepared.original_control_request(){
+            return request.prepare_boundary_source(prepared,route).map(Some).map_err(crate::backend::error::Error::into_backend_failure);
+        }
+        if prepared.has_original_parallel() || prepared.has_original_control(){
+            return Err(crate::backend::error::Error::Neural(prepared.model_source_missing()).into_backend_failure());
+        }
+        Ok(None)
+    }
+    fn with_prepared_publication_group<T,E,F>(group:&Group,prepared:&Group,
+        funding:&eredu_nn::workspace::WorkspaceMetadataFunding,executor:&Stream,run:F)
+        ->Result<Result<T,E>,Self::CommunicationError>
+    where F:FnOnce(Option<&Group>)->Result<T,E> {
+        prepared.with_prepared_publication_group(group,funding,executor,run)
+    }
+
+    fn with_parallel_control_context<T,E,F>(prepared:&Group,run:F)
+        ->Result<Result<T,E>,Self::CommunicationError>
+    where F:FnOnce(Option<(&Group,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E>, {
+        if let Some(request)=prepared.original_control_request() {
+            return request.with_context(prepared,run);
+        }
+        if let Some(binding)=prepared.original_control() {
+            return binding.with_context(prepared,run);
+        }
+        if prepared.has_original_parallel() {
+            return Err(crate::backend::error::Error::Neural(prepared.model_source_missing()));
+        }
+        Ok(run(None))
+    }
+    fn with_prepared_control_group<T,E,F>(
+        event:eredu_runtime::replicated_session::ParallelControlEvent,
+        group:&Group,prepared:&Group,funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+        executor:&Stream,run:F,
+    )->Result<Result<T,E>,Self::CommunicationError>
+    where F:FnOnce(Option<&Group>)->Result<T,E>, {
+        match prepared.original_control() {
+            Some(binding)=>binding.with_group(event,group,prepared,funding,executor,run),
+            None=>match prepared.original_control_request() {
+                Some(request)=>request.with_group(event,group,funding,executor,run),
+                None=>Ok(run(None)),
+            },
+        }
+    }
+
     type CommunicationGroup = Group;
     type CommunicationRoute = CommunicationRouteRealization;
-    type CommunicationCompletion = MlxCommunicationCompletion;
-    type CommunicationError = safemlx::error::Exception;
+    type CommunicationCompletion = MlxNeuralCommunicationCompletion;
+    type CommunicationError = crate::backend::error::Error;
 
     fn submit_local_dependencies<'a, I>(
         values: I,
@@ -594,7 +758,7 @@ impl CommunicationBackend for MlxNeuralBackend {
         )?;
         Ok(Submission {
             output: (),
-            completion,
+            completion: completion.into(),
         })
     }
 }
@@ -606,6 +770,29 @@ pub(crate) struct MlxCommunicationTensorMetadata;
 impl eredu_runtime::CommunicationTensorMetadata<MlxNeuralBackend>
     for MlxCommunicationTensorMetadata
 {
+    fn matches_shape_with_funding(&self,tensor:&MlxTensor,shape:&[i32],
+        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
+        ->Result<Option<bool>,eredu_nn::workspace::WorkspaceMetadataFundingError>{
+        let parts=[std::mem::size_of::<(&Self,&MlxTensor,&[i32],&eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+            std::mem::size_of::<Result<Option<bool>,eredu_nn::workspace::WorkspaceMetadataFundingError>>()];
+        funding.reserve_metadata(parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow)?)?;
+        Ok(Some(tensor.as_array().shape()==shape))
+    }
+    fn fixed_metadata_with_funding(&self,tensor:&MlxTensor,
+        funding:&eredu_nn::workspace::WorkspaceMetadataFunding)
+        ->Result<Option<(TensorDtype,usize,Option<usize>)>,eredu_nn::workspace::WorkspaceMetadataFundingError> {
+        use eredu_nn::workspace::WorkspaceMetadataFundingError;
+        let frames=[std::mem::size_of::<(&Self,&MlxTensor,&eredu_nn::workspace::WorkspaceMetadataFunding)>(),
+            std::mem::size_of::<(TensorDtype,usize,Option<usize>)>(),std::mem::size_of::<std::slice::Iter<'_,i32>>(),
+            std::mem::size_of::<Result<Option<(TensorDtype,usize,Option<usize>)>,WorkspaceMetadataFundingError>>()];
+        funding.reserve_metadata(frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
+            .ok_or(WorkspaceMetadataFundingError::Overflow)?)?;
+        let array=tensor.as_array();
+        let elements=array.shape().iter().try_fold(1usize,|count,&dim|usize::try_from(dim).ok().and_then(|dim|count.checked_mul(dim)));
+        Ok(Some((crate::tensor::portable_dtype(array.dtype()),array.ndim(),elements)))
+    }
+
     fn dtype(&self, tensor: &MlxTensor) -> TensorDtype {
         crate::tensor::portable_dtype(tensor.as_array().dtype())
     }
@@ -621,11 +808,15 @@ impl eredu_runtime::CommunicationTensorMetadata<MlxNeuralBackend>
 }
 
 impl SumReductionBackend for MlxNeuralBackend {
+    fn complete_model_sum(value:&MlxTensor,group:&Group,context:&Group,executor:&Stream)
+        ->Result<Option<MlxTensor>,Self::CommunicationError>{
+        prepared_collectives::sum(value,group,context,executor)
+    }
     fn all_reduce_sum(
         value: MlxTensor,
         group: &Group,
         executor: &Stream,
-    ) -> Result<Submission<MlxTensor, MlxCommunicationCompletion>, Self::CommunicationError> {
+    ) -> Result<Submission<MlxTensor, Self::CommunicationCompletion>, Self::CommunicationError> {
         let _setup = group.begin_bounded_setup()?;
         if let Some(setup) = &_setup {
             setup.check()?;
@@ -638,7 +829,7 @@ impl SumReductionBackend for MlxNeuralBackend {
         let completion = collective_completion(input, &output, group, executor, Vec::new())?;
         Ok(Submission {
             output: MlxTensor::from_array(output),
-            completion,
+            completion: completion.into(),
         })
     }
 }
@@ -649,7 +840,7 @@ impl EvenGatherBackend for MlxNeuralBackend {
         axis: usize,
         group: &Group,
         executor: &Stream,
-    ) -> Result<Submission<MlxTensor, MlxCommunicationCompletion>, Self::CommunicationError> {
+    ) -> Result<Submission<MlxTensor, Self::CommunicationCompletion>, Self::CommunicationError> {
         let _setup = group.begin_bounded_setup()?;
         if let Some(setup) = &_setup {
             setup.check()?;
@@ -665,19 +856,23 @@ impl EvenGatherBackend for MlxNeuralBackend {
         let completion = collective_completion(input, &output, group, executor, Vec::new())?;
         Ok(Submission {
             output: MlxTensor::from_array(output),
-            completion,
+            completion: completion.into(),
         })
     }
 }
 
 impl UnevenGatherBackend for MlxNeuralBackend {
+    fn complete_model_gather(value:&MlxTensor,counts:&[usize],axis:usize,group:&Group,
+        context:&Group,executor:&Stream)->Result<Option<MlxTensor>,Self::CommunicationError>{
+        prepared_collectives::gather(value,counts,axis,group,context,executor)
+    }
     fn all_gather_uneven(
         value: MlxTensor,
         counts: &[usize],
         axis: usize,
         group: &Group,
         executor: &Stream,
-    ) -> Result<Submission<MlxTensor, MlxCommunicationCompletion>, Self::CommunicationError> {
+    ) -> Result<Submission<MlxTensor, Self::CommunicationCompletion>, Self::CommunicationError> {
         let _setup = group.begin_bounded_setup()?;
         if let Some(setup) = &_setup {
             setup.check()?;
@@ -701,19 +896,40 @@ impl UnevenGatherBackend for MlxNeuralBackend {
             collective_completion(input, &output, group, executor, vec![counts.to_vec()])?;
         Ok(Submission {
             output: MlxTensor::from_array(output),
-            completion,
+            completion: completion.into(),
         })
     }
 }
 
 impl VariableAllToAllBackend for MlxNeuralBackend {
+    fn complete_prepared_variable_all_to_all(
+        value: &MlxTensor, counts: &CommunicationPeerCounts, axis: usize,
+        matrix: &eredu_runtime::CommunicationPeerMatrix<'_>, group: &Group,
+        context: &Group, executor: &Stream,
+        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+    ) -> Result<Option<MlxTensor>, Self::CommunicationError> {
+        Self::with_parallel_control_context(context, |source| {
+            let Some((_, actual)) = source else { return Ok(None); };
+            if !actual.same_account(funding) {
+                return Err(crate::backend::error::Error::Neural(context.model_source_missing()));
+            }
+            let projection = context.original_control_request()
+                .ok_or_else(|| crate::backend::error::Error::Neural(context.model_source_missing()))?;
+            // The selected transfer owns input readiness. Numerical region
+            // children have already settled and published their outputs; only
+            // the source-declared metadata/local/inactive inputs need another
+            // parent completion before entering the communication child.
+            projection.complete_variable_all_to_all(value.as_array(), counts, axis,
+                matrix, group, context, executor, funding).map(|value| Some(MlxTensor::from_array(value)))
+        })?
+    }
     fn variable_all_to_all(
         value: MlxTensor,
         counts: &CommunicationPeerCounts,
         axis: usize,
         group: &Group,
         executor: &Stream,
-    ) -> Result<Submission<MlxTensor, MlxCommunicationCompletion>, Self::CommunicationError> {
+    ) -> Result<Submission<MlxTensor, Self::CommunicationCompletion>, Self::CommunicationError> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::variable_all_to_all_submission();
         let _setup = group.begin_bounded_setup()?;
@@ -738,7 +954,7 @@ impl VariableAllToAllBackend for MlxNeuralBackend {
                 "variable all-to-all has {} peer counts for group size {}",
                 counts.group_size(),
                 group.size()
-            )));
+            )).into());
         }
         if counts
             .send()
@@ -748,7 +964,7 @@ impl VariableAllToAllBackend for MlxNeuralBackend {
         {
             return Err(safemlx::error::Exception::custom(
                 "variable all-to-all peer count exceeds advertised i32 limit",
-            ));
+            ).into());
         }
         let all_zero = counts
             .send()
@@ -783,7 +999,7 @@ impl VariableAllToAllBackend for MlxNeuralBackend {
             )?;
             return Ok(Submission {
                 output: MlxTensor::from_array(input),
-                completion,
+                completion: completion.into(),
             });
         }
         let output = crate::backend::distributed::all_to_all_v_axis(
@@ -803,7 +1019,7 @@ impl VariableAllToAllBackend for MlxNeuralBackend {
         )?;
         Ok(Submission {
             output: MlxTensor::from_array(output),
-            completion,
+            completion: completion.into(),
         })
     }
 }
@@ -814,7 +1030,19 @@ impl BroadcastBackend for MlxNeuralBackend {
         root: usize,
         group: &Group,
         executor: &Stream,
-    ) -> Result<Submission<MlxTensor, MlxCommunicationCompletion>, Self::CommunicationError> {
+    ) -> Result<Submission<MlxTensor, Self::CommunicationCompletion>, Self::CommunicationError> {
+        if let Some(funding)=group.model_funding() {
+            let frames=[std::mem::size_of::<MlxTensor>(),
+                std::mem::size_of::<Submission<MlxTensor,Self::CommunicationCompletion>>(),
+                std::mem::size_of::<Result<Submission<MlxTensor,Self::CommunicationCompletion>,Self::CommunicationError>>()];
+            funding.reserve_metadata(frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
+                .ok_or(crate::backend::error::Error::WorkspacePlanning(eredu_nn::workspace::WorkspaceMetadataFundingError::Overflow))?)
+                .map_err(crate::backend::error::Error::WorkspacePlanning)?;
+        }
+        if let Some(result)=group.publish_original(value.as_array(),root,executor) {
+            let (output,completion)=result?;
+            return Ok(Submission {output:MlxTensor::from_array(output),completion:completion.into()});
+        }
         let _setup = group.begin_bounded_setup()?;
         if let Some(setup) = &_setup {
             setup.check()?;
@@ -823,7 +1051,7 @@ impl BroadcastBackend for MlxNeuralBackend {
             return Err(safemlx::error::Exception::custom(format!(
                 "broadcast root {root} is outside group size {}",
                 group.size()
-            )));
+            )).into());
         }
         let input = value.into_array();
         #[cfg(test)]
@@ -836,7 +1064,7 @@ impl BroadcastBackend for MlxNeuralBackend {
         let contribution = if group.rank() == root {
             input.clone()
         } else {
-            input.multiply(Array::from_f32(0.0), executor)?
+            input.multiply(Array::try_from_f32(0.0)?, executor)?
         };
         let output = crate::backend::runtime::distributed::all_sum_for(
             eredu_runtime::CommunicationOperation::Broadcast,
@@ -854,7 +1082,7 @@ impl BroadcastBackend for MlxNeuralBackend {
         )?;
         Ok(Submission {
             output: MlxTensor::from_array(output),
-            completion,
+            completion: completion.into(),
         })
     }
 }
@@ -863,7 +1091,7 @@ impl BarrierBackend for MlxNeuralBackend {
     fn barrier(
         group: &Group,
         executor: &Stream,
-    ) -> Result<MlxCommunicationCompletion, Self::CommunicationError> {
+    ) -> Result<Self::CommunicationCompletion, Self::CommunicationError> {
         let _setup = group.begin_bounded_setup()?;
         if let Some(setup) = &_setup {
             setup.check()?;
@@ -882,7 +1110,7 @@ impl BarrierBackend for MlxNeuralBackend {
             vec![group.clone()],
             Vec::new(),
             vec![executor.clone()],
-        )
+        ).map(Into::into).map_err(Into::into)
     }
 }
 
@@ -893,8 +1121,12 @@ impl FailureAgreementBackend for MlxNeuralBackend {
         local_success: bool,
         group: &Group,
         executor: &Stream,
-    ) -> Result<Submission<MlxFailureAgreement, MlxCommunicationCompletion>, Self::CommunicationError>
+    ) -> Result<Submission<MlxFailureAgreement, Self::CommunicationCompletion>, Self::CommunicationError>
     {
+        if let Some(binding)=group.original_control() {
+            let (output,completion)=binding.agree(group,local_success,executor)?;
+            return Ok(Submission{output:output.into_agreement(),completion});
+        }
         let _setup = group.begin_bounded_setup()?;
         if let Some(setup) = &_setup {
             setup.check()?;
@@ -904,7 +1136,7 @@ impl FailureAgreementBackend for MlxNeuralBackend {
                 "failure-agreement group size exceeds the advertised i32 status count",
             )
         })?;
-        let input = Array::from_slice(&[i32::from(local_success)], &[1]);
+        let input = Array::try_from_slice(&[i32::from(local_success)], &[1])?;
         #[cfg(test)]
         trace_partition_collective(
             "agreement",
@@ -922,23 +1154,40 @@ impl FailureAgreementBackend for MlxNeuralBackend {
         let (agreement, completion) = completion.with_failure_agreement(output, member_count);
         Ok(Submission {
             output: agreement,
-            completion,
+            completion: completion.into(),
         })
+    }
+
+    fn agree_success_from_source(local_success:bool,group:&Group,
+        phase:eredu_runtime::DistributedExecutionPhase,executor:&Stream,source:&Group)
+        ->Result<Option<bool>,Self::CommunicationError>{
+        match source.original_control_request(){
+            Some(request)=>request.complete_provider_vote(local_success,group,phase,executor,source),
+            None=>Ok(None),
+        }
     }
 
     fn resolve_failure_agreement(
         output: Self::FailureAgreementOutput,
     ) -> Result<bool, Self::CommunicationError> {
-        output.resolve()
+        output.resolve_neural()
     }
 }
 
 impl PointToPointBackend for MlxNeuralBackend {
+    fn send_receive_prepared(values:eredu_runtime::PreparedBoundaryFrames<MlxTensor>,
+        route:&CommunicationRouteRealization,context:&Group,executor:&Stream)
+        ->Result<Option<Submission<Vec<MlxTensor>,Self::CommunicationCompletion>>,Self::CommunicationError>{
+        let request=context.original_control_request().ok_or_else(||
+            crate::backend::error::Error::Neural(context.model_source_missing()))?;
+        request.transfer_boundary_frames(context,values,route,executor).map(Some)
+    }
+
     fn send_receive(
         values: Vec<RoleExactBoundaryValue<MlxTensor>>,
         route: &CommunicationRouteRealization,
         executor: &Stream,
-    ) -> Result<Submission<Vec<MlxTensor>, MlxCommunicationCompletion>, Self::CommunicationError>
+    ) -> Result<Submission<Vec<MlxTensor>, Self::CommunicationCompletion>, Self::CommunicationError>
     {
         let group = route.group().ok_or_else(|| {
             safemlx::error::Exception::custom(format!(
@@ -972,16 +1221,14 @@ impl PointToPointBackend for MlxNeuralBackend {
         for value in values {
             let (header, tensor) = value.into_parts();
             let input = tensor.into_array();
-            let bytes = input
-                .view_dtype(Dtype::Uint8, executor)?
-                .reshape(&[-1], executor)?;
             let header_len = i32::try_from(header.len()).map_err(|_| {
                 safemlx::error::Exception::custom(
                     "boundary frame header length exceeds MLX dimensions",
                 )
             })?;
-            let header_array = Array::from_slice(&header, &[header_len]);
-            let frame = safemlx::ops::concatenate(&[&header_array, &bytes], executor)?;
+            let header_array = Array::try_from_slice(&header, &[header_len])?;
+            let frame = super::super::boundary_frame::encode(
+                &super::super::boundary_frame::Native(executor), &input, &header_array)?;
             inputs.push(input);
             frames.push(frame);
             expected_headers.push(header);
@@ -1006,8 +1253,8 @@ impl PointToPointBackend for MlxNeuralBackend {
                         "boundary frame header length exceeds MLX indexing",
                     )
                 })?;
-                let received_header = received.try_index_device(0..header_len, executor)?;
-                let payload = decode_boundary_payload(received, header_len, input, executor)?;
+                let (received_header,payload) = crate::backend::nn::boundary_frame::split(
+                    &crate::backend::nn::boundary_frame::Native(executor),received,header_len,input)?;
                 outputs.push(payload);
                 received_headers.push((received_header, expected.clone()));
             }
@@ -1033,7 +1280,7 @@ impl PointToPointBackend for MlxNeuralBackend {
         .with_boundary_headers(received_headers);
         Ok(Submission {
             output: outputs.into_iter().map(MlxTensor::from_array).collect(),
-            completion,
+            completion: completion.into(),
         })
     }
 }
@@ -1047,17 +1294,8 @@ pub(super) fn decode_boundary_payload(
     prototype: &Array,
     executor: &Stream,
 ) -> Result<Array, safemlx::error::Exception> {
-    let bytes = received.try_index_device(header_len.., executor)?;
-    let bytes = if (header_len as usize).is_multiple_of(prototype.item_size()) {
-        bytes
-    } else {
-        // MLX Copy shares storage; byte arithmetic materializes an aligned
-        // output while the received frame remains retained by the completion.
-        bytes.add(Array::from_slice(&[0u8], &[]), executor)?
-    };
-    bytes
-        .view_dtype(prototype.dtype(), executor)?
-        .reshape(prototype.shape(), executor)
+    super::super::boundary_frame::decode(
+        &super::super::boundary_frame::Native(executor), received, header_len, prototype)
 }
 
 impl TransferBackend for MlxNeuralBackend {
@@ -1077,10 +1315,9 @@ impl TransferBackend for MlxNeuralBackend {
             children: Cell::new(0),
             failed: Cell::new(false),
         }))?;
-        let submitted = host.copy_to_array(executor);
+        let submitted = host.copy_to_array_operation(executor);
         retained.seal();
-        let submitted = submitted?;
-        let (weight, event) = submitted.into_parts();
+        let (weight, event) = submitted?;
         let completion = MlxSubmissionCompletion::new(event, retained);
         completion.retain(weight.clone());
         completion.check_native_status()?;
@@ -1099,18 +1336,23 @@ impl TransferBackend for MlxNeuralBackend {
             children: Cell::new(0),
             failed: Cell::new(false),
         }))?;
-        let submitted = HostTransferBuffer::copy_from_array(
+        let submitted = HostTransferBuffer::copy_from_array_operation(
             weight.as_array(),
             HostTransferPolicy::Transfer,
             executor,
         );
         retained.seal();
-        let submitted = submitted?;
-        let (host, event) = submitted.into_parts();
+        let (host, event) = submitted?;
         let host = Arc::new(host.freeze());
         let completion = MlxSubmissionCompletion::new(event, retained);
         completion.retain(Arc::clone(&host));
         completion.check_native_status()?;
         Ok((host, completion))
+    }
+}
+
+impl eredu_runtime::TerminalCommunicationBackend for MlxNeuralBackend {
+    fn mark_terminal_submission(group: &Group) {
+        group.mark_terminal_submission();
     }
 }

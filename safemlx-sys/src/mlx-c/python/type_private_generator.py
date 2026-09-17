@@ -77,6 +77,14 @@ def generate(
         code = code.replace("CTOR_COPY_CODE", ctor_copy_code)
         code = code.replace("SET_CODE", set_copy_code)
 
+    if ctype == "mlx_array":
+        code = code.replace("CTYPE({nullptr})", "CTYPE({nullptr, nullptr})")
+        code = code.replace("CTYPE({new CPPTYPE(s)})", "CTYPE({new CPPTYPE(s), nullptr})")
+        code = code.replace("CTYPE({new CPPTYPE(std::move(s))})", "CTYPE({new CPPTYPE(std::move(s)), nullptr})")
+        code = code.replace("d.ctx = new CPPTYPE(s);", "d.ctx = new CPPTYPE(s);\n    d.prepared_owner = nullptr;")
+        code = code.replace("d.ctx = new CPPTYPE(std::move(s));", "d.ctx = new CPPTYPE(std::move(s));\n    d.prepared_owner = nullptr;")
+        code = code.replace("inline void CTYPE_free_(CTYPE d) {\n  if (d.ctx)",
+            "inline void CTYPE_free_(CTYPE d) {\n  if (d.prepared_owner) {\n    static_cast<mlx::core::PreparedInputArray*>(d.prepared_owner)->destroy();\n  } else if (d.ctx)")
     code = code.replace("CTYPE", ctype)
     code = code.replace("CPPTYPE", using if using else cpptype)
     return code
@@ -108,6 +116,8 @@ if __name__ == "__main__":
     print()
     print('#include "mlx/c/' + short_ctype + '.h"')
     print('#include "' + args.mlx_include + '"')
+    if "mlx_array" in args.ctype.split(";"):
+        print('#include "mlx/prepared_input.h"')
     ctypes = args.ctype.split(";")
     cpptypes = args.cpptype.split(";")
     usings = args.using.split(";")

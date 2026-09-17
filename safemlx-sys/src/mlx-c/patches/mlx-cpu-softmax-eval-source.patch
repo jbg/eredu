@@ -1,0 +1,225 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -66,6 +66,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/scan.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/select.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/softmax.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/softmax_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/logsumexp.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/sort.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/threefry.cpp
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -14,6 +14,7 @@
+ #include "mlx/backend/cpu/unary_storage.h"
+ #include "mlx/backend/cpu/binary_storage.h"
+ #include "mlx/backend/cpu/slice_storage.h"
++#include "mlx/backend/cpu/softmax_storage.h"
+ 
+ namespace mlx::core::cpu {
+ 
+@@ -41,7 +42,8 @@
+   const bool fixed_unary = fixed && cpu::is_unary_eval_primitive(arr);
+   const bool fixed_binary = fixed && cpu::is_binary_eval_primitive(arr);
+   const bool fixed_slice = fixed && cpu::is_slice_eval_primitive(arr);
+-  const bool extended = fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool fixed_softmax = fixed && cpu::is_softmax_eval_primitive(arr);
++  const bool extended = fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -49,7 +51,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_slice
++    const auto failure = fixed_softmax
++        ? submission::GraphConstruction::create_cpu_softmax_eval(*extended_prologue, extended_bank.value)
++        : fixed_slice
+         ? submission::GraphConstruction::create_cpu_slice_eval(*extended_prologue, extended_bank.value)
+         : fixed_distributed
+         ? submission::GraphConstruction::create_cpu_distributed(*extended_prologue, extended_bank.value)
+diff --git a/mlx/backend/cpu/softmax.cpp b/mlx/backend/cpu/softmax.cpp
+--- a/mlx/backend/cpu/softmax.cpp
++++ b/mlx/backend/cpu/softmax.cpp
+@@ -8,6 +8,7 @@
+ #include "mlx/backend/cpu/simd/simd.h"
+ #include "mlx/backend/cpu/exp_f32.h"
+ #include "mlx/primitives.h"
++#include "mlx/backend/cpu/softmax_storage.h"
+ #include "mlx/types/limits.h"
+ 
+ namespace mlx::core {
+@@ -17,18 +18,11 @@
+ using namespace mlx::core::simd;
+ 
+ template <typename T, typename AccT>
+-void softmax(const array& in, array& out, Stream stream) {
+-  auto& encoder = cpu::get_command_encoder(stream);
+-  encoder.set_input_array(in);
+-  encoder.set_output_array(out);
+-
+-  const T* in_ptr = in.data<T>();
+-  T* out_ptr = out.data<T>();
+-
+-  int M = in.shape().back();
+-  int L = in.data_size() / M;
+-
+-  encoder.dispatch([in_ptr, out_ptr, M, L]() mutable {
++struct SoftmaxTask {
++  const T* in_ptr;
++  T* out_ptr;
++  int M,L;
++  void operator()() {
+     constexpr bool same_t = std::is_same_v<T, AccT>;
+     constexpr int N = std::min(max_size<AccT>, max_size<T>);
+ 
+@@ -130,10 +124,34 @@
+         current_out_ptr++;
+       }
+     }
+-  });
++  }
++};
++template <typename T, typename AccT>
++void softmax(const array& in, array& out, Stream stream) {
++  auto& encoder = cpu::get_command_encoder(stream);
++  encoder.set_input_array(in);
++  encoder.set_output_array(out);
++  const T* in_ptr = in.data<T>();
++  T* out_ptr = out.data<T>();
++  int M = in.shape().back();
++  int L = in.data_size() / M;
++  encoder.dispatch(SoftmaxTask<T,AccT>{in_ptr,out_ptr,M,L});
+ }
+ 
+ } // namespace
++
++namespace cpu {
++bool softmax_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  DispatchLayout task;
++  if(!CommandEncoder::dispatch_layout<SoftmaxTask<float,float>>(task))return false;
++  constexpr int N=std::min(simd::max_size<float>,simd::max_size<float>);
++  const size_t controls=sizeof(EvalDispatchStorage)+sizeof(task)+sizeof(out)+
++      sizeof(SoftmaxTask<float,float>)*2+sizeof(float*)*4+sizeof(int)*7+
++      sizeof(size_t)*3+sizeof(float)*20+sizeof(simd::Simd<float,N>)*6+sizeof(bool)*2;
++  if(task.controls>SIZE_MAX-controls)return false;
++  out={task.task_bytes,task.task_alignment,0,task.controls+controls};return true;
++}
++}
+ 
+ void Softmax::eval_cpu(const ArrayVector& inputs, array& out) {
+   assert(inputs.size() == 1);
+diff --git a/mlx/backend/cpu/softmax_storage.cpp b/mlx/backend/cpu/softmax_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/softmax_storage.cpp
+@@ -0,0 +1,79 @@
++#include "mlx/backend/cpu/softmax_storage.h"
++#include "mlx/primitives.h"
++#include "mlx/prepared_input.h"
++#include "mlx/submission.h"
++#include <climits>
++#include <typeinfo>
++namespace mlx::core::cpu {
++namespace {
++bool add(size_t& total,size_t value) noexcept {
++  if(value>size_t(PTRDIFF_MAX)-total)return false;total+=value;return true;
++}
++}
++bool is_softmax_eval_primitive(const array& output) noexcept {
++  return output.has_primitive()&&output.primitive().stream().device==Device::cpu&&
++      typeid(output.primitive())==typeid(Softmax);
++}
++bool softmax_eval_layout(size_t rank,size_t columns,size_t rows,bool tracer,
++    CopyEvalStorage& out) noexcept {
++  if(rank<2||rank>3||!columns||!rows||columns>size_t(INT_MAX)||rows>size_t(INT_MAX)/columns)return false;
++  CopyEvalStorage value;EvalDispatchStorage task;
++  // The existing optional contiguous_copy_cpu owns one backing and its weak
++  // copy task. The direct branch allocates the same single output backing.
++  if(!copy_eval_layout(rank,1,true,tracer,value)||!softmax_dispatch_storage(task))return false;
++  submission::GraphQuota::Request descriptor[5]{};size_t count=0;
++  if(!PreparedInputLeaf::append_array_requests(rank,descriptor,count)||count!=3)return false;
++  // Optional x_copy has one extra direct descriptor; Data is the already
++  // counted copy output, which the final result aliases. rank<=3 is inline.
++  for(size_t i=0;i!=2;++i) {
++    const size_t slot=4+i;
++    value.request_bytes[slot]=std::max(value.request_bytes[slot],descriptor[i].bytes);
++    value.request_alignments[slot]=std::max(value.request_alignments[slot],descriptor[i].alignment);
++    if(!add(value.request_counts[slot],1))return false;
++  }
++  value.request_bytes[9]=task.task_bytes;value.request_alignments[9]=task.task_alignment;
++  value.request_counts[9]=1;
++  const size_t controls=sizeof(value)+sizeof(task)+sizeof(descriptor)+sizeof(count)+
++      sizeof(rank)+sizeof(columns)+sizeof(rows)+sizeof(tracer)+sizeof(out)+
++      sizeof(array)*4+sizeof(ArrayVector)+sizeof(Shape)+sizeof(Strides)+
++      sizeof(std::shared_ptr<Primitive>)+sizeof(Stream)*2+sizeof(array::Flags)+
++      sizeof(size_t)*5+sizeof(const array*)*3+sizeof(const Softmax*)+
++      sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+
++      sizeof(submission::GraphQuota*)+sizeof(submission::GraphConstructionContext)+
++      sizeof(submission::GraphFailure);
++  if(!add(value.named_control_bytes,controls)||!add(value.named_control_bytes,task.controls)||
++      !submission::GraphConstruction::complete_layout(value))return false;
++  out=value;return true;
++}
++bool softmax_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(!is_softmax_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1||
++      output.dtype()!=float32||output.itemsize()!=sizeof(float))return false;
++  const auto& input=output.inputs()[0];
++  if(input.dtype()!=float32||input.itemsize()!=sizeof(float)||input.shape()!=output.shape())return false;
++  const size_t rank=input.ndim();
++  if(rank<2||rank>3)return false;
++  size_t rows=1;
++  for(size_t i=0;i+1<rank;++i) {
++    if(input.shape(i)<=0||rows>size_t(INT_MAX)/size_t(input.shape(i)))return false;
++    rows*=size_t(input.shape(i));
++  }
++  if(input.shape(-1)<=0||!input.data_size()||input.data_size()>size_t(INT_MAX))return false;
++  const size_t columns=input.shape(-1);
++  if(rows>size_t(INT_MAX)/columns||rows*columns!=output.size())return false;
++  // Direct contiguous rows use data_size, while the copy path uses logical
++  // size. Both loop populations must fit the same actual int worker.
++  if(input.flags().contiguous&&input.strides().back()==1&&input.data_size()%columns)return false;
++  return softmax_eval_layout(rank,columns,rows,output.is_tracer(),out);
++}
++}
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_softmax_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record=guard.record();auto* graph=record.graph_quota();auto context=current_graph_construction_context();
++  if(out||!graph||!guard.cpu()||!context.scope||context.worker||context.dispatch!=&record||current_graph_quota()!=graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if(!cpu::softmax_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
++}
++}
+diff --git a/mlx/backend/cpu/softmax_storage.h b/mlx/backend/cpu/softmax_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/softmax_storage.h
+@@ -0,0 +1,11 @@
++#pragma once
++#include "mlx/backend/cpu/copy_storage.h"
++namespace mlx::core::cpu {
++// The existing precise/nonprecise F32 worker is the same source. Other dtypes
++// retain their ordinary path until separately qualified.
++MLX_API bool softmax_dispatch_storage(EvalDispatchStorage&) noexcept;
++MLX_API bool softmax_eval_layout(size_t rank,size_t columns,size_t rows,bool tracer,
++    CopyEvalStorage&) noexcept;
++MLX_API bool is_softmax_eval_primitive(const array&) noexcept;
++MLX_API bool softmax_eval_storage(const array&,CopyEvalStorage&) noexcept;
++}
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -164,6 +164,7 @@
+   static GraphFailure create_cpu_cleanup(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_argpartition(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_softmax_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_slice_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_copy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_unary_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;

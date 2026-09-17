@@ -17,6 +17,64 @@ impl From<eredu_runtime::ParameterBankLoadOptions>
     }
 }
 
+pub(crate) fn neural_observer_error(error: crate::backend::error::Error) -> eredu_nn::Error {
+    if error.is_ordinary_capture_failure() {
+        eredu_nn::Error::backend_retained_source(error)
+    } else {
+        eredu_nn::Error::backend_source(error)
+    }
+}
+fn retained_activation_error(error: crate::backend::error::Error) -> eredu_nn::Error {
+    if error.is_ordinary_capture_failure() {
+        eredu_nn::Error::backend_retained_source(error)
+    } else {
+        eredu_nn::Error::backend_source(RetainedActivationFailure(error))
+    }
+}
+
+// NN's legacy source constructor formats its input. Keep this retained-only
+// boundary bounded without formatting the original observer failure.
+#[derive(Debug)]
+struct RetainedActivationFailure(crate::backend::error::Error);
+impl std::fmt::Display for RetainedActivationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("retained generated activation observation failed")
+    }
+}
+impl std::error::Error for RetainedActivationFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Actual retained callback Arc block plus named NN constructor controls.
+/// Rust 1.98 ArcInner is repr(C, align(2)), two AtomicUsize counters followed by T;
+/// source is pinned with this unit. This excludes String capacity/allocator
+/// overhead and does not claim completeness for arbitrary NN error clones.
+pub(crate) fn retained_observation_error_control_bytes() -> Option<usize> {
+    use std::{
+        alloc::Layout,
+        mem::size_of,
+        sync::{atomic::AtomicUsize, Arc},
+    };
+    let block = Layout::new::<[AtomicUsize; 2]>()
+        .align_to(2)
+        .ok()?
+        .pad_to_align()
+        .extend(Layout::new::<RetainedActivationFailure>())
+        .ok()?
+        .0
+        .pad_to_align()
+        .size();
+    block
+        .checked_add(size_of::<RetainedActivationFailure>())?
+        .checked_add(size_of::<RetainedActivationFailure>())?
+        .checked_add(size_of::<Arc<RetainedActivationFailure>>())?
+        .checked_add(size_of::<Option<Arc<dyn std::error::Error + Send + Sync>>>())?
+        .checked_add(size_of::<eredu_nn::Error>())?
+        .checked_add(size_of::<Result<(), eredu_nn::Error>>())
+}
+
 /// Adapts public MLX-array observation to the neutral tensor/error contract.
 pub(crate) struct NeutralActivationObserver<'a> {
     inner: &'a mut dyn eredu_runtime::ActivationObserver<Array, crate::backend::error::Error>,
@@ -39,6 +97,40 @@ impl<'a> NeutralActivationObserver<'a> {
 impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     for NeutralActivationObserver<'_>
 {
+    fn requires_prepared_traversal(&self) -> bool {
+        self.inner.requires_prepared_traversal()
+    }
+
+    fn requires_sequence_readout(&self) -> bool {
+        self.inner.requires_sequence_readout()
+    }
+    fn original_speculative_capture(&self) -> Option<eredu_runtime::capture::OriginalSpeculativeCaptureInvocation<'_>> { self.inner.original_speculative_capture() }
+    fn retain_original_speculative_capture(&mut self, capture: eredu_core::speculative::SpeculativeActivationCapture) -> Result<(), eredu_runtime::capture::CaptureProtocolError> { self.inner.retain_original_speculative_capture(capture) }
+    fn admitted_prefill_capture(
+        &self,
+    ) -> Option<&eredu_runtime::working_memory::AdmittedPrefillCapture<'_>> {
+        self.inner.admitted_prefill_capture()
+    }
+    fn admitted_capture_continuation(
+        &self,
+    ) -> Option<&eredu_runtime::working_memory::AdmittedCaptureContinuation<'_>> {
+        self.inner.admitted_capture_continuation()
+    }
+    fn ordinary_prefill_capture(&self) -> Option<&eredu_runtime::capture::OrdinaryPrefillCapture> {
+        self.inner.ordinary_prefill_capture()
+    }
+    fn supports_prefill_spans(&self) -> bool {
+        self.inner.supports_prefill_spans()
+    }
+    fn supports_prefill_context(&self) -> bool {
+        self.inner.supports_prefill_context()
+    }
+    fn begin_prefill_context(&mut self, frontier: u64) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .begin_prefill_context(frontier)
+            .map_err(neural_observer_error)
+    }
+
     fn routed_unit_observer(
         &mut self,
         path: &str,
@@ -47,7 +139,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
         let Some(observer) = self
             .inner
             .routed_unit_observer(path)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(neural_observer_error)?
         else {
             self.routed_path = None;
             self.routed_invocation_active = false;
@@ -64,6 +156,50 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     fn transactional(&self) -> bool {
         self.inner.transactional()
     }
+    fn begin_prefill_chunk(
+        &mut self,
+        chunk: &eredu_runtime::prefill::PrefillChunk,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .begin_prefill_chunk(chunk)
+            .map_err(neural_observer_error)
+    }
+    fn finish_prefill(&mut self, committed: bool) {
+        self.inner.finish_prefill(committed);
+    }
+    fn requires_prefill_opening_state(&self) -> bool {
+        self.inner.requires_prefill_opening_state()
+    }
+    fn prepare_prefill_chunk_with_opening(
+        &mut self,
+        context: &eredu_runtime::inspection::PrefillChunkRetentionContext<'_>,
+        opening: &eredu_runtime::inspection::PrefillOpeningState<'_, crate::MlxTensor>,
+    ) -> Result<Option<eredu_runtime::inspection::PreparedPrefillChunkRetention>, eredu_nn::Error>
+    {
+        opening.with_tensor_adapter(crate::MlxTensor::as_array, |opening| {
+            self.inner
+                .prepare_prefill_chunk_with_opening(context, opening)
+                .map_err(retained_activation_error)
+        })
+    }
+    fn prepare_prefill_chunk_retention(
+        &mut self,
+        context: &eredu_runtime::inspection::PrefillChunkRetentionContext<'_>,
+    ) -> Result<Option<eredu_runtime::inspection::PreparedPrefillChunkRetention>, eredu_nn::Error>
+    {
+        self.inner
+            .prepare_prefill_chunk_retention(context)
+            .map_err(retained_activation_error)
+    }
+    fn retire_prefill_chunk_retention(
+        &mut self,
+        settled: eredu_runtime::inspection::SettledPrefillChunkRetention,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .retire_prefill_chunk_retention(settled)
+            .map_err(retained_activation_error)
+    }
+
     fn prepare_transaction(
         &mut self,
         epoch: eredu_core::DistributedCommitEpoch,
@@ -71,7 +207,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     ) -> Result<(), eredu_nn::Error> {
         self.inner
             .prepare_transaction(epoch, pass)
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(neural_observer_error)
     }
     fn coordinate_transaction(
         &mut self,
@@ -79,7 +215,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     ) -> Result<(), eredu_nn::Error> {
         self.inner
             .coordinate_transaction(epoch)
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(neural_observer_error)
     }
     fn complete_transaction(
         &mut self,
@@ -87,7 +223,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     ) -> Result<(), eredu_nn::Error> {
         self.inner
             .complete_transaction(epoch)
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(neural_observer_error)
     }
     fn finish_transaction(&mut self, epoch: eredu_core::DistributedCommitEpoch, committed: bool) {
         self.inner.finish_transaction(epoch, committed)
@@ -100,7 +236,26 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     {
         self.inner
             .routing_control(path, rows)
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(neural_observer_error)
+    }
+
+    fn routing_unmodified_interest(&self, path: &str) -> eredu_runtime::RoutingUnmodifiedInterest {
+        self.inner.routing_unmodified_interest(path)
+    }
+    fn routing_unmodified(
+        &mut self,
+        path: &str,
+        effective: eredu_runtime::RoutingDecision<'_, crate::MlxTensor>,
+    ) -> Result<(), eredu_nn::Error> {
+        self.inner
+            .routing_unmodified(
+                path,
+                eredu_runtime::RoutingDecision {
+                    ids: effective.ids.as_array(),
+                    coefficients: effective.coefficients.as_array(),
+                },
+            )
+            .map_err(neural_observer_error)
     }
 
     fn routing_applied(
@@ -121,7 +276,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
                     coefficients: effective.coefficients.as_array(),
                 },
             )
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(neural_observer_error)
     }
 
     fn routing_failed(&mut self, path: &str, message: &str) {
@@ -131,7 +286,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     fn observe(&mut self, path: &str, value: &crate::MlxTensor) -> Result<(), eredu_nn::Error> {
         self.inner
             .observe(path, value.as_array())
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(neural_observer_error)
     }
     fn observe_replica(
         &mut self,
@@ -140,7 +295,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
     ) -> Result<(), eredu_nn::Error> {
         self.inner
             .observe_replica(path, value.as_array())
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(neural_observer_error)
     }
 
     fn observe_generated(
@@ -156,7 +311,31 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
                     .map(crate::MlxTensor::into_array)
                     .map_err(crate::backend::error::Error::from)
             })
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(neural_observer_error)
+    }
+
+    fn observe_generated_retained(
+        &mut self,
+        path: &str,
+        prototype: &crate::MlxTensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<
+            crate::MlxTensor,
+            eredu_nn::Error,
+        >,
+    ) -> Result<(), eredu_nn::Error> {
+        let mut mapped = eredu_nn::MappedGeneratedTensorFactory::new(
+            factory,
+            crate::MlxTensor::as_array,
+            crate::MlxTensor::into_array,
+            crate::backend::error::Error::from,
+            |_: &crate::backend::error::Error| {
+                eredu_nn::Error::backend_source(eredu_nn::GeneratedTensorRetentionSignal)
+            },
+        );
+        self.inner
+            .observe_generated_retained(path, prototype.as_array(), source, &mut mapped)
+            .map_err(retained_activation_error)
     }
 
     fn intervene(
@@ -167,7 +346,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
         self.inner
             .intervene(path, value.as_array())
             .map(|value| value.map(crate::MlxTensor::from_array))
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(neural_observer_error)
     }
 
     fn observe_routing(
@@ -189,7 +368,7 @@ impl eredu_runtime::ActivationObserver<crate::MlxTensor, eredu_nn::Error>
                 combined_output: routing.combined_output.map(crate::MlxTensor::as_array),
                 expert_count: routing.expert_count,
             })
-            .map_err(eredu_nn::Error::backend_source)
+            .map_err(neural_observer_error)
     }
 }
 
@@ -206,7 +385,7 @@ impl eredu_runtime::RoutedUnitObserver<crate::MlxTensor> for NeutralActivationOb
         match self
             .inner
             .routed_unit_observer(path)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(neural_observer_error)?
         {
             Some(observer) => observer.begin_invocation(&eredu_runtime::RoutedUnitInvocation {
                 input: invocation.input.as_array(),
@@ -225,7 +404,7 @@ impl eredu_runtime::RoutedUnitObserver<crate::MlxTensor> for NeutralActivationOb
         match self
             .inner
             .routed_unit_observer(path)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(neural_observer_error)?
         {
             Some(observer) => observer.finish_invocation(success),
             None => Ok(()),
@@ -245,7 +424,7 @@ impl eredu_runtime::RoutedUnitObserver<crate::MlxTensor> for NeutralActivationOb
         match self
             .inner
             .routed_unit_observer(path)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(neural_observer_error)?
         {
             Some(observer) => observer.observe(&batch.map_tensors(crate::MlxTensor::as_array)),
             None => Ok(()),
@@ -262,7 +441,7 @@ impl eredu_runtime::RoutedUnitObserver<crate::MlxTensor> for NeutralActivationOb
         match self
             .inner
             .routed_unit_observer(path)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(neural_observer_error)?
         {
             Some(observer) => observer
                 .intervene(&batch.map_tensors(crate::MlxTensor::as_array))
@@ -281,7 +460,7 @@ impl eredu_runtime::RoutedUnitObserver<crate::MlxTensor> for NeutralActivationOb
         match self
             .inner
             .routed_unit_observer(path)
-            .map_err(eredu_nn::Error::backend_source)?
+            .map_err(neural_observer_error)?
         {
             Some(observer) => {
                 observer.observe_effective(&batch.map_tensors(crate::MlxTensor::as_array))
@@ -393,3 +572,7 @@ mod expert_selection_tests {
 #[cfg(test)]
 #[path = "tests/neutral_observer.rs"]
 mod neutral_observer_tests;
+
+#[cfg(test)]
+#[path = "tests/retained_generated_factory.rs"]
+mod retained_generated_factory_tests;

@@ -28,20 +28,20 @@ impl Producers {
 
     pub(super) fn admit(
         self,
-        plan: Arc<AdmittedCapturePlan>,
+        plan: crate::capture::CapturePlanSource,
         context: PartitionCaptureContext,
         world: usize,
         limits: PartitionCaptureReceiptLimits,
         quota: &mut CaptureQuota,
     ) -> Result<PartitionCaptureReceiptPlan, PartitionCaptureMergeError> {
         match self {
-            Self::Dense(producers) => {
-                PartitionCaptureReceiptPlan::new(plan, context, producers, world, limits, quota)
-            }
-            Self::Sum(producers) => {
-                PartitionCaptureReceiptPlan::new_sum(plan, context, producers, world, limits, quota)
-            }
-            Self::Routed(producers) => PartitionCaptureReceiptPlan::new_routed(
+            Self::Dense(producers) => PartitionCaptureReceiptPlan::new_source(
+                plan, context, producers, world, limits, quota,
+            ),
+            Self::Sum(producers) => PartitionCaptureReceiptPlan::new_sum_source(
+                plan, context, producers, world, limits, quota,
+            ),
+            Self::Routed(producers) => PartitionCaptureReceiptPlan::new_routed_source(
                 plan, context, producers, world, limits, quota,
             ),
         }
@@ -153,7 +153,7 @@ impl CaptureSession {
     {
         self.prepare_partition_work(
             transport,
-            Arc::clone(&self.plan),
+            self.plan.clone(),
             PartitionCaptureKey::Observation(index),
             index,
             Producers::Routed(producers),
@@ -262,14 +262,14 @@ impl CaptureSession {
         let coefficients = backend
             .shape(source.source.coefficients)
             .map_err(CaptureExecutionError::Backend)?;
-        let next = add(end, coefficients.first().copied().unwrap_or(0))?;
+        let next=eredu_core::capture::PartitionRoutedUnitCaptureLayout::advance_native_rows(
+            rows,end,source.source.token_offset,coefficients.first().copied().unwrap_or(0))
+            .map_err(|cause|match cause {eredu_core::capture::RoutedUnitValidationError::Overflow=>CaptureError::Overflow,
+                _=>invalid("sparse chunk changed its invocation geometry or dtype")})?;
         if backend.source_dtype(source.source.values) != work.source_dtype
             || groups != [rows, width]
             || coefficients.len() != 2
             || coefficients[1] != width
-            || source.source.token_offset != end
-            || next <= end
-            || next > rows
         {
             return Err(invalid("sparse chunk changed its invocation geometry or dtype").into());
         }
@@ -388,22 +388,7 @@ fn validate_invocation(
     units: &eredu_core::component::ComponentCoordinateMap,
     origins: Option<eredu_core::capture::RoutedUnitOrigins<'_>>,
 ) -> Result<(), CaptureError> {
-    let bank = geometry(receipt)?;
-    if units != owned.coordinates.units()
-        || rows > owned.maximum_source_rows(receipt.global_shape[0], bank.routes_per_token)?
-        || match origins {
-            Some(origins) => {
-                owned.source_peer.is_none()
-                    || origins.row_count() as u64 != rows
-                    || origins.peer_count() as u64 != owned.source_peers
-                    || origins.routes_per_token() as u64 != bank.routes_per_token
-            }
-            None => owned.source_peer.is_some() || rows != receipt.global_shape[0],
-        }
-    {
-        return Err(invalid(
-            "actual sparse invocation differs from retained ownership",
-        ));
-    }
-    Ok(())
+    eredu_core::capture::PartitionRoutedUnitCaptureLayout {
+        geometry: geometry(receipt)?, source_tokens: receipt.global_shape[0], ownership: owned,
+    }.validate_invocation(rows, units, origins)
 }

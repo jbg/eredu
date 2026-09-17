@@ -26,6 +26,10 @@ typedef struct mlx_vector_array_ {
   void* ctx;
 } mlx_vector_array;
 mlx_vector_array mlx_vector_array_new(void);
+/* Managed header and named native controls of new/append/concatenate/free.
+ * ArrayVector element backing is separately owned by the active Graph bank.
+ * Zero means an unqualified native standard-library layout. */
+size_t mlx_vector_array_control_bytes(void);
 int mlx_vector_array_set(mlx_vector_array* vec, const mlx_vector_array src);
 int mlx_vector_array_free(mlx_vector_array vec);
 mlx_vector_array mlx_vector_array_new_data(const mlx_array* data, size_t size);

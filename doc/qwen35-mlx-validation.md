@@ -5,6 +5,24 @@ Qwen hybrid admission supports the MLX-VLM SafeTensors layout used by
 and GGUF layouts. The converted layout is selected from the tensor catalog,
 not the repository name or quantization bit width.
 
+## Current validation scope
+
+The converted-checkpoint results below retain their 2026-09-12 scope. Later
+[official Qwen released-checkpoint evidence](validation/bounded-public-qwen-2026-09-16.json)
+closes selected resident ordinary/managed/controlled parity at 5 through 3,000
+prompt positions, independent prefill/cached-decode score comparisons, automatic
+smaller-chunk admission and refusal before execution. These use the separately
+pinned official artifact; they do not add a new converted-BF16/8-bit comparison.
+
+At 3,000 positions, recorded managed 128-position chunks use about 4.81 GB of MLX
+peak allocations versus 22.43 GB for an ordinary full chunk; ordinary 128-position
+chunking also uses about 4.81 GB. Managed admission bounds and observed process
+footprints have separate scopes; none of these measurements establishes a total
+process-memory ceiling. Selective readout preserves full sequence demand where
+required. The broader applicable family/path integration remains open in the
+[current bounded-inference record](bounded-inference.md#current-integration-status).
+Historical source-freeze limitations below are not current implementation status.
+
 ## Compatibility behavior
 
 - `language_model.model.*` and `vision_tower.*` bind to canonical text and
@@ -76,13 +94,15 @@ Add `--layerwise-host` for the host-windowed run, or
 `--dense-disk-stream --device-budget-bytes 1073741824 --host-budget-bytes 0
 --dense-host-lookahead 0 --dense-background-queue 0` for the disk-streamed run.
 
-`chat_probe` writes successful ordinary and semantic reports, then exits with
-the existing composite-executable controlled-session rejection:
+In the recorded 2026-09-12 run, `chat_probe` wrote successful ordinary and
+semantic reports, then exited with the composite-executable rejection:
 `complete native state copying is unavailable for this executable`.
-This checkpoint-layout change does not implement composite native state
-copying. Controlled/snapshot/fork validation for this released model therefore
-remains unavailable; ordinary generation and the reference comparison above
-succeed. Released image/video and native distributed execution were not run.
+That checkpoint-layout change did not implement composite native state copying.
+This record contains no later controlled/snapshot/fork rerun of the converted
+released checkpoint. Ordinary generation and the reference comparison above
+succeeded; released image/video and native distributed execution were not run.
+Later implementation and selected official-checkpoint validation are recorded in
+the [current integration status](bounded-inference.md#current-integration-status).
 
 ## Regression coverage
 
@@ -113,3 +133,32 @@ cargo test -p eredu --no-default-features \
   --test portable_facade --test backend_conformance
 cargo test -p eredu-cli --features metal
 ```
+
+
+## Selected neutral parallel prefill boundary coverage
+
+The source-staged `selected_qwen_hybrid_parallel_prefill_` cases use the existing
+nonzero reduced conditional Qwen hybrid fixture and actual selected TP/PP
+construction, independently of the released checkpoint results above. They
+compare shared `SessionPrefill` run/step execution across resident, host-windowed
+and disk-streamed mechanisms, the uneven 2/2/1 prompt schedule, three cached
+decodes and complete local KV/recurrent/convolution state. A rank-zero-only
+cancellation after the first delivered span must stop every rank at the exact
+independently executed two-token prefix, without intermediate vocabulary work
+or later source/model calls. See `doc/bounded-inference.md` for the focused
+command and assertion scope. These new cases are unexecuted at source freeze;
+they do not extend released-checkpoint, media, native-distributed or persisted
+snapshot validation.
+
+
+### Neutral retained media span follow-on
+
+The ordinary selected conditional-Qwen and Qwen VL retained-ingress unit adds six neutral `reference_numeric::media_prefill` cases. They use actual selected nonzero checkpoint binders and shared drivers, with encoder/DeepStack retention, cut-inside-media and ordered image/video/projected inputs, full and last-row readout, all local state, run/step, resident/host/disk, TP/PP/combined, cancellation and cached checkpoint rollback. Executed results appear in the central validation records. This adds no released-checkpoint or native MLX claim and does not replace the pinned validation above.
+
+At that source freeze, native retained-media adoption was held pending complete original input/source/control/graph and future-root completion admission. Ordinary prefix decode and funded prompt-end authority remain distinct; no budget or quote is refilled. Subsequent selected native media results and remaining obligations are in the [current integration record](bounded-inference.md#current-integration-status).
+
+### Original encoder-table validation obligations
+
+The first B3 source unit extends the genuine I/A/B path for conditional Qwen and Qwen VL with checked encoder tables and shared native interpolation/rotary execution. New selected fixtures compare full mutable state and three cached decodes in all three weight residencies, and reuse the existing completion probe for cancellation before work and at committed spans before/inside media. A mixed raw-image/video/projected numerical fixture compares direct and retained assembly. These tests are authored but not executed by the source author.
+
+The Metal diagnostic fixtures require actual hardware availability, finite selected native numerical-buffer/complete first-interval bounds, preserved future roots, unknown propagation for an injected missing rotary fact, and typed error/final-owner retirement. CPU native rotary parity is an explicitly ignored test to invoke centrally with its recorded command. No hardware result or released-checkpoint revalidation is claimed here. At that source freeze, original no-encoder admission, other-family populations, distributed original diagnostics and complete B3/C/D/E managed activation were outstanding. This historical obligation list does not override the [current integration record](bounded-inference.md#current-integration-status).

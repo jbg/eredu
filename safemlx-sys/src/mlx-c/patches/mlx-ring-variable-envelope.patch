@@ -1,0 +1,281 @@
+diff --git a/mlx/backend/cpu/distributed_storage.cpp b/mlx/backend/cpu/distributed_storage.cpp
+--- a/mlx/backend/cpu/distributed_storage.cpp
++++ b/mlx/backend/cpu/distributed_storage.cpp
+@@ -91,17 +91,17 @@
+       sizeof(GroupWorkerOperation)+sizeof(int)+sizeof(size_t)*4+sizeof(bool)+
+       sizeof(GroupTensorLayout)+sizeof(std::optional<GroupTensorLayout>)+
+       sizeof(std::span<const int>)+sizeof(Dtype)+sizeof(size_t)*4+
+-      VariableAllToAllGeometry::inspection_controls() + sizeof(VariableAllToAllPlan) * 2 +
++      VariableAllToAllGeometry::inspection_controls() + VariableAllToAllEnvelope::inspection_controls() + sizeof(VariableAllToAllPlan) * 2 +
+       sizeof(submission::GraphVector<size_t>) * 3 + sizeof(submission::GraphAllocator<size_t>) * 3 +
+       GraphConstruction::layout_control_bytes();
+ }
+ bool prepare_storage(const Group& group,const GroupTensorLayout& input,
+     GroupWorkerOperation operation,int peer,size_t output_rank,size_t input_bytes,
+     size_t output_bytes,bool tracer,size_t inspection_controls,CpuDistributedStorage& out,
+-    const VariableAllToAllGeometry* variable=nullptr) noexcept {
++    const VariableAllToAllGeometry* variable=nullptr, const VariableAllToAllEnvelope* envelope=nullptr) noexcept {
+   const bool receive=operation==GroupWorkerOperation::recv;
+   const bool send=operation==GroupWorkerOperation::send;
+-  const bool gather=operation==GroupWorkerOperation::gather || variable;
++  const bool gather=operation==GroupWorkerOperation::gather || variable || envelope;
+   const size_t inputs=receive?0:1;
+   CpuDistributedStorage value;
+   value.operation=operation;value.peer=peer;
+@@ -111,6 +111,9 @@
+   if (variable) {
+     if (operation != GroupWorkerOperation::variable || tracer ||
+         !group.variable_storage(input, variable->matrix(), variable->transposed(), dispatch, value.communication)) return false;
++  } else if (envelope) {
++    if (operation != GroupWorkerOperation::variable || tracer ||
++        !group.variable_envelope_storage(input, envelope->output_rows(), dispatch, value.communication)) return false;
+   } else if (!group.dispatch_storage(operation,input,peer,dispatch) ||
+       !group.worker_storage(operation,input,peer,value.communication)) return false;
+   submission::CpuEvalCleanupLayout cleanup;
+@@ -156,9 +159,9 @@
+   }
+   // Dispatch owns its matrix independently of the primitive. This allocation
+   // occurs on the CPU encoding thread under this exact fixed Eval bank.
+-  if (variable) {
++  if (variable || envelope) {
+     size_t matrix_bytes;
+-    if (!multiply(variable->matrix().size(), sizeof(size_t), matrix_bytes) ||
++    if (!multiply(variable ? variable->matrix().size() : envelope->matrix_entries(), sizeof(size_t), matrix_bytes) ||
+         !append(value,8,matrix_bytes,alignof(size_t),1)) return false;
+   }
+   value.communication_worker_graph_extent=value.communication.task_graph_extent;
+@@ -298,6 +301,19 @@
+       input.nbytes(),source->output_bytes(),false,cpu_distributed_source_inspection_controls(group),out,&*source);
+ #endif
+ }
++bool cpu_distributed_variable_envelope_storage(const Group& group, const GroupTensorLayout& input,
++    size_t maximum_receive_rows, CpuDistributedStorage& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  GroupConstructorStorage constructor;
++  if (!variable_envelope_constructor_storage(group, input, maximum_receive_rows, constructor) ||
++      constructor.primitives != 1 || constructor.input_edges != 1) return false;
++  const auto source = VariableAllToAllEnvelope::checked(input, group.size(), group.rank(), maximum_receive_rows);
++  return source && prepare_storage(group,input,GroupWorkerOperation::variable,0,input.ndim(),
++      input.nbytes(),source->output_bytes(),false,cpu_distributed_source_inspection_controls(group),out,nullptr,&*source);
++#endif
++}
+ } // namespace mlx::core::distributed
+ 
+ namespace mlx::core::submission {
+diff --git a/mlx/backend/cpu/distributed_storage.h b/mlx/backend/cpu/distributed_storage.h
+--- a/mlx/backend/cpu/distributed_storage.h
++++ b/mlx/backend/cpu/distributed_storage.h
+@@ -31,4 +31,6 @@
+     GroupWorkerOperation, int peer, CpuDistributedStorage&) noexcept;
+ MLX_API bool cpu_distributed_variable_source_storage(const Group&, const GroupTensorLayout&,
+     std::span<const size_t>, bool transposed, CpuDistributedStorage&) noexcept;
++MLX_API bool cpu_distributed_variable_envelope_storage(const Group&, const GroupTensorLayout&,
++    size_t maximum_receive_rows, CpuDistributedStorage&) noexcept;
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/constructor.cpp b/mlx/distributed/constructor.cpp
+--- a/mlx/distributed/constructor.cpp
++++ b/mlx/distributed/constructor.cpp
+@@ -29,14 +29,14 @@
+       sizeof(GroupWorkerOperation) + sizeof(int) * 3 + sizeof(size_t) * 9 + sizeof(bool) * 4 +
+       sizeof(GroupTensorLayout)+sizeof(std::optional<GroupTensorLayout>)+
+       sizeof(std::span<const int>)+sizeof(Dtype)+sizeof(size_t)*4+
+-      VariableAllToAllGeometry::inspection_controls() + sizeof(VariableAllToAllPlan) * 2 +
++      VariableAllToAllGeometry::inspection_controls() + VariableAllToAllEnvelope::inspection_controls() + sizeof(VariableAllToAllPlan) * 2 +
+       GraphConstruction::layout_control_bytes() +
+       // Shared exact-source helper, optional resident association and lexical
+       // restoration guard. These are controls, not added native capacity.
+       GraphConstruction::distributed_resident_loan_control_bytes();
+ }
+ static bool constructor_storage_impl(const Group&, const GroupTensorLayout&,
+-    GroupWorkerOperation, int, const VariableAllToAllGeometry*, GroupConstructorStorage&) noexcept;
++    GroupWorkerOperation, int, const VariableAllToAllGeometry*, GroupConstructorStorage&, const VariableAllToAllEnvelope* = nullptr) noexcept;
+ bool constructor_storage(const Group& group, const array& input,
+     GroupWorkerOperation operation, int peer, GroupConstructorStorage& out) noexcept {
+   const auto layout=GroupTensorLayout::checked(input);
+@@ -54,14 +54,19 @@
+   const auto source = VariableAllToAllGeometry::checked(input, group.size(), group.rank(), matrix, transposed);
+   return source && constructor_storage_impl(group, input, GroupWorkerOperation::variable, 0, &*source, out);
+ }
++bool variable_envelope_constructor_storage(const Group& group, const GroupTensorLayout& input,
++    size_t maximum_receive_rows, GroupConstructorStorage& out) noexcept {
++  const auto envelope = VariableAllToAllEnvelope::checked(input, group.size(), group.rank(), maximum_receive_rows);
++  return envelope && constructor_storage_impl(group, input, GroupWorkerOperation::variable, 0, nullptr, out, &*envelope);
++}
+ static bool constructor_storage_impl(const Group& group, const GroupTensorLayout& input,
+     GroupWorkerOperation operation, int peer, const VariableAllToAllGeometry* variable,
+-    GroupConstructorStorage& out) noexcept {
++    GroupConstructorStorage& out, const VariableAllToAllEnvelope* envelope) noexcept {
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+   if (group.terminal_submission() ||
+-      (variable ? operation != GroupWorkerOperation::variable : static_cast<unsigned>(operation) > 5)) return false;
++      ((variable || envelope) ? operation != GroupWorkerOperation::variable : static_cast<unsigned>(operation) > 5)) return false;
+   GroupStorageInventory inventory;
+   // Only these concrete implementations have the qualified scalar rank/size
+   // readers. Requested backend and geometry never qualify another native type.
+@@ -77,7 +82,7 @@
+   // Reject overflowing output geometry before ordinary all_gather multiplies
+   // its leading signed extent. Zero-dimensional gather produces [members].
+   for (size_t i = 0; i < input.ndim(); ++i) {
+-    const auto dimension = variable && i == 0 ? int(variable->output_rows()) : input.shape()[i];
++    const auto dimension = i == 0 && (variable || envelope) ? int(variable ? variable->output_rows() : envelope->output_rows()) : input.shape()[i];
+     if (dimension < 0 || !multiply(value.output_elements,size_t(dimension),value.output_elements)) return false;
+   }
+   if (operation == GroupWorkerOperation::gather && members > 1) {
+@@ -125,8 +130,8 @@
+     value.request_bytes[4]=sizeof(array);
+     value.request_alignments[4]=alignof(array);
+     value.request_counts[4]=value.input_edges;
+-    if (variable) {
+-      if (!multiply(variable->matrix().size(), sizeof(size_t), value.request_bytes[7])) return false;
++    if (variable || envelope) {
++      if (!multiply(variable ? variable->matrix().size() : envelope->matrix_entries(), sizeof(size_t), value.request_bytes[7])) return false;
+       value.request_alignments[7] = alignof(size_t); value.request_counts[7] = 1;
+       value.named_control_bytes += sizeof(VariableAllToAllPlan) * 2 +
+           sizeof(submission::GraphVector<size_t>) * 3 + sizeof(GraphAllocator<size_t>) * 3;
+diff --git a/mlx/distributed/constructor.h b/mlx/distributed/constructor.h
+--- a/mlx/distributed/constructor.h
++++ b/mlx/distributed/constructor.h
+@@ -14,4 +14,6 @@
+ MLX_API size_t constructor_storage_inspection_controls() noexcept;
+ MLX_API bool variable_constructor_storage(const Group&, const GroupTensorLayout&,
+     std::span<const size_t>, bool transposed, GroupConstructorStorage&) noexcept;
++MLX_API bool variable_envelope_constructor_storage(const Group&, const GroupTensorLayout&,
++    size_t maximum_receive_rows, GroupConstructorStorage&) noexcept;
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
+--- a/mlx/distributed/distributed.cpp
++++ b/mlx/distributed/distributed.cpp
+@@ -276,6 +276,11 @@
+ bool Group::variable_storage(const GroupTensorLayout& input, std::span<const size_t> matrix,
+     bool transposed, GroupDispatchStorage& dispatch, GroupWorkerStorage& worker) const noexcept {
+   return group_ && group_->variable_storage(input, matrix, transposed, dispatch, worker);
++}
++
++bool Group::variable_envelope_storage(const GroupTensorLayout& input, size_t maximum_receive_rows,
++    GroupDispatchStorage& dispatch, GroupWorkerStorage& worker) const noexcept {
++  return group_ && group_->variable_envelope_storage(input, maximum_receive_rows, dispatch, worker);
+ }
+ 
+ size_t Group::worker_storage_inspection_controls() const noexcept {
+diff --git a/mlx/distributed/distributed.h b/mlx/distributed/distributed.h
+--- a/mlx/distributed/distributed.h
++++ b/mlx/distributed/distributed.h
+@@ -113,6 +113,8 @@
+   // Complete borrowed matrix for the actual retained implementation's worker.
+   bool variable_storage(const GroupTensorLayout&, std::span<const size_t>, bool transposed,
+       GroupDispatchStorage&, GroupWorkerStorage&) const noexcept;
++  bool variable_envelope_storage(const GroupTensorLayout&, size_t maximum_receive_rows,
++      GroupDispatchStorage&, GroupWorkerStorage&) const noexcept;
+ 
+   int rank() const;
+   int size() const;
+diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
+--- a/mlx/distributed/distributed_impl.h
++++ b/mlx/distributed/distributed_impl.h
+@@ -49,6 +49,8 @@
+       GroupWorkerStorage&) const noexcept { return false; }
+ 
+   virtual bool variable_storage(const GroupTensorLayout&, std::span<const size_t>, bool,
++      GroupDispatchStorage&, GroupWorkerStorage&) const noexcept { return false; }
++  virtual bool variable_envelope_storage(const GroupTensorLayout&, size_t,
+       GroupDispatchStorage&, GroupWorkerStorage&) const noexcept { return false; }
+   virtual void all_to_all_v_prepared(const array&, array&,
+       const VariableAllToAllGeometry&, Stream) {
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -604,21 +604,31 @@
+   }
+ 
+   bool variable_storage(const GroupTensorLayout& input, std::span<const size_t> matrix,
+-      bool transposed, GroupDispatchStorage& dispatch_out,
+-      GroupWorkerStorage& worker_out) const noexcept override {
++      bool transposed, GroupDispatchStorage& dispatch,
++      GroupWorkerStorage& worker) const noexcept override {
++    const auto source = VariableAllToAllGeometry::checked(input, size_, rank_, matrix, transposed);
++    return source && variable_storage_impl(*source, dispatch, worker);
++  }
++  bool variable_envelope_storage(const GroupTensorLayout& input, size_t maximum_receive_rows,
++      GroupDispatchStorage& dispatch, GroupWorkerStorage& worker) const noexcept override {
++    const auto source = VariableAllToAllEnvelope::checked(input, size_, rank_, maximum_receive_rows);
++    return source && variable_storage_impl(*source, dispatch, worker);
++  }
++  template<class Geometry> bool variable_storage_impl(const Geometry& source,
++      GroupDispatchStorage& dispatch_out, GroupWorkerStorage& worker_out) const noexcept {
+     if (size_ <= 1 || rank_ < 0 || rank_ >= size_ || sockets_right_.empty() ||
+         sockets_right_.size() != sockets_left_.size()) return false;
+-    const auto source = VariableAllToAllGeometry::checked(input, size_, rank_, matrix, transposed);
+     GroupDispatchStorage dispatch;
+     GroupWorkerStorage worker;
+     WorkerStorageCounter counter;
+-    if (!source || !dispatch_layout<VariableDispatch>(dispatch)) return false;
+-    for (size_t distance = 1; distance < source->members(); ++distance) {
+-      if (!counter.vector<char>(source->hop_bytes(distance, 0))) return false;
++    if (!dispatch_layout<VariableDispatch>(dispatch)) return false;
++    for (size_t distance = 1; distance < source.members(); ++distance) {
++      if (!counter.vector<char>(source.hop_bytes(distance, 0))) return false;
+       for (size_t hop = 1; hop <= distance; ++hop)
+-        if (!counter.sockets(4) || !counter.vector<char>(source->hop_bytes(distance, hop))) return false;
++        if (!counter.sockets(4) || !counter.vector<char>(source.hop_bytes(distance, hop))) return false;
+     }
+     if (!counter.finish(VariableAllToAllGeometry::inspection_controls() +
++        VariableAllToAllEnvelope::inspection_controls() +
+         sizeof(VariableDispatch) * 2 + sizeof(VariablePacketHeader) * 2 + sizeof(SocketFuture) * 4 +
+         sizeof(submission::GraphVector<char>) * 2 + sizeof(submission::GraphAllocator<char>) * 2 +
+         sizeof(submission::GraphQuotaRef) + sizeof(size_t) * 15 + sizeof(void*) * 4, worker)) return false;
+diff --git a/mlx/distributed/variable_plan.h b/mlx/distributed/variable_plan.h
+--- a/mlx/distributed/variable_plan.h
++++ b/mlx/distributed/variable_plan.h
+@@ -2,9 +2,48 @@
+ 
+ #include "mlx/distributed/tensor_layout.h"
+ #include "mlx/graph_quota.h"
++#include <algorithm>
+ 
+ namespace mlx::core::distributed {
+ class VariableAllToAllPlan;
++
++// Descriptive global row ceilings for storage inspection only. It has no count
++// matrix and cannot be passed to the prepared variable constructor or worker.
++class VariableAllToAllEnvelope {
++ public:
++  static std::optional<VariableAllToAllEnvelope> checked(
++      const GroupTensorLayout& input, int members, int rank,
++      size_t maximum_receive_rows) noexcept {
++    if (members <= 1 || rank < 0 || rank >= members || !input.ndim() ||
++        maximum_receive_rows > size_t(INT_MAX)) return std::nullopt;
++    const size_t world = size_t(members);
++    if (world > size_t(PTRDIFF_MAX) / sizeof(size_t) / world) return std::nullopt;
++    size_t row_bytes = input.itemsize();
++    for (size_t axis = 1; axis < input.ndim(); ++axis) {
++      const size_t dimension = size_t(input.shape()[axis]);
++      if (dimension && row_bytes > size_t(PTRDIFF_MAX) / dimension) return std::nullopt;
++      row_bytes *= dimension;
++    }
++    const size_t sent = size_t(input.shape()[0]);
++    if (row_bytes && (sent > size_t(PTRDIFF_MAX) / row_bytes ||
++        maximum_receive_rows > size_t(PTRDIFF_MAX) / row_bytes)) return std::nullopt;
++    return VariableAllToAllEnvelope(world, maximum_receive_rows,
++        maximum_receive_rows * row_bytes, std::min(sent, maximum_receive_rows) * row_bytes);
++  }
++  size_t members() const noexcept { return members_; }
++  size_t output_rows() const noexcept { return output_rows_; }
++  size_t output_bytes() const noexcept { return output_bytes_; }
++  size_t matrix_entries() const noexcept { return members_ * members_; }
++  size_t hop_bytes(size_t, size_t) const noexcept { return packet_bytes_; }
++  static constexpr size_t inspection_controls() noexcept {
++    return sizeof(VariableAllToAllEnvelope) * 2 + sizeof(std::optional<VariableAllToAllEnvelope>) +
++        sizeof(GroupTensorLayout) + sizeof(size_t) * 8 + sizeof(int) * 2 + sizeof(bool) * 3;
++  }
++ private:
++  VariableAllToAllEnvelope(size_t members, size_t rows, size_t bytes, size_t packet) noexcept
++      : members_(members), output_rows_(rows), output_bytes_(bytes), packet_bytes_(packet) {}
++  size_t members_, output_rows_, output_bytes_, packet_bytes_;
++};
+ 
+ // Borrowed complete semantic count matrix. No native ownership, caller bytes,
+ // capacities or communication permission are encoded by this checked geometry.

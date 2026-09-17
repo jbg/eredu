@@ -16,19 +16,20 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             .text
             .layer_policy(index)
             .ok_or_else(|| Error::backend("missing Gemma 4 layer policy"))?;
-        let mask = if forward.mask.is_none() && hidden.dim(1) > 1 {
-            Some(B::causal_mask(
-                hidden.dim(1),
-                forward.position_offset,
-                policy
-                    .attention
-                    .window()
-                    .map(|window| window.get() as i32 - 1),
-                context,
-            )?)
-        } else {
-            None
-        };
+        // Full attention uses the absolute prefix. Sliding attention instead
+        // consumes its actual visible cache history in Attention::attend; a
+        // prefix-wide mask cannot broadcast after that history was truncated.
+        let mask =
+            if forward.mask.is_none() && hidden.dim(1) > 1 && policy.attention.window().is_none() {
+                Some(B::causal_mask(
+                    hidden.dim(1),
+                    forward.position_offset,
+                    None,
+                    context,
+                )?)
+            } else {
+                None
+            };
         let per_layer_input = forward
             .per_layer_inputs
             .as_ref()

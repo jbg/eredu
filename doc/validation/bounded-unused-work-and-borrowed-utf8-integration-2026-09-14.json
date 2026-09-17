@@ -1,0 +1,254 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T10:48:49.143135+00:00",
+  "scope": "Cancellation of original never-exposed funding and borrowed complete UTF8 through the shared parser",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-original-decoder-source-bridge-integration-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 586,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 393,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 234,
+      "ignored": 2
+    },
+    "portable": {
+      "passed": 26,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1239,
+  "new_tests": [
+    {
+      "check": "runtime",
+      "name": "unused_scopes_return_the_same_account_capacity_and_activation_keeps_its_count",
+      "path": "eredu-runtime/src/working_memory/funding/tests/prepared_scope.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "unused_scope_retires_its_real_borrowed_and_zero_byte_sources_after_unlock_even_on_unwind",
+      "path": "eredu-runtime/src/working_memory/funding/tests/prepared_scope.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "unused_cancellation_cannot_clear_sibling_quarantine_and_poison_preserves_every_pin",
+      "path": "eredu-runtime/src/working_memory/funding/tests/prepared_scope.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_control_guard_checks_unexposed_scope_and_same_scope_after_activation",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/preparation.rs"
+    },
+    {
+      "check": "session",
+      "name": "unused_busy_work_returns_original_budget_for_repeated_exact_capacity_admissions",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/preparation/tests/unused_work.rs"
+    },
+    {
+      "check": "session",
+      "name": "panic_after_native_begin_before_funding_exposure_cancels_only_unused_scope",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/preparation/tests/unused_work.rs"
+    },
+    {
+      "check": "session",
+      "name": "activated_original_work_keeps_actual_native_validation_error_and_ordinary_cleanup",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/preparation/tests/unused_work.rs"
+    },
+    {
+      "check": "session",
+      "name": "dropping_exposed_unresolved_work_keeps_canonical_quarantine_after_child_retirement",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/preparation/tests/unused_work.rs"
+    },
+    {
+      "check": "facade",
+      "name": "complete_utf8_fragments_lend_input_without_retaining_scratch",
+      "path": "eredu/src/runtime/generation/streaming.rs"
+    }
+  ],
+  "new_test_count": 9,
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib working_memory:: -- --test-threads=1",
+      "started_utc": "2026-09-14T10:44:34.587395+00:00",
+      "elapsed_seconds": 19.778,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-runtime.log",
+      "log_sha256": "b04b72a4df250bb2654b6a63c82fa69de92c1285ffd5083ac17fa4611d13d395"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T10:44:54.366611+00:00",
+      "elapsed_seconds": 123.684,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-session.log",
+      "log_sha256": "d0b43c8789a3dfee376e77aaa5afa232d50beed3de94e2109ab1d0598d298151"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib -- --test-threads=1",
+      "started_utc": "2026-09-14T10:46:58.052810+00:00",
+      "elapsed_seconds": 43.987,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-facade.log",
+      "log_sha256": "264a5e7d202b6c91e3bbc9d13d619b5ee9178f05e9f20f7f6d0098ac8c6b82a8"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade",
+      "started_utc": "2026-09-14T10:47:42.040613+00:00",
+      "elapsed_seconds": 15.103,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-portable.log",
+      "log_sha256": "8a3b718f58300bba6a5f58097029413538d0d45c5bac487651b57cd9ecd260df"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T10:47:57.144579+00:00",
+      "elapsed_seconds": 15.76,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-minimal.log",
+      "log_sha256": "d02f610a7f01fdc75cbad89be5becd1f40800ee5d592f2d1993270b93f2526ce"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T10:48:12.905189+00:00",
+      "elapsed_seconds": 16.641,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-features.log",
+      "log_sha256": "c704eb6820e616b44588f3dba8fb0875c23890bb760e6fef51952da636678c6d"
+    }
+  },
+  "source_sha256": {
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/preparation.rs": "9e5e1756e0337eb7aedf14a6013ae08c22a2ca8c4f86ede391ca50ef8ceff889",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote.rs": "9495e011b9704abc729f2ea3ba01a47d1c93cb6466c6783fb0abb3f03abe8c3b",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/preparation/tests.rs": "0a40bf9c0c6779d0b069045514ddc9974bd36a7d93643dc8f09e1871b3d753b3",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding.rs": "48fac9693d9e03f73053a72db4655b74ae06d934136f1ed932ad3551bff3c17e",
+    "eredu-runtime/src/working_memory.rs": "a5aae4d89827e03a042ded3894fe12b4fcb350a148a57bac1ae8217ae3a46d06",
+    "eredu-runtime/src/working_memory/funding/tests.rs": "13eec3f32d256f8f85fe1decdd9e45140fc9ceb1a5e983a64c9944655d55ca8a",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/preparation/tests/unused_work.rs": "1c754f9198867942c865ceb997eeaf701e61c07c49e598f985b4a8ac0b15a0cc",
+    "eredu-runtime/src/working_memory/funding/tests/prepared_scope.rs": "540f21aed026b8c5e021a5d3b39acf4952808d293bd252976e80cbc4a669e1a2",
+    "doc/backend-architecture.md": "dbceae9c549fd39ddf0f817d70939e59adbdb304a18cb9a9f778242f889cc3b7",
+    "eredu-runtime/src/working_memory/funding.rs": "e86c3f65f034e8006bfc586dc586114568153c8b7230b5cafc29032f7878c56d",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/prepared.rs": "9ead759d3d4ff0788c26f7a142a69f0344cf8844e51d4a13a5cbd371b2aeb306",
+    "doc/bounded-inference.md": "bd3d1ca6ce4ba27bcddb7f8343eb682ed90f621e3df2a925a5aa32d8bd52796c",
+    "eredu/src/runtime/generation/streaming.rs": "1291d5315066b19570c36b7dd48fcb190e028b53982c306c89f7ff437fdfcd84",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/preparation.rs": "4a7eff49439178653f9c4184ad5ea200edae66de2716c68c2e7236cb8de95991",
+    "eredu-runtime/src/working_memory/residual/span_workspace/text_controls.rs": "35c8f2a65ede0dd83060751161e7ac3716ce05b9b7d9c5c8cb4908e47e637d1f",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/mechanisms/opening_sources/rows.rs": "97641bc8401f7b537f8f932b888c504f820b093bf5e4708b93abc7e00c447a95",
+    "eredu-runtime/src/working_memory/funding/prepared_scope.rs": "4d850dda6327af48fabccba7f13a0cb29f56fd2656cecbe51e4c33d27356bfd2"
+  },
+  "source_snapshot": "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-original-decoder-source-bridge-integration-2026-09-14.json": "bd7885822f18e6b283ebb03d99999f1e342d4674e4dd836aa4d82ceb4e887060",
+    "/private/tmp/eredu-borrowed-utf8-review-sha256.json": "c93a48015b50b580247241307c1311e2fddfe4998b7c48c3f43ba03821e9fb2d",
+    "/private/tmp/eredu-borrowed-utf8-review.md": "279e6702bea0139b0c62126ed93b29b86a68677378ea6f2f453e9cbec24283db",
+    "/private/tmp/eredu-borrowed-utf8-stage/AUDIT.md": "c6ed0e2ad584d92d90a08ee64843832b4a627d8c710d255bd88222131c15bcc5",
+    "/private/tmp/eredu-borrowed-utf8-stage/artifact-hashes.json": "e50941f31bc55ccace79cf96fef4b799842635df073083a44b0f79562490a1c2",
+    "/private/tmp/eredu-borrowed-utf8-stage/change.patch": "8b0fc4968c7563f0dfba6c78e278ba9e1f8e2bb3f98b810d3c12119908870dda",
+    "/private/tmp/eredu-borrowed-utf8-stage/doc-additions.json": "4097d7428da377427c25e3fccdb08212586ba4e02e7e19a5d702c44a1d2517c4",
+    "/private/tmp/eredu-borrowed-utf8-stage/manifest.json": "90851c11928f661e611334684331962fad1030e61cc338241a371d77e2926013",
+    "/private/tmp/eredu-borrowed-utf8-stage/new-tests.json": "d5224650bcdce55c9c8f5b86a8ebab3b28d1debcc067eaff9aeda2f3a1120892",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-applied.json": "28375502b63294c4bce0f589161215e4e015c7db44cbea2ca4e31726b1e89b7a",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-apply.py": "ff5e02e64c64ab235b08892a88899a7b62de2464859f9d8c9e5191ed2bbfa6f4",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-checks.json": "0e69f2a4a35b077815e944d1b496a74571307ff2252f04473cfa598c7e5fc99d",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-doc-applied.json": "dfcaeec916c8e928e3703c18939817fdd0e54b5de23073c3455111bff113157e",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-facade.log": "264a5e7d202b6c91e3bbc9d13d619b5ee9178f05e9f20f7f6d0098ac8c6b82a8",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-features.log": "c704eb6820e616b44588f3dba8fb0875c23890bb760e6fef51952da636678c6d",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-minimal.log": "d02f610a7f01fdc75cbad89be5becd1f40800ee5d592f2d1993270b93f2526ce",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-portable.log": "8a3b718f58300bba6a5f58097029413538d0d45c5bac487651b57cd9ecd260df",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-review.json": "774cca8aaf64aec527ba80afbea61e2c878c5956773fefd2dcc81993ab203ab4",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-root-review.json": "26c8b73c9931b93b9fc75d055938b080166b682e3855b726e9c71e1e54bb2886",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-runtime.log": "b04b72a4df250bb2654b6a63c82fa69de92c1285ffd5083ac17fa4611d13d395",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-session.log": "d0b43c8789a3dfee376e77aaa5afa232d50beed3de94e2109ab1d0598d298151",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-spec.json": "1151f28b13a3d7bcab230be9ffdf5ea3f70cdfdf5849f7da3f79c9deb0ffa8ed",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-stage/all.patch": "cc14d496796d87ca70e815706c7bbe71e6b4e3b243ed62ec497ab2c211728c77",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-stage/change.patch": "2f0cd902cc32dd60f0948765bc26a4cc3150cb479e087440b74758e28030534e",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-stage/manifest.json": "28375502b63294c4bce0f589161215e4e015c7db44cbea2ca4e31726b1e89b7a",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-stage/staged-hashes.json": "b7db168ab4bf5a69fac0942742efb799eaedef647b01353621851d1da93a423b",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-validate.py": "83b0fca0d67f8cf9cec6e24989dee4a337b06cd1e638d707e41d1b03f7af7ccd",
+    "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-validation-config.json": "2deaf12ca8d9509430fe20ca764a3bcce03c78d2e0463b44066401ba3c5387a6",
+    "/private/tmp/eredu-unused-work-scope-doc-additions.json": "7d0c940e3eeab723870f2d6f74a9c0a08d56834d1c87010e09f866a468c655a8",
+    "/private/tmp/eredu-unused-work-scope-final-root-review.json": "c45fc65bd60d66fc2c884cbd96ae6a6ca1de0139faf55ac49bf7baf6c0956f4e",
+    "/private/tmp/eredu-unused-work-scope-review-checks.json": "eedde613e962601d098cb4fa1ed546f8deb71b7f307d4ff1b81d77700525b63c",
+    "/private/tmp/eredu-unused-work-scope-review-sha256.json": "439e4ae181e70995396c3b33db5b1b7244f4265c30b0ca24fbc02b1ee3083f6b",
+    "/private/tmp/eredu-unused-work-scope-review.md": "f114a24d04c16f064c7eff84c464530035abcaa203044b918727bc7cc907dff2",
+    "/private/tmp/eredu-unused-work-scope-stage/AUDIT.md": "8f178f882149f5319aed07f6dc50f3e174037d1630443b5f962953eb7364e1c6",
+    "/private/tmp/eredu-unused-work-scope-stage/CHECKS.json": "d509a976286eb8ba371e0f516821eb917221d85c5902bcdbd16deab744cfd365",
+    "/private/tmp/eredu-unused-work-scope-stage/FROZEN.json": "4d0c91aa9376c04c40255b7f95fde96a49730879e1745f37c90c68674ab25021",
+    "/private/tmp/eredu-unused-work-scope-stage/PRICING.md": "4c00ec101e37480fab73280319480a4801ab783155b7abdbc6b0bca1439b6eba",
+    "/private/tmp/eredu-unused-work-scope-stage/README.md": "fdf04f70a5bf16414caffaa81bb58c972f5caae65f83b170d5ea0a1ffced304e",
+    "/private/tmp/eredu-unused-work-scope-stage/TESTS.json": "87e02b06f14c58b6609461dbd21509caa699f199d6fd5fbf37b93cee7b0478ee",
+    "/private/tmp/eredu-unused-work-scope-stage/artifact-hashes.json": "b8108dd38d08e8fec6b7b28e9ecb374abbcd855e1b09ddc8fb09892ea14e9f92",
+    "/private/tmp/eredu-unused-work-scope-stage/base-origins.json": "5cc317221ff0398e99d3b1368519371a5348ca6317c697988b528875fefbf2ac",
+    "/private/tmp/eredu-unused-work-scope-stage/change.patch": "564457baba0e5481193f3d935a6e2404db1ebd10349af4e62923654283378359",
+    "/private/tmp/eredu-unused-work-scope-stage/dependency-hashes.json": "48e651e3d66e3b7778aa09403887d88cb646246f0308be17e5466b8566818ab0",
+    "/private/tmp/eredu-unused-work-scope-stage/full-manifest.json": "107380187cce783a694b6e412c43a4f72bf0e58f80ed8d295f6d10d7ae585dbf",
+    "/private/tmp/eredu-unused-work-scope-stage/full.patch": "fa13823fcf1f6ad20527df09634f7d5bcf5da75b4db04f7649e0b93d540dea24",
+    "/private/tmp/eredu-unused-work-scope-stage/manifest.json": "2d8602c6682b355ef738b229feac7f8a5faedc04281af04b708e9b996d408e72",
+    "/private/tmp/eredu-unused-work-scope-stage/merge-ledger.json": "1faa324cab626ae795b358e35c99a380f4c4168eca363e6cf385f82bc9108a4b",
+    "/private/tmp/eredu-unused-work-scope-stage/package.py": "fe464e509bf7f66977be7c975f9766e853dcc88567e2ff8ab65c98a748e156b6",
+    "/private/tmp/eredu-unused-work-scope-stage/rebase_unused_work_on_decoder.py": "d9c1160ebf69d7c1b4cd43be76706112b84d30b0b26b1445b7e83d929c696fe3",
+    "/private/tmp/eredu-unused-work-scope-stage/source-basis-hashes.json": "48e9fe8f03b5f1450b6c97bd325da38b211ec8d3ccbbbd17baf5b187ee1ccb07",
+    "/private/tmp/eredu-unused-work-scope-stage/write_unused_work_docs.py": "8edf4655d252f923d9fe95ff3b0dc7b1dc0c9ecc443f48a3cbb1a8b2d79f0e17"
+  },
+  "review": {
+    "full_manifest_sha256": "b7db168ab4bf5a69fac0942742efb799eaedef647b01353621851d1da93a423b",
+    "full_patch_sha256": "cc14d496796d87ca70e815706c7bbe71e6b4e3b243ed62ec497ab2c211728c77",
+    "patch_sha256": "2f0cd902cc32dd60f0948765bc26a4cc3150cb479e087440b74758e28030534e",
+    "replay": "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-stage/replay",
+    "review": "Root read full1148-line untouched-Work source patch, all8 introduced tests, pricing/audit/docs and independent review; verified141 artifacts,74 basis,21 dependencies,148 independent archive entries,14/16 replay and formatting. Root authored and independently reviewed one-file UTF8 Cow change; exact source replay and9 review archive pins verified. All15 source baselines match corrected decoder integration. No production blocker.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-original-decoder-source-bridge-integration-2026-09-14.json": "bd7885822f18e6b283ebb03d99999f1e342d4674e4dd836aa4d82ceb4e887060",
+      "/private/tmp/eredu-borrowed-utf8-review-sha256.json": "c93a48015b50b580247241307c1311e2fddfe4998b7c48c3f43ba03821e9fb2d",
+      "/private/tmp/eredu-borrowed-utf8-review.md": "279e6702bea0139b0c62126ed93b29b86a68677378ea6f2f453e9cbec24283db",
+      "/private/tmp/eredu-borrowed-utf8-stage/AUDIT.md": "c6ed0e2ad584d92d90a08ee64843832b4a627d8c710d255bd88222131c15bcc5",
+      "/private/tmp/eredu-borrowed-utf8-stage/artifact-hashes.json": "e50941f31bc55ccace79cf96fef4b799842635df073083a44b0f79562490a1c2",
+      "/private/tmp/eredu-borrowed-utf8-stage/change.patch": "8b0fc4968c7563f0dfba6c78e278ba9e1f8e2bb3f98b810d3c12119908870dda",
+      "/private/tmp/eredu-borrowed-utf8-stage/doc-additions.json": "4097d7428da377427c25e3fccdb08212586ba4e02e7e19a5d702c44a1d2517c4",
+      "/private/tmp/eredu-borrowed-utf8-stage/manifest.json": "90851c11928f661e611334684331962fad1030e61cc338241a371d77e2926013",
+      "/private/tmp/eredu-borrowed-utf8-stage/new-tests.json": "d5224650bcdce55c9c8f5b86a8ebab3b28d1debcc067eaff9aeda2f3a1120892",
+      "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-root-review.json": "26c8b73c9931b93b9fc75d055938b080166b682e3855b726e9c71e1e54bb2886",
+      "/private/tmp/eredu-unused-work-and-borrowed-utf8-integration-spec.json": "1151f28b13a3d7bcab230be9ffdf5ea3f70cdfdf5849f7da3f79c9deb0ffa8ed",
+      "/private/tmp/eredu-unused-work-scope-doc-additions.json": "7d0c940e3eeab723870f2d6f74a9c0a08d56834d1c87010e09f866a468c655a8",
+      "/private/tmp/eredu-unused-work-scope-final-root-review.json": "c45fc65bd60d66fc2c884cbd96ae6a6ca1de0139faf55ac49bf7baf6c0956f4e",
+      "/private/tmp/eredu-unused-work-scope-review-checks.json": "eedde613e962601d098cb4fa1ed546f8deb71b7f307d4ff1b81d77700525b63c",
+      "/private/tmp/eredu-unused-work-scope-review-sha256.json": "439e4ae181e70995396c3b33db5b1b7244f4265c30b0ca24fbc02b1ee3083f6b",
+      "/private/tmp/eredu-unused-work-scope-review.md": "f114a24d04c16f064c7eff84c464530035abcaa203044b918727bc7cc907dff2",
+      "/private/tmp/eredu-unused-work-scope-stage/AUDIT.md": "8f178f882149f5319aed07f6dc50f3e174037d1630443b5f962953eb7364e1c6",
+      "/private/tmp/eredu-unused-work-scope-stage/CHECKS.json": "d509a976286eb8ba371e0f516821eb917221d85c5902bcdbd16deab744cfd365",
+      "/private/tmp/eredu-unused-work-scope-stage/FROZEN.json": "4d0c91aa9376c04c40255b7f95fde96a49730879e1745f37c90c68674ab25021",
+      "/private/tmp/eredu-unused-work-scope-stage/PRICING.md": "4c00ec101e37480fab73280319480a4801ab783155b7abdbc6b0bca1439b6eba",
+      "/private/tmp/eredu-unused-work-scope-stage/README.md": "fdf04f70a5bf16414caffaa81bb58c972f5caae65f83b170d5ea0a1ffced304e",
+      "/private/tmp/eredu-unused-work-scope-stage/TESTS.json": "87e02b06f14c58b6609461dbd21509caa699f199d6fd5fbf37b93cee7b0478ee",
+      "/private/tmp/eredu-unused-work-scope-stage/artifact-hashes.json": "b8108dd38d08e8fec6b7b28e9ecb374abbcd855e1b09ddc8fb09892ea14e9f92",
+      "/private/tmp/eredu-unused-work-scope-stage/base-origins.json": "5cc317221ff0398e99d3b1368519371a5348ca6317c697988b528875fefbf2ac",
+      "/private/tmp/eredu-unused-work-scope-stage/change.patch": "564457baba0e5481193f3d935a6e2404db1ebd10349af4e62923654283378359",
+      "/private/tmp/eredu-unused-work-scope-stage/dependency-hashes.json": "48e651e3d66e3b7778aa09403887d88cb646246f0308be17e5466b8566818ab0",
+      "/private/tmp/eredu-unused-work-scope-stage/full-manifest.json": "107380187cce783a694b6e412c43a4f72bf0e58f80ed8d295f6d10d7ae585dbf",
+      "/private/tmp/eredu-unused-work-scope-stage/full.patch": "fa13823fcf1f6ad20527df09634f7d5bcf5da75b4db04f7649e0b93d540dea24",
+      "/private/tmp/eredu-unused-work-scope-stage/manifest.json": "2d8602c6682b355ef738b229feac7f8a5faedc04281af04b708e9b996d408e72",
+      "/private/tmp/eredu-unused-work-scope-stage/merge-ledger.json": "1faa324cab626ae795b358e35c99a380f4c4168eca363e6cf385f82bc9108a4b",
+      "/private/tmp/eredu-unused-work-scope-stage/package.py": "fe464e509bf7f66977be7c975f9766e853dcc88567e2ff8ab65c98a748e156b6",
+      "/private/tmp/eredu-unused-work-scope-stage/rebase_unused_work_on_decoder.py": "d9c1160ebf69d7c1b4cd43be76706112b84d30b0b26b1445b7e83d929c696fe3",
+      "/private/tmp/eredu-unused-work-scope-stage/source-basis-hashes.json": "48e9fe8f03b5f1450b6c97bd325da38b211ec8d3ccbbbd17baf5b187ee1ccb07",
+      "/private/tmp/eredu-unused-work-scope-stage/write_unused_work_docs.py": "8edf4655d252f923d9fe95ff3b0dc7b1dc0c9ecc443f48a3cbb1a8b2d79f0e17"
+    },
+    "source_manifest_sha256": "28375502b63294c4bce0f589161215e4e015c7db44cbea2ca4e31726b1e89b7a"
+  },
+  "behavior": [
+    "A closed prepared funding scope exposes no native adoption/capture/certification interface. Healthy unused destruction closes only its own existing count after which pins retire outside Usage; poison preserves canonical quarantine.",
+    "Actual native begin precedes the sole prepared Work activation, which moves the same scope into the same closed Work Rc before worker execution. Busy retains the original input, sampler, Work and Recovery allocation.",
+    "Real original admissions reuse exact capacity after all untouched owners retire. Tests distinguish an eager native validation error with ordinary safe settlement from an exposed unresolved child whose account remains fenced.",
+    "Complete valid UTF8 input with no pending bytes is borrowed directly into the existing parser. Incomplete/invalid legacy bytes retain their previous join, error and finish frontiers; same commit, event and cancellation drivers run."
+  ],
+  "limits": [
+    "The original two preparation roles are covered here; the five prediction roles remain a separate pending integration.",
+    "Native Record/graph/root/error populations and full input/output/media/copy ownership remain open.",
+    "Borrowed UTF8 removes its two intermediate copies only; stop/protocol/event storage, legacy partial-byte scratch and cold tokenizer/compiler resources still need bounded ownership.",
+    "No public managed gate activation or new released-checkpoint/native-distributed measurement."
+  ]
+}

@@ -34,7 +34,7 @@ pub struct RoutedValues<B: GroupedNeuralBackend> {
     pub router: B::Selector,
     /// Independently addressable value bank with owned output rows.
     pub experts: B::LinearGroups,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     output_width: i32,
 }
 
@@ -59,9 +59,9 @@ pub enum FeedForward<B: GroupedNeuralBackend> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Projections<B: GroupedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     layer: usize,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     points: Option<eredu_runtime::RoutedObservationPoints>,
     /// Optional routed attention-value stage.
     pub values: Option<RoutedValues<B>>,
@@ -393,9 +393,19 @@ pub type PartitionedLayeredModel<B> = decoder::PartitionedLayeredModel<B, ModelA
 /// Portable construction policy; no backend selects a K2 equation.
 pub struct BlockFactory;
 impl<B: GroupedNeuralBackend> decoder::BlockFactory<B, ModelArgs> for BlockFactory {
+    // MoVA projects and mixes each token before KV insertion; routing, shared
+    // FFNs and attention gates do not couple different query-token rows.
+    const CAUSAL_PREFILL_ROWS: bool = true;
+
     type FeedForward = Projections<B>;
     fn validate(args: &ModelArgs) -> Result<(), Error> {
         args.validate().map_err(Error::backend)
+    }
+    fn validate_with_metadata(
+        args: &ModelArgs,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), Error> {
+        <ModelArgs as decoder::Config>::validate_config_with_metadata(args, context)
     }
     fn build(
         args: &ModelArgs,
@@ -410,7 +420,13 @@ impl<B: GroupedNeuralBackend> decoder::BlockFactory<B, ModelArgs> for BlockFacto
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TransformerBlock<B>, Error> {
-        global.validate().map_err(Error::backend)?;
+        if let Some(metadata) =
+            B::construction_metadata(context).filter(|c| c.uses_checked_metadata())
+        {
+            <ModelArgs as decoder::Config>::validate_config_with_metadata(global, metadata)?;
+        } else {
+            global.validate().map_err(Error::backend)?;
+        }
         let norm = |field: &str| {
             B::normalization(
                 NormalizationConstructionSpec::learned(
@@ -490,16 +506,22 @@ pub type DenseLayeredModel<B> = decoder::LayeredModel<B, ModelArgs, DenseBlockFa
 /// Dense construction rejects configurations that require expert providers.
 pub struct DenseBlockFactory;
 impl<B: eredu_nn::NeuralBackend> decoder::BlockFactory<B, ModelArgs> for DenseBlockFactory {
+    // The validated dense subset uses the shared causal attention/FFN block.
+    const CAUSAL_PREFILL_ROWS: bool = true;
+
     type FeedForward = decoder::Mlp<B>;
     fn validate(args: &ModelArgs) -> Result<(), Error> {
         args.validate().map_err(Error::backend)?;
-        if args.is_moe() {
-            return Err(Error::backend(
-                "dense construction received routed invocations",
-            ));
-        }
-        Ok(())
+        validate_dense_policy(args, crate::decoder::identity::Metadata::new(None))
     }
+    fn validate_with_metadata(
+        args: &ModelArgs,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), Error> {
+        <ModelArgs as decoder::Config>::validate_config_with_metadata(args, context)?;
+        validate_dense_policy(args, crate::decoder::identity::Metadata::new(Some(context)))
+    }
+
     fn build(
         args: &ModelArgs,
         layer: usize,
@@ -514,4 +536,26 @@ impl<B: eredu_nn::NeuralBackend> decoder::BlockFactory<B, ModelArgs> for DenseBl
     ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
         decoder::layer_parallel_parameter_groups(block, args, layer)
     }
+    fn parameter_groups_with_metadata(
+        block: &decoder::TransformerBlock<B>,
+        args: &ModelArgs,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Option<Result<Vec<eredu_runtime::ParameterGroupSpec>, Error>> {
+        Some(decoder::layer_parallel_parameter_groups_with_metadata(
+            block, args, layer, context,
+        ))
+    }
+}
+
+fn validate_dense_policy(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<(), Error> {
+    if args.is_moe() {
+        return Err(metadata.error(format_args!(
+            "dense construction received routed invocations"
+        )));
+    }
+    Ok(())
 }

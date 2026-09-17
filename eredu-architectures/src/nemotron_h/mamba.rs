@@ -9,6 +9,8 @@ use eredu_nn::{
 use eredu_runtime::RuntimeStateComponents;
 
 use super::ModelArgs;
+mod construction;
+pub(crate) use construction::MambaSpec;
 
 /// One unloaded Mamba2 mixer with architecture-authored parameter identity.
 #[derive(Debug, Clone, Parameterized)]
@@ -28,23 +30,23 @@ pub struct Mamba2<B: NeuralBackend> {
     pub norm_weight: Parameter<B::Tensor>,
     /// Output projection.
     pub out_proj: B::Linear,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     groups: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dim: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     state_dim: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     intermediate: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     convolution_width: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     chunk_size: usize,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     time_step_floor: f32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     epsilon: f32,
 }
 
@@ -66,69 +68,8 @@ impl<B: NeuralBackend> Mamba2<B> {
         groups: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let intermediate = heads
-            .checked_mul(args.mamba_head_dim)
-            .ok_or_else(|| Error::backend("Mamba intermediate width overflowed"))?;
-        let convolution_width = intermediate
-            .checked_add(2 * groups * args.ssm_state_size)
-            .ok_or_else(|| Error::backend("Mamba convolution width overflowed"))?;
-        let projection = intermediate
-            .checked_add(convolution_width)
-            .and_then(|width| width.checked_add(heads))
-            .ok_or_else(|| Error::backend("Mamba input projection width overflowed"))?;
-        let prefix = format!("model.layers.{layer}.mamba");
-        let parameter = |field: &str| {
-            ParameterSpec::trainable(format!("{prefix}.{field}")).map_err(Error::backend)
-        };
-        let linear = |field: &str, input, output, bias: bool| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: bias
-                        .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
-                        .transpose()
-                        .map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.weight_quantization_for(&weight).into(),
-                    )?,
-                },
-                context,
-            )
-        };
-        Ok(Self {
-            in_proj: linear("in_proj", args.hidden_size, projection, args.use_bias)?,
-            conv1d: CausalDepthwiseConvolution::new(
-                CausalDepthwiseConvolutionSpec {
-                    channels: convolution_width,
-                    kernel_size: args.conv_kernel,
-                    weight: parameter("conv1d.weight")?,
-                    bias: args
-                        .use_conv_bias
-                        .then(|| parameter("conv1d.bias"))
-                        .transpose()?,
-                    activation: ConvolutionActivation::Silu,
-                },
-                context,
-            )?,
-            dt_bias: Parameter::unloaded(parameter("dt_bias")?, &[heads], context)?,
-            a_log: Parameter::unloaded(parameter("A_log")?, &[heads], context)?,
-            d: Parameter::unloaded(parameter("D")?, &[heads], context)?,
-            norm_weight: Parameter::unloaded(parameter("norm.weight")?, &[intermediate], context)?,
-            out_proj: linear("out_proj", intermediate, args.hidden_size, args.use_bias)?,
-            heads,
-            groups,
-            head_dim: args.mamba_head_dim,
-            state_dim: args.ssm_state_size,
-            intermediate,
-            convolution_width,
-            chunk_size: usize::try_from(args.chunk_size).map_err(Error::backend)?,
-            time_step_floor: args.time_step_min,
-            epsilon: args.layer_norm_epsilon,
-        })
+        MambaSpec::new_with_metadata(args, layer, heads, groups, crate::decoder::ModuleMetadata::new::<B>(context))?
+            .instantiate::<B>(context)
     }
 
     /// Executes Mamba2 and atomically replaces convolution and recurrent state.
@@ -191,16 +132,23 @@ impl<B: NeuralBackend> Mamba2<B> {
             ],
             context,
         )?;
-        let convolved = {
-            let history = state
+        // A width-one convolution has no declared history slot. Its recurrent
+        // matrix remains present and advances through the same selective scan.
+        let carries_history = self.conv1d.history_len() != 0;
+        let history = if carries_history {
+            state
                 .fixed_component(StateTensorRole::Convolution { slot: 0 })
-                .map_err(Error::backend)?;
-            self.conv1d
-                .forward(&convolution_input, history.as_ref(), context)?
+                .map_err(Error::backend)?
+                .as_ref()
+        } else {
+            None
         };
-        *state
-            .fixed_component(StateTensorRole::Convolution { slot: 0 })
-            .map_err(Error::backend)? = convolved.history;
+        let convolved = self.conv1d.forward(&convolution_input, history, context)?;
+        if carries_history {
+            *state
+                .fixed_component(StateTensorRole::Convolution { slot: 0 })
+                .map_err(Error::backend)? = convolved.history;
+        }
         let values = convolved.output.index(
             &[Index::Full, Index::Full, Index::Range(0, self.intermediate)],
             context,

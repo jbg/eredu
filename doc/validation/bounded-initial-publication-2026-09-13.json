@@ -1,0 +1,131 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted checked initial idle session storage publication",
+  "source_sha256": {
+    "doc/backend-architecture.md": "84681fd12d034cd34933033ae54cc00ba861ecf2d42973fe19c046abf8d7e009",
+    "doc/execution-control.md": "4a01135868f6b4a0db56853186b2cd911afe95ac2a632dff3808c0c82d5ed13e",
+    "doc/bounded-inference.md": "6cc5139211dc6e35845187ea80355ec51b73d6445f46a556824295c277375df2",
+    "eredu-backend-mlx/src/backend/managed_memory.rs": "eefdbf232ce7ff7a48b212572e27bcf824c7ebe256cea20825dfdebdcf256ea9",
+    "eredu-backend-mlx/src/backend/adapter/tests/managed_memory.rs": "118e35155e5c26cf06eae3c83e01b780d29345cc59260470f6212469e9184a4a",
+    "eredu-backend-mlx/src/composition/mlx/model.rs": "9118c397a33a966ddc659a862889b56e9a5bdd29e36268dbeb8bd9674221cb98",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "225b6184b6a16e45e70ee36f8672f741c3a3dfee24f166aa9781786cdf7f31ea",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/idle_storage.rs": "c82752f80d11591933a1d9c323fa1b86a26f6b6115ba4d2fbc31ad749f4b992f",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/initial_publication_tests.rs": "438fd1cf7dee2c289c6233de5fa0670e984246b771dd395ac1d83565773280de",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/operation_memory_tests.rs": "e2420440ea845d3a6a0d93aac349d8295c563a56d3843e3ad11730379ef9b393"
+  },
+  "prior_record": "doc/validation/bounded-retained-values-2026-09-13.json",
+  "coverage": {
+    "native_tests": 55,
+    "new_publication_tests": 6,
+    "ignored_tests": [
+      "composition::mlx::session::model_session::managed_admission_tests::public_managed_generation_matches_ordinary_and_controlled_unbudgeted_tokens",
+      "composition::mlx::session::model_session::managed_admission_tests::public_preparations_share_one_domain_capacity_and_release_only_their_own_reservations",
+      "composition::mlx::session::model_session::managed_admission_tests::public_resident_one_byte_short_rejects_before_prompt_sampling_or_state_mutation",
+      "composition::mlx::session::model_session::managed_admission_tests::public_resident_preparation_succeeds_at_its_exact_complete_domain_capacity"
+    ],
+    "public_strict_budget_success": false,
+    "new_peak_measurements": 0
+  },
+  "behavior": [
+    "MlxModelSession::from_model attempts checked initial idle storage publication after its initial reset settles.",
+    "The transition requires a healthy idle session, exclusive payload ownership, complete numerical nonstate inventory, certified empty decoder storage and exact loading-authority identity across the executable and initial operation history.",
+    "The outer session field audit covers discovery declarations, deferred fingerprint paths/file metadata, capture layouts, state-residency accounting metadata, capabilities, failure strings and session authority; no additional numerical payload is owned there.",
+    "Complete identity-based registration and native attachments finish before executable, payload and initial-reset loading handles retire. A local immutable owner guard spans the entire transition.",
+    "Uncertified lazy helpers, missing source/processor/communication coverage, nonempty decoder storage or different operation authority preserve local loading handles. Registration or attachment errors likewise retain the original guard.",
+    "Independent loading clones and native recovery keep exclusion even after local publication. Publication never clears a shared lease or authorizes a future operation.",
+    "Ordinary operations reacquire model/context authority before native work. A live synthetic reservation rejects reset, token construction and an input factory without changing state or accounting. Raw output aliases retain the newly acquired owner after the session retires.",
+    "The constructor does not repeat publication on an already promoted session. Test-only executable mutation accessors explicitly acquire unquoted authority after initial publication."
+  ],
+  "limits": [
+    "Public strict managed memory admission remains an unconditional UnknownBound rejection. The zero-byte synthetic test reservation verifies exclusion and existing-storage accounting, not a native inference workspace bound.",
+    "Nonempty state identity handoff and overlap, exact retained operation/sampling/controller/instrumentation authorization, cumulative escaped-output accounting and quoted independent copies remain unfinished.",
+    "Incomplete lazy/native/processor/distributed/observer inventories remain conservative; the construction transition does not materialize unknown values to manufacture a bound.",
+    "No new released-checkpoint comparison, peak-memory measurement or distributed matrix was run. The prior retained-value record preserves the preceding neutral and portable validation."
+  ],
+  "checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1 initial_publication_tests model_session::operation_ model_session::preparation_ model_session::output_retention_tests model_session::idle_storage model_session::managed_admission_tests adapter::tests::managed_memory observation::memory_tests admission::publication::tests prepared_speculative::memory_tests",
+      "exit_code": 0,
+      "passed": 55,
+      "ignored": 4,
+      "passed_tests": [
+        "backend::runtime::residency::storage::admission::publication::tests::host_publication_survives_array_aliases_until_final_physical_owner",
+        "backend::runtime::residency::storage::admission::publication::tests::non_native_publication_retires_payloads_outside_native_lock_before_charges",
+        "backend::runtime::residency::storage::admission::publication::tests::publication_charges_independent_backings_and_aliases_without_root_cycles",
+        "backend::runtime::residency::storage::admission::publication::tests::publication_rejects_complete_overcapacity_batch_and_unknown_lazy_storage_atomically",
+        "composition::mlx::prepared_speculative::memory_tests::bound_greedy_and_stochastic_sampler_clones_keep_their_domain_owner",
+        "composition::mlx::prepared_speculative::memory_tests::copied_speculative_tensor_has_distinct_backing_and_retains_fresh_authority_through_raw_escape",
+        "composition::mlx::prepared_speculative::memory_tests::embedded_state_copy_rejects_a_reserved_domain_without_changing_empty_or_populated_source",
+        "composition::mlx::prepared_speculative::memory_tests::empty_and_populated_embedded_state_copies_keep_fresh_authority_through_clone_and_restore",
+        "composition::mlx::prepared_speculative::memory_tests::prepared_speculation_rejects_a_reserved_domain_before_lane_setup_and_respects_other_domains",
+        "composition::mlx::prepared_speculative::memory_tests::speculative_control_seed_rejects_same_domain_reservation_before_allocation",
+        "composition::mlx::session::model_session::idle_storage::tests::erased_test_owner_is_not_reported_as_empty_storage",
+        "composition::mlx::session::model_session::idle_storage::tests::idle_payload_inventory_is_cold_and_keeps_decoder_storage_separate",
+        "composition::mlx::session::model_session::idle_storage::tests::retained_communication_and_target_world_each_prevent_complete_coverage",
+        "composition::mlx::session::model_session::initial_publication_tests::complete_fresh_session_publishes_exact_storage_and_releases_loading_authority",
+        "composition::mlx::session::model_session::initial_publication_tests::lazy_scaled_rotary_keeps_initial_session_unquoted_without_inventory_evaluation",
+        "composition::mlx::session::model_session::initial_publication_tests::live_reservation_blocks_reset_and_decode_input_before_native_work",
+        "composition::mlx::session::model_session::initial_publication_tests::nonempty_decoder_prevents_publication_even_with_certified_nonstate_storage",
+        "composition::mlx::session::model_session::initial_publication_tests::ordinary_decode_reacquires_authority_retained_by_escaped_output_backing",
+        "composition::mlx::session::model_session::initial_publication_tests::preexisting_model_owner_clone_remains_excluding_after_local_publication",
+        "composition::mlx::session::model_session::managed_admission_tests::public_managed_admission_preserves_typed_rejection_for_unproven_controller_and_native_facts",
+        "composition::mlx::session::model_session::operation_exchange_tests::exchanged_decoder_state_retains_its_independent_operation_domain",
+        "composition::mlx::session::model_session::operation_memory_tests::completed_output_observation_rejects_reserved_backend_domain_without_touching_output",
+        "composition::mlx::session::model_session::operation_memory_tests::ordinary_decode_variants_reject_before_input_construction_forward_and_observation",
+        "composition::mlx::session::model_session::operation_memory_tests::ordinary_prefill_variants_reject_before_forward_and_observer_callbacks",
+        "composition::mlx::session::model_session::operation_memory_tests::ordinary_reset_rejects_reserved_backend_domain_without_clearing_populated_state",
+        "composition::mlx::session::model_session::output_retention_tests::allocation_free_completed_output_adds_no_charge_owner",
+        "composition::mlx::session::model_session::output_retention_tests::completed_output_aliases_keep_all_request_charges_until_last_backing_retires",
+        "composition::mlx::session::model_session::output_retention_tests::direct_session_outputs_inherit_state_reservations_without_a_sampler",
+        "composition::mlx::session::model_session::output_retention_tests::existing_unquoted_output_owners_still_follow_the_native_backing",
+        "composition::mlx::session::model_session::output_retention_tests::unbudgeted_output_attachment_remains_a_cold_noop_without_memory_owners",
+        "composition::mlx::session::model_session::output_retention_tests::unfinished_backing_failure_preserves_submission_charge_for_retry",
+        "composition::mlx::session::model_session::output_retention_tests::zero_byte_request_still_excludes_unquoted_work_while_output_backing_survives",
+        "composition::mlx::session::model_session::preparation_authority_tests::native_preparation_authority_rejects_duplicates_and_changed_sampling_before_factory_work",
+        "composition::mlx::session::model_session::preparation_authority_tests::native_preparation_authority_stays_with_escaped_tokens_after_both_generation_drivers_drop",
+        "composition::mlx::session::model_session::preparation_authority_tests::native_preparation_authority_survives_sampler_and_prompt_snapshots_without_refunds",
+        "composition::mlx::session::model_session::preparation_authority_tests::native_preparation_nonstate_inventory_keeps_weights_separate_from_quoted_cache",
+        "composition::mlx::session::model_session::preparation_authority_tests::native_preparation_public_maximum_preserves_a_smaller_admitted_chunk",
+        "composition::mlx::session::model_session::preparation_authority_tests::native_preparation_public_policy_chunks_ordinary_and_controlled_generation",
+        "composition::mlx::session::model_session::preparation_authority_tests::native_preparation_unknown_public_domain_rejects_before_sampling_or_controller_work",
+        "composition::mlx::session::model_session::preparation_memory_tests::admitted_preparation_uses_its_same_domain_reservation_without_unquoted_acquisition",
+        "composition::mlx::session::model_session::preparation_memory_tests::admitted_prompt_backing_retains_reservation_when_it_escapes_before_binding",
+        "composition::mlx::session::model_session::preparation_memory_tests::explicitly_unbudgeted_preparation_still_acquires_independent_memory_authority",
+        "composition::mlx::session::model_session::preparation_memory_tests::independent_greedy_and_stochastic_samplers_outlive_their_backend",
+        "composition::mlx::session::model_session::preparation_memory_tests::independent_native_snapshots_and_copies_keep_distinct_memory_authorities",
+        "composition::mlx::session::model_session::preparation_memory_tests::independent_prompt_and_sampler_copies_outlive_their_sources_and_runtime",
+        "composition::mlx::session::model_session::preparation_memory_tests::independent_prompt_clones_and_escaped_native_views_retain_memory_authority",
+        "composition::mlx::session::model_session::preparation_memory_tests::live_zero_byte_reservation_rejects_independent_preparation_before_sampling_factory",
+        "composition::mlx::session::model_session::preparation_memory_tests::native_state_exchange_moves_memory_authority_with_installed_and_displaced_state",
+        "composition::mlx::session::model_session::preparation_memory_tests::reserved_domain_rejects_copy_capture_and_reseed_without_mutating_sources",
+        "composition::mlx::session::observation::memory_tests::generated_and_returned_intervention_values_receive_their_own_deferred_attachment",
+        "composition::mlx::session::observation::memory_tests::ordinary_and_replica_callbacks_keep_raw_strided_views_owned_after_success_error_and_panic",
+        "composition::mlx::session::observation::memory_tests::routed_invocation_and_every_batch_component_keep_authority_when_retained_alone",
+        "composition::mlx::session::observation::memory_tests::routing_observation_and_original_effective_decisions_cover_every_exposed_array",
+        "composition::mlx::session::observation::memory_tests::session_observer_intermediate_keeps_execution_domain_after_session_retirement",
+        "composition::mlx::session::observation::memory_tests::skipped_generated_values_keep_prototypes_lazy_and_none_keeps_attachment_optional"
+      ],
+      "ignored_tests": [
+        "composition::mlx::session::model_session::managed_admission_tests::public_managed_generation_matches_ordinary_and_controlled_unbudgeted_tokens",
+        "composition::mlx::session::model_session::managed_admission_tests::public_preparations_share_one_domain_capacity_and_release_only_their_own_reservations",
+        "composition::mlx::session::model_session::managed_admission_tests::public_resident_one_byte_short_rejects_before_prompt_sampling_or_state_mutation",
+        "composition::mlx::session::model_session::managed_admission_tests::public_resident_preparation_succeeds_at_its_exact_complete_domain_capacity"
+      ],
+      "log": "/private/tmp/eredu-initial-publication-native.log",
+      "sha256": "b35a3e755682b242aba9f17e02bef3c6531eda4a5565e1bfdb631c6dd0cfb57d"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal,image,audio",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-initial-publication-features.log",
+      "sha256": "79e94a6680cd9227ecc7b404888e539a21a0e08bf688e8afa5f70b9008b306e8"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-initial-publication-minimal.log",
+      "sha256": "55e65d0b3d55a64c7c4674b918dfb4402868b563fb6d2e61ef4a0b0586bce0ce"
+    }
+  ]
+}

@@ -1,0 +1,1055 @@
+diff --git a/mlx/backend/common/compiled.cpp b/mlx/backend/common/compiled.cpp
+--- a/mlx/backend/common/compiled.cpp
++++ b/mlx/backend/common/compiled.cpp
+@@ -44,7 +44,7 @@
+   }
+ }
+ 
+-std::string get_type_string(Dtype d) {
++std::string_view get_type_string_view(Dtype d) {
+   switch (d) {
+     case float32:
+       return "float";
+@@ -82,6 +82,8 @@
+   }
+ }
+ 
++std::string get_type_string(Dtype d) { return std::string(get_type_string_view(d)); }
++
+ bool has_negative_strides(const array& x) {
+   for (auto s : x.strides()) {
+     if (s < 0) {
+diff --git a/mlx/backend/common/compiled.h b/mlx/backend/common/compiled.h
+--- a/mlx/backend/common/compiled.h
++++ b/mlx/backend/common/compiled.h
+@@ -4,6 +4,7 @@
+ #include <cmath>
+ #include <functional>
+ #include <iomanip>
++#include <string_view>
+ 
+ #include "mlx/array.h"
+ #include "mlx/primitives.h"
+@@ -14,6 +15,7 @@
+   return (typeid(p) == typeid(Broadcast) || typeid(p) == typeid(AsType));
+ }
+ 
++std::string_view get_type_string_view(Dtype d);
+ std::string get_type_string(Dtype d);
+ 
+ template <typename T>
+diff --git a/mlx/backend/common/metal_kernel.cpp b/mlx/backend/common/metal_kernel.cpp
+--- a/mlx/backend/common/metal_kernel.cpp
++++ b/mlx/backend/common/metal_kernel.cpp
+@@ -6,13 +6,15 @@
+ #include <limits>
+ #include <new>
+ #include <type_traits>
+-#include <regex>
++#include <charconv>
++#include <atomic>
+ #include <sstream>
+ 
+ #include "mlx/backend/common/compiled.h"
+ #include "mlx/backend/metal/metal.h"
+ #include "mlx/fast.h"
+ #include "mlx/fast_primitives.h"
++#include "mlx/native_control.h"
+ #include "mlx/transforms_impl.h"
+ #include "mlx/utils.h"
+ 
+@@ -113,20 +115,96 @@
+   return Stream(-1, Device::gpu);
+ }
+ 
+-std::string write_signature(
+-    std::string_view func_name,
++// Count and write the same bytes; the counted pass touches no destination.
++// A supplied destination is exact-sized. Failure never publishes partial text.
++class SourceWriter {
++ public:
++  SourceWriter(char* data = nullptr, size_t capacity = 0) : data_(data), capacity_(capacity) {}
++  void append(const char* data, size_t size) noexcept {
++    if (!good_ || size > std::numeric_limits<size_t>::max() - size_) { good_ = false; return; }
++    if (data_) {
++      if (!data || size_ + size > capacity_) { good_ = false; return; }
++      if (size) std::memcpy(data_ + size_, data, size);
++    }
++    size_ += size;
++  }
++  SourceWriter& operator+=(std::string_view value) noexcept { append(value.data(), value.size()); return *this; }
++  template<class Integer> void decimal(Integer value, bool identifier = false) noexcept {
++    char buffer[32];
++    auto [end, error] = std::to_chars(buffer, buffer + sizeof(buffer), value);
++    if (error != std::errc{}) { good_ = false; return; }
++    if (identifier) for (auto* p = buffer; p != end; ++p) if (*p == '-') *p = '_';
++    append(buffer, size_t(end - buffer));
++  }
++  size_t size() const noexcept { return size_; }
++  bool good() const noexcept { return good_; }
++ private:
++  char* data_;
++  size_t capacity_, size_{0};
++  bool good_{true};
++};
++using InputSignature = KernelInputSignature;
++class SignatureView {
++ public:
++  SignatureView(const ArrayVector& arrays) : arrays_(&arrays), size_(arrays.size()) {}
++  SignatureView(std::span<const InputSignature> values) : values_(values.data()), size_(values.size()) {}
++  size_t size() const noexcept { return size_; }
++  InputSignature operator[](size_t i) const noexcept {
++    if (values_) return values_[i];
++    const auto& array = (*arrays_)[i];
++    return {array.dtype(), array.ndim() == 0, array.size() < max_constant_array_size};
++  }
++ private:
++  const ArrayVector* arrays_{nullptr};
++  const InputSignature* values_{nullptr};
++  size_t size_;
++};
++void emit_template_value(SourceWriter& output, const TemplateArg& value, bool identifier) {
++  if (std::holds_alternative<int>(value)) output.decimal(std::get<int>(value), identifier);
++  else if (std::holds_alternative<bool>(value)) output.decimal(int(std::get<bool>(value)));
++  else output += get_type_string_view(std::get<Dtype>(value));
++}
++void emit_template(SourceWriter& output, TemplateArgsView args) {
++  output += "<";
++  for (size_t i = 0; i < args.size(); ++i) {
++    if (i) output += ", ";
++    emit_template_value(output, args[i].second, false);
++  }
++  output += ">";
++}
++void emit_name(SourceWriter& output, std::string_view name, SignatureView inputs,
++    std::span<const Dtype> output_dtypes, TemplateArgsView args) {
++  output += "custom_kernel_";
++  output += name;
++  if (!args.empty()) {
++    output += "_";
++    for (size_t i = 0; i < args.size(); ++i) {
++      output += "_"; // the old '<' or ', ' replacement; final '>' is omitted
++      emit_template_value(output, args[i].second, true);
++    }
++  }
++  for (size_t i = 0; i < inputs.size(); ++i) {
++    const auto value = inputs[i];
++    output += "_";
++    output += get_type_string_view(value.dtype);
++    if (value.scalar) output += "s";
++    else if (value.constant) output += "c";
++  }
++  for (auto dtype : output_dtypes) { output += "_"; output += get_type_string_view(dtype); }
++}
++
++void emit_signature(SourceWriter& kernel_source,
++    const char* func_name, size_t func_name_bytes,
+     std::string_view header,
+     std::string_view source,
+     NameListView input_names,
+-    const ArrayVector& inputs,
++    SignatureView inputs,
+     NameListView output_names,
+     std::span<const Dtype> output_dtypes,
+     TemplateArgsView template_args,
+     std::span<const uint8_t> attributes,
+     std::span<const ShapeUsage> shape_infos,
+     bool atomic_outputs) {
+-  std::string kernel_source;
+-  kernel_source.reserve(header.size() + source.size() + 16384);
+   kernel_source += header;
+   // Auto-generate a function signature based on `template_args`
+   // and the dtype/shape of the arrays passed as `inputs`.
+@@ -134,7 +212,7 @@
+     kernel_source += "template <";
+     int i = 0;
+     for (const auto& [name, arg] : template_args) {
+-      std::string param_type;
++      std::string_view param_type;
+       if (std::holds_alternative<int>(arg)) {
+         param_type = "int";
+       } else if (std::holds_alternative<bool>(arg)) {
+@@ -153,7 +231,7 @@
+     kernel_source += ">\n";
+   }
+   kernel_source += "[[kernel]] void ";
+-  kernel_source += func_name;
++  kernel_source.append(func_name, func_name_bytes);
+   kernel_source += "(\n";
+ 
+   int index = 0;
+@@ -161,10 +239,9 @@
+   for (int i = 0; i < inputs.size(); ++i) {
+     const auto& name = input_names[i];
+     const auto& arr = inputs[i];
+-    auto dtype = get_type_string(arr.dtype());
+-    std::string location =
+-        arr.size() < max_constant_array_size ? "constant" : "device";
+-    std::string ref = arr.ndim() == 0 ? "&" : "*";
++    auto dtype = get_type_string_view(arr.dtype);
++    std::string_view location = arr.constant ? "constant" : "device";
++    std::string_view ref = arr.scalar ? "&" : "*";
+     kernel_source += "  const ";
+     kernel_source += location;
+     kernel_source += " ";
+@@ -173,16 +250,16 @@
+     kernel_source += " ";
+     kernel_source += name;
+     kernel_source += " [[buffer(";
+-    kernel_source += std::to_string(index);
++    kernel_source.decimal(index);
+     kernel_source += ")]],\n";
+     index++;
+     // Add input shape, strides and ndim if present in the source
+-    if (arr.ndim() > 0) {
++    if (!arr.scalar) {
+       if (std::get<0>(shape_infos[i])) {
+         kernel_source += "  const constant int* ";
+         kernel_source += name;
+         kernel_source += "_shape [[buffer(";
+-        kernel_source += std::to_string(index);
++        kernel_source.decimal(index);
+         kernel_source += ")]],\n";
+         index++;
+       }
+@@ -190,7 +267,7 @@
+         kernel_source += "  const constant int64_t* ";
+         kernel_source += name;
+         kernel_source += "_strides [[buffer(";
+-        kernel_source += std::to_string(index);
++        kernel_source.decimal(index);
+         kernel_source += ")]],\n";
+         index++;
+       }
+@@ -198,7 +275,7 @@
+         kernel_source += "  const constant int& ";
+         kernel_source += name;
+         kernel_source += "_ndim [[buffer(";
+-        kernel_source += std::to_string(index);
++        kernel_source.decimal(index);
+         kernel_source += ")]],\n";
+         index++;
+       }
+@@ -209,7 +286,7 @@
+     const auto& name = output_names[i];
+     const auto& dtype = output_dtypes[i];
+     kernel_source += "  device ";
+-    auto type_string = get_type_string(dtype);
++    auto type_string = get_type_string_view(dtype);
+     if (atomic_outputs) {
+       kernel_source += "atomic<";
+     }
+@@ -220,7 +297,7 @@
+     kernel_source += "* ";
+     kernel_source += name;
+     kernel_source += " [[buffer(";
+-    kernel_source += std::to_string(index);
++    kernel_source.decimal(index);
+     kernel_source += ")]]";
+     if (index < inputs.size() + output_names.size() - 1 ||
+         attributes.size() > 0) {
+@@ -250,28 +327,17 @@
+   }
+   kernel_source += source;
+   kernel_source += "\n}\n";
+-  return kernel_source;
+-}
+-
+-std::string write_template(TemplateArgsView template_args) {
+-  std::ostringstream template_def;
+-  template_def << "<";
+-  int i = 0;
+-  for (const auto& [name, arg] : template_args) {
+-    if (i > 0) {
+-      template_def << ", ";
+-    }
+-    if (std::holds_alternative<int>(arg)) {
+-      template_def << std::get<int>(arg);
+-    } else if (std::holds_alternative<bool>(arg)) {
+-      template_def << std::get<bool>(arg);
+-    } else if (std::holds_alternative<Dtype>(arg)) {
+-      template_def << get_type_string(std::get<Dtype>(arg));
+-    }
+-    i++;
+-  }
+-  template_def << ">";
+-  return template_def.str();
++  if (!template_args.empty()) {
++    kernel_source += "\ntemplate [[host_name(\"";
++    kernel_source.append(func_name, func_name_bytes);
++    kernel_source += "\")]] [[kernel]] decltype(";
++    kernel_source.append(func_name, func_name_bytes);
++    emit_template(kernel_source, template_args);
++    kernel_source += ") ";
++    kernel_source.append(func_name, func_name_bytes);
++    emit_template(kernel_source, template_args);
++    kernel_source += ";\n";
++  }
+ }
+ 
+ } // namespace
+@@ -309,59 +375,24 @@
+ 
+     auto s = resolve_metal_kernel_stream(s_);
+ 
+-    std::string kernel_name = "custom_kernel_";
+-    kernel_name += name;
+-    std::string template_def = "";
+-    if (!template_args.empty()) {
+-      std::regex disallowed_chars("\\<|\\>|(, )|-");
+-      template_def = write_template(template_args);
+-      auto template_hash =
+-          std::regex_replace(template_def, disallowed_chars, "_");
+-      template_hash.pop_back();
+-      kernel_name += "_";
+-      kernel_name += template_hash;
+-    }
+-
+-    // The generated source depends on the dtypes of the inputs and outputs
+-    // and on how each input is passed (see `write_signature`). Include them
+-    // in the kernel name so that a given name always maps to the same source.
+-    for (const auto& arr : inputs) {
+-      kernel_name += "_";
+-      kernel_name += get_type_string(arr.dtype());
+-      if (arr.ndim() == 0) {
+-        kernel_name += "s";
+-      } else if (arr.size() < max_constant_array_size) {
+-        kernel_name += "c";
+-      }
+-    }
+-    for (const auto& dtype : output_dtypes) {
+-      kernel_name += "_";
+-      kernel_name += get_type_string(dtype);
+-    }
+-
+-    std::string kernel_source = write_signature(
+-        kernel_name,
+-        header,
+-        source,
+-        input_names,
+-        inputs,
+-        output_names,
+-        output_dtypes,
+-        template_args,
+-        attributes,
+-        shape_infos,
+-        atomic_outputs);
+-
+-    if (!template_args.empty()) {
+-      template_def = kernel_name + template_def;
+-      kernel_source += "\ntemplate [[host_name(\"";
+-      kernel_source += kernel_name;
+-      kernel_source += "\")]] [[kernel]] decltype(";
+-      kernel_source += template_def;
+-      kernel_source += ") ";
+-      kernel_source += template_def;
+-      kernel_source += ";\n";
+-    }
++    SourceWriter name_count;
++    emit_name(name_count, name, inputs, output_dtypes, template_args);
++    if (!name_count.good()) throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++    std::string kernel_name(name_count.size(), '\0');
++    SourceWriter name_output(kernel_name.data(), kernel_name.size());
++    emit_name(name_output, name, inputs, output_dtypes, template_args);
++    SourceWriter source_count;
++    emit_signature(source_count, nullptr, name_count.size(), header, source,
++        input_names, inputs, output_names, output_dtypes, template_args,
++        attributes, shape_infos, atomic_outputs);
++    if (!source_count.good()) throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++    std::string kernel_source(source_count.size(), '\0');
++    SourceWriter source_output(kernel_source.data(), kernel_source.size());
++    emit_signature(source_output, kernel_name.data(), kernel_name.size(), header, source,
++        input_names, inputs, output_names, output_dtypes, template_args,
++        attributes, shape_infos, atomic_outputs);
++    if (!name_output.good() || !source_output.good())
++      throw submission::GraphQuotaError(submission::GraphFailure::construction_mismatch);
+ 
+     if (verbose) {
+       std::cout << "Generated source code for `" << name << "`:" << std::endl
+@@ -578,4 +609,239 @@
+       ensure_row_contiguous, atomic_outputs, compile_options);
+ }
+ 
++class PreparedKernelFamily {
++ public:
++  std::atomic<size_t> references{1};
++  PreparedMetalKernelDefinition* definition{nullptr};
++  size_t slot_count{0};
++  void* owner{nullptr};
++  void (*retire)(void*){nullptr};
++};
++class PreparedKernelSlot {
++ public:
++  PreparedKernelFamily* family{nullptr};
++  KernelSpecialization signature;
++  char template_names[4][23]{};
++  char* name{nullptr};
++  char* full_source{nullptr};
++  size_t prefix_bytes{0}, source_bytes{0};
++  PreparedPipeline compiled;
++};
++namespace {
++constexpr size_t maximum_specializations = 16;
++bool checked_add(size_t& a, size_t b) noexcept {
++  if (b > std::numeric_limits<size_t>::max() - a) return false;
++  a += b; return true;
++}
++size_t slot_offset() noexcept {
++  return (sizeof(PreparedKernelFamily) + alignof(PreparedKernelSlot) - 1) &
++      ~(alignof(PreparedKernelSlot) - 1);
++}
++PreparedKernelSlot* family_slots(const PreparedKernelFamily& family) noexcept {
++  return reinterpret_cast<PreparedKernelSlot*>(reinterpret_cast<char*>(
++      const_cast<PreparedKernelFamily*>(&family)) + slot_offset());
++}
++bool specialization_equal(const KernelSpecialization& a, const KernelSpecialization& b,
++    size_t inputs, size_t outputs) noexcept {
++  if (a.template_count != b.template_count) return false;
++  for (size_t i = 0; i < inputs; ++i) {
++    if (a.inputs[i].dtype != b.inputs[i].dtype || a.inputs[i].scalar != b.inputs[i].scalar ||
++        a.inputs[i].constant != b.inputs[i].constant) return false;
++  }
++  for (size_t i = 0; i < outputs; ++i) if (a.outputs[i] != b.outputs[i]) return false;
++  for (size_t i = 0; i < a.template_count; ++i) if (a.templates[i] != b.templates[i]) return false;
++  return true;
++}
++struct SpecializationSource {
++  std::array<ShapeUsage, definition_inputs> shapes;
++  std::array<uint8_t, std::size(metal_attributes)> attributes;
++  size_t attribute_count{0}, name_bytes{0}, source_bytes{0};
++  bool count(const MetalKernelDefinitionPlan& plan, const KernelSpecialization& signature) {
++    for (size_t i = 0; i < plan.inputs.size(); ++i) shapes[i] = shape_usage(plan.source, plan.inputs[i]);
++    for (uint8_t id = 0; id < std::size(metal_attributes); ++id)
++      if (plan.source.find(metal_attributes[id].name) != std::string_view::npos)
++        attributes[attribute_count++] = id;
++    auto inputs = SignatureView(std::span<const InputSignature>(signature.inputs.data(), plan.inputs.size()));
++    auto outputs = std::span<const Dtype>(signature.outputs.data(), plan.outputs.size());
++    auto templates = TemplateArgsView(std::span<const NamedTemplateView>(signature.templates.data(), signature.template_count));
++    SourceWriter name;
++    emit_name(name, plan.name, inputs, outputs, templates);
++    SourceWriter source;
++    emit_signature(source, nullptr, name.size(), plan.header, plan.source, plan.inputs, inputs,
++        plan.outputs, outputs, templates, std::span<const uint8_t>(attributes.data(), attribute_count),
++        std::span<const ShapeUsage>(shapes.data(), plan.inputs.size()), plan.atomic_outputs);
++    name_bytes = name.size(); source_bytes = source.size();
++    return name.good() && source.good();
++  }
++  bool write(const MetalKernelDefinitionPlan& plan, const KernelSpecialization& signature,
++      char* name, char* source) const {
++    auto inputs = SignatureView(std::span<const InputSignature>(signature.inputs.data(), plan.inputs.size()));
++    auto outputs = std::span<const Dtype>(signature.outputs.data(), plan.outputs.size());
++    auto templates = TemplateArgsView(std::span<const NamedTemplateView>(signature.templates.data(), signature.template_count));
++    SourceWriter name_output(name, name_bytes);
++    emit_name(name_output, plan.name, inputs, outputs, templates);
++    name[name_bytes] = '\0';
++    SourceWriter source_output(source, source_bytes);
++    emit_signature(source_output, name, name_bytes, plan.header, plan.source, plan.inputs, inputs,
++        plan.outputs, outputs, templates, std::span<const uint8_t>(attributes.data(), attribute_count),
++        std::span<const ShapeUsage>(shapes.data(), plan.inputs.size()), plan.atomic_outputs);
++    source[source_bytes] = '\0';
++    return name_output.good() && source_output.good() && name_output.size() == name_bytes && source_output.size() == source_bytes;
++  }
++};
++}
++size_t kernel_family_static_bytes() noexcept {
++  auto platform = prepared_kernel_platform_layout();
++  return metal_kernel_definition_static_bytes() + platform.prefix_bytes + (platform.prefix ? 1 : 0);
++}
++size_t kernel_family_invocation_control_bytes() noexcept {
++  const auto platform = prepared_kernel_platform_layout();
++  if (!platform.qualified) return 0;
++  return sizeof(KernelSpecialization) + sizeof(PreparedKernelSlot*) * 2 +
++      sizeof(PreparedKernelFamily*) + sizeof(PreparedKernelBorrow) * 3 +
++      sizeof(SignatureView) + sizeof(TemplateArgsView) + sizeof(StreamOrDevice) +
++      sizeof(PreparedKernelPlatformLayout) + sizeof(size_t) * 7 + platform.control_bytes;
++}
++MetalKernelDefinitionStatus kernel_family_layout(const MetalKernelDefinitionPlan& plan,
++    std::span<const KernelSpecialization> signatures, KernelFamilyLayout& result) noexcept {
++  result = {};
++  MetalKernelDefinitionLayout definition;
++  auto status = metal_kernel_definition_layout(plan, definition);
++  if (status != MetalKernelDefinitionStatus::success) return status;
++  const auto platform = prepared_kernel_platform_layout();
++  if (!platform.qualified) return MetalKernelDefinitionStatus::unknown_layout;
++  if (signatures.empty() || signatures.size() > maximum_specializations)
++    return MetalKernelDefinitionStatus::invalid;
++  size_t bytes = slot_offset() + signatures.size() * sizeof(PreparedKernelSlot);
++  try {
++    for (size_t i = 0; i < signatures.size(); ++i) {
++      const auto& signature = signatures[i];
++      if (signature.template_count > 4) return MetalKernelDefinitionStatus::invalid;
++      for (size_t j = 0; j < plan.inputs.size(); ++j)
++        if (signature.inputs[j].scalar && !signature.inputs[j].constant) return MetalKernelDefinitionStatus::invalid;
++      for (size_t j = 0; j < signature.template_count; ++j)
++        if (signature.templates[j].first.size() > 22) return MetalKernelDefinitionStatus::invalid;
++      for (size_t j = 0; j < i; ++j)
++        if (specialization_equal(signature, signatures[j], plan.inputs.size(), plan.outputs.size()))
++          return MetalKernelDefinitionStatus::invalid;
++      SpecializationSource source;
++      if (!source.count(plan, signature) || !checked_add(bytes, source.name_bytes) ||
++          !checked_add(bytes, source.source_bytes) || !checked_add(bytes, platform.prefix_bytes) ||
++          !checked_add(bytes, 2)) return MetalKernelDefinitionStatus::overflow;
++    }
++  } catch (...) { return MetalKernelDefinitionStatus::invalid; }
++  size_t controls = definition.construction_controls;
++  const size_t fixed = sizeof(KernelFamilyLayout) * 2 + sizeof(PreparedKernelFamily*) +
++      sizeof(PreparedKernelSlot*) + sizeof(SpecializationSource) + sizeof(SourceWriter) * 4 +
++      sizeof(SignatureView) * 2 + sizeof(NameListView) * 2 + sizeof(TemplateArgsView) * 2 +
++      sizeof(InputSignature) + sizeof(std::span<const KernelSpecialization>) +
++      sizeof(std::span<const Dtype>) * 2 + sizeof(std::span<const ShapeUsage>) +
++      sizeof(std::span<const uint8_t>) + sizeof(PreparedKernelPlatformLayout) +
++      sizeof(std::array<char, 32>) + sizeof(std::to_chars_result) + sizeof(size_t) * 12 +
++      sizeof(PreparedKernelBorrow) * 2 + sizeof(std::unique_lock<std::mutex>);
++  if (!checked_add(controls, fixed) || !checked_add(controls, platform.control_bytes))
++    return MetalKernelDefinitionStatus::overflow;
++  result = {definition.requested_bytes, bytes, std::max(alignof(PreparedKernelFamily), alignof(PreparedKernelSlot)), controls};
++  return MetalKernelDefinitionStatus::success;
++}
++void retain_kernel_family(PreparedKernelFamily* family) noexcept {
++  if (family) family->references.fetch_add(1, std::memory_order_relaxed);
++}
++void release_kernel_family(PreparedKernelFamily* family) noexcept {
++  if (!family || family->references.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
++  const auto owner = family->owner;
++  const auto retire = family->retire;
++  auto* slots = family_slots(*family);
++  for (size_t i = family->slot_count; i > 0; --i) slots[i - 1].~PreparedKernelSlot();
++  free_metal_kernel_definition(family->definition);
++  family->~PreparedKernelFamily();
++  ::operator delete(family);
++  if (retire) retire(owner); // after all source/cache/native storage; callback only queues
++}
++MetalKernelDefinitionStatus prepare_kernel_family(const MetalKernelDefinitionPlan& plan,
++    std::span<const KernelSpecialization> signatures, void* owner, void (*retire)(void*),
++    PreparedKernelFamily*& result) noexcept {
++  result = nullptr;
++  KernelFamilyLayout layout;
++  auto status = kernel_family_layout(plan, signatures, layout);
++  if (status != MetalKernelDefinitionStatus::success) return status;
++  static_assert(alignof(PreparedKernelSlot) <= __STDCPP_DEFAULT_NEW_ALIGNMENT__);
++  auto* memory = ::operator new(layout.family_bytes, std::nothrow);
++  if (!memory) return MetalKernelDefinitionStatus::allocation_failed;
++  auto* family = ::new (memory) PreparedKernelFamily{};
++  status = prepare_metal_kernel_definition(plan, family->definition);
++  if (status != MetalKernelDefinitionStatus::success) { release_kernel_family(family); return status; }
++  auto* slots = family_slots(*family);
++  char* text = reinterpret_cast<char*>(slots + signatures.size());
++  const auto platform = prepared_kernel_platform_layout();
++  try {
++    for (const auto& signature : signatures) {
++      auto* slot = ::new (slots + family->slot_count) PreparedKernelSlot{};
++      ++family->slot_count;
++      slot->family = family;
++      slot->signature = signature;
++      for (size_t i = 0; i < signature.template_count; ++i) {
++        const auto name = signature.templates[i].first;
++        if (!name.empty()) std::memcpy(slot->template_names[i], name.data(), name.size());
++        slot->signature.templates[i].first = {slot->template_names[i], name.size()};
++      }
++      SpecializationSource source;
++      if (!source.count(plan, signature)) { release_kernel_family(family); return MetalKernelDefinitionStatus::overflow; }
++      slot->name = text; text += source.name_bytes + 1;
++      slot->full_source = text;
++      slot->prefix_bytes = platform.prefix_bytes;
++      slot->source_bytes = source.source_bytes;
++      if (platform.prefix_bytes) std::memcpy(text, platform.prefix, platform.prefix_bytes);
++      if (!source.write(plan, signature, slot->name, text + platform.prefix_bytes)) {
++        release_kernel_family(family); return MetalKernelDefinitionStatus::invalid;
++      }
++      text += platform.prefix_bytes + source.source_bytes + 1;
++    }
++  } catch (...) { release_kernel_family(family); return MetalKernelDefinitionStatus::allocation_failed; }
++  family->owner = owner; family->retire = retire;
++  result = family;
++  return MetalKernelDefinitionStatus::success;
++}
++PreparedKernelBorrow::PreparedKernelBorrow(PreparedKernelSlot* slot) noexcept : slot_(slot) {
++  if (slot_) retain_kernel_family(slot_->family);
++}
++PreparedKernelBorrow::PreparedKernelBorrow(const PreparedKernelBorrow& other) noexcept : PreparedKernelBorrow(other.slot_) {}
++PreparedKernelBorrow::PreparedKernelBorrow(PreparedKernelBorrow&& other) noexcept : slot_(std::exchange(other.slot_, nullptr)) {}
++PreparedKernelBorrow::~PreparedKernelBorrow() { if (slot_) release_kernel_family(slot_->family); }
++const char* PreparedKernelBorrow::name() const noexcept { return slot_->name; }
++std::string_view PreparedKernelBorrow::source() const noexcept {
++  return {slot_->full_source + slot_->prefix_bytes, slot_->source_bytes};
++}
++const char* PreparedKernelBorrow::compilation_source() const noexcept { return slot_->full_source; }
++std::span<const ShapeUsage> PreparedKernelBorrow::shape_infos() const noexcept {
++  auto* d = slot_->family->definition;
++  return {d->shape_infos.data(), d->input_count};
++}
++PreparedPipeline& PreparedKernelBorrow::pipeline() const noexcept { return slot_->compiled; }
++ArrayVector apply_kernel_family(const PreparedKernelFamily& family, const ArrayVector& inputs,
++    std::span<const Shape> shapes, std::span<const Dtype> dtypes,
++    std::tuple<int, int, int> grid, std::tuple<int, int, int> group,
++    TemplateArgsView templates, StreamOrDevice stream) {
++  auto* definition = family.definition;
++  auto invalid = [] { throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend); };
++  if (inputs.size() != definition->input_count || shapes.size() != definition->output_count ||
++      dtypes.size() != definition->output_count || templates.size() > 4) invalid();
++  KernelSpecialization actual;
++  for (size_t i = 0; i < inputs.size(); ++i)
++    actual.inputs[i] = {inputs[i].dtype(), inputs[i].ndim() == 0, inputs[i].size() < max_constant_array_size};
++  for (size_t i = 0; i < dtypes.size(); ++i) actual.outputs[i] = dtypes[i];
++  actual.template_count = templates.size();
++  for (size_t i = 0; i < templates.size(); ++i) actual.templates[i] = templates[i];
++  PreparedKernelSlot* selected = nullptr;
++  auto* slots = family_slots(family);
++  for (size_t i = 0; i < family.slot_count; ++i)
++    if (specialization_equal(actual, slots[i].signature, inputs.size(), dtypes.size())) { selected = slots + i; break; }
++  if (!selected) invalid();
++  auto resolved = resolve_metal_kernel_stream(stream);
++  return array::make_arrays_borrowed(shapes, dtypes,
++      submission::make_graph_primitive<CustomKernel>(resolved, PreparedKernelBorrow(selected),
++          grid, group, definition->contiguous, definition->atomic,
++          definition->options), inputs);
++}
++
+ } // namespace mlx::core::fast
+diff --git a/mlx/backend/common/prepared_kernel.h b/mlx/backend/common/prepared_kernel.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/common/prepared_kernel.h
+@@ -0,0 +1,48 @@
++#pragma once
++#include <mutex>
++#include <span>
++#include <string_view>
++#include <tuple>
++#include "mlx/api.h"
++
++namespace mlx::core::fast {
++class PreparedKernelFamily;
++class PreparedKernelSlot;
++// Framework allocator/compiler/driver internals are not managed storage. These
++// actual C++ owning handles and their mutex are in the admitted family block.
++struct PreparedPipeline {
++  std::mutex mutex;
++  void* device{nullptr};
++  void* library{nullptr};
++  void* pipeline{nullptr};
++  void (*retire)(void*, void*) noexcept {nullptr};
++  ~PreparedPipeline() { if (retire) retire(library, pipeline); }
++};
++struct PreparedKernelPlatformLayout {
++  const char* prefix{nullptr};
++  size_t prefix_bytes{0}, control_bytes{0};
++  bool qualified{false};
++};
++MLX_API PreparedKernelPlatformLayout prepared_kernel_platform_layout() noexcept;
++MLX_API void retain_kernel_family(PreparedKernelFamily*) noexcept;
++MLX_API void release_kernel_family(PreparedKernelFamily*) noexcept;
++// Copying this loan retains the exact definition/source/cache owner; it never
++// owns request Graph, Scope, Record, mutable backing, or a per-request grant.
++class MLX_API PreparedKernelBorrow {
++ public:
++  PreparedKernelBorrow() noexcept = default;
++  explicit PreparedKernelBorrow(PreparedKernelSlot*) noexcept;
++  PreparedKernelBorrow(const PreparedKernelBorrow&) noexcept;
++  PreparedKernelBorrow(PreparedKernelBorrow&&) noexcept;
++  PreparedKernelBorrow& operator=(const PreparedKernelBorrow&) = delete;
++  ~PreparedKernelBorrow();
++  explicit operator bool() const noexcept { return slot_ != nullptr; }
++  const char* name() const noexcept;
++  std::string_view source() const noexcept;
++  const char* compilation_source() const noexcept;
++  std::span<const std::tuple<bool, bool, bool>> shape_infos() const noexcept;
++  PreparedPipeline& pipeline() const noexcept;
++ private:
++  PreparedKernelSlot* slot_{nullptr};
++};
++} // namespace mlx::core::fast
+diff --git a/mlx/backend/metal/custom_kernel.cpp b/mlx/backend/metal/custom_kernel.cpp
+--- a/mlx/backend/metal/custom_kernel.cpp
++++ b/mlx/backend/metal/custom_kernel.cpp
+@@ -1,12 +1,30 @@
+ // Copyright © 2024 Apple Inc.
+ 
+ #include "mlx/backend/common/metal_kernel.h"
++#include <cstring>
++#include <array>
++#include <optional>
+ #include "mlx/backend/gpu/copy.h"
+ #include "mlx/backend/metal/jit/includes.h"
+ #include "mlx/backend/metal/utils.h"
+ #include "mlx/fast_primitives.h"
++#include "mlx/native_control.h"
+ 
+ namespace mlx::core::fast {
++
++namespace {
++using PreparedInputs = std::array<std::optional<array>, 8>;
++}
++PreparedKernelPlatformLayout prepared_kernel_platform_layout() noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++  const auto* prefix = metal::utils();
++  return {prefix, std::strlen(prefix), metal::Device::prepared_kernel_control_bytes() + sizeof(PreparedInputs) +
++      2 * sizeof(ArrayVector) + sizeof(std::tuple<bool, bool, bool>) +
++      sizeof(MTL::ComputePipelineState*) + 2 * sizeof(MTL::Size) + 12 * sizeof(int), true};
++#else
++  return {};
++#endif
++}
+ 
+ struct CustomKernelCache {
+   std::unordered_map<std::string, std::pair<std::string, CompileOptions::Data>>
+@@ -48,14 +66,24 @@
+       return copies.back();
+     }
+   };
++  PreparedInputs prepared_inputs;
+   ArrayVector checked_inputs;
+-  for (const array& in : inputs) {
+-    checked_inputs.push_back(check_input(in));
++  if (prepared_) {
++    // The closed family has at most eight inputs. Keep normalized aliases in
++    // named stack slots; only actual noncontiguous copies need an owned vector.
++    size_t copy_count = 0;
++    for (const auto& in : inputs)
++      copy_count += ensure_row_contiguous_ && !in.flags().row_contiguous;
++    if (copy_count) copies.reserve(copy_count);
++    for (size_t i = 0; i < inputs.size(); ++i)
++      prepared_inputs[i].emplace(check_input(inputs[i]));
++  } else {
++    for (const array& in : inputs) checked_inputs.push_back(check_input(in));
+   }
+ 
+   auto& d = metal::device(s.device);
+ 
+-  {
++  if (!prepared_) {
+     // Clear kernels from the device library cache if needed
+     auto& kernel_cache = cache();
+     if (auto it = kernel_cache.libraries.find(name_);
+@@ -72,15 +100,20 @@
+     }
+   }
+ 
+-  auto lib = d.get_library_borrowed(
+-      name_, compile_options_, [this] { return metal::utils() + source_; });
+-  auto kernel = d.get_kernel(name_, lib);
++  MTL::ComputePipelineState* kernel;
++  if (prepared_) {
++    kernel = d.get_prepared_kernel(prepared_, compile_options_);
++  } else {
++    auto lib = d.get_library_borrowed(
++        name_, compile_options_, [this] { return metal::utils() + source_; });
++    kernel = d.get_kernel(name_, lib);
++  }
+   auto& compute_encoder = metal::get_command_encoder(s);
+   compute_encoder.set_compute_pipeline_state(kernel);
+   int index = 0;
+-  for (int i = 0; i < checked_inputs.size(); i++) {
+-    const array& in = checked_inputs[i];
+-    auto& shape_info = shape_infos_[i];
++  for (int i = 0; i < inputs.size(); i++) {
++    const array& in = prepared_ ? *prepared_inputs[i] : checked_inputs[i];
++    const auto shape_info = prepared_ ? prepared_.shape_infos()[i] : shape_infos_[i];
+     compute_encoder.set_input_array(in, index);
+     index++;
+     if (in.ndim() > 0) {
+@@ -108,6 +141,8 @@
+   auto tg_size = tx * ty * tz;
+   auto max_tg_size = kernel->maxTotalThreadsPerThreadgroup();
+   if (tg_size > max_tg_size) {
++    if (prepared_) throw submission::NativeControlError(
++        submission::NativeControlFailure::unsupported_backend);
+     std::ostringstream msg;
+     msg << "Thread group size (" << tg_size << ") is greater than "
+         << " the maximum allowed threads per threadgroup (" << max_tg_size
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -100,8 +100,8 @@
+       return MTL::LanguageVersion3_1;
+     }
+   };
+-  static auto metal_version_ = get_metal_version_();
+-  return metal_version_;
++  // The OS availability checks are pure; no lazily retained version/guard owner.
++  return get_metal_version_();
+ }
+ 
+ NS::SharedPtr<MTL::Device> load_device(bool prepared = false) {
+@@ -1168,13 +1168,66 @@
+   return new_lib;
+ }
+ 
++namespace {
++// The retained framework failure and the exact source/cache account survive
++// public error transport. No diagnostic string is allocated on this path.
++class PreparedKernelError final : public std::exception {
++ public:
++  PreparedKernelError(const char* stage, NS::Error* error, const fast::PreparedKernelBorrow& source)
++      : stage_(stage), error_(NS::RetainPtr(error)), source_(source) {}
++  const char* what() const noexcept override { return stage_; }
++ private:
++  const char* stage_;
++  NS::SharedPtr<NS::Error> error_;
++  fast::PreparedKernelBorrow source_;
++};
++void retire_prepared_pipeline(void* library, void* pipeline) noexcept {
++  if (pipeline) static_cast<MTL::ComputePipelineState*>(pipeline)->release();
++  if (library) static_cast<MTL::Library*>(library)->release();
++}
++}
++size_t Device::prepared_kernel_control_bytes() noexcept {
++  return sizeof(PreparedKernelError) + sizeof(NS::SharedPtr<MTL::Library>) * 2 +
++      sizeof(NS::SharedPtr<MTL::Function>) + sizeof(NS::SharedPtr<MTL::ComputePipelineState>) * 2 +
++      sizeof(decltype(new_scoped_memory_pool())) + sizeof(NS::String*) +
++      sizeof(MTL::CompileOptions*) + sizeof(NS::Error*) * 2 +
++      sizeof(std::unique_lock<std::mutex>) + sizeof(CompileOptions) +
++      sizeof(fast::PreparedKernelBorrow) * 2 + sizeof(void*) * 5;
++}
++MTL::ComputePipelineState* Device::get_prepared_kernel(
++    const fast::PreparedKernelBorrow& source, const CompileOptions& options) {
++  auto& slot = source.pipeline();
++  std::unique_lock lock(slot.mutex);
++  if (slot.device && slot.device != this)
++    throw PreparedKernelError("prepared Metal kernel belongs to another Device", nullptr, source);
++  if (slot.pipeline) return static_cast<MTL::ComputePipelineState*>(slot.pipeline);
++  if (!slot.library) {
++    auto library = build_library_(source.compilation_source(), options, &source);
++    slot.device = this;
++    slot.retire = retire_prepared_pipeline;
++    library->retain();
++    slot.library = library.get();
++  }
++  // Keep the successful library prefix in this same admitted slot if later
++  // function/pipeline construction fails. A retry never creates a new row.
++  auto function = get_function_(source.name(), static_cast<MTL::Library*>(slot.library));
++  auto pipeline = get_kernel_(source.name(), function.get(), &source);
++  pipeline->retain();
++  slot.pipeline = pipeline.get();
++  return pipeline.get();
++}
++
+ NS::SharedPtr<MTL::Library> Device::build_library_(
+     const std::string& source_string,
+     const CompileOptions& compile_options) {
++  return build_library_(source_string.c_str(), compile_options, nullptr);
++}
++NS::SharedPtr<MTL::Library> Device::build_library_(const char* source_string,
++    const CompileOptions& compile_options, const fast::PreparedKernelBorrow* prepared) {
+   auto pool = new_scoped_memory_pool();
+ 
+   auto ns_code =
+-      NS::String::string(source_string.c_str(), NS::ASCIIStringEncoding);
++      NS::String::string(source_string, NS::ASCIIStringEncoding);
+ 
+   NS::Error* error = nullptr;
+   auto options = MTL::CompileOptions::alloc()->init()->autorelease();
+@@ -1189,6 +1242,7 @@
+ 
+   // Throw error if unable to compile library
+   if (!mtl_lib) {
++    if (prepared) throw PreparedKernelError("unable to build prepared Metal library", error, *prepared);
+     std::ostringstream msg;
+     msg << "[metal::Device] Unable to build metal library from source\n";
+     if (error) {
+@@ -1203,9 +1257,12 @@
+ NS::SharedPtr<MTL::Function> Device::get_function_(
+     const std::string& name,
+     MTL::Library* mtl_lib) {
++  return get_function_(name.c_str(), mtl_lib);
++}
++NS::SharedPtr<MTL::Function> Device::get_function_(const char* name, MTL::Library* mtl_lib) {
+   auto pool = new_scoped_memory_pool();
+   // Pull kernel from library
+-  auto ns_name = NS::String::string(name.c_str(), NS::ASCIIStringEncoding);
++  auto ns_name = NS::String::string(name, NS::ASCIIStringEncoding);
+   return NS::TransferPtr(mtl_lib->newFunction(ns_name));
+ }
+ 
+@@ -1255,6 +1312,10 @@
+ NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(
+     const std::string& name,
+     const MTL::Function* mtl_function) {
++  return get_kernel_(name.c_str(), mtl_function, nullptr);
++}
++NS::SharedPtr<MTL::ComputePipelineState> Device::get_kernel_(const char* name,
++    const MTL::Function* mtl_function, const fast::PreparedKernelBorrow* prepared) {
+   // Compile kernel to compute pipeline
+   NS::Error* error = nullptr;
+   NS::SharedPtr<MTL::ComputePipelineState> kernel;
+@@ -1266,6 +1327,7 @@
+ 
+   // Throw error if unable to compile metal function
+   if (!mtl_function || !kernel) {
++    if (prepared) throw PreparedKernelError("unable to build prepared Metal pipeline", error, *prepared);
+     std::ostringstream msg;
+     msg << "[metal::Device] Unable to load kernel " << name << "\n";
+     if (error) {
+@@ -1418,9 +1480,11 @@
+     std::shared_lock lock(kernel_mtx_);
+ 
+     // Look for cached kernel
+-    auto& kernel_map_ = library_kernels_[mtl_lib];
+-    if (auto it = kernel_map_.find(kname); it != kernel_map_.end()) {
+-      return it->second.get();
++    if (auto library = library_kernels_.find(mtl_lib);
++        library != library_kernels_.end()) {
++      if (auto it = library->second.find(kname); it != library->second.end()) {
++        return it->second.get();
++      }
+     }
+   }
+   return get_kernel_(base_name, mtl_lib, kname, func_consts, linked_functions);
+@@ -1472,7 +1536,7 @@
+       sizeof(DeviceInitializationOwner) + sizeof(DeviceInitializationError) +
+       sizeof(std::unique_lock<std::mutex>) + sizeof(std::lock_guard<std::mutex>) + sizeof(PreparedDeviceSourceLock) * 2 +
+       sizeof(NS::SharedPtr<MTL::Device>) * 2 + sizeof(NS::SharedPtr<NS::Array>) +
+-      sizeof(NS::SharedPtr<NS::AutoreleasePool>) * 3 +
++      sizeof(decltype(new_scoped_memory_pool())) * 3 +
+       sizeof(NS::SharedPtr<MTL::ResidencySetDescriptor>) +
+       sizeof(NS::SharedPtr<MTL::Library>) + sizeof(NS::SharedPtr<NS::String>) +
+       sizeof(Device*) * 3 + sizeof(NS::Error*) * 2 + sizeof(const char*) * 3 +
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -12,6 +12,7 @@
+ #include <string>
+ #include <type_traits>
+ #include <unordered_map>
++#include "mlx/backend/common/prepared_kernel.h"
+ #include <unordered_set>
+ 
+ #include "mlx/array.h"
+@@ -332,6 +333,12 @@
+       const MTLFCList& func_consts = {},
+       const std::vector<MTL::Function*>& linked_functions = {});
+ 
++  // Uses a definition-owned admitted slot, not the unbounded ordinary maps.
++  // Both routes share the actual framework compilation/function/pipeline worker.
++  MTL::ComputePipelineState* get_prepared_kernel(const fast::PreparedKernelBorrow&,
++      const CompileOptions& compile_options);
++  static size_t prepared_kernel_control_bytes() noexcept;
++
+   ResidencySet& residency_set() {
+     return residency_set_;
+   }
+@@ -354,10 +361,13 @@
+   NS::SharedPtr<MTL::Library> build_library_(
+       const std::string& source_string,
+       const CompileOptions& compile_options = {});
++  NS::SharedPtr<MTL::Library> build_library_(const char* source_string,
++      const CompileOptions&, const fast::PreparedKernelBorrow*);
+ 
+   NS::SharedPtr<MTL::Function> get_function_(
+       const std::string& name,
+       MTL::Library* mtl_lib);
++  NS::SharedPtr<MTL::Function> get_function_(const char* name, MTL::Library* mtl_lib);
+   NS::SharedPtr<MTL::Function> get_function_(
+       const std::string& name,
+       const std::string& specialized_name,
+@@ -370,6 +380,8 @@
+   NS::SharedPtr<MTL::ComputePipelineState> get_kernel_(
+       const std::string& name,
+       const MTL::Function* mtl_function);
++  NS::SharedPtr<MTL::ComputePipelineState> get_kernel_(const char* name,
++      const MTL::Function*, const fast::PreparedKernelBorrow*);
+   NS::SharedPtr<MTL::ComputePipelineState> get_kernel_(
+       const std::string& name,
+       const MTL::Function* mtl_function,
+diff --git a/mlx/backend/metal/no_metal.cpp b/mlx/backend/metal/no_metal.cpp
+--- a/mlx/backend/metal/no_metal.cpp
++++ b/mlx/backend/metal/no_metal.cpp
+@@ -50,3 +50,8 @@
+ DeviceInitializationCause validate_prepared_device_source(const EmbeddedMetallib&) noexcept { return DeviceInitializationCause::unsupported; }
+ size_t device_source_static_bytes() noexcept { return 0; }
+ } // namespace mlx::core::metal
++
++#include "mlx/backend/common/prepared_kernel.h"
++namespace mlx::core::fast {
++PreparedKernelPlatformLayout prepared_kernel_platform_layout() noexcept { return {}; }
++}
+diff --git a/mlx/fast.h b/mlx/fast.h
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -3,6 +3,8 @@
+ #pragma once
+ 
+ #include <optional>
++#include <array>
++#include "mlx/backend/common/prepared_kernel.h"
+ #include <span>
+ #include <string_view>
+ #include <variant>
+@@ -153,6 +155,29 @@
+     std::span<const Shape>, std::span<const Dtype>, std::tuple<int, int, int>,
+     std::tuple<int, int, int>, TemplateArgsView, StreamOrDevice);
+ 
++// A finite declared specialization set. Only template values, dtypes and the
++// actual scalar/constant/device signature classes affect generated source.
++struct KernelInputSignature { Dtype dtype{float32}; bool scalar{false}, constant{false}; };
++struct KernelSpecialization {
++  std::array<KernelInputSignature, 8> inputs;
++  std::array<Dtype, 4> outputs{float32, float32, float32, float32};
++  std::array<NamedTemplateView, 4> templates;
++  size_t template_count{0};
++};
++struct KernelFamilyLayout {
++  size_t definition_bytes, family_bytes, alignment, control_bytes;
++};
++MLX_API MetalKernelDefinitionStatus kernel_family_layout(
++    const MetalKernelDefinitionPlan&, std::span<const KernelSpecialization>, KernelFamilyLayout&) noexcept;
++MLX_API MetalKernelDefinitionStatus prepare_kernel_family(
++    const MetalKernelDefinitionPlan&, std::span<const KernelSpecialization>,
++    void* owner, void (*retire)(void*), PreparedKernelFamily*&) noexcept;
++MLX_API ArrayVector apply_kernel_family(const PreparedKernelFamily&,
++    const ArrayVector&, std::span<const Shape>, std::span<const Dtype>,
++    std::tuple<int, int, int>, std::tuple<int, int, int>, TemplateArgsView, StreamOrDevice);
++MLX_API size_t kernel_family_static_bytes() noexcept;
++MLX_API size_t kernel_family_invocation_control_bytes() noexcept;
++
+ MLX_API CustomKernelFunction metal_kernel(
+     const std::string& name,
+     const std::vector<std::string>& input_names,
+diff --git a/mlx/fast_primitives.h b/mlx/fast_primitives.h
+--- a/mlx/fast_primitives.h
++++ b/mlx/fast_primitives.h
+@@ -4,6 +4,7 @@
+ #include <variant>
+ 
+ #include "mlx/backend/common/metal_kernel.h"
++#include "mlx/backend/common/prepared_kernel.h"
+ #include "mlx/primitives.h"
+ 
+ namespace mlx::core::fast {
+@@ -391,6 +392,13 @@
+         shared_memory_(shared_memory),
+         compile_options_(compile_options) {}
+ 
++  CustomKernel(Stream stream, PreparedKernelBorrow prepared,
++      std::tuple<int, int, int> grid, std::tuple<int, int, int> threadgroup,
++      bool ensure_row_contiguous, bool /* atomic_outputs */, CompileOptions::Data compile_options)
++      : Primitive(stream), grid_(grid), threadgroup_(threadgroup),
++        ensure_row_contiguous_(ensure_row_contiguous), is_precompiled_(false),
++        shared_memory_(0), compile_options_(compile_options), prepared_(std::move(prepared)) {}
++
+   void eval_cpu(const ArrayVector& inputs, ArrayVector& outputs)
+       override {
+     throw std::runtime_error("Custom kernels only run on GPU.");
+@@ -402,11 +410,11 @@
+   DEFINE_NAME(CustomKernel);
+   auto state() const {
+     return std::make_tuple(
+-        name_,
+-        source_,
++        prepared_ ? std::string(prepared_.name()) : name_,
++        prepared_ ? std::string(prepared_.source()) : source_,
+         grid_,
+         threadgroup_,
+-        shape_infos_,
++        prepared_ ? std::vector<std::tuple<bool, bool, bool>>(prepared_.shape_infos().begin(), prepared_.shape_infos().end()) : shape_infos_,
+         ensure_row_contiguous_,
+         init_value_,
+         scalar_arguments_,
+@@ -427,6 +435,7 @@
+   bool is_precompiled_;
+   int shared_memory_;
+   CompileOptions::Data compile_options_;
++  PreparedKernelBorrow prepared_;
+ };
+ 
+ } // namespace mlx::core::fast

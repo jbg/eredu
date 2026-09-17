@@ -1,0 +1,1090 @@
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -4,6 +4,7 @@
+ #include <thread>
+ 
+ #include "mlx/array.h"
++#include "mlx/scoped_evaluation.h"
+ #include "mlx/host_transfer.h"
+ #include "mlx/ops.h"
+ #include "mlx/primitives.h"
+@@ -148,6 +149,17 @@
+ }
+ 
+ bool array::is_available() const {
++  if (auto* scope = original_evaluation_scope()) {
++    const auto controls = submission::current_native_controls();
++    if (controls.failure != submission::NativeControlFailure::none)
++      throw ScopedEvaluationError(ScopedEvaluation::domain);
++    if (status() == Status::unscheduled) return false;
++    const auto result = validate_scoped_array(*this, *scope);
++    if (result == ScopedEvaluation::pending) return false;
++    if (result != ScopedEvaluation::complete) throw ScopedEvaluationError(result);
++    return true;
++  }
++
+   if (status() == Status::available) {
+     return true;
+   } else if (
+@@ -161,6 +173,11 @@
+ }
+ 
+ void array::wait() {
++  if (auto* scope = original_evaluation_scope()) {
++    const auto result = evaluate_scoped_array(*this, *scope);
++    if (result != ScopedEvaluation::complete) throw ScopedEvaluationError(result);
++    return;
++  }
+   if (!is_available()) {
+     if (event().valid()) {
+       event().wait();
+@@ -171,6 +188,11 @@
+ }
+ 
+ void array::eval() {
++  if (auto* scope = original_evaluation_scope()) {
++    const auto result = evaluate_scoped_array(*this, *scope);
++    if (result != ScopedEvaluation::complete) throw ScopedEvaluationError(result);
++    return;
++  }
+   // Ensure the array is ready to be read
+   if (status() == Status::unscheduled) {
+     mlx::core::eval({*this});
+diff --git a/mlx/completion.h b/mlx/completion.h
+--- a/mlx/completion.h
++++ b/mlx/completion.h
+@@ -59,6 +59,8 @@
+   bool is_complete() const;
+   /** Fixed read of the existing event only; no progress/formatting/re-eval. */
+   EventObservation observe() const noexcept;
++  // Exact retained event owner; empty completion has no outstanding producer.
++  bool matches_failure(const FailureCarrier*) const noexcept;
+ 
+   /** Return whether this completion carries device timestamp markers. */
+   bool is_timed() const {
+@@ -95,10 +97,15 @@
+   std::optional<Device> device_;
+   std::optional<DeviceTimer> timer_;
+   mutable std::optional<double> elapsed_seconds_;
++  // Set only by authenticated scoped evaluation; survives move/Scope exit.
++  // Legacy observation must never forget original provenance because TLS ended.
++  bool scoped_original_{false};
+ 
+   friend MLX_API Completion async_eval_with_completion(ArrayVector outputs);
+   friend MLX_API submission::ScopedProgress async_eval_with_completion_scoped(
+       ArrayVector, submission::Scope&, Completion&);
++  friend MLX_API submission::ScopedProgress evaluate_with_completion_scoped(
++      ArrayVector, submission::Scope&, Completion&, bool);
+   friend MLX_API Completion async_eval_with_timing(
+       ArrayVector outputs,
+       Stream stream);
+diff --git a/mlx/scoped_evaluation.h b/mlx/scoped_evaluation.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/scoped_evaluation.h
+@@ -0,0 +1,34 @@
++#pragma once
++#include <exception>
++#include "mlx/api.h"
++#include "mlx/completion.h"
++#include "mlx/submission.h"
++
++namespace mlx::core {
++// Fixed transport shared by root completion and synchronous borrowed-array
++// evaluation. A refusal is not terminal recovery or a native source substitute.
++enum class ScopedEvaluation : unsigned {
++  complete = 0, invalid = 1, capacity = 2, allocation = 3, domain = 4,
++  spent = 5, pending = 6, failed = 7, funded_progress = 8,
++  unobservable = 9, busy = 10,
++};
++class MLX_API ScopedEvaluationError final : public std::exception {
++ public:
++  explicit ScopedEvaluationError(ScopedEvaluation value) noexcept : value_(value) {}
++  ScopedEvaluation outcome() const noexcept { return value_; }
++  const char* what() const noexcept override;
++ private:
++  ScopedEvaluation value_;
++};
++MLX_API ScopedEvaluation evaluation_progress(submission::ScopedProgress) noexcept;
++MLX_API ScopedEvaluation evaluation_event(EventObservation) noexcept;
++MLX_API ScopedEvaluation query_scoped_completion(
++    submission::Scope&, const Completion&) noexcept;
++MLX_API ScopedEvaluation wait_scoped_completion(
++    submission::Scope&, const Completion&) noexcept;
++MLX_API ScopedEvaluation validate_scoped_array(const array&, submission::Scope&) noexcept;
++// Current original-required Scope only; no replacement owner or collector.
++MLX_API ScopedEvaluation evaluate_scoped_array(array&, submission::Scope&) noexcept;
++// TLS read only. A nonnull result still requires genuine configured authority.
++MLX_API submission::Scope* original_evaluation_scope() noexcept;
++}
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -12,6 +12,7 @@
+ #include "mlx/backend/cpu/eval.h"
+ #include "mlx/backend/gpu/eval.h"
+ #include "mlx/completion.h"
++#include "mlx/scoped_evaluation.h"
+ #include "mlx/fence.h"
+ #include "mlx/memory.h"
+ #include "mlx/ops.h"
+@@ -174,8 +175,14 @@
+     bool async,
+     DeviceTimer* timer,
+     submission::ScopedProgress* scoped_outcome) {
+-  submission::progress_records();
+-  submission::retire_records();
++  if (!scoped_outcome) {
++    // No original caller may reach global cleanup or legacy throttling, even
++    // through an overlooked native eval adapter.
++    if (original_evaluation_scope())
++      throw ScopedEvaluationError(ScopedEvaluation::unobservable);
++    submission::progress_records();
++    submission::retire_records();
++  }
+   auto prepared_recovery = submission::Record::create<EvalSubmissionRecord>();
+   prepared_recovery->enter();
+   auto* recovery = prepared_recovery.release();
+@@ -516,12 +523,19 @@
+   return *eval_impl_result(std::move(outputs), async, timer, nullptr);
+ }
+ 
+-submission::ScopedProgress async_eval_with_completion_scoped(
+-    ArrayVector outputs, submission::Scope& scope, Completion& destination) {
++submission::ScopedProgress evaluate_with_completion_scoped(
++    ArrayVector outputs, submission::Scope& scope, Completion& destination, bool async) {
+   using Outcome = submission::ScopedProgress;
+   if (submission::current_scope() != &scope || !scope.identity() ||
+       !scope.scoped_observation_only() || !scope.on_owner_thread() || !scope.failure_owner())
+     return Outcome::unobservable;
++  if (scope.original_controls_required()) {
++    const auto controls = submission::current_native_controls();
++    if (controls.failure != submission::NativeControlFailure::none ||
++        !controls.original || controls.scope_identity != scope.identity() ||
++        outputs.get_allocator().resource() != controls.graph)
++      return Outcome::unobservable;
++  }
+   bool needed = false;
+   for (auto& output : outputs) {
+     // Do not call is_available(): it can throw a newly formatted event error.
+@@ -530,16 +544,149 @@
+   }
+   if (!needed) {
+     destination = Completion{};
++    destination.scoped_original_ = scope.original_controls_required();
+     return Outcome::observed;
+   }
+   Outcome outcome = Outcome::observed;
+-  auto synchronizer = eval_impl_result(std::move(outputs), true, nullptr, &outcome);
++  auto synchronizer = eval_impl_result(std::move(outputs), async, nullptr, &outcome);
+   if (!synchronizer) return outcome;
+   destination = Completion{synchronizer->event()};
++  destination.scoped_original_ = scope.original_controls_required();
+   return Outcome::observed;
+ }
+ 
++submission::ScopedProgress async_eval_with_completion_scoped(
++    ArrayVector outputs, submission::Scope& scope, Completion& destination) {
++  return evaluate_with_completion_scoped(std::move(outputs), scope, destination, true);
++}
++
++const char* ScopedEvaluationError::what() const noexcept {
++  switch (value_) {
++    case ScopedEvaluation::domain: return "scoped evaluation domain mismatch";
++    case ScopedEvaluation::pending: return "scoped evaluation remains pending";
++    case ScopedEvaluation::failed: return "scoped evaluation retained native failure";
++    case ScopedEvaluation::funded_progress: return "scoped evaluation requires funded progress";
++    case ScopedEvaluation::busy: return "scoped evaluation runtime busy";
++    default: return "scoped evaluation is unobservable";
++  }
++}
++submission::Scope* original_evaluation_scope() noexcept {
++  auto* scope = submission::current_scope();
++  return scope && scope->original_controls_required() ? scope : nullptr;
++}
++ScopedEvaluation evaluation_progress(submission::ScopedProgress value) noexcept {
++  using P = submission::ScopedProgress;
++  switch (value) {
++    case P::observed: return ScopedEvaluation::complete;
++    case P::funded_progress: return ScopedEvaluation::funded_progress;
++    case P::busy: return ScopedEvaluation::busy;
++    case P::failed: return ScopedEvaluation::failed;
++    default: return ScopedEvaluation::unobservable;
++  }
++}
++ScopedEvaluation evaluation_event(EventObservation value) noexcept {
++  switch (value) {
++    case EventObservation::ready: return ScopedEvaluation::complete;
++    case EventObservation::pending: return ScopedEvaluation::pending;
++    case EventObservation::failed: return ScopedEvaluation::failed;
++    case EventObservation::busy: return ScopedEvaluation::busy;
++    default: return ScopedEvaluation::unobservable;
++  }
++}
++bool Completion::matches_failure(const FailureCarrier* failure) const noexcept {
++  return !event_ || event_->failure_owner().get() == failure;
++}
++ScopedEvaluation query_scoped_completion(
++    submission::Scope& scope, const Completion& completion) noexcept {
++  if (!scope.on_owner_thread() || !scope.scoped_observation_only() ||
++      !scope.identity() || !scope.failure_owner() ||
++      !completion.matches_failure(scope.failure_owner().get()))
++    return ScopedEvaluation::domain;
++  const auto progress = evaluation_progress(scope.progress_scoped());
++  if (progress != ScopedEvaluation::complete) return progress;
++  if (scope.failure_owner().get()->borrow()) return ScopedEvaluation::failed;
++  if (scope.failure_owner().get()->pending_publication()) return ScopedEvaluation::busy;
++  if (scope.query().failed) return ScopedEvaluation::unobservable;
++  return evaluation_event(completion.observe());
++}
++ScopedEvaluation wait_scoped_completion(
++    submission::Scope& scope, const Completion& completion) noexcept {
++  for (;;) {
++    const auto result = query_scoped_completion(scope, completion);
++    // Only owned, observable pending work may yield. This never commits or
++    // retires unrelated work and never spins on funded-progress/busy/unknown.
++    if (result != ScopedEvaluation::pending) return result;
++    std::this_thread::yield();
++  }
++}
++ScopedEvaluation validate_scoped_array(const array& value, submission::Scope& scope) noexcept {
++  if (!scope.on_owner_thread() || !scope.scoped_observation_only() || !scope.failure_owner())
++    return ScopedEvaluation::domain;
++  if (value.status() == array::Status::unscheduled) return ScopedEvaluation::invalid;
++  if (value.event().valid()) {
++    if (value.status() != array::Status::available &&
++        value.event().failure_owner().get() != scope.failure_owner().get())
++      return ScopedEvaluation::domain;
++    const auto result = value.status() == array::Status::available
++        ? ScopedEvaluation::complete : evaluation_event(value.event().observe());
++    if (result != ScopedEvaluation::complete) return result;
++    value.detach_event();
++  }
++  value.set_status(array::Status::available);
++  return ScopedEvaluation::complete;
++}
++ScopedEvaluation evaluate_scoped_array(array& value, submission::Scope& scope) noexcept {
++  const auto controls = submission::current_native_controls();
++  if (submission::current_scope() != &scope || !controls.original ||
++      controls.failure != submission::NativeControlFailure::none ||
++      controls.scope_identity != scope.identity() || !scope.on_owner_thread())
++    return ScopedEvaluation::domain;
++  // A preexisting retained cause is never overwritten by a new attempt.
++  if (scope.failure_owner().get()->borrow()) return ScopedEvaluation::failed;
++  if (scope.failure_owner().get()->pending_publication()) return ScopedEvaluation::busy;
++  if (scope.query().failed) return ScopedEvaluation::unobservable;
++  if (value.status() == array::Status::available)
++    return validate_scoped_array(value, scope);
++  if (value.event().valid() &&
++      value.event().failure_owner().get() != controls.carrier)
++    return ScopedEvaluation::domain;
++  try {
++    Completion completion;
++    ArrayVector outputs{submission::GraphAllocator<array>(controls.graph)};
++    outputs.reserve(1);
++    outputs.emplace_back(value);
++    auto result = evaluation_progress(evaluate_with_completion_scoped(
++        std::move(outputs), scope, completion, false));
++    if (result != ScopedEvaluation::complete) return result;
++    result = wait_scoped_completion(scope, completion);
++    return result == ScopedEvaluation::complete ? validate_scoped_array(value, scope) : result;
++  } catch (...) {
++    // No error handler, what(), new carrier or authority. Partial work is still
++    // owned by the actual Record/Scope; polling failure is not release evidence.
++    scope.failure_owner().get()->capture_current_exception();
++    return ScopedEvaluation::failed;
++  }
++}
++
+ void async_eval(ArrayVector outputs) {
++  if (auto* scope = original_evaluation_scope()) {
++    const auto controls = submission::current_native_controls();
++    if (controls.failure != submission::NativeControlFailure::none ||
++        outputs.get_allocator().resource() != controls.graph)
++      throw ScopedEvaluationError(ScopedEvaluation::domain);
++    Completion completion;
++    ScopedEvaluation result;
++    try {
++      result = evaluation_progress(async_eval_with_completion_scoped(
++          std::move(outputs), *scope, completion));
++    } catch (...) {
++      scope->failure_owner().get()->capture_current_exception();
++      throw;
++    }
++    if (result != ScopedEvaluation::complete) throw ScopedEvaluationError(result);
++    return;
++  }
++
+   if (outputs.empty()) {
+     return;
+   }
+@@ -554,6 +701,24 @@
+ }
+ 
+ Completion async_eval_with_completion(ArrayVector outputs) {
++  if (auto* scope = original_evaluation_scope()) {
++    const auto controls = submission::current_native_controls();
++    if (controls.failure != submission::NativeControlFailure::none ||
++        outputs.get_allocator().resource() != controls.graph)
++      throw ScopedEvaluationError(ScopedEvaluation::domain);
++    Completion completion;
++    ScopedEvaluation result;
++    try {
++      result = evaluation_progress(async_eval_with_completion_scoped(
++          std::move(outputs), *scope, completion));
++    } catch (...) {
++      scope->failure_owner().get()->capture_current_exception();
++      throw;
++    }
++    if (result != ScopedEvaluation::complete) throw ScopedEvaluationError(result);
++    return completion;
++  }
++
+   if (outputs.empty()) {
+     return Completion{};
+   }
+@@ -576,6 +741,11 @@
+ Completion async_eval_with_timing(
+     ArrayVector outputs,
+     Stream requested_stream) {
++  // Timing producers are not part of scoped evaluation. Refuse before default
++  // stream selection, mismatch formatting or DeviceTimer construction.
++  if (original_evaluation_scope())
++    throw ScopedEvaluationError(ScopedEvaluation::unobservable);
++
+   if (outputs.empty()) {
+     return Completion{0.0};
+   }
+@@ -613,6 +783,14 @@
+ }
+ 
+ void Completion::wait() const {
++  if (scoped_original_ && !original_evaluation_scope())
++    throw ScopedEvaluationError(ScopedEvaluation::unobservable);
++
++  if (auto* scope = original_evaluation_scope()) {
++    const auto result = wait_scoped_completion(*scope, *this);
++    if (result != ScopedEvaluation::complete) throw ScopedEvaluationError(result);
++    return;
++  }
+   if (event_) {
+     event_->wait();
+   }
+@@ -621,6 +799,11 @@
+ }
+ 
+ void Completion::wait(Stream stream) const {
++  // Cross-stream completion-wait Record/receipt producers require their own
++  // audited original route. Do not format a mismatch or create a legacy Record.
++  if (scoped_original_ || original_evaluation_scope())
++    throw ScopedEvaluationError(ScopedEvaluation::unobservable);
++
+   if (!event_) {
+     return;
+   }
+@@ -667,6 +850,15 @@
+ }
+ 
+ bool Completion::is_complete() const {
++  if (scoped_original_ && !original_evaluation_scope())
++    throw ScopedEvaluationError(ScopedEvaluation::unobservable);
++
++  if (auto* scope = original_evaluation_scope()) {
++    const auto result = query_scoped_completion(*scope, *this);
++    if (result == ScopedEvaluation::pending) return false;
++    if (result != ScopedEvaluation::complete) throw ScopedEvaluationError(result);
++    return true;
++  }
+   auto complete = !event_ || event_->is_signaled();
+   if (complete) {
+     submission::progress_records();
+@@ -675,6 +867,9 @@
+ }
+ 
+ double Completion::elapsed_seconds() const {
++  if (scoped_original_ || original_evaluation_scope())
++    throw ScopedEvaluationError(ScopedEvaluation::unobservable);
++
+   if (!is_timed()) {
+     throw std::invalid_argument(
+         "[Completion::elapsed_seconds] Completion has no timestamp markers.");
+@@ -688,6 +883,9 @@
+ }
+ 
+ std::optional<double> Completion::try_elapsed_seconds() const {
++  if (scoped_original_ || original_evaluation_scope())
++    throw ScopedEvaluationError(ScopedEvaluation::unobservable);
++
+   if (!is_timed()) {
+     throw std::invalid_argument(
+         "[Completion::try_elapsed_seconds] Completion has no timestamp "
+@@ -721,6 +919,25 @@
+ }
+ 
+ void eval(ArrayVector outputs) {
++  if (auto* scope = original_evaluation_scope()) {
++    const auto controls = submission::current_native_controls();
++    if (controls.failure != submission::NativeControlFailure::none ||
++        outputs.get_allocator().resource() != controls.graph)
++      throw ScopedEvaluationError(ScopedEvaluation::domain);
++    ScopedEvaluation result;
++    try {
++      Completion completion;
++      result = evaluation_progress(evaluate_with_completion_scoped(
++          std::move(outputs), *scope, completion, false));
++      if (result == ScopedEvaluation::complete)
++        result = wait_scoped_completion(*scope, completion);
++    } catch (...) {
++      scope->failure_owner().get()->capture_current_exception();
++      throw; // unchanged original source; no formatting/ordinary progress
++    }
++    if (result != ScopedEvaluation::complete) throw ScopedEvaluationError(result);
++    return;
++  }
+   if (outputs.empty()) {
+     return;
+   }
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -5,6 +5,7 @@
+ #include "mlx/backend/cpu/eval.h"
+ #include "mlx/backend/gpu/eval.h"
+ #include "mlx/utils.h"
++#include <utility>
+ 
+ namespace mlx::core {
+ 
+@@ -278,7 +279,9 @@
+   }
+   auto result = error_message;
+   if (consume) {
+-    retired_error = std::move(first_error);
++    // exception_ptr rvalue assignment may copy; explicitly empty the shared
++    // slot while the detached local keeps its cause alive until after unlock.
++    retired_error = std::exchange(first_error, std::exception_ptr{});
+     retired_message = std::move(error_message);
+     retired_failure = std::move(first_failure);
+     error_pending = false;
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1,6 +1,9 @@
+ // Copyright © 2023-2024 Apple Inc.
+ 
+ #include <compression.h>
++#include <cstring>
++#include <limits>
++#include "mlx/input_allocator.h"
+ #include <cstdlib>
+ #include <dispatch/dispatch.h>
+ #include <sstream>
+@@ -101,7 +104,7 @@
+   return metal_version_;
+ }
+ 
+-NS::SharedPtr<MTL::Device> load_device() {
++NS::SharedPtr<MTL::Device> load_device(bool prepared = false) {
+   auto pool = new_scoped_memory_pool();
+   auto devices = NS::TransferPtr(MTL::CopyAllDevices());
+   // In headless, sandboxed, or virtualized macOS sessions CopyAllDevices()
+@@ -115,6 +118,7 @@
+   auto device = first ? NS::RetainPtr(first)
+                       : NS::TransferPtr(MTL::CreateSystemDefaultDevice());
+   if (!device) {
++    if (prepared) throw DeviceInitializationError(DeviceInitializationCause::no_device);
+     throw std::runtime_error(
+         "[metal::load_device] No Metal device available. This typically "
+         "occurs in headless, sandboxed, or virtualized macOS sessions "
+@@ -995,23 +999,118 @@
+   return encoder_.get();
+ }
+ 
++namespace {
++using DeviceCause = DeviceInitializationCause;
++struct FreeDeviceBytes { void operator()(void* p) const noexcept { std::free(p); } };
++using DeviceBytes = std::unique_ptr<void, FreeDeviceBytes>;
++struct DispatchOwner {
++  dispatch_data_t value{nullptr};
++  ~DispatchOwner() { if (value) dispatch_release(value); }
++};
++struct DeviceConstruction {
++  DeviceBytes decoded, scratch;
++  DispatchOwner dispatch;
++  NS::Error* error{nullptr};
++  size_t decoded_size{0};
++  alignas(std::max_align_t) std::byte empty_scratch{};
++};
++DeviceBytes allocate_device_bytes(size_t count) {
++  DeviceBytes value(count ? std::malloc(count) : nullptr);
++  if (count && !value) throw DeviceInitializationError(DeviceCause::allocation_failed);
++  return value;
++}
++NS::SharedPtr<MTL::Library> load_prepared_library(MTL::Device* device,
++    const EmbeddedMetallib& source, const DeviceInitializationLayout& layout) {
++  DeviceConstruction construction;
++  construction.decoded = allocate_device_bytes(layout.decoded_bytes);
++  construction.scratch = allocate_device_bytes(layout.scratch_bytes);
++  construction.decoded_size = compression_decode_buffer(
++      static_cast<uint8_t*>(construction.decoded.get()), layout.decoded_bytes,
++      source.compressed_data, source.compressed_size,
++      layout.scratch_bytes ? construction.scratch.get() : &construction.empty_scratch,
++      COMPRESSION_LZFSE);
++  if (construction.decoded_size != layout.decoded_bytes)
++    throw DeviceInitializationError(DeviceCause::decompression_failed);
++  construction.dispatch.value = dispatch_data_create(construction.decoded.get(),
++      layout.decoded_bytes, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
++  if (!construction.dispatch.value) throw DeviceInitializationError(DeviceCause::dispatch_failed);
++  auto library = NS::TransferPtr(device->newLibrary(construction.dispatch.value, &construction.error));
++  if (!library) throw DeviceInitializationError(DeviceCause::library_failed);
++  return library;
++}
++struct DeviceCandidate {
++  void* memory{nullptr};
++  Device* value{nullptr};
++  ~DeviceCandidate() { if (value) value->~Device(); std::free(memory); }
++};
++struct DeviceSlot {
++  std::mutex mutex;
++  Device* value{nullptr};
++  DeviceInitializationOwner owner;
++  uint64_t identity{0};
++};
++MLX_INPUT_ALLOCATOR_NO_DESTROY MLX_INPUT_ALLOCATOR_CONSTINIT DeviceSlot device_slot;
++MLX_INPUT_ALLOCATOR_CONSTINIT std::atomic<uint64_t> next_device_identity{1};
++uint64_t device_identity() noexcept {
++  auto value = next_device_identity.load(std::memory_order_relaxed);
++  while (value) {
++    auto next = value == UINT64_MAX ? 0 : value + 1;
++    if (next_device_identity.compare_exchange_weak(value, next, std::memory_order_relaxed)) return value;
++  }
++  return 0;
++}
++bool device_add(size_t& value, size_t next) noexcept {
++  if (value > SIZE_MAX - next) return false;
++  value += next; return true;
++}
++}
++
+ Device::Device() : device_(load_device()), residency_set_(device_.get()) {
+   auto pool = new_scoped_memory_pool();
+   default_library_ = NS::TransferPtr(load_default_library(device_.get()));
+   arch_ = env::metal_gpu_arch();
+-  if (arch_.empty()) {
+-    arch_ = std::string(device_->architecture()->name()->utf8String());
++  if (arch_.empty()) arch_ = std::string(device_->architecture()->name()->utf8String());
++  set_architecture_policy(arch_.data(), arch_.size(), false);
++}
++Device::Device(const EmbeddedMetallib& source, const DeviceInitializationLayout& layout)
++    : device_(load_device(true)), residency_set_(device_.get(), true) {
++  auto pool = new_scoped_memory_pool();
++  default_library_ = load_prepared_library(device_.get(), source, layout);
++  const auto* text = std::getenv("MLX_METAL_GPU_ARCH");
++  const size_t length = text ? std::strlen(text) : 0;
++  if ((length ? length + 1 : 0) != layout.override_bytes)
++    throw DeviceInitializationError(DeviceCause::source_changed);
++  if (length) {
++    auto storage = allocate_device_bytes(layout.override_bytes);
++    std::memcpy(storage.get(), text, layout.override_bytes);
++    architecture_override_.reset(static_cast<char*>(storage.release()));
++    set_architecture_policy(architecture_override_.get(), length, true);
++  } else {
++    auto* architecture = device_->architecture();
++    if (!architecture || !architecture->name()) throw DeviceInitializationError(DeviceCause::invalid_architecture);
++    retained_architecture_ = NS::RetainPtr(architecture->name());
++    const auto* bytes = retained_architecture_->utf8String();
++    if (!bytes) throw DeviceInitializationError(DeviceCause::invalid_architecture);
++    // The temporary UTF8 view never escapes this live autorelease pool.
++    set_architecture_policy(bytes, std::strlen(bytes), true);
++  }
++}
++void Device::set_architecture_policy(const char* name, size_t length, bool prepared) {
++  if (!name || !length) {
++    if (prepared) throw DeviceInitializationError(DeviceCause::invalid_architecture);
++    throw std::runtime_error("[metal::Device] Empty architecture name.");
+   }
+   int ag_tens = 0;
+   int ag_ones = 0;
+-  if (arch_.size() >= 3) {
+-    ag_tens = arch_[arch_.size() - 3] - '0';
+-    ag_ones = arch_[arch_.size() - 2] - '0';
++  if (length >= 3) {
++    ag_tens = name[length - 3] - '0';
++    ag_ones = name[length - 2] - '0';
+     ag_tens = (ag_tens < 10 && ag_tens >= 0) ? ag_tens : 0;
+     ag_ones = (ag_ones < 10 && ag_ones >= 0) ? ag_ones : 0;
+   }
+   arch_gen_ = ag_tens * 10 + ag_ones;
+-  auto arch = arch_.back();
++  auto arch = name[length - 1];
++  arch_suffix_ = arch;
+   switch (arch) {
+     case 'p': // phone
+       max_ops_per_buffer_ = 20;
+@@ -1034,8 +1133,17 @@
+       max_mb_per_buffer_ = 40;
+       break;
+   }
+-  max_ops_per_buffer_ = env::max_ops_per_buffer(max_ops_per_buffer_);
+-  max_mb_per_buffer_ = env::max_mb_per_buffer(max_mb_per_buffer_);
++  max_ops_per_buffer_ = prepared ? env::get_var("MLX_MAX_OPS_PER_BUFFER", max_ops_per_buffer_) : env::max_ops_per_buffer(max_ops_per_buffer_);
++  max_mb_per_buffer_ = prepared ? env::get_var("MLX_MAX_MB_PER_BUFFER", max_mb_per_buffer_) : env::max_mb_per_buffer(max_mb_per_buffer_);
++}
++std::string Device::get_architecture() const {
++  // Explicit ordinary report allocation, never called by inference policy.
++  if (architecture_override_) return architecture_override_.get();
++  if (retained_architecture_) {
++    auto pool = new_scoped_memory_pool();
++    return retained_architecture_->utf8String();
++  }
++  return arch_;
+ }
+ 
+ Device::~Device() = default;
+@@ -1317,15 +1425,96 @@
+ }
+ 
+ Device& device(mlx::core::Device) {
+-  // Leak singleton device intentionally, to avoid cases where a compute kernel
+-  // returns and tries to access the object after it has been freed by the main
+-  // thread teardown.
+-  static Device* metal_device = [] {
++  std::lock_guard guard(device_slot.mutex);
++  if (!device_slot.value) {
+     auto* value = new Device;
++    device_slot.value = value;
+     published_device.store(value, std::memory_order_release);
+-    return value;
+-  }();
+-  return *metal_device;
++  }
++  return *device_slot.value;
++}
++
++DeviceInitializationStaticLayout device_initialization_static_layout() noexcept {
++  return {sizeof(device_slot) + sizeof(next_device_identity) + sizeof(published_device) +
++      device_source_static_bytes(), allocator::input_allocator_layout_qualified, true};
++}
++DeviceInitializationCause device_initialization_layout(const EmbeddedMetallib& source,
++    DeviceInitializationLayout& output) noexcept {
++  if (!allocator::input_allocator_layout_qualified) return DeviceCause::unsupported;
++  if (auto status = validate_prepared_device_source(source); status != DeviceCause::success) return status;
++  if (source.uncompressed_size > size_t(PTRDIFF_MAX)) return DeviceCause::invalid;
++  const auto* text = std::getenv("MLX_METAL_GPU_ARCH");
++  const size_t length = text ? std::strlen(text) : 0;
++  if (length >= size_t(PTRDIFF_MAX)) return DeviceCause::invalid;
++  DeviceInitializationLayout value;
++  value.object_bytes = sizeof(Device);
++  value.decoded_bytes = source.uncompressed_size;
++  value.dispatch_copy_bytes = source.uncompressed_size;
++  value.scratch_bytes = compression_decode_scratch_buffer_size(COMPRESSION_LZFSE);
++  value.override_bytes = length ? length + 1 : 0;
++  value.controls = sizeof(DeviceConstruction) + sizeof(DeviceBytes) + sizeof(DeviceCandidate) + sizeof(DeviceCause) * 4 +
++      sizeof(DeviceInitializationLayout) * 3 + sizeof(EmbeddedMetallib) * 2 +
++      sizeof(DeviceInitializationOwner) + sizeof(DeviceInitializationError) +
++      sizeof(std::unique_lock<std::mutex>) + sizeof(std::lock_guard<std::mutex>) + sizeof(PreparedDeviceSourceLock) * 2 +
++      sizeof(NS::SharedPtr<MTL::Device>) * 2 + sizeof(NS::SharedPtr<NS::Array>) +
++      sizeof(NS::SharedPtr<NS::AutoreleasePool>) * 3 +
++      sizeof(NS::SharedPtr<MTL::ResidencySetDescriptor>) +
++      sizeof(NS::SharedPtr<MTL::Library>) + sizeof(NS::SharedPtr<NS::String>) +
++      sizeof(Device*) * 3 + sizeof(NS::Error*) * 2 + sizeof(const char*) * 3 +
++      // Scalar/reference transports: source/layout references in constructor,
++      // library/query/validation; load-device/residency/architecture handles;
++      // checked sizes, config reads, parser scalars and identity CAS locals.
++      sizeof(void*) * 16 + sizeof(size_t) * 16 + sizeof(uint64_t) * 4 + sizeof(int) * 6 +
++      sizeof(bool) * 4 + sizeof(std::initializer_list<size_t>) + sizeof(size_t) * 5;
++  size_t total = value.object_bytes;
++  for (auto bytes : {value.decoded_bytes, value.dispatch_copy_bytes, value.scratch_bytes,
++                    value.override_bytes, value.controls})
++    if (!device_add(total, bytes)) return DeviceCause::invalid;
++  output = value;
++  return DeviceCause::success;
++}
++DeviceInitializationCause initialize_device(const EmbeddedMetallib& source,
++    const DeviceInitializationLayout& expected, DeviceInitializationOwner owner,
++    uint64_t& output) noexcept {
++  if (!owner.value || !owner.retire || output) return DeviceCause::invalid;
++  if (!device_slot.mutex.try_lock()) return DeviceCause::busy;
++  std::unique_lock guard(device_slot.mutex, std::adopt_lock);
++  if (device_slot.value) return device_slot.owner.value ? DeviceCause::already_initialized : DeviceCause::ordinary_predecessor;
++  DeviceInitializationLayout actual;
++  if (auto status = device_initialization_layout(source, actual); status != DeviceCause::success) return status;
++  if (actual.object_bytes != expected.object_bytes || actual.decoded_bytes != expected.decoded_bytes ||
++      actual.scratch_bytes != expected.scratch_bytes || actual.dispatch_copy_bytes != expected.dispatch_copy_bytes ||
++      actual.override_bytes != expected.override_bytes || actual.controls != expected.controls)
++    return DeviceCause::source_changed;
++  static_assert(alignof(Device) <= alignof(std::max_align_t));
++  DeviceCandidate candidate;
++  candidate.memory = std::malloc(sizeof(Device));
++  if (!candidate.memory) return DeviceCause::allocation_failed;
++  try { candidate.value = ::new (candidate.memory) Device(source, actual); }
++  catch (const DeviceInitializationError& error) { return error.cause(); }
++  catch (...) { return DeviceCause::allocation_failed; }
++  PreparedDeviceSourceLock source_lock;
++  if (auto status = lock_prepared_device_source(source, source_lock); status != DeviceCause::success) {
++    return status;
++  }
++  const auto identity = device_identity();
++  if (!identity) return DeviceCause::identity_exhausted;
++  device_slot.value = candidate.value;
++  device_slot.owner = owner;
++  device_slot.identity = identity;
++  published_device.store(candidate.value, std::memory_order_release);
++  candidate.value = nullptr;
++  candidate.memory = nullptr;
++  output = identity;
++  return DeviceCause::success;
++}
++DeviceInitializationCause borrow_initialized_device(uint64_t identity) noexcept {
++  if (!identity) return DeviceCause::identity_mismatch;
++  if (!device_slot.mutex.try_lock()) return DeviceCause::busy;
++  std::lock_guard guard(device_slot.mutex, std::adopt_lock);
++  if (!device_slot.value || !device_slot.owner.value || identity != device_slot.identity)
++    return DeviceCause::identity_mismatch;
++  return DeviceCause::success;
+ }
+ 
+ Device* prepared_device(mlx::core::Device selected) noexcept {
+@@ -1421,7 +1610,7 @@
+       can_use_nax = true;
+     }
+     auto& d = metal::device(mlx::core::Device::gpu);
+-    auto arch = d.get_architecture().back();
++    auto arch = d.architecture_suffix();
+     auto gen = d.get_architecture_gen();
+     can_use_nax &= gen >= (arch == 'p' ? 18 : 17);
+     return can_use_nax;
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -1,6 +1,8 @@
+ // Copyright © 2023-2024 Apple Inc.
+ 
+ #pragma once
++#include "mlx/device_initialization.h"
++#include <cstdlib>
+ 
+ #include <Metal/Metal.hpp>
+ #include <functional>
+@@ -246,9 +248,9 @@
+     return device_.get();
+   };
+ 
+-  const std::string& get_architecture() const {
+-    return arch_;
+-  }
++  // Ordinary report materialization; inference uses the retained scalar below.
++  std::string get_architecture() const;
++  char architecture_suffix() const noexcept { return arch_suffix_; }
+   int get_architecture_gen() const {
+     return arch_gen_;
+   }
+@@ -291,6 +293,11 @@
+   }
+ 
+  private:
++  friend DeviceInitializationCause initialize_device(const EmbeddedMetallib&,
++      const DeviceInitializationLayout&, DeviceInitializationOwner, uint64_t&) noexcept;
++  Device(const EmbeddedMetallib&, const DeviceInitializationLayout&);
++  void set_architecture_policy(const char*, size_t, bool prepared);
++  struct FreeBytes { void operator()(char* p) const noexcept { std::free(p); } };
+   NS::SharedPtr<MTL::Library> build_library_(
+       const std::string& source_string,
+       const CompileOptions& compile_options = {});
+@@ -334,6 +341,9 @@
+       std::unordered_map<std::string, NS::SharedPtr<MTL::ComputePipelineState>>>
+       library_kernels_;
+   std::string arch_;
++  NS::SharedPtr<NS::String> retained_architecture_;
++  std::unique_ptr<char, FreeBytes> architecture_override_;
++  char arch_suffix_{0};
+   int arch_gen_;
+   int max_ops_per_buffer_;
+   int max_mb_per_buffer_;
+diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
+--- a/mlx/backend/metal/matmul.cpp
++++ b/mlx/backend/metal/matmul.cpp
+@@ -205,7 +205,7 @@
+   int wm = 4, wn = 4;
+ 
+   // Temp routing for larger devices
+-  char devc = d.get_architecture().back();
++  char devc = d.architecture_suffix();
+   if (devc == 's' || devc == 'c' || devc == 'd') {
+     bk = (K >= 8192 && K > (M + N)) ? 64 : 256;
+ 
+@@ -369,7 +369,7 @@
+   int bm = 64, bn = 64, bk = 16;
+   int wm = 2, wn = 2;
+ 
+-  char devc = d.get_architecture().back();
++  char devc = d.architecture_suffix();
+   GEMM_TPARAM_MACRO(devc)
+ 
+   // Prepare kernel name
+@@ -915,7 +915,7 @@
+   bool use_nax = metal::is_nax_available() &&
+       !issubdtype(a.dtype(), complexfloating) &&
+       (env::enable_tf32() || a.dtype() != float32);
+-  char devc = d.get_architecture().back();
++  char devc = d.architecture_suffix();
+   int min_tmn_threshold = (devc == 's' || devc == 'd') ? 2048 : 1024;
+ 
+   // Case 1: Small M×N with large K, use SIMD split-K
+@@ -2287,7 +2287,7 @@
+   int batch_ndim_a = a.ndim() - 2;
+   int batch_ndim_b = b.ndim() - 2;
+ 
+-  char devc = d.get_architecture().back();
++  char devc = d.architecture_suffix();
+   GEMM_TPARAM_MACRO(devc)
+ 
+   const bool has_batch = batch_ndim > 1;
+@@ -2498,7 +2498,7 @@
+   int wm = 2, wn = 2;
+   size_t batch_size_out = out.size() / M / N;
+ 
+-  char devc = d.get_architecture().back();
++  char devc = d.architecture_suffix();
+   GEMM_TPARAM_MACRO(devc)
+ 
+   bool use_nax = metal::is_nax_available() &&
+diff --git a/mlx/backend/metal/metal.cpp b/mlx/backend/metal/metal.cpp
+--- a/mlx/backend/metal/metal.cpp
++++ b/mlx/backend/metal/metal.cpp
+@@ -1,5 +1,7 @@
+ // Copyright © 2023-2024 Apple Inc.
+ #include <memory>
++#include <mutex>
++#include "mlx/input_allocator.h"
+ 
+ #include "mlx/backend/metal/device.h"
+ #include "mlx/backend/metal/metal.h"
+@@ -11,6 +13,8 @@
+ 
+ std::string g_metallib_path;
+ EmbeddedMetallib g_embedded_metallib;
++MLX_INPUT_ALLOCATOR_CONSTINIT std::mutex source_mutex;
++bool ordinary_path_installed{false};
+ 
+ } // namespace
+ 
+@@ -54,6 +58,9 @@
+ }
+ 
+ void set_metallib_path(const std::string& path) {
++  std::lock_guard guard(source_mutex);
++  // A clear does not erase the old unadmitted String backing or its origin.
++  if (!path.empty()) ordinary_path_installed = true;
+   g_metallib_path = path;
+ }
+ 
+@@ -65,6 +72,7 @@
+     const uint8_t* compressed_data,
+     size_t compressed_size,
+     size_t uncompressed_size) {
++  std::lock_guard guard(source_mutex);
+   g_embedded_metallib = {
+       compressed_data, compressed_size, uncompressed_size};
+ }
+@@ -73,4 +81,30 @@
+   return g_embedded_metallib;
+ }
+ 
++PreparedDeviceSourceLock::~PreparedDeviceSourceLock() { if (owned_) source_mutex.unlock(); }
++DeviceInitializationCause lock_prepared_device_source(const EmbeddedMetallib& source,
++    PreparedDeviceSourceLock& loan) noexcept {
++  if (loan.owned_) return DeviceInitializationCause::invalid;
++  if (!source.compressed_data || !source.compressed_size || !source.uncompressed_size)
++    return DeviceInitializationCause::unqualified_source;
++  if (!source_mutex.try_lock()) return DeviceInitializationCause::busy;
++  loan.owned_ = true;
++  if (ordinary_path_installed || !g_metallib_path.empty())
++    return DeviceInitializationCause::unqualified_source;
++  if (g_embedded_metallib.compressed_data &&
++      (g_embedded_metallib.compressed_data != source.compressed_data ||
++       g_embedded_metallib.compressed_size != source.compressed_size ||
++       g_embedded_metallib.uncompressed_size != source.uncompressed_size))
++    return DeviceInitializationCause::source_changed;
++  return DeviceInitializationCause::success;
++}
++DeviceInitializationCause validate_prepared_device_source(const EmbeddedMetallib& source) noexcept {
++  PreparedDeviceSourceLock loan;
++  return lock_prepared_device_source(source, loan);
++}
++size_t device_source_static_bytes() noexcept {
++  return sizeof(source_mutex) + sizeof(ordinary_path_installed) +
++      sizeof(g_metallib_path) + sizeof(g_embedded_metallib);
++}
++
+ } // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/metal.h b/mlx/backend/metal/metal.h
+--- a/mlx/backend/metal/metal.h
++++ b/mlx/backend/metal/metal.h
+@@ -9,6 +9,7 @@
+ #include <variant>
+ 
+ #include "mlx/api.h"
++#include "mlx/device_initialization.h"
+ 
+ namespace mlx::core::metal {
+ 
+@@ -43,4 +44,20 @@
+     size_t uncompressed_size);
+ MLX_API const EmbeddedMetallib& get_embedded_metallib();
+ 
++// Internal selected-source snapshot. No borrowed String or metadata owner escapes.
++// Internal metadata loan: publication holds this exact source snapshot through
++// the Device slot commit. No constructor/platform call runs while it is held.
++class MLX_API PreparedDeviceSourceLock {
++ public:
++  PreparedDeviceSourceLock() noexcept = default;
++  ~PreparedDeviceSourceLock();
++  PreparedDeviceSourceLock(const PreparedDeviceSourceLock&) = delete;
++  PreparedDeviceSourceLock& operator=(const PreparedDeviceSourceLock&) = delete;
++ private:
++  friend DeviceInitializationCause lock_prepared_device_source(const EmbeddedMetallib&, PreparedDeviceSourceLock&) noexcept;
++  bool owned_{false};
++};
++MLX_API DeviceInitializationCause lock_prepared_device_source(const EmbeddedMetallib&, PreparedDeviceSourceLock&) noexcept;
++MLX_API DeviceInitializationCause validate_prepared_device_source(const EmbeddedMetallib&) noexcept;
++MLX_API size_t device_source_static_bytes() noexcept;
+ } // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/no_metal.cpp b/mlx/backend/metal/no_metal.cpp
+--- a/mlx/backend/metal/no_metal.cpp
++++ b/mlx/backend/metal/no_metal.cpp
+@@ -39,3 +39,14 @@
+ } // namespace metal
+ 
+ } // namespace mlx::core
++
++namespace mlx::core::metal {
++DeviceInitializationStaticLayout device_initialization_static_layout() noexcept { return {0, true, false}; }
++DeviceInitializationCause device_initialization_layout(const EmbeddedMetallib&, DeviceInitializationLayout&) noexcept { return DeviceInitializationCause::unsupported; }
++DeviceInitializationCause initialize_device(const EmbeddedMetallib&, const DeviceInitializationLayout&, DeviceInitializationOwner, uint64_t&) noexcept { return DeviceInitializationCause::unsupported; }
++DeviceInitializationCause borrow_initialized_device(uint64_t) noexcept { return DeviceInitializationCause::unsupported; }
++PreparedDeviceSourceLock::~PreparedDeviceSourceLock() {}
++DeviceInitializationCause lock_prepared_device_source(const EmbeddedMetallib&, PreparedDeviceSourceLock&) noexcept { return DeviceInitializationCause::unsupported; }
++DeviceInitializationCause validate_prepared_device_source(const EmbeddedMetallib&) noexcept { return DeviceInitializationCause::unsupported; }
++size_t device_source_static_bytes() noexcept { return 0; }
++} // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -82,7 +82,7 @@
+ }
+ 
+ inline int get_qmv_batch_limit(int D, int O, metal::Device& d) {
+-  auto arch_size = d.get_architecture().back();
++  auto arch_size = d.architecture_suffix();
+   auto arch_gen = d.get_architecture_gen();
+   if (arch_gen == 13 || arch_gen == 14) {
+     switch (arch_size) {
+diff --git a/mlx/backend/metal/resident.cpp b/mlx/backend/metal/resident.cpp
+--- a/mlx/backend/metal/resident.cpp
++++ b/mlx/backend/metal/resident.cpp
+@@ -2,18 +2,22 @@
+ 
+ #include "mlx/backend/metal/resident.h"
+ #include "mlx/backend/metal/device.h"
++#include "mlx/device_initialization.h"
+ 
+ namespace mlx::core::metal {
+ 
+-ResidencySet::ResidencySet(MTL::Device* d) {
++ResidencySet::ResidencySet(MTL::Device* d) : ResidencySet(d, false) {}
++ResidencySet::ResidencySet(MTL::Device* d, bool prepared) {
+   if (!d->supportsFamily(MTL::GPUFamilyMetal3)) {
+     return;
+   } else if (__builtin_available(macOS 15, iOS 18, *)) {
+     auto pool = new_scoped_memory_pool();
+-    auto desc = MTL::ResidencySetDescriptor::alloc()->init()->autorelease();
+-    NS::Error* error;
+-    wired_set_ = NS::TransferPtr(d->newResidencySet(desc, &error));
++    auto desc = NS::TransferPtr(MTL::ResidencySetDescriptor::alloc()->init());
++    if (!desc && prepared) throw DeviceInitializationError(DeviceInitializationCause::residency_failed);
++    NS::Error* error = nullptr;
++    wired_set_ = NS::TransferPtr(d->newResidencySet(desc.get(), &error));
+     if (!wired_set_) {
++      if (prepared) throw DeviceInitializationError(DeviceInitializationCause::residency_failed);
+       std::ostringstream msg;
+       msg << "[metal::Device] Unable to construct residency set.\n";
+       if (error) {
+diff --git a/mlx/backend/metal/resident.h b/mlx/backend/metal/resident.h
+--- a/mlx/backend/metal/resident.h
++++ b/mlx/backend/metal/resident.h
+@@ -12,6 +12,7 @@
+ class ResidencySet {
+  public:
+   ResidencySet(MTL::Device* d);
++  ResidencySet(MTL::Device* d, bool prepared);
+   ~ResidencySet();
+ 
+   ResidencySet(const ResidencySet&) = delete;
+diff --git a/mlx/backend/metal/scaled_dot_product_attention.cpp b/mlx/backend/metal/scaled_dot_product_attention.cpp
+--- a/mlx/backend/metal/scaled_dot_product_attention.cpp
++++ b/mlx/backend/metal/scaled_dot_product_attention.cpp
+@@ -440,7 +440,7 @@
+   int gqa_factor = q.shape(1) / k.shape(1);
+   int n_simds = gqa_factor * q.shape(2);
+ 
+-  char devc = d.get_architecture().back();
++  char devc = d.architecture_suffix();
+   int N = k.shape(2);
+   int blocks;
+   if (devc == 's') {
+@@ -745,7 +745,7 @@
+     // - The device is large and the sequence length long
+     // - The sequence length is even longer and we have gqa
+     bool do_causal = do_causal_ && q.shape(2) > 1;
+-    char devc = d.get_architecture().back();
++    char devc = d.architecture_suffix();
+     if (((devc == 'd' || devc == 's') && k.shape(2) >= 1024) ||
+         (k.shape(1) < q.shape(1) && k.shape(2) >= 4096)) {
+       sdpa_vector_2pass(s, d, q, k, v, o, scale_, do_causal, mask, sinks);
+diff --git a/mlx/device_initialization.h b/mlx/device_initialization.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/device_initialization.h
+@@ -0,0 +1,40 @@
++#pragma once
++#include "mlx/api.h"
++#include <cstddef>
++#include <cstdint>
++#include <exception>
++
++namespace mlx::core::metal {
++struct EmbeddedMetallib;
++enum class DeviceInitializationCause : unsigned {
++  success = 0, unsupported = 1, invalid = 2, busy = 3,
++  allocation_failed = 4, no_device = 5, ordinary_predecessor = 6,
++  already_initialized = 7, identity_mismatch = 8, identity_exhausted = 9,
++  unqualified_source = 10, source_changed = 11, residency_failed = 12,
++  decompression_failed = 13, dispatch_failed = 14, library_failed = 15,
++  invalid_architecture = 16,
++};
++class DeviceInitializationError final : public std::exception {
++ public:
++  explicit DeviceInitializationError(DeviceInitializationCause cause) noexcept : cause_(cause) {}
++  DeviceInitializationCause cause() const noexcept { return cause_; }
++  const char* what() const noexcept override { return "prepared Metal Device initialization failed"; }
++ private:
++  DeviceInitializationCause cause_;
++};
++struct DeviceInitializationLayout {
++  size_t object_bytes{0}, decoded_bytes{0}, scratch_bytes{0};
++  size_t dispatch_copy_bytes{0}, override_bytes{0}, controls{0};
++};
++struct DeviceInitializationStaticLayout {
++  size_t bytes{0}; bool qualified{false}; bool required{false};
++};
++struct DeviceInitializationOwner { void* value{nullptr}; void (*retire)(void*){nullptr}; };
++// These functions do not register sources, install handlers or create a Device.
++MLX_API DeviceInitializationStaticLayout device_initialization_static_layout() noexcept;
++MLX_API DeviceInitializationCause device_initialization_layout(
++    const EmbeddedMetallib&, DeviceInitializationLayout&) noexcept;
++MLX_API DeviceInitializationCause initialize_device(const EmbeddedMetallib&,
++    const DeviceInitializationLayout&, DeviceInitializationOwner, uint64_t&) noexcept;
++MLX_API DeviceInitializationCause borrow_initialized_device(uint64_t) noexcept;
++} // namespace mlx::core::metal

@@ -17,6 +17,8 @@ use crate::decoder::ComponentInstrumentation;
 use crate::linear_format::standard_expert_projection;
 
 use super::{FeedForwardPolicy, LayerPolicy, ModelArgs, TextArgs};
+pub(crate) mod construction;
+pub(crate) use construction::{DenseLayerSpec, DecoderLayerSpec};
 
 /// Four bounded causal histories owned by every Inkling decoder layer.
 #[derive(Debug, Clone)]
@@ -114,21 +116,21 @@ where
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Attention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     query_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     key_value_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     relative_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     relative_extent: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     policy: AttentionPolicy,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     log_scaling_floor: Option<i32>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     log_scaling_alpha: f32,
     /// Query projection.
     pub query: B::Linear,
@@ -170,102 +172,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         block_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let local = policy.window().is_some();
-        let query_heads = args.query_heads(local);
-        let key_value_heads = args.key_value_heads(local);
-        let head_dimensions = args.attention_head_dim(local);
-        let relative_extent = policy
-            .window()
-            .map(|window| window.get() as i32)
-            .unwrap_or(args.rel_extent);
-        let prefix = format!("{block_root}.self_attn");
-        let linear = |field: &str, input: i32, output: i32, bias: bool| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: bias
-                        .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
-                        .transpose()
-                        .map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.linear_format_for(&weight),
-                    )?,
-                },
-                context,
-            )
-        };
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    head_dimensions,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
-        };
-        let convolution = |field: &str, channels| {
-            CausalDepthwiseConvolution::new(
-                CausalDepthwiseConvolutionSpec {
-                    channels,
-                    kernel_size: args.sconv_kernel_size,
-                    weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                    bias: None,
-                    activation: ConvolutionActivation::Identity,
-                },
-                context,
-            )
-        };
-        Ok(Self {
-            query_heads,
-            key_value_heads,
-            head_dimensions,
-            relative_dimensions: args.d_rel,
-            relative_extent,
-            policy,
-            log_scaling_floor: args.log_scaling_n_floor,
-            log_scaling_alpha: args.log_scaling_alpha,
-            query: linear(
-                "q_proj",
-                args.hidden_size,
-                query_heads * head_dimensions,
-                args.q_bias,
-            )?,
-            key: linear(
-                "k_proj",
-                args.hidden_size,
-                key_value_heads * head_dimensions,
-                false,
-            )?,
-            value: linear(
-                "v_proj",
-                args.hidden_size,
-                key_value_heads * head_dimensions,
-                false,
-            )?,
-            relative: linear("r_proj", args.hidden_size, query_heads * args.d_rel, false)?,
-            output: linear(
-                "o_proj",
-                query_heads * head_dimensions,
-                args.hidden_size,
-                args.o_bias,
-            )?,
-            query_norm: norm("q_norm")?,
-            key_norm: norm("k_norm")?,
-            relative_projection: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.rel_proj")).map_err(Error::backend)?,
-                &[args.d_rel, relative_extent],
-                context,
-            )?,
-            key_convolution: convolution("k_sconv", key_value_heads * head_dimensions)?,
-            value_convolution: convolution("v_sconv", key_value_heads * head_dimensions)?,
-        })
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        construction::AttentionSpec::new(args, policy, block_root)?.instantiate::<B>(context)
     }
 
     /// Applies attention and replaces the two projection-convolution histories.
@@ -325,16 +233,18 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> {
         instrumentation.observe("attention.value.projected", &value)?;
         instrumentation.observe("attention.relative.projected", &relative)?;
         let (key, value, keys, values, key_offset) = if let Some(state) = state.as_deref_mut() {
-            let key = residual_convolution(
+            let key = residual_convolution_with_state(
                 &self.key_convolution,
                 &key,
-                state.convolution_state(0)?,
+                Some(&mut *state),
+                0,
                 context,
             )?;
-            let value = residual_convolution(
+            let value = residual_convolution_with_state(
                 &self.value_convolution,
                 &value,
-                state.convolution_state(1)?,
+                Some(&mut *state),
+                1,
                 context,
             )?;
             let normalized_key = self.key_norm.forward(
@@ -438,6 +348,31 @@ fn residual_convolution<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     input.add(&output.output, context)
 }
 
+// The actual operator determines whether a history role exists. Wider kernels
+// retain the exact slot lookup/error; width one never asks a KV-only owner for it.
+fn residual_convolution_with_state<B, C>(
+    convolution: &CausalDepthwiseConvolution<B>,
+    input: &B::Tensor,
+    state: Option<&mut C>,
+    slot: u32,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<B::Tensor, Error>
+where
+    B: NeuralBackend + eredu_nn::DistributedNeuralBackend,
+    C: AuxiliaryConvolutionState<B::Tensor>,
+{
+    let mut temporary = None;
+    let history = if convolution.history_len() == 0 {
+        &mut temporary
+    } else {
+        match state {
+            Some(state) => state.convolution_state(slot)?,
+            None => &mut temporary,
+        }
+    };
+    residual_convolution(convolution, input, history, context)
+}
+
 /// Dense SwiGLU branch with its learned global scalar.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -458,35 +393,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
         block_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{block_root}.dense");
-        let intermediate = args.dense_intermediate_size();
-        let linear = |field: &str, input, output| {
-            let weight = format!("{prefix}.{field}.weight");
-            B::linear(
-                LinearSpec {
-                    input,
-                    output,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight,
-                        args.linear_format_for(&weight),
-                    )?,
-                },
-                context,
-            )
-        };
-        Ok(Self {
-            gate: linear("gate_proj", args.hidden_size, intermediate)?,
-            up: linear("up_proj", args.hidden_size, intermediate)?,
-            down: linear("down_proj", intermediate, args.hidden_size)?,
-            global_scale: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{block_root}.dense_global_scale"))
-                    .map_err(Error::backend)?,
-                &[1],
-                context,
-            )?,
-        })
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        construction::DenseSpec::new(args, block_root)?.instantiate::<B>(context)
     }
 
     /// Executes dense SwiGLU units and the learned scalar on the canonical path.
@@ -518,13 +426,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DenseMlp<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct SparseMlp<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     routed_count: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     shared_count: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     top_k: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     coefficient_scale: f32,
     /// Joint routed/shared router projection.
     pub router_weight: Parameter<B::Tensor>,
@@ -564,49 +472,15 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SparseMlp<B> 
         block_root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{block_root}.moe");
-        let routed = expert_bank_spec_at(args, &prefix, "experts", args.n_routed_experts)?;
-        let shared = expert_bank_spec_at(args, &prefix, "shared_experts", args.n_shared_experts)?;
-        Self::new_at_with_specs(args, block_root, routed, shared, context)
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        construction::SparseSpec::new(args, block_root, None)?.instantiate::<B>(context)
     }
 
-    fn new_at_with_specs(
-        args: &TextArgs,
-        block_root: &str,
-        routed: GroupedGatedProductSpec,
-        shared: GroupedGatedProductSpec,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let prefix = format!("{block_root}.moe");
-        Ok(Self {
-            routed_count: args.n_routed_experts,
-            shared_count: args.n_shared_experts,
-            top_k: args.num_experts_per_tok,
-            coefficient_scale: args.route_scale,
-            router_weight: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.router.weight"))
-                    .map_err(Error::backend)?,
-                &[
-                    args.n_routed_experts + args.n_shared_experts,
-                    args.hidden_size,
-                ],
-                context,
-            )?,
-            router_bias: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.router.bias"))
-                    .map_err(Error::backend)?,
-                &[args.n_routed_experts],
-                context,
-            )?,
-            global_scale: Parameter::unloaded(
-                ParameterSpec::trainable(format!("{prefix}.router.global_scale"))
-                    .map_err(Error::backend)?,
-                &[1],
-                context,
-            )?,
-            routed_experts: B::grouped_gated_product(routed, context)?,
-            shared_experts: B::grouped_gated_product(shared, context)?,
-        })
+    fn new_at_with_specs(args: &TextArgs, block_root: &str,
+        routed: GroupedGatedProductSpec, shared: GroupedGatedProductSpec,
+        context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        construction::SparseSpec::new(args, block_root, Some(crate::inkling::ExpertBankRealization {routed, shared}))?.instantiate::<B>(context)
     }
 
     fn forward_with_provider_instrumented<P>(
@@ -911,9 +785,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct DecoderLayer<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     layer: usize,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     shared_expert_layer: usize,
     /// Pre-attention normalization.
     pub input_norm: B::Normalization,
@@ -989,55 +863,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
         context: &<B::Tensor as Tensor>::Context,
         realization: Option<crate::inkling::ExpertBankRealization>,
     ) -> Result<Self, Error> {
-        let prefix = block_root;
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                ),
-                context,
-            )
-        };
-        let convolution = |field: &str| {
-            CausalDepthwiseConvolution::new(
-                CausalDepthwiseConvolutionSpec {
-                    channels: args.hidden_size,
-                    kernel_size: args.sconv_kernel_size,
-                    weight: ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
-                    bias: None,
-                    activation: ConvolutionActivation::Identity,
-                },
-                context,
-            )
-        };
-        Ok(Self {
-            layer,
-            shared_expert_layer,
-            input_norm: norm("input_layernorm")?,
-            attention: Attention::new_at(args, policy.attention, block_root, context)?,
-            attention_convolution: convolution("attn_sconv")?,
-            post_attention_norm: norm("post_attention_layernorm")?,
-            feed_forward: match policy.feed_forward {
-                FeedForwardPolicy::Dense => {
-                    FeedForward::Dense(DenseMlp::new_at(args, block_root, context)?)
-                }
-                FeedForwardPolicy::SparseMoe => FeedForward::Sparse(match realization {
-                    Some(realization) => SparseMlp::new_at_with_specs(
-                        args,
-                        block_root,
-                        realization.routed,
-                        realization.shared,
-                        context,
-                    )?,
-                    None => SparseMlp::new_at(args, block_root, context)?,
-                }),
-            },
-            feed_forward_convolution: convolution("mlp_sconv")?,
-        })
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        DecoderLayerSpec::new(args, policy, block_root, layer, shared_expert_layer, realization)?.instantiate::<B>(context)
     }
 
     /// Runs the canonical layer with all four bounded convolution histories.
@@ -1232,13 +1059,13 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
             instrumentation,
         )?;
         let attention = instrumentation.apply("attention.write", attention)?;
-        let mut temporary_history = None;
-        let history = match state.as_deref_mut() {
-            Some(state) => state.convolution_state(2)?,
-            None => &mut temporary_history,
-        };
-        let attention =
-            residual_convolution(&self.attention_convolution, &attention, history, context)?;
+        let attention = residual_convolution_with_state(
+            &self.attention_convolution,
+            &attention,
+            state.as_deref_mut(),
+            2,
+            context,
+        )?;
         let attention = instrumentation.apply("attention.contribution", attention)?;
         let hidden =
             instrumentation.apply("attention.residual", hidden.add(&attention, context)?)?;
@@ -1248,15 +1075,11 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> DecoderLayer<
         )?;
         let feed_forward = feed_forward(&mut self.feed_forward, &normalized, instrumentation)?;
         let feed_forward = instrumentation.apply("feed_forward.write", feed_forward)?;
-        let mut temporary_history = None;
-        let history = match state.as_deref_mut() {
-            Some(state) => state.convolution_state(3)?,
-            None => &mut temporary_history,
-        };
-        let feed_forward = residual_convolution(
+        let feed_forward = residual_convolution_with_state(
             &self.feed_forward_convolution,
             &feed_forward,
-            history,
+            state.as_deref_mut(),
+            3,
             context,
         )?;
         let feed_forward = instrumentation.apply("feed_forward.contribution", feed_forward)?;
@@ -1278,9 +1101,9 @@ pub struct TextModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
     pub final_norm: B::Normalization,
     /// Untied vocabulary projection.
     pub output: B::Linear,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     logits_scale: f32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     output_vocabulary: i32,
 }
 

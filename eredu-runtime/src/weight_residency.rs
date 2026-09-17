@@ -474,13 +474,46 @@ impl ParameterBankKey {
         self.member
     }
 
+    /// Fixed decimal writer scratch for any key on this target.
+    pub const fn unit_id_buffer_bytes() -> usize {
+        let digits = usize::MAX.ilog10() as usize + 1;
+        19 + 3 * if digits < 5 { 5 } else { digits }
+    }
+
+    /// Exact byte count of the canonical existing residency identifier.
+    pub fn unit_id_length(self) -> usize {
+        [self.bank, self.unit, self.member].into_iter()
+            .fold(19, |bytes, value| bytes + (if value == 0 { 1 } else { value.ilog10() as usize + 1 }).max(5))
+    }
+
+    /// Writes the same canonical identifier into an exact caller-paid byte slice.
+    /// Invalid destination length refuses before writing; no allocation occurs.
+    pub fn write_unit_id(self, output: &mut [u8]) -> Option<&str> {
+        if output.len() != self.unit_id_length() { return None; }
+        let mut offset = 0;
+        for (prefix, mut value) in [(b"bank.".as_slice(), self.bank),
+            (b".unit.".as_slice(), self.unit), (b".member.".as_slice(), self.member)] {
+            output[offset..offset + prefix.len()].copy_from_slice(prefix);
+            offset += prefix.len();
+            let digits = (if value == 0 { 1 } else { value.ilog10() as usize + 1 }).max(5);
+            let target = &mut output[offset..offset + digits];
+            target.fill(b'0');
+            for digit in target.iter_mut().rev() {
+                *digit = b'0' + (value % 10) as u8;
+                value /= 10;
+            }
+            offset += digits;
+        }
+        std::str::from_utf8(output).ok()
+    }
+
     /// Returns the deterministic residency unit identifier.
     pub fn unit_id(self) -> OffloadUnitId {
-        OffloadUnitId::new(format!(
-            "bank.{:05}.unit.{:05}.member.{:05}",
-            self.bank, self.unit, self.member
-        ))
-        .expect("parameter-bank unit identifier is non-empty")
+        let mut storage = [0; Self::unit_id_buffer_bytes()];
+        let length = self.unit_id_length();
+        let value = self.write_unit_id(&mut storage[..length])
+            .expect("exact canonical parameter-bank identifier destination");
+        OffloadUnitId::new(value).expect("parameter-bank unit identifier is non-empty")
     }
 }
 

@@ -14,24 +14,24 @@ mod partition_sum;
 
 #[path = "components/composite_banks.rs"]
 mod composite_banks;
-#[path = "components/gemma4_components.rs"]
-mod gemma4_components;
 #[path = "components/composite_routed.rs"]
 mod composite_routed;
+#[path = "components/gemma4_components.rs"]
+mod gemma4_components;
 #[path = "components/gemma4_placement.rs"]
 mod gemma4_placement;
 #[path = "components/muse.rs"]
 mod muse;
 #[path = "components/muse_placement.rs"]
 mod muse_placement;
-#[path = "components/qwen_vl.rs"]
-mod qwen_vl;
 #[path = "components/qwen_conditional.rs"]
 mod qwen_conditional;
 #[path = "components/qwen_prediction.rs"]
 mod qwen_prediction;
 #[path = "components/qwen_recurrent.rs"]
 mod qwen_recurrent;
+#[path = "components/qwen_vl.rs"]
+mod qwen_vl;
 
 #[path = "components/nemotron_prediction.rs"]
 mod nemotron_prediction;
@@ -2455,8 +2455,20 @@ fn prepared_lfm2_moe_components_and_complete_expert_writes_cross_partitions_and_
     verify_prepared_lfm2_components(true);
 }
 
+#[test]
+fn prepared_lfm2_width_one_no_state_preserves_all_partition_and_residency_paths() {
+    for routed in [false, true] {
+        verify_prepared_lfm2_components_with_kernel(routed, 1);
+    }
+}
+
 fn verify_prepared_lfm2_components(routed: bool) {
+    verify_prepared_lfm2_components_with_kernel(routed, 3);
+}
+
+fn verify_prepared_lfm2_components_with_kernel(routed: bool, kernel: i32) {
     let mut config = lfm2_component_config();
+    config["conv_L_cache"] = kernel.into();
     config["hidden_size"] = 8.into();
     config["intermediate_size"] = 12.into();
     config["num_attention_heads"] = 4.into();
@@ -3783,3 +3795,6 @@ fn prepared_nemotron_components_and_complete_writes_cross_all_partitions_and_res
         .map(|(tp, pp, ep)| ParallelTopology::new(tp, pp, ep, 1).unwrap()),
     );
 }
+
+#[path = "components/outer_boundaries.rs"]
+mod outer_boundaries;

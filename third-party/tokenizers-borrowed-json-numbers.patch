@@ -1,0 +1,166 @@
+diff --git a/src/utils/json_view.rs b/src/utils/json_view.rs
+--- a/src/utils/json_view.rs
++++ b/src/utils/json_view.rs
+@@ -87,53 +87,38 @@
+     /// already validated. Quoted regions use the unchanged string scanner;
+     /// no number inside a key or string value participates in this profile.
+     pub fn validate_integer_profile(self) -> Result<(), IntegerProfileError> {
+-        let input = self.source();
+-        let bytes = input.as_bytes();
+-        let mut at = 0;
+-        while at < bytes.len() {
+-            if bytes[at] == b'"' {
+-                let mut reader = json::Reader::new(
+-                    input,
+-                    json::Span {
+-                        start: at,
+-                        end: input.len(),
+-                    },
+-                );
+-                reader.string().expect("whole document validated");
+-                at = reader.pos;
+-            } else if matches!(bytes[at], b'-' | b'0'..=b'9') {
+-                let start = at;
+-                while at < bytes.len()
+-                    && matches!(bytes[at], b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9')
+-                {
+-                    at += 1;
+-                }
+-                let raw = &bytes[start..at];
+-                let negative = raw[0] == b'-';
+-                let digits = &raw[usize::from(negative)..];
+-                if !digits.iter().all(u8::is_ascii_digit) {
+-                    return Err(IntegerProfileError {
+-                        offset: start,
+-                        kind: IntegerProfileErrorKind::NonInteger,
+-                    });
+-                }
+-                let limit = if negative { 1u64 << 63 } else { u64::MAX };
+-                let mut value = 0u64;
+-                for &digit in digits {
+-                    value = value
+-                        .checked_mul(10)
+-                        .and_then(|v| v.checked_add(u64::from(digit - b'0')))
+-                        .filter(|&v| v <= limit)
+-                        .ok_or(IntegerProfileError {
+-                            offset: start,
+-                            kind: IntegerProfileErrorKind::OutOfRange,
+-                        })?;
+-                }
+-            } else {
+-                at += 1;
++        for number in self.numbers() {
++            let raw = number.spelling().as_bytes();
++            let negative = raw[0] == b'-';
++            let digits = &raw[usize::from(negative)..];
++            if !digits.iter().all(u8::is_ascii_digit) {
++                return Err(IntegerProfileError {
++                    offset: number.offset(),
++                    kind: IntegerProfileErrorKind::NonInteger,
++                });
++            }
++            let limit = if negative { 1u64 << 63 } else { u64::MAX };
++            let mut value = 0u64;
++            for &digit in digits {
++                value = value
++                    .checked_mul(10)
++                    .and_then(|v| v.checked_add(u64::from(digit - b'0')))
++                    .filter(|&v| v <= limit)
++                    .ok_or(IntegerProfileError {
++                        offset: number.offset(),
++                        kind: IntegerProfileErrorKind::OutOfRange,
++                    })?;
+             }
+         }
+         Ok(())
++    }
++    /// Borrow all actual numeric tokens in document order, excluding strings
++    /// and keys. Every returned slice belongs to this fully validated document.
++    pub fn numbers(self) -> Numbers<'a> {
++        Numbers {
++            input: self.source(),
++            at: 0,
++        }
+     }
+     /// Checked fixed parser/projection/numeric-validation controls. These are
+     /// concrete live view/iterator populations, not a source-length multiplier.
+@@ -155,12 +140,79 @@
+             size_of::<[usize; 4]>(),
+             size_of::<[u64; 2]>(),
+             size_of::<bool>(),
++            size_of::<Numbers<'a>>(),
++            size_of::<NumberValue<'a>>(),
++            size_of::<Option<NumberValue<'a>>>(),
+             size_of::<IntegerProfileError>(),
+             size_of::<Result<(), IntegerProfileError>>(),
+             size_of::<json::Error>(),
+             size_of::<Error>(),
+         ])
+         .try_fold(0usize, usize::checked_add)
++    }
++}
++/// Borrowed scalar spelling proven to be an actual numeric JSON value.
++#[derive(Clone, Copy, Debug)]
++pub struct NumberValue<'a> {
++    input: &'a str,
++    start: usize,
++    end: usize,
++}
++impl<'a> NumberValue<'a> {
++    /// Exact original spelling, without conversion or normalized storage.
++    pub fn spelling(self) -> &'a str {
++        &self.input[self.start..self.end]
++    }
++    /// Original source byte offset.
++    pub fn offset(self) -> usize {
++        self.start
++    }
++    /// Original source byte range for a parser that retains document positions.
++    pub fn range(self) -> std::ops::Range<usize> {
++        self.start..self.end
++    }
++}
++/// Allocation-free numeric projection over a fully validated document.
++#[derive(Clone, Debug)]
++pub struct Numbers<'a> {
++    input: &'a str,
++    at: usize,
++}
++impl<'a> Iterator for Numbers<'a> {
++    type Item = NumberValue<'a>;
++    fn next(&mut self) -> Option<Self::Item> {
++        let bytes = self.input.as_bytes();
++        while self.at < bytes.len() {
++            if bytes[self.at] == b'"' {
++                let mut reader = json::Reader::new(
++                    self.input,
++                    json::Span {
++                        start: self.at,
++                        end: self.input.len(),
++                    },
++                );
++                reader.string().expect("whole document validated");
++                self.at = reader.pos;
++            } else if matches!(bytes[self.at], b'-' | b'0'..=b'9') {
++                let start = self.at;
++                while self.at < bytes.len()
++                    && matches!(
++                        bytes[self.at],
++                        b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'
++                    )
++                {
++                    self.at += 1;
++                }
++                return Some(NumberValue {
++                    input: self.input,
++                    start,
++                    end: self.at,
++                });
++            } else {
++                self.at += 1;
++            }
++        }
++        None
+     }
+ }
+ /// Validated subvalue; ranges can be obtained only from a validated document.

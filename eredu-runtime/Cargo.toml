@@ -12,9 +12,14 @@ readme = "README.md"
 [lints]
 workspace = true
 
+[features]
+# Read-only custody lifetime observations for downstream conformance tests.
+original-custody-test-support = []
+
 [dependencies]
 eredu-checkpoint.workspace = true
 eredu-core.workspace = true
+eredu-text = { workspace = true, default-features = false }
 eredu-nn.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -22,6 +27,14 @@ sha2.workspace = true
 safetensors = "0.8"
 thiserror.workspace = true
 
+# The qualified Darwin pool owns one actual std PAL pthread mutex allocation.
+[target.'cfg(all(target_arch = "aarch64", target_os = "macos"))'.dependencies]
+libc = "=0.2.189"
+
+[build-dependencies]
+sha2.workspace = true
+
 [dev-dependencies]
+eredu-text = { workspace = true, default-features = false, features = ["decode-compiler-test-support", "stop-compiler-test-support", "packed-bpe-test-support", "tokenizer-compiler-test-support"] }
 eredu-gguf.workspace = true
 tempfile.workspace = true

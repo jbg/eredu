@@ -1,0 +1,910 @@
+//! Fixed mixed publication into the existing canonical registry.
+//!
+//! Only the consumed selected bank supplies production observations from its
+//! retained neutral mechanism. That provider authenticates native birth, budget,
+//! generation and charged capacity; keys and capacities alone cannot create
+//! partition coverage. The existing-alias route recognizes only a published
+//! native row and derives origin from that row, never from the caller. Raw
+//! constructors remain private; the additional arbitrary fixtures are test-only.
+
+use super::directory::PreparedNamespace;
+use super::prepaid::{PrepaidHostOrigin, PrepaidStorageOrigin};
+use super::*;
+use funding::native_partition::NativePartition;
+use std::mem::{align_of, size_of};
+pub(super) mod copy;
+use copy::PublicationOrigin;
+
+pub(in crate::working_memory) struct NativeStorageWitness<K> {
+    key: K,
+    bytes: u64,
+    origin: PrepaidStorageOrigin,
+}
+
+// The retained native mechanism authenticates this exact immutable key and
+// charged capacity before constructing this closed input. It carries neither a
+// partition nor a native owner, and cannot introduce a new canonical row.
+pub(in crate::working_memory) struct ExistingNativeAlias<K> {
+    key: K,
+    bytes: u64,
+    immutable: bool,
+}
+
+pub(in crate::working_memory) enum NativePublicationInput<K> {
+    Ordinary(K, u64),
+    // An actual explicit source owner, positively validated by the complete
+    // inventory. May reuse an existing same-request prepaid immutable row;
+    // absence still takes the ordinary source charge and creates no origin.
+    SourceInventory(K, u64),
+    Native(NativeStorageWitness<K>),
+    Existing(ExistingNativeAlias<K>),
+    ExistingSource(NativeStorageWitness<K>),
+    // Ordinary load-time source payload, already fully paid in this pool.
+    // Unlike SourceInventory this can never create a row or take native credit.
+    RegisteredSource(K, u64),
+}
+
+impl<K> NativePublicationInput<K> {
+    fn parts(&self) -> (&K, u64, Option<&PrepaidStorageOrigin>, bool, bool, bool) {
+        match self {
+            Self::Ordinary(key, bytes) | Self::SourceInventory(key, bytes) => {
+                (key, *bytes, None, false, false, false)
+            }
+            Self::Native(witness) => (
+                &witness.key,
+                witness.bytes,
+                Some(&witness.origin),
+                false,
+                witness.origin.immutable(),
+                false,
+            ),
+            Self::Existing(alias) => (&alias.key, alias.bytes, None, true, alias.immutable, false),
+            Self::RegisteredSource(key, bytes) => (key, *bytes, None, true, false, true),
+            Self::ExistingSource(witness) => (
+                &witness.key,
+                witness.bytes,
+                Some(&witness.origin),
+                true,
+                false,
+                true,
+            ),
+        }
+    }
+}
+
+struct Row<K: Ord + Send + Sync + 'static> {
+    first_input: usize,
+    // Provider keys must all retire before the result registration.
+    key: Option<Arc<K>>,
+    registry_key: Option<RegistryKey<K>>,
+    bytes: u64,
+    // Sticky across duplicates: even a same-key birth witness cannot replace
+    // the requirement for an already registered native allocation.
+    existing_only: bool,
+    source_inventory: bool,
+    registered_source: bool,
+    immutable: bool,
+    source: bool,
+    locator: Option<EntryLocator>,
+    output: Option<WorkingMemoryStorage<K>>,
+    activation_pool: Option<WorkingMemoryPool>,
+    // Failed foreign-prefix keys must retire before their donor custody too.
+    origin: Option<PrepaidStorageOrigin>,
+}
+
+/// One terminal attempt. Inputs and partial preparation survive all refusals
+/// and provider unwind. Construction is not a claim that control storage fits Q.
+pub(in crate::working_memory) struct PreparedNativePublication<K: Ord + Send + Sync + 'static> {
+    inputs: Vec<NativePublicationInput<K>>,
+    rows: Vec<Row<K>>,
+    node: Option<Box<RegistryBatch<K>>>,
+    // Precharged outside Usage; only a successful first real row installs it.
+    namespace: Option<PreparedNamespace>,
+    terminal: bool,
+    published: bool,
+    slots: usize,
+    exact_storage: bool,
+    failure_site: &'static str,
+    partition: PublicationOrigin,
+}
+
+fn same_coverage(a: Option<&PrepaidStorageOrigin>, b: Option<&PrepaidStorageOrigin>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.same_origin(b),
+        _ => false,
+    }
+}
+
+impl<K: Clone + Ord + Send + Sync + 'static> PreparedNativePublication<K> {
+    pub(in crate::working_memory) fn failure_site(&self) -> &'static str {
+        self.failure_site
+    }
+
+    pub(in crate::working_memory) fn requested_control_bytes(
+        slots: usize,
+    ) -> Result<u64, WorkingMemoryError> {
+        // Requested layouts only. Arc headers, allocator charge/spare capacity,
+        // provider key payload and moves remain separately required inputs.
+        let array = |size: usize, align: usize| {
+            let bytes = size
+                .checked_mul(slots)
+                .ok_or(WorkingMemoryError::Overflow)?;
+            std::alloc::Layout::from_size_align(bytes, align)
+                .map_err(|_| WorkingMemoryError::Overflow)?;
+            u64::try_from(bytes).map_err(|_| WorkingMemoryError::Overflow)
+        };
+        let values = [
+            array(
+                size_of::<NativePublicationInput<K>>(),
+                align_of::<NativePublicationInput<K>>(),
+            )?,
+            array(size_of::<Row<K>>(), align_of::<Row<K>>())?,
+            // Include both requested buffers during Vec-to-Box conversion.
+            array(
+                size_of::<Option<(RegistryKey<K>, Entry)>>(),
+                align_of::<Option<(RegistryKey<K>, Entry)>>(),
+            )?,
+            array(
+                size_of::<Option<(RegistryKey<K>, Entry)>>(),
+                align_of::<Option<(RegistryKey<K>, Entry)>>(),
+            )?,
+            array(size_of::<K>(), align_of::<K>())?,
+            array(size_of::<K>(), align_of::<K>())?,
+            array(size_of::<Registration<K>>(), align_of::<Registration<K>>())?,
+            size_of::<Self>() as u64,
+            size_of::<RegistryBatch<K>>() as u64,
+            PreparedNamespace::requested_control_bytes::<K>()?,
+        ];
+        values.into_iter().try_fold(0u64, |a, b| {
+            a.checked_add(b).ok_or(WorkingMemoryError::Overflow)
+        })
+    }
+
+    pub(in crate::working_memory) fn prepare(
+        partition: NativePartition,
+        inputs: Vec<NativePublicationInput<K>>,
+    ) -> Self {
+        let slots = inputs.len();
+        Self {
+            inputs,
+            rows: Vec::with_capacity(slots),
+            node: Some(RegistryBatch::prepare_native(slots, partition.clone())),
+            namespace: Some(PreparedNamespace::prepare::<K>(
+                partition.namespace_metadata(),
+            )),
+            terminal: false,
+            published: false,
+            slots,
+            exact_storage: false,
+            failure_site: "registry preparation",
+            partition: PublicationOrigin::Prepaid(PrepaidStorageOrigin::Native(partition)),
+        }
+    }
+
+    pub(in crate::working_memory) fn publish(
+        &mut self,
+        scope: &WorkingMemoryFundingScope,
+    ) -> Result<(), WorkingMemoryError> {
+        self.publish_impl(Some(scope), None, None)
+    }
+
+    pub(in crate::working_memory) fn publish_original(
+        &mut self,
+        scope: &WorkingMemoryFundingScope,
+        controls: &crate::working_memory::OriginalTextControlGuard,
+        identity: &funding::native_partition::NativePublicationScopeIdentity,
+    ) -> Result<(), WorkingMemoryError> {
+        self.publish_impl(Some(scope), Some((controls, identity)), None)
+    }
+
+    pub(in crate::working_memory) fn publish_source(
+        &mut self,
+        controls: &crate::working_memory::OriginalHostSourceCustody,
+        reservation: Option<&crate::working_memory::WorkingMemoryReservation>,
+    ) -> Result<(), WorkingMemoryError> {
+        if !self.partition.immutable() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        self.publish_impl(
+            controls.text_scope()?,
+            None,
+            Some((controls, reservation)),
+        )
+    }
+
+    fn publish_impl(
+        &mut self,
+        scope: Option<&WorkingMemoryFundingScope>,
+        controls: Option<(
+            &crate::working_memory::OriginalTextControlGuard,
+            &funding::native_partition::NativePublicationScopeIdentity,
+        )>,
+        source: Option<(
+            &crate::working_memory::OriginalHostSourceCustody,
+            Option<&crate::working_memory::WorkingMemoryReservation>,
+        )>,
+    ) -> Result<(), WorkingMemoryError> {
+        self.failure_site = "registry terminal attempt";
+        if self.terminal {
+            return Err(WorkingMemoryError::PreparationAlreadyStarted);
+        }
+        self.terminal = true;
+        // Retain source accounting outside Usage. The source producer uses the
+        // same publication transaction without fabricating a native scope.
+        let source_account = source.map(|(controls, _)| controls.accounting());
+        let (pool, account) = match source_account.as_ref() {
+            Some(value) => (value.pool(), value.account()),
+            None => {
+                let scope = scope.ok_or(WorkingMemoryError::IdentityMismatch)?;
+                (scope.pool(), scope.id)
+            }
+        };
+        let registration_account = match source {
+            Some((controls, _)) => controls.funded_registration_account(),
+            None => Some(account),
+        };
+        // All provider clones and output shells are prepared outside Usage.
+        // The complete input vector remains owned on partial clone failure.
+        self.failure_site = "registry duplicate input coverage";
+        for (first_input, input) in self.inputs.iter().enumerate() {
+            let (key, bytes, origin, existing_only, immutable, source) = input.parts();
+            let source_inventory = matches!(input, NativePublicationInput::SourceInventory(..));
+            let registered_source = matches!(input, NativePublicationInput::RegisteredSource(..));
+            if let Some(prior) = self.rows.iter_mut().find(|row| {
+                row.key.as_ref().expect("staged key").as_ref().cmp(key) == Ordering::Equal
+            }) {
+                same_capacity(prior.bytes, bytes)?;
+                let prior_native = prior.origin.is_some() || prior.existing_only;
+                let incoming_native = origin.is_some() || existing_only;
+                if prior_native != incoming_native
+                    || prior.immutable != immutable
+                    || prior.source != source
+                    || prior.registered_source != registered_source
+                {
+                    return Err(WorkingMemoryError::IdentityMismatch);
+                }
+                if let (Some(a), Some(b)) = (prior.origin.as_ref(), origin) {
+                    if !a.same_origin(b) {
+                        return Err(WorkingMemoryError::IdentityMismatch);
+                    }
+                }
+                if prior.origin.is_none() {
+                    prior.origin = origin.cloned();
+                }
+                prior.existing_only |= existing_only;
+                // Every occurrence must be an authenticated explicit source.
+                prior.source_inventory &= source_inventory;
+                continue;
+            }
+            let key = Arc::new(key.clone());
+            let keys = if self.exact_storage {
+                let mut keys = crate::working_memory::qualified_storage::vector(1, true)?;
+                keys.push(key.as_ref().clone());
+                keys
+            } else {
+                vec![key.as_ref().clone()]
+            };
+            self.rows.push(Row {
+                first_input,
+                registry_key: Some(RegistryKey::Shared(key.clone())),
+                output: Some(match self.partition.preparation() {
+                    Some(host) => WorkingMemoryStorage::pending_prepared(keys, bytes, host),
+                    None => WorkingMemoryStorage::pending(keys, bytes),
+                }),
+                key: Some(key),
+                bytes,
+                existing_only,
+                source_inventory,
+                registered_source,
+                immutable,
+                source,
+                origin: origin.cloned(),
+                locator: None,
+                activation_pool: Some(pool.clone()),
+            });
+        }
+        self.failure_site = "registry output ownership";
+        for row in &mut self.rows {
+            Arc::get_mut(&mut row.output.as_mut().expect("prepared output").0)
+                .ok_or(WorkingMemoryError::IdentityMismatch)?;
+        }
+        self.failure_site = "registry publisher authority";
+        let mut usage = pool
+            .0
+            .usage
+            .lock()
+            .map_err(|_| WorkingMemoryError::Poisoned)?;
+        pool.0.available(&usage, None)?;
+        if let Some((controls, identity)) = controls {
+            let scope = scope.ok_or(WorkingMemoryError::IdentityMismatch)?;
+            if !scope
+                .native_publication_identity
+                .as_ref()
+                .is_some_and(|actual| actual.same(identity))
+            {
+                return Err(WorkingMemoryError::IdentityMismatch);
+            }
+            controls
+                .custody
+                .validate_native_publication_locked(scope, &usage)?;
+        }
+        if let Some((controls, reservation)) = source {
+            let accounting = source_account.as_ref().expect("source accounting retained");
+            if !self.partition.same_source_account(accounting) {
+                return Err(WorkingMemoryError::IdentityMismatch);
+            }
+            controls.validate_publication_locked(reservation, pool, &usage)?;
+            // Text sources preserve their exact original source-scope check.
+            // Speculative sources retain the accepted role account itself.
+            if let Some(scope) = scope { self.partition.validate_publisher(scope, &usage)?; }
+        } else {
+            if self.partition.immutable() { return Err(WorkingMemoryError::IdentityMismatch); }
+            self.partition.validate_publisher(scope.ok_or(WorkingMemoryError::IdentityMismatch)?, &usage)?;
+        }
+        let state = registration_account
+            .map(|id| {
+                usage
+                    .funding
+                    .get(&id)
+                    .ok_or(WorkingMemoryError::ExecutionFenced)
+            })
+            .transpose()?;
+        if source.is_none() {
+            state
+                .expect("funded publisher")
+                .validate_native_publication(scope.ok_or(WorkingMemoryError::IdentityMismatch)?)?;
+        }
+        if registration_account.is_none()
+            && self.rows.iter().any(|row| {
+                !row.immutable
+                    || row.existing_only
+                    || row.source
+                    || row.origin.as_ref().is_none_or(|origin| {
+                        !origin.immutable() || !self.partition.same_origin(origin)
+                    })
+            })
+        {
+            // This closed ticket-only route publishes actual immutable births
+            // already paid by its source bank. No ordinary allocation or native
+            // partition may borrow the ticket's protected remainder.
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        // Missing namespace is validated against the private empty candidate.
+        // Existing-only observations still require a real canonical row. No
+        // namespace becomes visible until every row/counter check succeeds.
+        let missing_namespace = usage.storage.get(&TypeId::of::<K>()).is_none();
+        let registry = if missing_namespace {
+            self.namespace
+                .as_ref()
+                .ok_or(WorkingMemoryError::PreparationAlreadyStarted)?
+                .registry::<K>()
+        } else {
+            usage
+                .storage
+                .get(&TypeId::of::<K>())
+                .and_then(|value| value.downcast_ref::<Registry<K>>())
+                .ok_or(WorkingMemoryError::IdentityMismatch)?
+        };
+        let mut incremental = 0u64;
+        let mut allocations = 0usize;
+        let mut new_rows = 0usize;
+        for row in &mut self.rows {
+            self.failure_site = "registry origin account and capacity";
+            if let Some(origin) = &row.origin {
+                origin.validate_pool(pool, &usage)?;
+                origin.validate_capacity(row.bytes)?;
+            }
+            if let Some((locator, entry)) =
+                registry.locate(row.key.as_ref().expect("staged key").as_ref())
+            {
+                self.failure_site = "registry canonical capacity and origin";
+                same_capacity(entry.bytes, row.bytes)?;
+                validate_entry_origin(entry, &usage)?;
+                if row.registered_source {
+                    self.failure_site = "registry ordinary source alias origin";
+                    // Recheck under the same commit lock: the source may have
+                    // retired since preflight. Preserve its full ordinary charge.
+                    // Neither a native witness nor constructor coverage can be
+                    // substituted for this explicitly selected existing source.
+                    if entry.owners == 0 || entry.prepaid.is_some() || entry.funding.is_some()
+                        || row.origin.is_some() {
+                        return Err(WorkingMemoryError::IdentityMismatch);
+                    }
+                } else if row.existing_only {
+                    self.failure_site = "registry canonical alias kind";
+                    let canonical = entry
+                        .prepaid
+                        .as_ref()
+                        .ok_or(WorkingMemoryError::IdentityMismatch)?;
+                    canonical.validate_pool(pool, &usage)?;
+                    canonical.validate_capacity(row.bytes)?;
+                    if if row.source {
+                        canonical.residual_source_charge().is_none()
+                    } else {
+                        !canonical.buffer_kind(row.immutable)
+                    } {
+                        return Err(WorkingMemoryError::IdentityMismatch);
+                    }
+                    if let Some(claimed) = &row.origin {
+                        if !claimed.same_origin(canonical) {
+                            return Err(WorkingMemoryError::IdentityMismatch);
+                        }
+                    } else {
+                        // Clone only accounting custody into an empty field.
+                        // It stays row-last through later validation refusal or
+                        // provider unwind; no active alias retires under Usage.
+                        row.origin = Some(canonical.clone());
+                    }
+                } else if row.source_inventory
+                    && entry
+                        .prepaid
+                        .as_ref()
+                        .is_some_and(|origin| origin.buffer_kind(true))
+                {
+                    // This is reuse only: the real source constructor already
+                    // created and attached the canonical origin. Validate the
+                    // exact live owner and publisher; no key/bytes pair can mint
+                    // a new prepaid row or borrow another request's allowance.
+                    let canonical = entry.prepaid.as_ref().expect("checked immutable origin");
+                    canonical.validate_pool(pool, &usage)?;
+                    canonical.validate_capacity(row.bytes)?;
+                    canonical.validate_publisher(scope.ok_or(WorkingMemoryError::IdentityMismatch)?, &usage)?;
+                    row.origin = Some(canonical.clone());
+                    row.immutable = true;
+                } else if !same_coverage(entry.prepaid.as_ref(), row.origin.as_ref()) {
+                    self.failure_site = "registry canonical coverage mismatch";
+                    return Err(WorkingMemoryError::IdentityMismatch);
+                }
+                entry
+                    .owners
+                    .checked_add(1)
+                    .ok_or(WorkingMemoryError::Overflow)?;
+                row.locator = Some(locator);
+            } else {
+                if row.existing_only {
+                    self.failure_site = "registry immutable alias missing";
+                    if !row.immutable { self.failure_site = "registry native alias missing"; }
+                    return Err(WorkingMemoryError::IdentityMismatch);
+                }
+                new_rows = new_rows
+                    .checked_add(1)
+                    .ok_or(WorkingMemoryError::Overflow)?;
+                if let Some(origin) = &row.origin {
+                    // An unpublished foreign birth cannot be relabeled by B.
+                    if !self.partition.same_origin(origin) {
+                        return Err(WorkingMemoryError::IdentityMismatch);
+                    }
+                } else {
+                    incremental = incremental
+                        .checked_add(row.bytes)
+                        .ok_or(WorkingMemoryError::Overflow)?;
+                    allocations = allocations
+                        .checked_add(1)
+                        .ok_or(WorkingMemoryError::Overflow)?;
+                }
+            }
+        }
+        self.failure_site = "registry duplicate physical location";
+        for (index, row) in self.rows.iter().enumerate() {
+            if row.locator.is_some()
+                && self.rows[..index]
+                    .iter()
+                    .any(|other| other.locator == row.locator)
+            {
+                return Err(WorkingMemoryError::IdentityMismatch);
+            }
+        }
+        self.failure_site = "registry final accounting";
+        let (remaining, allocations, registrations) = match state {
+            Some(state) => {
+                let available = state.spendable_remaining()?;
+                if incremental > available {
+                    return Err(WorkingMemoryError::BudgetExceeded {
+                        required_bytes: incremental,
+                        available_bytes: available,
+                    });
+                }
+                (
+                    state
+                        .remaining
+                        .checked_sub(incremental)
+                        .ok_or(WorkingMemoryError::Poisoned)?,
+                    state
+                        .allocations
+                        .checked_add(allocations)
+                        .ok_or(WorkingMemoryError::Overflow)?,
+                    state
+                        .registrations
+                        .checked_add(self.rows.len())
+                        .ok_or(WorkingMemoryError::Overflow)?,
+                )
+            }
+            None => {
+                if incremental != 0 || allocations != 0 {
+                    return Err(WorkingMemoryError::IdentityMismatch);
+                }
+                (0, 0, 0)
+            }
+        };
+        let reserved = usage
+            .reserved
+            .checked_sub(incremental)
+            .ok_or(WorkingMemoryError::Poisoned)?;
+        let registered = usage
+            .registered
+            .checked_add(incremental)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let node = self
+            .node
+            .as_mut()
+            .ok_or(WorkingMemoryError::PreparationAlreadyStarted)?;
+        if missing_namespace && new_rows != 0 {
+            usage
+                .storage
+                .install(self.namespace.take().expect("validated candidate"));
+        }
+        if !self.rows.is_empty() {
+            let registry = usage
+                .storage
+                .get_mut(&TypeId::of::<K>())
+                .and_then(|value| value.downcast_mut::<Registry<K>>())
+                .expect("validated registry");
+            // Commit uses only prevalidated locators, fixed slots and scalar writes.
+            for (index, row) in self.rows.iter_mut().enumerate() {
+                if let Some(locator) = row.locator {
+                    registry.at_mut(locator).owners += 1;
+                } else {
+                    let funding = row.origin.is_none().then_some(account);
+                    node.entries[index] = Some((
+                        row.registry_key.take().expect("prepared registry key"),
+                        Entry {
+                            reset_layout_id: None,
+                            bytes: row.bytes,
+                            owners: 1,
+                            funding,
+                            prepaid: row.origin.take(),
+                        },
+                    ));
+                }
+            }
+            if new_rows != 0 {
+                registry.link(self.node.take().expect("prepared fixed batch"));
+            }
+        }
+        if let Some(id) = registration_account {
+            let state = usage
+                .funding
+                .get_mut(&id)
+                .expect("validated funded publisher");
+            state.remaining = remaining;
+            state.allocations = allocations;
+            state.registrations = registrations;
+        }
+        usage.reserved = reserved;
+        usage.registered = registered;
+        for row in &mut self.rows {
+            let output = Arc::get_mut(&mut row.output.as_mut().expect("prepared output").0)
+                .expect("private registration");
+            output.pool = row.activation_pool.take();
+            output.funding = registration_account;
+        }
+        drop(usage);
+        // Duplicate and original provider keys retire before outputs may escape.
+        self.inputs.clear();
+        for row in &mut self.rows {
+            drop(row.registry_key.take());
+            drop(row.key.take());
+        }
+        self.published = true;
+        Ok(())
+    }
+
+    pub(in crate::working_memory) fn take(
+        &mut self,
+        index: usize,
+    ) -> Option<WorkingMemoryStorage<K>> {
+        self.published.then_some(())?;
+        self.rows.get_mut(index)?.output.take()
+    }
+
+    pub(in crate::working_memory) fn prepare_slots(
+        partition: NativePartition,
+        slots: usize,
+    ) -> Self {
+        Self {
+            inputs: Vec::with_capacity(slots),
+            rows: Vec::with_capacity(slots),
+            node: Some(RegistryBatch::prepare_native(slots, partition.clone())),
+            namespace: Some(PreparedNamespace::prepare::<K>(
+                partition.namespace_metadata(),
+            )),
+            terminal: false,
+            published: false,
+            slots,
+            exact_storage: false,
+            failure_site: "registry preparation",
+            partition: PublicationOrigin::Prepaid(PrepaidStorageOrigin::Native(partition)),
+        }
+    }
+
+    pub(in crate::working_memory) fn prepare_slots_exact(
+        partition: NativePartition,
+        slots: usize,
+    ) -> Result<Self, WorkingMemoryError> {
+        // The parameter retains original custody until every partial Vec/Box
+        // has retired on failure. No provider callback or Usage loan occurs.
+        let inputs = crate::working_memory::qualified_storage::vector(slots, true)?;
+        let rows = crate::working_memory::qualified_storage::vector(slots, true)?;
+        let node = RegistryBatch::prepare_native_exact(slots, partition.clone())?;
+        Ok(Self {
+            inputs,
+            rows,
+            node: Some(node),
+            namespace: Some(PreparedNamespace::prepare::<K>(
+                partition.namespace_metadata(),
+            )),
+            terminal: false,
+            published: false,
+            slots,
+            exact_storage: true,
+            failure_site: "registry preparation",
+            partition: PublicationOrigin::Prepaid(PrepaidStorageOrigin::Native(partition)),
+        })
+    }
+
+    pub(in crate::working_memory) fn prepare_source_exact(
+        origin: PrepaidHostOrigin,
+    ) -> Result<Self, WorkingMemoryError> {
+        let inputs = crate::working_memory::qualified_storage::vector(1, true)?;
+        let rows = crate::working_memory::qualified_storage::vector(1, true)?;
+        let node = RegistryBatch::prepare_source_exact(1, origin.raw().clone())?;
+        Ok(Self {
+            inputs,
+            rows,
+            node: Some(node),
+            namespace: Some(PreparedNamespace::prepare_source::<K>(Some(origin.raw().clone()))),
+            terminal: false,
+            published: false,
+            slots: 1,
+            exact_storage: true,
+            failure_site: "registry preparation",
+            partition: PublicationOrigin::Prepaid(PrepaidStorageOrigin::Immutable(origin)),
+        })
+    }
+    // Only the source worker holding the same successful attempt can supply
+    // its mechanism's actual completed-copy identity/capacity here.
+    pub(in crate::working_memory) fn push_source_birth(
+        &mut self,
+        key: K,
+        bytes: u64,
+    ) -> Result<(), WorkingMemoryError> {
+        if !self.partition.immutable() || self.terminal || !self.inputs.is_empty() {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        self.partition.validate_capacity(bytes)?;
+        self.inputs
+            .push(NativePublicationInput::Native(NativeStorageWitness {
+                key,
+                bytes,
+                origin: self.partition.prepaid()?.clone(),
+            }));
+        Ok(())
+    }
+
+    pub(in crate::working_memory) fn qualified_control_bytes(
+        slots: usize,
+        nested_key_bytes: u64,
+    ) -> Result<u64, WorkingMemoryError> {
+        use crate::working_memory::qualified_storage as storage;
+        // The legacy requested bound includes both buffers at Vec-to-Box.
+        // Exact native storage never makes that transition: retain one buffer.
+        let requested = Self::requested_control_bytes(slots)?
+            .checked_sub(storage::array_bytes::<Option<(RegistryKey<K>, Entry)>>(
+                slots,
+            )?)
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let frames = storage::vector_control_bytes::<NativePublicationInput<K>>()?
+            .checked_add(storage::vector_control_bytes::<Row<K>>()?)
+            .and_then(|n| {
+                storage::vector_control_bytes::<Option<(RegistryKey<K>, Entry)>>()
+                    .ok()
+                    .and_then(|b| n.checked_add(b))
+            })
+            .ok_or(WorkingMemoryError::Overflow)?;
+        let key_frame = storage::vector_control_bytes::<K>()?;
+        let headers = storage::shared_header_bytes::<K>()?
+            .checked_add(storage::shared_header_bytes::<Registration<K>>()?)
+            .and_then(|n| n.checked_add(key_frame))
+            // Input key, shared canonical key, registration key. Observation
+            // describes into the input; it does not create a fourth live copy.
+            .and_then(|n| {
+                nested_key_bytes
+                    .checked_mul(3)
+                    .and_then(|keys| n.checked_add(keys))
+            })
+            .and_then(|n| n.checked_mul(u64::try_from(slots).ok()?))
+            .ok_or(WorkingMemoryError::Overflow)?;
+        // publish_impl retains this account alias and its source/scope
+        // selectors through canonical commit. They are separate live caller
+        // values, not fields of the requested registry/output destinations.
+        let publication_frames = [
+            size_of::<Option<u64>>(),
+            size_of::<Option<&funding::FundingState>>(),
+            size_of::<(u64, usize, usize)>(),
+            size_of::<Option<crate::working_memory::OriginalHostMetadataCustody>>(),
+            size_of::<Option<&WorkingMemoryFundingScope>>(),
+            size_of::<Option<(
+                &crate::working_memory::OriginalTextControlGuard,
+                &funding::native_partition::NativePublicationScopeIdentity,
+            )>>(),
+            size_of::<Option<(
+                &crate::working_memory::OriginalHostSourceCustody,
+                Option<&crate::working_memory::WorkingMemoryReservation>,
+            )>>(),
+            size_of::<(&WorkingMemoryPool, u64)>(),
+            size_of::<Result<(), WorkingMemoryError>>(),
+        ];
+        let publication_frames = publication_frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&publication_frames), usize::checked_add)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or(WorkingMemoryError::Overflow)?;
+        requested
+            .checked_add(headers)
+            .and_then(|n| n.checked_add(frames))
+            .and_then(|n| n.checked_add(publication_frames))
+            .and_then(|n| WorkingMemoryPool::retained_source_inventory_control_bytes::<K>()
+                .and_then(|bytes| u64::try_from(bytes).ok()).and_then(|bytes| n.checked_add(bytes)))
+            .ok_or(WorkingMemoryError::Overflow)
+    }
+
+    pub(in crate::working_memory) fn push_source(
+        &mut self,
+        key: &K,
+        bytes: u64,
+        identity: Option<&eredu_checkpoint::store::SourceStorageIdentity>,
+        pool: &WorkingMemoryPool,
+    ) -> Result<usize, WorkingMemoryError> {
+        if self.terminal || self.inputs.len() == self.slots {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        // Authenticate the same owning source before the transaction lock.
+        // No native partition is substituted for its already admitted account.
+        let origin = match identity {
+            Some(identity) => crate::working_memory::gguf_source::SourceInventoryOrigin::inspect(
+                identity, bytes, pool,
+            )?,
+            None => None,
+        };
+        let registered_source = identity.is_some() && origin.is_none();
+        if registered_source {
+            // A foreign original constructor is not an ordinary load source.
+            if crate::working_memory::gguf_source::SourceInventoryOrigin::has_original_constructor(
+                identity.expect("source identity checked"),
+            ) {
+                return Err(WorkingMemoryError::IdentityMismatch);
+            }
+            pool.validate_registered_ordinary_source(key, bytes)?;
+        }
+        let key = key.clone();
+        let input = match origin {
+            Some(origin) => NativePublicationInput::ExistingSource(NativeStorageWitness {
+                key,
+                bytes,
+                origin: PrepaidStorageOrigin::Source(origin),
+            }),
+            None if registered_source => NativePublicationInput::RegisteredSource(key, bytes),
+            None => NativePublicationInput::SourceInventory(key, bytes),
+        };
+        let index = self.inputs.len();
+        self.inputs.push(input);
+        Ok(index)
+    }
+
+    pub(in crate::working_memory) fn push_observation(
+        &mut self,
+        observation: crate::working_memory::NativeStorageObservation<K>,
+    ) -> Result<usize, WorkingMemoryError> {
+        use crate::working_memory::NativeStorageObservation;
+        if self.terminal || self.inputs.len() == self.slots {
+            return Err(WorkingMemoryError::IdentityMismatch);
+        }
+        let input = match observation {
+            NativeStorageObservation::Originating(key, bytes) => {
+                NativePublicationInput::Native(NativeStorageWitness {
+                    key,
+                    bytes,
+                    origin: self.partition.prepaid()?.clone(),
+                })
+            }
+            NativeStorageObservation::Existing(key, bytes) => {
+                NativePublicationInput::Existing(ExistingNativeAlias {
+                    key,
+                    bytes,
+                    immutable: false,
+                })
+            }
+            NativeStorageObservation::ExistingImmutable(key, bytes) => {
+                NativePublicationInput::Existing(ExistingNativeAlias {
+                    key,
+                    bytes,
+                    immutable: true,
+                })
+            }
+            NativeStorageObservation::Ordinary(key, bytes) => {
+                NativePublicationInput::Ordinary(key, bytes)
+            }
+            NativeStorageObservation::Empty => return Err(WorkingMemoryError::IdentityMismatch),
+        };
+        let index = self.inputs.len();
+        self.inputs.push(input);
+        Ok(index)
+    }
+
+    #[cfg(test)]
+    pub(in crate::working_memory) fn control_capacities(&self) -> [usize; 3] {
+        [
+            self.inputs.capacity(),
+            self.rows.capacity(),
+            self.node
+                .as_ref()
+                .map_or(self.slots, |node| match &node.entries {
+                    registry::RegistrySlots::Native(rows) => rows.capacity(),
+                    registry::RegistrySlots::Ordinary(rows) => rows.len(),
+                }),
+        ]
+    }
+
+    pub(in crate::working_memory) fn input(
+        &self,
+        index: usize,
+    ) -> Option<&WorkingMemoryStorage<K>> {
+        self.published.then_some(())?;
+        self.rows
+            .iter()
+            .find(|row| row.first_input == index)?
+            .output
+            .as_ref()
+    }
+
+    pub(in crate::working_memory) fn take_input(
+        &mut self,
+        index: usize,
+    ) -> Option<WorkingMemoryStorage<K>> {
+        self.published.then_some(())?;
+        self.rows
+            .iter_mut()
+            .find(|row| row.first_input == index)?
+            .output
+            .take()
+    }
+}
+
+#[cfg(test)]
+pub(in crate::working_memory) fn test_native<K>(
+    key: K,
+    bytes: u64,
+    origin: &NativePartition,
+) -> NativePublicationInput<K> {
+    NativePublicationInput::Native(NativeStorageWitness {
+        key,
+        bytes,
+        origin: PrepaidStorageOrigin::Native(origin.clone()),
+    })
+}
+
+#[cfg(test)]
+pub(in crate::working_memory) fn test_existing_native<K>(
+    key: K,
+    bytes: u64,
+) -> NativePublicationInput<K> {
+    NativePublicationInput::Existing(ExistingNativeAlias {
+        key,
+        bytes,
+        immutable: false,
+    })
+}
+
+#[cfg(test)]
+mod tests;

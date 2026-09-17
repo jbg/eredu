@@ -1,0 +1,112 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted composed target storage; shared host-transfer array identity remains explicitly unknown",
+  "source_sha256": {
+    "doc/backend-architecture.md": "54fd6942df833cbcdcea2bae7fafc92fa1d276214d80882bd3a06d9da0f54032",
+    "doc/execution-control.md": "867362c37362a1dcd6f643b694b3b11bca93ecb35d397d74d509c051de35242a",
+    "doc/bounded-inference.md": "3980b2d144bd18523a78bd4bca26ceb4da62a10bc50cb075b715ad6c342d12f2",
+    "eredu-runtime/src/replicated_session.rs": "3c203224560a102d3738f329e0b90a6389b36e2f85880e0f6d490e1eb1f32141",
+    "eredu-runtime/src/cache/worker.rs": "615d931eac8ba7647044fca0eaa6377889d87925a5c8684a4971b51cb805ac89",
+    "eredu-runtime/tests/backend_independence.rs": "4e8f990682a2b27916053e847bf1c18041c10b72e46d095dcfd92c15296b4498",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage.rs": "b2b2bd11879bfaf6c8500e607433389d44079256437aa8e022df097c3bf35928",
+    "eredu-backend-mlx/src/backend/runtime/cache/residency.rs": "83410b8ae9467665a1339535d62d03d186a24e338276d3bfd2ae6815eb31f16e",
+    "eredu-backend-mlx/src/backend/runtime/cache/residency/manager.rs": "33932d14a2e406a26ca2818bca50028c224ad67fd17a45bc3997ea34b6b05733",
+    "eredu-backend-mlx/src/backend/runtime/cache/residency/manager/storage.rs": "7c67a15a7d4ba579af530aa09437ecc712dd8e0841c2bb160ea0da24ab5eb401",
+    "eredu-backend-mlx/src/backend/runtime/cache/residency/tests.rs": "0de392d1cbb87c1025c59bed2693243d7d7d786b59952feffbe87b4a6b5db8e9",
+    "eredu-backend-mlx/src/backend/runtime/cache/residency/tests/storage.rs": "386d03b8825fb467a96000a5e8cd85ba43587a9ef599faaaeb11ea7e77b606bc",
+    "eredu-backend-mlx/src/backend/runtime/cache/state.rs": "3d02e133de26ba7d91895724cd78b90d8e0b28c74b3b9a2c9880e99f1f4a81a2",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/key_value.rs": "aaa80d3457c38279fa201597f911e1b1dc13f686c23a89fffeda756bd9a8e2b0",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid.rs": "8880556986ec49871f4744d2a4b6e84a9dfb6df15f89153ad4358236273685c7",
+    "eredu-backend-mlx/src/backend/runtime/residency/parameter_bank/acquisition.rs": "033b26556e81cb931b0986c9d694d8b176b6700304421461f9e287df94e480a2",
+    "eredu-backend-mlx/src/backend/runtime/residency/parameter_bank/tests.rs": "2b98678f35c234aaa7b001e8cf6104027f3d0d5cc75d9ae9e17b4fce6e36292f",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/state.rs": "a3052d58254989006bca4ed2a2290649ce8e3f53134fb6593e8fb9d66941f103",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/mechanisms.rs": "6cd886e5d6ec2ed98bf1a3509331889f26729f5e5b907996d727917dd1028164",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/replicated.rs": "788de9532624fb03e59f8ee971ffb6654e69fa6a6a567f4f7d59d8b1b85fb5ee",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/composite.rs": "a77b424481073739ebeb6444818908b09d3102da1a65e7e615e556158d788cfc",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction.rs": "99a0549b01c63bdeb66df1f8ca47120e4d1a99ddc78a9c84d2eb037abe92949d",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/tests/retained_parameters.rs": "bfcc995bdfd445f0c8ebf06bff1437d2d482a3d291b300202470e534a6432bbc"
+  },
+  "coverage": {
+    "tests_passed": 766,
+    "runtime_tests": 656,
+    "native_target_tests": 1,
+    "native_target_configurations": 9,
+    "certified_target_configurations": 3,
+    "unknown_shared_host_configurations": 6,
+    "native_cache_tests": 51,
+    "native_residency_tests": 58,
+    "new_allocator_peak_measurements": 0,
+    "new_released_checkpoint_comparisons": 0
+  },
+  "behavior": [
+    "The neutral session guards a combined immutable mechanism/state inspection and rejects fenced or active transactions before invoking it.",
+    "MLX retains the exact prepared target residency manager and combines its current arrays, host buffers and source stores with loaded parameters, decoder state and complete shared parameter-bank pools.",
+    "State inventory includes every retained paging manager, native tails and fixed components; sealed device blocks, host blocks and buffered shard byte allocations preserve physical alias identities and lifetimes.",
+    "Cache inventory stays unknown through pending or retiring operations, background errors, queued/prepared disk work and worker-local payload destruction after completion publication.",
+    "Ordinary target completion finalizes output/state array readiness at the native completion boundary, never on behalf of cold inspection.",
+    "Nine native dense/tied/packed configurations exercise prefill plus two cached decodes, cold inventory with checkpoint files hidden, parameter replacement/restoration, deduplication and inventory lifetime past executable teardown.",
+    "Six host-layerwise/disk-streamed Metal configurations deliberately retain unknown bounds: MLX may share host-transfer backing through custom array deleters without a certified cross-owner identity.",
+    "Cache fixtures verify nonzero array aliases, host capacities, shared buffered shard bytes, pending host completion without reaping, and worker payloads outside the block map. Bank fixtures retain replacement values across scoped aliases and preserve unknown lazy backing without materialization."
+  ],
+  "limits": [
+    "Target-side physical payload inventory is not a complete model/request budget or a reservation. Prediction modules and prototypes, observers, escaped outputs and enclosing request resources still require composition.",
+    "MLX shared host-transfer array backing still needs a certified ownership identity; logical nbytes and completed events do not supply that fact.",
+    "Future execution, cache growth, streaming/materialization and copy workspace require separate bounds; public native shared-pool registration and end-to-end enforced admission remain unfinished.",
+    "Inventories themselves retain owners after logical eviction and require charging when integrated into a shared memory domain.",
+    "Metadata, allocator caches, JIT and other process memory remain outside these physical payload capacities.",
+    "The explicit native cache tests ran on Metal; CUDA-specific tests were not compiled or run. No new released-checkpoint comparison or allocator/process peak measurement was performed.",
+    "Builds retain the existing compact-unwind warning and native quote/projection helpers awaiting production admission wiring."
+  ],
+  "checks": [
+    {
+      "name": "runtime-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --tests",
+      "log": "/private/tmp/eredu-target-storage-runtime-tests.log",
+      "sha256": "764e3a59e6f687e481e197bea29ace9dec44985853f4584ef93ef3c027d823a5",
+      "passed": 656
+    },
+    {
+      "name": "native-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib retained_target_parameters_track_replacements_without_loading_or_double_counting -- --test-threads=1",
+      "log": "/private/tmp/eredu-target-storage-native-tests.log",
+      "sha256": "a1115327508b2911fe34bb3d5939504aab0b0be6d37072db0f00eb82729adcde",
+      "passed": 1
+    },
+    {
+      "name": "cache-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib backend::runtime::cache::residency:: -- --test-threads=1",
+      "log": "/private/tmp/eredu-target-storage-cache-tests.log",
+      "sha256": "b7af3b2fb75e8203b5a27d3f1446c63a1f5e0743cea4e608984a2ea3b9ae1468",
+      "passed": 44
+    },
+    {
+      "name": "cache-explicit-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib backend::runtime::cache::residency:: -- --ignored --test-threads=1",
+      "log": "/private/tmp/eredu-target-storage-cache-explicit-tests.log",
+      "sha256": "06567bb8f88b1cc3a307044d72e04491ffb1a669e83646243bbf1c83e5e65d46",
+      "passed": 7
+    },
+    {
+      "name": "residency-tests",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib backend::runtime::residency:: -- --test-threads=1",
+      "log": "/private/tmp/eredu-target-storage-residency-tests.log",
+      "sha256": "3d77acf61e638099123f157d52365afce4f22357bd4577d2f7c327c0f313f368",
+      "passed": 58
+    },
+    {
+      "name": "final-build",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib --no-run",
+      "log": "/private/tmp/eredu-target-storage-final-build.log",
+      "sha256": "8d104be34330904fb3ccdc0b3a77df85395ce187558ae6e0bcdaaac895a1aca6",
+      "passed": null
+    },
+    {
+      "name": "final-check",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "log": "/private/tmp/eredu-target-storage-final-check.log",
+      "sha256": "19d1f231a7fa8187e4a4a2265ef3a1a7478ffb342e060fabed3020bdac7529f8",
+      "passed": null
+    }
+  ]
+}

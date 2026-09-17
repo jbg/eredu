@@ -60,7 +60,8 @@ fn domain_uses_output_width_and_distinguishes_validity_from_constraints_and_forc
     let forced = TokenFilter::allowed(vec![true, false, false, false]).unwrap();
     decision.override_filter(forced.clone());
     assert_eq!(decision.filter(), &forced);
-    assert_eq!(decision.capture_domain().unwrap().filter, &filter);
+    let crate::capture::CaptureTokenFilter::Fixed(capture_filter) = decision.capture_domain().unwrap().filter else { panic!("fixed pre-forcing filter"); };
+    assert_eq!(capture_filter, &filter);
     assert!(decision.capture_domain().unwrap().filter.allows(2));
     let text = TokenSamplingDecision::new(validity.clone()).with_tokenizer_validity(&validity);
     assert_eq!(

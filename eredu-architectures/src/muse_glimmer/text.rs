@@ -22,9 +22,9 @@ use super::{DecoderConfig, LocalGeometry, WeightConvention};
 pub struct CenteredRmsNorm<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Stored scale parameter.
     pub weight: Parameter<B::Tensor>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     epsilon: f32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     centered: bool,
 }
 
@@ -74,21 +74,21 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> CenteredRmsNo
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Attention<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     query_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     key_value_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     scale: f32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     window: Option<i32>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     uses_rope: bool,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     qk_norm_epsilon: f32,
-    #[parameter(skip)]
+    #[parameter(skip, retained_optional_value)]
     query_scale: Option<B::Tensor>,
     /// Query projection.
     pub query: B::Linear,
@@ -208,7 +208,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> 
         &mut self,
         hidden: &B::Tensor,
         explicit_mask: Option<&B::Tensor>,
-        cache: Option<&mut C>,
+        mut cache: Option<&mut C>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
         let batch = hidden.dim(0);
@@ -245,34 +245,60 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Attention<B> 
                 .rotary
                 .forward(&keys, RotaryPosition::Offset(offset), context)?;
         }
+        let blockwise = cache
+            .as_ref()
+            .is_some_and(|cache| cache.uses_blockwise_attention());
+        let (keys, values) = match cache.as_mut() {
+            Some(cache) => cache.update_for_attention(keys, values, context)?,
+            None => (keys, values),
+        };
+        // Contiguous caches may expose only a retained suffix. Blockwise
+        // caches consume absolute masks while scanning their own history.
+        let mask_offset = if blockwise {
+            offset
+        } else {
+            keys.dim(2) - sequence
+        };
+        let explicit_mask = explicit_mask
+            .map(|mask| {
+                let rank = mask.shape().len();
+                let end = offset
+                    .checked_add(sequence)
+                    .ok_or_else(|| Error::backend("Muse attention position overflow"))?;
+                if !blockwise && rank > 0 && mask.shape()[rank - 1] == end && end > keys.dim(2) {
+                    let mut indices = vec![eredu_nn::Index::Full; rank];
+                    indices[rank - 1] = eredu_nn::Index::Range(end - keys.dim(2), end);
+                    mask.index(&indices, context)
+                } else {
+                    Ok(mask.clone())
+                }
+            })
+            .transpose()?;
         let generated = if explicit_mask.is_none() && sequence > 1 {
             Some(B::causal_mask(
                 sequence,
-                offset,
+                mask_offset,
                 self.window.map(|window| window - 1),
                 context,
             )?)
         } else {
             None
         };
-        let mask = explicit_mask.or(generated.as_ref());
+        let mask = explicit_mask.as_ref().or(generated.as_ref());
         let attended = match cache {
-            Some(cache) => {
-                let (keys, values) = cache.update_for_attention(keys, values, context)?;
-                cache.attention(
-                    AttentionRequest {
-                        arithmetic: eredu_nn::AttentionArithmetic::Fused,
-                        softcap: None,
-                        queries,
-                        keys,
-                        values,
-                        scale: self.scale,
-                        mask,
-                        sinks: None,
-                    },
-                    context,
-                )?
-            }
+            Some(cache) => cache.attention(
+                AttentionRequest {
+                    arithmetic: eredu_nn::AttentionArithmetic::Fused,
+                    softcap: None,
+                    queries,
+                    keys,
+                    values,
+                    scale: self.scale,
+                    mask,
+                    sinks: None,
+                },
+                context,
+            )?,
             None => B::attention_with_sinks(
                 AttentionRequest {
                     arithmetic: eredu_nn::AttentionArithmetic::Fused,
@@ -424,7 +450,7 @@ pub struct SparseMoe<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
     pub router: B::Selector,
     /// Packed routed expert bank.
     pub experts: B::GatedProductGroups,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     hidden_size: i32,
 }
 
@@ -669,7 +695,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct TransformerBlock<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     layer: usize,
     /// Gated self-attention.
     pub attention: Attention<B>,
@@ -1018,11 +1044,11 @@ pub struct StaticModules<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBa
     pub final_norm: B::Normalization,
     /// Optional untied head.
     pub head: Option<B::Linear>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     embedding_epsilon: f32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     output_multiplier: f32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     logit_cap: f32,
 }
 

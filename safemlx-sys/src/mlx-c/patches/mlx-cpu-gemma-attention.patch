@@ -1,0 +1,430 @@
+diff --git a/mlx/backend/cpu/alias_storage.cpp b/mlx/backend/cpu/alias_storage.cpp
+--- a/mlx/backend/cpu/alias_storage.cpp
++++ b/mlx/backend/cpu/alias_storage.cpp
+@@ -8,7 +8,7 @@
+   if(b&&a>size_t(PTRDIFF_MAX)/b)return false;out=a*b;return true;
+ }
+ bool shape_elements(const array& value,size_t& elements) noexcept {
+-  if(value.ndim()>4)return false;
++  if(value.ndim()>5)return false;
+   elements=1;
+   for(int extent:value.shape())
+     if(extent<=0||!product(elements,size_t(extent),elements))return false;
+@@ -24,7 +24,7 @@
+ }
+ }
+ bool alias_input_geometry(const array& input,size_t& elements) noexcept {
+-  if(!canonical_dtype(input)||!shape_elements(input,elements))return false;
++  if(input.strides().size()!=input.ndim()||!canonical_dtype(input)||!shape_elements(input,elements))return false;
+   size_t span=1,delta=0,bytes=0;
+   for(size_t axis=0;axis!=size_t(input.ndim());++axis) {
+     if(input.strides()[axis]<0||
+@@ -41,7 +41,7 @@
+ }
+ bool alias_eval_layout(AliasOperation operation,size_t rank,size_t output_rank,
+     bool tracer,CopyEvalStorage& out) noexcept {
+-  if(rank>4||output_rank>4)return false;
++  if(rank>5||output_rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
+   switch(operation) {
+     case AliasOperation::Transpose:if(rank!=output_rank)return false;break;
+     case AliasOperation::Broadcast:if(rank>output_rank)return false;break;
+@@ -56,7 +56,7 @@
+   const size_t controls=sizeof(value)+sizeof(operation)+sizeof(rank)+sizeof(output_rank)+
+       sizeof(tracer)+sizeof(out)+sizeof(Strides)*2+sizeof(array::Flags)+sizeof(Dtype)*2+
+       sizeof(const Shape*)+sizeof(const array*)*6+sizeof(const Primitive*)+
+-      sizeof(size_t)*15+sizeof(int)*6+sizeof(int64_t)*2+sizeof(bool)*7+
++      sizeof(size_t)*15+sizeof(int)*6+sizeof(int64_t)*2+sizeof(bool)*7+sizeof(bool[5])+
+       sizeof(Shape::const_iterator)+sizeof(submission::FixedEvalPrologueGuard*)+
+       sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
+       sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+@@ -76,7 +76,7 @@
+     operation=AliasOperation::Transpose;
+     const auto& axes=static_cast<const Transpose&>(output.primitive()).axes_ref();
+     if(rank!=output_rank||axes.size()!=rank||input_elements!=output_elements)return false;
+-    bool seen[4]{};
++    bool seen[5]{};
+     for(size_t axis=0;axis!=rank;++axis) {
+       const int selected=axes[axis];
+       if(selected<0||size_t(selected)>=rank||seen[selected]||
+diff --git a/mlx/backend/cpu/matmul_storage.cpp b/mlx/backend/cpu/matmul_storage.cpp
+--- a/mlx/backend/cpu/matmul_storage.cpp
++++ b/mlx/backend/cpu/matmul_storage.cpp
+@@ -38,7 +38,7 @@
+ }
+ static bool matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+     size_t batches,bool tracer,bool tiled,CopyEvalStorage& out) noexcept {
+-  if(rank<2||rank>4||!m||!n||!k||!batches||(rank==2&&batches!=1))return false;
++  if(rank<2||rank>(tiled?5:4)||!m||!n||!k||!batches||(rank==2&&batches!=1))return false;
+   TiledMatmulFacts facts;
+   if(tiled&&(!tiled_matmul_facts(facts)||m>size_t(INT_MAX)-15||n>size_t(INT_MAX)-15))return false;
+   size_t left=0,right=0,result=0,bytes=0;
+@@ -82,8 +82,8 @@
+ }
+ bool tiled_matmul_facts(TiledMatmulFacts& out) noexcept {
+   constexpr auto lanes=simd::max_size<float>;
+-  if(lanes<1||lanes>16||16%lanes)return false;
+-  out={16,size_t(lanes),4,size_t(INT_MAX)};return true;
++  if(lanes<1||lanes>16||16%lanes||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
++  out={16,size_t(lanes),5,size_t(INT_MAX)};return true;
+ }
+ bool is_tiled_matmul_eval_primitive(const array& out) noexcept {
+   return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
+@@ -92,7 +92,7 @@
+ }
+ static bool matmul_shape(const array& a,const array& b,const array& output,
+     bool tiled,size_t& batches) noexcept {
+-  const size_t rank=output.ndim();if(rank<2||rank>4||a.ndim()!=rank||b.ndim()!=rank)return false;
++  const size_t rank=output.ndim();if(rank<2||rank>(tiled?5:4)||a.ndim()!=rank||b.ndim()!=rank)return false;
+   const auto dtype=tiled?float32:bfloat16;
+   if(a.dtype()!=dtype||b.dtype()!=dtype||output.dtype()!=dtype||a.itemsize()!=dtype.size()||
+       b.itemsize()!=dtype.size()||output.itemsize()!=dtype.size()||a.shape(-1)!=b.shape(-2)||
+diff --git a/mlx/backend/cpu/reshape_storage.cpp b/mlx/backend/cpu/reshape_storage.cpp
+--- a/mlx/backend/cpu/reshape_storage.cpp
++++ b/mlx/backend/cpu/reshape_storage.cpp
+@@ -14,10 +14,10 @@
+       typeid(out.primitive())==typeid(Reshape);
+ }
+ bool reshape_alias_eval_layout(size_t rank,size_t output_rank,bool tracer,CopyEvalStorage& out) noexcept {
+-  if(rank>4||output_rank>4)return false;
++  if(rank>5||output_rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
+   CopyEvalStorage value;
+   // Actual prepare_reshape takes the row-contiguous branch, copies at most
+-  // four inline strides and delegates the same shared_buffer_reshape worker.
++  // five inline strides and delegates the same shared_buffer_reshape worker.
+   // No Data, output backing, copy task or collapse scratch is produced.
+   if(!copy_eval_layout(0,1,false,tracer,value))return false;
+   value.rank=rank;
+@@ -35,7 +35,7 @@
+   if(!is_reshape_alias_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
+   const auto& input=output.inputs()[0];const auto& shape=static_cast<const Reshape&>(output.primitive()).shape_ref();
+   const size_t rank=input.ndim(),output_rank=output.ndim();
+-  if(rank>4||output_rank>4||shape.size()!=output_rank||!input.flags().row_contiguous||
++  if(rank>5||output_rank>5||shape.size()!=output_rank||!input.flags().row_contiguous||
+       input.size()==0||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
+       !((input.dtype()==float32&&input.itemsize()==sizeof(float))||
+         (input.dtype()==uint32&&input.itemsize()==sizeof(uint32_t))||
+diff --git a/mlx/backend/cpu/softmax_storage.cpp b/mlx/backend/cpu/softmax_storage.cpp
+--- a/mlx/backend/cpu/softmax_storage.cpp
++++ b/mlx/backend/cpu/softmax_storage.cpp
+@@ -16,7 +16,7 @@
+ }
+ bool softmax_eval_layout(size_t rank,size_t columns,size_t rows,bool tracer,
+     CopyEvalStorage& out) noexcept {
+-  if(rank<2||rank>3||!columns||!rows||columns>size_t(INT_MAX)||rows>size_t(INT_MAX)/columns)return false;
++  if(rank<2||rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5||!columns||!rows||columns>size_t(INT_MAX)||rows>size_t(INT_MAX)/columns)return false;
+   CopyEvalStorage value;EvalDispatchStorage task;
+   // The existing optional contiguous_copy_cpu owns one backing and its weak
+   // copy task. The direct branch allocates the same single output backing.
+@@ -24,7 +24,7 @@
+   submission::GraphQuota::Request descriptor[5]{};size_t count=0;
+   if(!PreparedInputLeaf::append_array_requests(rank,descriptor,count)||count!=3)return false;
+   // Optional x_copy has one extra direct descriptor; Data is the already
+-  // counted copy output, which the final result aliases. rank<=3 is inline.
++  // counted copy output, which the final result aliases. rank<=5 is inline.
+   for(size_t i=0;i!=2;++i) {
+     const size_t slot=4+i;
+     value.request_bytes[slot]=std::max(value.request_bytes[slot],descriptor[i].bytes);
+@@ -51,7 +51,7 @@
+   const auto& input=output.inputs()[0];
+   if(input.dtype()!=float32||input.itemsize()!=sizeof(float)||input.shape()!=output.shape())return false;
+   const size_t rank=input.ndim();
+-  if(rank<2||rank>3)return false;
++  if(rank<2||rank>5)return false;
+   size_t rows=1;
+   for(size_t i=0;i+1<rank;++i) {
+     if(input.shape(i)<=0||rows>size_t(INT_MAX)/size_t(input.shape(i)))return false;
+@@ -62,7 +62,8 @@
+   if(rows>size_t(INT_MAX)/columns||rows*columns!=output.size())return false;
+   // Direct contiguous rows use data_size, while the copy path uses logical
+   // size. Both loop populations must fit the same actual int worker.
+-  if(input.flags().contiguous&&input.strides().back()==1&&input.data_size()%columns)return false;
++  if(input.flags().contiguous&&input.strides().back()==1&&
++      (input.data_size()%columns||input.data_size()>output.size()))return false;
+   return softmax_eval_layout(rank,columns,rows,output.is_tracer(),out);
+ }
+ }
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -684,117 +684,13 @@
+ }
+ 
+ /** Computes: O = softmax(Q @ K.T) @ V **/
+-array scaled_dot_product_attention(
+-    const array& queries,
+-    const array& keys,
+-    const array& values,
+-    const float scale,
+-    const std::string& mask_mode /* = "" */,
+-    std::optional<array> mask_arr /* = {} */,
+-    const std::optional<array>& sinks /* = {} */,
+-    StreamOrDevice s /* = {}*/) {
+-  for (const auto& tensor : {queries, keys, values}) {
+-    if (tensor.ndim() != 4) {
+-      std::ostringstream msg;
+-      msg << "[scaled_dot_product_attention] input with shape "
+-          << tensor.shape() << " expected to be rank 4";
+-      throw std::invalid_argument(msg.str());
+-    }
+-  }
+-  // Check valid mask
+-  if (mask_mode != "" && mask_mode != "causal" && mask_mode != "array") {
+-    std::ostringstream msg;
+-    msg << "[scaled_dot_product_attention] Invalid mask_mode " << mask_mode
+-        << ". mask_mode must be 'causal', 'array' or ''.";
+-    throw std::invalid_argument(msg.str());
+-  }
+-
+-  bool do_causal = false;
+-  bool has_mask = false;
+-  bool has_arr_mask = false;
+-  bool has_bool_mask = false;
+-
+-  if (mask_mode == "causal") {
+-    has_mask = true;
+-    do_causal = true;
+-
+-    if (mask_arr) {
+-      std::ostringstream msg;
+-      msg << "[scaled_dot_product_attention] Invalid mask_arr for mask_mode "
+-          << "'casusal'. No array mask should be passed.";
+-      throw std::invalid_argument(msg.str());
+-    }
+-  } else if (mask_arr) {
+-    has_mask = true;
+-    has_arr_mask = true;
+-    has_bool_mask = mask_arr->dtype() == bool_;
+-  }
+-
+-  if (has_arr_mask && mask_arr->ndim() > 4) {
+-    std::ostringstream msg;
+-    msg << "[scaled_dot_product_attention] the mask with shape "
+-        << mask_arr->shape() << " expected to have at most rank 4.";
+-    throw std::invalid_argument(msg.str());
+-  }
+-
+-  const size_t batch_dim = queries.shape(0);
+-  for (const auto& tensor : {keys, values}) {
+-    if (tensor.shape(0) != batch_dim) {
+-      std::ostringstream msg;
+-      msg << "[scaled_dot_product_attention] mismatching batch dimension for input with shape "
+-          << tensor.shape() << ".";
+-      throw std::invalid_argument(msg.str());
+-    }
+-  }
+-
+-  // Q, K must have matching last dims (d_k aka 'head_dim');
+-  if (queries.shape(-1) != keys.shape(-1)) {
+-    std::ostringstream msg;
+-    msg << "[scaled_dot_product_attention] query, keys expected to have matching last dimension; found query shape "
+-        << queries.shape() << " for keys shape " << keys.shape() << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-
+-  // K, V must have matching number of heads (n_kv_heads);
+-  auto n_q_heads = queries.shape(-3);
+-  auto n_kv_heads = keys.shape(-3);
+-
+-  if (keys.shape(-3) != values.shape(-3)) {
+-    std::ostringstream msg;
+-    msg << "[scaled_dot_product_attention] keys, values expected to have matching n_kv_heads; found keys with n_heads "
+-        << keys.shape(-3) << " for values with n_heads " << values.shape(-3)
+-        << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-
+-  // n_heads % n_kv_heads == 0; n_heads >= 1, n_kv_heads >= 1.
+-  if (n_q_heads % n_kv_heads != 0) {
+-    std::ostringstream msg;
+-    msg << "[scaled_dot_product_attention] n_heads must be a multiple of n_kv_heads, found n_heads "
+-        << n_q_heads << " for n_kv_heads " << n_kv_heads << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-
+-  auto final_type = result_type(queries, keys, values);
+-  if (!issubdtype(final_type, floating)) {
+-    std::ostringstream msg;
+-    msg << "[scaled_dot_product_attention] Received unsupported type "
+-        << final_type << ".";
+-    throw std::invalid_argument(msg.str());
+-  }
+-  bool has_sinks = sinks.has_value();
+-
+-  auto q = astype(queries, final_type, s);
+-  auto k = astype(keys, final_type, s);
+-  auto v = astype(values, final_type, s);
+-
+-  auto fallback = [scale,
+-                   n_q_heads,
+-                   n_kv_heads,
+-                   do_causal,
+-                   has_sinks,
+-                   has_arr_mask,
+-                   s](const ArrayVector& inputs) {
++namespace {
++struct SdpaFallback {
++  float scale;
++  int n_q_heads,n_kv_heads;
++  bool do_causal,has_sinks,has_arr_mask;
++  StreamOrDevice s;
++  ArrayVector operator()(const ArrayVector& inputs) const {
+     auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
+     int n_repeats = n_q_heads / n_kv_heads;
+     auto k = inputs[1];
+@@ -860,7 +756,129 @@
+       out = flatten(out, 1, 2, s);
+     }
+     return ArrayVector{out};
+-  };
++  
++  }
++};
++} // namespace
++bool cpu_sdpa_fallback_control_bytes(size_t rank,size_t queries,size_t keys,size_t values,size_t scores,size_t& out) noexcept {
++  if((rank!=4&&rank!=5)||!queries||!keys||!values||!scores||queries>size_t(INT_MAX)||keys>size_t(INT_MAX)||
++      values>size_t(INT_MAX)||scores>size_t(INT_MAX)||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
++  const size_t parts[]={sizeof(SdpaFallback),sizeof(std::function<ArrayVector(const ArrayVector&)>),
++      sizeof(ArrayVector)*8,sizeof(Shape)*7,sizeof(AxisView)*2,sizeof(array)*19,
++      sizeof(std::pair<array,array>)*2,sizeof(std::initializer_list<array>)*2,
++      sizeof(std::optional<array>)*3,sizeof(std::vector<int>),sizeof(StreamOrDevice)*3,sizeof(Stream),
++      sizeof(size_t)*10,sizeof(int)*10,sizeof(bool)*12,sizeof(float)*3,
++      sizeof(const array*)*7,sizeof(std::initializer_list<int>)*2};
++  size_t total=sizeof(parts)+sizeof(out);
++  for(auto value:parts) {if(value>SIZE_MAX-total)return false;total+=value;}
++  out=total;return true;
++}
++
++array scaled_dot_product_attention(
++    const array& queries,
++    const array& keys,
++    const array& values,
++    const float scale,
++    const std::string& mask_mode /* = "" */,
++    std::optional<array> mask_arr /* = {} */,
++    const std::optional<array>& sinks /* = {} */,
++    StreamOrDevice s /* = {}*/) {
++  for (const auto& tensor : {queries, keys, values}) {
++    if (tensor.ndim() != 4) {
++      std::ostringstream msg;
++      msg << "[scaled_dot_product_attention] input with shape "
++          << tensor.shape() << " expected to be rank 4";
++      throw std::invalid_argument(msg.str());
++    }
++  }
++  // Check valid mask
++  if (mask_mode != "" && mask_mode != "causal" && mask_mode != "array") {
++    std::ostringstream msg;
++    msg << "[scaled_dot_product_attention] Invalid mask_mode " << mask_mode
++        << ". mask_mode must be 'causal', 'array' or ''.";
++    throw std::invalid_argument(msg.str());
++  }
++
++  bool do_causal = false;
++  bool has_mask = false;
++  bool has_arr_mask = false;
++  bool has_bool_mask = false;
++
++  if (mask_mode == "causal") {
++    has_mask = true;
++    do_causal = true;
++
++    if (mask_arr) {
++      std::ostringstream msg;
++      msg << "[scaled_dot_product_attention] Invalid mask_arr for mask_mode "
++          << "'casusal'. No array mask should be passed.";
++      throw std::invalid_argument(msg.str());
++    }
++  } else if (mask_arr) {
++    has_mask = true;
++    has_arr_mask = true;
++    has_bool_mask = mask_arr->dtype() == bool_;
++  }
++
++  if (has_arr_mask && mask_arr->ndim() > 4) {
++    std::ostringstream msg;
++    msg << "[scaled_dot_product_attention] the mask with shape "
++        << mask_arr->shape() << " expected to have at most rank 4.";
++    throw std::invalid_argument(msg.str());
++  }
++
++  const size_t batch_dim = queries.shape(0);
++  for (const auto& tensor : {keys, values}) {
++    if (tensor.shape(0) != batch_dim) {
++      std::ostringstream msg;
++      msg << "[scaled_dot_product_attention] mismatching batch dimension for input with shape "
++          << tensor.shape() << ".";
++      throw std::invalid_argument(msg.str());
++    }
++  }
++
++  // Q, K must have matching last dims (d_k aka 'head_dim');
++  if (queries.shape(-1) != keys.shape(-1)) {
++    std::ostringstream msg;
++    msg << "[scaled_dot_product_attention] query, keys expected to have matching last dimension; found query shape "
++        << queries.shape() << " for keys shape " << keys.shape() << ".";
++    throw std::invalid_argument(msg.str());
++  }
++
++  // K, V must have matching number of heads (n_kv_heads);
++  auto n_q_heads = queries.shape(-3);
++  auto n_kv_heads = keys.shape(-3);
++
++  if (keys.shape(-3) != values.shape(-3)) {
++    std::ostringstream msg;
++    msg << "[scaled_dot_product_attention] keys, values expected to have matching n_kv_heads; found keys with n_heads "
++        << keys.shape(-3) << " for values with n_heads " << values.shape(-3)
++        << ".";
++    throw std::invalid_argument(msg.str());
++  }
++
++  // n_heads % n_kv_heads == 0; n_heads >= 1, n_kv_heads >= 1.
++  if (n_q_heads % n_kv_heads != 0) {
++    std::ostringstream msg;
++    msg << "[scaled_dot_product_attention] n_heads must be a multiple of n_kv_heads, found n_heads "
++        << n_q_heads << " for n_kv_heads " << n_kv_heads << ".";
++    throw std::invalid_argument(msg.str());
++  }
++
++  auto final_type = result_type(queries, keys, values);
++  if (!issubdtype(final_type, floating)) {
++    std::ostringstream msg;
++    msg << "[scaled_dot_product_attention] Received unsupported type "
++        << final_type << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  bool has_sinks = sinks.has_value();
++
++  auto q = astype(queries, final_type, s);
++  auto k = astype(keys, final_type, s);
++  auto v = astype(values, final_type, s);
++
++  auto fallback = SdpaFallback{scale,n_q_heads,n_kv_heads,do_causal,has_sinks,has_arr_mask,s};
+ 
+   auto stream = to_stream(s);
+   ArrayVector inputs = {q, k, v};
+diff --git a/mlx/fast.h b/mlx/fast.h
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -14,6 +14,8 @@
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core::fast {
++// Pure controls of the unchanged mask-free CPU SDPA/GQA fallback.
++bool cpu_sdpa_fallback_control_bytes(size_t rank,size_t queries,size_t keys,size_t values,size_t scores,size_t& out) noexcept;
+ // Pure controls of the same CPU default full-width RoPE fallback.
+ bool cpu_rope_fallback_control_bytes(size_t rank,size_t dimensions,size_t elements,size_t& out) noexcept;
+ 
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -3449,7 +3449,9 @@
+   if (in_a.ndim() > 2 && in_b.ndim() <= 2) {
+     a = flatten(a, 0, -2, s);
+   } else if (in_b.ndim() > 2) {
+-    std::tie(a, b) = broadcast_arrays(a, b, {-2, -1}, s);
++    auto broadcast = broadcast_arrays_ignoring({a, b}, Shape{-2, -1}, s);
++    a = std::move(broadcast[0]);
++    b = std::move(broadcast[1]);
+   }
+ 
+   auto out_shape = a.shape();

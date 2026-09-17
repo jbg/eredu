@@ -711,6 +711,9 @@ fn map_execution_class_error(
         ReplicatedTextDispatchError::Architecture(error) => {
             PreparationSelectionError::ExecutionClass(error)
         }
+        ReplicatedTextDispatchError::Metadata(error) => {
+            PreparationSelectionError::ExecutionClass(error.to_string())
+        }
     }
 }
 
@@ -1244,6 +1247,7 @@ pub(crate) mod tests {
         })
     }
 
+    #[derive(Clone, Copy)]
     struct SemanticExecutionProbe {
         partitioned: bool,
         routed: bool,
@@ -1255,6 +1259,53 @@ pub(crate) mod tests {
             assert_eq!(self.partitioned, partitioned);
             assert_eq!(self.routed, routed);
             assert_eq!(self.processor, processor);
+        }
+    }
+
+    impl<'a> crate::SelectedExecutionBorrowedDispatcher<'a> for SemanticExecutionProbe {
+        type Output = &'a eredu_runtime::SelectedReplicatedTextRealization;
+        type Error = std::convert::Infallible;
+        fn replicated(
+            self,
+            selected: &'a eredu_runtime::SelectedReplicatedTextRealization,
+        ) -> Result<Self::Output, Self::Error> {
+            self.verify(false, false, false);
+            Ok(selected)
+        }
+        fn routed(
+            self,
+            selected: &'a crate::SelectedRoutedTextRealization,
+        ) -> Result<Self::Output, Self::Error> {
+            self.verify(false, true, false);
+            Ok(selected.text())
+        }
+        fn composite(
+            self,
+            selected: &'a crate::replicated_text::SelectedCompositeTextRealization,
+        ) -> Result<Self::Output, Self::Error> {
+            self.verify(false, false, true);
+            Ok(selected.execution())
+        }
+        fn partitioned_dense(
+            self,
+            selected: &'a crate::SelectedDensePartitionedExecution,
+        ) -> Result<Self::Output, Self::Error> {
+            self.verify(true, false, false);
+            Ok(selected.base())
+        }
+        fn partitioned_routed(
+            self,
+            selected: &'a crate::SelectedRoutedPartitionedExecution,
+        ) -> Result<Self::Output, Self::Error> {
+            self.verify(true, true, false);
+            Ok(selected.base().text())
+        }
+        fn partitioned_composite(
+            self,
+            selected: &'a crate::SelectedCompositePartitionedExecution,
+        ) -> Result<Self::Output, Self::Error> {
+            self.verify(true, false, true);
+            Ok(selected.base().execution())
         }
     }
 
@@ -1611,6 +1662,12 @@ pub(crate) mod tests {
             };
             let selected = select_preparation(&inspection, &request, &mechanisms).unwrap();
             assert_eq!(selected.communication_manifest().is_some(), partitioned);
+            let borrowed = selected.execution().dispatch_ref(probe).unwrap();
+            let repeated = selected.execution().dispatch_ref(probe).unwrap();
+            assert!(std::ptr::eq(borrowed, repeated));
+            assert!(std::ptr::eq(borrowed, selected.text_realization()));
+            // Borrowed inspection preserves the same retained selection for its
+            // ordinary owned dispatcher; no backend re-selects a semantic class.
             selected.execution().clone().dispatch(probe).unwrap();
             assert_eq!(mechanisms.counters.preparation_queries.get(), 1);
             assert!(mechanisms.counters.text_queries.get() > 0);

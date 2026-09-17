@@ -1,0 +1,126 @@
+diff --git a/mlx/backend/cuda/eval.cpp b/mlx/backend/cuda/eval.cpp
+--- a/mlx/backend/cuda/eval.cpp
++++ b/mlx/backend/cuda/eval.cpp
+@@ -176,3 +176,9 @@
+     size_t, size_t, size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
+ bool resident_grouped_sort_additional_kernels(size_t, size_t&) noexcept { return false; }
+ }
++
++namespace mlx::core::submission {
++bool resident_gpu_worker_layout_with_frontiers(size_t, size_t, size_t, size_t,
++    size_t, size_t, size_t, size_t, size_t, size_t, size_t,
++    ResidentGpuWorkerLayout&) noexcept { return false; }
++}
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1929,6 +1929,20 @@
+     size_t output_slots, size_t array_nodes, size_t backing_births,
+     size_t maximum_rank, size_t maximum_operands, size_t additional_sort_kernels,
+     size_t cpu_partitions, ResidentGpuWorkerLayout& out) noexcept {
++  if (!resident_gpu_worker_layout_with_frontiers(entries, input_edges, output_slots,
++      array_nodes, backing_births, maximum_rank, maximum_operands,
++      additional_sort_kernels, cpu_partitions, 1, 0, out)) return false;
++  // The ordinary one-Eval entry keeps its own live forwarding frame.
++  const size_t controls = 9 * sizeof(size_t) + sizeof(&out) + sizeof(bool);
++  if (out.named_control_bytes > SIZE_MAX - controls) return false;
++  out.named_control_bytes += controls;
++  return true;
++}
++bool resident_gpu_worker_layout_with_frontiers(size_t entries, size_t input_edges,
++    size_t output_slots, size_t array_nodes, size_t backing_births,
++    size_t maximum_rank, size_t maximum_operands, size_t additional_sort_kernels,
++    size_t cpu_partitions, size_t evaluations, size_t consumer_waits,
++    ResidentGpuWorkerLayout& out) noexcept {
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+@@ -1951,7 +1965,10 @@
+   // Do not certify the fast alternative unless its actual source was compiled.
+   if (cpu_partitions) return false;
+ #endif
+-  if (cpu_partitions > input_edges) return false;
++  // The existing mixed-stream worker remains one Eval. The consumed
++  // cumulative profile is the authenticated no-tracing, single-GPU DAG.
++  if (!evaluations || (cpu_partitions && (evaluations != 1 || consumer_waits)) ||
++      cpu_partitions > input_edges) return false;
+   ResidentGpuWorkerLayout value;
+   size_t temporaries, data_controls, frontier_controls = 0;
+   // Every temporary is either a new output/scratch backing or an input view.
+@@ -1979,11 +1996,17 @@
+     if (!mul(cpu_partitions, 2, updates) || !add(input_edges, updates, kernels) ||
+         !add(value.kernel_attempts, kernels, value.kernel_attempts)) return false;
+   }
+-  // One threshold end per Eval entry, one possible foreign Event wait per
+-  // input edge, root/async Event signal, normal finalization and recovery.
+-  // The latter four are explicit call sites for the one selected GPU stream.
+-  if (!add(entries, input_edges, value.encoding_intervals) ||
+-      !add(value.encoding_intervals, 4, value.encoding_intervals)) return false;
++  // Entries/edges/births are cumulative actual descriptor populations. The
++  // same non-tracing descriptor cannot dispatch twice: fixed Eval skips every
++  // non-unscheduled input and marks/detaches each successful primitive before
++  // returning. Each new Eval still has its own Synchronizer and four possible
++  // root/async/finalization/recovery frontiers; each consumer wait can close one
++  // encoder. A failure terminates the caller's role, with its prefix retained.
++  size_t evaluation_frontiers;
++  if (!mul(evaluations, 4, evaluation_frontiers) ||
++      !add(entries, input_edges, value.encoding_intervals) ||
++      !add(value.encoding_intervals, evaluation_frontiers, value.encoding_intervals) ||
++      !add(value.encoding_intervals, consumer_waits, value.encoding_intervals)) return false;
+   if (cpu_partitions) {
+     size_t intervals;
+     // CPU entries may trigger GPU finalization under pressure; each GPU
+@@ -2102,10 +2125,12 @@
+   // The fixed Synchronizer owns the selected GPU's root Event separately.
+   // One additional async stream Event suffices: the admitted CPU stream in the
+   // mixed profile. Within-Eval fences are keyed by producing stream, at most two.
+-  if (!extent(event.shared_bytes, event.shared_alignment, 1)) return false;
++  if (!extent(event.shared_bytes, event.shared_alignment, evaluations)) return false;
+   if (!cpu_partitions) {
+     size_t event_actions;
+-    if (!add(input_edges, 2, event_actions) ||
++    if (!mul(evaluations, 2, event_actions) ||
++        !add(input_edges, event_actions, event_actions) ||
++        !add(event_actions, consumer_waits, event_actions) ||
+         !extent(event_dispatch.gpu_handler_bytes, event_dispatch.gpu_handler_alignment,
+             event_actions)) return false;
+   } else {
+@@ -2149,7 +2174,7 @@
+       // blocks/attempts/merge tiles; query selection/result and two loans.
+       sizeof(metal::SortDispatchLayout) + 12 * sizeof(size_t) + 2 * sizeof(bool);
+   if (!add(value.named_control_bytes, frontier_controls, value.named_control_bytes) ||
+-      !add(value.named_control_bytes, 4 * sizeof(size_t), value.named_control_bytes)) return false;
++      !add(value.named_control_bytes, 7 * sizeof(size_t), value.named_control_bytes)) return false;
+   out = value; return true;
+ #endif
+ }
+diff --git a/mlx/backend/no_gpu/eval.cpp b/mlx/backend/no_gpu/eval.cpp
+--- a/mlx/backend/no_gpu/eval.cpp
++++ b/mlx/backend/no_gpu/eval.cpp
+@@ -87,3 +87,9 @@
+     size_t, size_t, size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
+ bool resident_grouped_sort_additional_kernels(size_t, size_t&) noexcept { return false; }
+ }
++
++namespace mlx::core::submission {
++bool resident_gpu_worker_layout_with_frontiers(size_t, size_t, size_t, size_t,
++    size_t, size_t, size_t, size_t, size_t, size_t, size_t,
++    ResidentGpuWorkerLayout&) noexcept { return false; }
++}
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -64,6 +64,13 @@
+     size_t output_slots, size_t array_nodes, size_t backing_births,
+     size_t maximum_rank, size_t maximum_operands, size_t additional_sort_kernels,
+     size_t cpu_partitions, ResidentGpuWorkerLayout&) noexcept;
++// Same worker, cumulative no-tracing DAG execution plus explicit completion and
++// consumer frontiers. Callers include every fresh Synchronizer in entries/edges.
++MLX_API bool resident_gpu_worker_layout_with_frontiers(size_t entries, size_t input_edges,
++    size_t output_slots, size_t array_nodes, size_t backing_births,
++    size_t maximum_rank, size_t maximum_operands, size_t additional_sort_kernels,
++    size_t cpu_partitions, size_t evaluations, size_t consumer_waits,
++    ResidentGpuWorkerLayout&) noexcept;
+ MLX_API bool resident_grouped_sort_additional_kernels(size_t selections, size_t& out) noexcept;
+ 
+ // Four fixed-Eval host requests; no Data, worker or stream-frontier owners.

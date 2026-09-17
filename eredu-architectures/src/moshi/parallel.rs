@@ -932,6 +932,13 @@ impl LocalGeometry {
         )
     }
 
+    pub(super) fn depth_config_workspace(&self,global:&MoshiTransformerConfig,
+        slice:usize,layer:usize,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<MoshiTransformerConfig,eredu_nn::Error> {
+        local_config_workspace(global,self.depth.get(slice).and_then(|layers|layers.get(layer)),
+            "depth",layer,context)
+    }
+
     /// Builds one rank-local execution unit using the canonical Moshi unit
     /// types and shared decoder block implementation.
     pub fn build_unit<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
@@ -943,9 +950,11 @@ impl LocalGeometry {
     ) -> Result<Unit<B>, eredu_nn::Error> {
         match group {
             0 => {
-                let local = self
-                    .temporal_config(config.temporal(), index)
-                    .map_err(eredu_nn::Error::backend)?;
+                let local=match B::construction_metadata(context) {
+                    Some(context)=>local_config_workspace(config.temporal(),self.temporal.get(index),
+                        "temporal",index,context)?,
+                    None=>self.temporal_config(config.temporal(),index).map_err(eredu_nn::Error::backend)?,
+                };
                 super::block::build(&local, index, context).map(Unit::Temporal)
             }
             1 => super::DepthSlice::new_parallel(config, index, self, context).map(Unit::Depth),
@@ -954,6 +963,14 @@ impl LocalGeometry {
             ))),
         }
     }
+}
+
+fn local_config_workspace(global:&MoshiTransformerConfig,
+    geometry:Option<&LocalTransformerGeometry>,stack:&str,layer:usize,
+    context:&eredu_nn::workspace::WorkspaceContext)->Result<MoshiTransformerConfig,eredu_nn::Error> {
+    let geometry=geometry.ok_or_else(||context.metadata_error(format_args!(
+        "missing rank-local Moshi {stack} geometry for layer {layer}")))?;
+    global.with_parallel_geometry_workspace(geometry.attention_heads,geometry.gated_hidden_size,context)
 }
 
 fn local_config(

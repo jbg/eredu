@@ -109,7 +109,10 @@ fn matching_bonus_is_emitted_and_consumes_one_paired_proposal() {
         {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "accepted round did not commit");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "accepted round did not commit"
+        );
         std::thread::yield_now();
     }
 
@@ -123,6 +126,7 @@ fn matching_bonus_is_emitted_and_consumes_one_paired_proposal() {
     assert_eq!(
         retained.proposals()[0]
             .distribution()
+            .as_array()
             .try_index_device((0, 0, 1), draft.stream())
             .unwrap()
             .item::<f32>(draft.stream()),
@@ -294,7 +298,10 @@ fn promoted_round_leaves_last_emitted_token_out_of_target_cache() {
         {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "promoted round did not commit");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "promoted round did not commit"
+        );
         std::thread::yield_now();
     }
     assert_eq!(
@@ -353,7 +360,10 @@ fn rejection_discards_branch_sampler_prng_history_and_cache_state() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while scheduler.status(id) != Some(SpeculativeRequestStatus::OptimisticDraftReady) {
         scheduler.step().unwrap();
-        assert!(std::time::Instant::now() < deadline, "optimistic draft did not become ready");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "optimistic draft did not become ready"
+        );
         std::thread::yield_now();
     }
     loop {
@@ -364,7 +374,10 @@ fn rejection_discards_branch_sampler_prng_history_and_cache_state() {
         {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "rejected round did not commit");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "rejected round did not commit"
+        );
         std::thread::yield_now();
     }
     scheduler.cancel(id).unwrap();

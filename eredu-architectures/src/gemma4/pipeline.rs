@@ -1,8 +1,8 @@
 //! Shared-attention transport and its explicitly accounted receiver caches.
 
-use std::{collections::HashMap, ops::Range};
+use std::ops::Range;
 
-use eredu_core::{cache::LayerCachePolicy, AttentionPolicy, LayerSchedule};
+use eredu_core::{cache::LayerCachePolicy, LayerSchedule};
 use eredu_runtime::{StateError, StateLayout};
 
 use super::ModelArgs;
@@ -81,22 +81,22 @@ pub(crate) fn tensor_state_layout(
 /// One receiver cache per remote publisher, attached to its first local consumer.
 /// Local consumers of the same publication reuse that cache during the pass.
 pub(crate) fn receiver_caches(args: &ModelArgs, units: Range<usize>) -> Vec<(usize, usize)> {
-    let mut publishers = HashMap::new();
-    let mut receivers = HashMap::<AttentionPolicy, usize>::new();
-    let mut result = Vec::new();
-    for (layer, policy) in args.layer_schedule.iter().enumerate() {
-        if policy.key_value.publishes_state() {
-            publishers.insert(policy.attention, layer);
-        } else if policy.key_value == eredu_nn::AttentionStateSource::Shared
-            && units.contains(&layer)
-        {
-            let publisher = publishers[&policy.attention];
-            if publisher < units.start && receivers.insert(policy.attention, layer).is_none() {
-                result.push((layer, publisher));
-            }
-        }
-    }
-    result
+    receiver_cache_iter(args,units).collect()
+}
+
+/// The same receiver plan borrowed by an admitted live partition pass.
+pub(crate) fn receiver_cache_iter(args:&ModelArgs,units:Range<usize>)
+    ->impl Iterator<Item=(usize,usize)> + '_ {
+    units.clone().filter_map(move |layer| {
+        let policy=args.layer_policy(layer)?;
+        if policy.key_value!=eredu_nn::AttentionStateSource::Shared
+            || attention_cache_owner(args,units.clone(),layer)!=Some(layer) {return None;}
+        let publisher=(0..layer).rev().find(|&candidate|{
+            let source=args.layer_policy(candidate).expect("preceding layer");
+            source.attention==policy.attention && source.key_value.publishes_state()
+        })?;
+        (publisher<units.start).then_some((layer,publisher))
+    })
 }
 
 /// Finds the retained history used by a local attention invocation. Shared

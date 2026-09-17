@@ -668,3 +668,9 @@ fn compact_masks_reject_wrong_axes_duplicate_ids_and_component_axis_slicing() {
         .admit(&catalog, request(), "session")
         .is_err());
 }
+
+mod prepared_invocation;
+
+mod evidence_source;
+
+mod text_origin;

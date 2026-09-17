@@ -472,6 +472,10 @@ int mlx_gather_mm(
     const mlx_array rhs_indices /* may be null */,
     bool sorted_indices,
     const mlx_stream s);
+// Fixed explicit-index MXFP4 grouped call; no device or allocation is touched.
+bool mlx_mxfp4_gather_control_bytes(size_t* output);
+// Affine grouped call: selected=true is the actual group16 row-gather QMM path.
+bool mlx_affine_grouped_control_bytes(bool selected, size_t* output);
 int mlx_gather_qmm(
     mlx_array* res,
     const mlx_array x,

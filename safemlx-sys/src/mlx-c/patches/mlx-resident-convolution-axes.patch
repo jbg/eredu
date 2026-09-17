@@ -1,0 +1,921 @@
+diff --git a/mlx/backend/cpu/conv.cpp b/mlx/backend/cpu/conv.cpp
+--- a/mlx/backend/cpu/conv.cpp
++++ b/mlx/backend/cpu/conv.cpp
+@@ -1,5 +1,6 @@
+ // Copyright © 2023-2024 Apple Inc.
+ 
++#include "mlx/axis_view.h"
+ #include <cassert>
+ #include <numeric>
+ 
+@@ -22,11 +23,11 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding_lo,
+-    const std::vector<int>& padding_hi,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     bool flip,
+     Stream stream) {
+   auto& encoder = cpu::get_command_encoder(stream);
+@@ -111,11 +112,11 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding_lo,
+-    const std::vector<int>& padding_hi,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     bool flip,
+     Stream stream) {
+   auto& encoder = cpu::get_command_encoder(stream);
+@@ -156,11 +157,11 @@
+        out_stride_W = out.strides()[2],
+        out_stride_O = out.strides()[3],
+ 
+-       padding_lo,
+-       padding_hi,
+-       wt_strides,
+-       wt_dilation,
+-       in_dilation,
++       padding_lo = Shape(padding_lo.begin(), padding_lo.end()),
++       padding_hi = Shape(padding_hi.begin(), padding_hi.end()),
++       wt_strides = Shape(wt_strides.begin(), wt_strides.end()),
++       wt_dilation = Shape(wt_dilation.begin(), wt_dilation.end()),
++       in_dilation = Shape(in_dilation.begin(), in_dilation.end()),
+        flip]() mutable {
+         bool is_idil_one = in_dilation[0] == 1 && in_dilation[1] == 1;
+ 
+@@ -359,11 +360,11 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding_lo,
+-    const std::vector<int>& padding_hi,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     bool flip,
+     Stream stream) {
+   auto& encoder = cpu::get_command_encoder(stream);
+@@ -409,11 +410,11 @@
+                     out_stride_H = out.strides()[2],
+                     out_stride_W = out.strides()[3],
+                     out_stride_O = out.strides()[4],
+-                    padding_lo,
+-                    padding_hi,
+-                    wt_strides,
+-                    wt_dilation,
+-                    in_dilation,
++                    padding_lo = Shape(padding_lo.begin(), padding_lo.end()),
++                    padding_hi = Shape(padding_hi.begin(), padding_hi.end()),
++                    wt_strides = Shape(wt_strides.begin(), wt_strides.end()),
++                    wt_dilation = Shape(wt_dilation.begin(), wt_dilation.end()),
++                    in_dilation = Shape(in_dilation.begin(), in_dilation.end()),
+                     flip]() mutable {
+     bool is_idil_one =
+         in_dilation[0] == 1 && in_dilation[1] == 1 && in_dilation[2] == 1;
+@@ -674,11 +675,11 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding_lo,
+-    const std::vector<int>& padding_hi,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     bool flip,
+     Stream stream) {
+   if (in.dtype() == float32) {
+@@ -727,11 +728,11 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding_lo,
+-    const std::vector<int>& padding_hi,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     bool flip,
+     Stream stream) {
+   if (in.dtype() == float32) {
+@@ -780,11 +781,11 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding_lo,
+-    const std::vector<int>& padding_hi,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     bool flip,
+     Stream stream) {
+   if (in.dtype() == float32) {
+@@ -857,10 +858,10 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding_lo,
+-    const std::vector<int>& padding_hi,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
+     Stream stream) {
+   const int N = in.shape(0); // Batch size, should be the same as out.shape(0)
+   const int iH = in.shape(1); // Input spatial dim
+@@ -1000,10 +1001,10 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding_lo,
+-    const std::vector<int>& padding_hi,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
+     const bool flip,
+     Stream stream) {
+   const int N = in.shape(0); // Batch size, should be the same as out.shape(0)
+@@ -1172,11 +1173,11 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding_lo,
+-    const std::vector<int>& padding_hi,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     bool flip,
+     Stream stream) {
+   const int groups = in.shape().back() / wt.shape().back();
+@@ -1214,11 +1215,11 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding_lo,
+-    const std::vector<int>& padding_hi,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     bool flip,
+     Stream stream) {
+   const int groups = in.shape().back() / wt.shape().back();
+@@ -1252,11 +1253,11 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding_lo,
+-    const std::vector<int>& padding_hi,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding_lo,
++    AxisView padding_hi,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     bool flip,
+     Stream stream) {
+   const int groups = in.shape().back() / wt.shape().back();
+diff --git a/mlx/backend/cuda/conv/conv.h b/mlx/backend/cuda/conv/conv.h
+--- a/mlx/backend/cuda/conv/conv.h
++++ b/mlx/backend/cuda/conv/conv.h
+@@ -2,6 +2,7 @@
+ 
+ #pragma once
+ 
++#include "mlx/axis_view.h"
+ #include "mlx/backend/cuda/device.h"
+ #include "mlx/backend/gpu/copy.h"
+ 
+@@ -27,10 +28,10 @@
+       const array& in,
+       const array& wt,
+       const array& out,
+-      const std::vector<int>& strides,
+-      const std::vector<int>& padding,
+-      const std::vector<int>& kernel_dilation,
+-      const std::vector<int>& input_dilation,
++      AxisView strides,
++      AxisView padding,
++      AxisView kernel_dilation,
++      AxisView input_dilation,
+       int groups,
+       bool flip)
+       : N(in.shape(0)),
+@@ -54,10 +55,10 @@
+     const array& in,
+     const array& wt,
+     array& out,
+-    const std::vector<int>& strides,
+-    const std::vector<int>& padding,
+-    const std::vector<int>& kernel_dilation,
+-    const std::vector<int>& input_dilation,
++    AxisView strides,
++    AxisView padding,
++    AxisView kernel_dilation,
++    AxisView input_dilation,
+     int groups,
+     bool flip,
+     Stream s);
+@@ -67,10 +68,10 @@
+     const array& in,
+     const array& wt,
+     array& out,
+-    const std::vector<int>& strides,
+-    const std::vector<int>& padding,
+-    const std::vector<int>& kernel_dilation,
+-    const std::vector<int>& input_dilation,
++    AxisView strides,
++    AxisView padding,
++    AxisView kernel_dilation,
++    AxisView input_dilation,
+     bool flip,
+     Stream s);
+ 
+@@ -79,10 +80,10 @@
+     array in,
+     array wt,
+     array& out,
+-    const std::vector<int>& strides,
+-    const std::vector<int>& padding,
+-    const std::vector<int>& kernel_dilation,
+-    const std::vector<int>& input_dilation,
++    AxisView strides,
++    AxisView padding,
++    AxisView kernel_dilation,
++    AxisView input_dilation,
+     int groups,
+     bool flip,
+     Stream s) {
+diff --git a/mlx/backend/cuda/conv/gemm_conv.cu b/mlx/backend/cuda/conv/gemm_conv.cu
+--- a/mlx/backend/cuda/conv/gemm_conv.cu
++++ b/mlx/backend/cuda/conv/gemm_conv.cu
+@@ -1,5 +1,6 @@
+ // Copyright © 2025 Apple Inc.
+ 
++#include "mlx/axis_view.h"
+ #include "mlx/backend/cuda/conv/conv.h"
+ #include "mlx/backend/cuda/gemms/cublas_gemm.h"
+ #include "mlx/backend/cuda/kernel_utils.cuh"
+@@ -188,10 +189,10 @@
+     const array& in,
+     const array& wt,
+     array& out,
+-    const std::vector<int>& strides,
+-    const std::vector<int>& padding,
+-    const std::vector<int>& kernel_dilation,
+-    const std::vector<int>& input_dilation,
++    AxisView strides,
++    AxisView padding,
++    AxisView kernel_dilation,
++    AxisView input_dilation,
+     bool flip,
+     Stream s) {
+   int conv_ndim = in.ndim() - 2;
+diff --git a/mlx/backend/cuda/conv/gemm_grouped_conv.cu b/mlx/backend/cuda/conv/gemm_grouped_conv.cu
+--- a/mlx/backend/cuda/conv/gemm_grouped_conv.cu
++++ b/mlx/backend/cuda/conv/gemm_grouped_conv.cu
+@@ -1,5 +1,6 @@
+ // Copyright © 2025 Apple Inc.
+ 
++#include "mlx/axis_view.h"
+ #include "mlx/backend/cuda/conv/conv.h"
+ #include "mlx/backend/cuda/gemms/cublas_gemm.h"
+ #include "mlx/backend/cuda/kernel_utils.cuh"
+@@ -202,10 +203,10 @@
+     const array& in,
+     const array& wt,
+     array& out,
+-    const std::vector<int>& strides,
+-    const std::vector<int>& padding,
+-    const std::vector<int>& kernel_dilation,
+-    const std::vector<int>& input_dilation,
++    AxisView strides,
++    AxisView padding,
++    AxisView kernel_dilation,
++    AxisView input_dilation,
+     int groups,
+     bool flip,
+     Stream s) {
+diff --git a/mlx/backend/cuda/conv.cpp b/mlx/backend/cuda/conv.cpp
+--- a/mlx/backend/cuda/conv.cpp
++++ b/mlx/backend/cuda/conv.cpp
+@@ -1,5 +1,6 @@
+ // Copyright © 2025 Apple Inc.
+ 
++#include "mlx/axis_view.h"
+ #include "mlx/backend/cuda/conv/conv.h"
+ #include "mlx/backend/cuda/cudnn_utils.h"
+ #include "mlx/backend/cuda/device.h"
+@@ -51,11 +52,11 @@
+     array& x,
+     array& w,
+     array& y,
+-    const std::vector<int>& kernel_strides,
+-    const std::vector<int>& padding_lo_,
+-    const std::vector<int>& padding_hi_,
+-    const std::vector<int>& kernel_dilation,
+-    const std::vector<int>& input_dilation) {
++    AxisView kernel_strides,
++    AxisView padding_lo_,
++    AxisView padding_hi_,
++    AxisView kernel_dilation,
++    AxisView input_dilation) {
+   auto padding_lo = convert_vector<int64_t>(padding_lo_);
+   auto padding_hi = convert_vector<int64_t>(padding_hi_);
+ 
+diff --git a/mlx/backend/metal/conv.cpp b/mlx/backend/metal/conv.cpp
+--- a/mlx/backend/metal/conv.cpp
++++ b/mlx/backend/metal/conv.cpp
+@@ -1,4 +1,5 @@
+ // Copyright © 2023-2024 Apple Inc.
++#include "mlx/axis_view.h"
+ #include <algorithm>
+ #include <cassert>
+ #include <numeric>
+@@ -1094,10 +1095,10 @@
+     const array& in_pre,
+     const array& wt_pre,
+     array& out,
+-    const std::vector<int>& padding,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     int groups,
+     bool flip,
+     ArrayVector& copies) {
+@@ -1181,10 +1182,10 @@
+     const array& in_pre,
+     const array& wt_pre,
+     array& out,
+-    const std::vector<int>& padding,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     const int groups,
+     bool flip,
+     ArrayVector& copies) {
+@@ -1226,10 +1227,10 @@
+     const array& in,
+     const array& wt,
+     array out,
+-    const std::vector<int>& padding,
+-    const std::vector<int>& wt_strides,
+-    const std::vector<int>& wt_dilation,
+-    const std::vector<int>& in_dilation,
++    AxisView padding,
++    AxisView wt_strides,
++    AxisView wt_dilation,
++    AxisView in_dilation,
+     int groups,
+     bool flip,
+     ArrayVector& copies) {
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -3,6 +3,7 @@
+ #include "mlx/submission.h"
+ #include "mlx/prepared_input.h"
+ #include "mlx/primitives.h"
++#include "mlx/axis_view.h"
+ #include "mlx/fast_primitives.h"
+ #include <climits>
+ 
+@@ -379,6 +380,7 @@
+       resident_primitive_control<fast::CustomKernel>(),
+       resident_primitive_control<Sqrt>(), resident_primitive_control<Sigmoid>(),
+       resident_primitive_control<Negative>(),
++      resident_primitive_control<Convolution>(),
+       resident_primitive_control<Softmax>(), resident_primitive_control<StopGradient>(),
+       resident_primitive_control<Arange>(), resident_primitive_control<Cos>(),
+       resident_primitive_control<Sin>(), resident_primitive_control<Concatenate>(),
+@@ -442,7 +444,11 @@
+   }
+   value.named_control_bytes = sizeof(value) + sizeof(leaf) + sizeof(leaf_count) +
+       sizeof(primitives) + sizeof(seeds) + sizeof(rank) + sizeof(descriptors) + sizeof(control) +
+-      sizeof(maximum_operands) + sizeof(vector_elements);
++      sizeof(maximum_operands) + sizeof(vector_elements) +
++      // Convolution's normalized caller axes, moved aggregate and constructor
++      // parameter are distinct inline frames. The retained five axes are already
++      // inside its actual primitive control, never another heap allowance.
++      3 * sizeof(Convolution::Axes) + sizeof(Shape) + 4 * sizeof(AxisView);
+   if (!GraphConstruction::complete_layout(value)) return false;
+   output = value; return true;
+ #endif
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4332,6 +4332,12 @@
+ 
+ } // namespace
+ 
++namespace {
++array conv_general_axes(array in, array wt, Shape stride, Shape padding_lo,
++    Shape padding_hi, Shape kernel_dilation, Shape input_dilation,
++    int groups, bool flip, StreamOrDevice s);
++} // namespace
++
+ /** 1D convolution with a filter */
+ array conv1d(
+     const array& in_,
+@@ -4341,13 +4347,14 @@
+     int dilation /* = 1 */,
+     int groups /* = 1 */,
+     StreamOrDevice s /* = {} */) {
+-  return conv_general(
++  return conv_general_axes(
+       /* const array& input = */ in_,
+       /* const array& weight = */ wt_,
+-      /* std::vector<int> stride = */ {stride},
+-      /* std::vector<int> padding = */ {padding},
+-      /* std::vector<int> kernel_dilation = */ {dilation},
+-      /* std::vector<int> input_dilation = */ {1},
++      /* Shape stride = */ {stride},
++      /* Shape padding_lo = */ {padding},
++      /* Shape padding_hi = */ {padding},
++      /* Shape kernel_dilation = */ {dilation},
++      /* Shape input_dilation = */ {1},
+       /* int groups = */ groups,
+       /* bool flip = */ false,
+       s);
+@@ -4498,6 +4505,119 @@
+ }
+ 
+ /** General convolution with a filter */
++namespace {
++array conv_general_axes(
++    array in,
++    array wt,
++    Shape stride /* = {} */,
++    Shape padding_lo /* = {} */,
++    Shape padding_hi /* = {} */,
++    Shape kernel_dilation /* = {} */,
++    Shape input_dilation /* = {} */,
++    int groups /* = 1 */,
++    bool flip /* = false */,
++    StreamOrDevice s /* = {} */) {
++  // Run checks
++  if (groups != 1 && in.ndim() != 3 && in.ndim() != 4) {
++    throw std::invalid_argument(
++        "[conv] Can only handle groups != 1 in 1D or 2D convolutions.");
++  }
++
++  int spatial_dims = in.ndim() - 2;
++
++  if (spatial_dims < 1 || spatial_dims > 3) {
++    throw std::invalid_argument(
++        "[conv] Only works for inputs with 1-3 spatial dimensions."
++        " The inputs must be in the format [N, ..., C_in]");
++  }
++
++  // Run checks
++  run_conv_checks(in, wt, spatial_dims, groups);
++
++  // Type promotion
++  auto out_type = promote_types(in.dtype(), wt.dtype());
++  in = astype(in, out_type, s);
++  wt = astype(wt, out_type, s);
++
++  if (stride.size() <= 1) {
++    int stride_int = stride.size() ? stride[0] : 1;
++    stride = Shape(spatial_dims, stride_int);
++  }
++
++  if (padding_lo.size() <= 1) {
++    int padding_int = padding_lo.size() ? padding_lo[0] : 0;
++    padding_lo = Shape(spatial_dims, padding_int);
++  }
++
++  if (padding_hi.size() <= 1) {
++    int padding_int = padding_hi.size() ? padding_hi[0] : 0;
++    padding_hi = Shape(spatial_dims, padding_int);
++  }
++
++  if (kernel_dilation.size() <= 1) {
++    int kernel_dilation_int = kernel_dilation.size() ? kernel_dilation[0] : 1;
++    kernel_dilation = Shape(spatial_dims, kernel_dilation_int);
++  }
++
++  if (input_dilation.size() <= 1) {
++    int input_dilation_int = input_dilation.size() ? input_dilation[0] : 1;
++    input_dilation = Shape(spatial_dims, input_dilation_int);
++  }
++
++  // Check for negative padding
++  bool has_neg_padding = false;
++  for (auto& pd : padding_lo) {
++    has_neg_padding |= (pd < 0);
++  }
++  for (auto& pd : padding_hi) {
++    has_neg_padding |= (pd < 0);
++  }
++
++  // Handle negative padding
++  if (has_neg_padding) {
++    Shape starts(in.ndim(), 0);
++    auto stops = in.shape();
++
++    for (int i = 0; i < spatial_dims; i++) {
++      if (padding_lo[i] < 0) {
++        starts[i + 1] -= padding_lo[i];
++        padding_lo[i] = 0;
++      }
++
++      if (padding_hi[i] < 0) {
++        stops[i + 1] += padding_hi[i];
++        padding_hi[i] = 0;
++      }
++    }
++
++    in = slice(in, std::move(starts), std::move(stops), s);
++  }
++
++  // Get output shapes
++  auto out_shape = Convolution::conv_out_shape_axes(
++      in.shape(),
++      wt.shape(),
++      stride,
++      padding_lo,
++      padding_hi,
++      kernel_dilation,
++      input_dilation);
++
++  return array(
++      std::move(out_shape),
++      in.dtype(),
++      submission::make_graph_primitive<Convolution>(
++          to_stream(s),
++          Convolution::Axes{std::move(stride), std::move(padding_lo),
++              std::move(padding_hi), std::move(kernel_dilation),
++              std::move(input_dilation)},
++          groups,
++          flip),
++      {in, wt});
++}
++
++} // namespace
++
+ array conv_general(
+     array in,
+     array wt,
+@@ -4509,105 +4629,11 @@
+     int groups /* = 1 */,
+     bool flip /* = false */,
+     StreamOrDevice s /* = {} */) {
+-  // Run checks
+-  if (groups != 1 && in.ndim() != 3 && in.ndim() != 4) {
+-    throw std::invalid_argument(
+-        "[conv] Can only handle groups != 1 in 1D or 2D convolutions.");
+-  }
+-
+-  int spatial_dims = in.ndim() - 2;
+-
+-  if (spatial_dims < 1 || spatial_dims > 3) {
+-    throw std::invalid_argument(
+-        "[conv] Only works for inputs with 1-3 spatial dimensions."
+-        " The inputs must be in the format [N, ..., C_in]");
+-  }
+-
+-  // Run checks
+-  run_conv_checks(in, wt, spatial_dims, groups);
+-
+-  // Type promotion
+-  auto out_type = promote_types(in.dtype(), wt.dtype());
+-  in = astype(in, out_type, s);
+-  wt = astype(wt, out_type, s);
+-
+-  if (stride.size() <= 1) {
+-    int stride_int = stride.size() ? stride[0] : 1;
+-    stride = std::vector<int>(spatial_dims, stride_int);
+-  }
+-
+-  if (padding_lo.size() <= 1) {
+-    int padding_int = padding_lo.size() ? padding_lo[0] : 0;
+-    padding_lo = std::vector<int>(spatial_dims, padding_int);
+-  }
+-
+-  if (padding_hi.size() <= 1) {
+-    int padding_int = padding_hi.size() ? padding_hi[0] : 0;
+-    padding_hi = std::vector<int>(spatial_dims, padding_int);
+-  }
+-
+-  if (kernel_dilation.size() <= 1) {
+-    int kernel_dilation_int = kernel_dilation.size() ? kernel_dilation[0] : 1;
+-    kernel_dilation = std::vector<int>(spatial_dims, kernel_dilation_int);
+-  }
+-
+-  if (input_dilation.size() <= 1) {
+-    int input_dilation_int = input_dilation.size() ? input_dilation[0] : 1;
+-    input_dilation = std::vector<int>(spatial_dims, input_dilation_int);
+-  }
+-
+-  // Check for negative padding
+-  bool has_neg_padding = false;
+-  for (auto& pd : padding_lo) {
+-    has_neg_padding |= (pd < 0);
+-  }
+-  for (auto& pd : padding_hi) {
+-    has_neg_padding |= (pd < 0);
+-  }
+-
+-  // Handle negative padding
+-  if (has_neg_padding) {
+-    Shape starts(in.ndim(), 0);
+-    auto stops = in.shape();
+-
+-    for (int i = 0; i < spatial_dims; i++) {
+-      if (padding_lo[i] < 0) {
+-        starts[i + 1] -= padding_lo[i];
+-        padding_lo[i] = 0;
+-      }
+-
+-      if (padding_hi[i] < 0) {
+-        stops[i + 1] += padding_hi[i];
+-        padding_hi[i] = 0;
+-      }
+-    }
+-
+-    in = slice(in, std::move(starts), std::move(stops), s);
+-  }
+-
+-  // Get output shapes
+-  auto out_shape = Convolution::conv_out_shape(
+-      in.shape(),
+-      wt.shape(),
+-      stride,
+-      padding_lo,
+-      padding_hi,
+-      kernel_dilation,
+-      input_dilation);
+-
+-  return array(
+-      std::move(out_shape),
+-      in.dtype(),
+-      submission::make_graph_primitive<Convolution>(
+-          to_stream(s),
+-          stride,
+-          padding_lo,
+-          padding_hi,
+-          kernel_dilation,
+-          input_dilation,
+-          groups,
+-          flip),
+-      {in, wt});
++  return conv_general_axes(std::move(in), std::move(wt),
++      Shape(stride.begin(), stride.end()), Shape(padding_lo.begin(), padding_lo.end()),
++      Shape(padding_hi.begin(), padding_hi.end()),
++      Shape(kernel_dilation.begin(), kernel_dilation.end()),
++      Shape(input_dilation.begin(), input_dilation.end()), groups, flip, s);
+ }
+ 
+ std::pair<int, int> quantization_params_from_mode(
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -1334,6 +1334,21 @@
+     const std::vector<int>& pads_hi,
+     const std::vector<int>& kernel_dilation,
+     const std::vector<int>& input_dilation) {
++  return conv_out_shape_axes(in_shape, wt_shape,
++      Shape(strides.begin(), strides.end()), Shape(pads_lo.begin(), pads_lo.end()),
++      Shape(pads_hi.begin(), pads_hi.end()),
++      Shape(kernel_dilation.begin(), kernel_dilation.end()),
++      Shape(input_dilation.begin(), input_dilation.end()));
++}
++
++Shape Convolution::conv_out_shape_axes(
++    const Shape& in_shape,
++    const Shape& wt_shape,
++    const Shape& strides,
++    const Shape& pads_lo,
++    const Shape& pads_hi,
++    const Shape& kernel_dilation,
++    const Shape& input_dilation) {
+   int N = in_shape[0];
+   int O = wt_shape[0];
+   Shape out_shape(in_shape.size());
+@@ -1453,8 +1468,8 @@
+   for (int a : argnums) {
+     // Grads for input
+     if (a == 0) {
+-      std::vector<int> padding_lo = padding_lo_;
+-      std::vector<int> padding_hi = padding_hi_;
++      std::vector<int> padding_lo(padding_lo_.begin(), padding_lo_.end());
++      std::vector<int> padding_hi(padding_hi_.begin(), padding_hi_.end());
+ 
+       for (int i = 0; i < padding_lo.size(); ++i) {
+         int wt_size = 1 + kernel_dilation_[i] * (wt.shape(1 + i) - 1);
+@@ -1478,11 +1493,11 @@
+       auto grad = conv_general(
+           /* const array& input = */ cotan,
+           /* const array& weight = */ wt_trans,
+-          /* std::vector<int> stride = */ input_dilation_,
++          /* std::vector<int> stride = */ std::vector<int>(input_dilation_.begin(), input_dilation_.end()),
+           /* std::vector<int> padding_lo = */ padding_lo,
+           /* std::vector<int> padding_hi = */ padding_hi,
+-          /* std::vector<int> kernel_dilation = */ kernel_dilation_,
+-          /* std::vector<int> input_dilation = */ kernel_strides_,
++          /* std::vector<int> kernel_dilation = */ std::vector<int>(kernel_dilation_.begin(), kernel_dilation_.end()),
++          /* std::vector<int> input_dilation = */ std::vector<int>(kernel_strides_.begin(), kernel_strides_.end()),
+           /* int groups = */ groups_,
+           /* bool flip = */ !flip_,
+           stream());
+@@ -1516,10 +1531,13 @@
+ 
+       if (no_dilation && !flip_ && groups_ == 1) {
+         auto grad = conv_weight_backward_patches(
+-            in, wt, cotan, kernel_strides_, padding_lo_, padding_hi_, stream());
++            in, wt, cotan,
++            std::vector<int>(kernel_strides_.begin(), kernel_strides_.end()),
++            std::vector<int>(padding_lo_.begin(), padding_lo_.end()),
++            std::vector<int>(padding_hi_.begin(), padding_hi_.end()), stream());
+         grads.push_back(grad);
+       } else {
+-        auto padding_hi = padding_lo_;
++        std::vector<int> padding_hi(padding_lo_.begin(), padding_lo_.end());
+ 
+         for (int i = 0; i < padding_hi.size(); ++i) {
+           int in_size = 1 + input_dilation_[i] * (in.shape(1 + i) - 1);
+@@ -1534,11 +1552,11 @@
+         auto grad_trans = conv_general(
+             /* const array& input = */ in_trans,
+             /* const array& weight = */ cotan_trans,
+-            /* std::vector<int> stride = */ kernel_dilation_,
+-            /* std::vector<int> padding_lo = */ padding_lo_,
++            /* std::vector<int> stride = */ std::vector<int>(kernel_dilation_.begin(), kernel_dilation_.end()),
++            /* std::vector<int> padding_lo = */ std::vector<int>(padding_lo_.begin(), padding_lo_.end()),
+             /* std::vector<int> padding_hi = */ padding_hi,
+-            /* std::vector<int> kernel_dilation = */ kernel_strides_,
+-            /* std::vector<int> input_dilation = */ input_dilation_,
++            /* std::vector<int> kernel_dilation = */ std::vector<int>(kernel_strides_.begin(), kernel_strides_.end()),
++            /* std::vector<int> input_dilation = */ std::vector<int>(input_dilation_.begin(), input_dilation_.end()),
+             /* int groups = */ groups_,
+             /* bool flip = */ false,
+             stream());
+@@ -1572,11 +1590,11 @@
+     return conv_general(
+         in,
+         w,
+-        kernel_strides_,
+-        padding_lo_,
+-        padding_hi_,
+-        kernel_dilation_,
+-        input_dilation_,
++        std::vector<int>(kernel_strides_.begin(), kernel_strides_.end()),
++        std::vector<int>(padding_lo_.begin(), padding_lo_.end()),
++        std::vector<int>(padding_hi_.begin(), padding_hi_.end()),
++        std::vector<int>(kernel_dilation_.begin(), kernel_dilation_.end()),
++        std::vector<int>(input_dilation_.begin(), input_dilation_.end()),
+         groups,
+         flip_,
+         stream());
+@@ -1633,7 +1651,7 @@
+ 
+ std::vector<Shape> Convolution::output_shapes(
+     const ArrayVector& inputs) {
+-  return {conv_out_shape(
++  return {conv_out_shape_axes(
+       inputs[0].shape(), // in_shape
+       inputs[1].shape(), // wt_shape
+       kernel_strides_,
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -737,11 +737,30 @@
+       const int groups = 1,
+       const bool flip = false)
+       : UnaryPrimitive(stream),
+-        padding_lo_(padding_lo),
+-        padding_hi_(padding_hi),
+-        kernel_strides_(kernel_strides),
+-        kernel_dilation_(kernel_dilation),
+-        input_dilation_(input_dilation),
++        padding_lo_(padding_lo.begin(), padding_lo.end()),
++        padding_hi_(padding_hi.begin(), padding_hi.end()),
++        kernel_strides_(kernel_strides.begin(), kernel_strides.end()),
++        kernel_dilation_(kernel_dilation.begin(), kernel_dilation.end()),
++        input_dilation_(input_dilation.begin(), input_dilation.end()),
++        groups_(groups),
++        flip_(flip) {}
++
++  // The common convolution worker owns normalized axes inline (at most three
++  // spatial dimensions). This tagged input avoids ambiguous public vector calls.
++  struct Axes {
++    Shape strides;
++    Shape padding_lo;
++    Shape padding_hi;
++    Shape kernel_dilation;
++    Shape input_dilation;
++  };
++  explicit Convolution(Stream stream, Axes axes, int groups = 1, bool flip = false)
++      : UnaryPrimitive(stream),
++        padding_lo_(std::move(axes.padding_lo)),
++        padding_hi_(std::move(axes.padding_hi)),
++        kernel_strides_(std::move(axes.strides)),
++        kernel_dilation_(std::move(axes.kernel_dilation)),
++        input_dilation_(std::move(axes.input_dilation)),
+         groups_(groups),
+         flip_(flip) {}
+ 
+@@ -760,11 +779,11 @@
+   std::vector<Shape> output_shapes(const ArrayVector& inputs) override;
+   auto state() const {
+     return std::make_tuple(
+-        kernel_strides_,
+-        padding_lo_,
+-        padding_hi_,
+-        kernel_dilation_,
+-        input_dilation_,
++        std::vector<int>(kernel_strides_.begin(), kernel_strides_.end()),
++        std::vector<int>(padding_lo_.begin(), padding_lo_.end()),
++        std::vector<int>(padding_hi_.begin(), padding_hi_.end()),
++        std::vector<int>(kernel_dilation_.begin(), kernel_dilation_.end()),
++        std::vector<int>(input_dilation_.begin(), input_dilation_.end()),
+         groups_,
+         flip_);
+   }
+@@ -778,12 +797,21 @@
+       const std::vector<int>& kernel_dilation,
+       const std::vector<int>& input_dilation);
+ 
+- private:
+-  std::vector<int> padding_lo_;
+-  std::vector<int> padding_hi_;
+-  std::vector<int> kernel_strides_;
+-  std::vector<int> kernel_dilation_;
+-  std::vector<int> input_dilation_;
++  static Shape conv_out_shape_axes(
++      const Shape& in_shape,
++      const Shape& wt_shape,
++      const Shape& strides,
++      const Shape& pads_lo,
++      const Shape& pads_hi,
++      const Shape& kernel_dilation,
++      const Shape& input_dilation);
++
++ private:
++  Shape padding_lo_;
++  Shape padding_hi_;
++  Shape kernel_strides_;
++  Shape kernel_dilation_;
++  Shape input_dilation_;
+   int groups_;
+   bool flip_;
+ };

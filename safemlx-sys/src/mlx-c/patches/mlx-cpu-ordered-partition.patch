@@ -1,0 +1,103 @@
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -1,3 +1,5 @@
++#include <climits>
++#include <typeinfo>
+ #include "mlx/backend/cpu/concatenate_storage.h"
+ #include "mlx/backend/cpu/arange_storage.h"
+ // Copyright © 2025 Apple Inc.
+@@ -45,9 +47,7 @@
+   const bool fixed = submission::fixed_eval_prologue_required();
+   const bool fixed_distributed = fixed && distributed::is_cpu_distributed_primitive(arr);
+   const auto* partition = fixed ? dynamic_cast<const ArgPartition*>(&arr.primitive()) : nullptr;
+-  const bool fixed_partition = partition && arr.ndim() == 2 && arr.inputs().size() == 1 &&
+-      arr.inputs()[0].ndim() == 2 && arr.siblings().empty() &&
+-      partition->state().second == 1;
++  const bool fixed_partition = partition != nullptr;
+   const bool fixed_arange = fixed && cpu::is_arange_eval_primitive(arr);
+   const bool fixed_concatenate = fixed && cpu::is_concatenate_eval_primitive(arr);
+   const bool fixed_selection = fixed && cpu::is_selection_eval_primitive(arr);
+@@ -171,6 +171,39 @@
+   output = value;
+   return true;
+ }
++bool cpu_argpartition_source_layout(size_t rank, size_t elements, bool tracer,
++    CpuArgPartitionLayout& output) noexcept {
++  if(rank<1||rank>3||!elements||elements>size_t(INT_MAX)||
++      Shape::inline_capacity<3||Strides::inline_capacity<3)return false;
++  CpuArgPartitionLayout value;
++  if(!cpu_argpartition_layout(tracer,value))return false;
++  // The base query also pays this shared source-validation frame so existing
++  // rank-two router callers retain the exact enlarged consumer census.
++  output=value;return true;
++}
++bool cpu_argpartition_source_storage(const array& output,CpuArgPartitionLayout& result) noexcept {
++  if(!output.has_primitive()||typeid(output.primitive())!=typeid(ArgPartition)||
++      output.primitive().stream().device!=Device::cpu||output.inputs().size()!=1||
++      !output.siblings().empty()||output.dtype()!=uint32||output.itemsize()!=4)return false;
++  const auto& input=output.inputs()[0];const size_t rank=input.ndim();
++  const auto* primitive=static_cast<const ArgPartition*>(&output.primitive());
++  const auto state=primitive->state();
++  if(rank<1||rank>3||output.ndim()!=rank||(rank!=2&&input.dtype()!=float32)||input.itemsize()<=0||
++      input.strides().size()!=rank||state.second!=int(rank)-1)return false;
++  size_t elements=1,span=1;
++  for(size_t i=0;i!=rank;++i) {
++    const auto extent=input.shape(i);const auto stride=input.strides()[i];
++    if(extent<=0||output.shape(i)!=extent||stride<0||size_t(extent)>size_t(INT_MAX)/elements)return false;
++    elements*=size_t(extent);
++    if(extent>1&&size_t(stride)>(size_t(PTRDIFF_MAX)-span)/size_t(extent-1))return false;
++    span+=size_t(stride)*size_t(extent-1);
++  }
++  const int columns=input.shape(rank-1);const int kth=state.first<0?state.first+columns:state.first;
++  if(kth<0||kth>=columns||elements!=input.size()||elements!=output.size()||
++      span>input.data_size()||span>size_t(PTRDIFF_MAX)/size_t(input.itemsize()))return false;
++  return cpu_argpartition_source_layout(rank,elements,output.is_tracer(),result);
++}
++
+ bool cpu_argpartition_layout(bool tracer, CpuArgPartitionLayout& output) noexcept {
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+@@ -216,8 +249,11 @@
+     value.request_counts[6 + i] = 2;
+   }
+   const auto adoption = array::buffer_adoption_layout();
++  const size_t source_controls=sizeof(size_t)*10+sizeof(bool)*4+sizeof(int)*3+
++      sizeof(const array*)*2+sizeof(const ArgPartition*)+sizeof(std::pair<int,int>)+
++      sizeof(CpuArgPartitionLayout)*2+sizeof(CpuArgPartitionLayout&);
+   value.task_controls = task.controls;
+-  value.named_control_bytes = cleanup.named_control_bytes + task.controls + allocation_controls +
++  value.named_control_bytes = source_controls + sizeof(source_controls) + cleanup.named_control_bytes + task.controls + allocation_controls +
+       sizeof(routing) + sizeof(allocation_controls) +
+       sizeof(value) + sizeof(cleanup) + sizeof(task) + sizeof(array_requests) +
+       sizeof(count) + sizeof(tracer) + sizeof(output) + sizeof(adoption) +
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -113,6 +113,9 @@
+   size_t task_controls{0};
+ };
+ MLX_API bool cpu_argpartition_layout(bool tracer, CpuArgPartitionLayout&) noexcept;
++// Same ordinary partition worker with finite actual rank/extent geometry.
++MLX_API bool cpu_argpartition_source_layout(size_t rank, size_t elements, bool tracer, CpuArgPartitionLayout&) noexcept;
++MLX_API bool cpu_argpartition_source_storage(const array&, CpuArgPartitionLayout&) noexcept;
+ // GPU host prologue: retention controls and empty Data/invocation vectors.
+ struct GpuEvalPrologueLayout : GraphConstructionLayout {
+   size_t inputs{0}, siblings{0}, tracer_inputs{0};
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -607,11 +607,10 @@
+   const auto* primitive = dynamic_cast<const ArgPartition*>(&current.primitive());
+   if (output || !quota || !context.scope || context.worker || !guard.cpu() ||
+       context.dispatch != &dispatch || current_graph_quota() != quota ||
+-      !primitive || current.ndim() != 2 || guard.inputs() != 1 || guard.siblings() != 0 ||
+-      current.inputs()[0].ndim() != 2 || primitive->state().second != 1)
++      !primitive || guard.inputs() != 1 || guard.siblings() != 0)
+     return GraphFailure::foreign_parent;
+   CpuArgPartitionLayout actual;
+-  if (!cpu_argpartition_layout(guard.tracer(), actual)) return GraphFailure::invalid_layout;
++  if (!cpu_argpartition_source_storage(current, actual)) return GraphFailure::invalid_layout;
+   return create_layout(*quota, context.scope, &dispatch, actual, output, true);
+ }
+ GraphFailure GraphConstruction::create_layout(GraphQuota& quota, uint64_t scope,

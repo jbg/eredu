@@ -1,0 +1,407 @@
+diff --git a/mlx/backend/cpu/indexing.cpp b/mlx/backend/cpu/indexing.cpp
+--- a/mlx/backend/cpu/indexing.cpp
++++ b/mlx/backend/cpu/indexing.cpp
+@@ -4,6 +4,7 @@
+ #include <cmath>
+ 
+ #include "mlx/allocator.h"
++#include "mlx/axis_view.h"
+ #include "mlx/backend/common/utils.h"
+ #include "mlx/backend/cpu/binary.h"
+ #include "mlx/backend/cpu/binary_ops.h"
+@@ -64,7 +65,7 @@
+     const array& src,
+     const ArrayVector& inds,
+     array& out,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const Shape& slice_sizes) {
+   // Each gathered slice is written into the (row-contiguous) output as a
+   // sequential block. We can therefore replace the per-element strided read
+@@ -126,7 +127,7 @@
+     const array& src,
+     const ArrayVector& inds,
+     array& out,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const Shape& size) {
+   switch (out.dtype()) {
+     case bool_:
+@@ -378,7 +379,7 @@
+     const array& updates,
+     array& out,
+     const ArrayVector& inds,
+-    const std::vector<int>& axes) {
++    AxisView axes) {
+   int nind = inds.size();
+   auto inds_ndim = updates.ndim() - out.ndim();
+   size_t n_updates = nind ? inds[0].size() : 1;
+@@ -422,7 +423,7 @@
+     array& out,
+     const ArrayVector& indices,
+     const array& updates,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     Scatter::ReduceType rtype) {
+   switch (rtype) {
+     case Scatter::None:
+@@ -448,7 +449,7 @@
+     array& out,
+     const ArrayVector& inds,
+     const array& updates,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     Scatter::ReduceType rtype) {
+   if (inds.empty()) {
+     dispatch_scatter_inds<InT, uint8_t>(out, inds, updates, axes, rtype);
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -371,7 +371,9 @@
+       resident_primitive_control<Squeeze>(), resident_primitive_control<ExpandDims>(),
+       resident_primitive_control<Transpose>(), resident_primitive_control<Contiguous>(),
+       resident_primitive_control<Copy>(), resident_primitive_control<Full>(),
+-      resident_primitive_control<Gather>(), resident_primitive_control<Reduce>(),
++      resident_primitive_control<Gather>(), resident_primitive_control<GatherAxis>(),
++      resident_primitive_control<Scatter>(), resident_primitive_control<ArgSort>(),
++      resident_primitive_control<GatherMM>(), resident_primitive_control<Reduce>(),
+       resident_primitive_control<Slice>(), resident_primitive_control<SliceUpdate>(),
+       resident_primitive_control<ArgReduce>(),
+       resident_primitive_control<Matmul>(), resident_primitive_control<AddMM>(),
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -3465,10 +3465,10 @@
+   return axes.empty() ? out : squeeze(out, axes, s);
+ }
+ 
+-array gather(
++static array gather_owned(
+     const array& a,
+     const ArrayVector& indices,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const Shape& slice_sizes,
+     StreamOrDevice s /* = {} */) {
+   // Checks that indices, dimensions, and slice_sizes are all valid
+@@ -3479,7 +3479,10 @@
+     throw std::invalid_argument(msg.str());
+   }
+ 
+-  std::set dims(axes.begin(), axes.end());
++  Shape dims(axes.begin(), axes.end());
++  std::sort(dims.begin(), dims.end());
++  const auto unique_end = std::unique(dims.begin(), dims.end());
++  dims.erase(unique_end, dims.end());
+   if (dims.size() != axes.size()) {
+     throw std::invalid_argument("[gather] Repeat axes not allowed in gather.");
+   }
+@@ -3549,8 +3552,28 @@
+       std::move(out_shape),
+       a.dtype(),
+       submission::make_graph_primitive<Gather>(
+-          to_stream(s), std::move(axes), std::move(slice_sizes)),
++          to_stream(s),
++          Shape(axes.begin(), axes.end()),
++          slice_sizes,
++          std::in_place),
+       inputs);
++}
++
++array gather(
++    const array& a,
++    const ArrayVector& indices,
++    const std::vector<int>& axes,
++    const Shape& slice_sizes,
++    StreamOrDevice s) {
++  return gather_owned(a, indices, axes, slice_sizes, s);
++}
++array gather(
++    const array& a,
++    const array& indices,
++    int axis,
++    const Shape& slice_sizes,
++    StreamOrDevice s) {
++  return gather_owned(a, {indices}, Shape{axis}, slice_sizes, s);
+ }
+ 
+ array kron(const array& a, const array& b, StreamOrDevice s /* = {} */) {
+@@ -3612,14 +3635,14 @@
+ 
+   // Transpose indices dimensions to axis dimension
+   if (axis != 0) {
+-    std::vector<int> t_axes(out.ndim());
++    Shape t_axes(out.ndim());
+     std::iota(t_axes.begin(), t_axes.begin() + axis, indices.ndim());
+     std::iota(t_axes.begin() + axis, t_axes.begin() + axis + indices.ndim(), 0);
+     std::iota(
+         t_axes.begin() + axis + indices.ndim(),
+         t_axes.end(),
+         indices.ndim() + axis);
+-    out = transpose(out, t_axes, s);
++    out = transpose_owned(out, std::move(t_axes), s);
+   }
+ 
+   // Squeeze the axis we take over
+@@ -3766,11 +3789,11 @@
+ }
+ 
+ /** Scatter updates to given indices */
+-array scatter(
++static array scatter_owned(
+     const array& a,
+     const ArrayVector& indices,
+     const array& updates,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     Scatter::ReduceType mode,
+     StreamOrDevice s) {
+   // Checks that indices, dimensions, and slice_sizes are all valid
+@@ -3786,7 +3809,10 @@
+     }
+   }
+ 
+-  std::set dims(axes.begin(), axes.end());
++  Shape dims(axes.begin(), axes.end());
++  std::sort(dims.begin(), dims.end());
++  const auto unique_end = std::unique(dims.begin(), dims.end());
++  dims.erase(unique_end, dims.end());
+   if (dims.size() != axes.size()) {
+     throw std::invalid_argument(
+         "[scatter] Repeat axes not allowed in scatter.");
+@@ -3856,7 +3882,8 @@
+   return array(
+       a.shape(),
+       a.dtype(),
+-      submission::make_graph_primitive<Scatter>(to_stream(s), mode, axes),
++      submission::make_graph_primitive<Scatter>(
++          to_stream(s), mode, Shape(axes.begin(), axes.end()), std::in_place),
+       std::move(inputs));
+ }
+ 
+@@ -3865,8 +3892,25 @@
+     const ArrayVector& indices,
+     const array& updates,
+     const std::vector<int>& axes,
+-    StreamOrDevice s /*= {}*/) {
+-  return scatter(a, indices, updates, axes, Scatter::None, s);
++    Scatter::ReduceType mode,
++    StreamOrDevice s) {
++  return scatter_owned(a, indices, updates, axes, mode, s);
++}
++array scatter(
++    const array& a,
++    const ArrayVector& indices,
++    const array& updates,
++    const std::vector<int>& axes,
++    StreamOrDevice s) {
++  return scatter_owned(a, indices, updates, axes, Scatter::None, s);
++}
++array scatter(
++    const array& a,
++    const array& indices,
++    const array& updates,
++    int axis,
++    StreamOrDevice s) {
++  return scatter_owned(a, {indices}, updates, Shape{axis}, Scatter::None, s);
+ }
+ 
+ array scatter_add(
+diff --git a/mlx/ops.h b/mlx/ops.h
+--- a/mlx/ops.h
++++ b/mlx/ops.h
+@@ -1100,14 +1100,12 @@
+     const std::vector<int>& axes,
+     const Shape& slice_sizes,
+     StreamOrDevice s = {});
+-inline array gather(
++MLX_API array gather(
+     const array& a,
+     const array& indices,
+     int axis,
+     const Shape& slice_sizes,
+-    StreamOrDevice s = {}) {
+-  return gather(a, {indices}, std::vector<int>{axis}, slice_sizes, s);
+-}
++    StreamOrDevice s = {});
+ 
+ /**  Compute the Kronecker product of two arrays. */
+ MLX_API array kron(const array& a, const array& b, StreamOrDevice s = {});
+@@ -1248,14 +1246,12 @@
+     const array& updates,
+     const std::vector<int>& axes,
+     StreamOrDevice s = {});
+-inline array scatter(
++MLX_API array scatter(
+     const array& a,
+     const array& indices,
+     const array& updates,
+     int axis,
+-    StreamOrDevice s = {}) {
+-  return scatter(a, {indices}, updates, std::vector<int>{axis}, s);
+-}
++    StreamOrDevice s = {});
+ 
+ /** Scatter and add updates to given indices */
+ MLX_API array scatter_add(
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -2423,7 +2423,7 @@
+     const std::vector<int>& axes) {
+   auto& src = inputs[0];
+   ArrayVector indices(inputs.begin() + 1, inputs.end());
+-  auto gather_axes = axes_;
++  std::vector<int> gather_axes(axes_.begin(), axes_.end());
+   auto slice_sizes = slice_sizes_;
+   auto src_vmapped = axes[0] >= 0;
+   auto ind_vmap_ax_ptr =
+@@ -2486,6 +2486,7 @@
+     const ArrayVector& cotangents,
+     const std::vector<int>& argnums,
+     const ArrayVector&) {
++  const std::vector<int> ordinary_axes(axes_.begin(), axes_.end());
+   ArrayVector vjps;
+   for (int argnum : argnums) {
+     if (argnum > 0) {
+@@ -2495,7 +2496,8 @@
+     } else {
+       auto src = zeros_like(primals[0], stream());
+       ArrayVector inds(primals.begin() + 1, primals.end());
+-      vjps.push_back(scatter_add(src, inds, cotangents[0], axes_, stream()));
++      vjps.push_back(
++          scatter_add(src, inds, cotangents[0], ordinary_axes, stream()));
+     }
+   }
+   return vjps;
+@@ -2509,8 +2511,9 @@
+     throw std::invalid_argument(
+         "[gather] Cannot calculate JVP with respect to indices.");
+   }
++  const std::vector<int> ordinary_axes(axes_.begin(), axes_.end());
+   ArrayVector inds(primals.begin() + 1, primals.end());
+-  return {gather(tangents[0], inds, axes_, slice_sizes_, stream())};
++  return {gather(tangents[0], inds, ordinary_axes, slice_sizes_, stream())};
+ }
+ 
+ bool Gather::is_equivalent(const Primitive& other) const {
+@@ -4410,6 +4413,7 @@
+     const ArrayVector& cotangents,
+     const std::vector<int>& argnums,
+     const ArrayVector& outputs) {
++  const std::vector<int> ordinary_axes(axes_.begin(), axes_.end());
+   switch (reduce_type_) {
+     case Scatter::None:
+     case Scatter::Sum:
+@@ -4437,7 +4441,7 @@
+               cotangents[0],
+               indices,
+               zeros_like(updates, stream()),
+-              axes_,
++              ordinary_axes,
+               stream()));
+           break;
+         case Scatter::Sum:
+@@ -4463,23 +4467,23 @@
+         case Scatter::Sum: {
+           // Gather the values from the cotangent
+           auto slice_sizes = cotangents[0].shape();
+-          for (auto ax : axes_) {
++          for (auto ax : ordinary_axes) {
+             slice_sizes[ax] = 1;
+           }
+-          vjps.push_back(
+-              gather(cotangents[0], indices, axes_, slice_sizes, stream()));
++          vjps.push_back(gather(
++              cotangents[0], indices, ordinary_axes, slice_sizes, stream()));
+           break;
+         }
+         case Scatter::Max:
+         case Scatter::Min: {
+           auto slice_sizes = cotangents[0].shape();
+-          for (auto ax : axes_) {
++          for (auto ax : ordinary_axes) {
+             slice_sizes[ax] = 1;
+           }
+-          auto gathered_cotan =
+-              gather(cotangents[0], indices, axes_, slice_sizes, stream());
++          auto gathered_cotan = gather(
++              cotangents[0], indices, ordinary_axes, slice_sizes, stream());
+           auto gathered_result =
+-              gather(result, indices, axes_, slice_sizes, stream());
++              gather(result, indices, ordinary_axes, slice_sizes, stream());
+           vjps.push_back(
+               multiply(gathered_cotan, gathered_result == updates, stream()));
+           break;
+@@ -4512,7 +4516,7 @@
+ 
+   auto inputs = inputs_;
+ 
+-  auto scatter_axes = axes_;
++  std::vector<int> scatter_axes(axes_.begin(), axes_.end());
+   int src_ax = vmap_axes[0];
+ 
+   auto vmap_ax_it = std::find_if(
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -1190,6 +1190,11 @@
+  public:
+   explicit Gather(Stream stream, std::vector<int> axes, Shape slice_sizes)
+       : UnaryPrimitive(stream),
++        axes_(axes.begin(), axes.end()),
++        slice_sizes_(std::move(slice_sizes)) {}
++
++  Gather(Stream stream, Shape axes, Shape slice_sizes, std::in_place_t)
++      : UnaryPrimitive(stream),
+         axes_(std::move(axes)),
+         slice_sizes_(std::move(slice_sizes)) {}
+ 
+@@ -1202,11 +1207,11 @@
+   bool is_equivalent(const Primitive& other) const override;
+   std::vector<Shape> output_shapes(const ArrayVector& inputs) override;
+   std::pair<std::vector<int>, Shape> state() const {
+-    return {axes_, slice_sizes_};
+-  }
+-
+- private:
+-  std::vector<int> axes_;
++    return {std::vector<int>(axes_.begin(), axes_.end()), slice_sizes_};
++  }
++
++ private:
++  Shape axes_;
+   Shape slice_sizes_;
+ };
+ 
+@@ -1930,7 +1935,14 @@
+       Stream stream,
+       ReduceType reduce_type,
+       const std::vector<int>& axes)
+-      : UnaryPrimitive(stream), reduce_type_(reduce_type), axes_(axes) {}
++      : UnaryPrimitive(stream),
++        reduce_type_(reduce_type),
++        axes_(axes.begin(), axes.end()) {}
++
++  Scatter(Stream stream, ReduceType reduce_type, Shape axes, std::in_place_t)
++      : UnaryPrimitive(stream),
++        reduce_type_(reduce_type),
++        axes_(std::move(axes)) {}
+ 
+   void eval_cpu(const ArrayVector& inputs, array& out) override;
+   void eval_gpu(const ArrayVector& inputs, array& out) override;
+@@ -1956,12 +1968,12 @@
+ 
+   bool is_equivalent(const Primitive& other) const override;
+   std::pair<ReduceType, std::vector<int>> state() const {
+-    return {reduce_type_, axes_};
++    return {reduce_type_, std::vector<int>(axes_.begin(), axes_.end())};
+   };
+ 
+  private:
+   ReduceType reduce_type_;
+-  std::vector<int> axes_;
++  Shape axes_;
+ };
+ 
+ class ScatterAxis : public UnaryPrimitive {

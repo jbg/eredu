@@ -9,8 +9,8 @@ use crate::{rotary::RopeValue, GgufTensorCatalog};
 use eredu_checkpoint::WeightQuantization;
 use eredu_core::{
     cache::{
-        derive_prompt_cache_architecture_fingerprint, LayerCachePolicy, MutableStateResidency,
-        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
+        LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
+        StateTensorPolicy, StateTensorRole,
     },
     AttentionPolicy, LayerSchedule,
 };
@@ -430,6 +430,12 @@ impl ModelArgs {
     pub fn validate(&self) -> Result<(), ConfigError> {
         validate_args(self)
     }
+    pub(crate) fn validate_with_diagnostic<E>(
+        &self,
+        error: impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
+        validate_args_with(self, error)
+    }
 
     /// Returns one validated layer policy without an out-of-range fallback.
     pub fn layer_policy(&self, layer: usize) -> Option<&LayerPolicy> {
@@ -460,24 +466,10 @@ impl ModelArgs {
 
     /// Returns a stable ordered representation of the complete layer schedule.
     pub fn layer_schedule_fingerprint(&self) -> String {
-        self.layer_schedule
-            .iter()
-            .map(|policy| {
-                let operator = match policy.operator {
-                    OperatorPolicy::CausalConvolution => "c".to_string(),
-                    OperatorPolicy::SelfAttention(AttentionPolicy::Full) => "af".to_string(),
-                    OperatorPolicy::SelfAttention(AttentionPolicy::Sliding { window }) => {
-                        format!("as{}", window.get())
-                    }
-                };
-                let feed_forward = match policy.feed_forward {
-                    FeedForwardPolicy::Dense => "d",
-                    FeedForwardPolicy::SparseMoe => "e",
-                };
-                format!("{operator}{feed_forward}")
-            })
-            .collect::<Vec<_>>()
-            .join(",")
+        self.display_layer_schedule_fingerprint().to_string()
+    }
+    fn display_layer_schedule_fingerprint(&self) -> impl std::fmt::Display + '_ {
+        crate::cache_identity::Joined(|| self.layer_schedule.iter().map(PolicyFingerprint), ",")
     }
 
     /// Returns the physical encoding for one canonical parameter identity.
@@ -629,21 +621,39 @@ pub struct LayerCacheGeometry {
 
 /// Declares state geometry using the global replicated parameter layout.
 pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, ConfigError> {
-    let geometry = args
-        .layer_schedule
-        .iter()
-        .map(|policy| match policy.operator {
-            OperatorPolicy::CausalConvolution => LayerCacheGeometry {
-                kv_heads: None,
-                convolution_channels: Some(args.hidden_size),
+    state_layout_destination(args, &crate::state_geometry::Ordinary(invalid))
+}
+
+/// Constructs the same actual state geometry using counted metadata destinations.
+pub fn state_layout_with_metadata(
+    args: &ModelArgs,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<StateLayout, eredu_nn::Error> {
+    if !context.uses_checked_metadata() {
+        return state_layout(args).map_err(eredu_nn::Error::backend);
+    }
+    state_layout_destination(args, &crate::state_geometry::Counted::new(context, invalid))
+}
+
+fn state_layout_destination<D: crate::state_geometry::Destination>(
+    args: &ModelArgs,
+    destination: &D,
+) -> Result<StateLayout, D::Error> {
+    destination.controls::<(StateLayout, &ModelArgs)>()?;
+    let geometry =
+        destination.collect_values(args.layer_schedule.iter().map(
+            |policy| match policy.operator {
+                OperatorPolicy::CausalConvolution => LayerCacheGeometry {
+                    kv_heads: None,
+                    convolution_channels: Some(args.hidden_size),
+                },
+                OperatorPolicy::SelfAttention(_) => LayerCacheGeometry {
+                    kv_heads: Some(args.num_key_value_heads),
+                    convolution_channels: None,
+                },
             },
-            OperatorPolicy::SelfAttention(_) => LayerCacheGeometry {
-                kv_heads: Some(args.num_key_value_heads),
-                convolution_channels: None,
-            },
-        })
-        .collect::<Vec<_>>();
-    state_layout_with_geometry(args, &geometry)
+        ))?;
+    state_layout_with_geometry_destination(args, &geometry, destination)
 }
 
 /// Declares exact state geometry from a resolved rank-local parameter layout.
@@ -651,8 +661,21 @@ pub fn state_layout_with_geometry(
     args: &ModelArgs,
     geometry: &[LayerCacheGeometry],
 ) -> Result<StateLayout, ConfigError> {
+    state_layout_with_geometry_destination(
+        args,
+        geometry,
+        &crate::state_geometry::Ordinary(invalid),
+    )
+}
+
+fn state_layout_with_geometry_destination<D: crate::state_geometry::Destination>(
+    args: &ModelArgs,
+    geometry: &[LayerCacheGeometry],
+    destination: &D,
+) -> Result<StateLayout, D::Error> {
+    destination.controls::<(StateLayout, &ModelArgs, &[LayerCacheGeometry])>()?;
     if geometry.len() != args.layer_schedule.len() {
-        return Err(invalid(format!(
+        return Err(destination.error(format_args!(
             "LFM2 cache geometry has {} layers, expected {}",
             geometry.len(),
             args.layer_schedule.len()
@@ -661,94 +684,161 @@ pub fn state_layout_with_geometry(
     let history = args
         .conv_l_cache
         .checked_sub(1)
-        .ok_or_else(|| invalid("invalid LFM2 convolution width"))?;
-    let fixed =
-        |value| StateTensorDimension::fixed(value).map_err(|error| invalid(error.to_string()));
-    let policies = args
-        .layer_schedule
-        .iter()
-        .zip(geometry)
-        .map(|(policy, geometry)| {
-            match (
-                policy.operator,
-                geometry.kv_heads,
-                geometry.convolution_channels,
-            ) {
-                (OperatorPolicy::CausalConvolution, None, Some(_)) if history == 0 => {
-                    Ok(LayerCachePolicy::NoState)
-                }
-                (OperatorPolicy::CausalConvolution, None, Some(channels)) => {
-                    LayerCachePolicy::fixed_only(vec![StateTensorPolicy::new(
-                        StateTensorRole::Convolution { slot: 0 },
-                        vec![
-                            StateTensorDimension::Batch,
-                            fixed(history)?,
-                            fixed(channels)?,
-                        ],
-                        StateTensorDtype::Floating,
-                        MutableStateResidency::AlwaysDeviceMutable,
-                    )
-                    .map_err(|error| invalid(error.to_string()))?])
-                    .map_err(|error| invalid(error.to_string()))
-                }
-                (OperatorPolicy::SelfAttention(attention), Some(kv_heads), None) => {
-                    LayerCachePolicy::key_value(
-                        attention,
-                        kv_heads,
-                        args.hidden_size / args.num_attention_heads,
-                    )
-                    .map_err(|error| invalid(error.to_string()))
-                }
-                (OperatorPolicy::CausalConvolution, _, _) => Err(invalid(
-                    "LFM2 convolution layer requires only convolution-channel cache geometry",
-                )),
-                (OperatorPolicy::SelfAttention(_), _, _) => Err(invalid(
-                    "LFM2 attention layer requires only KV-head cache geometry",
-                )),
+        .ok_or_else(|| destination.error(format_args!("invalid LFM2 convolution width")))?;
+    let fixed = |value| destination.fixed(value);
+    let policies = destination.collect(args.layer_schedule.iter().zip(geometry).map(
+        |(policy, geometry)| match (
+            policy.operator,
+            geometry.kv_heads,
+            geometry.convolution_channels,
+        ) {
+            (OperatorPolicy::CausalConvolution, None, Some(_)) if history == 0 => {
+                Ok(LayerCachePolicy::NoState)
             }
+            (OperatorPolicy::CausalConvolution, None, Some(channels)) => {
+                destination.fixed_only(destination.values([destination.tensor(
+                    StateTensorRole::Convolution { slot: 0 },
+                    destination.values([
+                        StateTensorDimension::Batch,
+                        fixed(history)?,
+                        fixed(channels)?,
+                    ])?,
+                    StateTensorDtype::Floating,
+                    MutableStateResidency::AlwaysDeviceMutable,
+                )?])?)
+            }
+            (OperatorPolicy::SelfAttention(attention), Some(kv_heads), None) => {
+                destination.key_value(
+                    attention,
+                    kv_heads,
+                    args.hidden_size / args.num_attention_heads,
+                )
+            }
+            (OperatorPolicy::CausalConvolution, _, _) => Err(destination.error(format_args!(
+                "LFM2 convolution layer requires only convolution-channel cache geometry"
+            ))),
+            (OperatorPolicy::SelfAttention(_), _, _) => Err(destination.error(format_args!(
+                "LFM2 attention layer requires only KV-head cache geometry"
+            ))),
+        },
+    ))?;
+    let schedule = destination.schedule(args.layer_schedule.len(), policies)?;
+    destination.layout(schedule)
+}
+
+struct PolicyFingerprint<'a>(&'a LayerPolicy);
+impl std::fmt::Display for PolicyFingerprint<'_> {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.operator {
+            OperatorPolicy::CausalConvolution => output.write_str("c")?,
+            OperatorPolicy::SelfAttention(AttentionPolicy::Full) => output.write_str("af")?,
+            OperatorPolicy::SelfAttention(AttentionPolicy::Sliding { window }) => {
+                write!(output, "as{}", window.get())?
+            }
+        }
+        output.write_str(match self.0.feed_forward {
+            FeedForwardPolicy::Dense => "d",
+            FeedForwardPolicy::SparseMoe => "e",
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let schedule = LayerSchedule::new(args.layer_schedule.len(), policies)
-        .map_err(|error| invalid(error.to_string()))?;
-    StateLayout::new(schedule).map_err(|error| invalid(error.to_string()))
+    }
 }
 
 /// Derives the canonical cache-relevant architecture fingerprint.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    derive_prompt_cache_architecture_fingerprint(
-        "lfm2",
-        [
-            ("model_type", args.model_type.clone()),
-            ("hidden_size", args.hidden_size.to_string()),
-            ("layers", args.num_hidden_layers.to_string()),
-            ("layer_schedule", args.layer_schedule_fingerprint()),
-            ("query_heads", args.num_attention_heads.to_string()),
-            ("kv_heads", args.num_key_value_heads.to_string()),
+    prompt_cache_architecture_fingerprint_with_metadata(
+        args,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary fingerprint formatting is infallible")
+}
+pub(crate) fn prompt_cache_architecture_fingerprint_with_metadata(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    metadata.fingerprint("lfm2", || {
+        Ok([
+            ("model_type", metadata.text(&args.model_type)?),
+            (
+                "hidden_size",
+                metadata.format(format_args!("{}", args.hidden_size))?,
+            ),
+            (
+                "layers",
+                metadata.format(format_args!("{}", args.num_hidden_layers))?,
+            ),
+            (
+                "layer_schedule",
+                metadata.format(format_args!(
+                    "{}",
+                    args.display_layer_schedule_fingerprint()
+                ))?,
+            ),
+            (
+                "query_heads",
+                metadata.format(format_args!("{}", args.num_attention_heads))?,
+            ),
+            (
+                "kv_heads",
+                metadata.format(format_args!("{}", args.num_key_value_heads))?,
+            ),
             (
                 "head_dim",
-                (args.hidden_size / args.num_attention_heads).to_string(),
+                metadata.format(format_args!(
+                    "{}",
+                    args.hidden_size / args.num_attention_heads
+                ))?,
             ),
-            ("max_positions", args.max_position_embeddings.to_string()),
-            ("rope_theta", format!("{:08x}", args.rope.theta.to_bits())),
-            ("norm_eps", format!("{:08x}", args.norm_eps.to_bits())),
-            ("conv_history", args.conv_l_cache.to_string()),
-            ("conv_bias", args.conv_bias.to_string()),
-            ("quantization", format!("{:?}", args.weight_quantization)),
+            (
+                "max_positions",
+                metadata.format(format_args!("{}", args.max_position_embeddings))?,
+            ),
+            (
+                "rope_theta",
+                metadata.format(format_args!("{:08x}", args.rope.theta.to_bits()))?,
+            ),
+            (
+                "norm_eps",
+                metadata.format(format_args!("{:08x}", args.norm_eps.to_bits()))?,
+            ),
+            (
+                "conv_history",
+                metadata.format(format_args!("{}", args.conv_l_cache))?,
+            ),
+            (
+                "conv_bias",
+                metadata.format(format_args!("{}", args.conv_bias))?,
+            ),
+            (
+                "quantization",
+                metadata.format(format_args!("{:?}", args.weight_quantization))?,
+            ),
             (
                 "quantized_weights",
-                crate::cache_identity::string_set(args.quantized_weights.as_ref()),
+                crate::cache_identity::string_set_with_metadata(
+                    args.quantized_weights.as_ref(),
+                    metadata,
+                )?,
             ),
             (
                 "quantized_weight_configs",
-                crate::cache_identity::debug_map(args.quantized_weight_configs.as_ref()),
+                crate::cache_identity::debug_map_with_metadata(
+                    args.quantized_weight_configs.as_ref(),
+                    metadata,
+                )?,
             ),
-        ],
-    )
+        ])
+    })
 }
 
 fn validate_args(args: &ModelArgs) -> Result<(), ConfigError> {
+    validate_args_with(args, |text| invalid(text.to_string()))
+}
+fn validate_args_with<E>(
+    args: &ModelArgs,
+    error: impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     if !matches!(args.model_type.as_str(), "lfm2" | "lfm2_moe") {
-        return Err(invalid(format!(
+        return Err(error(format_args!(
             "LFM2 loader received model_type {:?}",
             args.model_type
         )));
@@ -763,13 +853,13 @@ fn validate_args(args: &ModelArgs) -> Result<(), ConfigError> {
         ("conv_L_cache", args.conv_l_cache),
     ] {
         if value <= 0 {
-            return Err(invalid(format!(
+            return Err(error(format_args!(
                 "LFM2 {name} must be positive, got {value}"
             )));
         }
     }
     if args.layer_schedule.len() != args.num_hidden_layers as usize {
-        return Err(invalid(format!(
+        return Err(error(format_args!(
             "LFM2 layer schedule has {} entries, expected {}",
             args.layer_schedule.len(),
             args.num_hidden_layers
@@ -781,17 +871,19 @@ fn validate_args(args: &ModelArgs) -> Result<(), ConfigError> {
             OperatorPolicy::SelfAttention(AttentionPolicy::Sliding { .. })
         )
     }) {
-        return Err(invalid("LFM2 supports only full self-attention policies"));
+        return Err(error(format_args!(
+            "LFM2 supports only full self-attention policies"
+        )));
     }
     if args.hidden_size % args.num_attention_heads != 0
         || args.num_attention_heads % args.num_key_value_heads != 0
     {
-        return Err(invalid(
-            "LFM2 attention head counts do not divide hidden/query dimensions",
-        ));
+        return Err(error(format_args!(
+            "LFM2 attention head counts do not divide hidden/query dimensions"
+        )));
     }
     if !args.rope.theta.is_finite() || args.rope.theta <= 0.0 {
-        return Err(invalid(format!(
+        return Err(error(format_args!(
             "LFM2 RoPE theta must be finite and positive, got {}",
             args.rope.theta
         )));
@@ -802,12 +894,14 @@ fn validate_args(args: &ModelArgs) -> Result<(), ConfigError> {
             || args.num_experts_per_tok <= 0
             || args.num_experts_per_tok > args.num_experts)
     {
-        return Err(invalid("LFM2 MoE expert configuration is invalid"));
+        return Err(error(format_args!(
+            "LFM2 MoE expert configuration is invalid"
+        )));
     }
     if args.model_type == "lfm2" && args.has_sparse_moe_layers() {
-        return Err(invalid(
-            "LFM2 dense config contains a sparse-MoE layer policy",
-        ));
+        return Err(error(format_args!(
+            "LFM2 dense config contains a sparse-MoE layer policy"
+        )));
     }
     Ok(())
 }

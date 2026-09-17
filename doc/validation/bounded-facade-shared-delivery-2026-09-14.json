@@ -1,0 +1,163 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T02:15:31.038527+00:00",
+  "scope": "Shared captured frame delivery through facade ordinary and controlled drivers",
+  "status": "Verified shared delivery; complete facade host admission and bounded inference remain unfinished",
+  "previous_increment": "bounded-native-retirement-fairness-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 1037,
+      "ignored": 0
+    },
+    "runtime_integration": {
+      "passed": 68,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 212,
+      "ignored": 2
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1451,
+  "new_tests": [
+    "actual_ordinary_and_controlled_callbacks_move_shared_frames_after_completion",
+    "managed_failed_drain_preserves_frame_and_typed_error_without_clearing_failure",
+    "facade_drain_failure_keeps_original_source_in_both_shared_drivers",
+    "shared_wire_reuses_legacy_nonfinite_policy_and_alias_custody_without_raw_export",
+    "settled_token_read_failure_delivers_shared_frame_without_replacing_original_error",
+    "callback_cancellation_retires_only_the_last_escaped_shared_alias",
+    "completed_no_output_cancellation_delivers_terminal_raw_and_shared_frames"
+  ],
+  "new_test_count": 7,
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T02:12:24.174614+00:00",
+      "elapsed_seconds": 17.423,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-facade-shared-delivery-runtime.log",
+      "log_sha256": "090d7df0af6b4236d857698ebea899b95958b9b1ef5f0d6eaa2585468382c8f1"
+    },
+    "runtime_integration": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test bounded_prefill",
+      "started_utc": "2026-09-14T02:12:41.598781+00:00",
+      "elapsed_seconds": 7.581,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-facade-shared-delivery-runtime_integration.log",
+      "log_sha256": "803d48bc9f110766f3d2748fb9a8d96d0617dab43674535faa23ba75a99043df"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib",
+      "started_utc": "2026-09-14T02:12:49.180278+00:00",
+      "elapsed_seconds": 36.422,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-facade-shared-delivery-facade.log",
+      "log_sha256": "e3a3e53cc54f6fbf57f6fadd14d89cce3029e7a7a4fd5c2f9362594844d8aff0"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T02:14:19.888742+00:00",
+      "elapsed_seconds": 17.713,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-facade-shared-delivery-portable.log",
+      "log_sha256": "30b245b5b36540f633ddceba88fe0086b45bc518c620c802f5aaf19b1735dd18"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features",
+      "started_utc": "2026-09-14T02:14:37.602542+00:00",
+      "elapsed_seconds": 12.301,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-facade-shared-delivery-minimal.log",
+      "log_sha256": "12b4d01e8f0e346b44db15bbd3573561a68a653b2a8ce1ecf937bdcb1805a9c3"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T02:14:49.904263+00:00",
+      "elapsed_seconds": 20.207,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-facade-shared-delivery-features.log",
+      "log_sha256": "6dcf71a1c39eaa4fd9c07b9b9f40b39a3d974db640e0712303465d4bb797b6b7"
+    }
+  },
+  "source_sha256": {
+    "eredu-runtime/src/execution_control/snapshot.rs": "602753483206f3a095b9f8d3e84491f92b61cb270db1c46874301ae1693e523e",
+    "eredu/src/api/control.rs": "c537f0e371b5918418330884305f3d6d4da1b406ac583cb58ef9007ff747265f",
+    "eredu/src/api/loaded.rs": "2ab971599b4b102416bbe012fd51bed98c366045d7576e8323976c620275809f",
+    "eredu/src/api/observed.rs": "a52ddb291516014baff1ffe395b861b11e3e4f9892cef9767b6e4836ed2d7eae",
+    "eredu/src/api/observed/delivery.rs": "db330a29e6d2944a787f7674bf59ac82084380a21f4d515502784edea9a3009c",
+    "eredu/src/api/request.rs": "7114bdb72cd4db457408b5f57645a5a5fadd3fb2b1b5932f21becb87e82a8c85",
+    "eredu/tests/backend_conformance.rs": "8974960d9d13042aef233b83195743df77d7973b68e6a6ee99ea9d2af8cae874",
+    "eredu/tests/backend_conformance/shared_delivery.rs": "3f7bbbd430e138297e6136f5fa76d850ae48692d66e04770e8502f4729d04221",
+    "doc/backend-architecture.md": "01adaae31b9712aeb8e0a7e507e2fedf6fc58e8c3cf0198d6408f41df4e78e94",
+    "doc/execution-control.md": "09a4e70ea1dc73bac3c0d316eda7193f8c6f89a8ca53e3da59836a531ae23b78",
+    "doc/bounded-inference.md": "cfbd9cf4bc54c8f0466cb6498773d7cc1bb61528873d25bfdfc2964eaed560e3"
+  },
+  "source_snapshot": "/private/tmp/eredu-facade-shared-delivery-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-facade-shared-delivery-applied.json": "a006b79bb5f9e4d95ba7e2882294b0f02bf0f472d4f46e81c6f5e3f4e100dea1",
+    "/private/tmp/eredu-facade-shared-delivery-checks.json": "50d9d40f930cc687299781aeb80de98700a8f7bda7e20a3f3e0734d2283db65d",
+    "/private/tmp/eredu-facade-shared-delivery-control-handle-test-correction.patch": "ca5b317b9505e8c8028b1ac563bd1aff3f97b14e5220f822834f2e13fca6b61a",
+    "/private/tmp/eredu-facade-shared-delivery-facade.log": "e3a3e53cc54f6fbf57f6fadd14d89cce3029e7a7a4fd5c2f9362594844d8aff0",
+    "/private/tmp/eredu-facade-shared-delivery-features.log": "6dcf71a1c39eaa4fd9c07b9b9f40b39a3d974db640e0712303465d4bb797b6b7",
+    "/private/tmp/eredu-facade-shared-delivery-files.txt": "0f1b3430080823016b7710288eb72a96cc3e67aeafda9ac16af98b251043d929",
+    "/private/tmp/eredu-facade-shared-delivery-minimal.log": "12b4d01e8f0e346b44db15bbd3573561a68a653b2a8ce1ecf937bdcb1805a9c3",
+    "/private/tmp/eredu-facade-shared-delivery-new-tests.json": "02a3b6bcc326da0ce32f1e1bfc94fe856ce20cc203ee4254d62ad5e83b1f5028",
+    "/private/tmp/eredu-facade-shared-delivery-portable.log": "30b245b5b36540f633ddceba88fe0086b45bc518c620c802f5aaf19b1735dd18",
+    "/private/tmp/eredu-facade-shared-delivery-portable.log.prevalidation": "ee3770c3249b27432d6fdf4d3eba43dec8f9b7938c7d01d259e360f1c79430c6",
+    "/private/tmp/eredu-facade-shared-delivery-portable.log.prevalidation2": "ed7a46428f26f1a03e90cd0a41240abea2f4d2715a1af3fae606b33f777725be",
+    "/private/tmp/eredu-facade-shared-delivery-review-sha256.json": "55af6cf1cda5f1ff6513cec740304902ab031944e7d74bde33f9f1406301d660",
+    "/private/tmp/eredu-facade-shared-delivery-review.json": "0443fc8be4882a95ab9948573c05292ea609fee839f9333146d5ba697e5cc889",
+    "/private/tmp/eredu-facade-shared-delivery-review.md": "96eac3dc43b857f0a203c9015a48f08bb77f591437aa853781c21e0a9db9c196",
+    "/private/tmp/eredu-facade-shared-delivery-runtime.log": "090d7df0af6b4236d857698ebea899b95958b9b1ef5f0d6eaa2585468382c8f1",
+    "/private/tmp/eredu-facade-shared-delivery-runtime_integration.log": "803d48bc9f110766f3d2748fb9a8d96d0617dab43674535faa23ba75a99043df",
+    "/private/tmp/eredu-facade-shared-delivery-stage/README.md": "f236da655ef15c8f36b5c50c3f53f372614270115a80e9ad346db4c4906fc1d3",
+    "/private/tmp/eredu-facade-shared-delivery-stage/base-hashes.json": "38023984786c77be2024920ba066169c34cb2bb05c602c9f79765c8359fb3311",
+    "/private/tmp/eredu-facade-shared-delivery-stage/change.patch": "0263eff3c3e5284e6166e4ace61438a1a4970f6a3e31215b52f1c961d5417ac4",
+    "/private/tmp/eredu-facade-shared-delivery-stage/checks.json": "cce78ab9c1b1c4c7316e6ce84f6b734e69504e3257ea9f523f37fe90d76300b9",
+    "/private/tmp/eredu-facade-shared-delivery-stage/dependency-hashes.json": "6016c5586eae9a9b3680a4ad49dcff2742cdb79cf98dba56fa832319c1a46090",
+    "/private/tmp/eredu-facade-shared-delivery-stage/doc-additions/backend-architecture.md": "052d68210137a6e32fad8a25530720b775bbde790be25029092fa3b8113d8e03",
+    "/private/tmp/eredu-facade-shared-delivery-stage/doc-additions/bounded-inference.md": "f8083678208ab63b63c6e9cfc41b1997ff8119b0d39db60333476327bb910509",
+    "/private/tmp/eredu-facade-shared-delivery-stage/doc-additions/execution-control.md": "d2212fbf0023e915a6cb27190d41dcd9a7584fc3370a74bc18e13e345985aeed",
+    "/private/tmp/eredu-facade-shared-delivery-stage/doc-additions-hashes.json": "14576f6306e99d12800155ee29a97e721e55d18a0c42cf5ceb9006697dabfd07",
+    "/private/tmp/eredu-facade-shared-delivery-stage/files.txt": "0f1b3430080823016b7710288eb72a96cc3e67aeafda9ac16af98b251043d929",
+    "/private/tmp/eredu-facade-shared-delivery-stage/original-repository-base-hashes.json": "781b8a8c39c800aaa94d1d85de6ad0f90b49edc5413753e6108c681dea62e0b4",
+    "/private/tmp/eredu-facade-shared-delivery-stage/staged-hashes.json": "45b0122020b1c57db3df71704ad915a479060a700c6332324ff10ff69c2ac40d",
+    "/private/tmp/eredu-facade-shared-delivery-validate.py": "33ec9b08a49106a7c1808a39cda66b6683eec26d9fe5262e96c585e3ed5269e4"
+  },
+  "review": {
+    "review": "Root read production carrier/forwarding diff, full seven neutral tests and inactive parent fixture seams. Independently reviewed with both ordinary drain gaps corrected before freeze.",
+    "independent_review": "/private/tmp/eredu-facade-shared-delivery-review.md",
+    "behavior": [
+      "Actual shared frame moves through ordinary and controlled callback events; event clones retain same storage, borrowing does not export an owning raw frame.",
+      "Same wire tags/field order/nonfinite spelling, Deserialize remains raw-only. Public exhaustive Rust matches need additive variants.",
+      "Ready no-token terminal frames are delivered. Error paths attempt completion/drain even with empty plans and preserve original execution error over secondary drain failure.",
+      "Managed forwarding preserves pending/failed state through failure, raw parking and retained retry; successful drain cannot resume a failed continuation."
+    ],
+    "limits": [
+      "Mock retirement probes establish ownership, not original funding.",
+      "Facade provenance, event envelopes, decoder and journals remain physically unpriced; options/admission gates unchanged.",
+      "Encoded TraceBudget remains transport accounting, not a host admission proof."
+    ]
+  },
+  "behavior": [
+    "Managed continuation forwards the existing core retained drain, preserving failed state and pending ownership across retries.",
+    "Both facade token sources move legacy/shared capture carriers after exact completion into matching event variants, retaining original shared frame custody.",
+    "No-token terminal frames are delivered. Error paths drain even with empty plans and preserve the original execution error over secondary drain failure.",
+    "Shared event/record clones keep the same frame storage; borrowed accessors do not export an owning raw frame.",
+    "Shared event variants reuse existing wire tags and nonfinite encoding; deserialization produces legacy caller-owned records."
+  ],
+  "corrections": [
+    "The no-output controlled fixture passes GenerationControlHandle::default and borrows its actual cancellation token; initial type mismatch and constructor-arity diagnostics are archived."
+  ],
+  "limits": [
+    "Mock retirement probes validate ownership, not original funding. Complete facade source/envelope/decoder/journal/output admission remains unfinished; gates are unchanged.",
+    "Encoded TraceBudget tests measure transport bytes, not physical host memory.",
+    "Public exhaustive Rust event matches must handle the two additive shared variants.",
+    "No new native numerical/reference/process-memory measurement is included."
+  ]
+}

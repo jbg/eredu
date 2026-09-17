@@ -4,14 +4,21 @@
 //! machinery deliberately knows nothing about a model family: format profiles
 //! supply parsers and ordinary generation supplies committed tokenizer ids.
 
+use eredu_core::HostPreparationAuthority;
 use eredu_core::generation::{
-    FinishReason, GenerationCancellationToken, GenerationSequence, SemanticEvent,
-    TokenTerminalSignals,
+    FinishReason, GenerationCancellationToken, GenerationSequence, LegacyGenerationStorage,
+    SemanticEvent, TokenTerminalSignals,
 };
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::num::NonZeroUsize;
 
+#[cfg(test)]
+mod authority_tests;
+mod cursor_storage;
+use cursor_storage::CursorStorage;
+pub(crate) use cursor_storage::RetainedConsumerCursor;
+pub(crate) mod prepared_channels;
 mod snapshot;
 
 /// Canonical parser-owned representation of a tool call being assembled.
@@ -36,8 +43,8 @@ impl InProgressToolCall {
     fn start_event(&self) -> SemanticEvent {
         SemanticEvent::ToolCallStart {
             index: self.index,
-            id: self.id.clone(),
-            name: self.name.clone(),
+            id: self.id.clone().into(),
+            name: self.name.clone().into(),
         }
     }
 
@@ -45,7 +52,7 @@ impl InProgressToolCall {
         self.arguments.push_str(fragment);
         SemanticEvent::ToolArgumentsDelta {
             index: self.index,
-            json_fragment: fragment.to_owned(),
+            json_fragment: fragment.to_owned().into(),
         }
     }
 }
@@ -78,6 +85,20 @@ pub(crate) trait TokenDecoderBackend {
 
     fn finish(&mut self) -> Result<Vec<u8>, Self::Error> {
         Ok(Vec::new())
+    }
+}
+
+/// Marker for a pipeline whose only decoder lives in the original sequence.
+/// It contains no HF source/state. Accidental legacy dispatch rejects locally.
+#[derive(Debug)]
+pub(crate) struct OriginalProviderDecoder;
+impl TokenDecoderBackend for OriginalProviderDecoder {
+    type Error = eredu_core::GenerationDecoderError;
+    fn decode_token(&mut self, _: u32, _: bool) -> Result<Vec<u8>, Self::Error> {
+        Err(eredu_core::GenerationDecoderError::Unavailable)
+    }
+    fn finish(&mut self) -> Result<Vec<u8>, Self::Error> {
+        Err(eredu_core::GenerationDecoderError::Unavailable)
     }
 }
 
@@ -170,21 +191,29 @@ struct Utf8Buffer {
 }
 
 impl Utf8Buffer {
-    fn push(&mut self, bytes: &[u8]) -> Result<String, Utf8BufferError> {
+    fn push<'a>(&mut self, bytes: &'a [u8]) -> Result<std::borrow::Cow<'a, str>, Utf8BufferError> {
+        // Original provider suffixes are already UTF-8. With no partial legacy
+        // bytes, lend that exact input through the shared parser instead of
+        // allocating both a pending copy and an intermediate String.
+        if self.pending.is_empty() {
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                return Ok(std::borrow::Cow::Borrowed(text));
+            }
+        }
         self.pending.extend_from_slice(bytes);
 
         match std::str::from_utf8(&self.pending) {
             Ok(text) => {
                 let text = text.to_owned();
                 self.pending.clear();
-                Ok(text)
+                Ok(std::borrow::Cow::Owned(text))
             }
             Err(error) if error.error_len().is_none() => {
                 let valid_up_to = error.valid_up_to();
                 let valid = String::from_utf8(self.pending[..valid_up_to].to_vec())
                     .expect("from_utf8 reported this prefix as valid");
                 self.pending.drain(..valid_up_to);
-                Ok(valid)
+                Ok(std::borrow::Cow::Owned(valid))
             }
             Err(error) => Err(Utf8BufferError::Invalid {
                 valid_up_to: error.valid_up_to(),
@@ -250,28 +279,24 @@ impl StopMatcher {
         }
 
         self.pending.extend_from_slice(text.as_bytes());
-        if let Some((position, stop_index)) = self.first_match() {
-            let visible = String::from_utf8(self.pending[..position].to_vec())
-                .expect("stop matching preserves UTF-8 boundaries");
-            let matched = String::from_utf8(self.stops[stop_index].clone())
-                .expect("stop sequences are valid UTF-8");
+        let decision = eredu_text::stop_storage::decide(
+            std::str::from_utf8(&self.pending).expect("complete stop input"),
+            self.stops
+                .iter()
+                .map(|s| std::str::from_utf8(s).expect("UTF-8 stops")),
+        );
+        let visible = String::from_utf8(self.pending[decision.visible.clone()].to_vec())
+            .expect("stop matching preserves UTF-8 boundaries");
+        let matched = decision
+            .matched
+            .map(|index| String::from_utf8(self.stops[index].clone()).expect("UTF-8 stops"));
+        if matched.is_some() {
             self.pending.clear();
             self.matched = true;
-            return StopMatch {
-                visible,
-                matched: Some(matched),
-            };
+        } else {
+            self.pending.drain(..decision.pending.start);
         }
-
-        let lookbehind = self.longest_possible_stop_prefix();
-        let visible_len = self.pending.len() - lookbehind;
-        let visible = String::from_utf8(self.pending[..visible_len].to_vec())
-            .expect("stop matching preserves UTF-8 boundaries");
-        self.pending.drain(..visible_len);
-        StopMatch {
-            visible,
-            matched: None,
-        }
+        StopMatch { visible, matched }
     }
 
     fn finish(&mut self) -> String {
@@ -280,33 +305,6 @@ impl StopMatcher {
         }
         String::from_utf8(std::mem::take(&mut self.pending))
             .expect("stop matching preserves UTF-8 boundaries")
-    }
-
-    fn first_match(&self) -> Option<(usize, usize)> {
-        (0..self.pending.len()).find_map(|position| {
-            self.stops
-                .iter()
-                .position(|stop| self.pending[position..].starts_with(stop))
-                .map(|index| (position, index))
-        })
-    }
-
-    fn longest_possible_stop_prefix(&self) -> usize {
-        let max = self
-            .stops
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or_default()
-            .min(self.pending.len());
-        (1..=max)
-            .rev()
-            .find(|&length| {
-                self.stops
-                    .iter()
-                    .any(|stop| stop.starts_with(&self.pending[self.pending.len() - length..]))
-            })
-            .unwrap_or_default()
     }
 }
 
@@ -431,81 +429,25 @@ pub(crate) enum JsonFragmentError {
 #[derive(Debug, Default, Clone)]
 pub(crate) struct JsonFragmentBuffer {
     fragment: String,
-    depth: usize,
-    in_string: bool,
-    escaped: bool,
-    started: bool,
-    complete: bool,
+    cursor: eredu_text::json_fragments::FragmentCursor,
 }
-
 impl JsonFragmentBuffer {
     /// Appends input and returns `(consumed_bytes, complete)`.
     pub(crate) fn push(&mut self, input: &str) -> Result<(usize, bool), JsonFragmentError> {
-        if self.complete {
-            return if input.is_empty() {
-                Ok((0, true))
-            } else {
-                Err(JsonFragmentError::TrailingData)
-            };
-        }
-
-        let mut consumed = 0;
-        for character in input.chars() {
-            let character_len = character.len_utf8();
-            if !self.started {
-                if character.is_whitespace() {
-                    self.fragment.push(character);
-                    consumed += character_len;
-                    continue;
-                }
-                if !matches!(character, '{' | '[') {
-                    return Err(JsonFragmentError::MissingContainer);
-                }
-                self.started = true;
-                self.depth = 1;
-                self.fragment.push(character);
-                consumed += character_len;
-                continue;
-            }
-
-            self.fragment.push(character);
-            consumed += character_len;
-            if self.in_string {
-                if self.escaped {
-                    self.escaped = false;
-                } else if character == '\\' {
-                    self.escaped = true;
-                } else if character == '"' {
-                    self.in_string = false;
-                }
-                continue;
-            }
-
-            match character {
-                '"' => self.in_string = true,
-                '{' | '[' => self.depth += 1,
-                '}' | ']' => {
-                    self.depth -= 1;
-                    if self.depth == 0 {
-                        self.complete = true;
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        Ok((consumed, self.complete))
+        use eredu_text::json_fragments::FragmentError;
+        let fragment = &mut self.fragment;
+        self.cursor.push(input, |character| {
+            fragment.push(character);
+            Ok::<(), std::convert::Infallible>(())
+        }).map_err(|error| match error {
+            FragmentError::MissingContainer => JsonFragmentError::MissingContainer,
+            FragmentError::TrailingData => JsonFragmentError::TrailingData,
+            FragmentError::Append(never) => match never {},
+        })
     }
-
-    pub(crate) fn fragment(&self) -> &str {
-        &self.fragment
-    }
-
+    pub(crate) fn fragment(&self) -> &str { &self.fragment }
     #[cfg(test)]
-    fn is_complete(&self) -> bool {
-        self.complete
-    }
+    fn is_complete(&self) -> bool { self.cursor.is_complete() }
 }
 
 /// Sink offered to protocol parsers so semantic state and emitted events stay
@@ -540,14 +482,15 @@ impl SemanticEventSink {
     pub(crate) fn reasoning(&mut self, delta: impl Into<String>) {
         let delta = delta.into();
         if !delta.is_empty() {
-            self.events.push(SemanticEvent::ReasoningDelta(delta));
+            self.events
+                .push(SemanticEvent::ReasoningDelta(delta.into()));
         }
     }
 
     pub(crate) fn text(&mut self, delta: impl Into<String>) {
         let delta = delta.into();
         if !delta.is_empty() {
-            self.events.push(SemanticEvent::TextDelta(delta));
+            self.events.push(SemanticEvent::TextDelta(delta.into()));
         }
     }
 
@@ -806,7 +749,14 @@ impl ProtocolParser for TextParser {
     }
 
     fn push(&mut self, text: &str, sink: &mut SemanticEventSink) -> Result<(), String> {
-        sink.text(text);
+        for event in eredu_core::GenerationPlainTextEvents::new(text, None) {
+            match event {
+                eredu_core::GenerationPlainTextEvent::TextDelta(text) => sink.text(text),
+                eredu_core::GenerationPlainTextEvent::Finished { .. } => {
+                    unreachable!("text-only batch")
+                }
+            }
+        }
         Ok(())
     }
 
@@ -818,6 +768,8 @@ impl ProtocolParser for TextParser {
 /// Independent text or protocol parsing state for one prepared generation.
 pub(crate) struct ToolRuntimeParser {
     stream: SemanticStream<Box<dyn ProtocolParser<Error = String>>>,
+    // Protocol state, stop buffers, events, and schemas retire before custody.
+    host_preparation: HostPreparationAuthority,
 }
 
 impl fmt::Debug for ToolRuntimeParser {
@@ -845,6 +797,7 @@ impl ToolRuntimeParser {
                 sink: self.stream.sink.clone(),
                 finished: self.stream.finished,
             },
+            host_preparation: self.host_preparation.clone(),
         })
     }
 
@@ -870,13 +823,44 @@ impl ToolRuntimeParser {
                 caller_stops,
                 structural_stop_spellings,
             ),
+            host_preparation: HostPreparationAuthority::unmanaged(),
         }
     }
 
+    /// Retains authority acquired before constructing this parser. Combining
+    /// custody also preserves prior domains if an already-owned parser is used.
+    pub(crate) fn with_host_preparation(mut self, authority: HostPreparationAuthority) -> Self {
+        self.host_preparation =
+            HostPreparationAuthority::retain((self.host_preparation.clone(), authority));
+        self
+    }
+
+    pub(crate) fn host_preparation(&self) -> &HostPreparationAuthority {
+        &self.host_preparation
+    }
+
     pub(crate) fn with_tool_schemas(mut self, tools: &[serde_json::Value]) -> Result<Self, String> {
-        self.stream.sink.tool_schemas =
-            Some(crate::runtime::chat::tool_schema::ToolSchemas::new(tools)?);
+        self.stream.sink.tool_schemas = Some(
+            crate::runtime::chat::tool_schema::ToolSchemas::new_under_authority(
+                tools,
+                &self.host_preparation,
+            )?,
+        );
         Ok(self)
+    }
+
+    pub(crate) fn with_tool_schemas_under_authority(
+        self,
+        tools: &[serde_json::Value],
+        authority: &HostPreparationAuthority,
+    ) -> Result<Self, String> {
+        // Preserve the existing parser/validator domain through replacement or
+        // failure; the new shared validator owner also retains its own custody.
+        let mut parser = self.with_host_preparation(authority.clone());
+        parser.stream.sink.tool_schemas = Some(
+            crate::runtime::chat::tool_schema::ToolSchemas::new_under_authority(tools, authority)?,
+        );
+        Ok(parser)
     }
 
     #[cfg(test)]
@@ -945,6 +929,8 @@ pub(crate) struct CommittedTokenPipeline<D> {
 pub(crate) enum CommittedTokenPipelineError<E> {
     /// The tokenizer-specific decoder rejected the token stream.
     Decoder(E),
+    /// The original provider's fixed decoder rejected this transition.
+    OriginalDecoder(eredu_core::GenerationDecoderError),
     /// UTF-8 assembly or semantic protocol parsing failed.
     Semantic(String),
 }
@@ -959,6 +945,7 @@ impl<E: fmt::Display> fmt::Display for CommittedTokenPipelineError<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Decoder(error) => write!(formatter, "token decoding failed: {error}"),
+            Self::OriginalDecoder(error) => fmt::Display::fmt(error, formatter),
             Self::Semantic(error) => formatter.write_str(error),
         }
     }
@@ -968,6 +955,12 @@ impl<D> CommittedTokenPipeline<D>
 where
     D: TokenDecoderBackend,
 {
+    /// Shared custody for enclosing facade state created by the same guarded
+    /// semantic preparation. Borrowing this token does not admit new copies.
+    pub(crate) fn host_preparation(&self) -> &HostPreparationAuthority {
+        self.parser.host_preparation()
+    }
+
     /// Independent copy including bytes not yet decoded as UTF-8, stop lookbehind,
     /// parser state and any records awaiting delivery. No token is consumed.
     pub(crate) fn fork(&self) -> Result<Self, String>
@@ -999,16 +992,15 @@ where
             .decoder
             .push(token_id)
             .map_err(CommittedTokenPipelineError::Decoder)?;
-        let text = self
-            .utf8
-            .push(&raw.bytes)
-            .map_err(|error| CommittedTokenPipelineError::Semantic(error.to_string()))?;
-        let mut matched = self.parser.push(&text)?;
-        if raw.structural {
-            if let Some(spelling) = raw.structural_spelling.as_deref() {
-                matched = self.parser.push_structural(raw.token_id, spelling)?;
-            }
-        }
+        let matched = Self::consume_decoded(
+            &mut self.utf8,
+            &mut self.parser,
+            raw.token_id,
+            &raw.bytes,
+            raw.structural
+                .then_some(raw.structural_spelling.as_deref())
+                .flatten(),
+        )?;
         self.drain_into(emit);
         Ok(matched)
     }
@@ -1025,16 +1017,15 @@ where
             .decoder
             .push(token_id)
             .map_err(CommittedTokenPipelineError::Decoder)?;
-        let text = self
-            .utf8
-            .push(&raw.bytes)
-            .map_err(|error| CommittedTokenPipelineError::Semantic(error.to_string()))?;
-        let mut matched = self.parser.push(&text)?;
-        if raw.structural {
-            if let Some(spelling) = raw.structural_spelling.as_deref() {
-                matched = self.parser.push_structural(raw.token_id, spelling)?;
-            }
-        }
+        let matched = Self::consume_decoded(
+            &mut self.utf8,
+            &mut self.parser,
+            raw.token_id,
+            &raw.bytes,
+            raw.structural
+                .then_some(raw.structural_spelling.as_deref())
+                .flatten(),
+        )?;
         let cancelled = if matched {
             // A decoded stop is already terminal before callbacks observe its
             // events. Preserve that normal terminal event even if a callback
@@ -1047,6 +1038,63 @@ where
         Ok((matched, cancelled))
     }
 
+    // One decoded-input consumption path for both the legacy adapter and the
+    // source-contained provider. Parser/UTF8/event allocations remain outside
+    // decoder admission; the provider suffix itself is never copied into a Vec.
+    fn consume_decoded(
+        utf8: &mut Utf8Buffer,
+        parser: &mut ToolRuntimeParser,
+        token_id: u32,
+        bytes: &[u8],
+        structural_spelling: Option<&str>,
+    ) -> Result<bool, CommittedTokenPipelineError<D::Error>> {
+        let text = utf8
+            .push(bytes)
+            .map_err(|error| CommittedTokenPipelineError::Semantic(error.to_string()))?;
+        let mut matched = parser.push(&text)?;
+        if let Some(spelling) = structural_spelling {
+            matched = parser.push_structural(token_id, spelling)?;
+        }
+        Ok(matched)
+    }
+    fn push_original_cancellable(
+        &mut self,
+        token_id: u32,
+        decoded: Result<Option<&str>, eredu_core::GenerationDecoderError>,
+        cancellation: &GenerationCancellationToken,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<(bool, bool), CommittedTokenPipelineError<D::Error>> {
+        let suffix = decoded.map_err(CommittedTokenPipelineError::OriginalDecoder)?;
+        let spelling = self
+            .decoder
+            .structural_token_spellings
+            .get(&token_id)
+            .map(String::as_str);
+        let bytes = if spelling.is_some() {
+            &[][..]
+        } else {
+            suffix.unwrap_or("").as_bytes()
+        };
+        let matched =
+            Self::consume_decoded(&mut self.utf8, &mut self.parser, token_id, bytes, spelling)?;
+        let cancelled = if matched {
+            self.drain_into(emit);
+            cancellation.is_cancelled()
+        } else {
+            self.drain_until_cancelled(cancellation, emit)
+        };
+        Ok((matched, cancelled))
+    }
+    fn finish_original(
+        &mut self,
+        local: Result<(), eredu_core::GenerationDecoderError>,
+        reason: FinishReason,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<(), CommittedTokenPipelineError<D::Error>> {
+        local.map_err(CommittedTokenPipelineError::OriginalDecoder)?;
+        self.finish_decoded(&[], reason, emit)
+    }
+
     /// Finalizes parsing exactly once and immediately delivers buffered events.
     pub(crate) fn finish(
         &mut self,
@@ -1057,9 +1105,17 @@ where
             .decoder
             .finish()
             .map_err(CommittedTokenPipelineError::Decoder)?;
+        self.finish_decoded(&trailing, reason, emit)
+    }
+    fn finish_decoded(
+        &mut self,
+        trailing: &[u8],
+        reason: FinishReason,
+        emit: &mut impl FnMut(SemanticEvent),
+    ) -> Result<(), CommittedTokenPipelineError<D::Error>> {
         let text = self
             .utf8
-            .push(&trailing)
+            .push(trailing)
             .map_err(|error| CommittedTokenPipelineError::Semantic(error.to_string()))?;
         self.parser.push(&text)?;
         std::mem::take(&mut self.utf8)
@@ -1102,7 +1158,10 @@ where
 pub(crate) trait CommittedTokenSource {
     type Error;
 
-    fn next_token(&mut self) -> Result<Option<u32>, Self::Error>;
+    fn next_token(
+        &mut self,
+        cancellation: &GenerationCancellationToken,
+    ) -> Result<Option<u32>, Self::Error>;
 
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error>;
 
@@ -1128,11 +1187,13 @@ pub(crate) trait CommittedTokenSource {
 /// In particular, `Source` preserves the selected backend's concrete error;
 /// callers never need to recover backend identity from a formatted message.
 #[derive(Debug)]
-pub(crate) enum CommittedGenerationError<S, D> {
+pub(crate) enum CommittedGenerationError<S, D, P = std::convert::Infallible> {
     /// Model submission, completion, token extraction, or constraint control failed.
     Source(S),
     /// Token decoding or semantic event construction failed.
     Pipeline(CommittedTokenPipelineError<D>),
+    /// Original retained token preparation failed with its owner intact.
+    Preparation(P),
     /// Portable generation lifecycle state was invalid.
     Lifecycle(eredu_core::generation::GenerationError),
     /// Bounded host-record delivery failed after native computation completed.
@@ -1141,12 +1202,15 @@ pub(crate) enum CommittedGenerationError<S, D> {
     MissingTerminalToken,
 }
 
-/// Rewindable ordinary commitment state. One-shot and controllable generation
-/// use this same token/semantic/termination boundary. Sampler, controller and
-/// native state stay with the source; incremental decoding stays in the pipeline.
-#[derive(Clone)]
-pub(crate) struct CommittedGenerationCursor {
-    sequence: GenerationSequence,
+/// Shared commitment state for legacy or original retained token storage.
+/// One-shot and controllable stepping use the same algorithm. Only the legacy
+/// specialization supports Clone/snapshot; source and pipeline ownership stay
+/// outside this cursor and still require their original facade admission.
+#[derive(Debug)]
+pub(crate) struct CommittedGenerationCursor<S: CursorStorage = LegacyGenerationStorage> {
+    // Taken only for consuming core preparation. Its typed failure owns the
+    // same sequence; no replacement or cloned provider is installed here.
+    sequence: Option<GenerationSequence<S>>,
     finish_reason: Option<FinishReason>,
     failed: bool,
 }
@@ -1154,19 +1218,36 @@ pub(crate) struct CommittedGenerationCursor {
 impl CommittedGenerationCursor {
     pub(crate) fn new(eos_token_ids: &[u32], max_tokens: NonZeroUsize) -> Self {
         Self {
-            sequence: GenerationSequence::new(max_tokens.get(), eos_token_ids.iter().copied()),
+            sequence: Some(GenerationSequence::new(
+                max_tokens.get(),
+                eos_token_ids.iter().copied(),
+            )),
             finish_reason: None,
             failed: false,
         }
     }
+}
 
+impl Clone for CommittedGenerationCursor {
+    fn clone(&self) -> Self {
+        Self {
+            sequence: self.sequence.clone(),
+            finish_reason: self.finish_reason,
+            failed: self.failed,
+        }
+    }
+}
+
+impl<S: CursorStorage> CommittedGenerationCursor<S> {
     pub(crate) fn finish_reason(&self) -> Option<FinishReason> {
         self.finish_reason
     }
 
     /// Canonical history, including terminal special tokens.
     pub(crate) fn token_ids(&self) -> &[u32] {
-        self.sequence.tokens()
+        self.sequence
+            .as_ref()
+            .map_or(&[], GenerationSequence::tokens)
     }
 
     /// Advances at most one committed prediction, including its semantic events.
@@ -1178,10 +1259,24 @@ impl CommittedGenerationCursor {
         pipeline: &mut CommittedTokenPipeline<D>,
         cancellation: &GenerationCancellationToken,
         emit: &mut impl FnMut(SemanticEvent),
-    ) -> Result<(), CommittedGenerationError<T::Error, D::Error>>
+    ) -> Result<(), CommittedGenerationError<T::Error, D::Error, S::PreparationError>>
     where
         D: TokenDecoderBackend,
         T: CommittedTokenSource,
+    {
+        self.step_pipeline(source, pipeline, cancellation, emit)
+    }
+
+    fn step_pipeline<T, P>(
+        &mut self,
+        source: &mut T,
+        pipeline: &mut P,
+        cancellation: &GenerationCancellationToken,
+        emit: &mut impl for<'event> FnMut(P::Event<'event>),
+    ) -> Result<(), CommittedGenerationError<T::Error, P::DecoderError, S::PreparationError>>
+    where
+        T: CommittedTokenSource,
+        P: CursorPipeline<S>,
     {
         if self.failed {
             return Err(CommittedGenerationError::Lifecycle(
@@ -1194,17 +1289,26 @@ impl CommittedGenerationCursor {
             ));
         }
         let result = (|| {
+            // Preserve delivery failure precedence. Materialize at most the
+            // original provider's one dormant attempt before the SAME readiness
+            // call, and let that call retain the concrete local failure.
+
+            let local = source.delivery_failure().map_or_else(
+                || self.prepare_sequence(cancellation),
+                |error| Err(CommittedGenerationError::Delivery(error)),
+            );
+
             let ready = source.finish_step(
-                source.delivery_failure().map_or(Ok(()), |error| {
-                    Err(CommittedGenerationError::Delivery(error))
-                }),
+                local,
                 cancellation.is_cancelled(),
                 CommittedGenerationError::Source,
             )?;
             if ready.is_none() {
                 cancellation.cancel();
             }
+
             let result = self.step_inner(source, pipeline, cancellation, emit);
+
             let result = result.and_then(|()| {
                 source.delivery_failure().map_or(Ok(()), |error| {
                     Err(CommittedGenerationError::Delivery(error))
@@ -1218,7 +1322,7 @@ impl CommittedGenerationCursor {
             if ready.is_none() {
                 cancellation.cancel();
                 if self.finish_reason.is_none() {
-                    self.sequence.cancel();
+                    self.sequence.as_mut().expect("ready sequence").cancel();
                     pipeline.cancel(emit);
                     self.finish_reason = Some(FinishReason::Cancelled);
                 }
@@ -1234,46 +1338,93 @@ impl CommittedGenerationCursor {
             }
             Ok(())
         })();
+
         if result.is_err() {
             self.failed = true;
         }
         result
     }
 
-    fn step_inner<D, T>(
+    fn prepare_sequence<E, D>(
+        &mut self,
+        cancellation: &GenerationCancellationToken,
+    ) -> Result<(), CommittedGenerationError<E, D, S::PreparationError>> {
+        let sequence = self
+            .sequence
+            .as_ref()
+            .expect("live sequence before readiness");
+        if cancellation.is_cancelled() || sequence.is_finished() {
+            return Ok(());
+        }
+        // A provider panic cannot leave a reusable cursor with a missing owner.
+        // Core owns the taken provider throughout callbacks and unwinding.
+
+        self.failed = true;
+        let sequence = self
+            .sequence
+            .take()
+            .expect("live sequence before readiness");
+        self.sequence = Some(S::prepare(sequence).map_err(CommittedGenerationError::Preparation)?);
+
+        self.failed = false;
+        Ok(())
+    }
+
+    fn step_inner<T, P>(
         &mut self,
         source: &mut T,
-        pipeline: &mut CommittedTokenPipeline<D>,
+        pipeline: &mut P,
         cancellation: &GenerationCancellationToken,
-        emit: &mut impl FnMut(SemanticEvent),
-    ) -> Result<(), CommittedGenerationError<T::Error, D::Error>>
+        emit: &mut impl for<'event> FnMut(P::Event<'event>),
+    ) -> Result<(), CommittedGenerationError<T::Error, P::DecoderError, S::PreparationError>>
     where
-        D: TokenDecoderBackend,
+        P: CursorPipeline<S>,
         T: CommittedTokenSource,
     {
-        if self.sequence.observe_cancellation(cancellation) {
+        let sequence = self.sequence.as_mut().expect("ready sequence");
+        if sequence.observe_cancellation(cancellation) {
             pipeline.cancel(emit);
             self.finish_reason = Some(FinishReason::Cancelled);
             return Ok(());
         }
-        let token_id = source
-            .next_token()
+        // Zero-output sequences settle through the same readiness/disposition
+        // calls while making no token request or token-slot allocation.
+        if let Some(reason) = sequence.finish_reason() {
+            pipeline
+                .finish(sequence, reason, emit)
+                .map_err(CommittedGenerationError::Pipeline)?;
+            self.finish_reason = Some(reason);
+            return Ok(());
+        }
+
+        let token_id = match source
+            .next_token(cancellation)
             .map_err(CommittedGenerationError::Source)?
-            .ok_or(CommittedGenerationError::MissingTerminalToken)?;
+        {
+            Some(token) => token,
+            None if sequence.observe_cancellation(cancellation) => {
+                pipeline.cancel(emit);
+                self.finish_reason = Some(FinishReason::Cancelled);
+                return Ok(());
+            }
+            None => return Err(CommittedGenerationError::MissingTerminalToken),
+        };
+
         let (stop_matched, cancelled_during_delivery) = pipeline
-            .push_cancellable(token_id, cancellation, emit)
+            .push(sequence, token_id, cancellation, emit)
             .map_err(CommittedGenerationError::Pipeline)?;
         if cancelled_during_delivery && !stop_matched {
-            self.sequence
+            sequence
                 .commit(token_id, TokenTerminalSignals::default())
                 .map_err(CommittedGenerationError::Lifecycle)?;
-            self.sequence.cancel();
+            sequence.cancel();
             pipeline.cancel(emit);
             // Preserve the established callback-cancellation outcome even when
             // the simultaneously committed token also exhausted the budget.
             self.finish_reason = Some(FinishReason::Cancelled);
             return Ok(());
         }
+
         let grammar_complete = if stop_matched {
             false
         } else {
@@ -1281,8 +1432,8 @@ impl CommittedGenerationCursor {
                 .grammar_is_complete()
                 .map_err(CommittedGenerationError::Source)?
         };
-        let reason = self
-            .sequence
+
+        let reason = sequence
             .commit(
                 token_id,
                 TokenTerminalSignals {
@@ -1294,7 +1445,7 @@ impl CommittedGenerationCursor {
             .finish_reason;
         if let Some(reason) = reason {
             pipeline
-                .finish(reason, emit)
+                .finish(sequence, reason, emit)
                 .map_err(CommittedGenerationError::Pipeline)?;
             self.finish_reason = Some(reason);
         }
@@ -1324,7 +1475,13 @@ where
     let reason = cursor
         .finish_reason()
         .expect("generation reached its terminal boundary");
-    Ok((cursor.sequence.into_tokens(), reason))
+    Ok((
+        cursor
+            .sequence
+            .expect("terminal legacy sequence")
+            .into_tokens(),
+        reason,
+    ))
 }
 
 #[cfg(test)]
@@ -1332,11 +1489,11 @@ mod tests {
     use std::{cell::Cell, collections::VecDeque, convert::Infallible, num::NonZeroUsize, rc::Rc};
 
     use super::{
-        drive_committed_generation_cancellable, CommittedTokenPipeline, CommittedTokenSource,
-        FinishReason, GenerationCancellationToken, JsonFragmentBuffer, PartialPatternBuffer,
-        PatternKind, PatternPiece, ProtocolParser, RawTokenDecoder, SemanticEvent,
-        SemanticEventSink, SemanticStream, StopMatcher, TokenDecoderBackend, ToolRuntimeParser,
-        Utf8Buffer, Utf8BufferError,
+        CommittedTokenPipeline, CommittedTokenSource, FinishReason, GenerationCancellationToken,
+        JsonFragmentBuffer, PartialPatternBuffer, PatternKind, PatternPiece, ProtocolParser,
+        RawTokenDecoder, SemanticEvent, SemanticEventSink, SemanticStream, StopMatcher,
+        TokenDecoderBackend, ToolRuntimeParser, Utf8Buffer, Utf8BufferError,
+        drive_committed_generation_cancellable,
     };
 
     const REASONING_START: &str = "<r>";
@@ -1520,6 +1677,32 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn complete_utf8_fragments_lend_input_without_retaining_scratch() {
+        use std::borrow::Cow;
+        let mut buffer = Utf8Buffer::default();
+        for text in ["", "ASCII", "café 東京 🦀", "<stop>"] {
+            let output = buffer.push(text.as_bytes()).unwrap();
+            assert!(matches!(output, Cow::Borrowed(_)));
+            assert_eq!(output.as_ptr(), text.as_ptr());
+            assert_eq!(output, text);
+            assert_eq!(buffer.pending.capacity(), 0);
+        }
+        // Legacy byte fragments still join before delivery. Once that exact
+        // frontier is complete, later whole fragments can be borrowed again.
+        assert_eq!(buffer.push(&[0xf0, 0x9f]).unwrap(), "");
+        let output = buffer.push(&[0xa6, 0x80]).unwrap();
+        assert!(matches!(output, Cow::Owned(_)));
+        assert_eq!(output, "🦀");
+        let capacity = buffer.pending.capacity();
+        let text = "following text";
+        let output = buffer.push(text.as_bytes()).unwrap();
+        assert!(matches!(output, Cow::Borrowed(_)));
+        assert_eq!(output.as_ptr(), text.as_ptr());
+        assert_eq!(buffer.pending.capacity(), capacity);
+        buffer.finish().unwrap();
     }
 
     #[test]
@@ -1819,10 +2002,12 @@ mod tests {
                     id: "id".into(),
                     name: "name".into(),
                 }));
-                assert!(!stream
-                    .events()
-                    .iter()
-                    .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+                assert!(
+                    !stream
+                        .events()
+                        .iter()
+                        .any(|event| matches!(event, SemanticEvent::ToolCallEnd))
+                );
                 assert_eq!(
                     stream.events().last(),
                     Some(&SemanticEvent::Finished {
@@ -1876,7 +2061,10 @@ mod tests {
     impl CommittedTokenSource for SyntheticModel {
         type Error = Infallible;
 
-        fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
+        fn next_token(
+            &mut self,
+            _cancellation: &GenerationCancellationToken,
+        ) -> Result<Option<u32>, Self::Error> {
             self.next_calls.set(self.next_calls.get() + 1);
             Ok(self.tokens.pop_front())
         }
@@ -2039,12 +2227,16 @@ mod tests {
         assert_eq!(reason, FinishReason::Cancelled);
         assert_eq!(tokens.len(), calls);
         assert!(tokens.len() < input.len());
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, SemanticEvent::ToolCallStart { .. })));
-        assert!(!events
-            .iter()
-            .any(|event| matches!(event, SemanticEvent::ToolCallEnd)));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::ToolCallStart { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SemanticEvent::ToolCallEnd))
+        );
         assert_exactly_one_finished(&events, FinishReason::Cancelled);
     }
 
@@ -2327,12 +2519,17 @@ mod tests {
             let _saved_pipeline = pipeline.fork().unwrap();
             assert_eq!(calls.get(), before + 1);
         }
-        assert_eq!(cursor.sequence.tokens(), expected_ids);
+        assert_eq!(cursor.token_ids(), expected_ids);
         assert_eq!(cursor.finish_reason(), Some(expected_reason));
         assert_eq!(events, expected_events);
-        assert!(cursor
-            .step(&mut source, &mut pipeline, &cancellation, &mut |_| {})
-            .is_err());
+        assert!(
+            cursor
+                .step(&mut source, &mut pipeline, &cancellation, &mut |_| {})
+                .is_err()
+        );
         assert_eq!(calls.get(), expected_ids.len());
     }
 }
+
+mod pipeline;
+use pipeline::CursorPipeline;

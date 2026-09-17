@@ -5,6 +5,7 @@ mod config;
 pub mod hybrid;
 mod moe;
 mod parallel;
+pub(crate) use parallel::routed_layer_parallel_parameter_groups_with_metadata;
 pub mod vision;
 pub mod vl;
 
@@ -98,19 +99,35 @@ pub fn new_block<B: NeuralBackend>(
     <QwenBlockFactory as crate::decoder::BlockFactory<B, ModelArgs>>::build(args, layer, context)
 }
 
+fn validate_dense_config(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<(), Error> {
+    if args.is_moe() {
+        return Err(metadata.error(format_args!(
+            "dense Qwen construction does not accept a routed MoE configuration"
+        )));
+    }
+    Ok(())
+}
+
 impl<B> crate::decoder::BlockFactory<B, ModelArgs> for QwenBlockFactory
 where
     B: NeuralBackend,
 {
+    // Shared causal attention and row-local RMS norms, SiLU MLP and residuals.
+    const CAUSAL_PREFILL_ROWS: bool = true;
+
     type FeedForward = Mlp<B>;
 
     fn validate(args: &ModelArgs) -> Result<(), Error> {
-        if args.is_moe() {
-            return Err(Error::backend(
-                "dense Qwen construction does not accept a routed MoE configuration",
-            ));
-        }
-        Ok(())
+        validate_dense_config(args, crate::decoder::identity::Metadata::new(None))
+    }
+    fn validate_with_metadata(
+        args: &ModelArgs,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), Error> {
+        validate_dense_config(args, crate::decoder::identity::Metadata::new(Some(context)))
     }
 
     fn build(
@@ -118,7 +135,10 @@ where
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TransformerBlock<B>, Error> {
-        <Self as crate::decoder::BlockFactory<B, ModelArgs>>::validate(args)?;
+        validate_dense_config(
+            args,
+            crate::decoder::identity::Metadata::new(B::construction_metadata(context)),
+        )?;
         assemble_block(args, layer, Mlp::new(args, layer, context)?, context)
     }
 
@@ -128,6 +148,18 @@ where
         layer: usize,
     ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
         parallel::layer_parallel_parameter_groups(block, args, layer)
+    }
+    fn parameter_groups_with_metadata(
+        block: &crate::decoder::TransformerBlock<B, Self::FeedForward>,
+        args: &ModelArgs,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Option<Result<Vec<eredu_runtime::ParameterGroupSpec>, Error>> {
+        Some(
+            crate::decoder::layer_parallel_parameter_groups_with_metadata(
+                block, args, layer, context,
+            ),
+        )
     }
 }
 
@@ -197,7 +229,30 @@ impl<B> crate::decoder::BlockFactory<B, ModelArgs> for RoutedQwenBlockFactory
 where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
+    // The dense alternative and per-token softmax/top-k expert mixture preserve
+    // ordinary causal rows; routing has no cross-token capacity/drop equation.
+    const CAUSAL_PREFILL_ROWS: bool = true;
+
     type FeedForward = FeedForward<B>;
+
+    fn append_component_prefill_observations(
+        args: &ModelArgs, unit_path: &str, _layer: usize,
+        declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+    ) {
+        // Same selected Dense/Routed branch as this factory's FeedForward.
+        // Sparse units retain the separately declared routed bank semantics.
+        if !args.is_moe() {
+            <Mlp<B> as crate::decoder::DecoderProjectionOperator<B>>::append_component_prefill_observations(
+                unit_path, declarations);
+        }
+    }
+
+    fn validate_with_metadata(
+        _config: &ModelArgs,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
 
     fn build(
         args: &ModelArgs,
@@ -238,6 +293,15 @@ where
         layer: usize,
     ) -> Result<Vec<eredu_runtime::ParameterGroupSpec>, eredu_runtime::ParallelPlanError> {
         parallel::routed_layer_parallel_parameter_groups(block, args, layer)
+    }
+
+    fn parameter_groups_with_metadata(
+        block: &RoutedTransformerBlock<B>, args: &ModelArgs, layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Option<Result<Vec<eredu_runtime::ParameterGroupSpec>, Error>> {
+        Some(parallel::routed_layer_parallel_parameter_groups_with_metadata(
+            block, args, layer, Some(context),
+        ))
     }
 }
 

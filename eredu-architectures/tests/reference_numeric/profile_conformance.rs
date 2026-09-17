@@ -26,7 +26,7 @@ impl
     fn visit<A>(
         self,
         prepared: PreparedReplicatedTextArchitecture<A>,
-        checkpoint: SharedCheckpointSource,
+        checkpoint: RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<
@@ -103,9 +103,10 @@ fn one_profile_conversion_changes_only_its_typed_visitor() {
             &capabilities,
         )
         .unwrap();
-        let checkpoint: SharedCheckpointSource = Arc::new(
+        let checkpoint: RetainedCheckpointSource = Arc::new(
             eredu_checkpoint::store::SafetensorsWeightStore::open(artifact.path()).unwrap(),
-        );
+        )
+        .into();
         let context = NumericContext::default();
         let tokens = NumericTensor::token_ids(&[1, 3, 2]);
         let events = Rc::new(RefCell::new(Vec::new()));

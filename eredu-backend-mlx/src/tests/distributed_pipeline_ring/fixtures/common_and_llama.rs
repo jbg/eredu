@@ -20,7 +20,7 @@ fn write_f32_shard(path: &Path, tensors: &[(&str, Vec<usize>, f32)]) {
     serialize_to_file(views, None, path).unwrap();
 }
 
-fn write_fixture(directory: &Path) {
+pub(crate) fn write_fixture(directory: &Path) {
     write_llama_compatible_fixture(directory, "llama");
 }
 

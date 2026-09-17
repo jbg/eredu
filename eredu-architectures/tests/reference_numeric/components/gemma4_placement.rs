@@ -366,7 +366,12 @@ fn run_placements(
                     let workers=(0..topology.world_size()).map(|rank| {
                             let (inspection,parameters,inputs,plan,descriptor)=(&inspection,&parameters,&inputs,&plan,&descriptor);
                             let world=world.clone();
-                            scope.spawn(move || {
+                            // Keep the deep typed constructor on the same explicit
+                            // fixture stack convention as the reference wrappers.
+                            std::thread::Builder::new()
+                                .name(format!("reference-gemma4-components-{rank}"))
+                                .stack_size(32 * 1024 * 1024)
+                                .spawn_scoped(scope, move || {
                                 let sources=partitioned_adapter::prepare_plan_with_banks_and_sequence_maximum(inspection,plan,rank,std::time::Duration::from_secs(30),
                                     independent.then(||ParameterBankLoadOptions::new(eredu_core::residency::OffloadConfig::new(Some(bank_budget),Some(1<<20),1).unwrap(),bank_budget,bank_budget).unwrap()),maximum_sequence).unwrap();
                                 let component_layout=sources.selected().execution().component_partition_layout(descriptor,parameters).unwrap().unwrap();
@@ -394,7 +399,7 @@ fn run_placements(
                                     if tp==1 && pp==1 {assert!(evidence.bank_evictions>0);}
                                 }
                                 trials
-                            })
+                            }).expect("spawn reference Gemma4 rank worker")
                         }).collect::<Vec<_>>();
                     workers
                         .into_iter()
@@ -514,11 +519,12 @@ fn serial_reference(
             let mut unit=<Model as LayeredArchitecture<NumericBackend,State>>::build_unit(&model,group,index,&context).unwrap();
             unit.visit_parameters_mut(&mut Populate(&parameters)); unit
         }).collect();
+        let admission=<Model as CompositeArchitecture<NumericBackend,State>>::admission_config(&model);
         let mut runtime=LayerwiseRuntime::new(model,ResidentUnitWindow::new(units));
         let mut state=State::create(gemma4::state_layout(&args.text).unwrap(),|_,policy|Ok::<_,Error>(NumericHybridLayerState::new(policy))).unwrap();
         let masks=masks(mode);
         inputs.iter().enumerate().map(|(step,input)| {
-            let admitted=<Model as CompositeArchitecture<NumericBackend,State>>::admit_prepared_input(&args,input,&NumericInputInspector).unwrap();
+            let admitted=<Model as CompositeArchitecture<NumericBackend,State>>::admit_prepared_input(&admission,input,&NumericInputInspector).unwrap();
             let ingress=gemma4::prepare_composite_ingress::<NumericBackend>(PreparedCompositeInput::new(input,&admitted).unwrap(),&context).unwrap();
             let mut observer=observer(mode,step,&masks,None,Some(&parameters));
             let parts=ingress.decoder_parts();
@@ -770,7 +776,12 @@ fn gemma4_selected_transforms_retain_source_geometry_and_cached_execution() {
                         let workers = (0..topology.world_size()).map(|rank| {
                             let (inspection,plan,args,parameters) = (&inspection,&plan,&args,&parameters);
                             let world = world.clone();
-                            scope.spawn(move || {
+                            // Keep the deep typed constructor on the same explicit
+                            // fixture stack convention as the reference wrappers.
+                            std::thread::Builder::new()
+                                .name(format!("reference-gemma4-selected-transform-{rank}"))
+                                .stack_size(32 * 1024 * 1024)
+                                .spawn_scoped(scope, move || {
                                 let sources = partitioned_adapter::prepare_plan(inspection,plan,rank,std::time::Duration::from_secs(30)).unwrap();
                                 let selected = sources.selected().execution().text_realization();
                                 assert!(selected.parameters().iter().any(|p| matches!(p.lowering(),eredu_runtime::WeightLoweringKind::Transform|eredu_runtime::WeightLoweringKind::DerivedTransform)));
@@ -791,7 +802,7 @@ fn gemma4_selected_transforms_retain_source_geometry_and_cached_execution() {
                                 [image_input(),numeric_text_prepared_input(&[3]),numeric_text_prepared_input(&[4])].iter().enumerate().map(|(step,input)| {
                                     executable.forward_observed(input,step==0,&mut NumericLifecycleObserver::default()).unwrap()
                                 }).collect::<Vec<_>>()
-                            })
+                            }).expect("spawn reference Gemma4 rank worker")
                         }).collect::<Vec<_>>();
                         workers
                             .into_iter()

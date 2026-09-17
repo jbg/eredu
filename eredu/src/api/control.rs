@@ -3,9 +3,7 @@
 use super::{
     loaded::map_prepared_chat_setup_error,
     observed::{new_identity, TraceBudget},
-    request::{
-        prepared_chat_control_runtime, prepared_text_control_runtime, PreparedChatTokenDecoder,
-    },
+    request::{PreparedChatTokenDecoder, PreparedGenerationMode},
     ConstraintError, LoadedModel, ObservedGenerationEvent, ObservedGenerationRecord,
     PreparedChatError, PreparedObservedGeneration,
 };
@@ -27,7 +25,15 @@ enum OutputMode {
     Text,
 }
 
+mod prepared;
+mod records;
+use prepared::StartupPolicy;
+pub use prepared::*;
+pub use records::*;
+use records::{BranchInfo, ControlEvent, PromptRecord, RecordContext, SnapshotInfo};
+
 mod branch;
+mod configuration_identity;
 mod snapshot;
 pub use branch::{ControlledGenerationBranch, GenerationBranchMetadata, GenerationBranchOptions};
 pub use snapshot::{
@@ -87,68 +93,113 @@ impl<E: std::error::Error + Send + Sync + 'static>
     From<TextContinuationError<E, ControlConstraintError>> for ControlledGenerationError
 {
     fn from(error: TextContinuationError<E, ControlConstraintError>) -> Self {
-        Self::Continuation(match error {
-            TextContinuationError::IncompatibleDriver => TextContinuationError::IncompatibleDriver,
-            TextContinuationError::Failed => TextContinuationError::Failed,
-            TextContinuationError::NotQuiescent => TextContinuationError::NotQuiescent,
-            TextContinuationError::Generation(error) => {
-                TextContinuationError::Generation(match error {
-                    ControlledTextGenerationError::Backend(error) => {
-                        ControlledTextGenerationError::Backend(BackendFailure::from_error(error))
-                    }
-                    ControlledTextGenerationError::Controller(error) => {
-                        ControlledTextGenerationError::Controller(error)
-                    }
-                    ControlledTextGenerationError::Preparation(error) => {
-                        ControlledTextGenerationError::Preparation(error)
-                    }
-                })
-            }
-        })
+        Self::Continuation(map_continuation_failure(error, BackendFailure::from_error))
     }
+}
+
+fn map_continuation_failure<E: std::error::Error + 'static>(
+    error: TextContinuationError<E, ControlConstraintError>,
+    convert: impl FnOnce(E) -> BackendFailure,
+) -> TextContinuationError<BackendFailure, ControlConstraintError> {
+    match error {
+        TextContinuationError::IncompatibleDriver => TextContinuationError::IncompatibleDriver,
+        TextContinuationError::Failed => TextContinuationError::Failed,
+        TextContinuationError::NotQuiescent => TextContinuationError::NotQuiescent,
+        TextContinuationError::Generation(error) => {
+            TextContinuationError::Generation(match error {
+                ControlledTextGenerationError::Backend(error) => {
+                    ControlledTextGenerationError::Backend(convert(error))
+                }
+                ControlledTextGenerationError::Controller(error) => {
+                    ControlledTextGenerationError::Controller(error)
+                }
+                ControlledTextGenerationError::Preparation(error) => {
+                    ControlledTextGenerationError::Preparation(error)
+                }
+            })
+        }
+    }
+}
+
+fn provider_continuation_error<B: BackendProvider>(
+    error: TextContinuationError<B::Error, ControlConstraintError>,
+) -> ControlledGenerationError {
+    ControlledGenerationError::Continuation(map_continuation_failure(
+        error,
+        B::into_backend_failure,
+    ))
+}
+
+fn map_sampling_failure<E: std::error::Error + 'static>(
+    error: SamplingOverrideError<E>,
+    convert: impl FnOnce(E) -> BackendFailure,
+) -> SamplingOverrideError<BackendFailure> {
+    match error {
+        SamplingOverrideError::Invalid(reason) => SamplingOverrideError::Invalid(reason),
+        SamplingOverrideError::Backend(error) => SamplingOverrideError::Backend(convert(error)),
+    }
+}
+
+fn provider_sampling_error<B: BackendProvider>(
+    error: SamplingOverrideError<B::Error>,
+) -> ControlledGenerationError {
+    ControlledGenerationError::Sampling(map_sampling_failure(error, B::into_backend_failure))
 }
 
 impl<E: std::error::Error + Send + Sync + 'static> From<SamplingOverrideError<E>>
     for ControlledGenerationError
 {
     fn from(error: SamplingOverrideError<E>) -> Self {
-        Self::Sampling(match error {
-            SamplingOverrideError::Invalid(reason) => SamplingOverrideError::Invalid(reason),
-            SamplingOverrideError::Backend(error) => {
-                SamplingOverrideError::Backend(BackendFailure::from_error(error))
-            }
-        })
+        Self::Sampling(map_sampling_failure(error, BackendFailure::from_error))
     }
+}
+
+pub(crate) fn map_snapshot_failure<E: std::error::Error + 'static>(
+    error: eredu_runtime::execution_control::TextSnapshotError<E>,
+    convert: impl FnOnce(E) -> BackendFailure,
+) -> eredu_runtime::execution_control::TextSnapshotError<BackendFailure> {
+    use eredu_runtime::execution_control::TextSnapshotError as S;
+    match error {
+        S::Host(reason) => S::Host(reason),
+        S::HostPreparation(error) => S::HostPreparation(error),
+        S::HostCopy(error) => S::HostCopy(error),
+        S::Resume(error) => S::Resume(error),
+        S::HostAdmission(error) => S::HostAdmission(error),
+        S::Controller(reason) => S::Controller(reason),
+        S::Backend(error) => S::Backend(convert(error)),
+        S::RetainedBackend(error) => S::RetainedBackend(error.map_cause(convert)),
+        S::Capture(error) => S::Capture(error),
+        S::Control(error) => S::Control(error),
+        S::IncompatibleRun => S::IncompatibleRun,
+        S::InconsistentState => S::InconsistentState,
+        S::Unsupported(reason) => S::Unsupported(reason),
+    }
+}
+
+fn provider_snapshot_error<B: BackendProvider>(
+    error: eredu_runtime::execution_control::TextSnapshotError<B::Error>,
+) -> ControlledGenerationError {
+    ControlledGenerationError::Snapshot(map_snapshot_failure(error, B::into_backend_failure))
 }
 
 impl<E: std::error::Error + Send + Sync + 'static>
     From<eredu_runtime::execution_control::TextSnapshotError<E>> for ControlledGenerationError
 {
     fn from(error: eredu_runtime::execution_control::TextSnapshotError<E>) -> Self {
-        use eredu_runtime::execution_control::TextSnapshotError as S;
-        Self::Snapshot(match error {
-            S::Host(reason) => S::Host(reason),
-            S::Controller(reason) => S::Controller(reason),
-            S::Backend(error) => S::Backend(BackendFailure::from_error(error)),
-            S::Capture(error) => S::Capture(error),
-            S::Control(error) => S::Control(error),
-            S::IncompatibleRun => S::IncompatibleRun,
-            S::InconsistentState => S::InconsistentState,
-            S::Unsupported(reason) => S::Unsupported(reason),
-        })
+        Self::Snapshot(map_snapshot_failure(error, BackendFailure::from_error))
     }
 }
 
-struct Delivery {
+struct Delivery<M: ControlRecordMode> {
     configuration_identity: [u8; 32],
-    template: ObservedGenerationRecord,
+    template: RecordContext,
     budget: TraceBudget,
     control: GenerationControlHandle,
     sequence: u64,
     epoch: u64,
     prediction: u64,
-    prompt_length: u64,
-    prompt_token_ids: std::sync::Arc<[u32]>,
+    prompt: PromptRecord,
+    mode: std::marker::PhantomData<M>,
     started: Instant,
     preparation_elapsed: std::time::Duration,
     timing: GenerationTiming,
@@ -156,25 +207,30 @@ struct Delivery {
     failure: Option<CaptureError>,
     semantic_prefix: Vec<SemanticEvent>,
 }
-impl Delivery {
+impl<M: ControlRecordMode> Delivery<M> {
     fn send(
         &mut self,
-        event: ObservedGenerationEvent,
-        emit: &mut impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        event: impl Into<ControlEvent>,
+        emit: &mut impl FnMut(M::Record) -> ControlFlow<()>,
     ) {
         if self.closed || self.failure.is_some() {
             return;
         }
-        let record = ControlledGenerationRecord {
-            schema_version: EXECUTION_CONTROL_SCHEMA_VERSION,
-            sequence: self.sequence,
-            epoch: self.epoch,
-            timing: self.timing,
-            generation: ObservedGenerationRecord {
-                event,
-                ..self.template.clone()
-            },
+        let event = event.into();
+        let semantic = match &event {
+            ControlEvent::Existing(ObservedGenerationEvent::Semantic { event, .. }) => {
+                Some(event.clone())
+            }
+            _ => None,
         };
+        let record = M::record(
+            &self.template,
+            &self.prompt,
+            event,
+            self.sequence,
+            self.epoch,
+            self.timing,
+        );
         let Some(next) = self.sequence.checked_add(1) else {
             self.failure = Some(CaptureError::Invalid("output sequence overflow".into()));
             self.control.cancel();
@@ -187,8 +243,8 @@ impl Delivery {
         }
         // Charge and advance before invoking user code, including a caught panic.
         self.sequence = next;
-        if let ObservedGenerationEvent::Semantic { event, .. } = &record.generation.event {
-            self.semantic_prefix.push(event.clone());
+        if let Some(event) = semantic {
+            self.semantic_prefix.push(event);
         }
         if emit(record).is_break() {
             self.closed = true;
@@ -199,45 +255,43 @@ impl Delivery {
         &mut self,
         token: Option<u32>,
         forced: bool,
-        captures: Option<CapturedStep>,
+        captures: Option<CapturedStepDelivery>,
         seconds: f64,
-        emit: &mut impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        emit: &mut impl FnMut(M::Record) -> ControlFlow<()>,
     ) {
         let prediction_index = self.prediction;
-        let input_range = if prediction_index == 0 {
-            [0, self.prompt_length]
-        } else {
-            [
-                self.prompt_length + prediction_index - 1,
-                self.prompt_length + prediction_index,
-            ]
+        let input_range = match self.prompt.range(prediction_index) {
+            Ok(range) => range,
+            Err(error) => {
+                self.failure = Some(CaptureError::Invalid(error.to_string()));
+                self.control.cancel();
+                return;
+            }
         };
         match token {
             Some(token_id) => {
                 self.prediction += 1;
                 self.send(
-                    ObservedGenerationEvent::Token {
+                    ObservedGenerationEvent::from_token_delivery(
                         token_id,
                         forced,
                         prediction_index,
                         input_range,
-                        committed: true,
-                        rank: 0,
                         captures,
-                        step_seconds: seconds,
-                    },
+                        seconds,
+                    ),
                     emit,
                 );
             }
             None => {
                 if let Some(captures) = captures {
                     self.send(
-                        ObservedGenerationEvent::CaptureFailure {
+                        ObservedGenerationEvent::from_failed_delivery(
                             prediction_index,
                             input_range,
                             captures,
-                            step_seconds: seconds,
-                        },
+                            seconds,
+                        ),
                         emit,
                     );
                 }
@@ -246,13 +300,13 @@ impl Delivery {
     }
 }
 
-struct Source<'a, 'b, B: TextGenerationBackend, F> {
+struct Source<'a, 'b, B: TextGenerationBackend, M: ControlRecordMode, F> {
     driver: &'a mut TextGenerationDriver<'b, B>,
     state: &'a mut ManagedTextContinuation<B, ControlConstraints>,
-    delivery: &'a RefCell<(&'a mut Delivery, &'a mut F)>,
+    delivery: &'a RefCell<(&'a mut Delivery<M>, &'a mut F)>,
 }
-impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFlow<()>>
-    CommittedTokenSource for Source<'_, '_, B, F>
+impl<B: TextGenerationBackend, M: ControlRecordMode, F: FnMut(M::Record) -> ControlFlow<()>>
+    CommittedTokenSource for Source<'_, '_, B, M, F>
 {
     type Error = TextContinuationError<B::Error, ControlConstraintError>;
     fn finish_step<T, E>(
@@ -261,7 +315,7 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
         cancelled: bool,
         map_source: impl FnOnce(Self::Error) -> E,
     ) -> Result<Option<T>, E> {
-        self.driver.runtime().finish_text_preparation_cancellable(
+        self.state.finish_text_preparation_cancellable(&self.driver,
             eredu_core::run_preparation::TextPreparationStage::Delivery,
             local.map(|value| (!cancelled).then_some(value)),
             |error| map_source(ControlledTextGenerationError::Preparation(error).into()),
@@ -270,9 +324,12 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
     fn delivery_failure(&self) -> Option<CaptureError> {
         self.delivery.borrow().0.failure.clone()
     }
-    fn next_token(&mut self) -> Result<Option<u32>, Self::Error> {
+    fn next_token(
+        &mut self,
+        cancellation: &eredu_core::GenerationCancellationToken,
+    ) -> Result<Option<u32>, Self::Error> {
         let started = Instant::now();
-        let result = self.state.advance(self.driver);
+        let result = self.state.advance_cancellable(self.driver, cancellation);
         if matches!(&result, Ok(Some(_))) {
             let mut delivery = self.delivery.borrow_mut();
             let delivery = &mut delivery.0;
@@ -281,7 +338,7 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
                     GenerationTiming::new(Some(delivery.preparation_elapsed + started.elapsed()));
             }
         }
-        let capture = self.state.take_completed_step(self.driver);
+        let capture = self.state.take_completed_delivery(self.driver);
         let token = match result {
             Ok(token) => token.map(|token| token.token_id()),
             Err(error) => {
@@ -307,8 +364,7 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
     }
     fn grammar_is_complete(&mut self) -> Result<bool, Self::Error> {
         self.state
-            .controller_mut()
-            .is_complete()
+            .controller_is_complete()
             .map_err(|error| ControlledTextGenerationError::Controller(error).into())
     }
 }
@@ -317,20 +373,26 @@ impl<B: TextGenerationBackend, F: FnMut(ControlledGenerationRecord) -> ControlFl
 /// It exclusively borrows its loaded model and retains incremental decoding,
 /// constraints, pending input and the backend's existing completion owner.
 /// Native objects remain thread-affine; `control_handle` may cross threads.
-pub struct ControlledGenerationSession<'a, B: TextGenerationBackend> {
+pub struct ControlledGenerationSession<
+    'a,
+    B: TextGenerationBackend,
+    M: ControlRecordMode = LegacyText,
+> {
     driver: TextGenerationDriver<'a, B>,
     state: ManagedTextContinuation<B, ControlConstraints>,
-    vocabulary: std::sync::Arc<tokenizers::Tokenizer>,
+    vocabulary: eredu_text::tokenizer::TokenizerSnapshot,
     tokenizer_identity: [u8; 32],
     snapshot_budget: Option<eredu_runtime::execution_control::SnapshotBudget>,
     branch_growth_known: bool,
     cursor: CommittedGenerationCursor,
     pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
     lifecycle: GenerationLifecycle,
-    delivery: Delivery,
+    delivery: Delivery<M>,
+    // Travels with copied facade payload during restore and branch exchange.
+    host_preparation: HostPreparationAuthority,
 }
 
-impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
+impl<B: TextGenerationBackend, M: ControlRecordMode> ControlledGenerationSession<'_, B, M> {
     /// Active preparation and execution through first commitment, before capture
     /// delivery. Pauses and inspections are excluded; restoration never rewinds it.
     pub fn timing(&self) -> GenerationTiming {
@@ -365,12 +427,12 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     /// Excludes native state, constraints, and shared immutable tokenizer data.
     /// Unknown custom parser/decoder costs remain explicit.
     pub fn semantic_snapshot_bytes(&self) -> Option<u64> {
-        use crate::runtime::generation::storage::SnapshotStorage;
-        self.pipeline
-            .snapshot_storage_bytes()?
-            .checked_add(self.cursor.snapshot_storage_bytes()?)?
-            .checked_add(self.delivery.semantic_prefix.snapshot_bytes()?)?
-            .checked_add((self.delivery.prompt_token_ids.len() as u64).checked_mul(4)?)
+        snapshot::host_copy::payload_bytes(
+            &self.pipeline,
+            &self.cursor,
+            &self.delivery.semantic_prefix,
+            &self.delivery.prompt,
+        )
     }
     /// Full facade support; native model-state primitives alone do not imply
     /// complete semantic/grammar snapshot support.
@@ -394,7 +456,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         };
         result
             .conditions
-            .push("ordinary single-sequence text; serial completed-token delivery".into());
+            .push("ordinary single-sequence input; serial completed-token delivery".into());
         result.conditions.push("native in-process snapshots; exact exclusive driver and executable; same logical run for restore".into());
         result.conditions.push("unchanged continuations preserve RNG and state; equality requires deterministic native execution on the same device".into());
         result
@@ -426,6 +488,15 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     /// This changes only the next decision; replacing a past token requires an
     /// earlier snapshot. Clear an existing choice before replacing it.
     pub fn force_next_token(&mut self, token: u32) -> Result<(), ControlledGenerationError> {
+        let host = self.host_preparation.clone();
+        self.force_next_token_retained_inner(token)
+            .map_err(|error| M::retain_error(error, host))
+    }
+
+    fn force_next_token_retained_inner(
+        &mut self,
+        token: u32,
+    ) -> Result<(), ControlledGenerationError> {
         self.validate_choice_boundary()?;
         if self.vocabulary.id_to_token(token).is_none() {
             return Err(TokenChoiceError::InvalidToken(token).into());
@@ -435,6 +506,12 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     }
     /// Removes a pending decision restriction without advancing generation.
     pub fn clear_forced_token(&mut self) -> Result<bool, ControlledGenerationError> {
+        let host = self.host_preparation.clone();
+        self.clear_forced_token_retained_inner()
+            .map_err(|error| M::retain_error(error, host))
+    }
+
+    fn clear_forced_token_retained_inner(&mut self) -> Result<bool, ControlledGenerationError> {
         self.validate_choice_boundary()?;
         Ok(self.state.controller_mut().clear_forced())
     }
@@ -443,10 +520,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         self.state.controller().pending_forced()
     }
 
-    fn lifecycle_record(
-        &mut self,
-        emit: &mut impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) {
+    fn lifecycle_record(&mut self, emit: &mut impl FnMut(M::Record) -> ControlFlow<()>) {
         self.delivery.send(
             ObservedGenerationEvent::Lifecycle {
                 status: self.status(),
@@ -468,7 +542,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
             None => Ok(()),
         });
         let cancelled = self.delivery.control.cancellation().is_cancelled();
-        let result = self.driver.runtime().finish_text_preparation_cancellable(
+        let result = self.state.finish_text_preparation_cancellable(&self.driver,
             eredu_core::run_preparation::TextPreparationStage::Delivery,
             local.map(|()| (!cancelled).then_some(())),
             |error| PreparedChatError::Backend(error).into(),
@@ -494,10 +568,12 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     /// permanently cancels and closes delivery, preserving ordinary semantics.
     pub fn step(
         &mut self,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<GenerationStatus, ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.step_inner(emit))) {
-            Ok(result) => result,
+            Ok(result) => {
+                result.map_err(|error| M::retain_error(error, self.host_preparation.clone()))
+            }
             Err(payload) => {
                 self.lifecycle.fail();
                 std::panic::resume_unwind(payload)
@@ -507,7 +583,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
 
     fn step_inner(
         &mut self,
-        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<GenerationStatus, ControlledGenerationError> {
         let cancelled = self.delivery.control.cancellation().is_cancelled();
         // Validate before touching the cursor, including terminal/error states.
@@ -545,13 +621,21 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
         if let Err(error) = result {
             self.lifecycle.fail();
             let error = match error {
-                CommittedGenerationError::Source(error) => ControlledGenerationError::from(error),
+                CommittedGenerationError::Source(error) => ControlledGenerationError::Continuation(
+                    map_continuation_failure(error, B::into_backend_failure),
+                ),
                 CommittedGenerationError::Pipeline(CommittedTokenPipelineError::Decoder(error)) => {
                     PreparedChatError::Tokenizer(error).into()
+                }
+                CommittedGenerationError::Pipeline(
+                    CommittedTokenPipelineError::OriginalDecoder(error),
+                ) => {
+                    PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error)).into()
                 }
                 CommittedGenerationError::Pipeline(CommittedTokenPipelineError::Semantic(
                     error,
                 )) => PreparedChatError::Semantic(error).into(),
+                CommittedGenerationError::Preparation(never) => match never {},
                 CommittedGenerationError::Lifecycle(error) => {
                     PreparedChatError::Generation(error).into()
                 }
@@ -602,10 +686,12 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     /// semantic text. An in-flight worker observes remote requests through `run`.
     pub fn pause(
         &mut self,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.pause_inner(emit))) {
-            Ok(result) => result,
+            Ok(result) => {
+                result.map_err(|error| M::retain_error(error, self.host_preparation.clone()))
+            }
             Err(payload) => {
                 self.lifecycle.fail();
                 std::panic::resume_unwind(payload)
@@ -615,7 +701,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
 
     fn pause_inner(
         &mut self,
-        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         self.lifecycle.pause()?;
         self.delivery.control.request_pause();
@@ -627,7 +713,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     /// text is discarded under the ordinary cancellation policy, never flushed.
     pub fn cancel(
         &mut self,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<GenerationStatus, ControlledGenerationError> {
         // Validate before changing the persistent cancellation handle.
         self.lifecycle.checkpoint()?;
@@ -645,7 +731,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     /// is delivered synchronously; no producer queue accumulates behind a consumer.
     pub fn run(
         &mut self,
-        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<GenerationStatus, ControlledGenerationError> {
         while matches!(
             self.status(),
@@ -664,7 +750,7 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     /// Explicitly acknowledges pause and continues the same ordinary run.
     pub fn resume(
         &mut self,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<GenerationStatus, ControlledGenerationError> {
         self.lifecycle.pause()?;
         self.delivery.control.acknowledge_resume();
@@ -672,10 +758,18 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     }
 }
 
-impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
+impl<B: TextSamplingControlBackend, M: ControlRecordMode> ControlledGenerationSession<'_, B, M> {
     /// Current temperature and RNG/adaptive compatibility facts at a quiescent
     /// boundary. No sampler or model work occurs.
     pub fn sampling_state(&mut self) -> Result<SamplingStateFacts, ControlledGenerationError> {
+        let host = self.host_preparation.clone();
+        self.sampling_state_retained_inner()
+            .map_err(|error| M::retain_error(error, host))
+    }
+
+    fn sampling_state_retained_inner(
+        &mut self,
+    ) -> Result<SamplingStateFacts, ControlledGenerationError> {
         self.validate_choice_boundary()?;
         Ok(B::sampling_control_facts(
             self.state.boundary(&mut self.driver)?.parts().1,
@@ -689,7 +783,7 @@ impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
     pub fn override_sampling(
         &mut self,
         request: SamplingOverride,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.override_sampling_inner(request, emit)
@@ -700,9 +794,11 @@ impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
                 // A native preparation error alone is not completion evidence.
                 // Retain the backend recovery owner and fence further advancement.
                 self.lifecycle.fail();
-                Err(error)
+                Err(M::retain_error(error, self.host_preparation.clone()))
             }
-            Ok(result) => result,
+            Ok(result) => {
+                result.map_err(|error| M::retain_error(error, self.host_preparation.clone()))
+            }
             Err(payload) => {
                 self.lifecycle.fail();
                 std::panic::resume_unwind(payload)
@@ -713,14 +809,15 @@ impl<B: TextSamplingControlBackend> ControlledGenerationSession<'_, B> {
     fn override_sampling_inner(
         &mut self,
         request: SamplingOverride,
-        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         self.validate_choice_boundary()?;
         let before = B::sampling_control_facts(self.state.boundary(&mut self.driver)?.parts().1);
         let after = eredu_runtime::execution_control::apply_sampling_override(
             &mut self.state.boundary(&mut self.driver)?,
             request,
-        )?;
+        )
+        .map_err(provider_sampling_error::<B>)?;
         self.delivery.send(
             ObservedGenerationEvent::SamplingChanged {
                 next_prediction: self.next_prediction(),
@@ -861,9 +958,60 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         prepared: PreparedObservedGeneration,
         caller_stop_sequences: &[String],
         control: GenerationControlHandle,
-        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
         mode: OutputMode,
     ) -> Result<ControlledGenerationSession<'a, B>, ControlledGenerationError> {
+        let PreparedObservedGeneration {
+            chat,
+            prompt_token_ids,
+            settings,
+            resolved,
+            plan,
+            intervention,
+            session_identity,
+            artifact_identity,
+            parameter_overlay_id,
+            trace_limits,
+        } = prepared;
+        let policy = StartupPolicy {
+            chat,
+            settings,
+            resolved,
+            plan: Some(plan),
+            prepared_capture: None,
+            intervention,
+            session_identity,
+            artifact_identity,
+            parameter_overlay_id,
+            trace_limits,
+        };
+        self.start_controlled_source::<LegacyText>(
+            policy,
+            |_: &ModelRuntime<B>| {
+                let prompt = PromptRecord::Tokens(prompt_token_ids.clone().into());
+                Ok((TextGenerationInput::TokenIds(prompt_token_ids), prompt))
+            },
+            caller_stop_sequences,
+            control,
+            emit,
+            mode,
+        )
+    }
+
+    fn start_controlled_source<'a, M: ControlRecordMode>(
+        &'a mut self,
+        prepared: StartupPolicy,
+        source: impl FnOnce(
+            &ModelRuntime<B>,
+        ) -> Result<
+            (TextGenerationInput<B::Prompt>, PromptRecord),
+            ControlledGenerationError,
+        >,
+        caller_stop_sequences: &[String],
+        control: GenerationControlHandle,
+        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
+        mode: OutputMode,
+    ) -> Result<ControlledGenerationSession<'a, B, M>, ControlledGenerationError> {
         let preparation_started = Instant::now();
         use eredu_core::run_preparation::TextPreparationStage as Stage;
         let host = (|| {
@@ -881,20 +1029,21 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             let (config, max_tokens) = self
                 .resolve_text_generation_settings(prepared.settings)
                 .map_err(PreparedChatError::Generation)?;
-            let prepare_runtime = match mode {
-                OutputMode::Semantic => prepared_chat_control_runtime,
-                OutputMode::Text => prepared_text_control_runtime,
+            let preparation_mode = match mode {
+                OutputMode::Semantic => PreparedGenerationMode::Semantic,
+                OutputMode::Text => PreparedGenerationMode::Text,
             };
-            let semantic = prepare_runtime(
-                &prepared.chat,
-                caller_stop_sequences,
-                self.token_validity.clone(),
-            )
-            .map_err(map_prepared_chat_setup_error)?;
+            let semantic = preparation_mode
+                .prepare_control(
+                    &self.runtime,
+                    &prepared.chat,
+                    caller_stop_sequences,
+                    self.token_validity.clone(),
+                )
+                .map_err(map_prepared_chat_setup_error)?;
             // Versioned initial policy identity; saved native sampler state retains
             // any later prospective changes. Compatibility also requires the opaque
             // exact driver/run identities, never this digest alone.
-            use sha2::Digest;
             let semantic_identity = match mode {
                 OutputMode::Text => None,
                 OutputMode::Semantic => {
@@ -915,24 +1064,22 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                     ))
                 }
             };
-            let configuration_identity: [u8; 32] = sha2::Sha256::digest(
-                serde_json::to_vec(&(
-                    EXECUTION_CONTROL_SCHEMA_VERSION,
-                    mode,
-                    self.tokenizer_fingerprint,
-                    prepared.resolved,
-                    prepared.settings.seed,
-                    semantic_identity,
-                    prepared.chat.eos_token_ids(),
-                    caller_stop_sequences,
-                ))
-                .map_err(|error| CaptureError::Invalid(error.to_string()))?,
-            )
-            .into();
+            let configuration_identity = configuration_identity::digest(&(
+                M::VERSION,
+                mode,
+                self.tokenizer_fingerprint,
+                prepared.resolved,
+                prepared.settings.seed,
+                prepared.settings.inference,
+                semantic_identity,
+                prepared.chat.eos_token_ids(),
+                caller_stop_sequences,
+            ))
+            .map_err(|error| CaptureError::Invalid(error.to_string()))?;
             let decoder = PreparedChatTokenDecoder {
                 decoder: self.text_decoder(true),
             };
-            let vocabulary = std::sync::Arc::clone(&decoder.decoder.tokenizer);
+            let vocabulary = decoder.decoder.tokenizer.clone();
             let domain = eredu_runtime::TokenDomain::new(
                 self.token_validity
                     .allowed_mask()
@@ -944,31 +1091,31 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 semantic.parser,
             );
             let cursor = CommittedGenerationCursor::new(prepared.chat.eos_token_ids(), max_tokens);
-            let delivery = Delivery {
+            let (input, prompt) = source(&self.runtime)?;
+            let delivery = Delivery::<M> {
                 configuration_identity,
-                template: ObservedGenerationRecord {
-                    schema_version: CAPTURE_SCHEMA_VERSION,
+                template: RecordContext {
                     run_id: new_identity("run"),
                     artifact_identity: prepared.artifact_identity,
                     parameter_overlay_id: prepared.parameter_overlay_id,
                     session_id: self.session_identity.clone(),
-                    capture_plan_id: prepared.plan.identity().into(),
+                    capture_plan_id: prepared
+                        .prepared_capture
+                        .as_ref()
+                        .map(|source| source.admission().identity().into())
+                        .or_else(|| prepared.plan.as_ref().map(|plan| plan.identity().into())),
                     intervention_plan_id: prepared
                         .intervention
                         .as_ref()
                         .map(|p| p.identity().into()),
-                    event: ObservedGenerationEvent::Lifecycle {
-                        status: GenerationStatus::Prepared,
-                        next_prediction: 0,
-                    },
                 },
                 budget: TraceBudget::new(prepared.trace_limits),
                 control,
                 sequence: 0,
                 epoch: 0,
                 prediction: 0,
-                prompt_length: prepared.prompt_token_ids.len() as u64,
-                prompt_token_ids: prepared.prompt_token_ids.clone().into(),
+                prompt,
+                mode: std::marker::PhantomData,
                 started: Instant::now(),
                 preparation_elapsed: std::time::Duration::ZERO,
                 timing: GenerationTiming::default(),
@@ -976,8 +1123,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 failure: None,
                 semantic_prefix: Vec::new(),
             };
-            let started = ObservedGenerationEvent::Started {
-                prompt_token_ids: prepared.prompt_token_ids.clone(),
+            let started = ControlEvent::Started {
                 generation: prepared.resolved,
                 seed: prepared.settings.seed,
             };
@@ -990,33 +1136,40 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 delivery,
                 started,
                 semantic.controller,
+                input,
             ))
         })();
-        let (config, vocabulary, domain, pipeline, cursor, mut delivery, started, controller) =
-            self.runtime
-                .finish_text_preparation(Stage::Request, host, |error| {
-                    PreparedChatError::Backend(error).into()
-                })?;
-        let prompt = B::prepare_text_prompt(self.runtime.backend(), prepared.prompt_token_ids)
-            .map_err(|error| {
-                PreparedChatError::Backend(eredu_core::BackendFailure::from_error(error))
-            });
-        let prompt = self.runtime.finish_text_preparation(
-            Stage::Prompt,
-            prompt,
-            PreparedChatError::Backend,
-        )?;
+        let (
+            config,
+            vocabulary,
+            domain,
+            pipeline,
+            cursor,
+            mut delivery,
+            started,
+            controller,
+            input,
+        ) = self
+            .runtime
+            .finish_text_preparation(Stage::Request, host, |error| {
+                PreparedChatError::Backend(error).into()
+            })?;
         let mut driver = TextGenerationDriver::new(&mut self.runtime);
         let mut state = driver
-            .start(
-                prompt,
+            .start_input(
+                input,
                 config,
                 TokenChoiceController::new(controller, domain),
             )
-            .map_err(TextContinuationError::Generation)?;
-        match prepared.intervention {
-            Some(plan) => driver.enable_interventions(&mut state, prepared.plan, plan)?,
-            None => driver.enable_capture(&mut state, prepared.plan)?,
+            .map_err(TextContinuationError::Generation)
+            .map_err(provider_continuation_error::<B>)?;
+        if let Some(source) = prepared.prepared_capture {
+            driver.enable_prepared_capture(&mut state, source)?;
+        } else if let Some(capture) = prepared.plan {
+            match prepared.intervention {
+                Some(plan) => driver.enable_interventions(&mut state, capture, plan)?,
+                None => driver.enable_capture(&mut state, capture)?,
+            }
         }
         delivery.preparation_elapsed = preparation_started.elapsed();
         delivery.send(started, &mut emit);
@@ -1028,7 +1181,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
                 Some(())
             }),
         };
-        let ready = driver.runtime().finish_text_preparation_cancellable(
+        let ready = driver.finish_text_preparation_cancellable(&state,
             Stage::Delivery,
             delivered,
             |error| PreparedChatError::Backend(error).into(),
@@ -1036,6 +1189,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
         if ready.is_none() {
             delivery.control.cancel();
         }
+        let host_preparation = pipeline.host_preparation().clone();
         Ok(ControlledGenerationSession {
             driver,
             state: ManagedTextContinuation::root(state),
@@ -1047,6 +1201,7 @@ impl<B: TextGenerationBackend> LoadedModel<B> {
             pipeline,
             lifecycle: GenerationLifecycle::default(),
             delivery,
+            host_preparation,
         })
     }
 }

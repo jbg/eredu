@@ -7,49 +7,90 @@
 //! until its exact backend transition either publishes the bytes into a
 //! registered manager or drops the reservation.
 
+mod visible;
+pub use visible::{
+    PagedLocalUpdateMechanisms, PagedLocalUpdatePlan, PagedVisibleError, PagedVisibleMechanisms,
+    PagedVisiblePlan,
+};
+
+mod scan;
+pub use scan::{PagedScanError, PagedScanMechanisms, PagedScanPlan};
+
+mod append;
+pub use append::{
+    PagedAppendError, PagedAppendMechanisms, PagedAppendPlan, PagedAppendStep, PagedAppendSteps,
+};
+
+mod table;
+pub use table::{
+    CacheRecordTable, CacheRecordTableIter, CacheTableCapacityError, PreparedCacheTable,
+};
+
+mod prepared_reservation;
+pub use prepared_reservation::{
+    CachePoolReservationAdmissionFailure, CachePoolReservationPreparationFailure,
+    PreparedCachePoolReservation,
+};
+mod prepared_membership;
+pub use prepared_membership::{
+    CachePoolRegistrationFailure, CachePoolRegistrationPreparationFailure,
+    PreparedCachePoolRegistration,
+};
+
 mod executor;
 mod lifecycle;
 mod persistence;
 mod policy;
+mod source;
 mod storage;
 mod telemetry;
 mod worker;
+pub use worker::{CacheIoQueueInstallationError, PreparedCacheIoQueue, RetiredCacheIoQueue};
+pub use worker::{
+    CacheIoRegistryInstallationError, CacheIoRegistryRefusal, PreparedCacheIoRegistry,
+    RetiredCacheIoRegistry,
+};
 
 pub use executor::{
     CacheIoAdmission, CacheIoCompletionDisposition, CacheIoExecutionState,
     CacheIoExecutionStateError, CacheIoPreparation, CacheIoStartDisposition,
 };
-pub use lifecycle::{CacheBlockLifecycle, CacheLifecycleError, MutableCacheTail};
+pub use lifecycle::{
+    CacheBlockLifecycle, CacheLifecycleError, CacheRecentCountDestination, MutableCacheTail,
+    PreparedCacheLifecycle, RetiredCacheLifecycleStorage,
+};
 pub use persistence::{
+    CacheShardError, CacheShardLayout, CacheShardMetadata, CacheShardTensor,
+    LiveCacheBlockPublication, LiveCacheBlockSource, LiveCachePublicationError,
+    LiveCacheReadFailure, MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_CURRENT_FILE,
+    PROMPT_CACHE_GENERATIONS_DIRECTORY, PreparedLiveCacheRead, PromptCachePersistenceError,
+    PromptCachePublication, ReversiblePromptCachePublication, cache_shard_tensor_names,
     finalize_prompt_cache_shard, hash_prompt_cache_shard_payload, inspect_prompt_cache,
     prompt_cache_rank_path, resolve_prompt_cache_root, safe_prompt_cache_shard_path,
-    validate_prompt_cache_manifest, LiveCacheBlockPublication, LiveCachePublicationError,
-    PromptCachePersistenceError, PromptCachePublication, ReversiblePromptCachePublication,
-    MAX_PROMPT_CACHE_SHARD_HEADER_BYTES, PROMPT_CACHE_CURRENT_FILE,
-    PROMPT_CACHE_GENERATIONS_DIRECTORY,
+    validate_prompt_cache_manifest,
 };
 pub use policy::{
     CacheResidencyConfigurationError, CacheResidencyPolicy, LiveCacheDiskPolicy, PagedCacheOptions,
 };
+pub use source::CacheBlockSelection;
 pub use storage::{
-    CacheBlockStorage, CacheHostDemotionOperation, CacheHostPromotion, CacheIoOperation,
-    CacheIoOperationKey, CacheIoOperationKind, CacheStorageError, CacheStoragePhase,
+    CacheBlockStorage, CacheDeviceDemotion, CacheHostDemotionOperation, CacheHostPromotion,
+    CacheIoOperation, CacheIoOperationKey, CacheIoOperationKind, CacheStorageError,
+    CacheStoragePhase,
 };
 pub use telemetry::{
-    CacheLayerResidencyReport, CacheLayerResidencyStats, CacheResidencyReport,
-    CacheResidencyTelemetry, CACHE_RESIDENCY_LAYER_REPORT_LIMIT,
+    CACHE_RESIDENCY_LAYER_REPORT_LIMIT, CacheLayerResidencyReport, CacheLayerResidencyStats,
+    CacheResidencyReport, CacheResidencyTelemetry, CacheTelemetryRows, PreparedCacheTelemetry,
+    RetiredCacheTelemetryStorage,
 };
 pub use worker::{
     CacheIoSubmission, CacheIoSubmissionOutcome, CacheIoTicket, CacheIoWorker, CacheIoWorkerError,
 };
 
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::BTreeMap,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
 };
 
 static NEXT_CACHE_POOL_ID: AtomicU64 = AtomicU64::new(1);
@@ -194,8 +235,8 @@ pub struct CachePoolReport {
 
 #[derive(Debug)]
 struct CachePoolState {
-    managers: BTreeMap<u64, CachePoolUsage>,
-    reservations: BTreeMap<u64, CachePoolUsage>,
+    managers: CacheRecordTable<u64, CachePoolUsage>,
+    reservations: CacheRecordTable<u64, CachePoolUsage>,
     current: CachePoolUsage,
     peak: CachePoolUsage,
 }
@@ -233,8 +274,8 @@ impl CacheResidencyPool {
             id: NEXT_CACHE_POOL_ID.fetch_add(1, Ordering::Relaxed),
             limits,
             state: Arc::new(Mutex::new(CachePoolState {
-                managers: BTreeMap::new(),
-                reservations: BTreeMap::new(),
+                managers: CacheRecordTable::new(),
+                reservations: CacheRecordTable::new(),
                 current: CachePoolUsage::default(),
                 peak: CachePoolUsage::default(),
             })),
@@ -254,13 +295,12 @@ impl CacheResidencyPool {
     /// Registers a manager and returns its exact RAII membership token.
     pub fn register_manager(&self, manager: u64) -> Result<CachePoolMembership, CachePoolError> {
         let mut state = self.state.lock().map_err(|_| CachePoolError::Poisoned)?;
-        if state.managers.contains_key(&manager) {
-            return Err(CachePoolError::DuplicateManager { manager });
-        }
+        validate_new_manager(&state, manager)?;
         state.managers.insert(manager, CachePoolUsage::default());
         Ok(CachePoolMembership {
             manager,
             pool: self.clone(),
+            _funding: None,
         })
     }
 
@@ -288,23 +328,48 @@ impl CacheResidencyPool {
             .ok_or(CachePoolError::AccountingOverflow {
                 operation: "manager occupancy publication",
             })?;
-        state.managers.insert(manager, usage);
+        *state
+            .managers
+            .get_mut(&manager)
+            .expect("validated registered manager") = usage;
         state.current = current;
         update_peaks(&mut state, self.limits);
         Ok(state.current)
     }
 
+    /// Fixed controls for updating existing membership and reading aggregate
+    /// limits/occupancy. This never prices or permits a new manager/reservation.
+    pub fn publication_control_bytes() -> Option<usize> {
+        use std::{
+            mem::size_of,
+            sync::{MutexGuard, PoisonError},
+        };
+        let frames = [
+            size_of::<&Self>(),
+            size_of::<u64>(),
+            size_of::<CachePoolUsage>(),
+            size_of::<CachePoolUsage>(),
+            size_of::<CachePoolUsage>(),
+            size_of::<CachePoolReport>(),
+            size_of::<CachePoolError>(),
+            size_of::<Result<CachePoolUsage, CachePoolError>>(),
+            size_of::<Result<CachePoolReport, CachePoolError>>(),
+            size_of::<MutexGuard<'_, CachePoolState>>(),
+            size_of::<
+                Result<MutexGuard<'_, CachePoolState>, PoisonError<MutexGuard<'_, CachePoolState>>>,
+            >(),
+            size_of::<Option<&mut CachePoolUsage>>(),
+            size_of::<Option<CachePoolUsage>>(),
+        ];
+        frames
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+    }
+
     /// Atomically admits additional occupancy until its RAII token is dropped.
     pub fn reserve(&self, usage: CachePoolUsage) -> Result<CachePoolReservation, CachePoolError> {
         let mut state = self.state.lock().map_err(|_| CachePoolError::Poisoned)?;
-        validate_additional(state.current, usage, self.limits)?;
-        let required =
-            state
-                .current
-                .checked_add(usage)
-                .ok_or(CachePoolError::AccountingOverflow {
-                    operation: "temporary admission",
-                })?;
+        let required = reservation_current(state.current, usage, self.limits)?;
         let reservation = NEXT_CACHE_POOL_RESERVATION_ID.fetch_add(1, Ordering::Relaxed);
         state.reservations.insert(reservation, usage);
         state.current = required;
@@ -312,6 +377,7 @@ impl CacheResidencyPool {
         Ok(CachePoolReservation {
             reservation,
             pool: self.clone(),
+            _funding: None,
         })
     }
 
@@ -342,14 +408,20 @@ impl CacheResidencyPool {
     }
 
     fn remove_manager(&self, manager: u64) {
-        if let Ok(mut state) = self.state.lock() {
+        let retired = if let Ok(mut state) = self.state.lock() {
             if let Some(previous) = state.managers.get(&manager).copied() {
                 if let Some(current) = state.current.checked_sub(previous) {
                     state.managers.remove(&manager);
                     state.current = current;
                 }
             }
-        }
+            take_empty_pool_table(&mut state.managers)
+        } else {
+            None
+        };
+        // The paying account may own other pool resources. Its destructor must
+        // run only after the pool lock has been released.
+        drop(retired);
     }
 }
 
@@ -358,18 +430,23 @@ impl CacheResidencyPool {
 pub struct CachePoolReservation {
     reservation: u64,
     pool: CacheResidencyPool,
+    _funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
 }
 
 impl Drop for CachePoolReservation {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.pool.state.lock() {
+        let retired = if let Ok(mut state) = self.pool.state.lock() {
             if let Some(usage) = state.reservations.get(&self.reservation).copied() {
                 if let Some(current) = state.current.checked_sub(usage) {
                     state.reservations.remove(&self.reservation);
                     state.current = current;
                 }
             }
-        }
+            take_empty_pool_table(&mut state.reservations)
+        } else {
+            None
+        };
+        drop(retired);
     }
 }
 
@@ -378,6 +455,8 @@ impl Drop for CachePoolReservation {
 pub struct CachePoolMembership {
     manager: u64,
     pool: CacheResidencyPool,
+    // The canonical table separately retains its own paying owner.
+    _funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
 }
 
 impl CachePoolMembership {
@@ -391,6 +470,62 @@ impl Drop for CachePoolMembership {
     fn drop(&mut self) {
         self.pool.remove_manager(self.manager);
     }
+}
+
+// Empty process-pool capacity belongs to no remaining membership/reservation.
+// Detach its actual allocation and retained funding; callers drop it after
+// unlocking. A later original insertion still needs a separately paid table.
+fn take_empty_pool_table(
+    table: &mut CacheRecordTable<u64, CachePoolUsage>,
+) -> Option<CacheRecordTable<u64, CachePoolUsage>> {
+    table.is_empty().then(|| std::mem::take(table))
+}
+
+fn pool_table_retirement_control_bytes() -> Option<usize> {
+    use std::{
+        mem::size_of,
+        sync::{MutexGuard, PoisonError},
+    };
+    let frames = [
+        size_of::<&CacheResidencyPool>(),
+        size_of::<&mut CachePoolReservation>(),
+        size_of::<u64>(),
+        size_of::<Option<CachePoolUsage>>(),
+        size_of::<Option<CachePoolUsage>>(),
+        size_of::<CacheRecordTable<u64, CachePoolUsage>>(),
+        size_of::<Option<CacheRecordTable<u64, CachePoolUsage>>>(),
+        size_of::<&mut CacheRecordTable<u64, CachePoolUsage>>(),
+        size_of::<bool>(),
+        size_of::<MutexGuard<'_, CachePoolState>>(),
+        size_of::<
+            Result<MutexGuard<'_, CachePoolState>, PoisonError<MutexGuard<'_, CachePoolState>>>,
+        >(),
+        CacheRecordTable::<u64, CachePoolUsage>::mutation_control_bytes()?,
+    ];
+    frames
+        .into_iter()
+        .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+}
+
+fn validate_new_manager(state: &CachePoolState, manager: u64) -> Result<(), CachePoolError> {
+    if state.managers.contains_key(&manager) {
+        Err(CachePoolError::DuplicateManager { manager })
+    } else {
+        Ok(())
+    }
+}
+
+fn reservation_current(
+    current: CachePoolUsage,
+    usage: CachePoolUsage,
+    limits: CachePoolLimits,
+) -> Result<CachePoolUsage, CachePoolError> {
+    validate_additional(current, usage, limits)?;
+    current
+        .checked_add(usage)
+        .ok_or(CachePoolError::AccountingOverflow {
+            operation: "temporary admission",
+        })
 }
 
 fn validate_additional(
@@ -476,6 +611,15 @@ pub enum CachePoolError {
         /// Missing manager identity.
         manager: u64,
     },
+    /// A reservation and destination membership belong to different pools.
+    #[error("cache reservation and manager belong to different pools")]
+    ForeignMembership,
+    /// The exact live reservation no longer exists in this pool.
+    #[error("cache reservation {reservation} is not registered")]
+    UnknownReservation {
+        /// Missing live reservation identity.
+        reservation: u64,
+    },
     /// Aggregate cache accounting exceeded one finite resource limit.
     #[error(
         "cache pool {resource:?} budget exceeded: required {required} bytes, budget {budget} bytes"
@@ -494,6 +638,12 @@ pub enum CachePoolError {
         /// Stable accounting transition.
         operation: &'static str,
     },
+    /// A nonblocking prepared registration found the pool in use.
+    #[error("cache residency pool is busy")]
+    Busy,
+    /// The actual canonical membership population exceeds its paid destination.
+    #[error(transparent)]
+    Capacity(#[from] CacheTableCapacityError),
     /// Shared ownership state was poisoned by a panic.
     #[error("cache residency pool state is poisoned")]
     Poisoned,
@@ -502,7 +652,7 @@ pub enum CachePoolError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{mpsc, Barrier};
+    use std::sync::{Barrier, mpsc};
 
     fn pool() -> CacheResidencyPool {
         CacheResidencyPool::new(CachePoolLimits::new(16, 12, 10, 8).unwrap())
@@ -683,3 +833,10 @@ mod tests {
         ));
     }
 }
+
+pub use worker::{
+    CacheIoBorrowedError, CacheIoTaskPreparationError, CacheIoTaskRefusal, PreparedCacheIoTask,
+    PreparedCacheIoTaskSlot,
+};
+
+pub use persistence::{PreparedLiveCachePublication, PreparedLiveCachePublicationFailure};

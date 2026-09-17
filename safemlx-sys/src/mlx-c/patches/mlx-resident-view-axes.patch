@@ -1,0 +1,290 @@
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -542,9 +542,27 @@
+       {astype(a, dtype, s)});
+ }
+ 
++namespace {
++// Sorted/deduplicated view axes need no tree nodes or recursive sort storage.
++// The caller owns one inline/Graph Shape. Duplicate and range error ordering
++// stays in the ordinary squeeze/expand entry points below.
++bool sort_unique_view_axes(Shape& axes) {
++  for (size_t i = 1; i < axes.size(); ++i) {
++    const auto value = axes[i];
++    size_t j = i;
++    while (j && axes[j - 1] > value) {
++      axes[j] = axes[j - 1];
++      --j;
++    }
++    axes[j] = value;
++  }
++  return std::adjacent_find(axes.begin(), axes.end()) == axes.end();
++}
++} // namespace
++
+ array squeeze_impl(
+     const array& a,
+-    std::vector<int> axes,
++    Shape axes,
+     StreamOrDevice s /* = {} */) {
+   for (auto& ax : axes) {
+     auto new_ax = ax < 0 ? ax + a.ndim() : ax;
+@@ -562,11 +580,11 @@
+     }
+     ax = new_ax;
+   }
+-  auto shape = Squeeze::output_shape(a, axes);
++  auto shape = Squeeze::output_shape_owned(a, axes);
+   return array(
+       std::move(shape),
+       a.dtype(),
+-      submission::make_graph_primitive<Squeeze>(to_stream(s), std::move(axes)),
++      submission::make_graph_primitive<Squeeze>(to_stream(s), std::move(axes), std::in_place),
+       {a});
+ }
+ 
+@@ -577,14 +595,11 @@
+   if (axes.empty()) {
+     return a;
+   }
+-  std::set<int> unique_axes;
+-  for (auto ax : axes) {
+-    unique_axes.insert(ax < 0 ? ax + a.ndim() : ax);
+-  }
+-  if (unique_axes.size() != axes.size()) {
++  Shape sorted_axes(axes.begin(), axes.end());
++  for (auto& ax : sorted_axes) ax = ax < 0 ? ax + a.ndim() : ax;
++  if (!sort_unique_view_axes(sorted_axes)) {
+     throw std::invalid_argument("[squeeze] Received duplicate axes.");
+   }
+-  std::vector<int> sorted_axes(unique_axes.begin(), unique_axes.end());
+   return squeeze_impl(a, std::move(sorted_axes), s);
+ }
+ 
+@@ -593,7 +608,7 @@
+ }
+ 
+ array squeeze(const array& a, StreamOrDevice s /* = {} */) {
+-  std::vector<int> axes;
++  Shape axes;
++  axes.reserve(a.ndim());
+   for (int i = 0; i < a.ndim(); ++i) {
+     if (a.shape(i) == 1) {
+       axes.push_back(i);
+@@ -604,7 +619,7 @@
+ 
+ array expand_dims_impl(
+     const array& a,
+-    std::vector<int> axes,
++    Shape axes,
+     StreamOrDevice s /* = {} */) {
+   auto out_ndim = a.ndim() + axes.size();
+   for (auto& ax : axes) {
+@@ -617,11 +632,11 @@
+     }
+     ax = new_ax;
+   }
+-  auto shape = ExpandDims::output_shape(a, axes);
++  auto shape = ExpandDims::output_shape_owned(a, axes);
+   return array(
+       std::move(shape),
+       a.dtype(),
+-      submission::make_graph_primitive<ExpandDims>(to_stream(s), std::move(axes)),
++      submission::make_graph_primitive<ExpandDims>(to_stream(s), std::move(axes), std::in_place),
+       {a});
+ }
+ 
+@@ -636,22 +651,16 @@
+   if (axes.empty()) {
+     return a;
+   }
+-  { // Check for repeats
+-    std::set<int> unique_axes(axes.begin(), axes.end());
+-    if (unique_axes.size() != axes.size()) {
+-      throw std::invalid_argument("[expand_dims] Received duplicate axes.");
+-    }
+-  }
+-  // Check for repeats again
++  Shape sorted_axes(axes.begin(), axes.end());
++  // Preserve both duplicate checks and their order before bounds validation.
++  if (!sort_unique_view_axes(sorted_axes)) {
++    throw std::invalid_argument("[expand_dims] Received duplicate axes.");
++  }
+   auto out_ndim = a.ndim() + axes.size();
+-  std::set<int> unique_axes;
+-  for (auto ax : axes) {
+-    unique_axes.insert(ax < 0 ? ax + out_ndim : ax);
+-  }
+-  if (unique_axes.size() != axes.size()) {
++  for (auto& ax : sorted_axes) ax = ax < 0 ? ax + out_ndim : ax;
++  if (!sort_unique_view_axes(sorted_axes)) {
+     throw std::invalid_argument("[expand_dims] Received duplicate axes.");
+   }
+-  std::vector<int> sorted_axes(unique_axes.begin(), unique_axes.end());
+   return expand_dims_impl(a, std::move(sorted_axes), s);
+ }
+ 
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -1078,6 +1078,11 @@
+ class ExpandDims : public UnaryPrimitive {
+  public:
+   explicit ExpandDims(Stream stream, std::vector<int> axes)
++      : UnaryPrimitive(stream), axes_(axes.begin(), axes.end()) {}
++
++  // Internal owning entry: inline first, otherwise immutable Graph birth.
++  // The tag keeps brace-initialized calls to the ordinary constructor unambiguous.
++  ExpandDims(Stream stream, Shape axes, std::in_place_t)
+       : UnaryPrimitive(stream), axes_(std::move(axes)) {}
+ 
+   void eval_cpu(const ArrayVector& inputs, array& out) override;
+@@ -1091,13 +1096,14 @@
+   bool is_equivalent(const Primitive& other) const override;
+ 
+   static Shape output_shape(const array& input, const std::vector<int>& axes);
+-  auto state() const {
+-    return axes_;
++  static Shape output_shape_owned(const array& input, const Shape& axes);
++  auto state() const {
++    return std::vector<int>(axes_.begin(), axes_.end());
+   }
+ 
+  private:
+   void eval(const ArrayVector& inputs, array& out);
+-  std::vector<int> axes_;
++  Shape axes_;
+ };
+ 
+ class FFT : public UnaryPrimitive {
+@@ -2324,6 +2330,11 @@
+ class Squeeze : public UnaryPrimitive {
+  public:
+   explicit Squeeze(Stream stream, std::vector<int> axes)
++      : UnaryPrimitive(stream), axes_(axes.begin(), axes.end()) {}
++
++  // Internal owning entry: inline first, otherwise immutable Graph birth.
++  // The tag keeps brace-initialized calls to the ordinary constructor unambiguous.
++  Squeeze(Stream stream, Shape axes, std::in_place_t)
+       : UnaryPrimitive(stream), axes_(std::move(axes)) {}
+ 
+   void eval_cpu(const ArrayVector& inputs, array& out) override;
+@@ -2337,13 +2348,14 @@
+   bool is_equivalent(const Primitive& other) const override;
+ 
+   static Shape output_shape(const array& input, const std::vector<int>& axes);
+-  auto state() const {
+-    return axes_;
++  static Shape output_shape_owned(const array& input, const Shape& axes);
++  auto state() const {
++    return std::vector<int>(axes_.begin(), axes_.end());
+   };
+ 
+  private:
+   void eval(const ArrayVector& inputs, array& out);
+-  std::vector<int> axes_;
++  Shape axes_;
+ };
+ 
+ class Tan : public UnaryPrimitive {
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -2065,21 +2065,21 @@
+     const ArrayVector& cotangents,
+     const std::vector<int>&,
+     const ArrayVector&) {
+-  return {squeeze(cotangents[0], axes_, stream())};
++  return {squeeze(cotangents[0], state(), stream())};
+ }
+ 
+ ArrayVector ExpandDims::jvp(
+     const ArrayVector&,
+     const ArrayVector& tangents,
+     const std::vector<int>&) {
+-  return {expand_dims(tangents[0], axes_, stream())};
++  return {expand_dims(tangents[0], state(), stream())};
+ }
+ 
+ std::pair<ArrayVector, std::vector<int>> ExpandDims::vmap(
+     const ArrayVector& inputs,
+     const std::vector<int>& axes) {
+   auto ax = axes[0];
+-  auto expand_axes = axes_;
++  auto expand_axes = state();
+   for (auto& s : expand_axes) {
+     if (s >= axes[0]) {
+       s++;
+@@ -2098,7 +2098,15 @@
+ Shape ExpandDims::output_shape(
+     const array& input,
+     const std::vector<int>& axes) {
++  return output_shape_owned(input, Shape(axes.begin(), axes.end()));
++}
++
++Shape ExpandDims::output_shape_owned(const array& input, const Shape& axes) {
+   auto shape = input.shape();
++  // One destination reserve closes the real high-rank insertion prefix.
++  // Copy-exact plus this grow request are both covered by the resident Shape
++  // class; repeated single-axis insertions cannot create an unbounded chain.
++  shape.reserve(shape.size() + axes.size());
+   for (auto ax : axes) {
+     shape.insert(shape.begin() + ax, 1);
+   }
+@@ -2106,7 +2114,7 @@
+ }
+ 
+ std::vector<Shape> ExpandDims::output_shapes(const ArrayVector& inputs) {
+-  return {ExpandDims::output_shape(inputs[0], axes_)};
++  return {ExpandDims::output_shape_owned(inputs[0], axes_)};
+ }
+ 
+ ArrayVector Flatten::vjp(
+@@ -5577,21 +5585,21 @@
+     const ArrayVector& cotangents,
+     const std::vector<int>&,
+     const ArrayVector&) {
+-  return {expand_dims(cotangents[0], axes_, stream())};
++  return {expand_dims(cotangents[0], state(), stream())};
+ }
+ 
+ ArrayVector Squeeze::jvp(
+     const ArrayVector&,
+     const ArrayVector& tangents,
+     const std::vector<int>&) {
+-  return {squeeze(tangents[0], axes_, stream())};
++  return {squeeze(tangents[0], state(), stream())};
+ }
+ 
+ std::pair<ArrayVector, std::vector<int>> Squeeze::vmap(
+     const ArrayVector& inputs,
+     const std::vector<int>& axes) {
+   auto ax = axes[0];
+-  auto squeeze_axes = axes_;
++  auto squeeze_axes = state();
+   for (auto& s : squeeze_axes) {
+     if (s >= axes[0]) {
+       s++;
+@@ -5608,7 +5616,12 @@
+ }
+ 
+ Shape Squeeze::output_shape(const array& input, const std::vector<int>& axes) {
++  return output_shape_owned(input, Shape(axes.begin(), axes.end()));
++}
++
++Shape Squeeze::output_shape_owned(const array& input, const Shape& axes) {
+   Shape shape;
++  shape.reserve(input.ndim());
+   for (int i = 0, j = 0; i < input.ndim(); ++i) {
+     if (j < axes.size() && i == axes[j]) {
+       j++;
+@@ -5620,7 +5633,7 @@
+ }
+ 
+ std::vector<Shape> Squeeze::output_shapes(const ArrayVector& inputs) {
+-  return {Squeeze::output_shape(inputs[0], axes_)};
++  return {Squeeze::output_shape_owned(inputs[0], axes_)};
+ }
+ 
+ ArrayVector Tan::vjp(

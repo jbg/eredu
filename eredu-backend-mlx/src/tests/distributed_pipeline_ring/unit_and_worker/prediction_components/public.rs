@@ -160,7 +160,7 @@ fn prove_public_bounded_fixture(device: DeviceType, write: impl FnOnce(&Path)) {
                             assert_eq!(step.sequence, sequence);
                             sequence += 1;
                             assert!(step.captures.is_empty());
-                            records.extend(step.activations);
+                            records.extend(step.activations.iter().cloned());
                         }
                         Ok(None) => break,
                         Err(error) => {
@@ -184,6 +184,22 @@ fn prove_public_bounded_fixture(device: DeviceType, write: impl FnOnce(&Path)) {
             config.clone(),
             visitor,
         );
+        // Failed execution keeps the actual session payload in nonblocking
+        // recovery. Drive that existing owner to retirement before borrowing
+        // host evidence; an error return alone is not completion authority.
+        if runtime.session().test_payload_owner_count() != 1 {
+            assert_eq!(
+                runtime
+                    .session_mut()
+                    .take_speculative_activation_capture()
+                    .unwrap_err()
+                    .kind(),
+                eredu_core::BackendFailureKind::Busy,
+            );
+        }
+        crate::backend::submission_recovery::wait_for_retirement(|| {
+            runtime.session().test_payload_owner_count() == 1
+        });
         assert!(runtime
             .session_mut()
             .take_speculative_activation_capture()
@@ -209,7 +225,7 @@ fn prove_public_bounded_fixture(device: DeviceType, write: impl FnOnce(&Path)) {
             );
             assert!(
                 serde_json::to_vec(record).unwrap().len() as u64
-                    <= record.captures.step_usage.encoded_bytes
+                    <= record.captures.as_step().step_usage.encoded_bytes
             );
         }
         (output, publications, records, failure)
@@ -220,12 +236,12 @@ fn prove_public_bounded_fixture(device: DeviceType, write: impl FnOnce(&Path)) {
     assert!(failure.is_none());
     assert_eq!(baseline.unwrap().token_ids(), observed.unwrap().token_ids());
     assert_eq!(records[0].phase, SpeculativeActivationPhase::TargetPrefill);
-    assert_eq!(records[0].captures.invocation.unwrap().sequence, 3);
+    assert_eq!(records[0].captures.as_step().invocation.unwrap().sequence, 3);
     assert_eq!(
         records[1].phase,
         SpeculativeActivationPhase::PredictionPrefill
     );
-    assert_eq!(records[1].captures.invocation.unwrap().sequence, 2);
+    assert_eq!(records[1].captures.as_step().invocation.unwrap().sequence, 2);
     assert!(records.iter().all(|r| r.completed));
     let (masked, _, edited, failure) = run(true, true, 512);
     masked.unwrap();
@@ -233,7 +249,7 @@ fn prove_public_bounded_fixture(device: DeviceType, write: impl FnOnce(&Path)) {
     let logits = |records: &[SpeculativeActivationCapture]| -> Vec<_> {
         records
             .iter()
-            .flat_map(|r| &r.captures.records)
+            .flat_map(|r| &r.captures.as_step().records)
             .filter(|r| r.path == scope.readout.logits)
             .filter_map(|r| r.payload.clone())
             .collect()
@@ -241,7 +257,7 @@ fn prove_public_bounded_fixture(device: DeviceType, write: impl FnOnce(&Path)) {
     assert_ne!(logits(&records), logits(&edited));
     assert!(edited
         .iter()
-        .flat_map(|r| &r.captures.interventions)
+        .flat_map(|r| &r.captures.as_step().interventions)
         .any(|edit| !edit.evidence.is_empty()));
     let (failed, _, evidence, failure) = run(true, false, 5);
     assert!(failed.is_err());

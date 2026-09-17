@@ -279,13 +279,15 @@ fn mlx_multi_axis_rotary_matches_scalar_reference() {
 fn mlx_masked_output_projection_matches_scalar_reference() {
     let context = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = context.stream();
-    let hidden_values = [2.0, 1.0];
+    let hidden_values = [
+        2.0, 1.0, -3.0, 4.0, 1.0, -5.0, 7.0, 2.0, -1.0, -2.0, 3.0, 6.0,
+    ];
     let weight_values = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, -1.0, 1.0];
-    let centroid_values = [0.1, 0.9];
+    let centroid_values = [0.1, 0.9, 0.8, 0.2, -0.3, 0.4, 0.7, 0.1, 0.2, 0.6, 0.9, 0.3];
     let ordering_values = [2, 0, 3, 1];
-    let hidden = MlxTensor::from_array(Array::from_slice(&hidden_values, &[1, 1, 2]));
+    let hidden = MlxTensor::from_array(Array::from_slice(&hidden_values, &[2, 3, 2]));
     let weight = MlxTensor::from_array(Array::from_slice(&weight_values, &[4, 2]));
-    let centroids = MlxTensor::from_array(Array::from_slice(&centroid_values, &[1, 1, 2]));
+    let centroids = MlxTensor::from_array(Array::from_slice(&centroid_values, &[2, 3, 2]));
     let ordering = MlxTensor::from_array(Array::from_slice(&ordering_values, &[4]));
     let actual = masked_output_projection(
         MaskedOutputProjectionInput {
@@ -301,7 +303,7 @@ fn mlx_masked_output_projection_matches_scalar_reference() {
     .unwrap();
     let expected = reference_masked_output_projection(
         &hidden_values,
-        1,
+        6,
         2,
         &weight_values,
         4,

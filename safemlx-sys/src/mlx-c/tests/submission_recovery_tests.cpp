@@ -71,7 +71,7 @@ class PartialPrimitive : public Primitive {
  public:
   PartialPrimitive(Stream stream, std::shared_ptr<Work> work, bool fail)
       : Primitive(stream), work_(std::move(work)), fail_(fail) {}
-  void eval_cpu(const std::vector<array>&, std::vector<array>& outputs) override {
+  void eval_cpu(const ArrayVector&, ArrayVector& outputs) override {
     // This temporary is not a graph input/output when the primitive throws.
     // A task with a raw pointer is accepted before the later synchronous error.
     auto temp = array(Shape{1}, float32, nullptr, {});
@@ -92,7 +92,7 @@ class PartialPrimitive : public Primitive {
     }
     outputs[0].copy_shared_buffer(temp);
   }
-  void eval_gpu(const std::vector<array>&, std::vector<array>&) override {
+  void eval_gpu(const ArrayVector&, ArrayVector&) override {
     throw std::runtime_error("CPU-only recovery test primitive");
   }
   DEFINE_NAME(PartialPrimitive);
@@ -107,7 +107,7 @@ class LateFailurePrimitive : public Primitive {
   LateFailurePrimitive(Stream stream, std::shared_ptr<Work> trigger,
                        std::shared_ptr<Work> pending)
       : Primitive(stream), trigger_(std::move(trigger)), pending_(std::move(pending)) {}
-  void eval_cpu(const std::vector<array>&, std::vector<array>& outputs) override {
+  void eval_cpu(const ArrayVector&, ArrayVector& outputs) override {
     outputs[0].set_data(allocator::malloc(sizeof(float)), [pending = pending_](auto buffer) {
       ++pending->destroyed;
       allocator::free(buffer);
@@ -124,7 +124,7 @@ class LateFailurePrimitive : public Primitive {
       pending->finished = true;
     });
   }
-  void eval_gpu(const std::vector<array>&, std::vector<array>&) override {
+  void eval_gpu(const ArrayVector&, ArrayVector&) override {
     throw std::runtime_error("CPU-only recovery test primitive");
   }
   DEFINE_NAME(LateFailurePrimitive);
@@ -359,7 +359,7 @@ TEST_CASE("submission recovery host wait observes late failure without releasing
   auto stream = new_stream(Device::cpu);
   std::optional<array> output(std::in_place, Shape{1}, float32,
       std::make_shared<LateFailurePrimitive>(stream, trigger.work, pending.work),
-      std::vector<array>{});
+      ArrayVector{});
   auto completion = async_eval_with_completion({*output});
   CHECK_FALSE(scope.progress().failed);
   CHECK_FALSE(completion.is_complete());
@@ -606,10 +606,10 @@ TEST_CASE("submission recovery scope progress defers arbitrary primitive destruc
       work_->gate.wait();
       ++work_->destroyed;
     }
-    void eval_cpu(const std::vector<array>& inputs, array& output) override {
+    void eval_cpu(const ArrayVector& inputs, array& output) override {
       output.copy_shared_buffer(inputs[0]);
     }
-    void eval_gpu(const std::vector<array>&, array&) override {
+    void eval_gpu(const ArrayVector&, array&) override {
       throw std::runtime_error("CPU-only retirement test primitive");
     }
     DEFINE_NAME(BlockingRetirement);

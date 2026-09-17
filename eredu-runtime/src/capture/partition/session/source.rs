@@ -5,10 +5,11 @@ use eredu_core::{BoundedCompletionOutcome, BoundedCompletionWait};
 /// Move-only authority for one source preflight and bounded preparation. Distinct
 /// from the final hook vote: agreeing geometry does not certify completed work.
 pub struct SessionPartitionSource<'a, T: PartitionCaptureHookTransport> {
-    vote: SessionPartitionHook<'a, T>,
     shape: Option<Vec<u64>>,
     routed: Option<RoutedSourceGeometry>,
     wait: BoundedCompletionWait,
+    // Retains run custody until the source geometry has retired.
+    vote: SessionPartitionHook<'a, T>,
 }
 
 struct RoutedSourceGeometry {

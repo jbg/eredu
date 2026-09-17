@@ -1,0 +1,233 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -46,6 +46,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/arg_reduce.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/greedy_storage.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/reshape_storage.cpp
++  ${CMAKE_CURRENT_SOURCE_DIR}/alias_storage.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/random_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/binary_storage.cpp
+diff --git a/mlx/backend/cpu/alias_storage.cpp b/mlx/backend/cpu/alias_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/alias_storage.cpp
+@@ -0,0 +1,104 @@
++#include "mlx/backend/cpu/alias_storage.h"
++#include "mlx/primitives.h"
++#include "mlx/submission.h"
++#include <typeinfo>
++namespace mlx::core::cpu {
++namespace {
++bool product(size_t a,size_t b,size_t& out) noexcept {
++  if(b&&a>size_t(PTRDIFF_MAX)/b)return false;out=a*b;return true;
++}
++bool shape_elements(const array& value,size_t& elements) noexcept {
++  if(value.ndim()>4)return false;
++  elements=1;
++  for(int extent:value.shape())
++    if(extent<=0||!product(elements,size_t(extent),elements))return false;
++  return elements==value.size();
++}
++bool canonical_dtype(const array& value) noexcept {
++  return (value.dtype()==float32&&value.itemsize()==4)||
++      (value.dtype()==float16&&value.itemsize()==2)||
++      (value.dtype()==bfloat16&&value.itemsize()==2)||
++      (value.dtype()==uint32&&value.itemsize()==4);
++}
++}
++bool alias_input_geometry(const array& input,size_t& elements) noexcept {
++  if(!canonical_dtype(input)||!shape_elements(input,elements))return false;
++  size_t span=1,delta=0,bytes=0;
++  for(size_t axis=0;axis!=size_t(input.ndim());++axis) {
++    if(input.strides()[axis]<0||
++        !product(size_t(input.strides()[axis]),size_t(input.shape(axis)-1),delta)||
++        delta>size_t(PTRDIFF_MAX)-span)return false;
++    span+=delta;
++  }
++  return span<=input.data_size()&&product(span,size_t(input.itemsize()),bytes)&&
++      product(elements,size_t(input.itemsize()),bytes);
++}
++bool is_alias_eval_primitive(const array& out) noexcept {
++  return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
++      (typeid(out.primitive())==typeid(Transpose)||typeid(out.primitive())==typeid(Broadcast));
++}
++bool alias_eval_layout(AliasOperation operation,size_t rank,size_t output_rank,
++    bool tracer,CopyEvalStorage& out) noexcept {
++  if(rank>4||output_rank>4)return false;
++  switch(operation) {
++    case AliasOperation::Transpose:if(rank!=output_rank)return false;break;
++    case AliasOperation::Broadcast:if(rank>output_rank)return false;break;
++    default:return false;
++  }
++  CopyEvalStorage value;
++  // The existing nonempty common worker only creates inline Strides and
++  // delegates copy_shared_buffer. No Data, backing, task, or weak copy exists.
++  if(!copy_eval_layout(0,1,false,tracer,value))return false;
++  value.rank=rank;
++  const size_t controls=sizeof(value)+sizeof(operation)+sizeof(rank)+sizeof(output_rank)+
++      sizeof(tracer)+sizeof(out)+sizeof(Strides)*2+sizeof(array::Flags)+sizeof(Dtype)*2+
++      sizeof(const Shape*)+sizeof(const array*)*6+sizeof(const Primitive*)+
++      sizeof(size_t)*15+sizeof(int)*6+sizeof(int64_t)*2+sizeof(bool)*7+
++      sizeof(Shape::const_iterator)+sizeof(submission::FixedEvalPrologueGuard*)+
++      sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
++      sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
++  if(controls>SIZE_MAX-value.named_control_bytes)return false;
++  value.named_control_bytes+=controls;out=value;return true;
++}
++bool alias_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(!is_alias_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
++  const auto& input=output.inputs()[0];
++  const size_t rank=input.ndim(),output_rank=output.ndim();
++  size_t input_elements=0,output_elements=0,bytes=0;
++  if(!alias_input_geometry(input,input_elements)||!shape_elements(output,output_elements)||
++      input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
++      !product(output_elements,size_t(output.itemsize()),bytes))return false;
++  AliasOperation operation;
++  if(typeid(output.primitive())==typeid(Transpose)) {
++    operation=AliasOperation::Transpose;
++    const auto& axes=static_cast<const Transpose&>(output.primitive()).axes_ref();
++    if(rank!=output_rank||axes.size()!=rank||input_elements!=output_elements)return false;
++    bool seen[4]{};
++    for(size_t axis=0;axis!=rank;++axis) {
++      const int selected=axes[axis];
++      if(selected<0||size_t(selected)>=rank||seen[selected]||
++          output.shape(axis)!=input.shape(selected))return false;
++      seen[selected]=true;
++    }
++  } else {
++    operation=AliasOperation::Broadcast;
++    const auto& shape=static_cast<const Broadcast&>(output.primitive()).shape_ref();
++    if(rank>output_rank||shape!=output.shape())return false;
++    const size_t offset=output_rank-rank;
++    for(size_t axis=0;axis!=rank;++axis)
++      if(input.shape(axis)!=1&&input.shape(axis)!=output.shape(offset+axis))return false;
++  }
++  return alias_eval_layout(operation,rank,output_rank,output.is_tracer(),out);
++}
++}
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_alias_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record=guard.record();auto* graph=record.graph_quota();auto context=current_graph_construction_context();
++  if(out||!graph||!guard.cpu()||!context.scope||context.worker||context.dispatch!=&record||current_graph_quota()!=graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if(!cpu::alias_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
++}
++}
+diff --git a/mlx/backend/cpu/alias_storage.h b/mlx/backend/cpu/alias_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/alias_storage.h
+@@ -0,0 +1,12 @@
++#pragma once
++#include "mlx/backend/cpu/copy_storage.h"
++namespace mlx::core::cpu {
++enum class AliasOperation : unsigned { Transpose = 0, Broadcast = 1 };
++// Common alias workers inspect only fixed inline shape/stride state. These
++// queries grant neither source storage nor permission to evaluate a primitive.
++MLX_API bool alias_input_geometry(const array&, size_t& elements) noexcept;
++MLX_API bool is_alias_eval_primitive(const array&) noexcept;
++MLX_API bool alias_eval_layout(AliasOperation, size_t rank, size_t output_rank,
++    bool tracer, CopyEvalStorage&) noexcept;
++MLX_API bool alias_eval_storage(const array&, CopyEvalStorage&) noexcept;
++}
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -17,6 +17,7 @@
+ #include "mlx/backend/cpu/softmax_storage.h"
+ #include "mlx/backend/cpu/greedy_storage.h"
+ #include "mlx/backend/cpu/reshape_storage.h"
++#include "mlx/backend/cpu/alias_storage.h"
+ #include "mlx/backend/cpu/random_storage.h"
+ #include "mlx/backend/cpu/matmul_storage.h"
+ 
+@@ -48,11 +49,12 @@
+   const bool fixed_slice = fixed && cpu::is_slice_eval_primitive(arr);
+   const bool fixed_softmax = fixed && cpu::is_softmax_eval_primitive(arr);
+   const bool fixed_greedy = fixed && cpu::is_greedy_eval_primitive(arr);
++  const bool fixed_alias = fixed && cpu::is_alias_eval_primitive(arr);
+   const bool fixed_reshape = fixed && cpu::is_reshape_alias_eval_primitive(arr);
+   const bool fixed_tiled_matmul = fixed && cpu::is_tiled_matmul_eval_primitive(arr);
+   const bool fixed_matmul = fixed && cpu::is_bf16_matmul_eval_primitive(arr);
+   const bool fixed_random = fixed && cpu::is_random_bits_eval_primitive(arr);
+-  const bool extended = fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool extended = fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -60,7 +62,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_tiled_matmul
++    const auto failure = fixed_alias
++        ? submission::GraphConstruction::create_cpu_alias_eval(*extended_prologue, extended_bank.value)
++        : fixed_tiled_matmul
+         ? submission::GraphConstruction::create_cpu_tiled_matmul_eval(*extended_prologue, extended_bank.value)
+         : fixed_matmul
+         ? submission::GraphConstruction::create_cpu_bf16_matmul_eval(*extended_prologue, extended_bank.value)
+diff --git a/mlx/backend/cpu/reshape_storage.cpp b/mlx/backend/cpu/reshape_storage.cpp
+--- a/mlx/backend/cpu/reshape_storage.cpp
++++ b/mlx/backend/cpu/reshape_storage.cpp
+@@ -1,4 +1,5 @@
+ #include "mlx/backend/cpu/reshape_storage.h"
++#include "mlx/backend/cpu/alias_storage.h"
+ #include "mlx/primitives.h"
+ #include "mlx/submission.h"
+ #include <typeinfo>
+@@ -24,6 +25,7 @@
+       sizeof(std::pair<bool,Strides>)+sizeof(Strides)*2+sizeof(array::Flags)+sizeof(Dtype)*2+
+       sizeof(const Shape*)+sizeof(const array*)*5+sizeof(const Reshape*)+sizeof(size_t)*8+
+       sizeof(int)*2+sizeof(bool)*3+sizeof(Shape::const_iterator)+
++      sizeof(size_t)*5+sizeof(const array*)+sizeof(Dtype)+sizeof(Shape::const_iterator)+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
+       sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+   if(controls>SIZE_MAX-value.named_control_bytes)return false;
+@@ -36,7 +38,11 @@
+   if(rank>4||output_rank>4||shape.size()!=output_rank||!input.flags().row_contiguous||
+       input.size()==0||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
+       !((input.dtype()==float32&&input.itemsize()==sizeof(float))||
+-        (input.dtype()==uint32&&input.itemsize()==sizeof(uint32_t))))return false;
++        (input.dtype()==uint32&&input.itemsize()==sizeof(uint32_t))||
++        (input.dtype()==float16&&input.itemsize()==2)||
++        (input.dtype()==bfloat16&&input.itemsize()==2)))return false;
++  size_t source_elements=0;
++  if(!alias_input_geometry(input,source_elements)||input.data_size()<source_elements)return false;
+   size_t input_elements=1,output_elements=1,bytes=0;
+   for(size_t i=0;i!=rank;++i)
+     if(input.shape(i)<=0||!product(input_elements,size_t(input.shape(i)),input_elements))return false;
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -166,6 +166,7 @@
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_greedy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_reshape_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_tiled_matmul_eval(const FixedEvalPrologueGuard&,
+       GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_bf16_matmul_eval(const FixedEvalPrologueGuard&,
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -608,6 +608,7 @@
+   static Shape output_shape(const ArrayVector& inputs);
+   std::vector<Shape> output_shapes(const ArrayVector& inputs) override;
+   bool is_equivalent(const Primitive& other) const override;
++  const Shape& shape_ref() const noexcept { return shape_; }
+   Shape state() const {
+     return shape_;
+   };
+@@ -2520,6 +2521,7 @@
+   DEFINE_NAME(Transpose)
+   bool is_equivalent(const Primitive& other) const override;
+   std::vector<Shape> output_shapes(const ArrayVector& inputs) override;
++  const Shape& axes_ref() const noexcept { return axes_; }
+   std::vector<int> state() const {
+     return std::vector<int>(axes_.begin(), axes_.end());
+   };

@@ -1,7 +1,7 @@
 use super::*;
 
-const GROUPED_PROJECTION_CHUNK_THRESHOLD: i32 = 64;
-const GROUPED_PROJECTION_CHUNK_TOKENS: i32 = 32;
+pub(crate) const GROUPED_PROJECTION_CHUNK_THRESHOLD: i32 = 64;
+pub(crate) const GROUPED_PROJECTION_CHUNK_TOKENS: i32 = 32;
 
 /// Packed gated-product bank with optional MLX affine, MXFP4, or block-FP8 projections.
 #[derive(Debug, Clone, PhysicalParameters)]
@@ -95,137 +95,48 @@ impl PackedGatedProductGroups {
         dense_dtype: Dtype,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let (gate_up_affine, gate_up_iquant) = match gate_up_affine {
+        Self::new_with_parameter_factory(group_count, hidden_dim, intermediate_dim,
+            gate_up_affine, down_affine, projection_biases, dense_dtype, None,
+            &mut UnloadedParameters(stream))
+    }
+
+    /// Constructs the same declared fields from an explicit native source.
+    pub(crate) fn new_with_parameter_factory<F: ParameterFactory>(
+        group_count: i32, hidden_dim: i32, intermediate_dim: i32,
+        gate_up_affine: Option<WeightQuantization>, down_affine: Option<WeightQuantization>,
+        projection_biases: [bool;2], dense_dtype: Dtype,
+        native_fp8: Option<(eredu_checkpoint::BlockFp8Format, eredu_nn::LinearRowLayout)>,
+        factory: &mut F) -> Result<Self, F::Error> {
+        let split = |quantization| match quantization {
             Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
             affine => (affine, None),
         };
-        let (down_affine, down_iquant) = match down_affine {
-            Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
-            affine => (affine, None),
-        };
-        let projection = |out_features: i32,
-                          in_features: i32,
-                          quantization: Option<WeightQuantization>,
-                          iquant: Option<WeightQuantization>|
-         -> Result<GroupProjectionParams, Exception> {
-            if let Some(iquant) = iquant {
-                let (ggml_type, _) = iquant.gguf_iquant().expect("IQ group format");
-                let (block_values, block_bytes) = ggml_type
-                    .block_and_bytes()
-                    .expect("canonical IQ block geometry");
-                Ok((
-                    PhysicalParam::<Array>::unloaded(
-                        &[
-                            group_count,
-                            out_features,
-                            in_features / block_values as i32 * block_bytes as i32,
-                        ],
-                        Dtype::Uint8,
-                        stream,
-                    )?,
-                    PhysicalParam::new(None),
-                    PhysicalParam::new(None),
-                ))
-            } else if let Some(quantization) = quantization {
-                if in_features % quantization.group_size() != 0 {
-                    return Err(Exception::custom(format!(
-                        "packed group input width {in_features} is not divisible by {quantization:?} group size {}",
-                        quantization.group_size(),
-                    )));
-                }
-                Ok((
-                    PhysicalParam::<Array>::unloaded(
-                        &[
-                            group_count,
-                            out_features,
-                            quantized_packed_dimension(in_features, quantization.bits()),
-                        ],
-                        Dtype::Uint32,
-                        stream,
-                    )?,
-                    PhysicalParam::<Option<Array>>::unloaded_some(
-                        &[
-                            group_count,
-                            out_features,
-                            in_features / quantization.group_size(),
-                        ],
-                        if quantization == WeightQuantization::MxFp4 {
-                            Dtype::Uint8
-                        } else {
-                            Dtype::Float16
-                        },
-                        stream,
-                    )?,
-                    if quantization.has_biases() {
-                        PhysicalParam::<Option<Array>>::unloaded_some(
-                            &[
-                                group_count,
-                                out_features,
-                                in_features / quantization.group_size(),
-                            ],
-                            Dtype::Float16,
-                            stream,
-                        )?
-                    } else {
-                        PhysicalParam::new(None)
-                    },
-                ))
-            } else {
-                Ok((
-                    PhysicalParam::<Array>::unloaded(
-                        &[group_count, out_features, in_features],
-                        dense_dtype,
-                        stream,
-                    )?,
-                    PhysicalParam::new(None),
-                    PhysicalParam::new(None),
-                ))
-            }
-        };
-        let (gate_up_proj, gate_up_proj_scales, gate_up_proj_biases) = projection(
-            2 * intermediate_dim,
-            hidden_dim,
-            gate_up_affine,
-            gate_up_iquant,
-        )?;
-        let (down_proj, down_proj_scales, down_proj_biases) =
-            projection(hidden_dim, intermediate_dim, down_affine, down_iquant)?;
+        let (gate_up_affine, gate_up_iquant) = split(gate_up_affine);
+        let (down_affine, down_iquant) = split(down_affine);
+        let gate_rows = intermediate_dim.checked_mul(2)
+            .ok_or_else(||factory.geometry("gate/up group row extent overflow"))?;
+        let (gate_up_proj, gate_up_proj_scales, gate_up_proj_biases) = construction::projection(
+            factory, ["gate_up_proj", "gate_up_proj_scales", "gate_up_proj_biases"],
+            group_count, gate_rows, hidden_dim, gate_up_affine, gate_up_iquant, dense_dtype, native_fp8)?;
+        let (down_proj, down_proj_scales, down_proj_biases) = construction::projection(
+            factory, ["down_proj", "down_proj_scales", "down_proj_biases"],
+            group_count, hidden_dim, intermediate_dim, down_affine, down_iquant, dense_dtype,
+            native_fp8.map(|(format,_)|(format,eredu_nn::LinearRowLayout::Contiguous)))?;
         Ok(Self {
-            group_count,
-            hidden_dim,
-            intermediate_dim,
-            policy: GatedProductPolicy::ordinary_silu(),
-            reduction: eredu_nn::GroupReduction::Sum,
-            gate_up_affine,
-            down_affine,
-            gate_up_iquant,
-            down_iquant,
-            native_fp8: false,
-            gate_up_row_layout: eredu_nn::LinearRowLayout::Contiguous,
+            group_count, hidden_dim, intermediate_dim,
+            policy: GatedProductPolicy::ordinary_silu(), reduction: eredu_nn::GroupReduction::Sum,
+            gate_up_affine, down_affine, gate_up_iquant, down_iquant,
+            native_fp8: native_fp8.is_some(),
+            gate_up_row_layout: native_fp8.map_or(eredu_nn::LinearRowLayout::Contiguous, |(_,rows)|rows),
             gate_up_proj,
-            gate_up_proj_bias: if projection_biases[0] {
-                PhysicalParam::<Option<Array>>::unloaded_some(
-                    &[group_count, 2 * intermediate_dim],
-                    dense_dtype,
-                    stream,
-                )?
-            } else {
-                PhysicalParam::new(None)
-            },
-            gate_up_proj_scales,
-            gate_up_proj_biases,
-            down_proj,
-            down_proj_bias: if projection_biases[1] {
-                PhysicalParam::<Option<Array>>::unloaded_some(
-                    &[group_count, hidden_dim],
-                    dense_dtype,
-                    stream,
-                )?
-            } else {
-                PhysicalParam::new(None)
-            },
-            down_proj_scales,
-            down_proj_biases,
+            gate_up_proj_bias: PhysicalParam::new(if projection_biases[0] {
+                Some(factory.array("gate_up_proj_bias", &[group_count, gate_rows], dense_dtype, None)?)
+            } else {None}),
+            gate_up_proj_scales, gate_up_proj_biases, down_proj,
+            down_proj_bias: PhysicalParam::new(if projection_biases[1] {
+                Some(factory.array("down_proj_bias", &[group_count, hidden_dim], dense_dtype, None)?)
+            } else {None}),
+            down_proj_scales, down_proj_biases,
         })
     }
 
@@ -362,7 +273,7 @@ impl PackedGatedProductGroups {
             up = safemlx::ops::clip(up, (-bound, bound), stream)?;
         }
         if self.policy.up_offset() != 0.0 {
-            up = up.add(Array::from_f32(self.policy.up_offset()), stream)?;
+            up = up.add(Array::try_from_f32(self.policy.up_offset())?, stream)?;
         }
         let gate = match self.policy.activation() {
             GatedProductActivation::Silu if self.policy.sigmoid_multiplier() == 1.0 => {
@@ -370,7 +281,10 @@ impl PackedGatedProductGroups {
             }
             GatedProductActivation::Silu => gate.multiply(
                 sigmoid(
-                    gate.multiply(Array::from_f32(self.policy.sigmoid_multiplier()), stream)?,
+                    gate.multiply(
+                        Array::try_from_f32(self.policy.sigmoid_multiplier())?,
+                        stream,
+                    )?,
                     stream,
                 )?,
                 stream,
@@ -472,6 +386,12 @@ impl PackedGatedProductGroups {
         mut observer: Option<&mut dyn NativeGroupedUnitObserver>,
     ) -> Result<Array, Exception> {
         let num_tokens = hidden_states.dim(0);
+        let original_ids = crate::backend::nn::tensor::original_group_indices(
+            top_k_index,
+            self.group_count,
+            stream,
+        )?;
+        let top_k_index = original_ids.as_ref().unwrap_or(top_k_index);
         if num_tokens <= GROUPED_PROJECTION_CHUNK_THRESHOLD {
             return self.forward_chunk(
                 hidden_states,
@@ -483,10 +403,13 @@ impl PackedGatedProductGroups {
                 stream,
             );
         }
-        let mut outputs = Vec::new();
+        let chunks = usize::try_from(num_tokens)
+            .map_err(|_| Exception::custom("negative grouped token count"))?
+            .div_ceil(GROUPED_PROJECTION_CHUNK_TOKENS as usize);
+        let mut outputs = crate::backend::nn::tensor::GroupedChunkOutputs::prepare(chunks)?;
         let mut start = 0;
         while start < num_tokens {
-            let end = (start + GROUPED_PROJECTION_CHUNK_TOKENS).min(num_tokens);
+            let end = start + (num_tokens - start).min(GROUPED_PROJECTION_CHUNK_TOKENS);
             outputs.push(self.forward_chunk(
                 &hidden_states.try_index_device((start..end, ..), stream)?,
                 &top_k_index.try_index_device((start..end, ..), stream)?,
@@ -495,10 +418,10 @@ impl PackedGatedProductGroups {
                 num_tokens as usize,
                 &mut observer,
                 stream,
-            )?);
+            )?)?;
             start = end;
         }
-        concatenate_axis(&outputs, 0, stream)
+        concatenate_axis(outputs.as_slice(), 0, stream)
     }
 
     /// Separates the rank-local projection contribution from replicated grouped

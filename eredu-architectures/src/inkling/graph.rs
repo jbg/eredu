@@ -108,8 +108,8 @@ pub fn component_graph(args: &ModelArgs) -> Result<ComponentGraph, ComponentGrap
     ComponentGraph::new(units, outputs)
 }
 
-/// Declares key/value state plus all four bounded convolution histories from
-/// the same normalized layer schedule consumed by execution.
+/// Declares key/value state and the four bounded histories for convolution
+/// kernels wider than one, from the same normalized schedule as execution.
 pub fn state_layout(args: &ModelArgs) -> Result<StateLayout, StateError> {
     text_state_layout(&args.text_config)
 }
@@ -255,11 +255,21 @@ fn text_state_policy(
     policy: super::LayerPolicy,
 ) -> Result<LayerCachePolicy, StateError> {
     let history = text.sconv_kernel_size - 1;
+    let local = policy.attention.window().is_some();
+    if history == 0 {
+        // Width one is the same pointwise convolution with no carried history.
+        // Attention remains stateful; no zero-length fixed role is constructed.
+        return LayerCachePolicy::key_value(
+            policy.attention,
+            text.key_value_heads(local),
+            text.attention_head_dim(local),
+        )
+        .map_err(|error| StateError::InvalidResidency(error.to_string()));
+    }
     let fixed = |value| {
         StateTensorDimension::fixed(value)
             .map_err(|error| StateError::InvalidResidency(error.to_string()))
     };
-    let local = policy.attention.window().is_some();
     let kv_width = text
         .key_value_heads(local)
         .checked_mul(text.attention_head_dim(local))

@@ -1,4 +1,5 @@
 mod speculative;
+mod windows;
 use super::*;
 use crate::capture::CaptureInvocationSelection;
 use std::{cell::Cell, sync::Arc};

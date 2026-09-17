@@ -11,9 +11,12 @@ use std::marker::PhantomData;
 pub(crate) const SUCCESS: i32 = 0;
 pub(crate) const FAILURE: i32 = 1;
 
+#[cfg(test)]
+pub(crate) mod allocation_test;
 pub(crate) mod guard;
 pub(crate) mod io;
 pub(crate) mod runtime_lock;
+pub use runtime_lock::{runtime_lock_layout, RuntimeLockLayout};
 
 pub(crate) fn resolve_index_signed_unchecked(index: i32, len: i32) -> i32 {
     if index < 0 {
@@ -268,14 +271,11 @@ where
 }
 
 /// Function to create a new (+1 reference) mlx_vector_array from a vector of Array
-fn new_mlx_vector_array(arrays: Vec<Array>) -> safemlx_sys::mlx_vector_array {
-    unsafe {
-        let result = safemlx_sys::mlx_vector_array_new();
-        let ctx_ptrs: Vec<safemlx_sys::mlx_array> =
-            arrays.iter().map(|array| array.as_ptr()).collect();
-        safemlx_sys::mlx_vector_array_append_data(result, ctx_ptrs.as_ptr(), arrays.len());
-        result
-    }
+fn new_mlx_vector_array(arrays: Vec<Array>) -> Result<safemlx_sys::mlx_vector_array, Exception> {
+    let values = VectorArray::try_from_iter(arrays.iter())?;
+    let raw = values.c_vec;
+    std::mem::forget(values); // exact successful C ownership handoff
+    Ok(raw)
 }
 
 fn mlx_vector_array_values(
@@ -315,11 +315,16 @@ where
         let result = closure(&arrays);
         let _ = Box::into_raw(closure); // prevent premature drop
 
-        // We should probably keep using new_mlx_vector_array here instead of VectorArray
-        // since we probably don't want to drop the arrays in the closure
-        *ret = new_mlx_vector_array(result);
-
-        SUCCESS
+        match new_mlx_vector_array(result) {
+            Ok(value) => {
+                *ret = value;
+                SUCCESS
+            }
+            Err(error) => {
+                set_closure_error(error);
+                FAILURE
+            }
+        }
     }
 }
 
@@ -345,9 +350,9 @@ where
         let result = closure(&arrays);
         let _ = Box::into_raw(closure); // prevent premature drop
 
-        match result {
+        match result.and_then(new_mlx_vector_array) {
             Ok(result) => {
-                *ret = new_mlx_vector_array(result);
+                *ret = result;
                 SUCCESS
             }
             Err(err) => {
@@ -496,3 +501,6 @@ impl<T> From<Vec<T>> for SingleOrVec<T> {
         SingleOrVec::Vec(value)
     }
 }
+
+#[cfg(test)]
+mod graph_quota_tests;

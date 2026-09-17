@@ -713,7 +713,15 @@ fn gemma4_shared_and_sliding_layers_use_executable_cache_retention() {
     assert_eq!(estimate.context_state_bytes, (256 + 2 * 4) * 2 * 4 * 2 * 4);
     assert_eq!(estimate.multimodal_embedding_bytes, 3 * 8 * 2 * 4);
     assert_eq!(estimate.media_execution_workspace_bytes, 2_048);
-    assert_eq!(estimate.completeness, EstimationCompleteness::Conservative);
+    assert_eq!(
+        estimate.persistent_state_completeness,
+        EstimationCompleteness::Conservative
+    );
+    assert!(estimate.execution_workspace.is_none());
+    assert_eq!(
+        estimate.completeness,
+        EstimationCompleteness::PersistentStateOnly
+    );
 }
 
 #[test]

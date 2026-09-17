@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 mod coordinates;
-pub use coordinates::{ComponentCoordinateError, ComponentCoordinateMap};
+pub use coordinates::{ComponentCoordinateCopyError, ComponentCoordinateError, ComponentCoordinateMap, ComponentIndexProjectionError, ComponentIndexProjectionPlan};
 mod routed;
 mod routed_read;
 mod streams;

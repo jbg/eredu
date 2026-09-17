@@ -1,0 +1,54 @@
+diff --git a/mlx/array.h b/mlx/array.h
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -259,6 +259,16 @@
+   /** A unique identifier for an array. */
+   std::uintptr_t id() const {
+     return reinterpret_cast<std::uintptr_t>(array_desc_.get());
++  }
++
++  // Read-only descriptor facts for a closed original validation-root consumer.
++  // No data/descriptor/allocator owner escapes and no initialization occurs.
++  static bool graph_descriptor_minimum_extent(size_t& out) noexcept {
++    return submission::GraphQuota::minimum_allocation_extent(
++        sizeof(ArrayDesc), alignof(ArrayDesc), out);
++  }
++  bool has_graph_descriptor(const submission::GraphQuota* domain) const noexcept {
++    return domain && array_desc_ && array_desc_->allocation_quota == domain;
+   }
+ 
+   /** A unique identifier for an arrays primitive. */
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -127,6 +127,16 @@
+   return add(sizeof(Block) + sizeof(size_t), align - 1, bytes) &&
+       add(bytes, std::max(requested, size_t{1}), bytes) &&
+       align_up(bytes, alignment, out);
++}
++
++bool GraphQuota::minimum_allocation_extent(size_t requested, size_t align, size_t& out) noexcept {
++  size_t start, used;
++  if (!align || (align & (align - 1)) || align > alignment) return false;
++  // Arena base and every split Block offset are max_align_t-aligned. This is
++  // the exact relative pointer calculation in try_allocate before tail choice.
++  return align_up(sizeof(Block) + sizeof(size_t), align, start) &&
++      add(start, std::max(requested, size_t{1}), used) &&
++      align_up(used, alignment, out);
+ }
+ 
+ GraphQuota* GraphQuota::try_create(size_t capacity, void* owner, void (*retire)(void*)) noexcept {
+diff --git a/mlx/graph_quota.h b/mlx/graph_quota.h
+--- a/mlx/graph_quota.h
++++ b/mlx/graph_quota.h
+@@ -43,6 +43,10 @@
+   static GraphQuota* try_create(size_t capacity, void* owner, void (*retire)(void*)) noexcept;
+   // Exact worst-alignment block extent used by both the allocator and source recipes.
+   static bool allocation_extent(size_t bytes, size_t alignment, size_t& out) noexcept;
++  // Lower physical extent for a distinct live block. The allocator may absorb
++  // an unusable tail, increasing occupancy. Never use worst-alignment reserve
++  // extents as lower bounds when deriving a bounded live-object population.
++  static bool minimum_allocation_extent(size_t bytes, size_t alignment, size_t& out) noexcept;
+   struct Request { size_t bytes; size_t alignment; };
+   // A source-private arena can reserve one leaf's concrete blocks without throwing.
+   // No ordinary allocator is used if a prepared constructor requests a mismatch.

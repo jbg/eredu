@@ -1,0 +1,196 @@
+diff --git a/src/bounded_number.rs b/src/bounded_number.rs
+new file mode 100644
+--- /dev/null
++++ b/src/bounded_number.rs
+@@ -0,0 +1,110 @@
++//! Move-only scalar planning around the ordinary JSON number deserializer.
++//!
++//! Planning borrows the original bytes and performs no allocation. Parsing must
++//! be invoked only after the caller admits the returned storage requirement.
++//! This module owns no memory grant. Additional numeric feature profiles remain
++//! explicit refusals until their actual scratch/storage producer is closed.
++use crate::{Error, Number};
++use core::{fmt, mem::size_of, ops::Range};
++
++/// Fixed planning refusal without an allocated serde error.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum PlanError {
++    /// Float-roundtrip or arbitrary-precision scratch is a separate profile.
++    Features,
++    /// The slice is not a numeric spelling or exceeds the ordinary i32 counter.
++    Input,
++    /// A requested control layout overflowed.
++    Overflow,
++}
++impl fmt::Display for PlanError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(match self {
++            Self::Features => "JSON scalar storage feature profile is unqualified",
++            Self::Input => "JSON scalar input profile is unqualified",
++            Self::Overflow => "JSON scalar storage layout overflow",
++        })
++    }
++}
++#[cfg(feature = "std")]
++impl std::error::Error for PlanError {}
++
++/// Concrete parser controls and its one possible owned syntax-error allocation.
++#[derive(Clone, Copy, Debug)]
++pub struct Requirements {
++    failure: usize,
++    controls: usize,
++}
++impl Requirements {
++    /// Actual private error Box payload. Successful numeric parsing allocates none.
++    pub fn failure_bytes(self) -> usize {
++        self.failure
++    }
++    /// Actual scalar parser, caller/return, and fixed planning controls.
++    pub fn control_bytes(self) -> usize {
++        self.controls
++    }
++    /// Checked sum to admit before parsing.
++    pub fn required_bytes(self) -> usize {
++        self.failure + self.controls
++    }
++}
++
++/// One numeric slice tied to the original complete immutable source.
++#[derive(Debug)]
++pub struct Plan<'a> {
++    source: &'a str,
++    range: Range<usize>,
++    requirements: Requirements,
++}
++impl<'a> Plan<'a> {
++    /// Borrow a numeric slice without deserializing or allocating. The spelling
++    /// check only confines the ordinary parser to numeric/syntax-error branches;
++    /// it does not replace JSON syntax or finite-range validation during parse.
++    pub fn prepare(source: &'a str, range: Range<usize>) -> Result<Self, PlanError> {
++        if cfg!(any(
++            feature = "float_roundtrip",
++            feature = "arbitrary_precision"
++        )) {
++            return Err(PlanError::Features);
++        }
++        let raw = tri!(source.get(range.clone()).ok_or(PlanError::Input));
++        if raw.len() > i32::MAX as usize
++            || !matches!(raw.as_bytes().first(), Some(b'-' | b'0'..=b'9'))
++            || !raw
++                .bytes()
++                .all(|byte| matches!(byte, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'))
++        {
++            return Err(PlanError::Input);
++        }
++        let parts = [
++            tri!(crate::de::bounded_number_control_bytes().ok_or(PlanError::Overflow)),
++            size_of::<Self>(),
++            size_of::<Result<Self, PlanError>>(),
++            size_of::<Requirements>(),
++            size_of::<PlanError>(),
++            size_of::<(&str, Range<usize>, core::str::Bytes<'a>, bool)>(),
++        ];
++        let controls = tri!(parts
++            .into_iter()
++            .try_fold(size_of::<[usize; 6]>(), usize::checked_add)
++            .ok_or(PlanError::Overflow));
++        let failure = Error::bounded_number_storage_bytes();
++        tri!(controls.checked_add(failure).ok_or(PlanError::Overflow));
++        Ok(Self {
++            source,
++            range,
++            requirements: Requirements { failure, controls },
++        })
++    }
++    /// Exact known storage before the first ordinary parser invocation.
++    pub fn requirements(&self) -> Requirements {
++        self.requirements
++    }
++    /// Consume this plan through the same deserializer as ordinary Number/Value.
++    /// The original serde error retains its exact code and document position.
++    pub fn parse(self) -> Result<Number, Error> {
++        crate::from_slice(self.source[self.range.clone()].as_bytes())
++            .map_err(|error: Error| error.relocate_number(&self.source[..self.range.start]))
++    }
++}
+diff --git a/src/de.rs b/src/de.rs
+--- a/src/de.rs
++++ b/src/de.rs
+@@ -2712,3 +2712,39 @@
+ {
+     from_trait(read::StrRead::new(s))
+ }
++
++
++// Owning controls for the existing non-roundtrip numeric branch. Every parser
++// method is the ordinary method above; this query introduces no numeric engine.
++pub(crate) fn bounded_number_control_bytes() -> Option<usize> {
++    use core::mem::size_of;
++    let parts = [
++        size_of::<Deserializer<SliceRead<'static>>>(),
++        size_of::<SliceRead<'static>>(),
++        size_of::<&mut Deserializer<SliceRead<'static>>>(),
++        size_of::<ParserNumber>(),
++        size_of::<Result<ParserNumber>>(),
++        size_of::<crate::Number>(),
++        size_of::<Result<crate::Number>>(),
++        // parse_integer/parse_number: signs, digit/significand and signed result.
++        size_of::<(bool, u8, u8, u64, u64, i64)>(),
++        // parse_long_integer: sign, retained significand and skipped exponent.
++        size_of::<(bool, u64, i32)>(),
++        // parse_decimal: sign, significand, before/after/final exponents, digit.
++        size_of::<(bool, u64, i32, i32, i32, u8, u64)>(),
++        // parse_decimal_overflow retains its exact three scalar inputs.
++        size_of::<(bool, u64, i32)>(),
++        // parse_exponent: inputs, exponent sign/digits, zero and saturated sum.
++        size_of::<(bool, u64, i32, bool, u8, i32, i32, bool, i32)>(),
++        // f64_from_parts and exponent overflow use no scratch allocation.
++        size_of::<(bool, u64, i32, f64, Option<&'static f64>)>(),
++        size_of::<(bool, bool, bool)>(),
++        // Read/peek/end and syntax-error positioning/return transports.
++        size_of::<(Option<u8>, Result<Option<u8>>, Result<u8>, Result<()>)>(),
++        size_of::<(crate::read::Position, ErrorCode, crate::Error)>(),
++        size_of::<(&str, core::str::Bytes<'static>, usize, Option<usize>)>(),
++    ];
++    parts
++        .into_iter()
++        .try_fold(core::mem::size_of_val(&parts), usize::checked_add)
++}
+diff --git a/src/error.rs b/src/error.rs
+--- a/src/error.rs
++++ b/src/error.rs
+@@ -311,6 +311,22 @@
+ }
+ 
+ impl Error {
++    pub(crate) fn bounded_number_storage_bytes() -> usize {
++        core::mem::size_of::<ErrorImpl>()
++    }
++
++    // The same owned syntax error, relocated from a borrowed scalar slice to
++    // the original document. This neither formats nor replaces its Box.
++    pub(crate) fn relocate_number(mut self, prefix: &str) -> Self {
++        let lines = prefix.bytes().filter(|byte| *byte == b'\n').count();
++        if self.err.line == 1 {
++            let column = prefix.rfind('\n').map_or(prefix.len(), |at| prefix.len() - at - 1);
++            self.err.column += column;
++        }
++        self.err.line += lines;
++        self
++    }
++
+     #[cold]
+     pub(crate) fn syntax(code: ErrorCode, line: usize, column: usize) -> Self {
+         Error {
+diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -419,6 +419,8 @@
+ #[macro_use]
+ mod macros;
+ 
++/// Bounded planning for the existing numeric scalar deserializer.
++pub mod bounded_number;
+ pub mod de;
+ pub mod error;
+ pub mod map;

@@ -1,4 +1,5 @@
 use super::*;
+mod host_authority;
 
 fn setup() -> (CaptureSession, CaptureDiscovery) {
     let (plan, catalog, mut support, capabilities) =

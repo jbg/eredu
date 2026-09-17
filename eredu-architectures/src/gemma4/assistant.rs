@@ -1,22 +1,27 @@
 //! External Gemma 4 assistant equations and forkable draft state.
+mod shared;
+pub use shared::SharedAssistantStates;
 
 use std::collections::HashMap;
+/// Shared ordinary/cold proposal operation.
+pub mod invocation;
+use crate::decoder::ModuleMetadata;
 
 use eredu_checkpoint::{
-    schema::{
-        matrix_for_linear_format, CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint,
-        GgufTypeConstraint, SafetensorsCheckpointPlan, SafetensorsTensorConstraint,
-        StoredDtypeConstraint, TensorOperation,
-    },
     LinearFormat, StoredDtype, WeightQuantization,
+    schema::{
+        CatalogPolicy, GgufCheckpointPlan, GgufTensorConstraint, GgufTypeConstraint,
+        SafetensorsCheckpointPlan, SafetensorsTensorConstraint, StoredDtypeConstraint,
+        TensorOperation, matrix_for_linear_format,
+    },
 };
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_gguf::MetadataValue;
 use eredu_nn::{
-    multimodal::{masked_output_projection, MaskedOutputProjectionInput},
     AttentionCache, AttentionStateSource, EmbeddingOperator, EmbeddingSpec, Error,
     GroupedNeuralBackend, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
     NormalizationOperator, Parameter, ParameterSpec, Parameterized, RotaryPosition, Tensor,
+    multimodal::{MaskedOutputProjectionInput, masked_output_projection},
 };
 use serde::Deserialize;
 
@@ -286,10 +291,13 @@ impl AssistantConfig {
 
     /// Validates output masking, drafting, and target-fusion geometry.
     pub fn validate(&self) -> Result<(), AssistantConfigError> {
+        self.validate_with(|message| AssistantConfigError::Invalid(message.into()))
+    }
+
+    fn validate_with<E>(&self, invalid: impl Fn(&'static str) -> E) -> Result<(), E> {
         if self.backbone_hidden_size <= 0 || self.block_size < 2 {
-            return Err(AssistantConfigError::Invalid(
-                "Gemma 4 assistant requires positive target width and block size at least two"
-                    .into(),
+            return Err(invalid(
+                "Gemma 4 assistant requires positive target width and block size at least two",
             ));
         }
         if self.use_ordered_embeddings
@@ -299,9 +307,8 @@ impl AssistantConfig {
                 || self.centroid_intermediate_top_k > self.num_centroids
                 || self.text_config.vocab_size % self.num_centroids != 0)
         {
-            return Err(AssistantConfigError::Invalid(
-                "ordered Gemma 4 assistant embeddings require dense weights and integral centroid groups"
-                    .into(),
+            return Err(invalid(
+                "ordered Gemma 4 assistant embeddings require dense weights and integral centroid groups",
             ));
         }
         if self
@@ -310,8 +317,8 @@ impl AssistantConfig {
             .iter()
             .any(|policy| policy.key_value != AttentionStateSource::Shared)
         {
-            return Err(AssistantConfigError::Invalid(
-                "Gemma 4 assistant layers must consume shared target KV".into(),
+            return Err(invalid(
+                "Gemma 4 assistant layers must consume shared target KV",
             ));
         }
         Ok(())
@@ -596,11 +603,13 @@ pub fn translate_assistant_gguf_weight_name(name: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct AssistantState<T> {
     /// Shared target K/V captures keyed by attention policy.
-    pub shared_kv: SharedAttentionStates<T>,
+    pub shared_kv: SharedAssistantStates<T>,
     /// Committed target cache length.
     pub kv_offset: i32,
     /// Target-width hidden capture from the prior position.
     pub hidden: T,
+    /// Exact completed source, retired after all branch tensor values.
+    pub evidence: Option<crate::speculative_execution::PreparedEmbeddedEvidence>,
 }
 
 /// Output from one assistant proposal step.
@@ -618,7 +627,7 @@ struct MaskedHead<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     centroids: B::Linear,
     token_ordering: Parameter<B::Tensor>,
     output_weight: Parameter<B::Tensor>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     top_k: i32,
 }
 
@@ -627,30 +636,36 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MaskedHead<B> {
         config: &AssistantConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = ModuleMetadata::new::<B>(context);
+        metadata.controls::<(
+            Self,
+            LinearSpec,
+            EmbeddingSpec,
+            NormalizationConstructionSpec,
+            Option<ParameterSpec>,
+            Result<Self, Error>,
+            &AssistantConfig,
+        )>()?;
         let args = &config.text_config;
         Ok(Self {
             centroids: B::linear(
                 LinearSpec {
                     input: args.hidden_size,
                     output: config.num_centroids,
-                    weight: ParameterSpec::trainable("masked_embedding.centroids.weight")
-                        .map_err(Error::backend)?,
+                    weight: metadata.plain_parameter("masked_embedding.centroids.weight")?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        "masked_embedding.centroids.weight",
-                        LinearFormat::Dense,
-                    )?,
+                    format: metadata
+                        .format("masked_embedding.centroids.weight", LinearFormat::Dense)?,
                 },
                 context,
             )?,
             token_ordering: Parameter::unloaded_i32(
-                ParameterSpec::trainable("masked_embedding.token_ordering")
-                    .map_err(Error::backend)?,
+                metadata.plain_parameter("masked_embedding.token_ordering")?,
                 &[args.vocab_size],
                 context,
             )?,
             output_weight: Parameter::unloaded(
-                ParameterSpec::trainable("model.embed_tokens.weight").map_err(Error::backend)?,
+                metadata.plain_parameter("model.embed_tokens.weight")?,
                 &[args.vocab_size, args.hidden_size],
                 context,
             )?,
@@ -682,8 +697,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> MaskedHead<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Assistant<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
-    config: AssistantConfig,
+    #[parameter(skip, metadata)]
+    block_size: usize,
+    #[parameter(skip, metadata)]
+    policies: Vec<super::LayerPolicy>,
     layers: Vec<DenseBlock<B>>,
     final_norm: B::Normalization,
     pre_projection: B::Linear,
@@ -699,11 +716,37 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> 
         config: AssistantConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        config.validate().map_err(Error::backend)?;
+        Self::from_config(&config, context)
+    }
+
+    /// Constructs the same module from a retained configuration loan. Only
+    /// scalar layer policies needed by the equation are retained in the module.
+    pub(crate) fn from_config(
+        config: &AssistantConfig,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let metadata = ModuleMetadata::new::<B>(context);
+        metadata.controls::<(
+            Self,
+            LinearSpec,
+            EmbeddingSpec,
+            NormalizationConstructionSpec,
+            Option<ParameterSpec>,
+            Result<Self, Error>,
+            &AssistantConfig,
+        )>()?;
+        config.validate_with(|message| metadata.error(format_args!("{message}")))?;
         let args = &config.text_config;
-        let layers = (0..args.num_hidden_layers())
-            .map(|layer| DenseBlock::new_at(args, layer, "model.layers", context))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut layers = metadata.vector(args.num_hidden_layers())?;
+        let mut policies = metadata.vector(args.num_hidden_layers())?;
+        for layer in 0..args.num_hidden_layers() {
+            layers.push(DenseBlock::new_at(args, layer, "model.layers", context)?);
+            policies.push(
+                args.layer_policy(layer).ok_or_else(|| {
+                    metadata.error(format_args!("missing assistant layer policy"))
+                })?,
+            );
+        }
         let format = |name: &str| {
             config
                 .quantization
@@ -715,9 +758,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> 
                 LinearSpec {
                     input,
                     output,
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(name)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(name, format(name))?,
+                    format: metadata.format(name, format(name))?,
                 },
                 context,
             )
@@ -732,9 +775,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> 
                     EmbeddingSpec {
                         vocabulary: args.vocab_size,
                         dimensions: args.hidden_size,
-                        weight: ParameterSpec::trainable("model.embed_tokens.weight")
-                            .map_err(Error::backend)?,
-                        format: crate::linear_format::standard_linear_format(
+                        weight: metadata.plain_parameter("model.embed_tokens.weight")?,
+                        format: metadata.format(
                             "model.embed_tokens.weight",
                             args.linear_format_for("model.embed_tokens.weight"),
                         )?,
@@ -752,7 +794,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> 
                 NormalizationConstructionSpec::learned(
                     args.hidden_size,
                     args.rms_norm_eps,
-                    ParameterSpec::trainable("model.norm.weight").map_err(Error::backend)?,
+                    metadata.plain_parameter("model.norm.weight")?,
                 ),
                 context,
             )?,
@@ -769,13 +811,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> 
             tied_embedding,
             output_head,
             masked_head,
-            config,
+            block_size: config.block_size,
+            policies,
         })
     }
 
     /// Maximum number of proposals after the anchor token.
     pub fn max_proposals(&self) -> usize {
-        self.config.block_size.saturating_sub(1)
+        self.block_size.saturating_sub(1)
     }
 
     /// Starts one proposal branch from committed target captures.
@@ -786,7 +829,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> 
         hidden: B::Tensor,
     ) -> AssistantState<B::Tensor> {
         AssistantState {
-            shared_kv,
+            evidence: None,
+            shared_kv: shared_kv.into(),
             kv_offset,
             hidden,
         }
@@ -799,33 +843,46 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> 
         state: &mut AssistantState<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let input = B::Tensor::concatenate(
-            &[scaled_target_token_embedding.clone(), state.hidden.clone()],
-            -1,
+        self.draft_step_parts::<C>(
+            scaled_target_token_embedding,
+            &mut state.hidden,
+            &mut state.kv_offset,
+            &mut state.shared_kv,
             context,
-        )?;
-        let output = self.forward::<C>(&input, state, context)?;
-        state.hidden = output.hidden;
-        state.kv_offset = state.kv_offset.saturating_add(1);
+        )
+    }
+
+    fn draft_step_parts<C: AttentionCache<B::Tensor>>(
+        &mut self,
+        embedding: &B::Tensor,
+        previous_hidden: &mut B::Tensor,
+        offset: &mut i32,
+        shared: &mut dyn super::SharedAttentionStore<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error> {
+        let input =
+            B::Tensor::concatenate(&[embedding.clone(), previous_hidden.clone()], -1, context)?;
+        let output = self.forward::<C>(&input, *offset, shared, context)?;
+        *previous_hidden = output.hidden;
+        *offset = offset.saturating_add(1);
         Ok(output.logits)
     }
 
     fn forward<C: AttentionCache<B::Tensor>>(
         &mut self,
         input: &B::Tensor,
-        state: &mut AssistantState<B::Tensor>,
+        offset: i32,
+        shared: &mut dyn super::SharedAttentionStore<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<AssistantOutput<B::Tensor>, Error> {
         let mut hidden = self.pre_projection.forward(input, context)?;
-        let query_offset = state.kv_offset.saturating_sub(1);
+        let query_offset = offset.saturating_sub(1);
         for (layer_index, layer) in self.layers.iter_mut().enumerate() {
             let policy = self
-                .config
-                .text_config
-                .layer_policy(layer_index)
+                .policies
+                .get(layer_index)
                 .ok_or_else(|| Error::backend("missing assistant layer policy"))?;
-            let key_length = state
-                .shared_kv
+            let key_length = shared
                 .get(&policy.attention)
                 .ok_or_else(|| Error::backend("missing shared K/V state for assistant layer"))?
                 .0
@@ -842,7 +899,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Assistant<B> 
                     hidden: &hidden,
                     mask: mask.as_ref(),
                     cache: None,
-                    shared: &mut state.shared_kv,
+                    shared,
                     per_layer_input: None,
                     rotary_position: Some(RotaryPosition::Offset(query_offset)),
                 },

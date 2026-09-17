@@ -20,11 +20,19 @@ communication bindings. Native groups, tensors, transfers, and exact
 completions stay in the selected session. MLX backend tooling is described in
 its [implementation architecture](../eredu-backend-mlx/doc/architecture.md).
 
+The topology matrix below describes functional execution. Finite request-wide
+managed-memory admission for distributed communication and workspace remains
+unfinished; a residency limit alone does not supply that bound. See the
+[current managed-admission matrix](bounded-inference.md#current-integration-status).
+
 ## Topology matrix
 
-Every listed combination supports prefill, cached decode, synchronized token
-generation, and rank-local prompt-cache persistence. The concrete artifact,
-quantization, and residency request must still pass `inspect_model`.
+The ordinary text combinations below support prefill, cached decode, synchronized
+token generation, and rank-local prompt-cache persistence. Moshi/PersonaPlex use
+their separate realtime frame protocol: current pure TP execution does not imply
+frame snapshot/fork or persisted prompt-cache support. Those lifecycle and PP
+paths remain implementation work. The concrete artifact, quantization, and
+residency request must still pass `inspect_model`.
 
 | Family | Axes | Executable combinations | Artifact notes |
 | --- | --- | --- | --- |
@@ -47,7 +55,7 @@ quantization, and residency request must still pass `inspect_model`.
 | Qwen3-VL dense | TP, PP | TP, PP, TP+PP | SafeTensors and GGUF with projector |
 | Qwen3-VL-MoE | TP, PP, EP | all pure, pairwise, and triple-axis combinations | vision blocks and MoE text decoder are both placed |
 | Muse-Glimmer | TP, PP | TP, PP, TP+PP | SafeTensors and canonical GGUF; EP does not apply |
-| Moshi / PersonaPlex | TP | TP | realtime temporal/depth runtime; PP and EP do not apply |
+| Moshi / PersonaPlex | TP | TP | realtime temporal/depth runtime; PP is not implemented; EP does not apply because these graphs have no routed experts |
 
 “All pure, pairwise, and triple-axis combinations” means TP, PP, EP, TP+PP,
 TP+EP, PP+EP, and TP+PP+EP.
@@ -116,3 +124,8 @@ common collective order.
 See [Cancellation and bounded execution](cancellation.md) for submitted-work
 ownership and [Model loading, quantization, and memory](model-loading.md) for
 distributed residency limits.
+
+
+### PersonaPlex selected scalar coverage
+
+A private F32 PersonaPlex fixture now exercises real selected resident, host-layerwise and disk-streamed construction using the same shared frame driver and normalized per-unit norm replicas. It preserves sixteen depth decisions and the released delay/alias/packed-slice semantics, compares complete nonzero state and output through continuation, and tests pre-vocabulary demand across wider low-level calls. This is single-rank semantic coverage. It does not establish nonzero native TP, combined TP/PP, checkpoint persistence, released 7B parity or PCM integration. Pipeline and persistence work remain explicit implementation gaps.

@@ -11,7 +11,7 @@ pub(super) fn prepare<B, S, V>(
         eredu_runtime::SelectedReplicatedTextRealization,
         eredu_runtime::ReplicatedTextRequirements,
     >,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, DenseDecoderPartitionedDispatchError<V::Error>>
@@ -34,7 +34,7 @@ fn prepare_with<B, S, F, O, E>(
         eredu_runtime::SelectedReplicatedTextRealization,
         eredu_runtime::ReplicatedTextRequirements,
     >,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
     finish: F,
 ) -> Result<O, DenseDecoderPartitionedDispatchError<E>>
@@ -51,7 +51,7 @@ where
             crate::qwen::hybrid::LocalGeometry,
             eredu_runtime::NoAuxiliaryBoundarySchema,
         >,
-        eredu_checkpoint::store::SharedCheckpointSource,
+        eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<O, E>,
 {
     if args.is_moe() || args.mtp_num_hidden_layers != 0 {
@@ -179,7 +179,7 @@ pub(super) fn prepare_prediction<B, S, M, V>(
         eredu_runtime::ReplicatedTextRequirements,
     >,
     extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, DenseDecoderPartitionedDispatchError<V::Error>>
@@ -213,7 +213,7 @@ where
 pub(super) fn prepare_routed<B, S, V>(
     args: &crate::qwen::hybrid::HybridConfig,
     selected: SelectedPartitionedAdmission<SelectedRoutedTextRealization, RoutedTextRequirements>,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as eredu_nn::Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, DenseDecoderPartitionedDispatchError<V::Error>>
@@ -327,6 +327,7 @@ where
     model.set_partition_target_start(start);
     model.install_expert_realization(plan.clone());
     prepare_family_routed_partition::<B, S, _, _, _, _>(
+        None,
         model,
         source_architecture,
         selected,

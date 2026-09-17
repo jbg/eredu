@@ -189,8 +189,16 @@ def generate(
     c_to_cpp=lambda s: s + "->ctx",
     c_assign=lambda d, s: "(*" + d + ")->ctx = " + s,
 ):
+    container = "mlx::core::ArrayVector" if sctype == "array" else "std::vector<" + cpptype + ">"
     if code is None:
-        return tpg.generate("mlx_vector_" + sctype, "std::vector<" + cpptype + ">")
+        return tpg.generate("mlx_vector_" + sctype, container)
+    if sctype == "array":
+        # No raw handle is published before fallible graph-buffer construction.
+        code = code.replace("auto vec = mlx_vector_SCTYPE_new();", "CPPCONTAINER values;")
+        code = code.replace("mlx_vector_SCTYPE_get_(vec).push_back(C_TO_CPP(data[i]));", "values.push_back(C_TO_CPP(data[i]));", 1)
+        code = code.replace("return vec;", "return mlx_vector_SCTYPE_new_(std::move(values));", 1)
+    code = code.replace("std::vector<CPPTYPE>", "CPPCONTAINER")
+    code = code.replace("CPPCONTAINER", container)
 
     if rctype is None:
         rctype = ctype.replace("const ", "") + "*"
@@ -297,7 +305,7 @@ print(
 print(
     generate(
         code,
-        "std::vector<mlx::core::array>",
+        "mlx::core::ArrayVector",
         "const mlx_vector_array",
         "vector_array",
         "mlx_vector_array*",

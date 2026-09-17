@@ -7,8 +7,29 @@ use std::sync::Arc;
 /// the enclosing execution controller. Invocation IDs and consumption are not saved.
 #[derive(Clone, Debug)]
 pub struct SpeculativeActivationCheckpoint {
-    owner: Arc<()>,
-    plan: AdmittedSpeculativeActivations,
+    pub(super) authority: Authority,
+    // Last: copied authority retires before inherited host custody.
+    pub(super) host_owner: Arc<crate::capture::CaptureHostOwner>,
+    // Original shared shell and authority allocations retire before source H.
+    pub(super) original_funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum Authority {
+    Ordinary { owner: Arc<()>, plan: AdmittedSpeculativeActivations },
+    Original(super::original::control::Saved),
+}
+
+
+impl SpeculativeActivationCheckpoint {
+    /// Retains already-acquired host custody for this checkpoint and source-run
+    /// aliases. This is not fresh speculative destination admission or a bound.
+    pub fn retain_host_preparation(
+        &self,
+        authority: &eredu_core::HostPreparationAuthority,
+    ) -> Result<(), CaptureError> {
+        self.host_owner.retain(authority)
+    }
 }
 
 /// Fully validated authority replacement. Dropping this preparation changes
@@ -36,7 +57,7 @@ impl<P: CaptureBackendProvider, F> PreparedSpeculativeActivationRestore for Prep
     }
 }
 
-fn storage(plan: &AdmittedSpeculativeActivations) -> Option<u64> {
+pub(super) fn storage(plan: &AdmittedSpeculativeActivations) -> Option<u64> {
     use crate::execution_control::storage::heap_bytes;
     let strings = [
         plan.identity(),
@@ -79,13 +100,16 @@ impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
         self.control_storage_bytes().ok_or_else(|| {
             CaptureError::Unsupported("internal authority has no drained bounded checkpoint".into())
         })?;
+        let _source_authority = self.session.owner.retained()?;
         Ok(SpeculativeActivationCheckpoint {
-            owner: Arc::clone(&self.control_owner),
+            authority: Authority::Ordinary { owner: Arc::clone(&self.control_owner),
             plan: self
                 .admitted
                 .as_ref()
                 .expect("bounded admitted authority")
-                .clone(),
+                .clone() },
+            host_owner: Arc::clone(&self.session.owner),
+            original_funding: None,
         })
     }
 
@@ -152,15 +176,20 @@ impl<P: CaptureBackendProvider, F> SpeculativeCaptureObserver<P, F> {
         &mut self,
         saved: &SpeculativeActivationCheckpoint,
     ) -> Result<Box<dyn PreparedSpeculativeActivationRestore + '_>, CaptureError> {
-        if !Arc::ptr_eq(&self.control_owner, &saved.owner) {
+        let Authority::Ordinary { owner, plan } = &saved.authority else {
+            return Err(CaptureError::Invalid("internal checkpoint belongs to another collector".into()));
+        };
+        if !Arc::ptr_eq(&self.control_owner, owner) {
             return Err(CaptureError::Invalid(
                 "internal checkpoint belongs to another collector".into(),
             ));
         }
         // Restoring authority alone performs no capture work. Its next invocation
         // must still reserve against the current, unreduced cumulative ledger.
-        self.validate_plan(&saved.plan, CaptureUsage::default())?;
-        Ok(self.prepare_plan(saved.plan.clone()))
+        self.validate_plan(plan, CaptureUsage::default())?;
+        let source_authority = saved.host_owner.retained()?;
+        self.session.retain_host_preparation(&source_authority)?;
+        Ok(self.prepare_plan(plan.clone()))
     }
 
     pub(super) fn readmit_control(

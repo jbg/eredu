@@ -64,6 +64,7 @@ fn mirostat() -> PreparedChatGenerationSettings {
             ..Default::default()
         },
         seed: 73,
+        ..Default::default()
     }
 }
 
@@ -98,6 +99,7 @@ fn prepared_sampling_preserves_strategy_resolved_controls_and_vocabulary_masks()
                 ..Default::default()
             },
             seed: 73,
+            ..Default::default()
         };
         let expected = model.resolve_generation_config(settings.overrides).unwrap();
         // The observed path shares the same strategy resolution and constraints.
@@ -444,4 +446,54 @@ fn assert_invalid_speculative_settings(
     assert_eq!(calls.speculative, 0);
     assert!(calls.configs.is_empty());
     assert!(calls.filters.is_empty());
+}
+
+#[test]
+fn speculative_single_batch_and_prompt_failures_use_provider_hook() {
+    for fail_prompt in [false, true] {
+        for batch in [false, true] {
+            let backend = MockBackend::default();
+            let calls = backend.calls.clone();
+            let mut model = sparse_vocabulary_model_with_backend(backend, None);
+            let chat = chat(&mut model);
+            calls.borrow_mut().reject_prompt = fail_prompt;
+            let error = if batch {
+                model
+                    .generate_prepared_chat_speculative_batch(PreparedChatSpeculativeBatchRequest {
+                        drafting: SpeculativeDraft::Embedded,
+                        lanes: vec![PreparedChatSpeculativeBatchLane {
+                            input: PreparedChatInput::rendered_prompt(&chat),
+                            settings: mirostat(),
+                            max_draft_tokens: std::num::NonZeroUsize::new(2).unwrap(),
+                            caller_stop_sequences: &[],
+                            cancellation: Default::default(),
+                            on_event: Box::new(|_| panic!("rejected backend must not emit")),
+                        }],
+                        scheduler: Default::default(),
+                    })
+                    .err()
+                    .unwrap()
+            } else {
+                model
+                    .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
+                        input: PreparedChatInput::rendered_prompt(&chat),
+                        drafting: SpeculativeDraft::Embedded,
+                        settings: mirostat(),
+                        options: Default::default(),
+                        caller_stop_sequences: &[],
+                        cancellation: Default::default(),
+                        on_event: |_| panic!("rejected backend must not emit"),
+                    })
+                    .unwrap_err()
+            };
+            let PreparedChatSpeculativeError::Backend(error) = error else {
+                panic!("backend error lost its typed facade branch")
+            };
+            assert_eq!(error.kind(), eredu_core::BackendFailureKind::Busy);
+            assert_eq!(error.operation(), "portable-provider-hook");
+            assert!(std::error::Error::source(&error).unwrap().is::<MockError>());
+            assert_eq!(calls.borrow().speculative, usize::from(!fail_prompt));
+            assert_eq!(calls.borrow().prompts, usize::from(!fail_prompt));
+        }
+    }
 }

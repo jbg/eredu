@@ -1,0 +1,281 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-13",
+  "created_utc": "2026-09-13T19:44:22.077321+00:00",
+  "scope": "Authenticated sampler custody and independently funded sampler-component copies",
+  "status": "verified_increment_full_goal_incomplete",
+  "tests": {
+    "runtime": {
+      "passed": 729,
+      "ignored": 0
+    },
+    "native": {
+      "passed": 4,
+      "ignored": 0
+    },
+    "sampling": {
+      "passed": 3,
+      "ignored": 0
+    },
+    "preparation": {
+      "passed": 42,
+      "ignored": 0
+    },
+    "quote": {
+      "passed": 9,
+      "ignored": 0
+    },
+    "admission": {
+      "passed": 5,
+      "ignored": 0
+    },
+    "reuse": {
+      "passed": 4,
+      "ignored": 0
+    },
+    "step": {
+      "passed": 4,
+      "ignored": 0
+    },
+    "handoff": {
+      "passed": 4,
+      "ignored": 0
+    },
+    "generation": {
+      "passed": 2,
+      "ignored": 0
+    },
+    "host": {
+      "passed": 8,
+      "ignored": 0
+    },
+    "disk": {
+      "passed": 5,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 212,
+      "ignored": 2
+    },
+    "portable": {
+      "passed": 125,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1156,
+  "new_tests": {
+    "runtime_sampler_account": 13,
+    "runtime_sampling_hold_quote": 2,
+    "native_funded_sampler_copy": 4,
+    "native_filter_failure_retry": 1
+  },
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib -- --test-threads=1",
+      "started_utc": "2026-09-13T19:36:08.614943+00:00",
+      "elapsed_seconds": 14.663,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-runtime.log",
+      "log_sha256": "8d8b87ffce5de938e72f781b3745726cb856133b3f4ff7a681bc43a0cfce41dd"
+    },
+    "native": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib funded_sampler_copy_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T19:36:29.514746+00:00",
+      "elapsed_seconds": 87.464,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-native.log",
+      "log_sha256": "fef769d527b0ab6f79c8367a43e1be9f0a2da7a030114f4736db0695828e6210"
+    },
+    "sampling": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib text_snapshot -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T19:37:56.980219+00:00",
+      "elapsed_seconds": 63.285,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-sampling.log",
+      "log_sha256": "d9bdaab7383d9a326cf640d78b653c465d3a2f8417d78c82d7a54e607785d3d1"
+    },
+    "preparation": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib preparation_ -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T19:42:32.745399+00:00",
+      "elapsed_seconds": 6.483,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-preparation.log",
+      "log_sha256": "47a60e20ff22e1105537db16d02248b67db65e573e523ef18b5d9ee1b74bdee6"
+    },
+    "quote": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib text_quote -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T19:40:24.854006+00:00",
+      "elapsed_seconds": 0.402,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-quote.log",
+      "log_sha256": "2550f77b7055a3c13091a6103bba017860eb2a33920edfbd7bd3e43dc2f01e8e"
+    },
+    "admission": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib managed_admission -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T19:40:25.256029+00:00",
+      "elapsed_seconds": 0.417,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-admission.log",
+      "log_sha256": "cd34201f7abc00d65cf21cdc4d0c7cf838466f59e4e6cfba4556cb1434959e90"
+    },
+    "reuse": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib text_reuse -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T19:40:25.673291+00:00",
+      "elapsed_seconds": 0.488,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-reuse.log",
+      "log_sha256": "d43c06fcdad0fefbd57bec60081514f5be1af1bf256b5738c9b1bfd59569be7f"
+    },
+    "step": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib text_step -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T19:40:26.162171+00:00",
+      "elapsed_seconds": 0.308,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-step.log",
+      "log_sha256": "b3e60881d49b84e216cc6a3c2b1aea0c1a3d62e12df2c9165dc9e3106bdb81aa"
+    },
+    "handoff": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib capacity_handoff -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T19:40:26.470629+00:00",
+      "elapsed_seconds": 0.875,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-handoff.log",
+      "log_sha256": "38a03e18b6ec7187973bdc972324503d82ba1e3c8f02fe82ea82f68da5cde835"
+    },
+    "generation": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib generation::tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T19:41:29.457671+00:00",
+      "elapsed_seconds": 63.287,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-generation.log",
+      "log_sha256": "a6b6da2769c4adc04e4c5a8dbff6efcfcdbb19981dd14976bfb7a293304df6ca"
+    },
+    "host": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib host_layerwise_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T19:42:39.228733+00:00",
+      "elapsed_seconds": 2.904,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-host.log",
+      "log_sha256": "1c563829f860429ef5abf500a6ccc31ea5610b97247efcf23cd0146203e6a5ea"
+    },
+    "disk": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib disk_layerwise_tests -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-13T19:42:42.132974+00:00",
+      "elapsed_seconds": 1.089,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-disk.log",
+      "log_sha256": "546f334ed2f7f1fff2737ffdce442c404cfe5bec50a438efa30dee91cc3890f4"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib -- --test-threads=1",
+      "started_utc": "2026-09-13T19:42:43.222699+00:00",
+      "elapsed_seconds": 42.012,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-facade.log",
+      "log_sha256": "5d7c4e9f41a524ea1d64ece06a9374dab47deacf59815e7739ff2d0d0fab6d66"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-13T19:43:25.235281+00:00",
+      "elapsed_seconds": 18.902,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-portable.log",
+      "log_sha256": "b9d1ae69239d08e0334508ee8dafc3f4aaa34f692857df7a9599036da61d7aac"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-13T19:43:44.143497+00:00",
+      "elapsed_seconds": 14.178,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-minimal.log",
+      "log_sha256": "305fd629550fecdf25d9b9df114fbdddac5798028dd63090974a8db3531b01c7"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-13T19:43:58.321569+00:00",
+      "elapsed_seconds": 15.101,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-funded-sampler-features.log",
+      "log_sha256": "73b1409e2d7390a1ed50cc8c203c1a5c5e15e4f5aebd0e1682372e18a685f752"
+    }
+  },
+  "source_sha256": {
+    "eredu-runtime/src/generation.rs": "f67789daca5b8b8b8ea15ed438ab97c6947e3481d5e9a14846b8a92ce52bec79",
+    "eredu-runtime/src/working_memory.rs": "454955f88dfa9761906dbb5d24d2af6c021a1e55a19b7649d1b171daf93ea73d",
+    "eredu-runtime/src/working_memory/funding.rs": "bce0c28184f7a1413495321eb4b44b4f1c38ec87da81cf7b7ea27b22adfc08b2",
+    "eredu-runtime/src/working_memory/storage.rs": "100fe961dccaf4ae0e202c9b7a2616130f10cc296c8c42913dd0b6c2f3937330",
+    "eredu-runtime/src/working_memory/text_preparation.rs": "3c4023af72ce9e4a9c5810541694320e42ab43b15dc6d92badc28d611ae8ccc5",
+    "eredu-runtime/src/working_memory/sampler_copy.rs": "38c235a4e208f80807c5da4c3b9ae933a8929305324f23510941ef914a3fa7ce",
+    "eredu-runtime/src/working_memory/sampler_copy/tests.rs": "c469a22e57712b3e518ede773b61b9aa1338a7228fdeaadcd81dea75420c66a1",
+    "eredu-runtime/src/working_memory/sampling/request.rs": "b66f482c8d0c3786b5d87a097f77ece9e10248af56467786e72648c97514f2b6",
+    "eredu-runtime/src/working_memory/sampling/tests.rs": "5888322d392e230c23e02fe84e1e6b462746432af82c4e633e25f061e715dfad",
+    "eredu-runtime/src/working_memory/sampling/tests/held_history.rs": "e8d22b5b81fb4a07587fb3d41a8acf0ceb06793d52b756a772f9ee0d1dab7f4e",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/funded_sampler_copy_tests.rs": "3d71f0c3676a4e81ed51dcef0519a7cfc32b3ab9c246ae3921ce8b77bff2a89d",
+    "eredu-backend-mlx/src/composition/mlx/session/generation/ordinary_sampler.rs": "c11c979013e0b22e58f6042b7d65da3d4ac4652695a3065191dbb4ac1eabfa6c",
+    "eredu-backend-mlx/src/composition/mlx/session/generation.rs": "63936207e9ec13277f4aca7dd2f097e74cbcc9c36c8859c39ea8f2af273eec48",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "74d127b74e23e8a0219b6279c56e176cc4dba25c70d1655c5c24eb4ce1daea68",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote.rs": "c724c77c2f51fc59b19730d45377a76596c0892b06cfa253414e88b4e2e11429",
+    "eredu-backend-mlx/src/composition/mlx/session/text_snapshot.rs": "f9bb393150dc3c3deaf653faf7b545ea1b184a62c9355cbcb19b6034a8d92831",
+    "eredu-backend-mlx/src/composition/mlx/session/text_snapshot/sampling_copy_tests.rs": "666298b65fb4636dc1a4bceeac57ea970eec7928eb23119a44dd7d1cca2d8988",
+    "eredu-backend-mlx/src/tests/distributed_pipeline_ring/unit_and_worker/worker_protocol.rs": "efac237b294ab07ccf0ec51b0fd5babffd1fca451ca93dbf057647520031491a",
+    "doc/backend-architecture.md": "7ed064cf29e9823446800072354f3f6060d3d1f881f291d95bc9a7474c4e4f31",
+    "doc/execution-control.md": "0e28a49cad59f37407b0298191353784fc5275530552cb98062422027163e44a",
+    "doc/bounded-inference.md": "92cd893455d11164597476151db6eee52d184f9458445489f42c605718c27ecc"
+  },
+  "artifacts": {
+    "/private/tmp/eredu-funded-sampler-checks.py": {
+      "sha256": "279400555173fc4862ef504c854b2dee57a4c7f262ecd59defd436653900a1fe"
+    },
+    "/private/tmp/eredu-funded-sampler-format.log": {
+      "sha256": "9e19c8d2c265258dbf0ddb8b6172e746b1884cccc617c71565ec2fe033c0953a"
+    },
+    "/private/tmp/eredu-funded-sampler-review.md": {
+      "sha256": "1dc4168793680cf5c237110666db954da936b5dac1611ab5fdd62e7518bfcc2e"
+    },
+    "/private/tmp/eredu-funded-sampler-preparation-initial.log": {
+      "sha256": "8315dd666a72bda4d5075c7680f8e839b142ddd61822f5f9c06c0049fe99f0eb"
+    },
+    "/private/tmp/eredu-funded-sampler-generation-initial.log": {
+      "sha256": "ae0bec86bb02a44eeeee662128df1cd63200ea96e1ee0b9013cd5a61b7dec8bf"
+    }
+  },
+  "previous_increment": "doc/validation/bounded-copy-components-2026-09-13.json",
+  "behavior": [
+    "Consuming original sampling preparation binds the canonical configuration, actual funding account and exact execution identity; a finish-only token cannot construct another sampler.",
+    "Closed sampler custody holds an independent host-only scope with no native adoption/completion methods and keeps source funding live after parent metadata/run retirement.",
+    "Canonical history growth, inline sampler and maximum replacement overlap protect a subset of the existing remaining balance; native adoption cannot spend it and undersized bootstrap rejects before construction.",
+    "Complete sampling quotes cover separate host and tensor maxima with checked aggregate overflow; unknown mechanisms remain unknown.",
+    "Move-only sample permits consume the original output allowance before callbacks/native filtering. The native wrapper consumes before filtering, including failed filtering and retry.",
+    "Concrete source-bound copy admission derives bytes from the exact sampler copy plan, counts complete source and destination overlap, respects tightest domain/app limits, and commits before actual copying.",
+    "Destination copy accounts reuse existing funding and common atomic numeric admission without fabricated inference geometry, source discounts or a second ledger.",
+    "Frozen Standard/Mirostat copies preserve fixed history capacity, controls and adaptive state; copies and copies-of-copies outlive their sources while each retains only its own account.",
+    "Wrong domains/accounts, unquoted sources, poisoned/fenced accounts, capacity and counter overflow reject before copy work; unexpected post-admission failure quarantines only its destination.",
+    "Ordinary MLX preparation uses protected sampler custody alongside a separate native PRNG/recovery scope; existing preparation, quote, lifetime, residency and facade paths remain validated."
+  ],
+  "initial_failures": [
+    {
+      "stage": "preparation",
+      "passed_before_failure": 41,
+      "failure": "Two-process Qwen speculative preparation fixture expected one agreement, but the current path performs accepted Admission then rejected lane Sampling. Updated exact expectation to two and preserved original error, zero publication, retained charge and fenced-session assertions.",
+      "log": "/private/tmp/eredu-funded-sampler-preparation-initial.log"
+    },
+    {
+      "stage": "generation",
+      "passed_before_failure": 1,
+      "failure": "New rejection fixture used a short mask, which is deliberately padded and valid. Replaced it with a mask permitting only an out-of-width token, exercising actual filter failure without changing production mask semantics.",
+      "log": "/private/tmp/eredu-funded-sampler-generation-initial.log"
+    }
+  ],
+  "review_refinements": [
+    "Consume the prepared native sampler before filtering to make one-use behavior intrinsic after filter failure; added actual failure/retry regression.",
+    "Root normalized final Rust formatting with edition2021 and skip_children before final scoped check."
+  ],
+  "limits": [
+    "This admits only the concrete frozen sampler component, not full native or facade snapshots or runnable branches. Existing whole-sampling-copy rejection remains.",
+    "The copy exposes no mutable/raw owned export or execution grant. Caller-owned raw clones carry no funding/source proof.",
+    "Source hold and copy extent cover managed sampler representation/history; allocation bookkeeping, native RNG/input/state, controller/parser, decoder, cursor, capture and delivery need their own complete aggregate proofs.",
+    "Source protection uses conservative separate native and host maxima; no allocator/RSS or process/system guarantee is claimed.",
+    "Native synthetic Metal execution, CPU sampling and local two-process Ring preparation-failure regressions ran. Three external checkpoint fixtures remain ignored; no new released-checkpoint, distributed numerical, multi-host or process-peak measurement is claimed.",
+    "Full family/path bounded inference goal remains incomplete."
+  ]
+}

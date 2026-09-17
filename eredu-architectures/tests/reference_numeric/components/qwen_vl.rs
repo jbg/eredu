@@ -284,7 +284,7 @@ fn serial_reference(
         if matches!(mode,1|3) { masks.push(("model.language_model.layers.0.attention.channels",vec![1],false)); }
         if !sparse && matches!(mode,2|3) { masks.push(("model.language_model.layers.1.feed_forward.units",vec![1],true)); }
         inputs.iter().enumerate().map(|(step,input)| {
-            let admitted = <Model as CompositeArchitecture<NumericBackend,State>>::admit_prepared_input(&args,input,&NumericInputInspector).unwrap();
+            let admitted = eredu_architectures::media_plan::admit_qwen_vl_input(&args,input,&NumericInputInspector).unwrap();
             let ingress = qwen::vl::prepare_input(PreparedCompositeInput::new(input,&admitted).unwrap(),&context).unwrap();
             let mut observer = Observer {
                 dense: GlobalComponentObserver {

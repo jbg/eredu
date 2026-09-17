@@ -1,6 +1,11 @@
 //! Backend-neutral mutable-cache residency telemetry.
 
 use std::{collections::BTreeMap, time::Duration};
+use super::table::CacheRecordTable;
+mod prepared;
+pub use prepared::{PreparedCacheTelemetry, RetiredCacheTelemetryStorage};
+/// Current per-layer rows reused by ordinary or prepared snapshot assembly.
+pub type CacheTelemetryRows = CacheRecordTable<usize, CacheLayerResidencyStats>;
 
 /// Maximum number of individually identified layers in a residency report.
 ///
@@ -247,7 +252,8 @@ pub struct CacheResidencyReport {
 pub struct CacheResidencyTelemetry {
     /// Aggregate current and cumulative report fields.
     pub report: CacheResidencyReport,
-    layer_activity: BTreeMap<usize, CacheLayerResidencyStats>,
+    layer_activity: CacheTelemetryRows,
+    metadata_funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
     layer_activity_overflow: CacheLayerResidencyStats,
 }
 
@@ -267,7 +273,7 @@ impl CacheResidencyTelemetry {
         if self.layer_activity.contains_key(&global_layer)
             || self.layer_activity.len() < CACHE_RESIDENCY_LAYER_REPORT_LIMIT
         {
-            self.layer_activity.entry(global_layer).or_default()
+            self.layer_activity.get_or_default(global_layer)
         } else {
             &mut self.layer_activity_overflow
         }
@@ -284,7 +290,23 @@ impl CacheResidencyTelemetry {
     /// configured limit, matching successful-admission semantics.
     pub fn finalize_snapshot(
         &mut self,
-        mut current: BTreeMap<usize, CacheLayerResidencyStats>,
+        current: BTreeMap<usize, CacheLayerResidencyStats>,
+        device_budget_bytes: u64,
+        host_budget_bytes: u64,
+        disk_budget_bytes: Option<u64>,
+    ) {
+        self.finalize_snapshot_with_rows(
+            &mut CacheTelemetryRows::from_ordered_map(current),
+            device_budget_bytes, host_budget_bytes, disk_budget_bytes,
+        );
+    }
+
+    /// Same snapshot worker with reusable caller-owned current rows. Prepared
+    /// callers must validate report/activity storage before entering this method.
+    /// The consumed current rows are cleared while their paid backing remains.
+    pub fn finalize_snapshot_with_rows(
+        &mut self,
+        current: &mut CacheTelemetryRows,
         device_budget_bytes: u64,
         host_budget_bytes: u64,
         disk_budget_bytes: Option<u64>,
@@ -293,30 +315,35 @@ impl CacheResidencyTelemetry {
         self.report.per_layer_overflow_layers = 0;
         self.report.per_layer_overflow = CacheLayerResidencyStats::default();
 
-        let mut selected_layers = self.layer_activity.keys().copied().collect::<Vec<_>>();
+        // The public report has this exact fixed identity limit. The shared
+        // worker uses bounded stack scratch instead of allocating a temporary
+        // selection Vec on every publication.
+        let mut selected_layers = [0usize; CACHE_RESIDENCY_LAYER_REPORT_LIMIT];
+        let mut selected = 0;
+        for layer in self.layer_activity.keys().copied() {
+            selected_layers[selected] = layer;
+            selected += 1;
+        }
         for global_layer in current.keys().copied() {
-            if selected_layers.len() == CACHE_RESIDENCY_LAYER_REPORT_LIMIT {
-                break;
-            }
+            if selected == CACHE_RESIDENCY_LAYER_REPORT_LIMIT { break; }
             if !self.layer_activity.contains_key(&global_layer) {
-                selected_layers.push(global_layer);
+                selected_layers[selected] = global_layer;
+                selected += 1;
             }
         }
-        selected_layers.sort_unstable();
-        for global_layer in selected_layers {
+        selected_layers[..selected].sort_unstable();
+        for &global_layer in &selected_layers[..selected] {
             let mut stats = current.remove(&global_layer).unwrap_or_default();
             if let Some(activity) = self.layer_activity.get(&global_layer) {
                 apply_activity(activity, &mut stats);
             }
-            self.report.per_layer.push(CacheLayerResidencyReport {
-                global_layer,
-                stats,
-            });
+            self.report.per_layer.push(CacheLayerResidencyReport { global_layer, stats });
         }
-        for (_, stats) in current {
+        for stats in current.values() {
             self.report.per_layer_overflow_layers += 1;
-            self.report.per_layer_overflow.accumulate(&stats);
+            self.report.per_layer_overflow.accumulate(stats);
         }
+        current.clear();
         apply_activity(
             &self.layer_activity_overflow,
             &mut self.report.per_layer_overflow,

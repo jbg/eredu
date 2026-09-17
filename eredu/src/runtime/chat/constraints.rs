@@ -1,16 +1,36 @@
 //! Private constrained-decoding implementation for native tool plans.
 
+mod declaration;
+pub(crate) mod forbidden;
+#[cfg(test)]
+mod frozen_tests;
+mod grammar_source;
+pub(crate) use grammar_source::OriginalPreparedGrammarController;
+mod grammar_policy;
+mod original;
+pub(crate) use original::OriginalControllerSourceError;
+pub(crate) mod recipe;
+mod selection;
+mod trigger;
+mod vocabulary;
+use recipe::ConstraintRecipe;
+use trigger::TriggerPrefix;
+use vocabulary::{SharedTokenVocabulary, VocabularyPlan};
+
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{num::NonZeroUsize, sync::Arc};
 
-use eredu_core::{SpeculativeTokenFilterController, TokenFilter, TokenFilterController};
+use eredu_core::{
+    HostPreparationAuthority, SharedTokenFilter, SpeculativeTokenFilterController,
+    TextControllerStorage, TokenFilter, TokenFilterController,
+};
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
 use llguidance::{
-    toktrie::{SimpleVob, TokEnv, TokenId},
     Matcher, ParserFactory,
+    toktrie::{SimpleVob, TokEnv, TokenId},
 };
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 pub(crate) use super::tool_schema::parse_tools;
 use sha2::{Digest, Sha256};
@@ -24,27 +44,43 @@ use crate::{
     },
 };
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ConstraintPreparationError {
+    #[error("constraint preparation failed: {0}")]
+    Constraint(#[from] ConstraintError),
+    #[error("shared vocabulary preparation failed: {0}")]
+    Backend(#[source] eredu_core::BackendFailure),
+}
+
 /// Canonical backend-independent grammar and activation state.
 pub(crate) struct ConstraintController {
     runtime: ConstraintRuntime,
-    committed_tokens: Vec<u32>,
-    validity: Arc<TokenFilter>,
+    committed_tokens: eredu_core::speculative::PlainControllerHistory,
+    validity: SharedTokenFilter,
+    // Retires only after all controller payload, including copied history.
+    authority: HostPreparationAuthority,
 }
 
 enum ConstraintRuntime {
     Text,
     Forbidden {
-        vocabulary: Arc<Vec<Vec<u8>>>,
+        vocabulary: SharedTokenVocabulary,
         trigger: Vec<u8>,
-        pending: Vec<u8>,
+        pending: TriggerPrefix,
+    },
+    PreparedForbidden {
+        inputs: eredu_core::speculative::ForbiddenControllerInputs,
+        pending: TriggerPrefix,
+        original: Option<eredu_runtime::working_memory::OriginalForbiddenSource>,
     },
     Auto {
         grammar: GrammarState,
-        vocabulary: Arc<Vec<Vec<u8>>>,
+        vocabulary: SharedTokenVocabulary,
         trigger: Vec<u8>,
-        pending: Vec<u8>,
+        pending: TriggerPrefix,
     },
     Active(GrammarState),
+    PreparedGrammar(eredu_core::SharedStorageOwner<grammar_source::OriginalPreparedGrammarController>),
 }
 
 impl Clone for ConstraintRuntime {
@@ -56,9 +92,18 @@ impl Clone for ConstraintRuntime {
                 trigger,
                 pending,
             } => Self::Forbidden {
-                vocabulary: Arc::clone(vocabulary),
+                vocabulary: vocabulary.clone(),
                 trigger: trigger.clone(),
-                pending: pending.clone(),
+                pending: *pending,
+            },
+            Self::PreparedForbidden {
+                inputs,
+                pending,
+                original,
+            } => Self::PreparedForbidden {
+                inputs: inputs.clone(),
+                pending: *pending,
+                original: original.clone(),
             },
             Self::Auto {
                 grammar,
@@ -67,11 +112,12 @@ impl Clone for ConstraintRuntime {
                 pending,
             } => Self::Auto {
                 grammar: grammar.fork(),
-                vocabulary: Arc::clone(vocabulary),
+                vocabulary: vocabulary.clone(),
                 trigger: trigger.clone(),
-                pending: pending.clone(),
+                pending: *pending,
             },
             Self::Active(grammar) => Self::Active(grammar.fork()),
+            Self::PreparedGrammar(grammar) => Self::PreparedGrammar(grammar.clone()),
         }
     }
 }
@@ -81,24 +127,48 @@ impl Clone for ConstraintController {
         Self {
             runtime: self.runtime.clone(),
             committed_tokens: self.committed_tokens.clone(),
-            validity: Arc::clone(&self.validity),
+            validity: self.validity.clone(),
+            authority: self.authority.clone(),
         }
     }
 }
 
 impl ConstraintController {
     /// Grammar-free generation still retains the exact tokenizer-valid domain.
-    pub(crate) fn text(validity: Arc<TokenFilter>) -> Self {
+    pub(crate) fn text(validity: SharedTokenFilter) -> Self {
+        Self::text_prepared(validity, HostPreparationAuthority::unmanaged())
+    }
+
+    /// Fixed empty controller destination. Shared validity keeps its original
+    /// source account; the empty history allocates nothing. Native provisional
+    /// copies use the existing paid history worker before any committed push.
+    pub(crate) fn text_metadata_bytes() -> Option<usize> {
+        let parts = [
+            std::mem::size_of::<Self>(),
+            std::mem::size_of::<ConstraintRuntime>(),
+            std::mem::size_of::<eredu_core::speculative::PlainControllerHistory>(),
+            std::mem::size_of::<SharedTokenFilter>(),
+            std::mem::size_of::<HostPreparationAuthority>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&parts), usize::checked_add)
+    }
+    pub(crate) fn text_prepared(
+        validity: SharedTokenFilter,
+        authority: HostPreparationAuthority,
+    ) -> Self {
         Self {
             runtime: ConstraintRuntime::Text,
-            committed_tokens: Vec::new(),
+            committed_tokens: eredu_core::speculative::PlainControllerHistory::default(),
             validity,
+            authority,
         }
     }
 
     /// Retains the facade's immutable tokenizer domain across grammar forks,
     /// speculative histories and execution-control snapshots.
-    pub(crate) fn with_validity(mut self, validity: Arc<TokenFilter>) -> Self {
+    pub(crate) fn with_validity(mut self, validity: SharedTokenFilter) -> Self {
         self.validity = validity;
         self
     }
@@ -121,67 +191,99 @@ impl ConstraintController {
 
     pub(crate) fn continuation_storage_bytes(&self, predictions: u64) -> Option<u64> {
         match &self.runtime {
-            ConstraintRuntime::Text => predictions.checked_mul(4),
+            ConstraintRuntime::Text | ConstraintRuntime::PreparedForbidden { .. } => {
+                predictions.checked_mul(4)
+            }
             ConstraintRuntime::Forbidden { trigger, .. } => predictions
                 .checked_mul(4)?
                 .checked_add(trigger.len() as u64),
-            ConstraintRuntime::Auto { .. } | ConstraintRuntime::Active(_) => None,
+            ConstraintRuntime::Auto { .. } | ConstraintRuntime::Active(_) | ConstraintRuntime::PreparedGrammar(_) => None,
         }
     }
-    /// Creates canonical constraint state from one prepared-chat plan.
-    pub(crate) fn from_generation_plan(
+    /// Creates canonical constraint state with vocabulary allocation admitted
+    /// by this exact backend domain before the allocating factory runs.
+    pub(crate) fn from_generation_plan<B: eredu_core::TextGenerationBackend>(
+        plan: &GenerationRuntimePlan,
+        runtime: &eredu_core::ModelRuntime<B>,
+        authority: &HostPreparationAuthority,
+    ) -> Result<Self, ConstraintPreparationError> {
+        Self::from_generation_plan_with(plan, authority, |vocabulary| {
+            vocabulary
+                .prepare(runtime)
+                .map_err(ConstraintPreparationError::Backend)
+        })
+    }
+
+    /// Standalone semantic conformance fixtures do not have a managed domain.
+    #[cfg(test)]
+    pub(crate) fn from_generation_plan_unregistered(
         plan: &GenerationRuntimePlan,
     ) -> Result<Self, ConstraintError> {
-        let constraint = plan.generation_constraint().clone();
-        let runtime = if !plan.has_tool_surface() {
-            ConstraintRuntime::Active(constraint.grammar_state())
-        } else {
-            match plan.tool_choice() {
-                ToolChoice::None => {
-                    let trigger =
-                        required_tool_call_trigger(plan.tool_call_trigger(), "forbidden")?;
-                    let vocabulary = constraint
-                        .grammar_state()
-                        .token_vocabulary()
-                        .map_err(constraint_error)?;
-                    ConstraintRuntime::Forbidden {
-                        vocabulary: Arc::new(vocabulary),
-                        trigger,
-                        pending: Vec::new(),
-                    }
+        Self::from_generation_plan_with(
+            plan,
+            &HostPreparationAuthority::unmanaged(),
+            |vocabulary| Ok(vocabulary.unregistered()),
+        )
+    }
+
+    fn from_generation_plan_with<E: From<ConstraintError>>(
+        plan: &GenerationRuntimePlan,
+        authority: &HostPreparationAuthority,
+        prepare_vocabulary: impl FnOnce(VocabularyPlan) -> Result<SharedTokenVocabulary, E>,
+    ) -> Result<Self, E> {
+        let constraint = plan.generation_constraint();
+        let selection =
+            selection::Selection::from_plan(plan).map_err(selection::Error::ordinary)?;
+        let runtime = match selection {
+            selection::Selection::Active => ConstraintRuntime::Active(
+                constraint
+                    .inner
+                    .state(authority)
+                    .map_err(constraint_error)?,
+            ),
+            selection::Selection::Forbidden(trigger) => {
+                let trigger = trigger.to_vec();
+                let vocabulary = prepare_vocabulary(constraint.inner.vocabulary_plan(authority)?)?;
+                ConstraintRuntime::Forbidden {
+                    vocabulary,
+                    trigger,
+                    pending: TriggerPrefix::default(),
                 }
-                ToolChoice::Auto => {
-                    let trigger =
-                        required_tool_call_trigger(plan.auto_activation_trigger(), "automatic")?;
-                    let grammar = constraint.grammar_state();
-                    let vocabulary = grammar.token_vocabulary().map_err(constraint_error)?;
-                    ConstraintRuntime::Auto {
-                        grammar,
-                        vocabulary: Arc::new(vocabulary),
-                        trigger,
-                        pending: Vec::new(),
-                    }
+            }
+            selection::Selection::Auto(trigger) => {
+                let trigger = trigger.to_vec();
+                let vocabulary = prepare_vocabulary(constraint.inner.vocabulary_plan(authority)?)?;
+                ConstraintRuntime::Auto {
+                    grammar: constraint
+                        .inner
+                        .state(authority)
+                        .map_err(constraint_error)?,
+                    vocabulary,
+                    trigger,
+                    pending: TriggerPrefix::default(),
                 }
-                ToolChoice::Required => ConstraintRuntime::Active(constraint.grammar_state()),
             }
         };
         Ok(Self {
             runtime,
-            committed_tokens: Vec::new(),
-            validity: Arc::new(TokenFilter::All),
+            committed_tokens: eredu_core::speculative::PlainControllerHistory::default(),
+            validity: SharedTokenFilter::new(TokenFilter::All),
+            authority: authority.clone(),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn constraint_is_active(&self) -> bool {
-        matches!(self.runtime, ConstraintRuntime::Active(_))
+        matches!(self.runtime, ConstraintRuntime::Active(_) | ConstraintRuntime::PreparedGrammar(_))
     }
 
     pub(crate) fn grammar_is_complete(&mut self) -> Result<bool, ConstraintError> {
         match &mut self.runtime {
             ConstraintRuntime::Active(grammar) => grammar.is_terminal().map_err(constraint_error),
+            ConstraintRuntime::PreparedGrammar(_) => Err(prepared_grammar_callback_refusal()),
             ConstraintRuntime::Text
             | ConstraintRuntime::Forbidden { .. }
+            | ConstraintRuntime::PreparedForbidden { .. }
             | ConstraintRuntime::Auto { .. } => Ok(false),
         }
     }
@@ -189,23 +291,41 @@ impl ConstraintController {
     pub(crate) fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, ConstraintError> {
         match &mut self.runtime_at(history)? {
             ConstraintRuntime::Active(grammar) => grammar.is_terminal().map_err(constraint_error),
+            ConstraintRuntime::PreparedGrammar(_) => Err(prepared_grammar_callback_refusal()),
             ConstraintRuntime::Text
             | ConstraintRuntime::Forbidden { .. }
+            | ConstraintRuntime::PreparedForbidden { .. }
             | ConstraintRuntime::Auto { .. } => Ok(false),
         }
     }
 
     fn runtime_at(&self, history: &[u32]) -> Result<ConstraintRuntime, ConstraintError> {
-        if !history.starts_with(&self.committed_tokens) {
-            return Err(ConstraintError::new(
-                "constrained sampler history diverges from its committed logical prefix",
-            ));
+        if let Some(source) = self.prepared_plain_source() {
+            source
+                .validate_history(history)
+                .map_err(|cause| ConstraintError::new(cause.to_string()))?;
+            return Ok(ConstraintRuntime::Text);
         }
+        if let Some(source) = self.forbidden_source() {
+            let decision = source
+                .decision_at(history)
+                .map_err(forbidden::ordinary_error)?;
+            return Ok(ConstraintRuntime::PreparedForbidden {
+                inputs: source.inputs().clone(),
+                pending: decision.prefix(),
+                original: self.original_forbidden_source().cloned(),
+            });
+        }
+        let suffix = eredu_runtime::execution_control::ControllerHistorySuffix::new(
+            &self.committed_tokens, history,
+        ).map_err(|_| ConstraintError::fixed(
+            "constrained sampler history diverges from its committed logical prefix",
+        ))?;
         let mut runtime = self.runtime.clone();
-        for &token in &history[self.committed_tokens.len()..] {
+        suffix.visit(|token| {
             self.validate_token(token)?;
-            commit_runtime_token(&mut runtime, token)?;
-        }
+            commit_runtime_token(&mut runtime, token)
+        })?;
         Ok(runtime)
     }
 
@@ -214,21 +334,32 @@ impl ConstraintController {
     }
 
     pub(crate) fn commit(&mut self, token: u32) -> Result<(), ConstraintError> {
+        if matches!(self.runtime, ConstraintRuntime::PreparedForbidden { .. }) {
+            return self
+                .forbidden_mutation()
+                .and_then(|mut mutation| mutation.commit(token))
+                .map_err(forbidden::ordinary_error);
+        }
         self.validate_token(token)?;
         commit_runtime_token(&mut self.runtime, token)?;
-        self.committed_tokens.push(token);
-        Ok(())
+        self.committed_tokens.try_push(token).map_err(|_| {
+            ConstraintError::fixed(
+                "plain controller mutation requires a unique prepared history destination",
+            )
+        })
     }
 
     #[cfg(test)]
     pub(crate) fn valid_token_ids(&mut self) -> Result<Option<Vec<u32>>, ConstraintError> {
         match &mut self.runtime {
+            ConstraintRuntime::PreparedGrammar(_) => Err(prepared_grammar_callback_refusal()),
             ConstraintRuntime::Active(grammar) => grammar
                 .allowed_tokens()
                 .map(|mask| Some(mask.iter().collect()))
                 .map_err(constraint_error),
             ConstraintRuntime::Text
             | ConstraintRuntime::Forbidden { .. }
+            | ConstraintRuntime::PreparedForbidden { .. }
             | ConstraintRuntime::Auto { .. } => Ok(None),
         }
     }
@@ -237,6 +368,37 @@ impl ConstraintController {
 impl TokenFilterController for ConstraintController {
     type Error = ConstraintError;
 
+    fn inference_storage(&self) -> TextControllerStorage<'_> {
+        if matches!(self.runtime, ConstraintRuntime::Text) {
+            TextControllerStorage::RunOwnedWithSharedFilters(std::slice::from_ref(&self.validity))
+        } else {
+            TextControllerStorage::Unknown
+        }
+    }
+
+    fn inference_workspace(
+        &self,
+        max_output_tokens: u64,
+    ) -> Option<eredu_core::TextControllerWorkspace<'_>> {
+        if !matches!(self.runtime, ConstraintRuntime::Text) {
+            return None;
+        }
+        let maximum = (self.committed_tokens.len() as u64).checked_add(max_output_tokens)?;
+        // Vec growth can retain the old buffer while allocating a doubled
+        // successor, including the minimum four-token allocation.
+        let history = (self.committed_tokens.capacity() as u64)
+            .checked_add(maximum.checked_mul(2)?.max(4))?
+            .checked_mul(4)?;
+        let source_filter = match self.validity.as_ref() {
+            TokenFilter::All => 0,
+            TokenFilter::Allowed(mask) => mask.capacity() as u64,
+        };
+        Some(eredu_core::TextControllerWorkspace {
+            filter: self.validity.as_ref().into(),
+            additional_host_bytes: history.checked_add(source_filter)?,
+        })
+    }
+
     fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
         let filter = token_filter_at_runtime(&mut self.runtime)?;
         self.restrict(filter)
@@ -244,7 +406,12 @@ impl TokenFilterController for ConstraintController {
 
     fn current_decision(&mut self) -> Result<eredu_core::TokenSamplingDecision<'_>, Self::Error> {
         let filter = self.current_filter()?;
-        Ok(eredu_core::TokenSamplingDecision::new(filter).with_tokenizer_validity(&self.validity))
+        let decision = eredu_core::TokenSamplingDecision::new(filter)
+            .with_shared_tokenizer_validity(&self.validity);
+        Ok(match self.inference_storage() {
+            TextControllerStorage::Unknown => decision,
+            storage => decision.with_controller_storage(storage),
+        })
     }
 
     fn commit_token(&mut self, token_id: u32) -> Result<(), Self::Error> {
@@ -261,25 +428,27 @@ impl eredu_runtime::execution_control::SnapshotTokenController for ConstraintCon
         let Self {
             runtime,
             committed_tokens,
-            validity: _, // Immutable Arc data is shared, not copied by snapshots.
+            validity: _,  // Immutable shared storage is not copied by snapshots.
+            authority: _, // Shared exclusion custody is not a copy-byte allowance.
         } = self;
         let bytes = (std::mem::size_of::<Self>() as u64)
             .checked_add((committed_tokens.len() as u64).checked_mul(4)?)?;
         match runtime {
             ConstraintRuntime::Text => Some(bytes),
-            // Immutable token bytes are already retained by Arc. Only the trigger
+            // Prepared forbidden snapshots use copy_prepared_forbidden, which
+            // owns an independent paid history. Ordinary Clone is identity-only.
+            ConstraintRuntime::PreparedForbidden { .. } => None,
+            // Immutable token bytes share their storage owner. Only the trigger
             // matcher and committed canonical history are copied for this mode.
             ConstraintRuntime::Forbidden {
                 vocabulary: _,
                 trigger,
-                pending,
-            } => bytes
-                .checked_add(trigger.len() as u64)?
-                .checked_add(pending.len() as u64),
+                pending: _, // Fixed prefix length is included in Self above.
+            } => bytes.checked_add(trigger.len() as u64),
             // llguidance 1.8.0 supports independent deep cloning, but exposes no
             // complete live Matcher storage estimate. Regex-table byte estimates
             // and per-step counters omit parser buffers and caches.
-            ConstraintRuntime::Auto { .. } | ConstraintRuntime::Active(_) => None,
+            ConstraintRuntime::Auto { .. } | ConstraintRuntime::Active(_) | ConstraintRuntime::PreparedGrammar(_) => None,
         }
     }
     fn fork_snapshot(&self) -> Result<Self, String> {
@@ -291,6 +460,93 @@ impl eredu_runtime::execution_control::SnapshotTokenController for ConstraintCon
 }
 
 impl SpeculativeTokenFilterController for ConstraintController {
+    type PreparedGrammar = grammar_source::OriginalPreparedGrammarController;
+    fn prepared_grammar(&self) -> Option<&Self::PreparedGrammar> {
+        match &self.runtime { ConstraintRuntime::PreparedGrammar(owner) => Some(owner), _ => None }
+    }
+    fn prepared_grammar_replacement_bytes(&self) -> Option<usize> {
+        self.original_grammar_replacement_bytes()
+    }
+    fn replace_prepared_grammar(
+        &self, grammar: Self::PreparedGrammar, funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<Self, eredu_core::speculative::PreparedGrammarInstallError<Self::PreparedGrammar>> {
+        self.replace_original_grammar(grammar, funding)
+    }
+
+    fn prepared_plain_source(&self) -> Option<eredu_core::speculative::PlainControllerSource<'_>> {
+        matches!(self.runtime, ConstraintRuntime::Text).then(|| {
+            eredu_core::speculative::PlainControllerSource::new(
+                &self.committed_tokens,
+                &self.validity,
+                self.inference_storage(),
+            )
+        })
+    }
+    fn prepared_plain_copy_bytes(&self, capacity: usize) -> Option<usize> {
+        use eredu_core::speculative::{PlainControllerError, PlainControllerHistory};
+        use std::mem::{size_of, size_of_val};
+        let source = self.prepared_plain_source()?;
+        if capacity < source.history().len() {
+            return None;
+        }
+        let parts = [
+            PlainControllerHistory::copy_metadata_bytes(capacity)?,
+            size_of::<Self>(),
+            size_of::<ConstraintRuntime>(),
+            size_of::<SharedTokenFilter>(),
+            size_of::<HostPreparationAuthority>(),
+            size_of::<Result<Self, PlainControllerError>>(),
+        ];
+        parts
+            .into_iter()
+            .try_fold(size_of_val(&parts), usize::checked_add)
+    }
+    fn copy_prepared_plain(
+        &self,
+        capacity: usize,
+        host: HostPreparationAuthority,
+    ) -> Result<Self, eredu_core::speculative::PlainControllerError> {
+        use eredu_core::speculative::PlainControllerError;
+        self.prepared_plain_source()
+            .ok_or(PlainControllerError::Unknown)?;
+        let committed_tokens = self
+            .committed_tokens
+            .copy_prepared(capacity, host.clone())?;
+        Ok(Self {
+            runtime: ConstraintRuntime::Text,
+            committed_tokens,
+            validity: self.validity.clone(),
+            authority: host,
+        })
+    }
+    fn prepared_plain_history_mut(
+        &mut self,
+    ) -> Option<&mut eredu_core::speculative::PlainControllerHistory> {
+        matches!(self.runtime, ConstraintRuntime::Text).then_some(&mut self.committed_tokens)
+    }
+    fn prepared_forbidden_source(
+        &self,
+    ) -> Option<eredu_core::speculative::ForbiddenControllerSource<'_>> {
+        self.forbidden_source()
+    }
+    fn prepared_forbidden_copy_bytes(&self, capacity: usize) -> Option<usize> {
+        self.forbidden_copy_bytes(capacity)
+    }
+    fn copy_prepared_forbidden(
+        &self,
+        capacity: usize,
+        host: HostPreparationAuthority,
+    ) -> Result<Self, eredu_core::speculative::ForbiddenControllerError> {
+        self.copy_forbidden(capacity, host)
+    }
+    fn prepared_forbidden_mutation(
+        &mut self,
+    ) -> Result<
+        eredu_core::speculative::ForbiddenControllerMutation<'_>,
+        eredu_core::speculative::ForbiddenControllerError,
+    > {
+        self.forbidden_mutation()
+    }
     fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error> {
         ConstraintController::filter_at(self, history)
     }
@@ -299,10 +555,12 @@ impl SpeculativeTokenFilterController for ConstraintController {
         &self,
         history: &[u32],
     ) -> Result<eredu_core::TokenSamplingDecision<'_>, Self::Error> {
-        Ok(
-            eredu_core::TokenSamplingDecision::new(self.filter_at(history)?)
-                .with_tokenizer_validity(&self.validity),
-        )
+        let decision = eredu_core::TokenSamplingDecision::new(self.filter_at(history)?)
+            .with_shared_tokenizer_validity(&self.validity);
+        Ok(match self.inference_storage() {
+            TextControllerStorage::Unknown => decision,
+            storage => decision.with_controller_storage(storage),
+        })
     }
 
     fn prefix_is_complete(&self, history: &[u32]) -> Result<bool, Self::Error> {
@@ -316,6 +574,7 @@ fn token_filter_at_runtime(
     let allowed = match runtime {
         // This grammar filter is intersected with baseline validity by the controller.
         ConstraintRuntime::Text => return Ok(TokenFilter::All),
+        ConstraintRuntime::PreparedGrammar(_) => return Err(prepared_grammar_callback_refusal()),
         ConstraintRuntime::Active(grammar) => {
             let allowed = grammar.allowed_tokens().map_err(constraint_error)?;
             (0..allowed.len())
@@ -328,7 +587,16 @@ fn token_filter_at_runtime(
             pending,
         } => vocabulary
             .iter()
-            .map(|bytes| !completes_trigger(pending, bytes, trigger))
+            .map(|bytes| !completes_trigger(pending.bytes(trigger), bytes, trigger))
+            .collect(),
+        ConstraintRuntime::PreparedForbidden {
+            inputs, pending, ..
+        } => (0..inputs.vocabulary_len())
+            .map(|token| {
+                inputs.token_bytes(token).is_some_and(|bytes| {
+                    !completes_trigger(pending.bytes(inputs.trigger()), bytes, inputs.trigger())
+                })
+            })
             .collect(),
         ConstraintRuntime::Auto {
             grammar,
@@ -339,7 +607,9 @@ fn token_filter_at_runtime(
             .iter()
             .enumerate()
             .map(|(token, bytes)| {
-                let Some(activation) = trigger_activation_bytes(pending, bytes, trigger) else {
+                let Some(activation) =
+                    trigger_activation_bytes(pending.bytes(trigger), bytes, trigger)
+                else {
                     return Ok(true);
                 };
                 let mut candidate = grammar.fork();
@@ -361,6 +631,7 @@ fn commit_runtime_token(
 ) -> Result<(), ConstraintError> {
     match runtime {
         ConstraintRuntime::Text => Ok(()),
+        ConstraintRuntime::PreparedGrammar(_) => Err(prepared_grammar_callback_refusal()),
         ConstraintRuntime::Forbidden {
             vocabulary,
             trigger,
@@ -372,12 +643,29 @@ fn commit_runtime_token(
                     vocabulary.len()
                 ))
             })?;
-            if completes_trigger(pending, bytes, trigger) {
+            if completes_trigger(pending.bytes(trigger), bytes, trigger) {
                 return Err(ConstraintError::new(
                     "token would emit a tool-call activation trigger while tool_choice is None",
                 ));
             }
-            advance_trigger_prefix(pending, bytes, trigger);
+            pending.advance(bytes, trigger);
+            Ok(())
+        }
+        ConstraintRuntime::PreparedForbidden {
+            inputs, pending, ..
+        } => {
+            let bytes = inputs.token_bytes(token as usize).ok_or_else(|| {
+                ConstraintError::new(format!(
+                    "token {token} is outside constraint vocabulary {}",
+                    inputs.vocabulary_len()
+                ))
+            })?;
+            if completes_trigger(pending.bytes(inputs.trigger()), bytes, inputs.trigger()) {
+                return Err(ConstraintError::fixed(
+                    "token would emit a tool-call activation trigger while tool_choice is None",
+                ));
+            }
+            pending.advance(bytes, inputs.trigger());
             Ok(())
         }
         ConstraintRuntime::Active(grammar) => grammar.commit(token).map_err(constraint_error),
@@ -393,7 +681,9 @@ fn commit_runtime_token(
                     vocabulary.len()
                 ))
             })?;
-            if let Some(activation) = trigger_activation_bytes(pending, bytes, trigger) {
+            if let Some(activation) =
+                trigger_activation_bytes(pending.bytes(trigger), bytes, trigger)
+            {
                 let mut active = grammar.fork();
                 let valid = if activation.starts_at_token_boundary {
                     active.try_commit(token)
@@ -407,32 +697,15 @@ fn commit_runtime_token(
                 }
                 *runtime = ConstraintRuntime::Active(active);
             } else {
-                advance_trigger_prefix(pending, bytes, trigger);
+                pending.advance(bytes, trigger);
             }
             Ok(())
         }
     }
 }
 
-fn required_tool_call_trigger(
-    trigger: Option<&str>,
-    mode: &str,
-) -> Result<Vec<u8>, ConstraintError> {
-    let trigger = trigger.ok_or_else(|| {
-        ConstraintError::new(format!(
-            "{mode} tool-call sampling requires an exact activation trigger"
-        ))
-    })?;
-    if trigger.is_empty() {
-        return Err(ConstraintError::new(format!(
-            "{mode} tool-call sampling requires a non-empty activation trigger"
-        )));
-    }
-    Ok(trigger.as_bytes().to_vec())
-}
-
 pub(crate) fn completes_trigger(pending: &[u8], bytes: &[u8], trigger: &[u8]) -> bool {
-    trigger_activation_bytes(pending, bytes, trigger).is_some()
+    trigger::find(pending, bytes, trigger).is_some()
 }
 
 struct TriggerActivation {
@@ -445,67 +718,74 @@ fn trigger_activation_bytes(
     bytes: &[u8],
     trigger: &[u8],
 ) -> Option<TriggerActivation> {
-    for start in 0..pending.len() {
-        let pending_suffix = &pending[start..];
-        if pending_suffix.len() + bytes.len() < trigger.len()
-            || !pending_suffix
-                .iter()
-                .chain(bytes)
-                .take(trigger.len())
-                .eq(trigger)
-        {
-            continue;
-        }
-        let trigger_bytes_in_token = trigger.len() - pending_suffix.len();
-        let mut activation = Vec::with_capacity(trigger.len() + bytes.len());
-        activation.extend_from_slice(trigger);
-        activation.extend_from_slice(&bytes[trigger_bytes_in_token..]);
-        return Some(TriggerActivation {
-            bytes: activation,
-            starts_at_token_boundary: false,
-        });
-    }
-    let start = bytes
-        .windows(trigger.len())
-        .position(|window| window == trigger)?;
+    let found = trigger::find(pending, bytes, trigger)?;
+    let capacity = found.prefix.len().checked_add(found.tail.len())?;
+    let mut activation = Vec::with_capacity(capacity);
+    activation.extend_from_slice(found.prefix);
+    activation.extend_from_slice(found.tail);
     Some(TriggerActivation {
-        bytes: bytes[start..].to_vec(),
-        starts_at_token_boundary: start == 0,
+        bytes: activation,
+        starts_at_token_boundary: found.starts_at_token_boundary,
     })
 }
 
+// Compatibility helper for the existing semantic fixtures. Production runtime
+// stores TriggerPrefix and never constructs a token-sized pending buffer.
+#[cfg(test)]
 pub(crate) fn advance_trigger_prefix(pending: &mut Vec<u8>, bytes: &[u8], trigger: &[u8]) {
-    pending.extend_from_slice(bytes);
-    let keep = (0..=pending.len().min(trigger.len().saturating_sub(1)))
-        .rev()
-        .find(|&length| pending.ends_with(&trigger[..length]))
-        .unwrap_or(0);
-    let discard = pending.len() - keep;
-    pending.drain(..discard);
+    let keep = trigger::next_prefix(pending, bytes, trigger);
+    pending.clear();
+    pending.extend_from_slice(&trigger[..keep]);
+}
+
+fn prepared_grammar_callback_refusal() -> ConstraintError {
+    ConstraintError::fixed("prepared grammar requires its funded semantic operation")
 }
 
 fn constraint_error(error: String) -> ConstraintError {
     ConstraintError::new(error)
 }
 
-/// Tokenizer-wide llguidance data. A `LoadedModel` constructs exactly one and
-/// every request grammar shares it.
+/// Temporary tokenizer-wide compilation state. Runtime preparation freezes the
+/// validated input recipe and retires these opaque products before publication.
 pub(crate) struct ConstraintCompiler {
     factory: Arc<ParserFactory>,
     eos_token_ids: Vec<u32>,
+    tokenizer_json: Option<Vec<u8>>,
+    grammar_tokenizer: Option<super::tokenizer_env::recipe::FrozenGrammarTokenizer>,
+    slicer_source: Option<llguidance::earley::SlicerSource>,
     #[cfg(test)]
     tokenizer_analysis_runs: usize,
     #[cfg(test)]
     schema_compilation_runs: AtomicUsize,
+    _authority: HostPreparationAuthority,
 }
 
 pub(crate) struct ConstraintBlueprint {
-    matcher: Matcher,
+    pub(crate) recipe: ConstraintRecipe,
+    declaration: Option<declaration::HistoricalGrammarDeclaration>,
+    // Arbitrary synthetic TokEnv fixtures are deliberately not serialized.
+    #[cfg(test)]
+    fixture_matcher: Option<Matcher>,
 }
 
 pub(crate) struct GrammarState {
     matcher: Matcher,
     terminal_eos_alias_committed: bool,
+    authority: HostPreparationAuthority,
+}
+
+enum MatcherConstructionError<E> {
+    Grammar(String),
+    Source(E),
+}
+impl<E: std::fmt::Display> std::fmt::Display for MatcherConstructionError<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Grammar(error) => f.write_str(error),
+            Self::Source(error) => error.fmt(f),
+        }
+    }
 }
 
 impl ConstraintCompiler {
@@ -513,21 +793,70 @@ impl ConstraintCompiler {
         tokenizer: &ChatTokenizer,
         eos_token_ids: &[u32],
     ) -> Result<Self, String> {
-        let token_env = super::tokenizer_env::from_tokenizer(tokenizer, eos_token_ids)?;
-        Self::from_tok_env(token_env, eos_token_ids.to_vec())
+        Self::from_tokenizer_with_authority(
+            tokenizer,
+            eos_token_ids,
+            &HostPreparationAuthority::unmanaged(),
+        )
     }
 
+    pub(crate) fn from_tokenizer_with_authority(
+        tokenizer: &ChatTokenizer,
+        eos_token_ids: &[u32],
+        authority: &HostPreparationAuthority,
+    ) -> Result<Self, String> {
+        let frozen = super::tokenizer_env::recipe::freeze(tokenizer, eos_token_ids, authority)?;
+        let mut compiler = Self::from_prepared_environment(
+            frozen.environment,
+            eos_token_ids.to_vec(),
+            Some(frozen.bytes),
+            authority,
+        )?;
+        compiler.grammar_tokenizer = Some(frozen.grammar);
+        Ok(compiler)
+    }
+
+    #[cfg(test)]
     fn from_tok_env(token_env: TokEnv, eos_token_ids: Vec<u32>) -> Result<Self, String> {
+        Self::from_prepared_environment(
+            token_env,
+            eos_token_ids,
+            None,
+            &HostPreparationAuthority::unmanaged(),
+        )
+    }
+
+    fn from_prepared_environment(
+        token_env: TokEnv,
+        eos_token_ids: Vec<u32>,
+        tokenizer_json: Option<Vec<u8>>,
+        authority: &HostPreparationAuthority,
+    ) -> Result<Self, String> {
         let mut factory = ParserFactory::new_simple(&token_env)
             .map_err(|error| format!("failed to analyze tokenizer trie: {error}"))?;
         factory.quiet();
+        let slicer_source = tokenizer_json
+            .as_ref()
+            .map(|_| {
+                factory
+                    .slicer()
+                    .source_plan()
+                    .map_err(|error| error.to_string())?
+                    .compile()
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()?;
         Ok(Self {
             factory: Arc::new(factory),
             eos_token_ids,
+            tokenizer_json,
+            grammar_tokenizer: None,
+            slicer_source,
             #[cfg(test)]
             tokenizer_analysis_runs: 1,
             #[cfg(test)]
             schema_compilation_runs: AtomicUsize::new(0),
+            _authority: authority.clone(),
         })
     }
 
@@ -636,9 +965,12 @@ impl ConstraintCompiler {
                 parallel_tool_calls,
                 grammar_structural_token_ids,
             )?;
-            match self.compile_matcher(configuration.grammar.clone()) {
-                Ok(matcher) => (configuration, matcher),
-                Err(_) => {
+            match self.compile_matcher_with(configuration.grammar.clone(), |grammar| {
+                declaration::PendingGrammarDeclaration::copy(grammar, &self._authority)
+            }) {
+                Ok((matcher, declaration)) => (configuration, matcher, declaration),
+                Err(MatcherConstructionError::Source(error)) => return Err(error.to_string()),
+                Err(MatcherConstructionError::Grammar(_)) => {
                     // Keep protocol, function names and call limits constrained.
                     // Only argument-schema enforcement moves to completion.
                     let syntax_tools = tools
@@ -656,8 +988,12 @@ impl ConstraintCompiler {
                         parallel_tool_calls,
                         grammar_structural_token_ids,
                     )?;
-                    let matcher = self.compile_matcher(configuration.grammar.clone())?;
-                    (configuration, matcher)
+                    let (matcher, declaration) = self
+                        .compile_matcher_with(configuration.grammar.clone(), |grammar| {
+                            declaration::PendingGrammarDeclaration::copy(grammar, &self._authority)
+                        })
+                        .map_err(|error| error.to_string())?;
+                    (configuration, matcher, declaration)
                 }
             }
         } else {
@@ -666,58 +1002,99 @@ impl ConstraintCompiler {
                 grammar_structural_token_ids,
                 &self.eos_token_ids,
             )?;
-            let matcher = self.compile_matcher(configuration.grammar.clone())?;
-            (configuration, matcher)
+            let (matcher, declaration) = self
+                .compile_matcher_with(configuration.grammar.clone(), |grammar| {
+                    declaration::PendingGrammarDeclaration::copy(grammar, &self._authority)
+                })
+                .map_err(|error| error.to_string())?;
+            (configuration, matcher, declaration)
         };
-        let (configuration, matcher) = configuration;
+        let (configuration, matcher, declaration) = configuration;
         let fingerprint: [u8; 32] = Sha256::digest(
             serde_json::to_vec(&(&configuration.grammar, tools))
                 .expect("grammar configuration serializes"),
         )
         .into();
-        Ok(GenerationRuntimePlan::new(GenerationRuntimePlanParts {
+        let trigger = if matches!(tool_choice, ToolChoice::None | ToolChoice::Auto) {
+            dialect.auto_activation_trigger(parameters)?
+        } else {
+            None
+        };
+        let recipe = ConstraintRecipe::new_with_trie_info(
+            self.tokenizer_json.as_deref(),
+            &configuration.grammar,
+            tools,
+            &self.eos_token_ids,
+            &runtime_structural_token_spellings,
+            &resolved_structural_token_ids,
+            &runtime_stop_sequences,
+            trigger,
+            *self.factory.tok_env().tok_trie().info(),
+            self.grammar_tokenizer.as_ref(),
+            self.slicer_source.as_ref(),
+        )?;
+        let declaration = declaration.bind(&recipe);
+        // Production plans retain independent immutable inputs only. Synthetic fixtures explicitly
+        // keep their nonserializable environment in test builds.
+        #[cfg(test)]
+        let fixture_matcher = self.tokenizer_json.is_none().then_some(matcher);
+        #[cfg(not(test))]
+        drop(matcher);
+        let mut plan = GenerationRuntimePlan::new(GenerationRuntimePlanParts {
             tool_choice,
             tool_surface,
             generation_constraint: GenerationConstraint::new(
                 fingerprint,
-                ConstraintBlueprint { matcher },
+                ConstraintBlueprint {
+                    recipe,
+                    declaration: Some(declaration),
+                    #[cfg(test)]
+                    fixture_matcher,
+                },
             ),
-            tool_call_trigger: if matches!(tool_choice, ToolChoice::None | ToolChoice::Auto) {
-                dialect
-                    .auto_activation_trigger(parameters)?
-                    .map(str::to_owned)
-            } else {
-                None
-            },
             dialect,
             dialect_parameters: parameters,
-            tools: tools.to_vec(),
-            structural_token_spellings: runtime_structural_token_spellings,
-            resolved_structural_token_ids,
-            profile_stop_sequences: runtime_stop_sequences,
-        }))
+        });
+        if tool_choice != ToolChoice::None {
+            plan.prepare_tool_schema_sources(tools, &self._authority)?;
+        }
+        Ok(plan)
     }
 
     fn compile_matcher(
         &self,
         grammar: llguidance::api::TopLevelGrammar,
     ) -> Result<Matcher, String> {
-        let parser = self
-            .factory
-            .create_parser(grammar)
-            .map_err(|error| format!("failed to compile tool grammar: {error}"))?;
+        self.compile_matcher_with(grammar, |_| Ok::<_, std::convert::Infallible>(()))
+            .map(|(matcher, ())| matcher)
+            .map_err(|error| error.to_string())
+    }
+
+    // A shared constructor handoff; the source callback sees only immutable
+    // compiled declarations. Ordinary reconstruction requests no extra copy.
+    fn compile_matcher_with<R, E: std::fmt::Display>(
+        &self,
+        grammar: llguidance::api::TopLevelGrammar,
+        prepare: impl FnOnce(&llguidance::earley::CGrammar) -> Result<R, E>,
+    ) -> Result<(Matcher, R), MatcherConstructionError<E>> {
+        let parser = self.factory.create_parser(grammar).map_err(|error| {
+            MatcherConstructionError::Grammar(format!("failed to compile tool grammar: {error}"))
+        })?;
+        let source = prepare(parser.parser.grammar()).map_err(MatcherConstructionError::Source)?;
         let mut matcher = Matcher::new(Ok(parser));
         if let Some(error) = matcher.get_error() {
-            return Err(format!("failed to compile tool grammar: {error}"));
+            return Err(MatcherConstructionError::Grammar(format!(
+                "failed to compile tool grammar: {error}"
+            )));
         }
         let warnings = matcher.grammar_warnings();
         if !warnings.is_empty() {
-            return Err(format!(
+            return Err(MatcherConstructionError::Grammar(format!(
                 "tool grammar produced unsupported warnings: {}",
                 warnings.join("; ")
-            ));
+            )));
         }
-        Ok(matcher)
+        Ok((matcher, source))
     }
 
     #[cfg(test)]
@@ -763,11 +1140,77 @@ impl ConstraintCompiler {
 }
 
 impl ConstraintBlueprint {
-    fn state(&self) -> GrammarState {
-        GrammarState {
-            matcher: self.matcher.deep_clone(),
-            terminal_eos_alias_committed: false,
+    fn environment(&self, authority: &HostPreparationAuthority) -> Result<TokEnv, String> {
+        #[cfg(test)]
+        if let Some(matcher) = &self.fixture_matcher {
+            return matcher.tok_env().map_err(|error| error.to_string());
         }
+        let tokenizer = self
+            .recipe
+            .tokenizer_json()
+            .ok_or("prepared grammar has no frozen tokenizer")?;
+        let eos = self.recipe.eos_token_ids().collect::<Vec<_>>();
+        if let Some(prepared) = self.recipe.grammar_tokenizer_json() {
+            super::tokenizer_env::recipe::restore_prepared(
+                prepared,
+                &eos,
+                self.recipe.trie_info().as_ref(),
+                authority,
+            )
+        } else {
+            super::tokenizer_env::recipe::restore_with_info(
+                tokenizer,
+                &eos,
+                self.recipe.trie_info().as_ref(),
+                authority,
+            )
+        }
+    }
+
+    fn vocabulary_plan(
+        &self,
+        authority: &HostPreparationAuthority,
+    ) -> Result<VocabularyPlan, ConstraintError> {
+        let environment = self.environment(authority).map_err(constraint_error)?;
+        VocabularyPlan::new(environment)
+    }
+
+    fn state(&self, authority: &HostPreparationAuthority) -> Result<GrammarState, String> {
+        #[cfg(test)]
+        if let Some(matcher) = &self.fixture_matcher {
+            return Ok(GrammarState {
+                matcher: matcher.deep_clone(),
+                terminal_eos_alias_committed: false,
+                authority: authority.clone(),
+            });
+        }
+        let environment = self.environment(authority)?;
+        let eos = self.recipe.eos_token_ids().collect();
+        let compiler =
+            ConstraintCompiler::from_prepared_environment(environment, eos, None, authority)?;
+        Ok(GrammarState {
+            matcher: compiler.compile_matcher(self.recipe.grammar()?)?,
+            terminal_eos_alias_committed: false,
+            authority: authority.clone(),
+        })
+    }
+
+    pub(crate) fn with_registered_recipe<B: eredu_core::TextGenerationBackend>(
+        &self,
+        runtime: &eredu_core::ModelRuntime<B>,
+        recipe: ConstraintRecipe,
+    ) -> Result<Self, eredu_core::BackendFailure> {
+        let declaration = self
+            .declaration
+            .as_ref()
+            .map(|source| source.register(runtime, &self.recipe, &recipe))
+            .transpose()?;
+        Ok(Self {
+            recipe,
+            declaration,
+            #[cfg(test)]
+            fixture_matcher: self.fixture_matcher.as_ref().map(Matcher::deep_clone),
+        })
     }
 }
 
@@ -776,6 +1219,7 @@ impl GrammarState {
         Self {
             matcher: self.matcher.deep_clone(),
             terminal_eos_alias_committed: self.terminal_eos_alias_committed,
+            authority: self.authority.clone(),
         }
     }
 
@@ -786,27 +1230,7 @@ impl GrammarState {
     }
 
     pub(crate) fn commit(&mut self, token: TokenId) -> Result<(), String> {
-        if self.terminal_eos_alias_committed {
-            return Err("generation grammar already committed its terminal EOS token".into());
-        }
-        if self.try_commit(token)? {
-            return Ok(());
-        }
-
-        // llguidance treats the first configured EOS token as canonical, but
-        // secondary EOS aliases cannot be consumed as explicit structural
-        // literals. Checkpoint protocols can legitimately use such an alias
-        // as their required turn terminator (Muse ATEM's <|eot|> is one).
-        // Preserve mask/commit consistency by accepting an EOS alias only
-        // when the grammar mask allowed that exact token at this prefix.
-        if self.is_eos_token(token)? && self.allowed_tokens()?.is_allowed(token) {
-            self.terminal_eos_alias_committed = true;
-            return Ok(());
-        }
-
-        Err(format!(
-            "token {token} is not allowed by the generation grammar"
-        ))
+        grammar_policy::commit(self, token)
     }
 
     pub(crate) fn try_commit(&mut self, token: TokenId) -> Result<bool, String> {
@@ -826,8 +1250,7 @@ impl GrammarState {
         let trie = token_env.tok_trie();
         // Activation uses decoded output bytes. Structural tokens retain their
         // IDs, but the trie's internal special-token marker is not output text.
-        let round_trip = trie.decode(&tokens);
-        if round_trip != bytes {
+        if !trie.decoded_tokens_match(&tokens, bytes) {
             return Err("grammar tokenizer could not represent activation bytes exactly".into());
         }
         let consumed = self
@@ -840,17 +1263,12 @@ impl GrammarState {
     /// An accepted prefix may still allow another call in the same response.
     /// End generation only when no extension remains or EOS was committed.
     fn is_terminal(&mut self) -> Result<bool, String> {
-        Ok(self.is_complete()? && (self.terminal_eos_alias_committed || self.matcher.is_stopped()))
+        grammar_policy::terminal(self)
     }
 
     /// Whether the prefix is a complete grammatical value, even if extendable.
     pub(crate) fn is_complete(&mut self) -> Result<bool, String> {
-        if self.terminal_eos_alias_committed {
-            return Ok(true);
-        }
-        self.matcher
-            .is_accepting()
-            .map_err(|error| format!("failed to inspect grammar completion: {error}"))
+        grammar_policy::complete(self)
     }
 
     fn is_eos_token(&self, token: TokenId) -> Result<bool, String> {
@@ -859,26 +1277,6 @@ impl GrammarState {
             .tok_env()
             .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
         Ok(token_env.tok_trie().eos_tokens().contains(&token))
-    }
-
-    pub(crate) fn token_vocabulary(&self) -> Result<Vec<Vec<u8>>, String> {
-        let token_env = self
-            .matcher
-            .tok_env()
-            .map_err(|error| format!("failed to inspect grammar tokenizer: {error}"))?;
-        let trie = token_env.tok_trie();
-        Ok((0..trie.vocab_size() as TokenId)
-            .map(|token| {
-                // Match triggers in the same byte domain as decoded output;
-                // otherwise a structural token appears to start one byte late.
-                // Keep absent vocabulary slots empty.
-                let bytes = trie.token(token);
-                bytes
-                    .strip_prefix(&[llguidance::toktrie::TokTrie::SPECIAL_TOKEN_MARKER])
-                    .unwrap_or(bytes)
-                    .to_vec()
-            })
-            .collect())
     }
 }
 
@@ -890,8 +1288,11 @@ impl GenerationConstraint {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn grammar_state(&self) -> GrammarState {
-        self.inner.state()
+        self.inner
+            .state(&HostPreparationAuthority::unmanaged())
+            .expect("validated fixture grammar reconstructs")
     }
 }
 
@@ -1004,9 +1405,216 @@ mod tests {
 
     use super::{ConstraintCompiler, ParallelToolCallPolicy, ToolChoice};
     use crate::runtime::chat::dialect::{
-        DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters, ExactEnvelope,
-        GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout, DECLARATIVE_DIALECT,
+        DECLARATIVE_DIALECT, DeclarativeDialectSpec, DeclarativePayloadShape, DialectParameters,
+        ExactEnvelope, GenerationPromptBehavior, JsonFunctionEnvelope, ParallelCallLayout,
     };
+
+    #[test]
+    fn prepared_plain_controller_commit_preserves_source_forcing_and_host_custody() {
+        use eredu_core::{
+            HostPreparationAuthority, SharedTokenFilter, SpeculativeTokenFilterController,
+            TokenFilter, TokenFilterController,
+        };
+        use eredu_runtime::{
+            TokenDomain,
+            execution_control::TokenChoiceController,
+            generation::{ConstrainedSampler, DefaultSampler, SpeculativeSampler},
+            working_memory::WorkspaceSamplingBackend,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Retires(Arc<AtomicBool>);
+        impl Drop for Retires {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        fn host(retired: &Arc<AtomicBool>) -> HostPreparationAuthority {
+            HostPreparationAuthority::retain(Retires(retired.clone()))
+        }
+        type Plain = ConstrainedSampler<DefaultSampler, super::ConstraintController>;
+        fn plan(
+            source: &Plain,
+        ) -> eredu_runtime::generation::PreparedSpeculativeController<'_, Plain> {
+            SpeculativeSampler::<WorkspaceSamplingBackend>::prepared_controller(source).unwrap()
+        }
+        let validity =
+            SharedTokenFilter::new(TokenFilter::allowed(vec![false, true, true]).unwrap());
+        let mut controller = super::ConstraintController::text(validity);
+        controller.commit_token(1).unwrap();
+        let mut ordinary = TokenChoiceController::new(controller.clone(), TokenDomain::new(3));
+        ordinary.force_at(2, TokenDomain::new(3), 1).unwrap();
+        let mut source = Plain::new(DefaultSampler, controller);
+        SpeculativeSampler::<WorkspaceSamplingBackend>::control_force_next(
+            &mut source,
+            2,
+            TokenDomain::new(3),
+            1,
+        )
+        .unwrap();
+        assert!(
+            SpeculativeSampler::<WorkspaceSamplingBackend>::prepared_host_copy(&source).is_none()
+        );
+        assert!(
+            SpeculativeSampler::<WorkspaceSamplingBackend>::prepared_logit_policy(&source)
+                .is_none()
+        );
+        let initial = Arc::new(AtomicBool::new(false));
+        assert!(plan(&source).copy_metadata_bytes() > 0);
+        let copied = plan(&source).copy(host(&initial)).unwrap();
+        let alias = copied.clone();
+        let (decision, _) = plan(&copied).logits(&[1]).unwrap().into_parts();
+        assert_eq!(decision.forced_token(), Some(2));
+        assert!(
+            decision.source().validity().same_storage(
+                source
+                    .controller()
+                    .prepared_plain_source()
+                    .unwrap()
+                    .validity()
+            )
+        );
+        assert!(plan(&copied).logits(&[0]).is_err());
+        assert!(plan(&copied).logits(&[1, 1]).is_err());
+        let refused = Arc::new(AtomicBool::new(false));
+        assert!(plan(&copied).commit(1, host(&refused)).is_err());
+        assert!(refused.load(Ordering::SeqCst));
+        assert_eq!(
+            copied
+                .controller()
+                .prepared_plain_source()
+                .unwrap()
+                .history(),
+            &[1]
+        );
+        assert_eq!(
+            SpeculativeSampler::<WorkspaceSamplingBackend>::control_pending_forced(&copied),
+            Some(2)
+        );
+        let committed_host = Arc::new(AtomicBool::new(false));
+        let committed = plan(&copied).commit(2, host(&committed_host)).unwrap();
+        ordinary.commit_token(2).unwrap();
+        assert_eq!(
+            committed
+                .controller()
+                .prepared_plain_source()
+                .unwrap()
+                .history(),
+            ordinary.inner().prepared_plain_source().unwrap().history()
+        );
+        assert_eq!(
+            SpeculativeSampler::<WorkspaceSamplingBackend>::control_pending_forced(&committed),
+            ordinary.pending_forced()
+        );
+        assert_eq!(
+            copied
+                .controller()
+                .prepared_plain_source()
+                .unwrap()
+                .history(),
+            &[1]
+        );
+        drop(copied);
+        assert!(!initial.load(Ordering::SeqCst));
+        drop(alias);
+        assert!(initial.load(Ordering::SeqCst));
+        assert!(!committed_host.load(Ordering::SeqCst));
+        drop(committed);
+        assert!(committed_host.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn prepared_plain_choice_tracks_controller_replacement_and_mask_expansion() {
+        use eredu_core::{
+            HostPreparationAuthority, SharedTokenFilter, SpeculativeTokenFilterController,
+            TokenFilter, TokenFilterController,
+        };
+        use eredu_runtime::{
+            TokenDomain,
+            generation::{ConstrainedSampler, DefaultSampler, SpeculativeSampler, TokenMaskPlan},
+            working_memory::WorkspaceSamplingBackend,
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Retires(Arc<AtomicBool>);
+        impl Drop for Retires {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        type Plain = ConstrainedSampler<DefaultSampler, super::ConstraintController>;
+        fn plan(
+            source: &Plain,
+        ) -> eredu_runtime::generation::PreparedSpeculativeController<'_, Plain> {
+            SpeculativeSampler::<WorkspaceSamplingBackend>::prepared_controller(source).unwrap()
+        }
+        let mut controller = super::ConstraintController::text(SharedTokenFilter::new(
+            TokenFilter::allowed(vec![true, false, true]).unwrap(),
+        ));
+        controller.commit_token(2).unwrap();
+        let mut source = Plain::new(DefaultSampler, controller);
+        SpeculativeSampler::<WorkspaceSamplingBackend>::control_force_next(
+            &mut source,
+            2,
+            TokenDomain::new(3),
+            1,
+        )
+        .unwrap();
+        // An unpriced ordinary history cannot become a completed-value witness.
+        assert!(plan(&source).choice(0.0).is_err());
+        let retired = Arc::new(AtomicBool::new(false));
+        let source = plan(&source)
+            .copy(HostPreparationAuthority::retain(Retires(retired.clone())))
+            .unwrap();
+        let choice = plan(&source).choice(0.0).unwrap();
+        assert!(plan(&source).matches_choice(&choice));
+        assert!(choice.greedy(0.0).is_ok());
+        assert!(choice.categorical(0.7).is_err());
+        let stochastic = plan(&source).choice(0.7).unwrap();
+        assert!(stochastic.categorical(0.7).is_ok());
+        assert!(stochastic.categorical(0.8).is_err());
+        let (decision, _) = plan(&source).logits(&[2]).unwrap().into_parts();
+        let mask = TokenMaskPlan::new(
+            decision.source().validity(),
+            &[1, 2, 5],
+            decision.forced_token(),
+        )
+        .unwrap();
+        let mut invalid = Vec::with_capacity(mask.elements());
+        mask.fill(&mut invalid).unwrap();
+        assert_eq!(
+            invalid,
+            [true, true, false, true, true, true, true, false, true, true]
+        );
+        let unforced = TokenMaskPlan::new(decision.source().validity(), &[1, 5], None).unwrap();
+        let mut invalid = Vec::with_capacity(unforced.elements());
+        unforced.fill(&mut invalid).unwrap();
+        assert_eq!(invalid, [false, true, false, true, true]);
+        let next = plan(&source)
+            .commit(2, HostPreparationAuthority::retain(()))
+            .unwrap();
+        assert!(!plan(&next).matches_choice(&choice));
+        assert_eq!(
+            next.controller().prepared_plain_source().unwrap().history(),
+            &[2, 2]
+        );
+        assert!(choice.same_source(&choice.clone()));
+        drop(source);
+        assert!(!retired.load(Ordering::SeqCst));
+        drop(choice);
+        assert!(!retired.load(Ordering::SeqCst));
+        drop(stochastic);
+        assert!(retired.load(Ordering::SeqCst));
+        assert!(
+            TokenMaskPlan::new(&TokenFilter::All, &[1, 5], None)
+                .unwrap()
+                .is_identity()
+        );
+    }
 
     const SYNTHETIC_JSON_FUNCTION: JsonFunctionEnvelope = JsonFunctionEnvelope {
         envelope: ExactEnvelope {
@@ -1051,7 +1659,7 @@ mod tests {
     }
 
     fn activation_tokenizer(markers: &[&str], special: bool) -> super::ChatTokenizer {
-        use tokenizers::{decoders::byte_level::ByteLevel, models::bpe::BPE, AddedToken};
+        use tokenizers::{AddedToken, decoders::byte_level::ByteLevel, models::bpe::BPE};
 
         let vocabulary = (b'!'..=b'~')
             .map(|byte| (byte as char).to_string())
@@ -1106,7 +1714,7 @@ mod tests {
                 .unwrap();
             for preamble in ["", "hello"] {
                 let mut controller =
-                    super::ConstraintController::from_generation_plan(&plan).unwrap();
+                    super::ConstraintController::from_generation_plan_unregistered(&plan).unwrap();
                 for &token in tokenizer.encode(preamble, false).unwrap().get_ids() {
                     controller.commit(token).unwrap();
                 }
@@ -1122,11 +1730,13 @@ mod tests {
                 assert!(controller.filter_at(&history).unwrap().allows(ids[0]));
                 controller.commit(ids[0]).unwrap();
                 assert!(controller.constraint_is_active());
-                assert!(!controller
-                    .valid_token_ids()
-                    .unwrap()
-                    .unwrap()
-                    .contains(&ids[1]));
+                assert!(
+                    !controller
+                        .valid_token_ids()
+                        .unwrap()
+                        .unwrap()
+                        .contains(&ids[1])
+                );
                 for &token in tokenizer.encode("[ping()]", false).unwrap().get_ids() {
                     controller.commit(token).unwrap();
                 }
@@ -1145,7 +1755,7 @@ mod tests {
                 )
                 .unwrap();
             let mut controller =
-                super::ConstraintController::from_generation_plan(&forbidden).unwrap();
+                super::ConstraintController::from_generation_plan_unregistered(&forbidden).unwrap();
             assert!(!controller.filter_at(&[]).unwrap().allows(ids[0]));
             assert!(controller.commit(ids[0]).is_err());
         }
@@ -1179,7 +1789,8 @@ mod tests {
                 vec![marker],
             )
             .unwrap();
-        let mut controller = super::ConstraintController::from_generation_plan(&plan).unwrap();
+        let mut controller =
+            super::ConstraintController::from_generation_plan_unregistered(&plan).unwrap();
         controller.commit(marker).unwrap();
         assert!(!controller.constraint_is_active());
         let space = tokenizer.encode(" ", false).unwrap().get_ids()[0];
@@ -1231,7 +1842,8 @@ mod tests {
                     vec![eos],
                 )
                 .unwrap();
-            let mut controller = super::ConstraintController::from_generation_plan(&plan).unwrap();
+            let mut controller =
+                super::ConstraintController::from_generation_plan_unregistered(&plan).unwrap();
             if choice == ToolChoice::None {
                 assert!(!controller.filter_at(&[]).unwrap().allows(marker));
                 continue;
@@ -1257,7 +1869,7 @@ mod tests {
     #[test]
     fn qwen_parallel_calls_remain_open_until_eos_or_call_limit() {
         use crate::runtime::chat::{
-            QWEN3_XML_TOOL_SPEC, QWEN_TAGGED_TOOL_SPEC_NO_REASONING, QWEN_XML_TOOL_SPEC,
+            QWEN_TAGGED_TOOL_SPEC_NO_REASONING, QWEN_XML_TOOL_SPEC, QWEN3_XML_TOOL_SPEC,
         };
 
         let json_call = "<tool_call>\n{\"name\":\"ping\",\"arguments\":{}}\n</tool_call>";
@@ -1288,7 +1900,8 @@ mod tests {
                             )
                             .unwrap();
                     let mut controller =
-                        super::ConstraintController::from_generation_plan(&plan).unwrap();
+                        super::ConstraintController::from_generation_plan_unregistered(&plan)
+                            .unwrap();
 
                     // Speculative prefixes must make the same termination decision
                     // as the committed controller, without advancing its state.
@@ -1321,10 +1934,12 @@ mod tests {
                         max_calls.is_some()
                     );
                     if max_calls.is_some() {
-                        assert!(!controller
-                            .filter_at(&history)
-                            .unwrap()
-                            .allows(u32::from(b'\n')));
+                        assert!(
+                            !controller
+                                .filter_at(&history)
+                                .unwrap()
+                                .allows(u32::from(b'\n'))
+                        );
                     } else {
                         controller.commit(255).unwrap();
                         assert!(controller.grammar_is_complete().unwrap());
@@ -1601,9 +2216,11 @@ mod tests {
         ] {
             let output = json!({"calls": [{"name": "check", "arguments": arguments}]}).to_string();
             let mut grammar = plan.generation_constraint().grammar_state();
-            assert!(output
-                .bytes()
-                .any(|byte| grammar.commit(u32::from(byte)).is_err()));
+            assert!(
+                output
+                    .bytes()
+                    .any(|byte| grammar.commit(u32::from(byte)).is_err())
+            );
         }
     }
 

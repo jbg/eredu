@@ -24,6 +24,24 @@ pub struct GroupedLinearSpec {
     projection: GroupedProjectionSpec,
 }
 
+impl crate::workspace::policy_clone::MetadataClone for GroupedLinearSpec {
+    fn metadata_clone_bytes(&self) -> Option<usize> {
+        let Self {
+            groups,
+            input,
+            global_output,
+            output,
+            activation,
+            reduction,
+            projection,
+        } = self;
+        let _ = (groups, input, global_output, output, activation, reduction);
+        crate::workspace::policy_clone::controls::<Self>()?.checked_add(
+            crate::workspace::policy_clone::MetadataClone::metadata_clone_bytes(projection)?,
+        )
+    }
+}
+
 impl GroupedLinearSpec {
     /// Declares a complete bank with packed weights `[groups, output, input]`.
     pub fn new(
@@ -102,6 +120,12 @@ impl GroupedLinearSpec {
     }
     /// Validates dimensions and output ownership without native resources.
     pub fn validate(&self) -> Result<(), Error> {
+        self.validate_fixed()
+            .map_err(|cause| cause.into_ordinary(&self.projection))
+    }
+
+    /// Validates the same source geometry without allocating an error or cloning identities.
+    pub fn validate_fixed(&self) -> Result<(), crate::GroupedLinearValidationError> {
         if self.groups < 0
             || self.input <= 0
             || self.global_output <= 0
@@ -109,11 +133,11 @@ impl GroupedLinearSpec {
             || self.output.end > self.global_output
             || self.output.start >= self.output.end
         {
-            return Err(Error::backend(
-                "invalid grouped-linear bank or output partition",
-            ));
+            return Err(crate::GroupedLinearValidationError::Geometry);
         }
-        self.projection.validate()
+        self.projection
+            .validate_fixed()
+            .map_err(crate::GroupedLinearValidationError::Projection)
     }
 }
 

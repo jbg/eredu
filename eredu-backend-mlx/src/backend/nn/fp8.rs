@@ -8,6 +8,8 @@
 //! expanding a complete weight bank. CPU execution uses a deliberately slow
 //! dequantized reference path for correctness tests and functional fallback.
 
+pub(crate) mod original;
+
 use std::cell::RefCell;
 
 use super::grouping::grouped_matmul;
@@ -17,14 +19,14 @@ use safemlx::fast::CustomKernelConfig;
 #[cfg(not(feature = "cuda"))]
 use safemlx::fast::MetalKernel;
 use safemlx::{
+    Array, DeviceType, Dtype, Stream,
     error::Exception,
     ops::{
         concatenate_axis,
-        indexing::{take, TryIndexOp},
+        indexing::{TryIndexOp, take},
         matmul,
     },
     transforms::eval,
-    Array, DeviceType, Dtype, Stream,
 };
 
 #[cfg(not(feature = "cuda"))]
@@ -50,11 +52,19 @@ thread_local! {
 const OUT_TILE: i32 = 16;
 const REDUCTION_TILE: i32 = 16;
 const SCALE_BLOCK: i32 = 128;
-#[cfg(not(feature = "cuda"))]
+static E8M0_SCALE_TABLE: [f32; 256] = {
+    let mut values = [0.0; 256];
+    let mut exponent = 0;
+    while exponent < 256 {
+        values[exponent] = f32::from_bits((exponent as u32) << 23);
+        exponent += 1;
+    }
+    values
+};
 const TILED_ROW_THRESHOLD: i32 = 8;
 
 fn ceil_div(lhs: i32, rhs: i32) -> i32 {
-    (lhs + rhs - 1) / rhs
+    lhs / rhs + i32::from(lhs % rhs > 0)
 }
 
 /// Decodes native unsigned E8M0 scale bytes without expanding FP8 weights.
@@ -65,16 +75,14 @@ pub fn decode_scale(scale: &Array, stream: &Stream) -> Result<Array, Exception> 
     match scale.dtype() {
         Dtype::Float16 | Dtype::Bfloat16 | Dtype::Float32 => Ok(scale.clone()),
         Dtype::Uint8 => {
-            let table = (0u32..=255)
-                .map(|exponent| f32::from_bits(exponent << 23))
-                .collect::<Vec<_>>();
+            let table = &E8M0_SCALE_TABLE;
             take(
-                Array::from_slice(&table, &[256]),
+                Array::try_from_slice(table, &[256])?,
                 scale.as_dtype(Dtype::Uint32, stream)?,
                 stream,
             )
         }
-        dtype => Err(Exception::custom(format!(
+        dtype => Err(original::invalid(format_args!(
             "block-FP8 scale must be Float16, Bfloat16, Float32, or native E8M0 bytes, got {dtype:?}"
         ))),
     }
@@ -116,7 +124,7 @@ fn grouped_tiled_config(
 fn activation_dtype(input: &Array) -> Result<Dtype, Exception> {
     let dtype = input.dtype();
     if !dtype.is_float() {
-        return Err(Exception::custom(format!(
+        return Err(original::invalid(format_args!(
             "block-FP8 activation input must be floating point, got {dtype:?}"
         )));
     }
@@ -136,7 +144,7 @@ fn restore_activation_dtype(
 }
 
 fn is_cpu_stream(stream: &Stream) -> Result<bool, Exception> {
-    Ok(stream.get_device()?.get_type()? == DeviceType::Cpu)
+    Ok(stream.device_type()? == DeviceType::Cpu)
 }
 
 fn dequantize_grouped(weight: &Array, scale: &Array, stream: &Stream) -> Result<Array, Exception> {
@@ -194,6 +202,26 @@ fn quantize_activations(
     stream: &Stream,
 ) -> Result<QuantizedActivations, Exception> {
     let scale_cols = ceil_div(in_dim, SCALE_BLOCK);
+    if let Some(observer) = safemlx::OriginalScopeObserver::try_current()? {
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        {
+            if stream.device_type()? != DeviceType::Gpu
+                || input.shape() != [rows, in_dim]
+                || !matches!(
+                    input.dtype(),
+                    Dtype::Float32 | Dtype::Float16 | Dtype::Bfloat16
+                )
+            {
+                return Err(observer.invalid_input_error());
+            }
+            let [values, scales] = crate::backend::managed_memory::fp8_kernel::quantize(
+                input, rows, in_dim, scale_cols, stream,
+            )?;
+            return Ok(QuantizedActivations { values, scales });
+        }
+        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+        return Err(observer.capacity_error());
+    }
     if is_cpu_stream(stream)? {
         let input = input
             .as_dtype(Dtype::Float32, stream)?
@@ -205,10 +233,10 @@ fn quantize_activations(
                 input.try_index_device((.., start..(start + SCALE_BLOCK).min(in_dim)), stream)?;
             let scale = safemlx::ops::maximum(
                 block.abs(stream)?.max_axis(-1, true, stream)?,
-                Array::from_f32(1.0e-4),
+                Array::try_from_f32(1.0e-4)?,
                 stream,
             )?
-            .divide(Array::from_f32(448.0), stream)?;
+            .divide(Array::try_from_f32(448.0)?, stream)?;
             values.push(block.divide(&scale, stream)?.to_fp8(stream)?);
             scales.push(scale);
         }
@@ -274,15 +302,102 @@ fn dequantize_activations(
     shape: &[i32],
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    let in_dim = *shape
-        .last()
-        .ok_or_else(|| Exception::custom("activation input has no feature axis"))?;
-    let scales = Array::repeat_axis::<f32>(quantized.scales.clone(), SCALE_BLOCK, 1, stream)?;
-    quantized
-        .values
-        .from_fp8(Dtype::Float32, stream)?
-        .multiply(scales.try_index_device((.., ..in_dim), stream)?, stream)?
-        .reshape(shape, stream)
+    let plan = eredu_nn::BlockFp8InputReconstructionPlan::new(shape)
+        .map_err(original::reconstruction_error)?;
+    plan.validate_operands(quantized.values.shape(), quantized.scales.shape())
+        .map_err(original::reconstruction_error)?;
+    eredu_nn::reconstruct_block_fp8_input(InputReconstruction {
+        plan,
+        quantized,
+        stream,
+    })
+}
+
+struct InputReconstruction<'a> {
+    plan: eredu_nn::BlockFp8InputReconstructionPlan<'a>,
+    quantized: &'a QuantizedActivations,
+    stream: &'a Stream,
+}
+impl InputReconstruction<'_> {
+    fn validate_sources(&self) -> Result<(), Exception> {
+        self.plan
+            .validate_operands(self.quantized.values.shape(), self.quantized.scales.shape())
+            .map_err(original::reconstruction_error)?;
+        if self.quantized.values.dtype() != Dtype::Uint8
+            || self.quantized.scales.dtype() != Dtype::Float32
+        {
+            return Err(original::reconstruction_error(
+                eredu_nn::ProjectionObservationError::Geometry,
+            ));
+        }
+        Ok(())
+    }
+}
+impl eredu_nn::RetainedGeneratedTensorFactory<Array, Exception> for InputReconstruction<'_> {
+    fn program(&self) -> eredu_nn::GeneratedTensorProgram<'_> {
+        eredu_nn::GeneratedTensorProgram::BlockFp8Input(self.plan)
+    }
+    fn visit_sources(
+        &mut self,
+        retain: &mut dyn FnMut(
+            eredu_nn::GeneratedTensorSourceRole,
+            &Array,
+        ) -> Result<(), Exception>,
+    ) -> Result<(), Exception> {
+        self.validate_sources()?;
+        retain(
+            eredu_nn::GeneratedTensorSourceRole::CompactValues,
+            &self.quantized.values,
+        )?;
+        retain(
+            eredu_nn::GeneratedTensorSourceRole::BlockScales,
+            &self.quantized.scales,
+        )
+    }
+    fn generate(
+        &mut self,
+        retain: &mut dyn FnMut(&Array) -> Result<(), Exception>,
+    ) -> Result<Array, Exception> {
+        self.validate_sources()?;
+        eredu_nn::reconstruct_block_fp8_input_retained(
+            InputReconstruction {
+                plan: self.plan,
+                quantized: self.quantized,
+                stream: self.stream,
+            },
+            retain,
+        )
+    }
+}
+
+impl eredu_nn::BlockFp8InputReconstructionMechanism for InputReconstruction<'_> {
+    type Value = Array;
+    type Error = Exception;
+    fn expand_scales(&self) -> Result<Array, Exception> {
+        self.quantized.scales.expand_dims(2, self.stream)
+    }
+    fn broadcast_scales(&self, expanded: &Array) -> Result<Array, Exception> {
+        safemlx::ops::broadcast_to(
+            expanded,
+            &[self.plan.rows(), self.plan.scale_columns(), SCALE_BLOCK],
+            self.stream,
+        )
+    }
+    fn flatten_scales(&self, broadcasted: &Array) -> Result<Array, Exception> {
+        broadcasted.reshape(&[self.plan.rows(), self.plan.padded_width()], self.stream)
+    }
+    fn decode_values(&self) -> Result<Array, Exception> {
+        self.quantized.values.from_fp8(Dtype::Float32, self.stream)
+    }
+    fn trim_scales(&self, repeated: &Array) -> Result<Array, Exception> {
+        repeated.try_index_device((.., ..self.plan.width()), self.stream)
+    }
+    fn multiply(&self, values: &Array, scales: &Array) -> Result<Array, Exception> {
+        values.multiply(scales, self.stream)
+    }
+    fn restore_shape(&self, product: &Array) -> Result<Array, Exception> {
+        product.reshape(self.plan.shape(), self.stream)
+    }
 }
 
 #[cfg(not(feature = "cuda"))]
@@ -291,29 +406,7 @@ fn activation_quantization_kernel_metal() -> Result<MetalKernel, Exception> {
         "block_fp8_activation_quantization",
         ["input"],
         ["quantized", "activation_scale"],
-        concat!(
-            "uint block = thread_position_in_grid.x / SCALE_BLOCK;",
-            "uint lane = thread_position_in_grid.x % SCALE_BLOCK;",
-            "uint row = block / SCALE_COLS;",
-            "uint scale_col = block % SCALE_COLS;",
-            "uint col = scale_col * SCALE_BLOCK + lane;",
-            "bool valid = col < IN_DIM;",
-            "float value = valid ? float(input[row * IN_DIM + col]) : 0.0f;",
-            "threadgroup float maxima[SCALE_BLOCK];",
-            "threadgroup float block_scale[1];",
-            "maxima[lane] = abs(value);",
-            "threadgroup_barrier(mem_flags::mem_threadgroup);",
-            "for (uint stride = SCALE_BLOCK / 2; stride > 0; stride /= 2) {",
-            " if (lane < stride) maxima[lane] = max(maxima[lane], maxima[lane + stride]);",
-            " threadgroup_barrier(mem_flags::mem_threadgroup);",
-            "}",
-            "if (lane == 0) {",
-            " block_scale[0] = max(maxima[0], 1.0e-4f) / 448.0f;",
-            " activation_scale[block] = block_scale[0];",
-            "}",
-            "threadgroup_barrier(mem_flags::mem_threadgroup);",
-            "if (valid) quantized[row * IN_DIM + col] = float_to_fp8_e4m3(value / block_scale[0]);"
-        ),
+        include_str!("fp8/activation.metal"),
         METAL_HEADER,
         true,
         false,
@@ -461,10 +554,11 @@ pub(crate) fn linear_with_input_observer(
     observer: Option<&mut dyn super::linear::NativeProjectionInputObserver>,
 ) -> Result<Array, Exception> {
     if input.ndim() < 1 || weight.ndim() != 2 || scale.ndim() != 2 {
-        return Err(Exception::custom(
+        return Err(original::invalid(format_args!(
             "block-FP8 linear expects an input with at least one dimension and rank-2 weight/scale arrays",
-        ));
+        )));
     }
+    let original_rows = original::validate(input, weight, stream)?;
     let scale = decode_scale(scale, stream)?;
     let input_shape = input.shape();
     let output_dtype = activation_dtype(input)?;
@@ -476,11 +570,11 @@ pub(crate) fn linear_with_input_observer(
         || scale.dim(0) != ceil_div(out_dim, SCALE_BLOCK)
         || scale.dim(1) != ceil_div(in_dim, SCALE_BLOCK)
     {
-        return Err(Exception::custom(
+        return Err(original::invalid(format_args!(
             "invalid block-FP8 linear weight or scale dimensions",
-        ));
+        )));
     }
-    let rows = (input.size() as i32) / in_dim;
+    let rows = original_rows.unwrap_or_else(|| (input.size() as i32) / in_dim);
     if is_cpu_stream(stream)? {
         let weight = dequantize(weight, &scale, stream)?;
         let input = activation_reference(input, rows, in_dim, stream)?;
@@ -496,16 +590,22 @@ pub(crate) fn linear_with_input_observer(
     if let Some(observer) = observer {
         // Repeated scales retain complete blocks even when the feature axis is
         // narrower than 128. Include that padding before offering the factory.
-        let creation_bytes =
-            projection_input_capture_storage(prototype.size() as u64, rows as u64, in_dim as u64)
-                .ok_or_else(|| Exception::custom("projection-input capture storage overflow"))?;
-        let source = eredu_nn::GeneratedTensorSource {
-            creation_bytes,
-            element_type: Some(eredu_nn::TensorElementType::F32),
-        };
-        observer.observe_generated(prototype, &source, &mut || {
-            dequantize_activations(&input, input_shape, stream)
-        })?;
+        let plan = eredu_nn::BlockFp8InputReconstructionPlan::new(input_shape)
+            .map_err(original::reconstruction_error)?;
+        plan.validate_operands(input.values.shape(), input.scales.shape())
+            .map_err(original::reconstruction_error)?;
+        let source = plan
+            .logical_capture_source()
+            .map_err(original::reconstruction_error)?;
+        observer.observe_generated_retained(
+            prototype,
+            &source,
+            &mut InputReconstruction {
+                plan,
+                quantized: &input,
+                stream,
+            },
+        )?;
     }
     let scale_cols = scale.dim(1);
 
@@ -513,10 +613,12 @@ pub(crate) fn linear_with_input_observer(
         &input, weight, &scale, rows, in_dim, out_dim, scale_cols, stream,
     )?;
 
-    finish_linear_output(out, input_shape, output_dtype, out_dim, stream)
+    finish_linear_output(out, prototype, output_dtype, out_dim, stream)
 }
 
-/// Logical factory bound shared by live FP8 input capture and cold admission.
+/// Legacy logical factory quota used by partition capture policy. The selected
+/// fixed reconstruction operations independently price physical allocations;
+/// this compatibility formula is not native allocation evidence.
 pub(crate) fn projection_input_capture_storage(
     elements: u64,
     rows: u64,
@@ -539,6 +641,21 @@ fn linear_quantized(
     scale_cols: i32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    if let Some(observer) = safemlx::OriginalScopeObserver::try_current()? {
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        {
+            let _ = observer;
+            return crate::backend::managed_memory::fp8_kernel::linear(
+                [&input.values, &input.scales, weight, scale],
+                rows,
+                out_dim,
+                rows <= TILED_ROW_THRESHOLD,
+                stream,
+            );
+        }
+        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+        return Err(observer.capacity_error());
+    }
     #[cfg(feature = "cuda")]
     let out = linear_tiled_cuda(
         &input.values,
@@ -584,14 +701,12 @@ fn linear_quantized(
 
 fn finish_linear_output(
     out: Array,
-    input_shape: &[i32],
+    prototype: &Array,
     output_dtype: Dtype,
     out_dim: i32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    let mut output_shape = input_shape.to_vec();
-    *output_shape.last_mut().expect("linear input rank") = out_dim;
-    let out = out.reshape(&output_shape, stream)?;
+    let out = safemlx::ops::reshape_like_prefix(&out, prototype, out_dim, stream)?;
     restore_activation_dtype(out, output_dtype, stream)
 }
 
@@ -719,32 +834,7 @@ fn linear_kernel() -> Result<MetalKernel, Exception> {
         "block_fp8_linear_k16",
         ["input", "input_scale", "weight", "scale"],
         ["out"],
-        concat!(
-            "uint out_col = thread_position_in_grid.x;",
-            "uint row = thread_position_in_grid.y / 16;",
-            "uint lane_k = thread_position_in_grid.y % 16;",
-            "uint local_col = thread_position_in_grid.x % 16;",
-            "uint input_base = row * IN_DIM;",
-            "threadgroup float partial[REDUCTION_TILE][OUT_TILE];",
-            "float acc = 0.0f;",
-            "if (out_col < OUT_DIM) {",
-            " for (uint k = lane_k; k < IN_DIM; k += REDUCTION_TILE) {",
-            "  uint8_t raw = weight[out_col * IN_DIM + k];",
-            "  float x = fp8_e4m3_to_float(input[input_base + k]);",
-            "  uint scale_col = k / SCALE_BLOCK;",
-            "  float xs = float(input_scale[row * SCALE_COLS + scale_col]);",
-            "  float ws = float(scale[(out_col / SCALE_BLOCK) * SCALE_COLS + scale_col]);",
-            "  acc += x * fp8_e4m3_to_float(raw) * xs * ws;",
-            " }",
-            "}",
-            "partial[lane_k][local_col] = acc;",
-            "threadgroup_barrier(mem_flags::mem_threadgroup);",
-            "if (lane_k == 0 && out_col < OUT_DIM) {",
-            " float sum = 0.0f;",
-            " for (uint lane = 0; lane < REDUCTION_TILE; ++lane) sum += partial[lane][local_col];",
-            " out[row * OUT_DIM + out_col] = sum;",
-            "}"
-        ),
+        include_str!("fp8/linear_tiled.metal"),
         METAL_HEADER,
         true,
         false,
@@ -757,23 +847,7 @@ fn linear_scalar_kernel() -> Result<MetalKernel, Exception> {
         "block_fp8_linear_scalar",
         ["input", "input_scale", "weight", "scale"],
         ["out"],
-        concat!(
-            "uint elem = thread_position_in_grid.x;",
-            "uint out_col = elem % OUT_DIM;",
-            "uint row = elem / OUT_DIM;",
-            "float acc = 0.0f;",
-            "uint weight_base = out_col * IN_DIM;",
-            "uint input_base = row * IN_DIM;",
-            "uint scale_row = out_col / SCALE_BLOCK;",
-            "for (uint k = 0; k < IN_DIM; ++k) {",
-            " float w = fp8_e4m3_to_float(weight[weight_base + k]);",
-            " uint scale_col = k / SCALE_BLOCK;",
-            " float xs = float(input_scale[row * SCALE_COLS + scale_col]);",
-            " float ws = float(scale[scale_row * SCALE_COLS + scale_col]);",
-            " acc += fp8_e4m3_to_float(input[input_base + k]) * w * xs * ws;",
-            "}",
-            "out[elem] = acc;"
-        ),
+        include_str!("fp8/linear_scalar.metal"),
         METAL_HEADER,
         true,
         false,
@@ -807,6 +881,7 @@ pub fn grouped_linear_with_row_layout(
     layout: eredu_nn::LinearRowLayout,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    original::validate_grouped(input, weight, scale, group_ids, layout, stream)?;
     if input.ndim() != 2 || weight.ndim() != 3 || scale.ndim() != 3 || group_ids.ndim() != 1 {
         return Err(Exception::custom(
             "grouped block-FP8 linear expects rank-2 input, rank-3 weight/scale, and rank-1 group ids",
@@ -818,13 +893,13 @@ pub fn grouped_linear_with_row_layout(
     let groups = weight.dim(0);
     let out_dim = weight.dim(1);
     let row_width = layout
-        .rows_per_partition(out_dim.max(0) as usize)
-        .map_err(|error| Exception::custom(error.to_string()))? as i32;
+        .rows_per_partition_fixed(out_dim.max(0) as usize)
+        .map_err(|error| original::invalid(format_args!("{error}")))? as i32;
     let scale_rows = layout
-        .scale_rows(out_dim.max(0) as usize, SCALE_BLOCK as usize)
-        .map_err(|error| Exception::custom(error.to_string()))? as i32;
+        .scale_rows_fixed(out_dim.max(0) as usize, SCALE_BLOCK as usize)
+        .map_err(|error| original::invalid(format_args!("{error}")))? as i32;
     if routes != group_ids.dim(0)
-        || routes <= 0
+        || routes < 0
         || groups <= 0
         || out_dim <= 0
         || in_dim <= 0
@@ -851,6 +926,9 @@ pub fn grouped_linear_with_row_layout(
             true,
             stream,
         );
+    }
+    if routes == 0 {
+        return safemlx::ops::zeros_dtype(&[0, out_dim], output_dtype, stream);
     }
     let scale = decode_scale(scale, stream)?;
     if is_cpu_stream(stream)? {
@@ -998,6 +1076,17 @@ fn grouped_linear_tiled(
     row_width: i32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    if let Some(observer) = safemlx::OriginalScopeObserver::try_current()? {
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        {
+            return crate::backend::managed_memory::fp8_kernel::grouped_linear(
+                [input, input_scale, weight, scale, group_ids], routes, out_dim, row_width, true, stream,
+            );
+        }
+        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+        return Err(observer.capacity_error());
+    }
+
     GROUPED_LINEAR_KERNEL.with(|cell| -> Result<_, Exception> {
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(grouped_linear_kernel()?);
@@ -1030,6 +1119,17 @@ fn grouped_linear_scalar(
     row_width: i32,
     stream: &Stream,
 ) -> Result<Array, Exception> {
+    if let Some(observer) = safemlx::OriginalScopeObserver::try_current()? {
+        #[cfg(all(feature = "metal", not(feature = "cuda")))]
+        {
+            return crate::backend::managed_memory::fp8_kernel::grouped_linear(
+                [input, input_scale, weight, scale, group_ids], routes, out_dim, row_width, false, stream,
+            );
+        }
+        #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
+        return Err(observer.capacity_error());
+    }
+
     GROUPED_LINEAR_SCALAR_KERNEL.with(|cell| -> Result<_, Exception> {
         if cell.borrow().is_none() {
             *cell.borrow_mut() = Some(grouped_linear_scalar_kernel()?);
@@ -1062,31 +1162,7 @@ fn grouped_linear_kernel() -> Result<MetalKernel, Exception> {
         "block_fp8_grouped_linear_k16",
         ["input", "input_scale", "weight", "scale", "group_ids"],
         ["out"],
-        concat!(
-            "uint out_col = thread_position_in_grid.x;",
-            "uint route = thread_position_in_grid.y / 16;",
-            "uint lane_k = thread_position_in_grid.y % 16;",
-            "uint local_col = thread_position_in_grid.x % 16;",
-            "uint group = uint(group_ids[route]);",
-            "uint input_base = route * IN_DIM;",
-            "threadgroup float partial[REDUCTION_TILE][OUT_TILE];",
-            "float acc = 0.0f;",
-            "if (out_col < OUT_DIM) {",
-            " for (uint k = lane_k; k < IN_DIM; k += REDUCTION_TILE) {",
-            "  uint wi = (group * OUT_DIM + out_col) * IN_DIM + k;",
-            "  uint si = (group * SCALE_OUT + (out_col / ROW_WIDTH) * ROW_SCALES + (out_col % ROW_WIDTH) / SCALE_BLOCK) * SCALE_COLS + k / SCALE_BLOCK;",
-            "  float xs = float(input_scale[route * SCALE_COLS + k / SCALE_BLOCK]);",
-            "  acc += fp8_e4m3_to_float(input[input_base + k]) * fp8_e4m3_to_float(weight[wi]) * xs * float(scale[si]);",
-            " }",
-            "}",
-            "partial[lane_k][local_col] = acc;",
-            "threadgroup_barrier(mem_flags::mem_threadgroup);",
-            "if (lane_k == 0 && out_col < OUT_DIM) {",
-            " float sum = 0.0f;",
-            " for (uint lane = 0; lane < REDUCTION_TILE; ++lane) sum += partial[lane][local_col];",
-            " out[route * OUT_DIM + out_col] = sum;",
-            "}"
-        ),
+        include_str!("fp8/grouped_tiled.metal"),
         METAL_HEADER,
         true,
         false,
@@ -1099,24 +1175,7 @@ fn grouped_linear_scalar_kernel() -> Result<MetalKernel, Exception> {
         "block_fp8_grouped_linear_scalar",
         ["input", "input_scale", "weight", "scale", "group_ids"],
         ["out"],
-        concat!(
-            "uint elem = thread_position_in_grid.x;",
-            "uint out_col = elem % OUT_DIM;",
-            "uint route = elem / OUT_DIM;",
-            "uint group = uint(group_ids[route]);",
-            "float acc = 0.0f;",
-            "uint weight_base = (group * OUT_DIM + out_col) * IN_DIM;",
-            "uint input_base = route * IN_DIM;",
-            "uint scale_base = (group * SCALE_OUT + (out_col / ROW_WIDTH) * ROW_SCALES + (out_col % ROW_WIDTH) / SCALE_BLOCK) * SCALE_COLS;",
-            "for (uint k = 0; k < IN_DIM; ++k) {",
-            " float w = fp8_e4m3_to_float(weight[weight_base + k]);",
-            " uint scale_col = k / SCALE_BLOCK;",
-            " float xs = float(input_scale[route * SCALE_COLS + scale_col]);",
-            " float ws = float(scale[scale_base + scale_col]);",
-            " acc += fp8_e4m3_to_float(input[input_base + k]) * w * xs * ws;",
-            "}",
-            "out[elem] = acc;"
-        ),
+        include_str!("fp8/grouped_scalar.metal"),
         METAL_HEADER,
         true,
         false,
@@ -1386,35 +1445,7 @@ fn segmented_transposed_linear_kernel() -> Result<CudaKernel, Exception> {
 }
 
 #[cfg(not(feature = "cuda"))]
-const METAL_HEADER: &str = concat!(
-    "float fp8_e4m3_to_float(uint8_t bits) {",
-    " if ((bits & 127) == 127) return as_type<float>(0x7fc00000u);",
-    " uint16_t v = uint16_t(bits & 127) << 7;",
-    " half converted = as_type<half>(v);",
-    " converted *= 256.0h;",
-    " return (bits & 128) ? -float(converted) : float(converted);",
-    "}\n",
-    "uint8_t float_to_fp8_e4m3(float value) {",
-    " if (isnan(value)) return uint8_t(0x7f);",
-    " uint sign = (as_type<uint>(value) >> 24) & 0x80u;",
-    " float magnitude = min(abs(value), 448.0f);",
-    " if (magnitude == 0.0f) return uint8_t(sign);",
-    " uint code;",
-    " if (magnitude < 0.015625f) {",
-    "  int mantissa = int(rint(magnitude * 512.0f));",
-    "  if (mantissa < 0) mantissa = 0;",
-    "  code = mantissa >= 8 ? 8u : uint(mantissa);",
-    " } else {",
-    "  int exponent = int(floor(log2(magnitude)));",
-    "  float base = exp2(float(exponent));",
-    "  int mantissa = int(rint((magnitude / base - 1.0f) * 8.0f));",
-    "  if (mantissa == 8) { exponent += 1; mantissa = 0; }",
-    "  code = uint((exponent + 7) * 8 + mantissa);",
-    "  if (code > 0x7eu) code = 0x7eu;",
-    " }",
-    " return uint8_t(sign | code);",
-    "}\n",
-);
+const METAL_HEADER: &str = include_str!("fp8/header.metal");
 
 #[cfg(feature = "cuda")]
 const CUDA_HEADER: &str = concat!(

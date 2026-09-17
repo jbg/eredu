@@ -151,7 +151,7 @@ class PublicationProbe : public UnaryPrimitive {
         fail_before_work_(fail_before_work),
         related_output_(related_output) {}
 
-  void eval_cpu(const std::vector<array>& inputs, array& output) override {
+  void eval_cpu(const ArrayVector& inputs, array& output) override {
     prepared_before_submission_ = destination_.ctx != nullptr &&
         (!related_output_ || *related_output_ != nullptr);
     if (fail_before_work_) {
@@ -163,7 +163,7 @@ class PublicationProbe : public UnaryPrimitive {
     });
   }
 
-  void eval_gpu(const std::vector<array>&, array&) override {
+  void eval_gpu(const ArrayVector&, array&) override {
     throw std::runtime_error("PublicationProbe requires a CPU stream");
   }
 
@@ -217,7 +217,7 @@ TEST_CASE("test C completion storage precedes native submission") {
       auto primitive = std::make_shared<PublicationProbe>(
           stream, destination.value, prepared_before_submission, completed);
       auto output = array({}, float32, primitive, {array(7.0f)});
-      std::vector<array> outputs{output};
+      ArrayVector outputs{output};
 
       // These scoped C views borrow the native values for the duration of the
       // call; the owning C producer must allocate its destination first.
@@ -261,7 +261,7 @@ TEST_CASE("test C completion producer failure preserves output storage") {
       auto primitive = std::make_shared<PublicationProbe>(
           stream, destination.value, prepared_before_submission, completed, true);
       auto output = array({}, float32, primitive, {array(7.0f)});
-      std::vector<array> outputs{output};
+      ArrayVector outputs{output};
       const mlx_vector_array c_outputs{&outputs};
       const mlx_stream c_stream{&stream};
       CountErrors errors;

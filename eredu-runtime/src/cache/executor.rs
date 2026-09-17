@@ -1,6 +1,10 @@
 //! Backend-neutral bounded admission for cache backing-store operations.
 
-use std::collections::HashMap;
+use super::{CacheRecordTable, CacheTableCapacityError, PreparedCacheTable};
+use eredu_nn::{
+    Error,
+    workspace::{WorkspaceContext, WorkspaceMetadataError},
+};
 
 use super::CacheIoOperationKey;
 
@@ -64,7 +68,8 @@ pub struct CacheIoExecutionState {
     capacity: usize,
     queued: usize,
     peak_queued: usize,
-    operations: HashMap<CacheIoOperationKey, OperationPhase>,
+    operations: CacheRecordTable<CacheIoOperationKey, OperationPhase>,
+    prepared: bool,
 }
 
 impl CacheIoExecutionState {
@@ -77,19 +82,79 @@ impl CacheIoExecutionState {
             capacity,
             queued: 0,
             peak_queued: 0,
-            operations: HashMap::new(),
+            operations: CacheRecordTable::new(),
+            prepared: false,
         })
     }
 
-    /// Registers an exact key or joins its existing completion owner.
+    /// Registers an exact key for the ordinary growing worker. Callers of an
+    /// installed finite registry use [`Self::try_prepare`] to retain refusal.
     pub fn prepare(&mut self, key: CacheIoOperationKey) -> CacheIoPreparation {
-        match self.operations.entry(key) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(OperationPhase::Prepared);
-                CacheIoPreparation::New
-            }
-            std::collections::hash_map::Entry::Occupied(_) => CacheIoPreparation::Joined,
+        self.try_prepare(key)
+            .expect("ordinary cache I/O registry can grow")
+    }
+
+    /// Registers or joins the same exact key. A finite registry refuses a new
+    /// key at its explicit retained-operation limit without changing any state.
+    pub fn try_prepare(
+        &mut self,
+        key: CacheIoOperationKey,
+    ) -> Result<CacheIoPreparation, CacheIoExecutionStateError> {
+        if self.operations.contains_key(&key) {
+            return Ok(CacheIoPreparation::Joined);
         }
+        if self.prepared {
+            self.operations
+                .insert_prepared(key, OperationPhase::Prepared)
+                .map_err(|(cause, _, _)| CacheIoExecutionStateError::RegistryCapacity(cause))?;
+        } else {
+            self.operations.insert(key, OperationPhase::Prepared);
+        }
+        Ok(CacheIoPreparation::New)
+    }
+
+    pub(super) fn prepared_bytes(maximum: usize) -> Option<usize> {
+        PreparedCacheTable::<CacheIoOperationKey, OperationPhase>::control_bytes(maximum)?
+            .checked_add(std::mem::size_of::<(Self, Result<Self, Error>, usize, usize)>())
+    }
+    pub(super) fn prepared(
+        capacity: usize,
+        maximum: usize,
+        context: &WorkspaceContext,
+    ) -> Result<Self, Error> {
+        context
+            .charge_metadata(std::mem::size_of::<(Self, Result<Self, Error>, usize, usize)>())?;
+        if capacity == 0 {
+            return Err(context.metadata_source(CacheIoExecutionStateError::ZeroCapacity));
+        }
+        let storage = PreparedCacheTable::prepare(maximum, context)?;
+        let mut operations = CacheRecordTable::new();
+        drop(
+            operations
+                .install(storage)
+                .map_err(|_| WorkspaceMetadataError::Unqualified)?,
+        );
+        Ok(Self {
+            capacity,
+            queued: 0,
+            peak_queued: 0,
+            operations,
+            prepared: true,
+        })
+    }
+    pub(super) fn capacity(&self) -> usize {
+        self.capacity
+    }
+    pub(super) fn is_empty(&self) -> bool {
+        self.operations.is_empty()
+    }
+    pub(super) fn is_prepared(&self) -> bool {
+        self.prepared
+    }
+    pub(super) fn preserve_history(&mut self, prior: &Self) {
+        debug_assert_eq!(self.capacity, prior.capacity);
+        debug_assert!(prior.is_empty());
+        self.peak_queued = prior.peak_queued;
     }
 
     /// Attempts to admit one previously prepared operation.
@@ -109,7 +174,10 @@ impl CacheIoExecutionState {
                 }
                 self.queued += 1;
                 self.peak_queued = self.peak_queued.max(self.queued);
-                self.operations.insert(key.clone(), OperationPhase::Queued);
+                *self
+                    .operations
+                    .get_mut(key)
+                    .expect("existing operation phase") = OperationPhase::Queued;
                 Ok(CacheIoAdmission::Admitted)
             }
             OperationPhase::CancelledPrepared => Ok(CacheIoAdmission::Cancelled),
@@ -125,14 +193,18 @@ impl CacheIoExecutionState {
         match self.operations.get(key) {
             Some(OperationPhase::Queued) => {
                 self.queued -= 1;
-                self.operations
-                    .insert(key.clone(), OperationPhase::Prepared);
+                *self
+                    .operations
+                    .get_mut(key)
+                    .expect("existing operation phase") = OperationPhase::Prepared;
                 Ok(())
             }
             Some(OperationPhase::CancelledQueued) => {
                 self.queued -= 1;
-                self.operations
-                    .insert(key.clone(), OperationPhase::CancelledPrepared);
+                *self
+                    .operations
+                    .get_mut(key)
+                    .expect("existing operation phase") = OperationPhase::CancelledPrepared;
                 Ok(())
             }
             _ => Err(CacheIoExecutionStateError::InvalidAdmissionRollback),
@@ -152,14 +224,18 @@ impl CacheIoExecutionState {
         match phase {
             OperationPhase::Queued => {
                 self.queued -= 1;
-                self.operations
-                    .insert(key.clone(), OperationPhase::InFlight);
+                *self
+                    .operations
+                    .get_mut(key)
+                    .expect("existing operation phase") = OperationPhase::InFlight;
                 Ok(CacheIoStartDisposition::Execute)
             }
             OperationPhase::CancelledQueued => {
                 self.queued -= 1;
-                self.operations
-                    .insert(key.clone(), OperationPhase::CompletedCancelled);
+                *self
+                    .operations
+                    .get_mut(key)
+                    .expect("existing operation phase") = OperationPhase::CompletedCancelled;
                 Ok(CacheIoStartDisposition::Discard)
             }
             _ => Err(CacheIoExecutionStateError::InvalidStart),
@@ -177,7 +253,10 @@ impl CacheIoExecutionState {
             OperationPhase::InFlight => OperationPhase::CancelledInFlight,
             _ => return false,
         };
-        self.operations.insert(key.clone(), cancelled);
+        *self
+            .operations
+            .get_mut(key)
+            .expect("existing operation phase") = cancelled;
         true
     }
 
@@ -188,13 +267,17 @@ impl CacheIoExecutionState {
     ) -> Result<CacheIoCompletionDisposition, CacheIoExecutionStateError> {
         match self.operations.get(key) {
             Some(OperationPhase::InFlight) => {
-                self.operations
-                    .insert(key.clone(), OperationPhase::Completed);
+                *self
+                    .operations
+                    .get_mut(key)
+                    .expect("existing operation phase") = OperationPhase::Completed;
                 Ok(CacheIoCompletionDisposition::Publish)
             }
             Some(OperationPhase::CancelledInFlight) => {
-                self.operations
-                    .insert(key.clone(), OperationPhase::CompletedCancelled);
+                *self
+                    .operations
+                    .get_mut(key)
+                    .expect("existing operation phase") = OperationPhase::CompletedCancelled;
                 Ok(CacheIoCompletionDisposition::Discard)
             }
             _ => Err(CacheIoExecutionStateError::InvalidCompletion),
@@ -236,6 +319,24 @@ impl CacheIoExecutionState {
 /// Invalid cache I/O executor lifecycle use.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
 pub enum CacheIoExecutionStateError {
+    /// The worker's physical FIFO has no shutdown slot after checked sizing.
+    #[error("cache I/O physical queue size overflow")]
+    QueueSizeOverflow,
+    /// The actual finite FIFO refused a message despite logical admission.
+    #[error("cache I/O physical queue capacity is exhausted")]
+    QueueCapacity,
+    /// The physical worker no longer accepts submitted resources.
+    #[error("cache I/O physical worker stopped")]
+    WorkerStopped,
+    /// A shared coordination lock was poisoned.
+    #[error("cache I/O coordination lock is poisoned")]
+    CoordinationPoisoned,
+    /// The backend task panicked inside the existing worker boundary.
+    #[error("cache I/O physical worker operation panicked")]
+    TaskPanicked,
+    /// The exact finite retained-operation registry cannot accept a new key.
+    #[error(transparent)]
+    RegistryCapacity(#[from] CacheTableCapacityError),
     /// Bounded I/O admission requires at least one slot.
     #[error("cache I/O queue capacity must be nonzero")]
     ZeroCapacity,

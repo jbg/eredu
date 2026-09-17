@@ -37,6 +37,9 @@ extern "C" {
  */
 typedef struct mlx_array_ {
   void* ctx;
+  // Null for ordinary new/delete. Only the prepared-input factory sets this
+  // closed source-arena owner. Shallow C copies still obey unique-handle custody.
+  void* prepared_owner;
 } mlx_array;
 
 static mlx_array mlx_array_empty;
@@ -80,6 +83,41 @@ mlx_array mlx_array_new(void);
  * Free an array.
  */
 int mlx_array_free(mlx_array arr);
+
+/**
+ * Cold storage for one future ordinary array handle, without constructing an
+ * ArrayDesc, Data, graph or numerical buffer. `storage` must initially be null.
+ * On failure it is unchanged. The unfilled storage has unique ownership.
+ */
+int mlx_array_clone_storage_new(void** storage);
+/** Same single handle extent; fixed status and no formatted error storage. */
+uint32_t mlx_array_clone_storage_new_fixed(void** storage);
+/** Free only unfilled storage returned by mlx_array_clone_storage_new. */
+void mlx_array_clone_storage_free(void* storage);
+/**
+ * Share the actual source descriptor into that final handle storage. The source
+ * and storage must be live, uniquely owned as applicable, and externally
+ * serialized. Output must be empty. Success consumes storage (sets it null)
+ * and publishes an ordinary mlx_array, paired with mlx_array_free. No allocation,
+ * evaluation, hooks or error formatting. 0 success; 4 invalid/consumed storage
+ * or arguments. Refusal changes neither output nor storage nor source.
+ */
+uint32_t mlx_array_clone_storage_fill(
+    mlx_array* output, void** storage, const mlx_array source);
+/** Named native call controls, excluding the separately reported handle bytes. */
+size_t mlx_array_clone_storage_control_bytes(void);
+
+/**
+ * Eager I32[groups * repeats] input: each integer in [0, groups) appears
+ * `repeats` times. Writes directly to the final owned native allocation.
+ * Both arguments and their product must fit INT32_MAX; all extents are checked
+ * before construction. Zero groups/repeats produces an empty rank-one array.
+ * Same destination, original-scope and error conventions as set_data.
+ */
+int mlx_array_set_repeated_i32(mlx_array* result, size_t groups, size_t repeats);
+/** Named fixed controls; excludes the ordinary Graph/P array and buffer owners. */
+size_t mlx_array_repeated_i32_control_bytes(void);
+
 
 /**
  * New array from a bool scalar.
@@ -170,6 +208,13 @@ mlx_array mlx_array_new_data_managed_payload(
  */
 int mlx_array_set(mlx_array* arr, const mlx_array src);
 /**
+ * Bytes of the single C++ handle allocated when copying into an empty mlx_array.
+ * The copy shares the existing ArrayDesc and does not copy its shape or backing.
+ * Excludes allocator bookkeeping, source storage, and caller-owned wrappers.
+ * Reads no array or runtime state and does not allocate or acquire a lock.
+ */
+size_t mlx_array_clone_handle_bytes(void);
+/**
  * Set array to a bool scalar.
  */
 int mlx_array_set_bool(mlx_array* arr, bool val);
@@ -225,6 +270,93 @@ size_t mlx_array_size(const mlx_array arr);
  */
 size_t mlx_array_nbytes(const mlx_array arr);
 /**
+ * Read completed allocator-owned or certified host-transfer backing without
+ * evaluating, polling, or waiting. Unknown for unfinished or foreign storage.
+ * Nonzero identity generations are never reused by this linked native runtime,
+ * even after backing retires. They do not retain storage or persist across runs.
+ */
+int mlx_array_allocation_info(
+    bool* known, bool* host_transfer, uint64_t* identity, size_t* bytes, const mlx_array arr);
+/**
+ * Borrowed descriptor witness. No field owns or pins an array, shape, backing,
+ * completion or allowance. Caller must retain the actual array and serialize
+ * its descriptor access for the entire read/fill loan. Completed backing is
+ * certified by the same kernel as mlx_array_allocation_info; unknown stays
+ * unknown. Shape is immutable descriptor storage, not a completion certificate.
+ */
+typedef struct mlx_array_descriptor_ {
+  uintptr_t descriptor;
+  const int* shape;
+  size_t rank;
+  mlx_dtype dtype;
+  size_t elements;
+  size_t logical_bytes;
+  uint32_t status;
+  bool event_present;
+  const void* data;
+  const void* buffer;
+  bool known;
+  bool host_transfer;
+  uint64_t identity;
+  size_t allocation_bytes;
+} mlx_array_descriptor;
+
+/** Fixed status, no allocation/evaluation/poll/reap/error callback. Output is
+ * written only on success. 0 success; 1 invalid argument; 2 empty descriptor;
+ * 3 logical-byte overflow; 4 invalid datatype representation; 5 changed source;
+ * 6 wrong destination length; 7 null nonempty destination. Legal borrowed
+ * descriptors use audited nonthrowing native queries, never catch/erase a cause.
+ */
+uint32_t mlx_array_descriptor_read(mlx_array_descriptor* out, const mlx_array arr);
+/** Rechecks the same witness before writing an exact, disjoint caller-owned
+ * shape destination. No rank cap or destination allocation. Zero rank accepts
+ * a null destination and still validates source identity/current-state facts.
+ */
+uint32_t mlx_array_descriptor_fill_shape(
+    const mlx_array arr, const mlx_array_descriptor* expected,
+    int* destination, size_t count);
+/** Concrete native scalar/control bytes only. No array, runtime or callback. */
+size_t mlx_array_descriptor_control_bytes(void);
+
+/* Prepared opaque owner node. new returns NULL on allocation failure; free is
+ * valid only before successful handoff. Both are runtime-independent, and the
+ * empty node owns no payload. Facts describe exact linked native objects. */
+size_t mlx_allocation_owner_node_bytes(void);
+size_t mlx_allocation_owner_list_bytes(void);
+void* mlx_allocation_owner_node_new(void);
+void mlx_allocation_owner_node_free(void* node);
+
+/* outcome: 0 = unfinished/uncertified, 1 = no allocation, 2 = consumed.
+ * The caller exclusively owns a fresh node and payload until outcome 2.
+ * Successful handoff never allocates and cannot subsequently fail. Caller
+ * serializes attachment and keeps the actual backing alive. Release may run on
+ * any native thread and must not throw, block, allocate or enter the runtime.
+ * Payload must not itself retain the destination backing or graph. */
+int mlx_array_attach_prepared_allocation_owner(
+    int* outcome, const mlx_array arr, void* node,
+    void* payload, void (*release)(void*));
+
+/**
+ * Attach opaque ownership to completed certified physical backing, preserving
+ * allocation identity and all native/host aliases. Caller serializes attachment.
+ * Ownership transfers only when this succeeds with *attached == true. Otherwise
+ * payload remains caller-owned and release is never called. Release can run on
+ * any native thread and must not throw, block, allocate or reenter the runtime.
+ */
+int mlx_array_retain_allocation_owner(
+    bool* attached, const mlx_array arr, void* payload, void (*release)(void*));
+/**
+ * Retain payload-free ownership on a shared lazy descriptor and publish it to
+ * certified backing when materialized. Does not evaluate, poll or wait. Existing
+ * descriptor clones and subsequent physical aliases share this retention;
+ * independently allocated results require their own attachment. Unrecognized
+ * future backing fails materialization before publication. Payload must not
+ * retain this descriptor, its graph, or any covered backing. Handoff and callback
+ * requirements are identical to mlx_array_retain_allocation_owner.
+ */
+int mlx_array_retain_deferred_allocation_owner(
+    bool* attached, const mlx_array arr, void* payload, void (*release)(void*));
+/**
  * The array's dimension.
  */
 size_t mlx_array_ndim(const mlx_array arr);
@@ -238,6 +370,8 @@ const int* mlx_array_shape(const mlx_array arr);
  * Returns: a pointer to the sizes of each dimension.
  */
 const size_t* mlx_array_strides(const mlx_array arr);
+/** Signed native strides, in elements, including reversed views. */
+const int64_t* mlx_array_signed_strides(const mlx_array arr);
 /**
  * The shape of the array in a particular dimension.
  */

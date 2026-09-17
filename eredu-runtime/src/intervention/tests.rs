@@ -4,6 +4,8 @@ use eredu_core::*;
 mod invocation;
 mod session;
 mod sparse;
+mod text_origin;
+mod context_prefix;
 
 #[test]
 fn global_component_masks_preserve_positions_and_empty_keep_semantics() {
@@ -142,6 +144,9 @@ fn estimate(
 impl CaptureBackend for Backend {
     type Tensor = Value;
     type Error = std::io::Error;
+    fn source_dtype(&self, _: &Value) -> Option<eredu_core::checkpoint::TensorDtype> {
+        Some(eredu_core::checkpoint::TensorDtype::F32)
+    }
     fn shape(&self, v: &Value) -> Result<Vec<u64>, Self::Error> {
         Ok(v.shape.clone())
     }
@@ -169,6 +174,28 @@ impl CaptureBackend for Backend {
             .take(maximum)
             .map(|i| v.data[i])
             .collect();
+        if selection.transform == CaptureTransform::Summary {
+            let finite: Vec<_> = data
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite())
+                .map(f64::from)
+                .collect();
+            let count = finite.len() as f64;
+            return Ok(CapturePayload::Summary(CaptureSummary {
+                elements: data.len() as u64,
+                finite: finite.len() as u64,
+                non_finite: (data.len() - finite.len()) as u64,
+                nan: data.iter().filter(|v| v.is_nan()).count() as u64,
+                positive_infinity: data.iter().filter(|v| **v == f32::INFINITY).count() as u64,
+                negative_infinity: data.iter().filter(|v| **v == f32::NEG_INFINITY).count() as u64,
+                min: finite.iter().copied().reduce(f64::min),
+                max: finite.iter().copied().reduce(f64::max),
+                mean: (!finite.is_empty()).then(|| finite.iter().sum::<f64>() / count),
+                rms: (!finite.is_empty())
+                    .then(|| (finite.iter().map(|v| v * v).sum::<f64>() / count).sqrt()),
+            }));
+        }
         Ok(CapturePayload::Tensor(
             TensorObservation::new(vec![data.len()], TensorObservationData::F32(data)).unwrap(),
         ))
@@ -1000,3 +1027,5 @@ fn activation_storage_exhaustion_fails_before_native_edit_or_evidence_copy() {
     ));
 }
 mod partition;
+
+mod static_preflight;

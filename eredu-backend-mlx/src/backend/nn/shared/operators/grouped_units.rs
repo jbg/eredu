@@ -1,9 +1,12 @@
 use super::*;
+use crate::backend::nn::tensor::PreparedGroupedUnitError;
 use eredu_nn::{GroupedUnitBatch, GroupedUnitError, GroupedUnitObserver};
 
 struct NativeUnitObserver<'a> {
     inner: &'a mut dyn GroupedUnitObserver<MlxTensor>,
     failure: Option<ComputeError>,
+    shape_error: Option<PreparedGroupedUnitError>,
+    original: bool,
 }
 
 impl common::grouped::NativeGroupedUnitObserver for NativeUnitObserver<'_> {
@@ -23,24 +26,40 @@ impl common::grouped::NativeGroupedUnitObserver for NativeUnitObserver<'_> {
             let replacement = self.inner.intervene(&batch)?;
             let effective = replacement.as_ref().unwrap_or(batch.values);
             if effective.shape() != batch.values.shape() {
-                return Err(ComputeError::backend_source(
-                    GroupedUnitError::ReplacementShape {
+                return Err(match self.shape_error.take() {
+                    Some(prepared) => prepared
+                        .shape(batch.values.shape(), effective.shape())
+                        .map_err(observation_transport::native)?,
+                    None => ComputeError::backend_source(GroupedUnitError::ReplacementShape {
                         expected: batch.values.shape().to_vec(),
                         actual: effective.shape().to_vec(),
-                    },
-                ));
+                    }),
+                });
             }
             if effective.as_array().dtype() != batch.values.as_array().dtype() {
-                return Err(ComputeError::backend_source(
-                    GroupedUnitError::ReplacementDtype,
-                ));
+                return Err(match self.shape_error.take() {
+                    Some(prepared) => prepared.dtype(),
+                    None => ComputeError::backend_source(GroupedUnitError::ReplacementDtype),
+                });
             }
             self.inner
                 .observe_effective(&batch.with_values(effective))?;
-            Ok(effective.as_array().clone())
+            // Transfer an owned replacement after the final borrowed callback.
+            // The no-intervention branch shares the original, as Workspace does.
+            Ok(match replacement {
+                Some(effective) => effective.into(),
+                None => batch.values.as_array().clone(),
+            })
         })();
         result.map_err(|error: ComputeError| {
-            let native = Exception::custom(error.to_string());
+            let (error, native) = if self.original {
+                let error = observation_transport::callback(error);
+                let native = observation_transport::signal(&error);
+                (error, native)
+            } else {
+                let native = Exception::custom(error.to_string());
+                (error, native)
+            };
             self.failure = Some(error);
             native
         })
@@ -53,10 +72,19 @@ fn with_observer<R>(
         Option<&mut dyn common::grouped::NativeGroupedUnitObserver>,
     ) -> Result<R, Exception>,
 ) -> Result<R, ComputeError> {
-    let mut adapter = observer.map(|inner| NativeUnitObserver {
-        inner,
-        failure: None,
-    });
+    let mut adapter = match observer {
+        Some(inner) => {
+            let shape_error =
+                PreparedGroupedUnitError::take_current().map_err(observation_transport::native)?;
+            Some(NativeUnitObserver {
+                inner,
+                failure: None,
+                original: shape_error.is_some(),
+                shape_error,
+            })
+        }
+        None => None,
+    };
     let result = execute(
         adapter
             .as_mut()
@@ -64,11 +92,53 @@ fn with_observer<R>(
     );
     match adapter.and_then(|adapter| adapter.failure) {
         Some(error) => Err(error),
-        None => compute(result),
+        None => super::super::selected_linear::original::Transport::new(true).compute(result),
     }
 }
 
 impl MlxGroupedGatedProduct {
+    /// One actual TP forwarding frame, including its reducible/post-bias
+    /// carriers and the existing source-preserving result transport.
+    pub(crate) fn original_tensor_parallel_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let controls = [
+            super::super::selected_linear::original::control_bytes()?,
+            size_of::<[Array; 4]>(),
+            size_of::<TensorParallelGroupedOutput<Array>>(),
+            size_of::<TensorParallelGroupedOutput<MlxTensor>>(),
+            size_of::<Result<TensorParallelGroupedOutput<Array>, Exception>>(),
+            size_of::<Result<TensorParallelGroupedOutput<Array>, ComputeError>>(),
+            size_of::<Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError>>(),
+            size_of::<(Array, Option<Array>)>(),
+            size_of::<Result<Option<MlxTensor>, ComputeError>>(),
+            size_of::<Option<&mut dyn common::grouped::NativeGroupedUnitObserver>>(),
+            size_of::<(&MlxTensor, &GroupSelection<MlxTensor>, usize, &Stream)>(),
+            size_of::<(&[i32], &Stream)>(),
+        ];
+        controls.into_iter().try_fold(size_of_val(&controls), usize::checked_add)
+    }
+    pub(crate) fn original_unit_observation_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let controls = [
+            super::super::selected_linear::original::control_bytes()?,
+            observation_transport::grouped_callback_control_bytes()?,
+            size_of::<NativeUnitObserver<'_>>(),
+            size_of::<Option<NativeUnitObserver<'_>>>(),
+            size_of::<GroupedUnitBatch<'_, MlxTensor>>(),
+            size_of::<GroupedUnitBatch<'_, Array>>(),
+            size_of::<Option<MlxTensor>>(),
+            size_of::<Result<Option<MlxTensor>, ComputeError>>(),
+            size_of::<Result<Array, ComputeError>>(),
+            size_of::<Result<Array, Exception>>(),
+            size_of::<Option<ComputeError>>(),
+            size_of::<Option<&Array>>(),
+            size_of::<&mut dyn GroupedUnitObserver<MlxTensor>>(),
+            size_of::<Option<&mut dyn common::grouped::NativeGroupedUnitObserver>>(),
+        ];
+        controls
+            .into_iter()
+            .try_fold(size_of_val(&controls), usize::checked_add)
+    }
     pub(super) fn forward_units(
         &mut self,
         input: &MlxTensor,
@@ -76,13 +146,17 @@ impl MlxGroupedGatedProduct {
         context: &Stream,
         observer: Option<&mut dyn GroupedUnitObserver<MlxTensor>>,
     ) -> Result<MlxTensor, ComputeError> {
+        if observer.is_none() {
+            return self.forward_grouped(input, selections, context);
+        }
         #[cfg(test)]
         crate::tests::support::provider_failure::check(
             crate::tests::support::provider_failure::Operator::Gated,
             context,
         )?;
+        let transport = super::super::selected_linear::original::Transport::new(true);
         let input = input.as_array();
-        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let flattened = transport.compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = with_observer(observer, |observer| {
             self.module.forward_with_unit_observer(
                 &flattened,
@@ -92,7 +166,7 @@ impl MlxGroupedGatedProduct {
                 observer,
             )
         })?;
-        compute_tensor(output.reshape(input.shape(), context))
+        transport.tensor(output.reshape(input.shape(), context))
     }
 
     pub(super) fn forward_units_tensor_parallel(
@@ -108,8 +182,9 @@ impl MlxGroupedGatedProduct {
             crate::tests::support::provider_failure::Operator::Gated,
             context,
         )?;
+        let transport = super::super::selected_linear::original::Transport::new(true);
         let input = input.as_array();
-        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let flattened = transport.compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = with_observer(observer, |observer| {
             self.module.forward_tensor_parallel_with_unit_observer(
                 &flattened,
@@ -120,7 +195,7 @@ impl MlxGroupedGatedProduct {
                 observer,
             )
         })?;
-        reshape_partial(output, input.shape(), context)
+        reshape_partial(output, input.shape(), context, &transport)
     }
 }
 
@@ -137,8 +212,9 @@ impl MlxGroupedRelu2 {
             crate::tests::support::provider_failure::Operator::Relu2,
             context,
         )?;
+        let transport = super::super::selected_linear::original::Transport::new(true);
         let input = input.as_array();
-        let flattened = compute(input.reshape(&[-1, input.dim(-1)], context))?;
+        let flattened = transport.compute(input.reshape(&[-1, input.dim(-1)], context))?;
         let output = with_observer(observer, |observer| {
             self.module.forward_with_unit_observer(
                 &flattened,
@@ -148,7 +224,7 @@ impl MlxGroupedRelu2 {
                 observer,
             )
         })?;
-        compute_tensor(output.reshape(input.shape(), context))
+        transport.tensor(output.reshape(input.shape(), context))
     }
 
     pub(super) fn forward_units_tensor_parallel(
@@ -176,7 +252,8 @@ impl MlxGroupedRelu2 {
                 observer,
             )
         })?;
-        reshape_partial(output, input.shape(), context)
+        reshape_partial(output, input.shape(), context,
+            &super::super::selected_linear::original::Transport::new(false))
     }
 }
 
@@ -184,12 +261,13 @@ fn reshape_partial(
     output: TensorParallelGroupedOutput<Array>,
     shape: &[i32],
     context: &Stream,
+    transport: &super::super::selected_linear::original::Transport,
 ) -> Result<TensorParallelGroupedOutput<MlxTensor>, ComputeError> {
     let (reducible, post_reduce) = output.into_parts();
     Ok(TensorParallelGroupedOutput::new(
-        compute_tensor(reducible.reshape(shape, context))?,
+        transport.tensor(reducible.reshape(shape, context))?,
         post_reduce
-            .map(|bias| compute_tensor(bias.reshape(shape, context)))
+            .map(|bias| transport.tensor(bias.reshape(shape, context)))
             .transpose()?,
     ))
 }

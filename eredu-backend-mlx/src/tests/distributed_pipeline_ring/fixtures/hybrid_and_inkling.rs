@@ -121,8 +121,25 @@ fn discovery_hybrid_supported_catalog_agrees_with_native_captures() {
     assert!(supported
         .iter()
         .any(|p| p.ends_with("routing.shared_output")));
+    // Legacy inspect returns complete tensors. Sparse values carry route identity
+    // through the existing bounded-capture payload and are checked below.
+    let tensor_paths = supported
+        .iter()
+        .filter(|path| {
+            matches!(
+                catalog.get(path).unwrap().value_type,
+                eredu_core::ObservationValueType::Tensor
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!tensor_paths.is_empty());
+    assert!(
+        tensor_paths.len() < supported.len(),
+        "fixture must include sparse hooks"
+    );
     let request =
-        ObservationRequest::selected(supported.iter().cloned().map(ObservationSelector::Exact));
+        ObservationRequest::selected(tensor_paths.iter().cloned().map(ObservationSelector::Exact));
     let execution = ExecutionContext::new(Device::new(DeviceType::Cpu, 0));
     let stream = execution.stream();
     let backend = crate::native::backend(stream, stream);
@@ -140,7 +157,7 @@ fn discovery_hybrid_supported_catalog_agrees_with_native_captures() {
         .inspect_decode(Array::from_slice(&[3_u32], &[1, 1]), &request)
         .unwrap();
     for output in [first, next] {
-        for path in &supported {
+        for path in &tensor_paths {
             assert!(catalog.get(path).is_some());
             assert!(
                 output.observations.get(path).is_some(),
@@ -148,10 +165,13 @@ fn discovery_hybrid_supported_catalog_agrees_with_native_captures() {
             );
         }
     }
-    verify_bounded_hybrid_capture(&mut runtime);
+    verify_bounded_hybrid_capture(&mut runtime, &supported);
 }
 
-fn verify_bounded_hybrid_capture(runtime: &mut ModelRuntime<crate::backend::MlxBackend<'_>>) {
+fn verify_bounded_hybrid_capture(
+    runtime: &mut ModelRuntime<crate::backend::MlxBackend<'_>>,
+    supported: &[String],
+) {
     use eredu_core::{capture::*, TextGenerationBackend, TextGenerationConfig, TokenOutput};
     struct Allow;
     impl eredu_core::TokenFilterController for Allow {
@@ -201,7 +221,12 @@ fn verify_bounded_hybrid_capture(runtime: &mut ModelRuntime<crate::backend::MlxB
                 path: point.path.clone(),
                 schedule: CaptureSchedule::default(),
                 slices: Vec::new(),
-                transform: if point.dtype == eredu_core::ObservationDtype::Integer {
+                transform: if matches!(
+                    point.value_type,
+                    eredu_core::ObservationValueType::RoutedUnits { .. }
+                ) {
+                    CaptureTransform::RoutedUnits
+                } else if point.dtype == eredu_core::ObservationDtype::Integer {
                     CaptureTransform::Preview { max_elements: 4 }
                 } else {
                     CaptureTransform::Summary
@@ -246,7 +271,20 @@ fn verify_bounded_hybrid_capture(runtime: &mut ModelRuntime<crate::backend::MlxB
                 CapturePhase::Decode
             }
         );
-        for record in step.records {
+        let captured = step
+            .records
+            .iter()
+            .map(|record| record.path.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(captured.len(), step.records.len(), "duplicate capture path");
+        assert_eq!(captured.len(), discovery.catalog.points.len());
+        for path in supported {
+            assert!(
+                captured.contains(path.as_str()),
+                "supported capture missing: {path}"
+            );
+        }
+        for record in &step.records {
             assert!(
                 matches!(
                     record.outcome,
@@ -256,13 +294,67 @@ fn verify_bounded_hybrid_capture(runtime: &mut ModelRuntime<crate::backend::MlxB
                 record.path,
                 record.outcome
             );
-            if discovery.catalog.get(&record.path).unwrap().dtype
-                == eredu_core::ObservationDtype::Integer
+            let point = discovery.catalog.get(&record.path).unwrap();
+            if let eredu_core::ObservationValueType::RoutedUnits { routing, geometry } =
+                &point.value_type
             {
+                let Some(CapturePayload::RoutedUnits(payload)) = &record.payload else {
+                    panic!("sparse payload missing: {}", record.path);
+                };
+                assert_eq!(record.outcome, CaptureOutcome::Captured);
+                assert_eq!(payload.geometry, *geometry);
+                let source_tokens = if tokens.len() == 1 { 2_u64 } else { 1 };
+                assert_eq!(
+                    record.selected_shape,
+                    Some(vec![
+                        source_tokens,
+                        geometry.routes_per_token,
+                        geometry.units_per_expert
+                    ])
+                );
+                assert_eq!(
+                    payload.rows.len() as u64,
+                    source_tokens * geometry.routes_per_token
+                );
+                let expert_path =
+                    eredu_core::RoutingObservationField::SelectedExperts.path(routing);
+                let experts = step
+                    .records
+                    .iter()
+                    .find(|record| record.path == expert_path)
+                    .unwrap();
+                let Some(CapturePayload::Tensor(experts)) = &experts.payload else {
+                    panic!("actual selected-expert tensor missing: {expert_path}");
+                };
+                let mut coordinates = std::collections::BTreeSet::new();
+                for row in &payload.rows {
+                    assert!(row.source_peer.is_none());
+                    assert!(row.token < source_tokens && row.slot < geometry.routes_per_token);
+                    assert!(coordinates.insert((row.token, row.slot)));
+                    assert!(row.expert < geometry.experts);
+                    let index = (row.token * geometry.routes_per_token + row.slot) as usize;
+                    let expert = match experts.data() {
+                        eredu_core::TensorObservationData::U64(values) => values[index],
+                        eredu_core::TensorObservationData::I64(values) => {
+                            u64::try_from(values[index]).expect("nonnegative expert identifier")
+                        }
+                        _ => panic!("selected expert identifiers must preserve integers"),
+                    };
+                    assert_eq!(row.expert, expert);
+                    assert!(row.coefficient.is_finite());
+                    assert_eq!((row.unit_start, row.unit_stride), (0, 1));
+                    assert_eq!(row.values.shape(), &[geometry.units_per_expert as usize]);
+                    assert!(matches!(
+                        row.values.data(),
+                        eredu_core::TensorObservationData::F32(_)
+                    ));
+                }
+            } else if point.dtype == eredu_core::ObservationDtype::Integer {
                 assert!(matches!(record.payload, Some(CapturePayload::Tensor(_))));
             }
         }
     }
+    assert_eq!(tokens.len(), 2, "both prefill and decode must execute");
     assert_eq!(tokens, ordinary);
     drop(generated);
     runtime.parts_mut().1.reset().unwrap();
@@ -276,7 +368,7 @@ fn write_qwen35_zero_prediction_fixture(directory: &Path) {
     write_qwen35_multimodal_fixture_with_prediction(directory, false, 0, false);
 }
 
-fn write_qwen35_conditional_component_fixture(directory: &Path, moe: bool) {
+pub(crate) fn write_qwen35_conditional_component_fixture(directory: &Path, moe: bool) {
     write_qwen35_multimodal_fixture_config(directory, moe, 0, false, true);
 }
 
@@ -487,7 +579,7 @@ fn write_qwen3_vl_fixture(directory: &Path, moe: bool) {
     write_qwen3_vl_fixture_config(directory, moe, false, false);
 }
 
-fn write_qwen3_vl_component_fixture(directory: &Path, moe: bool, quantizable: bool) {
+pub(crate) fn write_qwen3_vl_component_fixture(directory: &Path, moe: bool, quantizable: bool) {
     write_qwen3_vl_fixture_config(directory, moe, true, quantizable);
 }
 

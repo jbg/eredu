@@ -1,0 +1,23 @@
+{
+  "files": {
+    "Cargo.toml": {
+      "after": "753ef1e98a8f36a6dfab9ebde25ea2daf8b3b4d577c28cb35bedad84d2bc6503",
+      "before": "25d528e0bd6dd67c78462d3c7a426698b5d6e702052b25daf7599c0a211315b6"
+    },
+    "Cargo.toml.orig": {
+      "after": "baf6f0fb42d4dc9850f9ea169d467e8a099a38fd3f7861bf1907c832fcdb2743",
+      "before": "024ca34ebb2bd31f2df219ad258e10abb14b6285970fb6629d583e724dc9630d"
+    },
+    "src/nfa/thompson/pikevm/workspace.rs": {
+      "after": "472acc86b2c378c9a9cc008a13c58bda17fbc5a6f92dfdfc90215f443c01b0bd",
+      "before": "d0775fed8d70abbb2b46c7640f62503d57b149d9e3157386bfadc91db57169e2"
+    }
+  },
+  "final_complete_manifest_sha256": "da6c75c5691bd5f427cf414b719941a5b4a928426b8cc7948491f5bacd16d4fc",
+  "patch_sha256": "c34cc2dc0a62d7c0b35ee821448d68edf6e44e27b13bc97197d1817ae9723abf",
+  "predecessor_final_sha256": "6f41ed21dd6fd9a0c32e469f037385001228d127e3469dcb907ee472fd88db2c",
+  "predecessor_source_sha256": "096d71dd3426b28f099266f575fcf62f598777b5b8b8eea6159210d9e3aac0a9",
+  "predecessor_stage": "/private/tmp/eredu-pikevm-workspace-stage",
+  "scope": "Disabled development-only fixed failure selection on actual destination; no authority or successful override.",
+  "upstream_version": "0.4.18"
+}

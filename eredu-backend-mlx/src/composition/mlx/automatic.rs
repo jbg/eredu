@@ -14,14 +14,17 @@ use eredu_core::{
 use safemlx::{Device, DeviceType, Stream};
 
 use super::{
-    capability::available_memory, inspection::MlxInspectionOptions,
-    realtime::MlxRealtimeExecutionContext, speculative::MlxDrafter, MlxBackend, MlxLoadRequest,
+    MlxBackend, MlxLoadRequest, capability::available_memory, inspection::MlxInspectionOptions,
+    realtime::MlxRealtimeExecutionContext, speculative::MlxDrafter,
 };
 use crate::{
     backend::runtime::residency::parameter_bank::ParameterBanksResidencyReport,
-    backend::{error::Error, MlxAcceleratorFamily, MlxDeviceIdentity},
+    backend::{MlxAcceleratorFamily, MlxDeviceIdentity, error::Error},
 };
 use eredu_runtime::selected_text_bounded_requirement;
+
+mod state;
+pub use state::MlxStateBackendFactory;
 
 /// MLX automatic-planning adapter and whole-session backend factory.
 #[derive(Debug, Clone, Copy, Default)]
@@ -31,6 +34,15 @@ pub struct MlxBackendFactory {
 }
 
 impl MlxBackendFactory {
+    /// Selects mutable-cache residency before ordinary inspection and native
+    /// realization. The configured factory reuses the same prepared resources.
+    pub fn with_state_residency(
+        self,
+        policy: eredu_runtime::CacheResidencyPolicy,
+    ) -> MlxStateBackendFactory {
+        MlxStateBackendFactory::new(self, policy)
+    }
+
     /// Enables backend allocator and process-memory sampling for bounded residency.
     pub const fn with_residency_diagnostics(
         mut self,
@@ -86,11 +98,9 @@ pub fn create_realtime_execution(
         MlxRealtimeExecutionContext::select_realtime_execution(preparation, &options, false)?;
     #[cfg(test)]
     crate::tests::support::path_instrumentation::target_native_resource_realization_attempt();
-    let realized =
-        mlx_device(device).map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
-    let stream = Stream::try_new_with_device(&realized.device)?;
-    let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))?;
-    let context = MlxRealtimeExecutionContext::new(&stream, &weights_stream);
+    let backend = realize_backend(device)
+        .map_err(|error| Error::AutomaticPlanning(error.to_string()))?;
+    let context = MlxRealtimeExecutionContext::from_backend(backend);
     let execution = context.materialize_realtime_execution(selected)?;
     Ok((context, execution))
 }
@@ -203,13 +213,7 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
         &self,
         model_path: &Path,
     ) -> Result<(ModelResourceProfile, Self::Inspection), AutomaticPlanningError> {
-        let inspection = eredu_architectures::configuration::inspect_artifact(model_path)
-            .map_err(|error| planning_backend_error("inspect_resources", error))?;
-        let report = super::inspection::inspect_selected_artifact(
-            &inspection,
-            MlxInspectionOptions::default(),
-        );
-        Ok((report.resources, inspection))
+        state::inspect_resources(model_path, MlxInspectionOptions::default())
     }
 
     fn admit_candidate(
@@ -217,17 +221,7 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
         inspection: &Self::Inspection,
         plan: &ExecutionPlan,
     ) -> Result<CandidateAdmission, AutomaticPlanningError> {
-        let load = self.load_request_for_plan(plan)?;
-        match super::loading::select_preparation(inspection, load) {
-            Ok(_) => Ok(CandidateAdmission {
-                supported: true,
-                rejection: None,
-            }),
-            Err(error) => Ok(CandidateAdmission {
-                supported: false,
-                rejection: Some(error.to_string()),
-            }),
-        }
+        state::admit_candidate(inspection, self.load_request_for_plan(plan)?)
     }
 
     fn bounded_residency_requirement(
@@ -235,19 +229,7 @@ impl AutomaticPlanningBackend for MlxBackendFactory {
         inspection: &Self::Inspection,
         plan: &ExecutionPlan,
     ) -> Result<BoundedResidencyRequirement, AutomaticPlanningError> {
-        if matches!(plan.residency(), ResidencyPlan::FullyResident) {
-            return Err(AutomaticPlanningError::Invalid(
-                "fully resident execution has no bounded device window".into(),
-            ));
-        }
-        let options = self
-            .load_request_for_plan(plan)
-            .map_err(|error| planning_backend_error("bounded_residency_options", error))?;
-        let selected = super::loading::select_preparation(inspection, options)
-            .map_err(|error| planning_backend_error("select_model_preparation", error))?;
-        let (text, excluded) = selected.neutral().selected_bounded_residency();
-        selected_text_bounded_requirement(&text, &excluded)
-            .map_err(|error| planning_backend_error("selected_text_residency", error))
+        state::bounded_residency_requirement(inspection, plan, || self.load_request_for_plan(plan))
     }
 }
 
@@ -264,16 +246,7 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
         >,
         plan: &ExecutionPlan,
     ) -> Result<ExecutionPlanTargetSelection<Self::Backend>, AutomaticPlanningError> {
-        let options = self.load_request_for_plan(plan)?;
-        let selected = super::loading::select_preparation(inspection, options)
-            .map_err(|error| planning_backend_error("select_model_preparation", error))?;
-        let policy = selected.neutral().admission().request().policy();
-        let capabilities = selected.session_capabilities();
-        Ok(ExecutionPlanTargetSelection::new(
-            policy,
-            selected,
-            capabilities,
-        ))
+        state::select_target(inspection, self.load_request_for_plan(plan)?)
     }
 
     fn realize_target(
@@ -282,15 +255,8 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
     ) -> Result<ExecutionPlanTarget<Self::Backend>, AutomaticPlanningError> {
         #[cfg(test)]
         crate::tests::support::path_instrumentation::target_native_resource_realization_attempt();
-        let realized = mlx_device(selected.execution_plan().device())?;
-        let stream = Stream::try_new_with_device(&realized.device)
-            .map_err(|error| planning_backend_error("create_execution_stream", error))?;
-        let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))
-            .map_err(|error| planning_backend_error("create_weights_stream", error))?;
-        Ok(ExecutionPlanTarget::new(
-            MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity),
-            selected,
-        ))
+        let backend = realize_backend(selected.execution_plan().device())?;
+        Ok(ExecutionPlanTarget::new(backend, selected))
     }
 
     fn select_drafting(
@@ -352,27 +318,24 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
                         "external drafting is missing proven tokenizer compatibility".into(),
                     )
                 })?;
-                let draft_stream = match placement {
-                    DraftPlacementPlan::Target => target.backend().stream().clone(),
-                    DraftPlacementPlan::Device { device } => {
-                        let realized = mlx_device(device)?;
-                        Stream::try_new_with_device(&realized.device).map_err(|error| {
-                            planning_backend_error("create_draft_execution_stream", error)
-                        })?
-                    }
+                let drafter = match placement {
+                    DraftPlacementPlan::Target => MlxDrafter::materialize_with_source_pool(
+                        artifact.preparation,
+                        target.backend().memory_pool(),
+                        target.backend().stream(),
+                        target.backend().weights_stream(),
+                    ),
+                    DraftPlacementPlan::Device { device } => MlxDrafter::materialize_with_backend(
+                        artifact.preparation, realize_backend(device)?,
+                    ),
                     _ => {
                         return Err(AutomaticPlanningError::Invalid(
                             "unsupported draft placement".into(),
-                        ))
+                        ));
                     }
-                };
-                let drafter = MlxDrafter::materialize(
-                    artifact.preparation,
-                    &draft_stream,
-                    target.backend().weights_stream(),
-                )
+                }
                 .map_err(|error| planning_backend_error("realize_external_drafter", error))?;
-                draft_stream.synchronize().map_err(|error| {
+                drafter.stream().synchronize().map_err(|error| {
                     planning_backend_error("complete_external_drafter_load", error)
                 })?;
                 Ok(RealizedDrafting::External(drafter))
@@ -382,6 +345,31 @@ impl ExecutionPlanBackendFactory for MlxBackendFactory {
             )),
         }
     }
+}
+
+// Both selected placements use these exact native constructors. Ordinary
+// fallback is preserved where no admitted stream layout exists; it supplies
+// no original execution/source authority to later request admission.
+fn realize_backend(device: &DevicePlan) -> Result<MlxBackend<'static>, AutomaticPlanningError> {
+    let realized = mlx_device(device)?;
+    // The factory owns these native constructors. Exact prepared wrappers
+    // and source accounts remain in MlxBackend; no ordinary clone is needed.
+    if cfg!(all(feature = "metal", target_vendor = "apple")) {
+        let kind=realized.device.get_type().map_err(|error|planning_backend_error("execution_device_type",error))?;
+        let index=realized.device.get_index().map_err(|error|planning_backend_error("execution_device_index",error))?;
+        if index==0 {
+            let pool=crate::backend::managed_memory::domain();
+            let streams=crate::backend::managed_memory::gpu_stream::PreparedExecutionStreams::for_device_factory(&pool,kind).map_err(|error|planning_backend_error("create_admitted_execution_stream",error))?;
+            if let Some(streams)=streams {
+                return Ok(MlxBackend::for_prepared_execution_plan(streams,realized.identity));
+            }
+        }
+    }
+    let stream = Stream::try_new_with_device(&realized.device)
+        .map_err(|error| planning_backend_error("create_execution_stream", error))?;
+    let weights_stream = Stream::try_new_with_device(&Device::new(DeviceType::Cpu, 0))
+        .map_err(|error| planning_backend_error("create_weights_stream", error))?;
+    Ok(MlxBackend::for_execution_plan(&stream, &weights_stream, realized.identity))
 }
 
 /// Converts an MLX routed-expert cache snapshot into neutral telemetry.
@@ -428,7 +416,7 @@ fn mlx_device(device: &DevicePlan) -> Result<RealizedMlxDevice, AutomaticPlannin
         other => {
             return Err(AutomaticPlanningError::Invalid(format!(
                 "unknown MLX device family {other:?}"
-            )))
+            )));
         }
     };
     let canonical_id = format!("{family}:{index}");

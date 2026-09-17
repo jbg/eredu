@@ -1961,7 +1961,7 @@ fn lfm2_without_tools_generates_text_and_stops_at_message_end() {
                 ));
 
                 let mut constraints =
-                    crate::runtime::chat::constraints::ConstraintController::from_generation_plan(
+                    crate::runtime::chat::constraints::ConstraintController::from_generation_plan_unregistered(
                         plan,
                     )
                     .unwrap();
@@ -3221,7 +3221,9 @@ fn controlled_text_requires_raw_thinking_opt_in_even_with_a_recognized_parser() 
         let runtime = super::request::prepared_text_control_runtime(
             &prepared,
             &[],
-            std::sync::Arc::new(eredu_core::TokenFilter::allowed(vec![true; 256]).unwrap()),
+            eredu_core::SharedTokenFilter::new(
+                eredu_core::TokenFilter::allowed(vec![true; 256]).unwrap(),
+            ),
         );
         assert_eq!(runtime.is_ok(), allow_unparsed_reasoning);
     }

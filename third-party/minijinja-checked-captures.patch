@@ -1,0 +1,3177 @@
+--- /dev/null
++++ b/src/bounded/template_syntax/captures/proof.rs
+@@ -0,0 +1,118 @@
++//! Test-only observation around the actual shared worker and real closed store.
++//! The three visitation vectors belong to this observer, not the production workspace.
++#![forbid(unsafe_code)]
++use super::tests::{fixtures, syntax};
++use super::*;
++use crate::compiler::meta::view::{Storage, Task};
++
++struct Observed<'o, 's: 'o> {
++    scratch: Scratch<'o, 's>,
++    expressions: Vec<bool>,
++    statements: Vec<bool>,
++    macros: Vec<bool>,
++    appends: [usize; 4],
++}
++impl<'o, 's: 'o> Storage<'s, Packed<'o, 's>> for Observed<'o, 's> {
++    type Error = Cause;
++    type Nested = ();
++    fn push_task(&mut self, task: Task<'s, Packed<'o, 's>>) -> Result<(), Cause> {
++        self.scratch.push_task(task)?;
++        self.appends[Buffer::Tasks.index()] += 1;
++        Ok(())
++    }
++    fn pop_task(&mut self) -> Option<Task<'s, Packed<'o, 's>>> {
++        let task = self.scratch.pop_task()?;
++        let seen = match task {
++            Task::Expr(id) | Task::Assign(id) => Some(&mut self.expressions[id.0]),
++            Task::Stmt(id) => Some(&mut self.statements[id.0]),
++            Task::Macro(id, _) => Some(&mut self.macros[id.0]),
++            _ => None,
++        };
++        if let Some(seen) = seen {
++            assert!(!*seen, "one reachable node was visited twice");
++            *seen = true;
++        }
++        Some(task)
++    }
++    fn is_assigned(&self, name: &str) -> bool {
++        self.scratch.is_assigned(name)
++    }
++    fn assign(&mut self, name: &'s str) -> Result<(), Cause> {
++        let before = self.scratch.assigned.len();
++        self.scratch.assign(name)?;
++        self.appends[Buffer::Assigned.index()] += self.scratch.assigned.len() - before;
++        Ok(())
++    }
++    fn capture(&mut self, name: &'s str) -> Result<(), Cause> {
++        let before = self.scratch.captures.len();
++        self.scratch.capture(name)?;
++        self.appends[Buffer::Captures.index()] += self.scratch.captures.len() - before;
++        Ok(())
++    }
++    fn push_scope(&mut self) -> Result<(), Cause> {
++        self.scratch.push_scope()?;
++        self.appends[Buffer::Scopes.index()] += 1;
++        Ok(())
++    }
++    fn pop_scope(&mut self) -> Result<(), Cause> {
++        self.scratch.pop_scope()
++    }
++    fn tracks_nested(&self) -> bool {
++        self.scratch.tracks_nested()
++    }
++    fn nested_start(&mut self, name: &'s str) -> Result<(), Cause> {
++        self.scratch.nested_start(name)
++    }
++    fn nested_attr(&mut self, attrs: &mut (), name: &'s str) -> Result<(), Cause> {
++        self.scratch.nested_attr(attrs, name)
++    }
++    fn nested_finish(&mut self, attrs: (), name: &'s str) -> Result<(), Cause> {
++        self.scratch.nested_finish(attrs, name)
++    }
++    fn nested_variable(&mut self, name: &'s str) -> Result<(), Cause> {
++        self.scratch.nested_variable(name)
++    }
++}
++fn prove(owner: &ParsedTemplate<'_>) {
++    let Some(first) = owner.macros().next() else {
++        return;
++    };
++    let plan = Plan::for_macro(first).unwrap();
++    let limits = plan.requirements.counts;
++    let workspace = plan.construct().unwrap();
++    let mut observed = Observed {
++        scratch: workspace.scratch,
++        expressions: vec![false; owner.storage.expressions.nodes.len()],
++        statements: vec![false; owner.storage.statements.len()],
++        macros: vec![false; owner.storage.statements.len()],
++        appends: [0; 4],
++    };
++    for handle in owner.macros() {
++        observed.scratch.clear();
++        observed.expressions.fill(false);
++        observed.statements.fill(false);
++        observed.macros.fill(false);
++        observed.appends.fill(0);
++        observed.push_scope().unwrap();
++        shared::run(Packed(owner), &mut observed, Task::Macro(handle.id, false)).unwrap();
++        assert_eq!(observed.scratch.scopes.len(), 1);
++        assert!(observed.scratch.tasks.is_empty());
++        for (actual, bound) in observed.appends.into_iter().zip(limits) {
++            assert!(
++                actual <= bound,
++                "actual append total {actual} exceeds {bound}"
++            );
++        }
++    }
++}
++
++#[test]
++fn actual_capture_task_and_append_events_fit_the_source_inventory_without_duplicate_visits() {
++    prove(&syntax(super::tests::SOURCE));
++    for (_, source) in fixtures() {
++        let plan = super::super::Plan::inspect(source, "proof", Default::default()).unwrap();
++        if let Ok(owner) = plan.construct() {
++            prove(&owner);
++        }
++    }
++}
+--- /dev/null
++++ b/src/bounded/template_syntax/captures/storage.rs
+@@ -0,0 +1,111 @@
++//! The four actual once-reserved buffers; every append has a private bound.
++#![forbid(unsafe_code)]
++use super::{view::Packed, Buffer, Cause};
++use crate::compiler::meta::view::{Storage, Task};
++
++pub(super) struct Scratch<'o, 's: 'o> {
++    pub(super) assigned: Vec<&'s str>,
++    pub(super) scopes: Vec<usize>,
++    pub(super) captures: Vec<&'s str>,
++    pub(super) tasks: Vec<Task<'s, Packed<'o, 's>>>,
++    limits: [usize; 4],
++}
++impl<'o, 's: 'o> Scratch<'o, 's> {
++    pub(super) fn new(limits: [usize; 4]) -> Self {
++        Self {
++            assigned: Vec::new(),
++            scopes: Vec::new(),
++            captures: Vec::new(),
++            tasks: Vec::new(),
++            limits,
++        }
++    }
++    pub(super) fn clear(&mut self) {
++        self.assigned.clear();
++        self.scopes.clear();
++        self.captures.clear();
++        self.tasks.clear();
++    }
++    pub(super) fn capacities(&self) -> [usize; 4] {
++        [
++            self.assigned.capacity(),
++            self.scopes.capacity(),
++            self.captures.capacity(),
++            self.tasks.capacity(),
++        ]
++    }
++    #[cfg(test)]
++    pub(super) fn set_limit(&mut self, buffer: Buffer, limit: usize) {
++        self.limits[buffer.index()] = limit;
++    }
++    fn before_push(&self, target: Buffer, len: usize, capacity: usize) -> Result<(), Cause> {
++        if len >= self.limits[target.index()] || len == capacity {
++            Err(Cause::Capacity(target))
++        } else {
++            Ok(())
++        }
++    }
++}
++impl<'o, 's: 'o> Storage<'s, Packed<'o, 's>> for Scratch<'o, 's> {
++    type Error = Cause;
++    type Nested = ();
++    fn push_task(&mut self, value: Task<'s, Packed<'o, 's>>) -> Result<(), Cause> {
++        self.before_push(Buffer::Tasks, self.tasks.len(), self.tasks.capacity())?;
++        self.tasks.push(value);
++        Ok(())
++    }
++    fn pop_task(&mut self) -> Option<Task<'s, Packed<'o, 's>>> {
++        self.tasks.pop()
++    }
++    fn is_assigned(&self, name: &str) -> bool {
++        self.assigned.contains(&name)
++    }
++    fn assign(&mut self, name: &'s str) -> Result<(), Cause> {
++        let start = *self.scopes.last().ok_or(Cause::Geometry)?;
++        if !self.assigned[start..].contains(&name) {
++            self.before_push(
++                Buffer::Assigned,
++                self.assigned.len(),
++                self.assigned.capacity(),
++            )?;
++            self.assigned.push(name);
++        }
++        Ok(())
++    }
++    fn capture(&mut self, name: &'s str) -> Result<(), Cause> {
++        if !self.captures.contains(&name) {
++            self.before_push(
++                Buffer::Captures,
++                self.captures.len(),
++                self.captures.capacity(),
++            )?;
++            self.captures.push(name);
++        }
++        Ok(())
++    }
++    fn push_scope(&mut self) -> Result<(), Cause> {
++        self.before_push(Buffer::Scopes, self.scopes.len(), self.scopes.capacity())?;
++        self.scopes.push(self.assigned.len());
++        Ok(())
++    }
++    fn pop_scope(&mut self) -> Result<(), Cause> {
++        let start = self.scopes.pop().ok_or(Cause::Geometry)?;
++        self.assigned.truncate(start);
++        Ok(())
++    }
++    fn tracks_nested(&self) -> bool {
++        false
++    }
++    fn nested_start(&mut self, _: &'s str) -> Result<(), Cause> {
++        Err(Cause::Geometry)
++    }
++    fn nested_attr(&mut self, _: &mut (), _: &'s str) -> Result<(), Cause> {
++        Err(Cause::Geometry)
++    }
++    fn nested_finish(&mut self, _: (), _: &'s str) -> Result<(), Cause> {
++        Err(Cause::Geometry)
++    }
++    fn nested_variable(&mut self, _: &'s str) -> Result<(), Cause> {
++        Err(Cause::Geometry)
++    }
++}
+--- /dev/null
++++ b/src/bounded/template_syntax/captures/tests.rs
+@@ -0,0 +1,349 @@
++#![forbid(unsafe_code)]
++use super::*;
++use crate::bounded::template_syntax::{Plan as SyntaxPlan, WhitespaceConfig};
++use crate::compiler::{ast, meta, parser};
++use std::collections::HashSet;
++
++include!("../../expression/tests/fixtures.rs");
++
++pub(super) fn fixtures() -> &'static [(&'static str, &'static str)] {
++    FIXTURES
++}
++
++pub(super) const SOURCE: &str = "{% macro outer(p, q=default) %}{{ first }}{{ second }}{% if condition %}{{ branch }}{% else %}{{ other }}{% endif %}{% macro inner(x) %}{{ caller }}{{ nested }}{{ p }}{% endmacro %}{{ inner(p) }}{% endmacro %}";
++pub(super) fn syntax(source: &str) -> ParsedTemplate<'_> {
++    SyntaxPlan::inspect(source, "capture", WhitespaceConfig::default())
++        .unwrap()
++        .construct()
++        .unwrap()
++}
++fn pointers(work: &Workspace<'_, '_>) -> [usize; 4] {
++    [
++        work.scratch.assigned.as_ptr() as usize,
++        work.scratch.scopes.as_ptr() as usize,
++        work.scratch.captures.as_ptr() as usize,
++        work.scratch.tasks.as_ptr() as usize,
++    ]
++}
++fn ordinary_macros<'t, 's>(root: &'t ast::Stmt<'s>) -> Vec<(&'t ast::Macro<'s>, Span)> {
++    let mut stack = vec![root];
++    let mut out = Vec::new();
++    while let Some(stmt) = stack.pop() {
++        let mut body = |items: &'t [ast::Stmt<'s>]| {
++            stack.extend(items.iter().rev());
++        };
++        match stmt {
++            ast::Stmt::Template(v) => body(&v.children),
++            ast::Stmt::ForLoop(v) => {
++                body(&v.else_body);
++                body(&v.body);
++            }
++            ast::Stmt::IfCond(v) => {
++                body(&v.false_body);
++                body(&v.true_body);
++            }
++            ast::Stmt::WithBlock(v) => body(&v.body),
++            ast::Stmt::AutoEscape(v) => body(&v.body),
++            ast::Stmt::FilterBlock(v) => body(&v.body),
++            ast::Stmt::SetBlock(v) => body(&v.body),
++            #[cfg(feature = "multi_template")]
++            ast::Stmt::Block(v) => body(&v.body),
++            ast::Stmt::Macro(v) => {
++                out.push((&**v, v.span()));
++                body(&v.body);
++            }
++            ast::Stmt::CallBlock(v) => {
++                out.push((&*v.macro_decl, v.macro_decl.span()));
++                body(&v.macro_decl.body);
++            }
++            _ => {}
++        }
++    }
++    out
++}
++fn compare(source: &str, whitespace: WhitespaceConfig) -> usize {
++    let ordinary = parser::parse(source, "capture", Default::default(), whitespace);
++    let closed = SyntaxPlan::inspect(source, "capture", whitespace)
++        .unwrap()
++        .construct();
++    match (ordinary, closed) {
++        (Ok(ast), Ok(owner)) => {
++            for nested in [false, true] {
++                assert_eq!(
++                    meta::find_undeclared(&ast, nested),
++                    meta::reference::find_undeclared(&ast, nested)
++                );
++            }
++            let original = ordinary_macros(&ast);
++            let handles: Vec<_> = owner.macros().collect();
++            assert_eq!(handles.len(), original.len());
++            let Some(first) = handles.first().copied() else {
++                return 0;
++            };
++            let mut workspace = Plan::for_macro(first).unwrap().construct().unwrap();
++            let capacities = workspace.capacities();
++            let ptrs = pointers(&workspace);
++            for handle in handles {
++                let values: Vec<_> = original
++                    .iter()
++                    .filter(|(_, span)| *span == handle.span())
++                    .collect();
++                assert_eq!(values.len(), 1, "exact original macro span");
++                let expected = meta::reference::find_macro_closure(values[0].0);
++                assert_eq!(meta::find_macro_closure(values[0].0), expected);
++                let result = workspace.analyze(handle).unwrap();
++                let actual: HashSet<_> = result.names().collect();
++                assert_eq!(actual.len(), result.names().len());
++                assert_eq!(actual, expected, "{source}");
++                assert_eq!(result.contains("caller"), expected.contains("caller"));
++                workspace = result.into_workspace();
++                assert_eq!(workspace.capacities(), capacities);
++                assert_eq!(pointers(&workspace), ptrs);
++            }
++            original.len()
++        }
++        (Err(_), Err(_)) => 0, // Existing syntax oracle separately checks exact diagnostics.
++        _ => panic!("ordinary and closed source parsing differ"),
++    }
++}
++
++#[test]
++fn all_real_template_macro_and_dotted_memberships_match_untouched_reference() {
++    assert_eq!(FIXTURES.len(), 32);
++    let mut macros = 0;
++    let mut attempts = 0;
++    for (_, source) in FIXTURES {
++        for trim_blocks in [false, true] {
++            for lstrip_blocks in [false, true] {
++                for keep_trailing_newline in [false, true] {
++                    macros += compare(
++                        source,
++                        WhitespaceConfig {
++                            trim_blocks,
++                            lstrip_blocks,
++                            keep_trailing_newline,
++                        },
++                    );
++                    attempts += 1;
++                }
++            }
++        }
++    }
++    assert_eq!(attempts, 256);
++    assert!(macros > 0);
++    println!("checked macro corpus: templates=32 whitespace=8 attempts={attempts} actual_macro_comparisons={macros}");
++}
++
++#[test]
++fn nested_scopes_defaults_callers_and_ignored_children_match_actual_macro_worker() {
++    for source in [
++        SOURCE,
++        "{% macro m(x=default) %}{% set a = a %}{% with b=b, c=b %}{{ b }}{{ c }}{{ free }}{% endwith %}{{ free }}{% for t in t %}{{ loop.index }}{{ t }}{{ value }}{% else %}{{ t }}{{ value }}{% endfor %}{% endmacro %}",
++        "{% macro m() %}{{ ignored[a:b:c] }}{% autoescape ignored %}{{ kept }}{% endautoescape %}{% filter trim(ignored) %}{{ kept }}{% endfilter %}{% set x|trim(ignored) %}{{ body }}{% endset %}{{ x }}{% endmacro %}",
++        "{% macro m() %}{{ f(a, named=b, *args, **kwargs) }}{{ {key: value} }}{{ [first, second] }}{{ var if cond else other }}{% endmacro %}{% call(x) m() %}{{ x }}{{ external }}{% endcall %}",
++    ] { assert!(compare(source, WhitespaceConfig::default()) > 0); }
++}
++
++#[test]
++fn foreign_equal_source_owner_is_rejected_before_clearing_completed_membership() {
++    let one = syntax(SOURCE);
++    let two = syntax(SOURCE);
++    let handle = one.macros().last().unwrap();
++    let work = Plan::for_macro(handle).unwrap().construct().unwrap();
++    let work = work.analyze(handle).unwrap().into_workspace();
++    let old = work.scratch.captures.clone();
++    let ptrs = pointers(&work);
++    let capacities = work.capacities();
++    let failure = work.analyze(two.macros().last().unwrap()).unwrap_err();
++    assert!(matches!(failure.cause(), Cause::SourceMismatch));
++    assert_eq!(failure.workspace.scratch.captures, old);
++    assert_eq!(failure.capacities(), capacities);
++    assert_eq!(pointers(&failure.workspace), ptrs);
++    let work = failure.into_workspace();
++    assert!(work.analyze(handle).is_ok());
++}
++
++#[cfg(feature = "development-closed-chat")]
++#[test]
++fn every_real_capture_reserve_failure_retains_exact_completed_prefix() {
++    use std::error::Error;
++    let owner = syntax(SOURCE);
++    let handle = owner.macros().last().unwrap();
++    for buffer in [
++        Buffer::Assigned,
++        Buffer::Scopes,
++        Buffer::Captures,
++        Buffer::Tasks,
++    ] {
++        let plan = Plan::for_macro(handle).unwrap();
++        let requirements = plan.requirements();
++        let failure = plan.fail_reservation(buffer).construct().unwrap_err();
++        let Cause::Reserve {
++            buffer: actual,
++            error,
++        } = failure.cause()
++        else {
++            panic!("actual reserve error required")
++        };
++        assert_eq!(*actual, buffer);
++        assert!(std::ptr::eq(
++            error,
++            failure
++                .cause()
++                .source()
++                .unwrap()
++                .downcast_ref::<TryReserveError>()
++                .unwrap()
++        ));
++        let retained = failure.capacities();
++        for (index, capacity) in retained.into_iter().enumerate() {
++            if index < buffer.index() {
++                assert!(capacity >= requirements.counts[index] && requirements.counts[index] > 0);
++            } else {
++                assert_eq!(capacity, 0);
++            }
++        }
++    }
++}
++
++#[test]
++fn actual_late_append_refusals_hold_all_allocations_and_real_prefixes() {
++    let owner = syntax(SOURCE);
++    let handle = owner.macros().last().unwrap();
++    for (buffer, limit) in [
++        (Buffer::Assigned, 1),
++        (Buffer::Scopes, 1),
++        (Buffer::Captures, 1),
++        (Buffer::Tasks, 2),
++    ] {
++        let mut work = Plan::for_macro(handle).unwrap().construct().unwrap();
++        let capacities = work.capacities();
++        let ptrs = pointers(&work);
++        work.scratch.set_limit(buffer, limit);
++        let failure = work.analyze(handle).unwrap_err();
++        assert!(matches!(failure.cause(), Cause::Capacity(b) if *b==buffer));
++        assert_eq!(failure.capacities(), capacities);
++        assert_eq!(pointers(&failure.workspace), ptrs);
++        match buffer {
++            Buffer::Assigned => assert_eq!(failure.workspace.scratch.assigned.len(), 1),
++            Buffer::Scopes => {
++                assert_eq!(failure.workspace.scratch.scopes.len(), 1);
++                assert!(!failure.workspace.scratch.captures.is_empty());
++            }
++            Buffer::Captures => assert_eq!(failure.workspace.scratch.captures.len(), 1),
++            Buffer::Tasks => assert_eq!(failure.workspace.scratch.tasks.len(), 2),
++        }
++    }
++}
++
++#[test]
++fn independent_workspaces_share_only_the_immutable_source_and_survive_unwind() {
++    let owner = syntax(SOURCE);
++    std::thread::scope(|threads| {
++        let owner_ref = &owner;
++        let left = threads.spawn(move || {
++            let h = owner_ref.macros().last().unwrap();
++            Plan::for_macro(h)
++                .unwrap()
++                .construct()
++                .unwrap()
++                .analyze(h)
++                .unwrap()
++                .names()
++                .count()
++        });
++        let right = threads.spawn(move || {
++            let h = owner_ref.macros().next().unwrap();
++            Plan::for_macro(h)
++                .unwrap()
++                .construct()
++                .unwrap()
++                .analyze(h)
++                .unwrap()
++                .names()
++                .count()
++        });
++        assert!(left.join().unwrap() > 0);
++        assert!(right.join().unwrap() > 0);
++    });
++    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
++        let h = owner.macros().last().unwrap();
++        let _result = Plan::for_macro(h)
++            .unwrap()
++            .construct()
++            .unwrap()
++            .analyze(h)
++            .unwrap();
++        panic!("external unwind");
++    }));
++    assert!(caught.is_err());
++    let h = owner.macros().last().unwrap();
++    assert!(Plan::for_macro(h)
++        .unwrap()
++        .construct()
++        .unwrap()
++        .analyze(h)
++        .is_ok());
++}
++
++#[test]
++fn checked_geometry_rejects_each_layout_overflow_before_reserving() {
++    for index in 0..4 {
++        let mut counts = [0; 4];
++        counts[index] = usize::MAX;
++        assert_eq!(Requirements::checked(counts), Err(PlanError::Overflow));
++    }
++    // Each individual layout fits isize, while their checked sum does not.
++    let refs = isize::MAX as usize / size_of::<&str>();
++    let marks = isize::MAX as usize / size_of::<usize>();
++    assert_eq!(
++        Requirements::checked([refs, marks, refs, 0]),
++        Err(PlanError::Overflow)
++    );
++    let mut count = usize::MAX;
++    assert_eq!(add(&mut count, 1), Err(PlanError::Overflow));
++    assert_eq!(count, usize::MAX);
++    let counts = [2, 3, 4, 5];
++    let requirements = Requirements::checked(counts).unwrap();
++    assert_eq!(requirements.capacity(Buffer::Tasks), 5);
++    assert_eq!(
++        requirements.buffer_bytes(Buffer::Assigned),
++        2 * size_of::<&str>()
++    );
++    assert_eq!(
++        requirements.buffer_bytes(Buffer::Tasks),
++        5 * size_of::<walk::Task<'static, Packed<'static, 'static>>>()
++    );
++    assert_eq!(
++        requirements.requested_bytes(),
++        requirements.bytes.iter().sum()
++    );
++    assert!(control_bytes().unwrap() >= size_of::<Workspace<'static, 'static>>());
++}
++
++#[test]
++fn templates_without_macros_need_no_workspace_and_empty_capture_retains_no_name_buffer() {
++    let plain = syntax("plain UTF-8 café 🦀");
++    assert!(plain.macros().next().is_none());
++    let owner = syntax("{% macro empty() %}UTF-8 café 🦀{% endmacro %}");
++    let handle = owner.macros().next().unwrap();
++    let plan = Plan::for_macro(handle).unwrap();
++    assert_eq!(plan.requirements().capacity(Buffer::Captures), 0);
++    let result = plan.construct().unwrap().analyze(handle).unwrap();
++    assert_eq!(result.names().len(), 0);
++    assert_eq!(
++        result.into_workspace().capacities()[Buffer::Captures.index()],
++        0
++    );
++}
++
++#[cfg(feature = "unicode")]
++#[test]
++fn unicode_macro_parameters_and_capture_names_keep_exact_borrowed_text() {
++    assert!(
++        compare(
++            "{% macro café(α) %}{{ α }}{{ β }}{{ café }}{% endmacro %}",
++            WhitespaceConfig::default()
++        ) > 0
++    );
++}
+--- /dev/null
++++ b/src/bounded/template_syntax/captures/view.rs
+@@ -0,0 +1,156 @@
++//! Read-only source views. IDs never cross this private owner boundary.
++#![forbid(unsafe_code)]
++use super::super::{store::StmtId, ParsedTemplate};
++use crate::bounded::expression::store::{NodeId, OperandKind as O, RecordKind as R, Sequence};
++use crate::compiler::meta::view::{Expression as E, Item, MacroParts, Statement as S, View};
++use crate::compiler::parser::statements::storage::Statement;
++
++#[derive(Clone, Copy)]
++pub(super) struct Packed<'o, 's>(pub(super) &'o ParsedTemplate<'s>);
++#[derive(Clone, Copy)]
++pub(super) enum Cursor {
++    Body(Option<usize>),
++    Operand(Option<usize>),
++    Map(Option<usize>, Option<usize>),
++}
++fn body(v: Sequence) -> Cursor {
++    Cursor::Body(v.head)
++}
++fn operands(v: Sequence) -> Cursor {
++    Cursor::Operand(v.head)
++}
++
++impl<'o, 's: 'o> Packed<'o, 's> {
++    fn call(self, id: NodeId) -> (NodeId, Cursor) {
++        match self.0.storage.expressions.nodes[id.0].kind {
++            R::Call(receiver, args) => (receiver, operands(args)),
++            _ => unreachable!("source parser admitted a call"),
++        }
++    }
++}
++impl<'o, 's: 'o> View<'s> for Packed<'o, 's> {
++    type Expr = NodeId;
++    type Stmt = StmtId;
++    type Macro = StmtId;
++    type Cursor = Cursor;
++    fn expression(self, id: NodeId) -> E<'s, Self> {
++        match &self.0.storage.expressions.nodes[id.0].kind {
++            R::Var(name) => E::Var(name),
++            R::Const(_) => E::Const,
++            R::Unary(_, expr) => E::Unary(*expr),
++            R::Binary(_, left, right) => E::Binary(*left, *right),
++            R::Compare(root, rest) => E::Compare(*root, operands(*rest)),
++            R::If(test, yes, no) => E::If(*test, *yes, *no),
++            R::Filter(_, root, args) => E::Filter(*root, operands(*args)),
++            R::Test(_, root, args) => E::Test(*root, operands(*args)),
++            R::Attr(root, name) => E::Attr(*root, name),
++            R::Item(root, index) => E::Item(*root, *index),
++            R::Slice {
++                start, stop, step, ..
++            } => E::Slice(*start, *stop, *step),
++            R::Call(root, args) => E::Call(*root, operands(*args)),
++            R::List(items) => E::List(operands(*items)),
++            R::Map(keys, values) => E::Map(Cursor::Map(keys.head, values.head)),
++        }
++    }
++    fn statement(self, id: StmtId) -> S<'s, Self> {
++        match &self.0.storage.statements[id.0].value {
++            Statement::Template(items) => S::Template(body(*items)),
++            Statement::EmitExpr(expr) => S::EmitExpr(*expr),
++            Statement::EmitRaw(_) => S::EmitRaw,
++            Statement::For {
++                target,
++                iter,
++                filter,
++                body: items,
++                otherwise,
++                ..
++            } => S::For {
++                target: *target,
++                iter: *iter,
++                filter: *filter,
++                body: body(*items),
++                otherwise: body(*otherwise),
++            },
++            Statement::If { test, yes, no } => S::If(*test, body(*yes), body(*no)),
++            Statement::With(bindings, items) => S::With(operands(*bindings), body(*items)),
++            Statement::Set(target, value) => S::Set(*target, *value),
++            Statement::SetBlock(target, _, items) => S::SetBlock(*target, body(*items)),
++            Statement::AutoEscape(_, items) => S::AutoEscape(body(*items)),
++            Statement::FilterBlock(_, items) => S::FilterBlock(body(*items)),
++            #[cfg(feature = "multi_template")]
++            Statement::Block { body: items, .. } => S::Block(body(*items)),
++            #[cfg(feature = "multi_template")]
++            Statement::Extends(_) => S::Extends,
++            #[cfg(feature = "multi_template")]
++            Statement::Include(..) => S::Include,
++            #[cfg(feature = "multi_template")]
++            Statement::Import(_, name) => S::Import(*name),
++            #[cfg(feature = "multi_template")]
++            Statement::FromImport(_, names) => S::FromImport(operands(*names)),
++            Statement::Macro { name, .. } => S::Macro(name, id),
++            Statement::CallBlock { call, .. } => {
++                let (receiver, args) = self.call(*call);
++                S::CallBlock(receiver, args, id)
++            }
++            #[cfg(feature = "loop_controls")]
++            Statement::Continue => S::Continue,
++            #[cfg(feature = "loop_controls")]
++            Statement::Break => S::Break,
++            Statement::Do(call) => {
++                let (receiver, args) = self.call(*call);
++                S::Do(receiver, args)
++            }
++        }
++    }
++    fn macro_parts(self, id: StmtId) -> MacroParts<'s, Self> {
++        match &self.0.storage.statements[id.0].value {
++            Statement::Macro {
++                args,
++                defaults,
++                body: items,
++                ..
++            }
++            | Statement::CallBlock {
++                args,
++                defaults,
++                body: items,
++                ..
++            } => MacroParts {
++                args: operands(*args),
++                defaults: operands(*defaults),
++                body: body(*items),
++            },
++            _ => unreachable!("private source macro handle"),
++        }
++    }
++    fn next(self, cursor: Cursor) -> Option<(Item<'s, Self>, Cursor)> {
++        Some(match cursor {
++            Cursor::Body(index) => {
++                let entry = &self.0.storage.links[index?];
++                (Item::Stmt(entry.stmt), Cursor::Body(entry.next))
++            }
++            Cursor::Operand(index) => {
++                let entry = &self.0.storage.expressions.operands[index?];
++                let item = match entry.kind {
++                    O::Expr(id)
++                    | O::Pos(id)
++                    | O::Kwarg(_, id)
++                    | O::PosSplat(id)
++                    | O::KwargSplat(id)
++                    | O::Compare(_, id) => Item::Expr(id),
++                    O::Binding(target, value) => Item::Pair(target, value),
++                };
++                (item, Cursor::Operand(entry.next))
++            }
++            Cursor::Map(key, value) => {
++                let key = &self.0.storage.expressions.operands[key?];
++                let value = &self.0.storage.expressions.operands[value?];
++                let (O::Expr(k), O::Expr(v)) = (&key.kind, &value.kind) else {
++                    unreachable!("source map operands")
++                };
++                (Item::Pair(*k, Some(*v)), Cursor::Map(key.next, value.next))
++            }
++        })
++    }
++}
+--- /dev/null
++++ b/src/bounded/template_syntax/captures.rs
+@@ -0,0 +1,607 @@
++//! Reusable source-bound macro capture membership, without instruction ordering.
++//!
++//! A workspace cannot outlive its actual syntax owner:
++//! ```compile_fail,E0505
++//! use minijinja::bounded::template_syntax::{Plan as Syntax, WhitespaceConfig};
++//! use minijinja::bounded::template_syntax::captures::Plan;
++//! let owner = Syntax::inspect("{% macro m() %}{{ x }}{% endmacro %}", "x", WhitespaceConfig::default()).unwrap().construct().unwrap();
++//! let workspace = Plan::for_macro(owner.macros().next().unwrap()).unwrap().construct().unwrap();
++//! drop(owner);
++//! let _ = workspace.capacities();
++//! ```
++//! A completed membership view prevents scratch reuse:
++//! ```compile_fail,E0505
++//! use minijinja::bounded::template_syntax::{Plan as Syntax, WhitespaceConfig};
++//! use minijinja::bounded::template_syntax::captures::Plan;
++//! let owner = Syntax::inspect("{% macro m() %}{{ x }}{% endmacro %}", "x", WhitespaceConfig::default()).unwrap().construct().unwrap();
++//! let handle = owner.macros().next().unwrap();
++//! let result = Plan::for_macro(handle).unwrap().construct().unwrap().analyze(handle).unwrap();
++//! let mut names = result.names();
++//! let _workspace = result.into_workspace();
++//! assert_eq!(names.next(), Some("x"));
++//! ```
++//! A returned operation error still borrows its original syntax owner:
++//! ```compile_fail
++//! use minijinja::bounded::template_syntax::{Plan as Syntax, WhitespaceConfig};
++//! use minijinja::bounded::template_syntax::captures::Plan;
++//! let other = Syntax::inspect("{% macro m() %}{{ x }}{% endmacro %}", "x", WhitespaceConfig::default()).unwrap().construct().unwrap();
++//! let failure = {
++//!     let owner = Syntax::inspect("{% macro m() %}{{ x }}{% endmacro %}", "x", WhitespaceConfig::default()).unwrap().construct().unwrap();
++//!     let workspace = Plan::for_macro(owner.macros().next().unwrap()).unwrap().construct().unwrap();
++//!     workspace.analyze(other.macros().next().unwrap()).unwrap_err()
++//! };
++//! let _ = failure.capacities();
++//! ```
++//! Source IDs cannot be read or replaced by callers:
++//! ```compile_fail,E0616
++//! use minijinja::bounded::template_syntax::{Plan as Syntax, WhitespaceConfig};
++//! let owner = Syntax::inspect("{% macro m() %}{{ x }}{% endmacro %}", "x", WhitespaceConfig::default()).unwrap().construct().unwrap();
++//! let mut handle = owner.macros().next().unwrap();
++//! handle.id = handle.id;
++//! ```
++#![forbid(unsafe_code)]
++use super::{store::StmtId, ParsedTemplate};
++use crate::bounded::expression::store::{OperandKind, RecordKind};
++use crate::compiler::meta::{shared, view as walk};
++use crate::compiler::parser::statements::storage::Statement;
++use crate::compiler::tokens::Span;
++use std::{
++    alloc::Layout,
++    collections::TryReserveError,
++    fmt,
++    mem::{size_of, size_of_val},
++};
++
++mod storage;
++mod view;
++use storage::Scratch;
++use view::Packed;
++
++/// One concrete reserve target. It grants no storage or source authority.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum Buffer {
++    /// Active scope-local assignments.
++    Assigned,
++    /// Assignment entry lengths at scope entry.
++    Scopes,
++    /// Unique output membership names.
++    Captures,
++    /// Explicit traversal continuations.
++    Tasks,
++}
++impl Buffer {
++    fn index(self) -> usize {
++        match self {
++            Self::Assigned => 0,
++            Self::Scopes => 1,
++            Self::Captures => 2,
++            Self::Tasks => 3,
++        }
++    }
++}
++
++/// A checked source/count/layout planning refusal, before any reserve.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub enum PlanError {
++    /// The requested concrete count or layout cannot be represented.
++    Overflow,
++    /// The private location does not identify a macro in this source.
++    Source,
++}
++impl fmt::Display for PlanError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.write_str(match self {
++            Self::Overflow => "macro capture layout overflows",
++            Self::Source => "macro capture source mismatch",
++        })
++    }
++}
++impl std::error::Error for PlanError {}
++
++/// Fixed requested geometry, derived only from an actual closed syntax owner.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct Requirements {
++    counts: [usize; 4],
++    bytes: [usize; 4],
++    total: usize,
++}
++impl Requirements {
++    /// Requested element capacity of one concrete buffer.
++    pub fn capacity(self, buffer: Buffer) -> usize {
++        self.counts[buffer.index()]
++    }
++    /// Requested allocation layout bytes for one buffer.
++    pub fn buffer_bytes(self, buffer: Buffer) -> usize {
++        self.bytes[buffer.index()]
++    }
++    /// Sum of the four requested allocation layouts; excludes fixed controls.
++    pub const fn requested_bytes(self) -> usize {
++        self.total
++    }
++}
++
++/// A private macro location borrowing its exact immutable syntax owner.
++#[derive(Clone, Copy)]
++pub struct MacroRef<'o, 's> {
++    source: &'o ParsedTemplate<'s>,
++    id: StmtId,
++}
++impl MacroRef<'_, '_> {
++    /// Original macro or inline call-block declaration span.
++    pub fn span(self) -> Span {
++        match &self.source.storage.statements[self.id.0].value {
++            Statement::CallBlock { macro_span, .. } => *macro_span,
++            _ => self.source.storage.statements[self.id.0].span,
++        }
++    }
++    /// Whether this is a call block's inline caller declaration.
++    pub fn is_caller(self) -> bool {
++        matches!(
++            self.source.storage.statements[self.id.0].value,
++            Statement::CallBlock { .. }
++        )
++    }
++}
++impl fmt::Debug for MacroRef<'_, '_> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("MacroRef")
++            .field("span", &self.span())
++            .field("is_caller", &self.is_caller())
++            .finish()
++    }
++}
++impl<'s> ParsedTemplate<'s> {
++    /// Iterates actual macro declarations without allocation. Discovery order is
++    /// private source-record order, not an instruction or closure lookup order.
++    pub fn macros(&self) -> impl Iterator<Item = MacroRef<'_, 's>> {
++        self.storage
++            .statements
++            .iter()
++            .enumerate()
++            .filter_map(|(i, record)| {
++                matches!(
++                    record.value,
++                    Statement::Macro { .. } | Statement::CallBlock { .. }
++                )
++                .then_some(MacroRef {
++                    source: self,
++                    id: StmtId(i),
++                })
++            })
++    }
++}
++
++/// Geometry and source binding for one reusable macro workspace.
++pub struct Plan<'o, 's> {
++    source: &'o ParsedTemplate<'s>,
++    requirements: Requirements,
++    #[cfg(feature = "development-closed-chat")]
++    failure: Option<Buffer>,
++}
++fn add(value: &mut usize, extra: usize) -> Result<(), PlanError> {
++    *value = value.checked_add(extra).ok_or(PlanError::Overflow)?;
++    Ok(())
++}
++impl<'o, 's: 'o> Plan<'o, 's> {
++    /// Derives all four capacities from this genuine macro's syntax owner.
++    /// The same workspace may subsequently analyze any macro in that owner.
++    pub fn for_macro(value: MacroRef<'o, 's>) -> Result<Self, PlanError> {
++        if !matches!(
++            value
++                .source
++                .storage
++                .statements
++                .get(value.id.0)
++                .map(|r| &r.value),
++            Some(Statement::Macro { .. } | Statement::CallBlock { .. })
++        ) {
++            return Err(PlanError::Source);
++        }
++        let mut counts = [0usize, 1, 0, 1];
++        for node in &value.source.storage.expressions.nodes {
++            let tasks = match node.kind {
++                RecordKind::Var(_) => {
++                    add(&mut counts[0], 1)?;
++                    add(&mut counts[2], 1)?;
++                    0
++                }
++                RecordKind::Const(_) => 0,
++                RecordKind::Unary(..)
++                | RecordKind::Attr(..)
++                | RecordKind::List(..)
++                | RecordKind::Map(..) => 1,
++                RecordKind::Binary(..)
++                | RecordKind::Compare(..)
++                | RecordKind::Filter(..)
++                | RecordKind::Test(..)
++                | RecordKind::Item(..)
++                | RecordKind::Call(..) => 2,
++                RecordKind::If(..) | RecordKind::Slice { .. } => 3,
++            };
++            add(&mut counts[3], tasks)?;
++        }
++        for record in &value.source.storage.statements {
++            let (assigned, scopes, tasks) = match record.value {
++                Statement::Template(_) => (1, 0, 2),
++                Statement::EmitExpr(_) => (0, 0, 1),
++                Statement::EmitRaw(_) => (0, 0, 0),
++                Statement::For { .. } => (1, 2, 10),
++                Statement::If { .. } => (0, 2, 7),
++                Statement::With(..) => (0, 1, 4),
++                Statement::Set(..) => (0, 0, 2),
++                Statement::SetBlock(..) => (0, 1, 4),
++                Statement::AutoEscape(..) | Statement::FilterBlock(..) => (0, 1, 3),
++                #[cfg(feature = "multi_template")]
++                Statement::Block { .. } => (1, 1, 4),
++                #[cfg(feature = "multi_template")]
++                Statement::Extends(_) | Statement::Include(..) => (0, 0, 0),
++                #[cfg(feature = "multi_template")]
++                Statement::Import(..) | Statement::FromImport(..) => (0, 0, 1),
++                // Includes the separate macro-entry task's four children.
++                Statement::Macro { .. } => (2, 1, 8),
++                Statement::CallBlock { .. } => (1, 1, 9),
++                #[cfg(feature = "loop_controls")]
++                Statement::Continue | Statement::Break => (0, 0, 0),
++                Statement::Do(_) => (0, 0, 2),
++            };
++            add(&mut counts[0], assigned)?;
++            add(&mut counts[1], scopes)?;
++            add(&mut counts[3], tasks)?;
++        }
++        add(
++            &mut counts[3],
++            value
++                .source
++                .storage
++                .links
++                .len()
++                .checked_mul(2)
++                .ok_or(PlanError::Overflow)?,
++        )?;
++        add(
++            &mut counts[3],
++            value
++                .source
++                .storage
++                .expressions
++                .operands
++                .len()
++                .checked_mul(2)
++                .ok_or(PlanError::Overflow)?,
++        )?;
++        for entry in &value.source.storage.expressions.operands {
++            if matches!(entry.kind, OperandKind::Binding(..)) {
++                add(&mut counts[3], 1)?;
++            }
++        }
++        let requirements = Requirements::checked(counts)?;
++        Ok(Self {
++            source: value.source,
++            requirements,
++            #[cfg(feature = "development-closed-chat")]
++            failure: None,
++        })
++    }
++    /// Concrete source-derived requested capacities and layout sizes.
++    pub const fn requirements(&self) -> Requirements {
++        self.requirements
++    }
++    /// Selects a real capacity-overflow failure at one actual reserve site.
++    /// Disabled in ordinary builds; cannot choose a successful allocation size.
++    #[cfg(feature = "development-closed-chat")]
++    pub fn fail_reservation(mut self, buffer: Buffer) -> Self {
++        self.failure = Some(buffer);
++        self
++    }
++    /// Reserves all four concrete arrays once, retaining every partial prefix on failure.
++    pub fn construct(self) -> Result<Workspace<'o, 's>, ConstructError<'o, 's>> {
++        let mut workspace = Workspace {
++            source: self.source,
++            requirements: self.requirements,
++            scratch: Scratch::new(self.requirements.counts),
++        };
++        macro_rules! reserve {
++            ($buffer:ident, $field:ident) => {{
++                let requested = self.requirements.capacity(Buffer::$buffer);
++                #[cfg(feature = "development-closed-chat")]
++                let requested = if self.failure == Some(Buffer::$buffer) {
++                    usize::MAX
++                } else {
++                    requested
++                };
++                if let Err(error) = workspace.scratch.$field.try_reserve_exact(requested) {
++                    return Err(ConstructError {
++                        workspace,
++                        cause: Cause::Reserve {
++                            buffer: Buffer::$buffer,
++                            error,
++                        },
++                    });
++                }
++            }};
++        }
++        reserve!(Assigned, assigned);
++        reserve!(Scopes, scopes);
++        reserve!(Captures, captures);
++        reserve!(Tasks, tasks);
++        Ok(workspace)
++    }
++}
++
++/// Actual construction or operation failure, retained without allocating an error wrapper.
++#[derive(Debug)]
++pub enum Cause {
++    /// The original reserve error from the selected concrete buffer.
++    Reserve {
++        /// Actual target.
++        buffer: Buffer,
++        /// Original allocator/capacity error.
++        error: TryReserveError,
++    },
++    /// A real append would exceed its private request or actual capacity.
++    Capacity(Buffer),
++    /// The macro belongs to a different syntax owner; prior state is intact.
++    SourceMismatch,
++    /// An internal operation is inapplicable to the closed macro-only profile.
++    Geometry,
++}
++impl fmt::Display for Cause {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match self {
++            Self::Reserve { buffer, error } => {
++                write!(f, "macro capture {buffer:?} reserve failed: {error}")
++            }
++            Self::Capacity(b) => write!(f, "macro capture {b:?} capacity exhausted"),
++            Self::SourceMismatch => f.write_str("macro capture source owner differs"),
++            Self::Geometry => f.write_str("macro capture geometry differs"),
++        }
++    }
++}
++impl std::error::Error for Cause {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        match self {
++            Self::Reserve { error, .. } => Some(error),
++            _ => None,
++        }
++    }
++}
++
++/// Four owned reusable arrays borrowing exactly one immutable syntax owner.
++pub struct Workspace<'o, 's: 'o> {
++    source: &'o ParsedTemplate<'s>,
++    requirements: Requirements,
++    scratch: Scratch<'o, 's>,
++}
++impl fmt::Debug for Workspace<'_, '_> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("MacroWorkspace")
++            .field("requirements", &self.requirements)
++            .field("capacities", &self.capacities())
++            .finish()
++    }
++}
++impl<'o, 's: 'o> Workspace<'o, 's> {
++    /// Original concrete requested layouts.
++    pub const fn requirements(&self) -> Requirements {
++        self.requirements
++    }
++    /// Actual retained element capacities, in Buffer order.
++    pub fn capacities(&self) -> [usize; 4] {
++        self.scratch.capacities()
++    }
++    /// Analyzes a genuine macro of this same source without another reserve.
++    /// A foreign handle is rejected before clearing any previous state.
++    pub fn analyze(
++        mut self,
++        value: MacroRef<'o, 's>,
++    ) -> Result<Analysis<'o, 's>, AnalysisError<'o, 's>> {
++        if !std::ptr::eq(self.source, value.source)
++            || !matches!(
++                self.source
++                    .storage
++                    .statements
++                    .get(value.id.0)
++                    .map(|r| &r.value),
++                Some(Statement::Macro { .. } | Statement::CallBlock { .. })
++            )
++        {
++            return Err(AnalysisError {
++                workspace: self,
++                cause: Cause::SourceMismatch,
++            });
++        }
++        self.scratch.clear();
++        let result = walk::Storage::push_scope(&mut self.scratch).and_then(|()| {
++            shared::run(
++                Packed(self.source),
++                &mut self.scratch,
++                walk::Task::Macro(value.id, false),
++            )
++        });
++        match result {
++            Ok(()) => Ok(Analysis { workspace: self }),
++            Err(cause) => Err(AnalysisError {
++                workspace: self,
++                cause,
++            }),
++        }
++    }
++}
++
++/// Completed capture membership. This is not a closure instruction-order policy.
++pub struct Analysis<'o, 's: 'o> {
++    workspace: Workspace<'o, 's>,
++}
++impl<'o, 's: 'o> Analysis<'o, 's> {
++    /// Unique captured names borrowed only for this result-view lifetime.
++    pub fn names<'a>(&'a self) -> impl ExactSizeIterator<Item = &'a str> + 'a {
++        self.workspace.scratch.captures.iter().copied()
++    }
++    /// Tests membership without copying or changing lookup order elsewhere.
++    pub fn contains(&self, name: &str) -> bool {
++        self.workspace.scratch.captures.contains(&name)
++    }
++    /// Returns the same four allocations for another macro after all views end.
++    pub fn into_workspace(self) -> Workspace<'o, 's> {
++        self.workspace
++    }
++}
++impl fmt::Debug for Analysis<'_, '_> {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("MacroAnalysis")
++            .field("names", &self.workspace.scratch.captures)
++            .finish()
++    }
++}
++
++/// Owns all completed reserves and the real cause of construction failure.
++#[derive(Debug)]
++pub struct ConstructError<'o, 's: 'o> {
++    workspace: Workspace<'o, 's>,
++    cause: Cause,
++}
++/// Owns all scratch/source borrows after an operation failure.
++#[derive(Debug)]
++pub struct AnalysisError<'o, 's: 'o> {
++    workspace: Workspace<'o, 's>,
++    cause: Cause,
++}
++macro_rules! error_accessors {
++    ($ty:ident) => {
++        impl $ty<'_, '_> {
++            /// Original fixed or reserve cause.
++            pub fn cause(&self) -> &Cause {
++                &self.cause
++            }
++            /// Actual retained partial element capacities, in Buffer order.
++            pub fn capacities(&self) -> [usize; 4] {
++                self.workspace.capacities()
++            }
++        }
++        impl fmt::Display for $ty<'_, '_> {
++            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++                self.cause.fmt(f)
++            }
++        }
++        impl std::error::Error for $ty<'_, '_> {
++            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++                Some(&self.cause)
++            }
++        }
++    };
++}
++error_accessors!(ConstructError);
++error_accessors!(AnalysisError);
++impl<'o, 's: 'o> AnalysisError<'o, 's> {
++    /// Recovers the already-reserved storage without discarding its source binding.
++    pub fn into_workspace(self) -> Workspace<'o, 's> {
++        self.workspace
++    }
++}
++
++/// Concrete owned/control representations; requested array backing is separate.
++/// This is not an original source grant or a whole-rendering allocation bound.
++pub fn control_bytes() -> Option<usize> {
++    // Named source-level controls across inspect, reserve, run and return.
++    // Sum distinct phases conservatively; no compiler-stack size is inferred.
++    let sizes = [
++        size_of::<Plan<'static, 'static>>(),
++        size_of::<Requirements>(),
++        size_of::<Workspace<'static, 'static>>(),
++        size_of::<Analysis<'static, 'static>>(),
++        size_of::<ConstructError<'static, 'static>>(),
++        size_of::<AnalysisError<'static, 'static>>(),
++        size_of::<Result<Plan<'static, 'static>, PlanError>>(),
++        size_of::<Result<Workspace<'static, 'static>, ConstructError<'static, 'static>>>(),
++        size_of::<Result<Analysis<'static, 'static>, AnalysisError<'static, 'static>>>(),
++        size_of::<MacroRef<'static, 'static>>(),
++        size_of::<Cause>(),
++        size_of::<PlanError>(),
++        size_of::<Buffer>(),
++        size_of::<TryReserveError>(),
++        size_of::<Result<(), TryReserveError>>(),
++        size_of::<Result<(), Cause>>(),
++        size_of::<Result<(), PlanError>>(),
++        size_of::<Result<Layout, PlanError>>(),
++        size_of::<Result<usize, PlanError>>(),
++        // Root argument, popped current task, and one child push argument.
++        size_of::<walk::Task<'static, Packed<'static, 'static>>>(),
++        size_of::<walk::Task<'static, Packed<'static, 'static>>>(),
++        size_of::<walk::Task<'static, Packed<'static, 'static>>>(),
++        size_of::<Option<walk::Task<'static, Packed<'static, 'static>>>>(),
++        size_of::<walk::Expression<'static, Packed<'static, 'static>>>(),
++        size_of::<walk::Statement<'static, Packed<'static, 'static>>>(),
++        size_of::<walk::Item<'static, Packed<'static, 'static>>>(),
++        size_of::<walk::MacroParts<'static, Packed<'static, 'static>>>(),
++        size_of::<Option<(walk::Item<'static, Packed<'static, 'static>>, view::Cursor)>>(),
++        size_of::<walk::SequenceKind>(),
++        size_of::<view::Cursor>(),
++        size_of::<Packed<'static, 'static>>(),
++        size_of::<&mut Scratch<'static, 'static>>(),
++        // Closed nested builder is unit; the false branch has no Vec/String.
++        size_of::<()>(),
++        size_of::<bool>(),
++        size_of::<crate::bounded::expression::store::NodeId>(),
++        size_of::<Option<crate::bounded::expression::store::NodeId>>(),
++        size_of::<StmtId>(),
++        size_of::<&str>(),
++        // Planner counts, checked layout sizes and layout-construction result.
++        size_of::<[usize; 4]>(),
++        size_of::<[usize; 4]>(),
++        size_of::<Layout>(),
++        size_of::<Result<Layout, std::alloc::LayoutError>>(),
++        size_of::<std::slice::Iter<'static, crate::bounded::expression::store::Record<'static>>>(),
++        size_of::<std::slice::Iter<'static, super::store::Record<'static>>>(),
++        size_of::<std::slice::Iter<'static, crate::bounded::expression::store::Operand<'static>>>(),
++        size_of::<std::slice::Iter<'static, usize>>(),
++        size_of::<&crate::bounded::expression::store::Record<'static>>(),
++        size_of::<&super::store::Record<'static>>(),
++        size_of::<&crate::bounded::expression::store::Operand<'static>>(),
++        size_of::<(usize, usize, usize)>(), // per-statement assignment/scope/task increments
++        size_of::<usize>(),                 // per-expression task increment
++        size_of::<usize>(),                 // requested reserve count
++        size_of::<usize>(),                 // checked layout total
++        size_of::<&mut usize>(),            // checked accumulator borrow
++        size_of::<usize>(),                 // checked increment
++        size_of::<Option<usize>>(),         // checked arithmetic / cursor option
++        size_of::<usize>(),                 // append length
++        size_of::<usize>(),                 // append actual capacity
++        size_of::<usize>(),                 // current scope start
++        size_of::<Option<&usize>>(),        // scope last
++    ];
++    sizes
++        .iter()
++        .try_fold(size_of_val(&sizes), |sum, value| sum.checked_add(*value))
++}
++
++#[cfg(test)]
++mod proof;
++#[cfg(test)]
++mod tests;
++
++impl Requirements {
++    fn checked(counts: [usize; 4]) -> Result<Self, PlanError> {
++        let bytes = [
++            Layout::array::<&str>(counts[0])
++                .map_err(|_| PlanError::Overflow)?
++                .size(),
++            Layout::array::<usize>(counts[1])
++                .map_err(|_| PlanError::Overflow)?
++                .size(),
++            Layout::array::<&str>(counts[2])
++                .map_err(|_| PlanError::Overflow)?
++                .size(),
++            Layout::array::<walk::Task<'static, Packed<'static, 'static>>>(counts[3])
++                .map_err(|_| PlanError::Overflow)?
++                .size(),
++        ];
++        let total = bytes.iter().try_fold(0usize, |sum, value| {
++            sum.checked_add(*value).ok_or(PlanError::Overflow)
++        })?;
++        Ok(Self {
++            counts,
++            bytes,
++            total,
++        })
++    }
++}
+--- a/src/bounded/template_syntax.rs
++++ b/src/bounded/template_syntax.rs
+@@ -42,6 +42,9 @@
+ use std::alloc::Layout;
+ use std::fmt;
+ use std::mem::size_of;
++/// Reusable capture membership over this exact immutable syntax owner.
++#[cfg(feature = "macros")]
++pub mod captures;
+ mod store;
+ use store::{BlockNames, Storage};
+ 
+--- /dev/null
++++ b/src/compiler/meta/ordinary.rs
+@@ -0,0 +1,222 @@
++//! Ordinary AST/HashSet adapter. Hash-state construction and insertion stay here.
++#![forbid(unsafe_code)]
++use super::view::{self, Expression as E, Item, Statement as S, Task, View};
++use crate::compiler::ast;
++use std::{collections::HashSet, convert::Infallible, fmt::Write, marker::PhantomData};
++
++#[derive(Clone, Copy)]
++pub(crate) struct Ordinary<'t, 's>(PhantomData<(&'t (), &'s ())>);
++impl Ordinary<'_, '_> {
++    pub(crate) fn new() -> Self {
++        Self(PhantomData)
++    }
++}
++
++#[derive(Clone, Copy)]
++pub(crate) enum Cursor<'t, 's> {
++    Body(&'t [ast::Stmt<'s>]),
++    Exprs(&'t [ast::Expr<'s>]),
++    Args(&'t [ast::CallArg<'s>]),
++    Comparisons(&'t [ast::CompareOp<'s>]),
++    Map(&'t [ast::Expr<'s>], &'t [ast::Expr<'s>]),
++    Bindings(&'t [(ast::Expr<'s>, ast::Expr<'s>)]),
++    #[cfg(feature = "multi_template")]
++    Imports(&'t [(ast::Expr<'s>, Option<ast::Expr<'s>>)]),
++}
++
++impl<'t, 's: 't> View<'s> for Ordinary<'t, 's> {
++    type Expr = &'t ast::Expr<'s>;
++    type Stmt = &'t ast::Stmt<'s>;
++    #[cfg(feature = "macros")]
++    type Macro = &'t ast::Macro<'s>;
++    type Cursor = Cursor<'t, 's>;
++    fn expression(self, expr: Self::Expr) -> E<'s, Self> {
++        match expr {
++            ast::Expr::Var(v) => E::Var(v.id),
++            ast::Expr::Const(_) => E::Const,
++            ast::Expr::UnaryOp(v) => E::Unary(&v.expr),
++            ast::Expr::BinOp(v) => E::Binary(&v.left, &v.right),
++            ast::Expr::Compare(v) => E::Compare(&v.expr, Cursor::Comparisons(&v.ops)),
++            ast::Expr::IfExpr(v) => E::If(&v.test_expr, &v.true_expr, v.false_expr.as_ref()),
++            ast::Expr::Filter(v) => E::Filter(v.expr.as_ref(), Cursor::Args(&v.args)),
++            ast::Expr::Test(v) => E::Test(&v.expr, Cursor::Args(&v.args)),
++            ast::Expr::GetAttr(v) => E::Attr(&v.expr, v.name),
++            ast::Expr::GetItem(v) => E::Item(&v.expr, &v.subscript_expr),
++            ast::Expr::Slice(v) => E::Slice(v.start.as_ref(), v.stop.as_ref(), v.step.as_ref()),
++            ast::Expr::Call(v) => E::Call(&v.expr, Cursor::Args(&v.args)),
++            ast::Expr::List(v) => E::List(Cursor::Exprs(&v.items)),
++            ast::Expr::Map(v) => E::Map(Cursor::Map(&v.keys, &v.values)),
++        }
++    }
++    fn statement(self, stmt: Self::Stmt) -> S<'s, Self> {
++        match stmt {
++            ast::Stmt::Template(v) => S::Template(Cursor::Body(&v.children)),
++            ast::Stmt::EmitExpr(v) => S::EmitExpr(&v.expr),
++            ast::Stmt::EmitRaw(_) => S::EmitRaw,
++            ast::Stmt::ForLoop(v) => S::For {
++                target: &v.target,
++                iter: &v.iter,
++                filter: v.filter_expr.as_ref(),
++                body: Cursor::Body(&v.body),
++                otherwise: Cursor::Body(&v.else_body),
++            },
++            ast::Stmt::IfCond(v) => S::If(
++                &v.expr,
++                Cursor::Body(&v.true_body),
++                Cursor::Body(&v.false_body),
++            ),
++            ast::Stmt::WithBlock(v) => {
++                S::With(Cursor::Bindings(&v.assignments), Cursor::Body(&v.body))
++            }
++            ast::Stmt::Set(v) => S::Set(&v.target, &v.expr),
++            ast::Stmt::AutoEscape(v) => S::AutoEscape(Cursor::Body(&v.body)),
++            ast::Stmt::FilterBlock(v) => S::FilterBlock(Cursor::Body(&v.body)),
++            ast::Stmt::SetBlock(v) => S::SetBlock(&v.target, Cursor::Body(&v.body)),
++            #[cfg(feature = "multi_template")]
++            ast::Stmt::Block(v) => S::Block(Cursor::Body(&v.body)),
++            #[cfg(feature = "multi_template")]
++            ast::Stmt::Extends(_) => S::Extends,
++            #[cfg(feature = "multi_template")]
++            ast::Stmt::Include(_) => S::Include,
++            #[cfg(feature = "multi_template")]
++            ast::Stmt::Import(v) => S::Import(&v.name),
++            #[cfg(feature = "multi_template")]
++            ast::Stmt::FromImport(v) => S::FromImport(Cursor::Imports(&v.names)),
++            #[cfg(feature = "macros")]
++            ast::Stmt::Macro(v) => S::Macro(v.name, v),
++            #[cfg(feature = "macros")]
++            ast::Stmt::CallBlock(v) => {
++                S::CallBlock(&v.call.expr, Cursor::Args(&v.call.args), &v.macro_decl)
++            }
++            #[cfg(feature = "loop_controls")]
++            ast::Stmt::Continue(_) => S::Continue,
++            #[cfg(feature = "loop_controls")]
++            ast::Stmt::Break(_) => S::Break,
++            ast::Stmt::Do(v) => S::Do(&v.call.expr, Cursor::Args(&v.call.args)),
++        }
++    }
++    #[cfg(feature = "macros")]
++    fn macro_parts(self, value: Self::Macro) -> view::MacroParts<'s, Self> {
++        view::MacroParts {
++            args: Cursor::Exprs(&value.args),
++            defaults: Cursor::Exprs(&value.defaults),
++            body: Cursor::Body(&value.body),
++        }
++    }
++    fn next(self, cursor: Self::Cursor) -> Option<(Item<'s, Self>, Self::Cursor)> {
++        Some(match cursor {
++            Cursor::Body(values) => {
++                let (first, rest) = values.split_first()?;
++                (Item::Stmt(first), Cursor::Body(rest))
++            }
++            Cursor::Exprs(values) => {
++                let (first, rest) = values.split_first()?;
++                (Item::Expr(first), Cursor::Exprs(rest))
++            }
++            Cursor::Args(values) => {
++                let (first, rest) = values.split_first()?;
++                let (ast::CallArg::Pos(v)
++                | ast::CallArg::Kwarg(_, v)
++                | ast::CallArg::PosSplat(v)
++                | ast::CallArg::KwargSplat(v)) = first;
++                (Item::Expr(v), Cursor::Args(rest))
++            }
++            Cursor::Comparisons(values) => {
++                let (first, rest) = values.split_first()?;
++                (Item::Expr(&first.expr), Cursor::Comparisons(rest))
++            }
++            Cursor::Map(keys, values) => {
++                let (key, keys) = keys.split_first()?;
++                let (value, values) = values.split_first()?;
++                (Item::Pair(key, Some(value)), Cursor::Map(keys, values))
++            }
++            Cursor::Bindings(values) => {
++                let ((key, value), rest) = values.split_first()?;
++                (Item::Pair(key, Some(value)), Cursor::Bindings(rest))
++            }
++            #[cfg(feature = "multi_template")]
++            Cursor::Imports(values) => {
++                let ((key, value), rest) = values.split_first()?;
++                (Item::Pair(key, value.as_ref()), Cursor::Imports(rest))
++            }
++        })
++    }
++}
++
++pub(super) struct State<'t, 's: 't> {
++    pub(super) out: HashSet<&'s str>,
++    pub(super) nested_out: Option<HashSet<String>>,
++    assigned: Vec<HashSet<&'s str>>,
++    tasks: Vec<Task<'s, Ordinary<'t, 's>>>,
++}
++impl<'t, 's: 't> State<'t, 's> {
++    pub(super) fn new(nested: bool) -> Self {
++        // Preserve the original HashSet creation order. The explicit traversal
++        // vector creates no hash state and begins empty.
++        Self {
++            out: HashSet::new(),
++            nested_out: if nested { Some(HashSet::new()) } else { None },
++            assigned: vec![Default::default()],
++            tasks: Vec::new(),
++        }
++    }
++    fn assign_nested(&mut self, name: String) {
++        if let Some(ref mut nested_out) = self.nested_out {
++            if !nested_out.contains(&name) {
++                nested_out.insert(name);
++            }
++        }
++    }
++}
++impl<'t, 's: 't> view::Storage<'s, Ordinary<'t, 's>> for State<'t, 's> {
++    type Error = Infallible;
++    type Nested = Vec<&'s str>;
++    fn push_task(&mut self, task: Task<'s, Ordinary<'t, 's>>) -> Result<(), Infallible> {
++        self.tasks.push(task);
++        Ok(())
++    }
++    fn pop_task(&mut self) -> Option<Task<'s, Ordinary<'t, 's>>> {
++        self.tasks.pop()
++    }
++    fn is_assigned(&self, name: &str) -> bool {
++        self.assigned.iter().any(|x| x.contains(name))
++    }
++    fn assign(&mut self, name: &'s str) -> Result<(), Infallible> {
++        self.assigned.last_mut().unwrap().insert(name);
++        Ok(())
++    }
++    fn capture(&mut self, name: &'s str) -> Result<(), Infallible> {
++        self.out.insert(name);
++        Ok(())
++    }
++    fn push_scope(&mut self) -> Result<(), Infallible> {
++        self.assigned.push(Default::default());
++        Ok(())
++    }
++    fn pop_scope(&mut self) -> Result<(), Infallible> {
++        self.assigned.pop();
++        Ok(())
++    }
++    fn tracks_nested(&self) -> bool {
++        self.nested_out.is_some()
++    }
++    fn nested_start(&mut self, attr: &'s str) -> Result<Self::Nested, Infallible> {
++        Ok(vec![attr])
++    }
++    fn nested_attr(&mut self, attrs: &mut Self::Nested, attr: &'s str) -> Result<(), Infallible> {
++        attrs.push(attr);
++        Ok(())
++    }
++    fn nested_finish(&mut self, attrs: Self::Nested, root: &'s str) -> Result<(), Infallible> {
++        let mut name = root.to_string();
++        for attr in attrs.iter().rev() {
++            write!(name, ".{attr}").ok();
++        }
++        self.assign_nested(name);
++        Ok(())
++    }
++    fn nested_variable(&mut self, name: &'s str) -> Result<(), Infallible> {
++        self.assign_nested(name.to_string());
++        Ok(())
++    }
++}
+--- /dev/null
++++ b/src/compiler/meta/reference.rs
+@@ -0,0 +1,313 @@
++use std::collections::HashSet;
++use std::fmt::Write;
++
++use crate::compiler::ast;
++
++struct AssignmentTracker<'a> {
++    out: HashSet<&'a str>,
++    nested_out: Option<HashSet<String>>,
++    assigned: Vec<HashSet<&'a str>>,
++}
++
++impl<'a> AssignmentTracker<'a> {
++    fn is_assigned(&self, name: &str) -> bool {
++        self.assigned.iter().any(|x| x.contains(name))
++    }
++
++    fn assign(&mut self, name: &'a str) {
++        self.assigned.last_mut().unwrap().insert(name);
++    }
++
++    fn assign_nested(&mut self, name: String) {
++        if let Some(ref mut nested_out) = self.nested_out {
++            if !nested_out.contains(&name) {
++                nested_out.insert(name);
++            }
++        }
++    }
++
++    fn push(&mut self) {
++        self.assigned.push(Default::default());
++    }
++
++    fn pop(&mut self) {
++        self.assigned.pop();
++    }
++}
++
++/// Finds all variables that need to be captured as closure for a macro.
++#[cfg(feature = "macros")]
++pub fn find_macro_closure<'a>(m: &ast::Macro<'a>) -> HashSet<&'a str> {
++    let mut state = AssignmentTracker {
++        out: HashSet::new(),
++        nested_out: None,
++        assigned: vec![Default::default()],
++    };
++    tracker_visit_macro(m, &mut state, false);
++    state.out
++}
++
++/// Finds all variables that are undeclared in a template.
++pub fn find_undeclared(t: &ast::Stmt<'_>, track_nested: bool) -> HashSet<String> {
++    let mut state = AssignmentTracker {
++        out: HashSet::new(),
++        nested_out: if track_nested {
++            Some(HashSet::new())
++        } else {
++            None
++        },
++        assigned: vec![Default::default()],
++    };
++    track_walk(t, &mut state);
++    if let Some(nested) = state.nested_out {
++        nested
++    } else {
++        state.out.into_iter().map(|x| x.to_string()).collect()
++    }
++}
++
++fn tracker_visit_expr_opt<'a>(expr: &Option<ast::Expr<'a>>, state: &mut AssignmentTracker<'a>) {
++    if let Some(expr) = expr {
++        tracker_visit_expr(expr, state);
++    }
++}
++
++#[cfg(feature = "macros")]
++fn tracker_visit_macro<'a>(
++    m: &ast::Macro<'a>,
++    state: &mut AssignmentTracker<'a>,
++    declare_caller: bool,
++) {
++    if declare_caller {
++        // this is not completely correct as caller is actually only defined
++        // if the macro was used in the context of a call block.  However it
++        // is impossible to determine this at compile time so we err on the
++        // side of assuming caller is there.
++        state.assign("caller");
++    }
++    m.args.iter().for_each(|arg| track_assign(arg, state));
++    m.defaults
++        .iter()
++        .for_each(|expr| tracker_visit_expr(expr, state));
++    m.body.iter().for_each(|node| track_walk(node, state));
++}
++
++fn tracker_visit_callarg<'a>(callarg: &ast::CallArg<'a>, state: &mut AssignmentTracker<'a>) {
++    match callarg {
++        ast::CallArg::Pos(expr)
++        | ast::CallArg::Kwarg(_, expr)
++        | ast::CallArg::PosSplat(expr)
++        | ast::CallArg::KwargSplat(expr) => tracker_visit_expr(expr, state),
++    }
++}
++
++fn tracker_visit_expr<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a>) {
++    match expr {
++        ast::Expr::Var(var) => {
++            if !state.is_assigned(var.id) {
++                state.out.insert(var.id);
++                // if we are not tracking nested assignments, we can consider a variable
++                // to be assigned the first time we perform a lookup.
++                if state.nested_out.is_none() {
++                    state.assign(var.id);
++                } else {
++                    state.assign_nested(var.id.to_string());
++                }
++            }
++        }
++        ast::Expr::Const(_) => {}
++        ast::Expr::UnaryOp(expr) => tracker_visit_expr(&expr.expr, state),
++        ast::Expr::BinOp(expr) => {
++            tracker_visit_expr(&expr.left, state);
++            tracker_visit_expr(&expr.right, state);
++        }
++        ast::Expr::Compare(expr) => {
++            tracker_visit_expr(&expr.expr, state);
++            expr.ops
++                .iter()
++                .for_each(|op| tracker_visit_expr(&op.expr, state));
++        }
++        ast::Expr::IfExpr(expr) => {
++            tracker_visit_expr(&expr.test_expr, state);
++            tracker_visit_expr(&expr.true_expr, state);
++            tracker_visit_expr_opt(&expr.false_expr, state);
++        }
++        ast::Expr::Filter(expr) => {
++            tracker_visit_expr_opt(&expr.expr, state);
++            expr.args
++                .iter()
++                .for_each(|x| tracker_visit_callarg(x, state));
++        }
++        ast::Expr::Test(expr) => {
++            tracker_visit_expr(&expr.expr, state);
++            expr.args
++                .iter()
++                .for_each(|x| tracker_visit_callarg(x, state));
++        }
++        ast::Expr::GetAttr(expr) => {
++            // if we are tracking nested, we check if we have a chain of attribute
++            // lookups that terminate in a variable lookup.  In that case we can
++            // assign the nested lookup.
++            if state.nested_out.is_some() {
++                let mut attrs = vec![expr.name];
++                let mut ptr = &expr.expr;
++                loop {
++                    match ptr {
++                        ast::Expr::Var(var) => {
++                            if !state.is_assigned(var.id) {
++                                let mut rv = var.id.to_string();
++                                for attr in attrs.iter().rev() {
++                                    write!(rv, ".{attr}").ok();
++                                }
++                                state.assign_nested(rv);
++                                return;
++                            } else {
++                                break;
++                            }
++                        }
++                        ast::Expr::GetAttr(expr) => {
++                            attrs.push(expr.name);
++                            ptr = &expr.expr;
++                            continue;
++                        }
++                        _ => break,
++                    }
++                }
++            }
++            tracker_visit_expr(&expr.expr, state)
++        }
++        ast::Expr::GetItem(expr) => {
++            tracker_visit_expr(&expr.expr, state);
++            tracker_visit_expr(&expr.subscript_expr, state);
++        }
++        ast::Expr::Slice(slice) => {
++            tracker_visit_expr_opt(&slice.start, state);
++            tracker_visit_expr_opt(&slice.stop, state);
++            tracker_visit_expr_opt(&slice.step, state);
++        }
++        ast::Expr::Call(expr) => {
++            tracker_visit_expr(&expr.expr, state);
++            expr.args
++                .iter()
++                .for_each(|x| tracker_visit_callarg(x, state));
++        }
++        ast::Expr::List(expr) => expr.items.iter().for_each(|x| tracker_visit_expr(x, state)),
++        ast::Expr::Map(expr) => expr.keys.iter().zip(expr.values.iter()).for_each(|(k, v)| {
++            tracker_visit_expr(k, state);
++            tracker_visit_expr(v, state);
++        }),
++    }
++}
++
++fn track_assign<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a>) {
++    match expr {
++        ast::Expr::Var(var) => state.assign(var.id),
++        ast::Expr::List(list) => list.items.iter().for_each(|x| track_assign(x, state)),
++        _ => {}
++    }
++}
++
++fn track_walk<'a>(node: &ast::Stmt<'a>, state: &mut AssignmentTracker<'a>) {
++    match node {
++        ast::Stmt::Template(stmt) => {
++            state.assign("self");
++            stmt.children.iter().for_each(|x| track_walk(x, state));
++        }
++        ast::Stmt::EmitExpr(expr) => tracker_visit_expr(&expr.expr, state),
++        ast::Stmt::EmitRaw(_) => {}
++        ast::Stmt::ForLoop(stmt) => {
++            state.push();
++            state.assign("loop");
++            tracker_visit_expr(&stmt.iter, state);
++            track_assign(&stmt.target, state);
++            tracker_visit_expr_opt(&stmt.filter_expr, state);
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++            state.push();
++            stmt.else_body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        ast::Stmt::IfCond(stmt) => {
++            tracker_visit_expr(&stmt.expr, state);
++            state.push();
++            stmt.true_body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++            state.push();
++            stmt.false_body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        ast::Stmt::WithBlock(stmt) => {
++            state.push();
++            for (target, expr) in &stmt.assignments {
++                track_assign(target, state);
++                tracker_visit_expr(expr, state);
++            }
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        ast::Stmt::Set(stmt) => {
++            track_assign(&stmt.target, state);
++            tracker_visit_expr(&stmt.expr, state);
++        }
++        ast::Stmt::AutoEscape(stmt) => {
++            state.push();
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        ast::Stmt::FilterBlock(stmt) => {
++            state.push();
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        ast::Stmt::SetBlock(stmt) => {
++            track_assign(&stmt.target, state);
++            state.push();
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        #[cfg(feature = "multi_template")]
++        ast::Stmt::Block(stmt) => {
++            state.push();
++            state.assign("super");
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        #[cfg(feature = "multi_template")]
++        ast::Stmt::Extends(_) | ast::Stmt::Include(_) => {}
++        #[cfg(feature = "multi_template")]
++        ast::Stmt::Import(stmt) => {
++            track_assign(&stmt.name, state);
++        }
++        #[cfg(feature = "multi_template")]
++        ast::Stmt::FromImport(stmt) => stmt.names.iter().for_each(|(arg, alias)| {
++            track_assign(alias.as_ref().unwrap_or(arg), state);
++        }),
++        #[cfg(feature = "macros")]
++        ast::Stmt::Macro(stmt) => {
++            state.assign(stmt.name);
++            state.push();
++            tracker_visit_macro(stmt, state, true);
++            state.pop();
++        }
++        #[cfg(feature = "macros")]
++        ast::Stmt::CallBlock(stmt) => {
++            tracker_visit_expr(&stmt.call.expr, state);
++            stmt.call
++                .args
++                .iter()
++                .for_each(|x| tracker_visit_callarg(x, state));
++            state.push();
++            tracker_visit_macro(&stmt.macro_decl, state, true);
++            state.pop();
++        }
++        #[cfg(feature = "loop_controls")]
++        ast::Stmt::Continue(_) | ast::Stmt::Break(_) => {}
++        ast::Stmt::Do(stmt) => {
++            tracker_visit_expr(&stmt.call.expr, state);
++            stmt.call
++                .args
++                .iter()
++                .for_each(|x| tracker_visit_callarg(x, state));
++        }
++    }
++}
+--- /dev/null
++++ b/src/compiler/meta/shared.rs
+@@ -0,0 +1,224 @@
++//! One metadata walk for ordinary AST and source-bound flat syntax.
++#![forbid(unsafe_code)]
++use super::view::{Expression as E, Item, SequenceKind as K, Statement as S, Storage, Task, View};
++
++pub(crate) fn run<'s, V: View<'s>, T: Storage<'s, V>>(
++    view: V,
++    state: &mut T,
++    root: Task<'s, V>,
++) -> Result<(), T::Error> {
++    state.push_task(root)?;
++    while let Some(task) = state.pop_task() {
++        match task {
++            Task::Name(name) => state.assign(name)?,
++            Task::PushScope => state.push_scope()?,
++            Task::PopScope => state.pop_scope()?,
++            Task::Assign(expr) => match view.expression(expr) {
++                E::Var(name) => state.assign(name)?,
++                E::List(items) => state.push_task(Task::Sequence(K::Assign, items))?,
++                _ => {}
++            },
++            Task::Expr(expr) => match view.expression(expr) {
++                E::Var(name) => {
++                    if !state.is_assigned(name) {
++                        state.capture(name)?;
++                        if state.tracks_nested() {
++                            state.nested_variable(name)?;
++                        } else {
++                            state.assign(name)?;
++                        }
++                    }
++                }
++                E::Const => {}
++                E::Unary(child) => state.push_task(Task::Expr(child))?,
++                E::Binary(left, right) | E::Item(left, right) => {
++                    state.push_task(Task::Expr(right))?;
++                    state.push_task(Task::Expr(left))?;
++                }
++                E::Compare(root, rest) | E::Test(root, rest) | E::Call(root, rest) => {
++                    state.push_task(Task::Sequence(K::Lookup, rest))?;
++                    state.push_task(Task::Expr(root))?;
++                }
++                E::If(test, yes, no) => {
++                    if let Some(no) = no {
++                        state.push_task(Task::Expr(no))?;
++                    }
++                    state.push_task(Task::Expr(yes))?;
++                    state.push_task(Task::Expr(test))?;
++                }
++                E::Filter(root, rest) => {
++                    state.push_task(Task::Sequence(K::Lookup, rest))?;
++                    if let Some(root) = root {
++                        state.push_task(Task::Expr(root))?;
++                    }
++                }
++                E::Attr(base, name) => {
++                    let mut recorded = false;
++                    if state.tracks_nested() {
++                        let mut attrs = state.nested_start(name)?;
++                        let mut ptr = base;
++                        loop {
++                            match view.expression(ptr) {
++                                E::Var(name) => {
++                                    if !state.is_assigned(name) {
++                                        state.nested_finish(attrs, name)?;
++                                        recorded = true;
++                                    }
++                                    break;
++                                }
++                                E::Attr(child, name) => {
++                                    state.nested_attr(&mut attrs, name)?;
++                                    ptr = child;
++                                }
++                                _ => break,
++                            }
++                        }
++                    }
++                    if !recorded {
++                        state.push_task(Task::Expr(base))?;
++                    }
++                }
++                E::Slice(start, stop, step) => {
++                    // Preserve metadata's existing omission of the slice base.
++                    if let Some(step) = step {
++                        state.push_task(Task::Expr(step))?;
++                    }
++                    if let Some(stop) = stop {
++                        state.push_task(Task::Expr(stop))?;
++                    }
++                    if let Some(start) = start {
++                        state.push_task(Task::Expr(start))?;
++                    }
++                }
++                E::List(items) => state.push_task(Task::Sequence(K::Lookup, items))?,
++                E::Map(items) => state.push_task(Task::Sequence(K::Map, items))?,
++            },
++            #[cfg(feature = "macros")]
++            Task::Macro(value, declare_caller) => {
++                let parts = view.macro_parts(value);
++                state.push_task(Task::Sequence(K::Body, parts.body))?;
++                state.push_task(Task::Sequence(K::Lookup, parts.defaults))?;
++                state.push_task(Task::Sequence(K::Assign, parts.args))?;
++                if declare_caller {
++                    state.push_task(Task::Name("caller"))?;
++                }
++            }
++            Task::Sequence(kind, cursor) => {
++                if let Some((item, rest)) = view.next(cursor) {
++                    state.push_task(Task::Sequence(kind, rest))?;
++                    match (kind, item) {
++                        (K::Body, Item::Stmt(stmt)) => state.push_task(Task::Stmt(stmt))?,
++                        (K::Lookup, Item::Expr(expr)) => state.push_task(Task::Expr(expr))?,
++                        (K::Assign, Item::Expr(expr)) => state.push_task(Task::Assign(expr))?,
++                        (K::Map, Item::Pair(key, Some(value))) => {
++                            state.push_task(Task::Expr(value))?;
++                            state.push_task(Task::Expr(key))?;
++                        }
++                        (K::Binding, Item::Pair(target, Some(value))) => {
++                            state.push_task(Task::Expr(value))?;
++                            state.push_task(Task::Assign(target))?;
++                        }
++                        #[cfg(feature = "multi_template")]
++                        (K::Import, Item::Pair(name, alias)) => {
++                            state.push_task(Task::Assign(alias.unwrap_or(name)))?;
++                        }
++                        _ => unreachable!("private metadata cursor kind"),
++                    }
++                }
++            }
++            Task::Stmt(stmt) => match view.statement(stmt) {
++                S::Template(children) => {
++                    state.push_task(Task::Sequence(K::Body, children))?;
++                    state.push_task(Task::Name("self"))?;
++                }
++                S::EmitExpr(expr) => state.push_task(Task::Expr(expr))?,
++                S::EmitRaw => {}
++                S::For {
++                    target,
++                    iter,
++                    filter,
++                    body,
++                    otherwise,
++                } => {
++                    state.push_task(Task::PopScope)?;
++                    state.push_task(Task::Sequence(K::Body, otherwise))?;
++                    state.push_task(Task::PushScope)?;
++                    state.push_task(Task::PopScope)?;
++                    state.push_task(Task::Sequence(K::Body, body))?;
++                    if let Some(filter) = filter {
++                        state.push_task(Task::Expr(filter))?;
++                    }
++                    state.push_task(Task::Assign(target))?;
++                    state.push_task(Task::Expr(iter))?;
++                    state.push_task(Task::Name("loop"))?;
++                    state.push_task(Task::PushScope)?;
++                }
++                S::If(test, yes, no) => {
++                    state.push_task(Task::PopScope)?;
++                    state.push_task(Task::Sequence(K::Body, no))?;
++                    state.push_task(Task::PushScope)?;
++                    state.push_task(Task::PopScope)?;
++                    state.push_task(Task::Sequence(K::Body, yes))?;
++                    state.push_task(Task::PushScope)?;
++                    state.push_task(Task::Expr(test))?;
++                }
++                S::With(bindings, body) => {
++                    state.push_task(Task::PopScope)?;
++                    state.push_task(Task::Sequence(K::Body, body))?;
++                    state.push_task(Task::Sequence(K::Binding, bindings))?;
++                    state.push_task(Task::PushScope)?;
++                }
++                S::Set(target, value) => {
++                    state.push_task(Task::Expr(value))?;
++                    state.push_task(Task::Assign(target))?;
++                }
++                S::AutoEscape(body) | S::FilterBlock(body) => {
++                    state.push_task(Task::PopScope)?;
++                    state.push_task(Task::Sequence(K::Body, body))?;
++                    state.push_task(Task::PushScope)?;
++                }
++                S::SetBlock(target, body) => {
++                    state.push_task(Task::PopScope)?;
++                    state.push_task(Task::Sequence(K::Body, body))?;
++                    state.push_task(Task::PushScope)?;
++                    state.push_task(Task::Assign(target))?;
++                }
++                #[cfg(feature = "multi_template")]
++                S::Block(body) => {
++                    state.push_task(Task::PopScope)?;
++                    state.push_task(Task::Sequence(K::Body, body))?;
++                    state.push_task(Task::Name("super"))?;
++                    state.push_task(Task::PushScope)?;
++                }
++                #[cfg(feature = "multi_template")]
++                S::Extends | S::Include => {}
++                #[cfg(feature = "multi_template")]
++                S::Import(name) => state.push_task(Task::Assign(name))?,
++                #[cfg(feature = "multi_template")]
++                S::FromImport(names) => state.push_task(Task::Sequence(K::Import, names))?,
++                #[cfg(feature = "macros")]
++                S::Macro(name, value) => {
++                    state.push_task(Task::PopScope)?;
++                    state.push_task(Task::Macro(value, true))?;
++                    state.push_task(Task::PushScope)?;
++                    state.push_task(Task::Name(name))?;
++                }
++                #[cfg(feature = "macros")]
++                S::CallBlock(receiver, args, value) => {
++                    state.push_task(Task::PopScope)?;
++                    state.push_task(Task::Macro(value, true))?;
++                    state.push_task(Task::PushScope)?;
++                    state.push_task(Task::Sequence(K::Lookup, args))?;
++                    state.push_task(Task::Expr(receiver))?;
++                }
++                #[cfg(feature = "loop_controls")]
++                S::Continue | S::Break => {}
++                S::Do(receiver, args) => {
++                    state.push_task(Task::Sequence(K::Lookup, args))?;
++                    state.push_task(Task::Expr(receiver))?;
++                }
++            },
++        }
++    }
++    Ok(())
++}
+--- /dev/null
++++ b/src/compiler/meta/tests.rs
+@@ -0,0 +1,245 @@
++#![forbid(unsafe_code)]
++use super::view::Storage;
++use super::*;
++use crate::compiler::parser;
++
++#[test]
++fn ordinary_undeclared_and_dotted_paths_match_untouched_reference_quirks() {
++    for source in [
++        "{{ a.b.c }} {{ a.b }} {{ a }} {{ a.b.c }}",
++        "{% set a = a.b %}{{ a.c }} {{ free.attr }}",
++        "{% with a = a.path, b = a.other %}{{ a }} {{ b }} {{ c.d }}{% endwith %}{{ c.d }}",
++        "{% for x in x %}{{ loop.index }}{{ x }}{{ free.a }}{% else %}{{ x }}{{ free.a }}{% endfor %}",
++        "{% if cond %}{{ a.b }}{% else %}{{ a }}{% endif %}{{ a.b }}",
++        "{{ base[start:stop:step] }}{{ constant.attr }} {{ (f()).attr }}",
++        "{% autoescape omitted %}{{ kept }}{% endautoescape %}{% filter trim(omitted) %}{{ kept }}{% endfilter %}",
++        "{% set x | trim(omitted) %}{{ body }}{% endset %}{{ x }}",
++        "{{ f(x, named=y, *args, **kwargs) }} {{ [one, two] }} {{ {key: value} }}",
++    ] {
++        let ast = parser::parse(source, "meta", Default::default(), Default::default()).unwrap();
++        for nested in [false, true] {
++            assert_eq!(find_undeclared(&ast, nested), reference::find_undeclared(&ast, nested), "{source}; nested={nested}");
++        }
++    }
++    let ast = parser::parse(
++        "{{ omitted[a:b:c] }}",
++        "slice",
++        Default::default(),
++        Default::default(),
++    )
++    .unwrap();
++    assert_eq!(
++        find_undeclared(&ast, false),
++        ["a", "b", "c"].into_iter().map(str::to_owned).collect()
++    );
++}
++
++#[cfg(feature = "multi_template")]
++#[test]
++fn ordinary_import_and_block_metadata_keeps_existing_omitted_sources() {
++    let source = "{% extends ignored %}{% include also_ignored %}{% import imported_source as imp %}{% from another_source import a, b as c %}{% block test %}{{ super() }}{{ self.test() }}{{ imp }}{{ a }}{{ c }}{{ external }}{% endblock %}";
++    let ast = parser::parse(source, "meta", Default::default(), Default::default()).unwrap();
++    for nested in [false, true] {
++        assert_eq!(
++            find_undeclared(&ast, nested),
++            reference::find_undeclared(&ast, nested)
++        );
++    }
++    assert_eq!(
++        find_undeclared(&ast, false),
++        ["external"].into_iter().map(str::to_owned).collect()
++    );
++}
++
++#[cfg(feature = "macros")]
++#[test]
++fn ordinary_compiler_macro_defaults_and_caller_keep_real_render_behavior() {
++    let mut env = crate::Environment::new();
++    env.add_template(
++        "macro",
++        "{% macro twice(x, suffix='!') %}{{ x }}{{ x }}{{ suffix }}{% endmacro %}{{ twice(word) }}",
++    )
++    .unwrap();
++    assert_eq!(
++        env.get_template("macro")
++            .unwrap()
++            .render(crate::context!(word => "ab"))
++            .unwrap(),
++        "abab!"
++    );
++    env.add_template("caller", "{% macro wrapper(x) %}[{{ caller(x) }}]{% endmacro %}{% call(value) wrapper(word) %}{{ value }}{{ extra }}{% endcall %}").unwrap();
++    assert_eq!(
++        env.get_template("caller")
++            .unwrap()
++            .render(crate::context!(word => "ab", extra => "!"))
++            .unwrap(),
++        "[ab!]"
++    );
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub(super) enum Event {
++    Lookup(String, bool),
++    Assign(String),
++    Capture(String),
++    Nested(String),
++    Push,
++    Pop,
++}
++thread_local! { static EVENTS: std::cell::RefCell<Vec<Event>> = const { std::cell::RefCell::new(Vec::new()) }; }
++pub(super) fn record(event: Event) {
++    EVENTS.with(|events| events.borrow_mut().push(event));
++}
++fn traced(f: impl FnOnce()) -> Vec<Event> {
++    EVENTS.with(|events| events.borrow_mut().clear());
++    f();
++    EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
++}
++
++struct Traced<'t, 's: 't>(ordinary::State<'t, 's>);
++impl<'t, 's: 't> view::Storage<'s, ordinary::Ordinary<'t, 's>> for Traced<'t, 's> {
++    type Error = std::convert::Infallible;
++    type Nested = Vec<&'s str>;
++    fn push_task(
++        &mut self,
++        task: view::Task<'s, ordinary::Ordinary<'t, 's>>,
++    ) -> Result<(), Self::Error> {
++        self.0.push_task(task)
++    }
++    fn pop_task(&mut self) -> Option<view::Task<'s, ordinary::Ordinary<'t, 's>>> {
++        self.0.pop_task()
++    }
++    fn is_assigned(&self, name: &str) -> bool {
++        let found = self.0.is_assigned(name);
++        record(Event::Lookup(name.into(), found));
++        found
++    }
++    fn assign(&mut self, name: &'s str) -> Result<(), Self::Error> {
++        record(Event::Assign(name.into()));
++        self.0.assign(name)
++    }
++    fn capture(&mut self, name: &'s str) -> Result<(), Self::Error> {
++        record(Event::Capture(name.into()));
++        self.0.capture(name)
++    }
++    fn push_scope(&mut self) -> Result<(), Self::Error> {
++        record(Event::Push);
++        self.0.push_scope()
++    }
++    fn pop_scope(&mut self) -> Result<(), Self::Error> {
++        record(Event::Pop);
++        self.0.pop_scope()
++    }
++    fn tracks_nested(&self) -> bool {
++        self.0.tracks_nested()
++    }
++    fn nested_start(&mut self, attr: &'s str) -> Result<Self::Nested, Self::Error> {
++        self.0.nested_start(attr)
++    }
++    fn nested_attr(&mut self, attrs: &mut Self::Nested, attr: &'s str) -> Result<(), Self::Error> {
++        self.0.nested_attr(attrs, attr)
++    }
++    fn nested_finish(&mut self, attrs: Self::Nested, root: &'s str) -> Result<(), Self::Error> {
++        use std::fmt::Write;
++        let mut name = root.to_string();
++        for attr in attrs.iter().rev() {
++            write!(name, ".{attr}").unwrap();
++        }
++        record(Event::Nested(name));
++        self.0.nested_finish(attrs, root)
++    }
++    fn nested_variable(&mut self, name: &'s str) -> Result<(), Self::Error> {
++        record(Event::Nested(name.into()));
++        self.0.nested_variable(name)
++    }
++}
++
++#[test]
++fn shared_scope_lookup_assignment_and_capture_actions_preserve_original_order() {
++    for source in [
++        "{{ a.b.c }} {{ a }} {{ a.b.c }} {{ (f()).attr }}",
++        "{% set a = a %}{% with b=b, c=b %}{{ free }}{% endwith %}{{ free }}",
++        "{% if condition %}{{ x }}{% else %}{{ y }}{% endif %}{{ x }}{{ y }}",
++        "{% for item in item %}{{ loop }}{{ item }}{{ x }}{% else %}{{ item }}{{ x }}{% endfor %}",
++        "{{ base[a:b:c] }} {% autoescape omitted %}{{ x }}{% endautoescape %}{% set result | trim(omitted) %}{{ x }}{% endset %}",
++    ] {
++        let ast = parser::parse(source, "trace", Default::default(), Default::default()).unwrap();
++        for nested in [false, true] {
++            let expected = traced(|| { let _ = trace_reference::find_undeclared(&ast, nested); });
++            let actual = traced(|| { let mut state = Traced(ordinary::State::new(nested)); shared::run(ordinary::Ordinary::new(), &mut state, view::Task::Stmt(&ast)).unwrap(); assert_eq!(state.tracks_nested(), nested); });
++            assert_eq!(actual, expected, "{source}; nested={nested}");
++        }
++    }
++}
++
++#[cfg(feature = "macros")]
++#[test]
++fn macro_root_and_nested_caller_action_order_matches_traced_original() {
++    let ast = parser::parse("{% macro m(a, b=default) %}{{ caller }}{% macro n(x) %}{{ caller }}{{ a }}{{ free }}{% endmacro %}{{ n(a) }}{% endmacro %}", "trace", Default::default(), Default::default()).unwrap();
++    let ast::Stmt::Template(root) = &ast else {
++        panic!("template")
++    };
++    let ast::Stmt::Macro(m) = &root.children[0] else {
++        panic!("macro")
++    };
++    let expected = traced(|| {
++        let _ = trace_reference::find_macro_closure(m);
++    });
++    let actual = traced(|| {
++        let mut state = Traced(ordinary::State::new(false));
++        shared::run(
++            ordinary::Ordinary::new(),
++            &mut state,
++            view::Task::Macro(&**m, false),
++        )
++        .unwrap();
++    });
++    assert_eq!(actual, expected);
++}
++
++#[cfg(all(feature = "macros", feature = "multi_template"))]
++#[test]
++fn ordinary_dynamic_lookup_order_matches_that_same_compiled_enclose_group() {
++    use crate::{
++        compiler::instructions::Instruction,
++        value::{Object, Value},
++    };
++    use std::sync::{Arc, Mutex};
++    #[derive(Debug)]
++    struct Recorder(Arc<Mutex<Vec<String>>>);
++    impl Object for Recorder {
++        fn get_value_by_str(self: &Arc<Self>, key: &str) -> Option<Value> {
++            let value = match key {
++                "x" => 1,
++                "y" => 2,
++                "z" => 3,
++                _ => return None,
++            };
++            self.0.lock().unwrap().push(key.into());
++            Some(Value::from(value))
++        }
++    }
++    let mut env = crate::Environment::new();
++    env.add_template(
++        "lookup",
++        "{% macro m() %}{{ x }}{{ y }}{{ z }}{% endmacro %}{{ m() }}",
++    )
++    .unwrap();
++    let template = env.get_template("lookup").unwrap();
++    let (instructions, _) = template.instructions_and_blocks().unwrap();
++    let expected: Vec<_> = instructions
++        .instructions
++        .iter()
++        .filter_map(|instruction| match instruction {
++            Instruction::Enclose(name) => Some((*name).to_string()),
++            _ => None,
++        })
++        .collect();
++    assert_eq!(expected.len(), 3);
++    let calls = Arc::new(Mutex::new(Vec::new()));
++    let output = template
++        .render(Value::from_object(Recorder(calls.clone())))
++        .unwrap();
++    assert_eq!(output, "123");
++    assert_eq!(*calls.lock().unwrap(), expected);
++}
+--- /dev/null
++++ b/src/compiler/meta/trace_reference.rs
+@@ -0,0 +1,320 @@
++use std::collections::HashSet;
++use std::fmt::Write;
++
++use crate::compiler::ast;
++
++struct AssignmentTracker<'a> {
++    out: HashSet<&'a str>,
++    nested_out: Option<HashSet<String>>,
++    assigned: Vec<HashSet<&'a str>>,
++}
++
++impl<'a> AssignmentTracker<'a> {
++    fn is_assigned(&self, name: &str) -> bool {
++        let found = self.assigned.iter().any(|x| x.contains(name));
++        super::tests::record(super::tests::Event::Lookup(name.into(), found));
++        found
++    }
++
++    fn assign(&mut self, name: &'a str) {
++        super::tests::record(super::tests::Event::Assign(name.into()));
++        self.assigned.last_mut().unwrap().insert(name);
++    }
++
++    fn assign_nested(&mut self, name: String) {
++        super::tests::record(super::tests::Event::Nested(name.clone()));
++        if let Some(ref mut nested_out) = self.nested_out {
++            if !nested_out.contains(&name) {
++                nested_out.insert(name);
++            }
++        }
++    }
++
++    fn push(&mut self) {
++        super::tests::record(super::tests::Event::Push);
++        self.assigned.push(Default::default());
++    }
++
++    fn pop(&mut self) {
++        super::tests::record(super::tests::Event::Pop);
++        self.assigned.pop();
++    }
++}
++
++/// Finds all variables that need to be captured as closure for a macro.
++#[cfg(feature = "macros")]
++pub fn find_macro_closure<'a>(m: &ast::Macro<'a>) -> HashSet<&'a str> {
++    let mut state = AssignmentTracker {
++        out: HashSet::new(),
++        nested_out: None,
++        assigned: vec![Default::default()],
++    };
++    tracker_visit_macro(m, &mut state, false);
++    state.out
++}
++
++/// Finds all variables that are undeclared in a template.
++pub fn find_undeclared(t: &ast::Stmt<'_>, track_nested: bool) -> HashSet<String> {
++    let mut state = AssignmentTracker {
++        out: HashSet::new(),
++        nested_out: if track_nested {
++            Some(HashSet::new())
++        } else {
++            None
++        },
++        assigned: vec![Default::default()],
++    };
++    track_walk(t, &mut state);
++    if let Some(nested) = state.nested_out {
++        nested
++    } else {
++        state.out.into_iter().map(|x| x.to_string()).collect()
++    }
++}
++
++fn tracker_visit_expr_opt<'a>(expr: &Option<ast::Expr<'a>>, state: &mut AssignmentTracker<'a>) {
++    if let Some(expr) = expr {
++        tracker_visit_expr(expr, state);
++    }
++}
++
++#[cfg(feature = "macros")]
++fn tracker_visit_macro<'a>(
++    m: &ast::Macro<'a>,
++    state: &mut AssignmentTracker<'a>,
++    declare_caller: bool,
++) {
++    if declare_caller {
++        // this is not completely correct as caller is actually only defined
++        // if the macro was used in the context of a call block.  However it
++        // is impossible to determine this at compile time so we err on the
++        // side of assuming caller is there.
++        state.assign("caller");
++    }
++    m.args.iter().for_each(|arg| track_assign(arg, state));
++    m.defaults
++        .iter()
++        .for_each(|expr| tracker_visit_expr(expr, state));
++    m.body.iter().for_each(|node| track_walk(node, state));
++}
++
++fn tracker_visit_callarg<'a>(callarg: &ast::CallArg<'a>, state: &mut AssignmentTracker<'a>) {
++    match callarg {
++        ast::CallArg::Pos(expr)
++        | ast::CallArg::Kwarg(_, expr)
++        | ast::CallArg::PosSplat(expr)
++        | ast::CallArg::KwargSplat(expr) => tracker_visit_expr(expr, state),
++    }
++}
++
++fn tracker_visit_expr<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a>) {
++    match expr {
++        ast::Expr::Var(var) => {
++            if !state.is_assigned(var.id) {
++                super::tests::record(super::tests::Event::Capture(var.id.into()));
++                state.out.insert(var.id);
++                // if we are not tracking nested assignments, we can consider a variable
++                // to be assigned the first time we perform a lookup.
++                if state.nested_out.is_none() {
++                    state.assign(var.id);
++                } else {
++                    state.assign_nested(var.id.to_string());
++                }
++            }
++        }
++        ast::Expr::Const(_) => {}
++        ast::Expr::UnaryOp(expr) => tracker_visit_expr(&expr.expr, state),
++        ast::Expr::BinOp(expr) => {
++            tracker_visit_expr(&expr.left, state);
++            tracker_visit_expr(&expr.right, state);
++        }
++        ast::Expr::Compare(expr) => {
++            tracker_visit_expr(&expr.expr, state);
++            expr.ops
++                .iter()
++                .for_each(|op| tracker_visit_expr(&op.expr, state));
++        }
++        ast::Expr::IfExpr(expr) => {
++            tracker_visit_expr(&expr.test_expr, state);
++            tracker_visit_expr(&expr.true_expr, state);
++            tracker_visit_expr_opt(&expr.false_expr, state);
++        }
++        ast::Expr::Filter(expr) => {
++            tracker_visit_expr_opt(&expr.expr, state);
++            expr.args
++                .iter()
++                .for_each(|x| tracker_visit_callarg(x, state));
++        }
++        ast::Expr::Test(expr) => {
++            tracker_visit_expr(&expr.expr, state);
++            expr.args
++                .iter()
++                .for_each(|x| tracker_visit_callarg(x, state));
++        }
++        ast::Expr::GetAttr(expr) => {
++            // if we are tracking nested, we check if we have a chain of attribute
++            // lookups that terminate in a variable lookup.  In that case we can
++            // assign the nested lookup.
++            if state.nested_out.is_some() {
++                let mut attrs = vec![expr.name];
++                let mut ptr = &expr.expr;
++                loop {
++                    match ptr {
++                        ast::Expr::Var(var) => {
++                            if !state.is_assigned(var.id) {
++                                let mut rv = var.id.to_string();
++                                for attr in attrs.iter().rev() {
++                                    write!(rv, ".{attr}").ok();
++                                }
++                                state.assign_nested(rv);
++                                return;
++                            } else {
++                                break;
++                            }
++                        }
++                        ast::Expr::GetAttr(expr) => {
++                            attrs.push(expr.name);
++                            ptr = &expr.expr;
++                            continue;
++                        }
++                        _ => break,
++                    }
++                }
++            }
++            tracker_visit_expr(&expr.expr, state)
++        }
++        ast::Expr::GetItem(expr) => {
++            tracker_visit_expr(&expr.expr, state);
++            tracker_visit_expr(&expr.subscript_expr, state);
++        }
++        ast::Expr::Slice(slice) => {
++            tracker_visit_expr_opt(&slice.start, state);
++            tracker_visit_expr_opt(&slice.stop, state);
++            tracker_visit_expr_opt(&slice.step, state);
++        }
++        ast::Expr::Call(expr) => {
++            tracker_visit_expr(&expr.expr, state);
++            expr.args
++                .iter()
++                .for_each(|x| tracker_visit_callarg(x, state));
++        }
++        ast::Expr::List(expr) => expr.items.iter().for_each(|x| tracker_visit_expr(x, state)),
++        ast::Expr::Map(expr) => expr.keys.iter().zip(expr.values.iter()).for_each(|(k, v)| {
++            tracker_visit_expr(k, state);
++            tracker_visit_expr(v, state);
++        }),
++    }
++}
++
++fn track_assign<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a>) {
++    match expr {
++        ast::Expr::Var(var) => state.assign(var.id),
++        ast::Expr::List(list) => list.items.iter().for_each(|x| track_assign(x, state)),
++        _ => {}
++    }
++}
++
++fn track_walk<'a>(node: &ast::Stmt<'a>, state: &mut AssignmentTracker<'a>) {
++    match node {
++        ast::Stmt::Template(stmt) => {
++            state.assign("self");
++            stmt.children.iter().for_each(|x| track_walk(x, state));
++        }
++        ast::Stmt::EmitExpr(expr) => tracker_visit_expr(&expr.expr, state),
++        ast::Stmt::EmitRaw(_) => {}
++        ast::Stmt::ForLoop(stmt) => {
++            state.push();
++            state.assign("loop");
++            tracker_visit_expr(&stmt.iter, state);
++            track_assign(&stmt.target, state);
++            tracker_visit_expr_opt(&stmt.filter_expr, state);
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++            state.push();
++            stmt.else_body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        ast::Stmt::IfCond(stmt) => {
++            tracker_visit_expr(&stmt.expr, state);
++            state.push();
++            stmt.true_body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++            state.push();
++            stmt.false_body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        ast::Stmt::WithBlock(stmt) => {
++            state.push();
++            for (target, expr) in &stmt.assignments {
++                track_assign(target, state);
++                tracker_visit_expr(expr, state);
++            }
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        ast::Stmt::Set(stmt) => {
++            track_assign(&stmt.target, state);
++            tracker_visit_expr(&stmt.expr, state);
++        }
++        ast::Stmt::AutoEscape(stmt) => {
++            state.push();
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        ast::Stmt::FilterBlock(stmt) => {
++            state.push();
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        ast::Stmt::SetBlock(stmt) => {
++            track_assign(&stmt.target, state);
++            state.push();
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        #[cfg(feature = "multi_template")]
++        ast::Stmt::Block(stmt) => {
++            state.push();
++            state.assign("super");
++            stmt.body.iter().for_each(|x| track_walk(x, state));
++            state.pop();
++        }
++        #[cfg(feature = "multi_template")]
++        ast::Stmt::Extends(_) | ast::Stmt::Include(_) => {}
++        #[cfg(feature = "multi_template")]
++        ast::Stmt::Import(stmt) => {
++            track_assign(&stmt.name, state);
++        }
++        #[cfg(feature = "multi_template")]
++        ast::Stmt::FromImport(stmt) => stmt.names.iter().for_each(|(arg, alias)| {
++            track_assign(alias.as_ref().unwrap_or(arg), state);
++        }),
++        #[cfg(feature = "macros")]
++        ast::Stmt::Macro(stmt) => {
++            state.assign(stmt.name);
++            state.push();
++            tracker_visit_macro(stmt, state, true);
++            state.pop();
++        }
++        #[cfg(feature = "macros")]
++        ast::Stmt::CallBlock(stmt) => {
++            tracker_visit_expr(&stmt.call.expr, state);
++            stmt.call
++                .args
++                .iter()
++                .for_each(|x| tracker_visit_callarg(x, state));
++            state.push();
++            tracker_visit_macro(&stmt.macro_decl, state, true);
++            state.pop();
++        }
++        #[cfg(feature = "loop_controls")]
++        ast::Stmt::Continue(_) | ast::Stmt::Break(_) => {}
++        ast::Stmt::Do(stmt) => {
++            tracker_visit_expr(&stmt.call.expr, state);
++            stmt.call
++                .args
++                .iter()
++                .for_each(|x| tracker_visit_callarg(x, state));
++        }
++    }
++}
+--- /dev/null
++++ b/src/compiler/meta/view.rs
+@@ -0,0 +1,127 @@
++//! Private borrowed syntax views and capture storage operations.
++#![forbid(unsafe_code)]
++
++#[derive(Clone, Copy)]
++pub(crate) enum Expression<'s, V: View<'s>> {
++    Var(&'s str),
++    Const,
++    Unary(V::Expr),
++    Binary(V::Expr, V::Expr),
++    Compare(V::Expr, V::Cursor),
++    If(V::Expr, V::Expr, Option<V::Expr>),
++    Filter(Option<V::Expr>, V::Cursor),
++    Test(V::Expr, V::Cursor),
++    Attr(V::Expr, &'s str),
++    Item(V::Expr, V::Expr),
++    Slice(Option<V::Expr>, Option<V::Expr>, Option<V::Expr>),
++    Call(V::Expr, V::Cursor),
++    List(V::Cursor),
++    Map(V::Cursor),
++}
++
++#[derive(Clone, Copy)]
++pub(crate) enum Statement<'s, V: View<'s>> {
++    Template(V::Cursor),
++    EmitExpr(V::Expr),
++    EmitRaw,
++    For {
++        target: V::Expr,
++        iter: V::Expr,
++        filter: Option<V::Expr>,
++        body: V::Cursor,
++        otherwise: V::Cursor,
++    },
++    If(V::Expr, V::Cursor, V::Cursor),
++    With(V::Cursor, V::Cursor),
++    Set(V::Expr, V::Expr),
++    SetBlock(V::Expr, V::Cursor),
++    AutoEscape(V::Cursor),
++    FilterBlock(V::Cursor),
++    #[cfg(feature = "multi_template")]
++    Block(V::Cursor),
++    #[cfg(feature = "multi_template")]
++    Extends,
++    #[cfg(feature = "multi_template")]
++    Include,
++    #[cfg(feature = "multi_template")]
++    Import(V::Expr),
++    #[cfg(feature = "multi_template")]
++    FromImport(V::Cursor),
++    #[cfg(feature = "macros")]
++    Macro(&'s str, V::Macro),
++    #[cfg(feature = "macros")]
++    CallBlock(V::Expr, V::Cursor, V::Macro),
++    #[cfg(feature = "loop_controls")]
++    Continue,
++    #[cfg(feature = "loop_controls")]
++    Break,
++    Do(V::Expr, V::Cursor),
++}
++
++#[derive(Clone, Copy)]
++pub(crate) enum Item<'s, V: View<'s>> {
++    Stmt(V::Stmt),
++    Expr(V::Expr),
++    Pair(V::Expr, Option<V::Expr>),
++}
++
++#[cfg(feature = "macros")]
++pub(crate) struct MacroParts<'s, V: View<'s>> {
++    pub(crate) args: V::Cursor,
++    pub(crate) defaults: V::Cursor,
++    pub(crate) body: V::Cursor,
++}
++
++pub(crate) trait View<'s>: Copy {
++    type Expr: Copy;
++    type Stmt: Copy;
++    #[cfg(feature = "macros")]
++    type Macro: Copy;
++    type Cursor: Copy;
++    fn expression(self, expr: Self::Expr) -> Expression<'s, Self>;
++    fn statement(self, stmt: Self::Stmt) -> Statement<'s, Self>;
++    #[cfg(feature = "macros")]
++    fn macro_parts(self, value: Self::Macro) -> MacroParts<'s, Self>;
++    fn next(self, cursor: Self::Cursor) -> Option<(Item<'s, Self>, Self::Cursor)>;
++}
++
++#[derive(Clone, Copy)]
++pub(crate) enum SequenceKind {
++    Body,
++    Lookup,
++    Assign,
++    Map,
++    Binding,
++    #[cfg(feature = "multi_template")]
++    Import,
++}
++
++#[derive(Clone, Copy)]
++pub(crate) enum Task<'s, V: View<'s>> {
++    Stmt(V::Stmt),
++    Expr(V::Expr),
++    Assign(V::Expr),
++    #[cfg(feature = "macros")]
++    Macro(V::Macro, bool),
++    Sequence(SequenceKind, V::Cursor),
++    PushScope,
++    PopScope,
++    Name(&'s str),
++}
++
++pub(crate) trait Storage<'s, V: View<'s>> {
++    type Error;
++    type Nested;
++    fn push_task(&mut self, task: Task<'s, V>) -> Result<(), Self::Error>;
++    fn pop_task(&mut self) -> Option<Task<'s, V>>;
++    fn is_assigned(&self, name: &str) -> bool;
++    fn assign(&mut self, name: &'s str) -> Result<(), Self::Error>;
++    fn capture(&mut self, name: &'s str) -> Result<(), Self::Error>;
++    fn push_scope(&mut self) -> Result<(), Self::Error>;
++    fn pop_scope(&mut self) -> Result<(), Self::Error>;
++    fn tracks_nested(&self) -> bool;
++    fn nested_start(&mut self, attr: &'s str) -> Result<Self::Nested, Self::Error>;
++    fn nested_attr(&mut self, attrs: &mut Self::Nested, attr: &'s str) -> Result<(), Self::Error>;
++    fn nested_finish(&mut self, attrs: Self::Nested, root: &'s str) -> Result<(), Self::Error>;
++    fn nested_variable(&mut self, name: &'s str) -> Result<(), Self::Error>;
++}
+--- a/src/compiler/meta.rs
++++ b/src/compiler/meta.rs
+@@ -1,64 +1,29 @@
++//! Shared ordinary and checked metadata traversal.
++#![forbid(unsafe_code)]
++use crate::compiler::ast;
+ use std::collections::HashSet;
+-use std::fmt::Write;
+ 
+-use crate::compiler::ast;
+-
+-struct AssignmentTracker<'a> {
+-    out: HashSet<&'a str>,
+-    nested_out: Option<HashSet<String>>,
+-    assigned: Vec<HashSet<&'a str>>,
+-}
+-
+-impl<'a> AssignmentTracker<'a> {
+-    fn is_assigned(&self, name: &str) -> bool {
+-        self.assigned.iter().any(|x| x.contains(name))
+-    }
+-
+-    fn assign(&mut self, name: &'a str) {
+-        self.assigned.last_mut().unwrap().insert(name);
+-    }
+-
+-    fn assign_nested(&mut self, name: String) {
+-        if let Some(ref mut nested_out) = self.nested_out {
+-            if !nested_out.contains(&name) {
+-                nested_out.insert(name);
+-            }
+-        }
+-    }
+-
+-    fn push(&mut self) {
+-        self.assigned.push(Default::default());
+-    }
+-
+-    fn pop(&mut self) {
+-        self.assigned.pop();
+-    }
+-}
++mod ordinary;
++pub(crate) mod shared;
++pub(crate) mod view;
+ 
+ /// Finds all variables that need to be captured as closure for a macro.
+ #[cfg(feature = "macros")]
+ pub fn find_macro_closure<'a>(m: &ast::Macro<'a>) -> HashSet<&'a str> {
+-    let mut state = AssignmentTracker {
+-        out: HashSet::new(),
+-        nested_out: None,
+-        assigned: vec![Default::default()],
+-    };
+-    tracker_visit_macro(m, &mut state, false);
++    let mut state = ordinary::State::new(false);
++    shared::run(
++        ordinary::Ordinary::new(),
++        &mut state,
++        view::Task::Macro(m, false),
++    )
++    .unwrap();
+     state.out
+ }
+ 
+ /// Finds all variables that are undeclared in a template.
+ pub fn find_undeclared(t: &ast::Stmt<'_>, track_nested: bool) -> HashSet<String> {
+-    let mut state = AssignmentTracker {
+-        out: HashSet::new(),
+-        nested_out: if track_nested {
+-            Some(HashSet::new())
+-        } else {
+-            None
+-        },
+-        assigned: vec![Default::default()],
+-    };
+-    track_walk(t, &mut state);
++    let mut state = ordinary::State::new(track_nested);
++    shared::run(ordinary::Ordinary::new(), &mut state, view::Task::Stmt(t)).unwrap();
+     if let Some(nested) = state.nested_out {
+         nested
+     } else {
+@@ -66,248 +31,13 @@
+     }
+ }
+ 
+-fn tracker_visit_expr_opt<'a>(expr: &Option<ast::Expr<'a>>, state: &mut AssignmentTracker<'a>) {
+-    if let Some(expr) = expr {
+-        tracker_visit_expr(expr, state);
+-    }
+-}
++#[cfg(test)]
++#[path = "meta/reference.rs"]
++pub(crate) mod reference;
++#[cfg(test)]
++#[path = "meta/tests.rs"]
++mod tests;
+ 
+-#[cfg(feature = "macros")]
+-fn tracker_visit_macro<'a>(
+-    m: &ast::Macro<'a>,
+-    state: &mut AssignmentTracker<'a>,
+-    declare_caller: bool,
+-) {
+-    if declare_caller {
+-        // this is not completely correct as caller is actually only defined
+-        // if the macro was used in the context of a call block.  However it
+-        // is impossible to determine this at compile time so we err on the
+-        // side of assuming caller is there.
+-        state.assign("caller");
+-    }
+-    m.args.iter().for_each(|arg| track_assign(arg, state));
+-    m.defaults
+-        .iter()
+-        .for_each(|expr| tracker_visit_expr(expr, state));
+-    m.body.iter().for_each(|node| track_walk(node, state));
+-}
+-
+-fn tracker_visit_callarg<'a>(callarg: &ast::CallArg<'a>, state: &mut AssignmentTracker<'a>) {
+-    match callarg {
+-        ast::CallArg::Pos(expr)
+-        | ast::CallArg::Kwarg(_, expr)
+-        | ast::CallArg::PosSplat(expr)
+-        | ast::CallArg::KwargSplat(expr) => tracker_visit_expr(expr, state),
+-    }
+-}
+-
+-fn tracker_visit_expr<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a>) {
+-    match expr {
+-        ast::Expr::Var(var) => {
+-            if !state.is_assigned(var.id) {
+-                state.out.insert(var.id);
+-                // if we are not tracking nested assignments, we can consider a variable
+-                // to be assigned the first time we perform a lookup.
+-                if state.nested_out.is_none() {
+-                    state.assign(var.id);
+-                } else {
+-                    state.assign_nested(var.id.to_string());
+-                }
+-            }
+-        }
+-        ast::Expr::Const(_) => {}
+-        ast::Expr::UnaryOp(expr) => tracker_visit_expr(&expr.expr, state),
+-        ast::Expr::BinOp(expr) => {
+-            tracker_visit_expr(&expr.left, state);
+-            tracker_visit_expr(&expr.right, state);
+-        }
+-        ast::Expr::Compare(expr) => {
+-            tracker_visit_expr(&expr.expr, state);
+-            expr.ops
+-                .iter()
+-                .for_each(|op| tracker_visit_expr(&op.expr, state));
+-        }
+-        ast::Expr::IfExpr(expr) => {
+-            tracker_visit_expr(&expr.test_expr, state);
+-            tracker_visit_expr(&expr.true_expr, state);
+-            tracker_visit_expr_opt(&expr.false_expr, state);
+-        }
+-        ast::Expr::Filter(expr) => {
+-            tracker_visit_expr_opt(&expr.expr, state);
+-            expr.args
+-                .iter()
+-                .for_each(|x| tracker_visit_callarg(x, state));
+-        }
+-        ast::Expr::Test(expr) => {
+-            tracker_visit_expr(&expr.expr, state);
+-            expr.args
+-                .iter()
+-                .for_each(|x| tracker_visit_callarg(x, state));
+-        }
+-        ast::Expr::GetAttr(expr) => {
+-            // if we are tracking nested, we check if we have a chain of attribute
+-            // lookups that terminate in a variable lookup.  In that case we can
+-            // assign the nested lookup.
+-            if state.nested_out.is_some() {
+-                let mut attrs = vec![expr.name];
+-                let mut ptr = &expr.expr;
+-                loop {
+-                    match ptr {
+-                        ast::Expr::Var(var) => {
+-                            if !state.is_assigned(var.id) {
+-                                let mut rv = var.id.to_string();
+-                                for attr in attrs.iter().rev() {
+-                                    write!(rv, ".{attr}").ok();
+-                                }
+-                                state.assign_nested(rv);
+-                                return;
+-                            } else {
+-                                break;
+-                            }
+-                        }
+-                        ast::Expr::GetAttr(expr) => {
+-                            attrs.push(expr.name);
+-                            ptr = &expr.expr;
+-                            continue;
+-                        }
+-                        _ => break,
+-                    }
+-                }
+-            }
+-            tracker_visit_expr(&expr.expr, state)
+-        }
+-        ast::Expr::GetItem(expr) => {
+-            tracker_visit_expr(&expr.expr, state);
+-            tracker_visit_expr(&expr.subscript_expr, state);
+-        }
+-        ast::Expr::Slice(slice) => {
+-            tracker_visit_expr_opt(&slice.start, state);
+-            tracker_visit_expr_opt(&slice.stop, state);
+-            tracker_visit_expr_opt(&slice.step, state);
+-        }
+-        ast::Expr::Call(expr) => {
+-            tracker_visit_expr(&expr.expr, state);
+-            expr.args
+-                .iter()
+-                .for_each(|x| tracker_visit_callarg(x, state));
+-        }
+-        ast::Expr::List(expr) => expr.items.iter().for_each(|x| tracker_visit_expr(x, state)),
+-        ast::Expr::Map(expr) => expr.keys.iter().zip(expr.values.iter()).for_each(|(k, v)| {
+-            tracker_visit_expr(k, state);
+-            tracker_visit_expr(v, state);
+-        }),
+-    }
+-}
+-
+-fn track_assign<'a>(expr: &ast::Expr<'a>, state: &mut AssignmentTracker<'a>) {
+-    match expr {
+-        ast::Expr::Var(var) => state.assign(var.id),
+-        ast::Expr::List(list) => list.items.iter().for_each(|x| track_assign(x, state)),
+-        _ => {}
+-    }
+-}
+-
+-fn track_walk<'a>(node: &ast::Stmt<'a>, state: &mut AssignmentTracker<'a>) {
+-    match node {
+-        ast::Stmt::Template(stmt) => {
+-            state.assign("self");
+-            stmt.children.iter().for_each(|x| track_walk(x, state));
+-        }
+-        ast::Stmt::EmitExpr(expr) => tracker_visit_expr(&expr.expr, state),
+-        ast::Stmt::EmitRaw(_) => {}
+-        ast::Stmt::ForLoop(stmt) => {
+-            state.push();
+-            state.assign("loop");
+-            tracker_visit_expr(&stmt.iter, state);
+-            track_assign(&stmt.target, state);
+-            tracker_visit_expr_opt(&stmt.filter_expr, state);
+-            stmt.body.iter().for_each(|x| track_walk(x, state));
+-            state.pop();
+-            state.push();
+-            stmt.else_body.iter().for_each(|x| track_walk(x, state));
+-            state.pop();
+-        }
+-        ast::Stmt::IfCond(stmt) => {
+-            tracker_visit_expr(&stmt.expr, state);
+-            state.push();
+-            stmt.true_body.iter().for_each(|x| track_walk(x, state));
+-            state.pop();
+-            state.push();
+-            stmt.false_body.iter().for_each(|x| track_walk(x, state));
+-            state.pop();
+-        }
+-        ast::Stmt::WithBlock(stmt) => {
+-            state.push();
+-            for (target, expr) in &stmt.assignments {
+-                track_assign(target, state);
+-                tracker_visit_expr(expr, state);
+-            }
+-            stmt.body.iter().for_each(|x| track_walk(x, state));
+-            state.pop();
+-        }
+-        ast::Stmt::Set(stmt) => {
+-            track_assign(&stmt.target, state);
+-            tracker_visit_expr(&stmt.expr, state);
+-        }
+-        ast::Stmt::AutoEscape(stmt) => {
+-            state.push();
+-            stmt.body.iter().for_each(|x| track_walk(x, state));
+-            state.pop();
+-        }
+-        ast::Stmt::FilterBlock(stmt) => {
+-            state.push();
+-            stmt.body.iter().for_each(|x| track_walk(x, state));
+-            state.pop();
+-        }
+-        ast::Stmt::SetBlock(stmt) => {
+-            track_assign(&stmt.target, state);
+-            state.push();
+-            stmt.body.iter().for_each(|x| track_walk(x, state));
+-            state.pop();
+-        }
+-        #[cfg(feature = "multi_template")]
+-        ast::Stmt::Block(stmt) => {
+-            state.push();
+-            state.assign("super");
+-            stmt.body.iter().for_each(|x| track_walk(x, state));
+-            state.pop();
+-        }
+-        #[cfg(feature = "multi_template")]
+-        ast::Stmt::Extends(_) | ast::Stmt::Include(_) => {}
+-        #[cfg(feature = "multi_template")]
+-        ast::Stmt::Import(stmt) => {
+-            track_assign(&stmt.name, state);
+-        }
+-        #[cfg(feature = "multi_template")]
+-        ast::Stmt::FromImport(stmt) => stmt.names.iter().for_each(|(arg, alias)| {
+-            track_assign(alias.as_ref().unwrap_or(arg), state);
+-        }),
+-        #[cfg(feature = "macros")]
+-        ast::Stmt::Macro(stmt) => {
+-            state.assign(stmt.name);
+-            state.push();
+-            tracker_visit_macro(stmt, state, true);
+-            state.pop();
+-        }
+-        #[cfg(feature = "macros")]
+-        ast::Stmt::CallBlock(stmt) => {
+-            tracker_visit_expr(&stmt.call.expr, state);
+-            stmt.call
+-                .args
+-                .iter()
+-                .for_each(|x| tracker_visit_callarg(x, state));
+-            state.push();
+-            tracker_visit_macro(&stmt.macro_decl, state, true);
+-            state.pop();
+-        }
+-        #[cfg(feature = "loop_controls")]
+-        ast::Stmt::Continue(_) | ast::Stmt::Break(_) => {}
+-        ast::Stmt::Do(stmt) => {
+-            tracker_visit_expr(&stmt.call.expr, state);
+-            stmt.call
+-                .args
+-                .iter()
+-                .for_each(|x| tracker_visit_callarg(x, state));
+-        }
+-    }
+-}
++#[cfg(test)]
++#[path = "meta/trace_reference.rs"]
++mod trace_reference;

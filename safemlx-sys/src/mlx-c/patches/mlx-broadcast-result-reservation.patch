@@ -1,0 +1,14 @@
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -1810,6 +1810,10 @@
+   }
+   auto shape = Broadcast::output_shape(inputs);
+   ArrayVector outputs;
++  // The ordinary result has exactly one entry per input. Reserve that count
++  // once so the shared host source's initializer/result/retained-input bound
++  // remains three requests even when every broadcast is an identity.
++  outputs.reserve(inputs.size());
+ 
+   if (!detail::in_dynamic_tracing()) {
+     for (auto& in : inputs) {

@@ -1,0 +1,388 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T02:12:08.460026+00:00",
+  "scope": "Native owner-local terminal retirement fairness",
+  "status": "Verified native retirement repair; complete bounded inference remains unfinished",
+  "previous_increment": "bounded-controller-query-2026-09-14.json",
+  "tests": {
+    "native_patches": {
+      "passed": 50,
+      "existing_doctest_cases": 49,
+      "new_fairness_cases": 1,
+      "skipped": 0
+    },
+    "wrapper": {
+      "passed": 577,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 230,
+      "ignored": 0
+    },
+    "native_observation": {
+      "passed": 10,
+      "ignored": 0
+    },
+    "metal_regression": {
+      "passed": 1,
+      "new_fairness_cases": 1
+    }
+  },
+  "total_passed_executions": 868,
+  "new_test_count": 1,
+  "new_test_executions": 2,
+  "checks": {
+    "native_patches": {
+      "command": "CARGO_INCREMENTAL=0 bash safemlx-sys/scripts/test-mlx-patches.sh /private/tmp/eredu-retirement-fairness-full-cpu-build",
+      "started_utc": "2026-09-14T02:06:59.766066+00:00",
+      "elapsed_seconds": 114.195,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-retirement-fairness-native_patches.log",
+      "log_sha256": "43687cd2c88829aff2d95cf60a231219351a2fdecaca253b38ec56602c316800"
+    },
+    "wrapper": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p safemlx --no-default-features --features metal --lib -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T02:08:53.961251+00:00",
+      "elapsed_seconds": 20.196,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-retirement-fairness-wrapper.log",
+      "log_sha256": "e6b423788e3494a5454788eb8cd019b1137f9720ba58f815ed1f2ebfcfbfdb09"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::model_session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T02:09:14.157847+00:00",
+      "elapsed_seconds": 114.219,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-retirement-fairness-session.log",
+      "log_sha256": "ef6917e646159f55ea44f222649c3b276c5d57c29f9c33ca8669d05bfb602033"
+    },
+    "native_observation": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::observation:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T02:11:08.376730+00:00",
+      "elapsed_seconds": 0.35,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-retirement-fairness-native_observation.log",
+      "log_sha256": "c3363fb032b1ba832655d65bc5bb974521af9ae62c053dec4b8a1cadf38ae270"
+    },
+    "metal_build": {
+      "command": "CARGO_INCREMENTAL=0 cmake --build /Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build --target mlx-submission-retirement-fairness-test --parallel 2",
+      "started_utc": "2026-09-14T02:11:34.489525+00:00",
+      "elapsed_seconds": 2.013,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-retirement-fairness-metal_build.log",
+      "log_sha256": "a58343b7916699f1f025dfafa20d4bd63da8ab12c322bf9b33e1e0747fecee0c"
+    },
+    "metal_regression": {
+      "command": "CARGO_INCREMENTAL=0 /Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build/mlx-submission-retirement-fairness-test",
+      "started_utc": "2026-09-14T02:11:36.502742+00:00",
+      "elapsed_seconds": 0.596,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-retirement-fairness-metal_regression.log",
+      "log_sha256": "8463dbab347bb43cc43e2b776171c5c15f39fccfab064d07475938058fd97b3f"
+    }
+  },
+  "source_sha256": {
+    "safemlx-sys/src/mlx-c/patches/mlx-submission-recovery.patch": "89e4b8189d9373aa30f4dc259a32c5dae62980cca30e37caa53ecd367ee613d2",
+    "safemlx-sys/src/mlx-c/CMakeLists.txt": "ef725fb570f7331214caf33d6c9def9ce87f8c1bd132a575b593cf33a25af838",
+    "safemlx-sys/src/mlx-c/tests/submission_retirement_fairness_test.cpp": "1d0dd1ebc528ad838fa0b02f44ed548a79f4e0139d9b433f50e6b0120313e0cb",
+    "doc/backend-architecture.md": "0a1a670b75481113b9d115a8db6d9cf5c539bad003c4cb4bf01992efa28b6142",
+    "doc/execution-control.md": "d7d8dddbf1e262b3597ec5b8e9bc3e569a2f49854554e76cb5cdb6b592ea143b",
+    "doc/bounded-inference.md": "609dd6137cbb18c968e7bcb84455b8128858cf009865f29bed8976ec90a7c865"
+  },
+  "source_snapshot": "/private/tmp/eredu-retirement-fairness-source-snapshot",
+  "native_builds": {
+    "cpu": {
+      "build_directory": "/private/tmp/eredu-retirement-fairness-full-cpu-build",
+      "selected_source_directory": "/private/tmp/eredu-retirement-fairness-full-cpu-build/_deps/mlx-d2a37554946f25a5cee62724f873cb6e69bf176ee1d8b8f90ed26d6574f4ecb3-src",
+      "archive_sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+      "patches": [
+        {
+          "name": "mlx-apple-mobile-platforms.patch",
+          "sha256": "3fd25d518087f1bc355f80001e9e230c2217b65b4f15afc406d7d59d425dbfa3",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-cuda-global-encoder-lifetime.patch",
+          "sha256": "0d6c16f19fd9bbf345fb0a478c9b27b78ec5cc8bf253e0baee079214b0936147",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-affine-group16.patch",
+          "sha256": "dfc2bd65672fc8e29561ec5537b7f1a7eb7d8f0c9cc70f702ad8ea465070009d",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-completion-events.patch",
+          "sha256": "ae7baf598bac564d9d26fc4644b024858d1125367797d4912a2c0f34525cdf86",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-variable-all-to-all.patch",
+          "sha256": "b205209d9b82fb2d0f738d6963fc8f97e1b82cce1e827251f891bceb1c1e3913",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-host-transfer-buffer.patch",
+          "sha256": "3e7221c368fa31cff06448bb01e80d8fef771cd693d93e9523b5dd91f9a9c714",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-host-transfer-umbrella.patch",
+          "sha256": "21d30a632b22d0fbbf01ce55410e6b756423209f318981a04636cc49354f9aa7",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-timing-events.patch",
+          "sha256": "9d9d277c8f038b897aaf8bea65f515ed574312b255dd4587027fa18a823f9df3",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-cuda-jit-include-dirs.patch",
+          "sha256": "9ca912204ee197327b54be23ff9fa98141f12fe7b5234c8e027f0a8739093397",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-embedded-metallib.patch",
+          "sha256": "74986c0be3398e90b03ec09a6c0bf00242c4faa614e165267b8e1ef3a731d4d9",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-host-transfer-noexcept-move.patch",
+          "sha256": "77dec41709d07be47a34cc498582dc65803b6ab4bca3d3566b7abafd5614d077",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-cpu-submission-progress.patch",
+          "sha256": "4d99f4fde5e3f3ba84fc189d9db87346d0eb26964a7e48733ed14752600f986e",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-cpu-bf16-row-reduction.patch",
+          "sha256": "7a424fa58a23d5ea5c67c90585dbe31416b6614e9ed413de73e6cac4db2bb39c",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-cpu-cascade-sum.patch",
+          "sha256": "94cad0f7f215a2081138cfc982aed16a40e909c84308e4b71000fbbf038cd074",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-cpu-softmax-reduction.patch",
+          "sha256": "fd28eb8eb74c19e0357b435072f45be56010d153c5133c80763cd14dc50e224d",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-cpu-argpartition-equal-keys.patch",
+          "sha256": "c1232cf40bc0ad85f3cd3ba891e5c758a287dc4497bc5f603ba3e5e173624f4e",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-gpu-submission-progress.patch",
+          "sha256": "ea9c39300f840c243494ce5344bab7c65577c5e7d4f8efac2bb61503f67b1cc0",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": "/Users/jbg/dev/eredu/safemlx-sys/src/mlx-c/patches/mlx-gpu-submission-progress.patch:1841: new blank line at EOF.\n+\nwarning: 1 line adds whitespace errors.\n"
+        },
+        {
+          "name": "mlx-submission-recovery.patch",
+          "sha256": "89e4b8189d9373aa30f4dc259a32c5dae62980cca30e37caa53ecd367ee613d2",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-retained-sdpa-settings.patch",
+          "sha256": "f7c206615ab686db659aed917b604f72741859f9a46ad0354f292f9424b892d6",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-host-transfer-allocation-identity.patch",
+          "sha256": "ba3655fb7e047ea4b1b7b37c60c600c5828dbf385efdbcd09c2fe89445a717b9",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-allocation-owner-retention.patch",
+          "sha256": "4867409908bcdb64fc38bccbdd4246e54514c028ea0d4054274c9076050f7c34",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-allocation-lifetime-generations.patch",
+          "sha256": "86bf6d2866ff520a9ba9ad24521a1f365968fd2a1415de136f668a70a8f29aa0",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-deferred-allocation-owner-retention.patch",
+          "sha256": "11a542ebba95538f8f1c1cf977ad3491273cacac4563a574e7c327f9f30e7f96",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        },
+        {
+          "name": "mlx-view-descriptor-normalization.patch",
+          "sha256": "bc747d435c7e1c06bfce74d543a6662f8fd4e794cc9dc94ea0ecac44991deb88",
+          "check_exit": 0,
+          "apply_exit": 0,
+          "stderr": ""
+        }
+      ],
+      "source_sha256": {
+        "/private/tmp/eredu-retirement-fairness-full-cpu-build/_deps/mlx-d2a37554946f25a5cee62724f873cb6e69bf176ee1d8b8f90ed26d6574f4ecb3-src/mlx/submission.cpp": "6baba6426b3a34da5a2f0d5b103d9a3e5467cf2e5422d02223236443ebcaeddf",
+        "/private/tmp/eredu-retirement-fairness-full-cpu-build/_deps/mlx-d2a37554946f25a5cee62724f873cb6e69bf176ee1d8b8f90ed26d6574f4ecb3-src/mlx/submission.h": "d17b2540bfc24fa41bb65430e2275de88ccd25edd92a1d1108e8ceecfad1fd1b"
+      },
+      "build_inputs_sha256": {
+        "/private/tmp/eredu-retirement-fairness-full-cpu-build/CMakeCache.txt": "f69263805889e36face548dba9ee1c91fd82a9e4dccfad7916e5cd21e780c39b",
+        "/private/tmp/eredu-retirement-fairness-full-cpu-build/_deps/mlx-build/CMakeFiles/mlx.dir/flags.make": "c9604dee86a228b2ae3ef75df2e2d3a3560fef8530f145fa9b1379c85a12e81e",
+        "/private/tmp/eredu-retirement-fairness-full-cpu-build/CMakeFiles/mlx-submission-retirement-fairness-test.dir/link.txt": "a5b1c543df569ce17cdf2ce99e994e3142db7c3278be0ce0775b178a9a45c3c8",
+        "/private/tmp/eredu-retirement-fairness-full-cpu-build/CMakeFiles/mlx-submission-retirement-fairness-test.dir/flags.make": "effb91468b9aff738094cc926236e83fc1c573ffbc4cefd18688dd76a8d84d21"
+      },
+      "configuration": {
+        "MLX_BUILD_ACCELERATE": "OFF",
+        "MLX_BUILD_METAL": "OFF",
+        "MLX_BUILD_CUDA": "OFF",
+        "MLX_C_BUILD_PATCH_TESTS": "ON",
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    "metal": {
+      "build_directory": "/Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build",
+      "selected_source_directory": "/Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build/_deps/mlx-d2a37554946f25a5cee62724f873cb6e69bf176ee1d8b8f90ed26d6574f4ecb3-src",
+      "archive_sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+      "source_sha256": {
+        "/Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build/_deps/mlx-d2a37554946f25a5cee62724f873cb6e69bf176ee1d8b8f90ed26d6574f4ecb3-src/mlx/submission.cpp": "6baba6426b3a34da5a2f0d5b103d9a3e5467cf2e5422d02223236443ebcaeddf",
+        "/Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build/_deps/mlx-d2a37554946f25a5cee62724f873cb6e69bf176ee1d8b8f90ed26d6574f4ecb3-src/mlx/submission.h": "d17b2540bfc24fa41bb65430e2275de88ccd25edd92a1d1108e8ceecfad1fd1b"
+      },
+      "build_inputs_sha256": {
+        "/Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build/CMakeCache.txt": "c26643739f7aa5bd0c70c3a80e20e1052d20cbe1d260e7cb488f7ac78f03014f",
+        "/Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build/_deps/mlx-build/CMakeFiles/mlx.dir/flags.make": "1948d3a749b0fc181226768afc4baa0b991d6ae83ef49f7f8d5072dd9282cffc",
+        "/Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build/CMakeFiles/mlx-submission-retirement-fairness-test.dir/link.txt": "16430608c6ee1d2d4003f1b4c14184509982eb7965436c21e9343e625ffe1207",
+        "/Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build/CMakeFiles/mlx-submission-retirement-fairness-test.dir/flags.make": "9c1c3cb58027f9be0e2b63b24a990783548fe1d5de116cc7e1643aad46d46314",
+        "/Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build/_deps/mlx-build/libmlx.a": "f100ded9cacf8f099e4c6c8b6c083dace05719f8f8b326d062b7eda948417bd3",
+        "/Users/jbg/dev/eredu/target/debug/build/safemlx-sys-257004b9a0b09799/out/build/mlx-submission-retirement-fairness-test": "cc3265c7469bbbecfffc4acd8f7d1eeda54499363dce5c96a439b58f906d6069"
+      },
+      "configuration": {
+        "MLX_BUILD_ACCELERATE": "OFF",
+        "MLX_BUILD_METAL": "ON",
+        "MLX_BUILD_CUDA": "OFF",
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  },
+  "artifacts": {
+    "/private/tmp/eredu-retirement-fairness-applied.json": "52eeb422881dd04932a3d5507a03b93a7554659b5cae4ad55b32ed8b6c7b7248",
+    "/private/tmp/eredu-retirement-fairness-before.json": "fad3dc58de44feeb6194a6302baccfc669881bd38e2cbc9e04b62a651aae2bcb",
+    "/private/tmp/eredu-retirement-fairness-before.log": "c9aa5a8df4be0cbef7fb866f25d9fd21a9ca5085232fe63d137bd821954b5736",
+    "/private/tmp/eredu-retirement-fairness-checks.json": "1eb2c4c32b3e8c71370aad00a4a9c4d472b4b865fb693b46ffad478b11574619",
+    "/private/tmp/eredu-retirement-fairness-cpu-native-facts.json": "283b3cb80e63a1dc10b729fc5fb9c7855a9297aba3a57af851e459c088a3248e",
+    "/private/tmp/eredu-retirement-fairness-doc-additions.json": "71f50ccc651832fcbeb24bb563123f180d12390856f2a4df935f9d05e3246efe",
+    "/private/tmp/eredu-retirement-fairness-existing-build.py": "44084166b47f3638f8a813678ee4e87ba943ee4dba842340d361b6838dd8b95c",
+    "/private/tmp/eredu-retirement-fairness-files.txt": "6f3588d2dc545330e16f1307baa20232c6e756a89c23ac6c401fbce676505458",
+    "/private/tmp/eredu-retirement-fairness-metal-native-facts.json": "25a063efd2fcc3b1483661629ef80f83ae6ff7ed7516a8cb86ef248ad09eec1e",
+    "/private/tmp/eredu-retirement-fairness-metal_build.log": "a58343b7916699f1f025dfafa20d4bd63da8ab12c322bf9b33e1e0747fecee0c",
+    "/private/tmp/eredu-retirement-fairness-metal_regression.log": "8463dbab347bb43cc43e2b776171c5c15f39fccfab064d07475938058fd97b3f",
+    "/private/tmp/eredu-retirement-fairness-native_observation.log": "c3363fb032b1ba832655d65bc5bb974521af9ae62c053dec4b8a1cadf38ae270",
+    "/private/tmp/eredu-retirement-fairness-native_patches.log": "43687cd2c88829aff2d95cf60a231219351a2fdecaca253b38ec56602c316800",
+    "/private/tmp/eredu-retirement-fairness-review.json": "6229b8933ab62c6540324f780d6b4348886594c48b3b1e25d276dd02d18f38c9",
+    "/private/tmp/eredu-retirement-fairness-session.log": "ef6917e646159f55ea44f222649c3b276c5d57c29f9c33ca8669d05bfb602033",
+    "/private/tmp/eredu-retirement-fairness-staged-override.json": "58d42cecb6e7fd37efa0964e57ae54eab1554769d3bfbba14657d98174c7078e",
+    "/private/tmp/eredu-retirement-fairness-staged-override.log": "db8bda5f77952daa4014866c0d2383f93b71380ebedd2e03cd88194dd85e8d92",
+    "/private/tmp/eredu-retirement-fairness-staged-override.py": "5e2172b763845e84087dcd8ac27ffa35c914eb107f5a935734c74ca2a5fc73bc",
+    "/private/tmp/eredu-retirement-fairness-validate.py": "a4a5a5d9cecf2271aa35cc2f5aeea68736f10bf78099eec7aecbbb6f869e0d4b",
+    "/private/tmp/eredu-retirement-fairness-wrapper.log": "e6b423788e3494a5454788eb8cd019b1137f9720ba58f815ed1f2ebfcfbfdb09",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/CALLERS.md": "58d2fdf4b82b00f99120fa9815bec5efe2eb180e15a48547fd1b0f9106f1c5e3",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/README.md": "6e0f84c6a6f706f998f68db3f4dbcce53e6dc01045e3a9dfcaf646c3033e09f1",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/base-hashes.json": "3faa9f0c34b554fc095a093df4c7cc9e9b96029f66aabcab8b66413ae99c5faf",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/caller-basis-sha256.json": "3a0ee161d1e1cc71e26887bec37c43f6f9f541956faef19db1e087c425f7b2d1",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/change.patch": "451e7be0412ceb5ab01779231a9e35b804ac81847f0b77fef77abbb82822a83a",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/checks.json": "964766cba995b632855764f512dad2270fd8bcb8e0218206c3035cf2df2b1630",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/doc-additions.md": "9188d06bf007e9b2d2846e9e5260556c6f8c4bc7a458643c1f2b82055c6df05b",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/files.txt": "21a93327a495bd3943e7be4a6e3d6b69f83181fa6ffd28245a1056c499dd4182",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/native-change.patch": "e5fd51245ab930c518a366ee73fe8c9004a2b5b46a86bf19a514cc3b9305a7c6",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/native-patch-check.json": "89cc0e02caa0403af6029ed4aac00a74bc1d4fb730dcbb322ba9186b060d2509",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/repro-dependency.json": "3d237f4fe62c632952f9d78526829f601f47f4b692535317c892eced5fc14ea2",
+    "/private/tmp/eredu-submission-retirement-fairness-fix-stage/staged-hashes.json": "9242da0bfe8ef1f240bc91b22414cc23d737e6eed7ea8883386dbf9b715574ae",
+    "/private/tmp/eredu-submission-retirement-fairness-registration-stage/README.md": "ccf33cb9e956997e8442583b7c30e9015b8523912272ff08d2101c66b7d5ea89",
+    "/private/tmp/eredu-submission-retirement-fairness-registration-stage/TEST-COMMANDS.md": "9d3d91e1e38430e6916be8b318c3c39a6909f4ee8581ffd4e458e3af220b93b8",
+    "/private/tmp/eredu-submission-retirement-fairness-registration-stage/base-hashes.json": "6b0b41bfc76d97e9fd1cb22dd366a6ef579c93ff72fd7b74a22d89a96536fb7a",
+    "/private/tmp/eredu-submission-retirement-fairness-registration-stage/change.patch": "9a392589c0a032e436f4350be1737d0c3f312a9c462eebd746bc82d37c53016e",
+    "/private/tmp/eredu-submission-retirement-fairness-registration-stage/checks.json": "dba4317a3119069b62803be54d2de4b9b43a71e7690d660c5fee04b002dbf554",
+    "/private/tmp/eredu-submission-retirement-fairness-registration-stage/doc-additions.md": "ab0415e8f9013815443593fc5847bf820d13443fca9eb5887cd84afc4488de9c",
+    "/private/tmp/eredu-submission-retirement-fairness-registration-stage/files.txt": "3b817211d813044fda62cfccb9f61bc0123403d10ea8ee26543e8e86658c4ae6",
+    "/private/tmp/eredu-submission-retirement-fairness-registration-stage/provenance.json": "5bb2f4cfd55a45bec16b96e725d22cee2bb7d29341b6eec4067b8b400b7a9d18",
+    "/private/tmp/eredu-submission-retirement-fairness-registration-stage/staged-hashes.json": "88e56649215c4fab1c159fb91509b3fd5cdf29139643b4c9d795a70c95fb67b7",
+    "/private/tmp/eredu-submission-retirement-fairness-repro-stage/README.md": "9a929a1bc815191c7e44fd6055dd1dbeed4c15f8a23befe823e317ef1ecd72bd",
+    "/private/tmp/eredu-submission-retirement-fairness-repro-stage/base-hashes.json": "6b0b41bfc76d97e9fd1cb22dd366a6ef579c93ff72fd7b74a22d89a96536fb7a",
+    "/private/tmp/eredu-submission-retirement-fairness-repro-stage/change.patch": "724475d69443f1f970dfe74efe6fdb4e085a24f1e4838f85c3b3b4f215917ac3",
+    "/private/tmp/eredu-submission-retirement-fairness-repro-stage/checks.json": "abdd6a8e090055c5235b7d59b8f01d65c88013e75c841e1ef762e76f69966a65",
+    "/private/tmp/eredu-submission-retirement-fairness-repro-stage/files.txt": "3b817211d813044fda62cfccb9f61bc0123403d10ea8ee26543e8e86658c4ae6",
+    "/private/tmp/eredu-submission-retirement-fairness-repro-stage/source-basis-sha256.json": "e0c2089a98849c9d18a282e64a314a1087307e040e8aaffcda145bc1e9c7a5ad",
+    "/private/tmp/eredu-submission-retirement-fairness-repro-stage/staged-hashes.json": "9a98b4849ef0ed0d9adbfee89d6be1c6dfe55d6b90bdd8e1553f41637c103c63"
+  },
+  "review": {
+    "scope": "One checked vendored patch change, isolated C++ regression and central CMake registration.",
+    "review": [
+      "Root read complete native implementation/header delta, all four production caller contracts, full 139-line fixture and central target registration.",
+      "Only ordinary retirement changes from 64 nodes to the finite entry registry size. Existing try-lock, terminal test, original thread ownership and detach-then-destroy remain. No native work or arbitrary destructor occurs under registry lock.",
+      "Bounded progress and completion polling remain unchanged. Regression directly demonstrates exact alternating-list starvation while foreign original owner remains alive.",
+      "Central test target runs fixture in separate process to preserve deterministic empty-registry setup."
+    ],
+    "preliminary_evidence": [
+      "Existing production library failed isolated fixture: current0/foreign0 before direct owner cleanup.",
+      "Staged submission object linked before unchanged library passed current64/foreign0; this diagnostic is not a production rebuild."
+    ],
+    "validation_plan": "Fresh complete CPU patch suite then production Metal native rebuild via existing content-addressed CMake patch source, wrapper and session/observation suites, sequentially."
+  },
+  "behavior": [
+    "Ordinary retirement inspects exactly the finite entry-time registry, detaches only positively settled current-owner records and destroys them outside its try-locked registry.",
+    "Bounded progress and polling remain capped at64 records and never destroy arbitrary resources; foreign/unresolved records remain retained.",
+    "The isolated regression keeps a second owner thread alive and demonstrates current64/foreign0 followed by current64/foreign64 only after owner-local cleanup.",
+    "Regression runs as a separate process in the existing central mlx-patch-tests target, and again linked against the actual production Metal native library.",
+    "Original existing-library repro returned current0/foreign0. Staged single-object override was preliminary evidence; full library builds and regressions supersede it."
+  ],
+  "limits": [
+    "Ordinary retirement is O(N) host work and arbitrary eligible resource destructors may block; this is not a stronger nonblocking polling guarantee.",
+    "The regression submits no tensor or GPU work; full wrapper/session suites separately exercise real native operations.",
+    "No new completion proof, budget estimate, refund, scope certification or permission to release unresolved/foreign owners is introduced.",
+    "No new released-checkpoint process peak or native distributed benchmark is included."
+  ]
+}

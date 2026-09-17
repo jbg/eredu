@@ -2,10 +2,18 @@
 
 use super::*;
 
+mod original;
+pub(crate) use original::{
+    prepare_foreground_layerwise_manager, prepare_layerwise_manager, PreparedLayerwiseManager,
+    prepare_manager_from_declarations,
+};
+mod declarations;
+pub(crate) use declarations::{prepare_layerwise_declarations, PreparedLayerwiseDeclarations};
+
 /// Builds a generic MLX layerwise policy from neutral parameter topologies.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_layerwise_policy<A, S, P, I>(
-    store: SharedCheckpointSource,
+    store: RetainedCheckpointSource,
     architecture: &mut A,
     populator: P,
     state: std::marker::PhantomData<S>,
@@ -32,9 +40,7 @@ where
         stream,
         weights_stream,
         ignored,
-        |modules, store| {
-            build_module_bindings(&MlxModule::new(modules.clone()), "", store).map_err(Into::into)
-        },
+        |modules, store| build_module_bindings(modules, "", store).map_err(Into::into),
         |_ordinal, _address, _path, unit, store, _stream| {
             build_module_bindings(&MlxModule::new(unit), "", store).map_err(Into::into)
         },
@@ -51,7 +57,7 @@ where
 /// residency order.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_layerwise_policy_with_bindings<A, S, P, I, SB, UB>(
-    store: SharedCheckpointSource,
+    store: RetainedCheckpointSource,
     architecture: &mut A,
     populator: P,
     _state: std::marker::PhantomData<S>,
@@ -208,7 +214,7 @@ where
         stream.clone()
     };
     let residency = ResidencyManager::new_shared(
-        Arc::clone(&store),
+        store.clone(),
         plan,
         definitions,
         weights_stream.clone(),
@@ -258,7 +264,7 @@ where
         .transpose()?;
     let policy = MlxLayerwisePolicy::new(
         residency,
-        Arc::clone(&store),
+        store.clone(),
         unit_ids,
         layout,
         depth,
@@ -275,7 +281,7 @@ where
 /// a neutral constructor over its already-constructed execution units.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_layerwise_policy_from_bindings<A, S, P, I>(
-    store: SharedCheckpointSource,
+    store: RetainedCheckpointSource,
     architecture: &mut A,
     populator: P,
     state: std::marker::PhantomData<S>,
@@ -315,7 +321,7 @@ where
 /// retaining the exact prepared source associated with each supplementary owner.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_layerwise_policy_with_supplementary_bindings<A, S, P, I>(
-    store: SharedCheckpointSource,
+    store: RetainedCheckpointSource,
     architecture: &mut A,
     populator: P,
     _state: std::marker::PhantomData<S>,
@@ -336,179 +342,93 @@ where
     P: MlxUnitPopulator<A::Unit>,
     I: Fn(&str) -> bool,
 {
-    let unit_count = layout.len();
-    if unit_count == 0 || unit_bindings.len() != unit_count {
-        return Err(Error::Parallel(format!(
-            "exact MLX binding definitions contain {} units for a layout of {unit_count}",
-            unit_bindings.len()
-        )));
-    }
-    let fully_resident = options.is_fully_resident();
-    let dense = options.dense();
-    let offload = options.offload()?;
-    let depth = options.device_depth(unit_count);
-    let mut definitions = Vec::new();
-    let mut specs = Vec::new();
-    let mut consumed = BTreeSet::new();
+    prepare_layerwise_policy_with_prepared_manager(
+        store,
+        architecture,
+        populator,
+        _state,
+        options,
+        stream,
+        weights_stream,
+        ignored,
+        layout,
+        static_bindings,
+        unit_bindings,
+        supplementary,
+        None,
+    )
+}
 
-    let static_id = OffloadUnitId::new("model.static")?;
-    let static_bytes = binding_bytes(&static_bindings)?;
-    let static_parameters = static_bindings
-        .iter()
-        .map(|binding| binding.name().to_owned())
-        .collect();
-    consumed.extend(
-        static_bindings
-            .iter()
-            .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
-    );
-    definitions.push(OffloadUnit::new(static_id.clone(), static_bindings)?);
-    specs.push(OffloadUnitSpec::new(
-        static_id.clone(),
-        static_bytes,
-        ResidencyPolicy::Pinned,
-        MemoryTier::Device,
-    )?);
-
-    let mut unit_ids = Vec::with_capacity(unit_count);
-    let mut unit_bytes = Vec::with_capacity(unit_count);
-    let mut layer_parameter_bytes = 0u64;
-    let mut total_host_bytes = 0u64;
-    let mut maximum_host_bytes = 0u64;
-    for (index, bindings) in unit_bindings.into_iter().enumerate() {
-        let address = layout
-            .address(index)
-            .expect("validated layout covers every flat unit");
-        let bytes = binding_bytes(&bindings)?;
-        layer_parameter_bytes = layer_parameter_bytes
-            .checked_add(bytes)
-            .ok_or_else(|| Error::Parallel("generic layer bytes overflowed".into()))?;
-        let host_bytes = host_capacity_upper_bound_for_bindings(&bindings)?;
-        total_host_bytes = total_host_bytes
-            .checked_add(host_bytes)
-            .ok_or_else(|| Error::Parallel("generic host unit bytes overflowed".into()))?;
-        maximum_host_bytes = maximum_host_bytes.max(host_bytes);
-        consumed.extend(
-            bindings
-                .iter()
-                .flat_map(|binding| binding.checkpoint_keys().into_iter().map(str::to_owned)),
-        );
-        let group_id = layout
-            .group_id(address.group())
-            .expect("validated layout names every execution group");
-        let id = OffloadUnitId::new(format!(
-            "model.{}.{:05}",
-            group_id.as_str(),
-            address.index()
-        ))?;
-        definitions.push(OffloadUnit::new(id.clone(), bindings)?);
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            bytes,
-            if fully_resident {
-                ResidencyPolicy::Pinned
-            } else if dense.is_some() {
-                ResidencyPolicy::Cacheable
-            } else {
-                ResidencyPolicy::Windowed
-            },
-            if fully_resident {
-                MemoryTier::Device
-            } else if dense.is_some() {
-                MemoryTier::Disk
-            } else {
-                MemoryTier::Host
-            },
-        )?);
-        unit_ids.push(id);
-        unit_bytes.push(bytes);
-    }
-    let mut extra = eredu_runtime::AuxiliaryWeightRequirements::default();
-    let mut sources = std::collections::BTreeMap::new();
-    for unit in supplementary {
-        let bytes = binding_bytes(unit.definition.bindings())?;
-        let host = host_capacity_upper_bound_for_bindings(unit.definition.bindings())?;
-        extra = extra
-            .checked_add_module(bytes, host, unit.shared)
-            .ok_or_else(|| Error::Parallel("auxiliary residency bytes overflowed".into()))?;
-        let id = unit.definition.id().clone();
-        specs.push(OffloadUnitSpec::new(
-            id.clone(),
-            bytes,
-            if fully_resident {
-                ResidencyPolicy::Pinned
-            } else {
-                ResidencyPolicy::Cacheable
-            },
-            if fully_resident {
-                MemoryTier::Device
-            } else if dense.is_some() {
-                MemoryTier::Disk
-            } else {
-                MemoryTier::Host
-            },
-        )?);
-        sources.insert(id, unit.source);
-        definitions.push(unit.definition);
-    }
-    consumed.extend(store.materialized_source_keys());
-    validate_unused(store.as_ref(), &consumed, ignored)?;
-    let device_window_bytes = (0..layout.group_count())
-        .map(|group| {
-            let range = layout
-                .group_range(group)
-                .expect("validated layout covers every execution group");
-            largest_window_bytes(&unit_bytes[range], depth)
-        })
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .unwrap_or(0);
-    let host_required = match dense {
-        Some(dense) if dense.host_budget_bytes() > 0 => maximum_host_bytes
-            .checked_mul(dense.host_lookahead() as u64)
-            .ok_or_else(|| Error::Parallel("generic host window bytes overflowed".into()))?,
-        Some(_) => 0,
-        None if fully_resident => 0,
-        None => total_host_bytes,
-    };
-    let auxiliary_host = extra
-        .host_bytes(options)
-        .ok_or_else(|| Error::Parallel("auxiliary host bytes overflowed".into()))?;
-    let host_required = if dense.is_some() {
-        host_required.max(auxiliary_host)
-    } else {
-        host_required
-            .checked_add(auxiliary_host)
-            .ok_or_else(|| Error::Parallel("combined host bytes overflowed".into()))?
-    };
-    let auxiliary_device = extra
-        .device_bytes(options)
-        .ok_or_else(|| Error::Parallel("auxiliary device bytes overflowed".into()))?;
-    let required_device = if fully_resident {
-        device_window_bytes
-            .checked_add(auxiliary_device)
-            .ok_or_else(|| Error::Parallel("combined device bytes overflowed".into()))?
-    } else {
-        device_window_bytes.max(auxiliary_device)
-    };
-    validate_host_budget(offload, host_required)?;
-    validate_device_budget(offload, static_bytes, required_device, depth)?;
-
-    let plan = OffloadPlan::new(offload, specs)?;
-    let residency_stream = if dense.is_some() {
-        Stream::new_with_device(&stream.get_device()?)
-    } else {
-        stream.clone()
-    };
-    let residency = ResidencyManager::new_shared_sources(
-        Arc::clone(&store),
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_layerwise_policy_with_prepared_manager<A, S, P, I>(
+    store: RetainedCheckpointSource,
+    architecture: &mut A,
+    populator: P,
+    _state: std::marker::PhantomData<S>,
+    options: LayerWeightResidency,
+    stream: &Stream,
+    weights_stream: &Stream,
+    ignored: I,
+    layout: ExecutionUnitLayout,
+    static_bindings: Vec<WeightBinding>,
+    unit_bindings: Vec<Vec<WeightBinding>>,
+    supplementary: Vec<SupplementaryResidencyUnit>,
+    prepared_manager: Option<PreparedLayerwiseManager>,
+) -> Result<(MlxLayerwisePolicy<A::Unit, P>, LayerwiseModelMetadata), Error>
+where
+    A: LayeredArchitecture<MlxNeuralBackend, S>,
+    A::Unit: 'static,
+    S: RuntimeState<MlxNeuralBackend>,
+    A::Error: std::fmt::Display,
+    P: MlxUnitPopulator<A::Unit>,
+    I: Fn(&str) -> bool,
+{
+    let declarations = prepare_layerwise_declarations(
+        store,
+        options,
+        ignored,
+        &layout,
+        static_bindings,
+        unit_bindings,
+        supplementary,
+    )?;
+    let prepared_residency = prepared_manager
+        .map(|manager| manager.validate_and_take(&declarations, weights_stream, stream))
+        .transpose()?;
+    let PreparedLayerwiseDeclarations {
+        store,
         sources,
         plan,
         definitions,
-        weights_stream.clone(),
-        residency_stream,
-    )?;
+        static_bytes,
+        static_id,
+        static_parameters,
+        unit_ids,
+        unit_count,
+        layer_parameter_bytes,
+        device_window_bytes,
+        maximum_host_bytes,
+        depth,
+    } = declarations;
+    let dense = options.dense();
+    let residency = match prepared_residency {
+        Some(residency) => residency,
+        None => {
+            let residency_stream = if dense.is_some() {
+                Stream::new_with_device(&stream.get_device()?)
+            } else {
+                stream.clone()
+            };
+            ResidencyManager::new_retained_sources(
+                store.clone(),
+                sources,
+                plan,
+                definitions,
+                weights_stream.clone(),
+                residency_stream,
+            )?
+        }
+    };
     residency.initialize()?;
     let static_lease = residency.acquire(&static_id, MemoryTier::Device)?;
     populate_selected_parameterized(
@@ -527,33 +447,57 @@ where
         maximum_host_bytes,
         depth,
     );
-    let dense_controller = dense
-        .map(|options| {
-            DenseStreamController::new(
-                &residency,
-                options,
-                unit_count,
-                layer_parameter_bytes,
-                maximum_host_bytes,
-                static_bytes,
-                (0..layout.group_count()).map(|group| {
-                    let range = layout
-                        .group_range(group)
-                        .expect("validated layout covers every execution group");
-                    let id = layout
-                        .group_id(group)
-                        .expect("validated layout names every execution group")
-                        .as_str()
-                        .to_owned();
-                    (id, unit_ids[range].to_vec())
-                }),
-            )
-            .map(Arc::new)
-        })
-        .transpose()?;
-    let policy = MlxLayerwisePolicy::new(
+    let dense_controller = if let Some(controller) = residency.original_dense_controller() {
+        let options = dense.ok_or(Error::PrefillControl(
+            eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+        ))?;
+        let facts = OriginalDenseControllerFacts {
+            options,
+            planned_layers: unit_count,
+            planned_bytes: layer_parameter_bytes,
+            maximum_host_bytes: maximum_host_bytes,
+            static_bytes,
+            stream_index: stream.get_index()?,
+        };
+        if !controller.validate(facts, &layout, &unit_ids) {
+            return Err(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+            ));
+        }
+        Some(controller.into_handle())
+    } else {
+        dense
+            .map(|options| {
+                DenseStreamController::new(
+                    &residency,
+                    options,
+                    unit_count,
+                    layer_parameter_bytes,
+                    maximum_host_bytes,
+                    static_bytes,
+                    (0..layout.group_count()).map(|group| {
+                        let range = layout
+                            .group_range(group)
+                            .expect("validated layout covers every execution group");
+                        let id = layout
+                            .group_id(group)
+                            .expect("validated layout names every execution group")
+                            .as_str()
+                            .to_owned();
+                        (id, unit_ids[range].to_vec())
+                    }),
+                )
+                .map(|value| DenseControllerHandle::Ordinary(Arc::new(value)))
+            })
+            .transpose()?
+    };
+    let policy_source = residency
+        .original_checkpoint_source()
+        .cloned()
+        .unwrap_or_else(|| store.clone());
+    let policy = MlxLayerwisePolicy::new_with_controller(
         residency,
-        Arc::clone(&store),
+        policy_source,
         unit_ids,
         layout,
         depth,

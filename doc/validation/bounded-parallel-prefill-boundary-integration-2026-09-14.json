@@ -1,0 +1,184 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T14:24:39.648488+00:00",
+  "scope": "Selected hybrid parallel prefill boundaries and collective cancellation",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-native-original-table-consumer-integration-2026-09-14.json",
+  "tests": {
+    "numeric": {
+      "passed": 2,
+      "ignored": 0
+    },
+    "embedded": {
+      "passed": 1,
+      "ignored": 0
+    },
+    "shared": {
+      "passed": 2,
+      "ignored": 0
+    },
+    "partition": {
+      "passed": 1,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 6,
+  "new_tests": [
+    {
+      "check": "numeric",
+      "name": "prepared_workspace::observed::causal::conditional_qwen_rows::partition::prefill::selected_qwen_hybrid_parallel_prefill_run_and_step_preserve_uneven_spans_and_full_state",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/partition/prefill.rs"
+    },
+    {
+      "check": "numeric",
+      "name": "prepared_workspace::observed::causal::conditional_qwen_rows::partition::prefill::selected_qwen_hybrid_parallel_prefill_one_rank_cancel_stops_all_sources_and_model_work",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/partition/prefill.rs"
+    }
+  ],
+  "new_test_count": 2,
+  "checks": {
+    "numeric": {
+      "command": "CARGO_INCREMENTAL=0 env RUST_MIN_STACK=33554432 cargo test -p eredu-architectures --test reference_numeric selected_qwen_hybrid_parallel_prefill_ -- --test-threads=1",
+      "started_utc": "2026-09-14T14:20:45.585997+00:00",
+      "elapsed_seconds": 44.064,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parallel-prefill-boundary-integration-numeric.log",
+      "log_sha256": "4647f3c05a5cd3db0372ba517c557a8dd1890effa0e96258cb155e1673ec1ce7"
+    },
+    "embedded": {
+      "command": "CARGO_INCREMENTAL=0 env RUST_MIN_STACK=33554432 cargo test -p eredu-architectures --test reference_conformance composite_production_and_family_dispatch -- --test-threads=1",
+      "started_utc": "2026-09-14T14:22:29.162068+00:00",
+      "elapsed_seconds": 56.65,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parallel-prefill-boundary-integration-embedded.log",
+      "log_sha256": "3741c96063c20c44b74d7c97cb9257a4344a56d73bb844753a16f7e291f58c21"
+    },
+    "shared": {
+      "command": "CARGO_INCREMENTAL=0 env RUST_MIN_STACK=33554432 cargo test -p eredu-architectures --test reference_numeric composite_text_spans_ -- --test-threads=1",
+      "started_utc": "2026-09-14T14:23:25.813763+00:00",
+      "elapsed_seconds": 62.247,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parallel-prefill-boundary-integration-shared.log",
+      "log_sha256": "23321fddf2c181cf668dcaf837c873c9a801062c31ecd7d67d81b50cb6b7d30d"
+    },
+    "partition": {
+      "command": "CARGO_INCREMENTAL=0 env RUST_MIN_STACK=33554432 cargo test -p eredu-architectures --test reference_numeric conditional_qwen_prepared_rows_and_complete_state_cross_tp_pp_and_residency -- --test-threads=1",
+      "started_utc": "2026-09-14T14:24:28.062637+00:00",
+      "elapsed_seconds": 4.144,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parallel-prefill-boundary-integration-partition.log",
+      "log_sha256": "1537eb59963bc82fe1bf2eefa8e4c5d47c9d63c62cf51464b2afe5641ca64039"
+    }
+  },
+  "source_sha256": {
+    "doc/bounded-inference.md": "44ffc7d8009d635d5b8ba6e51f0a953c7b5403492ecc0b0bbf86b1c117e26080",
+    "eredu-architectures/tests/reference_numeric/bounded_readout/parallel_boundary.rs": "1fcb8425c9a83ea142d2c01ec4e7a5ce1115be2bccd0678771ad3afbf32b5181",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/partition.rs": "0a7fde50bacb93274be03a728bc46d5e26d5e01dec628ed74f3dd4ba4434c792",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/partition/prefill.rs": "4c17d83a89f5faa65b45f079ef277a5026034ad20b6809ce46a028a521ebd529",
+    "eredu-architectures/tests/reference_numeric/bounded_readout.rs": "13549973d22f86c1ee6d487e5f0d51fbf0de06e970a9e928e32199ea31052730",
+    "eredu-architectures/tests/reference_numeric.rs": "46bddf90345598c5c4c5264bdb45d02feebfc12eb172d230874b9e66d035e947",
+    "doc/qwen35-mlx-validation.md": "6512eb5524d88e7e099f93de680607b869bcad13dad9ace6c300bead37bdc7cd"
+  },
+  "source_snapshot": "/private/tmp/eredu-parallel-prefill-boundary-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-native-original-table-consumer-integration-2026-09-14.json": "81b1f2bf924d6a852f6992912e58d5174678f747dd4210053a11fb11ef82ed34",
+    "/private/tmp/eredu-correct-parallel-harness-validation.py": "9ac71a1f8fc1e7bb224132b3e4e496a6dbf81fa976df01e301ac5071c8ed9c97",
+    "/private/tmp/eredu-fold-applied-parallel-prefill-correction.py": "501fd562ab8966914e7008993aedceb3ac439ef2e56a57c1af5bb733ee20eabb",
+    "/private/tmp/eredu-parallel-prefill-boundary-final-root-review.json": "88d075b1868c204512ead4a60514b073277a5f0eab4050b4aab79e6e740548a6",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-applied.json": "e2df04719a2952c0e45ec263236ffb11abc1c143e4191d48884612fd15fa02a0",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-apply.py": "44969960c62d6506e1428e02066ba40880f71ccc6de08e1ac8da81deb7b8a0bd",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-checks.json": "54d644c227906a671f238bd2ce7f30709292960e609633fda936f6a230c51a8a",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-doc-applied.json": "a2a36d26f951ad52ad49ddc100e185dd85c9799f6a43276b19dfc7cd97627d9c",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-embedded.log": "3741c96063c20c44b74d7c97cb9257a4344a56d73bb844753a16f7e291f58c21",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-embedded.log.1789395749161850000.previous": "5b99327ff85e34cd0f2af1d8b6379ce585a31a47abb4a6aa7ea2fe4c4c70a34b",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-harness-validation-correction-review.json": "7b900b4908c4e5229421e8509c553de5281441fdf37b3ae88b68a45f6a33746f",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-module-path-correction-review.json": "cbb98757b06936c0c486ae5986f67ffb37806aafbe37f2da2965305908a2b83d",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-numeric.log": "4647f3c05a5cd3db0372ba517c557a8dd1890effa0e96258cb155e1673ec1ce7",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-numeric.log.1789395645585756000.previous": "91818aea1be95977c1cbfbec936a5ed4e45bed000ba28dd660940c9341f6e37d",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-partition.log": "1537eb59963bc82fe1bf2eefa8e4c5d47c9d63c62cf51464b2afe5641ca64039",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-review.json": "b8772ee1d2860abf14dfc6cecc9e92e4c2d492c1e6cd6070565c73c553da872b",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-root-review.json": "c9f7b5ba19abb68d2ab0d9b81bc577ceab8e85c3f3fbf9ffc0b7dbda20a305fb",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-shared.log": "23321fddf2c181cf668dcaf837c873c9a801062c31ecd7d67d81b50cb6b7d30d",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-spec.json": "97f5878b9591e29a283548c89124e12c20e60d289f64dbe90059e68030aebb91",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-stage/all.patch": "866fc5dc9299d16628cad9fc94483aa5cdea32dbf9e6c9782c56d269447c03c2",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-stage/before-harness-validation-correction/eredu-parallel-prefill-boundary-integration-checks.json": "e8a187cd261d0f352a15865a5e294173c9db69918b5a083c8c54d34153606a8a",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-stage/change.patch": "f45350550a0785726bc2f21fb3bbe96573be9c6f7a28c15f5b70057a83e3c2d6",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-stage/manifest.json": "e2df04719a2952c0e45ec263236ffb11abc1c143e4191d48884612fd15fa02a0",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-stage/staged-hashes.json": "951716dfb5ae5882e641eeb08769852d6a4d503689569a11d5d78a8b51808f7f",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-validate.py": "16e0f0bcd454c1e67abcb3df3a0eb7e51c47de37a208a6bdef14734533d1f11c",
+    "/private/tmp/eredu-parallel-prefill-boundary-integration-validation-config.json": "cf8c8b47626948378d87f300fd809bd6a28263328caabe08d7d3b7145a633d28",
+    "/private/tmp/eredu-parallel-prefill-boundary-reviewed-stage/doc-snippets.json": "fdf8e8e653e46bdce4ec2e4ce1d7e1925b5ab0fd94e66d32826e6e2c4588b25f",
+    "/private/tmp/eredu-parallel-prefill-boundary-reviewed-stage/manifest.json": "ab71b6528e59f121feec36077c05fc15812649643769043ca21a6e9bb532b898",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/FROZEN.json": "184286ce754c9c37276e37bc56664599eda8b13ece96fcca0f5e27bde80b3c2f",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/README.md": "cd2a34a1718d9056bbc6b263b0caa38c81165e264c2bf16993a99551fb426142",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/artifact-index.json": "7760076070916ae53261ef6b2fd4c533f47427c5f00a5f41f8ceba4bd73ae931",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/basis.json": "51a7d2f98a2d19b25ebd973c0042e460a0c871237300b83dcbad9210553dcd86",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/change.patch": "131c0f9ef060577c799b912b28925ea3e3dfcf89be27465a8c9c829002660022",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/checks.json": "198cb576e9a173768e6a7ddc9d2038583d5e8ab5747407077b5042ffbebec27c",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/dependencies.json": "75d3032b5847979d600b226ed787f098842f1a7c38458a1944aaeee8149d0474",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/doc-operations.json": "00c7528f5b8e24419de40e8f69c91b2221672d031f495bfb17c03ac26b6c5b4e",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/full-manifest.json": "93681e612a87e4db57cddde15c9d19dd75c89350cb2f2cd761b05481ed0a9d37",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/full.patch": "105e5eca4c538796ae5b041cda72b8d7d6573bc7e64edd116a3a5c1d38a77018",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/manifest.json": "ab71b6528e59f121feec36077c05fc15812649643769043ca21a6e9bb532b898",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/movement-ledger.json": "212bcfae568486fcbc9b649802453cba5f81a30edc547c45e98d548cd575fd06",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/package.py": "7a48f42947cb79b6378d68bf85151fafa85e82788371d461308b028edf96d727",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/replay.py": "c8e1062c3a6c00a9f17e541863c1ee49438a80b9c1a797f31bd25ca957d55770",
+    "/private/tmp/eredu-parallel-prefill-boundary-stage/test-inventory.json": "ce64b1d2723e3c5e091daf62aaa157cd39f1639ed57b35338f5e38fd3d8f322a",
+    "/private/tmp/eredu-parallel-prefill-module-path-correction-spec.json": "e97eb157d4ec2770624393bde463203e32a1ba9d13120f7b75387453aca05be4",
+    "/private/tmp/eredu-parallel-prefill-module-path-correction-stage/REVIEW.json": "bd599e5e03d400d684d5df80f20f298345a1883c50cf4ad5b3f8933264cdee22",
+    "/private/tmp/eredu-parallel-prefill-module-path-correction-stage/change.patch": "0d3e196e69da78ccbd80a27bbcbc9b1404b16b4b8de003067f219d449ae4a0eb",
+    "/private/tmp/eredu-parallel-prefill-module-path-correction-stage/compile-failure.log": "91818aea1be95977c1cbfbec936a5ed4e45bed000ba28dd660940c9341f6e37d",
+    "/private/tmp/eredu-parallel-prefill-module-path-correction-stage/manifest.json": "c99d2b34de00228b4783d8df27778e3f2fa729e5a18bbbfb931958910f03ac65"
+  },
+  "review": {
+    "full_manifest_sha256": "951716dfb5ae5882e641eeb08769852d6a4d503689569a11d5d78a8b51808f7f",
+    "full_patch_sha256": "866fc5dc9299d16628cad9fc94483aa5cdea32dbf9e6c9782c56d269447c03c2",
+    "patch_sha256": "f45350550a0785726bc2f21fb3bbe96573be9c6f7a28c15f5b70057a83e3c2d6",
+    "replay": "/private/tmp/eredu-parallel-prefill-boundary-integration-stage/replay-harness-validation-correction",
+    "review": "Root read all five source deltas, both new test modules, full state comparison and numeric world helpers, actual PrefillDriver cancellation/step, documentation and test inventory. Final rank-local-request versus shared-terminal-cancellation correction reviewed before freeze. Independent replay --origins verified source/full reconstruction, all archived/live bases and artifact pins; scoped rustfmt passed. Integration preparer enforces strict whitespace replay.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-native-original-table-consumer-integration-2026-09-14.json": "81b1f2bf924d6a852f6992912e58d5174678f747dd4210053a11fb11ef82ed34",
+      "/private/tmp/eredu-correct-parallel-harness-validation.py": "9ac71a1f8fc1e7bb224132b3e4e496a6dbf81fa976df01e301ac5071c8ed9c97",
+      "/private/tmp/eredu-fold-applied-parallel-prefill-correction.py": "501fd562ab8966914e7008993aedceb3ac439ef2e56a57c1af5bb733ee20eabb",
+      "/private/tmp/eredu-parallel-prefill-boundary-final-root-review.json": "88d075b1868c204512ead4a60514b073277a5f0eab4050b4aab79e6e740548a6",
+      "/private/tmp/eredu-parallel-prefill-boundary-integration-harness-validation-correction-review.json": "7b900b4908c4e5229421e8509c553de5281441fdf37b3ae88b68a45f6a33746f",
+      "/private/tmp/eredu-parallel-prefill-boundary-integration-module-path-correction-review.json": "cbb98757b06936c0c486ae5986f67ffb37806aafbe37f2da2965305908a2b83d",
+      "/private/tmp/eredu-parallel-prefill-boundary-integration-root-review.json": "c9f7b5ba19abb68d2ab0d9b81bc577ceab8e85c3f3fbf9ffc0b7dbda20a305fb",
+      "/private/tmp/eredu-parallel-prefill-boundary-integration-spec.json": "97f5878b9591e29a283548c89124e12c20e60d289f64dbe90059e68030aebb91",
+      "/private/tmp/eredu-parallel-prefill-boundary-integration-stage/before-harness-validation-correction/eredu-parallel-prefill-boundary-integration-checks.json": "e8a187cd261d0f352a15865a5e294173c9db69918b5a083c8c54d34153606a8a",
+      "/private/tmp/eredu-parallel-prefill-boundary-reviewed-stage/doc-snippets.json": "fdf8e8e653e46bdce4ec2e4ce1d7e1925b5ab0fd94e66d32826e6e2c4588b25f",
+      "/private/tmp/eredu-parallel-prefill-boundary-reviewed-stage/manifest.json": "ab71b6528e59f121feec36077c05fc15812649643769043ca21a6e9bb532b898",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/FROZEN.json": "184286ce754c9c37276e37bc56664599eda8b13ece96fcca0f5e27bde80b3c2f",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/README.md": "cd2a34a1718d9056bbc6b263b0caa38c81165e264c2bf16993a99551fb426142",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/artifact-index.json": "7760076070916ae53261ef6b2fd4c533f47427c5f00a5f41f8ceba4bd73ae931",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/basis.json": "51a7d2f98a2d19b25ebd973c0042e460a0c871237300b83dcbad9210553dcd86",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/change.patch": "131c0f9ef060577c799b912b28925ea3e3dfcf89be27465a8c9c829002660022",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/checks.json": "198cb576e9a173768e6a7ddc9d2038583d5e8ab5747407077b5042ffbebec27c",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/dependencies.json": "75d3032b5847979d600b226ed787f098842f1a7c38458a1944aaeee8149d0474",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/doc-operations.json": "00c7528f5b8e24419de40e8f69c91b2221672d031f495bfb17c03ac26b6c5b4e",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/full-manifest.json": "93681e612a87e4db57cddde15c9d19dd75c89350cb2f2cd761b05481ed0a9d37",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/full.patch": "105e5eca4c538796ae5b041cda72b8d7d6573bc7e64edd116a3a5c1d38a77018",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/manifest.json": "ab71b6528e59f121feec36077c05fc15812649643769043ca21a6e9bb532b898",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/movement-ledger.json": "212bcfae568486fcbc9b649802453cba5f81a30edc547c45e98d548cd575fd06",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/package.py": "7a48f42947cb79b6378d68bf85151fafa85e82788371d461308b028edf96d727",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/replay.py": "c8e1062c3a6c00a9f17e541863c1ee49438a80b9c1a797f31bd25ca957d55770",
+      "/private/tmp/eredu-parallel-prefill-boundary-stage/test-inventory.json": "ce64b1d2723e3c5e091daf62aaa157cd39f1639ed57b35338f5e38fd3d8f322a",
+      "/private/tmp/eredu-parallel-prefill-module-path-correction-spec.json": "e97eb157d4ec2770624393bde463203e32a1ba9d13120f7b75387453aca05be4",
+      "/private/tmp/eredu-parallel-prefill-module-path-correction-stage/REVIEW.json": "bd599e5e03d400d684d5df80f20f298345a1883c50cf4ad5b3f8933264cdee22",
+      "/private/tmp/eredu-parallel-prefill-module-path-correction-stage/change.patch": "0d3e196e69da78ccbd80a27bbcbc9b1404b16b4b8de003067f219d449ae4a0eb",
+      "/private/tmp/eredu-parallel-prefill-module-path-correction-stage/compile-failure.log": "91818aea1be95977c1cbfbec936a5ed4e45bed000ba28dd660940c9341f6e37d",
+      "/private/tmp/eredu-parallel-prefill-module-path-correction-stage/manifest.json": "c99d2b34de00228b4783d8df27778e3f2fa729e5a18bbbfb931958910f03ac65"
+    },
+    "source_manifest_sha256": "e2df04719a2952c0e45ec263236ffb11abc1c143e4191d48884612fd15fa02a0"
+  },
+  "behavior": [
+    "Final vocabulary projection consumes one position; intermediate and cancelled spans omit it.",
+    "Complete selected state and three cached decodes match independent unsplit execution across 36 parallel/residency worlds.",
+    "One local cancellation request propagates at existing rank agreement; repeated terminal steps perform no further source, model or projection work."
+  ],
+  "limits": [
+    "Two unique new test bodies run in reference_numeric; the separately registered reference_conformance composite aggregate checks shared constructor/execution compatibility.",
+    "Neutral fixture does not establish physical disk-I/O/native distributed performance or full facade lifecycle/strict budget coverage."
+  ]
+}

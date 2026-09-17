@@ -1,0 +1,101 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted native relative attention and multi-axis rotary bounds, coordinate fixes and prepared Inkling quote assertions",
+  "source_sha256": {
+    "doc/backend-architecture.md": "af1189af973c181ab79e68dcd36883a44a8a0e90f40ec09b5a8b6918918f8267",
+    "doc/execution-control.md": "890a7c7573f027e22bcdfed9bae22e73746026f4ebd82f44a4db391f2fb4ac77",
+    "doc/bounded-inference.md": "a2b89b9bc265c76e0ee4186a26074c5f1c43bdc7a4ae03131c20bf94baaf7e69",
+    "eredu-backend-mlx/src/backend/nn/workspace.rs": "fc683ccdfff712cfb07fc245e0b4c31e3082db3847681cdc64afb24319b128bf",
+    "eredu-backend-mlx/src/backend/nn/workspace/positional.rs": "5a1d70ae865f12845fb6cbce504f74ecfd60eff274cadf33152c7b1aacc286d6",
+    "eredu-backend-mlx/src/backend/nn/workspace/positional/tests.rs": "bc431b8787ef130f9002e3cc0fdf79bd4407109afc7bb1bdb0a1630b3b9f9c82",
+    "eredu-backend-mlx/src/backend/nn/workspace/host.rs": "3dfdc45c3c1d57a2180ee77a3e9dfd296280ece66098881e6c0b67cf8378a93d",
+    "eredu-backend-mlx/src/backend/nn/workspace/matrix.rs": "4defa3cb226a62de6d6bbeb286dccfa4d8b2ec68a1cd0acc1f613f2386b92774",
+    "eredu-backend-mlx/src/backend/nn/workspace/reduction.rs": "c14cc64516b55d14ffe9424b96a84f128a67e44baa27a51ccf6bb4b0fbd051a1",
+    "eredu-backend-mlx/src/backend/nn/relative_attention.rs": "20af9ea8e0ae67949aee6621b22730f071387ed442d042410d46d5b51e420f71",
+    "eredu-backend-mlx/src/backend/nn/shared/core_backend.rs": "1299c0616fb741ed9ba52831a5c9311327ab3232c954edff2756d1f6f78b2d2c",
+    "eredu-backend-mlx/src/backend/runtime/cache/kv/tests/blockwise_attention.rs": "dddf8833f82fd75ca83dd4c86c5e7ca8f08b2e0a24d1782c26511d0957300240",
+    "eredu-backend-mlx/src/tensor.rs": "6227194cf49a1f91c35452b7bee3f0dc7d5f6e0cd2c8643fdaf82b49d661a433",
+    "eredu-backend-mlx/src/tests/distributed_pipeline_ring/unit_and_worker/prepared_workspace.rs": "6cd125ec066e23f94d8eacfbc882beaf249609a07803310318b15f69473be29a",
+    "eredu-nn/src/multimodal.rs": "91fa519ce5f4b91128adec4a39a430c5c24b85236986de23470956fe5f24f3df",
+    "safemlx-sys/src/mlx-c/CMakeLists.txt": "587feff147adb0ee2e61c79841c7dc87418d4b8692488f5ba748b0a2e1d399a6"
+  },
+  "native_source": {
+    "archive": "safemlx-sys/vendor/mlx-v0.32.0.tar.gz",
+    "sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+    "patch_set": "427f983b2956844066ee3c996df4dbc8789fa6652bf3fd43945986cc85e69a24",
+    "derivation_files_sha256": {
+      "mlx/ops.cpp": "725dd3f5021a2f3d5ccf32d91f860a651c036785c77dba9022c8631e165d0a92",
+      "mlx/backend/metal/indexing.cpp": "c9fa7383e3d490c1bd12081cf882fb1b60dccd10fee56be353046db50925e786",
+      "mlx/backend/metal/copy.cpp": "35570b10905afb07f59ea16bf7abf840d290435fedbf716ca83cc7c51691e5d8",
+      "mlx/backend/metal/unary.cpp": "35a7a35a9d14f5cac74e1535106093383aeb91c147a8a1a5f486913e74ccc521",
+      "mlx/backend/metal/binary.cpp": "51c0fdb82e377b0fac2b0046cd40362ce61334ed21173003bf328652b08a33ab",
+      "mlx/backend/metal/matmul.cpp": "775f1879cdebf383eba6ffe0efd3cb3b679162a4cd75ec08978c2c8fdea95927",
+      "mlx/backend/metal/allocator.cpp": "e0b94dd881aef4ef8fdb5aafad1f775be8476c3a5758db3d0a4efe16f34a7da0"
+    }
+  },
+  "coverage": {
+    "native_cases": 579,
+    "relative_native_cases": 432,
+    "multi_axis_native_cases": 147,
+    "focused_tests": 9,
+    "workspace_regressions": 38,
+    "unique_tests": 45,
+    "cold_quote_trajectories": 96,
+    "new_released_checkpoint_comparisons": 0
+  },
+  "behavior": [
+    "Relative-profile attention composes two integer coordinate/mask constructions, optional logarithmic query/bias scaling, direct profile gathering, GQA head expansion, dense products and precise softmax. Casts, strided reshape copies and all native child buffers remain in the completion envelope; no disjoint host numerical payload is constructed.",
+    "Multi-axis rotary bounds follow independent-axis, split-half and round-robin layouts. They include widened integer coordinates and scalars, selected columns, native frequency sources/copies, concatenation, angle construction and cosine/sine output storage. The disjoint host bound is the largest live exact-sized Rust frequency vector.",
+    "Signed I32 position offsets saturate using widened arithmetic, matching the neutral reference. U32 coordinates widen before offset arithmetic. Round-robin execution no longer constructs unused independent-axis graphs; section selection uses widened multiplication.",
+    "Relative attention accepts the final valid I32 span by shifting integer coordinates after arange. The same kernel serves contiguous and paged attention.",
+    "432 relative configurations cover four geometries, three coordinate origins including the final I32 span, causal/window policies, optional logarithmic scaling, F32/F16/BF16 and contiguous/strided inputs. Outputs match an independent F64 scalar host equation and active native allocation peaks fit cold bounds.",
+    "147 multi-axis configurations cover all three layouts, heterogeneous axis widths, multiple leading ranks, empty rows, I32/U32 positions, contiguous/strided inputs and signed saturation endpoints. Outputs match the neutral scalar reference, peaks fit cold bounds, and actual output backing capacities fit retained allowances.",
+    "CPU and Metal paged relative attention match scalar reference and contiguous execution through uneven cached spans. Initial and cached Inkling resident text equation quotes are now asserted bounded; DeepSeek and Muse fixtures retain explicit missing costs."
+  ],
+  "tolerances": {
+    "relative_f32": {
+      "atol": 3e-05,
+      "rtol": 0.0003
+    },
+    "relative_f16_bf16": {
+      "atol": 0.003,
+      "rtol": 0.04
+    },
+    "multi_axis_atol": 2e-05,
+    "paged_relative_atol": 2e-06,
+    "relative_input_reference": "actual native inputs converted to F32 after measurement, preserving input rounding"
+  },
+  "limits": [
+    "This does not complete public request admission or full-family/path coverage. Grouped/hyper operators, selected addressable expert scheduling, materialization/transfers, paging, TP/PP, media, observation, speculation and independent copies still need complete prices or composition.",
+    "A bounded resident Inkling equation quote is not a complete request budget, released-checkpoint comparison, media quote or paged/distributed workspace bound.",
+    "Positional tensor bounds cover floating relative inputs and I32/U32 rotary positions represented by the metadata envelope. Other valid input domains remain explicitly unknown.",
+    "Native bounds cover active managed payload storage through completion, not allocator cache, native shape/command metadata, driver/JIT, total process or system memory. No new process-memory or released-checkpoint experiment was run.",
+    "Two cold tests occur in both suites, giving 45 unique tests. The workspace suite leaves 33 controlled allocator/native benchmarks ignored; the two new positional allocator benchmarks were explicitly run in the focused suite.",
+    "Initial compilation required correcting I64 scalar construction and a shadowed test helper. The recorded final commands passed after correction.",
+    "Existing large-unwind linker and unused internal quote/helper warnings remain; native runtime diagnostics are preserved in the logs."
+  ],
+  "checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib -- positional_workspace_ metal_relative_workspace metal_multi_axis_workspace relative_attention_gathers multi_axis_rotary prepared_workspace_native_routed paged_relative_profiles_match_scalar_reference --include-ignored --test-threads=1 --nocapture",
+      "passed": 9,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-positional-bounds-native-verified.log",
+      "sha256": "7c5a9550c58b81873b91d4c61b8947efcbf1b830d8345da612a8a897762eddea"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --features metal --lib -- backend::nn::workspace:: --test-threads=1",
+      "passed": 38,
+      "ignored": 33,
+      "log": "/private/tmp/eredu-positional-bounds-workspace-regression.log",
+      "sha256": "ee032d110dd4588068b2b4438c1b7cf13da3a982a61560c4295a4c820539d37f"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "passed": null,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-positional-bounds-check-final.log",
+      "sha256": "3459bde2e08920722b5e4af19b44e94193fcc68801dc1c23cbdf02892292a79d"
+    }
+  ]
+}

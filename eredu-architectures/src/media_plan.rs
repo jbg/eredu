@@ -10,6 +10,16 @@ use eredu_core::{
 };
 use eredu_runtime::{PreparedInputInspector, PreparedInputPart, PreparedModelInput};
 
+pub(crate) mod admission;
+mod original;
+pub(crate) mod qwen;
+pub use original::{
+    validate_selected_part, BoundPreparedMediaSemantics, OriginalPreparedMediaSemantics,
+    OriginalPromptSegment, PreparedMediaEncoderTablePlan, PreparedMediaPositionFacts,
+    PreparedMediaSemanticCompile,
+};
+pub use qwen::MediaSemanticError;
+
 use crate::qwen::{
     hybrid::{HybridConfig, ParsedHybridConfig},
     vision::{VisionAttentionPolicy, VisionConfig},
@@ -32,6 +42,18 @@ struct MediaAdmissionInput {
 }
 
 impl MediaAdmissionInput {
+    fn qwen_ref(&self) -> qwen::InspectedPartRef<'_> {
+        qwen::InspectedPartRef {
+            modality: self.descriptor.modality(),
+            kind: self.descriptor.payload_kind(),
+            shape: qwen::ShapeRef::Legacy(&self.payload_shape),
+            grid: self.patch_grid.as_ref().map(|grid| qwen::GridRef {
+                shape: qwen::ShapeRef::Legacy(&grid.shape),
+                values: &grid.values,
+            }),
+        }
+    }
+
     fn modality(&self) -> InputModality {
         self.descriptor.modality()
     }
@@ -82,53 +104,14 @@ fn inspect_part<Tensor>(
     input: &PreparedInputPart<Tensor>,
     inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<MediaAdmissionInput, CapabilityError> {
-    let descriptor = input
-        .descriptor(&|tensor| inspector.identity(tensor))
-        .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    let inspect_metadata = descriptor.payload_kind() == InputPayloadKind::Tensor
-        && descriptor.modality() != InputModality::Text;
-
-    let metadata_shape = |key| descriptor.metadata_value(key).map(u64_shape).transpose();
-    let i32_metadata = |key| -> Result<Option<MetadataValues<i32>>, CapabilityError> {
-        if !inspect_metadata {
-            return Ok(None);
-        }
-        input
-            .metadata_value(key)
-            .map(|tensor| {
-                Ok(MetadataValues {
-                    shape: metadata_shape(key)?.expect("runtime metadata has a descriptor"),
-                    values: inspector.i32_values(tensor)?,
-                })
-            })
-            .transpose()
-    };
-    let bool_metadata = |key| -> Result<Option<MetadataValues<bool>>, CapabilityError> {
-        if !inspect_metadata {
-            return Ok(None);
-        }
-        input
-            .metadata_value(key)
-            .map(|tensor| {
-                Ok(MetadataValues {
-                    shape: metadata_shape(key)?.expect("runtime metadata has a descriptor"),
-                    values: inspector.bool_values(tensor)?,
-                })
-            })
-            .transpose()
-    };
-    let payload_shape = u64_shape(descriptor.payload())?;
-    let patch_grid = i32_metadata(InputMetadataKey::PatchGrid)?;
-    let patch_positions = i32_metadata(InputMetadataKey::PatchPositions)?;
-    let audio_mask = bool_metadata(InputMetadataKey::AudioMask)?;
-    let media = MediaAdmissionInput {
-        descriptor,
-        payload_shape,
-        patch_grid,
-        patch_positions,
-        audio_mask,
-    };
-    Ok(media)
+    admission::inspect_shared(
+        input,
+        |part| part.descriptor(&|tensor| inspector.identity(tensor))
+            .map_err(|error| CapabilityError::Observation(error.to_string())),
+        u64_shape,
+        |tensor| inspector.i32_values(tensor),
+        |tensor| inspector.bool_values(tensor),
+    )
 }
 
 /// Architecture-owned admission and accounting plan for one prepared input part.
@@ -430,8 +413,52 @@ impl<P> AdmittedCompositeInput<P> {
     }
 }
 
-trait CompositePartPlan {
+impl<P: CompositePartPlan> AdmittedCompositeInput<P> {
+    /// Visits exact ordered decoder extents from the already admitted family plans.
+    /// Token attribution remains tied to the actual payload descriptor: projected
+    /// text and media placeholders never become canonical tokenizer IDs.
+    pub fn visit_prompt_segments(
+        &self,
+        mut visit: impl FnMut(eredu_core::PreparedPromptSegmentPlan),
+    ) -> Result<(), eredu_core::PreparedControlInputError> {
+        use eredu_core::PreparedControlInputError as E;
+        if self.parts.len() != self.identity.parts().len() {
+            return Err(E::InvalidAttribution);
+        }
+        let mut position = 0u64;
+        for (index, (part, descriptor)) in self.parts.iter().zip(self.identity.parts()).enumerate()
+        {
+            let extent = part.decoder_positions();
+            let end = position.checked_add(extent).ok_or(E::Overflow)?;
+            visit(eredu_core::PreparedPromptSegmentPlan {
+                source_part: u64::try_from(index).map_err(|_| E::Overflow)?,
+                modality: descriptor.modality(),
+                payload: descriptor.payload_kind(),
+                decoder_range: [position, end],
+            });
+            position = end;
+        }
+        if position != self.decoder_positions {
+            return Err(E::InvalidAttribution);
+        }
+        Ok(())
+    }
+}
+
+/// Borrowed family-owned decoder extent of one already admitted part.
+/// This geometry declaration grants no source, memory or execution authority.
+pub trait CompositePartPlan {
+    /// Exact decoder positions; no plan/grid clone or tensor inspection occurs.
     fn decoder_positions(&self) -> u64;
+}
+
+impl CompositePartPlan for PreparedInputPartPlan {
+    fn decoder_positions(&self) -> u64 {
+        match self {
+            Self::Text { positions } | Self::Projected { positions, .. } => *positions,
+            Self::Media { shape } => shape.decoder_positions,
+        }
+    }
 }
 
 impl CompositePartPlan for QwenVlInputPartPlan {
@@ -495,47 +522,11 @@ where
         .map_err(|error| CapabilityError::Observation(error.to_string()))?;
     let identity = PreparedInputIdentity::new(descriptors)
         .map_err(|error| CapabilityError::Observation(error.to_string()))?;
-    if &identity != input.identity() {
-        return Err(CapabilityError::Observation(
-            "prepared-input tensor identity changed before architecture admission".into(),
-        ));
-    }
-    let mut active_modalities = InputModalities {
-        text: false,
-        image: false,
-        audio: false,
-        video: false,
-    };
-    let mut decoder_positions = 0u64;
-    let mut parts = Vec::with_capacity(input.len());
-    for part in input.parts() {
-        let plan = admit_part(part)?;
-        decoder_positions = decoder_positions
-            .checked_add(plan.decoder_positions())
-            .ok_or(CapabilityError::ArithmeticOverflow {
-                operation: "composite decoder-position total",
-            })?;
-        match part.modality() {
-            InputModality::Text => active_modalities.text = true,
-            InputModality::Image => active_modalities.image = true,
-            InputModality::Audio => active_modalities.audio = true,
-            InputModality::Video => active_modalities.video = true,
-            _ => {}
-        }
-        parts.push(plan);
-    }
-    if decoder_positions == 0 {
-        return Err(CapabilityError::UnsupportedInput {
-            architecture: "replicated composite".into(),
-            reason: "prepared input occupies no decoder positions".into(),
-        });
-    }
-    Ok(AdmittedCompositeInput {
-        identity,
-        parts,
-        decoder_positions,
-        active_modalities,
-    })
+    admission::complete_shared(
+        input, identity, &mut admit_part,
+        |count| Ok(Vec::with_capacity(count)),
+        admission::Rejection::ordinary,
+    )
 }
 
 /// Admits a complete Qwen3-VL request before composite graph execution.
@@ -638,295 +629,13 @@ fn unsupported(architecture: &str, reason: impl Into<String>) -> CapabilityError
     }
 }
 
-fn qwen_attention_chunk_squares(
-    grid: &[(i32, i32, i32)],
-    merge: u64,
-    window_size: i32,
-    patch_size: i32,
-) -> Result<(u64, u64), CapabilityError> {
-    let patch = nonzero_positive(patch_size, "Qwen vision patch size")?;
-    let window_pixels = nonzero_positive(window_size, "Qwen vision window size")?;
-    let merger_window = window_pixels / merge / patch;
-    if merger_window == 0 {
-        return Err(CapabilityError::InvalidConfiguration {
-            field: "window_size",
-            detail: format!(
-                "Qwen vision window {window_pixels} is too small for merge {merge} and patch {patch}"
-            ),
-        });
-    }
-    let merge_area = checked_mul(merge, merge, "Qwen attention merge area")?;
-    let merge_area_square =
-        checked_mul(merge_area, merge_area, "Qwen attention merge-area square")?;
-    let mut full_squares = 0u64;
-    let mut window_squares = 0u64;
-    for (time, height, width) in grid {
-        let time = nonzero_positive(*time, "Qwen grid time")?;
-        let height = nonzero_positive(*height, "Qwen grid height")?;
-        let width = nonzero_positive(*width, "Qwen grid width")?;
-        if height % merge != 0 || width % merge != 0 {
-            return Err(CapabilityError::InvalidConfiguration {
-                field: "patch_grid",
-                detail: format!(
-                    "Qwen grid ({height}, {width}) is not divisible by spatial merge {merge}"
-                ),
-            });
-        }
-        let full_length = checked_mul(height, width, "Qwen full-attention chunk length")?;
-        full_squares = checked_add(
-            full_squares,
-            checked_mul(
-                time,
-                checked_mul(full_length, full_length, "Qwen full-attention chunk square")?,
-                "Qwen full-attention temporal chunks",
-            )?,
-            "Qwen full-attention chunk-square total",
-        )?;
-
-        let merged_height = height / merge;
-        let merged_width = width / merge;
-        let height_full = merged_height / merger_window;
-        let height_remainder = merged_height % merger_window;
-        let width_full = merged_width / merger_window;
-        let width_remainder = merged_width % merger_window;
-        let window_square = checked_mul(merger_window, merger_window, "Qwen merger-window square")?;
-        let height_square_sum = checked_add(
-            checked_mul(
-                height_full,
-                window_square,
-                "Qwen full height-window squares",
-            )?,
-            checked_mul(
-                height_remainder,
-                height_remainder,
-                "Qwen remainder height-window square",
-            )?,
-            "Qwen height-window square sum",
-        )?;
-        let width_square_sum = checked_add(
-            checked_mul(width_full, window_square, "Qwen full width-window squares")?,
-            checked_mul(
-                width_remainder,
-                width_remainder,
-                "Qwen remainder width-window square",
-            )?,
-            "Qwen width-window square sum",
-        )?;
-        let item_window_squares = checked_mul(
-            checked_mul(
-                height_square_sum,
-                width_square_sum,
-                "Qwen merged window-area squares",
-            )?,
-            merge_area_square,
-            "Qwen patch window-area squares",
-        )?;
-        window_squares = checked_add(
-            window_squares,
-            checked_mul(time, item_window_squares, "Qwen temporal window chunks")?,
-            "Qwen window-attention chunk-square total",
-        )?;
-    }
-    Ok((full_squares, window_squares))
-}
-
-/// Derives prepared Qwen image/video geometry from normalized vision policy.
+/// Legacy inspection adapter for the same borrowed Qwen equation kernel.
 fn qwen_vision(
     config: &VisionConfig,
     input: &MediaAdmissionInput,
     architecture: &str,
 ) -> Result<MediaShapePlan, CapabilityError> {
-    if !matches!(
-        input.modality(),
-        InputModality::Image | InputModality::Video
-    ) {
-        return Err(unsupported(
-            architecture,
-            format!(
-                "{} is not a Qwen vision modality",
-                input.modality().as_str()
-            ),
-        ));
-    }
-    if input.payload_shape.len() != 2 {
-        return Err(unsupported(
-            architecture,
-            format!(
-                "Qwen prepared vision tensor must be [patches, patch_dims], got {:?}",
-                input.payload_shape
-            ),
-        ));
-    }
-    let patches = dimension(&input.payload_shape, 0, "Qwen prepared patch count")?;
-    let merge = nonzero_positive(config.spatial_merge_size, "spatial_merge_size")?;
-    let patch = nonzero_positive(config.patch_size, "Qwen vision patch size")?;
-    let expected_patch_dims = checked_mul(
-        checked_mul(
-            nonzero_positive(config.in_channels, "Qwen vision input channels")?,
-            nonzero_positive(
-                config.temporal_patch_size,
-                "Qwen vision temporal patch size",
-            )?,
-            "Qwen temporal input channels",
-        )?,
-        checked_mul(patch, patch, "Qwen vision patch area")?,
-        "Qwen vision patch dimensions",
-    )?;
-    if dimension(&input.payload_shape, 1, "Qwen prepared patch dimensions")? != expected_patch_dims
-    {
-        return Err(unsupported(
-            architecture,
-            format!(
-                "Qwen prepared patches have width {}, expected {expected_patch_dims}",
-                input.payload_shape[1]
-            ),
-        ));
-    }
-    let merge_area = checked_mul(merge, merge, "Qwen spatial merge area")?;
-    if patches % merge_area != 0 {
-        return Err(unsupported(
-            architecture,
-            format!("Qwen patch count {patches} is not divisible by {merge_area}"),
-        ));
-    }
-    let positions = patches / merge_area;
-    let metadata = input
-        .patch_grid
-        .as_ref()
-        .ok_or_else(|| unsupported(architecture, "prepared Qwen media has no grid_thw metadata"))?;
-    if metadata.shape.len() != 2 || metadata.shape[1] != 3 || metadata.shape[0] == 0 {
-        return Err(unsupported(
-            architecture,
-            format!(
-                "patch grid must be shaped [items, 3], got {:?}",
-                metadata.shape
-            ),
-        ));
-    }
-    let expected_values = checked_mul(metadata.shape[0], 3, "Qwen patch-grid scalar count")?;
-    if u64::try_from(metadata.values.len()).ok() != Some(expected_values) {
-        return Err(unsupported(
-            architecture,
-            "Qwen patch grid has an incomplete row",
-        ));
-    }
-    let grid = metadata
-        .values
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|row| (row[0], row[1], row[2]))
-        .collect::<Vec<_>>();
-    let described_patches = grid.iter().try_fold(0u64, |total, (time, height, width)| {
-        let item_patches = checked_mul(
-            checked_mul(
-                nonzero_positive(*time, "Qwen grid time")?,
-                nonzero_positive(*height, "Qwen grid height")?,
-                "Qwen grid time-height",
-            )?,
-            nonzero_positive(*width, "Qwen grid width")?,
-            "Qwen grid item patches",
-        )?;
-        checked_add(total, item_patches, "Qwen described patch total")
-    })?;
-    if described_patches != patches {
-        return Err(unsupported(
-            architecture,
-            format!("Qwen grid describes {described_patches} patches but payload has {patches}"),
-        ));
-    }
-    let (full_chunk_squares, window_chunk_squares) =
-        qwen_attention_chunk_squares(&grid, merge, config.window_size, config.patch_size)?;
-    let depth =
-        u64::try_from(config.layer_count()).map_err(|_| CapabilityError::ArithmeticOverflow {
-            operation: "Qwen vision depth",
-        })?;
-    let full_blocks = u64::try_from(
-        config
-            .layer_schedule
-            .iter()
-            .filter(|policy| matches!(policy.attention, VisionAttentionPolicy::Full))
-            .count(),
-    )
-    .map_err(|_| CapabilityError::ArithmeticOverflow {
-        operation: "Qwen full-attention block count",
-    })?;
-    let window_blocks = depth - full_blocks;
-    let heads = positive(config.num_heads, "Qwen vision heads")?;
-    let hidden = positive(config.hidden_size, "Qwen vision hidden size")?;
-    let intermediate = positive(config.intermediate_size, "Qwen vision intermediate size")?;
-    let out_hidden = positive(config.out_hidden_size, "Qwen vision output size")?;
-    let patch_hidden = checked_mul(patches, hidden, "Qwen patch hidden elements")?;
-    let patch_intermediate =
-        checked_mul(patches, intermediate, "Qwen patch intermediate elements")?;
-    let per_block = checked_add(
-        checked_mul(32, patch_hidden, "Qwen block hidden workspace")?,
-        checked_mul(6, patch_intermediate, "Qwen block intermediate workspace")?,
-        "Qwen block workspace",
-    )?;
-    let block_workspace = checked_mul(depth, per_block, "Qwen all-block workspace")?;
-    let full_attention = checked_mul(
-        checked_mul(
-            checked_mul(
-                full_blocks,
-                full_chunk_squares,
-                "Qwen full-attention blocks",
-            )?,
-            heads,
-            "Qwen full-attention heads",
-        )?,
-        2,
-        "Qwen full-attention score/probability bound",
-    )?;
-    let window_attention = checked_mul(
-        checked_mul(
-            checked_mul(
-                window_blocks,
-                window_chunk_squares,
-                "Qwen window-attention blocks",
-            )?,
-            heads,
-            "Qwen window-attention heads",
-        )?,
-        2,
-        "Qwen window-attention score/probability bound",
-    )?;
-    let merge_width = checked_mul(hidden, merge_area, "Qwen merger width")?;
-    let merger_output = checked_mul(
-        positions,
-        checked_add(
-            checked_mul(12, merge_width, "Qwen merger hidden workspace")?,
-            checked_mul(6, out_hidden, "Qwen merger output workspace")?,
-            "Qwen merger per-position workspace",
-        )?,
-        "Qwen merger workspace",
-    )?;
-    let mergers = checked_add(
-        1,
-        u64::try_from(config.deepstack_layer_count()).map_err(|_| {
-            CapabilityError::ArithmeticOverflow {
-                operation: "Qwen deepstack merger count",
-            }
-        })?,
-        "Qwen merger count",
-    )?;
-    let graph_scalars = checked_add(
-        checked_add(
-            checked_mul(16, patch_hidden, "Qwen vision setup workspace")?,
-            block_workspace,
-            "Qwen setup plus blocks",
-        )?,
-        checked_add(
-            checked_add(full_attention, window_attention, "Qwen attention workspace")?,
-            checked_mul(mergers, merger_output, "Qwen all-merger workspace")?,
-            "Qwen attention plus mergers",
-        )?,
-        "Qwen vision graph workspace",
-    )?;
-    Ok(MediaShapePlan {
-        decoder_positions: positions,
-        execution_workspace_scalars: graph_scalars,
-    })
+    qwen::qwen_vision(config, input.qwen_ref()).map_err(|error| error.legacy(architecture))
 }
 
 /// Derives Qwen media geometry when the normalized hybrid policy may omit its
@@ -948,37 +657,31 @@ fn qwen_vision_ingress_with_shape(
     input: &MediaAdmissionInput,
     architecture: &str,
 ) -> Result<(QwenVisionIngressPlan, MediaShapePlan), CapabilityError> {
-    let shape = qwen_hybrid_vision(config, input, architecture)?;
-    let token_id = match input.modality() {
-        InputModality::Image => image_token_id,
-        InputModality::Video => video_token_id,
-        InputModality::Audio | InputModality::Text => None,
-        _ => None,
-    }
-    .ok_or_else(|| unsupported(architecture, "prepared media placeholder token is absent"))?;
-    let placeholder_token_id =
-        u32::try_from(token_id).map_err(|_| CapabilityError::InvalidConfiguration {
-            field: "Qwen media placeholder token",
-            detail: format!("expected a non-negative token ID, got {token_id}"),
-        })?;
-    let metadata = input
-        .patch_grid
-        .as_ref()
-        .ok_or_else(|| unsupported(architecture, "prepared Qwen media has no grid_thw metadata"))?;
-    let patch_grid = metadata
-        .values
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|row| (row[0], row[1], row[2]))
-        .collect();
+    let view = qwen::qwen_part(
+        qwen::QwenPolicy {
+            hidden: 0,
+            vision: config,
+            image: image_token_id,
+            video: video_token_id,
+            projected_media: false,
+        },
+        input.qwen_ref(),
+    )
+    .map_err(|error| error.legacy(architecture))?;
     Ok((
         QwenVisionIngressPlan {
-            placeholder_token_id,
-            placeholder_count: shape.decoder_positions,
-            patch_grid,
+            placeholder_token_id: view.placeholder,
+            placeholder_count: view.positions,
+            patch_grid: view
+                .grid
+                .iter()
+                .map(|row| (row[0], row[1], row[2]))
+                .collect(),
         },
-        shape,
+        MediaShapePlan {
+            decoder_positions: view.positions,
+            execution_workspace_scalars: view.workspace_scalars,
+        },
     ))
 }
 
@@ -1017,47 +720,14 @@ pub fn qwen_vl_input_part<Tensor>(
     inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<QwenVlInputPartPlan, CapabilityError> {
     let inspected = inspect_part(input, inspector)?;
-    let descriptor = &inspected.descriptor;
-    let modality = descriptor.modality();
-    let payload = descriptor.payload_kind();
-    let shape = u64_shape(descriptor.payload())?;
-    match (modality, payload) {
-        (InputModality::Text, InputPayloadKind::TokenIds) => Ok(QwenVlInputPartPlan::TextTokens {
-            positions: batch_one_sequence(&shape, 2, "text token IDs", &args.model_type)?,
-        }),
-        (InputModality::Text, InputPayloadKind::Embeddings) => {
-            let positions = batch_one_sequence(&shape, 3, "text embeddings", &args.model_type)?;
-            let hidden = positive(args.text.hidden_size, "Qwen3-VL hidden size")?;
-            if shape[2] != hidden {
-                return Err(unsupported(
-                    &args.model_type,
-                    format!(
-                        "prepared text embeddings must have hidden width {hidden}, got {:?}",
-                        shape
-                    ),
-                ));
-            }
-            Ok(QwenVlInputPartPlan::ProjectedText { positions })
-        }
-        (InputModality::Image | InputModality::Video, InputPayloadKind::Tensor) => {
-            let (ingress, shape) = qwen_vision_ingress_with_shape(
-                Some(&args.vision),
-                Some(args.image_token_id),
-                Some(args.video_token_id),
-                &inspected,
-                &args.model_type,
-            )?;
-            Ok(QwenVlInputPartPlan::Media { ingress, shape })
-        }
-        (modality, payload) => Err(unsupported(
-            &args.model_type,
-            format!(
-                "Qwen3-VL does not support a {} {} payload",
-                modality.as_str(),
-                payload_name(payload)
-            ),
-        )),
-    }
+    let view = qwen::qwen_part(
+        admission::vl_policy(args),
+        inspected.qwen_ref(),
+    )
+    .map_err(|error| error.legacy(&args.model_type))?;
+    admission::vl_plan(view, |rows| {
+        Ok(rows.iter().map(|row| (row[0], row[1], row[2])).collect())
+    })
 }
 
 fn qwen_hybrid_input_part_with_policy<Tensor>(
@@ -1069,60 +739,14 @@ fn qwen_hybrid_input_part_with_policy<Tensor>(
     inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<QwenHybridInputPartPlan, CapabilityError> {
     let inspected = inspect_part(input, inspector)?;
-    let descriptor = &inspected.descriptor;
-    let modality = descriptor.modality();
-    let payload = descriptor.payload_kind();
-    let shape = u64_shape(descriptor.payload())?;
-    match (modality, payload) {
-        (InputModality::Text, InputPayloadKind::TokenIds) => {
-            Ok(QwenHybridInputPartPlan::TextTokens {
-                positions: batch_one_sequence(&shape, 2, "text token IDs", &text.model_type)?,
-            })
-        }
-        (
-            modality @ (InputModality::Text | InputModality::Image | InputModality::Video),
-            InputPayloadKind::Embeddings,
-        ) => {
-            let positions = batch_one_sequence(
-                &shape,
-                3,
-                &format!("{} embeddings", modality.as_str()),
-                &text.model_type,
-            )?;
-            let hidden = positive(text.hidden_size, "Qwen hybrid hidden size")?;
-            if shape[2] != hidden {
-                return Err(unsupported(
-                    &text.model_type,
-                    format!(
-                        "prepared {} embeddings must have hidden width {hidden}, got {shape:?}",
-                        modality.as_str()
-                    ),
-                ));
-            }
-            Ok(QwenHybridInputPartPlan::Projected {
-                modality,
-                positions,
-            })
-        }
-        (InputModality::Image | InputModality::Video, InputPayloadKind::Tensor) => {
-            let (ingress, shape) = qwen_vision_ingress_with_shape(
-                vision,
-                image_token_id,
-                video_token_id,
-                &inspected,
-                &text.model_type,
-            )?;
-            Ok(QwenHybridInputPartPlan::Media { ingress, shape })
-        }
-        (modality, payload) => Err(unsupported(
-            &text.model_type,
-            format!(
-                "Qwen hybrid does not support a {} {} payload",
-                modality.as_str(),
-                payload_name(payload)
-            ),
-        )),
-    }
+    let view = qwen::qwen_part(
+        admission::hybrid_policy(text, vision, image_token_id, video_token_id),
+        inspected.qwen_ref(),
+    )
+    .map_err(|error| error.legacy(&text.model_type))?;
+    admission::hybrid_plan(view, |rows| {
+        Ok(rows.iter().map(|row| (row[0], row[1], row[2])).collect())
+    })
 }
 
 /// Validates one prepared conditional Qwen3.5 input part and derives the exact
@@ -1170,42 +794,6 @@ pub fn qwen_hybrid_text_input_part<Tensor>(
     }
 }
 
-fn gemma_batch_one_sequence(
-    shape: &[u64],
-    rank: usize,
-    name: &str,
-    architecture: &str,
-) -> Result<u64, CapabilityError> {
-    if shape.len() != rank || shape.first() != Some(&1) || shape.get(1).copied().unwrap_or(0) == 0 {
-        return Err(unsupported(
-            architecture,
-            format!("prepared Gemma {name} must be batch-one with rank {rank}, got {shape:?}"),
-        ));
-    }
-    Ok(shape[1])
-}
-
-fn gemma_placeholder_token(
-    args: &crate::gemma4::FamilyConfig,
-    modality: InputModality,
-) -> Result<u32, CapabilityError> {
-    let token = match modality {
-        InputModality::Text => Some(args.text.pad_token_id),
-        InputModality::Image => args.image_token_id,
-        InputModality::Video => args.video_token_id,
-        InputModality::Audio => args.audio_token_id,
-        _ => None,
-    };
-    token
-        .and_then(|token| u32::try_from(token).ok())
-        .ok_or_else(|| {
-            unsupported(
-                &args.model_type,
-                format!("Gemma 4 has no valid {} placeholder", modality.as_str()),
-            )
-        })
-}
-
 /// Validates one prepared Gemma 4 part and derives the exact placeholder,
 /// ingress geometry, and capability-accounting plan consumed by a backend.
 pub fn gemma4_input_part<Tensor>(
@@ -1214,459 +802,24 @@ pub fn gemma4_input_part<Tensor>(
     inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<Gemma4InputPartPlan, CapabilityError> {
     let inspected = inspect_part(input, inspector)?;
-    let descriptor = &inspected.descriptor;
-    let modality = descriptor.modality();
-    let payload = descriptor.payload_kind();
-    let shape = u64_shape(descriptor.payload())?;
-    match (modality, payload) {
-        (InputModality::Text, InputPayloadKind::TokenIds) => Ok(Gemma4InputPartPlan::TextTokens {
-            positions: gemma_batch_one_sequence(&shape, 2, "text token IDs", &args.model_type)?,
-        }),
-        (modality, InputPayloadKind::Embeddings) => {
-            let positions = gemma_batch_one_sequence(
-                &shape,
-                3,
-                &format!("{} embeddings", modality.as_str()),
-                &args.model_type,
-            )?;
-            let hidden = positive(args.text.hidden_size, "Gemma text hidden size")?;
-            if shape[2] != hidden {
-                return Err(unsupported(
-                    &args.model_type,
-                    format!(
-                        "prepared Gemma {} embeddings must have hidden width {hidden}, got {shape:?}",
-                        modality.as_str()
-                    ),
-                ));
-            }
-            Ok(Gemma4InputPartPlan::Projected {
-                modality,
-                placeholder_token_id: gemma_placeholder_token(args, modality)?,
-                positions,
-            })
-        }
-        (modality @ (InputModality::Image | InputModality::Video), InputPayloadKind::Tensor) => {
-            if inspected.patch_grid.is_none() {
-                return Err(unsupported(
-                    &args.model_type,
-                    format!(
-                        "prepared Gemma {} input has no patch grid",
-                        modality.as_str()
-                    ),
-                ));
-            }
-            let extent = inspected.patch_extent().ok_or_else(|| {
-                unsupported(
-                    &args.model_type,
-                    format!(
-                        "prepared Gemma {} input has no host-known patch extent",
-                        modality.as_str()
-                    ),
-                )
-            })?;
-            let grid = inspected.patch_grid.as_ref().expect("checked above");
-            let extent_i32 = extent.map(|value| {
-                i32::try_from(value).map_err(|_| CapabilityError::ArithmeticOverflow {
-                    operation: "Gemma patch extent",
-                })
-            });
-            let [time, height, width] = extent_i32;
-            let extent_i32 = [time?, height?, width?];
-            if grid.shape != [1, 3]
-                || grid.values.as_slice() != extent_i32
-                || grid.values.len() != 3
-            {
-                return Err(unsupported(
-                    &args.model_type,
-                    format!(
-                        "prepared Gemma {} patch grid must be one row matching extent {extent:?}",
-                        modality.as_str()
-                    ),
-                ));
-            }
-            let vision = args.vision.as_ref().ok_or_else(|| {
-                unsupported(&args.model_type, "loaded Gemma model has no vision tower")
-            })?;
-            let padded_patches =
-                i32::try_from(shape[1]).map_err(|_| CapabilityError::ArithmeticOverflow {
-                    operation: "Gemma padded vision patch count",
-                })?;
-            let ingress =
-                crate::gemma4::VisionIngressPartPlan::new(vision, extent_i32, padded_patches)
-                    .map_err(|error| unsupported(&args.model_type, error.to_string()))?;
-            let media_shape = gemma4(args, &inspected)?;
-            let valid_patches = gemma_valid_patch_count(
-                inspected
-                    .patch_positions
-                    .as_ref()
-                    .expect("Gemma media shape validation requires patch positions"),
-                &args.model_type,
-            )?;
-            if valid_patches != ingress.valid_patches as u64
-                || media_shape.decoder_positions != ingress.decoder_positions as u64
-            {
-                return Err(unsupported(
-                    &args.model_type,
-                    "prepared Gemma patch extent and position metadata disagree",
-                ));
-            }
-            Ok(Gemma4InputPartPlan::Vision {
-                placeholder_token_id: gemma_placeholder_token(args, modality)?,
-                ingress,
-                shape: media_shape,
-            })
-        }
-        (InputModality::Audio, InputPayloadKind::Tensor) => {
-            let valid_frames = inspected.audio_valid_frames().ok_or_else(|| {
-                unsupported(
-                    &args.model_type,
-                    "prepared Gemma audio has no host-known valid-frame extent",
-                )
-            })?;
-            let padded_frames =
-                i32::try_from(shape[1]).map_err(|_| CapabilityError::ArithmeticOverflow {
-                    operation: "Gemma padded audio frame count",
-                })?;
-            let valid_frames_i32 =
-                i32::try_from(valid_frames).map_err(|_| CapabilityError::ArithmeticOverflow {
-                    operation: "Gemma valid audio frame count",
-                })?;
-            let ingress = crate::gemma4::AudioIngressPartPlan::new(valid_frames_i32, padded_frames)
-                .map_err(|error| unsupported(&args.model_type, error.to_string()))?;
-            let media_shape = gemma4(args, &inspected)?;
-            let valid_mask_frames = inspected
-                .audio_mask
-                .as_ref()
-                .expect("Gemma media shape validation requires an audio mask")
-                .values
-                .iter()
-                .filter(|value| **value)
-                .count();
-            if valid_mask_frames != valid_frames
-                || media_shape.decoder_positions != ingress.decoder_positions as u64
-            {
-                return Err(unsupported(
-                    &args.model_type,
-                    "prepared Gemma audio valid-frame extent and mask disagree",
-                ));
-            }
-            Ok(Gemma4InputPartPlan::Audio {
-                placeholder_token_id: gemma_placeholder_token(args, InputModality::Audio)?,
-                ingress,
-                shape: media_shape,
-            })
-        }
-        (modality, payload) => Err(unsupported(
-            &args.model_type,
-            format!(
-                "Gemma 4 does not support a {} {} payload",
-                modality.as_str(),
-                payload_name(payload)
-            ),
-        )),
-    }
+    admission::gemma::raw::part(args, &inspected, admission::inkling::Ordinary)
 }
 
-fn gemma_valid_patch_count(
-    positions: &MetadataValues<i32>,
-    architecture: &str,
-) -> Result<u64, CapabilityError> {
-    if positions.shape.len() != 3 || positions.shape[0] != 1 || positions.shape[2] != 2 {
-        return Err(unsupported(
-            architecture,
-            format!(
-                "Gemma patch positions must be [1, patches, 2], got {:?}",
-                positions.shape
-            ),
-        ));
-    }
-    let expected = checked_mul(positions.shape[1], 2, "Gemma patch-position scalar count")?;
-    if u64::try_from(positions.values.len()).ok() != Some(expected) {
-        return Err(unsupported(
-            architecture,
-            "Gemma patch positions do not match their declared shape",
-        ));
-    }
-    u64::try_from(
-        positions
-            .values
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .filter(|pair| pair[0] >= 0 && pair[1] >= 0)
-            .count(),
-    )
-    .map_err(|_| CapabilityError::ArithmeticOverflow {
-        operation: "Gemma valid patch count",
-    })
+#[cfg(test)]
+fn gemma_valid_patch_count(positions: &MetadataValues<i32>, architecture: &str) -> Result<u64, CapabilityError> {
+    admission::gemma::raw::gemma_valid_patch_count(positions, architecture, admission::inkling::Ordinary)
 }
-
-fn gemma_vision(
-    config: &crate::gemma4::VisionConfig,
-    text_hidden: u64,
-    input: &MediaAdmissionInput,
-    architecture: &str,
-) -> Result<MediaShapePlan, CapabilityError> {
-    if input.payload_shape.len() != 3 || input.payload_shape[0] != 1 {
-        return Err(unsupported(
-            architecture,
-            format!(
-                "Gemma prepared vision tensor must be [1, patches, patch_dims], got {:?}",
-                input.payload_shape
-            ),
-        ));
-    }
-    let patch = nonzero_positive(config.patch_size, "Gemma vision patch size")?;
-    let expected_patch_dims = checked_mul(
-        3,
-        checked_mul(patch, patch, "Gemma vision patch area")?,
-        "Gemma vision patch dimensions",
-    )?;
-    if input.payload_shape[2] != expected_patch_dims {
-        return Err(unsupported(
-            architecture,
-            format!(
-                "Gemma prepared patches have width {}, expected {expected_patch_dims}",
-                input.payload_shape[2]
-            ),
-        ));
-    }
-    let position_ids = input
-        .patch_positions
-        .as_ref()
-        .ok_or_else(|| unsupported(architecture, "prepared Gemma media has no patch positions"))?;
-    let valid_patches = gemma_valid_patch_count(position_ids, architecture)?;
-    let pool = nonzero_positive(config.pooling_kernel_size, "Gemma pooling kernel")?;
-    let pool_area = checked_mul(pool, pool, "Gemma pooling area")?;
-    if valid_patches % pool_area != 0 {
-        return Err(unsupported(
-            architecture,
-            format!("Gemma valid patch count {valid_patches} is not divisible by {pool_area}"),
-        ));
-    }
-    let positions = valid_patches / pool_area;
-    let padded_patches = input.payload_shape[1];
-    if position_ids.shape[1] != padded_patches {
-        return Err(unsupported(
-            architecture,
-            format!(
-                "Gemma patch positions {:?} do not match prepared vision payload {:?}",
-                position_ids.shape, input.payload_shape
-            ),
-        ));
-    }
-    let hidden = positive(config.hidden_size, "Gemma vision hidden size")?;
-    let intermediate = positive(config.intermediate_size, "Gemma vision intermediate size")?;
-    let depth = positive(config.num_hidden_layers, "Gemma vision depth")?;
-    let patch_hidden = checked_mul(padded_patches, hidden, "Gemma vision patch hidden elements")?;
-    let per_layer = checked_add(
-        checked_mul(48, patch_hidden, "Gemma vision layer hidden workspace")?,
-        checked_mul(
-            8,
-            checked_mul(
-                padded_patches,
-                intermediate,
-                "Gemma vision intermediate elements",
-            )?,
-            "Gemma vision MLP workspace",
-        )?,
-        "Gemma vision layer workspace",
-    )?;
-    let output_workspace = checked_mul(
-        positions,
-        checked_add(
-            checked_mul(8, hidden, "Gemma pooled vision workspace")?,
-            checked_mul(8, text_hidden, "Gemma projected vision workspace")?,
-            "Gemma vision output workspace per position",
-        )?,
-        "Gemma vision output workspace",
-    )?;
-    let graph_scalars = checked_add(
-        checked_mul(20, patch_hidden, "Gemma vision setup workspace")?,
-        checked_add(
-            checked_mul(depth, per_layer, "Gemma all vision layers")?,
-            output_workspace,
-            "Gemma layers plus output workspace",
-        )?,
-        "Gemma vision graph workspace",
-    )?;
-    Ok(MediaShapePlan {
-        decoder_positions: positions,
-        execution_workspace_scalars: graph_scalars,
-    })
+#[cfg(test)]
+fn gemma_vision(config: &crate::gemma4::VisionConfig, text_hidden: u64, input: &MediaAdmissionInput, architecture: &str) -> Result<MediaShapePlan, CapabilityError> {
+    admission::gemma::raw::gemma_vision(config, text_hidden, input, architecture, admission::inkling::Ordinary)
 }
-
-fn gemma_audio(
-    config: &crate::gemma4::AudioConfig,
-    text_hidden: u64,
-    input: &MediaAdmissionInput,
-    architecture: &str,
-) -> Result<MediaShapePlan, CapabilityError> {
-    if input.payload_shape.len() != 3
-        || input.payload_shape[0] != 1
-        || input.payload_shape[2] != 128
-    {
-        return Err(unsupported(
-            architecture,
-            format!(
-                "Gemma prepared audio tensor must be [1, frames, 128], got {:?}",
-                input.payload_shape
-            ),
-        ));
-    }
-    let mask = input
-        .audio_mask
-        .as_ref()
-        .ok_or_else(|| unsupported(architecture, "prepared Gemma audio has no frame mask"))?;
-    let frames = input.payload_shape[1];
-    if mask.shape != [1, frames] || u64::try_from(mask.values.len()).ok() != Some(frames) {
-        return Err(unsupported(
-            architecture,
-            format!(
-                "Gemma audio mask must be [1, {frames}], got {:?}",
-                mask.shape
-            ),
-        ));
-    }
-    let valid_frames =
-        u64::try_from(mask.values.iter().filter(|value| **value).count()).map_err(|_| {
-            CapabilityError::ArithmeticOverflow {
-                operation: "Gemma valid audio frame count",
-            }
-        })?;
-    let positions = valid_frames.div_ceil(4);
-    let sequence = frames.div_ceil(4);
-    let hidden = positive(config.hidden_size, "Gemma audio hidden size")?;
-    let depth = positive(config.num_hidden_layers, "Gemma audio depth")?;
-    let heads = positive(config.num_attention_heads, "Gemma audio heads")?;
-    let chunk = nonzero_positive(config.attention_chunk_size, "Gemma audio attention chunk")?;
-    let past = nonzero_positive(
-        config.attention_context_left.checked_sub(1).ok_or(
-            CapabilityError::ArithmeticOverflow {
-                operation: "Gemma audio left context",
-            },
-        )?,
-        "Gemma audio left context",
-    )?;
-    let padded_sequence = checked_mul(
-        sequence.div_ceil(chunk),
-        chunk,
-        "Gemma padded audio sequence",
-    )?;
-    let chunks = padded_sequence / chunk;
-    let attention_elements = checked_mul(
-        checked_mul(
-            checked_mul(
-                checked_mul(chunks, heads, "Gemma audio attention chunk heads")?,
-                chunk,
-                "Gemma audio attention queries",
-            )?,
-            checked_add(chunk, past, "Gemma audio attention key bound")?,
-            "Gemma audio attention scores",
-        )?,
-        4,
-        "Gemma audio logits/relative/mask/probability workspace",
-    )?;
-    let layer_workspace = checked_add(
-        checked_mul(
-            80,
-            checked_mul(sequence, hidden, "Gemma audio hidden elements")?,
-            "Gemma audio layer hidden workspace",
-        )?,
-        attention_elements,
-        "Gemma audio layer workspace",
-    )?;
-    let first_frames = frames.div_ceil(2);
-    let first_channels = positive(
-        *config.subsampling_conv_channels.first().ok_or_else(|| {
-            CapabilityError::InvalidConfiguration {
-                field: "subsampling_conv_channels",
-                detail: "Gemma audio has no first convolution channel count".into(),
-            }
-        })?,
-        "Gemma audio first convolution channels",
-    )?;
-    let second_channels = positive(
-        *config.subsampling_conv_channels.get(1).ok_or_else(|| {
-            CapabilityError::InvalidConfiguration {
-                field: "subsampling_conv_channels",
-                detail: "Gemma audio has no second convolution channel count".into(),
-            }
-        })?,
-        "Gemma audio second convolution channels",
-    )?;
-    let conv_workspace = checked_add(
-        checked_mul(
-            6,
-            checked_mul(
-                checked_mul(first_frames, 64, "Gemma first convolution grid")?,
-                first_channels,
-                "Gemma first convolution elements",
-            )?,
-            "Gemma first convolution workspace",
-        )?,
-        checked_mul(
-            6,
-            checked_mul(
-                checked_mul(sequence, 32, "Gemma second convolution grid")?,
-                second_channels,
-                "Gemma second convolution elements",
-            )?,
-            "Gemma second convolution workspace",
-        )?,
-        "Gemma convolution workspace",
-    )?;
-    let output = positive(config.output_proj_dims, "Gemma audio output size")?;
-    let output_workspace = checked_mul(
-        positions,
-        checked_add(
-            checked_mul(8, output, "Gemma audio output workspace")?,
-            checked_mul(8, text_hidden, "Gemma audio text projection workspace")?,
-            "Gemma audio output workspace per position",
-        )?,
-        "Gemma audio projected output workspace",
-    )?;
-    let graph_scalars = checked_add(
-        conv_workspace,
-        checked_add(
-            checked_mul(depth, layer_workspace, "Gemma all audio layers")?,
-            output_workspace,
-            "Gemma audio layers plus output",
-        )?,
-        "Gemma audio graph workspace",
-    )?;
-    Ok(MediaShapePlan {
-        decoder_positions: positions,
-        execution_workspace_scalars: graph_scalars,
-    })
+#[cfg(test)]
+fn gemma_audio(config: &crate::gemma4::AudioConfig, text_hidden: u64, input: &MediaAdmissionInput, architecture: &str) -> Result<MediaShapePlan, CapabilityError> {
+    admission::gemma::raw::gemma_audio(config, text_hidden, input, architecture, admission::inkling::Ordinary)
 }
-
 /// Derives prepared Gemma 4 media geometry from normalized family policy.
-fn gemma4(
-    args: &crate::gemma4::FamilyConfig,
-    input: &MediaAdmissionInput,
-) -> Result<MediaShapePlan, CapabilityError> {
-    let text_hidden = positive(args.text.hidden_size, "Gemma text hidden size")?;
-    match input.modality() {
-        InputModality::Image | InputModality::Video => args
-            .vision
-            .as_ref()
-            .ok_or_else(|| unsupported(&args.model_type, "loaded model has no vision tower"))
-            .and_then(|config| gemma_vision(config, text_hidden, input, &args.model_type)),
-        InputModality::Audio => args
-            .audio
-            .as_ref()
-            .ok_or_else(|| unsupported(&args.model_type, "loaded model has no audio tower"))
-            .and_then(|config| gemma_audio(config, text_hidden, input, &args.model_type)),
-        InputModality::Text => Err(unsupported(
-            &args.model_type,
-            "text is not a Gemma media modality",
-        )),
-        _ => Err(unsupported(
-            &args.model_type,
-            "unknown modality is not supported by Gemma",
-        )),
-    }
+fn gemma4(args: &crate::gemma4::FamilyConfig, input: &MediaAdmissionInput) -> Result<MediaShapePlan, CapabilityError> {
+    admission::gemma::raw::gemma4(args, input, admission::inkling::Ordinary)
 }
 
 /// Derives prepared Inkling media geometry from normalized family policy.
@@ -1674,144 +827,7 @@ fn inkling(
     args: &crate::inkling::ModelArgs,
     input: &MediaAdmissionInput,
 ) -> Result<MediaShapePlan, CapabilityError> {
-    match input.modality() {
-        InputModality::Image => {
-            let config = args.vision_config.as_ref().ok_or_else(|| {
-                unsupported(
-                    &args.model_type,
-                    "loaded Inkling model has no vision configuration",
-                )
-            })?;
-            if input.payload_shape.len() != 5 || input.payload_shape[1..] != [2, 40, 40, 3] {
-                return Err(unsupported(
-                    &args.model_type,
-                    format!(
-                        "Inkling image patches must be [patches, 2, 40, 40, 3], got {:?}",
-                        input.payload_shape
-                    ),
-                ));
-            }
-            let patches = input.payload_shape[0];
-            let text_hidden = positive(config.text_hidden_size, "Inkling vision output size")?;
-            let layer_outputs = [
-                checked_mul(
-                    checked_mul(
-                        checked_mul(patches, 2, "Inkling vision time")?,
-                        8 * 8,
-                        "Inkling vision grid",
-                    )?,
-                    128,
-                    "Inkling vision layer 1",
-                )?,
-                checked_mul(
-                    checked_mul(
-                        checked_mul(patches, 2, "Inkling vision time")?,
-                        4 * 4,
-                        "Inkling vision grid",
-                    )?,
-                    512,
-                    "Inkling vision layer 2",
-                )?,
-                checked_mul(
-                    checked_mul(patches, 2, "Inkling vision time")?,
-                    4_800,
-                    "Inkling vision layer 3",
-                )?,
-                checked_mul(patches, text_hidden, "Inkling vision layer 4")?,
-            ];
-            let graph_scalars = layer_outputs.iter().try_fold(0u64, |total, value| {
-                checked_add(
-                    total,
-                    checked_mul(12, *value, "Inkling vision layer workspace")?,
-                    "Inkling vision graph workspace",
-                )
-            })?;
-            Ok(MediaShapePlan {
-                decoder_positions: patches,
-                execution_workspace_scalars: graph_scalars,
-            })
-        }
-        InputModality::Audio => {
-            let config = args.audio_config.as_ref().ok_or_else(|| {
-                unsupported(
-                    &args.model_type,
-                    "loaded Inkling model has no audio configuration",
-                )
-            })?;
-            let [1, padded_frames, payload_codebooks] = input.payload_shape.as_slice() else {
-                return Err(unsupported(
-                    &args.model_type,
-                    format!(
-                        "Inkling audio tokens must be [1, frames, codebooks], got {:?}",
-                        input.payload_shape
-                    ),
-                ));
-            };
-            let (padded_frames, payload_codebooks) = (*padded_frames, *payload_codebooks);
-            let codebooks = positive(config.num_codebooks, "Inkling audio codebooks")?;
-            if payload_codebooks != codebooks {
-                return Err(unsupported(
-                    &args.model_type,
-                    format!(
-                        "Inkling audio payload has {payload_codebooks} codebooks, expected {codebooks}"
-                    ),
-                ));
-            }
-            let frames = if let Some(mask) = &input.audio_mask {
-                if mask.shape != [1, padded_frames]
-                    || u64::try_from(mask.values.len()).ok() != Some(padded_frames)
-                {
-                    return Err(unsupported(
-                        &args.model_type,
-                        format!(
-                            "Inkling audio mask must be [1, {padded_frames}], got {:?}",
-                            mask.shape
-                        ),
-                    ));
-                }
-                let frames = mask.values.iter().take_while(|value| **value).count();
-                if mask.values[frames..].iter().any(|value| *value) {
-                    return Err(unsupported(
-                        &args.model_type,
-                        "Inkling audio mask must describe one valid prefix",
-                    ));
-                }
-                u64::try_from(frames).map_err(|_| CapabilityError::ArithmeticOverflow {
-                    operation: "Inkling valid audio frame count",
-                })?
-            } else {
-                padded_frames
-            };
-            let hidden = positive(config.text_hidden_size, "Inkling audio hidden size")?;
-            let embedded = checked_mul(
-                checked_mul(padded_frames, codebooks, "Inkling audio frame codebooks")?,
-                hidden,
-                "Inkling audio embedding elements",
-            )?;
-            let reduced = checked_mul(padded_frames, hidden, "Inkling audio reduced elements")?;
-            let graph_scalars = checked_add(
-                checked_mul(4, embedded, "Inkling audio embedding workspace")?,
-                checked_mul(12, reduced, "Inkling audio reduction/norm workspace")?,
-                "Inkling audio graph workspace",
-            )?;
-            Ok(MediaShapePlan {
-                decoder_positions: frames,
-                execution_workspace_scalars: graph_scalars,
-            })
-        }
-        InputModality::Video => Err(unsupported(
-            &args.model_type,
-            "video is not a supported Inkling modality",
-        )),
-        InputModality::Text => Err(unsupported(
-            &args.model_type,
-            "text is not an Inkling media modality",
-        )),
-        _ => Err(unsupported(
-            &args.model_type,
-            "unknown modality is not supported by Inkling",
-        )),
-    }
+    admission::inkling::media(args, input, admission::inkling::Ordinary)
 }
 
 /// Validates one prepared Inkling part and derives the exact placeholder,
@@ -1822,76 +838,7 @@ pub fn inkling_input_part<Tensor>(
     inspector: &impl PreparedInputInspector<Tensor>,
 ) -> Result<InklingInputPartPlan, CapabilityError> {
     let inspected = inspect_part(input, inspector)?;
-    let descriptor = &inspected.descriptor;
-    let modality = descriptor.modality();
-    let payload = descriptor.payload_kind();
-    let shape = u64_shape(descriptor.payload())?;
-    match (modality, payload) {
-        (InputModality::Text, InputPayloadKind::TokenIds) => Ok(InklingInputPartPlan::TextTokens {
-            positions: batch_one_sequence(&shape, 2, "Inkling text token IDs", &args.model_type)?,
-        }),
-        (
-            modality @ (InputModality::Image | InputModality::Audio),
-            InputPayloadKind::Embeddings,
-        ) => {
-            let positions = batch_one_sequence(
-                &shape,
-                3,
-                &format!("Inkling {} embeddings", modality.as_str()),
-                &args.model_type,
-            )?;
-            let hidden = positive(args.text_config.hidden_size, "Inkling text hidden size")?;
-            if shape[2] != hidden {
-                return Err(unsupported(
-                    &args.model_type,
-                    format!(
-                        "prepared Inkling {} embeddings must have hidden width {hidden}, got {shape:?}",
-                        modality.as_str()
-                    ),
-                ));
-            }
-            let placeholder_token_id = match modality {
-                InputModality::Image => args.image_token_id,
-                InputModality::Audio => args.audio_token_id,
-                InputModality::Text | InputModality::Video => unreachable!(),
-                _ => {
-                    return Err(unsupported(
-                        &args.model_type,
-                        "unknown projected Inkling modality",
-                    ));
-                }
-            };
-            Ok(InklingInputPartPlan::Projected {
-                modality,
-                placeholder_token_id,
-                positions,
-            })
-        }
-        (modality @ (InputModality::Image | InputModality::Audio), InputPayloadKind::Tensor) => {
-            let shape = inkling(args, &inspected)?;
-            let ingress = InklingIngressPlan {
-                placeholder_token_id: if modality == InputModality::Image {
-                    args.image_token_id
-                } else {
-                    args.audio_token_id
-                },
-                placeholder_count: shape.decoder_positions,
-            };
-            Ok(InklingInputPartPlan::Media {
-                modality,
-                ingress,
-                shape,
-            })
-        }
-        (modality, payload) => Err(unsupported(
-            &args.model_type,
-            format!(
-                "Inkling does not support a {} {} payload",
-                modality.as_str(),
-                payload_name(payload)
-            ),
-        )),
-    }
+    admission::inkling::part(args, &inspected, admission::inkling::Ordinary)
 }
 
 /// Derives prepared Muse-Glimmer media geometry and artifact modality policy.
@@ -2346,7 +1293,7 @@ mod tests {
         .unwrap();
     }
 
-    fn qwen_vl_args() -> QwenVlModelArgs {
+    pub(super) fn qwen_vl_args() -> QwenVlModelArgs {
         crate::qwen::vl::model_args_from_config_value(&json!({
             "model_type":"qwen3_vl", "image_token_id":61, "video_token_id":62,
             "text_config": {"model_type":"qwen3_vl_text", "hidden_size":32,
@@ -2362,7 +1309,7 @@ mod tests {
         .unwrap()
     }
 
-    fn qwen_hybrid_args() -> ParsedHybridConfig {
+    pub(super) fn qwen_hybrid_args() -> ParsedHybridConfig {
         crate::qwen::hybrid::model_args_from_config_value(&json!({
             "model_type":"qwen3_5","image_token_id":30,"video_token_id":31,
             "text_config":{
@@ -3067,5 +2014,303 @@ mod tests {
                 Err(CapabilityError::UnsupportedInput { .. })
             ));
         }
+    }
+
+    #[test]
+    fn admitted_prompt_segments_borrow_extent_without_clone_or_owned_conversion() {
+        struct Trap(u64);
+        impl Clone for Trap {
+            fn clone(&self) -> Self {
+                panic!("segment visitor cloned admitted part")
+            }
+        }
+        impl From<Trap> for PreparedInputPartPlan {
+            fn from(_: Trap) -> Self {
+                panic!("segment visitor converted owned part")
+            }
+        }
+        impl CompositePartPlan for Trap {
+            fn decoder_positions(&self) -> u64 {
+                self.0
+            }
+        }
+        let input = prepared_input([
+            TestInputPart {
+                modality: InputModality::Text,
+                payload: TestPayload::TokenIds(vec![1, 2]),
+            },
+            TestInputPart {
+                modality: InputModality::Text,
+                payload: TestPayload::Embeddings(vec![1, 3, 4]),
+            },
+            TestInputPart {
+                modality: InputModality::Image,
+                payload: TestPayload::Embeddings(vec![1, 1, 4]),
+            },
+        ]);
+        let mut extents = [2, 3, 1].into_iter();
+        let admitted = admit_composite_input(&input, &TestInspector, |_| {
+            Ok(Trap(extents.next().unwrap()))
+        })
+        .unwrap();
+        let mut plans = Vec::new();
+        admitted
+            .visit_prompt_segments(|part| plans.push(part))
+            .unwrap();
+        assert_eq!(
+            plans.iter().map(|p| p.decoder_range).collect::<Vec<_>>(),
+            [[0, 2], [2, 5], [5, 6]]
+        );
+        assert_eq!(
+            plans.iter().map(|p| p.payload).collect::<Vec<_>>(),
+            [
+                InputPayloadKind::TokenIds,
+                InputPayloadKind::Embeddings,
+                InputPayloadKind::Embeddings
+            ]
+        );
+        assert_eq!(plans[2].modality, InputModality::Image);
+        assert_eq!(admitted.decoder_positions(), 6);
+    }
+}
+
+#[cfg(test)]
+mod original_semantic_kernel_tests {
+    use super::*;
+    use eredu_runtime::input::host::{
+        HostInputPart, HostTensorValues, HostTensorView, PreparedHostInputPlan,
+    };
+    use eredu_runtime::working_memory::WorkingMemoryPool;
+    fn raw(policy: qwen::QwenPolicy<'_>, modality: InputModality, grid: &[i32]) {
+        let vision = policy.vision.unwrap();
+        let width = (vision.in_channels
+            * vision.temporal_patch_size
+            * vision.patch_size
+            * vision.patch_size) as usize;
+        let count = grid
+            .chunks_exact(3)
+            .map(|g| (g[0] * g[1] * g[2]) as usize)
+            .sum::<usize>();
+        let values = (0..count * width)
+            .map(|n| n as f32 / 137.)
+            .collect::<Vec<_>>();
+        let shape = [count, width];
+        let grid_shape = [grid.len() / 3, 3];
+        let metadata = [(
+            InputMetadataKey::PatchGrid,
+            HostTensorView {
+                shape: &grid_shape,
+                values: HostTensorValues::I32(grid),
+            },
+        )];
+        let parts = [HostInputPart {
+            modality,
+            kind: eredu_core::InputPayloadKind::Tensor,
+            payload: HostTensorView {
+                shape: &shape,
+                values: HostTensorValues::F32(&values),
+            },
+            metadata: &metadata,
+            extents: &[],
+        }];
+        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let source = pool
+            .compile_prepared_host_input(PreparedHostInputPlan::prepare(&parts).unwrap())
+            .unwrap();
+        let original = qwen::qwen_part(
+            policy,
+            qwen::InspectedPartRef::original(source.part(0).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let shape64 = shape.map(|n| n as u64);
+        let grid64 = grid_shape.map(|n| n as u64);
+        let ordinary = qwen::qwen_part(
+            policy,
+            qwen::InspectedPartRef {
+                modality,
+                kind: eredu_core::InputPayloadKind::Tensor,
+                shape: qwen::ShapeRef::Legacy(&shape64),
+                grid: Some(qwen::GridRef {
+                    shape: qwen::ShapeRef::Legacy(&grid64),
+                    values: grid,
+                }),
+            },
+        )
+        .unwrap();
+        assert_eq!(original.positions, ordinary.positions);
+        assert_eq!(original.placeholder, ordinary.placeholder);
+        assert_eq!(original.grid, ordinary.grid);
+        assert_eq!(original.workspace_scalars, ordinary.workspace_scalars);
+        assert_eq!(
+            original.positions,
+            count as u64 / (vision.spatial_merge_size * vision.spatial_merge_size) as u64
+        );
+        assert!(original.workspace_scalars > values.len() as u64);
+        assert_eq!(
+            original.placeholder,
+            match modality {
+                InputModality::Image => policy.image.unwrap(),
+                InputModality::Video => policy.video.unwrap(),
+                _ => unreachable!(),
+            } as u32
+        );
+    }
+    #[test]
+    fn original_and_legacy_grid_views_share_nonzero_geometry_and_workspace_equations() {
+        let vl = super::tests::qwen_vl_args();
+        let hybrid = super::tests::qwen_hybrid_args();
+        for policy in [
+            qwen::QwenPolicy {
+                hidden: vl.text.hidden_size,
+                vision: Some(&vl.vision),
+                image: Some(vl.image_token_id),
+                video: Some(vl.video_token_id),
+                projected_media: false,
+            },
+            qwen::QwenPolicy {
+                hidden: hybrid.text.hidden_size,
+                vision: hybrid.vision.as_ref(),
+                image: hybrid.image_token_id,
+                video: hybrid.video_token_id,
+                projected_media: true,
+            },
+        ] {
+            for modality in [InputModality::Image, InputModality::Video] {
+                raw(policy, modality, &[1, 4, 4, 5, 2, 2]);
+            }
+        }
+    }
+    #[test]
+    fn borrowed_projection_and_malformed_grid_preserve_family_semantic_distinctions() {
+        let vl = super::tests::qwen_vl_args();
+        for projected_media in [false, true] {
+            let policy = qwen::QwenPolicy {
+                hidden: vl.text.hidden_size,
+                vision: Some(&vl.vision),
+                image: Some(vl.image_token_id),
+                video: Some(vl.video_token_id),
+                projected_media,
+            };
+            for modality in [
+                InputModality::Text,
+                InputModality::Image,
+                InputModality::Video,
+                InputModality::Audio,
+            ] {
+                let view = qwen::InspectedPartRef {
+                    modality,
+                    kind: eredu_core::InputPayloadKind::Embeddings,
+                    shape: qwen::ShapeRef::Host(&[1, 3, 32]),
+                    grid: None,
+                };
+                let result = qwen::qwen_part(policy, view);
+                let allowed = modality == InputModality::Text
+                    || (projected_media
+                        && matches!(modality, InputModality::Image | InputModality::Video));
+                assert_eq!(result.is_ok(), allowed);
+                if let Ok(result) = result {
+                    assert_eq!(result.positions, 3);
+                    assert_eq!(result.placeholder, 0);
+                }
+            }
+        }
+        for (shape, values) in [
+            (&[1usize, 3][..], &[1, 2][..]),
+            (&[1usize, 2][..], &[1, 2][..]),
+            (&[0usize, 3][..], &[][..]),
+        ] {
+            assert!(qwen::GridRef {
+                shape: qwen::ShapeRef::Host(shape),
+                values
+            }
+            .rows()
+            .is_err());
+        }
+        let policy = qwen::QwenPolicy {
+            hidden: 32,
+            vision: Some(&vl.vision),
+            image: Some(61),
+            video: Some(62),
+            projected_media: false,
+        };
+        for values in [[0, 2, 2], [1, 3, 2], [1, -2, 2]] {
+            assert!(qwen::qwen_part(
+                policy,
+                qwen::InspectedPartRef {
+                    modality: InputModality::Image,
+                    kind: eredu_core::InputPayloadKind::Tensor,
+                    shape: qwen::ShapeRef::Host(&[4, 24]),
+                    grid: Some(qwen::GridRef {
+                        shape: qwen::ShapeRef::Host(&[1, 3]),
+                        values: &values
+                    })
+                }
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn original_metadata_reads_match_raw_only_legacy_inspection_scope() {
+        let vl = super::tests::qwen_vl_args();
+        let policy = qwen::QwenPolicy {
+            hidden: 32,
+            vision: Some(&vl.vision),
+            image: Some(61),
+            video: Some(62),
+            projected_media: true,
+        };
+        let values = [0.25_f32; 96];
+        let grid = [1_i32, 2, 2];
+        let wrong = [0.5_f32; 8];
+        let metadata = [
+            (
+                InputMetadataKey::PatchGrid,
+                HostTensorView {
+                    shape: &[1, 3],
+                    values: HostTensorValues::I32(&grid),
+                },
+            ),
+            (
+                InputMetadataKey::PatchPositions,
+                HostTensorView {
+                    shape: &[4, 2],
+                    values: HostTensorValues::F32(&wrong),
+                },
+            ),
+        ];
+        let raw = [HostInputPart {
+            modality: InputModality::Image,
+            kind: eredu_core::InputPayloadKind::Tensor,
+            payload: HostTensorView {
+                shape: &[4, 24],
+                values: HostTensorValues::F32(&values),
+            },
+            metadata: &metadata,
+            extents: &[],
+        }];
+        let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+        let source = pool
+            .compile_prepared_host_input(PreparedHostInputPlan::prepare(&raw).unwrap())
+            .unwrap();
+        let error = qwen::InspectedPartRef::original(source.part(0).unwrap())
+            .err()
+            .expect("raw metadata is actually read");
+        assert_eq!(error.key, Some(InputMetadataKey::PatchPositions));
+        let projected = [HostInputPart {
+            modality: InputModality::Image,
+            kind: eredu_core::InputPayloadKind::Embeddings,
+            payload: HostTensorView {
+                shape: &[1, 3, 32],
+                values: HostTensorValues::F32(&values),
+            },
+            metadata: &metadata,
+            extents: &[],
+        }];
+        let source = pool
+            .compile_prepared_host_input(PreparedHostInputPlan::prepare(&projected).unwrap())
+            .unwrap();
+        let projected = qwen::InspectedPartRef::original(source.part(0).unwrap()).unwrap();
+        assert!(projected.grid.is_none());
+        assert_eq!(qwen::qwen_part(policy, projected).unwrap().positions, 3);
     }
 }

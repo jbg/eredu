@@ -1,6 +1,6 @@
 use safemlx::{
-    ops::{concatenate_axis, indexing::TryIndexOp},
     Array, Device, DeviceType,
+    ops::{concatenate_axis, indexing::TryIndexOp},
 };
 
 use crate::backend::ExecutionContext;
@@ -17,6 +17,14 @@ fn vector_decay_matches_scalar_when_channels_are_equal() {
     let beta = Array::from_slice(&[0.8f32, 0.6], &[1, 2, 1]);
     let scalar = Array::from_slice(&[-0.2f32, -0.4], &[1, 2, 1]);
     let vector = Array::from_slice(&[-0.2f32, -0.2, -0.4, -0.4], &[1, 2, 1, 2]);
+    let short_key = Array::from_slice(&[0.3f32, -0.2], &[1, 2, 1, 1]);
+    let error = gated_delta_scan(&query, &short_key, &value, &scalar, &beta, None, stream)
+        .expect_err("query and key widths must agree before starting the scan");
+    assert!(
+        error
+            .to_string()
+            .contains("query and key widths must match")
+    );
     let (_, scalar_output) =
         gated_delta_scan(&query, &key, &value, &scalar, &beta, None, stream).unwrap();
     let (_, vector_output) =
@@ -25,10 +33,12 @@ fn vector_decay_matches_scalar_when_channels_are_equal() {
     let vector_output = vector_output.evaluated().unwrap();
     let scalar = scalar_output.as_slice::<f32>();
     let vector = vector_output.as_slice::<f32>();
-    assert!(scalar
-        .iter()
-        .zip(vector)
-        .all(|(left, right)| (left - right).abs() < 1e-6));
+    assert!(
+        scalar
+            .iter()
+            .zip(vector)
+            .all(|(left, right)| (left - right).abs() < 1e-6)
+    );
 }
 
 #[test]
@@ -65,18 +75,22 @@ fn cached_chunks_match_one_scan() {
     let actual = concatenate_axis(&[first, second], 1, stream).unwrap();
     let expected = expected.evaluated().unwrap();
     let actual = actual.evaluated().unwrap();
-    assert!(expected
-        .as_slice::<f32>()
-        .iter()
-        .zip(actual.as_slice::<f32>())
-        .all(|(left, right)| (left - right).abs() < 1e-6));
+    assert!(
+        expected
+            .as_slice::<f32>()
+            .iter()
+            .zip(actual.as_slice::<f32>())
+            .all(|(left, right)| (left - right).abs() < 1e-6)
+    );
     let expected_state = expected_state.evaluated().unwrap();
     let actual_state = actual_state.evaluated().unwrap();
-    assert!(expected_state
-        .as_slice::<f32>()
-        .iter()
-        .zip(actual_state.as_slice::<f32>())
-        .all(|(left, right)| (left - right).abs() < 1e-6));
+    assert!(
+        expected_state
+            .as_slice::<f32>()
+            .iter()
+            .zip(actual_state.as_slice::<f32>())
+            .all(|(left, right)| (left - right).abs() < 1e-6)
+    );
 }
 
 #[test]
@@ -96,16 +110,20 @@ fn metal_vector_decay_matches_cpu() {
     let (gpu_state, gpu_output) = values(gpu.stream());
     let cpu_output = cpu_output.evaluated().unwrap();
     let gpu_output = gpu_output.evaluated().unwrap();
-    assert!(cpu_output
-        .as_slice::<f32>()
-        .iter()
-        .zip(gpu_output.as_slice::<f32>())
-        .all(|(left, right)| (left - right).abs() < 1e-5));
+    assert!(
+        cpu_output
+            .as_slice::<f32>()
+            .iter()
+            .zip(gpu_output.as_slice::<f32>())
+            .all(|(left, right)| (left - right).abs() < 1e-5)
+    );
     let cpu_state = cpu_state.evaluated().unwrap();
     let gpu_state = gpu_state.evaluated().unwrap();
-    assert!(cpu_state
-        .as_slice::<f32>()
-        .iter()
-        .zip(gpu_state.as_slice::<f32>())
-        .all(|(left, right)| (left - right).abs() < 1e-5));
+    assert!(
+        cpu_state
+            .as_slice::<f32>()
+            .iter()
+            .zip(gpu_state.as_slice::<f32>())
+            .all(|(left, right)| (left - right).abs() < 1e-5)
+    );
 }

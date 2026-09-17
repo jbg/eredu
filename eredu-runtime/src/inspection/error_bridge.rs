@@ -57,8 +57,73 @@ where
     ToObserver: FnMut(X) -> E,
     ToExecution: FnMut(&E) -> X,
 {
+    fn requires_prepared_traversal(&self) -> bool {
+        self.observer.requires_prepared_traversal()
+    }
+    fn supports_prefill_spans(&self) -> bool {
+        self.observer.supports_prefill_spans()
+    }
+    fn supports_prefill_context(&self) -> bool {
+        self.observer.supports_prefill_context()
+    }
+    fn requires_sequence_readout(&self) -> bool {
+        self.observer.requires_sequence_readout()
+    }
+    fn original_speculative_capture(&self) -> Option<crate::capture::OriginalSpeculativeCaptureInvocation<'_>> { self.observer.original_speculative_capture() }
+    fn retain_original_speculative_capture(&mut self, capture: eredu_core::speculative::SpeculativeActivationCapture) -> Result<(), crate::capture::CaptureProtocolError> { self.observer.retain_original_speculative_capture(capture) }
+    fn admitted_prefill_capture(
+        &self,
+    ) -> Option<&crate::working_memory::AdmittedPrefillCapture<'_>> {
+        self.observer.admitted_prefill_capture()
+    }
+    fn ordinary_prefill_capture(&self) -> Option<&crate::capture::OrdinaryPrefillCapture> {
+        self.observer.ordinary_prefill_capture()
+    }
+    fn admitted_capture_continuation(
+        &self,
+    ) -> Option<&crate::working_memory::AdmittedCaptureContinuation<'_>> {
+        self.observer.admitted_capture_continuation()
+    }
     fn transactional(&self) -> bool {
         self.observer.transactional()
+    }
+    fn begin_prefill_context(&mut self, frontier: u64) -> Result<(), X> {
+        let value = self.observer.begin_prefill_context(frontier);
+        result(&mut self.failure, &mut self.to_execution, value)
+    }
+    fn begin_prefill_chunk(&mut self, chunk: &crate::prefill::PrefillChunk) -> Result<(), X> {
+        let value = self.observer.begin_prefill_chunk(chunk);
+        result(&mut self.failure, &mut self.to_execution, value)
+    }
+    fn finish_prefill(&mut self, committed: bool) {
+        self.observer.finish_prefill(committed);
+    }
+    fn requires_prefill_opening_state(&self) -> bool {
+        self.observer.requires_prefill_opening_state()
+    }
+    fn prepare_prefill_chunk_with_opening(
+        &mut self,
+        context: &PrefillChunkRetentionContext<'_>,
+        opening: &PrefillOpeningState<'_, T>,
+    ) -> Result<Option<PreparedPrefillChunkRetention>, X> {
+        let value = self
+            .observer
+            .prepare_prefill_chunk_with_opening(context, opening);
+        result(&mut self.failure, &mut self.to_execution, value)
+    }
+    fn prepare_prefill_chunk_retention(
+        &mut self,
+        context: &PrefillChunkRetentionContext<'_>,
+    ) -> Result<Option<PreparedPrefillChunkRetention>, X> {
+        let value = self.observer.prepare_prefill_chunk_retention(context);
+        result(&mut self.failure, &mut self.to_execution, value)
+    }
+    fn retire_prefill_chunk_retention(
+        &mut self,
+        settled: SettledPrefillChunkRetention,
+    ) -> Result<(), X> {
+        let value = self.observer.retire_prefill_chunk_retention(settled);
+        result(&mut self.failure, &mut self.to_execution, value)
     }
     fn prepare_transaction(
         &mut self,
@@ -90,6 +155,18 @@ where
         let value = self.observer.routing_control(path, rows);
         result(&mut self.failure, &mut self.to_execution, value)
     }
+    fn routing_unmodified_interest(&self, path: &str) -> crate::RoutingUnmodifiedInterest {
+        self.observer.routing_unmodified_interest(path)
+    }
+    fn routing_unmodified(
+        &mut self,
+        path: &str,
+        effective: RoutingDecision<'_, T>,
+    ) -> Result<(), X> {
+        let value = self.observer.routing_unmodified(path, effective);
+        result(&mut self.failure, &mut self.to_execution, value)
+    }
+
     fn routing_applied(
         &mut self,
         path: &str,
@@ -136,6 +213,30 @@ where
             });
         result(&mut self.failure, &mut self.to_execution, value)
     }
+    /// Forward the actual generated program and its caller-owned root retention.
+    fn observe_generated_retained(
+        &mut self,
+        path: &str,
+        prototype: &T,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<T, X>,
+    ) -> Result<(), X> {
+        fn identity_ref<T>(value: &T) -> &T {
+            value
+        }
+        let mut mapped = eredu_nn::MappedGeneratedTensorFactory::new(
+            factory,
+            identity_ref::<T>,
+            std::convert::identity::<T>,
+            &mut self.to_observer,
+            &mut self.to_execution,
+        );
+        let value = self
+            .observer
+            .observe_generated_retained(path, prototype, source, &mut mapped);
+        result(&mut self.failure, &mut self.to_execution, value)
+    }
+
     fn intervene(&mut self, path: &str, tensor: &T) -> Result<Option<T>, X> {
         let value = self.observer.intervene(path, tensor);
         result(&mut self.failure, &mut self.to_execution, value)
@@ -332,3 +433,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod retained_factory_tests;

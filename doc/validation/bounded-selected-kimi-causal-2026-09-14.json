@@ -1,0 +1,144 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T07:50:00.813771+00:00",
+  "scope": "Selected Kimi fixed/compressed ordinary causal row forwarding",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-gemma4-causal-prefill-2026-09-14.json",
+  "tests": {
+    "architectures": {
+      "passed": 1026,
+      "ignored": 1
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1160,
+  "new_tests": [
+    {
+      "name": "selected_kimi_rows_preserve_all_eighteen_hooks_and_complete_continued_state",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/replicated_rows/kimi_linear_rows.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "selected_kimi_binds_actual_prepared_sources_and_physical_readout",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/replicated_rows/kimi_linear_rows.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "selected_kimi_body_rows_preserve_state_only_and_last_position_execution",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/replicated_rows/kimi_linear_rows.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "selected_kimi_preserves_actual_routed_and_mtp_eligibility_rejections",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/replicated_rows/kimi_linear_rows.rs",
+      "check": "architectures"
+    }
+  ],
+  "new_test_count": 4,
+  "removed_tests": [
+    "selected_kimi_hooks_are_real_while_causal_declarations_remain_empty"
+  ],
+  "checks": {
+    "architectures": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib --test reference_numeric",
+      "started_utc": "2026-09-14T07:46:33.209577+00:00",
+      "elapsed_seconds": 135.265,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-selected-kimi-causal-integrated-architectures.log",
+      "log_sha256": "36d4e85e08de7d1ad32ba1f09e0ef6fc05f543cffe1ef0dd8f2994e50d9d109a"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T07:48:48.476936+00:00",
+      "elapsed_seconds": 38.819,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-selected-kimi-causal-integrated-portable.log",
+      "log_sha256": "58995b75d125fc49d50d1bd200bf1a26a7be5fff43f286219089d1ed71e40f2a"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T07:49:27.297320+00:00",
+      "elapsed_seconds": 12.104,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-selected-kimi-causal-integrated-minimal.log",
+      "log_sha256": "8f88d42de0ab81af2485050fc2c5bb2810956415c6a331c3916e9243f434867e"
+    },
+    "native": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal",
+      "started_utc": "2026-09-14T07:49:39.401790+00:00",
+      "elapsed_seconds": 3.71,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-selected-kimi-causal-integrated-native.log",
+      "log_sha256": "f4782762f9cb6a54235d8494acc680396b12416e149a730360f0ee5ffbe78ddf"
+    }
+  },
+  "source_sha256": {
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/replicated_rows/kimi_linear_rows.rs": "07b68dffd3dd709ba44be82c1c2aaaa116050a1572261f4f0bc1ef03a0caaa59",
+    "doc/backend-architecture.md": "44fd4417eab745ec46ecfe511140d109c70129b8e2b13ec27bc6843a986454aa",
+    "doc/execution-control.md": "39dd0b1bc4a8aaf570a91b7e91ee783ae89375d36ae518bb5fc5e2c82e8b7c55",
+    "doc/bounded-inference.md": "427eccd2d65a49ecdf8c028b146032f909d8b41b7512cb151032bbbe763e86ae",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/kimi_linear_rows.rs": "82e26f7402ce9eaf39eae4f9c609a5bdaa7bbe4df76323a14fb42e188cfe959f",
+    "eredu-architectures/src/replicated_text.rs": "cdb37277e2ad63af41c12edb1a0dc95c1e474ab4d3491c63c5cd923343931caa",
+    "doc/lm-inspector-execution-control.md": "09b318ca3e483a9e50693dab375e8deca5fa4d233f119fc5f5b3dfb07f366d05",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/replicated_rows.rs": "19ff55658ab457ec7c6033f7b8a2f8ba4f18e0167d1150763667e2481e77d080"
+  },
+  "source_snapshot": "/private/tmp/eredu-selected-kimi-causal-integrated-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-selected-kimi-causal-integrated-applied.json": "2da725611e03bdcf80dd2731549e3646e9788d94b74d53400aac70297278856d",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-apply.py": "bcf6fa16b48225054d563843fb5700ac18a0e969a6f639ed01ca0b8363ee4d13",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-architectures.log": "36d4e85e08de7d1ad32ba1f09e0ef6fc05f543cffe1ef0dd8f2994e50d9d109a",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-checks.json": "bbc772b9a7127624c37a04f9eba97de88d91c8a59966c0bd7143ba19c82b1d23",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-doc-applied.json": "f733230acdcc67ea09f2bb0047cff9b604396bcdf9ab9943ad4af6a7bd242a56",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-focused-delta.patch": "a6030cb621438051a9b403252e76e977ff7b890995742bb31e5d188759c73d77",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-focused-review-sha256.json": "4842737b392a021caa8f0990d81dfaa346ecfd94448c6535e7b4c4ffda061200",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-focused-review.md": "9cd9406eb3468ea3e586214ea5a0cc36db5478ef19e057440e9ef4b079b9592c",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-minimal.log": "8f88d42de0ab81af2485050fc2c5bb2810956415c6a331c3916e9243f434867e",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-native.log": "f4782762f9cb6a54235d8494acc680396b12416e149a730360f0ee5ffbe78ddf",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-portable.log": "58995b75d125fc49d50d1bd200bf1a26a7be5fff43f286219089d1ed71e40f2a",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-review.json": "2c939805d55386f722bf616f40aeb6bca4b936e10e70dc5f4d04593a2568dbe1",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-stage/all.patch": "229c99c0dafc3b6401ea3b87c9a70e50a4c8c30a4c622b99cac20935e181b926",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-stage/change.patch": "887a50e74aa0ae1d4c4ce114626a9270ec0e64506ebb7c5723e25c7946c06593",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-stage/doc-edits.json": "249ac524d8b2764a54bf31ffc6c3fd8fdc0f4e8e2845de4b53dec826ea4267c2",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-stage/manifest.json": "2da725611e03bdcf80dd2731549e3646e9788d94b74d53400aac70297278856d",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-stage/merge-ledger.json": "84f0d885923c8a0d2e9e4be71e6265208dfeff33365d39be7fffaef8c5e53bd7",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-stage/new-tests.json": "81d056aebefed255a579b43bdc8032aed3c91f0c1e4cbeec2a782443ae7ddd1d",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-stage/staged-hashes.json": "866cea850513ec93d2240cb7deee9cd2b13a835fa7bf77d93448782411ad9c9a",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-validate.py": "6a80eda3729575cc96fc86b17443dabb691bba6facab3725c5dfd57c120b727b",
+    "/private/tmp/eredu-selected-kimi-causal-integrated-validation-config.json": "59a29c28c73a2bcd03cadec029420d4faf9b2ca9550ce5ff0b9b063c23adb2c8",
+    "/private/tmp/eredu-selected-kimi-causal-review.md": "a9fbcb626e9ed852c2173421b6e2ce335722d4976e3a7fa6125735ed4c76aa6f",
+    "/private/tmp/eredu-selected-kimi-causal-root-review.json": "24e8ec05fada875b7b51f22ebf6e0c4fd14c079b3151e1ac62e9bb18623ef8ba"
+  },
+  "review": {
+    "status": "Root original and focused integration plus independent reviews complete; central selected tests pending",
+    "reviews": {
+      "/private/tmp/eredu-selected-kimi-causal-root-review.json": "24e8ec05fada875b7b51f22ebf6e0c4fd14c079b3151e1ac62e9bb18623ef8ba",
+      "/private/tmp/eredu-selected-kimi-causal-review.md": "a9fbcb626e9ed852c2173421b6e2ce335722d4976e3a7fa6125735ed4c76aa6f",
+      "/private/tmp/eredu-selected-kimi-causal-integrated-focused-review.md": "9cd9406eb3468ea3e586214ea5a0cc36db5478ef19e057440e9ef4b079b9592c"
+    },
+    "source_manifest_sha256": "2da725611e03bdcf80dd2731549e3646e9788d94b74d53400aac70297278856d",
+    "patch_sha256": "887a50e74aa0ae1d4c4ce114626a9270ec0e64506ebb7c5723e25c7946c06593",
+    "full_manifest_sha256": "866cea850513ec93d2240cb7deee9cd2b13a835fa7bf77d93448782411ad9c9a",
+    "full_patch_sha256": "229c99c0dafc3b6401ea3b87c9a70e50a4c8c30a4c622b99cac20935e181b926",
+    "focused_delta": "/private/tmp/eredu-selected-kimi-causal-integrated-focused-delta.patch",
+    "focused_delta_sha256": "a6030cb621438051a9b403252e76e977ff7b890995742bb31e5d188759c73d77",
+    "replay": "/private/tmp/eredu-selected-kimi-causal-integrated-stage/replay",
+    "root_review": "Kimi raw parameter override has precedence; None retains existing72 Nemotron negative raw A fixture, all other parameters use prior default. Frozen production/direct helper/new child unchanged. Ordered docs preserve native join/Gemma additions.",
+    "new_tests": 4,
+    "replaced_tests": 1
+  },
+  "behavior": [
+    "Only two existing fixed/compressed Kimi adapter constants change production; same family equations, prepared owner and eligibility remain authoritative.",
+    "Shared direct/selected immutable parameter initializer preserves actual nonzero convolution, A_log and dt_bias values before paths/state; seven existing direct tests retain their assertions.",
+    "Eight dense fixed, mixed and compressed configurations cover width1/3 histories and direct/low-rank query projection where applicable, across resident/host/disk.",
+    "All18 real callbacks and Full/Preview source bindings retain original owner identity and readout demand. Numerical comparisons include prefix2, continuation5 versus2/1/2, and three decodes. Full state compares at prefix/final/decode; intermediate checks are frontier/nonzero invariants.",
+    "Six routed and six MTP cold rejection cases preserve existing selected eligibility; no success fixture bypasses them."
+  ],
+  "limits": [
+    "Selected ordinary equation/source proofs do not establish native capture admission, partition row binding, media/proposal causality or original outer-resource coverage.",
+    "No new released-checkpoint/native distributed validation, memory authority, gateway activation or total-process bound."
+  ]
+}

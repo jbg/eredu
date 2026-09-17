@@ -1,0 +1,99 @@
+diff --git a/mlx/backend/cpu/argsort_f32.h b/mlx/backend/cpu/argsort_f32.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/argsort_f32.h
+@@ -0,0 +1,65 @@
++// Copyright © 2026 Eredu contributors.
++#pragma once
++
++#include <cmath>
++#include <cstddef>
++#include <cstdint>
++#include <utility>
++
++namespace mlx::core::cpu::detail {
++
++// Private rank-one F32 worker. The caller supplies the existing output storage
++// and valid signed strides; count is bounded by MLX's signed dimension width.
++// Ascending IDs encode stable ties, including the old stable_sort's trailing
++// NaN equivalence class. No score is rewritten and no auxiliary heap is used.
++inline void argsort_f32_row(
++    const float* values,
++    int64_t input_stride,
++    uint32_t* indices,
++    int64_t output_stride,
++    size_t count) noexcept {
++  if (count == 0) {
++    return;
++  }
++  const auto at = [indices, output_stride](size_t i) -> uint32_t& {
++    return indices[static_cast<int64_t>(i) * output_stride];
++  };
++  const auto less = [values, input_stride](uint32_t a, uint32_t b) {
++    const float x = values[static_cast<int64_t>(a) * input_stride];
++    const float y = values[static_cast<int64_t>(b) * input_stride];
++    if (std::isnan(x)) {
++      return std::isnan(y) && a < b;
++    }
++    if (std::isnan(y)) {
++      return true;
++    }
++    return x < y || (x == y && a < b);
++  };
++  for (size_t i = 0; i < count; ++i) {
++    at(i) = static_cast<uint32_t>(i);
++  }
++  // Test before computing 2 * root + 1; the child is then strictly below
++  // length, including the final single-child parent of an even-length heap.
++  const auto sift = [&](size_t root, size_t length) {
++    while (root < length / 2) {
++      size_t child = root * 2 + 1;
++      if (child + 1 < length && less(at(child), at(child + 1))) {
++        ++child;
++      }
++      if (!less(at(root), at(child))) {
++        return;
++      }
++      std::swap(at(root), at(child));
++      root = child;
++    }
++  };
++  for (size_t parent = count / 2; parent > 0; --parent) {
++    sift(parent - 1, count);
++  }
++  for (size_t length = count; length > 1; --length) {
++    std::swap(at(0), at(length - 1));
++    sift(0, length - 1);
++  }
++}
++
++} // namespace mlx::core::cpu::detail
+diff --git a/mlx/backend/cpu/sort.cpp b/mlx/backend/cpu/sort.cpp
+--- a/mlx/backend/cpu/sort.cpp
++++ b/mlx/backend/cpu/sort.cpp
+@@ -6,6 +6,7 @@
+ #include <numeric>
+ 
+ #include "mlx/backend/common/utils.h"
++#include "mlx/backend/cpu/argsort_f32.h"
+ #include "mlx/backend/cpu/copy.h"
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/dtype_utils.h"
+@@ -334,6 +335,17 @@
+   encoder.dispatch([in = array::unsafe_weak_copy(in),
+                     out = array::unsafe_weak_copy(out),
+                     axis_ = axis_]() mutable {
++    if (in.dtype() == float32 && in.ndim() == 1) {
++      const auto count = static_cast<size_t>(in.shape(0));
++      // Avoid both the generic worker's zero-width division and a null data
++      // pointer access for an empty row. Native allocation/dispatch is unchanged.
++      if (count != 0) {
++        cpu::detail::argsort_f32_row(
++            in.data<float>(), in.strides()[0], out.data<uint32_t>(),
++            out.strides()[0], count);
++      }
++      return;
++    }
+     switch (in.dtype()) {
+       case bool_:
+         return argsort<bool>(in, out, axis_);

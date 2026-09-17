@@ -144,6 +144,63 @@ impl MlxModelSession {
         self.verify_partition_parameter_coordination_for_test(
             stream, reference, &original, &changed, false,
         );
+        self.ensure_no_submission_in_flight().unwrap();
+        let mut guard = safemlx::RuntimeCallDeadline::new(std::time::Duration::from_secs(5))
+            .unwrap()
+            .enter()
+            .unwrap();
+        let count = self
+            .payload
+            .parameter_state
+            .parameter_sources()
+            .count(&mut guard)
+            .unwrap();
+        assert_eq!(
+            count
+                .counts()
+                .role(ParameterOwnerRole::DisplacedOriginal)
+                .parameters
+                .auxiliary_slots,
+            self.payload.parameter_state.originals.len()
+        );
+        assert_eq!(
+            count
+                .counts()
+                .role(ParameterOwnerRole::PublishedOverlay)
+                .parameters
+                .auxiliary_slots,
+            self.payload.parameter_state.published.len()
+        );
+        assert!(
+            count
+                .counts()
+                .role(ParameterOwnerRole::PublishedOverlay)
+                .parameters
+                .auxiliary_slots
+                > 0
+        );
+        drop(count);
+        let owner = crate::composition::mlx::replicated_text::NativeParameterOwnerSource::new(
+            self.payload.model.erased(),
+        )
+        .count(&mut guard)
+        .unwrap();
+        assert!(std::ptr::addr_eq(
+            owner.source().owner(),
+            self.payload.model.erased()
+        ));
+        assert_eq!(
+            owner.counts(),
+            crate::composition::mlx::replicated_text::NativeParameterOwnerSource::new(
+                self.payload.model.erased()
+            )
+            .count(&mut guard)
+            .unwrap()
+            .counts()
+        );
+        drop(owner);
+        drop(guard);
+
         for slot in &slots {
             let id = slot.parameter.id.as_str();
             self.with_model_operation(|model| {
@@ -185,6 +242,35 @@ impl MlxModelSession {
             })
             .unwrap();
         }
+        self.ensure_no_submission_in_flight().unwrap();
+        let mut guard = safemlx::RuntimeCallDeadline::new(std::time::Duration::from_secs(5))
+            .unwrap()
+            .enter()
+            .unwrap();
+        let counted = self
+            .payload
+            .parameter_state
+            .parameter_sources()
+            .count(&mut guard)
+            .unwrap();
+        assert_eq!(
+            counted
+                .counts()
+                .role(ParameterOwnerRole::DisplacedOriginal)
+                .parameters
+                .auxiliary_slots,
+            self.payload.parameter_state.originals.len()
+        );
+        assert_eq!(
+            counted
+                .counts()
+                .role(ParameterOwnerRole::PublishedOverlay)
+                .parameters
+                .auxiliary_slots,
+            self.payload.parameter_state.published.len()
+        );
+        drop(counted);
+        drop(guard);
         let restored = self.parameter_facts().unwrap();
         assert_eq!(restored.identity, facts.identity);
         assert_eq!(restored.parameters, facts.parameters);

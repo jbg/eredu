@@ -4,14 +4,16 @@
 //! modalities, cache/recurrent strategy, and executable state geometry. Concrete
 //! backends apply physical scalar widths and report live memory observations.
 
+use std::sync::Arc;
+
 use std::collections::BTreeMap;
 
 use crate::rotary::RopeValue;
 use eredu_core::{
-    cache::{LayerCachePolicy, StateTensorRole},
     CacheStateStrategy, CapabilityError, EstimationCompleteness, InputModalities,
     ModelCapabilities, ObservationKind, Observed, SlidingWindowLayerCount, SpeculativeDraftSource,
     StateMemoryLayout,
+    cache::{LayerCachePolicy, StateTensorRole},
 };
 use eredu_runtime::StateLayout as RuntimeStateLayout;
 
@@ -20,8 +22,8 @@ use crate::{
     llama::ModelArgs as LlamaModelArgs,
     nemotron_h,
     qwen::{
-        hybrid::{HybridConfig as QwenHybridConfig, HybridLayerPolicy as QwenHybridLayerPolicy},
         ModelArgs as QwenModelArgs, QwenVariant,
+        hybrid::{HybridConfig as QwenHybridConfig, HybridLayerPolicy as QwenHybridLayerPolicy},
     },
 };
 use eredu_core::attention::AttentionPolicy;
@@ -148,9 +150,10 @@ fn state_memory_layout_from_layout(
     allocation_granularity: u64,
     completeness: EstimationCompleteness,
 ) -> Result<StateMemoryLayout, CapabilityError> {
+    let offsets = layout.layer_prefix_offsets();
     StateMemoryLayout::new(
-        layout.layers().clone(),
-        layout.layer_prefix_offsets(),
+        layout.into_layers(),
+        offsets,
         positive(hidden_size, "hidden_size")?,
         allocation_granularity,
         completeness,
@@ -800,47 +803,111 @@ fn qwen_hybrid_spec(args: &QwenHybridConfig, multimodal: bool) -> Result<Spec, C
 }
 
 /// Complete portable capability and runtime-state estimate for one architecture.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Clones share the immutable constructed report. Consuming transformations
+/// retain independent values when another owner still uses the original.
+#[derive(Debug, PartialEq, Eq)]
 pub struct CapabilityEstimate {
+    // The closed owner lends immutable reports; no Weak or mutable payload escapes.
+    shared: Option<Arc<CapabilityEstimateData>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapabilityEstimateData {
     capabilities: ModelCapabilities,
     state_layout: StateMemoryLayout,
     draft_source: Option<SpeculativeDraftSource>,
 }
 
+impl Clone for CapabilityEstimate {
+    fn clone(&self) -> Self {
+        Self {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl Drop for CapabilityEstimate {
+    fn drop(&mut self) {
+        if let Some(shared) = self.shared.take() {
+            drop(Arc::into_inner(shared));
+        }
+    }
+}
+
 impl CapabilityEstimate {
+    fn from_data(data: CapabilityEstimateData) -> Self {
+        Self {
+            shared: Some(Arc::new(data)),
+        }
+    }
+
+    fn data(&self) -> &CapabilityEstimateData {
+        self.shared
+            .as_deref()
+            .expect("capability estimate was consumed")
+    }
+
+    fn into_data(mut self) -> CapabilityEstimateData {
+        let shared = self
+            .shared
+            .take()
+            .expect("capability estimate was consumed");
+        match Arc::try_unwrap(shared) {
+            Ok(data) => data,
+            Err(shared) => {
+                // Existing consuming APIs promise independent owned results.
+                // Keep the closed destructor if other reports retain this payload.
+                let owner = Self {
+                    shared: Some(shared),
+                };
+                owner.data().clone()
+            }
+        }
+    }
+
+    fn update(mut self, change: impl FnOnce(&mut CapabilityEstimateData)) -> Self {
+        if let Some(data) = self.shared.as_mut().and_then(Arc::get_mut) {
+            change(data);
+            self
+        } else {
+            let mut data = self.into_data();
+            change(&mut data);
+            Self::from_data(data)
+        }
+    }
+
     /// Projects memory accounting onto the exact selected rank-local state.
     /// Family capabilities and context limits remain global model properties.
     pub(crate) fn for_selected_state(
-        mut self,
+        self,
         layout: Option<&RuntimeStateLayout>,
     ) -> Result<Self, CapabilityError> {
-        self.state_layout = StateMemoryLayout::new(
+        let state_layout = StateMemoryLayout::new(
             layout.map_or_else(eredu_core::LayerSchedule::empty, |layout| {
                 layout.layers().clone()
             }),
             layout.map_or_else(Vec::new, |layout| layout.layer_prefix_offsets()),
-            self.state_layout.hidden_size,
-            self.state_layout.allocation_granularity,
-            self.state_layout.completeness,
+            self.data().state_layout.hidden_size,
+            self.data().state_layout.allocation_granularity,
+            self.data().state_layout.completeness,
         )?;
-        Ok(self)
+        Ok(self.update(|data| data.state_layout = state_layout))
     }
 
     /// Reuses an exact mechanism/state estimate for an architecture extension
     /// that implements the same validated neutral geometry under a new identity.
-    pub fn for_architecture_extension(mut self, effective_model_type: impl Into<String>) -> Self {
-        self.capabilities.effective_model_type = effective_model_type.into();
-        self
+    pub fn for_architecture_extension(self, effective_model_type: impl Into<String>) -> Self {
+        self.update(|data| data.capabilities.effective_model_type = effective_model_type.into())
     }
 
     /// Returns validated portable model capabilities.
-    pub const fn capabilities(&self) -> &ModelCapabilities {
-        &self.capabilities
+    pub fn capabilities(&self) -> &ModelCapabilities {
+        &self.data().capabilities
     }
 
     /// Returns memory metadata around the exact executable layer schedule.
-    pub const fn state_layout(&self) -> &StateMemoryLayout {
-        &self.state_layout
+    pub fn state_layout(&self) -> &StateMemoryLayout {
+        &self.data().state_layout
     }
 
     /// Architecture-declared checkpoint form for executable draft weights.
@@ -848,25 +915,24 @@ impl CapabilityEstimate {
     /// `None` means that this exact normalized configuration exposes no
     /// speculative drafting graph. Concrete backends decide whether they
     /// implement the declared graph; they do not infer family policy themselves.
-    pub const fn speculative_draft_source(&self) -> Option<SpeculativeDraftSource> {
-        self.draft_source
+    pub fn speculative_draft_source(&self) -> Option<SpeculativeDraftSource> {
+        self.data().draft_source
     }
 
     /// Splits the estimate into its portable capability and state values.
     pub fn into_parts(self) -> (ModelCapabilities, StateMemoryLayout) {
-        (self.capabilities, self.state_layout)
+        let data = self.into_data();
+        (data.capabilities, data.state_layout)
     }
 }
 
 fn finish(effective_model_type: String, spec: Spec) -> CapabilityEstimate {
     let (native_max_context, effective_max_context, state_strategy, modalities, state_layout) =
         spec;
-    let estimation = if modalities.image || modalities.audio || modalities.video {
-        EstimationCompleteness::Conservative
-    } else {
-        state_layout.completeness
-    };
-    CapabilityEstimate {
+    // Configuration/state geometry alone cannot bound native text workspace.
+    // A media-tower bound does not fill that gap either.
+    let estimation = EstimationCompleteness::PersistentStateOnly;
+    CapabilityEstimate::from_data(CapabilityEstimateData {
         capabilities: ModelCapabilities {
             effective_model_type,
             native_max_context,
@@ -877,15 +943,14 @@ fn finish(effective_model_type: String, spec: Spec) -> CapabilityEstimate {
         },
         state_layout,
         draft_source: None,
-    }
+    })
 }
 
 fn with_speculative_draft_source(
-    mut estimate: CapabilityEstimate,
+    estimate: CapabilityEstimate,
     draft_source: Option<SpeculativeDraftSource>,
 ) -> CapabilityEstimate {
-    estimate.draft_source = draft_source;
-    estimate
+    estimate.update(|data| data.draft_source = draft_source)
 }
 
 fn embedded_mtp_draft_source(layers: i32) -> Option<SpeculativeDraftSource> {
@@ -1076,6 +1141,60 @@ mod tests {
     use std::num::NonZeroU8;
 
     #[test]
+    fn qwen_hybrid_state_and_media_bounds_do_not_claim_complete_text_workspace() {
+        let args = crate::qwen::hybrid::model_args_from_config_value(&json!({
+            "model_type": "qwen3_5_text", "vocab_size": 248320,
+            "hidden_size": 8, "num_hidden_layers": 2, "mtp_num_hidden_layers": 0,
+            "num_attention_heads": 1, "num_key_value_heads": 1, "head_dim": 8,
+            "max_position_embeddings": 4096, "intermediate_size": 16,
+            "num_experts": 0, "tie_word_embeddings": true,
+            "layer_types": ["full_attention", "full_attention"]
+        }))
+        .unwrap();
+        let estimate = qwen_hybrid_text(&args.text).unwrap();
+        assert_eq!(
+            estimate.capabilities().estimation,
+            EstimationCompleteness::PersistentStateOnly
+        );
+        for input in [
+            eredu_core::InputTokenCount::text(3000),
+            eredu_core::InputTokenCount::prepared(2990, 10, 3000, 4096, ObservationKind::Estimated),
+        ] {
+            let state = eredu_core::estimate_runtime_state(
+                estimate.state_layout(),
+                input,
+                3,
+                1,
+                NonZeroU8::new(2).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                state.completeness,
+                EstimationCompleteness::PersistentStateOnly
+            );
+            assert!(matches!(
+                eredu_core::apply_admission_policy(
+                    estimate.capabilities(),
+                    eredu_core::AdmissionRequest {
+                        input,
+                        max_output_tokens: 3,
+                        batch_size: 1,
+                        safety_reserve_bytes: 0,
+                        application_memory_budget_bytes: Some(u64::MAX),
+                        require_complete_estimate: false,
+                    },
+                    state,
+                    None
+                )
+                .unwrap(),
+                eredu_core::AdmissionResult::Rejected(
+                    eredu_core::AdmissionRejection::EstimationUnsupported { .. }
+                )
+            ));
+        }
+    }
+
+    #[test]
     fn selected_partition_memory_uses_only_owned_layers_and_heads() {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/k2_horizon/reference.json"))
@@ -1091,6 +1210,8 @@ mod tests {
             &crate::k2_horizon::model_args_from_config_value(&config).unwrap(),
         )
         .unwrap();
+        let original_layout = global.state_layout().clone();
+        let original_capabilities = global.capabilities().clone();
         for (layout, expected) in [(Some(&local), 32), (None, 0)] {
             let projected = global.clone().for_selected_state(layout).unwrap();
             assert_eq!(projected.capabilities(), global.capabilities());
@@ -1104,7 +1225,17 @@ mod tests {
             .unwrap();
             assert_eq!(state.bytes_per_position_per_batch, expected);
             assert_eq!(state.requested_state_bytes, 7 * expected);
+            assert_eq!(global.state_layout(), &original_layout);
         }
+        let (extension, _) = global
+            .clone()
+            .for_architecture_extension("local-extension")
+            .into_parts();
+        assert_eq!(extension.effective_model_type, "local-extension");
+        assert_eq!(global.capabilities(), &original_capabilities);
+        let (capabilities, layout) = global.into_parts();
+        assert_eq!(capabilities, original_capabilities);
+        assert_eq!(layout, original_layout);
     }
 
     #[test]

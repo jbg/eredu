@@ -8,6 +8,7 @@ use std::{
 trait Retired {
     fn take_next(&mut self) -> Option<Box<dyn Retired>>;
     fn set_next(&mut self, next: Option<Box<dyn Retired>>);
+    fn retire(self: Box<Self>);
 }
 
 struct Node<T> {
@@ -22,6 +23,16 @@ impl<T> Retired for Node<T> {
     fn set_next(&mut self, next: Option<Box<dyn Retired>>) {
         self.next = next;
     }
+    fn retire(self: Box<Self>) {
+        // The caller detached next before invoking any payload destructor.
+        // Returning the concrete node retires its Box before T is dropped.
+        let node = unbox_node(self);
+        drop(node);
+    }
+}
+
+fn unbox_node<T>(node: Box<Node<T>>) -> Node<T> {
+    *node
 }
 
 #[derive(Default)]
@@ -45,13 +56,34 @@ thread_local! {
 pub(crate) struct OrdinaryRetirement<T: 'static>(Option<Box<Node<T>>>);
 
 impl<T: 'static> OrdinaryRetirement<T> {
+    /// Actual one-node allocation and its named unboxing/transfer controls.
+    /// Payload allocations and queue/TLS infrastructure are separate facts.
+    pub(crate) fn control_bytes() -> Option<u64> {
+        [
+            size_of::<Node<T>>(),
+            size_of::<Box<Node<T>>>(),
+            size_of::<Option<Box<Node<T>>>>(),
+            size_of::<Box<dyn Retired>>(),
+            size_of::<Option<Box<dyn Retired>>>(),
+            size_of::<Result<Option<Box<dyn Retired>>, std::thread::AccessError>>(),
+            size_of::<Queue>(), // Detached snapshot control, not TLS infrastructure.
+            size_of::<Self>(),
+            size_of::<Node<T>>(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+    }
+
     pub(crate) fn new(value: T) -> Self {
         Self(Some(Box::new(Node { value, next: None })))
     }
 
     /// Transfers an unretired owner to an ordinary caller without running Drop.
     pub(crate) fn into_inner(mut self) -> T {
-        self.0.take().expect("live retirement owner").value
+        // This typed owner has never entered the linked queue. The helper
+        // retires its Box before transferring the unchanged value to the caller.
+        unbox_node(self.0.take().expect("live retirement owner")).value
     }
 }
 
@@ -116,7 +148,7 @@ pub(crate) fn reclaim() {
         let mut pending = Queue(pending);
         while let Some(mut node) = pending.0.take() {
             pending.0 = node.take_next();
-            drop(node);
+            node.retire();
         }
     });
 }

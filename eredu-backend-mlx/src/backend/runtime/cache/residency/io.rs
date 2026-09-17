@@ -4,6 +4,12 @@ use super::*;
 
 #[derive(Debug, Clone)]
 struct DiskLocation {
+    inner: Arc<DiskLocationData>,
+    // Every alias drops its actual immutable fields/file before their H.
+    funding: Option<eredu_nn::workspace::WorkspaceMetadataFunding>,
+}
+#[derive(Debug)]
+struct DiskLocationData {
     path: PathBuf,
     first_name: String,
     second_name: String,
@@ -11,9 +17,31 @@ struct DiskLocation {
     buffered: Option<Arc<[u8]>>,
     payload_sha256: Option<String>,
     payload_verification: Arc<OnceLock<Result<(), String>>>,
+    // Declared last: paths/verification and worker payloads retire before the
+    // final source owner removes an ephemeral file. Persistent files have none.
+    live_source: Option<LiveCacheBlockSource>,
 }
 
+impl std::ops::Deref for DiskLocation {
+    type Target = DiskLocationData;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+impl DiskLocation {
+    fn ordinary(data: DiskLocationData) -> Self {
+        Self {
+            inner: Arc::new(data),
+            funding: None,
+        }
+    }
+}
+#[path = "io/location.rs"]
+mod location;
+
 enum DiskTask {
+    PreparedWrite(manager::PreparedDiskWrite),
+    PreparedRead(manager::PreparedDiskRead),
     Write {
         directory: PathBuf,
         id: CacheBlockId,
@@ -53,6 +81,8 @@ struct HostWriteReservation {
     logical_bytes: u64,
     host_capacity: u64,
     ticket: DiskTicket,
+    // Present only when the exact original task independently owns occupancy.
+    prepared: Option<manager::DiskWriteOccupancy>,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +94,8 @@ struct RetiringHostDemotion {
 
 #[derive(Debug, Clone)]
 enum DiskResult {
+    PreparedWrite(manager::PreparedDiskWriteOutput),
+    PreparedRead(manager::PreparedDiskReadOutput),
     Write(DiskLocation),
     Read(HostCacheBlock),
     #[cfg(test)]
@@ -73,18 +105,14 @@ enum DiskResult {
 impl DiskWriteCommit {
     fn reconcile(&self, result: &Result<DiskResult, CacheResidencyError>) {
         let Some(state) = self.state.upgrade() else {
-            if let Ok(DiskResult::Write(location)) = result {
-                if !location.persistent {
-                    let _ = fs::remove_file(&location.path);
-                }
-            }
+            // The result owns its unpublished file until the worker's actual
+            // completion/discard path releases the last source alias.
             return;
         };
         let Ok(mut state) = state.lock() else {
             return;
         };
         let stale = state.generation != self.key.generation;
-        let mut cleanup = None;
         match result {
             Ok(DiskResult::Write(location)) if !stale => {
                 let mut transitioned_to_disk = false;
@@ -115,10 +143,9 @@ impl DiskWriteCommit {
                         .disk_demotions += 1;
                 }
             }
-            Ok(DiskResult::Write(location)) => {
-                if !location.persistent {
-                    cleanup = Some(location.path.clone());
-                }
+            Ok(DiskResult::Write(_)) => {
+                // Stale generations retain the exact result owner until the
+                // worker discards it; no path is unlinked through a borrow.
             }
             Ok(_) => {
                 state.telemetry.report.failures += 1;
@@ -138,9 +165,6 @@ impl DiskWriteCommit {
         }
         update_report_totals(&mut state);
         drop(state);
-        if let Some(path) = cleanup {
-            let _ = fs::remove_file(path);
-        }
     }
 }
 
@@ -334,8 +358,19 @@ impl DiskWorker {
 }
 
 fn execute_disk_task(task: DiskTask) -> Result<DiskResult, String> {
+    // The actual prepared task publishes its typed result into its preallocated
+    // owner. Generic completion means the task settled, not that its I/O succeeded.
+    // No ordinary string conversion, manager callback or constructor runs here.
+    let task = match task {
+        DiskTask::PreparedWrite(task) => return Ok(DiskResult::PreparedWrite(task.run())),
+        DiskTask::PreparedRead(task) => return Ok(DiskResult::PreparedRead(task.run())),
+        other => other,
+    };
     let mut write_commit = None;
     let result = catch_unwind(AssertUnwindSafe(|| match task {
+        DiskTask::PreparedWrite(_) | DiskTask::PreparedRead(_) => {
+            unreachable!("handled prepared task")
+        }
         DiskTask::Write {
             directory,
             id,
@@ -384,11 +419,9 @@ fn execute_disk_task(task: DiskTask) -> Result<DiskResult, String> {
 }
 
 fn discard_disk_result(result: DiskResult) {
-    if let DiskResult::Write(location) = result {
-        if !location.persistent {
-            let _ = fs::remove_file(location.path);
-        }
-    }
+    // Dropping the actual location releases one shared file owner. A published
+    // manager or a queued read may still retain the same immutable file.
+    drop(result);
 }
 
 fn disk_worker_error(error: CacheIoWorkerError) -> CacheResidencyError {
@@ -412,10 +445,39 @@ fn disk_worker_error(error: CacheIoWorkerError) -> CacheResidencyError {
 
 #[path = "manager.rs"]
 mod manager;
-use manager::{
-    load_host_cache_block_direct, update_report_totals, write_live_block, CacheManagerState,
-};
 pub use manager::{
-    load_prompt_cache_state_tensors, open_prompt_cache, CacheBlockLease, CacheBlockPrefetch,
-    CacheResidencyManager, LoadedPromptCacheStateTensor, PromptCacheStateArray,
+    CacheBlockLease, CacheBlockPrefetch, CacheResidencyManager, LoadedPromptCacheStateTensor,
+    PromptCacheStateArray, load_prompt_cache_state_tensors, open_prompt_cache,
 };
+use manager::{
+    CacheManagerState, load_host_cache_block_direct, update_report_totals, write_live_block,
+};
+
+pub(crate) use manager::{
+    CacheBlockSource, CacheBlockSourceLoan, CacheDiskSource, CacheSourceError, CacheSourceFailure,
+    CacheSourceFailureCause, IndependentCacheManagerPlan, PinnedCacheBlock, PinnedCacheBlockLease,
+    PinnedCacheSource, PreparedIndependentCacheManager,
+};
+
+pub(crate) use manager::{
+    CacheBlockMetadata, CatalogInstallFailure, InstalledManagerCatalog,
+    PreparedFloatingBlockMetadata, PreparedManagerCatalog,
+};
+
+pub(crate) use manager::{PagedArrayCopyLayout, PreparedPagedArrayCopy};
+
+pub(crate) use manager::{PreparedCacheHostPromotion, PreparedCacheHostPromotionSlots};
+
+pub(crate) use manager::{PreparedCacheHostDemotion, StoredCacheHostSource};
+
+pub(crate) use manager::PreparedDiskWrite;
+
+pub(crate) use manager::PreparedDiskWriteDestination;
+
+pub(crate) use manager::{DiskWriteOperation, InstalledDiskWorker, PreparedDiskWorker};
+
+pub(crate) use manager::{DiskReadBinding, PreparedDiskReadDestination, disk_read_source_facts};
+
+pub(crate) use manager::{DiskReadOperation, PreparedDiskReadSource};
+
+pub(crate) use manager::PreparedInitialDiskReturn;

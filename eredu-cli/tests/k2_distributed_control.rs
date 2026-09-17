@@ -220,7 +220,8 @@ fn k2_distributed_facade_worker() {
             eos_token_ids: vec![],
             checkpoint_generation_config: None,
         },
-    );
+    )
+    .unwrap();
     for temperature in [0.0, 0.8] {
         let chat = model
             .prepare_chat(ChatTemplateRequest {

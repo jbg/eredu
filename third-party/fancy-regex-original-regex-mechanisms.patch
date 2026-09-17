@@ -1,0 +1,559 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -37,6 +37,8 @@
+ repository = "https://github.com/fancy-regex/fancy-regex"
+ 
+ [features]
++# Development-only real target capacity overflow; disabled by default.
++workspace-test-support = ["regex-automata/workspace-test-support"]
+ default = [
+     "unicode",
+     "perf",
+--- a/Cargo.toml.orig
++++ b/Cargo.toml.orig
+@@ -13,6 +13,8 @@
+ rust-version = "1.66"
+ 
+ [features]
++# Development-only real target capacity overflow; disabled by default.
++workspace-test-support = ["regex-automata/workspace-test-support"]
+ default = ["unicode", "perf", "std", "variable-lookbehinds"]
+ # Enable #[track_caller] in unit tests.
+ track_caller = []
+--- a/src/vm/workspace.rs
++++ b/src/vm/workspace.rs
+@@ -5,6 +5,9 @@
+ //! one reserve attempt per actual destination and retains partial owners on
+ //! failure. Search and iteration use the same workers as the ordinary APIs.
+ //! No source, instruction program, delegate or raw cache can be extracted.
++
++mod retirement;
++pub use retirement::RetiredPrepareError;
+ 
+ use alloc::{collections::TryReserveError, string::String, vec::Vec};
+ use core::{alloc::Layout, fmt, mem::size_of};
+@@ -104,6 +107,12 @@
+     options: RegexOptions,
+ }
+ impl Source {
++    /// Borrow the exact source text used to construct this immutable program.
++    /// This exposes no program, delegate, mutable configuration or owner.
++    pub fn pattern(&self) -> &str {
++        &self.options.pattern
++    }
++
+     /// Compile using ordinary default syntax/options and the explicit profile.
+     pub fn new(pattern: &str) -> Result<Self, SourceError> {
+         RegexBuilder::new(pattern).build_workspace_source()
+@@ -135,9 +144,9 @@
+         Ok(Plan {
+             source: self,
+             requirements: Requirements::for_source(self)?,
+-            #[cfg(test)]
++            #[cfg(any(test, feature = "workspace-test-support"))]
+             fail: None,
+-            #[cfg(test)]
++            #[cfg(any(test, feature = "workspace-test-support"))]
+             delegate_fail: None,
+         })
+     }
+@@ -260,6 +269,8 @@
+             size_of::<Storage<'static>>(),
+             size_of::<Workspace<'static>>(),
+             size_of::<PrepareError<'static>>(),
++            size_of::<RetiredPrepareError>(),
++            size_of::<[usize; 5]>(),
+             size_of::<Result<Plan<'static>, PlanError>>(),
+             size_of::<Result<Workspace<'static>, PrepareError<'static>>>(),
+             size_of::<Result<(), TryReserveError>>(),
+@@ -435,12 +446,50 @@
+ pub struct Plan<'s> {
+     source: &'s Source,
+     requirements: Requirements,
+-    #[cfg(test)]
++    #[cfg(any(test, feature = "workspace-test-support"))]
+     fail: Option<Buffer>,
+-    #[cfg(test)]
++    #[cfg(any(test, feature = "workspace-test-support"))]
+     delegate_fail: Option<(usize, pike::Buffer)>,
+ }
++/// Fixed actual reserve target for dependency-development tests only.
++#[cfg(feature = "workspace-test-support")]
++#[derive(Clone, Copy, Debug)]
++pub enum PrepareFailure {
++    /// One of the five existing outer destinations.
++    Outer(Buffer),
++    /// One actual delegate's destination; ordinal is checked against this source.
++    Delegate {
++        /// Zero-based ordinal of the actual delegate in this source.
++        ordinal: usize,
++        /// Actual reserve site within the selected delegate workspace.
++        buffer: DelegateBuffer,
++    },
++}
++/// Actual nested PikeVM destination selector; this supplies no capacity.
++#[cfg(feature = "workspace-test-support")]
++pub use pike::Buffer as DelegateBuffer;
++
+ impl<'s> Plan<'s> {
++    /// Select a real target for capacity overflow, preserving this exact source.
++    /// No successful override, arbitrary capacity or callback is accepted.
++    #[cfg(feature = "workspace-test-support")]
++    pub fn fail_reservation(mut self, failure: PrepareFailure) -> Result<Self, PlanError> {
++        match failure {
++            PrepareFailure::Outer(buffer) => {
++                self.fail = Some(buffer);
++                self.delegate_fail = None;
++            }
++            PrepareFailure::Delegate { ordinal, buffer } => {
++                if ordinal >= self.requirements.delegates {
++                    return Err(PlanError::Geometry);
++                }
++                self.fail = None;
++                self.delegate_fail = Some((ordinal, buffer));
++            }
++        }
++        Ok(self)
++    }
++
+     /// Checked requirements from the bound source.
+     pub fn requirements(&self) -> Requirements {
+         self.requirements
+@@ -478,7 +527,7 @@
+                     })
+                 }
+             };
+-            #[cfg(test)]
++            #[cfg(any(test, feature = "workspace-test-support"))]
+             let plan = match self.delegate_fail {
+                 Some((selected, buffer)) if selected == ordinal => plan.fail_reservation(buffer),
+                 _ => plan,
+@@ -508,7 +557,7 @@
+         })
+     }
+     fn requested(&self, buffer: Buffer) -> usize {
+-        #[cfg(test)]
++        #[cfg(any(test, feature = "workspace-test-support"))]
+         if self.fail == Some(buffer) {
+             return usize::MAX;
+         }
+--- a/src/vm/workspace/construction.rs
++++ b/src/vm/workspace/construction.rs
+@@ -106,6 +106,13 @@
+ }
+ include!("construction/recipes.rs");
+ 
++/// Borrow the exact full default source strings supported by fresh construction.
++/// This immutable view supplies no recipe, program, byte count or account grant.
++/// Call [`Plan::new`] with a fully validated actual source before construction.
++pub fn patterns() -> impl ExactSizeIterator<Item = &'static str> + Clone {
++    SOURCES.iter().map(|recipe| recipe.pattern)
++}
++
+ /// Fixed rejection before any source construction reserve.
+ #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ pub enum PlanError {
+@@ -272,6 +279,57 @@
+     pub fn prepare(self) -> Result<Source, Failure> {
+         self.prepare_inner(None)
+     }
++    /// Development-only actual failed reserve (or explicit completed-source
++    /// rejection). Missing literal/instruction targets reject before allocating;
++    /// no arbitrary capacity, replacement source or successful override exists.
++    #[cfg(feature = "workspace-test-support")]
++    pub fn prepare_failing(self, target: ConstructionFailure) -> Result<Source, Failure> {
++        let fault = match target {
++            ConstructionFailure::Pattern => Fault::Pattern,
++            ConstructionFailure::Instructions => match self.recipe.body {
++                BodyRecipe::Fancy { .. } => Fault::Instructions,
++                _ => {
++                    return Err(Failure {
++                        cause: Cause::Profile(WorkspacePlanError::Geometry),
++                        storage: Storage::new(),
++                    })
++                }
++            },
++            ConstructionFailure::FirstLiteral => match self.recipe.body {
++                BodyRecipe::Fancy { instructions, .. } => match instructions
++                    .iter()
++                    .position(|i| matches!(i, InsnRecipe::Lit(_)))
++                {
++                    Some(index) => Fault::Literal(index),
++                    None => {
++                        return Err(Failure {
++                            cause: Cause::Profile(WorkspacePlanError::Geometry),
++                            storage: Storage::new(),
++                        })
++                    }
++                },
++                _ => {
++                    return Err(Failure {
++                        cause: Cause::Profile(WorkspacePlanError::Geometry),
++                        storage: Storage::new(),
++                    })
++                }
++            },
++            ConstructionFailure::LastDelegate => {
++                let count = match self.recipe.body {
++                    BodyRecipe::Wrap { .. } => 1,
++                    BodyRecipe::Fancy { instructions, .. } => instructions
++                        .iter()
++                        .filter(|i| matches!(i, InsnRecipe::Pike { .. }))
++                        .count(),
++                };
++                Fault::Delegate(count.checked_sub(1).expect("validated delegate population"))
++            }
++            ConstructionFailure::Scratch(buffer) => Fault::Scratch(buffer),
++            ConstructionFailure::Completed => Fault::Completed,
++        };
++        self.prepare_inner(Some(fault))
++    }
+     fn prepare_inner(self, fault: Option<Fault>) -> Result<Source, Failure> {
+         let mut storage = Storage::new();
+         macro_rules! reserve {
+@@ -305,7 +363,19 @@
+                 Fault::Instructions
+             );
+         }
+-        storage.scratch = Some(match self.scratch.prepare() {
++        let scratch_result = {
++            #[cfg(feature = "workspace-test-support")]
++            if let Some(Fault::Scratch(buffer)) = fault {
++                self.scratch.prepare_failing(buffer)
++            } else {
++                self.scratch.prepare()
++            }
++            #[cfg(not(feature = "workspace-test-support"))]
++            {
++                self.scratch.prepare()
++            }
++        };
++        storage.scratch = Some(match scratch_result {
+             Ok(value) => value,
+             Err(error) => {
+                 return Err(Failure {
+@@ -325,7 +395,7 @@
+                         })
+                     }
+                 };
+-                #[cfg(test)]
++                #[cfg(any(test, feature = "workspace-test-support"))]
+                 let plan = if fault == Some(Fault::Delegate($ordinal)) {
+                     match plan.fail_reserve_for_testing(pike::ConstructionBuffer::LastTransitions) {
+                         Ok(plan) => plan,
+@@ -456,7 +526,7 @@
+                 storage,
+             });
+         }
+-        #[cfg(test)]
++        #[cfg(any(test, feature = "workspace-test-support"))]
+         if fault == Some(Fault::Completed) {
+             return Err(Failure {
+                 cause: Cause::Profile(WorkspacePlanError::Geometry),
+@@ -472,11 +542,33 @@
+     Pattern,
+     Instructions,
+     Literal(usize),
+-    #[cfg(test)]
++    #[cfg(any(test, feature = "workspace-test-support"))]
+     Delegate(usize),
+-    #[cfg(test)]
++    #[cfg(any(test, feature = "workspace-test-support"))]
+     Completed,
+-}
++    #[cfg(feature = "workspace-test-support")]
++    Scratch(pike::ScratchFailureBuffer),
++}
++/// Fixed construction failure selection for dependency-development coverage.
++#[cfg(feature = "workspace-test-support")]
++#[derive(Clone, Copy, Debug)]
++pub enum ConstructionFailure {
++    /// Actual source-string reserve.
++    Pattern,
++    /// Actual instruction-vector reserve, when the source has one.
++    Instructions,
++    /// First actual literal-string reserve, when one exists.
++    FirstLiteral,
++    /// Last delegate's last actual sparse-transition reserve.
++    LastDelegate,
++    /// One actual shared finalization scratch reserve.
++    Scratch(ScratchFailureBuffer),
++    /// Explicitly injected rejection after complete construction, not a natural error.
++    Completed,
++}
++/// Fixed scratch destination selector, enabled only for development tests.
++#[cfg(feature = "workspace-test-support")]
++pub use pike::ScratchFailureBuffer;
+ #[derive(Debug)]
+ struct Storage {
+     pattern: String,
+--- a/src/vm/workspace/construction/tests.rs
++++ b/src/vm/workspace/construction/tests.rs
+@@ -155,3 +155,54 @@
+     assert_eq!(Plan::new(&altered).unwrap_err(), PlanError::Profile);
+     assert!(Plan::new(SOURCES[0].pattern).unwrap().prepare().is_ok());
+ }
++
++#[cfg(all(feature = "workspace-test-support", feature = "std"))]
++#[test]
++fn development_selectors_fail_actual_source_scratch_and_late_delegate_targets() {
++    use std::error::Error as _;
++    let source = patterns().next().unwrap();
++    for target in [
++        ConstructionFailure::Pattern,
++        ConstructionFailure::Instructions,
++        ConstructionFailure::FirstLiteral,
++        ConstructionFailure::LastDelegate,
++        ConstructionFailure::Scratch(ScratchFailureBuffer::Stack),
++        ConstructionFailure::Scratch(ScratchFailureBuffer::Dense),
++        ConstructionFailure::Scratch(ScratchFailureBuffer::Sparse),
++    ] {
++        let error = Plan::new(source)
++            .unwrap()
++            .prepare_failing(target)
++            .unwrap_err();
++        let mut cause = error.source();
++        let mut actual_reserve = false;
++        while let Some(error) = cause {
++            actual_reserve |= error.is::<alloc::collections::TryReserveError>();
++            cause = error.source();
++        }
++        assert!(actual_reserve, "{target:?}: {error:?}");
++        if !matches!(target, ConstructionFailure::Pattern) {
++            assert!(!error.storage.pattern.is_empty());
++        }
++    }
++    let error = Plan::new(source)
++        .unwrap()
++        .prepare_failing(ConstructionFailure::Completed)
++        .unwrap_err();
++    assert!(error.storage.source.is_some());
++    assert!(matches!(
++        error.cause,
++        Cause::Profile(WorkspacePlanError::Geometry)
++    ));
++    // This is an explicit injected completed-source rejection, not a natural failure.
++    let no_literals = patterns().nth(2).unwrap();
++    let error = Plan::new(no_literals)
++        .unwrap()
++        .prepare_failing(ConstructionFailure::FirstLiteral)
++        .unwrap_err();
++    assert!(matches!(
++        error.cause,
++        Cause::Profile(WorkspacePlanError::Geometry)
++    ));
++    assert_eq!(error.storage.pattern.capacity(), 0);
++}
+--- /dev/null
++++ b/src/vm/workspace/retirement.rs
+@@ -0,0 +1,170 @@
++//! Owned terminal diagnostics after synchronous workspace retirement.
++use super::{pike, Buffer, PrepareCause, PrepareError, Requirements};
++use alloc::collections::TryReserveError;
++use core::fmt;
++
++#[derive(Debug)]
++enum Cause {
++    Reserve {
++        buffer: Buffer,
++        cause: TryReserveError,
++    },
++    Delegate {
++        ordinal: usize,
++        cause: pike::RetiredPrepareError,
++    },
++    Profile(pike::PlanError),
++}
++/// Actual owned failure after all outer, completed and partial delegate storage
++/// has retired. This retains no source borrow and offers no retry or cache.
++/// The caller's original account must surround retirement; no refund occurs here.
++#[derive(Debug)]
++pub struct RetiredPrepareError {
++    requirements: Requirements,
++    capacities: [usize; 5],
++    completed_delegates: usize,
++    cause: Cause,
++}
++impl PrepareError<'_> {
++    /// Consume the partial owners under the source borrow, then return the cause.
++    pub fn retire(self) -> RetiredPrepareError {
++        let Self {
++            source: _,
++            requirements,
++            partial,
++            cause,
++        } = self;
++        let capacities = partial.capacities();
++        let completed_delegates = partial.delegates.len();
++        let cause = match cause {
++            PrepareCause::Reserve { buffer, cause } => Cause::Reserve { buffer, cause },
++            PrepareCause::Delegate { ordinal, cause } => Cause::Delegate {
++                ordinal,
++                cause: cause.retire(),
++            },
++            PrepareCause::Profile(cause) => Cause::Profile(cause),
++        };
++        drop(partial);
++        RetiredPrepareError {
++            requirements,
++            capacities,
++            completed_delegates,
++            cause,
++        }
++    }
++}
++impl RetiredPrepareError {
++    /// Original requested layouts; retirement does not alter this diagnostic.
++    pub fn requirements(&self) -> Requirements {
++        self.requirements
++    }
++    /// Actual outer capacities which have already retired, in Buffer order.
++    pub fn retired_capacities(&self) -> [usize; 5] {
++        self.capacities
++    }
++    /// Number of completed delegate owners retired alongside the failure.
++    pub fn retired_delegates(&self) -> usize {
++        self.completed_delegates
++    }
++    /// Failed outer reserve target, when applicable.
++    pub fn buffer(&self) -> Option<Buffer> {
++        match self.cause {
++            Cause::Reserve { buffer, .. } => Some(buffer),
++            _ => None,
++        }
++    }
++    /// Actual nested reserve failure and its delegate ordinal, after retirement.
++    pub fn delegate_error(&self) -> Option<(usize, &pike::RetiredPrepareError)> {
++        match &self.cause {
++            Cause::Delegate { ordinal, cause } => Some((*ordinal, cause)),
++            _ => None,
++        }
++    }
++    /// The real reserve cause, with no reconstructed or boxed diagnostic.
++    pub fn reserve_error(&self) -> Option<&TryReserveError> {
++        match &self.cause {
++            Cause::Reserve { cause, .. } => Some(cause),
++            Cause::Delegate { cause, .. } => Some(cause.cause()),
++            Cause::Profile(_) => None,
++        }
++    }
++}
++impl fmt::Display for RetiredPrepareError {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        match &self.cause {
++            Cause::Reserve { cause, .. } => cause.fmt(f),
++            Cause::Delegate { cause, .. } => cause.fmt(f),
++            Cause::Profile(cause) => cause.fmt(f),
++        }
++    }
++}
++#[cfg(feature = "std")]
++impl std::error::Error for RetiredPrepareError {
++    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
++        if let Some(cause) = self.reserve_error() {
++            return Some(cause);
++        }
++        match &self.cause {
++            Cause::Profile(cause) => Some(cause),
++            _ => None,
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::workspace::Source;
++    use alloc::string::ToString;
++    #[test]
++    fn outer_and_nested_real_errors_outlive_source_after_consuming_retirement() {
++        let nested = [
++            pike::Buffer::Epsilon,
++            pike::Buffer::CurrentDense,
++            pike::Buffer::CurrentSparse,
++            pike::Buffer::NextDense,
++            pike::Buffer::NextSparse,
++            pike::Buffer::CurrentSlots,
++            pike::Buffer::NextSlots,
++        ];
++        for outer in Buffer::ALL {
++            let (error, capacities, diagnostic) = {
++                let source = Source::new(r"(a+)(?![bc])|\s+").unwrap();
++                let mut plan = source.plan().unwrap();
++                plan.fail = Some(outer);
++                let error = plan.prepare().unwrap_err();
++                let capacities = error.capacities();
++                let diagnostic = error.reserve_error().unwrap().to_string();
++                (error.retire(), capacities, diagnostic)
++            };
++            assert_eq!(error.buffer(), Some(outer));
++            assert_eq!(error.retired_capacities(), capacities);
++            assert_eq!(error.retired_delegates(), 0);
++            assert_eq!(error.reserve_error().unwrap().to_string(), diagnostic);
++        }
++        for target in nested {
++            let (error, outer, prefix, diagnostic) = {
++                let source = Source::new(r"(a+)(?![bc])|\s+").unwrap();
++                let mut plan = source.plan().unwrap();
++                plan.delegate_fail = Some((1, target));
++                let error = plan.prepare().unwrap_err();
++                assert_eq!(error.completed_delegates(), 1);
++                let outer = error.capacities();
++                let prefix = error.delegate_error().unwrap().1.capacities();
++                let diagnostic = error.reserve_error().unwrap().to_string();
++                (error.retire(), outer, prefix, diagnostic)
++            };
++            assert_eq!(error.retired_capacities(), outer);
++            assert_eq!(error.retired_delegates(), 1);
++            let (ordinal, nested) = error.delegate_error().unwrap();
++            assert_eq!(ordinal, 1);
++            assert_eq!(nested.buffer(), target);
++            assert_eq!(nested.retired_capacities(), prefix);
++            assert_eq!(error.reserve_error().unwrap().to_string(), diagnostic);
++            assert!(core::ptr::eq(
++                error.reserve_error().unwrap(),
++                nested.cause()
++            ));
++        }
++    }
++}
+--- a/src/vm/workspace/tests.rs
++++ b/src/vm/workspace/tests.rs
+@@ -393,3 +393,37 @@
+         }
+     });
+ }
++
++#[cfg(feature = "workspace-test-support")]
++#[test]
++fn public_development_selector_checks_exact_delegate_before_attempt() {
++    let source = Source::new(r"(a+)(?![bc])|\s+").unwrap();
++    let count = source
++        .plan()
++        .unwrap()
++        .requirements()
++        .capacity(Buffer::Delegates);
++    let invalid = source
++        .plan()
++        .unwrap()
++        .fail_reservation(PrepareFailure::Delegate {
++            ordinal: count,
++            buffer: DelegateBuffer::NextSlots,
++        });
++    assert!(matches!(invalid, Err(PlanError::Geometry)));
++    let error = source
++        .plan()
++        .unwrap()
++        .fail_reservation(PrepareFailure::Delegate {
++            ordinal: count - 1,
++            buffer: DelegateBuffer::NextSlots,
++        })
++        .unwrap()
++        .prepare()
++        .unwrap_err();
++    assert_eq!(error.completed_delegates(), count - 1);
++    assert_eq!(error.delegate_error().unwrap().0, count - 1);
++    assert!(error.reserve_error().is_some());
++    let mut valid = source.plan().unwrap().prepare().unwrap();
++    assert_eq!(valid.find("aaaa ").unwrap().unwrap().as_str(), "aaaa");
++}

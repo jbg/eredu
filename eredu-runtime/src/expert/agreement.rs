@@ -48,6 +48,19 @@ where
             .routing_control(bank, rows)
             .map_err(Error::backend_source)
     }
+    fn routing_unmodified_interest(&self, bank: RoutedBankId) -> crate::RoutingUnmodifiedInterest {
+        self.provider.routing_unmodified_interest(bank)
+    }
+    fn routing_unmodified(
+        &mut self,
+        bank: RoutedBankId,
+        effective: crate::RoutingDecision<'_, B::Tensor>,
+    ) -> Result<(), Error> {
+        self.provider
+            .routing_unmodified(bank, effective)
+            .map_err(Error::backend_source)
+    }
+
     fn routing_applied(
         &mut self,
         bank: RoutedBankId,

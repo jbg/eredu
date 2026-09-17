@@ -1,0 +1,534 @@
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -49,9 +49,10 @@
+   const bool fixed_softmax = fixed && cpu::is_softmax_eval_primitive(arr);
+   const bool fixed_greedy = fixed && cpu::is_greedy_eval_primitive(arr);
+   const bool fixed_reshape = fixed && cpu::is_reshape_alias_eval_primitive(arr);
++  const bool fixed_tiled_matmul = fixed && cpu::is_tiled_matmul_eval_primitive(arr);
+   const bool fixed_matmul = fixed && cpu::is_bf16_matmul_eval_primitive(arr);
+   const bool fixed_random = fixed && cpu::is_random_bits_eval_primitive(arr);
+-  const bool extended = fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool extended = fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -59,7 +60,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_matmul
++    const auto failure = fixed_tiled_matmul
++        ? submission::GraphConstruction::create_cpu_tiled_matmul_eval(*extended_prologue, extended_bank.value)
++        : fixed_matmul
+         ? submission::GraphConstruction::create_cpu_bf16_matmul_eval(*extended_prologue, extended_bank.value)
+         : fixed_random
+         ? submission::GraphConstruction::create_cpu_random_bits_eval(*extended_prologue, extended_bank.value)
+diff --git a/mlx/backend/cpu/gemms/simd_bf16.cpp b/mlx/backend/cpu/gemms/simd_bf16.cpp
+--- a/mlx/backend/cpu/gemms/simd_bf16.cpp
++++ b/mlx/backend/cpu/gemms/simd_bf16.cpp
+@@ -23,23 +23,8 @@
+     const Strides& a_strides,
+     const Shape& b_shape,
+     const Strides& b_strides) {
+-  auto ndim = a_shape.size();
+-  size_t M = a_shape[ndim - 2];
+-  size_t N = b_shape[ndim - 1];
+-  size_t K = a_shape[ndim - 1];
+-  for (int i = 0; i < batch_size; ++i) {
+-    simd_gemm<bfloat16_t, float>(
+-        a + elem_to_loc(M * K * i, a_shape, a_strides),
+-        b + elem_to_loc(K * N * i, b_shape, b_strides),
+-        out + M * N * i,
+-        a_transposed,
+-        b_transposed,
+-        M,
+-        N,
+-        K,
+-        alpha,
+-        beta);
+-  }
++  simd_matmul<bfloat16_t,float>(a,b,out,a_transposed,b_transposed,alpha,beta,
++      batch_size,a_shape,a_strides,b_shape,b_strides);
+ }
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/cpu/gemms/simd_fp16.cpp b/mlx/backend/cpu/gemms/simd_fp16.cpp
+--- a/mlx/backend/cpu/gemms/simd_fp16.cpp
++++ b/mlx/backend/cpu/gemms/simd_fp16.cpp
+@@ -23,23 +23,8 @@
+     const Strides& a_strides,
+     const Shape& b_shape,
+     const Strides& b_strides) {
+-  auto ndim = a_shape.size();
+-  size_t M = a_shape[ndim - 2];
+-  size_t N = b_shape[ndim - 1];
+-  size_t K = a_shape[ndim - 1];
+-  for (int i = 0; i < batch_size; ++i) {
+-    simd_gemm<float16_t, float>(
+-        a + elem_to_loc(M * K * i, a_shape, a_strides),
+-        b + elem_to_loc(K * N * i, b_shape, b_strides),
+-        out + M * N * i,
+-        a_transposed,
+-        b_transposed,
+-        M,
+-        N,
+-        K,
+-        alpha,
+-        beta);
+-  }
++  simd_matmul<float16_t,float>(a,b,out,a_transposed,b_transposed,alpha,beta,
++      batch_size,a_shape,a_strides,b_shape,b_strides);
+ }
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/cpu/gemms/simd_gemm.h b/mlx/backend/cpu/gemms/simd_gemm.h
+--- a/mlx/backend/cpu/gemms/simd_gemm.h
++++ b/mlx/backend/cpu/gemms/simd_gemm.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include "mlx/backend/cpu/simd/simd.h"
++#include "mlx/backend/common/utils.h"
+ 
+ namespace mlx::core {
+ 
+@@ -136,4 +137,19 @@
+   }
+ }
+ 
++// Shared batching for the existing half wrappers and explicit F32 selection.
++// Callers establish compact/transposed matrix interiors, as matmul_general does.
++template <typename T, typename AccT>
++void simd_matmul(const T* a,const T* b,T* out,bool a_transposed,bool b_transposed,
++    float alpha,float beta,size_t batch_size,const Shape& a_shape,const Strides& a_strides,
++    const Shape& b_shape,const Strides& b_strides) {
++  const auto ndim=a_shape.size();
++  const size_t M=a_shape[ndim-2],N=b_shape[ndim-1],K=a_shape[ndim-1];
++  for(int i=0;i<batch_size;++i) {
++    simd_gemm<T,AccT>(a+elem_to_loc(M*K*i,a_shape,a_strides),
++        b+elem_to_loc(K*N*i,b_shape,b_strides),out+M*N*i,
++        a_transposed,b_transposed,M,N,K,alpha,beta);
++  }
++}
++
+ } // namespace mlx::core
+diff --git a/mlx/backend/cpu/matmul.cpp b/mlx/backend/cpu/matmul.cpp
+--- a/mlx/backend/cpu/matmul.cpp
++++ b/mlx/backend/cpu/matmul.cpp
+@@ -10,6 +10,7 @@
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/backend/cpu/gemm.h"
+ #include "mlx/backend/cpu/matmul_storage.h"
++#include "mlx/backend/cpu/gemms/simd_gemm.h"
+ #include "mlx/primitives.h"
+ 
+ namespace mlx::core {
+@@ -86,12 +87,20 @@
+   bool a_transposed, b_transposed;
+   size_t lda, ldb, ldc;
+   float alpha, beta;
++  CpuMatmulKernel kernel;
+   size_t batch_size;
+   Shape a_shape;
+   Strides a_strides;
+   Shape b_shape;
+   Strides b_strides;
+   void operator()() {
++    if constexpr (std::is_same_v<T,float>) {
++      if(kernel==CpuMatmulKernel::Float32Tiles) {
++        simd_matmul<float,float>(a_ptr,b_ptr,out_ptr,a_transposed,b_transposed,
++            alpha,beta,batch_size,a_shape,a_strides,b_shape,b_strides);
++        return;
++      }
++    }
+     if constexpr (std::is_same_v<T, bfloat16_t>) {
+       if (alpha == 1.0f && beta == 0.0f) {
+         size_t m = a_shape[a_shape.size() - 2];
+@@ -140,6 +149,20 @@
+   if(task.controls>SIZE_MAX-controls)return false;
+   out={task.task_bytes,task.task_alignment,0,task.controls+controls};return true;
+ }
++bool tiled_matmul_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  DispatchLayout task;
++  if(!CommandEncoder::dispatch_layout<MatmulTask<float>>(task))return false;
++  // Exact fixed tiles and SIMD values from the shared source worker. No BLAS,
++  // packing arena, opaque context, secondary thread or heap scratch is called.
++  const size_t controls=sizeof(EvalDispatchStorage)+sizeof(task)+sizeof(out)+
++      sizeof(MatmulTask<float>)*2+sizeof(float[16*16])*3+
++      sizeof(simd::Simd<float,simd::max_size<float>>)*4+
++      sizeof(size_t)*18+sizeof(int)*25+sizeof(float)*6+sizeof(bool)*4+
++      sizeof(float*)*9+sizeof(ldiv_t)+sizeof(long)*2+sizeof(Shape)*2+sizeof(Strides)*2+sizeof(Stream);
++  if(task.controls>SIZE_MAX-controls)return false;
++  out={task.task_bytes,task.task_alignment,0,task.controls+controls};return true;
++}
++
+ }
+ 
+ template <typename T>
+@@ -153,7 +176,7 @@
+     size_t ldb,
+     float alpha,
+     float beta,
+-    Stream stream) {
++    Stream stream, CpuMatmulKernel kernel) {
+   const T* a_ptr = a.data<T>();
+   const T* b_ptr = b.data<T>();
+   T* out_ptr = out.data<T>();
+@@ -164,7 +187,7 @@
+   encoder.set_input_array(b);
+   encoder.set_output_array(out);
+   encoder.dispatch(MatmulTask<T>{a_ptr,b_ptr,out_ptr,a_transposed,b_transposed,
+-      lda,ldb,ldc,alpha,beta,batch_size,a.shape(),a.strides(),b.shape(),b.strides()});
++      lda,ldb,ldc,alpha,beta,kernel,batch_size,a.shape(),a.strides(),b.shape(),b.strides()});
+ }
+ 
+ void matmul_general(
+@@ -173,7 +196,7 @@
+     array& out,
+     Stream stream,
+     float alpha = 1.0f,
+-    float beta = 0.0f) {
++    float beta = 0.0f, CpuMatmulKernel kernel = CpuMatmulKernel::PlatformDefault) {
+   ArrayVector temps;
+   auto check_transpose = [stream, &temps](const array& arr) {
+     auto stx = arr.strides()[arr.ndim() - 2];
+@@ -200,19 +223,19 @@
+ 
+   if (out.dtype() == float32) {
+     matmul_dispatch<float>(
+-        a, b, out, a_transposed, b_transposed, lda, ldb, alpha, beta, stream);
++        a, b, out, a_transposed, b_transposed, lda, ldb, alpha, beta, stream, kernel);
+   } else if (out.dtype() == float16) {
+     matmul_dispatch<float16_t>(
+-        a, b, out, a_transposed, b_transposed, lda, ldb, alpha, beta, stream);
++        a, b, out, a_transposed, b_transposed, lda, ldb, alpha, beta, stream, kernel);
+   } else if (out.dtype() == bfloat16) {
+     matmul_dispatch<bfloat16_t>(
+-        a, b, out, a_transposed, b_transposed, lda, ldb, alpha, beta, stream);
++        a, b, out, a_transposed, b_transposed, lda, ldb, alpha, beta, stream, kernel);
+   } else if (out.dtype() == float64) {
+     matmul_dispatch<double>(
+-        a, b, out, a_transposed, b_transposed, lda, ldb, alpha, beta, stream);
++        a, b, out, a_transposed, b_transposed, lda, ldb, alpha, beta, stream, kernel);
+   } else if (out.dtype() == complex64) {
+     matmul_dispatch<complex64_t>(
+-        a, b, out, a_transposed, b_transposed, lda, ldb, alpha, beta, stream);
++        a, b, out, a_transposed, b_transposed, lda, ldb, alpha, beta, stream, kernel);
+   } else {
+     throw std::runtime_error("[Matmul::eval_cpu] Invalid type.");
+   }
+@@ -220,6 +243,10 @@
+ }
+ 
+ void Matmul::eval_cpu(const ArrayVector& inputs, array& out) {
++  if(cpu_matmul()!=CpuMatmulKernel::PlatformDefault &&
++      (cpu_matmul()!=CpuMatmulKernel::Float32Tiles||out.dtype()!=float32||
++       !cpu::tiled_matmul_shape(inputs[0],inputs[1],out)))
++    throw std::invalid_argument("[Matmul::eval_cpu] selected CPU tiled geometry is unavailable");
+   out.allocate_data(out.nbytes());
+   if (inputs[0].shape(-1) == 0) {
+     auto& encoder = cpu::get_command_encoder(stream());
+@@ -229,10 +256,14 @@
+     });
+     return;
+   }
+-  matmul_general(inputs[0], inputs[1], out, stream());
++  matmul_general(inputs[0], inputs[1], out, stream(), 1.0f, 0.0f, cpu_matmul());
+ }
+ 
+ void AddMM::eval_cpu(const ArrayVector& inputs, array& out) {
++  if(cpu_matmul()!=CpuMatmulKernel::PlatformDefault &&
++      (cpu_matmul()!=CpuMatmulKernel::Float32Tiles||out.dtype()!=float32||
++       !cpu::tiled_matmul_shape(inputs[0],inputs[1],out)))
++    throw std::invalid_argument("[Matmul::eval_cpu] selected CPU tiled geometry is unavailable");
+   if (out.size() == 0) {
+     out.allocate_data(out.nbytes());
+     return;
+@@ -261,7 +292,7 @@
+       ? CopyType::Scalar
+       : (c.flags().row_contiguous ? CopyType::Vector : CopyType::General);
+   copy_cpu(c, out, ctype, stream());
+-  matmul_general(inputs[0], inputs[1], out, stream(), alpha_, beta_);
++  matmul_general(inputs[0], inputs[1], out, stream(), alpha_, beta_, cpu_matmul());
+ }
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/cpu/matmul_storage.cpp b/mlx/backend/cpu/matmul_storage.cpp
+--- a/mlx/backend/cpu/matmul_storage.cpp
++++ b/mlx/backend/cpu/matmul_storage.cpp
+@@ -1,5 +1,6 @@
+ #include "mlx/backend/cpu/matmul_storage.h"
+ #include "mlx/backend/cpu/encoder.h"
++#include "mlx/backend/cpu/simd/simd.h"
+ #include "mlx/primitives.h"
+ #include "mlx/submission.h"
+ #include <climits>
+@@ -13,9 +14,9 @@
+ bool add(size_t& out,size_t more) noexcept {
+   if(more>size_t(PTRDIFF_MAX)-out)return false;out+=more;return true;
+ }
+-bool matrix_source(const array& value,size_t rank) noexcept {
+-  if(value.ndim()!=rank||value.strides().size()!=rank||value.dtype()!=bfloat16||
+-      value.itemsize()!=sizeof(bfloat16_t))return false;
++bool matrix_source(const array& value,size_t rank,Dtype dtype) noexcept {
++  if(value.ndim()!=rank||value.strides().size()!=rank||value.dtype()!=dtype||
++      value.itemsize()!=dtype.size())return false;
+   const auto row=value.strides()[rank-2],column=value.strides()[rank-1];
+   // Exactly the no-copy branches of ordinary matmul_general::check_transpose.
+   if(!((row==value.shape(-1)&&column==1)||(row==1&&column==value.shape(-2))))return false;
+@@ -26,25 +27,28 @@
+         !product(size_t(value.shape(i)-1),size_t(value.strides()[i]),extent)||!add(span,extent))return false;
+   }
+   return elements==value.size()&&elements<=size_t(INT_MAX)&&span<=value.data_size()&&
+-      product(span,sizeof(bfloat16_t),bytes);
++      product(span,dtype.size(),bytes);
+ }
+ }
+ bool is_bf16_matmul_eval_primitive(const array& out) noexcept {
+   return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
+-      typeid(out.primitive())==typeid(Matmul)&&out.dtype()==bfloat16;
++      typeid(out.primitive())==typeid(Matmul)&&out.dtype()==bfloat16&&
++      static_cast<const Matmul&>(out.primitive()).cpu_matmul()==CpuMatmulKernel::PlatformDefault;
+ }
+-bool bf16_matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+-    size_t batches,bool tracer,CopyEvalStorage& out) noexcept {
++static bool matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,bool tracer,bool tiled,CopyEvalStorage& out) noexcept {
+   if(rank<2||rank>4||!m||!n||!k||!batches||(rank==2&&batches!=1))return false;
++  TiledMatmulFacts facts;
++  if(tiled&&(!tiled_matmul_facts(facts)||m>size_t(INT_MAX)-15||n>size_t(INT_MAX)-15))return false;
+   size_t left=0,right=0,result=0,bytes=0;
+   // elem_to_loc takes int, and ordinary batch_size uses a signed shape product.
+   // Include all matrix/intermediate products before any cast or allocation.
+   if(!product(m,k,left)||!product(k,n,right)||!product(m,n,result)||
+       !product(left,batches,left)||!product(right,batches,right)||
+       !product(result,batches,result)||left>size_t(INT_MAX)||right>size_t(INT_MAX)||
+-      result>size_t(INT_MAX)||!product(result,sizeof(bfloat16_t),bytes))return false;
++      result>size_t(INT_MAX)||!product(result,tiled?sizeof(float):sizeof(bfloat16_t),bytes))return false;
+   EvalDispatchStorage task;SingleOutputEvalStorage common;RetentionLayout retention;
+-  if(!bf16_matmul_dispatch_storage(task)||!single_output_raw_task_layout(rank,2,tracer,task,common)||
++  if(!(tiled?tiled_matmul_dispatch_storage(task):bf16_matmul_dispatch_storage(task))||!single_output_raw_task_layout(rank,2,tracer,task,common)||
+       !CommandEncoder::retention_layout(2,0,retention))return false;
+   CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
+   // matmul_general unconditionally publishes its actual (possibly empty)
+@@ -54,6 +58,7 @@
+   value.request_counts[9]=1;
+   const size_t controls=sizeof(value)+sizeof(common)+sizeof(task)+sizeof(retention)+
+       sizeof(rank)+sizeof(m)+sizeof(n)+sizeof(k)+sizeof(batches)+sizeof(tracer)+sizeof(out)+
++      sizeof(tiled)+sizeof(facts)+sizeof(CpuMatmulKernel)*2+
+       sizeof(size_t)*20+sizeof(bool)*5+sizeof(int64_t)*2+sizeof(const array*)*8+
+       sizeof(array)*2+sizeof(ArrayVector)+sizeof(std::tuple<bool,int64_t,array>)*2+
+       sizeof(Stream)*2+sizeof(float)*2+sizeof(detail::TemporaryOwner)*2+
+@@ -66,21 +71,62 @@
+   if(!add(value.named_control_bytes,controls)||!submission::GraphConstruction::complete_layout(value))return false;
+   out=value;return true;
+ }
+-bool bf16_matmul_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+-  if(!is_bf16_matmul_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=2||
+-      output.itemsize()!=sizeof(bfloat16_t))return false;
+-  const size_t rank=output.ndim();if(rank<2||rank>4)return false;
+-  const auto& a=output.inputs()[0];const auto& b=output.inputs()[1];
+-  if(!matrix_source(a,rank)||!matrix_source(b,rank)||a.shape(-1)!=b.shape(-2)||
+-      output.shape(-2)!=a.shape(-2)||output.shape(-1)!=b.shape(-1))return false;
+-  size_t batches=1,result=0;
++bool bf16_matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,bool tracer,CopyEvalStorage& out) noexcept {
++  return matmul_eval_layout(rank,m,n,k,batches,tracer,false,out);
++}
++bool tiled_matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,bool tracer,CopyEvalStorage& out) noexcept {
++  return matmul_eval_layout(rank,m,n,k,batches,tracer,true,out);
++}
++bool tiled_matmul_facts(TiledMatmulFacts& out) noexcept {
++  constexpr auto lanes=simd::max_size<float>;
++  if(lanes<1||lanes>16||16%lanes)return false;
++  out={16,size_t(lanes),4,size_t(INT_MAX)};return true;
++}
++bool is_tiled_matmul_eval_primitive(const array& out) noexcept {
++  return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
++      typeid(out.primitive())==typeid(Matmul)&&out.dtype()==float32&&
++      static_cast<const Matmul&>(out.primitive()).cpu_matmul()==CpuMatmulKernel::Float32Tiles;
++}
++static bool matmul_shape(const array& a,const array& b,const array& output,
++    bool tiled,size_t& batches) noexcept {
++  const size_t rank=output.ndim();if(rank<2||rank>4||a.ndim()!=rank||b.ndim()!=rank)return false;
++  const auto dtype=tiled?float32:bfloat16;
++  if(a.dtype()!=dtype||b.dtype()!=dtype||output.dtype()!=dtype||a.itemsize()!=dtype.size()||
++      b.itemsize()!=dtype.size()||output.itemsize()!=dtype.size()||a.shape(-1)!=b.shape(-2)||
++      output.shape(-2)!=a.shape(-2)||output.shape(-1)!=b.shape(-1)||
++      a.shape(-2)<=0||b.shape(-1)<=0||a.shape(-1)<=0)return false;
++  size_t result=0,left=0,right=0;batches=1;
+   for(size_t i=0;i+2<rank;++i) {
+     if(output.shape(i)<=0||a.shape(i)!=output.shape(i)||b.shape(i)!=output.shape(i)||
+         !product(batches,size_t(output.shape(i)),batches))return false;
+   }
+-  if(!product(batches,size_t(output.shape(-2)),result)||
+-      !product(result,size_t(output.shape(-1)),result)||result!=output.size())return false;
+-  return bf16_matmul_eval_layout(rank,a.shape(-2),b.shape(-1),a.shape(-1),batches,output.is_tracer(),out);
++  if(!product(size_t(a.shape(-2)),size_t(a.shape(-1)),left)||!product(left,batches,left)||
++      !product(size_t(b.shape(-2)),size_t(b.shape(-1)),right)||!product(right,batches,right)||
++      !product(batches,size_t(output.shape(-2)),result)||
++      !product(result,size_t(output.shape(-1)),result)||result!=output.size()||
++      left!=a.size()||right!=b.size()||left>size_t(INT_MAX)||right>size_t(INT_MAX)||result>size_t(INT_MAX))return false;
++  return !tiled||(output.shape(-2)<=INT_MAX-15&&output.shape(-1)<=INT_MAX-15);
++}
++bool tiled_matmul_shape(const array& a,const array& b,const array& output) noexcept {
++  TiledMatmulFacts facts;size_t batches=0;
++  return tiled_matmul_facts(facts)&&matmul_shape(a,b,output,true,batches);
++}
++static bool matmul_eval_storage(const array& output,bool tiled,CopyEvalStorage& out) noexcept {
++  if(!(tiled?is_tiled_matmul_eval_primitive(output):is_bf16_matmul_eval_primitive(output))||
++      !output.siblings().empty()||output.inputs().size()!=2)return false;
++  const auto& a=output.inputs()[0];const auto& b=output.inputs()[1];size_t batches=0;
++  const auto dtype=tiled?float32:bfloat16;
++  if(!matmul_shape(a,b,output,tiled,batches)||!matrix_source(a,output.ndim(),dtype)||
++      !matrix_source(b,output.ndim(),dtype))return false;
++  return matmul_eval_layout(output.ndim(),a.shape(-2),b.shape(-1),a.shape(-1),batches,output.is_tracer(),tiled,out);
++}
++bool bf16_matmul_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  return matmul_eval_storage(output,false,out);
++}
++bool tiled_matmul_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  return matmul_eval_storage(output,true,out);
+ }
+ }
+ namespace mlx::core::submission {
+@@ -93,4 +139,14 @@
+   if(!cpu::bf16_matmul_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
+   return create_layout(*graph,context.scope,&record,actual,out,true);
+ }
++GraphFailure GraphConstruction::create_cpu_tiled_matmul_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record=guard.record();auto* graph=record.graph_quota();auto context=current_graph_construction_context();
++  if(out||!graph||!guard.cpu()||!context.scope||context.worker||context.dispatch!=&record||current_graph_quota()!=graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if(!cpu::tiled_matmul_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
+ }
++
++}
+diff --git a/mlx/backend/cpu/matmul_storage.h b/mlx/backend/cpu/matmul_storage.h
+--- a/mlx/backend/cpu/matmul_storage.h
++++ b/mlx/backend/cpu/matmul_storage.h
+@@ -1,6 +1,14 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
++struct TiledMatmulFacts { size_t tile_edge,reduction_lanes,max_rank,max_elements; };
++MLX_API bool tiled_matmul_facts(TiledMatmulFacts&) noexcept;
++MLX_API bool tiled_matmul_dispatch_storage(EvalDispatchStorage&) noexcept;
++MLX_API bool tiled_matmul_shape(const array&,const array&,const array&) noexcept;
++MLX_API bool tiled_matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool is_tiled_matmul_eval_primitive(const array&) noexcept;
++MLX_API bool tiled_matmul_eval_storage(const array&,CopyEvalStorage&) noexcept;
+ MLX_API bool bf16_matmul_dispatch_storage(EvalDispatchStorage&) noexcept;
+ MLX_API bool bf16_matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+     size_t batches,bool tracer,CopyEvalStorage&) noexcept;
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -166,6 +166,8 @@
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_greedy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_reshape_alias_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_tiled_matmul_eval(const FixedEvalPrologueGuard&,
++      GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_bf16_matmul_eval(const FixedEvalPrologueGuard&,
+       GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_random_bits_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -351,7 +351,7 @@
+ 
+ bool AddMM::is_equivalent(const Primitive& other) const {
+   const AddMM& a_other = static_cast<const AddMM&>(other);
+-  return (alpha_ == a_other.alpha_ && beta_ == a_other.beta_);
++  return (alpha_ == a_other.alpha_ && beta_ == a_other.beta_ && cpu_matmul_ == a_other.cpu_matmul_);
+ }
+ 
+ std::vector<Shape> AddMM::output_shapes(const ArrayVector& inputs) {
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -192,7 +192,9 @@
+ class AddMM : public UnaryPrimitive {
+  public:
+   explicit AddMM(Stream stream, float alpha, float beta)
+-      : UnaryPrimitive(stream), alpha_(alpha), beta_(beta) {}
++      : UnaryPrimitive(stream), alpha_(alpha), beta_(beta), cpu_matmul_(stream.cpu_matmul()) {}
++
++  CpuMatmulKernel cpu_matmul() const noexcept { return cpu_matmul_; }
+ 
+   void eval_cpu(const ArrayVector& inputs, array& out) override;
+   void eval_gpu(const ArrayVector& inputs, array& out) override;
+@@ -210,6 +212,7 @@
+  private:
+   const float alpha_;
+   const float beta_;
++  const CpuMatmulKernel cpu_matmul_;
+ };
+ 
+ class Arange : public UnaryPrimitive {
+@@ -1501,7 +1504,9 @@
+ 
+ class Matmul : public UnaryPrimitive {
+  public:
+-  explicit Matmul(Stream stream) : UnaryPrimitive(stream) {}
++  explicit Matmul(Stream stream) : UnaryPrimitive(stream), cpu_matmul_(stream.cpu_matmul()) {}
++
++  CpuMatmulKernel cpu_matmul() const noexcept { return cpu_matmul_; }
+ 
+   void eval_cpu(const ArrayVector& inputs, array& out) override;
+   void eval_gpu(const ArrayVector& inputs, array& out) override;
+@@ -1509,8 +1514,12 @@
+   DEFINE_GRADS()
+   DEFINE_VMAP()
+   DEFINE_NAME(Matmul)
+-  DEFINE_DEFAULT_IS_EQUIVALENT()
++  bool is_equivalent(const Primitive& other) const override {
++    return cpu_matmul_ == static_cast<const Matmul&>(other).cpu_matmul_;
++  }
+   std::vector<Shape> output_shapes(const ArrayVector& inputs) override;
++ private:
++  const CpuMatmulKernel cpu_matmul_;
+ };
+ 
+ class Maximum : public UnaryPrimitive {
+diff --git a/mlx/stream.h b/mlx/stream.h
+--- a/mlx/stream.h
++++ b/mlx/stream.h
+@@ -9,16 +9,28 @@
+ 
+ namespace mlx::core {
+ 
++// A numerical implementation carried by an explicit context copy. This is
++// independent of queue/device identity; consuming primitives retain it by value.
++enum class CpuMatmulKernel : unsigned { PlatformDefault = 0, Float32Tiles = 1 };
++
+ struct MLX_API Stream {
+   int index;
+   Device device;
+-  explicit Stream(int index, Device device) : index(index), device(device) {}
++  explicit Stream(int index, Device device,
++      CpuMatmulKernel cpu_matmul = CpuMatmulKernel::PlatformDefault)
++      : index(index), device(device), cpu_matmul_(cpu_matmul) {}
++
++  CpuMatmulKernel cpu_matmul() const noexcept { return cpu_matmul_; }
+ 
+   // TODO: Use default three-way comparison when it gets supported in XCode.
+-  bool operator==(const Stream&) const = default;
++  bool operator==(const Stream& other) const {
++    return index == other.index && device == other.device;
++  }
+   bool operator<(const Stream& rhs) const {
+     return device < rhs.device || index < rhs.index;
+   }
++ private:
++  CpuMatmulKernel cpu_matmul_;
+ };
+ 
+ struct MLX_API ThreadLocalStream : public Stream {

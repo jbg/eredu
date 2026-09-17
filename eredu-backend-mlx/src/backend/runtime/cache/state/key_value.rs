@@ -2,6 +2,26 @@
 
 use super::*;
 
+mod original_paged_copy;
+mod realtime_branch;
+pub(crate) use realtime_branch::RealtimeKvBranchPlan;
+mod prepared_copy;
+pub(crate) use prepared_copy::ResidentKvPreparationError;
+pub(in crate::backend::runtime::cache::state) use prepared_copy::{PagedWork, PreparedPagedStorageCopy};
+pub(in crate::backend::runtime::cache::state) use prepared_copy::copy_resident_kv_layer_retained;
+pub(crate) use prepared_copy::{
+    DenseResidentKvPublishError, InitializedPagedDenseCopy, PreparedDenseResidentKvState,
+    PreparedResidentKvCopy, PublishedDenseResidentKvState, ResidentKvCopyError,
+    SavedResidentKvCopy,
+};
+mod workspace;
+pub(crate) use workspace::CompleteStateProjectionFailure;
+pub(in crate::backend::runtime::cache::state) use workspace::project_layers;
+pub(in crate::backend::runtime::cache::state) use workspace::{SourceCounts, project_complete};
+
+#[cfg(test)]
+mod slot_tests;
+
 /// One concrete MLX key/value layer state selected by runtime residency policy.
 #[derive(Debug, Clone)]
 pub enum MlxKeyValueLayerState {
@@ -14,6 +34,14 @@ pub enum MlxKeyValueLayerState {
 }
 
 impl MlxKeyValueLayerState {
+    pub(super) fn retained_owner_slot_counts(&self) -> NativeStateSlotCounts {
+        match self {
+            Self::Stateless => NativeStateSlotCounts::default(),
+            Self::Device(_) => NativeStateSlotCounts::arrays(2, 0),
+            Self::Paged(_) => NativeStateSlotCounts::arrays(2, 1),
+        }
+    }
+
     pub(super) fn clear(&mut self) -> Result<(), Exception> {
         match self {
             Self::Stateless => Ok(()),
@@ -149,6 +177,18 @@ impl KeyValueCache for MlxKeyValueLayerState {
 impl RuntimeLayerState<MlxNeuralBackend> for MlxKeyValueLayerState {
     type RetainedValues<'a> = RetainedArrayIter<'a>;
 
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) {
+        match self {
+            Self::Stateless => {}
+            Self::Device(cache) => {
+                RuntimeLayerState::<MlxNeuralBackend>::visit_retained_values(cache, visitor)
+            }
+            Self::Paged(cache) => {
+                RuntimeLayerState::<MlxNeuralBackend>::visit_retained_values(cache, visitor)
+            }
+        }
+    }
+
     fn retained_values(&self) -> Self::RetainedValues<'_> {
         match self {
             Self::Stateless => [None, None].into_iter().flatten(),
@@ -166,12 +206,27 @@ impl ResettableRuntimeLayerState<MlxNeuralBackend> for MlxKeyValueLayerState {
 }
 
 /// Model-wide MLX key/value state created solely from a neutral layout.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MlxKeyValueState {
-    layout: StateLayout,
+    layout: eredu_runtime::SharedStateLayout,
     global_layer_start: usize,
-    pub(super) layers: Vec<MlxKeyValueLayerState>,
+    pub(super) layers: eredu_runtime::HostSlotTable<MlxKeyValueLayerState>,
     paged_transaction_branch: bool,
+    inference_retention: eredu_runtime::working_memory::InferenceRetention,
+}
+
+impl Clone for MlxKeyValueState {
+    fn clone(&self) -> Self {
+        Self {
+            layout: self.layout.clone(),
+            global_layer_start: self.global_layer_start,
+            layers: eredu_runtime::HostSlotTable::new(
+                self.layers.slots().to_vec().into_boxed_slice(),
+            ),
+            paged_transaction_branch: self.paged_transaction_branch,
+            inference_retention: self.inference_retention.clone(),
+        }
+    }
 }
 
 /// Unpublished, independently mutable resident MLX key/value state.
@@ -258,21 +313,157 @@ pub(super) fn common_selected_placement(
     Ok(Some(placement))
 }
 
-impl MlxKeyValueState {
-    pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
-        self.layers.iter().try_fold(0, |bound, layer| match layer {
-            MlxKeyValueLayerState::Stateless => Some(bound),
-            MlxKeyValueLayerState::Device(cache) => {
-                Some(bound.max(cache.continuation_capacity_bound(additional)?))
+fn empty_resident_kv_layer(window: Option<i32>) -> MlxKeyValueLayerState {
+    MlxKeyValueLayerState::Device(match window {
+        Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
+        None => ConcatKeyValueCache::new(),
+    })
+}
+
+impl eredu_runtime::working_memory::ResidentKvResetState for MlxKeyValueState {
+    type Layer = MlxKeyValueLayerState;
+    type ResetPlan = original_reset::MlxPagedResetPlan;
+    type ResetContext = original_reset::MlxPagedResetContext;
+    fn resident_reset_plan(
+        &self,
+    ) -> Result<(Self::ResetPlan, usize), eredu_runtime::working_memory::WorkingMemoryError> {
+        self.original_reset_plan()
+    }
+    fn prepare_resident_reset_context(
+        &self,
+        plan: &Self::ResetPlan,
+        funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>,
+    ) -> Result<Self::ResetContext, eredu_core::BackendFailure> {
+        self.prepare_original_reset(plan, funding)
+    }
+    fn validate_resident_reset_placement(
+        layer: &Self::Layer,
+        placement: eredu_runtime::StateComponentPlacement,
+    ) -> bool {
+        matches!(
+            (layer, placement),
+            (
+                MlxKeyValueLayerState::Paged(_),
+                eredu_runtime::StateComponentPlacement::Paged
+            ) | (
+                MlxKeyValueLayerState::Device(_) | MlxKeyValueLayerState::Stateless,
+                eredu_runtime::StateComponentPlacement::Device
+            )
+        )
+    }
+    fn empty_resident_reset_layer_prepared(
+        context: &mut Self::ResetContext,
+        source: &Self::Layer,
+        policy: &LayerCachePolicy,
+        child: Option<eredu_runtime::HostSlotTable<()>>,
+    ) -> Result<Self::Layer, eredu_core::BackendFailure> {
+        Self::empty_original_reset_layer(context, source, policy, child)
+    }
+    type Child = ();
+    fn resident_reset_layers(&self) -> &eredu_runtime::HostSlotTable<Self::Layer> {
+        &self.layers
+    }
+    fn resident_reset_layout(&self) -> &eredu_runtime::SharedStateLayout {
+        &self.layout
+    }
+    fn resident_reset_global_start(&self) -> usize {
+        self.global_layer_start
+    }
+    fn resident_fork_is_empty(&self) -> bool {
+        !self.paged_transaction_branch
+            && self.layers.slots().iter().all(|layer| match layer {
+                MlxKeyValueLayerState::Stateless => true,
+                MlxKeyValueLayerState::Device(cache) => cache.resident_fork_is_empty(),
+                _ => false,
+            })
+    }
+    fn validate_resident_reset_layer(layer: &Self::Layer, policy: &LayerCachePolicy) -> bool {
+        match (layer, policy) {
+            (MlxKeyValueLayerState::Stateless, LayerCachePolicy::NoState) => true,
+            (
+                MlxKeyValueLayerState::Device(cache),
+                LayerCachePolicy::KeyValue { attention, .. },
+            ) => attention
+                .sliding_window_i32()
+                .is_ok_and(|window| cache.matches_resident_reset_policy(window)),
+            (MlxKeyValueLayerState::Paged(cache), LayerCachePolicy::KeyValue { attention, .. }) => {
+                attention
+                    .sliding_window_i32()
+                    .is_ok_and(|window| cache.matches_original_reset_policy(window))
             }
-            MlxKeyValueLayerState::Paged(cache) => Some(
-                bound.max(
-                    u64::try_from(KeyValueCache::offset(cache))
-                        .ok()?
-                        .checked_add(additional)?,
-                ),
+            _ => false,
+        }
+    }
+    fn empty_resident_reset_layer(policy: &LayerCachePolicy) -> Self::Layer {
+        match policy {
+            LayerCachePolicy::NoState => MlxKeyValueLayerState::Stateless,
+            LayerCachePolicy::KeyValue { attention, .. } => empty_resident_kv_layer(
+                attention.sliding_window_i32().expect("validated KV window"),
             ),
-        })
+            _ => unreachable!("validated resident KV policy"),
+        }
+    }
+    fn from_resident_reset(
+        layout: eredu_runtime::SharedStateLayout,
+        global_layer_start: usize,
+        layers: eredu_runtime::HostSlotTable<Self::Layer>,
+    ) -> Self {
+        Self {
+            layout,
+            global_layer_start,
+            layers,
+            paged_transaction_branch: false,
+            inference_retention: Default::default(),
+        }
+    }
+}
+
+impl MlxKeyValueState {
+    /// Includes absent future KV fields and the actual immutable host tables.
+    /// Manager catalogs and external metadata are separate unknown domains.
+    pub(crate) fn retained_owner_slot_counts(&self) -> Option<NativeStateSlotCounts> {
+        self.layers.slots().iter().try_fold(
+            NativeStateSlotCounts {
+                layouts: 1,
+                slot_tables: 1,
+                ..Default::default()
+            },
+            |counts, layer| counts.checked_add(layer.retained_owner_slot_counts()),
+        )
+    }
+
+    /// Prepares a borrowed resident decoder copy without acquiring or granting
+    /// construction authority. Paged storage requires a separate closed plan.
+    pub(crate) fn prepare_resident_copy(
+        &self,
+    ) -> Result<PreparedResidentKvCopy<'_>, ResidentKvCopyError> {
+        PreparedResidentKvCopy::prepare(self)
+    }
+
+    /// Borrows the actual fixed layer-table extent and accounting identity.
+    /// Nested native arrays and manager resources require separate inventory.
+    /// Cloning this token grants neither slot access nor allocation permission.
+    pub(crate) fn layer_slot_metadata(&self) -> &eredu_runtime::HostSlotMetadata {
+        self.layers.metadata()
+    }
+
+    pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
+        self.layers
+            .slots()
+            .iter()
+            .try_fold(0, |bound, layer| match layer {
+                MlxKeyValueLayerState::Stateless => Some(bound),
+                MlxKeyValueLayerState::Device(cache) => {
+                    Some(bound.max(cache.continuation_capacity_bound(additional)?))
+                }
+                MlxKeyValueLayerState::Paged(cache) => Some(
+                    bound.max(
+                        u64::try_from(KeyValueCache::offset(cache))
+                            .ok()?
+                            .checked_add(additional)?,
+                    ),
+                ),
+            })
     }
 
     /// Creates contiguous execution-device state for every declared layer.
@@ -294,16 +485,14 @@ impl MlxKeyValueState {
                     return Ok(MlxKeyValueLayerState::Stateless);
                 }
                 let window = key_value_window(layer, policy)?;
-                Ok(MlxKeyValueLayerState::Device(match window {
-                    Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
-                    None => ConcatKeyValueCache::new(),
-                }))
+                Ok(empty_resident_kv_layer(window))
             })
             .collect::<Result<Vec<_>, Exception>>()?;
         Ok(Self {
-            layout,
+            layout: eredu_runtime::SharedStateLayout::new(layout),
             global_layer_start,
-            layers,
+            inference_retention: Default::default(),
+            layers: eredu_runtime::HostSlotTable::new(layers.into_boxed_slice()),
             paged_transaction_branch: false,
         })
     }
@@ -341,9 +530,10 @@ impl MlxKeyValueState {
             })
             .collect::<Result<Vec<_>, Exception>>()?;
         Ok(Self {
-            layout,
+            layout: eredu_runtime::SharedStateLayout::new(layout),
             global_layer_start,
-            layers,
+            inference_retention: Default::default(),
+            layers: eredu_runtime::HostSlotTable::new(layers.into_boxed_slice()),
             paged_transaction_branch: false,
         })
     }
@@ -382,12 +572,7 @@ impl MlxKeyValueState {
                 let window = key_value_window(layer, policy)?;
                 match common_selected_placement(layer, "key/value", components)? {
                     Some(StateComponentPlacement::Device) => {
-                        Ok(MlxKeyValueLayerState::Device(match window {
-                            Some(window) => {
-                                ConcatKeyValueCache::new_for_sliding_attention(window)
-                            }
-                            None => ConcatKeyValueCache::new(),
-                        }))
+                        Ok(empty_resident_kv_layer(window))
                     }
                     Some(StateComponentPlacement::Paged) => {
                         let manager = manager.as_ref().ok_or_else(|| {
@@ -417,29 +602,68 @@ impl MlxKeyValueState {
             })
             .collect::<Result<Vec<_>, Exception>>()?;
         Ok(Self {
-            layout,
+            layout: eredu_runtime::SharedStateLayout::new(layout),
             global_layer_start,
-            layers,
+            inference_retention: Default::default(),
+            layers: eredu_runtime::HostSlotTable::new(layers.into_boxed_slice()),
             paged_transaction_branch: false,
         })
     }
 
     /// Returns the common absolute token offset, or zero for an empty state.
     pub fn offset(&self) -> i32 {
-        self.layers.first().map_or(0, KeyValueCache::offset)
+        self.layers.slots().first().map_or(0, KeyValueCache::offset)
     }
 
     /// Clears retained arrays without changing residency or attention windows.
     pub fn clear(&mut self) -> Result<(), Exception> {
-        for layer in &mut self.layers {
+        for layer in self.layers.slots_mut() {
             layer.clear()?;
         }
         Ok(())
     }
 
-    /// Borrows every native array retained by the complete model state.
+    /// Inventories layer arrays and all retained paged managers together.
+    pub(crate) fn retained_storage(
+        &self,
+    ) -> Result<
+        crate::backend::runtime::residency::storage::RetainedStorage,
+        crate::backend::runtime::residency::manager::ResidencyError,
+    > {
+        let mut storage = crate::backend::runtime::residency::storage::RetainedStorage::default();
+        self.collect_retained_storage(&mut storage)?;
+        Ok(storage)
+    }
+
+    /// Fills caller-owned storage without allocating an intermediate inventory.
+    pub(crate) fn collect_retained_storage(
+        &self,
+        storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    ) -> Result<(), crate::backend::runtime::residency::manager::ResidencyError> {
+        storage
+            .include_retained_values::<crate::backend::runtime::residency::manager::ResidencyError>(
+                |visitor| {
+                    for layer in self.layers.slots() {
+                        RuntimeLayerState::<MlxNeuralBackend>::visit_retained_values(
+                            layer, visitor,
+                        );
+                    }
+                    Ok(true)
+                },
+            )?;
+        for manager in self.layers.slots().iter().filter_map(|layer| match layer {
+            MlxKeyValueLayerState::Paged(cache) => Some(cache.manager()),
+            _ => None,
+        }) {
+            manager.collect_retained_storage(storage)?;
+        }
+        Ok(())
+    }
+
+    /// Borrows native layer arrays; sealed paged blocks remain with their managers.
     pub fn retained_arrays(&self) -> Vec<&Array> {
         self.layers
+            .slots()
             .iter()
             .flat_map(RuntimeLayerState::<MlxNeuralBackend>::retained_values)
             .map(MlxTensor::as_array)
@@ -451,18 +675,22 @@ impl MlxKeyValueState {
         Ok(Self {
             layout: self.layout.clone(),
             global_layer_start: self.global_layer_start,
-            layers: self
-                .layers
-                .iter()
-                .map(MlxKeyValueLayerState::deep_clone_state)
-                .collect::<Result<_, _>>()?,
+            inference_retention: self.inference_retention.clone(),
+            layers: eredu_runtime::HostSlotTable::new(
+                self.layers
+                    .slots()
+                    .iter()
+                    .map(MlxKeyValueLayerState::deep_clone_state)
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_boxed_slice(),
+            ),
             paged_transaction_branch: self.paged_transaction_branch,
         })
     }
 
     pub(crate) fn supports_isolated_snapshot(&self) -> bool {
         let mut manager = None;
-        self.layers.iter().all(|layer| match layer {
+        self.layers.slots().iter().all(|layer| match layer {
             MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => true,
             MlxKeyValueLayerState::Paged(cache) => {
                 let id = cache.manager().session_id();
@@ -473,10 +701,24 @@ impl MlxKeyValueState {
 
     pub(crate) fn isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
         self.layers
+            .slots()
             .iter()
             .find_map(|layer| match layer {
                 MlxKeyValueLayerState::Paged(cache) => {
                     Some(cache.manager().isolated_snapshot_bytes())
+                }
+                _ => None,
+            })
+            .unwrap_or(Some(0))
+    }
+
+    pub(crate) fn original_isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
+        self.layers
+            .slots()
+            .iter()
+            .find_map(|layer| match layer {
+                MlxKeyValueLayerState::Paged(cache) => {
+                    Some(cache.manager().original_isolated_snapshot_bytes())
                 }
                 _ => None,
             })
@@ -488,6 +730,7 @@ impl MlxKeyValueState {
         // bound also covers partial tails becoming sealed during advancement.
         let paged = self
             .layers
+            .slots()
             .iter()
             .filter(|layer| matches!(layer, MlxKeyValueLayerState::Paged(_)))
             .count() as u64;
@@ -507,6 +750,7 @@ impl MlxKeyValueState {
         }
         let manager = self
             .layers
+            .slots()
             .iter()
             .find_map(|layer| match layer {
                 MlxKeyValueLayerState::Paged(cache) => Some(cache.manager()),
@@ -520,6 +764,7 @@ impl MlxKeyValueState {
             .transpose()?;
         let layers = self
             .layers
+            .slots()
             .iter()
             .map(|layer| match layer {
                 MlxKeyValueLayerState::Stateless => Ok(MlxKeyValueLayerState::Stateless),
@@ -537,24 +782,25 @@ impl MlxKeyValueState {
                     Ok(MlxKeyValueLayerState::Paged(copy))
                 }
             })
-            .collect::<Result<_, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             layout: self.layout.clone(),
             global_layer_start: self.global_layer_start,
+            inference_retention: self.inference_retention.clone(),
             paged_transaction_branch: self.paged_transaction_branch,
-            layers,
+            layers: eredu_runtime::HostSlotTable::new(layers.into_boxed_slice()),
         })
     }
 
     pub(crate) fn fork_prediction_target_state(&self, stream: &Stream) -> Result<Self, Exception> {
-        let manager = self.layers.iter().find_map(|layer| match layer {
+        let manager = self.layers.slots().iter().find_map(|layer| match layer {
             MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => None,
             MlxKeyValueLayerState::Paged(cache) => Some(cache.manager()),
         });
         let Some(manager) = manager else {
             return self.deep_clone_state();
         };
-        if self.layers.iter().any(|layer| match layer {
+        if self.layers.slots().iter().any(|layer| match layer {
             MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => false,
             MlxKeyValueLayerState::Paged(cache) => {
                 cache.manager().session_id() != manager.session_id()
@@ -568,7 +814,7 @@ impl MlxKeyValueState {
             .fork_session(stream)
             .map_err(|error| Exception::custom(error.to_string()))?;
         let mut fork = self.deep_clone_state()?;
-        for layer in &mut fork.layers {
+        for layer in fork.layers.slots_mut() {
             if let MlxKeyValueLayerState::Paged(cache) = layer {
                 cache.rebind_paging_manager(manager.clone());
             }
@@ -580,11 +826,8 @@ impl MlxKeyValueState {
         self.layout == other.layout
             && self.global_layer_start == other.global_layer_start
             && self.layers.len() == other.layers.len()
-            && self
-                .layers
-                .iter()
-                .zip(&other.layers)
-                .all(|(canonical, branch)| match (canonical, branch) {
+            && self.layers.slots().iter().zip(other.layers.slots()).all(
+                |(canonical, branch)| match (canonical, branch) {
                     (MlxKeyValueLayerState::Stateless, MlxKeyValueLayerState::Stateless) => true,
                     (MlxKeyValueLayerState::Device(_), MlxKeyValueLayerState::Device(_)) => true,
                     (
@@ -592,7 +835,8 @@ impl MlxKeyValueState {
                         MlxKeyValueLayerState::Paged(branch),
                     ) => canonical.has_same_transaction_identity(branch),
                     _ => false,
-                })
+                },
+            )
     }
 
     /// Restores every append-only layer to an exact speculative checkpoint.
@@ -609,7 +853,14 @@ impl MlxKeyValueState {
                 "key/value state checkpoint layout does not match canonical state",
             ));
         }
-        for (current, previous) in self.layers.iter_mut().zip(&checkpoint.layers) {
+        self.inference_retention
+            .restore_admission(&checkpoint.inference_retention);
+        for (current, previous) in self
+            .layers
+            .slots_mut()
+            .iter_mut()
+            .zip(checkpoint.layers.slots())
+        {
             current.restore_checkpoint(previous, stream)?;
         }
         Ok(())
@@ -618,6 +869,7 @@ impl MlxKeyValueState {
     /// Returns aggregate telemetry when this is paged state.
     pub fn residency_report(&self) -> Result<Option<CacheResidencyReport>, Exception> {
         self.layers
+            .slots()
             .iter()
             .find_map(|layer| match layer {
                 MlxKeyValueLayerState::Paged(cache) => Some(cache.report()),
@@ -635,7 +887,7 @@ impl MlxKeyValueState {
         options: &PromptCacheOptions,
     ) -> Result<PromptCacheManifest, Exception> {
         let mut manager = None;
-        for layer in &mut self.layers {
+        for layer in self.layers.slots_mut() {
             if matches!(layer, MlxKeyValueLayerState::Stateless) {
                 continue;
             }
@@ -661,6 +913,7 @@ impl SemanticStateTransaction for MlxKeyValueState {
     fn branch(&self) -> Result<Self::Branch, Self::Error> {
         let paged_rollback = self
             .layers
+            .slots()
             .iter()
             .map(|layer| match layer {
                 MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_) => Ok(None),
@@ -684,6 +937,9 @@ impl SemanticStateTransaction for MlxKeyValueState {
             ));
         }
         let mut state = branch.state;
+        state
+            .inference_retention
+            .extend_from(&self.inference_retention);
         state.paged_transaction_branch = false;
         *self = state;
         Ok(())
@@ -694,6 +950,7 @@ impl SemanticStateTransaction for MlxKeyValueState {
         for (layer, checkpoint) in branch
             .state
             .layers
+            .slots_mut()
             .iter_mut()
             .zip(branch.paged_rollback.iter())
         {
@@ -712,7 +969,7 @@ impl SemanticStateTransaction for MlxKeyValueState {
     }
 
     fn permits_parallel_branches(&self) -> bool {
-        self.layers.iter().all(|layer| {
+        self.layers.slots().iter().all(|layer| {
             matches!(
                 layer,
                 MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_)
@@ -721,11 +978,41 @@ impl SemanticStateTransaction for MlxKeyValueState {
     }
 }
 
+impl eredu_runtime::working_memory::InferenceStateRetention for MlxKeyValueState {
+    fn inference_retention(&self) -> &eredu_runtime::working_memory::InferenceRetention {
+        &self.inference_retention
+    }
+
+    fn inference_retention_mut(
+        &mut self,
+    ) -> &mut eredu_runtime::working_memory::InferenceRetention {
+        &mut self.inference_retention
+    }
+
+    fn retain_inference(&mut self, request: &eredu_runtime::working_memory::InferenceRequest) {
+        self.inference_retention.retain(request);
+    }
+}
+
 impl RuntimeState<MlxNeuralBackend> for MlxKeyValueState {
     type RetainedValues<'a> = RetainedArrayIter<'a>;
 
     fn layout(&self) -> &StateLayout {
-        &self.layout
+        self.layout.layout()
+    }
+
+    fn shared_layout(&self) -> Option<&eredu_runtime::SharedStateLayout> {
+        Some(&self.layout)
+    }
+
+    fn visit_all_retained_values(
+        &self,
+        visitor: &mut dyn FnMut(&MlxTensor),
+    ) -> Result<(), StateError> {
+        for layer in self.layers.slots() {
+            RuntimeLayerState::<MlxNeuralBackend>::visit_retained_values(layer, visitor);
+        }
+        Ok(())
     }
 
     fn retained_values(
@@ -735,6 +1022,7 @@ impl RuntimeState<MlxNeuralBackend> for MlxKeyValueState {
     ) -> Result<Self::RetainedValues<'_>, StateError> {
         let layer = ordinal;
         self.layers
+            .slots()
             .get(layer)
             .map(RuntimeLayerState::retained_values)
             .ok_or(StateError::UnknownLayer {
@@ -750,6 +1038,7 @@ impl LayerRuntimeState<MlxNeuralBackend> for MlxKeyValueState {
     fn layer(&mut self, layer: usize) -> Result<&mut Self::LayerState, StateError> {
         let count = self.layers.len();
         self.layers
+            .slots_mut()
             .get_mut(layer)
             .ok_or(StateError::UnknownLayer { layer, count })
     }
@@ -759,13 +1048,14 @@ impl ResettableRuntimeState<MlxNeuralBackend> for MlxKeyValueState {
     fn reset_segment(&mut self, segment: &StateSegmentId) -> Result<(), StateError> {
         let range = self
             .layout
+            .layout()
             .segment(segment)
             .map(StateSegmentSpec::layers)
             .ok_or_else(|| StateError::UnknownSegment {
                 segment: segment.clone(),
             })?;
         if self.paged_transaction_branch
-            && self.layers[range.clone()]
+            && self.layers.slots()[range.clone()]
                 .iter()
                 .any(|layer| matches!(layer, MlxKeyValueLayerState::Paged(_)))
         {
@@ -774,7 +1064,7 @@ impl ResettableRuntimeState<MlxNeuralBackend> for MlxKeyValueState {
                     .into(),
             ));
         }
-        for layer in &mut self.layers[range] {
+        for layer in &mut self.layers.slots_mut()[range] {
             ResettableRuntimeLayerState::<MlxNeuralBackend>::reset(layer)?;
         }
         Ok(())
@@ -783,13 +1073,13 @@ impl ResettableRuntimeState<MlxNeuralBackend> for MlxKeyValueState {
 
 impl AsRef<[MlxKeyValueLayerState]> for MlxKeyValueState {
     fn as_ref(&self) -> &[MlxKeyValueLayerState] {
-        &self.layers
+        self.layers.slots()
     }
 }
 
 impl AsMut<[MlxKeyValueLayerState]> for MlxKeyValueState {
     fn as_mut(&mut self) -> &mut [MlxKeyValueLayerState] {
-        &mut self.layers
+        self.layers.slots_mut()
     }
 }
 
@@ -803,3 +1093,16 @@ fn key_value_window(layer: usize, policy: &LayerCachePolicy) -> Result<Option<i3
         ))),
     }
 }
+
+#[path = "key_value/original_reset.rs"]
+mod original_reset;
+
+#[path = "key_value/snapshot_source.rs"]
+mod snapshot_source;
+pub(crate) use snapshot_source::PagedSnapshotSource;
+pub(in crate::backend::runtime::cache::state) use snapshot_source::{PagedSnapshotLayer, PagedSnapshotState};
+
+pub(crate) use prepared_copy::{
+    InitializedPagedKvCopy, PagedKvPreparationError, PreparedPagedKvCopy, PreparedPagedKvHostCopy,
+    SavedPagedKvCopy,
+};

@@ -36,7 +36,7 @@ impl CacheStoragePhase {
 }
 
 /// Kind of asynchronous backing-store operation.
-#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheIoOperationKind {
     /// Publish host resources to a durable backing.
@@ -46,7 +46,7 @@ pub enum CacheIoOperationKind {
 }
 
 /// Exact identity of one backing-store operation.
-#[derive(Debug, Clone, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct CacheIoOperationKey {
     /// Cache generation in which the operation was submitted.
     pub generation: u64,
@@ -77,6 +77,14 @@ pub struct CacheHostPromotion<H> {
     id: CacheBlockId,
     source: CacheStoragePhase,
     host: H,
+}
+
+/// Exact original Device ownership returned by a completed Host publication.
+/// Retain it until the replacing transfer's actual aliases have retired.
+#[derive(Debug)]
+pub struct CacheDeviceDemotion<D> {
+    id: CacheBlockId,
+    device: D,
 }
 
 /// Canonical physical-resource state machine for one cache block.
@@ -218,17 +226,46 @@ impl<D, H, B, HD: CacheHostDemotionOperation, IO: CacheIoOperation>
         host: H,
     ) -> Result<(D, HD), CacheStorageError> {
         self.require_host_demotion(operation_id)?;
-        let device = self
-            .device
-            .take()
-            .expect("demoting phase retains device resources");
-        let operation = self
-            .host_demotion
-            .take()
-            .expect("demoting phase retains its exact operation");
+        let operation = self.host_demotion.take().expect("matching operation");
+        let device = self.publish_host(host);
+        Ok((device, operation))
+    }
+
+    /// Publishes a copy already completed under the backend's closed operation
+    /// owner. This is a storage transition, not submission permission. The exact
+    /// prior Device owner is returned for rollback or deferred retirement.
+    pub fn demote_completed(
+        &mut self,
+        host: H,
+    ) -> Result<CacheDeviceDemotion<D>, CacheStorageError> {
+        self.require_phase(CacheStoragePhase::Device)?;
+        if self.backing.is_some() {
+            return Err(CacheStorageError::BackingAlreadyExists);
+        }
+        let id = self.id.clone();
+        let device = self.publish_host(host);
+        Ok(CacheDeviceDemotion { id, device })
+    }
+
+    fn publish_host(&mut self, host: H) -> D {
+        let device = self.device.take().expect("validated Device resources");
         self.host = Some(host);
         self.phase = CacheStoragePhase::HostUnbacked;
-        Ok((device, operation))
+        device
+    }
+
+    /// Restores only the exact completed Device-to-Host publication. The caller
+    /// receives Host storage back and retains its actual failed transfer owner.
+    pub fn restore_device(
+        &mut self,
+        demotion: CacheDeviceDemotion<D>,
+    ) -> Result<H, CacheStorageError> {
+        self.require_phase(CacheStoragePhase::HostUnbacked)?;
+        self.require_block(&demotion.id)?;
+        let host = self.host.take().expect("validated Host resources");
+        self.device = Some(demotion.device);
+        self.phase = CacheStoragePhase::Device;
+        Ok(host)
     }
 
     /// Abandons the matching host demotion and restores device residency.
@@ -562,6 +599,31 @@ mod tests {
             id: block(),
             kind,
         })
+    }
+
+    #[test]
+    fn completed_host_publication_returns_exact_device_rollback_owner() {
+        use std::{cell::Cell, rc::Rc};
+        struct Device(Rc<Cell<usize>>);
+        impl Drop for Device {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let retired = Rc::new(Cell::new(0));
+        let mut state: CacheBlockStorage<Device, u64, (), HostOp, IoOp> =
+            CacheBlockStorage::device(block(), Device(retired.clone()), None);
+        let owner = state.demote_completed(23).unwrap();
+        assert_eq!(state.phase(), CacheStoragePhase::HostUnbacked);
+        assert_eq!(retired.get(), 0);
+        assert_eq!(state.restore_device(owner).unwrap(), 23);
+        assert_eq!(state.phase(), CacheStoragePhase::Device);
+        assert_eq!(retired.get(), 0);
+        let owner = state.demote_completed(29).unwrap();
+        drop(state);
+        assert_eq!(retired.get(), 0);
+        drop(owner);
+        assert_eq!(retired.get(), 1);
     }
 
     #[test]

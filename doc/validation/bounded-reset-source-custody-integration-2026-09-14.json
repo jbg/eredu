@@ -1,0 +1,245 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T13:50:35.691953+00:00",
+  "scope": "Independent existing-layout ownership across repeated original reset and actual original-source inventory custody",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-tokenizer-static-alphabet-integration-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 1283,
+      "ignored": 0
+    },
+    "runtime_docs": {
+      "passed": 4,
+      "ignored": 0
+    },
+    "independence": {
+      "passed": 174,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 248,
+      "ignored": 2
+    },
+    "portable": {
+      "passed": 26,
+      "ignored": 1
+    },
+    "conformance": {
+      "passed": 110,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 1432,
+      "ignored": 735
+    }
+  },
+  "total_passed_executions": 3277,
+  "new_tests": [
+    {
+      "check": "session",
+      "name": "ordinary_native_source_classification_preserves_pin_bytes_and_alias_lifetimes",
+      "path": "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication/slot_metadata_tests.rs"
+    },
+    {
+      "check": "session",
+      "name": "ordinary_source_error_retains_genuine_participant_after_callers_drop_their_lease",
+      "path": "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication/slot_metadata_tests.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "repeated_original_reset_has_exact_overlap_and_retires_each_predecessor_independently",
+      "path": "eredu-runtime/src/working_memory/resident_reset/tests/sources.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "partial_repeated_reset_retains_only_actual_predecessor_until_error_retires",
+      "path": "eredu-runtime/src/working_memory/resident_reset/tests/sources.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_source_rejects_foreign_current_session_without_fill",
+      "path": "eredu-runtime/src/working_memory/resident_reset/tests/sources.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_layout_pin_avoids_provider_callbacks_and_destroys_last_key_outside_usage",
+      "path": "eredu-runtime/src/working_memory/resident_reset/tests/sources.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "closed_slot_classification_and_ordinary_transport_preserve_original_capacity_once",
+      "path": "eredu-runtime/src/working_memory/resident_reset/tests/sources.rs"
+    }
+  ],
+  "new_test_count": 7,
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T13:44:41.016114+00:00",
+      "elapsed_seconds": 23.362,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-reset-source-custody-integration-runtime.log",
+      "log_sha256": "5a75fbf44210722ad915dd3427cb5a567b449f8c3f240da21ee87ac86c4c868f"
+    },
+    "runtime_docs": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --doc",
+      "started_utc": "2026-09-14T13:45:04.384816+00:00",
+      "elapsed_seconds": 7.977,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-reset-source-custody-integration-runtime_docs.log",
+      "log_sha256": "641b46c9e199dc5f7f84b2267fcdc4697173dffe4900128d18014e7d28838db3"
+    },
+    "independence": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence",
+      "started_utc": "2026-09-14T13:45:12.362946+00:00",
+      "elapsed_seconds": 11.653,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-reset-source-custody-integration-independence.log",
+      "log_sha256": "1612dcee637ad3150fc19a2119e990f094d6e0896e04e748d38ca928b7106f0c"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib",
+      "started_utc": "2026-09-14T13:45:24.018543+00:00",
+      "elapsed_seconds": 38.654,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-reset-source-custody-integration-facade.log",
+      "log_sha256": "62dfd7fe31dae918a08c152bf3587cdee786129d8ff5994c35dec5f88cfd2885"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade",
+      "started_utc": "2026-09-14T13:46:02.673673+00:00",
+      "elapsed_seconds": 15.109,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-reset-source-custody-integration-portable.log",
+      "log_sha256": "a69f337d7a61427fa154781c391cfafb78032d2c54486ff88925f523beb7265a"
+    },
+    "conformance": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test backend_conformance",
+      "started_utc": "2026-09-14T13:46:17.783681+00:00",
+      "elapsed_seconds": 5.481,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-reset-source-custody-integration-conformance.log",
+      "log_sha256": "911ae66903c9d0b84fc1c81b84383ccdeb09b7105843018f24f2dff30e59576c"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1",
+      "started_utc": "2026-09-14T13:46:23.265323+00:00",
+      "elapsed_seconds": 219.638,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-reset-source-custody-integration-session.log",
+      "log_sha256": "6f58ad37a291cba3b752d45c0e6485e82392be1eda9c2f1db70c83396657d445"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T13:50:02.905888+00:00",
+      "elapsed_seconds": 16.012,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-reset-source-custody-integration-minimal.log",
+      "log_sha256": "07480354c2ba1d1404a6b6e55d0f4eeb5271a9faf7d91a5052d2c37c43c7cd0c"
+    }
+  },
+  "source_sha256": {
+    "eredu-runtime/src/host_metadata/slots.rs": "323e880349d1ae6b2d39b28b4f98f135250cbfd3e5c419495d30153900a247da",
+    "doc/backend-architecture.md": "b1ba3aa08a514f68c68ab92770df9ffa50ebce3c9043d5fae78ef687802b8876",
+    "eredu-runtime/src/working_memory/resident_reset/tests/sources.rs": "1868339581c2eb997b86866ca79d191dadd9b0bfcf0ae3b5e74d747d0192313c",
+    "eredu-runtime/src/working_memory/resident_reset.rs": "2bf96fd467c382f0ef621be2bc33df0732c92ecae374185f997c2134591c2d82",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication/slot_metadata_tests.rs": "5665b5c6988891b17e4978b9f482060ada7708dd0c3f58ff9994a10b5ae4e847",
+    "eredu-runtime/src/working_memory/storage/host_transfer.rs": "3235c4d07ee7376d1fbe655fa66c8903f7e633d87f2002aa1caeec853fff70be",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission.rs": "abb84a78500c7264de91eb45dc8bf2e552bd8843330afce72ab76342734d5f6e",
+    "eredu-runtime/src/working_memory/storage/capture_publication.rs": "161386412ce698e099fab4934e7fd7e1b8be79aa7af90ba306f8f5afd66b470b",
+    "eredu-runtime/src/working_memory/storage/registry/tests.rs": "f1b136592b5ef7cc5bc93fc4cb8950a35e6517a37801c10ea428e0e6fa396ad4",
+    "eredu-runtime/tests/backend_independence/original_resident_reset.rs": "10bb7eaefb766010be7f4dd37a54ef87e13067dab864ea63011923f791e01b11",
+    "eredu-runtime/src/working_memory/resident_reset/account.rs": "b378c3b9dc7b56eb119548908562b44be5481c9107aab8c9c1cde05fdd22a2fb",
+    "eredu-backend-mlx/src/backend/error.rs": "8d4cb5d8402b02e5a9b295ead3ed3548ebc5f87d13a9f661081fa2c3ac43e2fe",
+    "eredu-runtime/src/working_memory.rs": "6bb0e4ec42644b3097d537d0b72410c481d7cac1c84557bd4549d7db3abe89c2",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission/publication.rs": "730a3b08b61f445486937e205c59823cb46e04e18290970427fd3a1a4f1d92c7",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/mechanisms/opening_sources/capacity/registered.rs": "93566044b3d7e31bdacd33381a4e8cd34b4770d341b4359adc481f1171c7a24b",
+    "eredu-runtime/src/working_memory/storage/bounded_publication.rs": "d7d1345b4603985003cb57248e1fb8b1b9ad2ebe9d19ea9c2cca0240ff52844f",
+    "eredu-runtime/src/working_memory/storage.rs": "b3a2afece93b4785b96ccea71929b6bed29b93a566ff6647ef6984a07e6ea9b5",
+    "eredu-runtime/src/working_memory/storage/reset_layout.rs": "d136ce5712acbdcfebd6c3331ae15b8abe80d2500680025036d96664b0250769",
+    "eredu-runtime/src/working_memory/storage/registry.rs": "c42518ca4b15ee99a6212bfd67672bca014113716b1186dc51839b8a2c495c1e",
+    "eredu-runtime/src/working_memory/resident_reset/tests.rs": "088756b6dbd05bf878d6b15457bd9393d4bb5056949dbfaf9d504d366e7a49c6",
+    "doc/bounded-inference.md": "3a9ac17997a4cf97c7a78532c26da78b2a745beb3bb727aeed6e680682fe60b6"
+  },
+  "source_snapshot": "/private/tmp/eredu-reset-source-custody-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-tokenizer-static-alphabet-integration-2026-09-14.json": "e54e9d082db9addddcbb85d75559aaf8d155160a3752998f1b41b4eb924b9454",
+    "/private/tmp/eredu-reset-source-custody-composition-final-root-review.json": "9acb054d793f1a31c05603f3d3877d63348bef750fe24883f0985b886d48ea76",
+    "/private/tmp/eredu-reset-source-custody-composition-root-verification.json": "c6f8cabe5a7f037f9bd8b9b826e890557ec8c0ea9b88d8ccdeae58d45dde090f",
+    "/private/tmp/eredu-reset-source-custody-disk-composition-stage/FROZEN.json": "3c5f68614367a5e19689e874e044d28c631f8028527f452e69772867798dae33",
+    "/private/tmp/eredu-reset-source-custody-disk-composition-stage/change.patch": "d248f8d51fd6cdf395f8c4a7b3a4140a0e1ba8109a1425c257cabdfa94c3a06e",
+    "/private/tmp/eredu-reset-source-custody-disk-composition-stage/from-original.patch": "e31db7e2592c6b90cf28e88f6a3935baa5d1ffdc10f596df8cd393bdc44402b3",
+    "/private/tmp/eredu-reset-source-custody-disk-composition-stage/manifest.json": "581b724447308a29032c038f527d43932f6cc5885291edda31dcc6e91f7df086",
+    "/private/tmp/eredu-reset-source-custody-disk-composition-stage/replay.py": "69bde3a47c08c5f09fc04b76bb8b10590d2a53cd05954b2fe466b559b90532cd",
+    "/private/tmp/eredu-reset-source-custody-final-root-review.json": "2de6663c53af27976502f3916022356695a3fe60bdd5523c8b8114094054fe09",
+    "/private/tmp/eredu-reset-source-custody-independent-review.md": "4319179e941ea48a8b6eea40a95956ae797f0cdb6abeaba29962551f90baeb61",
+    "/private/tmp/eredu-reset-source-custody-integration-applied.json": "c7c57b3c36b79b7bd27e579706d11c8c7355ea5512433233eba63b4bcbcee59e",
+    "/private/tmp/eredu-reset-source-custody-integration-apply.py": "82cc3856a1af0f4f699dd4ac7694a64e5d9d88415895272b3e77b9a93c5ee1d3",
+    "/private/tmp/eredu-reset-source-custody-integration-checks.json": "42cefd2c88ba069039de92030c9632ec5f1396b853823fcdfde30cbf4d8055a3",
+    "/private/tmp/eredu-reset-source-custody-integration-conformance.log": "911ae66903c9d0b84fc1c81b84383ccdeb09b7105843018f24f2dff30e59576c",
+    "/private/tmp/eredu-reset-source-custody-integration-doc-applied.json": "c67b7ca51175154ebcc4619b53f3095865dc72f9008041330d64cfe29e153684",
+    "/private/tmp/eredu-reset-source-custody-integration-facade.log": "62dfd7fe31dae918a08c152bf3587cdee786129d8ff5994c35dec5f88cfd2885",
+    "/private/tmp/eredu-reset-source-custody-integration-independence.log": "1612dcee637ad3150fc19a2119e990f094d6e0896e04e748d38ca928b7106f0c",
+    "/private/tmp/eredu-reset-source-custody-integration-minimal.log": "07480354c2ba1d1404a6b6e55d0f4eeb5271a9faf7d91a5052d2c37c43c7cd0c",
+    "/private/tmp/eredu-reset-source-custody-integration-portable.log": "a69f337d7a61427fa154781c391cfafb78032d2c54486ff88925f523beb7265a",
+    "/private/tmp/eredu-reset-source-custody-integration-review.json": "ec2968fde0469b281f45486c4d27934ef97a6337021d5e24ad2467c39f4ac873",
+    "/private/tmp/eredu-reset-source-custody-integration-root-review.json": "c61eb3d786f2eb15151c98d713c33f51ac2dc4ea07bf9b1369539f63fd63baf2",
+    "/private/tmp/eredu-reset-source-custody-integration-runtime.log": "5a75fbf44210722ad915dd3427cb5a567b449f8c3f240da21ee87ac86c4c868f",
+    "/private/tmp/eredu-reset-source-custody-integration-runtime_docs.log": "641b46c9e199dc5f7f84b2267fcdc4697173dffe4900128d18014e7d28838db3",
+    "/private/tmp/eredu-reset-source-custody-integration-session.log": "6f58ad37a291cba3b752d45c0e6485e82392be1eda9c2f1db70c83396657d445",
+    "/private/tmp/eredu-reset-source-custody-integration-spec.json": "58bbf773d73a63389f2e77fb7b72b2f975fec22ff328aeb501446f67ef93f9bf",
+    "/private/tmp/eredu-reset-source-custody-integration-spec.pending.json": "584b66882f782c2af40cbe6931ecd27c31a928772d4282441360e05ef8cd68c4",
+    "/private/tmp/eredu-reset-source-custody-integration-stage/all.patch": "aee74d9b163d2db79145616716970aa41173a30a3c0bc35e2524b18b2b99ba5c",
+    "/private/tmp/eredu-reset-source-custody-integration-stage/change.patch": "d248f8d51fd6cdf395f8c4a7b3a4140a0e1ba8109a1425c257cabdfa94c3a06e",
+    "/private/tmp/eredu-reset-source-custody-integration-stage/manifest.json": "c7c57b3c36b79b7bd27e579706d11c8c7355ea5512433233eba63b4bcbcee59e",
+    "/private/tmp/eredu-reset-source-custody-integration-stage/staged-hashes.json": "05295320951f37971c618d5331d4e2b9ab1a6b66e3fbaf79439f3429c93bae2a",
+    "/private/tmp/eredu-reset-source-custody-integration-validate.py": "45cd23190e2c877f87695092eea44a088b85c44ebdeba7b230d055d273a505de",
+    "/private/tmp/eredu-reset-source-custody-integration-validation-config.json": "9cafacdb7e804d194da69136f576b2b0c3d3950e577b665d0b6dd86426d92fd1",
+    "/private/tmp/eredu-reset-source-custody-reviewed-stage/README.md": "9d422aaa59bde7542d9c89a991e4d3fcf98cf21d4ddc3c0bdcf3b33304b95b67",
+    "/private/tmp/eredu-reset-source-custody-reviewed-stage/doc-snippets.json": "dae4b3c34c7d7a4cd4440b7c95687ad6611b0afc275c93edff6a29adfadd2e30",
+    "/private/tmp/eredu-reset-source-custody-reviewed-stage/manifest.json": "c7c57b3c36b79b7bd27e579706d11c8c7355ea5512433233eba63b4bcbcee59e",
+    "/private/tmp/eredu-reset-source-custody-root-verification/checks.json": "b9fbd3651bab0bd0b877f015906688743dcb38bb98009799a5f216611ab68e46",
+    "/private/tmp/eredu-reset-source-custody-root-verify.py": "0e383355ddc331f19067e0610c5cbb3f86286456deae742b54a3594436371e6c"
+  },
+  "review": {
+    "full_manifest_sha256": "05295320951f37971c618d5331d4e2b9ab1a6b66e3fbaf79439f3429c93bae2a",
+    "full_patch_sha256": "aee74d9b163d2db79145616716970aa41173a30a3c0bc35e2524b18b2b99ba5c",
+    "patch_sha256": "d248f8d51fd6cdf395f8c4a7b3a4140a0e1ba8109a1425c257cabdfa94c3a06e",
+    "replay": "/private/tmp/eredu-reset-source-custody-integration-stage/replay",
+    "review": "Full original root/independent review plus exact root composition review completed; production unchanged in composition. Original19/21 replay,7 new test bodies,actual scalar stdlib retirement and native ordinary lease/error ownership reviewed. Subsequent composition preserves all prerequisite fixture corrections; validation pending.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-tokenizer-static-alphabet-integration-2026-09-14.json": "e54e9d082db9addddcbb85d75559aaf8d155160a3752998f1b41b4eb924b9454",
+      "/private/tmp/eredu-reset-source-custody-composition-final-root-review.json": "9acb054d793f1a31c05603f3d3877d63348bef750fe24883f0985b886d48ea76",
+      "/private/tmp/eredu-reset-source-custody-composition-root-verification.json": "c6f8cabe5a7f037f9bd8b9b826e890557ec8c0ea9b88d8ccdeae58d45dde090f",
+      "/private/tmp/eredu-reset-source-custody-disk-composition-stage/FROZEN.json": "3c5f68614367a5e19689e874e044d28c631f8028527f452e69772867798dae33",
+      "/private/tmp/eredu-reset-source-custody-disk-composition-stage/change.patch": "d248f8d51fd6cdf395f8c4a7b3a4140a0e1ba8109a1425c257cabdfa94c3a06e",
+      "/private/tmp/eredu-reset-source-custody-disk-composition-stage/from-original.patch": "e31db7e2592c6b90cf28e88f6a3935baa5d1ffdc10f596df8cd393bdc44402b3",
+      "/private/tmp/eredu-reset-source-custody-disk-composition-stage/manifest.json": "581b724447308a29032c038f527d43932f6cc5885291edda31dcc6e91f7df086",
+      "/private/tmp/eredu-reset-source-custody-disk-composition-stage/replay.py": "69bde3a47c08c5f09fc04b76bb8b10590d2a53cd05954b2fe466b559b90532cd",
+      "/private/tmp/eredu-reset-source-custody-final-root-review.json": "2de6663c53af27976502f3916022356695a3fe60bdd5523c8b8114094054fe09",
+      "/private/tmp/eredu-reset-source-custody-independent-review.md": "4319179e941ea48a8b6eea40a95956ae797f0cdb6abeaba29962551f90baeb61",
+      "/private/tmp/eredu-reset-source-custody-integration-root-review.json": "c61eb3d786f2eb15151c98d713c33f51ac2dc4ea07bf9b1369539f63fd63baf2",
+      "/private/tmp/eredu-reset-source-custody-integration-spec.json": "58bbf773d73a63389f2e77fb7b72b2f975fec22ff328aeb501446f67ef93f9bf",
+      "/private/tmp/eredu-reset-source-custody-reviewed-stage/README.md": "9d422aaa59bde7542d9c89a991e4d3fcf98cf21d4ddc3c0bdcf3b33304b95b67",
+      "/private/tmp/eredu-reset-source-custody-reviewed-stage/doc-snippets.json": "dae4b3c34c7d7a4cd4440b7c95687ad6611b0afc275c93edff6a29adfadd2e30",
+      "/private/tmp/eredu-reset-source-custody-reviewed-stage/manifest.json": "c7c57b3c36b79b7bd27e579706d11c8c7355ea5512433233eba63b4bcbcee59e",
+      "/private/tmp/eredu-reset-source-custody-root-verification/checks.json": "b9fbd3651bab0bd0b877f015906688743dcb38bb98009799a5f216611ab68e46",
+      "/private/tmp/eredu-reset-source-custody-root-verify.py": "0e383355ddc331f19067e0610c5cbb3f86286456deae742b54a3594436371e6c"
+    },
+    "source_manifest_sha256": "c7c57b3c36b79b7bd27e579706d11c8c7355ea5512433233eba63b4bcbcee59e"
+  },
+  "behavior": [
+    "Genuine exact/one-byte-short repeated reset preserves source on rejection and releases each of four predecessor allowances independently.",
+    "Partial repeat failure retains actual old table plus new original allowance through final owning error retirement.",
+    "Foreign current source rejects before fill, and scalar repeated pin/final key retirement avoid provider callbacks under the accounting lock.",
+    "Native ordinary classification and source error keep genuine lease/alias custody; original table transport validates live exact source without duplicate physical registration."
+  ],
+  "limits": [
+    "No native admitted reset publication or public gateway activation; actual positive native original-table publication remains the next required integration.",
+    "Initial ordinary validation still uses existing provider comparisons; generic registry nodes and host transfers are not newly bounded.",
+    "Neutral disk selection fixture covers actual bounded dispatch, not physical disk I/O.",
+    "Paged/hybrid/distributed and other state families remain required implementation work."
+  ]
+}

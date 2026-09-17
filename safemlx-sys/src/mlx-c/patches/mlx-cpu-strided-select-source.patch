@@ -1,0 +1,21 @@
+diff --git a/mlx/backend/cpu/selection_storage.cpp b/mlx/backend/cpu/selection_storage.cpp
+--- a/mlx/backend/cpu/selection_storage.cpp
++++ b/mlx/backend/cpu/selection_storage.cpp
+@@ -159,12 +159,16 @@
+     if(input.shape()!=output.shape()||!shape(input,actual,5)||actual!=elements||
+         input.dtype()!=(i==0?bool_:output.dtype())||
+         input.itemsize()!=(i==0?sizeof(bool):output.itemsize())||
+-        !input.data_size()||input.data_size()>elements)return false;
++        !input.data_size()||input.data_size()>size_t(INT_MAX)||
++        (input.flags().contiguous&&input.data_size()>elements))return false;
+     for(size_t axis=0;axis!=size_t(input.ndim());++axis) {
+       size_t offset=0;
+       if(input.strides()[axis]<0||!product(size_t(input.shape(axis)-1),size_t(input.strides()[axis]),offset)||
+           !add(span,offset))return false;
+     }
++    // General Select reads the proved span of a stepped/permuted input but
++    // allocates logical output elements. Vector paths must still reject a
++    // larger inherited contiguous backing above. No input copy is introduced.
+     if(span>input.data_size())return false;
+   }
+   return typed_select_broadcast_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out);

@@ -739,7 +739,7 @@ mod tests {
             parser.push_structural(2, END_MESSAGE).unwrap();
             assert!(parser.events().contains(&SemanticEvent::ToolCallStart {
                 index,
-                id: format!("call_{index}"),
+                id: format!("call_{index}").into(),
                 name: "lookup".into(),
             }));
         }

@@ -1,0 +1,207 @@
+diff --git a/mlx/distributed/ring/reduction_plan.h b/mlx/distributed/ring/reduction_plan.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/distributed/ring/reduction_plan.h
+@@ -0,0 +1,105 @@
++#pragma once
++
++#include <algorithm>
++#include <limits>
++#include <utility>
++#include "mlx/graph_quota.h"
++
++namespace mlx::core::distributed::ring {
++struct ReductionPlanGeometry {
++  size_t data_size, members, segment_size, buffer_size, packets, steps;
++};
++struct ReductionPlanLayout {
++  ReductionPlanGeometry geometry;
++  size_t plan_bytes, plan_alignment, plan_extent, controls;
++};
++using ReductionSpan = std::pair<size_t, size_t>;
++
++// One checked geometry worker shared by layout and actual plan construction.
++// It names per-worker data, including the existing padded small-input path.
++inline bool reduction_plan_geometry(size_t data_size, size_t members,
++    size_t item_size, size_t packet_bytes, ReductionPlanGeometry& out) noexcept {
++  if (!members || !item_size || packet_bytes < item_size) return false;
++  const auto segment = data_size / members + (data_size % members != 0);
++  const auto buffer = std::max(size_t(32768), std::min(packet_bytes / item_size, segment / 2));
++  const auto packets = segment / buffer + (segment % buffer != 0);
++  const auto phases = members - 1;
++  if (phases > std::numeric_limits<size_t>::max() / 2 ||
++      (packets && 2 * phases > std::numeric_limits<size_t>::max() / packets)) return false;
++  const auto steps = 2 * phases * packets;
++  if (steps > static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) / sizeof(ReductionSpan)) return false;
++  out = {data_size, members, segment, buffer, packets, steps};
++  return true;
++}
++
++class PreparedReductionPlan {
++ public:
++  static bool layout(size_t data_size, size_t members, size_t item_size,
++      size_t packet_bytes, ReductionPlanLayout& out) noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++    ReductionPlanLayout value{};
++    if (!reduction_plan_geometry(data_size, members, item_size, packet_bytes, value.geometry)) return false;
++    value.plan_bytes = value.geometry.steps * sizeof(ReductionSpan);
++    value.plan_alignment = alignof(ReductionSpan);
++    value.plan_extent = 0;
++    if (value.plan_bytes && !submission::GraphQuota::allocation_extent(
++            value.plan_bytes, value.plan_alignment, value.plan_extent)) return false;
++    value.controls = sizeof(ReductionPlanLayout) * 2 + sizeof(ReductionPlanGeometry) +
++        sizeof(PreparedReductionPlan) + sizeof(submission::GraphAllocator<ReductionSpan>) * 2 +
++        sizeof(size_t) * 17 + sizeof(int) * 2 + sizeof(bool) * 3;
++    out = value;
++    return true;
++#else
++    return false;
++#endif
++  }
++  PreparedReductionPlan(const PreparedReductionPlan&) = delete;
++  PreparedReductionPlan& operator=(const PreparedReductionPlan&) = delete;
++  PreparedReductionPlan(size_t data_size, size_t members, size_t rank,
++      int direction, size_t item_size, size_t packet_bytes, submission::GraphQuota* graph)
++      : sends_(submission::GraphAllocator<ReductionSpan>(graph)),
++        recvs_(submission::GraphAllocator<ReductionSpan>(graph)) {
++    ReductionPlanLayout layout;
++    if (rank >= members || (direction != -1 && direction != 1) ||
++        !reduction_plan_geometry(data_size, members, item_size, packet_bytes, geometry_) ||
++        (graph && !PreparedReductionPlan::layout(data_size, members, item_size, packet_bytes, layout)))
++      throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++    // Both concrete destinations exist before the first socket is submitted.
++    sends_.reserve(geometry_.steps);
++    recvs_.reserve(geometry_.steps);
++    auto send_segment = rank;
++    auto recv_segment = advance(rank, direction);
++    // Preserve the same scatter-reduce followed by gather plan and ordering.
++    for (int phase = 0; phase != 2; ++phase) {
++      for (size_t i = 0; i != members - 1; ++i) {
++        for (size_t packet = 0; packet != geometry_.packets; ++packet) {
++          sends_.emplace_back(span(send_segment, packet));
++          recvs_.emplace_back(span(recv_segment, packet));
++        }
++        send_segment = advance(send_segment, direction);
++        recv_segment = advance(recv_segment, direction);
++      }
++    }
++  }
++  const ReductionPlanGeometry& geometry() const noexcept { return geometry_; }
++  const submission::GraphVector<ReductionSpan>& sends() const noexcept { return sends_; }
++  const submission::GraphVector<ReductionSpan>& recvs() const noexcept { return recvs_; }
++ private:
++  size_t advance(size_t segment, int direction) const noexcept {
++    return direction > 0 ? (segment + 1 == geometry_.members ? 0 : segment + 1)
++                         : (segment == 0 ? geometry_.members - 1 : segment - 1);
++  }
++  ReductionSpan span(size_t segment, size_t packet) const noexcept {
++    // Saturated half-open intervals are exactly min(segment*size, data_size)
++    // and min(packet*buffer, segment_length), without overflowing intermediates.
++    const auto start = geometry_.segment_size && segment > geometry_.data_size / geometry_.segment_size
++        ? geometry_.data_size : segment * geometry_.segment_size;
++    const auto length = std::min(geometry_.segment_size, geometry_.data_size - start);
++    const auto offset = packet > length / geometry_.buffer_size ? length : packet * geometry_.buffer_size;
++    const auto first = start + offset;
++    return {first, first + std::min(geometry_.buffer_size, length - offset)};
++  }
++  ReductionPlanGeometry geometry_{};
++  submission::GraphVector<ReductionSpan> sends_, recvs_;
++};
++} // namespace mlx::core::distributed::ring
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -24,6 +24,7 @@
+ #include "mlx/distributed/reduction_ops.h"
+ #include "mlx/distributed/utils.h"
+ #include "mlx/distributed/ring/socket_tasks.h"
++#include "mlx/distributed/ring/reduction_plan.h"
+ #include "mlx/threadpool.h"
+ 
+ #ifndef SOL_TCP
+@@ -785,47 +786,12 @@
+     int socket_send = (direction < 0) ? socket_right : socket_left;
+     int socket_recv = (direction < 0) ? socket_left : socket_right;
+ 
+-    // We split the data into `size_` segments of size `segment_size` and each
+-    // of these in smaller segments of ALL_SUM_SIZE which we 'll call packets.
+-    size_t segment_size = ceildiv(data_size, size_);
+-    size_t BUFFER_SIZE = std::max(
+-        size_t(32768), std::min(ALL_SUM_SIZE / sizeof(T), segment_size / 2));
+-    size_t n_packets = ceildiv(segment_size, BUFFER_SIZE);
+-
+-    // Initial segments
+-    int send_segment = rank_;
+-    int recv_segment = (rank_ + direction + size_) % size_;
+-
+-    // Plan the whole reduce in terms of sends and recvs as indices in data.
+-    // It makes the actual async send and recv a bit simpler to follow when
+-    // there are less offset calculations around.
+-    std::vector<std::pair<size_t, size_t>> send_plan;
+-    std::vector<std::pair<size_t, size_t>> recv_plan;
+-
+-    // Two times the same send/recv operations, first scatter reduce and then
+-    // gather.
+-    for (int k = 0; k < 2; k++) {
+-      for (int i = 0; i < size_ - 1; i++) {
+-        size_t send_start = send_segment * segment_size;
+-        size_t send_stop =
+-            std::min((send_segment + 1) * segment_size, data_size);
+-        size_t recv_start = recv_segment * segment_size;
+-        size_t recv_stop =
+-            std::min((recv_segment + 1) * segment_size, data_size);
+-
+-        for (size_t j = 0; j < n_packets; j++) {
+-          send_plan.emplace_back(
+-              std::min(send_start + j * BUFFER_SIZE, send_stop),
+-              std::min(send_start + (j + 1) * BUFFER_SIZE, send_stop));
+-          recv_plan.emplace_back(
+-              std::min(recv_start + j * BUFFER_SIZE, recv_stop),
+-              std::min(recv_start + (j + 1) * BUFFER_SIZE, recv_stop));
+-        }
+-
+-        send_segment = (send_segment + size_ + direction) % size_;
+-        recv_segment = (recv_segment + size_ + direction) % size_;
+-      }
+-    }
++    PreparedReductionPlan plan(data_size, static_cast<size_t>(size_),
++        static_cast<size_t>(rank_), direction, sizeof(T), ALL_SUM_SIZE, graph);
++    const auto BUFFER_SIZE = plan.geometry().buffer_size;
++    const auto n_packets = plan.geometry().packets;
++    const auto& send_plan = plan.sends();
++    const auto& recv_plan = plan.recvs();
+ 
+     // Running the plan is fairly simple, we keep a send and a recv in flight
+     // while doing the summation.
+@@ -835,13 +801,14 @@
+     }
+     SocketFuture sends[2], recvs[2];
+     int a = 0;
+-    int b = (n_packets > 1) ? 1 : 0;
+-    for (int i = 0, j = -b; i < send_plan.size(); j++, i++) {
++    const size_t lag = n_packets > 1 ? 1 : 0;
++    int b = static_cast<int>(lag);
++    for (size_t i = 0; i < send_plan.size(); i++) {
+       sends[a] = comm_.send(
+           socket_send,
+           data + send_plan[i].first,
+           send_plan[i].second - send_plan[i].first, graph);
+-      if (2 * i < send_plan.size()) {
++      if (i < send_plan.size() / 2) {
+         recvs[a] = comm_.recv(
+             socket_recv,
+             recv_buffers[i % ALL_SUM_BUFFERS],
+@@ -853,10 +820,11 @@
+             recv_plan[i].second - recv_plan[i].first, graph);
+       }
+ 
+-      if (j >= 0) {
++      if (i >= lag) {
++        const auto j = i - lag;
+         sends[b].wait();
+         recvs[b].wait();
+-        if (2 * j < send_plan.size()) {
++        if (j < send_plan.size() / 2) {
+           reduce_op(
+               recv_buffers[j % ALL_SUM_BUFFERS],
+               data + recv_plan[j].first,

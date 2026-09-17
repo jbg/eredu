@@ -1,0 +1,169 @@
+diff --git a/mlx/backend/common/utils.h b/mlx/backend/common/utils.h
+--- a/mlx/backend/common/utils.h
++++ b/mlx/backend/common/utils.h
+@@ -291,6 +291,12 @@
+       in.buffer_size() <= out.nbytes() + donation_extra;
+ }
+ 
++// Fixed geometry counterpart of the same ordinary reshape planner. Scalar
++// metadata only; no array, allocator, source or execution authority is retained.
++struct FixedReshapePlan { bool copy{false}; int64_t strides[5]{}; };
++MLX_API bool fixed_reshape_plan(const int* shape,const int64_t* strides,size_t rank,
++    bool row_contiguous,const int* output_shape,size_t output_rank,FixedReshapePlan&) noexcept;
++MLX_API size_t fixed_reshape_plan_control_bytes() noexcept;
+ std::pair<bool, Strides> prepare_reshape(const array& in, const array& out);
+ 
+ void shared_buffer_reshape(
+diff --git a/mlx/backend/common/common.cpp b/mlx/backend/common/common.cpp
+--- a/mlx/backend/common/common.cpp
++++ b/mlx/backend/common/common.cpp
+@@ -1,3 +1,5 @@
++#include <climits>
++#include <cstdint>
+ // Copyright © 2024 Apple Inc.
+ #include <cassert>
+ 
+@@ -161,6 +163,54 @@
+   }
+ }
+ 
++size_t fixed_reshape_plan_control_bytes() noexcept {
++  return sizeof(FixedReshapePlan)*2+sizeof(int64_t[5])*2+sizeof(const int*)*2+
++      sizeof(const int64_t*)+sizeof(size_t)*9+sizeof(int64_t)*5+sizeof(bool)*2;
++}
++bool fixed_reshape_plan(const int* shape,const int64_t* strides,size_t rank,
++    bool row_contiguous,const int* output_shape,size_t output_rank,FixedReshapePlan& out) noexcept {
++  if(rank>5||output_rank>5||(rank&&(!shape||!strides))||(output_rank&&!output_shape))return false;
++  size_t source_elements=1,output_elements=1;
++  for(size_t i=0;i!=rank;++i) {
++    if(shape[i]<=0||strides[i]<0||source_elements>size_t(INT_MAX)/size_t(shape[i]))return false;
++    source_elements*=size_t(shape[i]);
++  }
++  for(size_t i=0;i!=output_rank;++i) {
++    if(output_shape[i]<=0||output_elements>size_t(INT_MAX)/size_t(output_shape[i]))return false;
++    output_elements*=size_t(output_shape[i]);
++  }
++  if(source_elements!=output_elements)return false;
++  FixedReshapePlan value;
++  if(row_contiguous||rank==0) {
++    int64_t stride=rank==0?0:1;
++    for(size_t i=output_rank;i--;) {value.strides[i]=stride;stride*=output_shape[i];}
++    out=value;return true;
++  }
++  // Same collapse_contiguous_dims order, singleton removal and divisibility
++  // decisions as the unbounded path below. All dimensions fit its int cap.
++  int64_t collapsed_shape[5]{},collapsed_strides[5]{};
++  size_t count=1;collapsed_shape[0]=shape[0];collapsed_strides[0]=strides[0];
++  for(size_t i=1;i!=rank;++i) {
++    if(shape[i]==1)continue;
++    if(strides[i]>INT64_MAX/shape[i])return false;
++    if(strides[i]*shape[i]!=collapsed_strides[count-1]) {
++      collapsed_shape[count]=shape[i];collapsed_strides[count]=strides[i];++count;
++    } else {collapsed_shape[count-1]*=shape[i];collapsed_strides[count-1]=strides[i];}
++  }
++  size_t j=0;
++  for(size_t i=0;i!=output_rank;++i) {
++    const int64_t dimension=output_shape[i];
++    if(j<count&&collapsed_shape[j]%dimension==0) {
++      collapsed_shape[j]/=dimension;
++      if(collapsed_shape[j]&&collapsed_strides[j]>INT64_MAX/collapsed_shape[j])return false;
++      value.strides[i]=collapsed_shape[j]*collapsed_strides[j];
++      j+=size_t(collapsed_shape[j]==1);
++    } else if(dimension==1&&i) {value.strides[i]=value.strides[i-1];}
++    else {value.copy=true;break;}
++  }
++  out=value;return true;
++}
++
+ std::pair<bool, Strides> prepare_reshape(const array& in, const array& out) {
+   // Special case for empty arrays or row contiguous arrays
+   if (in.size() == 0 || in.flags().row_contiguous) {
+@@ -170,6 +220,12 @@
+   // Special case for scalars
+   if (in.ndim() == 0) {
+     return {false, Strides(out.ndim(), 0)};
++  }
++
++  FixedReshapePlan fixed;
++  if(fixed_reshape_plan(in.shape().data(),in.strides().data(),in.ndim(),false,
++      out.shape().data(),out.ndim(),fixed)) {
++    return {fixed.copy,Strides(fixed.strides,fixed.strides+out.ndim())};
+   }
+ 
+   // Firstly let's collapse all the contiguous dimensions of the input
+diff --git a/mlx/backend/cpu/reshape_storage.cpp b/mlx/backend/cpu/reshape_storage.cpp
+--- a/mlx/backend/cpu/reshape_storage.cpp
++++ b/mlx/backend/cpu/reshape_storage.cpp
+@@ -1,8 +1,10 @@
+ #include "mlx/backend/cpu/reshape_storage.h"
+ #include "mlx/backend/cpu/alias_storage.h"
+ #include "mlx/primitives.h"
++#include "mlx/backend/common/utils.h"
+ #include "mlx/submission.h"
+ #include <typeinfo>
++#include <algorithm>
+ namespace mlx::core::cpu {
+ namespace {
+ bool product(size_t a,size_t b,size_t& out) noexcept {
+@@ -22,7 +24,7 @@
+   if(!copy_eval_layout(0,1,false,tracer,value))return false;
+   value.rank=rank;
+   const size_t controls=sizeof(value)+sizeof(rank)+sizeof(output_rank)+sizeof(tracer)+sizeof(out)+
+-      sizeof(std::pair<bool,Strides>)+sizeof(Strides)*2+sizeof(array::Flags)+sizeof(Dtype)*2+
++      sizeof(FixedReshapePlan)+sizeof(std::pair<bool,Strides>)+sizeof(Strides)*2+sizeof(array::Flags)+sizeof(Dtype)*2+
+       sizeof(const Shape*)+sizeof(const array*)*5+sizeof(const Reshape*)+sizeof(size_t)*8+
+       sizeof(int)*2+sizeof(bool)*4+sizeof(Shape::const_iterator)+
+       sizeof(size_t)*5+sizeof(const array*)+sizeof(Dtype)+sizeof(Shape::const_iterator)+
+@@ -31,11 +33,28 @@
+   if(controls>SIZE_MAX-value.named_control_bytes)return false;
+   value.named_control_bytes+=controls;out=value;return true;
+ }
++bool reshape_eval_layout(const int* source_shape,const int64_t* source_strides,
++    size_t rank,const int* output_shape,size_t output_rank,bool tracer,CopyEvalStorage& out) noexcept {
++  FixedReshapePlan plan;
++  if(!fixed_reshape_plan(source_shape,source_strides,rank,false,output_shape,output_rank,plan))return false;
++  CopyEvalStorage value;
++  if(plan.copy) {
++    // One actual output Data and the existing General-copy task; no additional
++    // destination shell because the Reshape output already owns its descriptor.
++    if(!copy_eval_layout(std::max(rank,output_rank),1,true,tracer,value))return false;
++  } else if(!reshape_alias_eval_layout(rank,output_rank,tracer,value))return false;
++  const size_t controls=fixed_reshape_plan_control_bytes()+sizeof(plan)+sizeof(value)+sizeof(out)+
++      sizeof(source_shape)+sizeof(source_strides)+sizeof(rank)+sizeof(output_shape)+sizeof(output_rank)+sizeof(tracer)+
++      sizeof(std::pair<bool,Strides>)+sizeof(Strides)+sizeof(const array*)*2+sizeof(bool);
++  if(controls>SIZE_MAX-value.named_control_bytes)return false;
++  value.named_control_bytes+=controls;out=value;return true;
++}
++
+ bool reshape_alias_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   if(!is_reshape_alias_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
+   const auto& input=output.inputs()[0];const auto& shape=static_cast<const Reshape&>(output.primitive()).shape_ref();
+   const size_t rank=input.ndim(),output_rank=output.ndim();
+-  if(rank>5||output_rank>5||shape.size()!=output_rank||!input.flags().row_contiguous||
++  if(rank>5||output_rank>5||shape.size()!=output_rank||
+       input.size()==0||input.dtype()!=output.dtype()||input.itemsize()!=output.itemsize()||
+       !((input.dtype()==float32&&input.itemsize()==sizeof(float))||
+         (input.dtype()==uint32&&input.itemsize()==sizeof(uint32_t))||
+@@ -62,7 +81,9 @@
+   }
+   if(input_elements!=input.size()||output_elements!=output.size()||input_elements!=output_elements||
+       !product(input_elements,size_t(input.itemsize()),bytes))return false;
+-  return reshape_alias_eval_layout(rank,output_rank,output.is_tracer(),out);
++  if(input.flags().row_contiguous)return reshape_alias_eval_layout(rank,output_rank,output.is_tracer(),out);
++  return reshape_eval_layout(input.shape().data(),input.strides().data(),rank,
++      output.shape().data(),output_rank,output.is_tracer(),out);
+ }
+ }
+ namespace mlx::core::submission {
+diff --git a/mlx/backend/cpu/reshape_storage.h b/mlx/backend/cpu/reshape_storage.h
+--- a/mlx/backend/cpu/reshape_storage.h
++++ b/mlx/backend/cpu/reshape_storage.h
+@@ -2,6 +2,8 @@
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+ MLX_API bool reshape_alias_eval_layout(size_t rank,size_t output_rank,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool reshape_eval_layout(const int* source_shape,const int64_t* source_strides,
++    size_t rank,const int* output_shape,size_t output_rank,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool is_reshape_alias_eval_primitive(const array&) noexcept;
+ MLX_API bool reshape_alias_eval_storage(const array&,CopyEvalStorage&) noexcept;
+ }

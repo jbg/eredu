@@ -1,0 +1,25 @@
+diff --git a/tests/host_transfer_tests.cpp b/tests/host_transfer_tests.cpp
+--- a/tests/host_transfer_tests.cpp
++++ b/tests/host_transfer_tests.cpp
+@@ -41,14 +41,20 @@
+ }
+ 
+ TEST_CASE("test CPU host transfer policy and shape validation") {
++  const auto kind = HostTransferBuffer(
++      Shape{1}, float32, HostTransferPolicy::transfer).storage_kind();
+   try {
+     auto managed =
+         HostTransferBuffer(Shape{4}, float32, HostTransferPolicy::managed);
+     CHECK(managed.storage_kind() == HostTransferStorageKind::cuda_managed);
+   } catch (const std::invalid_argument& error) {
++    REQUIRE((kind == HostTransferStorageKind::cpu ||
++             kind == HostTransferStorageKind::metal_shared));
+     CHECK(
+         std::string(error.what()) ==
+-        "Managed host transfer storage is not supported by this backend.");
++        (kind == HostTransferStorageKind::metal_shared
++             ? "Managed host transfer storage is not supported by Metal."
++             : "Managed host transfer storage is not supported by this backend."));
+   }
+   CHECK_THROWS_WITH_AS(
+       HostTransferBuffer(Shape{-1}, float32),

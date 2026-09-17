@@ -1,0 +1,24 @@
+{
+  "description": "Native allocator-owned minimum descriptor extent/domain facts; existing maximum block reservation unchanged",
+  "no_build_execution": true,
+  "patch_sha256": "0a1269c3c967d9f4d0a2347c9f70990ed4e3541cd6d8f150a8ef55757d284312",
+  "position": 34,
+  "predecessor_manifest": "/private/tmp/eredu-original-media-control-c-stage/native-base-manifest.json",
+  "predecessor_sha256": "1e35b9d67f237d72e6fbaa88ffacd61573e76e567728c2282280c2fd90386597",
+  "sources": {
+    "mlx/array.h": {
+      "after": "7e9fab726d0c6bb88f282c7076f42c3f8c31ca34bc4ce9a1ee73c55be1afc5d0",
+      "before": "821cd60b4d2b6395f26548ea05ab8d5f59bcf2cda3d559e70942837ad558246b"
+    },
+    "mlx/graph_quota.cpp": {
+      "after": "198084fd0f9c114555698b3338780f4681bd27e3c0c1cb0f3359a9b1bd1d49ff",
+      "before": "3dcd3bf3adb2c8c822e6e2a909b951d52726747039def49681bd1cd98b8f7e84"
+    },
+    "mlx/graph_quota.h": {
+      "after": "f35442f0edc8f78e6dc0068e3ad4b52e0d25b91fe4dd9250c1b5d566d51fd7a1",
+      "before": "daae644846e5af9173509d80521952efe4de27e02fe8fb02a284e70ec28031fa"
+    }
+  },
+  "upstream_archive": "/Users/jbg/dev/eredu/safemlx-sys/vendor/mlx-v0.32.0.tar.gz",
+  "upstream_sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec"
+}

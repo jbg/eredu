@@ -1,0 +1,11 @@
+diff --git a/mlx/fence.h b/mlx/fence.h
+--- a/mlx/fence.h
++++ b/mlx/fence.h
+@@ -1,5 +1,7 @@
+ // Copyright © 2024 Apple Inc.
+ 
++#pragma once
++
+ #include <vector>
+ 
+ #include "mlx/array.h"

@@ -1,0 +1,304 @@
+{
+  "status": "focused_checks_passed",
+  "scope": "Completed-equation carryover arithmetic, unknown fallback, opening/closing physical census and actual graph construction behavior. Not native lowered-capacity or complete media qualification.",
+  "build": {
+    "code": 0,
+    "seconds": 26.304134082980454
+  },
+  "command": {
+    "argv": [
+      "/opt/homebrew/opt/rustup/bin/cargo",
+      "test",
+      "--locked",
+      "--offline",
+      "-p",
+      "eredu-runtime",
+      "-p",
+      "eredu-nn",
+      "--no-default-features",
+      "--lib",
+      "--no-run",
+      "--message-format=json"
+    ],
+    "cwd": "/private/tmp/eredu-original-operation-rust-diagnostic/source",
+    "environment": {
+      "CARGO_BUILD_JOBS": "24",
+      "CARGO_INCREMENTAL": "1",
+      "CARGO_PROFILE_DEV_DEBUG": "0",
+      "CARGO_PROFILE_TEST_DEBUG": "0",
+      "CARGO_TARGET_DIR": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target",
+      "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+      "DEVICE": "cpu",
+      "EREDU_PUBLIC_MANAGED_HYBRID_MODE": null,
+      "EREDU_PUBLIC_MANAGED_PLAIN_MODE": null,
+      "EREDU_PUBLIC_MANAGED_STANDARD_MODE": null,
+      "EREDU_REQUIRE_CPU_WORKER_STARTUP_QUALIFICATION": "1",
+      "EREDU_REQUIRE_GPU_STREAM_QUALIFICATION": "1",
+      "EREDU_REQUIRE_IMMUTABLE_SOURCE_QUALIFICATION": "1",
+      "EREDU_REQUIRE_METAL_DEVICE_INITIALIZATION_QUALIFICATION": "1",
+      "EREDU_REQUIRE_MUTABLE_PAIR_QUALIFICATION": "1",
+      "EREDU_REQUIRE_PREPAID_STREAM_COPY_QUALIFICATION": "1",
+      "EREDU_REQUIRE_QUALIFIED_BF16_PROJECTION": "1",
+      "EREDU_REQUIRE_QUALIFIED_CACHE_CONTEXT": "1",
+      "EREDU_REQUIRE_QUALIFIED_FIXED_KERNEL": "1",
+      "EREDU_REQUIRE_QUALIFIED_G4": "1",
+      "EREDU_REQUIRE_QUALIFIED_GGUF_CATALOG": "1",
+      "EREDU_REQUIRE_QUALIFIED_GGUF_COMPOSITE": "1",
+      "EREDU_REQUIRE_QUALIFIED_GGUF_SOURCE": "1",
+      "EREDU_REQUIRE_QUALIFIED_KERNEL_DEFINITION": "1",
+      "EREDU_REQUIRE_QUALIFIED_KERNEL_FAMILY": "1",
+      "EREDU_REQUIRE_QUALIFIED_NATIVE_COLLECTOR": "1",
+      "EREDU_REQUIRE_QUALIFIED_PIPELINE_CACHE": "1",
+      "EREDU_REQUIRE_QUALIFIED_PROMPT_INPUT": "1",
+      "EREDU_REQUIRE_QUALIFIED_RECORD_LAYOUT": "1",
+      "EREDU_REQUIRE_QUALIFIED_RETAINED_SOURCE": "1",
+      "EREDU_REQUIRE_QUALIFIED_ROW_FAMILY": "1",
+      "EREDU_REQUIRE_QUALIFIED_SAMPLING_FILTERS": "1",
+      "EREDU_REQUIRE_QUALIFIED_SAMPLING_PENALTIES": "1",
+      "EREDU_REQUIRE_QUALIFIED_STANDARD_RANDOM": "1",
+      "EREDU_REQUIRE_ROUTER_QUALIFICATION": "1",
+      "EREDU_REQUIRE_SCHEDULER_INITIALIZATION_QUALIFICATION": "1",
+      "EREDU_REQUIRE_SHARED_INPUT_INITIALIZATION_QUALIFICATION": "1",
+      "EREDU_REQUIRE_STATIC_BASELINE_QUALIFICATION": "1",
+      "EREDU_REQUIRE_STREAM_REGISTRATION_QUALIFICATION": "1",
+      "MLX_C_BUILD_PATCH_TESTS": "OFF",
+      "PATH": "/Library/Developer/CommandLineTools/usr/bin:/Users/jbg/.rustup/toolchains/1.98.0-aarch64-apple-darwin/bin:/opt/homebrew/opt/rustup/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+      "PYTHONDONTWRITEBYTECODE": "1",
+      "RUSTC": "rustc",
+      "RUST_TEST_THREADS": "1",
+      "SAFEMLX_NATIVE_BUILD_ROOT": "/private/tmp/eredu-original-operation-rust-diagnostic/linked-native",
+      "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+      "EREDU_REQUIRE_QUALIFIED_MIROSTAT": "1"
+    }
+  },
+  "checks": [
+    {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-d4f0f709d1e5f8a0",
+        "--exact",
+        "working_memory::inference::tests::native_prefill_envelope_keeps_initial_state_escaped_outputs_and_unknown_fallback",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 1.1968891250435263,
+      "log_sha256": "34579e0567aad952ed313336d5a52962ab23aa903218a10926ef7295d3b9b1d0"
+    },
+    {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-d4f0f709d1e5f8a0",
+        "--exact",
+        "working_memory::inference::tests::native_completed_equation_envelope_carries_escaped_scores_and_late_unknowns",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 0.006244958145543933,
+      "log_sha256": "08b3a3f0fcf300d63459c3091922eecf5d8a709c54c7b6ff16692b652e7082ff"
+    },
+    {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-d4f0f709d1e5f8a0",
+        "--exact",
+        "execution::tests::graph_order_is_stable_and_dependency_driven",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 0.012126124929636717,
+      "log_sha256": "f889a0f92cbeb48d4a8a822a8a12a32d0843da530d114da232fb3b8b30676c05"
+    },
+    {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_runtime-d4f0f709d1e5f8a0",
+        "--exact",
+        "execution::tests::invalid_graphs_fail_closed",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 0.006144040962681174,
+      "log_sha256": "0daec824b721d92b3ca614b47efc968b9a393f6e41ad662f308820d0fdf7bae3"
+    },
+    {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_nn-54501e7046492e4c",
+        "--exact",
+        "workspace::report::tests::fixed_report_matches_independent_legacy_union_unknown_and_displacement_order",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 0.39016591594554484,
+      "log_sha256": "c06e8433409d8229a4076673101a6c138b94768e22e47410d726e6d124a47d30"
+    }
+  ],
+  "implementation_packets": [
+    "native-prefill-envelope",
+    "native-successful-equation-retirement",
+    "native-completed-equation-envelope",
+    "media-composite-graph-metadata"
+  ],
+  "native_component_build": {
+    "code": 0,
+    "seconds": 109.71420920779929
+  },
+  "native_component_checks": [
+    {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-0620f6d872438201",
+        "--exact",
+        "backend::nn::workspace::matrix::tests::source_representation_controls_dense_projection_and_owned_borrowed_facts",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 6.709807999897748,
+      "log_sha256": "ae45649b2f300e1ab13ee48c163889cf0d2bd401699d035db18a1ac14965990b"
+    },
+    {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-0620f6d872438201",
+        "--exact",
+        "composition::mlx::session::model_session::original_host_input::native::model_input::workspace::tests::original_vl_media_equation_intervals_keep_future_roots_and_actual_source_custody",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 1.42984737502411,
+      "log_sha256": "37e73b688702a049293d423c3ffc8db965421776b4e73f124661107ca981752e"
+    }
+  ],
+  "native_component_scope": "Build includes completed equation envelope, mixed F32/BF16 weight compaction bound, media graph/state producers through state6. Checks cover actual source eligibility/unknown singleton fallbacks and media interval/source custody. Does not include later identity10 or kernel-source memoization; native long managed result still pending.",
+  "report_identity_index": {
+    "argv": [
+      "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_nn-76e56d4ee814719d",
+      "workspace::report::tests::",
+      "--nocapture"
+    ],
+    "code": 0,
+    "seconds": 0.5705150829162449,
+    "build": {
+      "code": 0,
+      "seconds": 2.4043570831418037
+    },
+    "log_sha256": "14a6143e6c296483c9815f09d95d71868417e6b03b7cdb3389ca5d6402b5b46e",
+    "scope": "Eleven report-specific tests passed after adding fifth prepaid identity index. Independent review found ownership, stable traversal/order, failure prefix and capacity accounting intact. No native long-prompt result yet for this version."
+  },
+  "report_borrowed_identity_bits": {
+    "scope": "Actual borrowed roots marked once through the paid identity index; unused roots do not join the graph",
+    "build": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/report-indexed-borrowed-focused/build-result.json",
+    "tests": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_nn-76e56d4ee814719d",
+        "workspace::report::tests::",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 0.4963175000157207
+    },
+    "result": "11 passed; before binary-run merge optimization"
+  },
+  "report_binary_runs": {
+    "scope": "Same five preallocated destinations, stable node/edge/arithmetic order, exact source identity and borrowed exclusion. Removes per-insertion full-vector shifts with binary-run merging through idle DFS frames.",
+    "build": {
+      "code": 0,
+      "seconds": 0.9968848749995232
+    },
+    "tests": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_nn-76e56d4ee814719d",
+        "workspace::report::tests::",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 0.5040258751250803
+    },
+    "result": "11 passed",
+    "profile": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/public-managed-qwen/managed-3000-metal-indexed-chunk128-64gib/admission-sample.txt",
+    "native_probe": "pending next native build",
+    "independent_review": "Huygens: binary-run invariant, final exact ordering, borrowed-root marking, N-frame capacity and arithmetic bounds verified; no findings."
+  },
+  "next_native_milestone": {
+    "build": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/native-quantized-media-custody-fixed",
+    "initial_build": {
+      "code": 101,
+      "seconds": 51.18723649997264
+    },
+    "initial_error": "New GELU witness used method syntax for Tensor associated function; corrected before retry. Native C++/safemlx production code compiled.",
+    "scope": "Complete original GELU and quantized projection witnesses, generic completion custody, effective composite source owners, borrowed hybrid construction, private vision projection."
+  },
+  "native_quantized_media_custody": {
+    "build": {
+      "code": 0,
+      "seconds": 78.24481575004756
+    },
+    "command": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/native-quantized-media-custody-fixed/command.json",
+    "checks": [
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_architectures-20064443cc5b8e59",
+          "--exact",
+          "replicated_text::config_source::projection_tests::projected_configuration_retires_parent_with_final_alias",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 1.0566897499375045
+      },
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-5973d224325a1ce4",
+          "--exact",
+          "backend::nn::workspace::resident_recipe::activation::tests::standalone_and_gated_gelu_use_complete_native_receipts",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 6.779292249819264
+      },
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-5973d224325a1ce4",
+          "--exact",
+          "composition::mlx::session::model_session::text_quote::prefill_tests::operation_component_tests::original_exact_and_approximate_gelu_match_shared_ordinary_workers",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.44033045903779566
+      },
+      {
+        "argv": [
+          "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-5973d224325a1ce4",
+          "--exact",
+          "composition::mlx::session::model_session::text_quote::prefill_tests::operation_component_tests::original_quantized_projection_keeps_casts_on_supplied_stream",
+          "--nocapture"
+        ],
+        "code": 0,
+        "seconds": 0.511015750002116
+      }
+    ],
+    "scope": "All four focused checks pass. Private projected config parent lifetime; exact/approx/gated GELU receipts across declared representations; native exact/approx BF16-input GELU; 24 affine plus MXFP4 cold receipts and three nonzero actual native cast/format cases. Uses derived accepted Q/Graph/Record capacities and retained-output account lifetime. Generic completion custody and media effective/nested constructors compile. Full media/speculation request gates remain pending."
+  },
+  "rotary_media_followon": {
+    "first_build": {
+      "code": 101,
+      "seconds": 30.35471862507984
+    },
+    "first_error": "New rotary source module omitted its mod declaration; fixed before retry. Vision validation compiled.",
+    "current_build": "/private/tmp/eredu-original-operation-rust-diagnostic/validation/rotary-media-module-fixed",
+    "includes": [
+      "native-rotary-frequency-receipts10",
+      "media-vision-validation-metadata6",
+      "media-vision-module-metadata6"
+    ],
+    "native_case": "composition::mlx::session::model_session::text_quote::prefill_tests::rotary_component_tests::original_rotary_frequency_ancestors_match_ordinary_workers",
+    "status": "PASS: all six actual admitted-Graph rotary constructor/application cases; shared media validator and constructors compile.",
+    "build": {
+      "code": 0,
+      "seconds": 72.66009466582909
+    },
+    "native_result": {
+      "argv": [
+        "/private/tmp/eredu-original-operation-rust-diagnostic/linked-target/debug/deps/eredu_backend_mlx-5973d224325a1ce4",
+        "--exact",
+        "composition::mlx::session::model_session::text_quote::prefill_tests::rotary_component_tests::original_rotary_frequency_ancestors_match_ordinary_workers",
+        "--nocapture"
+      ],
+      "code": 0,
+      "seconds": 7.21870933403261
+    },
+    "scope": "Llama3 Native/InputProducts and proportional InputProducts, traditional and split pairs, nonzero input and retained partial tail. Derived Q/Graph/Record capacities, supplied original Scope, first-use ancestors, output comparison and custody retirement; whole family/media request coverage remains separate."
+  }
+}

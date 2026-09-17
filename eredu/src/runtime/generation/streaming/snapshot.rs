@@ -1,5 +1,5 @@
 use super::*;
-use crate::runtime::generation::storage::{snapshot_fields, SnapshotStorage};
+use crate::runtime::generation::storage::{SnapshotStorage, snapshot_fields};
 
 snapshot_fields!(InProgressToolCall {
     index,
@@ -14,14 +14,11 @@ snapshot_fields!(StopMatcher {
     matched
 });
 snapshot_fields!(PartialPatternBuffer { patterns, pending });
-snapshot_fields!(JsonFragmentBuffer {
-    fragment,
-    depth,
-    in_string,
-    escaped,
-    started,
-    complete
-});
+snapshot_fields!(JsonFragmentBuffer { fragment, cursor });
+impl SnapshotStorage for eredu_text::json_fragments::FragmentCursor {
+    fn heap_bytes(&self) -> Option<u64> { Some(0) }
+}
+
 snapshot_fields!(SemanticEventSink {
     events,
     active_tool_call,
@@ -29,7 +26,17 @@ snapshot_fields!(SemanticEventSink {
     tool_calls_enabled,
     tool_schemas
 });
-snapshot_fields!(ToolRuntimeParser { stream });
+impl SnapshotStorage for ToolRuntimeParser {
+    fn heap_bytes(&self) -> Option<u64> {
+        let Self {
+            stream,
+            host_preparation: _,
+        } = self;
+        // Shared exclusion custody carries no copied numerical payload. This
+        // logical ledger remains distinct from physical memory admission.
+        stream.heap_bytes()
+    }
+}
 
 impl SnapshotStorage for PatternKind {
     fn heap_bytes(&self) -> Option<u64> {
@@ -43,14 +50,17 @@ impl SnapshotStorage for PatternKind {
 impl SnapshotStorage for SemanticEvent {
     fn heap_bytes(&self) -> Option<u64> {
         match self {
-            Self::TextDelta(v) | Self::ReasoningDelta(v) => v.heap_bytes(),
+            Self::TextDelta(v) | Self::ReasoningDelta(v) => {
+                u64::try_from(v.snapshot_copy_bytes()).ok()
+            }
             Self::ToolCallStart { index: _, id, name } => {
-                id.heap_bytes()?.checked_add(name.heap_bytes()?)
+                u64::try_from(id.snapshot_copy_bytes()).ok()?
+                    .checked_add(u64::try_from(name.snapshot_copy_bytes()).ok()?)
             }
             Self::ToolArgumentsDelta {
                 index: _,
                 json_fragment,
-            } => json_fragment.heap_bytes(),
+            } => u64::try_from(json_fragment.snapshot_copy_bytes()).ok(),
             Self::ToolCallEnd | Self::Finished { reason: _ } => Some(0),
         }
     }
@@ -105,7 +115,10 @@ impl<D: TokenDecoderBackend> CommittedTokenPipeline<D> {
 }
 impl CommittedGenerationCursor {
     pub(crate) fn max_predictions(&self) -> u64 {
-        self.sequence.max_tokens() as u64
+        self.sequence
+            .as_ref()
+            .expect("live legacy sequence")
+            .max_tokens() as u64
     }
     pub(crate) fn snapshot_storage_bytes(&self) -> Option<u64> {
         let Self {
@@ -114,7 +127,7 @@ impl CommittedGenerationCursor {
             failed: _,
         } = self;
         (std::mem::size_of::<Self>() as u64)
-            .checked_add(sequence.snapshot_storage_bytes()?)?
+            .checked_add(sequence.as_ref()?.snapshot_storage_bytes()?)?
             .checked_sub(std::mem::size_of::<GenerationSequence>() as u64)
     }
 }

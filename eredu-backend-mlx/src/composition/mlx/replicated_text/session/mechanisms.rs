@@ -1,4 +1,22 @@
 use super::*;
+mod checkpoint;
+pub(super) use checkpoint::StateCheckpoint;
+
+// Both ordinary and original inspection read the same selected layout/offset.
+// The conversion error itself is fixed; only the legacy adapter boxes it.
+fn checked_prefill_frontier<S: MlxStateMechanisms>(
+    state: &S,
+) -> Result<Option<u64>, std::num::TryFromIntError> {
+    if state.optional_layout().is_none() {
+        return Ok(None);
+    }
+    u64::try_from(state.offset()).map(Some)
+}
+
+mod opening_sources;
+mod prefill_controls;
+mod prefill_entry;
+use opening_sources::{NativeOpeningSourceBinding, NativeOpeningSourceGuard};
 
 impl<A, S> eredu_runtime::replicated_session::ReplicatedTextSnapshotMechanisms<A, MlxNeuralBackend>
     for MlxReplicatedTextMechanisms<A, S>
@@ -12,6 +30,13 @@ where
         state: &S,
     ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
         state.isolated_snapshot_estimate()
+    }
+
+    fn estimate_original_snapshot_state(
+        &self,
+        state: &S,
+    ) -> Option<eredu_core::execution_control::SnapshotEstimate> {
+        state.original_isolated_snapshot_estimate()
     }
 
     fn estimate_reset_state(
@@ -61,12 +86,25 @@ where
     S: MlxStateMechanisms,
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
 {
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     prepared_bindings: Option<PreparedExactBindings>,
+    prepared_layerwise_manager:
+        Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
     prediction_residency: super::super::prediction::parameters::PredictionResidency,
     prepared_parameters: Vec<eredu_runtime::parameter_operations::PreparedParameterSlot>,
     parameter_declarations: Vec<eredu_nn::ParameterMetadata>,
     resident_report: Option<ResidencyReport>,
+    layerwise_workspace: Option<
+        Box<
+            dyn Fn(
+                crate::backend::nn::workspace::MetalAllocationFacts,
+            ) -> Result<
+                crate::backend::runtime::execution::generic::LayerwiseWorkspace,
+                Error,
+            >,
+        >,
+    >,
+    residency_manager: Option<crate::backend::runtime::residency::manager::ResidencyManager>,
     materialization: Option<eredu_runtime::WeightMaterializationReport>,
     stream: Stream,
     weights_stream: Stream,
@@ -75,6 +113,26 @@ where
     ignored_checkpoint_sources: std::collections::BTreeSet<String>,
     state_rank: Option<eredu_core::cache::CacheRankIdentity>,
     state_global_layer_start: usize,
+    opening_sources: NativeOpeningSourceBinding,
+    // Initialized at ordinary model construction, before any original request.
+    prefill_roots_runtime: safemlx::PrefillRootsRuntime,
+    // Ordinary model construction, before requests. Keep actual failure for
+    // original projection without making an ordinary load fail or retry here.
+    gguf_host_runtime:
+        Result<std::rc::Rc<safemlx::PreparedInputRuntime>, eredu_core::SharedBackendFailure>,
+    // Constructor coverage is partial: Device/TLS/context ownership remains
+    // separate even when the allocator was genuinely admitted earlier.
+    gguf_host_allocator_coverage:
+        crate::backend::managed_memory::input_allocator::InputAllocatorCoverage,
+    native_storage_selection: eredu_runtime::working_memory::NativeStorageSelection,
+    prefill_controls: std::cell::RefCell<
+        Option<crate::backend::submission_recovery::prefill::PrefillControlProjection>,
+    >,
+    prefill_roots: Option<crate::backend::submission_recovery::prefill::RootsProjection>,
+    parallel_control: std::cell::RefCell<Option<crate::backend::runtime::distributed::topology::original_source::control::OriginalParallelControlProjection>>,
+    nested_completion: std::cell::RefCell<Option<crate::backend::submission_recovery::prefill::nested::NestedCompletionProjection>>,
+    // Weak host-only installation: the original quote/work owns all row payloads.
+    opening_rows: std::cell::RefCell<Option<opening_sources::InstalledOpeningRows>>,
     state: PhantomData<fn() -> (A, S)>,
 }
 
@@ -98,17 +156,41 @@ where
     A: eredu_runtime::LayeredArchitecture<MlxNeuralBackend, S, Error = eredu_nn::Error>,
 {
     pub(super) fn new(
-        store: Arc<dyn CheckpointSource>,
+        store: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
         stream: &Stream,
         weights_stream: &Stream,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, Error> {
+        let store = store.into();
+        let prefill_roots_runtime =
+            safemlx::PrefillRootsRuntime::prepare_for_stream(stream, weights_stream).map_err(
+                |error| match error {
+                    safemlx::PrefillRuntimePreparationError::Native(error) => Error::from(error),
+                    safemlx::PrefillRuntimePreparationError::ActiveOriginalScope => {
+                        Error::from(safemlx::OriginalNativeControlError::InvalidScope)
+                    }
+                    safemlx::PrefillRuntimePreparationError::InvalidInput => {
+                        Error::from(safemlx::OriginalNativeControlError::ForeignDomain)
+                    }
+                    safemlx::PrefillRuntimePreparationError::InvalidStatus(status) => {
+                        Error::from(safemlx::OriginalNativeControlError::InvalidStatus(status))
+                    }
+                },
+            )?;
+        let (gguf_host_runtime, gguf_host_allocator_coverage) =
+            match crate::backend::managed_memory::input_allocator::prepare_ordinary() {
+                Ok((runtime, coverage)) => (Ok(runtime), coverage),
+                Err(cause) => (Err(cause), crate::backend::managed_memory::input_allocator::InputAllocatorCoverage::Ordinary),
+            };
+        Ok(Self {
             store,
             prepared_bindings: None,
+            prepared_layerwise_manager: None,
             prediction_residency: Default::default(),
             prepared_parameters: Vec::new(),
             parameter_declarations: Vec::new(),
             resident_report: None,
+            layerwise_workspace: None,
+            residency_manager: None,
             materialization: None,
             stream: stream.clone(),
             weights_stream: weights_stream.clone(),
@@ -117,8 +199,31 @@ where
             ignored_checkpoint_sources: std::collections::BTreeSet::new(),
             state_rank: None,
             state_global_layer_start: 0,
+            opening_sources: NativeOpeningSourceBinding::default(),
+            prefill_roots_runtime,
+            gguf_host_runtime: gguf_host_runtime.map(std::rc::Rc::new).map_err(|cause| {
+                // One ordinary cold allocation owns the actual Exception.
+                // Later request inspections retain this same source only.
+                eredu_core::SharedBackendFailure::new(eredu_core::BackendFailureKind::Other, cause)
+            }),
+            gguf_host_allocator_coverage,
+            native_storage_selection: Default::default(),
+            prefill_controls: std::cell::RefCell::new(None),
+            prefill_roots: None,
+            parallel_control: std::cell::RefCell::new(None),
+            nested_completion: std::cell::RefCell::new(None),
+            opening_rows: std::cell::RefCell::new(None),
             state: PhantomData,
-        }
+        })
+    }
+
+    /// Prepares only the private source handoff. No production caller enables it
+    /// until original collector/control pricing and recovery ownership are bound.
+    pub(in crate::composition::mlx::replicated_text) fn bind_opening_sources(
+        &mut self,
+        request: &eredu_runtime::working_memory::InferenceRequest,
+    ) -> Result<NativeOpeningSourceGuard, Error> {
+        self.opening_sources.bind(request)
     }
 
     pub(super) fn set_prediction_residency(
@@ -126,6 +231,64 @@ where
         residency: super::super::prediction::parameters::PredictionResidency,
     ) {
         self.prediction_residency = residency;
+    }
+
+    pub(super) fn retained_storage(
+        &self,
+        state: &S,
+    ) -> Result<crate::backend::runtime::residency::storage::RetainedStorage, Error> {
+        let mut storage = crate::backend::runtime::residency::storage::RetainedStorage::default();
+        self.collect_retained_storage(state, &mut storage)?;
+        Ok(storage)
+    }
+
+    /// Fills caller-owned storage without allocating an intermediate inventory.
+    pub(super) fn collect_retained_storage(
+        &self,
+        state: &S,
+        storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    ) -> Result<(), Error> {
+        self.collect_retained_parameter_storage(storage)?;
+        state.collect_retained_storage(storage)
+    }
+
+    pub(super) fn retained_parameter_storage(
+        &self,
+    ) -> Result<crate::backend::runtime::residency::storage::RetainedStorage, Error> {
+        let mut storage = crate::backend::runtime::residency::storage::RetainedStorage::default();
+        self.collect_retained_parameter_storage(&mut storage)?;
+        Ok(storage)
+    }
+
+    /// Fills caller-owned storage without allocating an intermediate inventory.
+    pub(super) fn collect_retained_parameter_storage(
+        &self,
+        storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    ) -> Result<(), Error> {
+        let manager = self.residency_manager.as_ref().ok_or_else(|| {
+            Error::ArchitectureModel("target residency manager was not retained".into())
+        })?;
+        manager.collect_retained_storage(storage)?;
+        storage.include_checkpoint_source(self.store.as_ref())?;
+        Ok(())
+    }
+
+    pub(super) fn layerwise_workspace(
+        &self,
+        allocation: crate::backend::nn::workspace::MetalAllocationFacts,
+    ) -> Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error> {
+        self.layerwise_workspace.as_ref().ok_or_else(|| {
+            Error::Other(Box::new(
+                eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+            ))
+        })?(allocation)
+    }
+
+    pub(super) fn set_prepared_layerwise_manager(
+        &mut self,
+        manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
+    ) {
+        self.prepared_layerwise_manager = manager;
     }
 
     pub(super) fn set_parallel_layout(&mut self, layout: eredu_runtime::LocalModelLayout) {
@@ -198,7 +361,7 @@ where
             #[cfg(test)]
             crate::tests::support::path_instrumentation::materialization();
             let (store, report) = quantize_exact_replicated_text_tasks(
-                Arc::clone(&self.store),
+                self.store.clone(),
                 source_static,
                 target_static,
                 source_units,
@@ -302,16 +465,8 @@ where
         let graph = architecture
             .execution_graph()
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
-        let counts = (0..graph.groups().len())
-            .map(|group| {
-                addresses
-                    .iter()
-                    .filter(|address| address.group() == group)
-                    .count()
-            })
-            .collect::<Vec<_>>();
-        let layout = eredu_runtime::ExecutionUnitLayout::new(&graph, counts)
-            .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
+        let layout = eredu_runtime::partitioned_materialization_unit_layout(&graph, addresses)
+            .map_err(Error::ArchitectureModel)?;
         (self.prepared_parameters, self.parameter_declarations) =
             super::prepared_parameters::collect::<A, S>(
                 architecture,
@@ -391,8 +546,8 @@ where
                 ignored_sources.extend(recipe.source_keys().into_iter().map(str::to_owned));
             }
         }
-        let (policy, _) = prepare_layerwise_policy_with_supplementary_bindings(
-            Arc::clone(&self.store),
+        let (policy, _) = crate::backend::runtime::execution::generic::prepare_layerwise_policy_with_prepared_manager(
+            self.store.clone(),
             architecture,
             MlxSelectiveUnitPopulator::new(prepared.excluded_parameters.clone()),
             PhantomData::<S>,
@@ -404,9 +559,11 @@ where
             prepared.static_bindings,
             prepared.unit_bindings,
             std::mem::take(&mut self.prediction_residency.units),
+            self.prepared_layerwise_manager.take(),
         )?;
         self.prediction_residency
             .install(policy.residency_manager())?;
+        self.residency_manager = Some(policy.residency_manager().clone());
         Ok((policy, layout, prepared.addresses))
     }
 }
@@ -419,11 +576,213 @@ where
     A::Error: std::fmt::Display,
     A::Unit: 'static,
 {
+    fn requires_prefill_opening_sources(&self) -> bool {
+        self.opening_sources.is_active()
+            || self
+                .opening_rows
+                .borrow()
+                .as_ref()
+                .is_some_and(|r| r.is_live())
+    }
+
+    fn prepare_prefill_opening_sources(
+        &mut self,
+        state: &Self::State,
+        context: &eredu_runtime::inspection::PrefillChunkRetentionContext<'_>,
+        execution: &eredu_runtime::inspection::PrefillOpeningExecution<'_, MlxTensor>,
+    ) -> Result<(), Self::Error> {
+        let rows = {
+            let slot = self
+                .opening_rows
+                .try_borrow()
+                .map_err(|e| Error::Other(Box::new(e)))?;
+            slot.as_ref().and_then(|rows| rows.upgrade())
+        };
+        if let Some(rows) = rows {
+            let manager = self.residency_manager.as_ref().ok_or_else(|| {
+                Error::Other(Box::new(
+                    eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+                ))
+            })?;
+            return rows.collect(state, execution, context, self.store.as_ref(), manager);
+        }
+        self.opening_sources.collect(
+            state,
+            context,
+            || self.retained_parameter_storage(),
+            |visitor| execution.visit(visitor),
+        )
+    }
+
+    fn requires_prepared_prefill_sources(&self) -> bool {
+        self.opening_rows
+            .borrow()
+            .as_ref()
+            .is_some_and(|r| r.is_live())
+    }
+
+    fn prepare_prefill_retirement_sources(
+        &mut self,
+        state: &S,
+        ticket: &eredu_runtime::inspection::SettledPrefillChunkRetention,
+        execution: &eredu_runtime::inspection::PrefillOpeningExecution<'_, MlxTensor>,
+    ) -> Result<(), Self::Error> {
+        let rows = {
+            let slot = self
+                .opening_rows
+                .try_borrow()
+                .map_err(|e| Error::Other(Box::new(e)))?;
+            slot.as_ref().and_then(|rows| rows.upgrade())
+        };
+        if let Some(rows) = rows {
+            let manager = self.residency_manager.as_ref().ok_or_else(|| {
+                Error::Other(Box::new(
+                    eredu_runtime::working_memory::WorkingMemoryError::UnknownBound,
+                ))
+            })?;
+            return rows.collect_completed(state, execution, ticket, self.store.as_ref(), manager);
+        }
+        Ok(())
+    }
+
+    fn with_execution_parallel_control<T,E,F>(
+        &self,event:eredu_runtime::replicated_session::ParallelControlEvent,context:&Stream,run:F,
+    )->Result<Result<T,E>,eredu_core::BackendFailure>
+    where F:FnOnce(Option<(&<MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E>, {
+        let projection={
+            let slot=self.parallel_control.try_borrow()
+                .map_err(|_|eredu_core::PreparedRequestRejection::Busy.into_backend_failure())?;
+            slot.as_ref().map(|value|value.retained()).transpose().map_err(Error::into_backend_failure)?
+        };
+        match projection {Some(projection)=>projection.run(event,context,run),None=>Ok(run(None))}
+    }
+
+    fn with_execution_parallel_control_context<T,E,F>(
+        &self,_context:&Stream,run:F,
+    )->Result<Result<T,E>,Self::Error>
+    where F:FnOnce(Option<(&mut Option<Box<<MlxNeuralBackend as NeuralBackend>::ParallelContext>>,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E>,
+    {
+        let control={
+            let slot=self.parallel_control.try_borrow().map_err(|_|
+                Error::with_original_control_source(eredu_core::PreparedRequestRejection::Busy.into_backend_failure(),false))?;
+            slot.as_ref().map(|control|control.retained()).transpose()?
+        };
+        match control {
+            Some(control)=>{
+                let roots=self.prefill_roots.as_ref().map(|roots|roots.transient_roots()).transpose()?;
+                let binding=match &self.prefill_roots {
+                    Some(roots)=>roots.with_parallel(|parallel|parallel
+                        .map(|(parallel,_)|parallel.boundary_binding()).transpose())?,
+                    None=>None,
+                };
+                control.with_request_context(roots,binding,run)
+            },
+            None=>Ok(run(None)),
+        }
+    }
+
+    fn with_execution_parallel<T,E,F>(
+        &self,context:&Stream,run:F,
+    )->Result<Result<T,E>,Self::Error>
+    where F:FnOnce(Option<(&mut <MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E>,
+    {
+        // Release the mechanism slot loan before model work or nested policy
+        // calls. The copied view is weak and shares the submission activation.
+        let control={
+            let slot=self.parallel_control.try_borrow().map_err(|_|
+                Error::with_original_control_source(eredu_core::PreparedRequestRejection::Busy.into_backend_failure(),false))?;
+            slot.as_ref().map(|control|control.retained()).transpose()?
+        };
+        match &self.prefill_roots {
+            Some(roots)=>roots.with_addressable(|| roots.with_parallel(|parallel|match parallel {
+                Some((parallel,observer))=>{
+                    let neural=parallel.has_neural_context();
+                    parallel.with_model_context(observer,context,control.as_ref(),roots.transient_roots()?,
+                        |parallel,funding|run(neural.then_some((parallel,funding))))
+                },
+                None=>Ok(run(None)),
+            })),
+            None=>Ok(run(None)),
+        }
+    }
+
+    fn with_execution_parallel_publication<T,E,F>(&self,context:&Stream,run:F)
+        ->Result<Result<T,E>,Self::Error>
+    where F:FnOnce(Option<(&<MlxNeuralBackend as NeuralBackend>::ParallelContext,&eredu_nn::workspace::WorkspaceMetadataFunding)>)->Result<T,E> {
+        match &self.prefill_roots {
+            Some(roots)=>roots.with_parallel_publication(context,run),
+            None=>Ok(run(None)),
+        }
+    }
+
+    fn prefill_state_frontier(&self, state: &S) -> Result<Option<u64>, Self::Error> {
+        checked_prefill_frontier(state).map_err(|error| Error::Other(Box::new(error)))
+    }
+
+    fn original_prefill_state_frontier(
+        &self,
+        state: &S,
+    ) -> Result<Option<u64>, eredu_runtime::working_memory::WorkingMemoryError> {
+        checked_prefill_frontier(state)
+            .map_err(|_| eredu_runtime::working_memory::WorkingMemoryError::Overflow)
+    }
+
+    type PrefillReservationGuard = crate::backend::submission_recovery::prefill::ReservationGuard;
+
+    fn begin_prefill_reservation(
+        &mut self,
+        reservation: eredu_runtime::working_memory::InferenceRequest,
+    ) -> Result<Self::PrefillReservationGuard, Self::Error> {
+        self.enter_prefill_retention(reservation, None, false)
+    }
+
+    fn begin_prefill_control(
+        &mut self,
+        reservation: eredu_runtime::working_memory::InferenceRequest,
+        role: eredu_runtime::prefill::PrefillControlRole,
+    ) -> Result<Self::PrefillReservationGuard, Self::Error> {
+        self.enter_prefill_retention(reservation, Some(role), false)
+    }
+
+    fn coordinate_prefill_entry(
+        &mut self,
+        reservation: eredu_runtime::working_memory::InferenceRequest,
+        role: Option<eredu_runtime::prefill::PrefillControlRole>,
+    ) -> Result<Self::PrefillReservationGuard, Self::Error> {
+        self.enter_prefill_retention(reservation, role, true)
+    }
+
+    fn finish_prefill_reservation(
+        &mut self,
+        guard: Self::PrefillReservationGuard,
+    ) -> Result<(), Self::Error> {
+        let guard = match guard.into_native() {
+            crate::backend::submission_recovery::prefill::NativeReservationGuard::Model(guard) => {
+                let result = guard.finish();
+                drop(self.prefill_roots.take());
+                return result;
+            }
+            crate::backend::submission_recovery::prefill::NativeReservationGuard::Prefill(guard) => guard,
+        };
+        let status = crate::backend::submission_recovery::prefill::finish(guard);
+        // End the mechanism's temporary projection after its actual guard. A
+        // quarantined Recovery keeps the strong payload on failed settlement.
+        let expired = self.prefill_roots.take();
+        drop(expired);
+        let status = status?;
+        if status.failed || status.blocked || !status.settled {
+            return Err(Error::ArchitectureModel(
+                "reserved inference work failed or remains unobservable".into(),
+            ));
+        }
+        Ok(())
+    }
+
     type State = S;
     type PolicyError = Error;
     type ResidentPolicy = MlxArchitectureLayerwisePolicy<A, S>;
     type BoundedPolicy = MlxArchitectureLayerwisePolicy<A, S>;
-    type StateCheckpoint = S;
+    type StateCheckpoint = StateCheckpoint<S>;
     type StateReport = MlxStateReport;
     type ExecutionReport = MlxExecutionReport;
     type Error = Error;
@@ -610,10 +969,19 @@ where
         selected: &SelectedReplicatedTextRealization,
         _context: &Stream,
     ) -> Result<Self::BoundedPolicy, Self::Error> {
-        self.take_prepared_policy(architecture, selected)
-            .and_then(|(policy, layout, addresses)| {
-                MlxSelectedLayerwisePolicy::bounded(policy, &layout, &addresses)
-            })
+        let (policy, layout, addresses) = self.take_prepared_policy(architecture, selected)?;
+        let policy = MlxSelectedLayerwisePolicy::bounded(policy, &layout, &addresses)?;
+        if matches!(
+            selected.residency(),
+            eredu_runtime::LayerWeightResidency::LayerwiseHost(_)
+                | eredu_runtime::LayerWeightResidency::DenseDiskStream(_)
+        ) {
+            let retained = policy.clone();
+            self.layerwise_workspace = Some(Box::new(move |allocation| {
+                retained.layerwise_workspace(allocation)
+            }));
+        }
+        Ok(policy)
     }
 
     fn index_text_output(
@@ -622,26 +990,34 @@ where
         sequence_index: i32,
         context: &Stream,
     ) -> Result<MlxTensor, Error> {
-        output
+        let indexed = output
             .as_array()
-            .try_index_device((.., sequence_index, ..), context)
-            .map(MlxTensor::from_array)
+            .try_index_device((.., sequence_index, ..), context)?;
+        // The model root is complete, but indexing introduces a new lazy view.
+        // Finish that operation while the enclosing prefill reservation still
+        // owns it, before publishing the output and its physical allocation.
+        indexed.evaluated()?;
+        Ok(MlxTensor::from_array(indexed))
+    }
+
+    fn copy_checkpoint_state(
+        &mut self,
+        state: &S,
+        _context: &Stream,
+    ) -> Result<StateCheckpoint<S>, Error> {
+        state
+            .deep_checkpoint()
+            .map(StateCheckpoint::ordinary)
             .map_err(Into::into)
     }
 
-    fn checkpoint_state(&mut self, state: &S, _context: &Stream) -> Result<S, Error> {
-        state.deep_checkpoint().map_err(Into::into)
-    }
-
-    fn restore_state(
+    fn restore_checkpoint_state(
         &mut self,
         state: &mut S,
-        checkpoint: S,
+        checkpoint: StateCheckpoint<S>,
         context: &Stream,
     ) -> Result<(), Error> {
-        state
-            .restore_checkpoint(&checkpoint, context)
-            .map_err(Into::into)
+        checkpoint.restore(state, context)
     }
 
     fn fork_prediction_target_state(
@@ -717,18 +1093,87 @@ where
         }
     }
 
-    fn complete(&mut self, output: &MlxTensor, state: &S, _context: &Stream) -> Result<(), Error> {
-        #[cfg(test)]
-        crate::tests::support::path_instrumentation::completion();
-        let token_validations = active_token_validation_arrays();
-        async_eval_with_event(
-            std::iter::once(output.as_array())
-                .chain(state.retained_arrays())
-                .chain(token_validations.iter()),
-        )?
-        .synchronize()?;
-        validate_active_token_validations().map_err(Into::into)
+    fn supports_media_ingress_completion(&self) -> bool {
+        true
     }
+
+    fn complete_media_ingress(
+        &mut self,
+        output: Option<&MlxTensor>,
+        state: &S,
+        roots: &eredu_runtime::media_prefill::RetainedMediaRoots<'_, MlxTensor>,
+        _context: &Stream,
+    ) -> Option<Result<(), Error>> {
+        match self.active_nested_completion() {
+            Ok(Some(nested)) => return Some(self.complete_nested_roots(&nested, output, state, Some(roots), _context)),
+            Err(cause) => return Some(Err(cause)),
+            Ok(None) => {}
+        }
+        if self.prefill_roots.is_some() {
+            #[cfg(test)]
+            crate::tests::support::media_completion::record(roots, false);
+            let result = self.complete_prefill_roots(output, state, Some(roots), _context);
+            #[cfg(test)]
+            if result.is_ok() {
+                crate::tests::support::media_completion::record(roots, true);
+            }
+            return Some(result);
+        }
+        // Callback-local root borrows cannot escape. These ordinary native
+        // handle clones keep every future root alive through the same event.
+        let token_validations = active_token_validation_arrays();
+        let mut retained = output
+            .into_iter()
+            .map(MlxTensor::as_array)
+            .chain(state.retained_arrays())
+            .chain(token_validations.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        roots.visit(&mut |root| retained.push(root.as_array().clone()));
+        #[cfg(test)]
+        crate::tests::support::media_completion::record(roots, false);
+        let result = complete_root_arrays(retained.iter());
+        #[cfg(test)]
+        if result.is_ok() {
+            crate::tests::support::media_completion::record(roots, true);
+        }
+        Some(result)
+    }
+
+    fn complete(
+        &mut self,
+        output: Option<&MlxTensor>,
+        state: &S,
+        _context: &Stream,
+    ) -> Result<(), Error> {
+        if let Some(roots) = self.active_nested_completion()? {
+            return self.complete_nested_roots(&roots, output, state, None, _context);
+        }
+        if self.prefill_roots.is_some() {
+            return self.complete_prefill_roots(output, state, None, _context);
+        }
+        let token_validations = active_token_validation_arrays();
+        let retained = output
+            .into_iter()
+            .map(MlxTensor::as_array)
+            .chain(state.retained_arrays())
+            .chain(token_validations.iter())
+            .collect::<Vec<_>>();
+        complete_root_arrays(retained.iter().copied())
+    }
+}
+
+// Both ordinary and retained-media completion have one native boundary. The
+// iterator only borrows already-owned roots; native VectorArray/Event creation
+// remains ordinary work under the surrounding operation's actual owner.
+fn complete_root_arrays<'a>(arrays: impl Iterator<Item = &'a Array> + Clone) -> Result<(), Error> {
+    #[cfg(test)]
+    crate::tests::support::path_instrumentation::completion();
+    async_eval_with_event(arrays.clone())?.synchronize()?;
+    for array in arrays {
+        array.evaluated()?;
+    }
+    validate_active_token_validations().map_err(Into::into)
 }
 
 impl<A, S> TransactionalPromptCacheMechanisms<A, MlxNeuralBackend>
@@ -801,3 +1246,270 @@ where
             .unwrap_or_else(|error| panic!("prompt-cache publication rollback failed: {error}"));
     }
 }
+
+/// Native recovery owns this charge even when the session or driver is dropped.
+#[cfg(test)]
+pub(crate) struct PrefillReservationRetention(
+    #[allow(dead_code)] eredu_runtime::working_memory::InferenceRequest,
+);
+#[cfg(test)]
+impl crate::backend::submission_recovery::Retention for PrefillReservationRetention {
+    fn observe(&self, _: crate::backend::submission_recovery::Status) {}
+}
+
+#[cfg(test)]
+mod prefill_reservation_tests {
+    use super::PrefillReservationRetention;
+    use crate::backend::submission_recovery::{self, Probe, Recovery, Status};
+    use eredu_core::*;
+    use eredu_runtime::working_memory::{InferenceExecutionIdentity, WorkingMemoryPool};
+    use std::{cell::Cell, rc::Rc};
+
+    struct Deferred(Rc<Cell<Status>>);
+    impl Probe for Deferred {
+        fn seal(&mut self) {}
+        fn progress(&self) -> Status {
+            self.0.get()
+        }
+    }
+
+    fn retention_admission() -> Admission {
+        let geometry = InferenceGeometry {
+            batch_size: 1,
+            cached_positions: 0,
+            input_positions: 3,
+            max_output_tokens: 1,
+            prefill_chunk_positions: 2,
+            output: OutputDemand::LastPosition,
+        };
+        let request = AdmissionRequest {
+            input: InputTokenCount::text(3),
+            max_output_tokens: 1,
+            batch_size: 1,
+            safety_reserve_bytes: 0,
+            application_memory_budget_bytes: None,
+            require_complete_estimate: true,
+        };
+        let capabilities = ModelCapabilities {
+            effective_model_type: "native retention fixture".into(),
+            native_max_context: Observed::exact(8, "fixture"),
+            effective_max_context: Observed::exact(8, "fixture"),
+            state_strategy: CacheStateStrategy::FullKv,
+            modalities: InputModalities::TEXT,
+            estimation: EstimationCompleteness::PersistentStateOnly,
+        };
+        let layout = StateMemoryLayout::new(
+            LayerSchedule::empty(),
+            vec![],
+            1,
+            1,
+            EstimationCompleteness::Complete,
+        )
+        .unwrap();
+        let bound = || WorkspaceBound::bounded(16, "retention fixture charge");
+        let state = estimate_runtime_state(
+            &layout,
+            request.input,
+            1,
+            1,
+            std::num::NonZeroU8::new(4).unwrap(),
+        )
+        .unwrap()
+        .with_execution_workspace(ExecutionWorkspaceEstimate {
+            geometry,
+            activations: bound(),
+            attention: bound(),
+            vocabulary: bound(),
+            state_update: bound(),
+            materialization: bound(),
+            retained: bound(),
+        })
+        .unwrap();
+        let AdmissionResult::Admitted(admission) =
+            apply_admission_policy(&capabilities, request, state, None).unwrap()
+        else {
+            panic!("fixture admission")
+        };
+        admission
+    }
+
+    #[test]
+    fn reservation_remains_charged_after_unobservable_native_scope_is_dropped() {
+        let admission = retention_admission();
+        for blocked in [false, true] {
+            let pool = WorkingMemoryPool::new(admission.incremental_required_bytes, 0).unwrap();
+            let reservation = pool
+                .reserve(&InferenceExecutionIdentity::default(), &admission)
+                .unwrap();
+            let charge = reservation.bytes();
+            let status = Rc::new(Cell::new(Status {
+                settled: false,
+                failed: !blocked,
+                blocked,
+            }));
+            let recovery = Recovery::with_probe(
+                PrefillReservationRetention(reservation.into()),
+                Deferred(status.clone()),
+            );
+            let observed = recovery.finish();
+            assert!(!observed.settled);
+            assert_eq!(
+                pool.used_bytes().unwrap(),
+                charge,
+                "scope failure cannot refund native authority"
+            );
+            assert!(matches!(
+                pool.reserve(&InferenceExecutionIdentity::default(), &admission),
+                Err(eredu_runtime::working_memory::WorkingMemoryError::BudgetExceeded { .. })
+            ));
+            status.set(Status {
+                settled: true,
+                failed: !blocked,
+                blocked: false,
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while pool.used_bytes().unwrap() != 0 && std::time::Instant::now() < deadline {
+                submission_recovery::reap();
+                std::thread::yield_now();
+            }
+            assert_eq!(
+                pool.used_bytes().unwrap(),
+                0,
+                "independent settlement releases the retained charge"
+            );
+            assert!(pool.peak_bytes().unwrap() >= charge);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires native CPU execution"]
+    fn native_state_copies_keep_request_charges_after_parent_and_driver_drop() {
+        use super::*;
+        use crate::backend::runtime::cache::kv::KeyValueCache;
+        use eredu_core::cache::{
+            LayerCachePolicy, MutableStateResidency, StateTensorDimension, StateTensorDtype,
+            StateTensorPolicy, StateTensorRole,
+        };
+        use eredu_nn::PoolingAttentionCache;
+        use eredu_runtime::working_memory::InferenceRequest;
+        use eredu_runtime::{RuntimeStateComponents, StateLayout};
+
+        fn values<S: MlxStateMechanisms>(state: &S, stream: &Stream) -> Vec<(Vec<i32>, Vec<f32>)> {
+            state
+                .retained_arrays()
+                .into_iter()
+                .map(|array| {
+                    let contiguous = array.contiguous(false, stream).unwrap();
+                    let evaluated = contiguous.evaluated().unwrap();
+                    (array.shape().to_vec(), evaluated.as_slice::<f32>().to_vec())
+                })
+                .collect()
+        }
+
+        fn check<S: MlxStateMechanisms>(mut state: S, stream: &Stream) {
+            // A synthetic accounting witness, not an allocation estimate for
+            // these native arrays. Numerical/native capacity bounds are tested
+            // separately; this test follows exact charge ownership only.
+            let admission = retention_admission();
+            let charge = admission.incremental_required_bytes;
+            let pool = WorkingMemoryPool::new(charge * 2, 0).unwrap();
+            let execution = InferenceExecutionIdentity::default();
+            let first: InferenceRequest = pool.reserve(&execution, &admission).unwrap().into();
+            state.retain_inference(&first);
+            drop(first);
+            let before = values(&state, stream);
+            assert!(!before.is_empty());
+            let checkpoint = state.deep_checkpoint().unwrap();
+            let saved = state.isolated_snapshot(stream).unwrap();
+            let fork = state.fork_prediction_target_state(stream).unwrap();
+            for descendant in [&checkpoint, &saved, &fork] {
+                assert_eq!(descendant.inference_retention().requests().len(), 1);
+                assert_eq!(values(descendant, stream), before);
+            }
+            let second: InferenceRequest = pool.reserve(&execution, &admission).unwrap().into();
+            state.retain_inference(&second);
+            drop(second);
+            state.restore_checkpoint(&checkpoint, stream).unwrap();
+            assert_eq!(state.inference_retention().requests().len(), 2);
+            assert_eq!(values(&state, stream), before);
+            assert_eq!(pool.used_bytes().unwrap(), charge * 2);
+            drop(state);
+            assert_eq!(pool.used_bytes().unwrap(), charge);
+            drop(checkpoint);
+            drop(saved);
+            assert_eq!(pool.used_bytes().unwrap(), charge);
+            drop(fork);
+            assert_eq!(pool.used_bytes().unwrap(), 0);
+            assert_eq!(pool.peak_bytes().unwrap(), charge * 2);
+        }
+
+        let stream = Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu, 0));
+        let layout =
+            |policy| StateLayout::new(LayerSchedule::new(1, vec![policy]).unwrap()).unwrap();
+        let input = Array::from_slice(&[1.0_f32, 2., 3., 5., 7., 11.], &[1, 1, 3, 2]);
+        let mut kv = MlxKeyValueState::device(layout(
+            LayerCachePolicy::key_value(AttentionPolicy::Full, 1, 2).unwrap(),
+        ))
+        .unwrap();
+        kv.layer(0)
+            .unwrap()
+            .update_and_fetch(input.clone(), input.clone(), &stream)
+            .unwrap();
+        check(kv, &stream);
+
+        let role = StateTensorRole::Recurrent;
+        let policy = LayerCachePolicy::fixed_only(vec![
+            StateTensorPolicy::new(
+                role,
+                vec![
+                    StateTensorDimension::fixed(2).unwrap(),
+                    StateTensorDimension::fixed(2).unwrap(),
+                ],
+                StateTensorDtype::Float32,
+                MutableStateResidency::LayerScopedOffloadable,
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let mut hybrid = MlxHybridState::device(layout(policy)).unwrap();
+        let layer = hybrid.layer(0).unwrap();
+        *layer.fixed_component(role).unwrap() = Some(MlxTensor::from_array(
+            Array::from_slice(&[2.0_f32, 3., 5., 7.], &[2, 2])
+                .transpose(&stream)
+                .unwrap(),
+        ));
+        layer.advance_fixed(3).unwrap();
+        check(hybrid, &stream);
+
+        let mut pooling = MlxPoolingAttentionStateFactory::device(layout(
+            LayerCachePolicy::key_only(AttentionPolicy::sliding(3).unwrap(), 1, 2).unwrap(),
+        ))
+        .unwrap();
+        pooling
+            .layer(0)
+            .unwrap()
+            .append_local(
+                MlxTensor::from_array(input.reshape(&[1, 3, 2], &stream).unwrap()),
+                &stream,
+            )
+            .unwrap();
+        check(pooling, &stream);
+    }
+}
+
+#[cfg(test)]
+#[path = "mechanisms/terminal_tests.rs"]
+mod terminal_tests;
+
+#[cfg(test)]
+pub(in crate::composition::mlx::replicated_text) use opening_sources::{
+    OpeningPinFailure, PreparedOpeningPins,
+};
+
+#[cfg(test)]
+pub(in crate::composition::mlx::replicated_text) use opening_sources::OpeningPinSetup;
+
+pub(crate) use opening_sources::{
+    NativeOpeningRows, NativeOpeningRowsOwner, NativeOpeningRowsPlan, RetiredOpeningRow,
+    SealedOpeningRows,
+};

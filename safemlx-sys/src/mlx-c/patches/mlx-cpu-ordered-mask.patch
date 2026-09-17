@@ -1,0 +1,184 @@
+diff --git a/mlx/backend/cpu/reduce.cpp b/mlx/backend/cpu/reduce.cpp
+--- a/mlx/backend/cpu/reduce.cpp
++++ b/mlx/backend/cpu/reduce.cpp
+@@ -662,28 +662,35 @@
+   if(!rank||rank>4)return false;
+   switch(kind) {
+     case ReductionEvalKind::BooleanAll:case ReductionEvalKind::BooleanAny:
+-    case ReductionEvalKind::Float32Rows:break;
++    case ReductionEvalKind::Float32Rows:case ReductionEvalKind::Float32MinimumRows:break;
+     default:return false;
+   }
+   DispatchLayout task;WeakCopyStorage weak;
+   if(!CommandEncoder::dispatch_layout<ReductionTask>(task)||
+       !PreparedInputLeaf::weak_copy_storage(rank,weak))return false;
+   EvalDispatchStorage value{task.task_bytes,task.task_alignment,0,0};
+-  // Only the all-contiguous boolean branch or the existing early F32 row
+-  // cascade is selected. Neither enters nd_loop/std::function or scratch-vector
+-  // branches. The cascade array is the actual fixed four-level source object.
++  // The source proves either the all-contiguous boolean path, the existing
++  // early F32 sum cascade, or a last-axis F32 minimum whose reduction plan has
++  // one contiguous row. None enters nd_loop/std::function or scratch vectors.
++  // Minimum preserves the existing SIMD comparison, NaN and tail order.
+   const size_t cascade=sizeof(float[4][4][4])+sizeof(size_t)*12+sizeof(float);
+   constexpr int boolean_lanes=std::min(simd::max_size<int8_t>,simd::max_size<bool>);
+   const size_t boolean=sizeof(ReductionPlan)+sizeof(AxisView)+
+       sizeof(simd::Simd<int8_t,boolean_lanes>)*2+
+       sizeof(simd::Simd<bool,boolean_lanes>)*3+
+       sizeof(AndReduce)+sizeof(OrReduce)+sizeof(bool)*4+sizeof(int)*3;
++  constexpr int minimum_lanes=simd::max_size<float>;
++  const size_t minimum=sizeof(ReductionPlan)*2+sizeof(Shape)*2+sizeof(Strides)*2+
++      sizeof(AxisView)+sizeof(MinReduce)*2+sizeof(simd::Simd<float,minimum_lanes>)*4+
++      sizeof(simd::Simd<bool,minimum_lanes>)*2+sizeof(float)*4+sizeof(size_t)*5+
++      sizeof(int)*5+sizeof(const float*)*2+sizeof(float*)*2;
+   const size_t controls[]={task.controls,weak.controls,weak.controls,
+-      kind==ReductionEvalKind::Float32Rows?cascade:boolean,
++      kind==ReductionEvalKind::Float32Rows?cascade:
++          kind==ReductionEvalKind::Float32MinimumRows?minimum:boolean,
+       sizeof(value)+sizeof(out)+sizeof(kind)+sizeof(rank)+sizeof(task)+sizeof(weak)+
+       sizeof(ReductionTask)*2+sizeof(array)*3+sizeof(Shape)*2+sizeof(Strides)+
+       sizeof(Stream)+sizeof(CommandEncoder*)+sizeof(size_t)*7+sizeof(void*)*5+
+-      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)};
++      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)};
+   value.controls=sizeof(controls);
+   for(size_t control:controls) {
+     if(control>SIZE_MAX-value.controls)return false;value.controls+=control;
+diff --git a/mlx/backend/cpu/reduction_storage.cpp b/mlx/backend/cpu/reduction_storage.cpp
+--- a/mlx/backend/cpu/reduction_storage.cpp
++++ b/mlx/backend/cpu/reduction_storage.cpp
+@@ -25,6 +25,7 @@
+     case ReductionEvalKind::BooleanAll:case ReductionEvalKind::BooleanAny:
+       if(rows!=1)return false;break;
+     case ReductionEvalKind::Float32Rows:break;
++    case ReductionEvalKind::Float32MinimumRows:if(width<=1)return false;break;
+     default:return false;
+   }
+   EvalDispatchStorage dispatch;SingleOutputEvalStorage common;
+@@ -34,7 +35,7 @@
+   const size_t controls=sizeof(kind)+sizeof(rank)+sizeof(width)+sizeof(rows)+sizeof(tracer)+sizeof(out)+
+       sizeof(elements)+sizeof(bytes)+sizeof(dispatch)+sizeof(common)+sizeof(value)+
+       sizeof(const array*)*3+sizeof(const Reduce*)+sizeof(const Shape*)+
+-      sizeof(size_t)*12+sizeof(bool)*4+sizeof(int)*3+sizeof(Reduce::ReduceType)+
++      sizeof(size_t)*14+sizeof(bool)*4+sizeof(int)*3+sizeof(Reduce::ReduceType)+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+
+       sizeof(submission::GraphQuota*)+sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+   if(!add(value.named_control_bytes,controls))return false;
+@@ -62,7 +63,7 @@
+     for(size_t axis=0;axis!=rank;++axis)
+       if(axes[axis]!=int(axis)||output.shape(axis)!=1)return false;
+     selected=kind==Reduce::And?ReductionEvalKind::BooleanAll:ReductionEvalKind::BooleanAny;
+-  } else if(kind==Reduce::Sum) {
++  } else if(kind==Reduce::Sum||kind==Reduce::Min) {
+     if(input.dtype()!=float32||input.itemsize()!=sizeof(float)||output.dtype()!=float32||
+         output.itemsize()!=sizeof(float)||!input.flags().row_contiguous||
+         axes.size()!=1||axes[0]!=int(rank)-1)return false;
+@@ -70,7 +71,17 @@
+     for(size_t axis=0;axis!=rank;++axis)
+       if(output.shape(axis)!=(axis+1==rank?1:input.shape(axis)))return false;
+     if(output.size()!=rows)return false;
+-    selected=ReductionEvalKind::Float32Rows;
++    if(kind==Reduce::Min) {
++      // A singleton minimum is elided by the ordinary operator. For an actual
++      // Reduce primitive, this proves get_reduction_plan's one-row path.
++      if(width<=1)return false;
++      size_t stride=1;
++      for(size_t axis=rank;axis--;) {
++        if((input.shape(axis)>1&&size_t(input.strides()[axis])!=stride)||
++            !product(stride,size_t(input.shape(axis)),stride))return false;
++      }
++    }
++    selected=kind==Reduce::Sum?ReductionEvalKind::Float32Rows:ReductionEvalKind::Float32MinimumRows;
+   } else return false;
+   return reduction_eval_layout(selected,rank,width,rows,output.is_tracer(),out);
+ }
+diff --git a/mlx/backend/cpu/reduction_storage.h b/mlx/backend/cpu/reduction_storage.h
+--- a/mlx/backend/cpu/reduction_storage.h
++++ b/mlx/backend/cpu/reduction_storage.h
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
+-enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows };
++enum class ReductionEvalKind : unsigned { BooleanAll, BooleanAny, Float32Rows, Float32MinimumRows };
+ MLX_API bool reduction_dispatch_storage(ReductionEvalKind,size_t rank,
+     EvalDispatchStorage&) noexcept;
+ MLX_API bool reduction_eval_layout(ReductionEvalKind,size_t rank,size_t width,
+diff --git a/mlx/backend/cpu/selection_storage.cpp b/mlx/backend/cpu/selection_storage.cpp
+--- a/mlx/backend/cpu/selection_storage.cpp
++++ b/mlx/backend/cpu/selection_storage.cpp
+@@ -37,6 +37,21 @@
+   return stride==elements;
+ }
+ }
++// Full broadcasts one actual stored value per row. The copy source is the
++// completed broadcast alias, and the ordinary General/Vector copy writes out.
++static bool row_full_source(const array& input,size_t elements) noexcept {
++  if(input.dtype()!=float32||input.itemsize()!=sizeof(float)||!input.ndim())return false;
++  const size_t rank=input.ndim(),width=size_t(input.shape(rank-1)),rows=elements/width;
++  if(input.data_size()!=rows)return false;
++  if(input.strides()[rank-1]<0||(width>1&&input.strides()[rank-1]!=0))return false;
++  size_t stride=1;
++  for(size_t axis=rank-1;axis--;) {
++    if(input.strides()[axis]<0||
++        (input.shape(axis)>1&&size_t(input.strides()[axis])!=stride)||
++        !product(stride,size_t(input.shape(axis)),stride))return false;
++  }
++  return stride==rows;
++}
+ bool is_selection_eval_primitive(const array& output) noexcept {
+   return output.has_primitive()&&output.primitive().stream().device==Device::cpu&&
+       (typeid(output.primitive())==typeid(Select)||typeid(output.primitive())==typeid(Full));
+@@ -66,6 +81,23 @@
+   if(!add(value.named_control_bytes,controls))return false;
+   out=value;return true;
+ }
++bool row_full_eval_layout(Dtype dtype,size_t rank,size_t width,size_t rows,
++    bool tracer,CopyEvalStorage& out) noexcept {
++  size_t elements=0;
++  if(dtype!=float32||dtype.size()!=sizeof(float)||!rank||rank>4||!width||!rows||
++      !product(width,rows,elements)||!common(dtype,rank,elements))return false;
++  CopyEvalStorage value;
++  if(rows==1) {
++    if(!scalar_full_eval_layout(dtype,rank,elements,tracer,value))return false;
++  } else if(!copy_eval_layout(rank,1,true,tracer,value))return false;
++  const size_t controls=sizeof(dtype)+sizeof(rank)+sizeof(width)+sizeof(rows)+sizeof(tracer)+sizeof(out)+
++      sizeof(elements)+sizeof(value)+sizeof(const array*)*4+sizeof(size_t)*18+
++      sizeof(int)*2+sizeof(bool)*4+sizeof(CopyType)+sizeof(Stream)+
++      sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+
++      sizeof(submission::GraphQuota*)+sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
++  if(!add(value.named_control_bytes,controls))return false;
++  out=value;return true;
++}
+ bool selection_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   if(!is_selection_eval_primitive(output)||!output.siblings().empty()||!canonical(output.dtype()))return false;
+   size_t elements=0;if(!shape(output,elements))return false;
+@@ -76,11 +108,15 @@
+     if(input.shape()!=output.shape()||!shape(input,actual)||actual!=elements||
+         input.dtype()!=(!full&&i==0?bool_:output.dtype())||!canonical(input.dtype()))return false;
+     if(full) {
+-      if(input.data_size()!=1)return false;
+-      for(size_t axis=0;axis!=size_t(input.ndim());++axis)
+-        if(input.strides()[axis]<0||(input.shape(axis)>1&&input.strides()[axis]!=0))return false;
++      if(input.data_size()==1) {
++        for(size_t axis=0;axis!=size_t(input.ndim());++axis)
++          if(input.strides()[axis]<0||(input.shape(axis)>1&&input.strides()[axis]!=0))return false;
++      } else if(!row_full_source(input,elements))return false;
+     } else if(!row(input,elements))return false;
+   }
++  if(full&&output.inputs()[0].data_size()!=1)
++    return row_full_eval_layout(output.dtype(),output.ndim(),size_t(output.shape(output.ndim()-1)),
++        output.inputs()[0].data_size(),output.is_tracer(),out);
+   return full?scalar_full_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out):
+       select_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out);
+ }
+diff --git a/mlx/backend/cpu/selection_storage.h b/mlx/backend/cpu/selection_storage.h
+--- a/mlx/backend/cpu/selection_storage.h
++++ b/mlx/backend/cpu/selection_storage.h
+@@ -4,6 +4,7 @@
+ MLX_API bool select_dispatch_storage(size_t rank,EvalDispatchStorage&) noexcept;
+ MLX_API bool select_eval_layout(Dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool scalar_full_eval_layout(Dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool row_full_eval_layout(Dtype,size_t rank,size_t width,size_t rows,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool is_selection_eval_primitive(const array&) noexcept;
+ MLX_API bool selection_eval_storage(const array&,CopyEvalStorage&) noexcept;
+ }

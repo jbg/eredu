@@ -2,15 +2,22 @@
 
 use super::*;
 
+mod parameter_source;
+pub(crate) use parameter_source::{
+    CountedResidentParameterSource, ResidentParameterCounts, ResidentParameterSource,
+    ResidentSourceError,
+};
+
 /// Permanently populated MLX units used by fully resident execution.
-pub struct MlxResidentPolicy<U> {
+pub struct MlxResidentPolicy<U: 'static> {
     pub(super) units: Vec<Option<MlxModule<U>>>,
     pub(super) residency: ResidencyManager,
-    pub(super) store: SharedCheckpointSource,
+    pub(super) store: RetainedCheckpointSource,
     pub(super) unit_ids: Vec<OffloadUnitId>,
     pub(super) layout: ExecutionUnitLayout,
     pub(super) window_depth: usize,
     pub(super) _transfer: ResidentTransfer,
+    pub(super) original_neural: original_operations::ResidentNeuralSlot<U>,
 }
 
 /// Exclusive borrow-by-ownership of one permanently resident unit.
@@ -33,15 +40,35 @@ impl<U> std::ops::DerefMut for MlxResidentUnit<U> {
     }
 }
 
-impl<U> MlxResidentPolicy<U> {
+impl<U: 'static> MlxResidentPolicy<U> {
+    pub(crate) fn original_realtime_plan(&self,stream:&Stream,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<original_operations::RealtimeNeuralPlan<U>,Error> {
+        self.original_neural.realtime_plan(&self.layout,stream,context)
+    }
+
+    pub(crate) fn original_neural_plan(
+        &self,
+        geometry: eredu_core::InferenceGeometry,
+    ) -> Result<original_operations::ResidentNeuralPlan<U>, Error> {
+        self.original_neural.plan(&self.layout, geometry)
+    }
+
+    pub(crate) fn submit_neural(
+        &self,
+        stream: &Stream,
+        value: &MlxTensor,
+    ) -> Result<original_operations::OrderedNeuralCompletion, Error> {
+        self.original_neural.submit(stream, value)
+    }
+
     /// Returns the checkpoint source backing this resident policy.
     pub fn checkpoint_store(&self) -> &dyn eredu_checkpoint::store::CheckpointSource {
         self.store.as_ref()
     }
 
     /// Clones the shared checkpoint source backing this resident policy.
-    pub fn checkpoint_store_arc(&self) -> SharedCheckpointSource {
-        Arc::clone(&self.store)
+    pub fn retained_checkpoint_store(&self) -> RetainedCheckpointSource {
+        self.store.clone()
     }
 
     /// Returns current weight-residency accounting.
@@ -84,9 +111,26 @@ impl<U> MlxResidentPolicy<U> {
     }
 }
 
-impl<U: Parameterized<MlxTensor>> LayerwisePolicy<MlxNeuralBackend, U> for MlxResidentPolicy<U> {
+impl<U: Parameterized<MlxTensor> + 'static> LayerwisePolicy<MlxNeuralBackend, U>
+    for MlxResidentPolicy<U>
+{
     type Lease = MlxResidentUnit<U>;
     type Error = Error;
+
+    fn uses_shared_group_executor(&self, stream: &Stream) -> Result<bool, Error> {
+        self.original_neural.uses_shared_executor(stream)
+    }
+
+    fn submit_group(
+        &mut self,
+        stream: &Stream,
+        value: &MlxTensor,
+    ) -> Result<
+        impl eredu_runtime::OrderedLayerwiseCompletion<Stream> + 'static,
+        impl std::error::Error + Send + Sync + 'static,
+    > {
+        self.submit_neural(stream, value)
+    }
 
     fn publish_parameter_replacements(
         &mut self,
@@ -104,6 +148,20 @@ impl<U: Parameterized<MlxTensor>> LayerwisePolicy<MlxNeuralBackend, U> for MlxRe
 
     fn resident_parameters_available(&self) -> bool {
         self.units.iter().all(Option::is_some)
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        self.units.iter().try_fold(0usize, |n, unit| {
+            n.checked_add(unit.as_ref()?.inner.retained_value_slot_bound()?)
+        })
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
+        let mut complete = self.resident_parameters_available();
+        for unit in self.units.iter().flatten() {
+            complete &= unit.inner.visit_retained_values(visitor);
+        }
+        complete
     }
 
     fn visit_resident_units(&mut self, visitor: &mut impl FnMut(&mut U)) -> bool {

@@ -69,6 +69,7 @@ fn visitor(stream: &Stream) -> MlxAssistantPreparationVisitor {
     MlxAssistantPreparationVisitor {
         stream: stream.clone(),
         weights_stream: stream.clone(),
+        source_pool: None,
     }
 }
 
@@ -103,6 +104,17 @@ impl MaterializedExternalAssistantVisitor<MlxAssistantPreparationVisitor> for In
         self,
         assistant: &mut MlxExternalAssistant<A>,
     ) -> Self::Output {
+        let source = &assistant.source;
+        assert!(!source.tasks().is_empty());
+        assert!(!source.bindings().is_empty());
+        for binding in source.bindings() {
+            assert!(source.values().contains_key(binding.name()));
+            assert!(source.store().source_metadata(binding.checkpoint_key()).is_ok());
+        }
+        // Original checkpoint format and actual selected executable format stay
+        // distinct in the retained typed handoff, including the MxFp4 case.
+        assert_eq!(A::quantization(source.source_config()), None);
+        let _ = (source.checkpoint(), source.artifact_identity());
         (
             A::configuration_model_type(&assistant.config).to_owned(),
             A::quantization(&assistant.config),

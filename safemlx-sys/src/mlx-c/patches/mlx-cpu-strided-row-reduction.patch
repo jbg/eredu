@@ -1,0 +1,78 @@
+diff --git a/mlx/backend/common/reduce.cpp b/mlx/backend/common/reduce.cpp
+--- a/mlx/backend/common/reduce.cpp
++++ b/mlx/backend/common/reduce.cpp
+@@ -75,6 +75,15 @@
+   //    reduce and be done with it.
+   // 2. We have weird transpositions and expands. Copy the strides to the
+   //    output, then call strided reduce.
++
++  // One nonunit unit-stride axis produces exactly this same one-entry plan.
++  // Retain the ordinary GeneralContiguousReduce numeric path while avoiding
++  // the general sorting/merging machinery for the already-resolved case.
++  if (axes.size() == 1 && x.shape(axes[0]) > 1 &&
++      x.strides()[axes[0]] == 1) {
++    return ReductionPlan(GeneralContiguousReduce,
++        Shape{x.shape(axes[0])}, Strides{1});
++  }
+ 
+   // Sort reduction axes by stride in order to merge them and figure out if we
+   // have a contiguous reduction.
+diff --git a/mlx/backend/cpu/reduce.cpp b/mlx/backend/cpu/reduce.cpp
+--- a/mlx/backend/cpu/reduce.cpp
++++ b/mlx/backend/cpu/reduce.cpp
+@@ -671,8 +671,10 @@
+       !PreparedInputLeaf::weak_copy_storage(rank,weak))return false;
+   EvalDispatchStorage value{task.task_bytes,task.task_alignment,0,0};
+   // The source proves either the all-contiguous boolean path, the existing
+-  // early F32 sum cascade, or a last-axis F32 minimum whose reduction plan has
+-  // one contiguous row. None enters nd_loop/std::function or scratch vectors.
++  // early F32 sum cascade, a general unit-stride final row, or a last-axis
++  // F32 minimum whose reduction plan has one contiguous row. The exact general
++  // Sum plan is built directly by the shared get_reduction_plan worker.
++  // None enters nd_loop/std::function or scratch vectors.
+   // Minimum preserves the existing SIMD comparison, NaN and tail order.
+   const size_t cascade=sizeof(float[4][4][4])+sizeof(size_t)*12+sizeof(float);
+   constexpr int boolean_lanes=std::min(simd::max_size<int8_t>,simd::max_size<bool>);
+@@ -690,14 +692,22 @@
+   const size_t sum_all=sizeof(ReductionPlan)*2+sizeof(AxisView)*3+sizeof(SumReduce)*3+
+       sizeof(simd::Simd<float,minimum_lanes>)*6+sizeof(float)*6+
+       sizeof(const float*)*3+sizeof(float*)*3+sizeof(int)*4+sizeof(size_t)*3;
++  // GeneralContiguousReduce has one reduction axis. After removing it the
++  // plan is empty, so each logical row uses elem_to_loc then the unchanged
++  // SIMD contiguous_reduce body. Shape/Strides remain inline at rank <= 4.
++  const size_t sum_rows=sizeof(ReductionPlan)*2+sizeof(Shape)*4+sizeof(Strides)*4+
++      sizeof(std::pair<Shape,Strides>)*2+sizeof(AxisView)*3+sizeof(SumReduce)*3+
++      sizeof(simd::Simd<float,minimum_lanes>)*6+sizeof(float)*6+
++      sizeof(const float*)*3+sizeof(float*)*3+sizeof(int)*12+sizeof(size_t)*8+
++      sizeof(Shape::const_iterator)*2+sizeof(Strides::const_iterator)*2;
+   const size_t controls[]={task.controls,weak.controls,weak.controls,
+-      kind==ReductionEvalKind::Float32Rows?cascade:
++      kind==ReductionEvalKind::Float32Rows?std::max(cascade,sum_rows):
+           kind==ReductionEvalKind::Float32MinimumRows?minimum:
+           kind==ReductionEvalKind::Float32All?sum_all:boolean,
+       sizeof(value)+sizeof(out)+sizeof(kind)+sizeof(rank)+sizeof(task)+sizeof(weak)+
+       sizeof(ReductionTask)*2+sizeof(array)*3+sizeof(Shape)*2+sizeof(Strides)+
+       sizeof(Stream)+sizeof(CommandEncoder*)+sizeof(size_t)*7+sizeof(void*)*5+
+-      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)+sizeof(sum_all)};
++      sizeof(Reduce::ReduceType)*2+sizeof(Dtype)*2+sizeof(cascade)+sizeof(boolean)+sizeof(boolean_lanes)+sizeof(minimum)+sizeof(minimum_lanes)+sizeof(sum_all)+sizeof(sum_rows)};
+   value.controls=sizeof(controls);
+   for(size_t control:controls) {
+     if(control>SIZE_MAX-value.controls)return false;value.controls+=control;
+diff --git a/mlx/backend/cpu/reduction_storage.cpp b/mlx/backend/cpu/reduction_storage.cpp
+--- a/mlx/backend/cpu/reduction_storage.cpp
++++ b/mlx/backend/cpu/reduction_storage.cpp
+@@ -75,9 +75,13 @@
+     selected=ReductionEvalKind::Float32All;
+   } else if(kind==Reduce::Sum||kind==Reduce::Min) {
+     if(input.dtype()!=float32||input.itemsize()!=sizeof(float)||output.dtype()!=float32||
+-        output.itemsize()!=sizeof(float)||!input.flags().row_contiguous||
++        output.itemsize()!=sizeof(float)||
+         axes.size()!=1||axes[0]!=int(rank)-1)return false;
+     width=size_t(input.shape(rank-1));rows=elements/width;
++    // Sum's existing general contiguous-row body is independently priced.
++    // Unknown/reversed final strides and singleton general plans stay refused.
++    if(!input.flags().row_contiguous &&
++        (kind!=Reduce::Sum||width<=1||input.strides()[rank-1]!=1))return false;
+     for(size_t axis=0;axis!=rank;++axis)
+       if(output.shape(axis)!=(axis+1==rank?1:input.shape(axis)))return false;
+     if(output.size()!=rows)return false;

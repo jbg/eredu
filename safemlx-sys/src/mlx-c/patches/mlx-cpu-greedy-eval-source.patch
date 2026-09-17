@@ -1,0 +1,242 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -44,6 +44,7 @@
+   mlx
+   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device_info.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/arg_reduce.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/greedy_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/binary_storage.cpp
+   ${CMAKE_CURRENT_SOURCE_DIR}/slice_storage.cpp
+diff --git a/mlx/backend/cpu/arg_reduce.cpp b/mlx/backend/cpu/arg_reduce.cpp
+--- a/mlx/backend/cpu/arg_reduce.cpp
++++ b/mlx/backend/cpu/arg_reduce.cpp
+@@ -5,6 +5,7 @@
+ #include "mlx/backend/common/utils.h"
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/primitives.h"
++#include "mlx/backend/cpu/greedy_storage.h"
+ 
+ namespace mlx::core {
+ 
+@@ -61,19 +62,11 @@
+   }
+ }
+ 
+-} // namespace
+-
+-void ArgReduce::eval_cpu(const ArrayVector& inputs, array& out) {
+-  assert(inputs.size() == 1);
+-  auto& in = inputs[0];
+-  out.allocate_data(out.nbytes());
+-  auto& encoder = cpu::get_command_encoder(stream());
+-  encoder.set_input_array(in);
+-  encoder.set_output_array(out);
+-  encoder.dispatch([in = array::unsafe_weak_copy(in),
+-                    out = array::unsafe_weak_copy(out),
+-                    reduce_type_ = reduce_type_,
+-                    axis_ = axis_]() mutable {
++struct ArgReduceTask {
++  array in,out;
++  ArgReduce::ReduceType reduce_type_;
++  int axis_;
++  void operator()() {
+     switch (in.dtype()) {
+       case bool_:
+         arg_reduce_dispatch<bool>(in, out, reduce_type_, axis_);
+@@ -118,7 +111,32 @@
+         arg_reduce_dispatch<complex64_t>(in, out, reduce_type_, axis_);
+         break;
+     }
+-  });
++  }
++};
++
++} // namespace
++
++namespace cpu {
++bool arg_reduce_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  DispatchLayout task;
++  if(!CommandEncoder::dispatch_layout<ArgReduceTask>(task))return false;
++  const size_t controls=sizeof(EvalDispatchStorage)+sizeof(task)+sizeof(out)+sizeof(ArgReduceTask)*2+
++      sizeof(array)*2+sizeof(ArgReduce::ReduceType)*2+sizeof(int)*3+sizeof(Strides)+sizeof(Shape)+
++      sizeof(void*)*6+sizeof(size_t)*3+sizeof(uint32_t)*6+sizeof(float)*3+sizeof(Stream);
++  if(task.controls>SIZE_MAX-controls)return false;
++  out={task.task_bytes,task.task_alignment,0,task.controls+controls};return true;
++}
++}
++
++void ArgReduce::eval_cpu(const ArrayVector& inputs, array& out) {
++  assert(inputs.size() == 1);
++  auto& in = inputs[0];
++  out.allocate_data(out.nbytes());
++  auto& encoder = cpu::get_command_encoder(stream());
++  encoder.set_input_array(in);
++  encoder.set_output_array(out);
++  encoder.dispatch(ArgReduceTask{array::unsafe_weak_copy(in),array::unsafe_weak_copy(out),
++      reduce_type_,axis_});
+ }
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -15,6 +15,7 @@
+ #include "mlx/backend/cpu/binary_storage.h"
+ #include "mlx/backend/cpu/slice_storage.h"
+ #include "mlx/backend/cpu/softmax_storage.h"
++#include "mlx/backend/cpu/greedy_storage.h"
+ 
+ namespace mlx::core::cpu {
+ 
+@@ -43,7 +44,8 @@
+   const bool fixed_binary = fixed && cpu::is_binary_eval_primitive(arr);
+   const bool fixed_slice = fixed && cpu::is_slice_eval_primitive(arr);
+   const bool fixed_softmax = fixed && cpu::is_softmax_eval_primitive(arr);
+-  const bool extended = fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool fixed_greedy = fixed && cpu::is_greedy_eval_primitive(arr);
++  const bool extended = fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -51,7 +53,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_softmax
++    const auto failure = fixed_greedy
++        ? submission::GraphConstruction::create_cpu_greedy_eval(*extended_prologue, extended_bank.value)
++        : fixed_softmax
+         ? submission::GraphConstruction::create_cpu_softmax_eval(*extended_prologue, extended_bank.value)
+         : fixed_slice
+         ? submission::GraphConstruction::create_cpu_slice_eval(*extended_prologue, extended_bank.value)
+diff --git a/mlx/backend/cpu/greedy_storage.cpp b/mlx/backend/cpu/greedy_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/greedy_storage.cpp
+@@ -0,0 +1,88 @@
++#include "mlx/backend/cpu/greedy_storage.h"
++#include "mlx/primitives.h"
++#include "mlx/submission.h"
++#include <climits>
++#include <typeinfo>
++namespace mlx::core::cpu {
++namespace {
++bool add(size_t& total,size_t value) noexcept { if(value>SIZE_MAX-total)return false;total+=value;return true; }
++bool product(size_t a,size_t b,size_t& out) noexcept {if(b&&a>size_t(PTRDIFF_MAX)/b)return false;out=a*b;return true;}
++}
++bool is_greedy_eval_primitive(const array& out) noexcept {
++  return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&
++      (typeid(out.primitive())==typeid(ArgReduce)||typeid(out.primitive())==typeid(Squeeze));
++}
++bool arg_reduce_eval_layout(size_t rank,size_t columns,size_t rows,bool tracer,CopyEvalStorage& out) noexcept {
++  size_t elements,bytes;
++  if(rank<1||rank>4||!columns||columns>size_t(INT_MAX)||!rows||rows>UINT32_MAX||!product(columns,rows,elements)||
++      !product(elements,sizeof(float),bytes))return false;
++  EvalDispatchStorage task;SingleOutputEvalStorage common;
++  if(!arg_reduce_dispatch_storage(task)||!single_output_eval_layout(rank,1,tracer,&task,common))return false;
++  CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
++  const size_t controls=sizeof(value)+sizeof(task)+sizeof(common)+sizeof(rank)+sizeof(columns)+sizeof(rows)+
++      sizeof(tracer)+sizeof(out)+sizeof(elements)+sizeof(bytes)+sizeof(std::pair<ArgReduce::ReduceType,int>)+
++      sizeof(size_t)*10+sizeof(bool)*2+sizeof(const array*)*2+sizeof(const ArgReduce*)+
++      sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
++      sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
++  if(!add(value.named_control_bytes,controls))return false;
++  out=value;return true;
++}
++bool squeeze_eval_layout(size_t rank,bool tracer,CopyEvalStorage& out) noexcept {
++  if(rank<1||rank>4)return false;
++  CopyEvalStorage value;
++  if(!copy_eval_layout(0,1,false,tracer,value))return false;
++  value.rank=rank;
++  const size_t controls=sizeof(value)+sizeof(rank)+sizeof(tracer)+sizeof(out)+sizeof(Strides)+sizeof(array::Flags)+
++      sizeof(const Shape*)+sizeof(int)*3+sizeof(size_t)*5+sizeof(const array*)*3+sizeof(const Squeeze*)+
++      sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
++      sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
++  if(!add(value.named_control_bytes,controls))return false;
++  out=value;return true;
++}
++bool greedy_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(!is_greedy_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=1)return false;
++  const auto& input=output.inputs()[0];const size_t rank=input.ndim();
++  if(rank<1||rank>4||!input.size()||!output.size())return false;
++  if(typeid(output.primitive())==typeid(ArgReduce)) {
++    const auto [kind,axis]=static_cast<const ArgReduce&>(output.primitive()).state();
++    if((kind!=ArgReduce::ArgMin&&kind!=ArgReduce::ArgMax)||axis<0||size_t(axis)>=rank||
++        input.dtype()!=float32||input.itemsize()!=sizeof(float)||output.dtype()!=uint32||
++        output.itemsize()!=sizeof(uint32_t)||output.ndim()!=rank)return false;
++    if(input.strides().size()!=rank)return false;
++    size_t rows=1,span=1,delta=0,bytes=0;
++    for(size_t i=0;i!=rank;++i) {
++      if(input.shape(i)<=0||input.strides()[i]<0||output.shape(i)!=(i==size_t(axis)?1:input.shape(i)))return false;
++      if(!product(size_t(input.shape(i)-1),size_t(input.strides()[i]),delta)||
++          delta>size_t(PTRDIFF_MAX)-span)return false;
++      span+=delta;
++      if(i!=size_t(axis)&&!product(rows,size_t(input.shape(i)),rows))return false;
++    }
++    if(rows!=output.size()||span>input.data_size()||!product(span,sizeof(float),bytes))return false;
++    return arg_reduce_eval_layout(rank,size_t(input.shape(axis)),rows,output.is_tracer(),out);
++  }
++  const auto& axes=static_cast<const Squeeze&>(output.primitive()).axes_ref();
++  if(axes.empty()||axes.size()>rank||output.ndim()!=rank-axes.size()||input.dtype()!=output.dtype()||
++      input.dtype()!=uint32||input.itemsize()!=sizeof(uint32_t)||output.itemsize()!=sizeof(uint32_t)||input.size()!=output.size())return false;
++  size_t selected=0,target=0;
++  for(size_t i=0;i!=rank;++i) {
++    if(input.shape(i)<=0)return false;
++    if(selected<axes.size()&&axes[selected]==int(i)) {
++      if(input.shape(i)!=1)return false;++selected;
++    } else {
++      if(target>=output.ndim()||output.shape(target++)!=input.shape(i))return false;
++    }
++  }
++  if(selected!=axes.size())return false;
++  return squeeze_eval_layout(rank,output.is_tracer(),out);
++}
++}
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_greedy_eval(const FixedEvalPrologueGuard& guard,GraphConstruction*& out) noexcept {
++  auto& record=guard.record();auto* graph=record.graph_quota();auto context=current_graph_construction_context();
++  if(out||!graph||!guard.cpu()||!context.scope||context.worker||context.dispatch!=&record||current_graph_quota()!=graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if(!cpu::greedy_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
++}
++}
+diff --git a/mlx/backend/cpu/greedy_storage.h b/mlx/backend/cpu/greedy_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/greedy_storage.h
+@@ -0,0 +1,9 @@
++#pragma once
++#include "mlx/backend/cpu/copy_storage.h"
++namespace mlx::core::cpu {
++MLX_API bool arg_reduce_dispatch_storage(EvalDispatchStorage&) noexcept;
++MLX_API bool arg_reduce_eval_layout(size_t rank,size_t columns,size_t rows,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool squeeze_eval_layout(size_t rank,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool is_greedy_eval_primitive(const array&) noexcept;
++MLX_API bool greedy_eval_storage(const array&,CopyEvalStorage&) noexcept;
++}
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -164,6 +164,7 @@
+   static GraphFailure create_cpu_cleanup(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_argpartition(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_greedy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_softmax_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_slice_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_copy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -2411,6 +2411,7 @@
+ 
+   static Shape output_shape(const array& input, const std::vector<int>& axes);
+   static Shape output_shape_owned(const array& input, const Shape& axes);
++  const Shape& axes_ref() const noexcept { return axes_; }
+   auto state() const {
+     return std::vector<int>(axes_.begin(), axes_.end());
+   };

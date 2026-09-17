@@ -59,6 +59,18 @@ pub struct RuntimeCallGuard {
 }
 
 impl RuntimeCallGuard {
+    /// Borrows exact array descriptor facts under this already-retained runtime
+    /// owner. This neither acquires another guard nor changes its depth, deadline
+    /// or retirement. The mutable borrow prevents constructing a loan from a
+    /// shared guard reference on a foreign thread. Native read/fill and the
+    /// returned borrow's drop allocate no storage; this outer owner's acquisition/final unlock remains ordinary.
+    pub fn descriptor<'loan>(
+        &'loan mut self,
+        source: &'loan crate::Array,
+    ) -> Result<crate::ArrayDescriptorLoan<'loan>, crate::ArrayDescriptorError> {
+        crate::ArrayDescriptorLoan::under_guard(source, &self._guard)
+    }
+
     /// Rechecks the retained setup deadline immediately before native mutation.
     pub fn check(&self) -> Result<(), Exception> {
         self.deadline.check()

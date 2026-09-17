@@ -144,7 +144,10 @@ impl MlxModelSession {
         );
         drop(session);
         let (prepared, estimate, epoch) = self.finish_parameter_control(&transport, result)?;
-        let payload = Rc::get_mut(&mut self.payload).expect("completed parameter transaction");
+        let payload = self
+            .payload
+            .get_mut()
+            .expect("completed parameter transaction");
         // Only completed peer publication invalidates reusable snapshots. These
         // final metadata changes cannot submit native work or fail semantically.
         payload.model.erased_mut().invalidate_parameter_snapshots();
@@ -262,7 +265,10 @@ impl MlxModelSession {
         );
         drop(session);
         let (_, epoch) = self.finish_parameter_control(&transport, result)?;
-        let payload = Rc::get_mut(&mut self.payload).expect("completed parameter restoration");
+        let payload = self
+            .payload
+            .get_mut()
+            .expect("completed parameter restoration");
         payload.model.erased_mut().invalidate_parameter_snapshots();
         let state = &mut payload.parameter_state;
         for parameter in &mut catalog.discovery.parameters {
@@ -323,7 +329,9 @@ impl MlxModelSession {
         #[cfg(test)]
         if !restore
             && std::mem::take(
-                &mut Rc::get_mut(&mut self.payload)
+                &mut self
+                    .payload
+                    .get_mut()
                     .expect("completed publication")
                     .parameter_state
                     .reject_publication,

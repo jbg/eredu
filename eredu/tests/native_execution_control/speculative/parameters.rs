@@ -93,22 +93,22 @@ pub(super) fn captures<B: eredu_core::SpeculativeGenerationBackend>(
     let output = if controlled {
         model
             .with_controlled_text_speculative(request(), options, |session| {
-                records.extend(session.step()?.unwrap().activations);
+                records.extend(session.step()?.unwrap().activations.iter().cloned());
                 let saved = session.snapshot()?;
                 let start = records.len();
                 while let Some(step) = session.step()? {
-                    records.extend(step.activations);
+                    records.extend(step.activations.iter().cloned());
                 }
                 let tokens = session.token_ids().to_vec();
                 session.restore(&saved)?;
                 let mut replay = Vec::new();
                 while let Some(step) = session.step()? {
-                    replay.extend(step.activations);
+                    replay.extend(step.activations.iter().cloned());
                 }
                 assert_eq!(session.token_ids(), tokens);
                 assert_eq!(replay.len(), records.len() - start);
                 for (a, b) in replay.iter().zip(&records[start..]) {
-                    assert_eq!(a.captures.records, b.captures.records);
+                    assert_eq!(a.captures.as_step().records, b.captures.as_step().records);
                     assert_eq!(a.admission_identity, b.admission_identity);
                 }
                 Ok(())
@@ -117,7 +117,7 @@ pub(super) fn captures<B: eredu_core::SpeculativeGenerationBackend>(
     } else {
         model
             .generate_observed_text_speculative(request(), options, |step| {
-                records.extend(step.activations);
+                records.extend(step.activations.iter().cloned());
                 ControlFlow::Continue(())
             })
             .unwrap()
@@ -133,7 +133,7 @@ pub(super) fn captures<B: eredu_core::SpeculativeGenerationBackend>(
         output.token_ids().to_vec(),
         records
             .into_iter()
-            .map(|r| (r.phase, r.captures.records))
+            .map(|r| (r.phase, r.captures.into_legacy().unwrap().records))
             .collect(),
     )
 }

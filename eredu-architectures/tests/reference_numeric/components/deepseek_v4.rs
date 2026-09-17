@@ -707,6 +707,9 @@ fn v4_partition_readout_matches_resident_across_cuts_providers_and_embedding_int
                                 )
                                 .unwrap()
                             {
+                                LayeredPartitionOutput::StateOnly { .. } => {
+                                    panic!("sequence readout omitted scores")
+                                }
                                 LayeredPartitionOutput::Boundary { hidden, auxiliary } => {
                                     assert_eq!(stage, 0);
                                     boundary = Some((hidden, auxiliary));
@@ -801,9 +804,13 @@ fn v4_custom_plain_executor_preserves_outer_boundary_capture() {
         for seam in ["input", "output"] {
             let path = format!("layers.{layer}.{seam}");
             assert_eq!(capture.values[&path].shape, [1, 3, 2, 4]);
-            // Generic outer hooks expose the original unit boundary. Detailed
-            // effective companions belong to the architecture's observed call.
-            assert!(!capture.values.contains_key(&format!("{path}.effective")));
+            // A plain custom executor has no intervention, so shared outer
+            // hooks publish its unchanged consumed input and output exactly once.
+            assert_tensor_exact(
+                &capture.values[&path],
+                &capture.values[&format!("{path}.effective")],
+                "plain custom executor effective boundary",
+            );
         }
     }
 }

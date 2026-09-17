@@ -1,0 +1,116 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted prediction-layer snapshot context and native cache ownership",
+  "source_sha256": {
+    "eredu-backend-mlx/src/backend/managed_memory.rs": "e506682d21bcc6e581c0cb515b0ffb26f046519869a2049221da240cab8fe785",
+    "eredu-backend-mlx/src/composition/mlx/prepared_speculative.rs": "945a473cacc18d8f60ca647a578214153ec84f62258a89127fb1557efb4b8cd9",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction.rs": "95e277637d8d2d83643a288e020a0b5809821d2029760e23ec9a114f0d346d0c",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction/parameters.rs": "828abd8bbbcb7a272711bffb8e0a2c5aac84924730f62c39e6df61d853dd5de3",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction/parameters/storage_tests.rs": "adae24afe599b68f7b7fa1ab5c3f9f82e40650715984b974827c7eeeacdbfbd3",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction/owned_cache.rs": "ebc4e0b8c6dec6a8a49c7408c37570437bfcffa2d539a4af1dbe6a0bc3daecb1",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction/owned_cache/tests.rs": "df48e8b7cc62182a87baea3614ebb3fbb731ffa3281a8f8feaf9ac4769e9ea50",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction/snapshot.rs": "c4e008bd260bea3a55e7fccdf85ea3d92be550d9b3157eafc48a363b629c86c8",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction/memory_tests.rs": "3e2849b4d313bf0cdd448c60f867511052a2e7a67e7aa82c98879d32cce86154",
+    "eredu-architectures/src/prediction_extension.rs": "48e8a078a39bbd0365f0c5bbf8fa57d90ad787a5fe7141fabca175bda98f5c1c",
+    "eredu-architectures/src/speculative_execution.rs": "6f52da1df2f797ab22aa2240c77d135e64580b5f68c9ee30ffc7cd9cf88c8644",
+    "eredu-architectures/tests/reference_numeric.rs": "66b7f04a5a5d97f65bbf17d19eb0e0ab7d2086be1d8696d9fbc9d87d9db30870",
+    "eredu-architectures/tests/reference_numeric/prediction_adapter.rs": "ca8941de43471ac0ac787bc917a3842dcb1ae677b6f12a65dd623a1ebb8d8261",
+    "eredu-architectures/tests/support/reference_composite.rs": "d0bd8a2318ef64ebbc4c1befc01ecf52183871633bcf050c2ba41ea74cb730f7",
+    "eredu-architectures/tests/reference_conformance.rs": "3a6ac0b85bf8b6d2afa9931c80775ac8c7c8ebd16fcb77464fadb4b6dfd1fdd1",
+    "doc/backend-architecture.md": "490b063cabede1cae049184a714af800f6a4219a234f70574ed6aa4245306beb",
+    "doc/execution-control.md": "cb53335dd9371f19f8f3fc713b50d45dd1336e3f5fa0c9552fbf47c799365df0",
+    "doc/bounded-inference.md": "2abfef341673e48c6c5923ed484a807791f81dfc033475ed66b97e4624810a32"
+  },
+  "prior_ownership_record": "doc/validation/bounded-speculative-memory-2026-09-13.json",
+  "coverage": {
+    "native_tests": 136,
+    "portable_facade_and_backend_tests": 111,
+    "neutral_production_aggregate_cases": 1,
+    "new_native_tests": 8,
+    "new_neutral_behavior_cases": 1,
+    "remaining_ignored_native_tests": 12,
+    "ignored_portable_fixture_tests": 1,
+    "new_peak_measurements": 0
+  },
+  "behavior": [
+    "PredictionExtensionMaterializer declares a borrowed SnapshotContext distinct from materialization and tensor equation contexts. Every executor forwards it through target-plus-prediction and prediction-only durable copies.",
+    "MLX prediction snapshot context preserves the exact managed domain. Each resident sequential or pooling snapshot acquires independent authority before settling or copying native work, including empty caches.",
+    "Opaque OwnedPredictionCache retains authority after its payload. Clone/checkpoint preserve it; clone_from and restore merge both histories before partial mutation or failure; clear does not release authority.",
+    "Completed independent native backing retains a shared payload-free authority list. CPU and Metal tests verify nonzero sequential latent/rotary values, local and both pooling streams, overlap frontiers, distinct allocation identities and strided raw-alias lifetime.",
+    "Copy estimates include the wrapper, shared allocation-sidecar payload and a separate temporary recovery list. Sharing the sidecar list avoids owner-history vector growth once per copied array.",
+    "Model-profile prediction snapshots reuse the target-state copying mechanism and neutral state retention. Active destination reservations reject sequential, pooling and model-profile copies before mutation; another domain remains usable.",
+    "The neutral production harness verifies marker context through target and every sequential/pooling prediction member, prediction-only copy, and missing-target short-circuit behavior alongside existing numeric speculative production scenarios."
+  ],
+  "limits": [
+    "Strict native managed budgets still reject UnknownBound. This increment does not complete native peak quotes, model/state promotion or successful quoted-copy admission.",
+    "The layer-wrapper path covers resident sequential and pooling caches created by the materializer. Sealed paging-manager arrays are outside its retained-array attachment set and need their enclosing inventory/lifetime integration.",
+    "Standalone speculative logits/capture/distribution ownership, exact decoder-state overlap, complete paging/materialization/media/observation accounting and rank-coordinated native admission remain outstanding.",
+    "Twelve tests stayed ignored after explicitly running Metal prediction completion. Five scheduler tests passed in the preceding speculative-memory record; five activation/component and two multiprocess ring tests were not newly run here.",
+    "One portable tokenizer/template fixture remains ignored because EREDU_LFM2_TOOL_CHECKPOINT was unset.",
+    "The estimates here price logical payload storage, not total allocator or registry bookkeeping. No new released-checkpoint reference or memory-peak measurement is claimed.",
+    "Final feature check retains existing unused-helper warnings; native linking retains the existing large unwind-table warning."
+  ],
+  "corrected_validation_findings": [
+    "Rust required the projection method input and output to retain associated-type projections for consistent lifetime binding. Repeating where bounds alone did not resolve E0195; a standalone rustc reproduction confirmed the minimal fix.",
+    "Native compilation required the existing pooling storage fixture to wrap its cache, and a new stream fixture to borrow its Device.",
+    "Review found cloning the full ownership list separately onto every copied array could outgrow the newly priced metadata. Array attachments now share one Arc-held list, and estimates include retained and temporary list payloads.",
+    "The portable sampler fixture needed separate context-family selection for external unit contexts and the embedded resource bundle. The new behavioral case is explicitly called by the unified production harness."
+  ],
+  "checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1 replicated_text::prediction speculative native_control native_preparation managed_memory recovery_tests",
+      "exit_code": 0,
+      "suites": [
+        135
+      ],
+      "passed": 135,
+      "ignored": 13,
+      "log": "/private/tmp/eredu-prediction-snapshot-native-verified.log",
+      "sha256": "0267f27575bb3230810f41fad5175ba6ab4d6a0d01e298bef0c11fc6db8737bc"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --ignored --test-threads=1 replicated_text::prediction::completion_tests",
+      "exit_code": 0,
+      "suites": [
+        1
+      ],
+      "passed": 1,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-prediction-snapshot-metal-completion.log",
+      "sha256": "fdf16717febbaa7c6ca0966fa78dd690477a85d4cf6f661e48f5cf3329b7e63b"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_conformance speculative_production",
+      "exit_code": 0,
+      "suites": [
+        1
+      ],
+      "passed": 1,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-prediction-snapshot-reference-verified.log",
+      "sha256": "b49e33e64528a79c1246718497cafc343d3c26f5a0fa80f76343d99e9d6ae274"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal,image,audio",
+      "exit_code": 0,
+      "suites": [],
+      "passed": null,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-prediction-snapshot-features-final.log",
+      "sha256": "f26375d862d065db74d6b29507d7fb3707f8fdb678d29c5f3320caef7c639294"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "exit_code": 0,
+      "suites": [
+        92,
+        19
+      ],
+      "passed": 111,
+      "ignored": 1,
+      "log": "/private/tmp/eredu-prediction-snapshot-portable.log",
+      "sha256": "284a227b790a8e391c2427b638aac2b11a56bf4cbbfa155b909818eca817bf3f"
+    }
+  ]
+}

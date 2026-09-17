@@ -1,14 +1,17 @@
 //! MLX routed-expert mechanisms shared by distributed composition.
 
-use eredu_runtime::ExpertRouteTensorMovement;
+use eredu_runtime::{ExpertRouteTensorMovement, PreparedExpertMovementLoan, ExpertRouteMovementSourceError};
+use crate::backend::runtime::distributed::topology::original_source::control::OriginalExpertMovementSource;
 use safemlx::{ops::zeros_dtype, Array, Stream};
 
 use crate::{backend::error::Error, MlxTensor};
+use crate::backend::nn::expert_movement;
 
 /// MLX arbitrary-row movement for architecture-owned expert exchange.
 #[derive(Debug, Clone)]
 pub(crate) struct MlxExpertRouteTensorMovement {
     stream: Stream,
+    source: Option<OriginalExpertMovementSource>,
 }
 
 impl MlxExpertRouteTensorMovement {
@@ -16,10 +19,23 @@ impl MlxExpertRouteTensorMovement {
     pub(crate) fn new(stream: &Stream) -> Self {
         Self {
             stream: stream.clone(),
+            source: None,
         }
     }
 
+    fn destination<T>(&self, count: usize) -> Result<Vec<T>, Error> {
+        if let Some(source) = &self.source { return source.destination(count, &self.stream); }
+        let mut value = Vec::new();
+        value.try_reserve_exact(count).map_err(|cause| Error::ArchitectureModel(cause.to_string()))?;
+        Ok(value)
+    }
+    fn add_rows(&self,base:&MlxTensor,rows:&[usize],updates:&MlxTensor)->Result<MlxTensor,Error> {
+        if let Some(source)=&self.source {return source.add(base,rows,updates,&self.stream);}
+        let indices=MlxTensor::from_array(self.indices(rows,true)?);
+        expert_movement::add(&expert_movement::Native(&self.stream),base,&indices,updates).map_err(Error::Neural)
+    }
     fn indices(&self, values: &[usize], trailing_axis: bool) -> Result<Array, Error> {
+        if let Some(source) = &self.source { return source.indices(values, trailing_axis, &self.stream); }
         let values = values
             .iter()
             .copied()
@@ -46,6 +62,45 @@ impl MlxExpertRouteTensorMovement {
 impl ExpertRouteTensorMovement<MlxTensor> for MlxExpertRouteTensorMovement {
     type Error = Error;
 
+    fn with_prepared_region<R, E, F>(&mut self, source: Option<PreparedExpertMovementLoan<'_>>, run: F)
+        -> Result<Result<R, E>, ExpertRouteMovementSourceError<Error>>
+    where F: FnOnce(&mut Self) -> Result<R, E> {
+        let source = source.map(|source| OriginalExpertMovementSource::from_loan(source, &self.stream))
+            .transpose().map_err(ExpertRouteMovementSourceError::Backend)?;
+        if self.source.is_some() {
+            return Err(ExpertRouteMovementSourceError::Backend(Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch)));
+        }
+        struct Loan<'a> { worker: &'a mut MlxExpertRouteTensorMovement, previous: Option<OriginalExpertMovementSource> }
+        impl Drop for Loan<'_> { fn drop(&mut self) { self.worker.source = self.previous.take(); } }
+        if let Some(source) = &source {
+            source.reserve_call::<(R, E, F, Loan<'_>)>(&self.stream).map_err(ExpertRouteMovementSourceError::Backend)?;
+        }
+        let previous = std::mem::replace(&mut self.source, source);
+        let loan = Loan { worker: self, previous };
+        Ok(run(loan.worker))
+    }
+    fn validate_population(&self,population:eredu_nn::workspace::WorkspaceExpertMovementPopulation,
+        transfers:eredu_nn::workspace::WorkspaceExpertTransfers)->Result<(),Error> {
+        if let Some(source)=&self.source {source.validate_population(population,transfers,&self.stream)?;}
+        Ok(())
+    }
+    fn index_directory(&self, count: usize) -> Result<Vec<usize>, Error> {
+        if let Some(source) = &self.source {
+            // Fixed shared order builder and iterative heap-sort controls.
+            source.reserve_call::<([usize; 12], [Vec<usize>; 2], &[usize])>(&self.stream)?;
+        }
+        self.destination(count)
+    }
+    fn checked_shape(&self, value: &MlxTensor) -> Result<Vec<usize>, Error> {
+        let mut shape = self.destination(value.as_array().ndim())?;
+        for &dimension in value.as_array().shape() {
+            shape.push(usize::try_from(dimension).map_err(|_| Error::PrefillControl(
+                eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?);
+        }
+        Ok(shape)
+    }
+
     fn shape(&self, value: &MlxTensor) -> Vec<usize> {
         value
             .as_array()
@@ -65,12 +120,9 @@ impl ExpertRouteTensorMovement<MlxTensor> for MlxExpertRouteTensorMovement {
                 "expert route row gather exceeds rank-two input geometry".into(),
             ));
         }
-        let rows = self.indices(rows, false)?;
-        value
-            .as_array()
-            .take_axis(&rows, 0, &self.stream)
-            .map(MlxTensor::from_array)
-            .map_err(Into::into)
+        if let Some(source)=&self.source { return source.gather(value,rows,false,&self.stream); }
+        let rows = MlxTensor::from_array(self.indices(rows, false)?);
+        expert_movement::gather(&expert_movement::Native(&self.stream), value, &rows, false).map_err(Error::Neural)
     }
 
     fn gather_route_values(
@@ -87,17 +139,9 @@ impl ExpertRouteTensorMovement<MlxTensor> for MlxExpertRouteTensorMovement {
                 "expert route value gather exceeds rank-two selection geometry".into(),
             ));
         }
-        let positions = self.indices(flattened_routes, false)?;
-        let rows = i32::try_from(flattened_routes.len()).map_err(|_| {
-            Error::ArchitectureModel("expert route count exceeds MLX i32 geometry".into())
-        })?;
-        value
-            .as_array()
-            .reshape(&[-1], &self.stream)?
-            .take_axis(&positions, 0, &self.stream)?
-            .reshape(&[rows, 1], &self.stream)
-            .map(MlxTensor::from_array)
-            .map_err(Into::into)
+        if let Some(source)=&self.source { return source.gather(value,flattened_routes,true,&self.stream); }
+        let positions = MlxTensor::from_array(self.indices(flattened_routes, false)?);
+        expert_movement::gather(&expert_movement::Native(&self.stream), value, &positions, true).map_err(Error::Neural)
     }
 
     fn scatter_add_rows(
@@ -118,41 +162,38 @@ impl ExpertRouteTensorMovement<MlxTensor> for MlxExpertRouteTensorMovement {
         let output_rows = i32::try_from(output_rows).map_err(|_| {
             Error::ArchitectureModel("expert route output rows exceed MLX i32 geometry".into())
         })?;
-        let mut output = zeros_dtype(
-            &[output_rows, value.as_array().dim(1)],
-            value.as_array().dtype(),
-            &self.stream,
-        )?;
+        let mut output = match &self.source {
+            Some(source)=>source.zeros(&value,output_rows,&self.stream)?,
+            None=>expert_movement::zeros(&expert_movement::Native(&self.stream), &value, output_rows).map_err(Error::Neural)?,
+        };
         if reduction == eredu_nn::GroupReduction::SequentialGroupOrder {
             // Each wave has at most one contribution per destination. Keeping
             // additions in separate operations preserves rounding after every
             // contribution without serializing unrelated source rows.
-            let mut counts = vec![0usize; output_rows as usize];
-            let mut waves = Vec::<Vec<usize>>::new();
+            let mut counts = self.destination(output_rows as usize)?;
+            counts.resize(output_rows as usize, 0usize);
+            for &destination in destination_rows { counts[destination] += 1; }
+            let wave_count = counts.iter().copied().max().unwrap_or(0);
+            let mut wave_lengths = self.destination(wave_count)?;
+            wave_lengths.resize(wave_count, 0usize);
+            for &count in &counts { for length in &mut wave_lengths[..count] { *length += 1; } }
+            let mut waves = self.destination::<Vec<usize>>(wave_count)?;
+            for count in wave_lengths { waves.push(self.destination(count)?); }
+            counts.fill(0);
             for (row, &destination) in destination_rows.iter().enumerate() {
                 let wave = counts[destination];
-                if wave == waves.len() {
-                    waves.push(Vec::new());
-                }
                 waves[wave].push(row);
                 counts[destination] += 1;
             }
             for rows in waves {
-                let destinations = rows
-                    .iter()
-                    .map(|row| destination_rows[*row])
-                    .collect::<Vec<_>>();
-                let indices = self.indices(&destinations, true)?;
+                let mut destinations = self.destination(rows.len())?;
+                destinations.extend(rows.iter().map(|row| destination_rows[*row]));
                 let selected = self.gather_rows(&value, &rows)?;
-                output = output.scatter_add(&indices, selected.as_array(), 0, &self.stream)?;
+                output = self.add_rows(&output,&destinations,&selected)?;
             }
-            return Ok(MlxTensor::from_array(output));
+            return Ok(output);
         }
-        let indices = self.indices(destination_rows, true)?;
-        output
-            .scatter_add(&indices, value.as_array(), 0, &self.stream)
-            .map(MlxTensor::from_array)
-            .map_err(Into::into)
+        self.add_rows(&output,destination_rows,&value)
     }
 }
 

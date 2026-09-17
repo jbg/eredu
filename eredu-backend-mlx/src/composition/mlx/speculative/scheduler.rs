@@ -3,37 +3,37 @@
 use std::{cell::Cell, marker::PhantomData, rc::Rc, time::Duration};
 
 #[cfg(test)]
-use eredu_core::generation::SpeculativeRequestStatus;
-#[cfg(test)]
 use eredu_core::BoundedCompletion;
 #[cfg(test)]
-use eredu_core::{
-    resolve_optimistic_branch, SpeculativeDraftBlock, SpeculativeExecutionTopology,
-    SpeculativeOptimisticBranch, SpeculativeProposal,
-};
+use eredu_core::generation::SpeculativeRequestStatus;
 #[cfg(test)]
 use eredu_core::{
     SpeculativeCallbackPublisher, SpeculativeDriverError, SpeculativeOutputError,
     SpeculativeOutputRuntime, SpeculativeSampling, SpeculativeSemanticConstraint,
     SpeculativeSemanticState,
 };
+#[cfg(test)]
+use eredu_core::{
+    SpeculativeDraftBlock, SpeculativeExecutionTopology, SpeculativeOptimisticBranch,
+    SpeculativeProposal, resolve_optimistic_branch,
+};
 use eredu_core::{SpeculativeExecutor, SpeculativeStats, SpeculativeTelemetry};
 #[cfg(test)]
 use eredu_core::{SpeculativeRequestTable, SpeculativeSchedulerStats};
-use safemlx::{error::Exception, Array};
+use safemlx::{Array, error::Exception};
 #[cfg(test)]
-use safemlx::{ops::indexing::TryIndexOp, transforms::async_eval_with_event, Stream};
+use safemlx::{Stream, ops::indexing::TryIndexOp, transforms::async_eval_with_event};
 
 use crate::composition::mlx::{
-    speculative::{MlxSpeculativeCompletion, SpeculativeExecutionStreams},
     MlxModelInput,
+    speculative::{MlxSpeculativeCompletion, SpeculativeExecutionStreams},
 };
 #[cfg(test)]
 use crate::{
+    MlxTensor,
     backend::runtime::generation::MlxSamplingBackend,
     backend::runtime::media::input::{InputPayload, ModelInput},
     composition::mlx::speculative::MlxSpeculativeSampling,
-    MlxTensor,
 };
 #[cfg(test)]
 use eredu_core::generation::{
@@ -41,7 +41,7 @@ use eredu_core::generation::{
     SpeculativeConfig, SpeculativeSchedulerOptions,
 };
 #[cfg(test)]
-use eredu_core::{generation::SpeculativeRequestId, InputModality};
+use eredu_core::{InputModality, generation::SpeculativeRequestId};
 #[cfg(test)]
 use eredu_runtime::SpeculativeSampler;
 
@@ -118,11 +118,8 @@ impl SpeculativeTelemetry for SpeculativeComponentTimings {
 pub trait MlxSpeculativeRuntime<'a>:
     SpeculativeExecutor<
         Input = MlxModelInput,
-        Logits = Array,
         Context<'a> = SpeculativeExecutionStreams<'a>,
-        Completion = MlxSpeculativeCompletion,
         Telemetry = SpeculativeComponentTimings,
-        Error = Exception,
     > + 'a
 {
 }
@@ -130,11 +127,8 @@ pub trait MlxSpeculativeRuntime<'a>:
 impl<'a, T> MlxSpeculativeRuntime<'a> for T where
     T: SpeculativeExecutor<
             Input = MlxModelInput,
-            Logits = Array,
             Context<'a> = SpeculativeExecutionStreams<'a>,
-            Completion = MlxSpeculativeCompletion,
             Telemetry = SpeculativeComponentTimings,
-            Error = Exception,
         > + 'a
 {
 }
@@ -171,7 +165,7 @@ where
 fn semantic_runtime<'a, S, F>(
     sampler: S,
     config: &SpeculativeConfig,
-    semantic: Box<dyn SpeculativeSemanticState>,
+    semantic: impl Into<eredu_core::SpeculativeSemanticOwner>,
     cancellation: GenerationCancellationToken,
     on_event: F,
 ) -> CommittedOutputRuntime<'a, S>
@@ -223,7 +217,7 @@ pub struct SpeculativeScheduleOutput<S> {
 #[cfg(test)]
 struct MlxSpeculativeScheduler<'a, B, S>
 where
-    B: MlxSpeculativeRuntime<'a>,
+    B: MlxSpeculativeRuntime<'a, Logits = Array, Error = Exception, Completion = MlxSpeculativeCompletion>,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'a,
 {
     backend: &'a mut B,
@@ -235,7 +229,7 @@ where
 #[cfg(test)]
 impl<'a, B, S> MlxSpeculativeScheduler<'a, B, S>
 where
-    B: MlxSpeculativeRuntime<'a>,
+    B: MlxSpeculativeRuntime<'a, Logits = Array, Error = Exception, Completion = MlxSpeculativeCompletion>,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'a,
 {
     /// Creates a scheduler over shared model parameters and explicit streams.
@@ -293,7 +287,7 @@ where
         config: SpeculativeConfig,
         prng_key: Option<Array>,
         sampler: S,
-        semantic: Box<dyn SpeculativeSemanticState>,
+        semantic: impl Into<eredu_core::SpeculativeSemanticOwner>,
         on_event: F,
     ) -> Result<SpeculativeRequestId, Exception>
     where
@@ -320,7 +314,7 @@ where
         config: SpeculativeConfig,
         prng_key: Option<Array>,
         sampler: S,
-        semantic: Box<dyn SpeculativeSemanticState>,
+        semantic: impl Into<eredu_core::SpeculativeSemanticOwner>,
         cancellation: GenerationCancellationToken,
         on_event: F,
     ) -> Result<SpeculativeRequestId, Exception>
@@ -345,7 +339,7 @@ where
         validate_input(input)?;
         let input = MlxModelInput::from(input);
         let randomness = <MlxSpeculativeSampling<S> as SpeculativeSampling>::initialize_randomness(
-            prng_key,
+            prng_key.map(MlxSpeculativeSampling::<S>::seed_from_array),
             config.temperature,
             self.streams,
         )?;
@@ -408,7 +402,10 @@ where
                 .into_iter()
                 .map(|request| {
                     let mut request = request.into_artifact();
-                    let token_ids = request.take_token_ids();
+                    let token_ids = request
+                        .take_token_ids()
+                        .try_into_ordinary()
+                        .expect("ordinary test scheduler");
                     let stats = request.take_stats();
                     let finish_reason = request.finish_reason();
                     #[cfg(test)]
@@ -445,7 +442,7 @@ fn generate<'runtime, B, S>(
     stream: &'runtime Stream,
 ) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
-    B: MlxSpeculativeRuntime<'runtime>,
+    B: MlxSpeculativeRuntime<'runtime, Logits = Array, Error = Exception, Completion = MlxSpeculativeCompletion>,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'runtime,
 {
     generate_with_streams(
@@ -470,7 +467,7 @@ fn generate_with_streams<'runtime, B, S>(
     streams: SpeculativeExecutionStreams<'runtime>,
 ) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
-    B: MlxSpeculativeRuntime<'runtime>,
+    B: MlxSpeculativeRuntime<'runtime, Logits = Array, Error = Exception, Completion = MlxSpeculativeCompletion>,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'runtime,
 {
     generate_tokens(
@@ -502,13 +499,13 @@ fn generate_tokens<'runtime, B, S, F>(
     on_token: F,
 ) -> Result<(Vec<u32>, SpeculativeStats), Exception>
 where
-    B: MlxSpeculativeRuntime<'runtime>,
+    B: MlxSpeculativeRuntime<'runtime, Logits = Array, Error = Exception, Completion = MlxSpeculativeCompletion>,
     S: SpeculativeSampler<MlxSamplingBackend> + Clone + 'runtime,
     F: FnMut(&[u32]) -> Result<(), Exception> + 'runtime,
 {
     validate_input(input)?;
     let randomness = <MlxSpeculativeSampling<S> as SpeculativeSampling>::initialize_randomness(
-        prng_key,
+        prng_key.map(MlxSpeculativeSampling::<S>::seed_from_array),
         config.temperature,
         streams,
     )?;
@@ -538,7 +535,10 @@ where
         .pop()
         .expect("one request was submitted")
         .into_artifact();
-    let token_ids = request.take_token_ids();
+    let token_ids = request
+        .take_token_ids()
+        .try_into_ordinary()
+        .expect("ordinary test scheduler");
     let stats = request.take_stats();
     *sampler = request.into_sampler().into_inner();
     Ok((token_ids, stats))

@@ -63,6 +63,58 @@ fn entries() -> Vec<ParameterBankEntry> {
 }
 
 #[test]
+fn retained_bank_storage_counts_shared_replacements_without_materialization() {
+    let (dir, store) = fixture();
+    let pool = SharedAddressableParameterBank::new(
+        AddressableParameterBank::new(
+            store,
+            entries(),
+            ParameterBankOptions::new(OffloadConfig::new(Some(64), Some(64), 1).unwrap(), 64, 64)
+                .unwrap(),
+            stream(),
+            stream(),
+        )
+        .unwrap(),
+    );
+    let scope = pool.scoped(0).unwrap();
+    let before = pool
+        .retained_storage()
+        .unwrap()
+        .byte_bound()
+        .unwrap()
+        .unwrap();
+    let value = Array::from_slice(&[1.25f32, -2.5], &[1, 2]);
+    let bytes = value.allocation_info().unwrap().unwrap().bytes() as u64;
+    pool.inner
+        .lock()
+        .unwrap()
+        .parameter_replacements
+        .insert("weight".into(), MlxTensor::from_array(value.clone()));
+    std::fs::remove_file(dir.path().join("model.safetensors")).unwrap();
+    let mut retained = scope.retained_storage().unwrap();
+    retained.merge(pool.retained_storage().unwrap()).unwrap();
+    retained.include_array(&value).unwrap();
+    assert_eq!(retained.byte_bound().unwrap(), Some(before + bytes));
+    let lazy = value.square(&stream()).unwrap();
+    pool.inner
+        .lock()
+        .unwrap()
+        .parameter_replacements
+        .insert("weight".into(), MlxTensor::from_array(lazy.clone()));
+    assert_eq!(
+        scope.retained_storage().unwrap().byte_bound().unwrap(),
+        None
+    );
+    assert_eq!(
+        lazy.allocation_info().unwrap(),
+        None,
+        "inspection must not evaluate replacements"
+    );
+    drop((pool, scope));
+    assert_eq!(retained.byte_bound().unwrap(), Some(before + bytes));
+}
+
+#[test]
 fn independent_bank_scopes_share_one_budget_and_reacquire_exact_companions() {
     let (_dir, store) = fixture();
     let execution = stream();
@@ -766,7 +818,7 @@ fn indexed_movement_validates_before_loading_and_bank_coalesces_demand() {
     assert_eq!(acquired.demand(), &[2, 2]);
     drop(acquired);
 
-    let mut movement = MlxIndexedMovement;
+    let mut movement = MlxIndexedMovement::default();
     let invalid = MlxTensor::from_array(Array::from_slice(&[-1i32, 0], &[2]));
     assert!(matches!(
         movement.index_demands(&invalid, 3, &execution),

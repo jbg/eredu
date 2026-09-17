@@ -1,0 +1,170 @@
+diff --git a/mlx/array.h b/mlx/array.h
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -15,6 +15,32 @@
+ #include "mlx/small_vector.h"
+ 
+ namespace mlx::core {
++
++namespace detail {
++// Each counter issues nonzero generations once and remains exhausted at zero.
++// The production counter has one out-of-line owner, never a header/DSO singleton.
++class AllocationGenerationCounter {
++ public:
++  explicit AllocationGenerationCounter(uint64_t first = 1) : next_(first) {}
++  uint64_t next() noexcept {
++    auto value = next_.load(std::memory_order_relaxed);
++    while (value != 0) {
++      const auto successor = value == UINT64_MAX ? uint64_t{0} : value + 1;
++      if (next_.compare_exchange_weak(
++              value, successor, std::memory_order_relaxed)) {
++        return value;
++      }
++    }
++    return 0;
++  }
++ private:
++  std::atomic<uint64_t> next_;
++};
++} // namespace detail
++
++// Runtime-local generations are never recycled, including after backing frees.
++// Zero means exhausted: allocation remains usable but cannot be certified.
++MLX_API uint64_t next_allocation_generation() noexcept;
+ 
+ // Forward declaration
+ class Primitive;
+@@ -232,6 +258,7 @@
+   struct Data {
+     allocator::Buffer buffer;
+     Deleter d;
++    uint64_t allocation_generation;
+     // Opaque allocation owners do not replace the certified buffer/deleter.
+     // Mutation is serialized by the embedding runtime before exposing aliases.
+     // Members retire after the destructor frees native backing.
+@@ -241,15 +268,17 @@
+     std::atomic<size_t> recovery_pins{0};
+     std::atomic_flag recovery_pin_lock = ATOMIC_FLAG_INIT;
+     Data(allocator::Buffer buffer, Deleter d = allocator::free)
+-        : buffer(buffer), d(d) {}
++        : buffer(buffer), d(d), allocation_generation(next_allocation_generation()) {}
+     // Not copyable
+     Data(const Data& d) = delete;
+     Data& operator=(const Data& d) = delete;
+     Data(Data&& o)
+         : buffer(o.buffer),
+           d(o.d),
++          allocation_generation(o.allocation_generation),
+           allocation_owners(std::move(o.allocation_owners)) {
+       o.buffer = allocator::Buffer(nullptr);
++      o.allocation_generation = 0;
+       o.d = [](allocator::Buffer) {};
+     }
+     ~Data() {
+diff --git a/mlx/array.cpp b/mlx/array.cpp
+--- a/mlx/array.cpp
++++ b/mlx/array.cpp
+@@ -10,6 +10,11 @@
+ #include "mlx/transforms_impl.h"
+ 
+ namespace mlx::core {
++
++uint64_t next_allocation_generation() noexcept {
++  static detail::AllocationGenerationCounter generations;
++  return generations.next();
++}
+ 
+ array::array(const std::complex<float>& val, Dtype dtype /* = complex64 */)
+     : array_desc_(std::make_shared<ArrayDesc>(Shape{}, dtype)) {
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -21,7 +21,7 @@
+ 
+ /** Exact physical host-transfer owner, retained by a buffer or array. */
+ struct MLX_API HostTransferAllocationInfo {
+-  const void* identity;
++  uint64_t identity;
+   size_t capacity;
+ };
+ 
+@@ -91,10 +91,10 @@
+   size_t nbytes() const;
+   /** Complete charged backing-allocation extent. */
+   size_t capacity() const;
+-  /** Opaque physical owner identity, valid only while storage is retained. */
+-  const void* allocation_identity() const {
+-    return storage_.get();
+-  }
++  /** Non-reused runtime-local generation; zero means identity supply exhausted. */
++  uint64_t allocation_identity() const;
++  /** Retain directly on shared host storage without constructing an array. */
++  bool retain_allocation_owner(std::shared_ptr<void> owner) const;
+   HostTransferPolicy policy() const;
+   HostTransferStorageKind storage_kind() const;
+ 
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -78,7 +78,8 @@
+         storage_kind_(
+             allocator::allocator().host_transfer_storage_kind(policy)),
+         capacity_(allocator::allocator().host_transfer_allocation_bytes(
+-            buffer_, policy_)) {
++            buffer_, policy_)),
++        generation_(next_allocation_generation()) {
+     record_host_transfer_allocation(storage_kind_, capacity_);
+   }
+ 
+@@ -87,6 +88,9 @@
+     record_host_transfer_free(storage_kind_, capacity_);
+   }
+ 
++  uint64_t allocation_generation() const {
++    return generation_;
++  }
+   void retain_allocation_owner(std::shared_ptr<void> owner) {
+     allocation_owners_.push_back(std::move(owner));
+   }
+@@ -112,6 +116,7 @@
+   HostTransferPolicy policy_;
+   HostTransferStorageKind storage_kind_;
+   size_t capacity_;
++  uint64_t generation_;
+   // Released after free_host_transfer and the physical accounting update.
+   std::vector<std::shared_ptr<void>> allocation_owners_;
+ };
+@@ -141,11 +146,12 @@
+   }
+   const auto* retained = data->d.target<HostTransferArrayDeleter>();
+   if (!retained || !retained->owner ||
+-      data->buffer.ptr() != retained->owner->buffer().ptr()) {
++      data->buffer.ptr() != retained->owner->buffer().ptr() ||
++      retained->owner->allocation_generation() == 0) {
+     return std::nullopt;
+   }
+   return HostTransferAllocationInfo{
+-      retained->owner.get(), retained->owner->capacity()};
++      retained->owner->allocation_generation(), retained->owner->capacity()};
+ }
+ 
+ bool retain_host_transfer_allocation_owner(
+@@ -156,6 +162,18 @@
+   const auto* retained =
+       value.data_shared_ptr()->d.target<HostTransferArrayDeleter>();
+   retained->owner->retain_allocation_owner(std::move(owner));
++  return true;
++}
++
++uint64_t HostTransferBuffer::allocation_identity() const {
++  return storage_ ? storage_->allocation_generation() : 0;
++}
++
++bool HostTransferBuffer::retain_allocation_owner(std::shared_ptr<void> owner) const {
++  if (!storage_ || storage_->allocation_generation() == 0) {
++    return false;
++  }
++  storage_->retain_allocation_owner(std::move(owner));
+   return true;
+ }
+ 

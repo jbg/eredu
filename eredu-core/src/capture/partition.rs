@@ -2,6 +2,10 @@
 
 use super::{elements, CaptureError, ResolvedCaptureSlice};
 use crate::component::ComponentCoordinateMap;
+mod contiguous;
+mod coordinate_source;
+pub use coordinate_source::CaptureCoordinateProjectionPlan;
+pub use contiguous::{CaptureContiguousProjectionError, CaptureContiguousProjectionPlan};
 
 /// One native slice and its exact destination within the globally selected result.
 /// This geometry is not capture authority and cannot be deserialized as a proof.
@@ -67,165 +71,8 @@ impl CaptureSlicePartition {
         coordinates: &ComponentCoordinateMap,
         max_fragments: usize,
     ) -> Result<Self, CaptureError> {
-        let rank = global_shape.len();
-        if rank == 0
-            || rank > 32
-            || axis >= rank
-            || [
-                &global_slice.starts,
-                &global_slice.ends,
-                &global_slice.strides,
-                &global_slice.shape,
-            ]
-            .iter()
-            .any(|values| values.len() != rank)
-            || global_shape[axis]
-                != u64::try_from(coordinates.global_count()).map_err(|_| CaptureError::Overflow)?
-        {
-            return Err(CaptureError::Invalid(
-                "partition capture axis/rank differs from global geometry".into(),
-            ));
-        }
-        elements(global_shape)?;
-        for dimension in 0..rank {
-            let (start, end, stride) = (
-                global_slice.starts[dimension],
-                global_slice.ends[dimension],
-                global_slice.strides[dimension],
-            );
-            if start > end
-                || end > global_shape[dimension]
-                || stride == 0
-                || (end - start).div_ceil(stride) != global_slice.shape[dimension]
-            {
-                return Err(CaptureError::Invalid(
-                    "invalid global partition capture slice".into(),
-                ));
-            }
-        }
-        let mut local_shape = global_shape.to_vec();
-        local_shape[axis] =
-            u64::try_from(coordinates.local_count()).map_err(|_| CaptureError::Overflow)?;
-        let mut plan = Self {
-            global_shape: global_shape.to_vec(),
-            local_shape,
-            global_slice: global_slice.clone(),
-            axis,
-            fragments: Vec::new(),
-        };
-        if elements(&global_slice.shape)? == 0 {
-            return Ok(plan);
-        }
-        let (start, end, stride) = (
-            global_slice.starts[axis],
-            global_slice.ends[axis],
-            global_slice.strides[axis],
-        );
-        if let Some(range) = coordinates.contiguous_range() {
-            let shard_start = u64::try_from(range.start).map_err(|_| CaptureError::Overflow)?;
-            let shard_end = u64::try_from(range.end).map_err(|_| CaptureError::Overflow)?;
-            let lower = shard_start.max(start);
-            let upper = shard_end.min(end);
-            if lower >= upper {
-                return Ok(plan);
-            }
-            let first = (lower - start).div_ceil(stride);
-            if first >= global_slice.shape[axis] {
-                return Ok(plan);
-            }
-            let last = (upper - 1 - start) / stride;
-            if first > last {
-                return Ok(plan);
-            }
-            // The validated selection proves these products fit inside `end`.
-            let local_first = start + first * stride - shard_start;
-            let local_last = start + last * stride - shard_start;
-            plan.push(
-                local_first,
-                local_last,
-                stride,
-                first,
-                last,
-                1,
-                max_fragments,
-            )?;
-        } else {
-            // Coalesce positive arithmetic runs in local and destination order.
-            // Descending/permuted destinations stay separate instead of changing
-            // the meaning of global component IDs or exporting unrelated columns.
-            let mut run: Option<(u64, u64, u64, u64, u64, u64, usize)> = None;
-            for local in 0..coordinates.local_count() {
-                let global = u64::try_from(
-                    coordinates
-                        .local_to_global(local)
-                        .expect("validated coordinate map"),
-                )
-                .map_err(|_| CaptureError::Overflow)?;
-                if global < start || global >= end || !(global - start).is_multiple_of(stride) {
-                    continue;
-                }
-                let destination = (global - start) / stride;
-                let local = u64::try_from(local).map_err(|_| CaptureError::Overflow)?;
-                if let Some((
-                    first_local,
-                    last_local,
-                    local_step,
-                    first_destination,
-                    last_destination,
-                    destination_step,
-                    count,
-                )) = run
-                {
-                    if destination > last_destination
-                        && (count == 1
-                            || (local - last_local == local_step
-                                && destination - last_destination == destination_step))
-                    {
-                        run = Some((
-                            first_local,
-                            local,
-                            local - last_local,
-                            first_destination,
-                            destination,
-                            destination - last_destination,
-                            count + 1,
-                        ));
-                        continue;
-                    }
-                    plan.push(
-                        first_local,
-                        last_local,
-                        local_step,
-                        first_destination,
-                        last_destination,
-                        destination_step,
-                        max_fragments,
-                    )?;
-                }
-                run = Some((local, local, 1, destination, destination, 1, 1));
-            }
-            if let Some((
-                first_local,
-                last_local,
-                local_step,
-                first_destination,
-                last_destination,
-                destination_step,
-                _,
-            )) = run
-            {
-                plan.push(
-                    first_local,
-                    last_local,
-                    local_step,
-                    first_destination,
-                    last_destination,
-                    destination_step,
-                    max_fragments,
-                )?;
-            }
-        }
-        Ok(plan)
+        CaptureCoordinateProjectionPlan::prepare(global_shape,global_slice,axis,coordinates,max_fragments)
+            .map(|source|source.construct()).map_err(|cause|cause.legacy())
     }
 
     #[allow(clippy::too_many_arguments)]

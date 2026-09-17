@@ -269,3 +269,33 @@ fn v4_sequential_prediction_declares_separate_fusion_and_stream_readout() {
         }
     }
 }
+
+#[test]
+fn v4_owned_unit_catalog_preserves_stream_axes_without_generic_duplicates() {
+    let json = v4_prediction_config();
+    let prepared = crate::configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(&json)
+        .unwrap();
+    let plan = prepared.architecture_plan();
+    let graph = plan.architecture_descriptor();
+    let interventions = plan.intervention_points();
+    validate(&graph);
+    let mut streams = axes(8);
+    streams.insert(
+        2,
+        TensorAxis {
+            name: "stream".into(),
+            dimension: SymbolicDimension::Known(2),
+        },
+    );
+    for layer in 0..3 {
+        for boundary in ["input", "output"] {
+            assert_unit_boundary_pair(
+                &graph,
+                &interventions,
+                &format!("layers.{layer}.{boundary}"),
+                &streams,
+            );
+        }
+    }
+}

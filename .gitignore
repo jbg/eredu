@@ -5,3 +5,6 @@ __pycache__/
 /examples/eredu-ios/Build/
 /examples/eredu-ios/*.xcodeproj/
 /.native-build
+
+# Build output from standalone checks of vendored dependencies.
+/third-party/*/target/

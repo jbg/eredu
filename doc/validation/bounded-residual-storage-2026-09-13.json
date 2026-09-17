@@ -1,0 +1,287 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted identity-aware residual cached-resident admission and intrinsic registered-storage pin custody",
+  "source_sha256": {
+    "doc/backend-architecture.md": "dbd60aebe038939918ff0d770f15502feae01f518c45dd90120976b258165d24",
+    "doc/bounded-inference.md": "a670416f5c7fa6d2302b3ae0c454b3e7d4c4d59552694caca93f85ef1c3936aa",
+    "doc/execution-control.md": "8bba8eb47c07cb9bbc7c3f7d5dcf6e899363136cd27a011fdeac0c45c71883ec",
+    "eredu-architectures/src/prepared_execution/workspace.rs": "356e3d6ba01e8b9464d7ca20cebafc7743a4a665ba63c08fd00e8f1822d6c67f",
+    "eredu-backend-mlx/src/backend/nn/workspace.rs": "791167ad6bddfb85f0aa22938b7c31ce72c92ee5de188400551998304cac2112",
+    "eredu-backend-mlx/src/backend/nn/workspace/projection.rs": "f1bcca76f32ff27174656dfa6b07d13ed906798eddf99caa51c9dc64208abd6d",
+    "eredu-backend-mlx/src/backend/runtime/cache/kv/compressed/workspace.rs": "410516d1c1fac50b62c3fbc78b765bec1a2569cf6eb82e60d1becc6219ec2684",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid/workspace.rs": "6dfb867df92dc6fc201715f9fc050fc6d2d9a23991cd99d1241a856d817938c6",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid/workspace/tests.rs": "7438ec2f1af6306a121164089987d6cc37dea1a0f7b4beea38ceffd2c4d574eb",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/key_value/workspace.rs": "fee785b41b385f78b4fcec1871d259cc21702ac34df1ff21d8242237afb94abb",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/pooling/workspace.rs": "bde1a158f5092fe79018e84633d176cce55aa4241bafc2a1a8b5a86d0db65220",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/pooling/workspace/tests.rs": "0ab9a304f31a93f48200fa98c17779e5cf9b2c4e0a2527f0d58d96693f96192b",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage.rs": "1c0091deb697532acb4c2c6346e1bb3ce6d03d4d5b39c4a9d8c13f50bd365c0e",
+    "eredu-backend-mlx/src/backend/runtime/residency/storage/admission.rs": "22a338bc100c05d30851efd411c82d3e923b590b5a96d1fe490fcebcc7a328da",
+    "eredu-backend-mlx/src/composition/mlx/model.rs": "97c9c9afaa7506393b8daa97642565f9c323375ca11749f56c1cad6663c979b7",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction.rs": "dbd8ca17876d31526185bc57b7c932aadd99fe99f78c0fb065f9c0c5e06c3d58",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/composite.rs": "91fd64f36d3dae7468c986285c2f4aab280625f17687d805490c515325eecca0",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/replicated.rs": "5bc1bc306f724b0c9e57004187c5c68dc9d0435febc265660c660bc6e2bbae55",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/state.rs": "df6455dab8b050afb7c4171fe670e3e9d0f8312633e78a2e46742d0290ffc226",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote.rs": "27fe99e6b0652d355d1dd289114c360be55d742cc97022f7dfb17810031042cd",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_reuse_tests.rs": "23268e75bc2b429cef805b13802f01af76a32733b1835632e176af520b77cae7",
+    "eredu-core/src/capability.rs": "f3b711b9340febdc584f55934e881c49e947176fa521944fb7bd2a1ca33eef99",
+    "eredu-core/src/capability/incremental_tests.rs": "1a2245e6f5565a92e843b48dfa2c0800df0bc4f952462976a15c21be1bbddc29",
+    "eredu-core/src/lib.rs": "1e7db675435209e0e6844be9f2443644ad083e23be87f3cf28d50c106bbe2ac9",
+    "eredu-nn/src/workspace.rs": "57e6a6f1cea2537145b38457fadc195a43c7d96511f093a4de0cc9dbbc12a134",
+    "eredu-nn/src/workspace/borrowed_tests.rs": "ffbf7f72d3e1bc325f1cdb621526efa133952e50965b1239da65ee2b296f5dd0",
+    "eredu-nn/src/workspace/tensor.rs": "82480ca62744345d2f8ca2531d847f1f5f885d73229a1fe59a8434a09fa59ee7",
+    "eredu-runtime/src/working_memory.rs": "735fb411b64155b2673073e20b04752d6e9b08d29bfe03636200bb02d3a39e73",
+    "eredu-runtime/src/working_memory/funding.rs": "c1ba573b3ffe8a2cbc884581471d4189f73dce1fb76655bd5843344d3193d295",
+    "eredu-runtime/src/working_memory/funding/tests.rs": "2f8fee2497f556d36d65001b0dfd47dd095370e3d5960971f3be062d435d4ef5",
+    "eredu-runtime/src/working_memory/inference.rs": "9921f7725ec51d358c6358ded4127845484824e4629790dc33fb1bce50d386c7",
+    "eredu-runtime/src/working_memory/residual.rs": "daf0d3c9065cb68eba9effb1fa1b0a4ad1729828a5c906312ad3a5d70d28bc7e",
+    "eredu-runtime/src/working_memory/residual/tests.rs": "20f861c54869ca40d873677d3bad6cd156d05a90fb019671558d5e5e33ae609e",
+    "eredu-runtime/src/working_memory/storage.rs": "de90b3568bb4937c10e814a4b3f6afa70d1165f640a753610807da535eb1cf2d",
+    "eredu-runtime/src/working_memory/storage/pin_tests.rs": "3deeec72308221bc1dca80649d076dbf077b7c82d0d2e44073798e928d362347"
+  },
+  "prior_record": "doc/validation/bounded-funded-storage-2026-09-13.json",
+  "coverage": {
+    "rust_tests": 1317,
+    "by_suite": {
+      "core": 285,
+      "nn": 58,
+      "runtime": 750,
+      "native-projection": 8,
+      "native-final": 85,
+      "architecture-workspace": 13,
+      "architecture-prepared": 7,
+      "portable": 111,
+      "minimal-final": 0,
+      "features": 0
+    },
+    "ignored": 1,
+    "identity_aware_residual_quote": true,
+    "intrinsic_reservation_pin_custody": true,
+    "shared_facade_controller_storage": false,
+    "full_family_path_goal_complete": false,
+    "new_peak_measurements": 0,
+    "new_released_checkpoint_comparisons": 0,
+    "new_native_distributed_runs": 0
+  },
+  "neutral_replacement_fixture": {
+    "opening_A_bytes": 64,
+    "first_replacement_B_bytes": 16,
+    "later_replacement_C_bytes": 80,
+    "full_bound_bytes": 144,
+    "unsound_scalar_subtraction_bytes": 80,
+    "residual_bound_bytes": 96,
+    "admitted_capacity_bytes": 160,
+    "rejected_capacity_bytes": 159
+  },
+  "native_fixture": {
+    "architecture": "nonzero synthetic tiny Llama loaded through normal artifact preparation",
+    "hardware": "Apple arm64 host using native Metal execution and a CPU source stream",
+    "runs": [
+      {
+        "controlled": false,
+        "tokens_A": [
+          5,
+          5,
+          5
+        ],
+        "tokens_B": [
+          7,
+          7,
+          7
+        ],
+        "cached_positions": 7,
+        "final_position": 12,
+        "published_bytes": 43392,
+        "original_A": 212967,
+        "residual_B": 221371,
+        "retained_after_A": 780,
+        "retained_after_B": 1176,
+        "live_domain": 44568
+      },
+      {
+        "controlled": true,
+        "tokens_A": [
+          5,
+          5,
+          5
+        ],
+        "tokens_B": [
+          7,
+          7,
+          7
+        ],
+        "cached_positions": 7,
+        "final_position": 12,
+        "published_bytes": 43392,
+        "original_A": 213015,
+        "residual_B": 221419,
+        "retained_after_A": 780,
+        "retained_after_B": 1176,
+        "live_domain": 44568
+      }
+    ],
+    "finite_capacity": {
+      "published_bytes": 43392,
+      "original_A": 213015,
+      "residual_B": 221419,
+      "full_B": 221803,
+      "live_after_A": 44172,
+      "exact_capacity_bytes": 265591,
+      "live_after_B": 44184,
+      "rejected_capacity_bytes": 265590,
+      "outputs": [
+        7,
+        7,
+        7
+      ]
+    },
+    "capacity_note": "Managed accounting and quoted bounds, not allocator or process peak measurements. Physical capacities differ between isolated and broad runs; tests compare actual identity unions.",
+    "escaped_decoder_alias": "A raw completed decoder array remains live across replacement and retirement of both runs, outputs and session. Its exact physical charge remains until the final raw alias is dropped."
+  },
+  "behavior": [
+    "Core applies the shared context, full-coverage, application-budget, available-memory and safety policies to a separate incremental requirement without rewriting full state diagnostics.",
+    "Existing-only storage pins validate registered key namespace, identity and exact capacity atomically. They cannot create bytes, raise peak, or change original funding origin.",
+    "One immutable metadata borrowed-root set spans the complete prefill and decode quote. Per-span unions exclude only exact borrowed identities; replacements, possible aliases, displaced roots, rollback copies, native scratch and host payload remain charged.",
+    "Runtime residual proof binds complete reports to exact registered roots, pool domain and candidate geometry. Ordinary reservation still enforces the full-report minimum.",
+    "The shared candidate planner drives full and residual admission. Incomplete quote construction fails conservatively; a native candidate that fails quote construction is not retried as a smaller geometry.",
+    "Reservation custody pins borrowed charges before returning and requires private funded preparation. Conversion transfers custody to the run and independent work scopes. Dropping historical request metadata or a diagnostic quote cannot release a live borrowed charge.",
+    "Pins retire outside accounting locks. Uncertified work quarantines both remaining funding and borrowed charge custody.",
+    "Native cold projection preserves actual cross-role allocation identities, capacity and unknown lazy backing without evaluation. Temporary native witnesses retire independently of metadata.",
+    "Ordinary and controlled cached native generation, exact-capacity admission, one-byte-short rejection, stale-state/predecessor fencing and escaped old raw decoder aliases pass."
+  ],
+  "limits": [
+    "This increment covers cached fully resident token-ID generation through the existing selected native quote; it does not complete the requested family/path matrix.",
+    "Shared facade controller numerical storage still needs independent lifetime accounting. The default-false ownership gate remains; sized external shared controllers reject before callbacks.",
+    "Uncertified funding currently quarantines indefinitely; borrowed pin custody can keep its pool alive. Safe later reclamation and old baseline capacity-ceiling retention remain unfinished.",
+    "Quoted reset, promotion of populated unquoted state, independently quoted snapshot/restore/fork/copy and mutable controls remain unfinished.",
+    "Capture, media, speculation, host/disk residency and complete TP/PP/combined admission remain unfinished implementation work.",
+    "Arbitrarily escaped raw logits/completions need additional cumulative lifetime accounting beyond serial token emission.",
+    "No new released-checkpoint comparison, allocator/process memory benchmark or native distributed run. Prior pinned Qwen evidence is unchanged. One external tokenizer fixture remains ignored."
+  ],
+  "review": {
+    "kind": "independent read-only integrated audit",
+    "result": "No concrete accounting bypass found in residual proof binding, pin transfer, private preparation, predecessor fencing or retirement ordering."
+  },
+  "validation_corrections": [
+    {
+      "log": "/private/tmp/eredu-residual-first-check.log",
+      "sha256": "08248c41d5e99690fb071d31fc71947fa94ff0469ca31152243badfb09d632f8",
+      "exit_code": 101,
+      "result": "First minimal backend check failed only the public missing-docs lint on two ProjectedResidentState fields and into_parts. Documentation was added before passing native and final minimal/feature checks."
+    }
+  ],
+  "supplementary_checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib model_session::text_reuse_tests -- --test-threads=1 --nocapture",
+      "log": "/private/tmp/eredu-residual-native-reuse.log",
+      "sha256": "fcc94c5c6739595d83d5fb4e137c0f44882a1bc557b5e25f7f822a5302183d8c",
+      "exit_code": 0,
+      "passed": 4,
+      "included_in_total": false
+    },
+    {
+      "command": "rustfmt --check --edition 2021 --config skip_children=true <32 Rust files listed in source_sha256>",
+      "log": "/private/tmp/eredu-residual-format.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exit_code": 0
+    },
+    {
+      "command": "git diff --check -- <35 source/documentation files listed in source_sha256>",
+      "log": "/private/tmp/eredu-residual-diff-check.log",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "exit_code": 0
+    }
+  ],
+  "checks": [
+    {
+      "name": "core",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib -- --test-threads=1",
+      "log": "/private/tmp/eredu-residual-core.log",
+      "exit_code": 0,
+      "passed": 285,
+      "ignored": 0,
+      "sha256": "3b896090ee753adfd6a19cad8a7dd4f84f6fa9cbdad92920812038eca67e27b9"
+    },
+    {
+      "name": "nn",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-nn --all-features --lib workspace -- --test-threads=1",
+      "log": "/private/tmp/eredu-residual-nn.log",
+      "exit_code": 0,
+      "passed": 58,
+      "ignored": 0,
+      "sha256": "2db755271101d549203c8f9a72859cb23b708573b89a4197a4cdd26b2a88d538"
+    },
+    {
+      "name": "runtime",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib --test bounded_prefill --test backend_independence -- --test-threads=1",
+      "log": "/private/tmp/eredu-residual-runtime.log",
+      "exit_code": 0,
+      "passed": 750,
+      "ignored": 0,
+      "sha256": "0bc1f4c7a2ad2eca7753baee1415ad0cea6ccceb1117cd3f50c92126568935b3"
+    },
+    {
+      "name": "native-projection",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1 --nocapture --ignored backend::nn::workspace::projection::tests backend::runtime::cache::state::hybrid::workspace::tests backend::runtime::cache::state::pooling::workspace::tests backend::runtime::cache::kv::compressed::workspace::tests",
+      "log": "/private/tmp/eredu-residual-native-projection.log",
+      "exit_code": 0,
+      "passed": 8,
+      "ignored": 0,
+      "sha256": "de6de0901c51a431337f02c093c38929c4e3ef429c19e44337c8761532721c0a"
+    },
+    {
+      "name": "native-final",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1 --nocapture initial_publication_tests model_session::operation_ model_session::preparation_ model_session::output_retention_tests model_session::idle_storage model_session::managed_admission_tests model_session::text_step_tests model_session::text_quote model_session::text_reuse_tests adapter::tests::managed_memory observation::memory_tests admission::publication::tests prepared_speculative::memory_tests generation::token_retention_tests sampling_native_facts_cover_sort_growth_host_masks_and_retained_key_replacement frontier_tests composition::mlx::session::tests:: adapter::completion::retirement_tests",
+      "log": "/private/tmp/eredu-residual-native-final.log",
+      "exit_code": 0,
+      "passed": 85,
+      "ignored": 0,
+      "sha256": "93e9d62f7a9c9ca06979b6dc4641f6e5d803ef6eba8227cbca3395d512e18117"
+    },
+    {
+      "name": "architecture-workspace",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test workspace_estimation -- --test-threads=1",
+      "log": "/private/tmp/eredu-residual-architecture-workspace.log",
+      "exit_code": 0,
+      "passed": 13,
+      "ignored": 0,
+      "sha256": "a408f8049b2d10f99c1936c3dd8278dbd75a64e5291fcb6b448656e135af8d70"
+    },
+    {
+      "name": "architecture-prepared",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric prepared_workspace -- --test-threads=1",
+      "log": "/private/tmp/eredu-residual-architecture-prepared.log",
+      "exit_code": 0,
+      "passed": 7,
+      "ignored": 0,
+      "sha256": "c467d469e78c848eaaa563bf96f8d6d9a2c82d85a3ebda954d493abb1c03e3b0"
+    },
+    {
+      "name": "portable",
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "log": "/private/tmp/eredu-residual-portable.log",
+      "exit_code": 0,
+      "passed": 111,
+      "ignored": 1,
+      "sha256": "0db9306e574bbdd656a45d9bc47a82f616d232d1c45bf098f2066efc6cfc3c43"
+    },
+    {
+      "name": "minimal-final",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "log": "/private/tmp/eredu-residual-minimal-final.log",
+      "exit_code": 0,
+      "passed": 0,
+      "ignored": 0,
+      "sha256": "9adb85aba07f65cac9eb737aa41161b2bdd64d8f7b8609260c350b0e76d3d5ff"
+    },
+    {
+      "name": "features",
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal,image,audio",
+      "log": "/private/tmp/eredu-residual-features.log",
+      "exit_code": 0,
+      "passed": 0,
+      "ignored": 0,
+      "sha256": "90da17cd7f22cbe4f485fc4cbe4e9c3dd71523bcb1cae87b04e1c4a7fea1f309"
+    }
+  ]
+}

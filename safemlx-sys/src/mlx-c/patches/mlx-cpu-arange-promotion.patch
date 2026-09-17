@@ -1,0 +1,15 @@
+diff --git a/mlx/backend/cpu/arange.h b/mlx/backend/cpu/arange.h
+--- a/mlx/backend/cpu/arange.h
++++ b/mlx/backend/cpu/arange.h
+@@ -13,7 +13,10 @@
+ template <typename T>
+ struct ArangeTask {
+   T* ptr;
+-  T start, step_size;
++  T start;
++  // Preserve the original `auto step_size = next - start`: integer and half
++  // promotions belong to the unchanged per-step arithmetic, not to T storage.
++  decltype(T{} - T{}) step_size;
+   size_t size;
+   void operator()() {
+     for (int i = 0; i < size; ++i) {

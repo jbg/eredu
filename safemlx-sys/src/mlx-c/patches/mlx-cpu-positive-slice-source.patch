@@ -1,0 +1,31 @@
+diff --git a/mlx/backend/cpu/slice_storage.cpp b/mlx/backend/cpu/slice_storage.cpp
+--- a/mlx/backend/cpu/slice_storage.cpp
++++ b/mlx/backend/cpu/slice_storage.cpp
+@@ -30,6 +30,7 @@
+       sizeof(std::tuple<int64_t,Strides>)+sizeof(std::tuple<size_t,bool,bool>)+
+       sizeof(Strides)*2+sizeof(array::Flags)+sizeof(int64_t)*8+sizeof(size_t)*12+
+       sizeof(int)*4+sizeof(bool)*4+sizeof(const array*)*3+sizeof(const Slice*)+
++      sizeof(size_t)*2+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+
+       sizeof(submission::GraphQuota*)+sizeof(submission::GraphConstructionContext)+
+       sizeof(submission::GraphFailure);
+@@ -46,12 +47,15 @@
+   if(starts.size()!=rank||ends.size()!=rank||steps.size()!=rank||input.strides().size()!=rank)return false;
+   size_t elements=1,offset=0,span=1;
+   for(size_t i=0;i!=rank;++i) {
+-    if(input.shape(i)<=0||steps[i]!=1||starts[i]<0||ends[i]<=starts[i]||
+-        ends[i]>input.shape(i)||output.shape(i)!=ends[i]-starts[i]||input.strides()[i]<0)return false;
+-    size_t start=0,delta=0;
++    if(input.shape(i)<=0||steps[i]<=0||starts[i]<0||ends[i]<=starts[i]||
++        ends[i]>input.shape(i)||input.strides()[i]<0)return false;
++    const size_t count=size_t((ends[i]-starts[i]-1)/steps[i]+1);
++    if(count!=size_t(output.shape(i)))return false;
++    size_t start=0,delta=0,step_stride=0;
+     if(!product(size_t(output.shape(i)),elements,elements)||
+         !product(size_t(starts[i]),size_t(input.strides()[i]),start)||!add(offset,start)||
+-        !product(size_t(output.shape(i)-1),size_t(input.strides()[i]),delta)||!add(span,delta))return false;
++        !product(size_t(input.strides()[i]),size_t(steps[i]),step_stride)||
++        !product(count-1,step_stride,delta)||!add(span,delta))return false;
+   }
+   size_t end=offset,bytes=0;
+   if(elements!=output.size()||!add(end,span)||end>input.data_size()||

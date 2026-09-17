@@ -1,0 +1,50 @@
+diff --git a/mlx/backend/metal/slicing.cpp b/mlx/backend/metal/slicing.cpp
+--- a/mlx/backend/metal/slicing.cpp
++++ b/mlx/backend/metal/slicing.cpp
+@@ -8,6 +8,7 @@
+ #include "mlx/backend/metal/device.h"
+ #include "mlx/backend/metal/kernels.h"
+ #include "mlx/backend/metal/utils.h"
++#include "mlx/graph_quota.h"
+ 
+ namespace mlx::core {
+ 
+@@ -16,7 +17,8 @@
+     array& out,
+     int axis,
+     const Stream& s) {
+-  std::vector<int> sizes;
++  submission::GraphVector<int> sizes;
++  sizes.reserve(inputs.size() + 1);
+   sizes.push_back(0);
+   for (auto& p : inputs) {
+     sizes.push_back(p.shape(axis));
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1875,6 +1875,16 @@
+       !GraphQuota::allocation_population_extent(vector_bytes, temporaries, vector_extents) ||
+       !add(value.allocation_extents, vector_extents, value.allocation_extents)) return false;
+ 
++  // Concatenate's independent prefix-size vector reserves exactly one zero
++  // plus its input count before pushing. At most P workers can concatenate,
++  // with at most E input edges in aggregate; this is separate from ArrayVector.
++  size_t concatenate_slots, concatenate_bytes, concatenate_extents;
++  if (!add(input_edges, entries, concatenate_slots) ||
++      !mul(concatenate_slots, sizeof(int), concatenate_bytes) ||
++      !GraphQuota::allocation_population_extent(
++          concatenate_bytes, entries, concatenate_extents) ||
++      !add(value.allocation_extents, concatenate_extents, value.allocation_extents)) return false;
++
+   // Copy/binary/slice use two operands; ternary and AddMM use three.
+   // Variadic concatenation loops through the two-buffer copy worker.
+   CollapseStorageLayout collapse;
+@@ -1955,7 +1965,7 @@
+       sizeof(array_requests) + sizeof(array_request_count) + sizeof(routing) +
+       sizeof(collapse) + sizeof(persistent) + sizeof(receipts) + sizeof(event) +
+       sizeof(event_dispatch) + sizeof(add) + sizeof(mul) + sizeof(extent) + sizeof(shape) +
+-      sizeof(vector_population);
++      sizeof(vector_population) + sizeof(GraphVector<int>) + 3 * sizeof(size_t);
+   out = value; return true;
+ #endif
+ }

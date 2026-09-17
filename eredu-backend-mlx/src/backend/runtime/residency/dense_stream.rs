@@ -5,46 +5,69 @@
 //! window. The current layer's completion orders its compute stream while the
 //! next layer may continue transferring independently.
 
+mod coordinator;
+pub(crate) use coordinator::{BackgroundHostCoordinator, PreparedBackgroundForward};
+pub use coordinator::BackgroundCoordinatorFailure;
+mod prepared_host;
+pub(crate) use prepared_host::{BackgroundHostReadService, BackgroundHostServiceError};
+
+#[cfg(test)]
 use std::sync::Arc;
 
 use crate::backend::runtime::residency::manager::{ResidencyManager, ResidentUnitLease};
 use eredu_core::residency::{
     BackgroundPrefetchReport, MemoryTier, OffloadUnitId, PrefetchDemandResolution,
 };
-use eredu_runtime::BackgroundPrefetchWorker;
+use eredu_runtime::{BackgroundPrefetchFailure, BackgroundPrefetchPanic, BackgroundPrefetchWorker};
 
+#[cfg(test)]
 type HostPrefetchOperation =
     Arc<dyn Fn(&OffloadUnitId) -> Result<(), String> + Send + Sync + 'static>;
 
 /// One bounded disk-to-host worker with explicit cancellation and nonjoining Drop.
 pub struct BackgroundLayerPrefetch {
     manager: ResidencyManager,
-    worker: BackgroundPrefetchWorker,
+    worker: BackgroundPrefetchWorker<HostPrefetchFailure>,
 }
 
 impl BackgroundLayerPrefetch {
     /// Starts a bounded background host-prefetch worker.
     pub fn new(manager: ResidencyManager, capacity: usize) -> Result<Self, DenseStreamError> {
         let worker_manager = manager.clone();
-        let operation = Arc::new(move |id: &OffloadUnitId| {
+        Self::new_with_typed_operation(manager, capacity, move |id: &OffloadUnitId| {
             worker_manager
                 .prefetch(id, MemoryTier::Host)
                 .map(|_| ())
-                .map_err(|error| error.to_string())
-        });
-        Self::new_with_operation(manager, capacity, operation)
+                .map_err(HostPrefetchFailure::Residency)
+        })
     }
 
+    #[cfg(test)]
     fn new_with_operation(
         manager: ResidencyManager,
         capacity: usize,
         operation: HostPrefetchOperation,
     ) -> Result<Self, DenseStreamError> {
-        let worker =
-            BackgroundPrefetchWorker::new(capacity, "eredu-mlx-dense-layer-prefetch", move |id| {
-                operation(id)
-            })?
-            .with_nonblocking_drop();
+        Self::new_with_typed_operation(manager, capacity, move |id| {
+            operation(id).map_err(HostPrefetchFailure::Message)
+        })
+    }
+
+    fn new_with_typed_operation<F>(
+        manager: ResidencyManager,
+        capacity: usize,
+        operation: F,
+    ) -> Result<Self, DenseStreamError>
+    where
+        F: Fn(&OffloadUnitId) -> Result<(), HostPrefetchFailure> + Send + Sync + 'static,
+    {
+        let worker = BackgroundPrefetchWorker::for_units_retaining(
+            capacity,
+            manager.prefetch_unit_domain()?,
+            "eredu-mlx-dense-layer-prefetch",
+            operation,
+        )?
+        .with_nonblocking_drop();
         Ok(Self { manager, worker })
     }
 
@@ -82,6 +105,30 @@ impl BackgroundLayerPrefetch {
     }
 }
 
+/// Exact backend source retained by the shared background lifecycle. No native
+/// observer crosses threads; source/transfer failures keep their original owner.
+#[derive(Debug, thiserror::Error)]
+pub enum HostPrefetchFailure {
+    /// Actual residency/source failure, including any accepted custody.
+    #[error(transparent)]
+    Residency(crate::backend::runtime::residency::manager::ResidencyError),
+    /// Caught worker panic with its exact owned payload.
+    #[error(transparent)]
+    Panic(BackgroundPrefetchPanic),
+    /// Ordinary injected operation diagnostic used by the existing fixtures.
+    #[cfg(test)]
+    #[error("{0}")]
+    Message(String),
+}
+impl BackgroundPrefetchFailure for HostPrefetchFailure {
+    fn from_panic(payload: Box<dyn std::any::Any + Send>) -> Self {
+        Self::Panic(BackgroundPrefetchPanic::new(payload))
+    }
+    fn error_source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self)
+    }
+}
+
 /// Structured validation and worker failures for dense disk streaming.
 #[derive(Debug, thiserror::Error)]
 pub enum DenseStreamError {
@@ -97,14 +144,15 @@ pub enum DenseStreamError {
         /// Failed unit.
         id: OffloadUnitId,
         /// Original residency error.
-        message: String,
+        #[source]
+        message: HostPrefetchFailure,
     },
     /// A residency transition failed.
     #[error(transparent)]
     Residency(#[from] crate::backend::runtime::residency::manager::ResidencyError),
     /// Backend-neutral background-prefetch execution failed.
     #[error(transparent)]
-    PrefetchWorker(#[from] eredu_runtime::BackgroundPrefetchWorkerError),
+    PrefetchWorker(#[from] eredu_runtime::BackgroundPrefetchWorkerError<HostPrefetchFailure>),
 }
 
 #[cfg(test)]
@@ -357,7 +405,7 @@ mod tests {
         };
         assert!(
             matches!(error, DenseStreamError::PrefetchFailed { ref message, .. }
-            if message.contains("controlled worker error"))
+            if message.to_string().contains("controlled worker error"))
         );
         let report = manager.report().unwrap();
         assert_eq!(report.offload().resident_bytes().get(MemoryTier::Host), 0);

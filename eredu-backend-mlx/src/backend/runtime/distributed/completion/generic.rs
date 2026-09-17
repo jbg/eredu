@@ -22,11 +22,12 @@ use super::*;
 pub struct DistributedCompletion<T> {
     value: T,
     event: Rc<Event>,
-    recovery: Rc<Recovery<Rc<NativeResources>>>,
+    recovery: Rc<Recovery<NativeOwner>>,
     authority: Option<AuthorizedCompletion>,
     quarantined: Cell<bool>,
     #[cfg(test)]
     force_pending: Rc<Cell<bool>>,
+    orphan_destination: RefCell<Option<destinations::Destination<DistributedCompletionOrphan>>>,
 }
 
 #[derive(Debug)]
@@ -39,14 +40,14 @@ struct AuthorizedCompletion {
 #[derive(Debug)]
 pub(super) struct DistributedCompletionOrphan {
     pub(super) _event: Rc<Event>,
-    recovery: Rc<Recovery<Rc<NativeResources>>>,
+    recovery: Rc<Recovery<NativeOwner>>,
     #[cfg(test)]
     pub(super) force_pending: Rc<Cell<bool>>,
 }
 
 #[derive(Debug, Default)]
 pub(super) struct DistributedCompletionOrphanQuarantine {
-    pub(super) work: Vec<DistributedCompletionOrphan>,
+    pub(super) work: destinations::Destinations<DistributedCompletionOrphan>,
 }
 
 impl DistributedCompletionOrphanQuarantine {
@@ -120,6 +121,7 @@ impl<T> DistributedCompletion<T> {
             recovery: Rc::new(recovery),
             authority: None,
             quarantined: Cell::new(false),
+            orphan_destination: RefCell::new(None),
             #[cfg(test)]
             force_pending: Rc::new(Cell::new(false)),
         })
@@ -186,6 +188,7 @@ impl<T> DistributedCompletion<T> {
                 phase: eredu_runtime::DistributedExecutionPhase::Execution,
             }),
             quarantined: Cell::new(false),
+            orphan_destination: RefCell::new(None),
             #[cfg(test)]
             force_pending,
         })
@@ -213,7 +216,14 @@ impl<T> DistributedCompletion<T> {
             force_pending: self.force_pending.clone(),
         };
         safemlx::register_thread_runtime_housekeeping(reap_distributed_completion_orphans);
-        DISTRIBUTED_COMPLETION_ORPHANS.with(|orphans| orphans.borrow_mut().work.push(work));
+        let destination = self.orphan_destination.borrow_mut().take();
+        DISTRIBUTED_COMPLETION_ORPHANS.with(|orphans| {
+            let mut orphans = orphans.borrow_mut();
+            match destination {
+                Some(destination) => orphans.work.push_prepared(work, destination),
+                None => orphans.work.push(work),
+            }
+        });
     }
 
     /// Returns the submitted value without waiting for its backend completion.

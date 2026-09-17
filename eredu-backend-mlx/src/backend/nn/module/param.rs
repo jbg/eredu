@@ -41,6 +41,11 @@ pub struct PhysicalParam<T> {
 }
 
 impl<T> PhysicalParam<T> {
+    /// Borrows the actual freeze state without constructing a parameter tree.
+    pub(crate) const fn is_trainable(&self) -> bool {
+        !self.is_frozen
+    }
+
     /// Create a new `PhysicalParam`
     pub fn new(value: T) -> Self {
         Self {

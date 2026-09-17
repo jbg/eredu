@@ -236,6 +236,10 @@ fn isolated_pooling_snapshots_copy_all_streams_and_preserve_interleaved_siblings
             );
             let saved =
                 MlxPoolingAttentionStateFactory::isolated_snapshot(&parent, &stream).unwrap();
+            assert!(parent
+                .shared_layout()
+                .unwrap()
+                .same_storage(saved.shared_layout().unwrap()));
             let expected_saved = pools(&parent, &stream);
             assert_eq!(pools(&saved, &stream), expected_saved);
             for (source, copy) in parent
@@ -253,8 +257,17 @@ fn isolated_pooling_snapshots_copy_all_streams_and_preserve_interleaved_siblings
                 let copy = copy.evaluated().unwrap();
                 if source.as_array().size() > 0 {
                     assert_ne!(
-                        source.as_slice::<f32>().as_ptr(),
-                        copy.as_slice::<f32>().as_ptr()
+                        source
+                            .as_array()
+                            .allocation_info()
+                            .unwrap()
+                            .unwrap()
+                            .identity(),
+                        copy.as_array()
+                            .allocation_info()
+                            .unwrap()
+                            .unwrap()
+                            .identity()
                     );
                 }
             }
@@ -262,6 +275,12 @@ fn isolated_pooling_snapshots_copy_all_streams_and_preserve_interleaved_siblings
                 MlxPoolingAttentionStateFactory::isolated_snapshot(&saved, &stream).unwrap();
             let mut second =
                 MlxPoolingAttentionStateFactory::isolated_snapshot(&saved, &stream).unwrap();
+            for copy in [&first, &second] {
+                assert!(parent
+                    .shared_layout()
+                    .unwrap()
+                    .same_storage(copy.shared_layout().unwrap()));
+            }
             if paged {
                 let identities: std::collections::BTreeSet<_> = [&parent, &saved, &first, &second]
                     .map(|state| {
@@ -307,6 +326,10 @@ fn isolated_pooling_snapshots_copy_all_streams_and_preserve_interleaved_siblings
             let mut forked =
                 MlxPoolingAttentionStateFactory::fork_prediction_target_state(&saved, &stream)
                     .unwrap();
+            assert!(parent
+                .shared_layout()
+                .unwrap()
+                .same_storage(forked.shared_layout().unwrap()));
             assert_eq!(pools(&forked, &stream), expected_saved);
             let mut replay =
                 MlxPoolingAttentionStateFactory::isolated_snapshot(&saved, &stream).unwrap();

@@ -1,0 +1,33 @@
+diff --git a/mlx/distributed/distributed.h b/mlx/distributed/distributed.h
+--- a/mlx/distributed/distributed.h
++++ b/mlx/distributed/distributed.h
+@@ -55,8 +55,9 @@
+ 
+ // Allocator requests of the actual retained communicator, not scalar geometry.
+ // shared_owner_bytes contains the implementation itself; do not add its sizeof
+-// again. Queued operation destinations remain in GroupWorkerStorage. OS-private
+-// socket/thread owners and inherited roots stay explicit unresolved domains.
++// again. Queued operation destinations remain in GroupWorkerStorage. The same
++// native runtime boundary excludes OS-private socket/thread resources. Missing
++// managed producers and inherited roots remain explicit unresolved domains.
+ struct GroupPersistentStorage {
+   GroupStorageKind kind{GroupStorageKind::unknown};
+   unsigned unresolved{group_unknown_implementation};
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -598,9 +598,11 @@
+     using Owner=std::__shared_ptr_emplace<RingGroup,std::allocator<RingGroup>>;
+     GroupPersistentStorage value;
+     value.kind=GroupStorageKind::ring;
+-    // Task/promise/plan owners belong to each accepted operation. The shared
+-    // communicator's kernel thread/socket resources remain an explicit unknown.
+-    value.unresolved=group_worker_runtime|group_backend_private;
++    // All retained managed owners of this exact Ring implementation are counted
++    // below. Task/promise/plan owners belong to each accepted operation; the same
++    // existing native runtime boundary excludes OS-private socket/thread state.
++    // A loaded thread-runtime qualification failure still refuses the source.
++    value.unresolved=0;
+     value.shared_owner_bytes=sizeof(Owner);value.shared_owner_alignment=alignof(Owner);
+     const size_t left=sockets_left_.capacity(),right=sockets_right_.capacity();
+     if(right>SIZE_MAX/sizeof(int) || left>SIZE_MAX/sizeof(int)-right ||

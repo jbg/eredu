@@ -3,7 +3,6 @@
 use std::f32::consts::PI;
 
 use safemlx::{
-    array,
     error::{Exception, Result as MlxResult},
     ops::{erf, exp, maximum, r#where, sqrt, tanh},
     Array, Stream,
@@ -28,7 +27,7 @@ pub fn silu(x: Array, stream: &Stream) -> Result<Array, Exception> {
     work.divide(
         work.negative(stream)?
             .exp(stream)?
-            .add(Array::from_f32(1.0), stream)?,
+            .add(Array::try_from_f32(1.0)?, stream)?,
         stream,
     )?
     .as_dtype(dtype, stream)
@@ -58,7 +57,7 @@ pub fn sigmoid(input: Array, stream: &Stream) -> Result<Array, Exception> {
 
 /// Applies the squared rectified-linear activation.
 pub fn relu2(x: Array, stream: &Stream) -> Result<Array, Exception> {
-    maximum(&x, Array::from_f32(0.0), stream)?.square(stream)
+    maximum(&x, Array::try_from_f32(0.0)?, stream)?.square(stream)
 }
 
 /// Applies the exponential linear unit.
@@ -69,18 +68,21 @@ pub fn elu(
 ) -> MlxResult<Array> {
     let stream = stream.as_ref();
     let x = x.as_ref();
-    let alpha = array!(alpha.into().unwrap_or(1.0));
+    let alpha = Array::try_from_f32(alpha.into().unwrap_or(1.0))?;
     r#where(
-        &x.gt(array!(0.0), stream)?,
+        &x.gt(Array::try_from_f32(0.0)?, stream)?,
         x,
-        alpha.multiply(exp(x, stream)?.subtract(array!(1.0), stream)?, stream)?,
+        alpha.multiply(
+            exp(x, stream)?.subtract(Array::try_from_f32(1.0)?, stream)?,
+            stream,
+        )?,
         stream,
     )
 }
 
 /// Applies softplus.
 pub fn softplus(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> MlxResult<Array> {
-    safemlx::ops::logaddexp(x.as_ref(), array!(0), stream)
+    safemlx::ops::logaddexp(x.as_ref(), Array::try_from_scalar(0)?, stream)
 }
 
 /// Applies log-sigmoid.
@@ -94,25 +96,30 @@ pub fn gelu(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> MlxResult<Array
     let stream = stream.as_ref();
     x.as_ref()
         .multiply(
-            array!(1).add(
-                erf(x.as_ref().divide(array!(2f32.sqrt()), stream)?, stream)?,
+            Array::try_from_scalar(1)?.add(
+                erf(
+                    x.as_ref()
+                        .divide(Array::try_from_scalar(2f32.sqrt())?, stream)?,
+                    stream,
+                )?,
                 stream,
             )?,
             stream,
         )?
-        .divide(array!(2.0), stream)
+        .divide(Array::try_from_f32(2.0)?, stream)
 }
 
 /// Applies the tanh GELU approximation.
 pub fn gelu_approximate(x: impl AsRef<Array>, stream: impl AsRef<Stream>) -> MlxResult<Array> {
     let stream = stream.as_ref();
     let x = x.as_ref();
-    array!(0.5).multiply(x, stream)?.multiply(
-        array!(1.0).add(
+    Array::try_from_f32(0.5)?.multiply(x, stream)?.multiply(
+        Array::try_from_f32(1.0)?.add(
             tanh(
-                sqrt(array!(2.0 / PI), stream)?.multiply(
+                sqrt(Array::try_from_scalar(2.0 / PI)?, stream)?.multiply(
                     x.add(
-                        array!(0.044715).multiply(x.power(array!(3), stream)?, stream)?,
+                        Array::try_from_f32(0.044715)?
+                            .multiply(x.power(Array::try_from_scalar(3)?, stream)?, stream)?,
                         stream,
                     )?,
                     stream,

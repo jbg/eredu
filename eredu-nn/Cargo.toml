@@ -13,5 +13,6 @@ workspace = true
 
 [dependencies]
 eredu-checkpoint.workspace = true
+eredu-core.workspace = true
 eredu-nn-macros.workspace = true
 thiserror.workspace = true

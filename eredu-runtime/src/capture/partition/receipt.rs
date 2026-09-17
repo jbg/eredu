@@ -1,8 +1,24 @@
 //! Expected-producer receipt admission and bounded host-record encoding/decoding.
 use super::*;
+use crate::capture::CapturePlanSource;
 use eredu_core::checkpoint::TensorDtype;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+mod routed_ownership;
+pub(super) use routed_ownership::RoutedOwnership;
+mod writer;
+pub(crate) use writer::{encode_contiguous,encode_fragment_records};
+mod encoded_bound;
+mod evidence_budget;
+pub(in crate::capture::partition) use evidence_budget::EvidenceBudgetSource;
+mod construction;
+pub use construction::{PartitionCaptureReceiptConstructionError, PartitionCaptureContiguousProducer, PartitionCaptureCoordinateProducer, PartitionCaptureRoutedProducerSource};
+use construction::PreparedReceiptStorage;
+pub(in crate::capture::partition) use construction::component_adapter_error;
+pub(in crate::capture::partition) use construction::{copy_routed_ownership,Cause as ReceiptConstructionCause};
+pub(in crate::capture::partition) use construction::copy_context;
+use eredu_nn::workspace::WorkspaceMetadataFunding;
+pub use writer::{PartitionCaptureEncodingError, PartitionCaptureRecordEncoding};
 
 /// One retained producer projection for an exact global selection and forward.
 /// Architecture composition supplies invocation ownership and scalar coordinates.
@@ -32,15 +48,23 @@ pub struct PartitionCaptureReceiptLimits {
 #[derive(Debug)]
 pub struct PartitionCaptureReceiptPlan {
     pub(super) combination: PartitionCaptureCombination,
-    pub(super) plan: Arc<AdmittedCapturePlan>,
+    pub(super) plan: CapturePlanSource,
     pub(super) context: PartitionCaptureContext,
     producers: BTreeMap<usize, CaptureSlicePartition>,
+    // Original receipts retain their prepaid canonical Vec without tree nodes.
+    funded: Vec<PartitionCaptureProducer>,
     pub(super) global_shape: Vec<u64>,
-    pub(super) routed: BTreeMap<usize, RoutedUnitCaptureOwnership>,
+    pub(super) routed: RoutedOwnership,
     limits: PartitionCaptureReceiptLimits,
+    // Original source ceiling remains stable while the finalized run/epoch
+    // envelope may tighten only the transport's effective record bound.
+    host_record_ceiling: u64,
     fragments: usize,
     identity: String,
     world_size: usize,
+    evidence_budget: Option<EvidenceBudgetSource>,
+    // Every owned geometry/context/identity destination retires before its account.
+    _metadata: Option<WorkspaceMetadataFunding>,
 }
 
 fn invalid(message: &str) -> CaptureError {
@@ -53,6 +77,147 @@ fn reserve(ledger: &mut dyn CaptureReservation, usage: CaptureUsage) -> Result<(
 }
 
 impl PartitionCaptureReceiptPlan {
+    /// Validates complete, disjoint ownership before any capture work. Producers
+    /// with zero overlap are retained so their explicit receipt cannot be confused
+    /// with a missing peer. Empty global selections still require a producer.
+    /// `ledger` prices cold host admission/storage; native work uses its separately
+    /// admitted producer quotas, not an untrusted receipt's charged field.
+    pub fn new(
+        plan: impl Into<Arc<AdmittedCapturePlan>>,
+        context: PartitionCaptureContext,
+        producers: Vec<PartitionCaptureProducer>,
+        world_size: usize,
+        limits: PartitionCaptureReceiptLimits,
+        ledger: &mut dyn CaptureReservation,
+    ) -> Result<Self, PartitionCaptureMergeError> {
+        Self::new_source(
+            CapturePlanSource::Legacy(plan.into()),
+            context,
+            producers,
+            world_size,
+            limits,
+            ledger,
+        )
+    }
+
+    /// Retain the exact shared admission source without copying or re-admitting
+    /// its payload. Its existing attachment covers source storage only; receipt
+    /// construction/quota and native execution remain separate obligations.
+    pub fn new_shared(
+        plan: SharedCapturePlan,
+        context: PartitionCaptureContext,
+        producers: Vec<PartitionCaptureProducer>,
+        world_size: usize,
+        limits: PartitionCaptureReceiptLimits,
+        ledger: &mut dyn CaptureReservation,
+    ) -> Result<Self, PartitionCaptureMergeError> {
+        Self::new_source(
+            CapturePlanSource::Shared(plan),
+            context,
+            producers,
+            world_size,
+            limits,
+            ledger,
+        )
+    }
+
+    /// Admits complete selected floating terms from every named producer. Unlike
+    /// disjoint assembly, missing terms can never be filled by another producer's
+    /// overlapping coverage. Raw selected values are priced before native work;
+    /// nonlinear transforms follow bounded, compensated host summation.
+    pub fn new_sum(
+        plan: impl Into<Arc<AdmittedCapturePlan>>,
+        context: PartitionCaptureContext,
+        producers: Vec<PartitionCaptureProducer>,
+        world_size: usize,
+        limits: PartitionCaptureReceiptLimits,
+        ledger: &mut dyn CaptureReservation,
+    ) -> Result<Self, PartitionCaptureMergeError> {
+        Self::new_sum_source(
+            CapturePlanSource::Legacy(plan.into()),
+            context,
+            producers,
+            world_size,
+            limits,
+            ledger,
+        )
+    }
+
+    /// Retain the exact shared admission source without copying or re-admitting
+    /// its payload. Its existing attachment covers source storage only; receipt
+    /// construction/quota and native execution remain separate obligations.
+    pub fn new_sum_shared(
+        plan: SharedCapturePlan,
+        context: PartitionCaptureContext,
+        producers: Vec<PartitionCaptureProducer>,
+        world_size: usize,
+        limits: PartitionCaptureReceiptLimits,
+        ledger: &mut dyn CaptureReservation,
+    ) -> Result<Self, PartitionCaptureMergeError> {
+        Self::new_sum_source(
+            CapturePlanSource::Shared(plan),
+            context,
+            producers,
+            world_size,
+            limits,
+            ledger,
+        )
+    }
+
+    /// Admits dynamic routed rows against exact expert/unit ownership. This uses
+    /// the ordinary receipt transport and completion protocol; no native work or
+    /// publication is authorized by this host declaration alone.
+    pub fn new_routed(
+        plan: impl Into<Arc<AdmittedCapturePlan>>,
+        context: PartitionCaptureContext,
+        producers: Vec<PartitionRoutedCaptureProducer>,
+        world_size: usize,
+        limits: PartitionCaptureReceiptLimits,
+        ledger: &mut dyn CaptureReservation,
+    ) -> Result<Self, PartitionCaptureMergeError> {
+        // Preserve legacy conversion timing: a rejected producer/ownership
+        // preparation does not construct an Arc or invoke the caller's Into.
+        let (projections, ownership) = Self::prepare_routed_producers(producers, limits, ledger)?;
+        Self::new_with_ownership(
+            CapturePlanSource::Legacy(plan.into()),
+            context,
+            projections,
+            ownership.into(),
+            PartitionCaptureCombination::Disjoint,
+            world_size,
+            limits,
+            ledger,
+            None,
+        )
+    }
+
+    /// Retain the exact shared admission source without copying or re-admitting
+    /// its payload. Its existing attachment covers source storage only; receipt
+    /// construction/quota and native execution remain separate obligations.
+    pub fn new_routed_shared(
+        plan: SharedCapturePlan,
+        context: PartitionCaptureContext,
+        producers: Vec<PartitionRoutedCaptureProducer>,
+        world_size: usize,
+        limits: PartitionCaptureReceiptLimits,
+        ledger: &mut dyn CaptureReservation,
+    ) -> Result<Self, PartitionCaptureMergeError> {
+        Self::new_routed_source(
+            CapturePlanSource::Shared(plan),
+            context,
+            producers,
+            world_size,
+            limits,
+            ledger,
+        )
+    }
+
+    /// Borrow the original shared source, when this is a shared-source receipt.
+    /// A legacy raw Arc is never promoted into a registered shared owner.
+    pub fn shared_plan_source(&self) -> Option<&SharedCapturePlan> {
+        self.plan.shared()
+    }
+
     /// Cold host storage bound before retaining these already bounded declarations.
     pub fn preparation_usage(
         producers: &[PartitionCaptureProducer],
@@ -72,9 +237,14 @@ impl PartitionCaptureReceiptPlan {
     fn routed_ownership_usage(
         producers: &[PartitionRoutedCaptureProducer],
     ) -> Result<CaptureUsage, CaptureError> {
+        Self::routed_ownership_source_usage(producers.iter().map(|producer| &producer.ownership))
+    }
+    fn routed_ownership_source_usage<'a>(mut ownership: impl Iterator<Item=&'a RoutedUnitCaptureOwnership>)
+        -> Result<CaptureUsage,CaptureError>
+    {
         Ok(CaptureUsage {
-            host_bytes: producers.iter().try_fold(4096u64, |bytes, producer| {
-                add(bytes, super::routed::ownership_bytes(&producer.ownership)?)
+            host_bytes: ownership.try_fold(4096u64, |bytes, owned| {
+                add(bytes, super::routed::ownership_bytes(owned)?)
             })?,
             ..Default::default()
         })
@@ -92,14 +262,13 @@ impl PartitionCaptureReceiptPlan {
             .try_fold(first.fragments().len() as u64, |sum, projection| {
                 add(sum, projection.fragments().len() as u64)
             })?;
+        Self::preparation_population_usage(producers, rank, fragments)
+    }
+    pub(super) fn preparation_population_usage(producers: u64, rank: usize, fragments: u64)
+        -> Result<CaptureUsage, CaptureError> {
         Ok(CaptureUsage {
-            host_bytes: add(
-                4096,
-                add(
-                    mul(producers, 2048)?,
-                    mul(fragments, add(1024, mul(rank as u64, 256)?)?)?,
-                )?,
-            )?,
+            host_bytes: add(4096, add(mul(producers, 2048)?,
+                mul(fragments, add(1024, mul(rank as u64, 256)?)?)?)?)?,
             ..Default::default()
         })
     }
@@ -108,8 +277,8 @@ impl PartitionCaptureReceiptPlan {
     /// with a missing peer. Empty global selections still require a producer.
     /// `ledger` prices cold host admission/storage; native work uses its separately
     /// admitted producer quotas, not an untrusted receipt's charged field.
-    pub fn new(
-        plan: impl Into<Arc<AdmittedCapturePlan>>,
+    pub(in crate::capture) fn new_source(
+        plan: CapturePlanSource,
         context: PartitionCaptureContext,
         producers: Vec<PartitionCaptureProducer>,
         world_size: usize,
@@ -117,14 +286,15 @@ impl PartitionCaptureReceiptPlan {
         ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureMergeError> {
         Self::new_with_ownership(
-            plan.into(),
+            plan,
             context,
             producers,
-            BTreeMap::new(),
+            BTreeMap::new().into(),
             PartitionCaptureCombination::Disjoint,
             world_size,
             limits,
             ledger,
+            None,
         )
     }
 
@@ -132,8 +302,8 @@ impl PartitionCaptureReceiptPlan {
     /// disjoint assembly, missing terms can never be filled by another producer's
     /// overlapping coverage. Raw selected values are priced before native work;
     /// nonlinear transforms follow bounded, compensated host summation.
-    pub fn new_sum(
-        plan: impl Into<Arc<AdmittedCapturePlan>>,
+    pub(in crate::capture) fn new_sum_source(
+        plan: CapturePlanSource,
         context: PartitionCaptureContext,
         producers: Vec<PartitionCaptureProducer>,
         world_size: usize,
@@ -141,28 +311,54 @@ impl PartitionCaptureReceiptPlan {
         ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureMergeError> {
         Self::new_with_ownership(
-            plan.into(),
+            plan,
             context,
             producers,
-            BTreeMap::new(),
+            BTreeMap::new().into(),
             PartitionCaptureCombination::SumF64ToF32,
             world_size,
             limits,
             ledger,
+            None,
         )
     }
 
     /// Admits dynamic routed rows against exact expert/unit ownership. This uses
     /// the ordinary receipt transport and completion protocol; no native work or
     /// publication is authorized by this host declaration alone.
-    pub fn new_routed(
-        plan: impl Into<Arc<AdmittedCapturePlan>>,
+    pub(in crate::capture) fn new_routed_source(
+        plan: CapturePlanSource,
         context: PartitionCaptureContext,
         producers: Vec<PartitionRoutedCaptureProducer>,
         world_size: usize,
         limits: PartitionCaptureReceiptLimits,
         ledger: &mut dyn CaptureReservation,
     ) -> Result<Self, PartitionCaptureMergeError> {
+        let (projections, ownership) = Self::prepare_routed_producers(producers, limits, ledger)?;
+        Self::new_with_ownership(
+            plan,
+            context,
+            projections,
+            ownership.into(),
+            PartitionCaptureCombination::Disjoint,
+            world_size,
+            limits,
+            ledger,
+            None,
+        )
+    }
+
+    fn prepare_routed_producers(
+        producers: Vec<PartitionRoutedCaptureProducer>,
+        limits: PartitionCaptureReceiptLimits,
+        ledger: &mut dyn CaptureReservation,
+    ) -> Result<
+        (
+            Vec<PartitionCaptureProducer>,
+            BTreeMap<usize, RoutedUnitCaptureOwnership>,
+        ),
+        PartitionCaptureMergeError,
+    > {
         if producers.is_empty() || producers.len() > limits.max_producers {
             return Err(invalid("sparse producer count exceeds its bound").into());
         }
@@ -182,27 +378,19 @@ impl PartitionCaptureReceiptPlan {
                 projection: producer.projection,
             });
         }
-        Self::new_with_ownership(
-            plan.into(),
-            context,
-            projections,
-            ownership,
-            PartitionCaptureCombination::Disjoint,
-            world_size,
-            limits,
-            ledger,
-        )
+        Ok((projections, ownership))
     }
 
     fn new_with_ownership(
-        plan: Arc<AdmittedCapturePlan>,
+        plan: CapturePlanSource,
         context: PartitionCaptureContext,
-        producers: Vec<PartitionCaptureProducer>,
-        routed: BTreeMap<usize, RoutedUnitCaptureOwnership>,
+        mut producers: Vec<PartitionCaptureProducer>,
+        routed: RoutedOwnership,
         combination: PartitionCaptureCombination,
         world_size: usize,
         limits: PartitionCaptureReceiptLimits,
         ledger: &mut dyn CaptureReservation,
+        mut prepared: Option<PreparedReceiptStorage>,
     ) -> Result<Self, PartitionCaptureMergeError> {
         context.validate()?;
         if context.capture_plan_identity != plan.identity() {
@@ -247,9 +435,24 @@ impl PartitionCaptureReceiptPlan {
             &routed,
             limits.max_fragments,
         )?;
-        plan.geometry_at(context.phase, context.prediction, context.invocation)?
-            .validate_actual(point, first.global_shape())?;
-        let slice = resolve_slice(point, selection, first.global_shape())?;
+        if let Some(rows)=prepared.as_ref().and_then(|storage|storage.terminal_rows) {
+            // Only the paid terminal constructor carries this source fact. The
+            // ordinary complete shape validator remains unchanged for other rows.
+            let geometry=super::CompleteVocabularyGeometry::prepare(&plan,context.selection_index,
+                context.phase,context.prediction,Some(rows))
+                .map_err(|_|invalid("terminal vocabulary source differs from admission"))?
+                .ok_or_else(||invalid("terminal rows require vocabulary capture"))?;
+            if context.invocation.is_some()||!geometry.matches(first.global_shape()) {
+                return Err(invalid("terminal vocabulary source differs from its retained rows").into());
+            }
+        } else {
+            plan.geometry_at(context.phase, context.prediction, context.invocation)?
+                .validate_actual(point, first.global_shape())?;
+        }
+        let slice = match prepared.as_mut() {
+            Some(storage) => storage.slice.take().expect("paid normalized selection"),
+            None => resolve_slice(point, selection, first.global_shape())?,
+        };
         let mut fragments = 0usize;
         let mut covered = 0u64;
         for (index, producer) in producers.iter().enumerate() {
@@ -311,31 +514,84 @@ impl PartitionCaptureReceiptPlan {
         if routed.is_empty() {
             reserve(ledger, Self::preparation_usage(&producers)?)?;
         }
-        let global_shape = first.global_shape().to_vec();
-        let producers = producers
-            .into_iter()
-            .map(|p| (p.rank, p.projection))
-            .collect();
+        let (global_shape, identity_destination, metadata) = match prepared {
+            Some(storage) => (storage.global_shape, Some(storage.identity), Some(storage.metadata)),
+            None => (first.global_shape().to_vec(), None, None),
+        };
+        let (funded, producers) = if metadata.is_some() {
+            // Canonical world order uses only the already-paid Vec. Adjacent
+            // insertion has a fixed local frame and no sorting scratch/heap.
+            for index in 1..producers.len() {
+                let mut at=index;
+                while at>0&&producers[at-1].rank>producers[at].rank {
+                    producers.swap(at-1,at);at-=1;
+                }
+            }
+            (producers, BTreeMap::new())
+        } else {
+            (Vec::new(), producers.into_iter().map(|p| (p.rank, p.projection)).collect())
+        };
         let identity = receipt_identity(
             &context,
             &producers,
+            &funded,
             &routed,
+            identity_destination,
             combination,
             world_size,
             limits,
+            None,
         )?;
         Ok(Self {
             combination,
             plan,
             context,
             producers,
+            funded,
             global_shape,
             routed,
             limits,
+            host_record_ceiling: limits.max_record_bytes,
             fragments,
             identity,
             world_size,
+            evidence_budget: None,
+            _metadata: metadata,
         })
+    }
+
+    /// Original per-selection construction limits before receipt transport
+    /// tightening. These remain descriptive and cannot issue native allowance.
+    pub(crate) const fn original_limits(&self)->PartitionCaptureReceiptLimits {
+        PartitionCaptureReceiptLimits { max_producers:self.limits.max_producers,
+            max_fragments:self.limits.max_fragments,max_record_bytes:self.host_record_ceiling }
+    }
+
+    /// Actual fixed controls of the existing canonical producer iterators.
+    pub(crate) fn fragment_host_comparison_control_bytes(&self)->Option<usize> {
+        let parts=[std::mem::size_of_val(&self.producers()).checked_mul(2)?,
+            std::mem::size_of_val(&self.routed.iter()).checked_mul(2)?,
+            std::mem::size_of::<(&Self,&Self)>(),std::mem::size_of::<(&PartitionCaptureContext,&PartitionCaptureContext)>(),
+            std::mem::size_of::<Option<(&SharedCapturePlan,&SharedCapturePlan)>>(),std::mem::size_of::<bool>()*4];
+        parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
+    }
+    /// Same immutable fragment source across the later original run/forward
+    /// binding. This is host destination compatibility only; the final receipt
+    /// still supplies and authenticates its own run identity and forward epoch.
+    pub(crate) fn same_fragment_host_source(&self, other:&Self)->bool {
+        let (a,b)=(&self.context,&other.context);
+        self.shared_plan_source().zip(other.shared_plan_source())
+            .is_some_and(|(a,b)|a.same_storage(b))
+            && a.artifact_identity==b.artifact_identity && a.execution_identity==b.execution_identity
+            && a.overlay_identity==b.overlay_identity && a.capture_plan_identity==b.capture_plan_identity
+            && a.selection_index==b.selection_index && a.phase==b.phase && a.prediction==b.prediction
+            && a.invocation==b.invocation && self.world_size==other.world_size
+            && self.combination==other.combination && self.global_shape==other.global_shape
+            && self.fragments==other.fragments && self.routed.iter().eq(other.routed.iter())
+            && self.limits.max_producers==other.limits.max_producers
+            && self.limits.max_fragments==other.limits.max_fragments
+            && self.host_record_ceiling==other.host_record_ceiling
+            && self.producers().eq(other.producers())
     }
 
     /// Stable digest of this exact producer geometry, context and delivery bound.
@@ -359,7 +615,8 @@ impl PartitionCaptureReceiptPlan {
     }
     /// Expected native geometry for an admitted producer.
     pub fn producer(&self, rank: usize) -> Option<&CaptureSlicePartition> {
-        self.producers.get(&rank)
+        self.producers.get(&rank).or_else(|| self.funded.binary_search_by_key(&rank, |producer| producer.rank)
+            .ok().map(|index| &self.funded[index].projection))
     }
     /// Exact sparse expert/source ownership, separate from the unit rectangle.
     pub fn routed_producer(&self, rank: usize) -> Option<&RoutedUnitCaptureOwnership> {
@@ -375,6 +632,11 @@ impl PartitionCaptureReceiptPlan {
         self.producers
             .iter()
             .map(|(&rank, projection)| (rank, projection))
+            .chain(self.funded.iter().map(|producer| (producer.rank, &producer.projection)))
+    }
+
+    fn producer_count(&self) -> usize {
+        self.producers.len() + self.funded.len()
     }
 
     /// Prepaid producer encoding bound, without constructing or serializing a value.
@@ -397,19 +659,16 @@ impl PartitionCaptureReceiptPlan {
     pub fn delivery_usage(&self) -> Result<CaptureUsage, CaptureError> {
         let selection = &self.plan.plan().selections[self.context.selection_index];
         let point = &self.plan.points()[self.context.selection_index];
-        let slice = resolve_slice(point, selection, &self.global_shape)?;
+        let ordinary_slice;
+        let slice = if let Some(producer) = self.funded.first() {
+            producer.projection.global_slice()
+        } else {
+            ordinary_slice = resolve_slice(point, selection, &self.global_shape)?;
+            &ordinary_slice
+        };
         self.decoding_usage(self.limits.max_record_bytes)?
-            .checked_mul(self.producers.len() as u64)?
-            .checked_add(CaptureUsage {
-                host_bytes: add(
-                    mul(
-                        self.fragments as u64,
-                        std::mem::size_of::<CapturedPartitionFragment>() as u64,
-                    )?,
-                    mul(self.producers.len() as u64, 8)?,
-                )?,
-                ..Default::default()
-            })?
+            .checked_mul(self.producer_count() as u64)?
+            .checked_add(self.delivery_table_usage()?)?
             .checked_add(super::assembly::assembly_metadata_usage(
                 selection,
                 point,
@@ -429,6 +688,39 @@ impl PartitionCaptureReceiptPlan {
                     )?
                 },
             )
+    }
+
+    /// Existing receipt table component, separate from decoding and assembly.
+    pub(crate) fn delivery_table_usage(&self) -> Result<CaptureUsage, CaptureError> {
+        Ok(CaptureUsage { host_bytes: add(
+            mul(self.fragments as u64, std::mem::size_of::<CapturedPartitionFragment>() as u64)?,
+            mul(self.producer_count() as u64, 8)?)?, ..Default::default() })
+    }
+
+    /// Exact ordinary assembly component of a retained dense receipt. The source
+    /// projection already owns normalized coordinates; this query allocates none.
+    pub(crate) fn dense_assembly_usage(&self)->Result<Option<CaptureUsage>,CaptureError> {
+        let selection=&self.plan.plan().selections[self.context.selection_index];
+        if matches!(selection.transform,CaptureTransform::RoutedUnits|CaptureTransform::TopCandidates{..}|CaptureTransform::TokenScores{..}) {
+            return Ok(None);
+        }
+        let Some(projection)=self.funded.first() else {return Ok(None);};
+        let shape=&projection.projection.global_slice().shape;
+        Ok(Some(super::assembly::assembly_metadata_usage(selection,&self.plan.points()[self.context.selection_index],shape.len(),self.fragments)?
+            .checked_add(if self.combination==PartitionCaptureCombination::SumF64ToF32 {
+                super::sum::payload_usage(&selection.transform,elements(shape)?)?
+            }else{super::assembly::assembly_payload_usage(&selection.transform,elements(shape)?,self.fragments==0)?})?))
+    }
+
+    /// The same final record equation used by ordinary sparse/dense assembly.
+    /// Retained global projection supplies geometry without re-resolving a slice.
+    pub(crate) fn fragment_assembly_usage(&self)->Result<Option<CaptureUsage>,CaptureError> {
+        let selection=&self.plan.plan().selections[self.context.selection_index];
+        if !matches!(selection.transform,CaptureTransform::RoutedUnits){return self.dense_assembly_usage();}
+        let Some((_,projection))=self.producers().next() else{return Ok(None);};
+        let slice=projection.global_slice();
+        Ok(Some(super::assembly::assembly_metadata_usage(selection,&self.plan.points()[self.context.selection_index],3,self.fragments)?
+            .checked_add(super::routed::payload_usage(self,slice)?)?))
     }
 
     /// Conservative parser/decoded-record storage for an exact received byte count.
@@ -495,23 +787,14 @@ impl PartitionCaptureReceiptPlan {
                 ..Default::default()
             },
         )?;
-        let record = PartitionCaptureProducerRecord {
+        let record = eredu_core::capture::BorrowedPartitionCaptureProducerRecord {
             schema_version: PARTITION_CAPTURE_SCHEMA_VERSION,
             combination: self.combination,
-            receipt_plan_identity: self.identity.clone(),
-            context: self.context.clone(),
+            receipt_plan_identity: &self.identity,
+            context: &self.context,
             producer_rank,
-            source_dtype,
-            fragments: fragments
-                .into_iter()
-                .enumerate()
-                .map(
-                    |(fragment_index, fragment)| PartitionCaptureFragmentRecord {
-                        fragment_index,
-                        record: fragment.record,
-                    },
-                )
-                .collect(),
+            source_dtype: source_dtype.as_ref(),
+            fragments: BorrowedFragments(&fragments),
         };
         // Count before allocating a JSON buffer. The counting sink enforces the
         // same byte limit as the subsequent bounded writer.
@@ -587,13 +870,14 @@ impl PartitionCaptureReceiptPlan {
                 "partition fragment record differs from its admitted selection or geometry",
             ));
         }
+        let limits = self.evidence_budget.as_ref().map_or(&self.plan.plan().limits, EvidenceBudgetSource::limits);
         if record
             .charged
-            .exceeded(self.plan.plan().limits.per_step)
+            .exceeded(limits.per_step)
             .is_some()
             || record
                 .charged
-                .exceeded(self.plan.plan().limits.cumulative)
+                .exceeded(limits.cumulative)
                 .is_some()
         {
             return Err(invalid(
@@ -816,9 +1100,8 @@ impl PartitionCaptureDelivery {
     /// with no selected values remains missing until it acknowledges that fact.
     pub fn missing_producers(&self) -> impl Iterator<Item = usize> + '_ {
         self.plan
-            .producers
-            .keys()
-            .copied()
+            .producers()
+            .map(|(rank, _)| rank)
             .filter(|rank| !self.receipts.contains_key(rank))
     }
 
@@ -1025,10 +1308,13 @@ fn source_representation_matches(
 fn receipt_identity(
     context: &PartitionCaptureContext,
     producers: &BTreeMap<usize, CaptureSlicePartition>,
-    routed: &BTreeMap<usize, RoutedUnitCaptureOwnership>,
+    funded: &[PartitionCaptureProducer],
+    routed: &RoutedOwnership,
+    destination: Option<String>,
     combination: PartitionCaptureCombination,
     world_size: usize,
     limits: PartitionCaptureReceiptLimits,
+    evidence_budget: Option<&EvidenceBudgetSource>,
 ) -> Result<String, CaptureError> {
     use sha2::{Digest, Sha256};
     fn word(hash: &mut Sha256, value: u64) {
@@ -1052,6 +1338,12 @@ fn receipt_identity(
     }
     let mut hash = Sha256::new();
     hash.update(b"eredu.partition.capture.receipt.v2");
+    if let Some(source) = evidence_budget {
+        hash.update(b"original.intervention.evidence.budget.v1");
+        text(&mut hash, source.parent_identity());
+        text(&mut hash, source.intervention_intent());
+        word(&mut hash, source.operation() as u64);
+    }
     word(
         &mut hash,
         match combination {
@@ -1076,7 +1368,7 @@ fn receipt_identity(
         world_size,
         limits.max_producers,
         limits.max_fragments,
-        producers.len(),
+        producers.len() + funded.len(),
     ] {
         word(
             &mut hash,
@@ -1093,8 +1385,9 @@ fn receipt_identity(
     );
     word(&mut hash, context.prediction);
     word(&mut hash, context.forward_epoch);
-    for (rank, projection) in producers {
-        word(&mut hash, *rank as u64);
+    for (rank, projection) in producers.iter().map(|(&rank, projection)| (rank, projection))
+        .chain(funded.iter().map(|producer| (producer.rank, &producer.projection))) {
+        word(&mut hash, rank as u64);
         word(&mut hash, projection.axis() as u64);
         numbers(&mut hash, projection.global_shape());
         numbers(&mut hash, projection.local_shape());
@@ -1107,7 +1400,7 @@ fn receipt_identity(
     }
     if !routed.is_empty() {
         hash.update(b"routed.ownership.v1");
-        for (rank, owned) in routed {
+        for (rank, owned) in routed.iter() {
             word(&mut hash, *rank as u64);
             word(&mut hash, owned.source_peers);
             word(&mut hash, u64::from(owned.source_peer.is_some()));
@@ -1132,9 +1425,27 @@ fn receipt_identity(
         }
     }
     use std::fmt::Write;
-    let mut identity = String::with_capacity(64);
+    let mut identity = destination.unwrap_or_else(|| String::with_capacity(64));
     for byte in hash.finalize() {
         write!(&mut identity, "{byte:02x}").expect("writing into String");
     }
     Ok(identity)
+}
+
+// The owning and scheduled producers share the core receipt serializer. This
+// adapter only lends the original fragment records; no context, identity, shape
+// or protected tensor DTO is cloned to construct an encoding input.
+struct BorrowedFragments<'a>(&'a [CapturedPartitionFragment]);
+impl serde::Serialize for BorrowedFragments<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut sequence = serializer.serialize_seq(Some(self.0.len()))?;
+        for (fragment_index, fragment) in self.0.iter().enumerate() {
+            sequence.serialize_element(&eredu_core::capture::BorrowedPartitionCaptureFragmentRecord {
+                fragment_index,
+                record: &fragment.record,
+            })?;
+        }
+        sequence.end()
+    }
 }

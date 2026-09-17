@@ -1,0 +1,29 @@
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index d1348d60..904e2326 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1837,6 +1837,14 @@ bool resident_gpu_worker_layout(size_t entries, size_t input_edges,
+   // Every temporary is either a new output/scratch backing or an input view.
+   // Output Data owners are additional; primitive descriptors already belong
+   // to the host bank and are not charged again here.
++  // This also covers the closed six-input/two-output recurrent CustomKernel:
++  // each sibling is an output slot and each of its <=6 compactions is a backing
++  // birth. Prepared input aliases occupy fixed optional<array> stack slots.
++  // The separable conv1D branch allocates one output and <=2 contiguous copies,
++  // registering each copy with add_temporary before the depthwise dispatch;
++  // its exact constructor predicates return before implicit GEMM or im2col.
++  // Both use the existing temporary descriptor/Data/TemporaryBatch classes;
++  // no extra population is added for the same copies.
+   if (!add(backing_births, input_edges, temporaries) ||
+       !add(output_slots, temporaries, data_controls) ||
+       !add(entries, temporaries, value.kernel_attempts) ||
+@@ -1911,7 +1919,8 @@ bool resident_gpu_worker_layout(size_t entries, size_t input_edges,
+   size_t interval_resources, argument_resources, fence_candidates;
+   // The closed family owns eight input and four output slots. Every other
+   // selected worker below has no more bound buffers: SDPA <=7; matmul <=6;
+-  // rank<10 indexed gather/scatter <=11; copy/reduce/normalization <=4.
++  // rank<10 indexed gather/scatter <=11; copy/reduce/normalization <=4;
++  // prepared recurrent <=8 and separable depthwise conv1D <=3.
+   // Concat invokes one two-buffer copy per input, already included in K.
+   constexpr size_t argument_buffers =
+       std::tuple_size_v<decltype(fast::KernelSpecialization::inputs)> +

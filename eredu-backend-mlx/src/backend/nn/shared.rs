@@ -89,11 +89,13 @@ fn trace_partition_collective(operation: &str, input: &Array, group: &Group, det
 
 mod core_backend;
 mod extensions;
+mod grouped_construction;
 mod operators;
 mod selected_linear;
 pub use selected_linear::MlxGroupedLinear;
 mod parameters;
 mod submission;
+pub(crate) use submission::value_completion_control_bytes;
 
 pub use core_backend::MlxParameterError;
 pub use operators::*;
@@ -106,3 +108,9 @@ pub struct MlxNeuralBackend;
 
 #[cfg(test)]
 mod tests;
+
+mod parallel_gather;
+
+mod parallel_lookup;
+
+pub(crate) use parallel_lookup::control_bytes as parallel_vocabulary_lookup_control_bytes;

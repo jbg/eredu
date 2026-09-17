@@ -1,9 +1,11 @@
 use super::*;
 use eredu_core::{intervention::*, *};
-use eredu_runtime::capture::CaptureSession;
+use eredu_runtime::{capture::CaptureSession, execution_control::SamplingCopyPolicy};
 use std::{cell::Cell, collections::VecDeque, io, rc::Rc, sync::Arc};
 
+mod paired_components;
 mod records;
+mod saved_sampling;
 use records::*;
 
 #[derive(Clone, Default)]
@@ -11,6 +13,8 @@ struct Host {
     forwards: Rc<Cell<u64>>,
     fault: Rc<Cell<Option<&'static str>>>,
     copies: Rc<Cell<u64>>,
+    sampling_operations: Rc<Cell<[u64; 3]>>,
+    paired_operations: Rc<Cell<[u64; 3]>>,
 }
 impl Host {
     fn copying(&self, stage: &'static str) -> io::Result<()> {
@@ -175,6 +179,34 @@ fn sample(
     })
 }
 impl TextGenerationBackend for Host {
+    type TextPreparation = ();
+    type TextPreparationControl = ();
+    type TextStepPermit = ();
+
+    fn begin_text_step<C: TokenFilterController>(
+        _: &ModelRuntime<Self>,
+        _: &Self::TextPreparation,
+        _: &Self::TextGenerationState,
+        _: &C,
+        _: PendingTextInput<&Self::Prompt, &Self::Token>,
+        _: &TextStepContext,
+    ) -> io::Result<Self::TextStepPermit> {
+        Ok(())
+    }
+
+    fn finish_text_step(_: Self::TextStepPermit) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn admit_text_preparation<C: eredu_core::TokenFilterController>(
+        _: &eredu_core::ModelRuntime<Self>,
+        _: &eredu_core::TextPreparationInput<'_, Self::Prompt>,
+        _: eredu_core::TextGenerationConfig,
+        _: &C,
+    ) -> Result<Self::TextPreparation, eredu_core::BackendFailure> {
+        Ok(())
+    }
+
     fn reset_session(_: &Self, session: &mut Self::Session) -> Result<(), BackendFailure> {
         session.native = NativeState::default();
         Ok(())
@@ -328,8 +360,203 @@ impl NativeTextStateBackend for Host {
         Ok(())
     }
 }
+// This semantic fixture has no managed component proof. Bounded copying is
+// rejected before either payload is cloned; full unquoted snapshots keep their
+// existing enclosing host authority through copying and installation.
+struct SavedSampling {
+    sampling: Sampling,
+    pending: Option<PendingTextInput<Vec<u32>, Token>>,
+}
+
+fn copy_sampling_parts(
+    runtime: &mut ModelRuntime<Host>,
+    sampling: &Sampling,
+    pending: Option<PendingTextInput<&Vec<u32>, &Token>>,
+) -> Result<(Sampling, Option<PendingTextInput<Vec<u32>, Token>>), io::Error> {
+    let pending = Host::copy_pending_input(runtime, pending)?;
+    let sampling = Host::copy_sampling_state(runtime, sampling)?;
+    Ok((sampling, pending))
+}
+
+// Only backend capture/copy hooks assemble this immutable pair. No allocating
+// Clone or mutable component extraction is exposed by its associated type.
+struct SavedComponents {
+    native: Saved,
+    sampling: SavedSampling,
+}
+
 impl TextSnapshotBackend for Host {
     type SamplingState = Sampling;
+    type SavedSamplingState = SavedSampling;
+    type SavedTextComponents = SavedComponents;
+    fn capture_saved_components(
+        runtime: &mut ModelRuntime<Self>,
+        sampling: &Sampling,
+        input: Option<PendingTextInput<&Vec<u32>, &Token>>,
+        policy: SamplingCopyPolicy,
+    ) -> Result<SavedComponents, io::Error> {
+        if !matches!(policy, SamplingCopyPolicy::Unquoted) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bounded saved text components are unpriced in this fixture",
+            ));
+        }
+        let mut calls = runtime.backend().paired_operations.get();
+        calls[0] += 1;
+        runtime.backend().paired_operations.set(calls);
+        // Keep the established sampler/input then native-copy order. The
+        // shared driver already holds host authority through partial failure.
+        let sampling = Self::capture_saved_sampling(runtime, sampling, input, policy)?;
+        let native = Self::capture_native_text_state(runtime)?;
+        Ok(SavedComponents { native, sampling })
+    }
+    fn copy_saved_components(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &SavedComponents,
+        policy: SamplingCopyPolicy,
+    ) -> Result<SavedComponents, io::Error> {
+        if !matches!(policy, SamplingCopyPolicy::Unquoted) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bounded saved text components are unpriced in this fixture",
+            ));
+        }
+        Self::validate_saved_components(runtime, saved)?;
+        let mut calls = runtime.backend().paired_operations.get();
+        calls[1] += 1;
+        runtime.backend().paired_operations.set(calls);
+        let sampling = Self::copy_saved_sampling(runtime, &saved.sampling, policy)?;
+        let native = Self::copy_native_text_state(runtime, &saved.native)?;
+        Ok(SavedComponents { native, sampling })
+    }
+    fn saved_sampling(saved: &SavedComponents) -> &SavedSampling {
+        &saved.sampling
+    }
+    fn validate_saved_components(
+        runtime: &ModelRuntime<Self>,
+        saved: &SavedComponents,
+    ) -> Result<(), io::Error> {
+        Self::validate_native_text_state(runtime, &saved.native)
+    }
+    fn estimate_saved_components(
+        runtime: &ModelRuntime<Self>,
+        saved: &SavedComponents,
+    ) -> Result<Option<SnapshotEstimate>, io::Error> {
+        Self::validate_saved_components(runtime, saved)?;
+        let native = Self::estimate_native_text_state(runtime, Some(&saved.native))?;
+        let sampling = Self::estimate_saved_sampling(runtime, &saved.sampling)?;
+        Ok(native.zip(sampling).and_then(|(native, sampling)| {
+            Some(SnapshotEstimate {
+                retained_bytes: native.retained_bytes.checked_add(sampling.retained_bytes)?,
+                copy_bytes: native.copy_bytes.checked_add(sampling.copy_bytes)?,
+            })
+        }))
+    }
+    fn estimate_saved_native_growth(
+        runtime: &ModelRuntime<Self>,
+        saved: &SavedComponents,
+        input_tokens: u64,
+    ) -> Result<Option<u64>, io::Error> {
+        Self::validate_saved_components(runtime, saved)?;
+        Self::estimate_native_text_growth(runtime, &saved.native, input_tokens)
+    }
+    fn prepare_saved_components_resume(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &SavedComponents,
+    ) -> Result<(Saved, Sampling, Option<PendingTextInput<Vec<u32>, Token>>), io::Error> {
+        Self::validate_saved_components(runtime, saved)?;
+        let mut calls = runtime.backend().paired_operations.get();
+        calls[2] += 1;
+        runtime.backend().paired_operations.set(calls);
+        let (sampling, pending) = Self::prepare_saved_sampling_resume(runtime, &saved.sampling)?;
+        let native = Self::copy_native_text_state(runtime, &saved.native)?;
+        Ok((native, sampling, pending))
+    }
+    fn capture_saved_sampling(
+        runtime: &mut ModelRuntime<Self>,
+        sampling: &Sampling,
+        input: Option<PendingTextInput<&Vec<u32>, &Token>>,
+        policy: SamplingCopyPolicy,
+    ) -> Result<SavedSampling, io::Error> {
+        if !matches!(policy, SamplingCopyPolicy::Unquoted) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bounded saved sampling is unpriced in this fixture",
+            ));
+        }
+        let mut calls = runtime.backend().sampling_operations.get();
+        calls[0] += 1;
+        runtime.backend().sampling_operations.set(calls);
+        let (sampling, pending) = copy_sampling_parts(runtime, sampling, input)?;
+        Ok(SavedSampling { sampling, pending })
+    }
+    fn copy_saved_sampling(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &SavedSampling,
+        policy: SamplingCopyPolicy,
+    ) -> Result<SavedSampling, io::Error> {
+        if !matches!(policy, SamplingCopyPolicy::Unquoted) {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bounded saved sampling is unpriced in this fixture",
+            ));
+        }
+        let mut calls = runtime.backend().sampling_operations.get();
+        calls[1] += 1;
+        runtime.backend().sampling_operations.set(calls);
+        let (sampling, pending) = copy_sampling_parts(
+            runtime,
+            &saved.sampling,
+            saved.pending.as_ref().map(PendingTextInput::as_ref),
+        )?;
+        Ok(SavedSampling { sampling, pending })
+    }
+    fn saved_sampling_prediction(saved: &SavedSampling) -> u64 {
+        Self::sampling_prediction(&saved.sampling)
+    }
+    fn estimate_saved_sampling(
+        runtime: &ModelRuntime<Self>,
+        saved: &SavedSampling,
+    ) -> Result<Option<SnapshotEstimate>, io::Error> {
+        let sampling = Self::estimate_sampling_state(runtime, &saved.sampling)?;
+        let input = Self::estimate_pending_input(
+            runtime,
+            saved.pending.as_ref().map(PendingTextInput::as_ref),
+        )?;
+        Ok(sampling.zip(input).and_then(|(sampling, input)| {
+            Some(SnapshotEstimate {
+                retained_bytes: sampling.retained_bytes.checked_add(input.retained_bytes)?,
+                copy_bytes: sampling.copy_bytes.checked_add(input.copy_bytes)?,
+            })
+        }))
+    }
+    fn saved_input_tokens(saved: &SavedSampling, predictions: u64) -> Option<u64> {
+        Self::continuation_input_tokens(
+            saved.pending.as_ref().map(PendingTextInput::as_ref),
+            predictions,
+        )
+    }
+    fn estimate_saved_sampling_growth(
+        runtime: &ModelRuntime<Self>,
+        saved: &SavedSampling,
+        predictions: u64,
+    ) -> Result<Option<u64>, io::Error> {
+        Self::estimate_sampling_growth(runtime, &saved.sampling, predictions)
+    }
+    fn prepare_saved_sampling_resume(
+        runtime: &mut ModelRuntime<Self>,
+        saved: &SavedSampling,
+    ) -> Result<(Sampling, Option<PendingTextInput<Vec<u32>, Token>>), io::Error> {
+        let mut calls = runtime.backend().sampling_operations.get();
+        calls[2] += 1;
+        runtime.backend().sampling_operations.set(calls);
+        copy_sampling_parts(
+            runtime,
+            &saved.sampling,
+            saved.pending.as_ref().map(PendingTextInput::as_ref),
+        )
+    }
+
     fn continuation_input_tokens(
         input: Option<PendingTextInput<&Vec<u32>, &Token>>,
         predictions: u64,

@@ -1,6 +1,7 @@
 //! Family-blind interpretation of portable realtime schedule transitions.
 
-use std::collections::BTreeMap;
+use crate::host_metadata::funded_vec;
+use eredu_core::realtime::RealtimeSlotTable;
 
 use eredu_core::{
     RealtimeForcedSource, RealtimeFrameScheduleState, RealtimeFrameSlot, RealtimeFrameTransition,
@@ -19,6 +20,12 @@ pub trait RealtimeFrameTensorMechanisms {
     /// Mechanism failure.
     type Error;
 
+    /// Copies an actual descriptor through its original host source.
+    fn clone_with_host_source(&mut self,_value:&Self::Tensor,_funding:&eredu_core::HostMetadataFunding)
+        ->Result<Self::Tensor,eredu_core::BackendFailure> {
+        Err(eredu_core::HostMetadataFundingError::Unavailable.into())
+    }
+
     /// Selects one token column while retaining the batch and singleton axes.
     fn column(&mut self, matrix: &Self::Tensor, column: usize)
         -> Result<Self::Tensor, Self::Error>;
@@ -33,6 +40,9 @@ pub trait RealtimeFrameTensorMechanisms {
         batch: usize,
     ) -> Result<Self::Tensor, Self::Error>;
 }
+
+mod tensor;
+pub use tensor::NeuralRealtimeFrameTensorMechanisms;
 
 /// Fully resolved temporal inputs and ordered target directives for one step.
 pub struct PreparedRealtimeFrame<T> {
@@ -140,6 +150,10 @@ impl<T, D> CompletedRealtimeFrame<T, D> {
 }
 
 /// Records sampled decisions, resolves aligned output, and prunes history.
+fn host_error<E>(cause:eredu_core::HostMetadataFundingError)->RealtimeFrameInterpretationError<E> {
+    RealtimeFrameInterpretationError::History(RealtimePayloadHistoryError::HostMetadata(cause))
+}
+
 pub fn complete_realtime_frame<M, D>(
     schedule: &RealtimeSpeechConfig,
     history: &mut RealtimePayloadHistory<M::Tensor>,
@@ -154,6 +168,11 @@ where
     history
         .validate_schedule(schedule)
         .map_err(RealtimeFrameInterpretationError::History)?;
+    let funding=history.host_funding().cloned();
+    if let Some(funding)=&funding {
+        funding.reserve_metadata(completed_host_header_bytes::<M::Tensor,D,M::Error>())
+            .map_err(host_error)?;
+    }
     let (prepared_schedule, transition, _, directives, batch, retain_diagnostics) =
         prepared.into_parts();
     if &prepared_schedule != schedule {
@@ -178,7 +197,8 @@ where
         let padding = mechanisms
             .filled_column(schedule.audio_padding_token(), batch)
             .map_err(RealtimeFrameInterpretationError::Mechanism)?;
-        let sampled_columns = vec![padding; schedule.generated_audio_codebooks()];
+        let mut sampled_columns=funded_vec(schedule.generated_audio_codebooks(),funding.as_ref()).map_err(host_error)?;
+        for _ in 0..schedule.generated_audio_codebooks() {sampled_columns.push(clone_frame_tensor(&padding,funding.as_ref(),mechanisms)?);}
         let sampled_audio = mechanisms
             .stack_columns(&sampled_columns, batch)
             .map_err(RealtimeFrameInterpretationError::Mechanism)?;
@@ -206,10 +226,8 @@ where
             actual: diagnostics.len(),
         });
     }
-    let text = decisions
-        .first()
-        .cloned()
-        .ok_or(RealtimeFrameInterpretationError::MissingTextDecision)?;
+    let text = clone_frame_tensor(decisions.first()
+        .ok_or(RealtimeFrameInterpretationError::MissingTextDecision)?,funding.as_ref(),mechanisms)?;
     let generated = schedule.generated_audio_codebooks();
     let generated_end = 1usize
         .checked_add(generated)
@@ -221,17 +239,12 @@ where
         });
     }
 
-    let mut history_branch = history.clone();
-    let resolved_targets = transition
-        .targets()
-        .iter()
-        .zip(&decisions)
-        .filter_map(|(target, payload)| {
-            target
-                .coordinate()
-                .map(|coordinate| (coordinate, payload.clone()))
-        })
-        .collect::<Vec<_>>();
+    let mut history_branch = clone_frame_history(history,mechanisms)?;
+    let mut resolved_targets=funded_vec(transition.targets().iter()
+        .filter(|target|target.coordinate().is_some()).count(),funding.as_ref()).map_err(host_error)?;
+    for (target,payload) in transition.targets().iter().zip(&decisions) {
+        if let Some(coordinate)=target.coordinate() {resolved_targets.push((coordinate,clone_frame_tensor(payload,funding.as_ref(),mechanisms)?));}
+    }
     history_branch
         .overwrite_many(schedule, resolved_targets)
         .map_err(RealtimeFrameInterpretationError::History)?;
@@ -245,12 +258,10 @@ where
     let aligned_audio = transition
         .output()
         .map(|coordinates| {
-            let columns = history_branch
-                .resolve_required(schedule, coordinates.iter().copied())
-                .map_err(RealtimeFrameInterpretationError::History)?
-                .into_iter()
-                .cloned()
-                .collect::<Vec<_>>();
+            let required=history_branch.resolve_required(schedule,coordinates.iter().copied())
+                .map_err(RealtimeFrameInterpretationError::History)?;
+            let mut columns=funded_vec(required.len(),funding.as_ref()).map_err(host_error)?;
+            for value in required {columns.push(clone_frame_tensor(value,funding.as_ref(),mechanisms)?);}
             mechanisms
                 .stack_columns(&columns, batch)
                 .map_err(RealtimeFrameInterpretationError::Mechanism)
@@ -292,85 +303,101 @@ where
     history
         .validate_schedule(schedule)
         .map_err(RealtimeFrameInterpretationError::History)?;
-    let mut schedule_branch = schedule_state.clone();
-    let mut history_branch = history.clone();
-    let transition = schedule_branch
-        .advance(schedule, input.forcing())
-        .map_err(RealtimeFrameInterpretationError::Schedule)?;
+    let funding=history.host_funding().cloned();
+    let mut schedule_branch = match &funding {
+        Some(funding)=>schedule_state.try_clone_with_host_source(funding)
+            .map_err(RealtimeScheduleError::HostMetadata)
+            .map_err(RealtimeFrameInterpretationError::Schedule)?,
+        None=>schedule_state.clone(),
+    };
+    let mut history_branch = clone_frame_history(history,mechanisms)?;
+    let transition = match &funding {
+        Some(funding)=>schedule_branch.advance_with_host_source(schedule,input.forcing(),funding),
+        None=>schedule_branch.advance(schedule,input.forcing()),
+    }.map_err(RealtimeFrameInterpretationError::Schedule)?;
 
-    let mut insertions = BTreeMap::new();
+    if let Some(funding)=&funding {
+        funding.reserve_metadata(prepared_host_header_bytes::<M::Tensor,M::Error>())
+            .map_err(host_error)?;
+    }
+    let mut insertions = RealtimeSlotTable::new();
+    if let Some(funding)=&funding {
+        let count=transition.input_placements().len().checked_add(transition.forced_placements().len())
+            .and_then(|n|n.checked_add(transition.warmup_padding().len()))
+            .ok_or_else(||host_error(eredu_core::HostMetadataFundingError::Overflow))?;
+        insertions.reserve_prepared(count,funding).map_err(host_error)?;
+    }
     for (column, coordinate) in transition.input_placements().iter().copied().enumerate() {
         let payload = mechanisms
             .column(input.input_audio(), column)
             .map_err(RealtimeFrameInterpretationError::Mechanism)?;
-        insertions.insert(coordinate, payload);
+        insertions.insert_checked(coordinate, payload).map_err(|(cause,_)|host_error(cause))?;
     }
     for coordinate in transition.forced_placements().iter().copied() {
-        insertions.insert(
+        insertions.insert_checked(
             coordinate,
-            forced_payload(input, coordinate.slot(), mechanisms)?,
-        );
+            forced_payload(input, coordinate.slot(), funding.as_ref(), mechanisms)?,
+        ).map_err(|(cause,_)|host_error(cause))?;
     }
     for coordinate in transition.warmup_padding().iter().copied() {
         let payload = mechanisms
             .filled_column(padding_token(schedule, coordinate.slot())?, input.batch())
             .map_err(RealtimeFrameInterpretationError::Mechanism)?;
-        insertions.insert(coordinate, payload);
+        insertions.insert_checked(coordinate, payload).map_err(|(cause,_)|host_error(cause))?;
     }
     history_branch
         .overwrite_many(schedule, insertions)
         .map_err(RealtimeFrameInterpretationError::History)?;
 
-    let temporal = transition
-        .temporal_inputs()
-        .iter()
-        .map(|source| match source {
+    let mut temporal=funded_vec(transition.temporal_inputs().len(),funding.as_ref()).map_err(host_error)?;
+    for source in transition.temporal_inputs() {
+        let value=match source {
             RealtimeTemporalSource::Padding(slot) => mechanisms
                 .filled_column(padding_token(schedule, *slot)?, input.batch())
                 .map_err(RealtimeFrameInterpretationError::Mechanism),
-            RealtimeTemporalSource::Occupied { coordinate, .. } => history_branch
-                .required(schedule, *coordinate)
-                .cloned()
-                .map_err(RealtimeFrameInterpretationError::History),
+            RealtimeTemporalSource::Occupied { coordinate, .. } => clone_frame_tensor(
+                history_branch.required(schedule,*coordinate).map_err(RealtimeFrameInterpretationError::History)?,
+                funding.as_ref(),mechanisms),
             _ => Err(RealtimeFrameInterpretationError::UnsupportedTemporalSource),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let directives = transition
-        .targets()
-        .iter()
-        .map(|target| match target.source() {
+        }?;
+        temporal.push(value);
+    }
+    let mut directives=funded_vec(transition.targets().len(),funding.as_ref()).map_err(host_error)?;
+    for target in transition.targets() {
+        let value=match target.source() {
             RealtimeTargetSource::Sampled => Ok(PredictionDirective::Sample),
             RealtimeTargetSource::Forced(RealtimeForcedSource::CurrentInput) => {
-                forced_payload(input, target.slot(), mechanisms).map(PredictionDirective::Force)
+                forced_payload(input, target.slot(), funding.as_ref(), mechanisms).map(PredictionDirective::Force)
             }
             RealtimeTargetSource::Forced(RealtimeForcedSource::Retained) => target
                 .coordinate()
                 .ok_or(RealtimeFrameInterpretationError::MissingTargetCoordinate)
                 .and_then(|coordinate| {
-                    history_branch
-                        .required(schedule, coordinate)
-                        .cloned()
-                        .map_err(RealtimeFrameInterpretationError::History)
+                    clone_frame_tensor(history_branch.required(schedule,coordinate)
+                        .map_err(RealtimeFrameInterpretationError::History)?,funding.as_ref(),mechanisms)
                 })
                 .map(PredictionDirective::Force),
             RealtimeTargetSource::Existing(_) => target
                 .coordinate()
                 .ok_or(RealtimeFrameInterpretationError::MissingTargetCoordinate)
                 .and_then(|coordinate| {
-                    history_branch
-                        .required(schedule, coordinate)
-                        .cloned()
-                        .map_err(RealtimeFrameInterpretationError::History)
+                    clone_frame_tensor(history_branch.required(schedule,coordinate)
+                        .map_err(RealtimeFrameInterpretationError::History)?,funding.as_ref(),mechanisms)
                 })
                 .map(PredictionDirective::Force),
             _ => Err(RealtimeFrameInterpretationError::UnsupportedTargetSource),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        }?;
+        directives.push(value);
+    }
 
+    let prepared_schedule=match &funding {
+        Some(funding)=>schedule.try_clone_with_host_source(funding).map_err(host_error)?,
+        None=>schedule.clone(),
+    };
     *schedule_state = schedule_branch;
     *history = history_branch;
     Ok(PreparedRealtimeFrame {
-        schedule: schedule.clone(),
+        schedule: prepared_schedule,
         transition,
         temporal,
         directives,
@@ -382,16 +409,15 @@ where
 fn forced_payload<M>(
     input: &MaterializedRealtimeInput<M::Tensor>,
     slot: RealtimeFrameSlot,
+    funding:Option<&eredu_core::HostMetadataFunding>,
     mechanisms: &mut M,
 ) -> Result<M::Tensor, RealtimeFrameInterpretationError<M::Error>>
 where
     M: RealtimeFrameTensorMechanisms,
 {
     match slot {
-        RealtimeFrameSlot::Text => input
-            .forced_text()
-            .cloned()
-            .ok_or(RealtimeFrameInterpretationError::MissingForcedPayload { slot }),
+        RealtimeFrameSlot::Text => clone_frame_tensor(input.forced_text()
+            .ok_or(RealtimeFrameInterpretationError::MissingForcedPayload { slot })?,funding,mechanisms),
         RealtimeFrameSlot::Audio(codebook) => mechanisms
             .column(
                 input
@@ -421,6 +447,9 @@ fn padding_token<E>(
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeFrameInterpretationError<E> {
+    /// A retained native descriptor copy failed under its original account.
+    #[error(transparent)]
+    HostClone(eredu_core::BackendFailure),
     /// Opaque input was validated under a different normalized schedule.
     #[error("materialized realtime input does not match the normalized schedule")]
     InputScheduleMismatch,
@@ -1000,4 +1029,25 @@ mod tests {
             PredictionDirective::Force(matrix) if matrix.values == vec![7]
         ));
     }
+}
+
+pub(crate) fn prepared_host_header_bytes<T,E>()->usize {
+    std::mem::size_of::<PreparedRealtimeFrame<T>>()*2
+        +std::mem::size_of::<Result<PreparedRealtimeFrame<T>,RealtimeFrameInterpretationError<E>>>()
+}
+pub(crate) fn completed_host_header_bytes<T,D,E>()->usize {
+    std::mem::size_of::<CompletedRealtimeFrame<T,D>>()*2
+        +std::mem::size_of::<Result<CompletedRealtimeFrame<T,D>,RealtimeFrameInterpretationError<E>>>()
+}
+
+pub(crate) fn clone_frame_tensor<M:RealtimeFrameTensorMechanisms>(value:&M::Tensor,
+    funding:Option<&eredu_core::HostMetadataFunding>,mechanisms:&mut M)
+    ->Result<M::Tensor,RealtimeFrameInterpretationError<M::Error>> {
+    match funding {Some(funding)=>mechanisms.clone_with_host_source(value,funding)
+        .map_err(RealtimeFrameInterpretationError::HostClone),None=>Ok(value.clone())}
+}
+pub(crate) fn clone_frame_history<M:RealtimeFrameTensorMechanisms>(history:&RealtimePayloadHistory<M::Tensor>,mechanisms:&mut M)
+    ->Result<RealtimePayloadHistory<M::Tensor>,RealtimeFrameInterpretationError<M::Error>> {
+    history.clone_with_payload_source(&mut |value,funding|mechanisms.clone_with_host_source(value,funding))
+        .map_err(RealtimeFrameInterpretationError::HostClone)
 }

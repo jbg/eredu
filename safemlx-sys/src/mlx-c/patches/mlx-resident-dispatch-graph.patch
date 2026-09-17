@@ -1,0 +1,288 @@
+diff --git a/mlx/backend/cuda/eval.cpp b/mlx/backend/cuda/eval.cpp
+--- a/mlx/backend/cuda/eval.cpp
++++ b/mlx/backend/cuda/eval.cpp
+@@ -161,3 +161,8 @@
+   return false;
+ }
+ } // namespace mlx::core::submission
++
++namespace mlx::core::submission {
++bool resident_gpu_worker_layout(size_t, size_t, size_t, size_t, size_t,
++    size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
++}
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1803,3 +1803,160 @@
+ }
+ 
+ } // namespace mlx::core::metal
++
++#include "mlx/graph_construction.h"
++#include "mlx/prepared_input.h"
++#include "mlx/fast.h"
++#include "mlx/original_buffer.h"
++#include "mlx/event.h"
++
++namespace mlx::core::submission {
++bool resident_gpu_worker_layout(size_t entries, size_t input_edges,
++    size_t output_slots, size_t array_nodes, size_t backing_births,
++    size_t maximum_rank, size_t maximum_operands, ResidentGpuWorkerLayout& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  // Individual Shape/Strides and reduction-axis temporaries in this profile
++  // stay inline. Collapse's doubled markers and GEMM's concatenated batch
++  // strides are independently priced below. Larger ranks need that separate
++  // worker request profile; ordinary execution is unchanged.
++  if (maximum_rank >= Shape::inline_capacity ||
++      maximum_rank >= Strides::inline_capacity || maximum_rank >= 10 ||
++      maximum_operands < 4 || !entries) return false;
++  auto add = [](size_t a, size_t b, size_t& result) {
++    if (b > SIZE_MAX - a) return false;
++    result = a + b; return true;
++  };
++  auto mul = [](size_t a, size_t b, size_t& result) {
++    if (a && b > SIZE_MAX / a) return false;
++    result = a * b; return true;
++  };
++  ResidentGpuWorkerLayout value;
++  size_t temporaries, data_controls;
++  // Every temporary is either a new output/scratch backing or an input view.
++  // Output Data owners are additional; primitive descriptors already belong
++  // to the host bank and are not charged again here.
++  if (!add(backing_births, input_edges, temporaries) ||
++      !add(output_slots, temporaries, data_controls) ||
++      !add(entries, temporaries, value.kernel_attempts) ||
++      !add(array_nodes, backing_births, value.buffer_universe)) return false;
++  // One threshold end per Eval entry, one possible foreign Event wait per
++  // input edge, root/async Event signal, normal finalization and recovery.
++  // The latter four are explicit call sites for the one selected GPU stream.
++  if (!add(entries, input_edges, value.encoding_intervals) ||
++      !add(value.encoding_intervals, 4, value.encoding_intervals)) return false;
++  auto extent = [&](size_t bytes, size_t alignment, size_t count) {
++    if (!count || !bytes) return true;
++    size_t each, total;
++    return GraphQuota::allocation_extent(bytes, alignment, each) &&
++        mul(each, count, total) && add(value.allocation_extents, total, value.allocation_extents);
++  };
++  auto shape = [&](const metal::AllocationShape& request, size_t count) {
++    return extent(request.bytes, request.alignment, count);
++  };
++  GraphQuota::Request array_requests[5]{};
++  size_t array_request_count = 0;
++  if (!PreparedInputLeaf::append_array_requests(0, array_requests, array_request_count) ||
++      array_request_count != 3) return false;
++  if (!extent(array_requests[0].bytes, array_requests[0].alignment, temporaries) ||
++      !extent(array_requests[1].bytes, array_requests[1].alignment, temporaries) ||
++      !extent(array_requests[2].bytes, array_requests[2].alignment, data_controls)) return false;
++  OriginalBufferRoutingLayout routing;
++  if (!original_buffer_routing_layout(routing) ||
++      !extent(routing.birth_bytes, routing.birth_alignment, backing_births)) return false;
++
++  // Fresh libc++ ArrayVector push_back doubles capacity: for m>0, all
++  // allocations together request fewer than 4m slots and make at most m
++  // nonempty attempts, including a failing final attempt. Copies/temporary
++  // views are counted in temporaries; moves keep the original allocator.
++  size_t vector_bytes, vector_extents;
++  if (!mul(temporaries, 4 * sizeof(array), vector_bytes) ||
++      !GraphQuota::allocation_population_extent(vector_bytes, temporaries, vector_extents) ||
++      !add(value.allocation_extents, vector_extents, value.allocation_extents)) return false;
++
++  // Copy/binary/slice use two operands; ternary and AddMM use three.
++  // Variadic concatenation loops through the two-buffer copy worker.
++  CollapseStorageLayout collapse;
++  if (!collapse_contiguous_dims_layout(3, maximum_rank + 1, true, collapse)) return false;
++  size_t collapse_extents;
++  if (!mul(collapse.graph_extent_sum, value.kernel_attempts, collapse_extents) ||
++      !add(value.allocation_extents, collapse_extents, value.allocation_extents)) return false;
++
++  // Regular GEMM owns a copy of A's batch strides, then appends B and
++  // optionally C. Even when each input rank is inline, their concatenation
++  // can grow. Mirror the actual two insertions and reserve each new capacity
++  // including a failing second growth, once per potential primitive worker.
++  const size_t batch_rank = maximum_rank > 2 ? maximum_rank - 2 : 0;
++  size_t batch_size = batch_rank;
++  size_t batch_capacity = Strides::inline_capacity;
++  for (size_t append = 0; append != 2; ++append) {
++    if (!add(batch_size, batch_rank, batch_size)) return false;
++    if (batch_size > batch_capacity) {
++      size_t doubled, bytes;
++      if (!mul(batch_capacity, 2, doubled)) return false;
++      batch_capacity = std::max(batch_size, doubled);
++      if (!mul(batch_capacity, sizeof(Strides::value_type), bytes) ||
++          !extent(bytes, alignof(Strides::value_type), entries)) return false;
++    }
++  }
++
++  metal::PersistentControlLayout persistent;
++  metal::ReceiptControlLayout receipts;
++  EventControlLayout event;
++  EventDispatchControlLayout event_dispatch;
++  if (!metal::CommandEncoder::persistent_control_layout(persistent) ||
++      !metal::CommandEncoder::receipt_control_layout(receipts) ||
++      !event_control_layout(event) || !event_dispatch_control_layout(event_dispatch)) return false;
++  size_t interval_resources, argument_resources, fence_candidates;
++  // The closed family owns eight input and four output slots. Every other
++  // selected worker below has no more bound buffers: SDPA <=7; matmul <=6;
++  // rank<10 indexed gather/scatter <=11; copy/reduce/normalization <=4.
++  // Concat invokes one two-buffer copy per input, already included in K.
++  constexpr size_t argument_buffers =
++      std::tuple_size_v<decltype(fast::KernelSpecialization::inputs)> +
++      std::tuple_size_v<decltype(fast::KernelSpecialization::outputs)>;
++  if (!mul(value.encoding_intervals, value.buffer_universe, interval_resources) ||
++      !mul(value.kernel_attempts, argument_buffers, argument_resources)) return false;
++  interval_resources = std::min(interval_resources, argument_resources);
++  if (!mul(interval_resources, 2, fence_candidates) ||
++      !shape(persistent.resource_entry, interval_resources) ||
++      !shape(persistent.fence_entry, fence_candidates) ||
++      !shape(persistent.temporary_batch, temporaries) ||
++      !shape(persistent.encoder_fence, value.encoding_intervals) ||
++      !shape(receipts.cleanup_node, value.encoding_intervals) ||
++      !shape(receipts.receipt, value.encoding_intervals)) return false;
++  // Sum the real finite interval destinations, not maximum-vector size times
++  // every allocation class. Each temporary enters one cleanup; each resource
++  // registration supplies at most one output and displaced slot and two wait
++  // slots (retained prior fence plus the new candidate).
++  auto vector_population = [&](size_t slots, size_t slot_bytes) {
++    size_t bytes, extents;
++    const size_t attempts = std::min(slots, value.encoding_intervals);
++    return mul(slots, slot_bytes, bytes) &&
++        GraphQuota::allocation_population_extent(bytes, attempts, extents) &&
++        add(value.allocation_extents, extents, value.allocation_extents);
++  };
++  size_t waiting_slots;
++  if (!mul(interval_resources, 2, waiting_slots) ||
++      !vector_population(temporaries, sizeof(array)) ||
++      !vector_population(interval_resources, sizeof(const void*)) ||
++      !vector_population(waiting_slots, sizeof(metal::detail::FenceOwner)) ||
++      !vector_population(interval_resources, sizeof(metal::detail::FenceOwner))) return false;
++  // The fixed Synchronizer owns the first root Event separately. At most one
++  // async stream Event is additional. Its signal and the root signal plus
++  // foreign input waits each own an actual EventEntry handler. There is no
++  // within-Eval Fence in this authenticated one-stream profile.
++  size_t event_actions;
++  if (!add(input_edges, 2, event_actions) ||
++      !extent(event.shared_bytes, event.shared_alignment, 1) ||
++      !extent(event_dispatch.gpu_handler_bytes, event_dispatch.gpu_handler_alignment, event_actions)) return false;
++  value.named_control_bytes = sizeof(value) + sizeof(out) + 7 * sizeof(size_t) +
++      sizeof(array_requests) + sizeof(array_request_count) + sizeof(routing) +
++      sizeof(collapse) + sizeof(persistent) + sizeof(receipts) + sizeof(event) +
++      sizeof(event_dispatch) + sizeof(add) + sizeof(mul) + sizeof(extent) + sizeof(shape) +
++      sizeof(vector_population);
++  out = value; return true;
++#endif
++}
++} // namespace mlx::core::submission
+diff --git a/mlx/backend/no_gpu/eval.cpp b/mlx/backend/no_gpu/eval.cpp
+--- a/mlx/backend/no_gpu/eval.cpp
++++ b/mlx/backend/no_gpu/eval.cpp
+@@ -72,3 +72,8 @@
+   return false;
+ }
+ } // namespace mlx::core::submission
++
++namespace mlx::core::submission {
++bool resident_gpu_worker_layout(size_t, size_t, size_t, size_t, size_t,
++    size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
++}
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -32,11 +32,28 @@
+ // Ordinary std::vector/set axis storage is outside this Graph-only recipe.
+ struct ResidentGraphLayout : GraphConstructionLayout {
+   size_t primitives{0}, seeds{0}, maximum_rank{0}, maximum_operands{4};
++  size_t additional_shells{0};
+ };
+ MLX_API bool resident_graph_layout(size_t primitives, size_t seeds,
+     size_t maximum_rank, ResidentGraphLayout&) noexcept;
+ MLX_API bool resident_graph_layout_with_operands(size_t primitives, size_t seeds,
+     size_t maximum_rank, size_t maximum_operands, ResidentGraphLayout&) noexcept;
++
++// Semantic handle copies have no primitive or buffer birth. Their separately
++// derived population is consumed by the same existing physical shell class.
++MLX_API bool resident_graph_layout_with_shells(size_t primitives, size_t seeds,
++    size_t maximum_rank, size_t maximum_operands, size_t additional_shells,
++    ResidentGraphLayout&) noexcept;
++
++// Single-GPU no-tracing worker population. These are request sums for the
++// closed native worker set, independent of platform-private Metal storage.
++struct ResidentGpuWorkerLayout {
++  size_t allocation_extents{0}, named_control_bytes{0};
++  size_t kernel_attempts{0}, encoding_intervals{0}, buffer_universe{0};
++};
++MLX_API bool resident_gpu_worker_layout(size_t entries, size_t input_edges,
++    size_t output_slots, size_t array_nodes, size_t backing_births,
++    size_t maximum_rank, size_t maximum_operands, ResidentGpuWorkerLayout&) noexcept;
+ 
+ // Four fixed-Eval host requests; no Data, worker or stream-frontier owners.
+ struct EvalGraphLayout : GraphConstructionLayout {
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -1,3 +1,4 @@
++#include "mlx/original_buffer.h"
+ #include "mlx/graph_quota.h"
+ #include "mlx/graph_construction.h"
+ #include "mlx/submission.h"
+@@ -350,6 +351,10 @@
+ }
+ bool resident_graph_layout_with_operands(size_t primitives, size_t seeds, size_t rank,
+     size_t maximum_operands, ResidentGraphLayout& output) noexcept {
++  return resident_graph_layout_with_shells(primitives, seeds, rank, maximum_operands, 0, output);
++}
++bool resident_graph_layout_with_shells(size_t primitives, size_t seeds, size_t rank,
++    size_t maximum_operands, size_t additional_shells, ResidentGraphLayout& output) noexcept {
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+@@ -393,6 +398,7 @@
+   ResidentGraphLayout value;
+   value.primitives = primitives; value.seeds = seeds; value.maximum_rank = rank;
+   value.maximum_operands = maximum_operands;
++  value.additional_shells = additional_shells;
+   value.request_bytes[0] = leaf[0].bytes;
+   value.request_bytes[1] = leaf[1].bytes;
+   value.request_bytes[2] = control;
+@@ -433,21 +439,24 @@
+     value.request_alignments[5] = alignof(Strides::value_type);
+     value.request_counts[5] = descriptors;
+   }
+-  // Operation-result shells have one term per potential constructor, including
+-  // elided primitives. Independent Rust/Array clone transports are not derived
+-  // from P+S: their admitted population remains a separate caller obligation.
+-  // The physical bank refuses an unaccounted request; it grants no whole-fit
+-  // success promise for a semantic program containing additional alias copies.
++  // Each potential host constructor owns a result shell; neutral semantic
++  // copies and named backend aliases contribute the separately derived count.
++  // Both consume real blocks from this bank through PreparedInputArray.
+   value.request_bytes[6] = sizeof(PreparedInputArray);
+   value.request_alignments[6] = alignof(PreparedInputArray);
+-  value.request_counts[6] = descriptors;
++  if (!add(descriptors, additional_shells, value.request_counts[6])) return false;
++  OriginalBufferRoutingLayout seed_routing;
++  if (!original_buffer_routing_layout(seed_routing)) return false;
++  value.request_bytes[7] = seed_routing.birth_bytes;
++  value.request_alignments[7] = seed_routing.birth_alignment;
++  value.request_counts[7] = seeds;
+   for (size_t i = 0; i < GraphConstructionLayout::classes; ++i) {
+     if (value.request_bytes[i] > size_t(PTRDIFF_MAX)) return false;
+     if (!value.request_alignments[i]) value.request_alignments[i] = 1;
+   }
+   value.named_control_bytes = sizeof(value) + sizeof(leaf) + sizeof(leaf_count) +
+       sizeof(primitives) + sizeof(seeds) + sizeof(rank) + sizeof(descriptors) + sizeof(control) +
+-      sizeof(maximum_operands) + sizeof(vector_elements) +
++      sizeof(maximum_operands) + sizeof(additional_shells) + sizeof(vector_elements) + sizeof(seed_routing) +
+       // Convolution's normalized caller axes, moved aggregate and constructor
+       // parameter are distinct inline frames. The retained five axes are already
+       // inside its actual primitive control, never another heap allowance.
+@@ -465,7 +474,7 @@
+   if (output || !scope || context.worker || context.dispatch || context.scope != scope ||
+       current_graph_quota() != &quota) return GraphFailure::foreign_parent;
+   ResidentGraphLayout actual;
+-  if (!resident_graph_layout_with_operands(layout.primitives, layout.seeds, layout.maximum_rank, layout.maximum_operands, actual))
++  if (!resident_graph_layout_with_shells(layout.primitives, layout.seeds, layout.maximum_rank, layout.maximum_operands, layout.additional_shells, actual))
+     return GraphFailure::invalid_layout;
+   return create_layout(quota, scope, nullptr, actual, output);
+ }

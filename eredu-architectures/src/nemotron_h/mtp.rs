@@ -9,6 +9,8 @@ use eredu_runtime::{RoutedExpertProvider, RuntimeStateComponents};
 use crate::decoder::ComponentInstrumentation;
 
 use super::{Block, LayerGeometry, LayerPolicy, ModelArgs};
+mod construction;
+pub(crate) use construction::PredictionUnitSpec;
 
 /// Borrowed input selecting target execution or one MTP prediction depth.
 pub enum EmbeddedInput<'a, T> {
@@ -69,7 +71,7 @@ pub struct PredictionUnit<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralB
     pub block: Block<B>,
     /// Last-unit normalization before the shared vocabulary projection.
     pub final_norm: Option<B::Normalization>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     experts: i32,
 }
 
@@ -81,44 +83,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
         relative: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let steps = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
-        if depth >= steps {
-            return Err(Error::backend(format!(
-                "Nemotron-H MTP depth {depth} is outside {steps} prediction steps"
-            )));
-        }
-        let policies = args.mtp_policies().map_err(Error::backend)?;
-        let pattern_len = policies
-            .len()
-            .checked_div(steps)
-            .filter(|length| *length > 0)
-            .ok_or_else(|| Error::backend("Nemotron-H MTP pattern is empty"))?;
-        if relative >= pattern_len {
-            return Err(Error::backend(format!(
-                "Nemotron-H MTP unit {relative} is outside pattern length {pattern_len}"
-            )));
-        }
-        let physical = depth
-            .checked_mul(pattern_len)
-            .and_then(|start| start.checked_add(relative))
-            .ok_or_else(|| Error::backend("Nemotron-H MTP physical index overflowed"))?;
-        let policy = policies[physical];
-        let geometry = match policy {
-            LayerPolicy::SelfAttention(_) => LayerGeometry::Attention {
-                query_heads: args.num_attention_heads,
-                kv_heads: args.num_key_value_heads,
-            },
-            LayerPolicy::SparseMoe => LayerGeometry::SparseMoe {
-                routed: args.moe_intermediate_size,
-                shared: args.moe_shared_expert_intermediate_size,
-            },
-            _ => {
-                return Err(Error::backend(format!(
-                    "unsupported Nemotron-H MTP policy {policy:?}"
-                )))
-            }
-        };
-        Self::new_with_geometry(args, depth, relative, policy, geometry, context)
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        PredictionUnitSpec::new(args, depth, relative)?.instantiate::<B>(context)
     }
 
     /// Builds one prediction unit from placement-resolved local geometry.
@@ -130,73 +96,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> PredictionUni
         geometry: LayerGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let steps = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
-        let policies = args.mtp_policies().map_err(Error::backend)?;
-        let pattern_len = policies
-            .len()
-            .checked_div(steps)
-            .filter(|length| *length > 0)
-            .ok_or_else(|| Error::backend("Nemotron-H MTP pattern is empty"))?;
-        if depth >= steps || relative >= pattern_len {
-            return Err(Error::backend(
-                "Nemotron-H MTP unit is outside its schedule",
-            ));
-        }
-        let physical = depth
-            .checked_mul(pattern_len)
-            .and_then(|start| start.checked_add(relative))
-            .ok_or_else(|| Error::backend("Nemotron-H MTP physical index overflowed"))?;
-        if policies[physical] != policy {
-            return Err(Error::backend(format!(
-                "Nemotron-H MTP policy {policy:?} does not match schedule {:?}",
-                policies[physical]
-            )));
-        }
-        let root = format!("model.mtp.layers.{physical}");
-        let parameter = |name: String| ParameterSpec::trainable(name).map_err(Error::backend);
-        let norm = |name: String| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.layer_norm_epsilon,
-                    parameter(name)?,
-                ),
-                context,
-            )
-        };
-        let first = relative == 0;
-        let last = relative + 1 == pattern_len;
-        let fusion_name = format!("{root}.eh_proj.weight");
-        Ok(Self {
-            experts: args.n_routed_experts,
-            embedding_norm: first
-                .then(|| norm(format!("{root}.enorm.weight")))
-                .transpose()?,
-            hidden_norm: first
-                .then(|| norm(format!("{root}.hnorm.weight")))
-                .transpose()?,
-            fusion: first
-                .then(|| {
-                    B::linear(
-                        LinearSpec {
-                            input: args.hidden_size * 2,
-                            output: args.hidden_size,
-                            weight: parameter(fusion_name.clone())?,
-                            bias: None,
-                            format: crate::linear_format::standard_linear_format(
-                                &fusion_name,
-                                args.weight_quantization_for(&fusion_name).into(),
-                            )?,
-                        },
-                        context,
-                    )
-                })
-                .transpose()?,
-            block: Block::new_mtp_with_geometry(args, physical, policy, geometry, context)?,
-            final_norm: last
-                .then(|| norm(format!("{root}.final_layernorm.weight")))
-                .transpose()?,
-        })
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        PredictionUnitSpec::with_geometry(args, depth, relative, policy, geometry)?
+            .instantiate::<B>(context)
     }
 
     /// Admitted global expert count for routed observation geometry.

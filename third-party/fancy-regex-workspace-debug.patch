@@ -1,0 +1,10 @@
+--- a/src/vm/workspace.rs
++++ b/src/vm/workspace.rs
+@@ -767,6 +767,7 @@
+     }
+ }
+ /// Borrowed iterator; it cannot outlive or concurrently reuse the workspace.
++#[derive(Debug)]
+ pub struct Matches<'w, 's, 't> {
+     workspace: &'w mut Workspace<'s>,
+     text: &'t str,

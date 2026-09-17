@@ -869,6 +869,9 @@ fn k2_pipeline_cuts_before_and_after_dense_to_mova_transition_match_cached_refer
                 {
                     LayeredPartitionOutput::Boundary { hidden, .. } => boundary = Some(hidden),
                     LayeredPartitionOutput::Final { output, .. } => actual.extend(output.data),
+                    LayeredPartitionOutput::StateOnly { .. } => {
+                        panic!("sequence readout omitted scores")
+                    }
                 }
             }
         }

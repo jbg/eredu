@@ -26,6 +26,7 @@ impl TokenFilterController for TestConstraint {
 }
 
 impl SpeculativeTokenFilterController for TestConstraint {
+    type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
     fn filter_at(&self, history: &[u32]) -> Result<TokenFilter, Self::Error> {
         assert!(history.starts_with(&self.committed));
         Ok(TokenFilter::allowed(vec![true, false, true, true]).unwrap())
@@ -37,7 +38,63 @@ impl SpeculativeTokenFilterController for TestConstraint {
 }
 
 #[test]
+fn native_preparation_speculative_sampling_rejects_unintegrated_policy() {
+    let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(0, 0).unwrap();
+    let memory = NativeMemoryOwner::acquire(&pool).unwrap();
+    let sampling = eredu_core::resolve_generation_config(
+        None,
+        eredu_core::GenerationConfigOverrides {
+            max_new_tokens: Some(3),
+            temperature: Some(0.7),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let chunk = eredu_core::TextInferencePolicy {
+        prefill_chunk_positions: std::num::NonZeroU64::new(2),
+        ..Default::default()
+    };
+    let generation = TextGenerationConfig::new(sampling).with_inference_policy(chunk);
+    validate_speculative_prefill_policy(generation, true).unwrap();
+    let error = validate_speculative_prefill_policy(generation, false).unwrap_err();
+    let Error::Other(source) = error else {
+        panic!("typed policy rejection")
+    };
+    assert!(matches!(
+        source.downcast_ref::<eredu_core::CapabilityError>(),
+        Some(eredu_core::CapabilityError::InvalidConfiguration {
+            field: "speculative_inference_policy",
+            ..
+        })
+    ));
+    let managed = eredu_core::TextInferencePolicy {
+        managed_memory_capacity_bytes: Some(u64::MAX),
+        ..Default::default()
+    };
+    for independent in [false, true] {
+        let generation = TextGenerationConfig::new(sampling).with_inference_policy(managed);
+        assert!(validate_speculative_prefill_policy(generation, independent).is_err());
+        let error = MlxSpeculativeSession::prepare_mlx_speculative_sampling(
+            generation,
+            TestConstraint::default(),
+            &memory,
+        )
+        .err()
+        .expect("unknown memory bound rejects before sampler construction");
+        let Error::Other(source) = error else {
+            panic!("typed memory rejection")
+        };
+        assert_eq!(
+            source.downcast_ref::<eredu_runtime::working_memory::WorkingMemoryError>(),
+            Some(&eredu_runtime::working_memory::WorkingMemoryError::UnknownBound)
+        );
+    }
+}
+
+#[test]
 fn prepared_mirostat_preserves_seed_penalties_constraints_and_forked_state() {
+    let pool = eredu_runtime::working_memory::WorkingMemoryPool::new(0, 0).unwrap();
+    let memory = NativeMemoryOwner::acquire(&pool).unwrap();
     let device = safemlx::Device::new(safemlx::DeviceType::Cpu, 0);
     let stream = Stream::new_with_device(&device);
     let resolved = eredu_core::generation::resolve_generation_config(
@@ -62,23 +119,33 @@ fn prepared_mirostat_preserves_seed_penalties_constraints_and_forked_state() {
     let (key, mut sampler) = MlxSpeculativeSession::prepare_mlx_speculative_sampling(
         generation,
         TestConstraint::default(),
+        &memory,
     )
     .unwrap();
     assert_eq!(
-        key.unwrap().evaluated().unwrap().as_slice::<u32>(),
+        key.unwrap()
+            .as_array()
+            .evaluated()
+            .unwrap()
+            .as_slice::<u32>(),
         safemlx::random::key(73)
             .unwrap()
             .evaluated()
             .unwrap()
             .as_slice::<u32>()
     );
-    assert!(!sampler.supports_exact_optimistic_promotion());
+    assert!(
+        !SpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(&sampler)
+    );
     let (_, standard) = MlxSpeculativeSession::prepare_mlx_speculative_sampling(
         TextGenerationConfig::new(resolved),
         TestConstraint::default(),
+        &memory,
     )
     .unwrap();
-    assert!(standard.supports_exact_optimistic_promotion());
+    assert!(
+        SpeculativeSampler::<MlxSamplingBackend>::supports_exact_optimistic_promotion(&standard)
+    );
 
     let mut reference = ConstrainedSampler::new(
         MirostatV2Sampler::new(4.0, 0.2)
@@ -90,9 +157,14 @@ fn prepared_mirostat_preserves_seed_penalties_constraints_and_forked_state() {
     let mut history = Vec::new();
     let mut expected_mu = 8.0;
     for token in [0, 2, 0] {
-        let processed = sampler
-            .process_logits(&logits, 0.8, &history, &stream)
-            .unwrap();
+        let processed = SpeculativeSampler::<MlxSamplingBackend>::process_logits(
+            &mut sampler,
+            &logits,
+            0.8,
+            &history,
+            &stream,
+        )
+        .unwrap();
         let expected = SpeculativeSampler::<MlxSamplingBackend>::process_logits(
             &mut reference,
             &logits,
@@ -119,7 +191,13 @@ fn prepared_mirostat_preserves_seed_penalties_constraints_and_forked_state() {
         let probability =
             MlxSamplingBackend::token_probability(&processed, token, &stream).unwrap();
         expected_mu -= 0.2 * (-probability.log2() - 4.0);
-        sampler.commit_token(&processed, token, &stream).unwrap();
+        SpeculativeSampler::<MlxSamplingBackend>::commit_token(
+            &mut sampler,
+            &processed,
+            token,
+            &stream,
+        )
+        .unwrap();
         history.push(token);
         let MlxTextSampler::MirostatV2(policy) = sampler.policy() else {
             panic!("prepared sampler must retain Mirostat V2");
@@ -137,10 +215,12 @@ fn prepared_mirostat_preserves_seed_penalties_constraints_and_forked_state() {
     }
 
     let mut fork = sampler.clone();
-    let processed = fork
-        .process_logits(&logits, 0.8, &history, &stream)
+    let processed = SpeculativeSampler::<MlxSamplingBackend>::process_logits(
+        &mut fork, &logits, 0.8, &history, &stream,
+    )
+    .unwrap();
+    SpeculativeSampler::<MlxSamplingBackend>::commit_token(&mut fork, &processed, 3, &stream)
         .unwrap();
-    fork.commit_token(&processed, 3, &stream).unwrap();
     assert_eq!(fork.controller().committed, [0, 2, 0, 3]);
     assert_eq!(sampler.controller().committed, history);
     let MlxTextSampler::MirostatV2(policy) = sampler.policy() else {
@@ -179,5 +259,6 @@ fn fused_rows_are_selected_by_backend_mechanisms_without_family_policy() {
         SpeculativeExecutionStreams::single(&stream),
     )
     .unwrap();
+    let IndependentLogits::Ordinary(row) = row else { panic!("ordinary fused row"); };
     assert_eq!(row.evaluated().unwrap().as_slice::<f32>(), &[4.0, 5.0, 6.0]);
 }

@@ -1,0 +1,78 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted standalone speculative distribution and policy-callback ownership",
+  "source_sha256": {
+    "eredu-backend-mlx/src/composition/mlx/speculative/sampling.rs": "4a61bfc2058cc407db179bf60c6c2ae04eaa1b716a2a949448dc111a483e8f7b",
+    "eredu-backend-mlx/src/composition/mlx/speculative/sampling/distribution.rs": "516d5e0d55b72e06242e6fb9c90f19ffd3ab59d67cff81edade7c9440c391a7c",
+    "eredu-backend-mlx/src/composition/mlx/speculative/sampling/distribution_tests.rs": "5dc1f47d434c38b28e8804aef3fed373fdca3c706ef36b4fd86701740882f061",
+    "eredu-backend-mlx/src/composition/mlx/speculative/sampling/ownership_tests.rs": "8ea622e835ea6fefbb9bd6d62e73f752064ea9bc890403940ed2cb39ffac11fe",
+    "eredu-backend-mlx/src/composition/mlx/speculative/scheduler/tests/transactions.rs": "347b2b2796185bd7142815a49312c10ab34d08e6b853b54ca270f16c4c63c19f",
+    "doc/backend-architecture.md": "45cc4a0791277784785ed2c3f634d3c334b58732a389b90fee3b587d187663b5",
+    "doc/execution-control.md": "3cd9740f331211bb68ddee8c7449ee7f04f9e7848dadd4472e7033fc1e6010bd",
+    "doc/bounded-inference.md": "cb89cd029f75c6a235e7856bb0cc7612bc4da78979b310c21b165843464a1c28"
+  },
+  "prior_ownership_record": "doc/validation/bounded-prediction-snapshot-memory-2026-09-13.json",
+  "coverage": {
+    "unique_native_tests": 147,
+    "new_distribution_tests": 7,
+    "remaining_ignored_native_tests": 8,
+    "new_peak_measurements": 0
+  },
+  "behavior": [
+    "Opaque MlxSpeculativeDistribution keeps lazy processed values and their allocation authority together. It exposes no production raw-array export or dereference.",
+    "Logits processing and capture callbacks acquire the selected domain before policy or capture-ledger mutation, including standalone sampling outside prepared generation.",
+    "Probability queries, residual construction, sampling and adaptive commitment merge sampler, distribution and RNG authorities before native work; repeated same-domain use reuses existing ownership.",
+    "Sampler clones share a mutable authority list because custom policies and capture payloads may share native state, including arrays retained from &self callbacks. No list borrow spans a user callback.",
+    "Verification acquires all source and destination authorities before changing any distribution or submitting native work. Empty, zero-temperature and single-stream no-work paths do not acquire a fresh owner.",
+    "Nonzero numerical fixtures verify probabilities, positive residuals, greedy sampling, lazy values and CPU/Metal verification. Errors and unwinding retain authority through native recovery and preserve original causes.",
+    "Five explicit Metal scheduler cases preserve CPU-draft/GPU-target execution, same-device handoff without producer synchronization, optimistic lookahead and stochastic acceptance."
+  ],
+  "limits": [
+    "Public strict managed budgets still reject UnknownBound. This increment provides allocation-operation admission and lifetime protection, not complete native byte quotes or successful quoted-copy admission.",
+    "Drained host capture records still need complete shared-domain accounting beyond their cumulative capture quotas.",
+    "Checked model ownership promotion, reserved backing protection for ordinary escaped outputs, real public request admission and identity-backed opening-state accounting remain prerequisites for successful native managed budgets.",
+    "Complete paging/materialization/media/observation and distributed accounting remain part of the full goal; no missing path is classified as an architectural limitation.",
+    "Eight selected native tests were not run in this increment: the prediction-completion Metal case passed in the prior record, while five activation/component and two multiprocess ring cases have no new native evidence here.",
+    "Portable contracts and model equations were unchanged. No portable test suite, released-checkpoint numerics or peak-memory measurements were rerun for this backend ownership increment.",
+    "The final feature build retains 12 existing unused-helper warnings; native linking retains the existing large unwind-table warning."
+  ],
+  "corrected_validation_findings": [
+    "Review found custom sample_processed callbacks can retain native arrays through interior mutable policy state. Shared sampler authority now preserves domains added by a later invocation when an earlier sampler clone survives.",
+    "The existing optimistic-transaction fixture directly indexed Array distributions. It now uses the test-only native inspection accessor while the distribution remains alive.",
+    "A redundant outer distribution re-export caused an unused-import warning and was removed; the implementation remains available through the opaque associated distribution type."
+  ],
+  "checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1 replicated_text::prediction speculative native_control native_preparation managed_memory recovery_tests",
+      "exit_code": 0,
+      "suites": [
+        142
+      ],
+      "passed": 142,
+      "ignored": 13,
+      "log": "/private/tmp/eredu-speculative-distribution-native-verified.log",
+      "sha256": "4a0e35b6ed14ca7c9f159d8781bf1851cb18e423b1882dfac6b0cf8cecccb501"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --ignored --test-threads=1 speculative::scheduler::tests",
+      "exit_code": 0,
+      "suites": [
+        5
+      ],
+      "passed": 5,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-speculative-distribution-metal.log",
+      "sha256": "d8dffe39de272e3a8d5dc3d068a8f1a4e041bc1b851ae820dd074472cea7afe2"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal,image,audio",
+      "exit_code": 0,
+      "suites": [],
+      "passed": null,
+      "ignored": 0,
+      "log": "/private/tmp/eredu-speculative-distribution-features-final.log",
+      "sha256": "62a97998ee10ce15096626e5fb66ea857f4bb42c1bdad361d0a0f5c270549782"
+    }
+  ]
+}

@@ -57,17 +57,17 @@ impl<B: BlockwiseAttentionBackend> QueryProjection<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct KimiLatentAttention<B: BlockwiseAttentionBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     nope_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     positional_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     value_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     latent_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     scale: f32,
     query: QueryProjection<B>,
     kv_a: B::Linear,

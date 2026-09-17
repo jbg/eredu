@@ -1,0 +1,360 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T10:59:10.864662+00:00",
+  "scope": "Five original prediction Scope roles under genuine active-step authority and independent native/Recovery retirement",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-unused-work-and-borrowed-utf8-integration-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 592,
+      "ignored": 0
+    },
+    "docs": {
+      "passed": 2,
+      "ignored": 0
+    },
+    "recovery": {
+      "passed": 22,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 399,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 26,
+      "ignored": 1
+    },
+    "conformance": {
+      "passed": 109,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 1150,
+  "new_tests": [
+    {
+      "check": "session",
+      "name": "busy_prediction_begin_keeps_never_started_recovery_custody_without_false_completion",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/prediction/tests.rs"
+    },
+    {
+      "check": "session",
+      "name": "cancellation_after_real_permit_uses_only_model_and_validation_roles",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/prediction/tests.rs"
+    },
+    {
+      "check": "session",
+      "name": "five_original_roles_follow_shared_ordinary_controlled_and_resident_host_disk_execution",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/prediction/tests.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prediction_bank_accepts_real_started_decode_and_independent_retirement_tails",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/prediction.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prediction_bank_checks_registered_source_health_before_issuing_any_role",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/prediction.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_prediction_bank_rejects_foreign_preparation_and_abandoned_active_step",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/prediction.rs"
+    },
+    {
+      "check": "session",
+      "name": "original_prediction_custody_survives_scope_unwind_until_guarded_reclamation",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/prediction/tests.rs"
+    },
+    {
+      "check": "session",
+      "name": "original_scalar_is_once_after_run_drop_copy_rejects_and_ordinary_copy_observes_fresh",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/prediction/tests.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "prediction_bank_is_original_exact_admission_and_cannot_spend_protected_headroom",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/prediction.rs"
+    },
+    {
+      "check": "session",
+      "name": "prediction_native_and_recovery_custody_retire_independently_after_original_run_closes",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/prediction/tests.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "unknown_prediction_role_and_overflow_reject_without_a_partial_original_seal",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/prediction.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "zero_output_and_initial_cancellation_never_issue_prediction_roles",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/prediction.rs"
+    }
+  ],
+  "new_test_count": 12,
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib working_memory:: -- --test-threads=1",
+      "started_utc": "2026-09-14T10:49:04.935351+00:00",
+      "elapsed_seconds": 19.925,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-prediction-scopes-integration-runtime.log",
+      "log_sha256": "7ecc6c472f37fe4f65bd9bba7afd62cdb81be036968185581aa7990d01b834d6"
+    },
+    "docs": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --doc",
+      "started_utc": "2026-09-14T10:49:24.862341+00:00",
+      "elapsed_seconds": 7.534,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-prediction-scopes-integration-docs.log",
+      "log_sha256": "2a06ef974dc15db7ac0ab6b70b1a4815ad523a5c3b69cf76b6243135df8d715f"
+    },
+    "recovery": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::submission_recovery:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T10:51:19.872923+00:00",
+      "elapsed_seconds": 78.461,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-prediction-scopes-integration-recovery.log",
+      "log_sha256": "af82aa8c201e0e30bdada65d73c929ff4f5870e2c0905f43ad3e952e08019f43"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T10:56:09.885097+00:00",
+      "elapsed_seconds": 99.691,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-prediction-scopes-integration-session.log",
+      "log_sha256": "9cd4df27675423f1021006d90b3472bdbbb740431520766c75c65f130c011633"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade",
+      "started_utc": "2026-09-14T10:57:49.567282+00:00",
+      "elapsed_seconds": 39.297,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-prediction-scopes-integration-portable.log",
+      "log_sha256": "34299f5e8b3a123065c036c43be464f45fbf885caf70d5a104042b89ce7bc116"
+    },
+    "conformance": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test backend_conformance",
+      "started_utc": "2026-09-14T10:58:28.863357+00:00",
+      "elapsed_seconds": 5.39,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-prediction-scopes-integration-conformance.log",
+      "log_sha256": "67764d7ea90d25da5f1ece85d5c46c1464788a6051419c3b0ae401041e1188df"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T10:58:34.253942+00:00",
+      "elapsed_seconds": 15.762,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-prediction-scopes-integration-minimal.log",
+      "log_sha256": "4fe8829d8492e319a5d41bed080b8e802f0f53df7f7fa7e8c857564c32f7e9f6"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T10:58:50.015970+00:00",
+      "elapsed_seconds": 16.612,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-prediction-scopes-integration-features.log",
+      "log_sha256": "495579620bf4d7f0619f69a89b2294a0c1c4b2cc49661690556631173700e0e6"
+    }
+  },
+  "source_sha256": {
+    "doc/bounded-inference.md": "d3f7b939d547e7311512d4020cf78d1e445d59931d2329ef40dc650f72941a0f",
+    "eredu-backend-mlx/src/composition/mlx/session/generation.rs": "49664c182e10f5d6aa1b1b37629d6ed4f0cf513dc324efb45c433fc3fd736b6a",
+    "eredu-backend-mlx/src/composition/mlx/session/output_completion/observation.rs": "2af53d760eea63275815c10a1033ab54703a7904802d8d43d24c8414fb10877b",
+    "eredu-backend-mlx/src/composition/mlx/session.rs": "f1a2f1d0ffaa921e66ff7ed106bb75ac654574712041f1d85a236cab2a5d04f0",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls.rs": "b660e11eb7297d61d678cf086a6852366d72dd03b9c3a29ea385a14d4d52f796",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/sequence.rs": "b8b874110d5da57ba8ca6eb045235368fc80bdd517e3c4bf22124d31359e4a95",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/submission_owner.rs": "f2234beafa8c8d1551bce6aa8afdd5ea583e09c75bc576e47186e32ad45f412c",
+    "eredu-backend-mlx/src/backend/error.rs": "4a03d0b34df7c6d1e7025bda49db62ea37bae4a1e9ac52d0ff1508806bb91e7f",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/prediction.rs": "7fa8b1395a8719bea9bf5fc1be19f6b76a59728d5e9f381dc8966b0274de4960",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/mechanisms/opening_sources/rows.rs": "db724f623612587939684616a9bc80a44517478d29c2b482ce6338a4e7aa9a54",
+    "eredu-backend-mlx/src/backend/submission_recovery/prediction.rs": "b6e872e4529653e8f75d2b14aad49911a86c76d3469d8d9d595039987fe78e25",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "836c633351b900fca2c07db00b15d7f66288a5220d6206bd3a0b3198139f1178",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/prediction/tests.rs": "c48c17a2bf3e5f6dedc797ad626b31522fddbfd7c5a2b3068662c46e85796067",
+    "eredu-runtime/src/working_memory/text_preparation/run.rs": "7986564fe8a06c64822f4b94f13bb0c46697ad08ea896d0fffe5cd71899df949",
+    "eredu-runtime/src/working_memory.rs": "4f588a2e81825b5f124b622e4e817bba40a32513681f9770c200ee86f4aa7bef",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_step.rs": "92e447577c7901ed478b785be7ec52c4e997af1bc8d574c0096986f112ce4b93",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/capture/tests/controls.rs": "12fa744320894c505106b930d4615c5a0afc77dcf24b0c1809a99f71062ffe80",
+    "eredu-backend-mlx/src/composition/mlx/session/output_completion.rs": "688a5091ff6ce264e142c833ed2641022bff27857cabfe1988518f15ec7453d3",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote.rs": "cefe64b27d6a0e750e0d0fa967ca69c1ee030237189522ae39d411211dcf041a",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence/harness.rs": "29feea622bfdb96be1945f3f44fb584ad85b8e8a3997f498fecf0059eeec5b9f",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/prediction.rs": "bea9c388205b6cf53eb0861ad0f4cac56d6a9fe1e3bad593104a7000351646bc",
+    "eredu-runtime/src/working_memory/residual.rs": "552c1fc37306e5dee51ee2b4c945733639130ee509ebbdf3cc401a39ba283c25",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/sequence/fixture.rs": "92fbd9c0b4fb45fb5899d0ae6794843491ba94eeb7fd6f3b1817e31607cdd20b",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/mechanisms/opening_sources/capacity.rs": "4f50175cc5e10c9e7ad3c7ca2143ee27a81799324ac527114903a495e640eb7b",
+    "eredu-runtime/src/working_memory/residual/span_workspace/text_controls/sequence.rs": "696f876e249457ed4db41fa496b4a60b1fb490226d4f2078af768a53a25d44ef",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/capture.rs": "a59dfff857b4d7fd2a5f24b7367b8806954d28ac58cf634b26b073bbca68f3e8",
+    "eredu-backend-mlx/src/backend/submission_recovery.rs": "da8ecaf4b2e366a8170aff88e317b626885d491e78ac3cb41edb999f2a482c53",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/resume.rs": "d8c07d9a4b63c58ca7776148464f012b022c88c9ccb13eb1ae7198ed77d692b9",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/prediction.rs": "cc100329b49b63c10fd8ce036521a45161cd1865a366dfe3fc90765dfebf22f8",
+    "eredu-runtime/src/working_memory/residual/span_workspace/text_controls/prediction.rs": "4d7917fc7717852a86c2667f845e02492eb1555f59d27465a7038cbe401e0f13",
+    "eredu-runtime/src/working_memory/residual/span_workspace/text_controls.rs": "0d39e2590faf697482d5aeae668db1a2c2894179f545a20064ee07379e09512f",
+    "doc/backend-architecture.md": "86da959ab48a340025c9d225c17585ac5da2fdcfb782a0ec0974607b3a7b4bfd",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/sequence.rs": "7806ad1467eab8396d93434e3cad075998ccc6be6237124b1ad5e32dfe0ccec3",
+    "eredu-runtime/src/working_memory/residual/span_workspace.rs": "0f43ba9c262ba471d7405ceab2bfe7da104d98abfe451ed5b59e49d745af3c43",
+    "eredu-backend-mlx/src/backend/adapter/completion.rs": "0c9150b4aa89e4eed5a4101a7dac9ec85844698605961273ce4a4c4b150a8d4e"
+  },
+  "source_snapshot": "/private/tmp/eredu-original-prediction-scopes-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-unused-work-and-borrowed-utf8-integration-2026-09-14.json": "3653d5054ecc6700e329f396b923eaaf726ea015d8e6fa2d039824d566376a3b",
+    "/private/tmp/eredu-original-prediction-scopes-doc-additions.json": "f8a2b2adb7aff9e2b0a9ee6d7494c7c0f30fc3e0e9593bbc9f718d6d3af41be9",
+    "/private/tmp/eredu-original-prediction-scopes-final-root-review.json": "c757cb1f1a9abd607a3b3dfdfe8b0dc1cf49b3a44dec41d0a44155576cb42edc",
+    "/private/tmp/eredu-original-prediction-scopes-integration-applied.json": "23d78fd633de1c503beb1d2e3006383e21f38058543cfe0f1550f4a0d4d3a683",
+    "/private/tmp/eredu-original-prediction-scopes-integration-apply.py": "fee89d0dab1444369d12aa951b8ea682058f20de27d293eefd214332a5ab07f6",
+    "/private/tmp/eredu-original-prediction-scopes-integration-checks.json": "ae5d2a46218ab6cb026ced77932c93ca7f5bdf630e1d138fe64e7372d0d9c87b",
+    "/private/tmp/eredu-original-prediction-scopes-integration-conformance.log": "67764d7ea90d25da5f1ece85d5c46c1464788a6051419c3b0ae401041e1188df",
+    "/private/tmp/eredu-original-prediction-scopes-integration-doc-applied.json": "bd6ea1acfcb9e8fb0e3f00f1c091190ea896547bf37dba1039e08037cc7e0687",
+    "/private/tmp/eredu-original-prediction-scopes-integration-docs.log": "2a06ef974dc15db7ac0ab6b70b1a4815ad523a5c3b69cf76b6243135df8d715f",
+    "/private/tmp/eredu-original-prediction-scopes-integration-fact-context-fixture-correction-review.json": "c6f473266355dad6d6ab209694ee38f35b34e2262d128792ba56ad9213378dd1",
+    "/private/tmp/eredu-original-prediction-scopes-integration-features.log": "495579620bf4d7f0619f69a89b2294a0c1c4b2cc49661690556631173700e0e6",
+    "/private/tmp/eredu-original-prediction-scopes-integration-import-visibility-compile-correction-review.json": "9fc17d8b16ec93fca4139349f57c4a12c7bec2165e35811bf124650be5688fb1",
+    "/private/tmp/eredu-original-prediction-scopes-integration-minimal.log": "4fe8829d8492e319a5d41bed080b8e802f0f53df7f7fa7e8c857564c32f7e9f6",
+    "/private/tmp/eredu-original-prediction-scopes-integration-portable.log": "34299f5e8b3a123065c036c43be464f45fbf885caf70d5a104042b89ce7bc116",
+    "/private/tmp/eredu-original-prediction-scopes-integration-recovery.log": "af82aa8c201e0e30bdada65d73c929ff4f5870e2c0905f43ad3e952e08019f43",
+    "/private/tmp/eredu-original-prediction-scopes-integration-recovery.log.1789383079872715000.previous": "c3d15b3a2b4d394e32ea6c765922da4150e96318ac515d01eb7b148995816f2f",
+    "/private/tmp/eredu-original-prediction-scopes-integration-review.json": "bbbe85f0e71f3b2b267573e3e4d18ab2129882f9e31926d7cbef46dca3212fc9",
+    "/private/tmp/eredu-original-prediction-scopes-integration-root-review.json": "c6a3483d7e1498a9d8852967c6d8070c62f9c90a013f8b15991469e6e0b725fa",
+    "/private/tmp/eredu-original-prediction-scopes-integration-runtime.log": "7ecc6c472f37fe4f65bd9bba7afd62cdb81be036968185581aa7990d01b834d6",
+    "/private/tmp/eredu-original-prediction-scopes-integration-scalar-copy-fixture-correction-review.json": "bcdf3287a8bbfc6f75c8d02eeb3ef2a47c9916471154947304a944f427b2f361",
+    "/private/tmp/eredu-original-prediction-scopes-integration-session.log": "9cd4df27675423f1021006d90b3472bdbbb740431520766c75c65f130c011633",
+    "/private/tmp/eredu-original-prediction-scopes-integration-session.log.1789383346723507000.previous": "4f47f01644430a94e5f962d90782c11a5288fb08fd47ae6ee752f184d7ed15d0",
+    "/private/tmp/eredu-original-prediction-scopes-integration-session.log.1789383369884877000.previous": "6360bfd7f11891797ebd23cbd4c4591e0d0c654003824656601db8da06c62f3d",
+    "/private/tmp/eredu-original-prediction-scopes-integration-spec.json": "2fb45f97af0b4bad624bb348e80e210d5c06001116443bae1e4ec1ae1cb4a3d8",
+    "/private/tmp/eredu-original-prediction-scopes-integration-spec.pending.json": "f6e0332cf938ea9075efa18754ceba38eecaaa39f6b0782ba4d31ff2333e687c",
+    "/private/tmp/eredu-original-prediction-scopes-integration-stage/all.patch": "27510e9b215b12ccb976b7bfc67a38e31963acee0dc58f519a73be0e62f0d123",
+    "/private/tmp/eredu-original-prediction-scopes-integration-stage/change.patch": "a99e5a78d8941df9951e0fa8cc844a443e16d4612d8e0cdc80c51c388275c023",
+    "/private/tmp/eredu-original-prediction-scopes-integration-stage/manifest.json": "23d78fd633de1c503beb1d2e3006383e21f38058543cfe0f1550f4a0d4d3a683",
+    "/private/tmp/eredu-original-prediction-scopes-integration-stage/staged-hashes.json": "96574c48ff9cc00e233cb1dbd6eb94176c720814d1bdaa63e281e99f3bc2bc3b",
+    "/private/tmp/eredu-original-prediction-scopes-integration-validate.py": "5f1d577d08448bab301a357f9abc5780312ba6a26c358fb479470db023734492",
+    "/private/tmp/eredu-original-prediction-scopes-integration-validation-config.json": "4ff082af7a32bc615e03c990638d698de6ec8ffe1e635e05c221612f1bc9344a",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/AUDIT.md": "3525b1abc14cdcb83a8fbcd20f5908581e89d41f6a648b31262a06efd410321b",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/FROZEN.json": "ebaa37dfc01ae9a8845b2d973dd1ab122ee35b266428bf184ee7c5fddb2f7627",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/PRICING.md": "5a4a4cabac248ebed2313f301a2fdd9305a6a3800a4f4198449f24ab33c5c0a1",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/README.md": "08e2d8ac183a5f3e025f9df401b414d7ddf1ed9fdf11abdf2b3274f959e386d2",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/REPLAY-CHECKS.json": "447ae54cec6a47b254da5ff0766ab6c2e747f99447ffbdad63719cb8b97abed0",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/STATIC-CHECKS.json": "cc6ded3183acc906372b506bf2e2cc310fdfeaa18d43221ae0268a6d6a7c8191",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/TEST-COMMANDS.md": "2756c98a26b5d2bf5bafdd825ec1289fe7ecd28c57ac3f4e66739aa6875d65e7",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/after-file-delta-manifest.json": "908ea703b59efe80aa3fd7505592e3632b7e1b0ec787fd05c0d2322f8026b109",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/after-file-delta.patch": "1254c6ac8b1fc0313044ca6a1ed63b53f26c78522f9c4d7ac6383f665ae151ef",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/all.patch": "9e052b51731b118f16786c6395c92732b57814f26dfacd737dc8ec4a72783923",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/artifact-hashes.json": "20ec4b8b8100d9f022649cf1561e02fb8b8d3bca8b73f0bf64839a3030ef5ba8",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/base-origins.json": "5814337056d3a45a3a6ea1a169009012cf1c9dde3a0d520cc25f40f58f5a8b4c",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/change.patch": "8474f2ca5bcca889cc5742487908db46ca0f835d7c288508d886fdba4f212287",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/dependency-hashes.json": "10073964c5cf34aafa8d9e217118e11eefc5729f17f67f4aeaeca76fc496c87a",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/doc-additions.json": "316fa338863a6b38ce6dcabe7a29211da2097d8d0e881d299cf9083abe98c7cf",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/manifest.json": "952596be8529607ebdf10cbe1fc7fb4c7088608d864e27106e5983a377b68529",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/merge-inputs.json": "d969d3ea92604c520a638165e3b086f1ea958c59e908f54ec65dea93e540c8b1",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/merge-ledger.json": "afc9689a3dba4abd2ecdf0a0c2660726ec10034c13c8134bd78cd612dac5dc8e",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/new-tests.json": "67a222eef9b1973934f71eab69ea8ed5dc06c5148f273d4ab246775b8132ff23",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/prepare.py": "87abb9673cb4a0a6068acc17e668a6cf259bac7849cf731816d8fb99d9ba967e",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/rebase.py": "9013485a172363c9c4ca907c5e02b72bc82146dc7b8a3fda6886ea8499bf95ca",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/replay.py": "02be28d1747f7af452c89dabde17163944c52ddeed87ddc5c65501982731e78f",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/source-basis-hashes.json": "d969d3ea92604c520a638165e3b086f1ea958c59e908f54ec65dea93e540c8b1",
+    "/private/tmp/eredu-original-prediction-scopes-rebase-stage/staged-hashes.json": "95e8122a95bdea1d42e7dce588ed3cb1a818ed5896e86f67c9faa36cf64418c4",
+    "/private/tmp/eredu-original-prediction-scopes-review-checks.json": "0932ed066fcce2800f9c42d341f4ee6a8737c1913ba270e249a7040a2dd27d57",
+    "/private/tmp/eredu-original-prediction-scopes-review-sha256.json": "7f24a5075a84e98576311960b1d625f667b36d2f4f64cda359ad3263ceb7b690",
+    "/private/tmp/eredu-original-prediction-scopes-review.md": "1192594fa3316927965c64759b000a814c36313c4ade854ceffcb86618b9060a",
+    "/private/tmp/eredu-prediction-fact-context-fixture-correction-spec.json": "9d9f46fcb66c9be111c671a43b7275e6ee427d191fb94435a845acede2001eb0",
+    "/private/tmp/eredu-prediction-fact-context-fixture-correction-stage/AUDIT.md": "7300f5a01b798e5a85a5e40362aca2114b74bf0e13599e6064467bd96e493cdf",
+    "/private/tmp/eredu-prediction-fact-context-fixture-correction-stage/change.patch": "899c6682fc4d7cdb00eb235ef9264ba855e9bdcb1232fcb91afe8d22a20f32af",
+    "/private/tmp/eredu-prediction-fact-context-fixture-correction-stage/failed-session.log": "4f47f01644430a94e5f962d90782c11a5288fb08fd47ae6ee752f184d7ed15d0",
+    "/private/tmp/eredu-prediction-fact-context-fixture-correction-stage/manifest.json": "561422a3ddf69675a60724ca6038f976c37eeb2b965458579d195c8d50f5a1ef",
+    "/private/tmp/eredu-prediction-import-visibility-correction-spec.json": "562c959d7f4eea60963b80cc7a3a96de7f0bc15305375168e78e8f75620b7fc0",
+    "/private/tmp/eredu-prediction-import-visibility-correction-stage/AUDIT.md": "afab88c510d592b57ca03927be9f43d86330aded041993be5e36e734fdf37e2f",
+    "/private/tmp/eredu-prediction-import-visibility-correction-stage/change.patch": "b2e8b9e8b9e89b160f077b8245224c199ec837bedf440f53b1fce485eba49524",
+    "/private/tmp/eredu-prediction-import-visibility-correction-stage/failed-recovery-compile.log": "c3d15b3a2b4d394e32ea6c765922da4150e96318ac515d01eb7b148995816f2f",
+    "/private/tmp/eredu-prediction-import-visibility-correction-stage/manifest.json": "b218428b4d59cd736464be8223982fb2874357e4c68ee50f9013ca55f683a6fc",
+    "/private/tmp/eredu-prediction-scalar-copy-fixture-correction-spec.json": "9baee857b59f1c05bc473c1b85c31ca8f95306b201149bb9942085b6482dbcf5",
+    "/private/tmp/eredu-prediction-scalar-copy-fixture-final-root-review.json": "31f479f597d716036494c244fe2386ff7e26a1411750d1f812efc9845155b45d",
+    "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/FROZEN.json": "7ab0f7f6abcd7390626d14670ae3aa819869f5f2f5d25457f0b2019a086c48e6",
+    "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/README.md": "0b6ff3d89de6c7363100640b8f195bcb22e6b045e782ebe7584c7c242f27f934",
+    "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/artifact-hashes.json": "51ac473ce88254d0cfc1bcb08263e95965651a2a24381c363d4dcaff42a41a09",
+    "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/base-hashes.json": "f06cc7f1f3fa2621a91f9ab7fb18d3455165ba96048c9293b7ac8bb12992c3e4",
+    "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/change.patch": "5bca9291919b33246e58ad4781002618caf1b688efe8de3a7ad0d2e28ccb7820",
+    "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/checks.json": "ba9b6de9e5a1d32fa9034bd58b61c40e1e861b0a5c9d94141a0d2a4c45959114",
+    "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/manifest.json": "591313a9bba030cc99544eb76b092491efae397a098b17ea6db7e61504cb757d",
+    "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/source-basis.json": "5950f1eb099257cf91b387a969f8c91b52868a47ac7e6a41ec3f4b3eea46a7c3"
+  },
+  "review": {
+    "full_manifest_sha256": "96574c48ff9cc00e233cb1dbd6eb94176c720814d1bdaa63e281e99f3bc2bc3b",
+    "full_patch_sha256": "27510e9b215b12ccb976b7bfc67a38e31963acee0dc58f519a73be0e62f0d123",
+    "patch_sha256": "a99e5a78d8941df9951e0fa8cc844a443e16d4612d8e0cdc80c51c388275c023",
+    "replay": "/private/tmp/eredu-original-prediction-scopes-integration-stage/replay",
+    "review": "{\n  \"source_manifest_sha256\": \"952596be8529607ebdf10cbe1fc7fb4c7088608d864e27106e5983a377b68529\",\n  \"source_patch_sha256\": \"8474f2ca5bcca889cc5742487908db46ca0f835d7c288508d886fdba4f212287\",\n  \"full_manifest_sha256\": \"95e8122a95bdea1d42e7dce588ed3cb1a818ed5896e86f67c9faa36cf64418c4\",\n  \"full_patch_sha256\": \"9e052b51731b118f16786c6395c92732b57814f26dfacd737dc8ec4a72783923\",\n  \"review\": \"Root read complete original production patch (1526 lines) and test patch (1108 lines), current concrete authority/owner/consumer implementations, pricing/audit/docs, candidate delta, merge ledger, and independent review. No concrete production blocker.\",\n  \"verified\": {\n    \"original_artifacts\": 232,\n    \"original_dependencies\": 68,\n    \"original_basis\": 29,\n    \"candidate_artifacts\": 119,\n    \"candidate_dependencies\": 20,\n    \"candidate_basis_merge_inputs\": 18,\n    \"candidate_source_replay\": 32,\n    \"candidate_full_replay\": 34,\n    \"candidate_rustfmt_paths\": 32,\n    \"independent_review_pins\": 492,\n    \"live_source_baseline_mismatches\": 0\n  },\n  \"independent_review_sha256\": \"1192594fa3316927965c64759b000a814c36313c4ade854ceffcb86618b9060a\",\n  \"behavior\": [\n    \"Genuine active step authority accepts initial Preparing and Started cached decode while checking exact reservation/preparation/current source health and nonrefundable ordinal below original M.\",\n    \"Five roles each retain native and Rust Recovery custody independently under original Q; actual consumers consume once, original scalar aliases cache, copied tokens get no original role.\",\n    \"Prepared Recovery and owner controls precede native begin, guarded never-started/Busy/unwind cleanup retained, all closed allocations retire before their final raw custody.\",\n    \"Four clean Work overlap merges preserve prepared Work cancellation; remaining28 Rust after-files are unchanged.\"\n  ],\n  \"limits\": [\n    \"Source review only; root serial behavioral/feature validation remains required.\",\n    \"No native Record/root/graph/error/copy population or complete host/disk opening claim; no managed gateway activation.\"\n  ]\n}\n",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-unused-work-and-borrowed-utf8-integration-2026-09-14.json": "3653d5054ecc6700e329f396b923eaaf726ea015d8e6fa2d039824d566376a3b",
+      "/private/tmp/eredu-original-prediction-scopes-doc-additions.json": "f8a2b2adb7aff9e2b0a9ee6d7494c7c0f30fc3e0e9593bbc9f718d6d3af41be9",
+      "/private/tmp/eredu-original-prediction-scopes-final-root-review.json": "c757cb1f1a9abd607a3b3dfdfe8b0dc1cf49b3a44dec41d0a44155576cb42edc",
+      "/private/tmp/eredu-original-prediction-scopes-integration-fact-context-fixture-correction-review.json": "c6f473266355dad6d6ab209694ee38f35b34e2262d128792ba56ad9213378dd1",
+      "/private/tmp/eredu-original-prediction-scopes-integration-import-visibility-compile-correction-review.json": "9fc17d8b16ec93fca4139349f57c4a12c7bec2165e35811bf124650be5688fb1",
+      "/private/tmp/eredu-original-prediction-scopes-integration-root-review.json": "c6a3483d7e1498a9d8852967c6d8070c62f9c90a013f8b15991469e6e0b725fa",
+      "/private/tmp/eredu-original-prediction-scopes-integration-scalar-copy-fixture-correction-review.json": "bcdf3287a8bbfc6f75c8d02eeb3ef2a47c9916471154947304a944f427b2f361",
+      "/private/tmp/eredu-original-prediction-scopes-integration-spec.json": "2fb45f97af0b4bad624bb348e80e210d5c06001116443bae1e4ec1ae1cb4a3d8",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/AUDIT.md": "3525b1abc14cdcb83a8fbcd20f5908581e89d41f6a648b31262a06efd410321b",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/FROZEN.json": "ebaa37dfc01ae9a8845b2d973dd1ab122ee35b266428bf184ee7c5fddb2f7627",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/PRICING.md": "5a4a4cabac248ebed2313f301a2fdd9305a6a3800a4f4198449f24ab33c5c0a1",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/README.md": "08e2d8ac183a5f3e025f9df401b414d7ddf1ed9fdf11abdf2b3274f959e386d2",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/REPLAY-CHECKS.json": "447ae54cec6a47b254da5ff0766ab6c2e747f99447ffbdad63719cb8b97abed0",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/STATIC-CHECKS.json": "cc6ded3183acc906372b506bf2e2cc310fdfeaa18d43221ae0268a6d6a7c8191",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/TEST-COMMANDS.md": "2756c98a26b5d2bf5bafdd825ec1289fe7ecd28c57ac3f4e66739aa6875d65e7",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/after-file-delta-manifest.json": "908ea703b59efe80aa3fd7505592e3632b7e1b0ec787fd05c0d2322f8026b109",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/after-file-delta.patch": "1254c6ac8b1fc0313044ca6a1ed63b53f26c78522f9c4d7ac6383f665ae151ef",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/all.patch": "9e052b51731b118f16786c6395c92732b57814f26dfacd737dc8ec4a72783923",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/artifact-hashes.json": "20ec4b8b8100d9f022649cf1561e02fb8b8d3bca8b73f0bf64839a3030ef5ba8",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/base-origins.json": "5814337056d3a45a3a6ea1a169009012cf1c9dde3a0d520cc25f40f58f5a8b4c",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/change.patch": "8474f2ca5bcca889cc5742487908db46ca0f835d7c288508d886fdba4f212287",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/dependency-hashes.json": "10073964c5cf34aafa8d9e217118e11eefc5729f17f67f4aeaeca76fc496c87a",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/doc-additions.json": "316fa338863a6b38ce6dcabe7a29211da2097d8d0e881d299cf9083abe98c7cf",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/manifest.json": "952596be8529607ebdf10cbe1fc7fb4c7088608d864e27106e5983a377b68529",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/merge-inputs.json": "d969d3ea92604c520a638165e3b086f1ea958c59e908f54ec65dea93e540c8b1",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/merge-ledger.json": "afc9689a3dba4abd2ecdf0a0c2660726ec10034c13c8134bd78cd612dac5dc8e",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/new-tests.json": "67a222eef9b1973934f71eab69ea8ed5dc06c5148f273d4ab246775b8132ff23",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/prepare.py": "87abb9673cb4a0a6068acc17e668a6cf259bac7849cf731816d8fb99d9ba967e",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/rebase.py": "9013485a172363c9c4ca907c5e02b72bc82146dc7b8a3fda6886ea8499bf95ca",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/replay.py": "02be28d1747f7af452c89dabde17163944c52ddeed87ddc5c65501982731e78f",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/source-basis-hashes.json": "d969d3ea92604c520a638165e3b086f1ea958c59e908f54ec65dea93e540c8b1",
+      "/private/tmp/eredu-original-prediction-scopes-rebase-stage/staged-hashes.json": "95e8122a95bdea1d42e7dce588ed3cb1a818ed5896e86f67c9faa36cf64418c4",
+      "/private/tmp/eredu-original-prediction-scopes-review-checks.json": "0932ed066fcce2800f9c42d341f4ee6a8737c1913ba270e249a7040a2dd27d57",
+      "/private/tmp/eredu-original-prediction-scopes-review-sha256.json": "7f24a5075a84e98576311960b1d625f667b36d2f4f64cda359ad3263ceb7b690",
+      "/private/tmp/eredu-original-prediction-scopes-review.md": "1192594fa3316927965c64759b000a814c36313c4ade854ceffcb86618b9060a",
+      "/private/tmp/eredu-prediction-fact-context-fixture-correction-spec.json": "9d9f46fcb66c9be111c671a43b7275e6ee427d191fb94435a845acede2001eb0",
+      "/private/tmp/eredu-prediction-fact-context-fixture-correction-stage/AUDIT.md": "7300f5a01b798e5a85a5e40362aca2114b74bf0e13599e6064467bd96e493cdf",
+      "/private/tmp/eredu-prediction-fact-context-fixture-correction-stage/change.patch": "899c6682fc4d7cdb00eb235ef9264ba855e9bdcb1232fcb91afe8d22a20f32af",
+      "/private/tmp/eredu-prediction-fact-context-fixture-correction-stage/failed-session.log": "4f47f01644430a94e5f962d90782c11a5288fb08fd47ae6ee752f184d7ed15d0",
+      "/private/tmp/eredu-prediction-fact-context-fixture-correction-stage/manifest.json": "561422a3ddf69675a60724ca6038f976c37eeb2b965458579d195c8d50f5a1ef",
+      "/private/tmp/eredu-prediction-import-visibility-correction-spec.json": "562c959d7f4eea60963b80cc7a3a96de7f0bc15305375168e78e8f75620b7fc0",
+      "/private/tmp/eredu-prediction-import-visibility-correction-stage/AUDIT.md": "afab88c510d592b57ca03927be9f43d86330aded041993be5e36e734fdf37e2f",
+      "/private/tmp/eredu-prediction-import-visibility-correction-stage/change.patch": "b2e8b9e8b9e89b160f077b8245224c199ec837bedf440f53b1fce485eba49524",
+      "/private/tmp/eredu-prediction-import-visibility-correction-stage/failed-recovery-compile.log": "c3d15b3a2b4d394e32ea6c765922da4150e96318ac515d01eb7b148995816f2f",
+      "/private/tmp/eredu-prediction-import-visibility-correction-stage/manifest.json": "b218428b4d59cd736464be8223982fb2874357e4c68ee50f9013ca55f683a6fc",
+      "/private/tmp/eredu-prediction-scalar-copy-fixture-correction-spec.json": "9baee857b59f1c05bc473c1b85c31ca8f95306b201149bb9942085b6482dbcf5",
+      "/private/tmp/eredu-prediction-scalar-copy-fixture-final-root-review.json": "31f479f597d716036494c244fe2386ff7e26a1411750d1f812efc9845155b45d",
+      "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/FROZEN.json": "7ab0f7f6abcd7390626d14670ae3aa819869f5f2f5d25457f0b2019a086c48e6",
+      "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/README.md": "0b6ff3d89de6c7363100640b8f195bcb22e6b045e782ebe7584c7c242f27f934",
+      "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/artifact-hashes.json": "51ac473ce88254d0cfc1bcb08263e95965651a2a24381c363d4dcaff42a41a09",
+      "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/base-hashes.json": "f06cc7f1f3fa2621a91f9ab7fb18d3455165ba96048c9293b7ac8bb12992c3e4",
+      "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/change.patch": "5bca9291919b33246e58ad4781002618caf1b688efe8de3a7ad0d2e28ccb7820",
+      "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/checks.json": "ba9b6de9e5a1d32fa9034bd58b61c40e1e861b0a5c9d94141a0d2a4c45959114",
+      "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/manifest.json": "591313a9bba030cc99544eb76b092491efae397a098b17ea6db7e61504cb757d",
+      "/private/tmp/eredu-prediction-scalar-copy-fixture-stage/source-basis.json": "5950f1eb099257cf91b387a969f8c91b52868a47ac7e6a41ec3f4b3eea46a7c3"
+    },
+    "source_manifest_sha256": "23d78fd633de1c503beb1d2e3006383e21f38058543cfe0f1550f4a0d4d3a683"
+  },
+  "behavior": [
+    "The original cold seal prices one bank and M fixed five-role sets; unknown facts and overflow reject, and extraction is once from the exact original span.",
+    "Actual active InferenceTextStep authority checks exact reservation/preparation/source health, ready stages and nonrefundable ordinal. Both Preparing prefill and Started decode use this same predicate.",
+    "Model execution, sampling, event publication, first model validation and first original token read consume their named role once. Copies have fresh observation state with no original scalar role.",
+    "Independent native and Rust Recovery capsules keep the original account through their respective deallocation tails, including Busy, unwind, aliases and cached-error observation.",
+    "Twenty shared-driver/residency runs compare actual token IDs and retained state. Opening-row fixture coverage remains resident only.",
+    "The scalar fixture verifies original funded-token ownership rejects unquoted copying with ReservedWorkActive. Separate eligible ordinary production/copy validates fresh scalar observation and alias caching; no bounded original copy support is claimed."
+  ],
+  "limits": [
+    "Fixed outer-role controls do not bound inner native Record/graph/root buffers, errors, copies or complete host/disk opening inventories.",
+    "Compiler/HF resident, parser/event/output, media/transport and other original source/copy ownership obligations remain open.",
+    "No public managed gate activation or new released-checkpoint/native-distributed measurement."
+  ]
+}

@@ -1,0 +1,108 @@
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -685,6 +685,33 @@
+ 
+ /** Computes: O = softmax(Q @ K.T) @ V **/
+ namespace {
++// The same ordinary mask worker, named so its actual borrowed arguments,
++// local arrays and returned result can be included in a selected CPU source.
++struct SdpaMask {
++  int n_kv_heads,n_repeats;
++  bool do_causal;
++  StreamOrDevice s;
++  array fetch(const ArrayVector& inputs,const array& q,const array& k) const {
++    if(do_causal) {
++      int kL=k.shape(-2),qL=q.shape(-2),offset=kL-qL;
++      auto q_idx=arange(offset,qL+offset,s);
++      auto k_idx=arange(0,kL,s);
++      q_idx=expand_dims(q_idx,1,s);k_idx=expand_dims(k_idx,0,s);
++      return greater_equal(q_idx,k_idx,s);
++    }
++    return inputs[3];
++  }
++  array apply(const ArrayVector& inputs,const array& q,const array& k,const array& scores) const {
++    auto mask=fetch(inputs,q,k);
++    if(n_repeats>1&&mask.ndim()>=3) {
++      if(mask.shape(-3)==1)mask=expand_dims(mask,-3,s);
++      else mask=unflatten(mask,-3,{n_kv_heads,n_repeats},s);
++    }
++    if(mask.dtype()==bool_)
++      return where(mask,scores,array(finfo(scores.dtype()).min,scores.dtype()),s);
++    return add(scores,mask,s);
++  }
++};
+ struct SdpaFallback {
+   float scale;
+   int n_q_heads,n_kv_heads;
+@@ -702,35 +729,7 @@
+     }
+     auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
+     if (has_arr_mask || do_causal) {
+-      // Mask must be broadcast-compatible with [B, n_q_heads, L_q, L_kv]
+-      auto make_or_fetch_mask = [&]() {
+-        if (do_causal) {
+-          int kL = k.shape(-2);
+-          int qL = q.shape(-2);
+-          int offset = kL - qL;
+-          auto q_idx = arange(offset, qL + offset, s);
+-          auto k_idx = arange(0, kL, s);
+-          q_idx = expand_dims(q_idx, 1, s);
+-          k_idx = expand_dims(k_idx, 0, s);
+-          return greater_equal(q_idx, k_idx, s);
+-        }
+-        return inputs[3];
+-      };
+-      auto mask = make_or_fetch_mask();
+-
+-      if (n_repeats > 1 && mask.ndim() >= 3) {
+-        if (mask.shape(-3) == 1) {
+-          mask = expand_dims(mask, -3, s);
+-        } else {
+-          mask = unflatten(mask, -3, {n_kv_heads, n_repeats}, s);
+-        }
+-      }
+-      if (mask.dtype() == bool_) {
+-        scores = where(
+-            mask, scores, array(finfo(scores.dtype()).min, scores.dtype()), s);
+-      } else {
+-        scores = add(scores, mask, s);
+-      }
++      scores = SdpaMask{n_kv_heads,n_repeats,do_causal,s}.apply(inputs,q,k,scores);
+     }
+     if (has_sinks) {
+       auto sinks = inputs.back();
+@@ -771,6 +770,22 @@
+       sizeof(const array*)*7,sizeof(std::initializer_list<int>)*2};
+   size_t total=sizeof(parts)+sizeof(out);
+   for(auto value:parts) {if(value>SIZE_MAX-total)return false;total+=value;}
++  out=total;return true;
++}
++
++bool cpu_sdpa_array_mask_control_bytes(size_t rank,size_t queries,size_t keys,size_t values,size_t scores,size_t& out) noexcept {
++  size_t total=0;
++  if(!cpu_sdpa_fallback_control_bytes(rank,queries,keys,values,scores,total))return false;
++  // Exact array-mask frontend plus the shared SdpaMask apply/fetch worker.
++  // The causal aranges are a separate selected producer, not granted here.
++  const size_t parts[]={sizeof(SdpaMask),sizeof(const SdpaMask*)*2,
++      sizeof(array)*8,sizeof(const array*)*9,sizeof(const ArrayVector*)*2,
++      sizeof(Shape),sizeof(ArrayVector)*2,sizeof(std::initializer_list<array>),
++      sizeof(std::initializer_list<int>),sizeof(std::optional<array>),
++      sizeof(decltype(finfo(float32))),sizeof(Dtype)*3,sizeof(Stream),
++      sizeof(StreamOrDevice)*2,sizeof(int)*4,sizeof(bool)*4,sizeof(size_t)*8};
++  if(sizeof(parts)>SIZE_MAX-total)return false;total+=sizeof(parts);
++  for(size_t value:parts){if(value>SIZE_MAX-total)return false;total+=value;}
+   out=total;return true;
+ }
+ 
+diff --git a/mlx/fast.h b/mlx/fast.h
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -15,6 +15,7 @@
+ 
+ namespace mlx::core::fast {
+ // Pure controls of the unchanged mask-free CPU SDPA/GQA fallback.
++bool cpu_sdpa_array_mask_control_bytes(size_t rank,size_t queries,size_t keys,size_t values,size_t scores,size_t& out) noexcept;
+ bool cpu_sdpa_fallback_control_bytes(size_t rank,size_t queries,size_t keys,size_t values,size_t scores,size_t& out) noexcept;
+ // Pure controls of the same CPU default full-width RoPE fallback.
+ bool cpu_rope_fallback_control_bytes(size_t rank,size_t dimensions,size_t elements,size_t& out) noexcept;

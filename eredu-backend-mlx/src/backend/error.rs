@@ -1,5 +1,13 @@
 use safemlx::error::Exception;
 
+mod ordinary_capture;
+pub use ordinary_capture::OrdinaryCaptureFailure;
+mod output_observation;
+mod retained_original;
+pub(crate) mod scoped_snapshots;
+pub use output_observation::OutputObservationFailure;
+pub use retained_original::RetainedOriginalFailure;
+
 /// Backend-produced evidence that a failed model call did not advance state.
 /// The payload has no public constructor; native completion must still be
 /// proven independently before a session can accept another operation.
@@ -8,6 +16,28 @@ use safemlx::error::Exception;
 pub struct ModelStatePreservedError {
     #[source]
     source: Box<dyn std::error::Error + Send + Sync>,
+}
+
+/// One original-operation error whose complete concrete source retires through
+/// the neutral owned source boundary. The preservation witness is private and
+/// does not establish native completion.
+#[derive(Debug)]
+pub struct OriginalControlFailure {
+    source: eredu_core::BackendFailure,
+    state_preserved: bool,
+}
+impl std::fmt::Display for OriginalControlFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(
+            std::error::Error::source(&self.source).expect("original source"),
+            f,
+        )
+    }
+}
+impl std::error::Error for OriginalControlFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.source)
+    }
 }
 
 fn format_keys(keys: &[String]) -> String {
@@ -30,6 +60,188 @@ fn format_keys(keys: &[String]) -> String {
 /// Error type used by MLX model loading and execution.
 #[non_exhaustive]
 pub enum Error {
+    /// Exact shared embedded protocol diagnostic, with no formatted allocation.
+    #[error("{0}")]
+    EmbeddedPredictionContract(#[from] eredu_architectures::speculative_execution::EmbeddedPredictionContractError),
+    /// Fixed mechanism validation diagnostic without a formatted allocation.
+    #[error("{0}")]
+    InvalidOperation(&'static str),
+    /// Exact neutral selected-occurrence refusal before native dispatch.
+    #[error("{0}")]
+    SpeculativeOccurrence(
+        #[source] eredu_runtime::speculative::autoregressive::AutoregressiveOccurrenceError,
+    ),
+    /// Fixed borrowed native descriptor refusal.
+    #[error("{0}")]
+    ArrayDescriptor(#[from] safemlx::ArrayDescriptorError),
+    /// Fixed host-planning admission refusal; no diagnostic allocation.
+    #[error("{0}")]
+    WorkspacePlanning(#[from] eredu_nn::workspace::WorkspaceMetadataFundingError),
+    /// Exact stream source/constructor refusal, retaining failed native prefixes.
+    #[error(transparent)]
+    GpuStreamOwnership(#[from] crate::backend::managed_memory::gpu_stream::MlxStreamOwnershipError),
+    /// A previously allocated original diagnostic snapshot; retaining and public
+    /// conversion preserve the same source without a new error-source Box.
+    #[error(transparent)]
+    RetainedOriginal(RetainedOriginalFailure),
+    /// Fixed original Event/task mode refusal, without a second boxed shell.
+    #[error(transparent)]
+    OriginalNativeControl(#[from] safemlx::OriginalNativeControlError),
+    /// Fixed shared-session inspection boundary; no formatted or boxed wrapper.
+    #[error("runtime inspection: {0}")]
+    RuntimeInspection(#[source] eredu_runtime::replicated_session::RuntimeInspectionBoundary),
+    /// The concrete state visitor's cause without a second boxed error shell.
+    #[error("prefill state roots: {0}")]
+    PrefillState(#[source] eredu_runtime::StateError),
+    /// Fixed root refusal or the unchanged native submission/completion cause.
+    #[error(transparent)]
+    PrefillRoots(#[from] safemlx::PrefillRootsError),
+    /// Exact source/request/role check, without allocating a boxed fixed cause.
+    #[error("original prefill control mismatch: {0}")]
+    PrefillControl(#[source] eredu_runtime::working_memory::WorkingMemoryError),
+    /// Exact original source boundary and unchanged neutral identity refusal.
+    #[error("original source {stage}: {cause}")]
+    OriginalSourceContract {
+        /// Mechanism boundary which rejected the retained source.
+        stage: &'static str,
+        /// Neutral source/account validation cause.
+        #[source]
+        cause: eredu_runtime::working_memory::WorkingMemoryError,
+    },
+    /// Fixed phase attribution before original speculative native entry. The
+    /// actual neutral cause remains a source; no diagnostic allocation is made.
+    #[error("original speculative {stage}: {cause}")]
+    SpeculativePrerequisite {
+        /// Actual producer or validation boundary which refused.
+        stage: &'static str,
+        /// The unchanged neutral accounting or source-identity refusal.
+        #[source]
+        cause: eredu_runtime::working_memory::WorkingMemoryError,
+    },
+    /// Exact retained equation prerequisite which refused a neural frontier.
+    /// Existing paid detail moves from the recipe; this adds no formatted copy.
+    #[error("original neural boundary {boundary}, record {record}, {requirement} (operation {operation:?}, detail {detail:?}): {cause}")]
+    NeuralBoundarySource {
+        /// Selected shared completion worker.
+        boundary: &'static str,
+        /// Original equation row in the retained request recipe.
+        record: usize,
+        /// Missing source or inconsistent population, without an allocated label.
+        requirement: &'static str,
+        /// Actual missing operation ordinal, if the equation producer recorded it.
+        operation: Option<usize>,
+        /// Previously paid diagnostic; never a fresh source inspection or copy.
+        detail: Option<String>,
+        /// Unchanged typed source refusal.
+        #[source]
+        cause: eredu_runtime::working_memory::WorkingMemoryError,
+    },
+    /// Fixed native text-step attribution; the original neutral refusal stays
+    /// inline, with a static call-site and no allocated diagnostic wrapper.
+    #[error("original text admission at {at}: {cause}")]
+    TextAdmission {
+        /// Exact native admission boundary which returned this refusal.
+        at: &'static std::panic::Location<'static>,
+        /// Unchanged accounting, request or source-identity refusal.
+        #[source]
+        cause: eredu_runtime::working_memory::WorkingMemoryError,
+    },
+    /// No original Scope accepted; the same prepared role remains retained.
+    #[error("original prefill scope could not begin: {0}")]
+    PrefillScope(#[source] safemlx::SubmissionScopeOwnerCause),
+    /// Reentrant access cannot issue or replace a native prefill role.
+    #[error("original prefill scope is already in flight")]
+    PrefillScopeReentrant,
+    /// Missing or consumed roles cannot fall back to an ordinary Scope.
+    #[error("original prefill scope role is unavailable")]
+    PrefillScopeUnavailable,
+    /// Ordinary capture error and its existing host custody; no completion grant.
+    #[error(transparent)]
+    OrdinaryCapture(OrdinaryCaptureFailure),
+    /// Contradictory private prepared-capture input without ordinary custody.
+    /// This inline rejection allocates no error shell or replacement authority.
+    #[error("ordinary prepared capture rebinding: {0}")]
+    PreparedCaptureRebind(#[source] eredu_core::PreparedControlInputError),
+    /// Ordinary storage-source construction retained its original source and
+    /// genuine unquoted participant through closed concrete error retirement.
+    #[error("{0}")]
+    StorageSource(#[source] eredu_core::BackendFailure),
+    /// Ordinary pending-input copy failure, retaining the same unquoted owner
+    /// through closed concrete error retirement. It certifies no model rollback.
+    #[error("{0}")]
+    PendingInputCopy(#[source] eredu_core::BackendFailure),
+    /// Saved-copy collector construction refused before native entry. The
+    /// closed source retains the original allocator cause and copy custody.
+    #[error("{0}")]
+    SavedCopyConstructor(#[source] eredu_core::BackendFailure),
+    /// Fixed saved-copy completion evidence. This is a refusal, never proof
+    /// that failed or unobservable native work can release its resources.
+    #[error(
+        "saved copy completion unavailable (settled={settled}, failed={failed}, blocked={blocked})"
+    )]
+    SavedCopyCompletion {
+        /// Whether the retained native scope established terminal settlement.
+        settled: bool,
+        /// Whether the same scope reported a native or callback failure.
+        failed: bool,
+        /// Whether completion remained unobservable or otherwise blocked.
+        blocked: bool,
+    },
+    /// The enclosing originally funded model operation did not prove settlement.
+    #[error("original operation completion unavailable (settled={settled}, failed={failed}, blocked={blocked})")]
+    OriginalOperationCompletion {
+        /// Whether the retained native scope established terminal settlement.
+        settled: bool,
+        /// Whether the same scope reported a native or callback failure.
+        failed: bool,
+        /// Whether completion remained unobservable or otherwise blocked.
+        blocked: bool,
+    },
+    /// A consumed original prediction role could not begin its native Scope.
+    #[error("original prediction scope could not begin: {0}")]
+    PredictionScope(#[source] safemlx::SubmissionScopeOwnerCause),
+    /// A promised original prediction role is absent or already consumed.
+    #[error("original prediction scope role is unavailable")]
+    PredictionScopeUnavailable,
+    /// The original role bank is already borrowed by the current operation.
+    #[error("original prediction scope role is already in flight")]
+    PredictionScopeReentrant,
+    /// No Scope was accepted; the original quote retains the same pending attempt.
+    #[error("original preparation scope could not begin: {0}")]
+    PreparationScope(#[source] safemlx::SubmissionScopeOwnerCause),
+    /// The same preparation is currently checked out by an existing call.
+    #[error("original preparation scope is already in flight")]
+    PreparationScopeReentrant,
+    /// A consumed or interrupted role cannot be replaced.
+    #[error("original preparation scope role is unavailable")]
+    PreparationScopeUnavailable,
+    /// A retry cannot replace the originally retained prompt input.
+    #[error("original preparation retry input differs from its retained source")]
+    PreparationScopeInputMismatch,
+
+    /// The exact first observation failure, including its original source custody.
+    #[error(transparent)]
+    OutputObservation(OutputObservationFailure),
+
+    /// A prepared sampling result was not a valid borrowed U32 scalar.
+    #[error("original sampling scalar storage failed: {0}")]
+    OriginalSamplingData(#[source] safemlx::error::AsSliceError),
+    /// Preparing the retained native alias for the advanced sampling key failed.
+    #[error("original sampling key alias: {0}")]
+    OriginalSamplingClone(#[source] safemlx::PreparedArrayCloneCause),
+
+    /// The same output is already being observed by a reentrant call.
+    #[error("output observation is already in flight")]
+    OutputObservationReentrant,
+
+    /// An earlier output observation unwound without returning a result.
+    #[error("output observation was interrupted")]
+    OutputObservationInterrupted,
+
+    /// A complete original native operation failure with closed source retirement.
+    #[error(transparent)]
+    OriginalControl(OriginalControlFailure),
+
     /// Cold text-run agreement or its selected transport failed.
     #[error("text run preparation failed: {0}")]
     RunPreparation(#[from] eredu_runtime::run_preparation::TextPreparationAgreementError),
@@ -223,6 +435,101 @@ pub enum Error {
 }
 
 impl Error {
+    #[track_caller]
+    pub(crate) fn text_admission(cause: eredu_runtime::working_memory::WorkingMemoryError) -> Self {
+        Self::TextAdmission { at: std::panic::Location::caller(), cause }
+    }
+
+    /// Reuse the existing boxed neutral error, if present, without allocating
+    /// a second source or discarding custody on other concrete error variants.
+    #[track_caller]
+    pub(crate) fn at_text_admission(self) -> Self {
+        match self {
+            Self::Other(source) => match source.downcast::<eredu_runtime::working_memory::WorkingMemoryError>() {
+                Ok(cause) => Self::text_admission(*cause),
+                Err(source) => Self::Other(source),
+            },
+            Self::PrefillControl(cause) => Self::text_admission(cause),
+            error => error,
+        }
+    }
+
+    pub(crate) fn at_speculative_stage(self, stage: &'static str) -> Self {
+        match self {
+            Self::PrefillControl(cause) => Self::SpeculativePrerequisite { stage, cause },
+            other => other,
+        }
+    }
+
+    pub(crate) fn retained_original(
+        source: eredu_core::SharedBackendFailure,
+        state_preserved: bool,
+    ) -> Self {
+        Self::RetainedOriginal(RetainedOriginalFailure {
+            source,
+            state_preserved,
+        })
+    }
+    /// Borrows an existing public classification without allocating or
+    /// classifying an unconverted native diagnostic. Closed aliases remain
+    /// closed; the temporary shared alias allocates no new error source.
+    pub(crate) fn retained_backend_failure_kind(&self) -> Option<eredu_core::BackendFailureKind> {
+        match self {
+            Self::RetainedOriginal(error) => Some(error.source.retained().into_failure().kind()),
+            Self::OriginalControl(error) => Some(error.source.kind()),
+            Self::SavedCopyConstructor(error) => Some(error.kind()),
+            Self::WorkspacePlanning(error) => Some(
+                Self::WorkspacePlanning(*error)
+                    .into_backend_failure()
+                    .kind(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Transfers only an existing neutral source or the exact inline funding
+    /// refusal. Other errors return unchanged for their caller's ordinary path.
+    pub(crate) fn take_retained_backend_failure(self) -> Result<eredu_core::BackendFailure, Self> {
+        match self {
+            Self::Neural(error) => match error.into_metadata_funding_error() {
+                Ok(cause) => Ok(cause.into_backend_failure()),
+                Err(error) => Err(Self::Neural(error)),
+            },
+            Self::StorageSource(error) => Ok(error),
+            error @ (Self::WorkspacePlanning(_)
+            | Self::RetainedOriginal(_)
+            | Self::OriginalControl(_)
+            | Self::SavedCopyConstructor(_)) => Ok(error.into_backend_failure()),
+            error => Err(error),
+        }
+    }
+
+    pub(crate) fn into_backend_failure(self) -> eredu_core::BackendFailure {
+        match self {
+            // This is already the retained neutral envelope. Preserve its exact
+            // source/custody without allocating a second backend error box.
+            Self::StorageSource(error) => error,
+            Self::WorkspacePlanning(error) => error.into_backend_failure(),
+            Self::RetainedOriginal(error) => error.source.into_failure(),
+            Self::OutputObservation(error) => error.into_backend_failure(),
+            Self::OriginalControl(error) => error.source,
+            Self::SavedCopyConstructor(error) => error,
+            ordinary => eredu_core::BackendFailure::from_error(ordinary),
+        }
+    }
+
+    // Only native original claim/installation composition supplies this already
+    // closed source. This creates neither a guard nor an allocation.
+    pub(crate) fn with_original_control_source(
+        source: eredu_core::BackendFailure,
+        state_preserved: bool,
+    ) -> Self {
+        Self::OriginalControl(OriginalControlFailure {
+            source,
+            state_preserved,
+        })
+    }
+
     pub(crate) fn observation(error: impl std::error::Error + Send + Sync + 'static) -> Self {
         Self::Observation(Box::new(error))
     }
@@ -270,7 +577,14 @@ impl Error {
     }
 
     pub(crate) const fn model_state_preserved(&self) -> bool {
-        matches!(self, Self::ModelStatePreserved(_))
+        match self {
+            Self::ModelStatePreserved(_) => true,
+            Self::OriginalControl(failure) => failure.state_preserved,
+            Self::RetainedOriginal(failure) => failure.state_preserved,
+            Self::OutputObservation(failure) => failure.state_preserved(),
+            Self::OrdinaryCapture(failure) => failure.state_preserved(),
+            _ => false,
+        }
     }
 }
 

@@ -2,10 +2,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+mod prefill_retention;
+pub use prefill_retention::{
+    PrefillChunkRetentionContext, PrefillOpeningExecution, PrefillOpeningState,
+    PreparedPrefillChunkRetention, SettledPrefillChunkRetention,
+};
+pub(crate) use prefill_retention::{RuntimeOpeningExecution, RuntimeOpeningState};
+
 mod error_bridge;
 pub use error_bridge::ObserverErrorBridge;
+mod intervention_projection;
+pub use intervention_projection::{validate_static_intervention_declarations,validate_static_intervention_declarations_with_phases,validate_activation_intervention_declarations_with_phases,static_intervention_validation_control_bytes};
 mod speculative;
-pub use speculative::{with_speculative_activation, SpeculativeActivationObserver};
+pub use speculative::{SpeculativeActivationObserver, with_speculative_activation};
 
 /// Execution site responsible for an architecture-declared internal observation.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -84,36 +93,15 @@ pub fn intervention_support(
     capture: &eredu_core::capture::CaptureDiscovery,
     mechanisms: &eredu_core::intervention::InterventionMechanisms,
 ) -> eredu_core::intervention::InterventionDiscovery {
-    use eredu_core::{intervention::*, ObservationSupportStatus as S};
+    use eredu_core::intervention::*;
     for point in &mut points {
-        point
-            .operations
-            .retain(|kind| mechanisms.operations.contains(kind));
-        point
-            .dtypes
-            .retain(|dtype| mechanisms.dtypes.contains(dtype));
-        point
-            .score_stages
-            .retain(|stage| mechanisms.score_stages.contains(stage));
         let path = if point.routing.is_some() {
             eredu_core::RoutingObservationField::SelectedExperts.path(&point.path)
         } else {
             point.path.clone()
         };
-        if let Some(support) = capture.support.points.iter().find(|p| p.path == path) {
-            point.prefill = support.prefill.clone();
-            point.decode = support.decode.clone();
-        }
-        if point.axes.is_empty()
-            || (point.routed_units.is_some() && !mechanisms.routed_units)
-            || point.operations.is_empty()
-            || (point.routing.is_none() && point.dtypes.is_empty())
-        {
-            point.prefill = S::Unsupported(
-                "required intervention geometry or native mechanism is not declared".into(),
-            );
-            point.decode = point.prefill.clone();
-        }
+        let support=capture.support.points.iter().find(|p|p.path==path);
+        intervention_projection::apply(point,support,mechanisms.borrowed());
     }
     InterventionDiscovery {
         schema_version: INTERVENTION_SCHEMA_VERSION,
@@ -183,47 +171,129 @@ fn point_support(
     context: ObservationExecutionContext,
     partition: &mut impl FnMut(&eredu_core::ObservationPoint) -> eredu_core::ObservationSupportStatus,
 ) -> eredu_core::ObservationSupportStatus {
-    use eredu_core::{ObservationRequirement as R, ObservationSupportStatus as S};
-    if !phase_available {
-        return S::Unsupported("The architecture does not emit this point in this phase".into());
-    }
-    if !context.selected {
-        return S::Unverified("No admitted execution configuration".into());
-    }
-    if !context.activation_inspection {
-        return S::Unsupported("Selected session does not enable activation inspection".into());
-    }
-    if !context.mechanisms.activation_tensors {
-        return S::Unsupported("Backend has not declared tensor capture support".into());
-    }
-    if point.requirements.contains(&R::PredictionExecution) && !context.prediction_inspection {
-        return S::Unsupported(
-            "Selected call path does not supply prediction activation hooks".into(),
-        );
-    }
-    if matches!(
-        point.value_type,
-        eredu_core::ObservationValueType::RoutedUnits { .. }
-    ) && !context.mechanisms.routed_unit_tensors
-    {
-        return S::Unsupported("Backend does not collect bounded routed-unit values".into());
-    }
-    if point.requirements.contains(&R::RoutingEvents) && !context.mechanisms.routing_tensors {
-        return S::Unsupported("Backend does not collect normalized routing events".into());
+    if let Some(status) = point_support_before_partition(point, phase_available, context, false) {
+        return status.owned();
     }
     if context.partitioned {
         match partition(point) {
-            S::Supported => {}
+            eredu_core::ObservationSupportStatus::Supported => {}
             status => return status,
         }
     }
+    point_support_after_partition(point, false).owned()
+}
+
+#[derive(Clone, Copy)]
+enum BorrowedPointSupport {
+    Supported,
+    Conditional(&'static str),
+    Unsupported(&'static str),
+    Unverified(&'static str),
+}
+impl BorrowedPointSupport {
+    fn owned(self) -> eredu_core::ObservationSupportStatus {
+        use eredu_core::ObservationSupportStatus as S;
+        match self {
+            Self::Supported => S::Supported,
+            Self::Conditional(reason) => S::Conditional(reason.into()),
+            Self::Unsupported(reason) => S::Unsupported(reason.into()),
+            Self::Unverified(reason) => S::Unverified(reason.into()),
+        }
+    }
+    fn admissible(self) -> bool {
+        matches!(self, Self::Supported | Self::Conditional(_))
+    }
+}
+fn point_support_before_partition(
+    point: &eredu_core::ObservationPoint,
+    phase_available: bool,
+    context: ObservationExecutionContext,
+    prediction_requirement_discharged: bool,
+) -> Option<BorrowedPointSupport> {
+    use eredu_core::ObservationRequirement as R;
+    use BorrowedPointSupport as S;
+    let status = if !phase_available {
+        S::Unsupported("The architecture does not emit this point in this phase")
+    } else if !context.selected {
+        S::Unverified("No admitted execution configuration")
+    } else if !context.activation_inspection {
+        S::Unsupported("Selected session does not enable activation inspection")
+    } else if !context.mechanisms.activation_tensors {
+        S::Unsupported("Backend has not declared tensor capture support")
+    } else if !prediction_requirement_discharged
+        && point.requirements.contains(&R::PredictionExecution) && !context.prediction_inspection {
+        S::Unsupported("Selected call path does not supply prediction activation hooks")
+    } else if matches!(point.value_type, eredu_core::ObservationValueType::RoutedUnits { .. })
+        && !context.mechanisms.routed_unit_tensors {
+        S::Unsupported("Backend does not collect bounded routed-unit values")
+    } else if point.requirements.contains(&R::RoutingEvents) && !context.mechanisms.routing_tensors {
+        S::Unsupported("Backend does not collect normalized routing events")
+    } else { return None; };
+    Some(status)
+}
+fn point_support_after_partition(
+    point: &eredu_core::ObservationPoint,
+    prediction_requirement_discharged: bool,
+) -> BorrowedPointSupport {
+    use eredu_core::ObservationRequirement as R;
     if point.requirements.contains(&R::MediaInput) {
-        return S::Conditional("Requires the corresponding media input during prefill".into());
+        BorrowedPointSupport::Conditional("Requires the corresponding media input during prefill")
+    } else if !prediction_requirement_discharged && point.requirements.contains(&R::PredictionExecution) {
+        BorrowedPointSupport::Conditional("Requires the corresponding prediction execution group")
+    } else { BorrowedPointSupport::Supported }
+}
+
+/// Borrowed selected-hook predicate using the same phase/collector requirements
+/// as ordinary discovery. Only the architecture owner may discharge the declared
+/// prediction requirement with its actual selected invocation hooks. Partitioned
+/// execution still needs its separate producer projection and is refused here.
+/// This neither allocates diagnostics nor establishes native capture authority.
+pub fn observation_phase_is_admissible(
+    point: &eredu_core::ObservationPoint,
+    phase: eredu_core::capture::CapturePhase,
+    context: ObservationExecutionContext,
+    prediction_requirement_discharged: bool,
+) -> bool {
+    let available = match phase {
+        eredu_core::capture::CapturePhase::Prefill => point.prefill,
+        eredu_core::capture::CapturePhase::Decode => point.decode,
+    };
+    if let Some(status) = point_support_before_partition(point, available, context, prediction_requirement_discharged) {
+        return status.admissible();
     }
-    if point.requirements.contains(&R::PredictionExecution) {
-        return S::Conditional("Requires the corresponding prediction execution group".into());
+    !context.partitioned && point_support_after_partition(point, prediction_requirement_discharged).admissible()
+}
+/// Exact nonallocating status comparison using the same selected ordinary hook
+/// projection. The architecture supplies its real prediction requirement proof.
+pub fn observation_phase_matches(point:&eredu_core::ObservationPoint,phase:eredu_core::capture::CapturePhase,context:ObservationExecutionContext,prediction_requirement_discharged:bool,expected:&eredu_core::ObservationSupportStatus)->bool {
+    if context.partitioned {return false;}
+    let available=match phase {eredu_core::capture::CapturePhase::Prefill=>point.prefill,eredu_core::capture::CapturePhase::Decode=>point.decode};
+    let actual=point_support_before_partition(point,available,context,prediction_requirement_discharged)
+        .unwrap_or_else(||point_support_after_partition(point,prediction_requirement_discharged));
+    match (actual,expected) {
+        (BorrowedPointSupport::Supported,eredu_core::ObservationSupportStatus::Supported)=>true,
+        (BorrowedPointSupport::Conditional(a),eredu_core::ObservationSupportStatus::Conditional(b))
+        |(BorrowedPointSupport::Unsupported(a),eredu_core::ObservationSupportStatus::Unsupported(b))
+        |(BorrowedPointSupport::Unverified(a),eredu_core::ObservationSupportStatus::Unverified(b))=>a==b,
+        _=>false,
     }
-    S::Supported
+}
+/// Fixed controls for the borrowed predicate, including the actual support
+/// projection and source requirement iterator. No observation payload is copied.
+pub fn observation_phase_validation_control_bytes() -> Option<usize> {
+    use std::mem::{size_of, size_of_val};
+    let frames = [
+        size_of::<(&eredu_core::ObservationPoint, eredu_core::capture::CapturePhase, ObservationExecutionContext, bool)>(),
+        size_of::<(&eredu_core::ObservationPoint, eredu_core::capture::CapturePhase, ObservationExecutionContext, bool, &eredu_core::ObservationSupportStatus)>(),
+        size_of::<(&eredu_core::ObservationPoint, bool)>(),
+        size_of::<(&eredu_core::ObservationPoint, bool, ObservationExecutionContext, bool)>(),
+        size_of::<(&eredu_core::ObservationPoint, bool)>(),
+        size_of::<Option<BorrowedPointSupport>>(),
+        size_of::<BorrowedPointSupport>(),
+        size_of::<bool>(),
+        size_of::<std::slice::Iter<'static, eredu_core::ObservationRequirement>>(),
+    ];
+    frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
 }
 
 /// One ordinary block output selected for a target/draft consumer.
@@ -358,13 +428,152 @@ impl<T> RoutingObservation<'_, T> {
     }
 }
 
+/// Explicit use of an ordinary selector decision by an observation callback.
+/// This read-only declaration performs no work and grants no resource authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingUnmodifiedInterest {
+    /// The callback is unused; ordinary selection adds no notification work.
+    None,
+    /// Only source shape/dtype metadata may be inspected. The callback must not
+    /// retain tensor aliases, evaluate values, or create dependent native work.
+    Metadata,
+    /// The callback may inspect values or retain aliases. Native adapters must
+    /// preserve their existing source custody and charge actual attachment work.
+    Values,
+}
+
 /// Statically dispatched activation observation and intervention contract.
 pub trait ActivationObserver<T, E> {
+    /// Requires the executor's already prepared, borrowed traversal paths.
+    /// This requirement stays fixed through one forward. It grants no funding,
+    /// admission or completion authority. Missing/stale bindings must reject
+    /// before state work; allocating semantic rebinding belongs to preparation.
+    fn requires_prepared_traversal(&self) -> bool {
+        false
+    }
+
+    /// Whether this observer's tensor operations preserve their semantics when
+    /// called on explicit prefill spans. Arbitrary whole-tensor callbacks must
+    /// opt in deliberately; sequence readout demand alone does not prove this.
+    fn supports_prefill_spans(&self) -> bool {
+        false
+    }
+
+    /// Whether the observer accepts complete architecture context tensors at a
+    /// declared target frontier during split prefill. Such values may have
+    /// policy-specific context axes; they are not prompt-row fragments.
+    fn supports_prefill_context(&self) -> bool {
+        false
+    }
+
+    /// Announces complete retained context at this installed target frontier.
+    /// No prompt-row window is implied. The observer must use the tensor's
+    /// declared axes; this grants no allocation or completion authority.
+    fn begin_prefill_context(&mut self, _frontier: u64) -> Result<(), E> {
+        Ok(())
+    }
+
+    /// Whether readout observations/interventions require complete sequence
+    /// geometry. Unknown observers preserve their original full-row semantics;
+    /// no-op or explicitly final-row collectors can opt out.
+    fn requires_sequence_readout(&self) -> bool {
+        true
+    }
+
+    /// Ordinary prepared-media decoder capture binding. This grants no original
+    /// authority; the selected session validates actual source/path/geometry.
+    fn ordinary_prefill_capture(&self) -> Option<&crate::capture::OrdinaryPrefillCapture> {
+        None
+    }
+
+    /// Original accepted physical capture contract, when supplied by its owner.
+    /// A truthful sequence requirement alone does not authenticate admission.
+    fn admitted_prefill_capture(
+        &self,
+    ) -> Option<&crate::working_memory::AdmittedPrefillCapture<'_>> {
+        None
+    }
+
+    /// Original saved-token opening, authenticated separately from prompt-row
+    /// assembly. It permits only the source's sealed single-token continuation.
+    fn admitted_capture_continuation(
+        &self,
+    ) -> Option<&crate::working_memory::AdmittedCaptureContinuation<'_>> {
+        None
+    }
+
+    /// Source-only internal capture declaration for this exact outer invocation.
+    /// The native adapter must quote its actual source/shape/scope and substitute
+    /// the local funded observer before callbacks. This is not native authority.
+    fn original_speculative_capture(&self) -> Option<crate::capture::OriginalSpeculativeCaptureInvocation<'_>> { None }
+
+    /// Receives a model phase's already paid shared frame after exact retirement.
+    /// Unknown observers refuse; this handoff performs no capture/native work.
+    fn retain_original_speculative_capture(&mut self, _capture: eredu_core::speculative::SpeculativeActivationCapture) -> Result<(), crate::capture::CaptureProtocolError> {
+        Err(crate::capture::CaptureProtocolError::Invocation)
+    }
+
     /// Whether this observer needs the shared session's transactional lifecycle.
     /// The value must stay fixed throughout one forward. Partitioned sessions
     /// agree participation before invoking callbacks that may communicate.
     fn transactional(&self) -> bool {
         false
+    }
+
+    /// Announces the next semantic chunk of one scheduled prefill before its
+    /// input is prepared. This does not replace the chunk's ordinary transaction
+    /// callbacks or grant execution, allocation, or completion authority.
+    /// Errors must enter the existing all-rank input preparation agreement.
+    fn begin_prefill_chunk(&mut self, _chunk: &crate::prefill::PrefillChunk) -> Result<(), E> {
+        Ok(())
+    }
+
+    /// Ends one scheduled prefill after final score indexing and reservation
+    /// settlement. `committed` is false on cancellation, error, or unwind; earlier
+    /// chunks may nevertheless have committed their state. This notification is
+    /// infallible and must perform no native work or communication. It does not
+    /// establish native completion or authorize a retained-record drain.
+    fn finish_prefill(&mut self, _committed: bool) {}
+
+    /// Requests lexical access to the actual state before input preparation.
+    /// The original enclosing request must price traversal/inventory work. This
+    /// flag grants no allocation, completion or remaining-capacity authority.
+    fn requires_prefill_opening_state(&self) -> bool {
+        false
+    }
+
+    /// Same original retention boundary with the current selected state source.
+    /// The shared driver lends it under its existing preparation guard, before
+    /// source.prepare_chunk. Errors enter the unchanged input agreement. The
+    /// default preserves existing retention; reading values is explicitly opt-in.
+    fn prepare_prefill_chunk_with_opening(
+        &mut self,
+        context: &PrefillChunkRetentionContext<'_>,
+        _opening: &PrefillOpeningState<'_, T>,
+    ) -> Result<Option<PreparedPrefillChunkRetention>, E> {
+        self.prepare_prefill_chunk_retention(context)
+    }
+
+    /// Register exact original-bank retention after chunk annotation and before
+    /// input preparation, under the existing reservation guard. None preserves
+    /// ordinary full-span retention; it proves no reusable chunk coverage.
+    fn prepare_prefill_chunk_retention(
+        &mut self,
+        _context: &PrefillChunkRetentionContext<'_>,
+    ) -> Result<Option<PreparedPrefillChunkRetention>, E> {
+        Ok(None)
+    }
+
+    /// Consume canonical successful chunk evidence at post-chunk cancellation
+    /// readiness. This callback cannot communicate or create new native work.
+    /// It may reject retirement; the runtime settles the existing guard and
+    /// agrees the rejection before advancing. A ticket alone proves no memory
+    /// credit, native-record destruction, or whole-work certification.
+    fn retire_prefill_chunk_retention(
+        &mut self,
+        _settled: SettledPrefillChunkRetention,
+    ) -> Result<(), E> {
+        Ok(())
     }
 
     /// Performs local admission before model/state work. This callback must not
@@ -411,7 +620,23 @@ pub trait ActivationObserver<T, E> {
         Ok(None)
     }
 
-    /// Receives original/effective decisions before they reach the expert provider.
+    /// Borrows the ordinary decision after selection and before expert dispatch.
+    /// This does not announce an applied control; the default performs no work.
+    /// Declares ordinary-decision interest without allocation or native work.
+    fn routing_unmodified_interest(&self, _path: &str) -> RoutingUnmodifiedInterest {
+        RoutingUnmodifiedInterest::None
+    }
+
+    /// Borrows the actual ordinary decision when the declared interest requests it.
+    fn routing_unmodified(
+        &mut self,
+        _path: &str,
+        _effective: RoutingDecision<'_, T>,
+    ) -> Result<(), E> {
+        Ok(())
+    }
+
+    /// Receives original/effective decisions for a requested routing control.
     fn routing_applied(
         &mut self,
         _path: &str,
@@ -464,6 +689,18 @@ pub trait ActivationObserver<T, E> {
     ) -> Result<(), E> {
         self.observe(path, &generate()?)
     }
+    /// Forward the actual generated program and its caller-owned root retention.
+    fn observe_generated_retained(
+        &mut self,
+        path: &str,
+        prototype: &T,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<T, E>,
+    ) -> Result<(), E> {
+        self.observe_generated(path, prototype, source, &mut || {
+            factory.generate(&mut |_| Ok(()))
+        })
+    }
 
     /// Optionally replaces an activation before it is consumed or returned.
     fn intervene(&mut self, _path: &str, _value: &T) -> Result<Option<T>, E> {
@@ -482,6 +719,38 @@ pub struct BorrowedActivationObserver<'a, O: ?Sized>(pub &'a mut O);
 impl<T, E, O: ActivationObserver<T, E> + ?Sized> ActivationObserver<T, E>
     for BorrowedActivationObserver<'_, O>
 {
+    fn requires_prepared_traversal(&self) -> bool {
+        self.0.requires_prepared_traversal()
+    }
+    fn supports_prefill_spans(&self) -> bool {
+        self.0.supports_prefill_spans()
+    }
+    fn supports_prefill_context(&self) -> bool {
+        self.0.supports_prefill_context()
+    }
+    fn begin_prefill_context(&mut self, frontier: u64) -> Result<(), E> {
+        self.0.begin_prefill_context(frontier)
+    }
+    fn requires_sequence_readout(&self) -> bool {
+        self.0.requires_sequence_readout()
+    }
+    fn admitted_prefill_capture(
+        &self,
+    ) -> Option<&crate::working_memory::AdmittedPrefillCapture<'_>> {
+        self.0.admitted_prefill_capture()
+    }
+    fn ordinary_prefill_capture(&self) -> Option<&crate::capture::OrdinaryPrefillCapture> {
+        self.0.ordinary_prefill_capture()
+    }
+    fn admitted_capture_continuation(
+        &self,
+    ) -> Option<&crate::working_memory::AdmittedCaptureContinuation<'_>> {
+        self.0.admitted_capture_continuation()
+    }
+
+    fn original_speculative_capture(&self) -> Option<crate::capture::OriginalSpeculativeCaptureInvocation<'_>> { self.0.original_speculative_capture() }
+    fn retain_original_speculative_capture(&mut self, capture: eredu_core::speculative::SpeculativeActivationCapture) -> Result<(), crate::capture::CaptureProtocolError> { self.0.retain_original_speculative_capture(capture) }
+
     fn routed_unit_observer(
         &mut self,
         path: &str,
@@ -490,6 +759,34 @@ impl<T, E, O: ActivationObserver<T, E> + ?Sized> ActivationObserver<T, E>
     }
     fn transactional(&self) -> bool {
         self.0.transactional()
+    }
+    fn begin_prefill_chunk(&mut self, chunk: &crate::prefill::PrefillChunk) -> Result<(), E> {
+        self.0.begin_prefill_chunk(chunk)
+    }
+    fn finish_prefill(&mut self, committed: bool) {
+        self.0.finish_prefill(committed);
+    }
+    fn requires_prefill_opening_state(&self) -> bool {
+        self.0.requires_prefill_opening_state()
+    }
+    fn prepare_prefill_chunk_with_opening(
+        &mut self,
+        context: &PrefillChunkRetentionContext<'_>,
+        opening: &PrefillOpeningState<'_, T>,
+    ) -> Result<Option<PreparedPrefillChunkRetention>, E> {
+        self.0.prepare_prefill_chunk_with_opening(context, opening)
+    }
+    fn prepare_prefill_chunk_retention(
+        &mut self,
+        context: &PrefillChunkRetentionContext<'_>,
+    ) -> Result<Option<PreparedPrefillChunkRetention>, E> {
+        self.0.prepare_prefill_chunk_retention(context)
+    }
+    fn retire_prefill_chunk_retention(
+        &mut self,
+        settled: SettledPrefillChunkRetention,
+    ) -> Result<(), E> {
+        self.0.retire_prefill_chunk_retention(settled)
     }
     fn prepare_transaction(
         &mut self,
@@ -525,6 +822,18 @@ impl<T, E, O: ActivationObserver<T, E> + ?Sized> ActivationObserver<T, E>
     ) -> Result<(), E> {
         self.0.observe_generated(path, prototype, source, generate)
     }
+    /// Forward the actual generated program and its caller-owned root retention.
+    fn observe_generated_retained(
+        &mut self,
+        path: &str,
+        prototype: &T,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<T, E>,
+    ) -> Result<(), E> {
+        self.0
+            .observe_generated_retained(path, prototype, source, factory)
+    }
+
     fn intervene(&mut self, path: &str, value: &T) -> Result<Option<T>, E> {
         self.0.intervene(path, value)
     }
@@ -535,6 +844,19 @@ impl<T, E, O: ActivationObserver<T, E> + ?Sized> ActivationObserver<T, E>
     ) -> Result<Option<eredu_nn::routing_intervention::GroupSelectionControl>, E> {
         self.0.routing_control(path, rows)
     }
+    /// Declares ordinary-decision interest without allocation or native work.
+    fn routing_unmodified_interest(&self, path: &str) -> RoutingUnmodifiedInterest {
+        self.0.routing_unmodified_interest(path)
+    }
+
+    fn routing_unmodified(
+        &mut self,
+        path: &str,
+        effective: RoutingDecision<'_, T>,
+    ) -> Result<(), E> {
+        self.0.routing_unmodified(path, effective)
+    }
+
     fn routing_applied(
         &mut self,
         path: &str,
@@ -551,6 +873,37 @@ impl<T, E, O: ActivationObserver<T, E> + ?Sized> ActivationObserver<T, E>
     }
     fn finish(&mut self) -> Result<(), E> {
         self.0.finish()
+    }
+}
+
+/// Keeps a logical prefill observation provisional through all chunk commits,
+/// cancellation checks, final score indexing and reservation settlement. This
+/// inline borrowed guard allocates nothing and establishes no native completion.
+pub(crate) struct PrefillObservationGuard<'a, T, E, O: ActivationObserver<T, E> + ?Sized> {
+    pub(crate) observer: &'a mut O,
+    active: bool,
+    marker: std::marker::PhantomData<fn(T) -> E>,
+}
+
+impl<'a, T, E, O: ActivationObserver<T, E> + ?Sized> PrefillObservationGuard<'a, T, E, O> {
+    pub(crate) fn new(observer: &'a mut O) -> Self {
+        Self {
+            observer,
+            active: true,
+            marker: std::marker::PhantomData,
+        }
+    }
+    pub(crate) fn finish(mut self, committed: bool) {
+        self.active = false;
+        self.observer.finish_prefill(committed);
+    }
+}
+
+impl<T, E, O: ActivationObserver<T, E> + ?Sized> Drop for PrefillObservationGuard<'_, T, E, O> {
+    fn drop(&mut self) {
+        if self.active {
+            self.observer.finish_prefill(false);
+        }
     }
 }
 
@@ -637,6 +990,15 @@ where
 pub struct NoopObserver;
 
 impl<T, E> ActivationObserver<T, E> for NoopObserver {
+    fn supports_prefill_context(&self) -> bool {
+        true
+    }
+    fn supports_prefill_spans(&self) -> bool {
+        true
+    }
+    fn requires_sequence_readout(&self) -> bool {
+        false
+    }
     fn observe_generated(
         &mut self,
         _: &str,
@@ -987,3 +1349,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "inspection/prefill_tests.rs"]
+mod prefill_tests;

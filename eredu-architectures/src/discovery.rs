@@ -309,7 +309,7 @@ impl Builder {
         });
     }
 
-    /// Declares both sides of a real component hook. Effective values are read-only
+    /// Declares both sides of a real component or unit-boundary hook. Effective values are read-only
     /// and never acquire a second intervention target.
     fn component_observation(
         &mut self,
@@ -396,21 +396,17 @@ impl Builder {
         self.get_mut(&id).layer_index = Some(index);
         self.decoder_execution(&id, index);
         self.edge(previous, &id, ArchitectureEdgeKind::Data);
-        self.observation(
+        self.component_observation(
             &id,
             UnitObservation::Input.path(path),
             "Block input",
-            ObservationDtype::Floating,
-            Some(axes(width)),
-            false,
+            axes(width),
         );
-        self.observation(
+        self.component_observation(
             &id,
             UnitObservation::Output.path(path),
             "Block output including residual contributions",
-            ObservationDtype::Floating,
-            Some(axes(width)),
-            false,
+            axes(width),
         );
         id
     }

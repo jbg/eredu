@@ -1,0 +1,301 @@
+diff --git a/mlx/backend/cpu/copy.cpp b/mlx/backend/cpu/copy.cpp
+--- a/mlx/backend/cpu/copy.cpp
++++ b/mlx/backend/cpu/copy.cpp
+@@ -318,7 +318,9 @@
+ } // namespace
+ 
+ bool contiguous_copy_dispatch_storage(const array& input,CpuCopyDispatchStorage& out) noexcept {
+-  const auto rank=input.ndim();
++  return contiguous_copy_dispatch_storage(input.ndim(),out);
++}
++bool contiguous_copy_dispatch_storage(size_t rank,CpuCopyDispatchStorage& out) noexcept {
+   if(rank>size_t(INT_MAX))return false;
+   WeakCopyStorage weak;
+   cpu::DispatchLayout dispatch;
+@@ -336,7 +338,8 @@
+   value.controls=sizeof(CpuCopyDispatchStorage)+sizeof(WeakCopyStorage)+sizeof(cpu::DispatchLayout)+
+       sizeof(InplaceCopyTask)*2+sizeof(CopyType)*2+sizeof(array)*4+sizeof(Stream)*2+
+       sizeof(size_t)*12+sizeof(bool)*3+sizeof(const void*)*12+sizeof(int64_t)*8+
+-      sizeof(std::optional<array>)*4+sizeof(Shape)*2+sizeof(Strides)*2;
++      sizeof(std::optional<array>)*4+sizeof(Shape)*2+sizeof(Strides)*2+
++      sizeof(size_t)+sizeof(const array*)+sizeof(CpuCopyDispatchStorage*);
+   if(!copy_add(dispatch.controls,value.controls) || !copy_repeat(2,weak.controls,value.controls))return false;
+   if(rank) {
+     CollapseStorageLayout collapse;
+diff --git a/mlx/backend/cpu/copy.h b/mlx/backend/cpu/copy.h
+--- a/mlx/backend/cpu/copy.h
++++ b/mlx/backend/cpu/copy.h
+@@ -19,6 +19,7 @@
+   size_t weak_graph_extent_sum{0},worker_graph_extent_bound{0},controls{0};
+ };
+ MLX_API bool contiguous_copy_dispatch_storage(const array&,CpuCopyDispatchStorage&) noexcept;
++MLX_API bool contiguous_copy_dispatch_storage(size_t rank,CpuCopyDispatchStorage&) noexcept;
+ void copy_cpu(const array& src, array& dst, CopyType ctype, Stream stream);
+ void copy_cpu_inplace(
+     const array& src,
+diff --git a/mlx/backend/cpu/distributed_storage.cpp b/mlx/backend/cpu/distributed_storage.cpp
+--- a/mlx/backend/cpu/distributed_storage.cpp
++++ b/mlx/backend/cpu/distributed_storage.cpp
+@@ -83,9 +83,11 @@
+       sizeof(bool)*7+sizeof(int)*4+sizeof(GroupWorkerOperation)+
+       sizeof(const Group*)+sizeof(const array*)+sizeof(CpuDistributedStorage*)+
+       sizeof(GroupWorkerOperation)+sizeof(int)+sizeof(size_t)*4+sizeof(bool)+
++      sizeof(GroupTensorLayout)+sizeof(std::optional<GroupTensorLayout>)+
++      sizeof(std::span<const int>)+sizeof(Dtype)+sizeof(size_t)*4+
+       GraphConstruction::layout_control_bytes();
+ }
+-bool prepare_storage(const Group& group,const array& input,
++bool prepare_storage(const Group& group,const GroupTensorLayout& input,
+     GroupWorkerOperation operation,int peer,size_t output_rank,size_t input_bytes,
+     size_t output_bytes,bool tracer,size_t inspection_controls,CpuDistributedStorage& out) noexcept {
+   const bool receive=operation==GroupWorkerOperation::recv;
+@@ -129,7 +131,7 @@
+   CpuCopyDispatchStorage copy;
+   WeakCopyStorage weak;
+   if(value.possible_copy) {
+-    if(!contiguous_copy_dispatch_storage(input,copy) ||
++    if(!contiguous_copy_dispatch_storage(input.ndim(),copy) ||
+         !PreparedInputLeaf::weak_copy_storage(input.ndim(),weak) || weak.count<3)return false;
+     for(size_t i=0;i<2;++i)
+       if(!append(value,4+i,descriptor[i].bytes,descriptor[i].alignment,3))return false;
+@@ -215,7 +217,9 @@
+     } else if(output.shape()[0]!=members)return false;
+   } else if(input.shape()!=output.shape() || input_bytes!=output_bytes)return false;
+ 
+-  return prepare_storage(group,input,selected.operation,selected.peer,output.ndim(),
++  const auto layout=GroupTensorLayout::checked(input);
++  if(!layout)return false;
++  return prepare_storage(group,*layout,selected.operation,selected.peer,output.ndim(),
+       input_bytes,output_bytes,output.is_tracer(),cpu_distributed_storage_inspection_controls(output),out);
+ #endif
+ }
+@@ -231,13 +235,20 @@
+ }
+ bool cpu_distributed_source_storage(const Group& group,const array& input,
+     GroupWorkerOperation operation,int peer,CpuDistributedStorage& out) noexcept {
++  if(input.is_tracer())return false;
++  const auto layout=GroupTensorLayout::checked(input);
++  return layout && cpu_distributed_source_storage(group,*layout,operation,peer,out);
++}
++bool cpu_distributed_source_storage(const Group& group,const GroupTensorLayout& input,
++    GroupWorkerOperation operation,int peer,CpuDistributedStorage& out) noexcept {
+   GroupConstructorStorage construction;
+-  // The original constructor refuses tracer leaves. This is an actual source
+-  // condition, not a caller-provided output shape or optional primitive recipe.
+-  if(input.is_tracer() || !constructor_storage(group,input,operation,peer,construction) ||
++  // The checked layout selects no placeholder or input DAG. Actual Array
++  // callers reject tracers above; binding revalidates the same physical classes.
++  if(!constructor_storage(group,input,operation,peer,construction) ||
+       construction.primitives!=1)return false;
+   size_t input_bytes,output_bytes;
+-  if(!bytes(input,input_bytes) || !multiply(construction.output_elements,input.itemsize(),output_bytes))return false;
++  input_bytes=input.nbytes();
++  if(!multiply(construction.output_elements,input.itemsize(),output_bytes))return false;
+   const size_t controls=cpu_distributed_source_inspection_controls(group);
+   if(controls==SIZE_MAX)return false;
+   return prepare_storage(group,input,operation,peer,construction.output_rank,
+diff --git a/mlx/backend/cpu/distributed_storage.h b/mlx/backend/cpu/distributed_storage.h
+--- a/mlx/backend/cpu/distributed_storage.h
++++ b/mlx/backend/cpu/distributed_storage.h
+@@ -27,4 +27,6 @@
+ MLX_API size_t cpu_distributed_source_inspection_controls(const Group&) noexcept;
+ MLX_API bool cpu_distributed_source_storage(const Group&, const array&,
+     GroupWorkerOperation, int peer, CpuDistributedStorage&) noexcept;
++MLX_API bool cpu_distributed_source_storage(const Group&, const GroupTensorLayout&,
++    GroupWorkerOperation, int peer, CpuDistributedStorage&) noexcept;
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/constructor.cpp b/mlx/distributed/constructor.cpp
+--- a/mlx/distributed/constructor.cpp
++++ b/mlx/distributed/constructor.cpp
+@@ -27,9 +27,16 @@
+   return sizeof(GroupConstructorStorage) + sizeof(GroupStorageInventory) +
+       sizeof(GraphQuota::Request) * 3 + sizeof(const Group*) + sizeof(const array*) +
+       sizeof(GroupWorkerOperation) + sizeof(int) * 3 + sizeof(size_t) * 9 + sizeof(bool) * 4 +
++      sizeof(GroupTensorLayout)+sizeof(std::optional<GroupTensorLayout>)+
++      sizeof(std::span<const int>)+sizeof(Dtype)+sizeof(size_t)*4+
+       GraphConstruction::layout_control_bytes();
+ }
+ bool constructor_storage(const Group& group, const array& input,
++    GroupWorkerOperation operation, int peer, GroupConstructorStorage& out) noexcept {
++  const auto layout=GroupTensorLayout::checked(input);
++  return layout && constructor_storage(group,*layout,operation,peer,out);
++}
++bool constructor_storage(const Group& group, const GroupTensorLayout& input,
+     GroupWorkerOperation operation, int peer, GroupConstructorStorage& out) noexcept {
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+diff --git a/mlx/distributed/constructor.h b/mlx/distributed/constructor.h
+--- a/mlx/distributed/constructor.h
++++ b/mlx/distributed/constructor.h
+@@ -9,5 +9,7 @@
+ };
+ MLX_API bool constructor_storage(const Group&, const array&, GroupWorkerOperation,
+     int peer, GroupConstructorStorage&) noexcept;
++MLX_API bool constructor_storage(const Group&, const GroupTensorLayout&,
++    GroupWorkerOperation, int peer, GroupConstructorStorage&) noexcept;
+ MLX_API size_t constructor_storage_inspection_controls() noexcept;
+ } // namespace mlx::core::distributed
+diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
+--- a/mlx/distributed/distributed.cpp
++++ b/mlx/distributed/distributed.cpp
+@@ -257,12 +257,20 @@
+     int peer, GroupDispatchStorage& out) const noexcept {
+   return group_ && group_->dispatch_storage(operation, input, peer, out);
+ }
++bool Group::dispatch_storage(GroupWorkerOperation operation, const GroupTensorLayout& input,
++    int peer, GroupDispatchStorage& out) const noexcept {
++  return group_ && group_->dispatch_storage(operation, input, peer, out);
++}
+ 
+ size_t Group::worker_storage_inspection_controls() const noexcept {
+   return sizeof(void*) * 2 + sizeof(size_t) + (group_ ? group_->worker_storage_inspection_controls() : 0);
+ }
+ 
+ bool Group::worker_storage(GroupWorkerOperation operation, const array& input,
++    int peer, GroupWorkerStorage& out) const noexcept {
++  return group_ && group_->worker_storage(operation, input, peer, out);
++}
++bool Group::worker_storage(GroupWorkerOperation operation, const GroupTensorLayout& input,
+     int peer, GroupWorkerStorage& out) const noexcept {
+   return group_ && group_->worker_storage(operation, input, peer, out);
+ }
+diff --git a/mlx/distributed/distributed.h b/mlx/distributed/distributed.h
+--- a/mlx/distributed/distributed.h
++++ b/mlx/distributed/distributed.h
+@@ -6,6 +6,7 @@
+ 
+ #include "mlx/api.h"
+ #include "mlx/array.h"
++#include "mlx/distributed/tensor_layout.h"
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core::distributed {
+@@ -97,8 +98,12 @@
+   size_t dispatch_storage_inspection_controls() const noexcept;
+   bool dispatch_storage(GroupWorkerOperation, const array&, int peer,
+                         GroupDispatchStorage& out) const noexcept;
++  bool dispatch_storage(GroupWorkerOperation, const GroupTensorLayout&, int peer,
++                        GroupDispatchStorage& out) const noexcept;
+   size_t worker_storage_inspection_controls() const noexcept;
+   bool worker_storage(GroupWorkerOperation, const array&, int peer,
++                      GroupWorkerStorage& out) const noexcept;
++  bool worker_storage(GroupWorkerOperation, const GroupTensorLayout&, int peer,
+                       GroupWorkerStorage& out) const noexcept;
+ 
+   int rank() const;
+diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
+--- a/mlx/distributed/distributed_impl.h
++++ b/mlx/distributed/distributed_impl.h
+@@ -35,9 +35,13 @@
+   virtual size_t dispatch_storage_inspection_controls() const noexcept { return 0; }
+   virtual bool dispatch_storage(GroupWorkerOperation, const array&, int,
+                                 GroupDispatchStorage&) const noexcept { return false; }
++  virtual bool dispatch_storage(GroupWorkerOperation, const GroupTensorLayout&, int,
++      GroupDispatchStorage&) const noexcept { return false; }
+   virtual size_t worker_storage_inspection_controls() const noexcept { return 0; }
+   virtual bool worker_storage(GroupWorkerOperation, const array&, int,
+                               GroupWorkerStorage&) const noexcept { return false; }
++  virtual bool worker_storage(GroupWorkerOperation, const GroupTensorLayout&, int,
++      GroupWorkerStorage&) const noexcept { return false; }
+ 
+   // Choose the stream this communication group can operate on
+   virtual Stream communication_stream(StreamOrDevice s = {}) = 0;
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -489,6 +489,8 @@
+  public:
+   size_t dispatch_storage_inspection_controls() const noexcept override {
+     return sizeof(GroupDispatchStorage) * 2 + sizeof(cpu::DispatchLayout) * 2 +
++        sizeof(GroupTensorLayout)+sizeof(std::optional<GroupTensorLayout>)+
++        sizeof(std::span<const int>)+sizeof(Dtype)+sizeof(size_t)*4+
+         sizeof(GatherDispatch) + sizeof(SendDispatch) + sizeof(ReceiveDispatch) +
+         reduce_dispatch_frames<bool>() + reduce_dispatch_frames<int8_t>() +
+         reduce_dispatch_frames<int16_t>() + reduce_dispatch_frames<int32_t>() +
+@@ -500,6 +502,11 @@
+         sizeof(void*) * 8 + sizeof(size_t) * 8 + sizeof(bool) * 3 + sizeof(int);
+   }
+   bool dispatch_storage(GroupWorkerOperation operation, const array& input, int peer,
++      GroupDispatchStorage& out) const noexcept override {
++    const auto layout=GroupTensorLayout::checked(input);
++    return layout && dispatch_storage(operation,*layout,peer,out);
++  }
++  bool dispatch_storage(GroupWorkerOperation operation, const GroupTensorLayout& input, int peer,
+       GroupDispatchStorage& out) const noexcept override {
+     if (size_ <= 0 || rank_ < 0 || rank_ >= size_ || sockets_right_.empty() ||
+         sockets_right_.size() != sockets_left_.size()) return false;
+@@ -517,6 +524,8 @@
+   }
+   size_t worker_storage_inspection_controls() const noexcept override {
+     return sizeof(GroupWorkerStorage) * 2 + sizeof(WorkerStorageCounter) +
++        sizeof(GroupTensorLayout)+sizeof(std::optional<GroupTensorLayout>)+
++        sizeof(std::span<const int>)+sizeof(Dtype)+sizeof(size_t)*4+
+         sizeof(ReductionWorkers) + sizeof(WorkerPartitions) + sizeof(DirectWorkers) +
+         sizeof(ReductionPlanLayout) * 2 + sizeof(SocketTaskLayout) * 2 +
+         sizeof(threadpool_detail::TaskLayout) * 2 + sizeof(GatherJob) +
+@@ -530,6 +539,11 @@
+         sizeof(size_t) * 32 + sizeof(void*) * 12 + sizeof(int) * 3 + sizeof(bool) * 8;
+   }
+   bool worker_storage(GroupWorkerOperation operation, const array& input, int peer,
++      GroupWorkerStorage& out) const noexcept override {
++    const auto layout=GroupTensorLayout::checked(input);
++    return layout && worker_storage(operation,*layout,peer,out);
++  }
++  bool worker_storage(GroupWorkerOperation operation, const GroupTensorLayout& input, int peer,
+       GroupWorkerStorage& out) const noexcept override {
+     if (size_ <= 0 || rank_ < 0 || rank_ >= size_ || sockets_right_.empty() ||
+         sockets_right_.size() != sockets_left_.size() ||
+diff --git a/mlx/distributed/tensor_layout.h b/mlx/distributed/tensor_layout.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/distributed/tensor_layout.h
+@@ -0,0 +1,49 @@
++#pragma once
++#include "mlx/array.h"
++#include <climits>
++#include <limits>
++#include <optional>
++#include <span>
++
++namespace mlx::core::distributed {
++// Validated immutable equation layout, never an Array, allocation or group
++// authority. Only actual retained implementation queries consume this view.
++class GroupTensorLayout {
++ public:
++  static std::optional<GroupTensorLayout> checked(std::span<const int> shape,Dtype dtype) noexcept {
++    if(shape.size()>size_t(INT_MAX))return std::nullopt;
++    size_t item=0;
++    switch(dtype.val()) {
++      case Dtype::Val::bool_:item=sizeof(bool);break;
++      case Dtype::Val::uint8:case Dtype::Val::int8:item=1;break;
++      case Dtype::Val::uint16:case Dtype::Val::int16:case Dtype::Val::float16:case Dtype::Val::bfloat16:item=2;break;
++      case Dtype::Val::uint32:case Dtype::Val::int32:case Dtype::Val::float32:item=4;break;
++      case Dtype::Val::uint64:case Dtype::Val::int64:case Dtype::Val::float64:case Dtype::Val::complex64:item=8;break;
++      default:return std::nullopt;
++    }
++    if(dtype.size()!=item)return std::nullopt;
++    size_t elements=1;
++    for(int dimension:shape) {
++      if(dimension<0 || (dimension && elements>size_t(PTRDIFF_MAX)/size_t(dimension)))return std::nullopt;
++      elements*=size_t(dimension);
++    }
++    if(elements>size_t(PTRDIFF_MAX)/item)return std::nullopt;
++    return GroupTensorLayout(shape,dtype,elements);
++  }
++  static std::optional<GroupTensorLayout> checked(const array& input) noexcept {
++    return checked(std::span<const int>(input.shape().data(),input.ndim()),input.dtype());
++  }
++  std::span<const int> shape()const noexcept{return shape_;}
++  size_t ndim()const noexcept{return shape_.size();}
++  Dtype dtype()const noexcept{return dtype_;}
++  size_t itemsize()const noexcept{return dtype_.size();}
++  size_t size()const noexcept{return elements_;}
++  size_t nbytes()const noexcept{return elements_*itemsize();}
++ private:
++  GroupTensorLayout(std::span<const int> shape,Dtype dtype,size_t elements) noexcept
++      :shape_(shape),dtype_(dtype),elements_(elements){}
++  std::span<const int> shape_;
++  Dtype dtype_;
++  size_t elements_;
++};
++} // namespace mlx::core::distributed

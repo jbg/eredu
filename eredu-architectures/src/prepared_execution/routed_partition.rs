@@ -92,10 +92,16 @@ where
         BTreeMap<eredu_runtime::RoutedBankId, Retained>,
     ) -> Result<O, E>,
 {
+    let resident_source = match prepared.bank_residency() {
+        ParameterBankResidency::WithLayer => Some(prepared.resident_partition_source()
+            .map_err(|cause| PreparedExecutionError::Architecture(cause.to_string()))?.clone()),
+        _ => None,
+    };
     let selection = PreparedPartitionBanks::new(
         prepared.bank_residency(),
         prepared.banks().clone(),
         prepared.prepared().selected().expert_group().is_some(),
+        resident_source,
     );
     let (providers, retained) = construct_partition_bank_providers(&selection, |_, options| {
         make_banks(&prepared, options)
@@ -110,18 +116,36 @@ pub struct PreparedPartitionBanks {
     residency: ParameterBankResidency,
     banks: BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::SelectedRoutedBank>,
     expert_exchange: bool,
+    resident_source: Option<crate::routed_text::RetainedPartitionResidentSource>,
 }
 impl PreparedPartitionBanks {
     pub(crate) fn new(
         residency: ParameterBankResidency,
         banks: BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::SelectedRoutedBank>,
         expert_exchange: bool,
+        resident_source: Option<crate::routed_text::RetainedPartitionResidentSource>,
     ) -> Self {
         Self {
             residency,
             banks,
             expert_exchange,
+            resident_source,
         }
+    }
+
+    pub(crate) fn prepare(
+        residency: ParameterBankResidency,
+        banks: BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::SelectedRoutedBank>,
+        expert_exchange: bool,
+    ) -> Result<Self, crate::RoutedTextExecutionError> {
+        let source = if matches!(residency, ParameterBankResidency::WithLayer) {
+            Some(crate::routed_text::RetainedPartitionResidentSource::prepare(&banks, expert_exchange)?)
+        } else { None };
+        Ok(Self::new(residency, banks, expert_exchange, source))
+    }
+
+    pub(crate) fn resident_source(&self) -> Result<&crate::routed_text::RetainedPartitionResidentSource, crate::RoutedTextExecutionError> {
+        self.resident_source.as_ref().ok_or(crate::RoutedTextExecutionError::ResidentSourceUnavailable)
     }
 
     /// The selected immutable-weight cache policy.
@@ -191,11 +215,16 @@ where
         E,
     >,
 {
-    use crate::routed_text::{PartitionUnitProvider, PlannedAddressableBank, PlannedResidentBank};
+    use crate::routed_text::{PartitionUnitProvider, PlannedAddressableBank};
     let exchange = selection.expert_exchange;
     let options = match selection.residency() {
-        ParameterBankResidency::WithLayer => None,
-        ParameterBankResidency::IndependentCache(options) => Some(options),
+        ParameterBankResidency::WithLayer => {
+            let providers = selection.resident_source()
+                .and_then(|source| source.ordinary::<B>())
+                .map_err(|cause| PreparedExecutionError::Architecture(cause.to_string()))?;
+            return Ok((providers, BTreeMap::new()));
+        }
+        ParameterBankResidency::IndependentCache(options) => options,
         _ => {
             return Err(PreparedExecutionError::Architecture(
                 "selected partition bank residency has no construction mechanism".into(),
@@ -203,7 +232,7 @@ where
         }
     };
     let mut mechanisms =
-        if let Some(options) = options.filter(|_| !selection.addressable_members().is_empty()) {
+        if !selection.addressable_members().is_empty() {
             make_banks(selection, options).map_err(PreparedExecutionError::Backend)?
         } else {
             BTreeMap::new()
@@ -217,10 +246,10 @@ where
                 Error = crate::routed_text::RoutedTextExecutionError,
             >,
         > = if bank.plan().local_global_group_indices().is_empty()
-            || (options.is_some() && bank.addressable_members().is_empty())
+            || bank.addressable_members().is_empty()
         {
             Box::new(EmptyPartitionRoutedExpertProvider)
-        } else if let Some(options) = options {
+        } else {
             let mechanism = mechanisms.remove(id).ok_or_else(|| {
                 PreparedExecutionError::Architecture(format!(
                     "missing mechanism for routed bank {id:?}"
@@ -238,12 +267,6 @@ where
                     options,
                 )
                 .map_err(|e| PreparedExecutionError::Architecture(e.to_string()))?,
-            ))
-        } else {
-            Box::new(PartitionUnitProvider::new(
-                bank,
-                PlannedResidentBank::from_partitioned(bank, exchange)
-                    .map_err(|e| PreparedExecutionError::Architecture(e.to_string()))?,
             ))
         };
         providers.insert(*id, provider);

@@ -11,6 +11,35 @@ use crate::utils::guard::Guarded;
 use crate::utils::{IntoOption, VectorArray, SUCCESS};
 use crate::{Array, Dtype, Stream};
 use safemlx_internal_macros::generate_macro;
+pub(crate) mod fixed_config;
+mod host_controls;
+pub(crate) mod prepared_definition;
+pub use fixed_config::{BorrowedKernelOutput, BorrowedKernelTemplate};
+pub use host_controls::three_input_kernel_control_bytes;
+pub use prepared_definition::{
+    KernelDefinitionCause, KernelDefinitionError, KernelDefinitionLayout,
+    MetalKernelDefinitionPlan, PreparedMetalKernelDefinition,
+};
+
+/// Returns the process-retained Metal attention scratch override. `None` uses
+/// native device defaults. The first call, or first two-pass Metal attention,
+/// captures `MLX_SDPA_BLOCKS`; subsequent environment edits cannot change it.
+/// Positive overrides must be multiples of 32, as required by the native
+/// final reduction. Incompatible or overflowing values return an error.
+/// This query initializes no device, stream, tensor or allocator.
+pub fn sdpa_blocks_override() -> Result<Option<u32>> {
+    crate::error::ensure_mlx_error_handler();
+    let mut selected = 0;
+    // SAFETY: the native function writes one live int and retains only its
+    // immutable process setting. Native exceptions become the usual error.
+    let status = unsafe { safemlx_sys::mlx_fast_sdpa_blocks_override(&mut selected) };
+    if status != SUCCESS {
+        return Err(crate::error::get_and_clear_last_mlx_error()
+            .expect("SDPA setting failed without a native error")
+            .into());
+    }
+    Ok((selected > 0).then_some(selected as u32))
+}
 
 /// A compiled custom Metal kernel.
 ///
@@ -85,10 +114,10 @@ impl MetalKernel {
         };
 
         if c_kernel.ctx.is_null() {
-            let what = crate::error::get_and_clear_last_mlx_error()
-                .map(|e| e.what)
-                .unwrap_or_else(|| "failed to create Metal kernel".to_string());
-            return Err(Exception::custom(what));
+            let error = crate::error::get_and_clear_last_mlx_error()
+                .map(Exception::from)
+                .unwrap_or_else(|| Exception::custom("failed to create Metal kernel"));
+            return Err(error);
         }
 
         Ok(Self {
@@ -229,10 +258,10 @@ impl CudaKernel {
             )
         };
         if c_kernel.ctx.is_null() {
-            let what = crate::error::get_and_clear_last_mlx_error()
-                .map(|error| error.what)
-                .unwrap_or_else(|| "failed to create CUDA kernel".to_string());
-            return Err(Exception::custom(what));
+            let error = crate::error::get_and_clear_last_mlx_error()
+                .map(Exception::from)
+                .unwrap_or_else(|| Exception::custom("failed to create CUDA kernel"));
+            return Err(error);
         }
         Ok(Self {
             c_kernel,
@@ -506,10 +535,13 @@ impl RawMetalKernelConfig {
 
         let c_config = unsafe { safemlx_sys::mlx_fast_metal_kernel_config_new() };
         if c_config.ctx.is_null() {
-            let what = crate::error::get_and_clear_last_mlx_error()
-                .map(|e| e.what)
-                .unwrap_or_else(|| "failed to create Metal kernel config".to_string());
-            return Err(Exception::custom(what));
+            if let Some(observer) = crate::OriginalScopeObserver::try_current()? {
+                return Err(observer.error(7));
+            }
+            let error = crate::error::get_and_clear_last_mlx_error()
+                .map(Exception::from)
+                .unwrap_or_else(|| Exception::custom("failed to create Metal kernel config"));
+            return Err(error);
         }
 
         let raw = Self { c_config };
@@ -613,10 +645,10 @@ impl RawCudaKernelConfig {
         crate::error::ensure_mlx_error_handler();
         let c_config = unsafe { safemlx_sys::mlx_fast_cuda_kernel_config_new() };
         if c_config.ctx.is_null() {
-            let what = crate::error::get_and_clear_last_mlx_error()
-                .map(|error| error.what)
-                .unwrap_or_else(|| "failed to create CUDA kernel config".to_string());
-            return Err(Exception::custom(what));
+            let error = crate::error::get_and_clear_last_mlx_error()
+                .map(Exception::from)
+                .unwrap_or_else(|| Exception::custom("failed to create CUDA kernel config"));
+            return Err(error);
         }
         let raw = Self { c_config };
         raw.populate(config)?;
@@ -745,10 +777,13 @@ fn check_status(status: i32) -> Result<()> {
     match status {
         SUCCESS => Ok(()),
         _ => {
-            let what = crate::error::get_and_clear_last_mlx_error()
-                .map(|e| e.what)
-                .unwrap_or_else(|| "MLX operation failed but no error was set".to_string());
-            Err(Exception::custom(what))
+            if let Some(observer) = crate::OriginalScopeObserver::try_current()? {
+                return Err(observer.error(7));
+            }
+            let error = crate::error::get_and_clear_last_mlx_error()
+                .map(Exception::from)
+                .unwrap_or_else(|| Exception::custom("MLX operation failed but no error was set"));
+            Err(error)
         }
     }
 }
@@ -804,6 +839,26 @@ pub fn rope<'a>(
         concatenate_axis(&outputs, 0, stream)?
     };
     Ok(output)
+}
+
+/// Controls of the existing supplied-stream RoPE batch wrapper, when each
+/// batch has at most four axes. Counts the actual output Vec and inline index
+/// and concatenate frames; native handles/Graph/Record are separately priced.
+/// This pure query grants no source or submission authority.
+pub fn rope_control_bytes(batches: usize) -> Option<usize> {
+    use std::{alloc::Layout, mem::size_of};
+    let outputs = Layout::array::<Array>(batches).ok()?.size();
+    outputs
+        .checked_add(size_of::<Vec<Array>>())?
+        .checked_add(size_of::<safemlx_sys::mlx_optional_float>())?
+        .checked_add(size_of::<Option<&Array>>())?
+        .checked_add(size_of::<[i32; 3]>())?
+        .checked_add(size_of::<[&Array; 2]>())?
+        .checked_add(size_of::<Result<Array>>())?
+        .checked_add(
+            crate::ops::indexing::inline_basic_index_control_bytes()?.checked_mul(batches)?,
+        )?
+        .checked_add(crate::ops::concatenate_axis_control_bytes()?)
 }
 
 /// Optimized implementation of `NN.RoPE` with dynamic (array) offset.
@@ -1094,6 +1149,51 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "metal", not(feature = "cuda")))]
+    fn custom_metal_kernel_keeps_outputs_after_configuration_retirement() {
+        let stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Gpu, 0));
+        let input = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[4]);
+        let kernel = MetalKernel::new(
+            "configuration_retirement",
+            ["input"],
+            ["output"],
+            concat!(
+                "uint i = thread_position_in_grid.x;",
+                "if (i < COUNT) output[i] = input[i] * RETAINED_TEMPLATE_SCALE_VALUE;"
+            ),
+            "",
+            true,
+            false,
+        )
+        .unwrap();
+        let config = CustomKernelConfig::new()
+            .with_template_arg_int("COUNT", 4)
+            .with_template_arg_int("RETAINED_TEMPLATE_SCALE_VALUE", 2)
+            .with_grid([4, 1, 1])
+            .with_thread_group([32, 1, 1])
+            .with_output_arg([4], Dtype::Float32);
+        // A failed invocation must leave the same kernel/configuration usable.
+        assert!(kernel
+            .apply_device(std::iter::empty::<&Array>(), &config, &stream)
+            .is_err());
+        let first = kernel.apply_one_device([&input], &config, &stream).unwrap();
+        drop(config);
+        // Reuse the actual kernel with different geometry and template data.
+        let second = {
+            let config = CustomKernelConfig::new()
+                .with_template_arg_int("COUNT", 2)
+                .with_template_arg_int("RETAINED_TEMPLATE_SCALE_VALUE", 3)
+                .with_grid([2, 1, 1])
+                .with_thread_group([32, 1, 1])
+                .with_output_arg([2], Dtype::Float32);
+            kernel.apply_one_device([&input], &config, &stream).unwrap()
+        };
+        drop(kernel);
+        assert_eq!(crate::array::eval_vec::<f32>(&first), &[2.0, 4.0, 6.0, 8.0]);
+        assert_eq!(crate::array::eval_vec::<f32>(&second), &[3.0, 6.0]);
+    }
+
+    #[test]
     fn test_rope() {
         let stream = crate::test_stream();
         let key = crate::test_key(71, stream);
@@ -1263,3 +1363,8 @@ mod tests {
         assert_eq!(result.shape(), &[b, n_q, t_q, d]);
     }
 }
+
+pub use crate::allocation_retention::kernel_family::{
+    KernelFamilyLayout, KernelInputClass, KernelInputSignature, KernelSpecialization,
+    MetalKernelFamilyPlan, PreparedMetalKernelFamily,
+};

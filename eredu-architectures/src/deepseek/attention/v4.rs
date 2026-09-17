@@ -8,63 +8,23 @@ use eredu_nn::{
 };
 
 use crate::decoder::ComponentInstrumentation;
-use crate::deepseek::{projection::ProjectionPolicy, V4Args, V4AttentionPolicy};
+use crate::deepseek::{V4Args, V4AttentionPolicy, projection::ProjectionPolicy};
 use eredu_runtime::ActivationObserver;
+mod construction;
+pub(crate) use construction::V4AttentionSpec;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Parameterized)]
+#[parameterized(tensor = "T")]
 struct V4Rotary<T: Tensor> {
+    #[parameter(skip, metadata)]
     rotary_dimensions: i32,
+    #[parameter(skip, metadata)]
     frequency_scale: i32,
+    #[parameter(skip, retained_value)]
     frequencies: T,
 }
 
 impl<T: Tensor> V4Rotary<T> {
-    fn new(
-        args: &V4Args,
-        base: f32,
-        yarn: bool,
-        frequency_scale: i32,
-        context: &T::Context,
-    ) -> Result<Self, Error> {
-        let dimensions = args.qk_rope_head_dim;
-        let mut inverse = (0..dimensions)
-            .step_by(2)
-            .map(|index| 1.0 / base.powf(index as f32 / dimensions as f32))
-            .collect::<Vec<_>>();
-        if yarn {
-            if let Some(config) = &args.rope_scaling {
-                let correction = |rotations: f32| {
-                    dimensions as f32
-                        * (config.original_max_position_embeddings as f32
-                            / (rotations * 2.0 * std::f32::consts::PI))
-                            .ln()
-                        / (2.0 * base.ln())
-                };
-                let low = correction(config.beta_fast).floor().max(0.0);
-                let mut high = correction(config.beta_slow)
-                    .ceil()
-                    .min((dimensions - 1) as f32);
-                if low == high {
-                    high += 0.001;
-                }
-                for (index, frequency) in inverse.iter_mut().enumerate() {
-                    let ramp = ((index as f32 - low) / (high - low)).clamp(0.0, 1.0);
-                    let smooth = 1.0 - ramp;
-                    *frequency = *frequency / config.factor * (1.0 - smooth) + *frequency * smooth;
-                }
-            }
-        }
-        let frequencies = inverse
-            .into_iter()
-            .map(|frequency| 1.0 / frequency / frequency_scale as f32)
-            .collect::<Vec<_>>();
-        Ok(Self {
-            rotary_dimensions: dimensions,
-            frequency_scale,
-            frequencies: T::from_f32_slice(&frequencies, &[dimensions / 2], context)?,
-        })
-    }
-
     fn apply(
         &self,
         input: &T,
@@ -110,66 +70,88 @@ impl<T: Tensor> V4Rotary<T> {
     }
 }
 
+// Architecture-owned scalar expressions. These contain no heap allocation,
+// native operation, or external effect. The shared fixed initializer owns the
+// single host buffer; its metadata implementation never evaluates these scalars.
+#[derive(Debug, Clone, Copy)]
+struct V4FrequencyValues {
+    dimensions: i32,
+    base: f32,
+    frequency_scale: i32,
+    correction: Option<(f32, f32, f32)>,
+}
+
+impl V4FrequencyValues {
+    fn new(
+        dimensions: i32,
+        base: f32,
+        yarn: Option<&crate::deepseek::config::YarnConfig>,
+        frequency_scale: i32,
+    ) -> Self {
+        let correction = yarn.map(|config| {
+            let correction = |rotations: f32| {
+                dimensions as f32
+                    * (config.original_max_position_embeddings as f32
+                        / (rotations * 2.0 * std::f32::consts::PI))
+                        .ln()
+                    / (2.0 * base.ln())
+            };
+            let low = correction(config.beta_fast).floor().max(0.0);
+            let mut high = correction(config.beta_slow)
+                .ceil()
+                .min((dimensions - 1) as f32);
+            if low == high {
+                high += 0.001;
+            }
+            (low, high, config.factor)
+        });
+        Self {
+            dimensions,
+            base,
+            frequency_scale,
+            correction,
+        }
+    }
+
+    fn value(&self, index: usize) -> f32 {
+        // Preserve the original f32 expression and rounding order, including
+        // even dimension indices, the YaRN blend and its final reciprocal.
+        let mut inverse = 1.0 / self.base.powf((index * 2) as f32 / self.dimensions as f32);
+        if let Some((low, high, factor)) = self.correction {
+            let ramp = ((index as f32 - low) / (high - low)).clamp(0.0, 1.0);
+            let smooth = 1.0 - ramp;
+            inverse = inverse / factor * (1.0 - smooth) + inverse * smooth;
+        }
+        1.0 / inverse / self.frequency_scale as f32
+    }
+
+    fn initialize<T: Tensor>(&self, context: &T::Context) -> Result<T, Error> {
+        T::from_f32_fn(&[self.dimensions / 2], |index| self.value(index), context)
+    }
+}
+
+#[cfg(test)]
+mod frequency_tests;
+
 /// One learned gated compressor shared by ordinary compressed and sparse
 /// index streams.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Compressor<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     ratio: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     overlapping: bool,
     wkv: B::Linear,
     wgate: B::Linear,
     ape: Parameter<B::Tensor>,
     norm: B::Normalization,
-    #[parameter(skip)]
     rope: V4Rotary<B::Tensor>,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Compressor<B> {
-    fn new(
-        args: &V4Args,
-        ratio: i32,
-        head_dimensions: i32,
-        root: &str,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let overlapping = ratio == 4;
-        let output = head_dimensions * if overlapping { 2 } else { 1 };
-        Ok(Self {
-            ratio,
-            head_dimensions,
-            overlapping,
-            wkv: linear::<B>(
-                format!("{root}.wkv.weight"),
-                args.hidden_size,
-                output,
-                args.linear_format_for(&format!("{root}.wkv.weight")),
-                context,
-            )?,
-            wgate: linear::<B>(
-                format!("{root}.wgate.weight"),
-                args.hidden_size,
-                output,
-                args.linear_format_for(&format!("{root}.wgate.weight")),
-                context,
-            )?,
-            ape: Parameter::unloaded(parameter(format!("{root}.ape"))?, &[ratio, output], context)?,
-            norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    head_dimensions,
-                    args.rms_norm_eps,
-                    parameter(format!("{root}.norm.weight"))?,
-                ),
-                context,
-            )?,
-            rope: V4Rotary::new(args, args.compress_rope_theta, true, ratio, context)?,
-        })
-    }
-
     fn forward<C: PoolingAttentionCache<B::Tensor>>(
         &mut self,
         input: &B::Tensor,
@@ -341,11 +323,11 @@ where
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Indexer<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     top_k: i32,
     wq_b: B::Linear,
     weights_projection: B::Linear,
@@ -353,40 +335,6 @@ pub struct Indexer<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Indexer<B> {
-    fn new(
-        args: &V4Args,
-        ratio: i32,
-        root: &str,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        Ok(Self {
-            heads: args.index_n_heads,
-            head_dimensions: args.index_head_dim,
-            top_k: args.index_topk,
-            wq_b: linear::<B>(
-                format!("{root}.wq_b.weight"),
-                args.q_lora_rank,
-                args.index_n_heads * args.index_head_dim,
-                args.linear_format_for(&format!("{root}.wq_b.weight")),
-                context,
-            )?,
-            weights_projection: linear::<B>(
-                format!("{root}.weights_proj.weight"),
-                args.hidden_size,
-                args.index_n_heads,
-                args.linear_format_for(&format!("{root}.weights_proj.weight")),
-                context,
-            )?,
-            compressor: Compressor::new(
-                args,
-                ratio,
-                args.index_head_dim,
-                &format!("{root}.compressor"),
-                context,
-            )?,
-        })
-    }
-
     fn forward<C: PoolingAttentionCache<B::Tensor>>(
         &mut self,
         input: &B::Tensor,
@@ -433,19 +381,19 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> Indexer<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct Attention<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dimensions: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     groups: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     output_rank: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     scale: f32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     normalization_epsilon: f32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     policy: V4AttentionPolicy,
     query: LowRankProjection<B>,
     wkv: B::Linear,
@@ -455,7 +403,6 @@ pub struct Attention<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNe
     sinks: Parameter<B::Tensor>,
     compressor: Option<Compressor<B>>,
     indexer: Option<Indexer<B>>,
-    #[parameter(skip)]
     rope: V4Rotary<B::Tensor>,
 }
 
@@ -466,6 +413,7 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
         Self::new_at(args, layer, &format!("layers.{layer}.attn"), context)
     }
 
@@ -475,95 +423,8 @@ impl<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Att
         root: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        args.validate().map_err(Error::backend)?;
-        let policy = args
-            .attention_policy(layer)
-            .ok_or_else(|| Error::backend(format!("missing V4 attention policy {layer}")))?;
-        let ratio = match policy {
-            V4AttentionPolicy::Local => 0,
-            V4AttentionPolicy::Compressed { ratio } => ratio,
-        };
-        let query = ProjectionPolicy {
-            first_weight: Some(format!("{root}.wq_a.weight")),
-            normalization_weight: format!("{root}.q_norm.weight"),
-            second_weight: format!("{root}.wq_b.weight"),
-            input_dimensions: args.hidden_size,
-            rank: args.q_lora_rank,
-            output_dimensions: args.num_attention_heads * args.head_dim,
-            epsilon: args.rms_norm_eps,
-            first_format: args.linear_format_for(&format!("{root}.wq_a.weight")),
-            second_format: args.linear_format_for(&format!("{root}.wq_b.weight")),
-        }
-        .build(context)?;
-        Ok(Self {
-            heads: args.num_attention_heads,
-            head_dimensions: args.head_dim,
-            groups: args.o_groups,
-            output_rank: args.o_lora_rank,
-            scale: (args.head_dim as f32).sqrt().recip(),
-            normalization_epsilon: args.rms_norm_eps,
-            policy,
-            query,
-            wkv: linear::<B>(
-                format!("{root}.wkv.weight"),
-                args.hidden_size,
-                args.head_dim,
-                args.linear_format_for(&format!("{root}.wkv.weight")),
-                context,
-            )?,
-            kv_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.head_dim,
-                    args.rms_norm_eps,
-                    parameter(format!("{root}.kv_norm.weight"))?,
-                ),
-                context,
-            )?,
-            wo_a: linear::<B>(
-                format!("{root}.wo_a.weight"),
-                args.num_attention_heads * args.head_dim / args.o_groups,
-                args.o_groups * args.o_lora_rank,
-                args.linear_format_for(&format!("{root}.wo_a.weight")),
-                context,
-            )?,
-            wo_b: linear::<B>(
-                format!("{root}.wo_b.weight"),
-                args.o_groups * args.o_lora_rank,
-                args.hidden_size,
-                args.linear_format_for(&format!("{root}.wo_b.weight")),
-                context,
-            )?,
-            sinks: Parameter::unloaded(
-                parameter(format!("{root}.attn_sink"))?,
-                &[args.num_attention_heads],
-                context,
-            )?,
-            compressor: (ratio != 0)
-                .then(|| {
-                    Compressor::new(
-                        args,
-                        ratio,
-                        args.head_dim,
-                        &format!("{root}.compressor"),
-                        context,
-                    )
-                })
-                .transpose()?,
-            indexer: (ratio == 4)
-                .then(|| Indexer::new(args, ratio, &format!("{root}.indexer"), context))
-                .transpose()?,
-            rope: V4Rotary::new(
-                args,
-                if ratio == 0 {
-                    args.rope_theta
-                } else {
-                    args.compress_rope_theta
-                },
-                ratio != 0,
-                1,
-                context,
-            )?,
-        })
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        V4AttentionSpec::new(args, layer, root)?.instantiate::<B>(context)
     }
 
     /// Executes the scheduled V4 attention policy over one neutral cache.
@@ -856,26 +717,6 @@ fn slice_last<T: Tensor>(
     context: &T::Context,
 ) -> Result<T, Error> {
     slice_axis(value, value.shape().len() - 1, start, end, context)
-}
-
-fn linear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    name: impl Into<String>,
-    input: i32,
-    output: i32,
-    format: eredu_checkpoint::LinearFormat,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Linear, Error> {
-    let name = name.into();
-    B::linear(
-        LinearSpec {
-            input,
-            output,
-            weight: parameter(&name)?,
-            bias: None,
-            format: crate::linear_format::standard_linear_format(&name, format)?,
-        },
-        context,
-    )
 }
 
 fn parameter(name: impl Into<String>) -> Result<ParameterSpec, Error> {

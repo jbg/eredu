@@ -1,0 +1,201 @@
+diff --git a/mlx/backend/cpu/copy.cpp b/mlx/backend/cpu/copy.cpp
+--- a/mlx/backend/cpu/copy.cpp
++++ b/mlx/backend/cpu/copy.cpp
+@@ -302,6 +302,37 @@
+   array src,dst;
+   CopyType ctype;
+   void operator()(){copy_inplace_dispatch(src,dst,ctype);}
++};
++// The existing shaped-copy callable is named only to expose its actual
++// TaskNode size. Both ordinary and original paths execute the same switch.
++struct ShapedCopyTask {
++  array src,dst;
++  Shape data_shape;
++  Strides i_strides,o_strides;
++  int64_t i_offset,o_offset;
++  CopyType ctype;
++  std::optional<array> dynamic_i_offset,dynamic_o_offset;
++  void operator()() {
++        switch (ctype) {
++          case CopyType::General:
++          case CopyType::GeneralGeneral:
++            copy_inplace_dispatch(
++                src,
++                dst,
++                ctype,
++                data_shape,
++                i_strides,
++                o_strides,
++                i_offset,
++                o_offset,
++                dynamic_i_offset,
++                dynamic_o_offset);
++            break;
++          case CopyType::Scalar:
++          case CopyType::Vector:
++            copy_inplace_dispatch(src, dst, ctype);
++        }
++  }
+ };
+ bool copy_add(size_t value,size_t& total) noexcept {
+   if(value>SIZE_MAX-total)return false;total+=value;return true;
+@@ -360,6 +391,22 @@
+   }
+   out=value;return true;
+ }
++bool scalar_update_copy_dispatch_storage(CpuCopyDispatchStorage& out) noexcept {
++  // Both exact rank-one tasks use inline shape/stride storage. The first is
++  // the unchanged full-row copy, the second the unchanged shaped overwrite.
++  CpuCopyDispatchStorage value;
++  cpu::DispatchLayout shaped;
++  if(!contiguous_copy_dispatch_storage(1,value) ||
++      !cpu::CommandEncoder::dispatch_layout<ShapedCopyTask>(shaped))return false;
++  value.task_bytes=std::max(value.task_bytes,shaped.task_bytes);
++  value.task_alignment=std::max(value.task_alignment,shaped.task_alignment);
++  if(!submission::GraphQuota::allocation_extent(value.task_bytes,value.task_alignment,
++      value.task_graph_extent))return false;
++  const size_t controls=sizeof(value)+sizeof(out)+sizeof(shaped)+sizeof(ShapedCopyTask)*2+
++      sizeof(Shape)*2+sizeof(Strides)*4+sizeof(int64_t)*4+sizeof(std::optional<array>)*4;
++  if(!copy_add(shaped.controls,value.controls)||!copy_add(controls,value.controls))return false;
++  out=value;return true;
++}
+ void copy_cpu_inplace(
+     const array& src,
+     array& dst,
+@@ -407,37 +454,9 @@
+       return std::nullopt;
+     }
+   };
+-  encoder.dispatch(
+-      [src = array::unsafe_weak_copy(src),
+-       dst = array::unsafe_weak_copy(dst),
+-       data_shape,
+-       i_strides,
+-       o_strides,
+-       i_offset,
+-       o_offset,
+-       ctype,
+-       dynamic_i_offset = weak_copy_if_set(dynamic_i_offset),
+-       dynamic_o_offset = weak_copy_if_set(dynamic_o_offset)]() mutable {
+-        switch (ctype) {
+-          case CopyType::General:
+-          case CopyType::GeneralGeneral:
+-            copy_inplace_dispatch(
+-                src,
+-                dst,
+-                ctype,
+-                data_shape,
+-                i_strides,
+-                o_strides,
+-                i_offset,
+-                o_offset,
+-                dynamic_i_offset,
+-                dynamic_o_offset);
+-            break;
+-          case CopyType::Scalar:
+-          case CopyType::Vector:
+-            copy_inplace_dispatch(src, dst, ctype);
+-        }
+-      });
++  encoder.dispatch(ShapedCopyTask{array::unsafe_weak_copy(src),array::unsafe_weak_copy(dst),
++      data_shape,i_strides,o_strides,i_offset,o_offset,ctype,
++      weak_copy_if_set(dynamic_i_offset),weak_copy_if_set(dynamic_o_offset)});
+ }
+ 
+ array contiguous_copy_cpu(const array& arr, Stream stream) {
+diff --git a/mlx/backend/cpu/copy.h b/mlx/backend/cpu/copy.h
+--- a/mlx/backend/cpu/copy.h
++++ b/mlx/backend/cpu/copy.h
+@@ -20,6 +20,7 @@
+ };
+ MLX_API bool contiguous_copy_dispatch_storage(const array&,CpuCopyDispatchStorage&) noexcept;
+ MLX_API bool contiguous_copy_dispatch_storage(size_t rank,CpuCopyDispatchStorage&) noexcept;
++MLX_API bool scalar_update_copy_dispatch_storage(CpuCopyDispatchStorage&) noexcept;
+ void copy_cpu(const array& src, array& dst, CopyType ctype, Stream stream);
+ void copy_cpu_inplace(
+     const array& src,
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -35,6 +35,9 @@
+ }
+ bool exact_cast(const array& output) noexcept {
+   return output.has_primitive() && typeid(output.primitive()) == typeid(AsType);
++}
++bool exact_scalar_update(const array& output) noexcept {
++  return output.has_primitive() && typeid(output.primitive()) == typeid(SliceUpdate);
+ }
+ bool copy_dtype(Dtype dtype) noexcept {
+   switch(dtype) {
+@@ -65,7 +68,7 @@
+ } // namespace
+ bool is_copy_eval_primitive(const array& output) noexcept {
+   return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
+-      (exact_contiguous(output) || exact_cast(output) || is_completion_synchronizer(output));
++      (exact_contiguous(output) || exact_cast(output) || exact_scalar_update(output) || is_completion_synchronizer(output));
+ }
+ static bool single_output_layout(size_t rank, size_t inputs, bool tracer,
+     const EvalDispatchStorage* dispatch_source, bool raw_task, SingleOutputEvalStorage& out) noexcept {
+@@ -215,8 +218,50 @@
+   out = value; return true;
+ }
+ 
++bool scalar_update_eval_layout(size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
++  if(elements<2 || elements>size_t(INT_MAX) || Shape::inline_capacity<1 || Strides::inline_capacity<1)
++    return false;
++  CpuCopyDispatchStorage copy;EvalDispatchStorage dispatch;SingleOutputEvalStorage common;
++  WeakCopyStorage weak;
++  if(!scalar_update_copy_dispatch_storage(copy) ||
++      !PreparedInputLeaf::weak_copy_storage(1,weak) || weak.count!=3)return false;
++  dispatch={copy.task_bytes,copy.task_alignment,copy.worker_graph_extent_bound,copy.controls};
++  if(!single_output_eval_layout(1,2,tracer,&dispatch,common))return false;
++  CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
++  // Base two-input Eval prices three weak arrays and one task. The actual
++  // retained non-donating path copies (source,out), then (update,out): one
++  // more weak descriptor/Data and one more task, but only one backing birth.
++  if(!append(value,3,weak.requests[2].bytes,weak.requests[2].alignment,1) ||
++      !append(value,4,weak.requests[0].bytes,weak.requests[0].alignment,1) ||
++      !append(value,5,weak.requests[1].bytes,weak.requests[1].alignment,1) ||
++      !append(value,6,copy.task_bytes,copy.task_alignment,1) ||
++      !add(value.worker_graph_extents,copy.worker_graph_extent_bound) ||
++      !add(value.named_control_bytes,copy.controls) || !add(value.named_control_bytes,weak.controls))return false;
++  const size_t controls=sizeof(elements)+sizeof(tracer)+sizeof(out)+sizeof(copy)+sizeof(dispatch)+
++      sizeof(common)+sizeof(weak)+sizeof(value)+sizeof(size_t)*8+sizeof(bool)*4+sizeof(const array*)*3+
++      sizeof(std::tuple<SliceUpdate::ReduceType,Shape,Shape,Shape>)+sizeof(Shape)*4+sizeof(Strides)*3+
++      sizeof(std::pair<int64_t,Strides>)+sizeof(CopyType)+sizeof(Stream)+sizeof(SliceUpdate::ReduceType);
++  if(!add(value.named_control_bytes,controls) || !submission::GraphConstruction::complete_layout(value))return false;
++  out=value;return true;
++}
++static bool scalar_update_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(output.ndim()!=1 || output.dtype()!=float32 || output.itemsize()!=sizeof(float) ||
++      output.inputs().size()!=2 || output.size()<2)return false;
++  const auto& source=output.inputs()[0];const auto& update=output.inputs()[1];
++  if(source.ndim()!=1 || update.ndim()!=1 || source.dtype()!=float32 || update.dtype()!=float32 ||
++      source.itemsize()!=sizeof(float) || update.itemsize()!=sizeof(float) ||
++      source.shape()!=output.shape() || update.shape(0)!=1 ||
++      source.data_size()!=source.size() || update.data_size()!=1 ||
++      source.strides().size()!=1 || update.strides().size()!=1 || source.strides()[0]!=1 ||
++      update.strides()[0]!=1 || !source.flags().row_contiguous || !update.flags().row_contiguous)return false;
++  const auto [kind,starts,ends,strides]=static_cast<const SliceUpdate&>(output.primitive()).state();
++  if(kind!=SliceUpdate::None || starts.size()!=1 || ends.size()!=1 || strides.size()!=1 ||
++      starts[0]<0 || starts[0]>=source.shape(0) || ends[0]!=starts[0]+1 || strides[0]!=1)return false;
++  return scalar_update_eval_layout(source.size(),output.is_tracer(),out);
++}
+ bool copy_eval_storage(const array& output, CopyEvalStorage& out) noexcept {
+   if (!is_copy_eval_primitive(output) || !output.siblings().empty()) return false;
++  if (exact_scalar_update(output)) return scalar_update_eval_storage(output,out);
+   const bool cast = exact_cast(output);
+   const bool copy = exact_contiguous(output) || cast;
+   if (copy) {
+diff --git a/mlx/backend/cpu/copy_storage.h b/mlx/backend/cpu/copy_storage.h
+--- a/mlx/backend/cpu/copy_storage.h
++++ b/mlx/backend/cpu/copy_storage.h
+@@ -18,6 +18,8 @@
+ // Adds one existing General-copy temporary inside another Eval: no extra
+ // cleanup/Eval/output-vector occurrence. The actual parent owns its lifetime.
+ MLX_API bool append_copy_temporary_layout(size_t rank,CopyEvalStorage&) noexcept;
++// Existing rank-one F32 scalar overwrite: full-row copy plus shaped update.
++MLX_API bool scalar_update_eval_layout(size_t elements,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool is_copy_eval_primitive(const array&) noexcept;
+ MLX_API bool copy_eval_storage(const array&, CopyEvalStorage&) noexcept;
+ } // namespace mlx::core::cpu

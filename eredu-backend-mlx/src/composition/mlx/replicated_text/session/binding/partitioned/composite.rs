@@ -1,7 +1,30 @@
 use super::super::*;
 
+// The exact existing selected executor, provider and native transport. Naming
+// it keeps the media strategy proof available before the ordinary final erasure.
+type NativeCompositePartitionStrategy<A> = eredu_runtime::PartitionedTextExecution<
+    eredu_architectures::partitioned_execution::CompositePartitionExecutor<
+        A,
+        MlxNeuralBackend,
+        MlxHybridState,
+        MlxArchitectureLayerwisePolicy<PreparedCompositeArchitecture<A>, MlxHybridState>,
+        MlxPartitionTensorAllocator,
+        eredu_architectures::partitioned_execution::SelectedCompositePartitionUnitStrategy<
+            eredu_architectures::prepared_execution::PartitionBankProviders<MlxNeuralBackend>,
+            super::super::distributed::expert::MlxExpertRouteTensorMovement,
+        >,
+    >,
+    crate::backend::runtime::distributed::Group,
+    crate::backend::runtime::distributed::topology::CommunicationRouteRealization,
+    crate::backend::nn::shared::MlxCommunicationTensorMetadata,
+    eredu_runtime::OpaqueBoundaryTransport,
+    eredu_runtime::OpaqueOutputPublisher,
+    eredu_runtime::OpaqueFailureAgreement,
+>;
+
 pub(crate) struct PartitionedCompositeBindingVisitor<'a> {
-    pub(in crate::composition::mlx) store: Arc<dyn CheckpointSource>,
+    pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
+    pub(in crate::composition::mlx) store: eredu_checkpoint::store::RetainedCheckpointSource,
     pub(in crate::composition::mlx) distributed: crate::backend::distributed::MlxDistributedSession,
     pub(in crate::composition::mlx) stream: &'a Stream,
     pub(in crate::composition::mlx) weights_stream: &'a Stream,
@@ -138,12 +161,44 @@ impl
             self.stream,
             self.weights_stream,
             OrdinaryReplicatedFinalizer,
+            self.addressable_manager,
         )
+    }
+
+    fn visit_media<A, G, W>(
+        self,
+        prepared: eredu_architectures::composite_partitioned::PreparedCompositePartition<A, G, W>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+            + eredu_architectures::composite_execution::CompositeMediaIngressArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+            > + eredu_runtime::PartitionedLayeredArchitecture<
+                MlxNeuralBackend,
+                MlxHybridState,
+                Boundary = W,
+            > + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+            + 'static,
+        A::Error: std::fmt::Display,
+        W: eredu_runtime::ArchitectureBoundary,
+    {
+        let completed = complete_prepared_partitioned_composite(
+            prepared,
+            self.store,
+            self.distributed,
+            self.stream,
+            self.weights_stream,
+            Default::default(),
+            self.addressable_manager,
+        )?;
+        Ok(Box::new(completed.with_media_prefill()))
     }
 }
 
 pub(crate) struct PartitionedCompositePredictionBindingVisitor<'a> {
-    pub store: Arc<dyn CheckpointSource>,
+    pub(in crate::composition::mlx) addressable_manager: Option<&'a AddressableManagerSlot>,
+    pub store: eredu_checkpoint::store::RetainedCheckpointSource,
     pub distributed: crate::backend::distributed::MlxDistributedSession,
     pub stream: &'a Stream,
     pub weights_stream: &'a Stream,
@@ -196,17 +251,19 @@ impl
                 },
                 capability: self.capability,
             },
+            self.addressable_manager,
         )
     }
 }
 
 pub(crate) fn bind_prepared_partitioned_composite<A, G, W, F>(
     prepared: eredu_architectures::composite_partitioned::PreparedCompositePartition<A, G, W>,
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     distributed: crate::backend::distributed::MlxDistributedSession,
     stream: &Stream,
     weights_stream: &Stream,
     mut finalizer: F,
+    addressable_manager: Option<&AddressableManagerSlot>,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
@@ -219,6 +276,39 @@ where
     A::Error: std::fmt::Display,
     W: eredu_runtime::ArchitectureBoundary,
     F: CompositeExecutableFinalizer<A>,
+{
+    let residency = finalizer.prediction_residency()?;
+    let completed = complete_prepared_partitioned_composite(
+        prepared,
+        store,
+        distributed,
+        stream,
+        weights_stream,
+        residency,
+            addressable_manager,
+        )?;
+    finalizer.finish(completed)
+}
+
+fn complete_prepared_partitioned_composite<A, G, W>(
+    prepared: eredu_architectures::composite_partitioned::PreparedCompositePartition<A, G, W>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
+    distributed: crate::backend::distributed::MlxDistributedSession,
+    stream: &Stream,
+    weights_stream: &Stream,
+    prediction_residency: crate::composition::mlx::replicated_text::prediction::parameters::PredictionResidency,
+    addressable_manager: Option<&AddressableManagerSlot>,
+) -> Result<CompletedComposite<A, NativeCompositePartitionStrategy<A>>, Error>
+where
+    A: CompositeArchitecture<MlxNeuralBackend, MlxHybridState, Error = eredu_nn::Error>
+        + eredu_runtime::PartitionedLayeredArchitecture<
+            MlxNeuralBackend,
+            MlxHybridState,
+            Boundary = W,
+        > + eredu_runtime::ParallelRoutedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>
+        + 'static,
+    A::Error: std::fmt::Display,
+    W: eredu_runtime::ArchitectureBoundary,
 {
     let facts = prepared
         .session_facts::<MlxNeuralBackend>()
@@ -243,16 +333,19 @@ where
             selection,
             |selection, options| {
                 let (bytes, pool) = selected_addressable_partition_bank(
-                    &selection.addressable_members(), Arc::clone(&store), options,
+                    &selection.addressable_members(), store.clone(), options,
                     prepared.layout(), weights_stream, stream,
-                )?;
+            addressable_manager,
+        )?;
                 selection.banks().iter().filter(|(_, bank)| !bank.addressable_members().is_empty()).map(|(id, _)| {
                     let bank = pool.scoped(id.value() as usize)?;
                     let bytes = bytes.iter().filter(|(key, _)| key.bank() == id.value() as usize)
                         .map(|(key, bytes)| (*key, *bytes)).collect();
-                    Ok((*id, eredu_architectures::prepared_execution::PartitionBankMechanisms::new(
-                        bytes, bank.clone(), crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement, bank,
-                    )))
+                    let movement=crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement::for_bank(bank.clone(),options);
+                    let retained=movement.indexed_bank_source().cloned().ok_or(Error::PrefillControl(
+                        eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
+                    Ok((*id,eredu_architectures::prepared_execution::PartitionBankMechanisms::new(
+                        bytes,bank,movement,retained)))
                 }).collect::<Result<std::collections::BTreeMap<_, _>, Error>>()
             },
         ).map_err(super::super::routed::construction_error)?;
@@ -263,8 +356,8 @@ where
     let mut mechanisms: MlxReplicatedTextMechanisms<
         PreparedCompositeArchitecture<A>,
         MlxHybridState,
-    > = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
-    mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
+    > = MlxReplicatedTextMechanisms::new(store, stream, weights_stream)?;
+    mechanisms.set_prediction_residency(prediction_residency);
     mechanisms.set_ignored_checkpoint_sources(prepared.unowned_expert_checkpoint_sources());
     let mut distributed = Some(distributed);
     let mut partition_sampling_group = None;
@@ -335,7 +428,7 @@ where
         eredu_runtime::PartitionedTextExecution::new(),
     )
     .map_err(|error| Error::Other(Box::new(error)))?;
-    finalizer.finish(
+    Ok(
         CompletedComposite::<A, _, NoSelectedPrediction>::from_session(
             session,
             admission,

@@ -5,11 +5,12 @@ use std::collections::{HashMap, HashSet};
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_nn::{
     Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, PadMode, Parameter, ParameterSpec, Parameterized, Tensor,
+    NormalizationOperator, PadMode, Parameter, Parameterized, Tensor,
 };
 use serde::Deserialize;
 
 use super::vision::ClippedLinear;
+use crate::decoder::identity::Metadata;
 
 /// Invalid Gemma audio configuration.
 #[derive(Debug, thiserror::Error)]
@@ -185,7 +186,7 @@ pub struct AudioInput<'a, T> {
 struct SubsampleLayer<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     weight: Parameter<B::Tensor>,
     norm_weight: Parameter<B::Tensor>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     epsilon: f32,
 }
 
@@ -197,13 +198,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> SubsampleLayer<B> {
         epsilon: f32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, [i32; 4], [i32; 1])>()?;
         Ok(Self {
-            weight: parameter(
-                &format!("{prefix}.conv.weight"),
-                &[output, 3, 3, input],
-                context,
-            )?,
-            norm_weight: parameter(&format!("{prefix}.norm.weight"), &[output], context)?,
+            weight: Parameter::unloaded(metadata.named_parameter(format_args!("{prefix}.conv.weight"))?,
+                &[output, 3, 3, input], context)?,
+            norm_weight: Parameter::unloaded(metadata.named_parameter(format_args!("{prefix}.norm.weight"))?,
+                &[output], context)?,
             epsilon,
         })
     }
@@ -239,26 +240,30 @@ struct SubsampleProjection<B: NeuralBackend + eredu_nn::DistributedNeuralBackend
     layer0: SubsampleLayer<B>,
     layer1: SubsampleLayer<B>,
     input_projection: B::Linear,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     second_channels: i32,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> SubsampleProjection<B> {
     fn new(config: &AudioConfig, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, LinearSpec, eredu_checkpoint::LinearFormat, i32, i32)>()?;
         let root = "model.audio_tower.subsample_conv_projection";
         let first = config.subsampling_conv_channels[0];
         let second = config.subsampling_conv_channels[1];
-        let weight = format!("{root}.input_proj_linear.weight");
+        let input = second.checked_mul(32)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+        let weight = metadata.text(format_args!("{root}.input_proj_linear.weight"))?;
         Ok(Self {
             layer0: SubsampleLayer::new(
-                &format!("{root}.layer0"),
+                &metadata.text(format_args!("{root}.layer0"))?,
                 1,
                 first,
                 config.rms_norm_eps,
                 context,
             )?,
             layer1: SubsampleLayer::new(
-                &format!("{root}.layer1"),
+                &metadata.text(format_args!("{root}.layer1"))?,
                 first,
                 second,
                 config.rms_norm_eps,
@@ -266,13 +271,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> SubsampleProjection<
             )?,
             input_projection: B::linear(
                 LinearSpec {
-                    input: 32 * second,
+                    input: input,
                     output: config.hidden_size,
-                    weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(&weight)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
+                    format: metadata.format(
                         &weight,
-                        config.linear_format_for(&weight, 32 * second),
+                        config.linear_format_for(&weight, input),
                     )?,
                 },
                 context,
@@ -310,7 +315,7 @@ struct AudioFeedForward<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     first: ClippedLinear<B>,
     second: ClippedLinear<B>,
     post_norm: B::Normalization,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     residual_weight: f32,
 }
 
@@ -320,23 +325,27 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioFeedForward<B> 
         prefix: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &<B::Tensor as Tensor>::Context, i32)>()?;
+        let intermediate = config.hidden_size.checked_mul(4)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
         Ok(Self {
-            pre_norm: rms_norm::<B>(config, &format!("{prefix}.pre_layer_norm.weight"), context)?,
+            pre_norm: rms_norm::<B>(config, &metadata.text(format_args!("{prefix}.pre_layer_norm.weight"))?, context)?,
             first: clipped(
                 config,
-                &format!("{prefix}.ffw_layer_1"),
+                &metadata.text(format_args!("{prefix}.ffw_layer_1"))?,
                 config.hidden_size,
-                4 * config.hidden_size,
+                intermediate,
                 context,
             )?,
             second: clipped(
                 config,
-                &format!("{prefix}.ffw_layer_2"),
-                4 * config.hidden_size,
+                &metadata.text(format_args!("{prefix}.ffw_layer_2"))?,
+                intermediate,
                 config.hidden_size,
                 context,
             )?,
-            post_norm: rms_norm::<B>(config, &format!("{prefix}.post_layer_norm.weight"), context)?,
+            post_norm: rms_norm::<B>(config, &metadata.text(format_args!("{prefix}.post_layer_norm.weight"))?, context)?,
             residual_weight: config.residual_weight,
         })
     }
@@ -367,9 +376,9 @@ struct LightConv1d<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     depthwise_weight: Parameter<B::Tensor>,
     conv_norm: B::Normalization,
     linear_end: ClippedLinear<B>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     kernel_size: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     hidden_size: i32,
 }
 
@@ -379,24 +388,28 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> LightConv1d<B> {
         prefix: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &<B::Tensor as Tensor>::Context, [i32; 3], i32)>()?;
+        let gated_width = config.hidden_size.checked_mul(2)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
         Ok(Self {
-            pre_norm: rms_norm::<B>(config, &format!("{prefix}.pre_layer_norm.weight"), context)?,
+            pre_norm: rms_norm::<B>(config, &metadata.text(format_args!("{prefix}.pre_layer_norm.weight"))?, context)?,
             linear_start: clipped(
                 config,
-                &format!("{prefix}.linear_start"),
+                &metadata.text(format_args!("{prefix}.linear_start"))?,
                 config.hidden_size,
-                2 * config.hidden_size,
+                gated_width,
                 context,
             )?,
-            depthwise_weight: parameter(
-                &format!("{prefix}.depthwise_conv1d.weight"),
+            depthwise_weight: parameter::<B>(
+                &metadata.text(format_args!("{prefix}.depthwise_conv1d.weight"))?,
                 &[config.hidden_size, config.conv_kernel_size, 1],
                 context,
             )?,
-            conv_norm: rms_norm::<B>(config, &format!("{prefix}.conv_norm.weight"), context)?,
+            conv_norm: rms_norm::<B>(config, &metadata.text(format_args!("{prefix}.conv_norm.weight"))?, context)?,
             linear_end: clipped(
                 config,
-                &format!("{prefix}.linear_end"),
+                &metadata.text(format_args!("{prefix}.linear_end"))?,
                 config.hidden_size,
                 config.hidden_size,
                 context,
@@ -456,19 +469,19 @@ struct AudioAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     output: ClippedLinear<B>,
     relative_key: B::Linear,
     per_dimension_scale: Parameter<B::Tensor>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dim: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     hidden_size: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     chunk_size: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     past: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     logit_cap: f32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     invalid_logits: f32,
 }
 
@@ -478,28 +491,30 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
         prefix: &str,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &<B::Tensor as Tensor>::Context, LinearSpec, eredu_checkpoint::LinearFormat, [i32; 1])>()?;
         let hidden = config.hidden_size;
-        let relative_weight = format!("{prefix}.relative_k_proj.weight");
+        let relative_weight = metadata.text(format_args!("{prefix}.relative_k_proj.weight"))?;
         Ok(Self {
-            query: clipped(config, &format!("{prefix}.q_proj"), hidden, hidden, context)?,
-            key: clipped(config, &format!("{prefix}.k_proj"), hidden, hidden, context)?,
-            value: clipped(config, &format!("{prefix}.v_proj"), hidden, hidden, context)?,
-            output: clipped(config, &format!("{prefix}.post"), hidden, hidden, context)?,
+            query: clipped(config, &metadata.text(format_args!("{prefix}.q_proj"))?, hidden, hidden, context)?,
+            key: clipped(config, &metadata.text(format_args!("{prefix}.k_proj"))?, hidden, hidden, context)?,
+            value: clipped(config, &metadata.text(format_args!("{prefix}.v_proj"))?, hidden, hidden, context)?,
+            output: clipped(config, &metadata.text(format_args!("{prefix}.post"))?, hidden, hidden, context)?,
             relative_key: B::linear(
                 LinearSpec {
                     input: hidden,
                     output: hidden,
-                    weight: ParameterSpec::trainable(&relative_weight).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(&relative_weight)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
+                    format: metadata.format(
                         &relative_weight,
                         config.linear_format_for(&relative_weight, hidden),
                     )?,
                 },
                 context,
             )?,
-            per_dimension_scale: parameter(
-                &format!("{prefix}.per_dim_scale"),
+            per_dimension_scale: parameter::<B>(
+                &metadata.text(format_args!("{prefix}.per_dim_scale"))?,
                 &[config.head_dim()],
                 context,
             )?,
@@ -516,9 +531,13 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
     fn relative_embeddings(
         &self,
         context: &<B::Tensor as Tensor>::Context,
+        metadata: Metadata<'_>,
     ) -> Result<B::Tensor, Error> {
-        let values = relative_embedding_values(self.hidden_size, self.past);
-        B::Tensor::from_f32_slice(&values, &[self.past + 1, self.hidden_size], context)
+        metadata.controls::<(&Self, [i32;2], RelativeEmbeddingGeometry, B::Tensor)>()?;
+        let geometry = RelativeEmbeddingGeometry::new(self.hidden_size, self.past, metadata)?;
+        let scalar = |index| geometry.value(index);
+        if let Some(source) = metadata.context() { source.charge_metadata(std::mem::size_of_val(&scalar))?; }
+        B::Tensor::from_f32_fn(&[self.past + 1, self.hidden_size], scalar, context)
     }
 
     fn forward(
@@ -526,11 +545,19 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
         input: &B::Tensor,
         valid: &[i32],
         context: &<B::Tensor as Tensor>::Context,
+        metadata: Metadata<'_>,
     ) -> Result<B::Tensor, Error> {
+        metadata.controls::<(&Self, &B::Tensor, &[i32], Vec<B::Tensor>, Vec<B::Tensor>,
+            Vec<B::Tensor>, Vec<B::Tensor>, [Index;4], [i32;4], [i32;3], B::Tensor,
+            B::Tensor, B::Tensor, B::Tensor, B::Tensor, B::Tensor, B::Tensor, B::Tensor)>()?;
         let batch = input.dim(0);
         let sequence = input.dim(1);
-        let padded_sequence =
-            ((sequence + self.chunk_size - 1) / self.chunk_size) * self.chunk_size;
+        if batch < 0 || sequence < 0 || self.chunk_size <= 0 || self.past <= 0 || valid.len() != batch as usize {
+            return Err(metadata.error(format_args!("invalid Gemma audio attention extent")));
+        }
+        let padded_sequence = sequence.checked_add(self.chunk_size - 1)
+            .and_then(|n| (n / self.chunk_size).checked_mul(self.chunk_size))
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
         let hidden = if padded_sequence == sequence {
             input.clone()
         } else {
@@ -575,12 +602,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
             .transpose_axes(&[0, 2, 1, 3], context)?;
         let relative = self
             .relative_key
-            .forward(&self.relative_embeddings(context)?, context)?
+            .forward(&self.relative_embeddings(context, metadata)?, context)?
             .reshape(&[self.past + 1, self.heads, self.head_dim], context)?
             .transpose_axes(&[1, 0, 2], context)?
             .expand_dims(0, context)?
             .swap_axes(2, 3, context)?;
-        let mut outputs = Vec::new();
+        let mut outputs = metadata.vector((padded_sequence / self.chunk_size) as usize)?;
         for start in (0..padded_sequence).step_by(self.chunk_size as usize) {
             let key_start = (start - self.past).max(0);
             let key_end = (start + self.chunk_size).min(padded_sequence);
@@ -615,10 +642,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
                 B::Tensor::matmul(&query_chunk, &key_chunk.swap_axes(2, 3, context)?, context)?;
             let relative_logits = B::Tensor::matmul(&query_chunk, &relative, context)?;
             let key_count = key_end - key_start;
-            let mut rows = Vec::with_capacity(self.chunk_size as usize);
+            let mut rows = metadata.vector(self.chunk_size as usize)?;
             for query_index in 0..self.chunk_size {
                 let absolute_query = start + query_index;
-                let mut columns = Vec::with_capacity(key_count as usize);
+                let mut columns = metadata.vector(key_count as usize)?;
                 for key_index in key_start..key_end {
                     let distance = (absolute_query - key_index).clamp(0, self.past - 1);
                     columns.push(relative_logits.index(
@@ -634,25 +661,17 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioAttention<B> {
                 rows.push(B::Tensor::stack(&columns, -1, context)?);
             }
             logits = logits.add(&B::Tensor::stack(&rows, 2, context)?, context)?;
-            let masks = valid
-                .iter()
-                .map(|valid| {
-                    let mut mask = Vec::with_capacity((self.chunk_size * key_count) as usize);
-                    for query_index in 0..self.chunk_size {
-                        let absolute_query = start + query_index;
-                        for key_index in key_start..key_end {
-                            mask.push(audio_attention_mask_value(
-                                absolute_query,
-                                key_index,
-                                *valid,
-                                self.past,
-                                self.invalid_logits,
-                            ));
-                        }
-                    }
-                    B::Tensor::from_f32_slice(&mask, &[1, self.chunk_size, key_count], context)
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+            let mut masks = metadata.vector(valid.len())?;
+            for &valid in valid {
+                let scalar = |index: usize| {
+                    let query_index = index / key_count as usize;
+                    let key_index = index % key_count as usize;
+                    audio_attention_mask_value(start + query_index as i32,
+                        key_start + key_index as i32, valid, self.past, self.invalid_logits)
+                };
+                if let Some(source) = metadata.context() { source.charge_metadata(std::mem::size_of_val(&scalar))?; }
+                masks.push(B::Tensor::from_f32_fn(&[1, self.chunk_size, key_count], scalar, context)?);
+            }
             let mask = B::Tensor::stack(&masks, 0, context)?;
             logits = logits
                 .multiply_scalar(1.0 / self.logit_cap, context)?
@@ -698,31 +717,33 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioLayer<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("model.audio_tower.layers.{layer}");
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &<B::Tensor as Tensor>::Context)>()?;
+        let prefix = metadata.text(format_args!("model.audio_tower.layers.{layer}"))?;
         Ok(Self {
             feed_forward1: AudioFeedForward::new(
                 config,
-                &format!("{prefix}.feed_forward1"),
+                &metadata.text(format_args!("{prefix}.feed_forward1"))?,
                 context,
             )?,
             pre_attention_norm: rms_norm::<B>(
                 config,
-                &format!("{prefix}.norm_pre_attn.weight"),
+                &metadata.text(format_args!("{prefix}.norm_pre_attn.weight"))?,
                 context,
             )?,
-            attention: AudioAttention::new(config, &format!("{prefix}.self_attn"), context)?,
+            attention: AudioAttention::new(config, &metadata.text(format_args!("{prefix}.self_attn"))?, context)?,
             post_attention_norm: rms_norm::<B>(
                 config,
-                &format!("{prefix}.norm_post_attn.weight"),
+                &metadata.text(format_args!("{prefix}.norm_post_attn.weight"))?,
                 context,
             )?,
-            light_convolution: LightConv1d::new(config, &format!("{prefix}.lconv1d"), context)?,
+            light_convolution: LightConv1d::new(config, &metadata.text(format_args!("{prefix}.lconv1d"))?, context)?,
             feed_forward2: AudioFeedForward::new(
                 config,
-                &format!("{prefix}.feed_forward2"),
+                &metadata.text(format_args!("{prefix}.feed_forward2"))?,
                 context,
             )?,
-            output_norm: rms_norm::<B>(config, &format!("{prefix}.norm_out.weight"), context)?,
+            output_norm: rms_norm::<B>(config, &metadata.text(format_args!("{prefix}.norm_out.weight"))?, context)?,
         })
     }
 
@@ -733,11 +754,23 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioLayer<B> {
         valid: &[i32],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_with_metadata(input, valid, context, Metadata::new(B::construction_metadata(context)))
+    }
+
+    pub(super) fn forward_with_metadata(
+        &mut self,
+        input: &B::Tensor,
+        valid: &[i32],
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: Metadata<'_>,
+    ) -> Result<B::Tensor, Error> {
+        super::model::forward::with_metadata(metadata, || {
+        metadata.controls::<(&Self, &B::Tensor, &[i32], B::Tensor, B::Tensor, B::Tensor)>()?;
         let hidden = self.feed_forward1.forward(input, context)?;
         let attended = self.attention.forward(
             &self.pre_attention_norm.forward(&hidden, context)?,
             valid,
-            context,
+            context, metadata,
         )?;
         let hidden = hidden.add(
             &self.post_attention_norm.forward(&attended, context)?,
@@ -746,6 +779,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioLayer<B> {
         let hidden = self.light_convolution.forward(&hidden, context)?;
         let hidden = self.feed_forward2.forward(&hidden, context)?;
         self.output_norm.forward(&hidden, context)
+
+        })
     }
 }
 
@@ -753,10 +788,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioLayer<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct AudioStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
-    config: AudioConfig,
     subsampling: SubsampleProjection<B>,
     output_projection: B::Linear,
+    #[parameter(skip, metadata)]
+    config: crate::replicated_text::SharedCompositeConfig<AudioConfig>,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioStatic<B> {
@@ -765,22 +800,34 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioStatic<B> {
         config: AudioConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        if B::construction_metadata(context).is_some_and(|m| m.uses_checked_metadata()) {
+            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+        }
         config.validate().map_err(Error::backend)?;
+        Self::from_source(crate::replicated_text::SharedCompositeConfig::new(
+            config, B::construction_metadata(context),
+        )?, context)
+    }
+
+    // The family constructor has validated this exact immutable child source.
+    pub(super) fn from_source(
+        config: crate::replicated_text::SharedCompositeConfig<AudioConfig>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, SubsampleProjection<B>, B::Linear, LinearSpec,
+            crate::replicated_text::SharedCompositeConfig<AudioConfig>, eredu_checkpoint::LinearFormat)>()?;
         let subsampling = SubsampleProjection::new(&config, context)?;
         let weight = "model.audio_tower.output_proj.weight";
         let output_projection = B::linear(
             LinearSpec {
                 input: config.hidden_size,
                 output: config.output_proj_dims,
-                weight: ParameterSpec::trainable(weight).map_err(Error::backend)?,
-                bias: config
-                    .output_projection_bias
-                    .then(|| {
-                        ParameterSpec::trainable("model.audio_tower.output_proj.bias")
-                            .map_err(Error::backend)
-                    })
-                    .transpose()?,
-                format: crate::linear_format::standard_linear_format(
+                weight: metadata.plain_parameter(weight)?,
+                bias: if config.output_projection_bias {
+                    Some(metadata.plain_parameter("model.audio_tower.output_proj.bias")?)
+                } else { None },
+                format: metadata.format(
                     weight,
                     config.linear_format_for(weight, config.hidden_size),
                 )?,
@@ -800,9 +847,23 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioStatic<B> {
         input: AudioInput<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, Vec<i32>), Error> {
-        validate_input(&input)?;
-        let valid = input.valid_subsampled_frames.to_vec();
+        self.begin_with_metadata(input, context, Metadata::new(B::construction_metadata(context)))
+    }
+
+    pub(super) fn begin_with_metadata(
+        &mut self,
+        input: AudioInput<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: Metadata<'_>,
+    ) -> Result<(B::Tensor, Vec<i32>), Error> {
+        super::model::forward::with_metadata(metadata, || {
+        metadata.controls::<(&Self, AudioInput<'_, B::Tensor>, Vec<i32>, B::Tensor)>()?;
+        validate_input(&input, metadata)?;
+        let mut valid = metadata.vector(input.valid_subsampled_frames.len())?;
+        valid.extend_from_slice(input.valid_subsampled_frames);
         Ok((self.subsampling.forward(&input, context)?, valid))
+
+        })
     }
 
     /// Crops padding and projects encoder output into the declared media width.
@@ -812,27 +873,31 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioStatic<B> {
         valid: &[i32],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        let hidden = valid
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(batch, valid)| {
-                hidden.index(
-                    &[
-                        Index::Range(batch as i32, batch as i32 + 1),
-                        Index::Range(0, valid),
-                        Index::Full,
-                    ],
-                    context,
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let hidden = B::Tensor::concatenate(&hidden, 1, context)?;
+        self.finish_with_metadata(hidden, valid, context, Metadata::new(B::construction_metadata(context)))
+    }
+
+    pub(super) fn finish_with_metadata(
+        &mut self,
+        hidden: &B::Tensor,
+        valid: &[i32],
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: Metadata<'_>,
+    ) -> Result<B::Tensor, Error> {
+        super::model::forward::with_metadata(metadata, || {
+        metadata.controls::<(&Self, &B::Tensor, &[i32], Vec<B::Tensor>, [Index;3], B::Tensor)>()?;
+        let mut parts = metadata.vector(valid.len())?;
+        for (batch, &valid) in valid.iter().enumerate() {
+            let batch = i32::try_from(batch).map_err(|_| eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+            parts.push(hidden.index(&[Index::Range(batch, batch + 1), Index::Range(0, valid), Index::Full], context)?);
+        }
+        let hidden = B::Tensor::concatenate(&parts, 1, context)?;
         self.output_projection.forward(&hidden, context)
+
+        })
     }
 
     /// Validated configuration retained by the tower.
-    pub const fn config(&self) -> &AudioConfig {
+    pub fn config(&self) -> &AudioConfig {
         &self.config
     }
 }
@@ -853,9 +918,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioTower<B> {
         config: AudioConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let layers = (0..config.num_hidden_layers as usize)
-            .map(|layer| AudioLayer::new(&config, layer, context))
-            .collect::<Result<Vec<_>, _>>()?;
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &<B::Tensor as Tensor>::Context)>()?;
+        let count = usize::try_from(config.num_hidden_layers)
+            .map_err(|_| metadata.error(format_args!("invalid Gemma 4 audio layer count")))?;
+        let mut layers = metadata.vector(count)?;
+        for layer in 0..count { layers.push(AudioLayer::new(&config, layer, context)?); }
         Ok(Self {
             static_modules: AudioStatic::new(config, context)?,
             layers,
@@ -876,15 +944,16 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioTower<B> {
     }
 
     /// Validated configuration retained by the tower.
-    pub const fn config(&self) -> &AudioConfig {
+    pub fn config(&self) -> &AudioConfig {
         self.static_modules.config()
     }
 }
 
-fn validate_input<T: Tensor>(input: &AudioInput<'_, T>) -> Result<(), Error> {
+fn validate_input<T: Tensor>(input: &AudioInput<'_, T>, metadata: Metadata<'_>) -> Result<(), Error> {
+    metadata.controls::<(&AudioInput<'_,T>,i32,i32,i32,i32)>()?;
     let frames = input.features.shape().get(1).copied().unwrap_or(0);
-    let first_frames = (frames + 1) / 2;
-    let output_frames = (frames + 3) / 4;
+    let first_frames = frames / 2 + i32::from(frames % 2 != 0);
+    let output_frames = frames / 4 + i32::from(frames % 4 != 0);
     let batch = input.features.shape().first().copied().unwrap_or(0);
     if input.features.shape() != [batch, frames, 128]
         || input.input_mask.shape() != [batch, frames, 1]
@@ -895,21 +964,19 @@ fn validate_input<T: Tensor>(input: &AudioInput<'_, T>) -> Result<(), Error> {
             .iter()
             .any(|valid| *valid < 0 || *valid > output_frames)
     {
-        return Err(Error::backend("invalid Gemma 4 prepared audio geometry"));
+        return Err(metadata.error(format_args!("invalid Gemma 4 prepared audio geometry")));
     }
     Ok(())
 }
 
-fn parameter<T: Tensor>(
+fn parameter<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     name: &str,
     shape: &[i32],
-    context: &T::Context,
-) -> Result<Parameter<T>, Error> {
-    Parameter::unloaded(
-        ParameterSpec::trainable(name).map_err(Error::backend)?,
-        shape,
-        context,
-    )
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<Parameter<B::Tensor>, Error> {
+    let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+    metadata.controls::<(Parameter<B::Tensor>, &[i32])>()?;
+    Parameter::unloaded(metadata.plain_parameter(name)?, shape, context)
 }
 
 fn rms_norm<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
@@ -917,11 +984,13 @@ fn rms_norm<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     weight: &str,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<B::Normalization, Error> {
+    let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+    metadata.controls::<(B::Normalization, NormalizationConstructionSpec)>()?;
     B::normalization(
         NormalizationConstructionSpec::learned(
             config.hidden_size,
             config.rms_norm_eps,
-            ParameterSpec::trainable(weight).map_err(Error::backend)?,
+            metadata.plain_parameter(weight)?,
         ),
         context,
     )
@@ -934,28 +1003,38 @@ fn clipped<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
     output: i32,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<ClippedLinear<B>, Error> {
-    ClippedLinear::from_format(
-        prefix,
-        input,
-        output,
-        config.linear_format_for(&format!("{prefix}.linear.weight"), input),
-        context,
-    )
+    let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+    metadata.controls::<(ClippedLinear<B>, LinearFormat)>()?;
+    let weight = metadata.text(format_args!("{prefix}.linear.weight"))?;
+    ClippedLinear::from_format(prefix, input, output, config.linear_format_for(&weight, input), context)
 }
 
-fn relative_embedding_values(hidden_size: i32, past: i32) -> Vec<f32> {
-    let timescales = hidden_size / 2;
-    let increment = 10_000.0_f32.ln() / (timescales - 1).max(1) as f32;
-    let mut values = Vec::with_capacity(((past + 1) * hidden_size) as usize);
-    for position in (0..=past).rev() {
-        for index in 0..timescales {
-            values.push((position as f32 * (-increment * index as f32).exp()).sin());
+struct RelativeEmbeddingGeometry {
+    width: usize,
+    half: usize,
+    past: i32,
+    increment: f32,
+}
+impl RelativeEmbeddingGeometry {
+    fn new(hidden_size: i32, past: i32, metadata: Metadata<'_>) -> Result<Self,Error> {
+        if hidden_size <= 0 || hidden_size % 2 != 0 || past < 0 || past == i32::MAX {
+            return Err(metadata.error(format_args!("invalid Gemma audio relative embedding extent")));
         }
-        for index in 0..timescales {
-            values.push((position as f32 * (-increment * index as f32).exp()).cos());
-        }
+        let timescales = hidden_size / 2;
+        Ok(Self { width: hidden_size as usize, half: timescales as usize, past,
+            increment: 10_000.0_f32.ln() / (timescales - 1).max(1) as f32 })
     }
-    values
+    fn value(&self, index: usize) -> f32 {
+        let position = self.past - (index / self.width) as i32;
+        let feature = index % self.width;
+        let angle = position as f32 * (-self.increment * (feature % self.half) as f32).exp();
+        if feature < self.half { angle.sin() } else { angle.cos() }
+    }
+}
+#[cfg(test)]
+fn relative_embedding_values(hidden_size: i32, past: i32) -> Vec<f32> {
+    let geometry = RelativeEmbeddingGeometry::new(hidden_size, past, Metadata::new(None)).unwrap();
+    (0..(past as usize + 1) * hidden_size as usize).map(|i| geometry.value(i)).collect()
 }
 
 fn audio_attention_mask_value(query: i32, key: i32, valid: i32, past: i32, invalid: f32) -> f32 {

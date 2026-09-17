@@ -1,0 +1,170 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted shared text-step permits and cumulative retained-token sampling quotes",
+  "source_sha256": {
+    "eredu-core/src/backend.rs": "6c62be264d6f712d51cabc5cb9e0ed2aa957ddd265c6dee1c179f84e191fade6",
+    "eredu-core/src/backend/continuation.rs": "35e3504bde1ca25b8fb06746d750287eea9649ae1e10bde4ab87aec4a541a960",
+    "eredu-core/src/backend/text_step.rs": "8584eaab17798ce3b8cf674ff62d90ea74b9fefb890775385272fa78f24a9edb",
+    "eredu-core/src/backend/text_step/tests.rs": "209e4ab93b1ea7bceaadba24dafac48d5dd075af69f16ea25ee89cf447c7cd79",
+    "eredu-core/src/lib.rs": "e21b2690e112e2aa0475fa5f91f4462c71cd0ba8561ce9f3e16d047e096b7bae",
+    "eredu-core/src/run_preparation.rs": "ddedd1c5be1a8674f888645af6e5241fec5662f9a0aad50c534bf6110f57bacf",
+    "eredu-runtime/src/run_preparation.rs": "01c36d9245b767a9bc8b3e469d9ee134e85e403aef0a3f3c7769e9ee1e6b76c3",
+    "eredu-runtime/src/run_preparation/tests.rs": "f2e8d8e14bc47a8f6e75307be94ef0467cc3beeca735df690377915e0714514d",
+    "eredu-runtime/src/working_memory/sampling/request.rs": "f04936443b7b54c9ca3bac8c7dd632aa35229a37ab99fbe475faff10ca06f8fa",
+    "eredu-runtime/src/working_memory/sampling/tests.rs": "c3ec8b14a0dea3f612b8a468c89f5844e9f8f9f476b82489e493e9d4829361d6",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "06d8611a310b9d9904bc5095faaddac258f1afd11fd4f18dbe90b0317c6ef378",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_step.rs": "500819e56eda78148db6a05f5143a0e3402775967fe2ffa7bf62f91068717a49",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_step_tests.rs": "5b8fcfc7252d4d56540a90855b7b13e1cb2c33be7aa950d2ad9374b4ec2548c7",
+    "eredu-backend-mlx/src/composition/mlx/session/generation.rs": "a99462c51e0a192feb9c35785b4db4d48dc2ea303b2c216f61b9c87294701fbc",
+    "eredu-backend-mlx/src/composition/mlx/session/generation/token_retention_tests.rs": "d2ab44e5cec614c4d799f29ceef98a87fd444fc7d32deded54610c3414851dba",
+    "eredu-evaluation/src/execution_control/tests.rs": "4e72547ed97f5af6aeaa403091b98247ae8a6d0a8088e39d01ea0aebc1cc2cff",
+    "eredu/tests/backend_conformance.rs": "a6c92a306793610f7c630fb2c699e14f47622c284543ecd0f8eb64abc349b9b3",
+    "eredu/tests/backend_conformance/preparation.rs": "fbe448acefccff6e135a28ac8beb10d5e563ff8e65258dbe957403d671f5886f",
+    "eredu/tests/backend_conformance/preparation/admission.rs": "650b90af441993b715bae334cc087b409002288dc0cb1a9d4b8d24e8158ac162",
+    "eredu/tests/portable_facade.rs": "f9a74ffe9f254eea6175e5b3016a655ceba96a3a4848ba5740855bebccef932e",
+    "eredu/tests/portable_facade/lifecycle.rs": "6ea0229ac558acd696d954bcca0c785b1cdc1e2e4fc1b23934ec5e0e30fdcdac",
+    "doc/backend-architecture.md": "c9ee7d81b05ebae9ecb47f1bf39bd2d6d28803c712f0d923104ba3761ffde3cc",
+    "doc/execution-control.md": "1ad1afe901b390c6bf036a9d207658cdf9ad94570272f17d0e46314c97dc0dc3",
+    "doc/bounded-inference.md": "c727b2331b640dcfc1e2c733629c49d3c19b8b530af0cf4d4b0ea4006cca6d4f"
+  },
+  "prior_record": "doc/validation/bounded-initial-publication-2026-09-13.json",
+  "coverage": {
+    "rust_tests": 229,
+    "core": 28,
+    "runtime": 18,
+    "portable_facade_and_conformance": 111,
+    "evaluation": 2,
+    "architecture": 1,
+    "native": 69,
+    "ignored": 5,
+    "public_strict_budget_success": false,
+    "new_peak_measurements": 0,
+    "new_released_checkpoint_comparisons": 0,
+    "new_native_distributed_runs": 0
+  },
+  "behavior": [
+    "Core acquires a move-only backend step permit after exact session admission and before controller decisions or native input creation. Ordinary output remains asynchronous; controlled output holds the permit through token observation, exact completion and controller commitment.",
+    "Core-issued run, policy and attempt evidence survives restoration; local issuance consumes an ordinal before peer agreement. Forked machines get distinct identities while preparation clones only retain their charge.",
+    "Prediction, Decision and controlled Commitment use the existing bounded rank coordinator. Local admission and callback errors still agree failure and preserve their original typed cause. Successful peers stop before subsequent work.",
+    "Controller/sampler mutation, host-state installation and fallible instrumentation hooks replace policy identity before mutation. A nonmutating phase rejection leaves identity unchanged.",
+    "The current native permit validates session, model/context domains, parameter epoch, prediction phase and canonical preparation bindings, then acquires unquoted authority. A retained reservation is never an alternative allocation permit.",
+    "Sampling inspection retains every emitted token backing across the output allowance, deduplicates genuine aliases, preserves unknown capacities and rejects arithmetic overflow. Native tests retain four real greedy/stochastic tokens while their logits and displaced RNG parents retire.",
+    "Native continuation tests reject stale sampler epochs, equal-geometry replacement prompts, substituted sampler reservations and reserved model/context pools before callbacks, input construction or model-state changes."
+  ],
+  "limits": [
+    "Public strict native memory admission still returns UnknownBound; this increment does not issue a complete quoted run grant.",
+    "Canonical initial run/policy binding must happen before mutable exposure. The existing runtime TextPreparationAuthority still needs monotone run claims and exact predecessor-token receipts; historical request retention is insufficient.",
+    "Complete preparation/instrumentation quotes, mutable-control repricing, nonempty-state identity handoff, quoted independent copies and complete media/paging/distributed admission remain unfinished.",
+    "Token retention after serial completion does not price separately retained completion objects, raw logits, observers or arbitrary callback allocations. These require their own complete lifetime contracts.",
+    "Four positive public strict-budget tests remain ignored; the portable LFM tokenizer fixture also requires its external checkpoint. No additional peak, released-checkpoint or native distributed measurements were made."
+  ],
+  "corrected_validation_findings": [
+    "A preliminary core fixture changed capabilities before startup, causing existing startup rejection; it now changes them after startup to exercise step admission.",
+    "Portable completion-retention probing now records actual one-time lease resolution through either polling or waiting. Peer prediction/decision rejection permits only the expected failed-delivery cleanup vote.",
+    "Native epoch binding uses the existing validate_parameter_epoch method instead of accessing its private field. The native rejection fixture matches the exact transparent error wrapper.",
+    "The preliminary RNG assertion incorrectly required the entire split parent as a lower bound. Greedy has no RNG; stochastic U32[2] key backing can be smaller than the split parent. Final tests record actual capacity and compare it with a conservative allocator bound.",
+    "The Metal fixture uses a dedicated CPU residency source stream while preserving Metal execution."
+  ],
+  "native_capacity_diagnostics": [
+    "retained RNG after four samples: target=CPU, temperature=0.7, dtype=Uint32, bytes=8, upper_bound=16",
+    "retained RNG after four samples: target=Metal, temperature=0.7, dtype=Uint32, bytes=8, upper_bound=31"
+  ],
+  "checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib -- --test-threads=1 backend:: run_preparation::",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-text-step-core-policy.log",
+      "sha256": "41a6193e2bcf283ebe5f89b394faf5da6f59b10d612ef9074b28d794a5bfd882",
+      "passed": 28,
+      "ignored": 0,
+      "ignored_tests": []
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib -- --test-threads=1 working_memory::sampling run_preparation::",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-text-step-runtime.log",
+      "sha256": "dd5832935de41ba1fad1710b6447e2a12a1b0dc55f970f52fefe8668a5ec0efb",
+      "passed": 18,
+      "ignored": 0,
+      "ignored_tests": []
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-text-step-portable-verified.log",
+      "sha256": "6c5a66d079f7432ee5b33369d31e1d0b2f78c4b3b045b8e31083503ea063046e",
+      "passed": 111,
+      "ignored": 1,
+      "ignored_tests": [
+        "lfm_checkpoint_native_tool_activation_with_portable_backend"
+      ]
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-evaluation --lib execution_control::",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-text-step-evaluation.log",
+      "sha256": "df6273d8a02658ba1372fd8a12e3dde222bcc9bf02e3e40ffe153f48195d22df",
+      "passed": 2,
+      "ignored": 0,
+      "ignored_tests": []
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric prepared_workspace::prepared_sampling_workspace_uses_selected_score_geometry_and_shared_policy",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-text-step-architecture.log",
+      "sha256": "3c9c8da29b0fb0a2ed1538279c0a43e2e7589361b6844ae7d6305f4a0aa62731",
+      "passed": 1,
+      "ignored": 0,
+      "ignored_tests": []
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib -- --test-threads=1 --nocapture initial_publication_tests model_session::operation_ model_session::preparation_ model_session::output_retention_tests model_session::idle_storage model_session::managed_admission_tests model_session::text_step_tests adapter::tests::managed_memory observation::memory_tests admission::publication::tests prepared_speculative::memory_tests generation::token_retention_tests sampling_native_facts_cover_sort_growth_host_masks_and_retained_key_replacement composition::mlx::session::tests::",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-text-step-native-complete.log",
+      "sha256": "167c593b4439804ebccda1c9d43f9c08c38f0eb98412d1a907e171c2f6750f59",
+      "passed": 69,
+      "ignored": 4,
+      "ignored_tests": [
+        "composition::mlx::session::model_session::managed_admission_tests::public_managed_generation_matches_ordinary_and_controlled_unbudgeted_tokens",
+        "composition::mlx::session::model_session::managed_admission_tests::public_preparations_share_one_domain_capacity_and_release_only_their_own_reservations",
+        "composition::mlx::session::model_session::managed_admission_tests::public_resident_one_byte_short_rejects_before_prompt_sampling_or_state_mutation",
+        "composition::mlx::session::model_session::managed_admission_tests::public_resident_preparation_succeeds_at_its_exact_complete_domain_capacity"
+      ]
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal,image,audio",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-text-step-features.log",
+      "sha256": "1cd5f98519eb0e2ead4b6dde5b619fbdfe91a0a49e6d2b266c1b25e8b8f116e7"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-text-step-minimal.log",
+      "sha256": "5204af7f35a99985ff27065b1be08fbd0b27b32150fc6a741a261778d9e2eb0b"
+    }
+  ],
+  "preliminary_logs": [
+    {
+      "log": "/private/tmp/eredu-text-step-core.log",
+      "sha256": "756d127cc300458e5124e70404338d198405f27d818ec32c5152d1e705484023",
+      "exit_code": 101
+    },
+    {
+      "log": "/private/tmp/eredu-text-step-portable.log",
+      "sha256": "a97754e9cc5617e869248d687b7a51021766369b44911ed787a2fcb7b3ff6c63",
+      "exit_code": 101
+    },
+    {
+      "log": "/private/tmp/eredu-text-step-native.log",
+      "sha256": "3d9de2be23d9644bfe4afcb04a54752d750d4b6d99372d5753adac06e123da2e",
+      "exit_code": 101
+    },
+    {
+      "log": "/private/tmp/eredu-text-step-native-verified.log",
+      "sha256": "7d2dded2e608ba65fe9a9d88bc028daf0faed1b6c70d10cad6743a287424ab42",
+      "exit_code": 101
+    }
+  ]
+}

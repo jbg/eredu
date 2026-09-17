@@ -1,0 +1,12 @@
+diff --git a/mlx/backend/common/metal_kernel.cpp b/mlx/backend/common/metal_kernel.cpp
+--- a/mlx/backend/common/metal_kernel.cpp
++++ b/mlx/backend/common/metal_kernel.cpp
+@@ -628,7 +628,7 @@
+   PreparedPipeline compiled;
+ };
+ namespace {
+-constexpr size_t maximum_specializations = 16;
++constexpr size_t maximum_specializations = 64;
+ bool checked_add(size_t& a, size_t b) noexcept {
+   if (b > std::numeric_limits<size_t>::max() - a) return false;
+   a += b; return true;

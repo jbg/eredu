@@ -1,0 +1,154 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T02:32:57.157373+00:00",
+  "scope": "Derived core axis slices and existing shared MLX selection program for physical prefill fragments",
+  "status": "Verified fragment selection leaf; native source/host transfer, canonical retirement and bounded inference remain unfinished",
+  "previous_increment": "bounded-prefill-host-target-2026-09-14.json",
+  "tests": {
+    "core": {
+      "passed": 399,
+      "ignored": 0
+    },
+    "native_capture": {
+      "passed": 28,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 561,
+  "new_tests": [
+    "real_fragment_program_matches_global_selection_for_all_supported_float_types",
+    "lazy_actual_fragment_source_stays_lazy_during_constructor_and_cold_trace",
+    "fragment_program_keeps_global_preview_order_and_complete_enclosing_span",
+    "fragment_validation_is_cold_and_missing_source_or_operator_facts_stay_unknown",
+    "signed_slice_normalization_and_preview_flatten_limits_are_checked",
+    "canonical_axis_slices_match_physical_cartesian_mapping_and_global_preview",
+    "canonical_axis_keeps_extreme_stride_and_checked_exclusive_endpoint"
+  ],
+  "new_test_count": 7,
+  "checks": {
+    "core": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib",
+      "started_utc": "2026-09-14T02:28:51.105718+00:00",
+      "elapsed_seconds": 16.155,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-fragment-selection-core.log",
+      "log_sha256": "f44750c511444e81e8e4b5faa7bcdc98b9522e547a6c17f58389f6c5372a3eb0"
+    },
+    "native_capture": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::array_copy::capture_tensor:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T02:29:07.261945+00:00",
+      "elapsed_seconds": 100.158,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-fragment-selection-native_capture.log",
+      "log_sha256": "3118bf67bf5574f7540304831bded567bf0418328518355f51d81a0fb66daee7"
+    },
+    "architectures": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-architectures",
+      "started_utc": "2026-09-14T02:30:47.421179+00:00",
+      "elapsed_seconds": 15.424,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-fragment-selection-architectures.log",
+      "log_sha256": "f3aab8d832e5918a0660cb4eeba916ab5b27b42b0ec53367936c6fcd7b32acb6"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T02:31:02.845565+00:00",
+      "elapsed_seconds": 47.675,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-fragment-selection-portable.log",
+      "log_sha256": "948070a83d1687822867aa57e6d96cc9173abd495f302c4351200def8f31a4c5"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T02:31:50.522188+00:00",
+      "elapsed_seconds": 18.873,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-fragment-selection-minimal.log",
+      "log_sha256": "b22366ea648bbf28f3e2be6c268efd8606c04ba66007b9b3ccf1fd36c049128c"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T02:32:09.396103+00:00",
+      "elapsed_seconds": 19.911,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-fragment-selection-features.log",
+      "log_sha256": "50b8a2ae6cd50897f5f116e16cedf5a16b1197fc12786b783f10f454f046b3c9"
+    }
+  },
+  "source_sha256": {
+    "eredu-backend-mlx/src/backend/array_copy/capture_tensor.rs": "e2197ed36b464b860da844011f3cd2b02cfe3a379eaa8dfe92c07e479f05686d",
+    "eredu-backend-mlx/src/backend/array_copy/capture_tensor/tests.rs": "39749e3e65a74e8dd22b2590ebc4b70de2825a140878a5ed332f9e09a83dc980",
+    "eredu-backend-mlx/src/backend/array_copy/capture_tensor/tests/metal/fragments.rs": "0b144207964755e98122748d2d123cc0c48312373b87d670bf0d8d4ad5d7ce42",
+    "eredu-backend-mlx/src/backend/array_copy/capture_tensor/workspace_tests.rs": "748d1656dcf8e4742811cfb6e9492320f5f8a45ac452b65cbbae1120bb7ca64d",
+    "eredu-backend-mlx/src/backend/array_copy/capture_tensor/workspace_tests/fragments.rs": "65db09c3247b7f3d80542dfe79046f2dd442c7e33a8062bf3b72340c76f83af6",
+    "eredu-core/src/capture.rs": "96c1d63db8e65806f1c23de0d17edf031e067bf53faa83e92dcd38a585428023",
+    "eredu-core/src/capture/prefill_geometry.rs": "3e25af4b98f91ebe9e5b8414513d1d5d9d7febaaf0d05c10ebb95e997016242b",
+    "eredu-core/src/capture/prefill_geometry/tests.rs": "790ffc76c471c583670ffe4f76b3b0f5b3c94b035bc9e964414977486e16eb6d",
+    "doc/backend-architecture.md": "6524dc7d5bea97888a3adca59652df8d38413796fb3d79902d98ab5a5df1da21",
+    "doc/execution-control.md": "d9b1134541ecac6e3d01b15e6b4afc3d2c2cd0f078067417409e3ff36a088fbd",
+    "doc/bounded-inference.md": "b63d260c87883f85667976628ca1a0c66d3f71bdec0d4d6835b996d760d40ded"
+  },
+  "source_snapshot": "/private/tmp/eredu-prefill-fragment-selection-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-prefill-fragment-selection-applied.json": "e8bceedc104a52eeeb519ef7394c67d0df7f7aba065501c5582f347f893f65f9",
+    "/private/tmp/eredu-prefill-fragment-selection-architectures.log": "f3aab8d832e5918a0660cb4eeba916ab5b27b42b0ec53367936c6fcd7b32acb6",
+    "/private/tmp/eredu-prefill-fragment-selection-checks.json": "8a06123dae9a2be83cda79fb15b1bf4a6cc5bd5b8341ca74891f9047ddb61562",
+    "/private/tmp/eredu-prefill-fragment-selection-core.log": "f44750c511444e81e8e4b5faa7bcdc98b9522e547a6c17f58389f6c5372a3eb0",
+    "/private/tmp/eredu-prefill-fragment-selection-features.log": "50b8a2ae6cd50897f5f116e16cedf5a16b1197fc12786b783f10f454f046b3c9",
+    "/private/tmp/eredu-prefill-fragment-selection-files.txt": "651be90cbe9b0f05e8f36658bea17e74faff972263323d81623f86121a5aceca",
+    "/private/tmp/eredu-prefill-fragment-selection-minimal.log": "b22366ea648bbf28f3e2be6c268efd8606c04ba66007b9b3ccf1fd36c049128c",
+    "/private/tmp/eredu-prefill-fragment-selection-native_capture.log": "3118bf67bf5574f7540304831bded567bf0418328518355f51d81a0fb66daee7",
+    "/private/tmp/eredu-prefill-fragment-selection-new-tests.json": "fa67e2953225d47de06dab668c2679fd833635d2a20ac64d5b730834c152e7c7",
+    "/private/tmp/eredu-prefill-fragment-selection-portable.log": "948070a83d1687822867aa57e6d96cc9173abd495f302c4351200def8f31a4c5",
+    "/private/tmp/eredu-prefill-fragment-selection-review.json": "136d6dd102a550e685e3267de3084ab0929ed7ec469303186d2f1cd942882a59",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/README.md": "4d9f410e23ff49e7f9fb220573af9b107576ba917571a843ee35feadb232560f",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/base-hashes.json": "4913ce0f8cffeb5d6938f9c99b42fa280ad430be86a4823adaa919b2a939b6bd",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/change.patch": "c92df4fafd674451ece7995e894083cf18828acf508ea326e4cffc1d8cff3dbc",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/checks.json": "47fb3ddb874e4bd4448a1cd39a7bcf97538341ec8943900f105a31bfe1e63db3",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/dependencies.json": "993ad324a2e074c3b0d4c87a6b5930e5a780b857e081c55c69c064d87671e41c",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/doc-additions.json": "9c9cbdde0639622f8e30913278634fbc74babec934de7227c0f1e25a3453af47",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/doc-additions.md": "baccffd59e78efac53beed6f6089f2b9bcd23a446af1231e096fe6b0c4eb1e68",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/doc-base-hashes.json": "8cffb53be972b5391c6d5e241795c8f31384a1a2788919b21f1c06c0aee14d74",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/files.txt": "651be90cbe9b0f05e8f36658bea17e74faff972263323d81623f86121a5aceca",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/reviewed-source-hashes.json": "e3d2574ba5a0bf9dd611b3c83f5de4a6bc67f79eadf3bb87180f1ef81c77058d",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/staged-hashes.json": "a23f6dbe884cdb26aa83c2152edca2b5d8d6021a56b494e6ad9f96a131be76c5",
+    "/private/tmp/eredu-prefill-fragment-selection-stage/tests.json": "a1776b7fdb902127196e54bb2e117eb966434ac274fe2e960613b6944b3c485b",
+    "/private/tmp/eredu-prefill-fragment-selection-validate.py": "e4a7386184a7950a8318e41ed2780fcf87f544cdc85d28e8ab63139e6aeb6939"
+  },
+  "review": {
+    "review": "Root read the complete eight-file diff, all seven tests, existing parent test helpers and all three documentation additions. Exact current bases and staged sources verified.",
+    "behavior": [
+      "Core derives positive-stride axis slices from existing checked fragment state, with canonical exclusive end and empty-axis handling; no new stored fragment fields or authority.",
+      "Selection::from_fragment only fills the existing program and retains signed MLX extent/stride/normalization and Preview flatten limits. Existing selected/Trace/Native/execute_selected workers are unchanged.",
+      "Preview uses fragment contribution to the global prefix; Full/Slice requires the full local rectangle. Nonempty erased precision conservatively casts to F32.",
+      "Core cartesian-reference tests cover axis mapping independent of native code. Metadata tests retain one enclosing span and unknown facts. Actual-array tests compare F32/F16/BF16 output with whole-source nonzero filtering and verify larger backing aliases, unchanged cold metadata and lazy sources."
+    ],
+    "limits": [
+      "No host transfer, source registration, exact scope, native carrier or chunk-retirement integration exists in this increment.",
+      "The new program is geometry only; no causal row-assembly proof or gate removal.",
+      "New native tests are leaf/shared-runner tests, not original managed-account or full-model admission proof.",
+      "Actual-source precision-specific construction and source-bound short transfer remain required."
+    ],
+    "stage_manifest_sha256": "a23f6dbe884cdb26aa83c2152edca2b5d8d6021a56b494e6ad9f96a131be76c5",
+    "patch_sha256": "c92df4fafd674451ece7995e894083cf18828acf508ea326e4cffc1d8cff3dbc"
+  },
+  "behavior": [
+    "Core derives checked canonical local axis slices from the actual immutable fragment. No new stored fragment fields or caller-provided offsets are introduced.",
+    "The MLX constructor fills the existing static selection, optional reshape/prefix and F32 conversion program; existing selected/Trace/Native/execute_selected workers remain unchanged.",
+    "Preview uses each fragment contribution to the global prefix. Signed MLX source/stride/normalization and flatten limits remain checked.",
+    "Independent physical cartesian tests compare core mappings; metadata tests preserve the enclosing trace, exact operation sequence and unknown facts.",
+    "Actual F32/F16/BF16 source views retain larger backing allocations and match independent nonzero full-source references through the unchanged runner. Cold construction/tracing leaves evaluated and lazy source metadata unchanged."
+  ],
+  "corrections": [],
+  "limits": [
+    "This is a geometry/selection leaf. No actual-source fragment constructor, closed host transfer, original managed-account admission or native carrier retirement is supplied.",
+    "Axis placement does not establish causal equivalence to full-forward activations. Selected-prefill semantic/readout gates remain unchanged.",
+    "Metadata tracing may allocate its existing ledger/description objects; zero allocator activity is not claimed.",
+    "No new full-model released-checkpoint, distributed hardware or process-memory measurement is included."
+  ]
+}

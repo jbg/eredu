@@ -17,14 +17,14 @@ use std::{
 };
 
 use safemlx::{
-    host_transfer_capacity_upper_bound, transforms::async_eval_with_event, Array, DeviceType,
-    Event, HostTransferBuffer, HostTransferPolicy, ImmutableHostTransferBuffer, Stream,
+    Array, DeviceType, Event, HostTransferBuffer, HostTransferPolicy, ImmutableHostTransferBuffer,
+    Stream, host_transfer_capacity_upper_bound, transforms::async_eval_with_event,
 };
 
 use crate::{
     backend::nn::shared::MlxNeuralBackend,
     backend::residency::sample_allocator_memory,
-    backend::runtime::checkpoint::recipe::{MlxWeightRecipeExt, WeightRecipeError},
+    backend::runtime::checkpoint::recipe::WeightRecipeError,
     backend::runtime::checkpoint::store::{
         CheckpointMaterializationError, MlxParameterMaterializationContext,
         PendingWeightMaterialization, WeightMaterialization,
@@ -35,29 +35,68 @@ use eredu_core::residency::{
     ResidencyLedgerError, TransferDirection, UnitResidencyReport,
 };
 
+use eredu_runtime::ResidencyReport;
 use eredu_runtime::residency::{
     OffloadUnit, ResidencyController, ResidencyControllerError, ResidencyLease,
     ResidencyLeaseOwner, ResidencyLeaseStorage, ResidencyWindowError, ResidencyWindowManager,
     WeightBinding,
 };
-use eredu_runtime::ResidencyReport;
+mod background;
+pub(crate) use background::{
+    BackgroundHostReadFailure, BackgroundHostReadOwner, BackgroundSourceAttempt, PreparedBackgroundHostReads,
+    PreparedHostProtection, PreparedHostPublication, PreparedBackgroundHostWindow,
+};
+mod eviction;
+mod parameter_source;
+pub(crate) use parameter_source::{ResidentParameterSource, ResidentParameterSourceError};
+mod construction;
+pub use construction::OriginalManagerError;
+pub(crate) use construction::{
+    ForegroundDiskDescriptors, ForegroundDiskReadError, ForegroundDiskReadLayout,
+    ForegroundDiskReadPlan, ForegroundDiskSourceError, OriginalManagerPlan,
+    PreparedForegroundDiskIo, PreparedForegroundDiskRead, ReadForegroundDiskBatch, prepare_foreground_disk_descriptors,
+};
+mod owner;
+mod rows;
+pub(crate) use owner::ManagerCustody;
+use owner::ManagerOwner;
+pub use owner::{ManagerWeak, ResidentHostOwner, RetainedHostBuffer};
 
 /// A resident unit that prevents eviction of one tier until it is dropped.
-pub type ResidentUnitLease = ResidencyLease<ResidentLeaseStorage, ManagerInner>;
+pub type ResidentUnitLease = ResidencyLease<ResidentLeaseStorage, ManagerInner, ManagerWeak>;
 
 /// Host or device storage retained by a weight-residency lease.
 pub enum ResidentLeaseStorage {
     /// Immutable host-transfer buffers.
-    Host(Arc<ResidentHostBuffers>),
+    Host(ResidentHostOwner),
     /// Materialized device arrays.
-    Device(Arc<ResidentArrays>),
+    Device(ResidentArraysOwner),
+}
+
+/// Borrowed binding names from the actual host map or device destination.
+/// The iterator itself uses no separate heap allocation.
+pub struct ResidentBindingNames<'a> {
+    inner: ResidentBindingNamesInner<'a>,
+}
+enum ResidentBindingNamesInner<'a> {
+    Host(rows::Keys<'a, String, RetainedHostBuffer>),
+    Device(named_arrays::NamedIter<'a>),
+}
+impl<'a> Iterator for ResidentBindingNames<'a> {
+    type Item = &'a str;
+    fn next(&mut self) -> Option<Self::Item> {
+        match &mut self.inner {
+            ResidentBindingNamesInner::Host(names) => names.next().map(String::as_str),
+            ResidentBindingNamesInner::Device(values) => values.next().map(|(name, _)| name),
+        }
+    }
 }
 
 impl ResidencyLeaseStorage for ResidentLeaseStorage {
     type DeviceValue = Array;
     type HostValue = ImmutableHostTransferBuffer;
     type Error = ResidencyError;
-    type BindingNames<'a> = Box<dyn Iterator<Item = &'a str> + 'a>;
+    type BindingNames<'a> = ResidentBindingNames<'a>;
 
     fn device_value<'a>(
         &'a self,
@@ -88,7 +127,7 @@ impl ResidencyLeaseStorage for ResidentLeaseStorage {
     ) -> Result<&'a Self::HostValue, Self::Error> {
         match self {
             ResidentLeaseStorage::Host(buffers) => {
-                buffers.buffers.get(name).map(Arc::as_ref).ok_or_else(|| {
+                buffers.buffers.get(name).map(AsRef::as_ref).ok_or_else(|| {
                     ResidencyError::UnknownBinding {
                         id: id.clone(),
                         name: name.to_string(),
@@ -103,13 +142,15 @@ impl ResidencyLeaseStorage for ResidentLeaseStorage {
     }
 
     fn binding_names(&self) -> Self::BindingNames<'_> {
-        match self {
-            ResidentLeaseStorage::Host(buffers) => {
-                Box::new(buffers.buffers.keys().map(String::as_str))
-            }
-            ResidentLeaseStorage::Device(arrays) => {
-                Box::new(arrays.arrays.keys().map(String::as_str))
-            }
+        ResidentBindingNames {
+            inner: match self {
+                ResidentLeaseStorage::Host(buffers) => {
+                    ResidentBindingNamesInner::Host(buffers.buffers.keys())
+                }
+                ResidentLeaseStorage::Device(arrays) => {
+                    ResidentBindingNamesInner::Device(arrays.arrays.iter())
+                }
+            },
         }
     }
 }
@@ -117,6 +158,86 @@ impl ResidencyLeaseStorage for ResidentLeaseStorage {
 /// Structured failures from residency validation and state transitions.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyError {
+    /// Allocation-free native metadata refusal during a cold source census.
+    #[error("cold retained array inspection: {0}")]
+    OriginalArrayInspection(#[source] safemlx::ArrayMetadataError),
+    /// Allocation-free immutable host metadata refusal during a cold census.
+    #[error("cold retained host inspection: {0}")]
+    OriginalHostInspection(#[source] safemlx::HostTransferMetadataError),
+    #[error("original retained inventory: {0}")]
+    /// Original retained-storage collection failed its admitted contract.
+    OriginalInventory(#[source] eredu_runtime::working_memory::WorkingMemoryError),
+    /// Immutable original source construction or finite native alias refusal.
+    #[error("original immutable host source: {0}")]
+    OriginalHostInput(#[source] safemlx::PreparedInputCause),
+    #[error("prepared retained descriptor: {0}")]
+    /// A prepared native handle could not retain the inspected array.
+    OriginalClone(#[source] safemlx::PreparedArrayCloneCause),
+
+    /// The retained canonical owner closure or caller destination was invalid.
+    #[error("invalid residency operation closure: {0:?}")]
+    OperationClosure(eredu_runtime::residency::ResidencyClosureError),
+    /// The manager control state is held by another operation; no work started.
+    #[error("original residency manager is busy")]
+    OriginalManagerBusy,
+    /// An earlier transfer must settle at its actual owner before acquisition.
+    #[error("original residency acquisition has an unresolved predecessor transfer")]
+    OriginalPendingTransfer,
+    /// A source-bound final named destination rejected activation or publication.
+    #[error(transparent)]
+    OriginalNamedDestination(#[from] NamedArrayError),
+
+    /// Prepared neutral admission failed; exact source and final destinations
+    /// remain owned until this error is destroyed under its original custody.
+    #[error(transparent)]
+    OriginalAdmission(#[from] PreparedAdmissionFailure),
+
+    /// Fixed neutral explicit-eviction refusal; the consuming bank retains the
+    /// exact source ID and original operation custody with this error.
+    #[error("original residency eviction from {tier:?}: {cause}")]
+    OriginalEviction {
+        /// Same neutral policy/pin/accounting refusal as ordinary eviction.
+        #[source]
+        cause: eredu_core::residency::ResidencyEvictionError,
+        /// Actual requested materialized tier.
+        tier: MemoryTier,
+    },
+
+    /// Fixed original native observation/submission transport. This preserves
+    /// the actual native cause without allocating a residency ID or message.
+    #[error("original residency operation: {0}")]
+    OriginalNative(#[source] safemlx::error::Exception),
+    /// Fixed cache-origin refusal. It does not certify streams, sources or rows.
+    #[error("original converted-cache owner: {0}")]
+    OriginalCache(#[source] eredu_runtime::working_memory::WorkingMemoryError),
+    /// Exact prepaid materialization stream wrapper refusal.
+    #[error("original materialization stream: {0}")]
+    OriginalStreams(
+        #[source] crate::backend::runtime::checkpoint::store::PreparedMaterializationStreamError,
+    ),
+    /// The explicit original-operation role does not match its retained owner.
+    #[error("original residency operation domain mismatch")]
+    OriginalOperationDomain,
+    /// A consuming original finish retained its node in recovery. The caller
+    /// cannot query the now-absent local handle as if retirement had succeeded.
+    #[error("original residency operation retention transferred to recovery")]
+    OriginalOperationRetirementTransferred,
+    /// An exactly prepared operation family has no unused slot left.
+    #[error("original {family} operation storage exhausted after {prepared} slots")]
+    OriginalOperationCapacity {
+        /// Concrete prepriced operation family.
+        family: &'static str,
+        /// Number of original slots prepared for that family.
+        prepared: usize,
+    },
+
+    /// An active admitted disk operation rejected a route or backing change.
+    #[error("admitted direct disk route rejected: {source}")]
+    AdmittedDiskRoute {
+        /// Original typed source, including memory and checkpoint failures.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     /// A complete owner binding set is unsupported by the MLX parameter backend.
     #[error("MLX residency binding preflight failed: {0}")]
     BindingPreflight(String),
@@ -148,7 +269,9 @@ pub enum ResidencyError {
         actual_bytes: u64,
     },
     /// A binding's selected checkpoint size contradicted its definition.
-    #[error("binding {binding:?} in unit {id} selects {actual_bytes} bytes but declares {expected_bytes}")]
+    #[error(
+        "binding {binding:?} in unit {id} selects {actual_bytes} bytes but declares {expected_bytes}"
+    )]
     BindingByteMismatch {
         /// Unit identifier.
         id: OffloadUnitId,
@@ -159,6 +282,27 @@ pub enum ResidencyError {
         /// Store-validated size.
         actual_bytes: u64,
     },
+    /// Exact source catalog or retained read authentication failed.
+    #[error("original source recipe: {0}")]
+    OriginalSourceRecipe(#[from] WeightRecipeError),
+    /// A read through retained disk descriptors failed during ordinary execution.
+    /// The error preserves its detached source owner until the cause is released.
+    #[error("detached disk read: {0}")]
+    DetachedDiskRead(#[source] eredu_core::BackendFailure),
+    /// Exact foreground read/copy refusal, retaining its admitted source prefix.
+    #[error("original foreground disk materialization: {0}")]
+    OriginalForegroundDiskMaterialization(
+        #[from] materialization::ForegroundDiskMaterializationError,
+    ),
+    /// Exact failed host publication and its source-owned preparation prefix.
+    #[error("{0}")]
+    OriginalHostPublication(#[source] Box<background::BackgroundHostPublicationFailure>),
+    /// Failed exact background window, retaining its source/control owner.
+    #[error("{0}")]
+    OriginalHostWindow(#[source] Box<background::BackgroundHostWindowFailure>),
+    /// A source-bound background forward failed before its successful join.
+    #[error("{0}")]
+    OriginalBackgroundCoordinator(#[source] Box<super::dense_stream::BackgroundCoordinatorFailure>),
     /// A derived-weight recipe was invalid or could not be materialized.
     #[error("derived-weight recipe for binding {binding:?} failed: {source}")]
     Recipe {
@@ -242,18 +386,56 @@ pub enum ResidencyError {
 /// Serialized, shareable manager for immutable checkpoint weight residency.
 #[derive(Clone)]
 pub struct ResidencyManager {
-    inner: Arc<ManagerInner>,
+    inner: ManagerOwner,
 }
 
 /// Immutable source identity is retained per physical unit. Transformed modules
 /// may use the same source key with different geometry or values.
-pub(super) struct ResidencySources {
-    primary: eredu_checkpoint::store::SharedCheckpointSource,
-    units: BTreeMap<OffloadUnitId, eredu_checkpoint::store::SharedCheckpointSource>,
+pub(super) enum ResidencySources {
+    Ordinary {
+        primary: eredu_checkpoint::store::RetainedCheckpointSource,
+        units: rows::Rows<OffloadUnitId, eredu_checkpoint::store::RetainedCheckpointSource>,
+    },
+    Original(construction::OriginalHostSources),
 }
 impl ResidencySources {
+    fn foreground(&self) -> Option<&ForegroundDiskDescriptors> {
+        match self {
+            Self::Original(source) => source.foreground(),
+            Self::Ordinary { .. } => None,
+        }
+    }
     fn source(&self, unit: &OffloadUnitId) -> &dyn eredu_checkpoint::store::CheckpointSource {
-        self.units.get(unit).unwrap_or(&self.primary).as_ref()
+        match self {
+            Self::Ordinary { primary, units } => units.get(unit).unwrap_or(primary).as_ref(),
+            Self::Original(source) => source.catalog(unit),
+        }
+    }
+    fn retained(
+        &self,
+        unit: &OffloadUnitId,
+    ) -> Option<&eredu_checkpoint::store::RetainedCheckpointSource> {
+        match self {
+            Self::Ordinary { primary, units } => Some(units.get(unit).unwrap_or(primary)),
+            Self::Original(_) => None,
+        }
+    }
+    fn ordinary_sources(
+        &self,
+    ) -> impl Iterator<Item = &eredu_checkpoint::store::RetainedCheckpointSource> {
+        let (primary, units) = match self {
+            Self::Ordinary { primary, units } => (Some(primary), Some(units)),
+            Self::Original(_) => (None, None),
+        };
+        primary
+            .into_iter()
+            .chain(units.into_iter().flat_map(|units| units.values()))
+    }
+    fn prepared_host(&self, unit: &OffloadUnitId) -> Option<&ResidentHostOwner> {
+        match self {
+            Self::Original(source) => source.host(unit),
+            Self::Ordinary { .. } => None,
+        }
     }
 }
 
@@ -262,16 +444,184 @@ fn preflight_residency_owner_bindings(
     control: &ResidencyController,
 ) -> Result<(), ResidencyError> {
     for unit in control.units() {
-        eredu_runtime::preflight_bindings::<MlxNeuralBackend>(
-            sources.source(unit.id()),
-            unit.bindings(),
-        )
-        .map_err(|error| ResidencyError::BindingPreflight(error.to_string()))?;
+        // The neutral controller already validated aliases across the complete
+        // unit graph. Only physical owners select recipes against this unit's
+        // exact source; a cross-unit alias is not a second source binding.
+        let owners = unit
+            .bindings()
+            .iter()
+            .filter(|binding| !binding.is_alias())
+            .cloned()
+            .collect::<Vec<_>>();
+        eredu_runtime::preflight_bindings::<MlxNeuralBackend>(sources.source(unit.id()), &owners)
+            .map_err(|error| ResidencyError::BindingPreflight(error.to_string()))?;
     }
     Ok(())
 }
 
 impl ResidencyManager {
+    pub(crate) fn original_host_recipe(
+        &self,
+        unit: &OffloadUnitId,
+        binding: &str,
+    ) -> Option<&eredu_checkpoint::recipe::RecipeMetadata> {
+        match &self.inner.sources {
+            ResidencySources::Original(source) => source.output(unit, binding),
+            _ => None,
+        }
+    }
+    pub(crate) fn original_checkpoint_source(
+        &self,
+    ) -> Option<&eredu_checkpoint::store::RetainedCheckpointSource> {
+        match &self.inner.sources {
+            ResidencySources::Original(source) => Some(source.policy()),
+            _ => None,
+        }
+    }
+    /// Exact source-only disk owner. Request read slots and native operation
+    /// admission must still be supplied before materializing any disk unit.
+    pub(crate) fn original_foreground_disk_descriptors(
+        &self,
+    ) -> Option<&construction::ForegroundDiskDescriptors> {
+        match &self.inner.sources {
+            ResidencySources::Original(source) => source.foreground(),
+            _ => None,
+        }
+    }
+    pub(crate) fn original_dense_controller(
+        &self,
+    ) -> Option<crate::backend::runtime::execution::layerwise::PreparedDenseController> {
+        self.inner.dense_controller.get().cloned()
+    }
+    pub(crate) fn original_dense_controller_control_bytes(&self) -> Option<usize> {
+        self.inner.dense_controller.get()?;
+        let controls = [
+            crate::backend::runtime::execution::layerwise::PreparedDenseController::control_bytes(
+            )?,
+            std::mem::size_of::<std::sync::MutexGuard<'_, ManagerState>>(),
+            std::mem::size_of::<std::sync::TryLockError<std::sync::MutexGuard<'_, ManagerState>>>(),
+            std::mem::size_of::<Result<(), ResidencyError>>(),
+            std::mem::size_of::<[&ManagerWeak; 1]>(),
+        ];
+        controls
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+    }
+    pub(crate) fn with_original_dense_ledger<T>(
+        &self,
+        source: &ManagerWeak,
+        operation: impl FnOnce(&eredu_core::residency::ResidencyLedger) -> T,
+    ) -> Result<T, ResidencyError> {
+        if source.as_ptr() != self.inner.as_ptr()
+            || self.inner.source_custody().is_none()
+            || self
+                .inner
+                .failed_transfer
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ResidencyError::OriginalOperationDomain);
+        }
+        let state = self
+            .inner
+            .state
+            .try_lock()
+            .map_err(|_| ResidencyError::OriginalManagerBusy)?;
+        Ok(operation(state.control.ledger()))
+    }
+    /// Clone only this constructor's raw source custody. No allocation or grant.
+    pub(crate) fn original_source_custody(&self) -> Option<ManagerCustody> {
+        self.inner.source_custody()
+    }
+
+    /// Ordinary worker preparation over the actual retained unit declarations,
+    /// including canonical owners. This borrows no recovery/native operation.
+    pub(crate) fn prefetch_unit_domain(&self) -> Result<Vec<OffloadUnitId>, ResidencyError> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ResidencyError::StatePoisoned)?;
+        Ok(state
+            .control
+            .units()
+            .map(|unit| unit.id().clone())
+            .collect())
+    }
+
+    /// Retains this manager's current physical arrays, host buffers and original
+    /// or transformed source stores. This cold query performs no recovery reap,
+    /// completion poll, payload read, eviction or native materialization.
+    ///
+    /// In-flight or failed transfers make the bound unknown because they can own
+    /// resources outside the manager's storage map. This snapshot does not pin
+    /// ledger entries or price future streaming, and it must be composed with
+    /// module parameters, state and other owners before request admission.
+    pub fn retained_storage(&self) -> Result<super::storage::RetainedStorage, ResidencyError> {
+        let mut storage = crate::backend::runtime::residency::storage::RetainedStorage::default();
+        self.collect_retained_storage(&mut storage)?;
+        Ok(storage)
+    }
+
+    /// Fills caller-owned storage without allocating an intermediate inventory.
+    pub fn collect_retained_storage(
+        &self,
+        storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    ) -> Result<(), ResidencyError> {
+        for source in self.inner.sources.ordinary_sources() {
+            storage.include_checkpoint_source(source.as_ref())?;
+        }
+        if let ResidencySources::Original(source) = &self.inner.sources {
+            for host in source.hosts() {
+                for buffer in host.buffers.values() {
+                    storage.include_retained_host(buffer.clone())?;
+                }
+            }
+        }
+        // `self.lock()` reaps native recovery. Admission inspection must not
+        // establish completion as a side effect, so take only the state mutex.
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| ResidencyError::StatePoisoned)?;
+        if self
+            .inner
+            .failed_transfer
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            storage.mark_incomplete();
+        }
+        for (id, retained) in &state.storage {
+            for tier in [MemoryTier::Host, MemoryTier::Device] {
+                if state
+                    .control
+                    .ledger()
+                    .copy_status(id, tier)?
+                    .is_some_and(|copy| copy.in_flight().is_some())
+                {
+                    storage.mark_incomplete();
+                }
+            }
+            if let Some(host) = &retained.host {
+                for buffer in host.buffers.values() {
+                    storage.include_retained_host(buffer.clone())?;
+                }
+            }
+            if let Some(device) = &retained.device {
+                // The owning collector needs the same positive host witness as
+                // the borrowed visitor. These source owners belong to device
+                // cells, not the Host tier, and can back zero-copy array aliases.
+                for buffer in device.arrays.host_sources() {
+                    storage.include_retained_host(buffer.clone())?;
+                }
+                for array in device.arrays.values() {
+                    storage.include_array(array)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Returns the MLX stream index used for device residency transfers.
     pub fn device_stream_index(&self) -> Result<i32, ResidencyError> {
         self.lock()?
@@ -298,20 +648,20 @@ impl ResidencyManager {
     where
         S: eredu_checkpoint::store::CheckpointSource + 'static,
     {
-        let store: Arc<dyn eredu_checkpoint::store::CheckpointSource> = store;
+        let store: eredu_checkpoint::store::RetainedCheckpointSource = store.into();
         Self::new_shared(store, plan, units, source_stream, device_stream)
     }
 
     /// Creates a manager from an already type-erased checkpoint store.
     pub fn new_shared(
-        store: Arc<dyn eredu_checkpoint::store::CheckpointSource>,
+        store: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
         plan: OffloadPlan,
         units: impl IntoIterator<Item = OffloadUnit>,
         source_stream: Stream,
         device_stream: Stream,
     ) -> Result<Self, ResidencyError> {
-        Self::new_shared_sources(
-            store,
+        Self::new_retained_sources(
+            store.into(),
             BTreeMap::new(),
             plan,
             units,
@@ -331,13 +681,85 @@ impl ResidencyManager {
         source_stream: Stream,
         device_stream: Stream,
     ) -> Result<Self, ResidencyError> {
-        let sources = ResidencySources {
+        Self::new_retained_sources(
+            store.into(),
+            unit_sources
+                .into_iter()
+                .map(|(id, source)| (id, source.into()))
+                .collect(),
+            plan,
+            units,
+            source_stream,
+            device_stream,
+        )
+    }
+
+    /// Same manager driver retaining opaque source roots without outgoing Arc.
+    pub fn new_retained_sources(
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
+        unit_sources: BTreeMap<OffloadUnitId, eredu_checkpoint::store::RetainedCheckpointSource>,
+        plan: OffloadPlan,
+        units: impl IntoIterator<Item = OffloadUnit>,
+        source_stream: Stream,
+        device_stream: Stream,
+    ) -> Result<Self, ResidencyError> {
+        Self::new_shared_sources_impl(
+            store,
+            unit_sources,
+            plan,
+            units,
+            source_stream,
+            device_stream,
+            None,
+        )
+    }
+
+    /// Same factory with an actually admitted shared cache. Only this fixed
+    /// cache owner is covered; manager/catalog/stream producers stay separate.
+    /// The ordinary factory never silently adopts or replaces its cache.
+    pub(crate) fn new_shared_sources_with_cache(
+        store: impl Into<eredu_checkpoint::store::RetainedCheckpointSource>,
+        unit_sources: BTreeMap<OffloadUnitId, eredu_checkpoint::store::RetainedCheckpointSource>,
+        plan: OffloadPlan,
+        units: impl IntoIterator<Item = OffloadUnit>,
+        source_stream: Stream,
+        device_stream: Stream,
+        cache: crate::backend::runtime::checkpoint::store::CacheHandle,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    ) -> Result<Self, ResidencyError> {
+        Self::new_shared_sources_impl(
+            store.into(),
+            unit_sources,
+            plan,
+            units,
+            source_stream,
+            device_stream,
+            Some((cache, pool)),
+        )
+    }
+
+    fn new_shared_sources_impl(
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
+        unit_sources: BTreeMap<OffloadUnitId, eredu_checkpoint::store::RetainedCheckpointSource>,
+        plan: OffloadPlan,
+        units: impl IntoIterator<Item = OffloadUnit>,
+        source_stream: Stream,
+        device_stream: Stream,
+        cache: Option<(
+            crate::backend::runtime::checkpoint::store::CacheHandle,
+            &eredu_runtime::working_memory::WorkingMemoryPool,
+        )>,
+    ) -> Result<Self, ResidencyError> {
+        let sources = ResidencySources::Ordinary {
             primary: store,
-            units: unit_sources,
+            units: unit_sources.into_iter().collect(),
         };
         let units = units.into_iter().collect::<Vec<_>>();
         let control = ResidencyController::new_with_catalogs(|id| sources.source(id), plan, units)?;
-        for id in sources.units.keys() {
+        for id in match &sources {
+            ResidencySources::Ordinary { units, .. } => units.keys(),
+            _ => unreachable!("ordinary constructor"),
+        } {
             if control.unit(id).is_none() {
                 return Err(
                     ResidencyControllerError::UnexpectedUnitDefinition { id: id.clone() }.into(),
@@ -365,30 +787,108 @@ impl ResidencyManager {
             return Err(ResidencyError::InvalidSourceStream);
         }
 
+        // Preserve every existing source/plan/stream validation above. Check
+        // supplied origin before any new manager/context owner below is built.
+        if let Some((cache, pool)) = &cache {
+            cache
+                .validate_pool(pool)
+                .map_err(ResidencyError::OriginalCache)?;
+        }
+        let prepared_streams = match &cache {
+            Some((_, pool)) => Some(crate::backend::runtime::checkpoint::store::PreparedMaterializationStreams::prepare(pool, &source_stream, &device_stream)
+                .map_err(ResidencyError::OriginalStreams)?),
+            None => None,
+        };
+        let alias_owner_pins = rows::AliasPins::new(control.units().map(OffloadUnit::id));
         let storage = control
             .units()
             .map(|unit| (unit.id().clone(), UnitStorage::default()))
             .collect();
-        let failed_transfer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let custody = owner::ManagerCustody::default();
+        let failed_transfer = owner::FailureFlag::new(custody.clone());
         Ok(Self {
-            inner: Arc::new(ManagerInner {
+            inner: ManagerOwner::new(ManagerInner {
                 sources,
-                failed_transfer: Arc::clone(&failed_transfer),
+                host_workspace: std::sync::OnceLock::new(),
+                dense_controller: std::sync::OnceLock::new(),
+                original_operation_source:std::sync::OnceLock::new(),
+                background_operation_source: std::sync::OnceLock::new(),
+                supplementary_source:std::sync::OnceLock::new(),
+                failed_transfer: failed_transfer.clone(),
                 state: Mutex::new(ManagerState {
                     failed_transfer,
                     control,
                     storage,
-                    alias_owner_pins: BTreeSet::new(),
-                    materialization: MlxParameterMaterializationContext::new(
-                        &source_stream,
-                        &device_stream,
-                    ),
-                    source_stream,
-                    device_stream,
+                    alias_owner_pins,
+                    admitted_disk_route: std::sync::Weak::new(),
+                    admitted_disk_window: BTreeSet::new(),
+                    materialization: match cache {
+                        Some((cache, pool)) => crate::backend::runtime::checkpoint::store::ManagerMaterializationContext::prepared(
+                            prepared_streams.expect("prepared exact stream pair"), cache, pool,
+                        ).map_err(ResidencyError::OriginalCache)?,
+                        None => crate::backend::runtime::checkpoint::store::ManagerMaterializationContext::ordinary(
+                            MlxParameterMaterializationContext::new(&source_stream, &device_stream)
+                        ),
+                    },
+                    source_stream: owner::ManagerStream::Ordinary(source_stream),
+                    device_stream: owner::ManagerStream::Ordinary(device_stream),
                 }),
                 changed: Condvar::new(),
-            }),
+            }, custody),
         })
+    }
+
+    /// One selected-plan lookup or installation check, including the private
+    /// state loan. The two calls are sequential; no shared cache is allocated.
+    pub(crate) fn gguf_cache_identity_control_bytes() -> Option<usize> {
+        use crate::backend::runtime::checkpoint::store::{
+            CacheHandle, ManagerMaterializationContext, MaterializationView,
+        };
+        let controls = [
+            size_of::<&Self>(),
+            size_of::<&CacheHandle>(),
+            size_of::<&ManagerMaterializationContext>(),
+            size_of::<MaterializationView<'static>>(),
+            size_of::<std::sync::TryLockResult<MutexGuard<'static, ManagerState>>>(),
+            size_of::<std::sync::TryLockError<MutexGuard<'static, ManagerState>>>(),
+            size_of::<MutexGuard<'static, ManagerState>>(),
+            size_of::<Result<MutexGuard<'static, ManagerState>, ResidencyError>>(),
+            size_of::<Result<CacheHandle, ResidencyError>>(),
+            size_of::<Result<(), ResidencyError>>(),
+            size_of::<ResidencyError>(),
+            size_of::<bool>(),
+        ];
+        controls
+            .into_iter()
+            .try_fold(CacheHandle::identity_control_bytes()?, usize::checked_add)?
+            .checked_add(std::mem::size_of_val(&controls))
+    }
+
+    /// Retain only the actual cache owner. No stream clone, source callback or
+    /// native operation occurs while the manager state is borrowed.
+    pub(crate) fn gguf_cache_handle(
+        &self,
+    ) -> Result<crate::backend::runtime::checkpoint::store::CacheHandle, ResidencyError> {
+        let state = self.inner.state.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => ResidencyError::OriginalManagerBusy,
+            std::sync::TryLockError::Poisoned(_) => ResidencyError::StatePoisoned,
+        })?;
+        Ok(state.materialization.cache_handle())
+    }
+
+    pub(crate) fn validate_gguf_cache(
+        &self,
+        expected: &crate::backend::runtime::checkpoint::store::CacheHandle,
+    ) -> Result<(), ResidencyError> {
+        let state = self.inner.state.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => ResidencyError::OriginalManagerBusy,
+            std::sync::TryLockError::Poisoned(_) => ResidencyError::StatePoisoned,
+        })?;
+        if state.materialization.matches_cache(expected) {
+            Ok(())
+        } else {
+            Err(ResidencyError::OriginalOperationDomain)
+        }
     }
 
     /// Materializes all planned host and device units in identifier order.
@@ -429,6 +929,7 @@ impl ResidencyManager {
     ) -> Result<PrefetchOutcome, ResidencyError> {
         validate_target(tier, "prefetch")?;
         let mut state = self.lock()?;
+        disk_workspace::validate_disk_access(&state, std::slice::from_ref(id), tier)?;
         loop {
             state.control.ledger_mut().require_initialized()?;
             let copy = state.control.ledger_mut().copy_status(id, tier)?;
@@ -476,7 +977,7 @@ impl ResidencyManager {
         tier: MemoryTier,
     ) -> Result<Vec<ResidentUnitLease>, ResidencyError> {
         self.acquire_many_with_mode(requests, tier, false)
-            .map(|(leases, _)| leases)
+            .map(|(leases, _)| leases.into_ordinary())
     }
 
     /// Submits one residency batch and returns its owning completion lease.
@@ -493,10 +994,45 @@ impl ResidencyManager {
     ) -> Result<ResidentTransfer, ResidencyError> {
         let (leases, submitted) = self.acquire_many_with_mode(requests, tier, true)?;
         let transfer = match submitted {
-            None => ResidentTransfer::immediate(leases, tier),
+            None => ResidentTransfer::immediate(leases.into_ordinary(), tier),
             Some(submitted) => ResidentTransfer::submitted(leases, submitted),
         };
         Ok(transfer)
+    }
+
+    pub(crate) fn acquire_many_with_original_transfer(
+        &self,
+        requests: &[(OffloadUnitId, u64)],
+        tier: MemoryTier,
+        slots: &mut OriginalResidencySlots<'_>,
+        observer: &safemlx::OriginalScopeObserver,
+    ) -> Result<ResidentTransfer, ResidencyError> {
+        // Host publication requires the exact admitted worker and one-use
+        // destination. Other original acquisitions remain Device promotions.
+        if tier != MemoryTier::Device && !(tier == MemoryTier::Host && slots.background_host.is_some()) {
+            return Err(ResidencyError::OriginalOperationDomain);
+        }
+        transfer::validate_original_observer(observer)?;
+        // Reserve the root acquisition's warm-hit owner before any pin/source
+        // work. Missing batches additionally consume their own transfer slots.
+        let mut immediate = slots.transfers.checkout().map_err(|cause| {
+            ResidencyError::OriginalOperationCapacity {
+                family: "resident warm acquisition",
+                prepared: cause.prepared,
+            }
+        })?;
+        let prepared_leases = immediate.take_lease_collection(&self.inner, requests, tier)?;
+        let (leases, submitted) = self.acquire_many_with_operations(
+            requests,
+            tier,
+            true,
+            Some((slots, observer)),
+            Some(prepared_leases),
+        )?;
+        Ok(match submitted {
+            None => ResidentTransfer::immediate_original(leases, tier, observer, immediate),
+            Some(submitted) => ResidentTransfer::submitted(leases, submitted),
+        })
     }
 
     fn acquire_many_with_mode(
@@ -504,14 +1040,80 @@ impl ResidencyManager {
         requests: &[(OffloadUnitId, u64)],
         tier: MemoryTier,
         return_transfer: bool,
-    ) -> Result<(Vec<ResidentUnitLease>, Option<SubmittedResidentTransfer>), ResidencyError> {
+    ) -> Result<
+        (
+            transfer::ResidentLeaseCollection,
+            Option<SubmittedResidentTransfer>,
+        ),
+        ResidencyError,
+    > {
+        self.acquire_many_with_operations(requests, tier, return_transfer, None, None)
+    }
+
+    fn acquire_many_with_operations(
+        &self,
+        requests: &[(OffloadUnitId, u64)],
+        tier: MemoryTier,
+        return_transfer: bool,
+        mut original: Option<(
+            &mut OriginalResidencySlots<'_>,
+            &safemlx::OriginalScopeObserver,
+        )>,
+        prepared_leases: Option<transfer::PreparedLeaseCollection>,
+    ) -> Result<
+        (
+            transfer::ResidentLeaseCollection,
+            Option<SubmittedResidentTransfer>,
+        ),
+        ResidencyError,
+    > {
+        if original.is_some() != prepared_leases.is_some() {
+            return Err(ResidencyError::OriginalOperationDomain);
+        }
+        if let Some(leases) = &prepared_leases {
+            leases.validate(&self.inner, requests, tier)?;
+        }
+        if let Some((_, observer)) = &original {
+            let current = safemlx::OriginalScopeObserver::require_current()
+                .map_err(ResidencyError::OriginalNative)?;
+            if !current.same_scope(observer) {
+                return Err(ResidencyError::OriginalOperationDomain);
+            }
+        }
         validate_target(tier, "acquire")?;
-        let mut state = self.lock()?;
-        let ids = requests
-            .iter()
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        state.control.ledger_mut().validate_batch(&ids, tier)?;
+        let mut state = match &original {
+            Some((_, observer)) => self.lock_original(observer)?,
+            None => self.lock()?,
+        };
+        // The original window's final lease IDs serve this immutable request
+        // phase too. Their loan ends before LeaseBuilder moves the same buffer
+        // into its consuming iterator. Ordinary collection behavior is retained.
+        let ordinary_ids = prepared_leases.is_none().then(|| {
+            requests
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        });
+        let ids = match &prepared_leases {
+            Some(prepared) => prepared.requested_ids()?,
+            None => ordinary_ids.as_deref().expect("ordinary request IDs"),
+        };
+        disk_workspace::validate_disk_access(&state, ids, tier)?;
+        let controller = match original.as_mut() {
+            Some((slots, _)) => Some(
+                PreparedControllerAttempt::take(
+                    slots.controller,
+                    &self.inner,
+                    state.control.ledger(),
+                    ids.len(),
+                )?
+                .validate(state.control.ledger(), ids, tier)?,
+            ),
+            None => {
+                state.control.ledger_mut().validate_batch(ids, tier)?;
+                None
+            }
+        };
         loop {
             state.control.ledger_mut().require_initialized()?;
             for (id, _) in requests {
@@ -529,6 +1131,11 @@ impl ResidencyManager {
             if !waiting {
                 break;
             }
+            if original.is_some() {
+                // The selected caller drains its actual preceding owner. This
+                // method cannot globally reap or adopt another transfer here.
+                return Err(ResidencyError::OriginalPendingTransfer);
+            }
             state = self.wait_for_transfer(state)?;
         }
         let missing = requests
@@ -542,13 +1149,16 @@ impl ResidencyManager {
             })
             .count();
         let started = Instant::now();
-        let residency = ensure_many_resident(
+        let residency = transfer::ensure_many_resident_with_operations(
             &mut state,
             &self.inner.sources,
-            &ids,
+            ids,
             tier,
             return_transfer,
             false,
+            Some(&self.inner),
+            original,
+            controller,
         );
         if missing > 0 {
             state
@@ -558,38 +1168,42 @@ impl ResidencyManager {
         }
         let (_, submitted) = residency?;
         if let Some(submitted) = &submitted {
-            submitted.attach_owner(Arc::downgrade(&self.inner));
+            submitted.attach_owner(self.inner.downgrade());
         }
-        let mut leases = crate::backend::ordinary_retirement::OrdinaryRetirement::new(Vec::new());
+        let mut leases = transfer::LeaseBuilder::new(prepared_leases);
         let acquired = (|| -> Result<(), ResidencyError> {
             for (id, demand) in requests {
                 let unit = state.storage.get(id).ok_or(ResidencyError::StatePoisoned)?;
                 let storage = match tier {
-                    MemoryTier::Host => ResidentLeaseStorage::Host(Arc::clone(
+                    MemoryTier::Host => ResidentLeaseStorage::Host(Clone::clone(
                         unit.host.as_ref().ok_or(ResidencyError::StatePoisoned)?,
                     )),
-                    MemoryTier::Device => ResidentLeaseStorage::Device(Arc::clone(
-                        unit.device.as_ref().ok_or(ResidencyError::StatePoisoned)?,
-                    )),
+                    MemoryTier::Device => ResidentLeaseStorage::Device(
+                        unit.device
+                            .as_ref()
+                            .ok_or(ResidencyError::StatePoisoned)?
+                            .clone(),
+                    ),
                     MemoryTier::Disk => unreachable!("validated above"),
                 };
-                state.control.ledger_mut().pin(id, tier, *demand)?;
-                leases.push(ResidentUnitLease::new(
-                    id.clone(),
+                leases.acquire(
+                    state.control.ledger_mut(),
+                    id,
                     tier,
+                    *demand,
                     storage,
-                    Arc::downgrade(&self.inner),
-                ));
+                    self.inner.downgrade(),
+                )?;
             }
             Ok(())
         })();
         if let Err(error) = acquired {
             if let Some(submitted) = &submitted {
-                submitted.retain_partial_leases(leases.into_inner());
+                submitted.retain_partial_leases(leases.finish());
             }
             return Err(error);
         }
-        Ok((leases.into_inner(), submitted))
+        Ok((leases.finish(), submitted))
     }
 
     /// Returns whether a logical copy currently resides in a memory tier.
@@ -630,6 +1244,11 @@ impl ResidencyManager {
     ) -> Result<Vec<(OffloadUnitId, PrefetchOutcome)>, ResidencyError> {
         validate_target(tier, "prepare_group_window")?;
         let mut state = self.lock()?;
+        disk_workspace::validate_disk_access(
+            &state,
+            &active.iter().chain(upcoming).cloned().collect::<Vec<_>>(),
+            tier,
+        )?;
         loop {
             state.control.ledger_mut().require_initialized()?;
             for id in active.iter().chain(upcoming) {
@@ -722,27 +1341,34 @@ impl ResidencyManager {
     /// Returns an immutable point-in-time residency and storage report.
     pub fn report(&self) -> Result<ResidencyReport, ResidencyError> {
         let (initialized, offload, units, active_window) = self.telemetry_snapshot()?;
-        Ok(ResidencyReport::new(
-            initialized,
-            offload,
-            units,
-            active_window,
-            self.inner.sources.primary.source_diagnostics()?,
+        let (primary, unit_sources) = match &self.inner.sources {
+            ResidencySources::Ordinary { primary, units } => (
+                primary.source_diagnostics()?,
+                units
+                    .iter()
+                    .map(|(id, source)| {
+                        source.source_diagnostics().map(|value| (id.clone(), value))
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            ResidencySources::Original(source) => (
+                source.policy().source_diagnostics()?,
+                units
+                    .iter()
+                    .map(|unit| {
+                        source
+                            .catalog(unit.id())
+                            .source_diagnostics()
+                            .map(|value| (unit.id().clone(), value))
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+        };
+        Ok(
+            ResidencyReport::new(initialized, offload, units, active_window, primary)
+                .with_unit_sources(unit_sources),
         )
-        .with_unit_sources(
-            self.inner
-                .sources
-                .units
-                .iter()
-                .map(|(id, source)| {
-                    source
-                        .source_diagnostics()
-                        .map(|diagnostics| (id.clone(), diagnostics))
-                })
-                .collect::<Result<_, _>>()?,
-        ))
     }
-
     /// Returns initialized state, aggregate telemetry, unit reports, and active window.
     pub fn telemetry_snapshot(
         &self,
@@ -764,6 +1390,30 @@ impl ResidencyManager {
             units,
             active.into_iter().collect(),
         ))
+    }
+
+    fn lock_original(
+        &self,
+        observer: &safemlx::OriginalScopeObserver,
+    ) -> Result<MutexGuard<'_, ManagerState>, ResidencyError> {
+        // Explicit original entry performs no global recovery/ordinary reaping.
+        if self
+            .inner
+            .failed_transfer
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let cause = observer.retained_failure().unwrap_or_else(|| {
+                observer
+                    .observation_error(safemlx::ScopedSubmissionProgress::Unobservable)
+                    .expect("fixed original refusal")
+            });
+            return Err(ResidencyError::OriginalNative(cause));
+        }
+        match self.inner.state.try_lock() {
+            Ok(state) => Ok(state),
+            Err(std::sync::TryLockError::WouldBlock) => Err(ResidencyError::OriginalManagerBusy),
+            Err(std::sync::TryLockError::Poisoned(_)) => Err(ResidencyError::StatePoisoned),
+        }
     }
 
     fn lock(&self) -> Result<MutexGuard<'_, ManagerState>, ResidencyError> {
@@ -834,16 +1484,115 @@ impl ResidencyWindowManager for ResidencyManager {
     }
 }
 
+mod borrowed_storage;
+mod capacity;
+pub(crate) use capacity::PreparedWeightOwnerSlotBounds;
+
 mod transfer;
 use transfer::*;
 pub use transfer::{
     ManagerInner, ResidentArrays, ResidentHostBuffers, ResidentTransfer, ResidentTransferResources,
 };
 
+mod named_arrays;
+use named_arrays::NamedArrays;
+pub(crate) use named_arrays::{
+    NameCatalogOwner, NamePreparationError, NamedPreparationSource, NamedStorageLayout,
+};
+pub use named_arrays::{NamedArrayError, ResidentArraysOwner};
 mod materialization;
 pub use materialization::host_capacity_upper_bound_for_bindings;
+pub(crate) use materialization::original_host_copy_control_bytes;
 use materialization::*;
+
+mod host_workspace;
+pub(crate) use host_workspace::{
+    HostCopyIdentity, HostCopySourcePins, HostCopyWorkspace, HostCopyWorkspaceError,
+};
+mod disk_workspace;
+pub(crate) use disk_workspace::{
+    DiskCopyWorkspace, DiskCopyWorkspaceError, DiskRouteGuard, DiskRouteReceipt,
+    PreparedDiskReadPlans,
+};
 
 #[cfg(test)]
 #[path = "manager/tests.rs"]
 mod tests;
+
+pub(crate) use materialization::PreparedHostMaterialization;
+pub(crate) use transfer::{
+    PreparedResidentTransfer, PreparedTransferDestinationCause, PreparedTransferObservation,
+    TransferPayloadShape,
+};
+
+mod operation_population;
+pub(crate) use operation_population::MaterializationPopulation;
+
+mod controller_attempt;
+pub use controller_attempt::PreparedAdmissionFailure;
+pub(crate) use controller_attempt::{
+    ControllerPreparationCause, ControllerPreparationError, PreparedControllerAttempt,
+};
+
+impl ResidencyError {
+    pub(crate) fn capacity(&self) -> Option<eredu_core::residency::ResidencyCapacityRef<'_>> {
+        match self {
+            Self::Ledger(cause) => cause.capacity(),
+            Self::OriginalAdmission(cause) => cause.capacity(),
+            _ => None,
+        }
+    }
+}
+
+mod closure_ids;
+pub(crate) use closure_ids::{
+    ClosurePreparationCause, ClosurePreparationError, PreparedClosureIds,
+};
+
+mod operation_slots;
+pub(crate) use operation_slots::{
+    ForegroundDiskPopulation, ForegroundDiskSourceCapacity, ForegroundDiskWindowPlan, ForegroundDiskSubsetCeiling, ForegroundDiskSourceSeries,
+    PreparedForegroundDiskSlots,
+};
+pub(crate) use operation_slots::{OriginalHostPublicationSlots, OriginalResidencySlots};
+
+#[cfg(test)]
+pub(crate) use tests::exercise_original_capacity_retry;
+
+#[cfg(test)]
+pub(crate) use named_arrays::tests::NamedArraysFixture;
+
+mod operation_source;
+pub(crate) use operation_source::ForegroundDiskIdentity;
+pub(crate) use operation_source::{
+    OperationSourceFailure, OperationWindows, OriginalResidencySource,
+    SupplementaryResidencySource, WindowPopulation,
+};
+
+#[cfg(test)]
+pub(crate) use tests::LeaseReturnFixture;
+
+pub(crate) mod acquisition_destinations;
+
+/// Consume a declared immutable source alias for initial parameter binding.
+/// Ordinary stores have no source slot; repeated original operation binding
+/// uses its separate accepted request Graph shell population.
+pub(crate) fn clone_original_source_value(
+    lease: &ResidentUnitLease,
+    name: &str,
+) -> Result<Option<Array>, ResidencyError> {
+    let ResidentLeaseStorage::Device(owner) = lease.storage() else {
+        return Ok(None);
+    };
+    let NamedArrays::Source(values) = &owner.arrays else {
+        return Ok(None);
+    };
+    let value = values
+        .get(name)
+        .ok_or(ResidencyError::OriginalOperationDomain)?;
+    value
+        .source
+        .try_prepared_source_array()
+        .map(Some)
+        .map_err(ResidencyError::OriginalHostInput)
+}

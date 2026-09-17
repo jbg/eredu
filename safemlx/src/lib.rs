@@ -17,6 +17,11 @@
 #[macro_use]
 pub mod macros;
 
+mod allocation_retention;
+mod prefill_roots;
+pub use prefill_roots::*;
+mod prepared_input;
+pub use prepared_input::*;
 mod array;
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -25,6 +30,13 @@ pub mod distributed;
 mod dtype;
 pub mod error;
 mod event;
+mod operation_event;
+pub use operation_event::{
+    OperationEvalRecordLayout, OperationEvalTraversalLayout, OperationEvalTraversalLimits,
+    OperationEvent, OperationRootStorageLayout, OperationWaitRecordLayout, PointwiseGraphLayout,
+    PreparedNestedRoots, PreparedNestedRootsCause, PreparedNestedRootsFailure,
+    PreparedPointwiseGraph, PreparedResidentGraph, ResidentGpuWorkerLayout, ResidentGraphLayout,
+};
 pub mod fast;
 pub mod fft;
 mod host_transfer;
@@ -34,6 +46,8 @@ pub mod memory;
 pub mod metal;
 pub mod ops;
 pub mod random;
+mod runtime_baseline;
+pub use runtime_baseline::{runtime_static_baseline, RuntimeStaticBaseline};
 mod runtime_deadline;
 mod stream;
 mod submission;
@@ -41,6 +55,7 @@ pub mod system;
 pub mod transforms;
 pub mod utils;
 
+pub use allocation_retention::*;
 pub use array::*;
 pub use device::*;
 pub use dtype::*;
@@ -49,6 +64,9 @@ pub use host_transfer::*;
 pub use runtime_deadline::*;
 pub use stream::*;
 pub use submission::*;
+
+pub use utils::runtime_lock::{HousekeepingRegistrationCause, HousekeepingRegistrationFailure,
+    PreparedThreadRuntimeHousekeeping, RegisteredThreadRuntimeHousekeeping};
 
 /// Registers one idempotent same-thread housekeeping callback.
 ///
@@ -114,3 +132,10 @@ pub(crate) mod sealed {
     {
     }
 }
+
+pub use submission::{OriginalNativeControlError, OriginalNativeControlLayout};
+
+pub use operation_event::{
+    CpuArgPartitionLayout, CpuCopyEvalLayout, CpuUnaryOperation, CpuUnaryEvalLayout, CpuBinaryOperation, CpuBinaryEvalLayout, CpuEvalCleanupLayout, CpuEvalCleanupPopulation, RouterReceiptLayout,
+};
+pub use operation_event::{GpuEvalPrologueLayout, GpuEvalProloguePopulation};

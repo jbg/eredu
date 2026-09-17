@@ -51,7 +51,7 @@ pub fn open_prompt_cache(
             let record = CacheBlockRecord {
                 physical: MlxCacheBlockStorage::disk(
                     id.clone(),
-                    DiskLocation {
+                    DiskLocation::ordinary(DiskLocationData {
                         path: shard,
                         first_name: block.first_array.clone(),
                         second_name: block.second_array.clone(),
@@ -59,12 +59,15 @@ pub fn open_prompt_cache(
                         buffered: Some(buffered),
                         payload_sha256: Some(block.payload_sha256.clone()),
                         payload_verification: Arc::new(OnceLock::new()),
-                    },
+                        live_source: None,
+                    }),
                 ),
                 bytes: block.logical_bytes,
                 shapes: [block.first_shape.clone(), block.second_shape.clone()],
                 dtypes: [block.first_dtype.clone(), block.second_dtype.clone()],
                 imported: true,
+                original_discard: None,
+                _metadata_funding: None,
             };
             state
                 .lifecycle

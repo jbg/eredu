@@ -6,3 +6,5 @@ pub mod dense_stream;
 pub mod manager;
 /// Architecture-independent addressable parameter-bank residency.
 pub mod parameter_bank;
+/// Retained native storage facts for inference working-memory composition.
+pub mod storage;

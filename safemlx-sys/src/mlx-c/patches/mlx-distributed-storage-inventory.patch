@@ -1,0 +1,200 @@
+diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
+--- a/mlx/distributed/distributed.cpp
++++ b/mlx/distributed/distributed.cpp
+@@ -105,6 +105,12 @@
+ 
+ class EmptyGroup : public GroupImpl {
+  public:
++  void storage_inventory(GroupStorageInventory& out) const noexcept override {
++    out = GroupStorageInventory{};
++    out.kind = GroupStorageKind::empty;
++    out.implementation_bytes = sizeof(EmptyGroup);
++    out.unresolved = group_shared_control;
++  }
+   Stream communication_stream(StreamOrDevice s) override {
+     return to_stream(s);
+   }
+@@ -205,6 +211,18 @@
+     throw std::runtime_error(
+         "distributed communicator is terminal for new submissions");
+   }
++}
++
++bool Group::storage_inventory(GroupStorageInventory& out) const noexcept {
++  out = GroupStorageInventory{};
++  if (!group_) return false;
++  group_->storage_inventory(out);
++  if (group_->terminal_owner_) out.unresolved |= group_inherited_owner;
++  return true;
++}
++
++bool Group::same_implementation(const Group& other) const noexcept {
++  return group_ && group_.get() == other.group_.get();
+ }
+ 
+ int Group::rank() const {
+diff --git a/mlx/distributed/distributed.h b/mlx/distributed/distributed.h
+--- a/mlx/distributed/distributed.h
++++ b/mlx/distributed/distributed.h
+@@ -13,6 +13,30 @@
+ // Forward declaration of the base group implementation.
+ namespace detail {
+ class GroupImpl;
++};
++
++// Immutable fields of the actual implementation, not a whole-communicator
++// fit. Values never include inferred std-library control blocks, OS resources,
++// mutable submission queues or an inherited terminal owner. Named unresolved
++// domains remain explicit until their real producers are qualified.
++enum class GroupStorageKind : unsigned { unknown, empty, ring, mpi, jaccl, nccl };
++enum GroupStorageUnresolved : unsigned {
++  group_shared_control = 1u << 0,
++  group_associative_storage = 1u << 1,
++  group_worker_runtime = 1u << 2,
++  group_submission_storage = 1u << 3,
++  group_backend_private = 1u << 4,
++  group_inherited_owner = 1u << 5,
++  group_unknown_implementation = 1u << 6,
++};
++struct GroupStorageInventory {
++  GroupStorageKind kind{GroupStorageKind::unknown};
++  unsigned unresolved{group_unknown_implementation | group_shared_control |
++                      group_backend_private | group_submission_storage};
++  size_t implementation_bytes{0};
++  size_t socket_handles{0}, socket_capacity_bytes{0}, buffer_bytes{0};
++  size_t pool_workers{0}, pool_worker_capacity_bytes{0};
++  size_t socket_workers{0}, socket_map_buckets{0};
+ };
+ 
+ /* Check if a communication backend is available */
+@@ -32,6 +56,10 @@
+   void mark_terminal_submission() const noexcept;
+   bool terminal_submission() const noexcept;
+   void ensure_submission_available() const;
++
++  // Read only, no rank/size query, initialization, lock, task, polling or error.
++  bool storage_inventory(GroupStorageInventory&) const noexcept;
++  bool same_implementation(const Group&) const noexcept;
+ 
+   int rank() const;
+   int size() const;
+diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
+--- a/mlx/distributed/distributed_impl.h
++++ b/mlx/distributed/distributed_impl.h
+@@ -25,6 +25,10 @@
+ 
+  public:
+   virtual ~GroupImpl() {}
++
++  virtual void storage_inventory(GroupStorageInventory& out) const noexcept {
++    out = GroupStorageInventory{};
++  }
+ 
+   // Choose the stream this communication group can operate on
+   virtual Stream communication_stream(StreamOrDevice s = {}) = 0;
+diff --git a/mlx/distributed/jaccl/jaccl.cpp b/mlx/distributed/jaccl/jaccl.cpp
+--- a/mlx/distributed/jaccl/jaccl.cpp
++++ b/mlx/distributed/jaccl/jaccl.cpp
+@@ -60,6 +60,13 @@
+  */
+ class JACCLGroup : public GroupImpl {
+  public:
++  void storage_inventory(GroupStorageInventory& out) const noexcept override {
++    out = GroupStorageInventory{};
++    out.kind = GroupStorageKind::jaccl;
++    out.implementation_bytes = sizeof(JACCLGroup);
++    out.unresolved = group_shared_control | group_backend_private |
++        group_submission_storage;
++  }
+   JACCLGroup(std::shared_ptr<::jaccl::Group> group)
+       : group_(std::move(group)) {}
+ 
+diff --git a/mlx/distributed/mpi/mpi.cpp b/mlx/distributed/mpi/mpi.cpp
+--- a/mlx/distributed/mpi/mpi.cpp
++++ b/mlx/distributed/mpi/mpi.cpp
+@@ -362,6 +362,13 @@
+ 
+ class MPIGroup : public GroupImpl {
+  public:
++  void storage_inventory(GroupStorageInventory& out) const noexcept override {
++    out = GroupStorageInventory{};
++    out.kind = GroupStorageKind::mpi;
++    out.implementation_bytes = sizeof(MPIGroup);
++    out.unresolved = group_shared_control | group_backend_private |
++        group_submission_storage;
++  }
+   MPIGroup(MPI_Comm comm, bool global)
+       : comm_(comm), global_(global), rank_(-1), size_(-1) {}
+ 
+diff --git a/mlx/distributed/nccl/nccl.cpp b/mlx/distributed/nccl/nccl.cpp
+--- a/mlx/distributed/nccl/nccl.cpp
++++ b/mlx/distributed/nccl/nccl.cpp
+@@ -318,6 +318,13 @@
+ using GroupImpl = mlx::core::distributed::detail::GroupImpl;
+ class NCCLGroup : public GroupImpl {
+  public:
++  void storage_inventory(GroupStorageInventory& out) const noexcept override {
++    out = GroupStorageInventory{};
++    out.kind = GroupStorageKind::nccl;
++    out.implementation_bytes = sizeof(NCCLGroup);
++    out.unresolved = group_shared_control | group_backend_private |
++        group_submission_storage;
++  }
+   NCCLGroup(int worldRank, int worldSize, const std::string initMethod)
+       : rank_(worldRank), size_(worldSize), initMethod_(initMethod) {
+     if (initialized_)
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -279,6 +279,8 @@
+ 
+ class CommunicationThreads {
+  public:
++  size_t retained_worker_count() const noexcept { return threads_.size(); }
++  size_t retained_bucket_count() const noexcept { return threads_.bucket_count(); }
+   void add(const std::vector<int>& sockets) {
+     for (int sock : sockets) {
+       threads_.emplace(sock, sock);
+@@ -383,6 +385,29 @@
+ 
+ class RingGroup : public GroupImpl {
+  public:
++  void storage_inventory(GroupStorageInventory& out) const noexcept override {
++    // These owners are never resized after construction. Workers mutate only
++    // their task queues, which this query deliberately does not inspect.
++    out = GroupStorageInventory{};
++    out.kind = GroupStorageKind::ring;
++    out.implementation_bytes = sizeof(RingGroup);
++    if (sockets_left_.capacity() > std::numeric_limits<size_t>::max() / sizeof(int) -
++            sockets_right_.capacity()) {
++      out.unresolved |= group_unknown_implementation;
++      return;
++    }
++    out.socket_handles = sockets_left_.size() + sockets_right_.size();
++    out.socket_capacity_bytes =
++        (sockets_left_.capacity() + sockets_right_.capacity()) * sizeof(int);
++    out.buffer_bytes = buffers_.capacity() * sizeof(char);
++    out.pool_workers = pool_.retained_worker_count();
++    out.pool_worker_capacity_bytes =
++        pool_.retained_worker_capacity() * sizeof(std::thread);
++    out.socket_workers = comm_.retained_worker_count();
++    out.socket_map_buckets = comm_.retained_bucket_count();
++    out.unresolved = group_shared_control | group_associative_storage |
++        group_worker_runtime | group_submission_storage | group_backend_private;
++  }
+   RingGroup(
+       int rank,
+       std::vector<std::vector<detail::address_t>> nodes,
+diff --git a/mlx/threadpool.h b/mlx/threadpool.h
+--- a/mlx/threadpool.h
++++ b/mlx/threadpool.h
+@@ -39,6 +39,9 @@
+   auto enqueue(F&& f, Args&&... args)
+       -> std::future<typename std::invoke_result_t<F, Args...>>;
+   void resize(size_t);
++  // Read only while the owner excludes resize/destruction; no task-queue read.
++  size_t retained_worker_count() const noexcept { return workers.size(); }
++  size_t retained_worker_capacity() const noexcept { return workers.capacity(); }
+   ~ThreadPool();
+ 
+  private:

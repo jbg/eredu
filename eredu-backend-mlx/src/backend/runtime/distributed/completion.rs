@@ -25,6 +25,8 @@ use crate::backend::{
 #[derive(Debug)]
 struct NativeResources {
     event: RefCell<Option<Rc<Event>>>,
+    original_event: RefCell<Option<Rc<safemlx::OperationEvent>>>,
+    housekeeping: RefCell<Option<safemlx::RegisteredThreadRuntimeHousekeeping>>,
     arrays: Vec<Array>,
     _count_buffers: Vec<Vec<usize>>,
     groups: Vec<Group>,
@@ -36,7 +38,34 @@ struct NativeResources {
     child_failed: Cell<bool>,
 }
 
-impl Retention for NativeResources {
+/// Each strong native alias retains only account/source custody after its Rc.
+/// This releases the actual Rc allocation before the final funding alias.
+#[derive(Debug)]
+struct NativeOwner {
+    resources: Option<Rc<NativeResources>>,
+    custody: Option<prepared::ResourceCustody>,
+}
+impl Clone for NativeOwner {
+    fn clone(&self) -> Self { Self { resources: self.resources.clone(), custody: self.custody.clone() } }
+}
+impl std::ops::Deref for NativeOwner {
+    type Target = NativeResources;
+    fn deref(&self) -> &Self::Target { self.resources.as_deref().expect("native resource owner") }
+}
+impl Drop for NativeOwner {
+    fn drop(&mut self) {
+        drop(self.resources.take());
+        // Retire dead weak shells while this alias still retains funding. A
+        // reentrant list loan merely defers this pruning to its next use.
+        let _ = NATIVE_RESOURCE_OWNERS.try_with(|owners| {
+            if let Ok(mut owners) = owners.try_borrow_mut() {
+                owners.retain(|owner| owner.strong_count() != 0);
+            }
+        });
+    }
+}
+
+impl Retention for NativeOwner {
     fn observe(&self, status: Status) {
         self.status.set(status);
     }
@@ -49,9 +78,20 @@ impl NativeResources {
         groups: Vec<Group>,
         routes: Vec<CommunicationRouteRealization>,
         streams: Vec<Stream>,
-    ) -> Rc<Self> {
+    ) -> NativeOwner {
+        Self::from_owned(arrays, count_buffers, groups, routes, streams, None, None)
+    }
+
+    fn from_owned(
+        arrays: Vec<Array>, count_buffers: Vec<Vec<usize>>, groups: Vec<Group>,
+        routes: Vec<CommunicationRouteRealization>, streams: Vec<Stream>,
+        custody: Option<prepared::ResourceCustody>,
+        destination: Option<destinations::Destination<std::rc::Weak<NativeResources>>>,
+    ) -> NativeOwner {
         let resources = Rc::new(Self {
             event: RefCell::new(None),
+            original_event: RefCell::new(None),
+            housekeeping: RefCell::new(None),
             arrays,
             _count_buffers: count_buffers,
             groups,
@@ -66,15 +106,19 @@ impl NativeResources {
             children: Cell::new(0),
             child_failed: Cell::new(false),
         });
-        if !resources.groups.is_empty() {
+        if !resources.groups.is_empty() || destination.is_some() {
             // Reserve registration before submission, not on the failure path.
             NATIVE_RESOURCE_OWNERS.with(|owners| {
                 let mut owners = owners.borrow_mut();
                 owners.retain(|owner| owner.strong_count() != 0);
-                owners.push(Rc::downgrade(&resources));
+                let weak = Rc::downgrade(&resources);
+                match destination {
+                    Some(destination) => owners.push_prepared(weak, destination),
+                    None => owners.push(weak),
+                }
             });
         }
-        resources
+        NativeOwner { resources: Some(resources), custody }
     }
 
     fn unavailable(&self) -> bool {
@@ -89,9 +133,9 @@ impl NativeResources {
 
 /// A child observation must not replace the original submission's status.
 struct NativeChildResources {
-    owner: Rc<NativeResources>,
     _arrays: Vec<Array>,
     _stream: Option<Stream>,
+    owner: NativeOwner,
 }
 
 impl Retention for NativeChildResources {
@@ -121,7 +165,7 @@ impl Drop for ChildUnwind<'_> {
 }
 
 fn observe_native_child<T>(
-    owner: &Rc<NativeResources>,
+    owner: &NativeOwner,
     arrays: Vec<Array>,
     stream: Option<Stream>,
     operation: impl FnOnce() -> safemlx::error::Result<T>,
@@ -134,7 +178,7 @@ fn observe_native_child<T>(
             .expect("native child ticket overflow"),
     );
     let mut recovery = Recovery::begin(NativeChildResources {
-        owner: Rc::clone(owner),
+        owner: owner.clone(),
         _arrays: arrays,
         _stream: stream,
     })?;
@@ -153,37 +197,53 @@ fn observe_native_child<T>(
     Ok((result?, status.settled))
 }
 
-fn native_resources_releasable<P: Probe>(recovery: &Recovery<Rc<NativeResources>, P>) -> bool {
+fn native_resources_releasable(recovery: &impl original::CompletionState) -> bool {
     safemlx::try_with_submission_retirement(|| {
         crate::backend::submission_recovery::reap();
-        recovery.progress().settled && recovery.retention().children.get() == 0
+        recovery.completion_status().is_ok_and(|status| status.settled) && recovery.resources().children.get() == 0
     })
     .unwrap_or(false)
 }
 
-fn check_native_status<P: Probe>(
-    recovery: &Recovery<Rc<NativeResources>, P>,
+fn check_native_status(
+    recovery: &impl original::CompletionState,
 ) -> safemlx::error::Result<bool> {
     crate::backend::submission_recovery::reap();
-    let status = recovery.progress();
-    let resources = recovery.retention();
+    let status = recovery.completion_status()?;
+    let resources = recovery.resources();
     if status.failed
         || status.blocked
         || resources.host_failed.get()
         || resources.child_failed.get()
     {
-        return Err(safemlx::error::Exception::custom(
-            "native communication failed; unresolved resources remain retained",
-        ));
+        return Err(match recovery.observer() {
+            Some(observer) => observer.retained_failure().unwrap_or_else(|| observer.invalid_input_error()),
+            None => safemlx::error::Exception::custom("native communication failed; unresolved resources remain retained"),
+        });
     }
-    Ok(status.settled && resources.children.get() == 0)
+    // An inline original event can complete before its enclosing model role.
+    // This permits querying that exact event, never releasing the role payload.
+    Ok(recovery.observer().is_some() || (status.settled && resources.children.get() == 0))
 }
 
 mod communication;
+mod original;
+mod consumers;
+mod scalar;
+mod readouts;
+use readouts::{BoundaryHeaders, WordsResult};
+pub(crate) use readouts::{PreparedCommunicationWords, PreparedCommunicationHeader, OriginalCommunicationWords, CompletedCommunicationWords,
+    PreparedCommunicationU32Words,OriginalCommunicationU32Words,CompletedCommunicationU32Words};
+pub(crate) use scalar::{PreparedCommunicationScalar, OriginalCommunicationBool};
+use scalar::BoolResult;
+use original::{CompletionRecovery, NativeEvent};
+pub(crate) use original::OriginalCommunicationCompletion;
+mod destinations;
+pub(crate) mod prepared;
 mod generic;
 
 thread_local! {
-    static NATIVE_RESOURCE_OWNERS: RefCell<Vec<std::rc::Weak<NativeResources>>> = const { RefCell::new(Vec::new()) };
+    static NATIVE_RESOURCE_OWNERS: RefCell<destinations::Destinations<std::rc::Weak<NativeResources>>> = const { RefCell::new(destinations::Destinations::new()) };
     static DISTRIBUTED_COMPLETION_ORPHANS: RefCell<generic::DistributedCompletionOrphanQuarantine> =
         RefCell::new(generic::DistributedCompletionOrphanQuarantine::default());
     static COMMUNICATION_ORPHANS: RefCell<communication::CommunicationOrphanQuarantine> =
@@ -192,13 +252,15 @@ thread_local! {
     static FORCE_NEXT_COMMUNICATION_PENDING: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(crate) use communication::ensure_group_available;
+pub(crate) use communication::{ensure_group_available, group_source_available, group_source_controls};
 #[cfg(test)]
 pub(crate) use communication::{
     distributed_completion_orphan_count, force_next_communication_pending,
     release_forced_pending_orphans,
 };
 pub use communication::{synchronize_outputs, MlxCommunicationCompletion, MlxFailureAgreement};
+mod neural;
+pub use neural::MlxNeuralCommunicationCompletion;
 pub use generic::DistributedCompletion;
 
 #[cfg(test)]
@@ -224,18 +286,18 @@ mod child_scope_tests {
         }
     }
 
-    fn owner() -> Rc<NativeResources> {
+    fn owner() -> NativeOwner {
         NativeResources::new(Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
     }
 
     fn child(
-        owner: &Rc<NativeResources>,
+        owner: &NativeOwner,
         probe: Rc<Cell<Status>>,
     ) -> Recovery<NativeChildResources, FakeProbe> {
         owner.children.set(owner.children.get() + 1);
         Recovery::with_probe(
             NativeChildResources {
-                owner: Rc::clone(owner),
+                owner: owner.clone(),
                 _arrays: Vec::new(),
                 _stream: None,
             },
@@ -247,7 +309,7 @@ mod child_scope_tests {
     fn child_scope_cannot_hide_pending_parent_or_sibling() {
         let owner = owner();
         let parent_state = Rc::new(Cell::new(state(false, false)));
-        let parent = Recovery::with_probe(Rc::clone(&owner), FakeProbe(Rc::clone(&parent_state)));
+        let parent = Recovery::with_probe(owner.clone(), FakeProbe(Rc::clone(&parent_state)));
         let first = child(&owner, Rc::new(Cell::new(state(true, false))));
         let pending = Rc::new(Cell::new(state(false, false)));
         let second = child(&owner, Rc::clone(&pending));
@@ -267,7 +329,7 @@ mod child_scope_tests {
     fn later_healthy_parent_observation_cannot_clear_child_failure() {
         let owner = owner();
         let parent = Recovery::with_probe(
-            Rc::clone(&owner),
+            owner.clone(),
             FakeProbe(Rc::new(Cell::new(state(true, false)))),
         );
         let failed = Rc::new(Cell::new(state(false, true)));

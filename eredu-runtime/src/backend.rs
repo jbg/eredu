@@ -15,8 +15,9 @@ pub trait SubmissionBackend: NeuralBackend {
     type Executor: ?Sized;
     /// Owned executor used for an independently schedulable graph lane.
     type OwnedExecutor: std::borrow::Borrow<Self::Executor>;
-    /// Exact completion object for one submission.
-    type Completion: Completion;
+    /// Owned exact completion for one submission. It may outlive the borrowed
+    /// executor, inputs and policy call; those lifetimes cannot hide resources.
+    type Completion: Completion + 'static;
 
     /// Creates independently schedulable executors on the same backend device.
     fn fork_executors(
@@ -175,6 +176,66 @@ pub trait CommunicationBackend: SubmissionBackend {
     /// Stable mechanism failure with no architecture-family policy.
     type CommunicationError: std::error::Error + Send + Sync + 'static;
 
+    /// Borrows control funding attached to the exact current execution context.
+    /// None selects ordinary execution. A backend with an original context must
+    /// report invalid/missing request ownership as an error instead of None.
+    /// The callback permits a weak source to be held for this complete loan.
+    fn with_parallel_control_context<T, E, F>(
+        context: &Self::ParallelContext, run: F,
+    ) -> Result<Result<T, E>, Self::CommunicationError>
+    where F: FnOnce(Option<(&Self::ParallelContext,
+        &eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+    {
+        let _ = context;
+        Ok(run(None))
+    }
+
+    /// Lends a source-bound group for one actual shared lifecycle event.
+    /// The prepared context and funding belong to the enclosing request, which
+    /// may precede a numerical forward. None explicitly means unavailable;
+    /// callers with a prepared context must refuse rather than submit ordinary
+    /// communication. A provided group and its resources outlive native completion.
+    fn with_prepared_control_group<T, E, F>(
+        event: crate::replicated_session::ParallelControlEvent,
+        group: &Self::CommunicationGroup, prepared: &Self::ParallelContext,
+        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+        executor: &Self::Executor, run: F,
+    ) -> Result<Result<T, E>, Self::CommunicationError>
+    where F: FnOnce(Option<&Self::CommunicationGroup>) -> Result<T, E>,
+    {
+        let _ = (event, group, prepared, funding, executor);
+        Ok(run(None))
+    }
+
+    /// Retains the selected route declaration and paid destination account from
+    /// an explicit execution/control context. This descriptive loan grants no
+    /// native transport authority. None preserves the ordinary default; original
+    /// contexts must return a retained failure when their source is unavailable.
+    fn prepare_boundary_source(context:&Self::ParallelContext,route:&Self::CommunicationRoute)
+        ->Result<Option<crate::PreparedBoundarySource>,eredu_core::BackendFailure>{
+        let _=(context,route);Ok(None)
+    }
+
+    /// Authenticates an exact quoted publication group against the selected
+    /// stored resource. None keeps missing prepared support explicit.
+    fn with_prepared_publication_group<T,E,F>(group:&Self::CommunicationGroup,
+        prepared:&Self::ParallelContext,funding:&eredu_nn::workspace::WorkspaceMetadataFunding,
+        executor:&Self::Executor,run:F)->Result<Result<T,E>,Self::CommunicationError>
+    where F:FnOnce(Option<&Self::CommunicationGroup>)->Result<T,E> {
+        let _=(group,prepared,funding,executor);Ok(run(None))
+    }
+
+    /// Completes exactly the selected boundary's model dependencies through
+    /// their existing original scope. None is a missing producer, never a
+    /// request to evaluate the same values through the ordinary constructor.
+    fn submit_prepared_boundary_dependencies(
+        values:&[crate::ArchitectureBoundaryValue<Self::Tensor>],
+        source:&crate::PreparedBoundarySource,route:&Self::CommunicationRoute,
+        context:&Self::ParallelContext,executor:&Self::Executor,
+    )->Result<Option<Submission<(),Self::CommunicationCompletion>>,Self::CommunicationError>{
+        let _=(values,source,route,context,executor);Ok(None)
+    }
+
     /// Submits evaluation of rank-local tensor dependencies before a
     /// communication-readiness agreement.
     ///
@@ -182,6 +243,137 @@ pub trait CommunicationBackend: SubmissionBackend {
     /// tensor and native execution resource through exact completion or safe
     /// cancellation teardown. This operation does not select or infer a
     /// collective group.
+    /// Complete exact local roots through a retained model context when that
+    /// context owns their submission. Some means successful native completion;
+    /// None leaves the unchanged ordinary submission path to the caller.
+    /// A present but invalid retained context must return an error.
+    fn complete_model_dependencies(
+        values: &[&Self::Tensor], context: &Self::ParallelContext,
+        executor: &Self::Executor,
+    ) -> Result<Option<()>, Self::CommunicationError> {
+        let _ = (values, context, executor);
+        Ok(None)
+    }
+
+    /// Executes one architecture-declared dynamic expert region. Cold backends
+    /// retain the finite source and symbolic output; native backends bind the
+    /// actual completed IDs/counts and lend a separately admitted child graph.
+    /// The default preserves the ordinary route body and selects no new work.
+    fn with_expert_route_region<P, E, F>(
+        source: eredu_nn::workspace::WorkspaceExpertRegionView<'_>,
+        bank: &mut P, input: &Self::Tensor,
+        routes: &eredu_nn::GroupSelection<Self::Tensor>,
+        context: Option<&Self::ParallelContext>, executor: &Self::Executor, run: F,
+    ) -> Result<Result<crate::RoutedExpertTensorParallelOutput<Self::Tensor>, E>, Self::CommunicationError>
+    where P: eredu_nn::Parameterized<Self::Tensor>,
+        F: FnOnce(&mut P, Option<crate::PreparedExpertMovementLoan<'_>>) -> Result<crate::RoutedExpertTensorParallelOutput<Self::Tensor>, E>,
+    {
+        let _ = (source, input, routes, context, executor);
+        Ok(run(bank, None))
+    }
+
+    /// Carries the actual routed observer through the same region boundary.
+    /// A cold realization records its prospective source; a native realization
+    /// lends this observer to the ordinary route body and its real callbacks.
+    /// Describing a source never supplies received rows or completed evidence.
+    fn with_observed_expert_route_region<'observer, P, E, F>(
+        source: eredu_nn::workspace::WorkspaceExpertRegionView<'_>,
+        bank: &mut P, input: &Self::Tensor,
+        routes: &eredu_nn::GroupSelection<Self::Tensor>,
+        context: Option<&Self::ParallelContext>, executor: &Self::Executor,
+        observer: Option<&'observer mut dyn crate::RoutedUnitObserver<Self::Tensor>>,
+        run: F,
+    ) -> Result<Result<crate::RoutedExpertTensorParallelOutput<Self::Tensor>, E>, Self::CommunicationError>
+    where P: eredu_nn::Parameterized<Self::Tensor>,
+        F: FnOnce(&mut P, Option<crate::PreparedExpertMovementLoan<'_>>,
+            Option<&'observer mut dyn crate::RoutedUnitObserver<Self::Tensor>>)
+            -> Result<crate::RoutedExpertTensorParallelOutput<Self::Tensor>, E>,
+    {
+        Self::with_expert_route_region(source, bank, input, routes, context, executor,
+            observed_expert_region_body(run, observer))
+    }
+
+    /// Lends one retained control-only inactive provider occurrence. Cold
+    /// backends record the declared votes; ordinary backends run this same body.
+    fn with_expert_provider_wave<E,F>(source:eredu_nn::workspace::WorkspaceExpertProviderWave,
+        context:Option<&Self::ParallelContext>,executor:&Self::Executor,run:F)
+        ->Result<Result<(),E>,Self::CommunicationError>
+    where F:FnOnce()->Result<(),E>{
+        let _=(source,context,executor);Ok(run())
+    }
+
+    /// Runs the existing zero-work count/dispatch/return itinerary through one
+    /// exact retained wave occurrence. Cold recording grants no actual counts.
+    fn with_expert_inactive_wave<E,F>(source:Option<eredu_nn::workspace::WorkspaceExpertInactiveWave>,
+        context:Option<&Self::ParallelContext>,executor:&Self::Executor,run:F)
+        ->Result<Result<(),E>,Self::CommunicationError>
+    where F:FnOnce()->Result<(),E>{let _=(source,context,executor);Ok(run())}
+
+    /// Copies an actual validated integer row source through the selected
+    /// original input producer. None preserves ordinary construction. A backend
+    /// with an original context must retain the source or return an error.
+    fn prepare_expert_route_input(values: &[i32], source: &eredu_core::ErasedSharedStorageOwner,
+        context: &Self::ParallelContext, executor: &Self::Executor) -> Result<Option<Self::Tensor>, Self::CommunicationError> {
+        let _ = (values, source, context, executor); Ok(None)
+    }
+
+    /// The selected local grouped worker runs after completed count/ID binding.
+    /// The same typed output returns to the ordinary forward/reverse driver.
+    fn with_expert_route_local<P, E, F>(
+        source: eredu_nn::workspace::WorkspaceExpertRegionView<'_>, bank: &mut P,
+        input: &Self::Tensor, scores: &Self::Tensor, coefficients: &Self::Tensor,
+        completed: &eredu_core::ErasedSharedStorageOwner,
+        local_expert_rows: &[usize], context: &Self::ParallelContext,
+        executor: &Self::Executor, run: F,
+    ) -> Result<Result<crate::RoutedExpertTensorParallelOutput<Self::Tensor>, E>, Self::CommunicationError>
+    where P: eredu_nn::Parameterized<Self::Tensor>,
+        F: FnOnce(&mut P) -> Result<crate::RoutedExpertTensorParallelOutput<Self::Tensor>, E>,
+    {
+        let _ = (source, input, scores, coefficients, completed, local_expert_rows, context, executor);
+        Ok(run(bank))
+    }
+
+    /// Completes and lends the ordinary I32 readout of a selected route source under the exact
+    /// current model invocation. The callback cannot retain the borrowed slice;
+    /// any derived host destination retains the supplied cumulative account.
+    /// None selects ordinary readout. An invalid original context must fail.
+    fn with_prepared_expert_route_indices<T, E, F>(
+        value: &Self::Tensor, context: &Self::ParallelContext,
+        executor: &Self::Executor, run: F,
+    ) -> Result<Result<T, E>, Self::CommunicationError>
+    where F: for<'loan> FnOnce(Option<(&'loan [i32],
+        &'loan eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+    {
+        let _ = (value, context, executor);
+        Ok(run(None))
+    }
+
+    /// Source-bound integer peer-row consensus. The completed rank-major
+    /// matrix is borrowed only during the callback; derived destinations retain
+    /// the supplied account. None preserves the ordinary collective driver.
+    fn with_prepared_peer_count_consensus<T, E, F>(
+        local: &[i32], group: &Self::CommunicationGroup,
+        context: &Self::ParallelContext, executor: &Self::Executor, run: F,
+    ) -> Result<Result<T, E>, Self::CommunicationError>
+    where F: for<'loan> FnOnce(Option<(&'loan [i32],
+        &'loan eredu_nn::workspace::WorkspaceMetadataFunding)>) -> Result<T, E>,
+    {
+        let _ = (local, group, context, executor);
+        Ok(run(None))
+    }
+
+    /// Companion carrying a closed completed source through the same consensus.
+    /// Existing backends keep their established consensus and provide no owner.
+    fn with_prepared_peer_count_source<T, E, F>(
+        local: &[i32], group: &Self::CommunicationGroup,
+        context: &Self::ParallelContext, executor: &Self::Executor, run: F,
+    ) -> Result<Result<T, E>, Self::CommunicationError>
+    where F: for<'loan> FnOnce(Option<crate::PreparedPeerCountLoan<'loan>>) -> Result<T, E> {
+        Self::with_prepared_peer_count_consensus(local, group, context, executor, |loan| {
+            run(loan.map(|(matrix, funding)| crate::PreparedPeerCountLoan::new(matrix, funding, None)))
+        })
+    }
+
     fn submit_local_dependencies<'a, I>(
         values: I,
         executor: &Self::Executor,
@@ -193,6 +385,17 @@ pub trait CommunicationBackend: SubmissionBackend {
 
 /// Sum reduction on an opaque communication group.
 pub trait SumReductionBackend: CommunicationBackend {
+    /// Execute and complete a sum using the exact retained model occurrence.
+    /// The borrowed input permits ordinary fallback without copying when None.
+    /// Some must retain authority until successful completion; an invalid
+    /// retained context is an error and never ordinary fallback.
+    fn complete_model_sum(
+        value: &Self::Tensor, group: &Self::CommunicationGroup,
+        context: &Self::ParallelContext, executor: &Self::Executor,
+    ) -> Result<Option<Self::Tensor>, Self::CommunicationError> {
+        let _ = (value, group, context, executor);
+        Ok(None)
+    }
     /// Submits one elementwise sum and returns its exact completion.
     fn all_reduce_sum(
         value: Self::Tensor,
@@ -214,6 +417,16 @@ pub trait EvenGatherBackend: CommunicationBackend {
 
 /// Unequal-size gathering on an opaque communication group.
 pub trait UnevenGatherBackend: CommunicationBackend {
+    /// Complete a gather through its retained model occurrence, with the same
+    /// completion and ordinary-fallback contract as complete_model_sum.
+    fn complete_model_gather(
+        value: &Self::Tensor, counts: &[usize], axis: usize,
+        group: &Self::CommunicationGroup, context: &Self::ParallelContext,
+        executor: &Self::Executor,
+    ) -> Result<Option<Self::Tensor>, Self::CommunicationError> {
+        let _ = (value, counts, axis, group, context, executor);
+        Ok(None)
+    }
     /// Gathers values and concatenates in member order using exact element counts.
     fn all_gather_uneven(
         value: Self::Tensor,
@@ -226,6 +439,20 @@ pub trait UnevenGatherBackend: CommunicationBackend {
 
 /// Variable-count exchange on an opaque communication group.
 pub trait VariableAllToAllBackend: CommunicationBackend {
+    /// Completes one variable exchange from its exact completed count matrix.
+    /// The retained context authenticates native source/stream/owner identity;
+    /// matrix geometry alone grants no submission authority. The implementation
+    /// retains accepted inputs, matrix storage and resources until completion or
+    /// safe failure. None means missing source and must never select ordinary
+    /// execution when called with an original context.
+    fn complete_prepared_variable_all_to_all(
+        value: &Self::Tensor, counts: &CommunicationPeerCounts, axis: usize,
+        matrix: &crate::CommunicationPeerMatrix<'_>, group: &Self::CommunicationGroup,
+        context: &Self::ParallelContext, executor: &Self::Executor,
+        funding: &eredu_nn::workspace::WorkspaceMetadataFunding,
+    ) -> Result<Option<Self::Tensor>, Self::CommunicationError> {
+        let _=(value,counts,axis,matrix,group,context,executor,funding); Ok(None)
+    }
     /// Exchanges exact per-peer partitions on `axis` and returns exact completion.
     fn variable_all_to_all(
         value: Self::Tensor,
@@ -251,6 +478,15 @@ pub trait PointToPointBackend: CommunicationBackend {
         Submission<Vec<Self::Tensor>, Self::CommunicationCompletion>,
         Self::CommunicationError,
     >;
+
+    /// Same selected transfer with canonical headers and their exact paid
+    /// source. None is a typed missing producer, never an ordinary fallback.
+    fn send_receive_prepared(values:crate::PreparedBoundaryFrames<Self::Tensor>,
+        route:&Self::CommunicationRoute,context:&Self::ParallelContext,executor:&Self::Executor)
+        ->Result<Option<Submission<Vec<Self::Tensor>,Self::CommunicationCompletion>>,Self::CommunicationError>{
+        let _=(values,route,context,executor);Ok(None)
+    }
+
 }
 
 /// One logical boundary tensor coupled to the exact in-band header that must
@@ -327,8 +563,41 @@ pub trait FailureAgreementBackend: CommunicationBackend {
         Self::CommunicationError,
     >;
 
+    /// Optional exact source-owned vote. A returned boolean is already terminal
+    /// under the selected communication authority; this creates no detached
+    /// completion or substitute group. Defaults preserve ordinary submission.
+    fn agree_success_from_source(
+        _local_success: bool, _group: &Self::CommunicationGroup,
+        _phase: crate::DistributedExecutionPhase, _executor: &Self::Executor,
+        _source: &Self::ParallelContext,
+    ) -> Result<Option<bool>, Self::CommunicationError> { Ok(None) }
+
     /// Resolves the completed backend result without starting new native work.
     fn resolve_failure_agreement(
         output: Self::FailureAgreementOutput,
     ) -> Result<bool, Self::CommunicationError>;
+}
+
+/// Canonical terminal rejection for already-realized communication resources.
+/// Marking must be infallible, allocation-free and nonblocking, and submit,
+/// evaluate, poll or retire no work. All aliases of that native incarnation,
+/// including newly wrapped cached handles, must reject later submissions.
+/// Existing accepted work retains its owners: this proves no completion.
+pub trait TerminalCommunicationBackend: CommunicationBackend {
+    /// Irreversibly prevents new submissions on the retained incarnation.
+    fn mark_terminal_submission(group: &Self::CommunicationGroup);
+}
+
+/// The same forwarding closure is constructed by native dispatch and inspected
+/// by its cold source. Its captured observer option changes no storage layout.
+pub(crate) fn observed_expert_region_body<'observer, T: eredu_nn::Tensor, P, E, F>(
+    run: F, observer: Option<&'observer mut dyn crate::RoutedUnitObserver<T>>,
+) -> impl FnOnce(&mut P, Option<crate::PreparedExpertMovementLoan<'_>>)
+    -> Result<crate::RoutedExpertTensorParallelOutput<T>, E>
+    + use<'observer, T, P, E, F>
+where F: FnOnce(&mut P, Option<crate::PreparedExpertMovementLoan<'_>>,
+    Option<&'observer mut dyn crate::RoutedUnitObserver<T>>)
+    -> Result<crate::RoutedExpertTensorParallelOutput<T>, E>,
+{
+    move |bank, movement| run(bank, movement, observer)
 }

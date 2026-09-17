@@ -1,0 +1,159 @@
+[package]
+name = "jsonschema"
+version = "0.52.0"
+description = "JSON schema validaton library"
+keywords = ["jsonschema", "validation"]
+categories = ["web-programming"]
+readme = "../../README.md"
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+authors.workspace = true
+
+[features]
+# Conformance checks for custom JSON representations (`json` module).
+conformance = ["jsonschema-value/conformance"]
+default = ["resolve-http", "resolve-file", "tls-aws-lc-rs", "idna"]
+resolve-http = ["reqwest", "dep:rustls"]
+resolve-file = []
+resolve-async = [
+    "referencing/retrieve-async",
+    "reqwest",
+    "dep:async-trait",
+    "dep:tokio",
+]
+# `idn-hostname` and `idn-email` format validation.
+idna = ["dep:idna"]
+# Default TLS provider for HTTP resolution.
+tls-aws-lc-rs = ["rustls/aws-lc-rs"]
+# Use ring instead of aws-lc-rs for TLS.
+tls-ring = ["rustls/ring"]
+# Support for arbitrarily large integers and exact decimal values when parsing JSON from strings.
+arbitrary-precision = ["serde_json/arbitrary_precision", "dep:num-bigint", "jsonschema-macros?/arbitrary-precision", "jsonschema-value/arbitrary-precision"]
+# The `#[jsonschema::validator]` compile-time validator macro.
+# `float-roundtrip` keeps the macro's schema parsing bit-identical to the runtime's.
+macros = ["dep:jsonschema-macros", "jsonschema-macros/float-roundtrip", "jsonschema-value/macros"]
+# The `json::Magnus` instance representation used by the Ruby bindings.
+magnus = ["jsonschema-value/magnus"]
+# The `json::Pyo3` instance representation used by the Python bindings.
+pyo3 = ["jsonschema-value/pyo3"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Use rustls-no-provider to allow manual selection of crypto backend
+reqwest = { version = "0.13", default-features = false, features = [
+  "blocking",
+  "json",
+  "http2",
+  "rustls-no-provider",
+], optional = true }
+# Crypto provider for TLS: aws-lc-rs by default, or ring when tls-ring feature is enabled
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
+
+# Mirror reqwest's wasm cfg; other wasm targets get native deps that don't build.
+[target.'cfg(all(target_arch = "wasm32", any(target_os = "unknown", target_os = "none")))'.dependencies]
+reqwest = { version = "0.13", features = ["json"], default-features = false, optional = true }
+
+[dependencies]
+ahash.workspace = true
+jsonschema-macros = { version = "0.52.0", path = "../jsonschema-macros", optional = true }
+jsonschema-regex = { version = "0.52.0", path = "../jsonschema-regex" }
+jsonschema-value = { version = "0.52.0", path = "../jsonschema-value" }
+async-trait = { version = "0.1.86", optional = true }
+bytecount = { version = "0.6", features = ["runtime-dispatch-simd"] }
+data-encoding = "2.9"
+email_address = "0.2.9"
+fancy-regex = "0.19"
+fraction = { version = "0.17", default-features = false, features = [
+  "with-bigint",
+] }
+idna = { version = "1.0.2", optional = true }
+itoa = "1"
+num-bigint = { version = "0.4", optional = true }
+num-cmp = "0.1"
+num-traits = "0.2.19"
+percent-encoding = "2.3"
+referencing = { version = "0.52.0", path = "../jsonschema-referencing" }
+regex = "1.11.1"
+serde.workspace = true
+# `float_roundtrip`: canonical JSON serialization round-trips floats through re-parses downstream.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+strum = { version = "0.28.0", features = ["derive"] }
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
+unicode-general-category = "1.1"
+uuid-simd = { version = "0.8", default-features = false, features = ["std", "detect"] }
+
+[dev-dependencies]
+test-case = "3"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+testsuite = { package = "jsonschema-testsuite", path = "../jsonschema-testsuite" }
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3.55"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+benchmark = { path = "../benchmark/" }
+hegeltest = { version = "0.31", features = ["serde_json"] }
+codspeed-criterion-compat = { version = "5.0", default-features = false }
+criterion = { version = "0.8", default-features = false }
+tempfile = "3.13.0"
+test-case = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+
+[package.metadata.docs.rs]
+all-features = true
+
+[lints]
+workspace = true
+
+[[test]]
+name = "codegen"
+required-features = ["macros"]
+
+[[test]]
+name = "suite"
+required-features = ["macros"]
+
+[[bench]]
+harness = false
+name = "jsonschema"
+required-features = ["macros"]
+
+[[bench]]
+harness = false
+name = "codegen"
+required-features = ["macros"]
+
+[[bench]]
+harness = false
+name = "keywords"
+
+[[bench]]
+harness = false
+name = "errors"
+
+[[bench]]
+harness = false
+name = "location"
+
+[[bench]]
+harness = false
+name = "unevaluated_properties"
+
+[[bench]]
+harness = false
+name = "unevaluated_items"
+
+[[bench]]
+harness = false
+name = "metaschema"
+required-features = ["macros"]
+
+[[bench]]
+harness = false
+name = "canonicalize"
+required-features = ["macros"]
+

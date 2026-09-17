@@ -1,0 +1,375 @@
+diff --git a/mlx/graph_quota.h b/mlx/graph_quota.h
+--- a/mlx/graph_quota.h
++++ b/mlx/graph_quota.h
+@@ -4,6 +4,7 @@
+ #include <cstddef>
+ #include <cstdint>
+ #include <exception>
++#include <functional>
+ #include <limits>
+ #include <memory>
+ #include <type_traits>
+@@ -243,4 +244,38 @@
+   return std::allocate_shared<T>(GraphAllocator<T>{}, std::forward<Args>(args)...);
+ }
+ 
++// A retained callback whose concrete object consumes the current Graph bank.
++// std::function stores only this shared pointer in its pinned small buffer.
++// The shared allocator and physical block keep the arena through the final
++// callable destructor; the callable never owns a Scope or its parent primitive.
++template<class F> struct GraphFunctionCapture {
++  std::shared_ptr<F> value;
++  template<class... Args> decltype(auto) operator()(Args&&... args) const {
++    return (*value)(std::forward<Args>(args)...);
++  }
++};
++template<class Signature, class F>
++size_t graph_function_control_bytes() noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L && !defined(_LIBCPP_ABI_OPTIMIZED_FUNCTION)
++  using Capture = GraphFunctionCapture<F>;
++  using Function = std::__function::__func<Capture, Signature>;
++  using Owner = std::__shared_ptr_emplace<F, GraphAllocator<F>>;
++  if constexpr (sizeof(Function) <= 3 * sizeof(void*) &&
++                std::is_nothrow_copy_constructible_v<Capture> &&
++                alignof(Owner) <= alignof(std::max_align_t)) return sizeof(Owner);
++#endif
++  return 0;
++}
++template<class Signature, class F>
++std::function<Signature> make_graph_function(F&& callable) {
++  using Value = std::remove_cvref_t<F>;
++  if (!current_graph_quota())
++    return std::function<Signature>(std::forward<F>(callable));
++  if (!graph_function_control_bytes<Signature, Value>())
++    throw GraphQuotaError(GraphFailure::invalid_layout);
++  auto owner = std::allocate_shared<Value>(GraphAllocator<Value>{},
++                                           std::forward<F>(callable));
++  return std::function<Signature>(GraphFunctionCapture<Value>{std::move(owner)});
++}
++
+ } // namespace mlx::core::submission
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -1,3 +1,4 @@
++#include "mlx/dequantize_fallback.h"
+ #include "mlx/backend/common/pipeline_cache.h"
+ #include "mlx/original_buffer.h"
+ #include "mlx/graph_quota.h"
+@@ -424,7 +425,9 @@
+   if (!add(primitives, seeds, descriptors)) return false;
+   GraphQuota::Request leaf[5]{}; size_t leaf_count = 0;
+   if (!PreparedInputLeaf::append_array_requests(0, leaf, leaf_count) || leaf_count != 3) return false;
+-  const size_t control = std::max({leaf[2].bytes,
++  const auto fallback_control = dequantize_fallback_control_bytes();
++  if (!fallback_control) return false;
++  const size_t control = std::max({leaf[2].bytes, fallback_control,
+       resident_primitive_control<AsType>(), resident_primitive_control<Broadcast>(),
+       resident_primitive_control<Add>(), resident_primitive_control<Subtract>(),
+       resident_primitive_control<Multiply>(), resident_primitive_control<Divide>(),
+@@ -450,6 +453,7 @@
+       resident_primitive_control<ArgReduce>(), resident_primitive_control<ArgPartition>(),
+       resident_primitive_control<Matmul>(), resident_primitive_control<AddMM>(),
+       resident_primitive_control<QuantizedMatmul>(),
++      resident_primitive_control<fast::Quantize>(),
+       resident_primitive_control<fast::CustomKernel>(),
+       resident_primitive_control<Sqrt>(), resident_primitive_control<Sigmoid>(),
+       resident_primitive_control<Negative>(),
+@@ -522,6 +526,7 @@
+   value.named_control_bytes = sizeof(value) + sizeof(leaf) + sizeof(leaf_count) +
+       sizeof(primitives) + sizeof(seeds) + sizeof(rank) + sizeof(descriptors) + sizeof(control) +
+       sizeof(maximum_operands) + sizeof(additional_shells) + sizeof(vector_elements) + sizeof(seed_routing) +
++      sizeof(fallback_control) + dequantize_fallback_frame_bytes() +
+       // Convolution's normalized caller axes, moved aggregate and constructor
+       // parameter are distinct inline frames. The retained five axes are already
+       // inside its actual primitive control, never another heap allowance.
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -14,6 +14,7 @@
+ #include "mlx/backend/metal/metal.h"
+ #include "mlx/fast_primitives.h"
+ #include "mlx/ops.h"
++#include "mlx/dequantize_fallback.h"
+ #include "mlx/primitives.h"
+ #include "mlx/transforms.h"
+ #include "mlx/transforms_impl.h"
+@@ -5277,6 +5278,45 @@
+   }
+ }
+ 
++ArrayVector AffineDequantizeFallback::operator()(const ArrayVector& inputs) {
++  auto w = inputs[0];
++  auto& scales = inputs[1];
++  auto& biases = inputs[2];
++  if (is_power_of_2(bits)) {
++    ArrayVector parts;
++    for (int start = 0; start < 32; start += bits) {
++      parts.push_back(expand_dims(
++          right_shift(
++              left_shift(w, array(32 - (start + bits), uint32), s),
++              array(32 - bits, uint32),
++              s),
++          -1,
++          s));
++    }
++    w = concatenate(parts, -1, s);
++  } else {
++    w = expand_dims(w, /* axis= */ -1, s);
++    w = bitwise_and(
++        right_shift(w, arange(32, uint32, s), s), array({1}, uint32), s);
++    auto new_shape = w.shape();
++    new_shape[new_shape.size() - 2] = -1;
++    new_shape.back() = bits;
++    w = reshape(w, new_shape, s);
++    array shifts = arange(bits, uint32, s);
++    w = sum(
++        left_shift(w, shifts, s), /* axis= */ -1, /* keepdims= */ false, s);
++  }
++
++  // Dequantize
++  wshape.push_back(group_size);
++  w = reshape(w, wshape, s);
++  w = multiply(w, expand_dims(scales, -1, s), s);
++  w = add(w, expand_dims(biases, -1, s), s);
++  w = reshape(w, sshape, s);
++
++  return {w};
++}
++
+ array affine_dequantize(
+     const array& w,
+     const array& scales,
+@@ -5314,49 +5354,8 @@
+ 
+   auto s = to_stream(s_);
+ 
+-  auto fallback =
+-      [wshape = std::move(wshape),
+-       sshape = std::move(sshape),
+-       group_size,
+-       bits,
+-       s](const ArrayVector& inputs) mutable -> ArrayVector {
+-    auto w = inputs[0];
+-    auto& scales = inputs[1];
+-    auto& biases = inputs[2];
+-    if (is_power_of_2(bits)) {
+-      ArrayVector parts;
+-      for (int start = 0; start < 32; start += bits) {
+-        parts.push_back(expand_dims(
+-            right_shift(
+-                left_shift(w, array(32 - (start + bits), uint32), s),
+-                array(32 - bits, uint32),
+-                s),
+-            -1,
+-            s));
+-      }
+-      w = concatenate(parts, -1, s);
+-    } else {
+-      w = expand_dims(w, /* axis= */ -1, s);
+-      w = bitwise_and(
+-          right_shift(w, arange(32, uint32, s), s), array({1}, uint32), s);
+-      auto new_shape = w.shape();
+-      new_shape[new_shape.size() - 2] = -1;
+-      new_shape.back() = bits;
+-      w = reshape(w, new_shape, s);
+-      array shifts = arange(bits, uint32, s);
+-      w = sum(
+-          left_shift(w, shifts, s), /* axis= */ -1, /* keepdims= */ false, s);
+-    }
+-
+-    // Dequantize
+-    wshape.push_back(group_size);
+-    w = reshape(w, wshape, s);
+-    w = multiply(w, expand_dims(scales, -1, s), s);
+-    w = add(w, expand_dims(biases, -1, s), s);
+-    w = reshape(w, sshape, s);
+-
+-    return {w};
+-  };
++  auto fallback = AffineDequantizeFallback{
++      std::move(wshape), std::move(sshape), group_size, bits, s};
+ 
+   if (s.device == Device::gpu) {
+     auto out_shape = w.shape();
+@@ -5365,10 +5364,63 @@
+         std::move(out_shape),
+         scales.dtype(),
+         submission::make_graph_primitive<fast::Quantize>(
+-            s, fallback, group_size, bits, QuantizationMode::Affine, true),
++            s,
++            submission::make_graph_function<ArrayVector(ArrayVector)>(
++                std::move(fallback)),
++            group_size,
++            bits,
++            QuantizationMode::Affine,
++            true),
+         {w, scales, biases});
+   }
+   return fallback({w, scales, biases})[0];
++}
++
++ArrayVector FloatingDequantizeFallback::operator()(const ArrayVector& inputs) {
++  auto out = inputs[0];
++  auto scales = inputs[1];
++  if (bits == 4) {
++    auto lut = array(
++        {
++            +0.0f,
++            +0.5f,
++            +1.0f,
++            +1.5f,
++            +2.0f,
++            +3.0f,
++            +4.0f,
++            +6.0f,
++            -0.0f,
++            -0.5f,
++            -1.0f,
++            -1.5f,
++            -2.0f,
++            -3.0f,
++            -4.0f,
++            -6.0f,
++        },
++        out_type);
++    out = view(reshape(out, {-1, 4}, s), int8, s);
++    auto idx_lo = bitwise_and(out, array(0x0F, int8), s);
++    auto idx_hi = right_shift(out, array(4, int8), s);
++    auto lo = gather(lut, idx_lo, 0, {1}, s);
++    auto hi = gather(lut, idx_hi, 0, {1}, s);
++    out = concatenate({lo, hi}, -1, s);
++  } else {
++    out = from_fp8(view(out, uint8, s), out_type, s);
++  }
++  out = reshape(out, {-1, group_size}, s);
++  scales = reshape(scales, {-1, 1}, s);
++  if (group_size == 16) {
++    array inv_scale_enc = inputs.size() > 2
++        ? divide(inputs[2], array(448.0f * 6.0f, out_type), s)
++        : array(1.0f, out_type);
++    scales = multiply(from_fp8(scales, out_type, s), inv_scale_enc, s);
++  } else {
++    scales = subtract(astype(scales, out_type, s), array(127, out_type), s);
++    scales = power(array(2.0f, out_type), scales, s);
++  }
++  return {reshape(multiply(out, scales, s), wshape, s)};
+ }
+ 
+ array fp_dequantize(
+@@ -5428,58 +5480,8 @@
+     inputs.push_back(global_scale.value());
+   }
+ 
+-  auto fallback =
+-      [wshape = std::move(wshape),
+-       sshape = std::move(sshape),
+-       group_size,
+-       bits,
+-       out_type,
+-       s](const ArrayVector& inputs) mutable -> ArrayVector {
+-    auto out = inputs[0];
+-    auto scales = inputs[1];
+-    if (bits == 4) {
+-      auto lut = array(
+-          {
+-              +0.0f,
+-              +0.5f,
+-              +1.0f,
+-              +1.5f,
+-              +2.0f,
+-              +3.0f,
+-              +4.0f,
+-              +6.0f,
+-              -0.0f,
+-              -0.5f,
+-              -1.0f,
+-              -1.5f,
+-              -2.0f,
+-              -3.0f,
+-              -4.0f,
+-              -6.0f,
+-          },
+-          out_type);
+-      out = view(reshape(out, {-1, 4}, s), int8, s);
+-      auto idx_lo = bitwise_and(out, array(0x0F, int8), s);
+-      auto idx_hi = right_shift(out, array(4, int8), s);
+-      auto lo = gather(lut, idx_lo, 0, {1}, s);
+-      auto hi = gather(lut, idx_hi, 0, {1}, s);
+-      out = concatenate({lo, hi}, -1, s);
+-    } else {
+-      out = from_fp8(view(out, uint8, s), out_type, s);
+-    }
+-    out = reshape(out, {-1, group_size}, s);
+-    scales = reshape(scales, {-1, 1}, s);
+-    if (group_size == 16) {
+-      array inv_scale_enc = inputs.size() > 2
+-          ? divide(inputs[2], array(448.0f * 6.0f, out_type), s)
+-          : array(1.0f, out_type);
+-      scales = multiply(from_fp8(scales, out_type, s), inv_scale_enc, s);
+-    } else {
+-      scales = subtract(astype(scales, out_type, s), array(127, out_type), s);
+-      scales = power(array(2.0f, out_type), scales, s);
+-    }
+-    return {reshape(multiply(out, scales, s), wshape, s)};
+-  };
++  auto fallback = FloatingDequantizeFallback{
++      std::move(wshape), std::move(sshape), group_size, bits, out_type, s};
+ 
+   if (s.device == Device::gpu) {
+     auto out_shape = w.shape();
+@@ -5488,7 +5490,13 @@
+         std::move(out_shape),
+         out_type,
+         submission::make_graph_primitive<fast::Quantize>(
+-            s, fallback, group_size, bits, mode, true),
++            s,
++            submission::make_graph_function<ArrayVector(ArrayVector)>(
++                std::move(fallback)),
++            group_size,
++            bits,
++            mode,
++            true),
+         inputs);
+   }
+   return fallback(inputs)[0];
+diff --git a/mlx/dequantize_fallback.h b/mlx/dequantize_fallback.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/dequantize_fallback.h
+@@ -0,0 +1,35 @@
++#pragma once
++#include <algorithm>
++#include "mlx/array.h"
++#include "mlx/graph_quota.h"
++namespace mlx::core {
++struct AffineDequantizeFallback {
++  Shape wshape, sshape;
++  int group_size, bits;
++  Stream s;
++  ArrayVector operator()(const ArrayVector& inputs);
++};
++struct FloatingDequantizeFallback {
++  Shape wshape, sshape;
++  int group_size, bits;
++  Dtype out_type;
++  Stream s;
++  ArrayVector operator()(const ArrayVector& inputs);
++};
++inline size_t dequantize_fallback_control_bytes() noexcept {
++  const auto affine = submission::graph_function_control_bytes<
++      ArrayVector(ArrayVector), AffineDequantizeFallback>();
++  const auto floating = submission::graph_function_control_bytes<
++      ArrayVector(ArrayVector), FloatingDequantizeFallback>();
++  return affine && floating ? std::max(affine, floating) : 0;
++}
++inline size_t dequantize_fallback_frame_bytes() noexcept {
++  // One constructor at a time: moved source, shared owner, small-buffer
++  // capture, returned function and Quantize's by-value constructor argument.
++  return std::max(sizeof(AffineDequantizeFallback), sizeof(FloatingDequantizeFallback)) +
++      3 * sizeof(std::shared_ptr<AffineDequantizeFallback>) +
++      2 * sizeof(std::function<ArrayVector(ArrayVector)>) +
++      2 * sizeof(submission::GraphAllocator<AffineDequantizeFallback>) +
++      sizeof(submission::GraphQuota*) + sizeof(size_t);
++}
++} // namespace mlx::core

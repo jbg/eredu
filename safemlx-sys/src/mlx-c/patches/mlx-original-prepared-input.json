@@ -1,0 +1,65 @@
+{
+  "archive": "safemlx-sys/vendor/mlx-v0.32.0.tar.gz",
+  "archive_sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+  "contract": "Completed original native source leaves only; explicit ordinary runtime initialization and ordinary selected consumer. B2/B3/C/D/E remain; no managed media activation or opaque driver/RSS bound.",
+  "native_changes": {
+    "mlx/CMakeLists.txt": {
+      "after": "27c0e414265a194c5845202fa07ec97932cdaca6ad2407b91003cccc99551826",
+      "before": "4a6d5579cca7e94e86e8aefedf1fb95568b6e9f60b786209f6e457d1344a80eb"
+    },
+    "mlx/allocator.h": {
+      "after": "804a68c6fd685da40e94f536735f3a8861d8d2740ec4c80055e9cb9d29bd4230",
+      "before": "3ed4aec3d06ae5573ef7032cbe24858691a3e403911298f77b14b6bebe2b2a8a"
+    },
+    "mlx/array.cpp": {
+      "after": "b4765ab238e407ad4c4ff7f9f26e4aae2a62ab5462652d1cb1866b81a18c3c1f",
+      "before": "8c18b2478519de0e1d291513779563801d7719ba9f698ca5a8504ef8331828c0"
+    },
+    "mlx/array.h": {
+      "after": "821cd60b4d2b6395f26548ea05ab8d5f59bcf2cda3d559e70942837ad558246b",
+      "before": "3c859025d165f7aedb4c477d699331daea0fe22c37d2affb8efce97845b28a85"
+    },
+    "mlx/backend/metal/allocator.cpp": {
+      "after": "1f62bd0bdf1cf586f72a61af579707d893cf859e0bee582c5fd3be1cce41dae0",
+      "before": "e0b94dd881aef4ef8fdb5aafad1f775be8476c3a5758db3d0a4efe16f34a7da0"
+    },
+    "mlx/backend/metal/allocator.h": {
+      "after": "663aac7e1505048cbc6c454f33aad9753e496e5dd339fd72d948890acfb74487",
+      "before": "4f31b6b2e64b06fc5066f479cef4dbcd9e453da6a777cf1859dcb1e71eacf2c0"
+    },
+    "mlx/backend/metal/resident.cpp": {
+      "after": "c9582a93105f6022b91e746e463455eea973d7faa65936c1c0635ac8e8544cd0",
+      "before": "2f7e74d45c39eb0c2dc93bf3070d560f90400392a4c1c8822233e66e6f2b9a78"
+    },
+    "mlx/backend/metal/resident.h": {
+      "after": "106e29dee8dfa281eea2c16be1dc32b3b0835b74aa3e02bde5f5c8af7a979ace",
+      "before": "82a13f1ae49bfa93a46c0d1e4f2068db6865aa1f8434563fc47e0d0871c02da2"
+    },
+    "mlx/backend/no_gpu/allocator.cpp": {
+      "after": "6ca8d73a12172e9e60681dce307c9d96a4d5ad3c400814d3854423711f6b1d64",
+      "before": "f2a81d8e20b744abc0267730f37886068d400444282ed94e39371e82a3007ed3"
+    },
+    "mlx/graph_quota.cpp": {
+      "after": "3dcd3bf3adb2c8c822e6e2a909b951d52726747039def49681bd1cd98b8f7e84",
+      "before": "4a9e2a146c73c9d087e3488627e7f520596fb51b707130d883ce6e279a3986a6"
+    },
+    "mlx/graph_quota.h": {
+      "after": "daae644846e5af9173509d80521952efe4de27e02fe8fb02a284e70ec28031fa",
+      "before": "6731463b6b9b352978eadd808eda25cf76e84d187f4244ecea1148da4cfd035c"
+    },
+    "mlx/prepared_input.cpp": {
+      "after": "da5efdb16b3e640feb9fac6b78f15c728873a2c574dd6e2a3e077c39c716e2d6",
+      "before": null
+    },
+    "mlx/prepared_input.h": {
+      "after": "45ab7e5cc245bd9f5ac60f44e58de7b0067c11bb1a0dc503ce028e9184f6f154",
+      "before": null
+    }
+  },
+  "patch_position": 31,
+  "patch_sha256": "832a9c67f65e5a97e2239b2c632998bbdb0195411e37e5fb12e476f0c2c01cac",
+  "predecessor_full_native_sha256": "7c172d9e4e1647c07acf2801aaa1ad2ffaedb2732f2d1656e5750c4571940a5a",
+  "predecessor_patch": "mlx-cpu-f32-argsort-inplace.patch",
+  "predecessor_patch_sha256": "b4ed6443780014ebc8fad19ee88056f5489b5105c8acda8fec450e8b4cbfba8f",
+  "upstream": "MLX v0.32.0"
+}

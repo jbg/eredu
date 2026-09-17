@@ -1,0 +1,269 @@
+diff --git a/mlx/backend/cuda/eval.cpp b/mlx/backend/cuda/eval.cpp
+--- a/mlx/backend/cuda/eval.cpp
++++ b/mlx/backend/cuda/eval.cpp
+@@ -167,5 +167,7 @@
+     size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
+ bool resident_gpu_worker_layout_with_sorts(size_t, size_t, size_t, size_t, size_t,
+     size_t, size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
++bool resident_gpu_worker_layout_with_router(size_t, size_t, size_t, size_t, size_t,
++    size_t, size_t, size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
+ bool resident_grouped_sort_additional_kernels(size_t, size_t&) noexcept { return false; }
+ }
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1899,12 +1899,14 @@
+ #include "mlx/original_buffer.h"
+ #include "mlx/event.h"
+ #include "mlx/backend/metal/sort_dispatch.h"
++#include "mlx/fence.h"
+ 
+ namespace mlx::core::submission {
+ bool resident_grouped_sort_additional_kernels(size_t selections, size_t& out) noexcept {
+   if (!selections) { out = 0; return true; }
+   metal::SortDispatchLayout layout;
+-  // group_by_id casts the flattened IDs to Int32 before the actual ArgSort.
++  // Group IDs are Int32; router scores are Float32. Both actual sort workers
++  // use this four-byte element geometry and the same shared dispatch planner.
+   if (!metal::sort_dispatch_layout(selections, sizeof(int32_t), layout)) return false;
+   out = layout.kernel_attempts - 1; // the entry's first kernel already belongs to P
+   return true;
+@@ -1919,6 +1921,14 @@
+     size_t output_slots, size_t array_nodes, size_t backing_births,
+     size_t maximum_rank, size_t maximum_operands, size_t additional_sort_kernels,
+     ResidentGpuWorkerLayout& out) noexcept {
++  return resident_gpu_worker_layout_with_router(entries, input_edges, output_slots,
++      array_nodes, backing_births, maximum_rank, maximum_operands,
++      additional_sort_kernels, 0, out);
++}
++bool resident_gpu_worker_layout_with_router(size_t entries, size_t input_edges,
++    size_t output_slots, size_t array_nodes, size_t backing_births,
++    size_t maximum_rank, size_t maximum_operands, size_t additional_sort_kernels,
++    size_t cpu_partitions, ResidentGpuWorkerLayout& out) noexcept {
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+@@ -1937,8 +1947,13 @@
+     if (a && b > SIZE_MAX / a) return false;
+     result = a * b; return true;
+   };
++#if !defined(MLX_MANAGED_FENCE_KERNELS) || !MLX_MANAGED_FENCE_KERNELS
++  // Do not certify the fast alternative unless its actual source was compiled.
++  if (cpu_partitions) return false;
++#endif
++  if (cpu_partitions > input_edges) return false;
+   ResidentGpuWorkerLayout value;
+-  size_t temporaries, data_controls;
++  size_t temporaries, data_controls, frontier_controls = 0;
+   // Every temporary is either a new output/scratch backing or an input view.
+   // Output Data owners are additional; primitive descriptors already belong
+   // to the host bank and are not charged again here.
+@@ -1955,11 +1970,27 @@
+       !add(entries, temporaries, value.kernel_attempts) ||
+       !add(value.kernel_attempts, additional_sort_kernels, value.kernel_attempts) ||
+       !add(array_nodes, backing_births, value.buffer_universe)) return false;
++  if (cpu_partitions) {
++    size_t updates, kernels;
++    // Every CPU partition consumes one GPU result and emits one CPU result.
++    // A needs_fence input is waited on even by same-stream GPU consumers, so
++    // all GPU input edges bound fence_wait. Each GPU update also launches the
++    // cross-device input_coherent shader. Both source names are fixed/inline.
++    if (!mul(cpu_partitions, 2, updates) || !add(input_edges, updates, kernels) ||
++        !add(value.kernel_attempts, kernels, value.kernel_attempts)) return false;
++  }
+   // One threshold end per Eval entry, one possible foreign Event wait per
+   // input edge, root/async Event signal, normal finalization and recovery.
+   // The latter four are explicit call sites for the one selected GPU stream.
+   if (!add(entries, input_edges, value.encoding_intervals) ||
+       !add(value.encoding_intervals, 4, value.encoding_intervals)) return false;
++  if (cpu_partitions) {
++    size_t intervals;
++    // CPU entries may trigger GPU finalization under pressure; each GPU
++    // producer's slow-Fence Event signal can separately end an encoder.
++    if (!mul(cpu_partitions, 2, intervals) ||
++        !add(value.encoding_intervals, intervals, value.encoding_intervals)) return false;
++  }
+   auto extent = [&](size_t bytes, size_t alignment, size_t count) {
+     if (!count || !bytes) return true;
+     size_t each, total;
+@@ -2068,14 +2099,47 @@
+       !vector_population(interval_resources, sizeof(const void*)) ||
+       !vector_population(waiting_slots, sizeof(metal::detail::FenceOwner)) ||
+       !vector_population(interval_resources, sizeof(metal::detail::FenceOwner))) return false;
+-  // The fixed Synchronizer owns the first root Event separately. At most one
+-  // async stream Event is additional. Its signal and the root signal plus
+-  // foreign input waits each own an actual EventEntry handler. There is no
+-  // within-Eval Fence in this authenticated one-stream profile.
+-  size_t event_actions;
+-  if (!add(input_edges, 2, event_actions) ||
+-      !extent(event.shared_bytes, event.shared_alignment, 1) ||
+-      !extent(event_dispatch.gpu_handler_bytes, event_dispatch.gpu_handler_alignment, event_actions)) return false;
++  // The fixed Synchronizer owns the selected GPU's root Event separately.
++  // One additional async stream Event suffices: the admitted CPU stream in the
++  // mixed profile. Within-Eval fences are keyed by producing stream, at most two.
++  if (!extent(event.shared_bytes, event.shared_alignment, 1)) return false;
++  if (!cpu_partitions) {
++    size_t event_actions;
++    if (!add(input_edges, 2, event_actions) ||
++        !extent(event_dispatch.gpu_handler_bytes, event_dispatch.gpu_handler_alignment,
++            event_actions)) return false;
++  } else {
++    FenceControlLayout fence;
++    if (!fence_control_layout(fence)) return false;
++    auto total_extent = [&](size_t each, size_t count) {
++      size_t total;
++      return mul(each, count, total) &&
++          add(value.allocation_extents, total, value.allocation_extents);
++    };
++    size_t gpu_actions, actions, cpu_actions;
++    if (!add(input_edges, cpu_partitions, gpu_actions) ||
++        !mul(cpu_partitions, 3, cpu_actions) ||
++        !add(input_edges, cpu_actions, actions) ||
++        !extent(fence.shared_bytes, fence.shared_alignment, 2) ||
++        // Slow fences own an Event instead of a U32 backing. Fast backing
++        // births already belong to backing_births, with their routing owner.
++        !extent(event.shared_bytes, event.shared_alignment, 2) ||
++        !total_extent(std::max(fence.cpu_wait_extent, event_dispatch.cpu_wait_extent), cpu_partitions) ||
++        !total_extent(std::max(fence.cpu_update_extent, event_dispatch.cpu_signal_extent), cpu_partitions) ||
++        !total_extent(event_dispatch.cpu_signal_extent, 1) ||
++        // Each input waits either its within-Eval Fence or a prior Event.
++        // Each GPU producer update likewise uses exactly one handler.
++        !total_extent(std::max(fence.gpu_handler_extent, event_dispatch.gpu_handler_extent), gpu_actions) ||
++        !total_extent(event_dispatch.gpu_handler_extent, 1) ||
++        !mul(std::max(fence.controls, event_dispatch.controls), actions, frontier_controls)) return false;
++    size_t constructors;
++    if (!add(fence.controls, event.construction_controls, constructors) ||
++        !mul(constructors, 2, constructors) ||
++        !add(frontier_controls, constructors, frontier_controls) ||
++        !add(frontier_controls, event.construction_controls, frontier_controls) ||
++        !add(frontier_controls, event_dispatch.controls, frontier_controls) ||
++        !add(frontier_controls, sizeof(fence) + sizeof(total_extent) + 5 * sizeof(size_t), frontier_controls)) return false;
++  }
+   value.named_control_bytes = sizeof(value) + sizeof(out) + 7 * sizeof(size_t) +
+       sizeof(array_requests) + sizeof(array_request_count) + sizeof(routing) +
+       sizeof(collapse) + sizeof(persistent) + sizeof(receipts) + sizeof(event) +
+@@ -2084,6 +2148,8 @@
+       // Shared sort planner: length/element width, potential/bn/per-block/
+       // blocks/attempts/merge tiles; query selection/result and two loans.
+       sizeof(metal::SortDispatchLayout) + 12 * sizeof(size_t) + 2 * sizeof(bool);
++  if (!add(value.named_control_bytes, frontier_controls, value.named_control_bytes) ||
++      !add(value.named_control_bytes, 4 * sizeof(size_t), value.named_control_bytes)) return false;
+   out = value; return true;
+ #endif
+ }
+diff --git a/mlx/backend/metal/indexing.cpp b/mlx/backend/metal/indexing.cpp
+--- a/mlx/backend/metal/indexing.cpp
++++ b/mlx/backend/metal/indexing.cpp
+@@ -482,7 +482,11 @@
+   kernel_name += src.flags().row_contiguous ? "c" : "nc";
+   kernel_name += idx.flags().row_contiguous ? "c" : "nc";
+ 
+-  auto lib = d.get_library_borrowed(lib_name, [&]() {
++  const bool original = d.original_precompiled_kernel_required();
++  if (original && ((out.dtype() != float32 && out.dtype() != float16 &&
++      out.dtype() != bfloat16) || idx.dtype() != uint32))
++    throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
++  auto lib = original ? d.precompiled_library() : d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+     kernel_source += metal::gather_axis();
+     std::string out_type_str = get_type_string(out.dtype());
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -90,6 +90,9 @@
+ build_kernel(scaled_dot_product_attention sdpa_vector.h)
+ if(MLX_METAL_VERSION GREATER_EQUAL 320)
+   build_kernel(fence)
++  target_compile_definitions(mlx PRIVATE MLX_MANAGED_FENCE_KERNELS=1)
++else()
++  target_compile_definitions(mlx PRIVATE MLX_MANAGED_FENCE_KERNELS=0)
+ endif()
+ 
+ set(STEEL_HEADERS
+@@ -164,6 +167,7 @@
+   build_kernel(indexing/gather_front indexing/indexing.h indexing/gather_front.h)
+   build_kernel(indexing/single_index indexing/indexing.h indexing/gather.h
+                indexing/scatter.h reduction/ops.h atomic.h)
++  build_kernel(indexing/gather_axis indexing/gather_axis.h)
+   build_kernel(arange arange.h)
+   build_kernel(binary binary.h binary_ops.h)
+   build_kernel(binary_two binary_two.h)
+diff --git a/mlx/backend/metal/kernels/indexing/gather_axis.metal b/mlx/backend/metal/kernels/indexing/gather_axis.metal
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/metal/kernels/indexing/gather_axis.metal
+@@ -0,0 +1,15 @@
++// Copyright © 2025 Apple Inc.
++// Existing floating values gathered by UInt32 sort/partition indices.
++#include "mlx/backend/metal/kernels/utils.h"
++#include "mlx/backend/metal/kernels/indexing/gather_axis.h"
++#define GATHER_AXIS_WIDTH(tname, type, lname, location) \
++  instantiate_kernel("gather_axis" #tname "uint32_" #lname "cc", gather_axis, type, uint32_t, location, true, true) \
++  instantiate_kernel("gather_axis" #tname "uint32_" #lname "cnc", gather_axis, type, uint32_t, location, true, false) \
++  instantiate_kernel("gather_axis" #tname "uint32_" #lname "ncc", gather_axis, type, uint32_t, location, false, true) \
++  instantiate_kernel("gather_axis" #tname "uint32_" #lname "ncnc", gather_axis, type, uint32_t, location, false, false)
++#define GATHER_AXIS_TYPE(tname, type) \
++  GATHER_AXIS_WIDTH(tname, type, int, int) \
++  GATHER_AXIS_WIDTH(tname, type, int64_t, int64_t)
++GATHER_AXIS_TYPE(float32, float)
++GATHER_AXIS_TYPE(float16, half)
++GATHER_AXIS_TYPE(bfloat16, bfloat16_t)
+diff --git a/mlx/backend/metal/selector_controls.cpp b/mlx/backend/metal/selector_controls.cpp
+--- a/mlx/backend/metal/selector_controls.cpp
++++ b/mlx/backend/metal/selector_controls.cpp
+@@ -34,6 +34,7 @@
+     3 * integer + text("prod") + dtype_tag;
+ constexpr size_t indexing = text("gather_front___") + 2 * dtype_tag +
+     text("int64_t") + integer;
++constexpr size_t gather_axis = text("gather_axis_int64_tncnc") + 2 * dtype_tag;
+ constexpr size_t single_index = text("scatter_none_1_updc_false_nwork1_int64_t") + 2 * dtype_tag;
+ constexpr size_t sort_name = text("partition_mbsort__bn_tn") + 2 * dtype_tag + 2 * integer;
+ constexpr size_t gathered_rhs = text("steel_gather_mm_rhs_nax_n") + 1 +
+@@ -44,7 +45,7 @@
+ constexpr size_t rope = text("rope_single_freqs_large__vjp_traditional_transpose") + dtype_tag;
+ constexpr size_t normalization = text("layer_norm_looped") + dtype_tag;
+ constexpr size_t maximum_name = std::max({gemm_specialized, gemm_split, gemv,
+-    attention, vector_attention, reduce, indexing, single_index, sort_name, gathered_rhs,
++    attention, vector_attention, reduce, indexing, gather_axis, single_index, sort_name, gathered_rhs,
+     pointwise, rope, normalization});
+ 
+ // The widest formatting call is split-K: two transpose chars, two dtype tags,
+@@ -109,7 +110,10 @@
+       sizeof(std::string*) * concatenate_arguments + sizeof(IndexMetadata) +
+       // Single-block sort has a second inline stride list. Index metadata's
+       // three range loans remain live through the synchronous encoder binding.
+-      sizeof(Strides) + 3 * sizeof(void*) + 2 * sizeof(bool);
++      sizeof(Strides) + 3 * sizeof(void*) + 2 * sizeof(bool) +
++      // GatherAxis binds one removed Shape and two removed Strides, all inline
++      // for the rank-two router (only one temporary is alive per binding call).
++      sizeof(Shape) + 2 * sizeof(Strides);
+   out = {allocation, controls, maximum_name, constants, linked};
+   return true;
+ #endif
+diff --git a/mlx/backend/no_gpu/eval.cpp b/mlx/backend/no_gpu/eval.cpp
+--- a/mlx/backend/no_gpu/eval.cpp
++++ b/mlx/backend/no_gpu/eval.cpp
+@@ -78,5 +78,7 @@
+     size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
+ bool resident_gpu_worker_layout_with_sorts(size_t, size_t, size_t, size_t, size_t,
+     size_t, size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
++bool resident_gpu_worker_layout_with_router(size_t, size_t, size_t, size_t, size_t,
++    size_t, size_t, size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
+ bool resident_grouped_sort_additional_kernels(size_t, size_t&) noexcept { return false; }
+ }
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -58,6 +58,12 @@
+     size_t output_slots, size_t array_nodes, size_t backing_births,
+     size_t maximum_rank, size_t maximum_operands, size_t additional_sort_kernels,
+     ResidentGpuWorkerLayout&) noexcept;
++// GPU populations exclude the separately banked rank-two CPU partitions.
++// Those partitions use one admitted CPU stream alongside the selected GPU.
++MLX_API bool resident_gpu_worker_layout_with_router(size_t entries, size_t input_edges,
++    size_t output_slots, size_t array_nodes, size_t backing_births,
++    size_t maximum_rank, size_t maximum_operands, size_t additional_sort_kernels,
++    size_t cpu_partitions, ResidentGpuWorkerLayout&) noexcept;
+ MLX_API bool resident_grouped_sort_additional_kernels(size_t selections, size_t& out) noexcept;
+ 
+ // Four fixed-Eval host requests; no Data, worker or stream-frontier owners.

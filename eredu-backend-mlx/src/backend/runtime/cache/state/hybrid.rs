@@ -2,6 +2,26 @@
 
 use super::*;
 
+mod fixed_slots;
+mod resident_kv_copy;
+pub(crate) use resident_kv_copy::{
+    PreparedDenseHybridKvState, PreparedHybridKvCopy, PublishedDenseHybridKvState,
+    SavedHybridKvCopy,
+};
+mod resident_grouped_copy;
+pub(crate) use resident_grouped_copy::{
+    InitializedHybridDenseGroup, InitializedHybridGroupCopy, PreparedDenseHybridGroupedState,
+    PreparedHybridGroupHostCopy, PreparedHybridGroupedCopy, PublishedDenseHybridGroupedState,
+    SavedHybridGroupedCopy,
+};
+mod resident_reset;
+mod workspace;
+
+#[cfg(test)]
+mod slot_owner_tests;
+
+use fixed_slots::FixedStateSlots;
+
 // Numeric conformance reports include integer media positions as well as
 // floating cache values. Preserve every integer exactly in this test-only
 // representation; an unrepresentable value must not hide a state difference.
@@ -21,7 +41,9 @@ fn numeric_fixture_values(array: &Array) -> Result<Vec<f32>, Exception> {
                 if f64::from(converted) == f64::from(value) {
                     Ok(converted)
                 } else {
-                    Err(Exception::custom("integer state is not exactly representable in the numeric fixture report"))
+                    Err(Exception::custom(
+                        "integer state is not exactly representable in the numeric fixture report",
+                    ))
                 }
             })
             .collect(),
@@ -133,11 +155,36 @@ impl MlxHybridAttentionState {
 #[derive(Debug, Clone)]
 pub struct MlxHybridLayerState {
     attention: Option<MlxHybridAttentionState>,
-    fixed: BTreeMap<StateTensorRole, Option<MlxTensor>>,
+    fixed: FixedStateSlots,
     fixed_offset: i32,
 }
 
+fn empty_resident_attention_cache(window: Option<i32>) -> ConcatKeyValueCache {
+    match window {
+        Some(window) => ConcatKeyValueCache::new_for_sliding_attention(window),
+        None => ConcatKeyValueCache::new(),
+    }
+}
+
 impl MlxHybridLayerState {
+    fn retained_owner_slot_counts(&self) -> Option<NativeStateSlotCounts> {
+        // Attention absence is fixed by this layer's construction policy;
+        // ordinary fixed-value updates cannot add an attention representation.
+        let attention = match self.attention.as_ref() {
+            None => NativeStateSlotCounts::default(),
+            Some(MlxHybridAttentionState::KeyValue(cache)) => cache.retained_owner_slot_counts(),
+            Some(MlxHybridAttentionState::Compressed(cache)) => NativeStateSlotCounts::arrays(
+                if cache.is_paged() { 2 } else { 4 },
+                usize::from(cache.is_paged()),
+            ),
+        };
+        attention.checked_add(NativeStateSlotCounts {
+            arrays: self.fixed.values().len(),
+            slot_tables: 1,
+            ..Default::default()
+        })
+    }
+
     fn deep_clone_state(&self) -> Result<Self, Exception> {
         let attention = self
             .attention
@@ -152,6 +199,7 @@ impl MlxHybridLayerState {
     }
 
     fn device(layer: usize, policy: &LayerCachePolicy) -> Result<Self, Exception> {
+        let fixed = FixedStateSlots::from_policy(policy).map_err(Exception::from_source)?;
         let attention = hybrid_attention_policy(layer, policy)?.map(|policy| match policy {
             HybridAttentionPolicy::KeyValue { window, key_only } => {
                 MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Device(
@@ -159,11 +207,9 @@ impl MlxHybridLayerState {
                         (Some(window), true) => {
                             ConcatKeyValueCache::new_key_only_for_sliding_attention(window)
                         }
-                        (Some(window), false) => {
-                            ConcatKeyValueCache::new_for_sliding_attention(window)
-                        }
+                        (Some(window), false) => empty_resident_attention_cache(Some(window)),
                         (None, true) => ConcatKeyValueCache::new_key_only(),
-                        (None, false) => ConcatKeyValueCache::new(),
+                        (None, false) => empty_resident_attention_cache(None),
                     },
                 ))
             }
@@ -173,11 +219,7 @@ impl MlxHybridLayerState {
         });
         Ok(Self {
             attention,
-            fixed: policy
-                .fixed_state()
-                .iter()
-                .map(|tensor| (tensor.role, None))
-                .collect(),
+            fixed,
             fixed_offset: 0,
         })
     }
@@ -188,6 +230,7 @@ impl MlxHybridLayerState {
         manager: &CacheResidencyManager,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
+        let fixed = FixedStateSlots::from_policy(policy).map_err(Exception::from_source)?;
         let attention = hybrid_attention_policy(layer, policy)?
             .map(|policy| match policy {
                 HybridAttentionPolicy::KeyValue { window, key_only } => if key_only {
@@ -211,11 +254,7 @@ impl MlxHybridLayerState {
             .transpose()?;
         Ok(Self {
             attention,
-            fixed: policy
-                .fixed_state()
-                .iter()
-                .map(|tensor| (tensor.role, None))
-                .collect(),
+            fixed,
             fixed_offset: 0,
         })
     }
@@ -227,6 +266,7 @@ impl MlxHybridLayerState {
         manager: Option<&CacheResidencyManager>,
         rank: Option<CacheRankIdentity>,
     ) -> Result<Self, Exception> {
+        let fixed = FixedStateSlots::from_policy(policy).map_err(Exception::from_source)?;
         let attention_policy = hybrid_attention_policy(layer, policy)?;
         let attention_components = match policy {
             LayerCachePolicy::NoState | LayerCachePolicy::FixedState { .. } => 0,
@@ -327,13 +367,22 @@ impl MlxHybridLayerState {
         };
         Ok(Self {
             attention,
-            fixed: policy
-                .fixed_state()
-                .iter()
-                .map(|tensor| (tensor.role, None))
-                .collect(),
+            fixed,
             fixed_offset: 0,
         })
+    }
+
+    /// Exact retained bytes of the fixed-role slot box, including absent slots.
+    /// Native tensor backing, identity/custody metadata and the enclosing layer
+    /// value are separate payloads.
+    pub(crate) fn fixed_slot_payload_bytes(&self) -> Option<u64> {
+        self.fixed.payload_bytes()
+    }
+
+    /// Borrows custody metadata for the actual fixed slot box. The token grants
+    /// no access to tensor values and does not describe their native backing.
+    pub(crate) fn fixed_slot_metadata(&self) -> &eredu_runtime::HostSlotMetadata {
+        self.fixed.metadata()
     }
 
     /// Clears attention and fixed components while retaining their policies.
@@ -349,8 +398,33 @@ impl MlxHybridLayerState {
     }
 }
 
+impl MlxHybridLayerState {
+    fn visit_borrowed_values<'a>(&'a self, visitor: &mut dyn FnMut(&'a MlxTensor)) {
+        match self.attention.as_ref() {
+            Some(MlxHybridAttentionState::KeyValue(cache)) => {
+                for value in RuntimeLayerState::<MlxNeuralBackend>::retained_values(cache) {
+                    visitor(value);
+                }
+            }
+            Some(MlxHybridAttentionState::Compressed(cache)) => {
+                for value in cache.borrowed_retained_values() {
+                    visitor(value);
+                }
+            }
+            None => {}
+        }
+        for value in self.fixed.values().filter_map(Option::as_ref) {
+            visitor(value);
+        }
+    }
+}
+
 impl RuntimeLayerState<MlxNeuralBackend> for MlxHybridLayerState {
     type RetainedValues<'a> = std::vec::IntoIter<&'a MlxTensor>;
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) {
+        self.visit_borrowed_values(visitor);
+    }
 
     fn retained_values(&self) -> Self::RetainedValues<'_> {
         let mut retained = self
@@ -564,17 +638,61 @@ impl CompressedAttentionCache<MlxTensor> for MlxHybridLayerState {
 }
 
 /// MLX state realization for a schedule mixing attention and fixed components.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MlxHybridState {
-    layout: StateLayout,
+    layout: eredu_runtime::SharedStateLayout,
     global_layer_start: usize,
-    layers: Vec<MlxHybridLayerState>,
+    layers: eredu_runtime::HostSlotTable<MlxHybridLayerState>,
     manager: Option<CacheResidencyManager>,
+    inference_retention: eredu_runtime::working_memory::InferenceRetention,
+}
+
+impl Clone for MlxHybridState {
+    fn clone(&self) -> Self {
+        Self {
+            layout: self.layout.clone(),
+            global_layer_start: self.global_layer_start,
+            layers: eredu_runtime::HostSlotTable::new(Box::from(self.layers.slots())),
+            manager: self.manager.clone(),
+            inference_retention: self.inference_retention.clone(),
+        }
+    }
 }
 
 impl MlxHybridState {
+    /// Fixed fields only; every actual manager role counts even when aliased.
+    pub(crate) fn retained_owner_slot_counts(&self) -> Option<NativeStateSlotCounts> {
+        self.layers.slots().iter().try_fold(
+            NativeStateSlotCounts {
+                layouts: 1,
+                slot_tables: 1,
+                manager_roles: usize::from(self.manager.is_some()),
+                ..Default::default()
+            },
+            |counts, layer| counts.checked_add(layer.retained_owner_slot_counts()?),
+        )
+    }
+
+    /// Actual inline layer-table extent and custody. Nested fixed slots, native
+    /// arrays and paging metadata require their own inventory.
+    pub(crate) fn layer_slot_metadata(&self) -> &eredu_runtime::HostSlotMetadata {
+        self.layers.metadata()
+    }
+
+    /// Actual fixed-role table tokens, including empty tables, in layer order.
+    /// Borrowing metadata neither copies payload nor grants allocation authority.
+    pub(crate) fn fixed_slot_metadata(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &eredu_runtime::HostSlotMetadata> + '_ {
+        self.layers
+            .slots()
+            .iter()
+            .map(MlxHybridLayerState::fixed_slot_metadata)
+    }
+
     pub(crate) fn continuation_capacity_bound(&self, additional: u64) -> Option<u64> {
         self.layers
+            .slots()
             .iter()
             .try_fold(0, |bound, layer| match &layer.attention {
                 None
@@ -600,23 +718,27 @@ impl MlxHybridState {
     }
 
     pub(crate) fn supports_isolated_snapshot(&self) -> bool {
-        self.layers.iter().all(|layer| match &layer.attention {
-            None
-            | Some(MlxHybridAttentionState::KeyValue(
-                MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_),
-            )) => true,
-            Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))) => self
-                .manager
-                .as_ref()
-                .is_some_and(|manager| manager.session_id() == cache.manager().session_id()),
-            Some(MlxHybridAttentionState::Compressed(cache)) => {
-                cache.residency_manager().is_none_or(|paging| {
+        self.layers
+            .slots()
+            .iter()
+            .all(|layer| match &layer.attention {
+                None
+                | Some(MlxHybridAttentionState::KeyValue(
+                    MlxKeyValueLayerState::Stateless | MlxKeyValueLayerState::Device(_),
+                )) => true,
+                Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))) => {
                     self.manager
                         .as_ref()
-                        .is_some_and(|manager| manager.session_id() == paging.session_id())
-                })
-            }
-        })
+                        .is_some_and(|manager| manager.session_id() == cache.manager().session_id())
+                }
+                Some(MlxHybridAttentionState::Compressed(cache)) => {
+                    cache.residency_manager().is_none_or(|paging| {
+                        self.manager
+                            .as_ref()
+                            .is_some_and(|manager| manager.session_id() == paging.session_id())
+                    })
+                }
+            })
     }
 
     pub(crate) fn isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
@@ -626,9 +748,17 @@ impl MlxHybridState {
             .unwrap_or(Some(0))
     }
 
+    pub(crate) fn original_isolated_snapshot_auxiliary_bytes(&self) -> Option<u64> {
+        self.manager
+            .as_ref()
+            .map(|manager| manager.original_isolated_snapshot_bytes())
+            .unwrap_or(Some(0))
+    }
+
     pub(crate) fn isolated_snapshot_auxiliary_growth(&self, additional: u64) -> Option<u64> {
         let paged = self
             .layers
+            .slots()
             .iter()
             .filter(|layer| {
                 layer
@@ -663,6 +793,7 @@ impl MlxHybridState {
             .transpose()?;
         let layers = self
             .layers
+            .slots()
             .iter()
             .map(|layer| {
                 let attention = match &layer.attention {
@@ -704,36 +835,19 @@ impl MlxHybridState {
                         Some(MlxHybridAttentionState::Compressed(cache))
                     }
                 };
-                let fixed = layer
-                    .fixed
-                    .iter()
-                    .map(|(role, value)| {
-                        Ok((
-                            *role,
-                            value
-                                .as_ref()
-                                .map(|value| {
-                                    value
-                                        .as_array()
-                                        .contiguous(false, stream)?
-                                        .deep_clone()
-                                        .map(MlxTensor::from_array)
-                                })
-                                .transpose()?,
-                        ))
-                    })
-                    .collect::<Result<_, Exception>>()?;
+                let fixed = layer.fixed.prepare_copy().copy(stream)?;
                 Ok(MlxHybridLayerState {
                     attention,
                     fixed,
                     fixed_offset: layer.fixed_offset,
                 })
             })
-            .collect::<Result<_, Exception>>()?;
+            .collect::<Result<Vec<_>, Exception>>()?;
         Ok(Self {
             layout: self.layout.clone(),
             global_layer_start: self.global_layer_start,
-            layers,
+            inference_retention: self.inference_retention.clone(),
+            layers: eredu_runtime::HostSlotTable::new(layers.into_boxed_slice()),
             manager,
         })
     }
@@ -755,9 +869,10 @@ impl MlxHybridState {
             .map(|(layer, policy)| MlxHybridLayerState::device(layer, policy))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            layout,
+            layout: eredu_runtime::SharedStateLayout::new(layout),
             global_layer_start,
-            layers,
+            inference_retention: Default::default(),
+            layers: eredu_runtime::HostSlotTable::new(layers.into_boxed_slice()),
             manager: None,
         })
     }
@@ -790,9 +905,10 @@ impl MlxHybridState {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            layout,
+            layout: eredu_runtime::SharedStateLayout::new(layout),
             global_layer_start,
-            layers,
+            inference_retention: Default::default(),
+            layers: eredu_runtime::HostSlotTable::new(layers.into_boxed_slice()),
             manager: Some(manager),
         })
     }
@@ -838,31 +954,85 @@ impl MlxHybridState {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            layout,
+            layout: eredu_runtime::SharedStateLayout::new(layout),
             global_layer_start,
-            layers,
+            inference_retention: Default::default(),
+            layers: eredu_runtime::HostSlotTable::new(layers.into_boxed_slice()),
             manager,
         })
     }
 
     /// Mutably borrows the ordinary per-layer states used by neutral units.
     pub fn layers_mut(&mut self) -> &mut [MlxHybridLayerState] {
-        &mut self.layers
+        self.layers.slots_mut()
+    }
+
+    /// Reads only per-layer logical positions; no native payload is inspected.
+    pub(crate) fn layer_positions(&self) -> impl ExactSizeIterator<Item = i32> + '_ {
+        self.layers
+            .slots()
+            .iter()
+            .map(RuntimeStateComponents::position)
     }
 
     /// Borrows the paging manager shared by this state's attention components.
     pub fn residency_manager(&self) -> Option<&CacheResidencyManager> {
         self.manager.as_ref().or_else(|| {
             self.layers
+                .slots()
                 .iter()
                 .filter_map(|layer| layer.attention.as_ref())
                 .find_map(MlxHybridAttentionState::manager)
         })
     }
 
-    /// Borrows every native array retained by the complete hybrid state.
+    /// Inventories fixed/attention arrays and all retained paged managers together.
+    pub(crate) fn retained_storage(
+        &self,
+    ) -> Result<
+        crate::backend::runtime::residency::storage::RetainedStorage,
+        crate::backend::runtime::residency::manager::ResidencyError,
+    > {
+        let mut storage = crate::backend::runtime::residency::storage::RetainedStorage::default();
+        self.collect_retained_storage(&mut storage)?;
+        Ok(storage)
+    }
+
+    /// Fills caller-owned storage without allocating an intermediate inventory.
+    pub(crate) fn collect_retained_storage(
+        &self,
+        storage: &mut crate::backend::runtime::residency::storage::RetainedStorage,
+    ) -> Result<(), crate::backend::runtime::residency::manager::ResidencyError> {
+        storage
+            .include_retained_values::<crate::backend::runtime::residency::manager::ResidencyError>(
+                |visitor| {
+                    for layer in self.layers.slots() {
+                        RuntimeLayerState::<MlxNeuralBackend>::visit_retained_values(
+                            layer, visitor,
+                        );
+                    }
+                    Ok(true)
+                },
+            )?;
+        for manager in self
+            .manager
+            .iter()
+            .chain(self.layers.slots().iter().filter_map(|layer| {
+                layer
+                    .attention
+                    .as_ref()
+                    .and_then(MlxHybridAttentionState::manager)
+            }))
+        {
+            manager.collect_retained_storage(storage)?;
+        }
+        Ok(())
+    }
+
+    /// Borrows native layer arrays; sealed paged blocks remain with their managers.
     pub fn retained_arrays(&self) -> Vec<&Array> {
         self.layers
+            .slots()
             .iter()
             .flat_map(RuntimeLayerState::<MlxNeuralBackend>::retained_values)
             .map(MlxTensor::as_array)
@@ -872,6 +1042,7 @@ impl MlxHybridState {
     /// Returns the common absolute token frontier.
     pub fn offset(&self) -> i32 {
         self.layers
+            .slots()
             .first()
             .map_or(0, RuntimeStateComponents::position)
     }
@@ -879,6 +1050,7 @@ impl MlxHybridState {
     #[cfg(test)]
     pub(crate) fn semantic_snapshot(&self) -> Vec<(i32, Vec<(StateTensorRole, bool)>)> {
         self.layers
+            .slots()
             .iter()
             .map(|layer| {
                 (
@@ -898,7 +1070,7 @@ impl MlxHybridState {
         &self,
     ) -> Result<Vec<(usize, StateTensorRole, Vec<i32>, Vec<f32>)>, Exception> {
         let mut snapshot = Vec::new();
-        for (layer, state) in self.layers.iter().enumerate() {
+        for (layer, state) in self.layers.slots().iter().enumerate() {
             for (role, value) in &state.fixed {
                 let Some(value) = value else {
                     continue;
@@ -918,15 +1090,13 @@ impl MlxHybridState {
     pub(crate) fn retained_numeric_snapshot(&self) -> Result<Vec<(Vec<i32>, Vec<f32>)>, Exception> {
         self.retained_arrays()
             .into_iter()
-            .map(|array| {
-                Ok((array.shape().to_vec(), numeric_fixture_values(array)?))
-            })
+            .map(|array| Ok((array.shape().to_vec(), numeric_fixture_values(array)?)))
             .collect()
     }
 
     /// Clears every heterogeneous component.
     pub fn clear(&mut self) -> Result<(), Exception> {
-        for layer in &mut self.layers {
+        for layer in self.layers.slots_mut() {
             layer.clear()?;
         }
         Ok(())
@@ -940,11 +1110,14 @@ impl MlxHybridState {
         Ok(Self {
             layout: self.layout.clone(),
             global_layer_start: self.global_layer_start,
-            layers: self
-                .layers
-                .iter()
-                .map(MlxHybridLayerState::deep_clone_state)
-                .collect::<Result<_, _>>()?,
+            inference_retention: self.inference_retention.clone(),
+            layers: eredu_runtime::HostSlotTable::new(
+                self.layers
+                    .slots()
+                    .iter()
+                    .map(MlxHybridLayerState::deep_clone_state)
+                    .collect::<Result<Box<[_]>, _>>()?,
+            ),
             manager: self.manager.clone(),
         })
     }
@@ -957,7 +1130,7 @@ impl MlxHybridState {
             .fork_session(stream)
             .map_err(|error| Exception::custom(error.to_string()))?;
         let mut fork = self.deep_clone_state()?;
-        for layer in &mut fork.layers {
+        for layer in fork.layers.slots_mut() {
             match layer.attention.as_mut() {
                 Some(MlxHybridAttentionState::KeyValue(MlxKeyValueLayerState::Paged(cache))) => {
                     cache.rebind_paging_manager(manager.clone());
@@ -989,7 +1162,14 @@ impl MlxHybridState {
                 "hybrid state checkpoint layout does not match canonical state",
             ));
         }
-        for (current, previous) in self.layers.iter_mut().zip(&checkpoint.layers) {
+        self.inference_retention
+            .restore_admission(&checkpoint.inference_retention);
+        for (current, previous) in self
+            .layers
+            .slots_mut()
+            .iter_mut()
+            .zip(checkpoint.layers.slots())
+        {
             match (&mut current.attention, &previous.attention) {
                 (Some(current), Some(previous)) => {
                     current.restore_checkpoint(previous, stream)?;
@@ -1018,7 +1198,9 @@ impl MlxHybridState {
             ));
         }
         let range = self.segment_range(segment)?;
-        self.layers[range.clone()].clone_from_slice(&source.layers[range]);
+        self.inference_retention
+            .extend_from(&source.inference_retention);
+        self.layers.slots_mut()[range.clone()].clone_from_slice(&source.layers.slots()[range]);
         Ok(())
     }
 
@@ -1027,6 +1209,7 @@ impl MlxHybridState {
         let segment =
             StateSegmentId::new(segment).map_err(|error| Exception::custom(error.to_string()))?;
         self.layout
+            .layout()
             .segment(&segment)
             .map(StateSegmentSpec::layers)
             .ok_or_else(|| Exception::custom(format!("unknown hybrid state segment {segment:?}")))
@@ -1065,8 +1248,9 @@ impl MlxHybridState {
             .collect::<BTreeMap<_, _>>();
         for (layer, ((state, policy), delta)) in self
             .layers
+            .slots_mut()
             .iter_mut()
-            .zip(self.layout.layers().iter())
+            .zip(self.layout.layout().layers().iter())
             .zip(layer_prefix_offsets)
             .enumerate()
         {
@@ -1124,9 +1308,10 @@ impl MlxHybridState {
             ));
         }
         for (relative, layer) in range.enumerate() {
-            let state = &mut self.layers[layer];
+            let state = &mut self.layers.slots_mut()[layer];
             let policy = self
                 .layout
+                .layout()
                 .layers()
                 .get(layer)
                 .expect("validated hybrid state range is inside its layout");
@@ -1176,7 +1361,7 @@ impl MlxHybridState {
             ));
         }
         for (relative, layer) in range.clone().enumerate() {
-            let state = &mut self.layers[layer];
+            let state = &mut self.layers.slots_mut()[layer];
             if state.attention.is_none() && state.fixed.is_empty() {
                 continue;
             }
@@ -1201,7 +1386,7 @@ impl MlxHybridState {
         let global_layer_start = self.global_layer_start;
         Ok(range
             .flat_map(|layer| {
-                self.layers[layer]
+                self.layers.slots()[layer]
                     .fixed
                     .iter()
                     .filter_map(move |(role, value)| {
@@ -1235,6 +1420,7 @@ impl MlxHybridState {
         let mut manager = self.manager.clone();
         for (layer, (state, delta)) in self
             .layers
+            .slots_mut()
             .iter_mut()
             .zip(descriptor.layer_prefix_offsets())
             .enumerate()
@@ -1266,6 +1452,7 @@ impl MlxHybridState {
         let global_layer_start = self.global_layer_start;
         let state_arrays = self
             .layers
+            .slots()
             .iter()
             .enumerate()
             .flat_map(|(layer, state)| {
@@ -1291,11 +1478,59 @@ impl MlxHybridState {
     }
 }
 
+impl eredu_runtime::working_memory::InferenceStateRetention for MlxHybridState {
+    fn inference_retention(&self) -> &eredu_runtime::working_memory::InferenceRetention {
+        &self.inference_retention
+    }
+
+    fn inference_retention_mut(
+        &mut self,
+    ) -> &mut eredu_runtime::working_memory::InferenceRetention {
+        &mut self.inference_retention
+    }
+
+    fn retain_inference(&mut self, request: &eredu_runtime::working_memory::InferenceRequest) {
+        self.inference_retention.retain(request);
+    }
+}
+
 impl RuntimeState<MlxNeuralBackend> for MlxHybridState {
     type RetainedValues<'a> = std::vec::IntoIter<&'a MlxTensor>;
 
     fn layout(&self) -> &StateLayout {
-        &self.layout
+        self.layout.layout()
+    }
+
+    fn shared_layout(&self) -> Option<&eredu_runtime::SharedStateLayout> {
+        Some(&self.layout)
+    }
+
+    fn visit_all_retained_values(
+        &self,
+        visitor: &mut dyn FnMut(&MlxTensor),
+    ) -> Result<(), StateError> {
+        for layer in self.layers.slots() {
+            RuntimeLayerState::<MlxNeuralBackend>::visit_retained_values(layer, visitor);
+        }
+        Ok(())
+    }
+
+    fn visit_unit_retained_values<'a>(
+        &'a self,
+        ordinal: usize,
+        _address: eredu_runtime::ExecutionUnitAddress,
+        visitor: &mut dyn FnMut(&'a MlxTensor),
+    ) -> Result<(), StateError> {
+        let layer = self
+            .layers
+            .slots()
+            .get(ordinal)
+            .ok_or(StateError::UnknownLayer {
+                layer: ordinal,
+                count: self.layers.len(),
+            })?;
+        layer.visit_borrowed_values(visitor);
+        Ok(())
     }
 
     fn retained_values(
@@ -1305,6 +1540,7 @@ impl RuntimeState<MlxNeuralBackend> for MlxHybridState {
     ) -> Result<Self::RetainedValues<'_>, StateError> {
         let layer = ordinal;
         self.layers
+            .slots()
             .get(layer)
             .map(RuntimeLayerState::retained_values)
             .ok_or(StateError::UnknownLayer {
@@ -1320,6 +1556,7 @@ impl LayerRuntimeState<MlxNeuralBackend> for MlxHybridState {
     fn layer(&mut self, layer: usize) -> Result<&mut Self::LayerState, StateError> {
         let count = self.layers.len();
         self.layers
+            .slots_mut()
             .get_mut(layer)
             .ok_or(StateError::UnknownLayer { layer, count })
     }

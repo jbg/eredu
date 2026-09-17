@@ -1,0 +1,386 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T11:42:18.355025+00:00",
+  "scope": "One original enforced native submission tracking arena across preparation and prediction",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-loaded-decode-source-integration-2026-09-14.json",
+  "tests": {
+    "patchtests": {
+      "passed": 74,
+      "ignored": 0
+    },
+    "core": {
+      "passed": 449,
+      "ignored": 0
+    },
+    "core_docs": {
+      "passed": 6,
+      "ignored": 0
+    },
+    "runtime": {
+      "passed": 1243,
+      "ignored": 0
+    },
+    "scopeowners": {
+      "passed": 33,
+      "ignored": 0
+    },
+    "recovery": {
+      "passed": 22,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 240,
+      "ignored": 2
+    },
+    "portable": {
+      "passed": 26,
+      "ignored": 1
+    },
+    "conformance": {
+      "passed": 109,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 405,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 2607,
+  "new_tests": [
+    {
+      "check": "patchtests",
+      "name": "submission recovery quota nested scopes share actual nonzero eval storage",
+      "path": "safemlx-sys/src/mlx-c/tests/submission_record_quota_tests.cpp"
+    },
+    {
+      "check": "patchtests",
+      "name": "submission recovery quota retains occupied blocks until actual record destruction",
+      "path": "safemlx-sys/src/mlx-c/tests/submission_record_quota_tests.cpp"
+    },
+    {
+      "check": "patchtests",
+      "name": "submission recovery quota capture refusal protects old data and incoming buffer",
+      "path": "safemlx-sys/src/mlx-c/tests/submission_record_quota_tests.cpp"
+    },
+    {
+      "check": "patchtests",
+      "name": "submission recovery quota refuses nonzero graph before tracked allocation growth",
+      "path": "safemlx-sys/src/mlx-c/tests/submission_record_quota_tests.cpp"
+    },
+    {
+      "check": "patchtests",
+      "name": "submission recovery quota tracks actual eval and cross-stream wait records",
+      "path": "safemlx-sys/src/mlx-c/tests/submission_record_quota_tests.cpp"
+    },
+    {
+      "check": "scopeowners",
+      "name": "tracking_invalid_capacity_preserves_original_and_unattached_unwind_drops_it_once",
+      "path": "safemlx/src/allocation_retention/record_quota/tests.rs"
+    },
+    {
+      "check": "scopeowners",
+      "name": "tracking_busy_returns_same_node_then_native_scope_outlives_all_rust_arena_aliases",
+      "path": "safemlx/src/allocation_retention/record_quota/tests.rs"
+    },
+    {
+      "check": "scopeowners",
+      "name": "tracking_nonzero_graph_exhaustion_keeps_fixed_typed_native_cause",
+      "path": "safemlx/src/allocation_retention/record_quota/tests.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_tracking_control_only_quote_is_exact_nonrefillable_and_not_native_headroom",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/tracking.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "original_tracking_rejects_foreign_preparation_without_spending_the_real_capsule",
+      "path": "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/tracking.rs"
+    },
+    {
+      "check": "session",
+      "name": "one_original_arena_follows_real_ordinary_controlled_capture_sequence_and_opening_execution",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/tracking/tests.rs"
+    },
+    {
+      "check": "session",
+      "name": "ordinary_tracking_capacity_is_in_the_first_quote_exact_and_minus_one_before_work",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/tracking/tests.rs"
+    },
+    {
+      "check": "session",
+      "name": "ordinary_exhaustion_preserves_typed_source_and_original_arena_without_refill",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/tracking/tests.rs"
+    },
+    {
+      "check": "session",
+      "name": "original_tracking_prompt_busy_preserves_the_same_input_work_node_and_arena",
+      "path": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/tracking/tests.rs"
+    }
+  ],
+  "new_test_count": 14,
+  "checks": {
+    "patchtests": {
+      "command": "CARGO_INCREMENTAL=0 python3 /private/tmp/eredu-original-record-quota-integration-patchtests.py",
+      "started_utc": "2026-09-14T11:34:16.065737+00:00",
+      "elapsed_seconds": 117.258,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-patchtests.log",
+      "log_sha256": "0a6b5563dec6817ad558f847e7393f8b60c1021faf37722d007bde7010538a99"
+    },
+    "core": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib",
+      "started_utc": "2026-09-14T11:36:13.326780+00:00",
+      "elapsed_seconds": 16.83,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-core.log",
+      "log_sha256": "75f4a0b0a00899e06e685fa79435763e9d3b8ab03a1d2898c4da5e5431e8a980"
+    },
+    "core_docs": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core --doc",
+      "started_utc": "2026-09-14T11:36:30.157757+00:00",
+      "elapsed_seconds": 6.597,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-core_docs.log",
+      "log_sha256": "5948cb6ad896b032733ca0985bc5849dd41a5db7d34fcf5d8408b1720902b6a2"
+    },
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T11:36:36.755638+00:00",
+      "elapsed_seconds": 25.963,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-runtime.log",
+      "log_sha256": "27a075bfbe903cb95bacce4126daf3c440c67a917866820f2f9ecf247739e9e5"
+    },
+    "scopeowners": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p safemlx --no-default-features --features metal --lib allocation_retention -- --test-threads=1",
+      "started_utc": "2026-09-14T11:37:02.720590+00:00",
+      "elapsed_seconds": 19.785,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-scopeowners.log",
+      "log_sha256": "56fde4a6761ebf96a88af009e2633f95e4bf6e624dcc1dacabb26ac8519d459c"
+    },
+    "recovery": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::submission_recovery:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T11:38:43.578913+00:00",
+      "elapsed_seconds": 78.174,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-recovery.log",
+      "log_sha256": "953af66c625cd364c250801a73cb4f871ec469bf992cd39e38d2e70e06820a95"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib",
+      "started_utc": "2026-09-14T11:40:01.754801+00:00",
+      "elapsed_seconds": 42.938,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-facade.log",
+      "log_sha256": "92ab8f54e3b32f8e29713cd451200d1f3b5d9bb3cd8c9af8a64f2284014a4597"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade",
+      "started_utc": "2026-09-14T11:40:44.693495+00:00",
+      "elapsed_seconds": 15.015,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-portable.log",
+      "log_sha256": "25fca818f1f681df4d9e7df29ff1d919fde917a8b99b8e42edad6ce6a68f0558"
+    },
+    "conformance": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test backend_conformance",
+      "started_utc": "2026-09-14T11:40:59.709320+00:00",
+      "elapsed_seconds": 5.498,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-conformance.log",
+      "log_sha256": "e60d017441bb398de98593cfba4cbb5c8e39a8cb5ce8fed9d37ccedcbae20595"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T11:41:05.207923+00:00",
+      "elapsed_seconds": 22.867,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-session.log",
+      "log_sha256": "ff4686143753a96c0ec99d20a84f098a554f433ebfecb86cbd320ea0a95c47b2"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T11:41:28.076163+00:00",
+      "elapsed_seconds": 22.324,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-minimal.log",
+      "log_sha256": "be9b1b0fdc707cc113eff77ff3e4d0697b106496a156eab07267d2012c6e3180"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T11:41:50.389933+00:00",
+      "elapsed_seconds": 24.489,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-original-record-quota-integration-features.log",
+      "log_sha256": "7600fccf30685ae1883213a95e97e8582ccb77ab2bd15a1d531126142559a0e6"
+    }
+  },
+  "source_sha256": {
+    "safemlx/src/error.rs": "6d76d1ce758b0bedece50fb04d54c01c69fd1029ed53d1db4983c2cb1c6ed10a",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/sequence/fixture/tests/decoder/loaded.rs": "84da8752bd28a01e3ce46f436180b739bd73198168f2cb1b7f2bfea588ace831",
+    "eredu/tests/backend_conformance/preparation/admission.rs": "ff0545b509c9aeecb1e5a9940f0169165b75c8ab439cff7552ea1e8092f5795b",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/shared_controller_tests.rs": "c822ed3f2904f8326eb481b7b5e4f460bb100cc772a511054433c513a36c9292",
+    "eredu-runtime/src/working_memory.rs": "b1cf3e3a7baba421bac14bd8251cee50d135a0e9bb256b1bcf92d52ff54953e4",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/disk_layerwise_tests.rs": "b8d5359aae77c6e610e33813dc8cb7b58512fa4975fbfcac873a9c6e4b4e1432",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/saved_array_copy/decoder/resume_driver/tests.rs": "910b01113f9a45d7347f218fb8985333154c1921fc6a1afe2ba111d5dfa33b45",
+    "eredu-backend-mlx/src/composition/mlx/prepared_speculative/mechanism_tests.rs": "4d457b6f891c08a6c1de121ffc43f7b8381a5c3b8849b337aa0b93d562485e0d",
+    "safemlx/src/utils/guard.rs": "5512fae8d8411f5ce91d1308472dde4bee26b18c4bf692103b81d581d8d4d061",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_reuse_tests.rs": "60fd383267eae6c3d9eabfbb46c40c1ab60a97b43a4761a6cb8d295d0250532a",
+    "eredu-runtime/src/working_memory/residual/span_workspace/text_controls.rs": "221b126c71ba3a8d0ddcf33d574c29f12fef3cad8475d63ee050d05f87cdb0c5",
+    "safemlx/src/allocation_retention/record_quota.rs": "73c0876048aa2ed9222f82556ed0a706360dfec8afa23f42954e9c801e6be32c",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote.rs": "0f3aa6f4c46aba99efcb31539a4feeec89bce9c04a96c3848cfac56322c71914",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/resume.rs": "3559d830c4d46eefaeacd1f01c5f3c72b6d433e11ae3ddfc84db5caafb688631",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/submission_owner.rs": "d8156a141b017fba9a9158f8265f9671bcb51874391b7d590632f6fd2924e0bf",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_step.rs": "7b293800f54487fb5056f39b644bc7a7aa9690d8614c29564c864f9382c6a383",
+    "eredu-backend-mlx/src/backend/adapter/completion.rs": "e65e6b6097eca38f525724b4619818c97bdac4814166421528ff059fb7e7d76f",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls.rs": "e5ce53388e8433fae6ed60721c23c9b13cd9b086275bc4a0a83e6a47c85c85f8",
+    "eredu-runtime/src/working_memory/residual/span_workspace/text_controls/sequence.rs": "c0b79beb49892b9c8671b280335ae1c1fc735a659eed4943aac8e762daf381df",
+    "safemlx-sys/src/mlx-c/mlx/c/error.h": "c422a42511c9d84c9fa51767327d5008688fc956d6d9956049956fac8d5eb8b0",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/capture.rs": "e9810add678fd8a9df484017aba29f993134a27f51c7d5abb1e71b559ecb59ac",
+    "doc/execution-control.md": "c69c2fa628351143580f511bb0ac1cafb767647c868d2ef0c6b1b1afacef4a3b",
+    "doc/bounded-inference.md": "ab8745b4ed5b6751364c74d12fc6e711fe00f8a69d95aee10a3b32ac65961207",
+    "eredu/tests/backend_conformance/preparation/speculative.rs": "d2615024ef761d52914ae15b98796af6316170a1e07faaa7620cf7b6a9816a7c",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/opening/tests/native.rs": "3ebe43708a8461418ce80e2775907ad605d4cc1a2094e041c29d23609a97b8ef",
+    "safemlx-sys/src/mlx-c/CMakeLists.txt": "5537f64dbb64502ac3cbec28853a76a1b9405b33cdcfb5a462a67bedaa942942",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/preparation_authority_tests.rs": "913f8cf6355ab7c9de87af4a5e04b2f6b659ee0dc1b5184865ae24a1a35832b1",
+    "eredu-backend-mlx/src/backend/submission_recovery/prepared.rs": "990363a2d3f0acb4213de6536d67d41dfdb4fea1fdf2868348c3d14a74fcc639",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/controller_credit_tests.rs": "606544061c94983748aa9431daff2c6717dced69ce1b92a1075a73f792920156",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/preparation.rs": "e6dc50611d21ac1dd891930124977fe906ecff35f4a5cc66b281492f45b534a9",
+    "eredu-runtime/src/working_memory/residual/span_workspace.rs": "6762edf9ed8e6f528a6fd13cf8a64f3ddedf248e97a2a8a351852463ff851dfb",
+    "safemlx-sys/src/bindings.rs": "4887856f13e94c3e6c2382cf83ee71d84e852d3b92eba10ea1c7fd755ca5d188",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/managed_admission_tests.rs": "475f1222d7185ad065fdee80d3f6560953e885d25aa0d7c22b555246ba5c2f33",
+    "safemlx-sys/src/mlx-c/mlx/c/submission.h": "8c14504dbe9b5dae4be0ef9c1b3c4bad54adcbb7acd92a56051140eb68baa782",
+    "safemlx/src/allocation_retention/scope.rs": "328608faa8a9b2549d3066e93d8b82a05fbc55e1981fa9fedc43414526308098",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/funded_sampler_copy_tests.rs": "9e33c9c00d6f1de5dfeb220f261f799683771d6f4de7a9df88316477fd4bffcc",
+    "eredu-backend-mlx/src/composition/mlx/session/output_completion/observation.rs": "e18b11bf215f2ac5eac7a37831985c3462dc4dfaeb55891a5093fda984262855",
+    "safemlx-sys/src/mlx-c/mlx/c/submission.cpp": "22f7d9046f4586ce36826c8350194e947cc77016b2dd2024de466847fb004f6e",
+    "safemlx/src/fast.rs": "727ff6179a20436a5f2144ae90840aaee02ae2cd0b2bb80552123043a6651c78",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "2cf4bd4b9ec69198e5b39099b3a6011ab784426cb4d695bd657b87faf7bd4168",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/optional_filter_tests.rs": "fd23eadebff4a61efd88bc02bb7f616d6c614c631a9d1c70b837e4a1141f4398",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/mechanisms/opening_sources/rows.rs": "b1b4e4730832fc760f97fbb85b5f3e1850c82b231d4e49d41aba13da6cb14a4a",
+    "eredu-core/src/backend.rs": "7dfb6eae3b769414006ba7f5ba58794893e7209d2793fe018a78ae08ba772a35",
+    "eredu-runtime/src/working_memory/sampling/tests/projection.rs": "0d01ae0ca3db9e428301b15550b1a223191f899b326cbd54e2c2578637922e76",
+    "safemlx-sys/src/mlx-c/mlx/c/error.cpp": "df842a51d2c03d429761bfe12b72b48768af1f5d298cafb78a4b909a50e93879",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/sequence.rs": "db3c3a3f6fafd2193040b8514390ae38fb2910b1d613356f90ef562b9083a561",
+    "safemlx-sys/src/mlx-c/tests/submission_record_quota_tests.cpp": "b29d1ae34c48b3a498377a9569f6b2d16e8e088c2dc9aa1d1d3b8568654c3779",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/sequence/fixture/tests.rs": "4e9f83ab26ccbea0e1893dbcc8e78977fc5d6e27d027f14658c9d3dbdd617b1b",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/tracking/tests.rs": "e4532cbd8e2904669d3be00ef1762c24bb516d735ff1b3211ffa6fd2b59275d2",
+    "eredu-runtime/src/working_memory/residual/span_workspace/text_controls/tracking.rs": "cd628ebdc96c95d171611cd1f3ff40bd7aba06b314e122a67c8cda491e8a2dab",
+    "eredu-runtime/src/working_memory/residual/tests/span_workspace/text_controls/tracking.rs": "f62b9d0ac89f1f6e08d7ead08822086bf69f7be1657843967f6d08ee55ea2b0f",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/saved_array_copy/tests.rs": "9a9e76c81e66fbe788c75db974efe73ee201fd5c3c449d588010275fd6a98f6d",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote_tests.rs": "3174fa24764ace6d5cf2ab9e37c7f533d8166455b262fa4493b4f47e433e51a8",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/sequence/fixture.rs": "51d9eff7ba05274d7ab7c23ff3a67f598f62befac9f88e736c6881c162427fff",
+    "doc/backend-architecture.md": "0de25e50f8bc836a0047815bdb704677c0e0c5e77587743355ee4b9643e9da79",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/loaded_helper_tests.rs": "a942a4d4f88a62edca9bd5dbf965ceb44faf39bd797c4dc412155ee70d37317c",
+    "eredu-runtime/src/working_memory/residual.rs": "07943052537ea0ff284c6371ba3f7dc8c081fa4bea32bf7c42f8334ef378b752",
+    "safemlx/src/allocation_retention/record_quota/tests.rs": "9401556d4f2f06f7a59972a00ac4f9a44b0a61321ac18d8e021cf682a669869e",
+    "safemlx/src/host_transfer.rs": "962768f8702e35cb0893f1b4b2ab9e0abed84eb55497e36f87b83cb480acbe97",
+    "safemlx-sys/src/mlx-c/patches/mlx-record-storage-quota.patch": "f1a684de95731674e8f0aea6cf510352853ba52a524f8871d4120e09b56363ca",
+    "eredu-backend-mlx/src/composition/mlx/session/output_completion.rs": "4f484b9a2ae9af4a6e4a4e396085adee712ed9f7c9ef29a80bd14b1ca12b9743",
+    "eredu-runtime/src/working_memory/text_preparation.rs": "fa1d21d49832e064204bd44fe78a91512bc4ecc10546bfad500c8d3e9e42962a",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/prediction/tests.rs": "e0efda40f38b814741b60cc26a28bd39d94580b8efc23ed418109695ca521227",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/prediction.rs": "8c2c3192c27f4ce12b368bebecd174c6a992afec5c6547891d591d93ab6e66b6",
+    "eredu-core/src/inference.rs": "4f86318c6ef841e8c51ce7ef33b196e76d2eeac83c2402530518be44cbab01c0",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/host_layerwise_tests.rs": "9a5c50c6cae817f8f7afdb7b039454cab820044374222ba16b03de37ec6a1151",
+    "safemlx/src/allocation_retention.rs": "b5ff2face1fbcf5f376ccb5d20a74db6783cf18c1a0de5bdbf6b5e23a431fc6d",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/tracking.rs": "fdf59856ca277fd6f5a2e3b248fc54ce96cbc1a5eb1a4d579611188a67b6d10d",
+    "eredu-backend-mlx/src/backend/submission_recovery/prediction.rs": "8148dd6214ffbf9a09c55b81d395e3796e86d7402837b999b3e16f7e8dffd53d"
+  },
+  "source_snapshot": "/private/tmp/eredu-original-record-quota-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-loaded-decode-source-integration-2026-09-14.json": "8b7798801b4df3b0306d195ac3344c236c237f964f2c23337728930f9df9f185",
+    "/private/tmp/eredu-original-record-quota-continuation-final-root-review.json": "81db94c5a625a8ad598f569107bc4319087a7fa1bbffa46598b0345c301cf965",
+    "/private/tmp/eredu-original-record-quota-final-root-replay/checks.json": "99231b20d596cad571d953ef7a29dd6d38e630bb38fbca21ad3ee08387238931",
+    "/private/tmp/eredu-original-record-quota-final-root-review.json": "dc2ae35a4d03e778512a8de4c6de0bd949c4e8a20186c071649ab75280ef360e",
+    "/private/tmp/eredu-original-record-quota-integration-applied.json": "3f343e2f4a7741bc077ae9070d57af649f1e86599706f07659bfea593b2281c7",
+    "/private/tmp/eredu-original-record-quota-integration-apply.py": "03b1f5fc0680968ae017ff480c3023c1dee44d104bc98c92287e67b6b5b1a404",
+    "/private/tmp/eredu-original-record-quota-integration-checks.json": "04c2ba63cbcc48a099d559fdfa73fc7227a1219afe6f68450a2b7ae86ba2b8ba",
+    "/private/tmp/eredu-original-record-quota-integration-conformance.log": "e60d017441bb398de98593cfba4cbb5c8e39a8cb5ce8fed9d37ccedcbae20595",
+    "/private/tmp/eredu-original-record-quota-integration-core.log": "75f4a0b0a00899e06e685fa79435763e9d3b8ab03a1d2898c4da5e5431e8a980",
+    "/private/tmp/eredu-original-record-quota-integration-core_docs.log": "5948cb6ad896b032733ca0985bc5849dd41a5db7d34fcf5d8408b1720902b6a2",
+    "/private/tmp/eredu-original-record-quota-integration-doc-applied.json": "0f5c653964fdd875e467b3a6edce5ffafb3e53052ef7e4a273675aa7f00a4116",
+    "/private/tmp/eredu-original-record-quota-integration-facade.log": "92ab8f54e3b32f8e29713cd451200d1f3b5d9bb3cd8c9af8a64f2284014a4597",
+    "/private/tmp/eredu-original-record-quota-integration-features.log": "7600fccf30685ae1883213a95e97e8582ccb77ab2bd15a1d531126142559a0e6",
+    "/private/tmp/eredu-original-record-quota-integration-minimal.log": "be9b1b0fdc707cc113eff77ff3e4d0697b106496a156eab07267d2012c6e3180",
+    "/private/tmp/eredu-original-record-quota-integration-native-fixture-correction-review.json": "2a8fd738c8f16fc84a32ef039c28f5e8ca3072bb14f8d971f55991d6bba73438",
+    "/private/tmp/eredu-original-record-quota-integration-patchtests.log": "0a6b5563dec6817ad558f847e7393f8b60c1021faf37722d007bde7010538a99",
+    "/private/tmp/eredu-original-record-quota-integration-patchtests.py": "97066dca6cf1d38262d5ba69e66d34aee9a6d0af1bf252ee252de3d57b750c98",
+    "/private/tmp/eredu-original-record-quota-integration-portable.log": "25fca818f1f681df4d9e7df29ff1d919fde917a8b99b8e42edad6ce6a68f0558",
+    "/private/tmp/eredu-original-record-quota-integration-recovery.log": "953af66c625cd364c250801a73cb4f871ec469bf992cd39e38d2e70e06820a95",
+    "/private/tmp/eredu-original-record-quota-integration-recovery.log.1789385923578719000.previous": "f2bc511bd47f3fa2eae1481c84c3024c4eb8e28ad8aef51ef23b9af867569800",
+    "/private/tmp/eredu-original-record-quota-integration-review.json": "5eac901e4b395e14621f615c27bd7d34e1b65409231fd46d796188fab4015f8b",
+    "/private/tmp/eredu-original-record-quota-integration-root-review.json": "3c123c213f23c31cafe4781b15dceae7c2778a2a36b294a56277593bb4c8d037",
+    "/private/tmp/eredu-original-record-quota-integration-runtime.log": "27a075bfbe903cb95bacce4126daf3c440c67a917866820f2f9ecf247739e9e5",
+    "/private/tmp/eredu-original-record-quota-integration-scopeowners.log": "56fde4a6761ebf96a88af009e2633f95e4bf6e624dcc1dacabb26ac8519d459c",
+    "/private/tmp/eredu-original-record-quota-integration-session.log": "ff4686143753a96c0ec99d20a84f098a554f433ebfecb86cbd320ea0a95c47b2",
+    "/private/tmp/eredu-original-record-quota-integration-spec.json": "303bdea5506ec7b4a1fe39ec77d522f20a18ee014e04486adf0cfcfab3b31a78",
+    "/private/tmp/eredu-original-record-quota-integration-spec.pending.json": "d2836c6a648b3496ac0f28d5b11b4ba78e2279b49b7498079a37c9879f5f0402",
+    "/private/tmp/eredu-original-record-quota-integration-stage/all.patch": "bf74928b1e2b8d69ede36cece525bbe04a661e1f8af914cdb84ba6de9ef0795d",
+    "/private/tmp/eredu-original-record-quota-integration-stage/change.patch": "2abc7553ec29d3e0f316ad0d0387db7ae317ad17f788b9b8d0d021f30093f4b0",
+    "/private/tmp/eredu-original-record-quota-integration-stage/manifest.json": "3f343e2f4a7741bc077ae9070d57af649f1e86599706f07659bfea593b2281c7",
+    "/private/tmp/eredu-original-record-quota-integration-stage/staged-hashes.json": "ee38bb6043b27d3e12f32aebe84665bc8a5aa86def589da263e35059edfd9a9d",
+    "/private/tmp/eredu-original-record-quota-integration-validate.py": "84b22e205824c43bac8fc23ed842f048ffa97dfbb255a345bdf57e4937031ade",
+    "/private/tmp/eredu-original-record-quota-integration-validation-config.json": "c81528595e45658d0c89e6765d71edf57b371506f87a4198d3ce8f766b030103",
+    "/private/tmp/eredu-original-record-quota-loaded-continuation-stage/README.md": "a6ce69aba61c06a53f0b5f5a71dad616f4cfa37feab8faf13f89c57badc226ab",
+    "/private/tmp/eredu-original-record-quota-loaded-continuation-stage/doc-additions.json": "a117da3e285fe7092af950176b80970e5779620650efab1957e02740e52e1a67",
+    "/private/tmp/eredu-original-record-quota-loaded-continuation-stage/fixture.patch": "d7aed5ee0a54f663b07d917d3a5494e3db9be1fed6de9d6372fb81745ec2ee1c",
+    "/private/tmp/eredu-original-record-quota-loaded-continuation-stage/manifest.json": "287c14a1ecd82682c2b5cd55d3dcbc30c0c5be32e1a1244003d11450b2805a06",
+    "/private/tmp/eredu-original-record-quota-loaded-continuation-stage/provenance.json": "1ae0cdc4e8de895eb5ee888ff3613945a4497c47ed91bb184c081c42bdf5c1cc",
+    "/private/tmp/eredu-prepare-record-quota-reviewed-integration.py": "8afcdccf52aa3c738b6570f7e5303acd1132386f7f75055a994075dfaa420a2c",
+    "/private/tmp/eredu-record-quota-native-fixture-correction-spec.json": "5c8694cd5e97f614ef112da86c26ebeb1e5717e9d921e1ea9707116637e84a47",
+    "/private/tmp/eredu-record-quota-native-fixture-correction-stage/README.md": "cdb3e0b1e9a34c1bdadf77b0ec02355caeb7df366f522008b20961fe1b332d6c",
+    "/private/tmp/eredu-record-quota-native-fixture-correction-stage/change.patch": "4e040a84a613024431a50f6214851a60199e0facbd76d50a284337650d9438a1",
+    "/private/tmp/eredu-record-quota-native-fixture-correction-stage/failed-recovery-build.log": "f2bc511bd47f3fa2eae1481c84c3024c4eb8e28ad8aef51ef23b9af867569800",
+    "/private/tmp/eredu-record-quota-native-fixture-correction-stage/manifest.json": "59e9e69c6ebebdba8f8e173c87a35105b250b1cb44b94833a9652cf8a84829b9"
+  },
+  "review": {
+    "full_manifest_sha256": "ee38bb6043b27d3e12f32aebe84665bc8a5aa86def589da263e35059edfd9a9d",
+    "full_patch_sha256": "bf74928b1e2b8d69ede36cece525bbe04a661e1f8af914cdb84ba6de9ef0795d",
+    "patch_sha256": "2abc7553ec29d3e0f316ad0d0387db7ae317ad17f788b9b8d0d021f30093f4b0",
+    "replay": "/private/tmp/eredu-original-record-quota-integration-stage/replay",
+    "review": "Root fully reviewed original source/test changes, exact native early snapshots, final corrected merge and all fourteen tests. Verified 568 artifacts, 211 basis snapshots, 199 original/snapshot dependencies, 65 current baselines, source/full replay 65/67, all 27 authoritative native patches/seven finals and 58 Rust formatting checks. Nested patch context whitespace is preserved exactly by outer application; source bytes and native replay remain pinned.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-loaded-decode-source-integration-2026-09-14.json": "8b7798801b4df3b0306d195ac3344c236c237f964f2c23337728930f9df9f185",
+      "/private/tmp/eredu-original-record-quota-continuation-final-root-review.json": "81db94c5a625a8ad598f569107bc4319087a7fa1bbffa46598b0345c301cf965",
+      "/private/tmp/eredu-original-record-quota-final-root-replay/checks.json": "99231b20d596cad571d953ef7a29dd6d38e630bb38fbca21ad3ee08387238931",
+      "/private/tmp/eredu-original-record-quota-final-root-review.json": "dc2ae35a4d03e778512a8de4c6de0bd949c4e8a20186c071649ab75280ef360e",
+      "/private/tmp/eredu-original-record-quota-integration-native-fixture-correction-review.json": "2a8fd738c8f16fc84a32ef039c28f5e8ca3072bb14f8d971f55991d6bba73438",
+      "/private/tmp/eredu-original-record-quota-integration-patchtests.py": "97066dca6cf1d38262d5ba69e66d34aee9a6d0af1bf252ee252de3d57b750c98",
+      "/private/tmp/eredu-original-record-quota-integration-root-review.json": "3c123c213f23c31cafe4781b15dceae7c2778a2a36b294a56277593bb4c8d037",
+      "/private/tmp/eredu-original-record-quota-integration-spec.json": "303bdea5506ec7b4a1fe39ec77d522f20a18ee014e04486adf0cfcfab3b31a78",
+      "/private/tmp/eredu-original-record-quota-loaded-continuation-stage/README.md": "a6ce69aba61c06a53f0b5f5a71dad616f4cfa37feab8faf13f89c57badc226ab",
+      "/private/tmp/eredu-original-record-quota-loaded-continuation-stage/doc-additions.json": "a117da3e285fe7092af950176b80970e5779620650efab1957e02740e52e1a67",
+      "/private/tmp/eredu-original-record-quota-loaded-continuation-stage/fixture.patch": "d7aed5ee0a54f663b07d917d3a5494e3db9be1fed6de9d6372fb81745ec2ee1c",
+      "/private/tmp/eredu-original-record-quota-loaded-continuation-stage/manifest.json": "287c14a1ecd82682c2b5cd55d3dcbc30c0c5be32e1a1244003d11450b2805a06",
+      "/private/tmp/eredu-original-record-quota-loaded-continuation-stage/provenance.json": "1ae0cdc4e8de895eb5ee888ff3613945a4497c47ed91bb184c081c42bdf5c1cc",
+      "/private/tmp/eredu-prepare-record-quota-reviewed-integration.py": "8afcdccf52aa3c738b6570f7e5303acd1132386f7f75055a994075dfaa420a2c",
+      "/private/tmp/eredu-record-quota-native-fixture-correction-spec.json": "5c8694cd5e97f614ef112da86c26ebeb1e5717e9d921e1ea9707116637e84a47",
+      "/private/tmp/eredu-record-quota-native-fixture-correction-stage/README.md": "cdb3e0b1e9a34c1bdadf77b0ec02355caeb7df366f522008b20961fe1b332d6c",
+      "/private/tmp/eredu-record-quota-native-fixture-correction-stage/change.patch": "4e040a84a613024431a50f6214851a60199e0facbd76d50a284337650d9438a1",
+      "/private/tmp/eredu-record-quota-native-fixture-correction-stage/failed-recovery-build.log": "f2bc511bd47f3fa2eae1481c84c3024c4eb8e28ad8aef51ef23b9af867569800",
+      "/private/tmp/eredu-record-quota-native-fixture-correction-stage/manifest.json": "59e9e69c6ebebdba8f8e173c87a35105b250b1cb44b94833a9652cf8a84829b9"
+    },
+    "source_manifest_sha256": "3f343e2f4a7741bc077ae9070d57af649f1e86599706f07659bfea593b2281c7"
+  },
+  "behavior": [
+    "Explicit optional tracking ceiling enters original Q once, including genuine control-only promotion with unchanged actual preparation identity and one consuming Send capsule",
+    "One native physical arena holds Record objects and concrete container allocation requests with no non-null fallback; allocator links/scratch are inside the allocation and callbacks occur after its loan",
+    "Record constructor/failure/destruction retain actual quota; complete object block and Scope precede original capsule retirement",
+    "Incoming buffer guard and indexed capture reservation preserve old Data and free rejected incoming storage once",
+    "Prompt/Sampling and five prediction roles carry the same original arena, preserving Busy ownership and one-shot token observation",
+    "Native quota error classification is inline; formatting and graph/task/device/error payload closure remain separately unfinished",
+    "Root caught missing capacity argument before Record integration; corrected signature and exact NonZeroU64 control are included. Geometry validation already checks full cached+input+output arithmetic",
+    "Matching owner_identity prevents foreign native retirement while Eval local borrowed-allocator scratch remains on its originating stack",
+    "The loaded-source cached-continuation fixture and explicit reset rejection survive unchanged apart from its required None tracking policy field."
+  ],
+  "limits": [
+    "No graph-fit estimate or selected default; None preserves current incomplete tracking behavior",
+    "Saved/copy quota authority is still missing and explicitly rejects selected capacity before work",
+    "Graph descriptors/control/Shape/Stride/primitive/root vectors, Event/Fence/task/future/encoder allocations, exception formatting and global/thread metadata need separate original inventory",
+    "ArrayDesc no-allocation retirement successor remains required; this unit does not activate public managed eligibility"
+  ]
+}

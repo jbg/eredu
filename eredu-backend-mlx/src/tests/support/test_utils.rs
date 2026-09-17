@@ -120,3 +120,13 @@ fn write_tensors(
         .write(std::fs::File::create(path).unwrap(), &metadata, &inputs)
         .unwrap();
 }
+
+/// Construct the same source-owned Device, scheduler, input allocator and finite
+/// kernel families used by the public factory, before a cold test queries them.
+/// The returned pool retains their genuine shared initialization accounts.
+pub(crate) fn initialize_original_sources() -> eredu_runtime::working_memory::WorkingMemoryPool {
+    let pool = crate::backend::managed_memory::domain();
+    crate::backend::managed_memory::input_allocator::prepare_admitted(&pool)
+        .expect("genuine shared native source initialization");
+    pool
+}

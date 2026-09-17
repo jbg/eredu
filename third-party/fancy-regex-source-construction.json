@@ -1,0 +1,65 @@
+{
+  "base_complete_manifest": {
+    ".cargo_vcs_info.json": "5647ef462c350156cf28c93e20a1f9c098cbd764daed93b0b478641bb3093e60",
+    ".gitignore": "d02caed6e54b39fb898bc32f9b8d72f87b5d7a7e44f8271503984617450c1dcc",
+    "AUTHORS": "d5fca2653c88ad02d197faead77e22b80c70636b5bec6e02f2805f389a21b86d",
+    "CHANGELOG.md": "f870582ac48b5c46490cd2cc0b1436c1c976578fc383558e223082f456ef3f03",
+    "CONTRIBUTING.md": "a7e0f3d282301aa5f4b546ed7fc5376159569987a002f24bf57082d49746fde6",
+    "Cargo.lock": "23c13b3797c14a37e96a5d1b18c78aaf4e32ff1f4d1b599337fd4761d27116d0",
+    "Cargo.toml": "70a7e822ba66ec5b56057154e674f304d353f5695f493d1d1fb25bb197516bf2",
+    "Cargo.toml.orig": "e4259bda6f9827bc22c37eceedf130defef80116fa23f655ffa851613458d4f4",
+    "LICENSE": "3bc70e239e91272782006c638fc0452a714d384224f11f0923036b7be07cf9b5",
+    "PERFORMANCE.md": "4d0b9d68394c0255232277611d2955ce4e94ccdee75f14f1f6136d9ce7557dd1",
+    "README.md": "e2dd45390c32d575829675576ab62f69c68724438497ce358ca258d4ebeea9a8",
+    "benches/bench.rs": "3be0465a2e31554f1b3e7fba775a70344398c66f54db2324a7b42d4df23ccf52",
+    "codecov.yml": "d6ebfcadb4d940a0f86ab1a99928b673195c7d84cecee17a5eefeaf396c8477b",
+    "examples/toy.rs": "0277d4864390fb3d02687cf967294258c64d0b12d9792eef50b9962ab02f756f",
+    "src/analyze.rs": "83446e3ae41c4f31b05823625770873d6ce27a30755164005003524510b87c3f",
+    "src/compile.rs": "931d04db19d2b22ad10aa5b82b69086067ead92cc8fa71923dc63081df09f8c2",
+    "src/error.rs": "71b0983544baa6cd2c79521dc8764568c788b919082246743df11616ba7de609",
+    "src/expand.rs": "122f2fe0beb68f19a36ac2f1f9963692eefa0f5d5f4c7c6b4d0dccde401a2984",
+    "src/lib.rs": "bb83df25ccf6c9c765a91c3aee7a49f2827f3bf4a66e0041eb5baa0cc2a6d58c",
+    "src/optimize.rs": "a7c6efba04c4b435412fdc7f0754b5aa9268b0b3c479cf0d09811920a7d1ddcd",
+    "src/parse.rs": "c15666ddb32906690c9bd7dfa9012618f561ae23b3181cbfb8b09e1674b5638f",
+    "src/parse_flags.rs": "73fb78791cadde939c6398a54f156eb3ad69dbe63923427f05d24301f5cf9b44",
+    "src/replacer.rs": "cf3992fea4c44c2f9846e5cb91f99d0814b2ea8c9b170f77bc2f5db3efcfd753",
+    "src/vm.rs": "221e5dac9df0a0ce896c2332b7c6da83dcad43ebb0c53e5c2885f11eaa376024",
+    "src/vm/workspace.rs": "85dd1b08969b19e8401ccb731612049efcf5763c7f145723113456bb15b377a2",
+    "src/vm/workspace/recipe_emitter.rs": "ad40ce1a35603714100423af4bf8f2b5e3579015c537fb44e8327ca27056892e",
+    "src/vm/workspace/tests.rs": "7e42191a3249a8f7b0db4a3c70460992aaa681bc98d1082c54e4b3b4ea61eae5",
+    "tests/captures.rs": "90c87757804742f7b830442388bf3b6a7f548ebd0d5158f59dbfd73ec40f37a3",
+    "tests/common/mod.rs": "b8ab2a7a3a25adad8317c8eb1f4566df6a81978c3a7ab49847ec2f838d77c888",
+    "tests/finding.rs": "d4f5b2443b216ece0b2a79b594fb6cbb0bcd65a0fe732ad8d4314e6e95c29b54",
+    "tests/matching.rs": "da552d03c81a97e958f93bfbfa624141928eed6b77d27d305d1e22c8fcff581b",
+    "tests/oniguruma.rs": "37e6c0c9410209675ffa2729cf23d50bfd9def8fa65bbf9599129659c9d8b200",
+    "tests/oniguruma/.gitattributes": "b8d35d419a619abf4283b4f1e8a3daeaca142c87df6634b4cd706b726d29a88d",
+    "tests/oniguruma/README.md": "eae6ac089cd32010ffacb4b2f0f8cbac03ad2623e115386af53bfc93e04d1903",
+    "tests/oniguruma/test_utf8.c": "1e4813ac64703cfdbcdca359b82856c5c6778abf977e577992f6b34ab26b92de",
+    "tests/oniguruma/test_utf8_ignore.c": "6415e8361b25c8ac701e933638d441f0eef39908cbd8edc5247fceaf89348f04",
+    "tests/regex_options.rs": "39beeac1f558257d0a177fa0fd78d59da912740b9a0c60d97ed7a7f181008061",
+    "tests/replace.rs": "689fef80c2cd243a510be212cb8e6a04a30a0b0fa6f1dd6be63b17a9abb158d8",
+    "tests/send_sync.rs": "c199289872770882213bb79bb2bb8af0075d95fbd8170195eec6940935e8991c",
+    "tests/splitting.rs": "55a60e7953e92cf542fff8016c24607d3da4fdf9cbf68712348cc430b2bc0f3f"
+  },
+  "files": {
+    "src/vm/workspace.rs": {
+      "after": "f6b72d384a48036cd476a327d901b77f853ed8ee8d623280591975d4502d540f",
+      "before": "85dd1b08969b19e8401ccb731612049efcf5763c7f145723113456bb15b377a2"
+    },
+    "src/vm/workspace/construction.rs": {
+      "after": "178f784b17cef62c1545e8890e1599b755824f2b1d9ac4a36177dad7c3db6d89",
+      "before": null
+    },
+    "src/vm/workspace/construction/recipes.rs": {
+      "after": "aa13ae05b327e2767aeedfc342bb99259b88b0de48d388486f211d47ee6baab6",
+      "before": null
+    },
+    "src/vm/workspace/construction/tests.rs": {
+      "after": "e5e0a6c081c3c357b7fe9f6f360eb14fe88f2d2e7511d6b9065fc08aa4c700ff",
+      "before": null
+    }
+  },
+  "final_complete_manifest_sha256": "74aed48ffd4624a0024cebf46cee2bd858a68f0a520fe938ef88074bec8bc43f",
+  "patch_sha256": "6279df281e2864a279a41cba0146bb0f4d516cf04eb85328fca5cde104d6e00d",
+  "scope": "fresh exact-source construction mechanism, no original account or HF activation"
+}

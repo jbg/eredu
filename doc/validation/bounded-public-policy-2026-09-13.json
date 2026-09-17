@@ -1,0 +1,155 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted public text policy, selected state backing, transaction quotes and unquoted-domain exclusion",
+  "source_sha256": {
+    "doc/backend-architecture.md": "1a9923b9b9182fdebed10a061ccda90b75c1b600c634f99f0e9e6a900c0d8b02",
+    "doc/execution-control.md": "a0dbacd370100b7127a82fe3eb749aae06a84d76b377ce19eb885d77eb3391e5",
+    "doc/bounded-inference.md": "e30023c9bb93504464dbd48e5b8fed9a44c078d4a000ed55ceee8b5ffcaf2bee",
+    "eredu-core/src/inference.rs": "8a8a223d5adfe3fab0f1d95f9a7e987d77e843b2130f4594c445cb2e70029c41",
+    "eredu-core/src/backend.rs": "e75e4ea5ea461513c571ce4ca01ac0e9bcee5c121bce87d5ef5d78bd48eb0dad",
+    "eredu-core/src/backend/preparation.rs": "630167ea945a5a3bc0f9bb4e176d0eb80da693448378e9df082d35e4cd75201e",
+    "eredu-core/src/capability.rs": "490143638284004d939cded2ae6a4e333f7debdb5f61f3acef0913b78c3077a8",
+    "eredu-core/src/lib.rs": "48eb6d3dd18e0bcdf629e96ad00335b1b1cb66441bc5527a7b181b7a977a2908",
+    "eredu-runtime/src/working_memory.rs": "e7e13af45d7d6dac57f5e23f8c1d72b1c0e6f0db1c36b1cf474d65ecf119b07a",
+    "eredu-runtime/src/working_memory/storage.rs": "1f686ce925464a335b02e7b4c38b59fef2511d9e3fce65a19bd5bbf4710c2db3",
+    "eredu-runtime/src/working_memory/inference.rs": "fb158da20d9ba4397abc1dd9e744a6ca5d0e2a20ee0e6c22d8717e3f062aed6f",
+    "eredu-runtime/src/working_memory/resident.rs": "4c226007d81d5f86bb3df65d6c04fc32869410972489c860efbe42e791446010",
+    "eredu-runtime/src/working_memory/state.rs": "3b9c062d3742e5da76e6a4e12d883a6a2ebbbad5140f3113e12bb98b4dc60fe5",
+    "eredu-runtime/src/working_memory/pooling.rs": "2c19b94ced6adac8a9dad7f2c1ad71d49c41788ba5067ef58bccdc37e4f0b9b8",
+    "eredu-runtime/src/working_memory/compressed/tests.rs": "9c485dcdcbed2c16d9c203b707dfd9242c2806c2ee3be0652bf8e843c56aa3e1",
+    "eredu-runtime/tests/bounded_prefill.rs": "b7a3a66561d74d5caa0b0a6cd477c447d5c4df1c72c162443ea25718f430b8bb",
+    "eredu-runtime/tests/bounded_prefill/unquoted.rs": "c7037af5222112cf33ce4db32d9cea85cb17de223d41814bc30e5bacd0c73a0f",
+    "eredu-architectures/src/prepared_execution/workspace.rs": "510690f7bf6198b39c8e8a8c55ac7f38c509dc611ff8e37c9a41c21ad8ea941f",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace.rs": "69ce98dc55faf4bd40b33cd153da92ab2855b3b7a2fe9183be51382cde81a543",
+    "eredu-backend-mlx/src/composition/mlx/model.rs": "420e2a1332e4b8b3fb94a0c5e837a89e391617773c622dbd379eca84f8c3bd91",
+    "eredu-backend-mlx/src/composition/mlx/prepared_speculative.rs": "ebc4fe96bc1b5e4e0ec8f11819d6815bdb9e32e8f3939635fbae76137cf82204",
+    "eredu-backend-mlx/src/composition/mlx/prepared_speculative/mechanism_tests.rs": "70e6debfd937bc337a3010fc0166c525375407e73d8825e7eab17db86a2e7e95",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/prediction.rs": "d6cacf7237c4f50f5bc32a461428081e342592f0f9eb59143e19f758d40b6a2f",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/mechanisms.rs": "9f6cca787118c633e02c0f8ec7135e5ef82dd54b9432e12ea5e751f31faa63dd",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/replicated.rs": "3d669c6daf5f0e5c75d8334b779e3a1129828d239b76e0c55216b0472da70555",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/composite.rs": "2fe1345b8ffc3ff32610fbb216132f02639842784c0a71fd3bc135471b94c0ed",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session.rs": "43fe108e56cebec0c59ef98839a69c5d3eae9bca1ad57e09b91d598e6f4f6954",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/preparation_authority_tests.rs": "59ae8fee8eed543a92f7900a31f666ce4cc64baa90bb2048d85ce3027175190d",
+    "eredu-backend-mlx/src/tests/distributed_pipeline_ring/unit_and_worker/prepared_workspace.rs": "4a170ad0d504920ae06fad5042d11685520f27b8636c49974ed68f933fe5d13e",
+    "eredu/src/api/mod.rs": "c8d005c4d41eeb128776eac6a67016a8fa7ae0d60b9549b18094810e6301d51f",
+    "eredu/src/api/request.rs": "bd5163d14340e04016870f589d050fd4925a3a9808cb6acb626ffc6c534d5d34",
+    "eredu/src/api/loaded.rs": "49fac967575e2868dce892220b1ca7ac5b9271625405ed4a1f331feadea9131f",
+    "eredu/src/api/control.rs": "13330d084139b3ae69e37d5c66855d49283c6dd0d4063f0ff4bd42e6803b6d08",
+    "eredu/src/runtime/chat/constraints.rs": "d9e0258fab81c2210dad610a59f7e560f4a48be40c949d5b50071c5cbe862ae9",
+    "eredu/tests/backend_conformance.rs": "9dd41df40c7041fe70e35a2c41d9f82b9b9dbcbd1abaee606dcefeaaba370dc2",
+    "eredu/tests/backend_conformance/preparation.rs": "0807305631a2330c35f8ca4f6574efed940bad20543fec91cee3d977f158c798",
+    "eredu/tests/backend_conformance/preparation/admission.rs": "875777a54d2b0144f054fd8d338904ecbd61536fc062894db5a3014907ba6263",
+    "eredu/tests/backend_conformance/preparation/speculative.rs": "59ad2af34dbfbb99e4eec7aba7d76b878c8bc02e76b601cef33fcea195c4cb6a",
+    "eredu/tests/backend_conformance/control/snapshots.rs": "0da2393ee4002d658b7d2d331db8236610c0a5b589ee3346a54beaf2c495d323",
+    "eredu/tests/portable_facade/sampling.rs": "32e79113ac0c5a580ac45b7eb38a7613f880c487ba6f93e6338ba88528a8fcd8",
+    "eredu-cli/src/main.rs": "cdb06b94f5f0d1bbb57e996c4181e2b1f7fa6170f0cc5692c10ca4a99340aec6"
+  },
+  "coverage": {
+    "core_capability_tests": 7,
+    "bounded_prefill_tests": 41,
+    "focused_runtime_tests": 49,
+    "prepared_architecture_tests": 7,
+    "portable_facade_and_conformance_tests": 111,
+    "native_preparation_tests": 8,
+    "native_metal_composition_tests": 2,
+    "unique_tests": 225,
+    "existing_ignored_facade_tests": 1,
+    "prepared_request_trajectories": 297,
+    "compressed_copy_gap_cases": 12,
+    "native_chunk_policy_combinations": 16,
+    "unquoted_admission_races": 64,
+    "new_peak_measurements": 0
+  },
+  "behavior": [
+    "Public TextInferencePolicy reaches raw-token and prepared-input ordinary/controlled MLX prefill; smaller admitted chunks remain valid under larger public maxima. Snapshot configuration identity includes the policy.",
+    "Direct unbounded strict requests reject during coordinated admission before controller or native preparation; the facade uses its existing finite 256-token fallback.",
+    "Prepared speculative facade and direct native routes reject unintegrated policies before execution, including a policy on a later batch lane. Public MLX managed capacities reject UnknownBound rather than bypassing policy.",
+    "Selected resident transaction quotes include checkpoint and possible rollback copies. Ordinary/fixed and pooling storage shares; compressed capacity and logical arrays copy independently. Missing copy facts remain unknown and cold state is unchanged.",
+    "SelectedStateBacking preserves exact geometry and physical capacity independently from logical state and media. Either attachment order rejects different geometry; strict admission and pool reservation reject explicit missing bounds despite stale completeness.",
+    "Prepared native composition combines prompt, transaction/equation, sampling, controller and selected backing with mandatory enclosing bounds. Native Metal validates the composition while preserving missing prompt or external components.",
+    "Unquoted-owner leases atomically exclude all live reservations, including zero-byte reservations. Clones share a blocker; exact storage can publish before releasing it. Overflow, poisoning and concurrent admission are covered.",
+    "Static target inventories exclude decoder state while retaining and deduplicating parameters and sources. Existing request charges survive snapshots, cancellation/recovery and escaped opaque token handles."
+  ],
+  "limits": [
+    "Public MLX managed-capacity admission remains explicitly rejected. The native shared domain has not yet installed complete participation before loading, independent preparation, session work, copies and output escapes.",
+    "Speculative policy rejection is a temporary implementation gap, not architectural inapplicability. Dynamic grammar controller bounds remain incomplete.",
+    "Raw logits/native-array descendants, independent snapshot/capture reservations and incremental state-charge promotion still need complete ownership accounting.",
+    "Full streaming/materialization, parallel, media, prediction and observation admission remain outstanding. Equation and local native tests do not establish complete family/path enforcement.",
+    "No new released-checkpoint or process/allocator peak measurement was performed. Prior pinned Qwen numerical and memory records remain separate.",
+    "Runtime focused tests include the two unquoted overflow/poison tests also run independently; these are counted once. Existing native unused-helper and linker warnings remain."
+  ],
+  "checks": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-core --lib capability::tests",
+      "passed": 7,
+      "suites": [
+        7
+      ],
+      "log": "/private/tmp/eredu-public-policy-core.log",
+      "sha256": "4bb6072516951626d4722b5df74bb81f338a1d91f580bc9f3910d4adb0cbed07"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test bounded_prefill",
+      "passed": 41,
+      "suites": [
+        41
+      ],
+      "log": "/private/tmp/eredu-unquoted-prefill.log",
+      "sha256": "dd1083cb14d5acd1855fe81ec3022587cdf404f116d8bfe06e85d263802597ac"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib working_memory",
+      "passed": 49,
+      "suites": [
+        49
+      ],
+      "log": "/private/tmp/eredu-transaction-working-memory-final.log",
+      "sha256": "98563a3f63383e690f1908f28e0692488d60ecdac776962406a74c18847baf32"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric prepared_workspace",
+      "passed": 7,
+      "suites": [
+        7
+      ],
+      "log": "/private/tmp/eredu-transaction-prepared-workspace-final.log",
+      "sha256": "0f56b93c1539eda3450a5ec271841935eb377521cca71faa3e5340328f89a850"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "passed": 111,
+      "suites": [
+        92,
+        19
+      ],
+      "log": "/private/tmp/eredu-policy-conformance.log",
+      "sha256": "cad3443317a45054966f5d8ec952ba192fe662a9237912efedfc8493cc90613f"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --lib native_preparation -- --test-threads=1",
+      "passed": 8,
+      "suites": [
+        8
+      ],
+      "log": "/private/tmp/eredu-public-policy-native.log",
+      "sha256": "2fedbcad59ac9d87822810d3710b13f405ba1645ae292e15afb80fda810701e5"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib prepared_workspace_native -- --include-ignored --test-threads=1 --nocapture",
+      "passed": 2,
+      "suites": [
+        2
+      ],
+      "log": "/private/tmp/eredu-public-policy-metal.log",
+      "sha256": "5159022c8529b6342be88aa4657dc873e3bd96d1993a0f674b7fa561bf9ca1f0"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-cli --no-default-features --features mlx",
+      "passed": null,
+      "suites": [],
+      "log": "/private/tmp/eredu-policy-cli.log",
+      "sha256": "79d9e4e23baa41b5c6409127b986618b6ee8c5ec2af0397db24c13ccdcf13a94"
+    }
+  ]
+}

@@ -1,0 +1,726 @@
+diff --git a/mlx/backend/cpu/argpartition.h b/mlx/backend/cpu/argpartition.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/argpartition.h
+@@ -0,0 +1,16 @@
++#pragma once
++#include "mlx/array.h"
++
++namespace mlx::core::cpu {
++// Exact callable used by the ordinary and original CPU partition worker.
++// It owns the same weak array views and scalar axes as the former lambda.
++struct ArgPartitionTask {
++  array in, out;
++  int axis_, kth_;
++  void operator()();
++};
++struct ArgPartitionTaskLayout {
++  size_t bytes{0}, alignment{0}, extent{0}, controls{0};
++};
++MLX_API bool argpartition_task_layout(ArgPartitionTaskLayout&) noexcept;
++} // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -6,6 +6,9 @@
+ #include "mlx/utils.h"
+ #include "mlx/graph_construction.h"
+ #include "mlx/submission.h"
++#include "mlx/prepared_input.h"
++#include "mlx/original_buffer.h"
++#include "mlx/backend/cpu/argpartition.h"
+ 
+ namespace mlx::core::cpu {
+ 
+@@ -21,19 +24,34 @@
+ void eval(array& arr) {
+   auto s = arr.primitive().stream();
+   auto& encoder = cpu::get_command_encoder(s);
++  // Only the actual rank-two, last-axis partition worker uses the extended
++  // bank. Ordinary Eval and other primitives retain the same cleanup path.
++  const auto* partition = submission::fixed_eval_prologue_required()
++      ? dynamic_cast<const ArgPartition*>(&arr.primitive()) : nullptr;
++  const bool fixed_partition = partition && arr.ndim() == 2 && arr.inputs().size() == 1 &&
++      arr.inputs()[0].ndim() == 2 && arr.siblings().empty() &&
++      partition->state().second == 1;
++  std::optional<submission::FixedEvalPrologueGuard> partition_prologue;
++  struct Bank {
++    submission::GraphConstruction* value{nullptr};
++    ~Bank() { if (value) value->destroy(); }
++  } partition_bank;
++  if (fixed_partition) {
++    partition_prologue.emplace(arr);
++    const auto failure = submission::GraphConstruction::create_cpu_argpartition(
++        *partition_prologue, partition_bank.value);
++    if (failure != submission::GraphFailure{}) throw submission::GraphQuotaError(failure);
++  }
+   auto cleanup = [&] {
+     std::optional<submission::FixedEvalPrologueGuard> prologue;
+-    struct Bank {
+-      submission::GraphConstruction* value{nullptr};
+-      ~Bank() { if (value) value->destroy(); }
+-    } bank;
+-    if (submission::fixed_eval_prologue_required()) {
++    Bank bank;
++    if (!fixed_partition && submission::fixed_eval_prologue_required()) {
+       prologue.emplace(arr);
+       const auto failure = submission::GraphConstruction::create_cpu_cleanup(*prologue, bank.value);
+       if (failure != submission::GraphFailure{}) throw submission::GraphQuotaError(failure);
+     }
+     return encoder.prepare_cleanup(arr.inputs().size(), arr.siblings().size());
+-  }(); // No bank crosses outputs(), donation, primitive dispatch, or cleanup enqueue.
++  }(); // The extended bank contains empty destinations; alias timing is unchanged.
+ 
+   auto outputs = arr.outputs();
+   {
+@@ -86,4 +104,73 @@
+   output = value;
+   return true;
+ }
++bool cpu_argpartition_layout(bool tracer, CpuArgPartitionLayout& output) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  CpuEvalCleanupLayout cleanup;
++  cpu::ArgPartitionTaskLayout task;
++  OriginalBufferRoutingLayout routing;
++  size_t allocation_controls = 0;
++  GraphQuota::Request array_requests[5]{};
++  size_t count = 0;
++  if (!cpu_eval_cleanup_layout(1, 0, cleanup) ||
++      !cpu::argpartition_task_layout(task) ||
++      !original_buffer_routing_layout(routing) ||
++      !allocator::original_buffer_allocation_control_bytes(allocation_controls) ||
++      !PreparedInputLeaf::append_array_requests(2, array_requests, count) || count != 3)
++    return false;
++  CpuArgPartitionLayout value;
++  value.tracer = tracer;
++  for (size_t i = 0; i < 2; ++i) {
++    value.request_bytes[i] = cleanup.request_bytes[i];
++    value.request_alignments[i] = cleanup.request_alignments[i];
++    value.request_counts[i] = cleanup.request_counts[i];
++  }
++  // outputs() contains the sole output; the optional tracer copy holds the sole
++  // input at exactly its previous construction point. Both vectors start empty.
++  value.request_bytes[2] = sizeof(array);
++  value.request_alignments[2] = alignof(array);
++  value.request_counts[2] = 1 + size_t(tracer);
++  value.request_bytes[3] = array_requests[2].bytes;
++  value.request_alignments[3] = array_requests[2].alignment;
++  value.request_counts[3] = 3; // output Data plus both task weak-view Data controls
++  value.request_bytes[4] = task.bytes;
++  value.request_alignments[4] = task.alignment;
++  value.request_counts[4] = 1;
++  value.request_bytes[5] = routing.birth_bytes;
++  value.request_alignments[5] = routing.birth_alignment;
++  value.request_counts[5] = 1;
++  // Each unsafe_weak_copy builds a real descriptor and descriptor control,
++  // then set_data builds the extra Data control included in class three.
++  for (size_t i = 0; i < 2; ++i) {
++    value.request_bytes[6 + i] = array_requests[i].bytes;
++    value.request_alignments[6 + i] = array_requests[i].alignment;
++    value.request_counts[6 + i] = 2;
++  }
++  const auto adoption = array::buffer_adoption_layout();
++  value.task_controls = task.controls;
++  value.named_control_bytes = cleanup.named_control_bytes + task.controls + allocation_controls +
++      sizeof(routing) + sizeof(allocation_controls) +
++      sizeof(value) + sizeof(cleanup) + sizeof(task) + sizeof(array_requests) +
++      sizeof(count) + sizeof(tracer) + sizeof(output) + sizeof(adoption) +
++      adoption.incoming_bytes + adoption.scratch_owner_bytes + adoption.deleter_bytes +
++      adoption.prepared_strides_bytes + sizeof(CaptureSlot) + sizeof(std::shared_ptr<array::Data>) +
++      sizeof(GraphAllocator<array::Data>) + 2 * sizeof(ArrayVector) +
++      2 * sizeof(GraphAllocator<array>) + sizeof(const ArgPartition*) +
++      sizeof(std::optional<FixedEvalPrologueGuard>) + sizeof(GraphConstruction*) +
++      sizeof(bool) + 2 * (sizeof(array) + sizeof(Shape) + sizeof(ArrayVector) +
++          sizeof(std::shared_ptr<Primitive>) + sizeof(Strides) + sizeof(array::Flags) +
++          sizeof(Dtype) + sizeof(size_t) + sizeof(int64_t) + sizeof(allocator::Buffer) +
++          PreparedInputLeaf::descriptor_shared_control_bytes() +
++          PreparedInputLeaf::descriptor_allocator_control_bytes() +
++          sizeof(std::shared_ptr<array::Data>) + sizeof(GraphAllocator<array::Data>) +
++          sizeof(CaptureSlot) + adoption.incoming_bytes + adoption.deleter_bytes +
++          adoption.prepared_strides_bytes);
++  if (!GraphConstruction::complete_layout(value)) return false;
++  output = value;
++  return true;
++#endif
++}
++
+ } // namespace mlx::core::submission
+diff --git a/mlx/backend/cpu/sort.cpp b/mlx/backend/cpu/sort.cpp
+--- a/mlx/backend/cpu/sort.cpp
++++ b/mlx/backend/cpu/sort.cpp
+@@ -3,10 +3,13 @@
+ #include <algorithm>
+ #include <cassert>
+ #include <cmath>
++#include <functional>
+ #include <numeric>
+ 
+ #include "mlx/backend/common/utils.h"
+ #include "mlx/backend/cpu/argsort_f32.h"
++#include "mlx/backend/cpu/argpartition.h"
++#include "mlx/scheduler_task.h"
+ #include "mlx/backend/cpu/copy.h"
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/dtype_utils.h"
+@@ -413,41 +416,8 @@
+   auto& encoder = cpu::get_command_encoder(stream());
+   encoder.set_input_array(in);
+   encoder.set_input_array(out);
+-  encoder.dispatch([in = array::unsafe_weak_copy(in),
+-                    out = array::unsafe_weak_copy(out),
+-                    axis_ = axis_,
+-                    kth_ = kth_]() mutable {
+-    switch (in.dtype()) {
+-      case bool_:
+-        return argpartition<bool>(in, out, axis_, kth_);
+-      case uint8:
+-        return argpartition<uint8_t>(in, out, axis_, kth_);
+-      case uint16:
+-        return argpartition<uint16_t>(in, out, axis_, kth_);
+-      case uint32:
+-        return argpartition<uint32_t>(in, out, axis_, kth_);
+-      case uint64:
+-        return argpartition<uint64_t>(in, out, axis_, kth_);
+-      case int8:
+-        return argpartition<int8_t>(in, out, axis_, kth_);
+-      case int16:
+-        return argpartition<int16_t>(in, out, axis_, kth_);
+-      case int32:
+-        return argpartition<int32_t>(in, out, axis_, kth_);
+-      case int64:
+-        return argpartition<int64_t>(in, out, axis_, kth_);
+-      case float32:
+-        return argpartition<float>(in, out, axis_, kth_);
+-      case float64:
+-        return argpartition<double>(in, out, axis_, kth_);
+-      case float16:
+-        return argpartition<float16_t>(in, out, axis_, kth_);
+-      case bfloat16:
+-        return argpartition<bfloat16_t>(in, out, axis_, kth_);
+-      case complex64:
+-        return argpartition<complex64_t>(in, out, axis_, kth_);
+-    }
+-  });
++  encoder.dispatch(cpu::ArgPartitionTask{array::unsafe_weak_copy(in),
++      array::unsafe_weak_copy(out), axis_, kth_});
+ }
+ 
+ void Partition::eval_cpu(const ArrayVector& inputs, array& out) {
+@@ -498,4 +468,59 @@
+   });
+ }
+ 
++void cpu::ArgPartitionTask::operator()() {
++  switch (in.dtype()) {
++    case bool_:
++      return argpartition<bool>(in, out, axis_, kth_);
++    case uint8:
++      return argpartition<uint8_t>(in, out, axis_, kth_);
++    case uint16:
++      return argpartition<uint16_t>(in, out, axis_, kth_);
++    case uint32:
++      return argpartition<uint32_t>(in, out, axis_, kth_);
++    case uint64:
++      return argpartition<uint64_t>(in, out, axis_, kth_);
++    case int8:
++      return argpartition<int8_t>(in, out, axis_, kth_);
++    case int16:
++      return argpartition<int16_t>(in, out, axis_, kth_);
++    case int32:
++      return argpartition<int32_t>(in, out, axis_, kth_);
++    case int64:
++      return argpartition<int64_t>(in, out, axis_, kth_);
++    case float32:
++      return argpartition<float>(in, out, axis_, kth_);
++    case float64:
++      return argpartition<double>(in, out, axis_, kth_);
++    case float16:
++      return argpartition<float16_t>(in, out, axis_, kth_);
++    case bfloat16:
++      return argpartition<bfloat16_t>(in, out, axis_, kth_);
++    case complex64:
++      return argpartition<complex64_t>(in, out, axis_, kth_);
++  }
++}
++
++bool cpu::argpartition_task_layout(ArgPartitionTaskLayout& output) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  using Bound = decltype(std::bind(std::declval<ArgPartitionTask>()));
++  using Node = scheduler::TaskNode<Bound>;
++  ArgPartitionTaskLayout value;
++  value.bytes = sizeof(Node); value.alignment = alignof(Node);
++  if (!scheduler::task_graph_extent<Bound>(value.extent)) return false;
++  // Rank-two inputs leave rank-one iteration geometry. Shape, Strides and both
++  // ContiguousIterators stay inline; nth_element/sort use no owning container.
++  value.controls = sizeof(value) + sizeof(ArgPartitionTask) + sizeof(Bound) +
++      sizeof(scheduler::TaskContext) + sizeof(scheduler::TaskOwner) +
++      sizeof(submission::GraphAllocator<Node>) + 2 * sizeof(Shape) +
++      2 * sizeof(Strides) + 2 * sizeof(ContiguousIterator) +
++      5 * sizeof(StridedIterator<uint32_t>) + 6 * sizeof(size_t) +
++      4 * sizeof(int) + 4 * sizeof(void*);
++  output = value;
++  return true;
++#endif
++}
++
+ } // namespace mlx::core
+diff --git a/mlx/backend/cuda/event.cu b/mlx/backend/cuda/event.cu
+--- a/mlx/backend/cuda/event.cu
++++ b/mlx/backend/cuda/event.cu
+@@ -646,3 +646,8 @@
+ }
+ 
+ } // namespace mlx::core
++
++#include "mlx/event.h"
++namespace mlx::core {
++bool event_dispatch_control_layout(EventDispatchControlLayout&) noexcept { return false; }
++}
+diff --git a/mlx/backend/cuda/fence.cpp b/mlx/backend/cuda/fence.cpp
+--- a/mlx/backend/cuda/fence.cpp
++++ b/mlx/backend/cuda/fence.cpp
+@@ -53,3 +53,8 @@
+ }
+ 
+ } // namespace mlx::core
++
++#include "mlx/fence.h"
++namespace mlx::core {
++bool fence_control_layout(FenceControlLayout&) noexcept { return false; }
++}
+diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
+--- a/mlx/backend/metal/event.cpp
++++ b/mlx/backend/metal/event.cpp
+@@ -189,14 +189,64 @@
+   else impl->wait(value());
+ }
+ 
++namespace {
++struct EventCpuWait {
++  std::shared_ptr<metal::EventImpl> impl;
++  uint64_t value;
++  bool scoped;
++  void operator()() const {
++    if (scoped) impl->wait_scoped(value);
++    else impl->wait(value);
++  }
++};
++struct EventCpuSignal {
++  std::shared_ptr<metal::EventImpl> impl;
++  Stream stream;
++  uint64_t value;
++  bool scoped;
++  void operator()() const {
++    if (!scoped) {
++      if (auto error = scheduler::stream_error(stream)) impl->set_error(std::move(error));
++    }
++    impl->signal(value);
++  }
++};
++} // namespace
++
++bool event_dispatch_control_layout(EventDispatchControlLayout& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus < 202002L
++  return false;
++#else
++  metal::AllocationShape wait{}, signal{};
++  metal::ReceiptControlLayout receipt{};
++  if (!metal::allocation_shape<scheduler::TaskNode<EventCpuWait>>(wait) ||
++      !metal::allocation_shape<scheduler::TaskNode<EventCpuSignal>>(signal) ||
++      !metal::CommandEncoder::receipt_control_layout(receipt)) return false;
++  // The encoder owns the exact private EventEntry handler used by both GPU
++  // branches. Its query includes the inline event alias, without a new grant.
++  const auto& gpu = receipt.event_node;
++  out = {wait.bytes, wait.alignment, wait.graph_extent,
++         signal.bytes, signal.alignment, signal.graph_extent,
++         gpu.bytes, gpu.alignment, gpu.graph_extent,
++         sizeof(EventDispatchControlLayout) + sizeof(metal::ReceiptControlLayout) +
++         sizeof(metal::AllocationShape) * 2 + sizeof(std::shared_ptr<metal::EventImpl>) +
++         sizeof(EventCpuWait) + sizeof(EventCpuSignal) + sizeof(Stream) + sizeof(bool) +
++         sizeof(std::shared_ptr<metal::CommandEncoder>) + sizeof(scheduler::TaskOwner) +
++         sizeof(submission::GraphAllocator<scheduler::TaskNode<EventCpuWait>>) +
++         sizeof(submission::GraphAllocator<scheduler::TaskNode<EventCpuSignal>>) +
++         sizeof(metal::HandlerOwner) +
++         // EventEntry is private to the encoder. Its containing concrete node
++         // also bounds the inline temporary passed to prepare_completed_handler.
++         gpu.bytes};
++  return true;
++#endif
++}
++
+ void Event::wait(Stream stream) const {
+   auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
+   if (stream.device == Device::cpu) {
+     const bool scoped = scope_identity_ != 0;
+-    scheduler::enqueue(stream, [impl = std::move(impl), value = value(), scoped]() {
+-      if (scoped) impl->wait_scoped(value);
+-      else impl->wait(value);
+-    });
++    scheduler::enqueue(stream, EventCpuWait{std::move(impl), value(), scoped});
+   } else {
+     auto encoder = metal::get_command_encoder_owner(stream);
+     encoder->wait_event(std::move(impl), value());
+@@ -207,12 +257,7 @@
+   auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
+   if (stream.device == Device::cpu) {
+     const bool scoped = scope_identity_ != 0;
+-    scheduler::enqueue(stream, [impl = std::move(impl), stream, value = value(), scoped]() {
+-      if (!scoped) {
+-        if (auto error = scheduler::stream_error(stream)) impl->set_error(std::move(error));
+-      }
+-      impl->signal(value);
+-    });
++    scheduler::enqueue(stream, EventCpuSignal{std::move(impl), stream, value(), scoped});
+   } else {
+     auto encoder = metal::get_command_encoder_owner(stream);
+     encoder->signal_event(std::move(impl), value());
+diff --git a/mlx/backend/metal/fence.cpp b/mlx/backend/metal/fence.cpp
+--- a/mlx/backend/metal/fence.cpp
++++ b/mlx/backend/metal/fence.cpp
+@@ -43,6 +43,66 @@
+         static_cast<MTL::Buffer*>(buffer.ptr())->contents());
+   }
+ };
++
++namespace {
++struct FenceCpuWait {
++  std::shared_ptr<void> fence;
++  uint32_t count;
++  void operator()() {
++    auto& f = *static_cast<FenceImpl*>(fence.get());
++    while (f.cpu_value()[0] < count) {
++    }
++  }
++};
++struct FenceCpuUpdate {
++  std::shared_ptr<void> fence;
++  uint32_t count;
++  void operator()() {
++    auto& f = *static_cast<FenceImpl*>(fence.get());
++    f.cpu_value()[0] = count;
++  }
++};
++struct FenceGpuRetention {
++  std::shared_ptr<void> fence;
++  void operator()(MTL::CommandBuffer*) const {}
++};
++} // namespace
++
++bool fence_control_layout(FenceControlLayout& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus < 202002L
++  return false;
++#else
++  using Allocator = submission::GraphAllocator<FenceImpl>;
++  using Shared = std::__shared_ptr_emplace<FenceImpl, Allocator>;
++  metal::AllocationShape shared{}, wait{}, update{}, handler{};
++  if (!metal::allocation_shape<Shared>(shared) ||
++      !metal::allocation_shape<scheduler::TaskNode<FenceCpuWait>>(wait) ||
++      !metal::allocation_shape<scheduler::TaskNode<FenceCpuUpdate>>(update) ||
++      !metal::allocation_shape<metal::HandlerNode<FenceGpuRetention>>(handler)) return false;
++  out = {sizeof(FenceImpl), shared.bytes, shared.alignment, shared.graph_extent,
++         wait.bytes, wait.alignment, wait.graph_extent,
++         update.bytes, update.alignment, update.graph_extent,
++         handler.bytes, handler.alignment, handler.graph_extent,
++         sizeof(uint32_t), 1,
++         sizeof(FenceControlLayout) + sizeof(metal::AllocationShape) * 4 +
++         sizeof(Allocator) + sizeof(submission::NativeControlBinding) +
++         sizeof(allocator::OriginalBufferBinding*) + sizeof(metal::Device*) +
++         sizeof(std::shared_ptr<FenceImpl>) + sizeof(std::shared_ptr<void>) +
++         sizeof(FenceCpuWait) + sizeof(FenceCpuUpdate) + sizeof(FenceGpuRetention) +
++         sizeof(Stream) + sizeof(scheduler::TaskOwner) + sizeof(metal::HandlerOwner) +
++         sizeof(metal::PreparedHandler<FenceGpuRetention>) +
++         sizeof(std::shared_ptr<metal::CommandEncoder>) +
++         sizeof(submission::GraphAllocator<scheduler::TaskNode<FenceCpuWait>>) +
++         sizeof(submission::GraphAllocator<scheduler::TaskNode<FenceCpuUpdate>>) +
++         sizeof(submission::GraphAllocator<metal::HandlerNode<FenceGpuRetention>>) +
++         sizeof(MTL::Size) * 3 + sizeof(MTL::Buffer*) + sizeof(uint32_t) + sizeof(bool) +
++         // The three fixed kernel names fit libc++ short-string storage. Empty
++         // default function-constant/link arguments own no element allocation.
++         sizeof(std::string) * 2 + sizeof(metal::MTLFCList) +
++         sizeof(std::vector<MTL::Function*>) + sizeof(MTL::ComputePipelineState*)};
++  return true;
++#endif
++}
+ 
+ Fence::Fence(Stream stream) : Fence(stream, nullptr) {}
+ Fence::Fence(Stream stream, const allocator::OriginalBufferBinding& original)
+@@ -79,11 +139,7 @@
+   }
+ 
+   if (stream.device == Device::cpu) {
+-    scheduler::enqueue(stream, [fence_ = fence_, count = f.count]() mutable {
+-      auto& f = *static_cast<FenceImpl*>(fence_.get());
+-      while (f.cpu_value()[0] < count) {
+-      }
+-    });
++    scheduler::enqueue(stream, FenceCpuWait{fence_, f.count});
+     return;
+   }
+ 
+@@ -91,7 +147,7 @@
+   auto encoder_owner = metal::get_command_encoder_owner(stream);
+   auto& compute_encoder = *encoder_owner;
+   auto retained_fence = compute_encoder.prepare_completed_handler(
+-      [fence_ = fence_](MTL::CommandBuffer*) {});
++      FenceGpuRetention{fence_});
+   compute_encoder.record_submission();
+ 
+   // Register outputs to ensure that no kernels which depends on the
+@@ -121,10 +177,7 @@
+   }
+ 
+   if (stream.device == Device::cpu) {
+-    scheduler::enqueue(stream, [fence_ = fence_, count = f.count]() mutable {
+-      auto& f = *static_cast<FenceImpl*>(fence_.get());
+-      f.cpu_value()[0] = count;
+-    });
++    scheduler::enqueue(stream, FenceCpuUpdate{fence_, f.count});
+     return;
+   }
+ 
+@@ -132,7 +185,7 @@
+   auto encoder_owner = metal::get_command_encoder_owner(stream);
+   auto& compute_encoder = *encoder_owner;
+   auto retained_fence = compute_encoder.prepare_completed_handler(
+-      [fence_ = fence_](MTL::CommandBuffer*) {});
++      FenceGpuRetention{fence_});
+   compute_encoder.record_submission();
+ 
+   // Launch input visibility kernels
+diff --git a/mlx/backend/no_cpu/primitives.cpp b/mlx/backend/no_cpu/primitives.cpp
+--- a/mlx/backend/no_cpu/primitives.cpp
++++ b/mlx/backend/no_cpu/primitives.cpp
+@@ -147,3 +147,8 @@
+ } // namespace distributed
+ 
+ } // namespace mlx::core
++
++#include "mlx/backend/cpu/argpartition.h"
++namespace mlx::core {
++namespace cpu { bool argpartition_task_layout(ArgPartitionTaskLayout&) noexcept { return false; } }
++}
+diff --git a/mlx/backend/no_gpu/event.cpp b/mlx/backend/no_gpu/event.cpp
+--- a/mlx/backend/no_gpu/event.cpp
++++ b/mlx/backend/no_gpu/event.cpp
+@@ -184,3 +184,8 @@
+ 
+ void Event::progress_side_effects() noexcept {}
+ } // namespace mlx::core
++
++#include "mlx/event.h"
++namespace mlx::core {
++bool event_dispatch_control_layout(EventDispatchControlLayout&) noexcept { return false; }
++}
+diff --git a/mlx/backend/no_gpu/fence.cpp b/mlx/backend/no_gpu/fence.cpp
+--- a/mlx/backend/no_gpu/fence.cpp
++++ b/mlx/backend/no_gpu/fence.cpp
+@@ -85,3 +85,8 @@
+ void Fence::progress_side_effects() noexcept {}
+ 
+ } // namespace mlx::core
++
++#include "mlx/fence.h"
++namespace mlx::core {
++bool fence_control_layout(FenceControlLayout&) noexcept { return false; }
++}
+diff --git a/mlx/event.h b/mlx/event.h
+--- a/mlx/event.h
++++ b/mlx/event.h
+@@ -18,6 +18,16 @@
+   size_t construction_controls;
+   size_t platform_events;
+ };
++
++// Concrete dispatch owners. Requested bytes/alignment and Graph block extent
++// are distinct; caller supplies the actual CPU/GPU dispatch population.
++struct EventDispatchControlLayout {
++  size_t cpu_wait_bytes, cpu_wait_alignment, cpu_wait_extent;
++  size_t cpu_signal_bytes, cpu_signal_alignment, cpu_signal_extent;
++  size_t gpu_handler_bytes, gpu_handler_alignment, gpu_handler_extent;
++  size_t controls;
++};
++MLX_API bool event_dispatch_control_layout(EventDispatchControlLayout&) noexcept;
+ 
+ // Fixed component facts only; no inferred Event count or whole graph fit.
+ MLX_API bool event_control_layout(EventControlLayout&) noexcept;
+diff --git a/mlx/fence.h b/mlx/fence.h
+--- a/mlx/fence.h
++++ b/mlx/fence.h
+@@ -6,6 +6,20 @@
+ #include "mlx/original_buffer.h"
+ 
+ namespace mlx::core {
++
++// Fixed original Fence owners. The shared allocation includes FenceImpl;
++// slow Event construction/dispatch uses its own Event layout. The fast U32
++// backing is a separate physical birth, never a platform-event allocation.
++struct FenceControlLayout {
++  size_t object_bytes;
++  size_t shared_bytes, shared_alignment, shared_extent;
++  size_t cpu_wait_bytes, cpu_wait_alignment, cpu_wait_extent;
++  size_t cpu_update_bytes, cpu_update_alignment, cpu_update_extent;
++  size_t gpu_handler_bytes, gpu_handler_alignment, gpu_handler_extent;
++  size_t fast_backing_bytes, fast_backing_births;
++  size_t controls;
++};
++MLX_API bool fence_control_layout(FenceControlLayout&) noexcept;
+ 
+ /* A fence to be used for synchronizing work between streams.
+  *
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -55,6 +55,13 @@
+ };
+ MLX_API bool cpu_eval_cleanup_layout(size_t inputs, size_t siblings,
+     CpuEvalCleanupLayout&) noexcept;
++// Rank-two CPU ArgPartition: cleanup, invocation aliases, output Data control
++// and the real FIFO task. Output buffer bytes and cross-stream receipts are separate.
++struct CpuArgPartitionLayout : GraphConstructionLayout {
++  bool tracer{false};
++  size_t task_controls{0};
++};
++MLX_API bool cpu_argpartition_layout(bool tracer, CpuArgPartitionLayout&) noexcept;
+ // GPU host prologue: retention controls and empty Data/invocation vectors.
+ struct GpuEvalPrologueLayout : GraphConstructionLayout {
+   size_t inputs{0}, siblings{0}, tracer_inputs{0};
+@@ -82,6 +89,7 @@
+       const Record& dispatch, GraphConstruction*&) noexcept;
+   static GraphFailure create_gpu_prologue(const GpuEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_cleanup(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_argpartition(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   void destroy() noexcept;
+   size_t remaining() const noexcept;
+  private:
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -377,7 +377,7 @@
+       resident_primitive_control<Scatter>(), resident_primitive_control<ArgSort>(),
+       resident_primitive_control<GatherMM>(), resident_primitive_control<Reduce>(),
+       resident_primitive_control<Slice>(), resident_primitive_control<SliceUpdate>(),
+-      resident_primitive_control<ArgReduce>(),
++      resident_primitive_control<ArgReduce>(), resident_primitive_control<ArgPartition>(),
+       resident_primitive_control<Matmul>(), resident_primitive_control<AddMM>(),
+       resident_primitive_control<QuantizedMatmul>(),
+       resident_primitive_control<fast::CustomKernel>(),
+@@ -505,6 +505,22 @@
+     return GraphFailure::invalid_layout;
+   return create_layout(*quota, context.scope, &dispatch, actual, output, true);
+ }
++GraphFailure GraphConstruction::create_cpu_argpartition(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& output) noexcept {
++  auto& dispatch = guard.record();
++  auto* quota = dispatch.graph_quota();
++  const auto context = current_graph_construction_context();
++  const auto& current = guard.current();
++  const auto* primitive = dynamic_cast<const ArgPartition*>(&current.primitive());
++  if (output || !quota || !context.scope || context.worker || !guard.cpu() ||
++      context.dispatch != &dispatch || current_graph_quota() != quota ||
++      !primitive || current.ndim() != 2 || guard.inputs() != 1 || guard.siblings() != 0 ||
++      current.inputs()[0].ndim() != 2 || primitive->state().second != 1)
++    return GraphFailure::foreign_parent;
++  CpuArgPartitionLayout actual;
++  if (!cpu_argpartition_layout(guard.tracer(), actual)) return GraphFailure::invalid_layout;
++  return create_layout(*quota, context.scope, &dispatch, actual, output, true);
++}
+ GraphFailure GraphConstruction::create_layout(GraphQuota& quota, uint64_t scope,
+     const Record* dispatch, const GraphConstructionLayout& actual,
+     GraphConstruction*& output, bool exclusive_host) noexcept {
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -1728,16 +1728,16 @@
+  * - negative values indicating axes from the end
+  * - sorted in increasing order
+  */
+-ArrayVector broadcast_arrays(
++static ArrayVector broadcast_arrays_ignoring(
+     const ArrayVector& inputs,
+-    std::vector<int> ignore_axes,
++    AxisView ignore_axes,
+     StreamOrDevice s) {
+   if (inputs.size() <= 1) {
+     return inputs;
+   }
+ 
+   ArrayVector outputs;
+-  auto shape = BroadcastAxes::output_shape(inputs, ignore_axes);
++  auto shape = BroadcastAxes::output_shape_axes(inputs, ignore_axes);
+   auto check_and_get_shape = [&shape, &ignore_axes](const array& in) {
+     auto out_shape = shape;
+     for (int i = 0; i < ignore_axes.size(); ++i) {
+@@ -1788,10 +1788,17 @@
+     outputs.push_back(array(
+         out_shape,
+         in.dtype(),
+-        submission::make_graph_primitive<BroadcastAxes>(to_stream(s), ignore_axes),
++        submission::make_graph_primitive<BroadcastAxes>(to_stream(s),
++            ignore_axes.empty() ? std::vector<int>{} :
++            std::vector<int>(ignore_axes.begin(), ignore_axes.end())),
+         std::move(p_inputs)));
+   }
+   return outputs;
++}
++
++ArrayVector broadcast_arrays(const ArrayVector& inputs, std::vector<int> ignore_axes,
++    StreamOrDevice s) {
++  return broadcast_arrays_ignoring(inputs, AxisView(ignore_axes), s);
+ }
+ 
+ ArrayVector broadcast_arrays(
+@@ -3711,7 +3718,7 @@
+ 
+   // Broadcast indices and input ignoring the take axis
+   auto inputs =
+-      broadcast_arrays({a, indices}, std::vector<int>{axis - int(a.ndim())}, s);
++      broadcast_arrays_ignoring({a, indices}, Shape{axis - int(a.ndim())}, s);
+ 
+   auto out_shape = inputs[1].shape();
+   return array(
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -963,11 +963,14 @@
+ Shape BroadcastAxes::output_shape(
+     const ArrayVector& inputs,
+     const std::vector<int>& ignore_axes) {
++  return output_shape_axes(inputs, AxisView(ignore_axes));
++}
++Shape BroadcastAxes::output_shape_axes(const ArrayVector& inputs, AxisView ignore_axes) {
+   auto shape = Shape{};
+   for (auto& in : inputs) {
+     auto in_shape = in.shape();
+-    for (auto it = ignore_axes.rbegin(); it != ignore_axes.rend(); ++it) {
+-      in_shape.erase(in_shape.begin() + in.ndim() + *it);
++    for (size_t i = ignore_axes.size(); i-- > 0;) {
++      in_shape.erase(in_shape.begin() + in.ndim() + ignore_axes[i]);
+     }
+     shape = broadcast_shapes(shape, in_shape);
+   }
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -580,6 +580,7 @@
+   static Shape output_shape(
+       const ArrayVector& inputs,
+       const std::vector<int>& ignore_axes);
++  static Shape output_shape_axes(const ArrayVector&, AxisView);
+   std::vector<Shape> output_shapes(const ArrayVector& inputs) override;
+   auto state() const {
+     return ignore_axes_;
+diff --git a/mlx/submission.h b/mlx/submission.h
+--- a/mlx/submission.h
++++ b/mlx/submission.h
+@@ -196,6 +196,7 @@
+   size_t siblings() const noexcept { return current_->siblings().size(); }
+   bool tracer() const noexcept { return current_->is_tracer(); }
+   bool cpu() const noexcept;
++  const array& current() const noexcept { return *current_; }
+  private:
+   Record* record_;
+   const array* current_;

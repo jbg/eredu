@@ -48,6 +48,7 @@ pub struct ExpertRealizationPlan<S> {
     expert_parallel_size: usize,
     expert_parallel_rank: usize,
     owners: Vec<usize>,
+    owner_local_experts: Vec<usize>,
     local_global_group_indices: Vec<usize>,
     collective_members: Vec<usize>,
     collective_local_rank: usize,
@@ -70,13 +71,17 @@ impl<S> ExpertRealizationPlan<S> {
         }
         let ownership_policy = ExpertOwnershipPolicy::Balanced;
         let mut owners = vec![0; global_expert_count];
+        let mut owner_local_experts = vec![0; global_expert_count];
         for owner in 0..topology.expert_parallel_size() {
             let range = ownership_policy.range(
                 global_expert_count,
                 topology.expert_parallel_size(),
                 owner,
             )?;
-            owners[range].fill(owner);
+            for (local, global) in range.enumerate() {
+                owners[global] = owner;
+                owner_local_experts[global] = local;
+            }
         }
         let local = ownership_policy.range(
             global_expert_count,
@@ -92,6 +97,7 @@ impl<S> ExpertRealizationPlan<S> {
             expert_parallel_size: topology.expert_parallel_size(),
             expert_parallel_rank: topology.expert_parallel_rank(),
             owners,
+            owner_local_experts,
             local_global_group_indices: local.collect(),
             collective_members: collective.global_ranks().to_vec(),
             collective_local_rank: collective.rank(),
@@ -211,6 +217,7 @@ impl<S> ExpertRealizationPlan<S> {
             expert_parallel_size: self.expert_parallel_size,
             expert_parallel_rank: self.expert_parallel_rank,
             owners: self.owners,
+            owner_local_experts: self.owner_local_experts,
             local_global_group_indices: self.local_global_group_indices,
             collective_members: self.collective_members,
             collective_local_rank: self.collective_local_rank,
@@ -282,58 +289,8 @@ impl ExpertRouteCountPlan {
         local_send_counts: Vec<usize>,
         count_matrix: Vec<usize>,
     ) -> Result<Self, RoutedMechanismExecutionError> {
-        let group_size = local_send_counts.len();
-        if group_size == 0 || local_rank >= group_size {
-            return Err(RoutedMechanismExecutionError::InvalidPlan(format!(
-                "expert route rank {local_rank} is outside group size {group_size}"
-            )));
-        }
-        let expected = group_size.checked_mul(group_size).ok_or_else(|| {
-            RoutedMechanismExecutionError::InvalidPlan(
-                "expert route count matrix size overflowed usize".into(),
-            )
-        })?;
-        if count_matrix.len() != expected {
-            return Err(RoutedMechanismExecutionError::InvalidPlan(format!(
-                "expert route count consensus has {} entries, expected {expected}",
-                count_matrix.len()
-            )));
-        }
-        let local_start = local_rank.checked_mul(group_size).ok_or_else(|| {
-            RoutedMechanismExecutionError::InvalidPlan(
-                "expert route count row offset overflowed usize".into(),
-            )
-        })?;
-        if count_matrix[local_start..local_start + group_size] != local_send_counts {
-            return Err(RoutedMechanismExecutionError::InvalidPlan(
-                "expert route count consensus changed the local send row".into(),
-            ));
-        }
-        let receive = (0..group_size)
-            .map(|source| count_matrix[source * group_size + local_rank])
-            .collect::<Vec<_>>();
-        local_send_counts
-            .iter()
-            .chain(&receive)
-            .try_fold(0usize, |total, count| total.checked_add(*count))
-            .ok_or_else(|| {
-                RoutedMechanismExecutionError::InvalidPlan(
-                    "expert route peer count total overflowed usize".into(),
-                )
-            })?;
-        let forward =
-            CommunicationPeerCounts::new(local_send_counts.clone(), receive.clone(), group_size)
-                .map_err(|error| RoutedMechanismExecutionError::InvalidPlan(error.to_string()))?;
-        let reverse = CommunicationPeerCounts::new(receive, local_send_counts, group_size)
-            .map_err(|error| RoutedMechanismExecutionError::InvalidPlan(error.to_string()))?;
-        Ok(Self {
-            group,
-            group_size,
-            local_rank,
-            count_matrix,
-            forward,
-            reverse,
-        })
+        route_counts::build(group, local_rank, local_send_counts, count_matrix)
+            .map_err(|cause| RoutedMechanismExecutionError::InvalidPlan(cause.to_string()))
     }
 
     /// Opaque communication group selected before model construction.
@@ -397,6 +354,18 @@ pub enum ExpertRouteExchangeDirection {
     Reverse,
 }
 
+#[path = "expert_residency/region.rs"]
+mod region;
+pub use region::{FundedExpertRegionSelection, ExpertRouteRegionSource, ExpertRouteRegionPopulation, ExpertRouteRegionRows,
+    ExpertRouteRegionCause};
+
+#[path = "expert_residency/route_packing.rs"]
+mod route_packing;
+pub use route_packing::{
+    ExpertRoutePackingCause, ExpertRoutePackingGeometry, ExpertRoutePackingSource,
+    FundedExpertRoutePacking, FundedExpertRoutePackingFailure,
+};
+
 /// Destination-major route packing selected from architecture-global expert IDs.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ExpertRoutePackingPlan {
@@ -417,59 +386,9 @@ impl ExpertRoutePackingPlan {
         routes_per_token: usize,
         global_experts: &[usize],
     ) -> Result<Self, RoutedMechanismExecutionError> {
-        if routes_per_token == 0
-            || source_tokens.checked_mul(routes_per_token) != Some(global_experts.len())
-        {
-            return Err(RoutedMechanismExecutionError::InvalidPlan(
-                "expert route IDs do not match source token and route cardinality".into(),
-            ));
-        }
-        let mut owner_local = vec![0usize; realization.global_expert_count()];
-        let mut next_local = vec![0usize; realization.expert_parallel_size()];
-        for (global, owner) in realization.owners().iter().copied().enumerate() {
-            let local = next_local.get_mut(owner).ok_or_else(|| {
-                RoutedMechanismExecutionError::InvalidPlan(format!(
-                    "global expert {global} has owner {owner} outside the selected group"
-                ))
-            })?;
-            owner_local[global] = *local;
-            *local = local.checked_add(1).ok_or_else(|| {
-                RoutedMechanismExecutionError::InvalidPlan(
-                    "owner-local expert identity overflowed usize".into(),
-                )
-            })?;
-        }
-        let mut by_owner = vec![Vec::new(); realization.expert_parallel_size()];
-        for (position, global) in global_experts.iter().copied().enumerate() {
-            let owner = realization.owners().get(global).copied().ok_or_else(|| {
-                RoutedMechanismExecutionError::InvalidPlan(format!(
-                    "route position {position} selects invalid global expert {global}"
-                ))
-            })?;
-            by_owner[owner].push((position, global, owner_local[global]));
-        }
-        let send_counts = by_owner.iter().map(Vec::len).collect::<Vec<_>>();
-        let mut packed_route_positions = Vec::with_capacity(global_experts.len());
-        let mut packed_token_indices = Vec::with_capacity(global_experts.len());
-        let mut packed_global_experts = Vec::with_capacity(global_experts.len());
-        let mut packed_owner_local_experts = Vec::with_capacity(global_experts.len());
-        for routes in by_owner {
-            for (position, global, local) in routes {
-                packed_route_positions.push(position);
-                packed_token_indices.push(position / routes_per_token);
-                packed_global_experts.push(global);
-                packed_owner_local_experts.push(local);
-            }
-        }
-        Ok(Self {
-            source_tokens,
-            routes_per_token,
-            send_counts,
-            packed_route_positions,
-            packed_token_indices,
-            packed_global_experts,
-            packed_owner_local_experts,
-        })
+        realization.route_packing_source()
+            .pack(source_tokens, routes_per_token, global_experts)
+            .map_err(RoutedMechanismExecutionError::from_error)
     }
 
     /// Source token rows before route expansion.
@@ -575,6 +494,126 @@ where
     ExpertRouteCountPlan::from_consensus(group, local_rank, local_send_counts, matrix)
 }
 
+/// Keeps the derived counts with their original metadata account for all
+/// forward/reverse exchanges. Ordinary count plans keep their existing owner.
+pub(crate) enum ExpertRouteCountStorage {
+    Ordinary(ExpertRouteCountPlan),
+    Original(FundedExpertRouteCounts),
+}
+impl ExpertRouteCountStorage {
+    pub(crate) fn bind_local_region(&self, source: ExpertRouteRegionSource<'_>, global: &[usize], local: &[usize])
+        -> Result<Option<region::FundedExpertRegionSelection>, RoutedMechanismExecutionError> {
+        match self {
+            Self::Ordinary(_) => Ok(None),
+            Self::Original(counts) => counts.bind_local(source, global, local).map(Some)
+                .map_err(RoutedMechanismExecutionError::from_error),
+        }
+    }
+
+    pub(crate) fn bind_region(&mut self, source: ExpertRouteRegionSource<'_>)
+        -> Result<(), RoutedMechanismExecutionError> {
+        match self {
+            Self::Ordinary(plan) => source.bind_counts(plan).map(|_| ())
+                .map_err(RoutedMechanismExecutionError::from_error),
+            Self::Original(plan) => plan.bind_region(source)
+                .map_err(RoutedMechanismExecutionError::from_error),
+        }
+    }
+    pub(crate) fn region_rows(&self) -> Option<&ExpertRouteRegionRows> {
+        match self { Self::Ordinary(_) => None, Self::Original(plan) => plan.region_rows() }
+    }
+    pub(crate) fn completed_source(&self) -> Option<&eredu_core::ErasedSharedStorageOwner> {
+        match self { Self::Ordinary(_) => None, Self::Original(plan) => plan.completed_source() }
+    }
+}
+impl std::ops::Deref for ExpertRouteCountStorage {
+    type Target=ExpertRouteCountPlan;
+    fn deref(&self)->&Self::Target { match self {
+        Self::Ordinary(plan)=>plan, Self::Original(plan)=>plan.plan(),
+    } }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn agree_expert_route_counts_with_source<B,G,R,I>(
+    group:CollectiveGroupId, local_rank:usize, local:&[usize],
+    communication:&PartitionCommunication<B,G,R,I>, executor:&B::Executor,
+    context:&<B::Tensor as Tensor>::Context, source:Option<&B::ParallelContext>,
+)->Result<ExpertRouteCountStorage,RoutedMechanismExecutionError>
+where B:EvenGatherBackend,
+    G:std::borrow::Borrow<B::CommunicationGroup>,
+    R:std::borrow::Borrow<B::CommunicationRoute>,
+    I:CommunicationTensorMetadata<B>,
+{
+    let ordinary=||agree_expert_route_counts::<B,G,R,I>(group,local_rank,local.to_vec(),communication,executor,context)
+        .map(ExpertRouteCountStorage::Ordinary);
+    let Some(source)=source else { return ordinary(); };
+    B::with_parallel_control_context(source,|bound| {
+        let Some((source,funding))=bound else { return ordinary(); };
+        let fail=|cause|RoutedMechanismExecutionError::from_error(route_counts::retain(cause,funding));
+        let frames=[std::mem::size_of::<ExpertRouteCountStorage>(),std::mem::size_of::<ExpertRouteCountSource<'_>>(),
+            std::mem::size_of::<Result<ExpertRouteCountStorage,RoutedMechanismExecutionError>>(),
+            std::mem::size_of::<eredu_runtime::PartitionExecutionError>(),
+            eredu_core::BackendFailure::source_retention_peak_bytes::<B::CommunicationError>()
+                .ok_or_else(||fail(ExpertRouteCountCause::Overflow))?,
+            eredu_runtime::CommunicationOperationRequirement::tensor_metadata_control_bytes()
+                .ok_or_else(||fail(ExpertRouteCountCause::Overflow))?];
+        let bytes=frames.into_iter().try_fold(std::mem::size_of_val(&frames),usize::checked_add)
+            .ok_or_else(||fail(ExpertRouteCountCause::Overflow))?;
+        funding.reserve_metadata(bytes).map_err(|cause|fail(ExpertRouteCountCause::Funding(cause)))?;
+        let descriptor=communication.manifest().groups().iter().find(|entry|entry.id()==group)
+            .ok_or_else(||fail(ExpertRouteCountCause::Group))?;
+        let counts=ExpertRouteCountSource::new(descriptor,local).map_err(&fail)?;
+        if counts.local_rank()!=local_rank { return Err(fail(ExpertRouteCountCause::Group)); }
+        let row=counts.prepare_row(funding.clone()).map_err(RoutedMechanismExecutionError::from_error)?;
+        communication.with_prepared_peer_count_source(row.values(),group,source,executor,|loan| {
+            let Some(loan)=loan else { return Err(fail(ExpertRouteCountCause::Source)); };
+            let (matrix,actual,completed_source)=loan.into_parts();
+            if !funding.same_account(actual) { return Err(fail(ExpertRouteCountCause::Source)); }
+            counts.prepare_i32(matrix,actual.clone()).map(|plan|ExpertRouteCountStorage::Original(plan.with_completed_source(completed_source)))
+                .map_err(RoutedMechanismExecutionError::from_error)
+        }).map_err(RoutedMechanismExecutionError::from_error)?
+    }).map_err(RoutedMechanismExecutionError::from_error)?
+}
+
+/// The idle stage derives its zero row from exact selected peer geometry and
+/// pays it before allocation. Count exchange and its host result use the same
+/// source worker as active routes; no guessed wave count or caller capacity.
+pub(crate) fn agree_empty_expert_route_counts_with_source<B,G,R,I>(
+    group:CollectiveGroupId,local_rank:usize,peers:usize,
+    communication:&PartitionCommunication<B,G,R,I>,executor:&B::Executor,
+    context:&<B::Tensor as Tensor>::Context,source:Option<&B::ParallelContext>,
+)->Result<ExpertRouteCountStorage,RoutedMechanismExecutionError>
+where B:EvenGatherBackend,G:std::borrow::Borrow<B::CommunicationGroup>,
+    R:std::borrow::Borrow<B::CommunicationRoute>,I:CommunicationTensorMetadata<B>,
+{
+    let ordinary=||agree_expert_route_counts::<B,G,R,I>(group,local_rank,vec![0;peers],communication,executor,context)
+        .map(ExpertRouteCountStorage::Ordinary);
+    let Some(source)=source else{return ordinary();};
+    B::with_parallel_control_context(source,|prepared|{
+        let Some((source,funding))=prepared else{return ordinary();};
+        let fail=|cause|RoutedMechanismExecutionError::from_error(route_counts::retain(cause,funding));
+        let controls=[std::mem::size_of::<Vec<usize>>(),std::mem::size_of::<ExpertRouteCountStorage>(),
+            std::mem::size_of::<Result<ExpertRouteCountStorage,RoutedMechanismExecutionError>>(),
+            std::mem::size_of::<Result<(),std::collections::TryReserveError>>(),
+            std::mem::size_of::<std::ops::Range<usize>>(),std::mem::size_of::<(usize,usize,usize)>(),
+            ExpertRouteCountSource::preparation_control_bytes().ok_or_else(||fail(ExpertRouteCountCause::Overflow))?];
+        let controls=controls.into_iter().try_fold(std::mem::size_of_val(&controls),usize::checked_add)
+            .ok_or_else(||fail(ExpertRouteCountCause::Overflow))?;
+        funding.reserve_metadata(controls).map_err(|cause|fail(ExpertRouteCountCause::Funding(cause)))?;
+        let descriptor=communication.manifest().groups().iter().find(|entry|entry.id()==group)
+            .ok_or_else(||fail(ExpertRouteCountCause::Group))?;
+        if descriptor.members().len()!=peers || descriptor.local_index()!=Some(local_rank) {
+            return Err(fail(ExpertRouteCountCause::Group));
+        }
+        let bytes=peers.checked_mul(std::mem::size_of::<usize>()).filter(|bytes|*bytes<=isize::MAX as usize)
+            .ok_or_else(||fail(ExpertRouteCountCause::Overflow))?;
+        funding.reserve_metadata(bytes).map_err(|cause|fail(ExpertRouteCountCause::Funding(cause)))?;
+        let mut row=Vec::new();row.try_reserve_exact(peers).map_err(|_|fail(ExpertRouteCountCause::Source))?;
+        for _ in 0..peers {row.push(0);}
+        agree_expert_route_counts_with_source(group,local_rank,&row,communication,executor,context,Some(source))
+    }).map_err(RoutedMechanismExecutionError::from_error)?
+}
+
 /// Exchanges already packed expert rows through an opaque generic mechanism.
 #[allow(clippy::too_many_arguments)]
 pub fn exchange_expert_rows<B, G, R, I>(
@@ -583,6 +622,24 @@ pub fn exchange_expert_rows<B, G, R, I>(
     value: B::Tensor,
     communication: &PartitionCommunication<B, G, R, I>,
     executor: &B::Executor,
+) -> Result<B::Tensor, RoutedMechanismExecutionError>
+where
+    B: VariableAllToAllBackend,
+    G: std::borrow::Borrow<B::CommunicationGroup>,
+    R: std::borrow::Borrow<B::CommunicationRoute>,
+    I: CommunicationTensorMetadata<B>,
+{
+    exchange_expert_rows_with_source(counts,direction,value,communication,executor,None,None)
+}
+
+fn exchange_expert_rows_with_source<B, G, R, I>(
+    counts: &ExpertRouteCountPlan,
+    direction: ExpertRouteExchangeDirection,
+    value: B::Tensor,
+    communication: &PartitionCommunication<B, G, R, I>,
+    executor: &B::Executor,
+    source_context: Option<&B::ParallelContext>,
+    completed_source: Option<&eredu_core::ErasedSharedStorageOwner>,
 ) -> Result<B::Tensor, RoutedMechanismExecutionError>
 where
     B: VariableAllToAllBackend,
@@ -658,7 +715,8 @@ where
             })
         })?;
     let output = communication
-        .variable_all_to_all(value, peer_counts, 0, counts.group(), executor)
+        .variable_all_to_all_with_count_source(value, peer_counts, 0, counts.group(), executor,
+            source_context,counts.count_matrix(),direction==ExpertRouteExchangeDirection::Reverse,completed_source)
         .map_err(RoutedMechanismExecutionError::from_error)?;
     let actual_rows = output
         .shape()
@@ -687,6 +745,7 @@ pub(crate) fn agree_partition_provider_work<B, G, R, I>(
     expert_group: CollectiveGroupId,
     wave_group: Option<CollectiveGroupId>,
     local_success: bool,
+    source_context: Option<&B::ParallelContext>,
 ) -> Result<bool, RoutedMechanismExecutionError>
 where
     B: eredu_runtime::FailureAgreementBackend,
@@ -695,25 +754,25 @@ where
     I: CommunicationTensorMetadata<B>,
 {
     let tensor = tensor_group.map_or(Ok(local_success), |group| {
-        eredu_runtime::PartitionCommitAgreement::agree_phase(
+        communication.agree_phase_with_parallel_context(
             &mut eredu_runtime::OpaqueFailureAgreement,
-            communication,
             group,
             eredu_runtime::DistributedExecutionPhase::Execution,
             local_success,
             executor,
+            source_context,
         )
         .map_err(RoutedMechanismExecutionError::from_error)
     });
     // A TP rejection must still reach the EP owners before any participant
     // returns. Inactive pipeline waves use this same ordered pair of votes.
-    let expert = eredu_runtime::PartitionCommitAgreement::agree_phase(
+    let expert = communication.agree_phase_with_parallel_context(
         &mut eredu_runtime::OpaqueFailureAgreement,
-        communication,
         expert_group,
         eredu_runtime::DistributedExecutionPhase::Execution,
         matches!(tensor, Ok(true)),
         executor,
+        source_context,
     )
     .map_err(RoutedMechanismExecutionError::from_error);
     let owners = match (tensor, expert) {
@@ -721,13 +780,13 @@ where
         (Ok(tensor), Ok(expert)) => Ok(tensor && expert),
     };
     let wave = wave_group.map_or(Ok(matches!(owners, Ok(true))), |group| {
-        eredu_runtime::PartitionCommitAgreement::agree_phase(
+        communication.agree_phase_with_parallel_context(
             &mut eredu_runtime::OpaqueFailureAgreement,
-            communication,
             group,
             eredu_runtime::DistributedExecutionPhase::Execution,
             matches!(owners, Ok(true)),
             executor,
+            source_context,
         )
         .map_err(RoutedMechanismExecutionError::from_error)
     });
@@ -753,6 +812,8 @@ where
     communication: &'a PartitionCommunication<B, G, R, I>,
     executor: &'a B::Executor,
     context: &'a <B::Tensor as Tensor>::Context,
+    source_context: Option<&'a B::ParallelContext>,
+    completed_source: Option<&'a eredu_core::ErasedSharedStorageOwner>,
 }
 
 impl<'a, B, G, R, I> PartitionExpertRouteExchange<'a, B, G, R, I>
@@ -775,7 +836,20 @@ where
             communication,
             executor,
             context,
+            source_context: None,
+            completed_source: None,
         }
+    }
+
+    /// Lends the enclosing original request to both exchange directions and
+    /// the provider votes. It does not alter neural tensor-parallel selection.
+    pub const fn with_source_context(mut self,context:Option<&'a B::ParallelContext>)->Self {
+        self.source_context=context;self
+    }
+
+    /// Borrows the exact completed consensus owner for both exchange directions.
+    pub const fn with_completed_source(mut self, source: Option<&'a eredu_core::ErasedSharedStorageOwner>) -> Self {
+        self.completed_source = source; self
     }
 
     /// Retains the selected tensor group for the local-work vote preceding EP
@@ -816,6 +890,7 @@ where
             self.counts.group(),
             self.provider_wave_group,
             local_success,
+            self.source_context,
         )
     }
 
@@ -829,12 +904,14 @@ where
                 "expert route exchange received counts for the wrong direction".into(),
             ));
         }
-        exchange_expert_rows(
+        exchange_expert_rows_with_source(
             self.counts,
             self.direction,
             value,
             self.communication,
             self.executor,
+            self.source_context,
+            self.completed_source,
         )
     }
 
@@ -843,35 +920,92 @@ where
         counts: &CommunicationPeerCounts,
         values: Vec<usize>,
     ) -> Result<Vec<usize>, Self::Error> {
+        self.exchange_indices_ref(counts, &values)
+    }
+
+    fn exchange_indices_ref(
+        &mut self,
+        counts: &CommunicationPeerCounts,
+        values: &[usize],
+    ) -> Result<Vec<usize>, Self::Error> {
         if counts != self.expected_counts() {
             return Err(RoutedMechanismExecutionError::InvalidPlan(
                 "expert route metadata received counts for the wrong direction".into(),
             ));
         }
-        let values = values
-            .into_iter()
-            .map(|value| {
-                i32::try_from(value).map_err(|_| {
-                    RoutedMechanismExecutionError::InvalidPlan(
-                        "expert route metadata exceeds i32 transport geometry".into(),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let rows = i32::try_from(values.len()).map_err(|_| {
-            RoutedMechanismExecutionError::InvalidPlan(
-                "expert route metadata row count exceeds i32 geometry".into(),
-            )
-        })?;
-        let tensor = B::Tensor::from_i32_slice(&values, &[rows, 1], self.context)
-            .map_err(RoutedMechanismExecutionError::from_error)?;
-        let exchanged = exchange_expert_rows(
+        let convert = |funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>| {
+            if let Some(funding) = funding {
+                let bytes = values.len().checked_mul(std::mem::size_of::<i32>())
+                    .filter(|bytes| *bytes <= isize::MAX as usize)
+                    .and_then(|bytes| bytes.checked_add(ExpertRouteRegionSource::binding_control_bytes()?))
+                    .ok_or_else(|| RoutedMechanismExecutionError::from_error(ExpertRouteRegionCause::Overflow))?;
+                funding.reserve_metadata(bytes).map_err(|cause| RoutedMechanismExecutionError::from_error(
+                    region::FundedExpertRouteRegionFailure::new(ExpertRouteRegionCause::Funding(cause), funding.clone())
+                        .with_completed_source(self.completed_source.cloned())))?;
+            }
+            let mut converted = Vec::with_capacity(values.len());
+            for &value in values {
+                converted.push(i32::try_from(value).map_err(|_| RoutedMechanismExecutionError::from_error(
+                    ExpertRouteRegionCause::Geometry))?);
+            }
+            Ok::<_, RoutedMechanismExecutionError>(converted)
+        };
+        let values = match self.source_context {
+            Some(context) => B::with_parallel_control_context(context, |loan| {
+                if loan.is_some() && self.completed_source.is_none() {
+                    return Err(RoutedMechanismExecutionError::from_error(ExpertRouteRegionCause::Source));
+                }
+                convert(loan.map(|(_, funding)| funding))
+            }).map_err(RoutedMechanismExecutionError::from_error)??,
+            None => convert(None)?,
+        };
+        let prepared = match (self.source_context, self.completed_source) {
+            (Some(context), Some(source)) => B::prepare_expert_route_input(&values, source, context, self.executor)
+                .map_err(RoutedMechanismExecutionError::from_error)?,
+            _ => None,
+        };
+        let tensor = match prepared {
+            Some(value) => value,
+            None => {
+                if self.completed_source.is_some() {
+                    return Err(RoutedMechanismExecutionError::from_error(ExpertRouteRegionCause::Source));
+                }
+                let rows = i32::try_from(values.len()).map_err(|_| RoutedMechanismExecutionError::from_error(ExpertRouteRegionCause::Geometry))?;
+                B::Tensor::from_i32_slice(&values, &[rows, 1], self.context)
+                    .map_err(RoutedMechanismExecutionError::from_error)?
+            }
+        };
+        let exchanged = exchange_expert_rows_with_source(
             self.counts,
             self.direction,
             tensor,
             self.communication,
             self.executor,
+            self.source_context,
+            self.completed_source,
         )?;
+        if let Some(context) = self.source_context {
+            let prepared = B::with_prepared_expert_route_indices(&exchanged, context, self.executor, |loan| {
+                let Some((values, funding)) = loan else { return Ok(None); };
+                let bytes = values.len().checked_mul(std::mem::size_of::<usize>())
+                    .filter(|bytes| *bytes <= isize::MAX as usize)
+                    .and_then(|bytes| bytes.checked_add(ExpertRouteRegionSource::binding_control_bytes()?))
+                    .ok_or_else(|| RoutedMechanismExecutionError::from_error(ExpertRouteRegionCause::Overflow))?;
+                funding.reserve_metadata(bytes).map_err(|cause| RoutedMechanismExecutionError::from_error(
+                    region::FundedExpertRouteRegionFailure::new(ExpertRouteRegionCause::Funding(cause), funding.clone())
+                        .with_completed_source(self.completed_source.cloned())))?;
+                let mut output = Vec::with_capacity(values.len());
+                for &value in values {
+                    output.push(usize::try_from(value).map_err(|_| RoutedMechanismExecutionError::from_error(
+                        ExpertRouteRegionCause::Geometry))?);
+                }
+                Ok::<_, RoutedMechanismExecutionError>(Some(output))
+            }).map_err(RoutedMechanismExecutionError::from_error)??;
+            if let Some(output) = prepared { return Ok(output); }
+            if self.completed_source.is_some() {
+                return Err(RoutedMechanismExecutionError::from_error(ExpertRouteRegionCause::Source));
+            }
+        }
         // Metadata is resolved on the host below. Complete the selected native
         // dependency on every participant first, including peers whose exact
         // exchange has zero rows. Otherwise an empty peer can advance to the
@@ -1027,7 +1161,7 @@ where
         .gather_route_values(coefficients, packing.packed_route_positions())
         .map_err(RoutedMechanismExecutionError::from_error)?;
     let packed_rows = packing.packed_route_positions().len();
-    let hidden = movement.shape(input)[1];
+    let hidden = movement.checked_shape(input).map_err(RoutedMechanismExecutionError::from_error)?[1];
     validate_packed_tensor_shape(movement, &packed_input, packed_rows, Some(hidden), "input")?;
     validate_packed_tensor_shape(movement, &packed_scores, packed_rows, Some(1), "scores")?;
     validate_packed_tensor_shape(
@@ -1039,16 +1173,16 @@ where
     )?;
 
     let received_global_experts = forward
-        .exchange_indices(counts.forward(), packing.packed_global_experts().to_vec())
+        .exchange_indices_ref(counts.forward(), packing.packed_global_experts())
         .map_err(RoutedMechanismExecutionError::from_error)?;
     let received_local_experts = forward
-        .exchange_indices(
+        .exchange_indices_ref(
             counts.forward(),
-            packing.packed_owner_local_experts().to_vec(),
+            packing.packed_owner_local_experts(),
         )
         .map_err(RoutedMechanismExecutionError::from_error)?;
     let received_route_tags = forward
-        .exchange_indices(counts.forward(), packing.packed_route_positions().to_vec())
+        .exchange_indices_ref(counts.forward(), packing.packed_route_positions())
         .map_err(RoutedMechanismExecutionError::from_error)?;
     let received_input = forward
         .exchange_tensor(counts.forward(), packed_input)
@@ -1168,6 +1302,11 @@ where
         (Ok(output), Ok(true)) => output,
     };
 
+    let population = region::movement_population(packing.source_tokens(), packing.routes_per_token(),
+        invocation.reduction, post_reduce.is_some()).ok_or_else(||
+            RoutedMechanismExecutionError::InvalidPlan("expert movement population overflowed".into()))?;
+    movement.validate_population(population, region::transfer_itinerary(post_reduce.is_some())).map_err(RoutedMechanismExecutionError::from_error)?;
+
     let returned = reverse
         .exchange_tensor(counts.reverse(), reducible)
         .map_err(RoutedMechanismExecutionError::from_error)?;
@@ -1206,8 +1345,13 @@ where
     // the architecture-global expert order, independently for every token.
     let (returned, returned_bias, destinations) =
         if invocation.reduction == eredu_nn::GroupReduction::SequentialGroupOrder {
-            let mut order = (0..packed_rows).collect::<Vec<_>>();
-            order.sort_by_key(|row| packing.packed_global_experts()[*row]);
+            let mut order = movement.index_directory(packed_rows)
+                .map_err(RoutedMechanismExecutionError::from_error)?;
+            if !order.is_empty() || order.capacity() < packed_rows {
+                return Err(RoutedMechanismExecutionError::from_error(ExpertRouteRegionCause::Geometry));
+            }
+            order.extend(0..packed_rows);
+            order_route_indices(&mut order, packing.packed_global_experts());
             let returned = movement
                 .gather_rows(&returned, &order)
                 .map_err(RoutedMechanismExecutionError::from_error)?;
@@ -1215,16 +1359,18 @@ where
                 .map(|bias| movement.gather_rows(&bias, &order))
                 .transpose()
                 .map_err(RoutedMechanismExecutionError::from_error)?;
-            let destinations = order
-                .iter()
-                .map(|row| packing.packed_token_indices()[*row])
-                .collect::<Vec<_>>();
-            (returned, returned_bias, destinations)
+            let mut destinations = movement.index_directory(packed_rows)
+                .map_err(RoutedMechanismExecutionError::from_error)?;
+            if !destinations.is_empty() || destinations.capacity() < packed_rows {
+                return Err(RoutedMechanismExecutionError::from_error(ExpertRouteRegionCause::Geometry));
+            }
+            destinations.extend(order.iter().map(|row| packing.packed_token_indices()[*row]));
+            (returned, returned_bias, std::borrow::Cow::Owned(destinations))
         } else {
             (
                 returned,
                 returned_bias,
-                packing.packed_token_indices().to_vec(),
+                std::borrow::Cow::Borrowed(packing.packed_token_indices()),
             )
         };
     let output = movement
@@ -1373,15 +1519,15 @@ where
             ));
         }
     }
-    let input_shape = movement.shape(input);
+    let input_shape = movement.checked_shape(input).map_err(RoutedMechanismExecutionError::from_error)?;
     let selection_shape = [packing.source_tokens(), packing.routes_per_token()];
     if input_shape.len() != 2 || input_shape.first() != Some(&packing.source_tokens()) {
         return Err(RoutedMechanismExecutionError::InvalidPlan(format!(
             "expert route input shape {input_shape:?} is not [source_tokens, hidden]"
         )));
     }
-    if movement.shape(selected_scores) != selection_shape
-        || movement.shape(coefficients) != selection_shape
+    if movement.checked_shape(selected_scores).map_err(RoutedMechanismExecutionError::from_error)? != selection_shape
+        || movement.checked_shape(coefficients).map_err(RoutedMechanismExecutionError::from_error)? != selection_shape
     {
         return Err(RoutedMechanismExecutionError::InvalidPlan(
             "expert route score and coefficient shapes differ from route geometry".into(),
@@ -1400,7 +1546,7 @@ fn validate_packed_tensor_shape<T, M>(
 where
     M: ExpertRouteTensorMovement<T>,
 {
-    let shape = movement.shape(value);
+    let shape = movement.checked_shape(value).map_err(RoutedMechanismExecutionError::from_error)?;
     if shape.len() != 2
         || shape.first() != Some(&rows)
         || trailing.is_some_and(|trailing| shape.get(1) != Some(&trailing))
@@ -3035,5 +3181,56 @@ mod tests {
         assert_fixture_cause(&error, "exchange failed");
         assert_eq!((forward.calls, provider.calls, reverse.calls), (3, 0, 0));
         assert_eq!(movement.scatter_rows, 0);
+    }
+}
+
+#[path = "expert_residency/route_counts.rs"]
+mod route_counts;
+pub use route_counts::{ExpertRouteCountSource, ExpertRouteCountCause,
+    FundedExpertRouteCounts, FundedExpertRouteCountFailure};
+
+
+// Fixed-workspace heap ordering preserves the prior stable expert sort by
+// including the original row as the tie breaker. No temporary sort buffer,
+// recursion, or capacity-dependent allocation runs inside the retained region.
+fn order_route_indices(order: &mut [usize], experts: &[usize]) {
+    fn sift(order: &mut [usize], experts: &[usize], mut root: usize, end: usize) {
+        while root < end / 2 {
+            let left = root * 2 + 1;
+            let mut child = left;
+            if left + 1 < end
+                && (experts[order[left]], order[left])
+                    < (experts[order[left + 1]], order[left + 1]) {
+                child += 1;
+            }
+            if (experts[order[root]], order[root])
+                >= (experts[order[child]], order[child]) {
+                break;
+            }
+            order.swap(root, child);
+            root = child;
+        }
+    }
+    for root in (0..order.len() / 2).rev() {
+        sift(order, experts, root, order.len());
+    }
+    for end in (1..order.len()).rev() {
+        order.swap(0, end);
+        sift(order, experts, 0, end);
+    }
+}
+
+#[cfg(test)]
+mod route_order_tests {
+    #[test]
+    fn paid_route_directory_order_preserves_equal_expert_ties() {
+        for n in 0..129 {
+            let experts = (0..n).map(|row| (row * 37 + 11) % 9).collect::<Vec<_>>();
+            let mut actual = (0..n).collect::<Vec<_>>();
+            let mut expected = actual.clone();
+            expected.sort_by_key(|row| experts[*row]);
+            super::order_route_indices(&mut actual, &experts);
+            assert_eq!(actual, expected, "route count {n}");
+        }
     }
 }

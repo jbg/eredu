@@ -72,7 +72,7 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
             })
             .unwrap();
         let identity = plan.identity().to_owned();
-        let mut records = Vec::new();
+        let mut record_steps = Vec::new();
         let output = model
             .with_controlled_chat_speculative(
                 request(),
@@ -83,26 +83,28 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
                 |session| {
                     while let Some(step) = session.step()? {
                         assert!(step.captures.is_empty());
-                        records.extend(step.activations);
+                        record_steps.push(step.activations);
                     }
                     assert!(session.take_activation_evidence()?.is_none());
                     Ok(())
                 },
             )
             .unwrap();
+        // Keep each immutable delivery owner alive while borrowing its rows.
+        let records: Vec<_> = record_steps.iter().flat_map(|rows| rows.iter()).collect();
         assert_eq!(output.token_ids()[0], (7.0 * factor) as u32);
         if factor == 1.0 {
             assert_eq!(output.token_ids(), baseline.token_ids());
         }
-        assert_eq!(records[0].captures.invocation.unwrap().sequence, 2);
+        assert_eq!(records[0].captures.as_step().invocation.unwrap().sequence, 2);
         assert!(records
             .iter()
             .all(|r| r.completed && r.admission_identity.as_deref() == Some(identity.as_str())));
         assert!(records
             .iter()
-            .flat_map(|r| &r.captures.interventions)
+            .flat_map(|r| &r.captures.as_step().interventions)
             .any(|edit| edit.outcome == InterventionOutcome::Applied));
-        let mut continuous = Vec::new();
+        let mut continuous_steps = Vec::new();
         let streamed = model
             .generate_observed_chat_speculative(
                 request(),
@@ -111,20 +113,21 @@ fn public_internal_activation_authority_preserves_parity_and_applies_edits() {
                     ..Default::default()
                 },
                 |step| {
-                    continuous.extend(step.activations);
+                    continuous_steps.push(step.activations);
                     std::ops::ControlFlow::Continue(())
                 },
             )
             .unwrap();
+        let continuous: Vec<_> = continuous_steps.iter().flat_map(|rows| rows.iter()).collect();
         assert_eq!(streamed.token_ids(), output.token_ids());
         assert_eq!(continuous.len(), records.len());
         for (a, b) in continuous.iter().zip(&records) {
             assert_eq!(
-                (a.origin, a.phase, a.captures.invocation),
-                (b.origin, b.phase, b.captures.invocation)
+                (a.origin, a.phase, a.captures.as_step().invocation),
+                (b.origin, b.phase, b.captures.as_step().invocation)
             );
-            assert_eq!(a.captures.records, b.captures.records);
-            assert_eq!(a.captures.interventions, b.captures.interventions);
+            assert_eq!(a.captures.as_step().records, b.captures.as_step().records);
+            assert_eq!(a.captures.as_step().interventions, b.captures.as_step().interventions);
         }
         let fresh = model.generate_prepared_chat_speculative(request()).unwrap();
         assert_eq!(fresh.token_ids(), baseline.token_ids());
@@ -341,7 +344,7 @@ fn controlled_speculative_snapshots_replay_semantics_without_rewinding_delivery_
                 let first = session.step()?.unwrap();
                 let last = first.activations.last().unwrap();
                 let mut last_invocation = last.invocation;
-                let mut last_usage = last.captures.cumulative_usage;
+                let mut last_usage = last.captures.as_step().cumulative_usage;
                 let timing = session.timing();
                 assert!(session.can_snapshot());
                 let snapshot = session.snapshot()?;
@@ -354,11 +357,11 @@ fn controlled_speculative_snapshots_replay_semantics_without_rewinding_delivery_
                         for activation in &step.activations {
                             assert!(activation.invocation > last_invocation);
                             assert!(
-                                activation.captures.cumulative_usage.encoded_bytes
+                                activation.captures.as_step().cumulative_usage.encoded_bytes
                                     > last_usage.encoded_bytes
                             );
                             last_invocation = activation.invocation;
-                            last_usage = activation.captures.cumulative_usage;
+                            last_usage = activation.captures.as_step().cumulative_usage;
                         }
                         sequences.push(step.sequence);
                         tokens.extend(step.committed_token_ids);
@@ -674,3 +677,6 @@ fn speculative_forks_isolate_choices_sampling_and_semantics_and_reject_foreign_h
             .unwrap();
     }
 }
+
+#[path = "controlled_speculative/retained_errors.rs"]
+pub(crate) mod retained_errors;

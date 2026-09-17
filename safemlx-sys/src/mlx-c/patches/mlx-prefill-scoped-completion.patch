@@ -1,0 +1,1421 @@
+diff --git a/mlx/backend/cuda/eval.cpp b/mlx/backend/cuda/eval.cpp
+--- a/mlx/backend/cuda/eval.cpp
++++ b/mlx/backend/cuda/eval.cpp
+@@ -12,6 +12,14 @@
+ #include <nvtx3/nvtx3.hpp>
+ 
+ namespace mlx::core::gpu {
++
++bool supports_scoped_observation() noexcept { return false; }
++ObservationRequirement observation_requirement(const SubmissionToken&, uint64_t) noexcept {
++  // Legacy CUDA observation is unchanged. Its scoped event/receipt proof is a
++  // required next integration, not authority inferred from a Metal frontier.
++  return ObservationRequirement::unobservable;
++}
++
+ 
+ SubmissionToken prepare_submission_stream(Stream s) {
+   auto owner = cu::get_command_encoder_owner(s);
+diff --git a/mlx/backend/cuda/event.cu b/mlx/backend/cuda/event.cu
+--- a/mlx/backend/cuda/event.cu
++++ b/mlx/backend/cuda/event.cu
+@@ -1,3 +1,4 @@
++#include "mlx/failure.h"
+ // Copyright © 2024 Apple Inc.
+ 
+ #include "mlx/backend/cuda/allocator.h"
+@@ -15,6 +16,16 @@
+ #include <nvtx3/nvtx3.hpp>
+ 
+ namespace mlx::core {
++NativeFailure::NativeFailure(const NativeFailure&) noexcept = default;
++NativeFailure::NativeFailure(NativeFailure&&) noexcept = default;
++NativeFailure& NativeFailure::operator=(const NativeFailure&) noexcept = default;
++NativeFailure& NativeFailure::operator=(NativeFailure&&) noexcept = default;
++NativeFailure::~NativeFailure() = default;
++size_t NativeFailure::copy_utf16(bool, size_t, uint16_t*, size_t,
++    size_t& remaining) const noexcept { remaining = 0; return 0; }
++long long NativeFailure::code() const noexcept { return 0; }
++NativeFailure NativeFailure::from_metal_error(void*) noexcept { return {}; }
++
+ 
+ namespace cu {
+ 
+@@ -597,6 +608,10 @@
+   return false;
+ }
+ 
++EventObservation Event::observe() const noexcept {
++  return valid() ? EventObservation::unobservable : EventObservation::ready;
++}
++
+ bool Event::is_signaled() const {
+   auto* event = static_cast<EventImpl*>(event_.get());
+   if (side_effects_failed()) {
+diff --git a/mlx/backend/gpu/eval.h b/mlx/backend/gpu/eval.h
+--- a/mlx/backend/gpu/eval.h
++++ b/mlx/backend/gpu/eval.h
+@@ -19,6 +19,11 @@
+   uint64_t completed{0};
+   bool failed{false};
+ };
++// Scoped host observation can distinguish an already submitted frontier from
++// one requiring a new native commit. These facts do not submit or release work.
++enum class ObservationRequirement : uint8_t { observe, funded_progress, unobservable };
++bool supports_scoped_observation() noexcept;
++ObservationRequirement observation_requirement(const SubmissionToken&, uint64_t end) noexcept;
+ SubmissionToken prepare_submission_stream(Stream);
+ SubmissionProgress submission_progress(const SubmissionToken&) noexcept;
+ void block_submission_stream(const SubmissionToken&) noexcept;
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -598,6 +598,7 @@
+ void CommandEncoder::record_submission() {
+   submission_state_->check_admission();
+   if (!receipt_->active) {
++    receipt_->begin = submission_state_->query().accepted;
+     submission_state_->open();
+     receipt_->active = true;
+   }
+@@ -625,6 +626,7 @@
+   auto timer = timer_;
+   if (!receipt_->active) {
+     submission_state_->check_admission();
++    receipt_->begin = submission_state_->query().accepted;
+     submission_state_->open();
+     receipt_->active = true;
+     submission_state_->accept();
+@@ -639,6 +641,13 @@
+        signals = std::move(signals), completion = std::move(completion)]
+       (MTL::CommandBuffer* cbuf) mutable noexcept {
+         bool failed = cbuf->status() == MTL::CommandBufferStatusError;
++        const bool scoped_signals = !signals.empty() &&
++            std::all_of(signals.begin(), signals.end(), [](const auto& item) {
++              return std::get<0>(item)->has_scoped_failure();
++            });
++        auto capture_exception = [&]() noexcept {
++          for (auto& item : signals) std::get<0>(item)->record_current_exception();
++        };
+         try {
+           if (timer) { timer->record(cbuf); }
+           for (auto& event : waits) {
+@@ -648,22 +657,24 @@
+               failed = true;
+             }
+           }
+-          if (failed && !std::atomic_load(&error_)) {
++          if (failed && !scoped_signals && !std::atomic_load(&error_)) {
+             std::atomic_store(&error_, std::make_shared<std::string>(
+                 "[METAL] Command buffer execution failed."));
+           }
+-        } catch (...) { failed = true; }
++        } catch (...) { capture_exception(); failed = true; }
+         if (failed) { state->fail(); }
+         for (auto& handler : receipt->handlers) {
+-          try { handler(cbuf); } catch (...) { state->fail(); failed = true; }
++          try { handler(cbuf); } catch (...) { capture_exception(); state->fail(); failed = true; }
+           handler = nullptr;
+         }
+         receipt->handlers.clear();
+         if (completion) {
+-          try { completion(); } catch (...) { state->fail(); failed = true; }
++          try { completion(); } catch (...) { capture_exception(); state->fail(); failed = true; }
+           completion = nullptr;
+         }
+         for (auto& [event, value] : signals) {
++          if (cbuf->status() == MTL::CommandBufferStatusError)
++            event->record_native_error(cbuf->error());
+           if (failed) { event->mark_failed(); }
+           if (cbuf->status() == MTL::CommandBufferStatusError) {
+             try { event->signal(value); } catch (...) { state->fail(); }
+@@ -690,6 +701,17 @@
+   buffer_sizes_ = 0;
+ }
+ 
++gpu::ObservationRequirement CommandEncoder::observation_requirement(uint64_t end) const noexcept {
++  const auto progress = submission_state_->query();
++  if (progress.completed >= end) return gpu::ObservationRequirement::observe;
++  if (end > progress.accepted) return gpu::ObservationRequirement::unobservable;
++  if (!receipt_->active || end <= receipt_->begin)
++    return gpu::ObservationRequirement::observe;
++  if (commit_attempted_ || recovery_attempted_ || encoding_cleanup_failed_)
++    return gpu::ObservationRequirement::unobservable;
++  return gpu::ObservationRequirement::funded_progress;
++}
++
+ void CommandEncoder::progress_submission() noexcept {
+   // Only the current open receipt needs a commit.
+   if (!receipt_->active || recovery_attempted_ || commit_attempted_ ||
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -111,6 +111,7 @@
+   }
+   void block_submission() noexcept { submission_state_->block(); }
+   void progress_submission() noexcept;
++  gpu::ObservationRequirement observation_requirement(uint64_t end) const noexcept;
+   bool submission_idle() const noexcept { return submission_state_->idle(); }
+ 
+   MTL::CommandBuffer* get_command_buffer() const {
+@@ -125,6 +126,10 @@
+ 
+   struct Receipt {
+     bool active{false};
++    // Accepted frontier immediately before this receipt first opened. A later
++    // unrelated open receipt must not make an earlier committed scope wait
++    // require funding or trigger a commit of that unrelated work.
++    uint64_t begin{0};
+     std::vector<std::function<void(MTL::CommandBuffer*)>> handlers;
+   };
+   std::shared_ptr<gpu::SubmissionState> submission_state_{
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -9,6 +9,13 @@
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core::gpu {
++
++bool supports_scoped_observation() noexcept { return true; }
++ObservationRequirement observation_requirement(const SubmissionToken& token, uint64_t end) noexcept {
++  auto* encoder = static_cast<metal::CommandEncoder*>(token.state.get());
++  return encoder ? encoder->observation_requirement(end) : ObservationRequirement::unobservable;
++}
++
+ 
+ SubmissionToken prepare_submission_stream(Stream s) {
+   auto owner = metal::get_command_encoder_owner(s);
+diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
+--- a/mlx/backend/metal/event.cpp
++++ b/mlx/backend/metal/event.cpp
+@@ -1,3 +1,5 @@
++#include "mlx/failure.h"
++#include <algorithm>
+ // Copyright © 2024 Apple Inc.
+ 
+ #include "mlx/backend/metal/event.h"
+@@ -5,6 +7,62 @@
+ #include "mlx/submission.h"
+ 
+ namespace mlx::core {
++NativeFailure::NativeFailure(const NativeFailure& other) noexcept
++    : error_(other.error_), description_(other.description_), domain_(other.domain_) {
++  if (error_) static_cast<NS::Error*>(error_)->retain();
++  if (description_) static_cast<NS::String*>(description_)->retain();
++  if (domain_) static_cast<NS::String*>(domain_)->retain();
++}
++NativeFailure::NativeFailure(NativeFailure&& other) noexcept
++    : error_(std::exchange(other.error_, nullptr)),
++      description_(std::exchange(other.description_, nullptr)),
++      domain_(std::exchange(other.domain_, nullptr)) {}
++NativeFailure& NativeFailure::operator=(const NativeFailure& other) noexcept {
++  if (this != &other) { NativeFailure copy(other); *this = std::move(copy); }
++  return *this;
++}
++NativeFailure& NativeFailure::operator=(NativeFailure&& other) noexcept {
++  if (this != &other) {
++    if (domain_) static_cast<NS::String*>(domain_)->release();
++    if (description_) static_cast<NS::String*>(description_)->release();
++    if (error_) static_cast<NS::Error*>(error_)->release();
++    error_ = std::exchange(other.error_, nullptr);
++    description_ = std::exchange(other.description_, nullptr);
++    domain_ = std::exchange(other.domain_, nullptr);
++  }
++  return *this;
++}
++NativeFailure::~NativeFailure() {
++  if (domain_) static_cast<NS::String*>(domain_)->release();
++  if (description_) static_cast<NS::String*>(description_)->release();
++  if (error_) static_cast<NS::Error*>(error_)->release();
++}
++NativeFailure NativeFailure::from_metal_error(void* raw) noexcept {
++  NativeFailure result;
++  if (auto* error = static_cast<NS::Error*>(raw)) {
++    result.error_ = error->retain();
++    if (auto* description = error->localizedDescription())
++      result.description_ = description->retain();
++    if (auto* domain = error->domain()) result.domain_ = domain->retain();
++  }
++  return result;
++}
++size_t NativeFailure::copy_utf16(bool domain, size_t offset, uint16_t* output,
++    size_t capacity, size_t& remaining) const noexcept {
++  const auto* string = static_cast<NS::String*>(domain ? domain_ : description_);
++  const auto length = string ? string->length() : 0;
++  remaining = offset < length ? length - offset : 0;
++  const auto count = std::min(capacity, remaining);
++  // Copy raw UTF-16 into caller storage. No UTF8String/cString conversion or
++  // autoreleased byte pointer escapes; both actual NSString objects are retained.
++  for (size_t i = 0; i < count; ++i) output[i] = string->character(offset + i);
++  remaining -= count;
++  return count;
++}
++long long NativeFailure::code() const noexcept {
++  return error_ ? static_cast<NS::Error*>(error_)->code() : 0;
++}
++
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+ // EventImpl implementations
+@@ -12,7 +70,8 @@
+ 
+ namespace metal {
+ 
+-EventImpl::EventImpl(Device& d) {
++EventImpl::EventImpl(Device& d, FailureCarrierRef failure)
++    : failure_(std::move(failure)) {
+   auto p = new_scoped_memory_pool();
+   mtl_event_ = NS::TransferPtr(d.mtl_device()->newSharedEvent());
+   if (!mtl_event_) {
+@@ -32,6 +91,25 @@
+   check_error();
+ }
+ 
++void EventImpl::wait_scoped(uint64_t value) {
++  // Exact physical event dependency, not a host polling error as terminality.
++  mtl_event_->waitUntilSignaledValue(value, -1);
++  if (failed() || (failure_ && failure_.get()->borrow()))
++    (void)scheduler::record_current_failure(failure_);
++}
++
++void EventImpl::record_native_error(NS::Error* error) noexcept {
++  if (failure_) failure_.get()->capture_native_error(error);
++}
++
++EventObservation EventImpl::observe(uint64_t value) const noexcept {
++  if (!failure_) return EventObservation::unobservable;
++  if (failure_.get()->borrow()) return EventObservation::failed;
++  if (failure_.get()->pending_publication()) return EventObservation::busy;
++  if (failed() || error()) return EventObservation::unobservable;
++  return mtl_event_->signaledValue() >= value ? EventObservation::ready : EventObservation::pending;
++}
++
+ void EventImpl::signal(uint64_t value) {
+   mtl_event_->setSignaledValue(value);
+ }
+@@ -55,7 +133,11 @@
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+ Event::Event(Stream stream) : stream_(stream) {
+-  event_ = std::make_shared<metal::EventImpl>(metal::device(stream.device));
++  if (auto* scope = submission::current_scope(); scope && scope->scoped_observation_only()) {
++    scope_identity_ = scope->identity();
++    failure_ = scope->failure_owner();
++  }
++  event_ = std::make_shared<metal::EventImpl>(metal::device(stream.device), failure_);
+ }
+ 
+ void Event::wait() const {
+@@ -63,14 +145,18 @@
+ }
+ 
+ void Event::wait_dependency() const {
+-  static_cast<metal::EventImpl*>(event_.get())->wait(value());
++  auto* impl = static_cast<metal::EventImpl*>(event_.get());
++  if (scope_identity_) impl->wait_scoped(value());
++  else impl->wait(value());
+ }
+ 
+ void Event::wait(Stream stream) const {
+   auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
+   if (stream.device == Device::cpu) {
+-    scheduler::enqueue(stream, [impl = std::move(impl), value = value()]() {
+-      impl->wait(value);
++    const bool scoped = scope_identity_ != 0;
++    scheduler::enqueue(stream, [impl = std::move(impl), value = value(), scoped]() {
++      if (scoped) impl->wait_scoped(value);
++      else impl->wait(value);
+     });
+   } else {
+     auto& encoder = metal::get_command_encoder(stream);
+@@ -81,9 +167,10 @@
+ void Event::signal(Stream stream) {
+   auto impl = std::static_pointer_cast<metal::EventImpl>(event_);
+   if (stream.device == Device::cpu) {
+-    scheduler::enqueue(stream, [impl = std::move(impl), stream, value = value()]() {
+-      if (auto error = scheduler::stream_error(stream)) {
+-        impl->set_error(std::move(error));
++    const bool scoped = scope_identity_ != 0;
++    scheduler::enqueue(stream, [impl = std::move(impl), stream, value = value(), scoped]() {
++      if (!scoped) {
++        if (auto error = scheduler::stream_error(stream)) impl->set_error(std::move(error));
+       }
+       impl->signal(value);
+     });
+@@ -104,6 +191,12 @@
+   } catch (...) { return false; }
+ }
+ 
++EventObservation Event::observe() const noexcept {
++  if (!valid()) return EventObservation::ready;
++  return scope_identity_ ? static_cast<metal::EventImpl*>(event_.get())->observe(value())
++                         : EventObservation::unobservable;
++}
++
+ bool Event::is_signaled() const {
+   auto* impl = static_cast<metal::EventImpl*>(event_.get());
+   impl->check_error();
+diff --git a/mlx/backend/metal/event.h b/mlx/backend/metal/event.h
+--- a/mlx/backend/metal/event.h
++++ b/mlx/backend/metal/event.h
+@@ -7,13 +7,20 @@
+ 
+ class EventImpl {
+  public:
+-  EventImpl(Device& d);
++  EventImpl(Device& d, FailureCarrierRef failure = {});
+   ~EventImpl();
+ 
+   void wait(uint64_t value);
+   void signal(uint64_t value);
+   void set_error(std::shared_ptr<std::string> error);
+   void check_error();
++  void wait_scoped(uint64_t value);
++  void record_native_error(NS::Error* error) noexcept;
++  void record_current_exception() noexcept {
++    if (failure_) failure_.get()->capture_current_exception();
++  }
++  bool has_scoped_failure() const noexcept { return bool(failure_); }
++  EventObservation observe(uint64_t value) const noexcept;
+ 
+   auto error() const { return std::atomic_load(&error_); }
+   bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
+@@ -24,6 +31,9 @@
+   }
+ 
+  private:
++  // Retire every event/error field before this same failure-custody alias.
++  // The separate shared Event control allocation remains a producer follow-on.
++  FailureCarrierRef failure_;
+   // TODO: Use std::atomic<std::shared_ptr> when it gets supported in Xcode.
+   std::shared_ptr<std::string> error_;
+   std::atomic<bool> failed_{false};
+diff --git a/mlx/backend/no_gpu/eval.cpp b/mlx/backend/no_gpu/eval.cpp
+--- a/mlx/backend/no_gpu/eval.cpp
++++ b/mlx/backend/no_gpu/eval.cpp
+@@ -6,6 +6,13 @@
+ #include "mlx/backend/gpu/eval.h"
+ 
+ namespace mlx::core::gpu {
++
++bool supports_scoped_observation() noexcept { return true; }
++ObservationRequirement observation_requirement(const SubmissionToken&, uint64_t) noexcept {
++  // A real CPU-only accepted record cannot have a GPU receipt.
++  return ObservationRequirement::unobservable;
++}
++
+ 
+ SubmissionToken prepare_submission_stream(Stream) {
+   throw std::runtime_error("GPU backend is not available.");
+diff --git a/mlx/backend/no_gpu/event.cpp b/mlx/backend/no_gpu/event.cpp
+--- a/mlx/backend/no_gpu/event.cpp
++++ b/mlx/backend/no_gpu/event.cpp
+@@ -1,3 +1,4 @@
++#include "mlx/failure.h"
+ // Copyright © 2024 Apple Inc.
+ 
+ #include "mlx/event.h"
+@@ -10,16 +11,30 @@
+ #include <mutex>
+ 
+ namespace mlx::core {
++NativeFailure::NativeFailure(const NativeFailure&) noexcept = default;
++NativeFailure::NativeFailure(NativeFailure&&) noexcept = default;
++NativeFailure& NativeFailure::operator=(const NativeFailure&) noexcept = default;
++NativeFailure& NativeFailure::operator=(NativeFailure&&) noexcept = default;
++NativeFailure::~NativeFailure() = default;
++size_t NativeFailure::copy_utf16(bool, size_t, uint16_t*, size_t,
++    size_t& remaining) const noexcept { remaining = 0; return 0; }
++long long NativeFailure::code() const noexcept { return 0; }
++NativeFailure NativeFailure::from_metal_error(void*) noexcept { return {}; }
++
+ 
+ struct EventCounter {
+-  uint64_t value{0};
+-  bool recovery_failed{false};
++  std::atomic<uint64_t> value{0};
++  std::atomic<bool> recovery_failed{false};
+   std::shared_ptr<std::string> error;
+   std::mutex mtx;
+   std::condition_variable cv;
+ };
+ 
+ Event::Event(Stream stream) : stream_(stream) {
++  if (auto* scope = submission::current_scope(); scope && scope->scoped_observation_only()) {
++    scope_identity_ = scope->identity();
++    failure_ = scope->failure_owner();
++  }
+   auto dtor = [](void* ptr) { delete static_cast<EventCounter*>(ptr); };
+   event_ = std::shared_ptr<void>(new EventCounter{}, dtor);
+ }
+@@ -29,6 +44,17 @@
+ }
+ 
+ void Event::wait_dependency() const {
++  if (scope_identity_) {
++    auto* ec = static_cast<EventCounter*>(event_.get());
++    bool failed = false;
++    {
++      std::unique_lock lock(ec->mtx);
++      ec->cv.wait(lock, [&] { return ec->value >= value(); });
++      failed = ec->recovery_failed || (failure_ && failure_.get()->borrow());
++    }
++    if (failed) (void)scheduler::record_current_failure(failure_);
++    return;
++  }
+   auto ec = static_cast<EventCounter*>(event_.get());
+   std::unique_lock<std::mutex> lk(ec->mtx);
+   while (ec->value < value()) {
+@@ -56,7 +82,7 @@
+     auto ec = static_cast<EventCounter*>(event_.get());
+     {
+       std::lock_guard<std::mutex> lk(ec->mtx);
+-      ec->error = scheduler::stream_error(stream);
++      if (!scope_identity_) ec->error = scheduler::stream_error(stream);
+       ec->value = value();
+     }
+     ec->cv.notify_all();
+@@ -78,6 +104,19 @@
+   }
+ }
+ 
++EventObservation Event::observe() const noexcept {
++  if (!valid()) return EventObservation::ready;
++  if (!scope_identity_ || !failure_) return EventObservation::unobservable;
++  const auto* ec = static_cast<EventCounter*>(event_.get());
++  if (failure_.get()->borrow()) return EventObservation::failed;
++  if (failure_.get()->pending_publication()) return EventObservation::busy;
++  if (ec->recovery_failed.load(std::memory_order_acquire)) return EventObservation::unobservable;
++  // Scoped Event construction bound the same carrier; its signal path never
++  // writes the legacy String slot. Read only these actual atomic publications.
++  return ec->value.load(std::memory_order_acquire) >= value()
++      ? EventObservation::ready : EventObservation::pending;
++}
++
+ bool Event::recover_terminal_failure() noexcept {
+   if (!valid()) {
+     return true;
+@@ -89,7 +128,7 @@
+       return false;
+     }
+     ec->recovery_failed = true;
+-    ec->value = std::max(ec->value, value());
++    ec->value = std::max(ec->value.load(std::memory_order_acquire), value());
+     lock.unlock();
+     ec->cv.notify_all();
+     return true;
+diff --git a/mlx/completion.h b/mlx/completion.h
+--- a/mlx/completion.h
++++ b/mlx/completion.h
+@@ -12,6 +12,8 @@
+ #include "mlx/timing.h"
+ 
+ namespace mlx::core {
++namespace submission { class Scope; enum class ScopedProgress : uint8_t; }
++
+ 
+ /** The execution backend which owns a completion token. */
+ enum class CompletionBackend {
+@@ -55,6 +57,8 @@
+ 
+   /** Return true when complete, or rethrow a retained asynchronous error. */
+   bool is_complete() const;
++  /** Fixed read of the existing event only; no progress/formatting/re-eval. */
++  EventObservation observe() const noexcept;
+ 
+   /** Return whether this completion carries device timestamp markers. */
+   bool is_timed() const {
+@@ -93,6 +97,8 @@
+   mutable std::optional<double> elapsed_seconds_;
+ 
+   friend MLX_API Completion async_eval_with_completion(ArrayVector outputs);
++  friend MLX_API submission::ScopedProgress async_eval_with_completion_scoped(
++      ArrayVector, submission::Scope&, Completion&);
+   friend MLX_API Completion async_eval_with_timing(
+       ArrayVector outputs,
+       Stream stream);
+diff --git a/mlx/event.h b/mlx/event.h
+--- a/mlx/event.h
++++ b/mlx/event.h
+@@ -6,13 +6,41 @@
+ #include <stdexcept>
+ 
+ #include "mlx/stream.h"
++#include "mlx/failure.h"
+ 
+ namespace mlx::core {
++
++enum class EventObservation { ready, pending, failed, busy, unobservable };
+ 
+ class MLX_API Event {
+  public:
+   Event() {};
+   explicit Event(Stream stream);
++  Event(const Event&) noexcept = default;
++  Event(Event&&) noexcept = default;
++  Event& operator=(const Event& other) noexcept {
++    if (this != &other) {
++      auto displaced = std::move(failure_);
++      failure_ = other.failure_;
++      event_ = other.event_;
++      stream_ = other.stream_;
++      value_ = other.value_;
++      scope_identity_ = other.scope_identity_;
++      // The old event object/shared control has retired before displaced.
++    }
++    return *this;
++  }
++  Event& operator=(Event&& other) noexcept {
++    if (this != &other) {
++      auto displaced = std::move(failure_);
++      failure_ = std::move(other.failure_);
++      event_ = std::move(other.event_);
++      stream_ = other.stream_;
++      value_ = other.value_;
++      scope_identity_ = other.scope_identity_;
++    }
++    return *this;
++  }
+ 
+   // Wait for the event to be signaled at its current value
+   void wait() const;
+@@ -29,6 +57,10 @@
+ 
+   // Check if the event has been signaled at its current value
+   bool is_signaled() const;
++
++  // Fixed, no-format inspection; never waits/commits/retires another scope.
++  EventObservation observe() const noexcept;
++  const FailureCarrierRef& failure_owner() const noexcept { return failure_; }
+ 
+   // Recovery only: the producer's exact native frontier is already terminal.
+   // Publish failure to dependent waiters without enqueueing additional work.
+@@ -60,11 +92,13 @@
+   }
+ 
+  private:
++  FailureCarrierRef failure_;
+   // Default constructed stream should never be used
+   // since the event is not yet valid
+   Stream stream_{0, Device::cpu};
+   std::shared_ptr<void> event_{nullptr};
+   uint64_t value_{0};
++  uint64_t scope_identity_{0};
+ };
+ 
+ } // namespace mlx::core
+diff --git a/mlx/failure.h b/mlx/failure.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/failure.h
+@@ -0,0 +1,205 @@
++#pragma once
++#include <atomic>
++#include <cstddef>
++#include <cstdint>
++#include <new>
++#include <exception>
++#include <cstring>
++#include <typeinfo>
++#include <utility>
++#include "mlx/api.h"
++
++namespace mlx::core {
++namespace metal { class EventImpl; class CommandEncoder; }
++class FailureCarrier;
++
++// Concrete backend error ownership, never a generic allocation/callback owner.
++// CPU/no-GPU is empty. Metal retains the actual immutable NS::Error and its
++// description; the three opaque platform objects have explicit bounded counts.
++// Library wrapper bytes are sizeof(NativeFailure), not an OS-private byte claim.
++class MLX_API NativeFailure {
++ public:
++  NativeFailure() noexcept = default;
++  NativeFailure(const NativeFailure&) noexcept;
++  NativeFailure(NativeFailure&&) noexcept;
++  NativeFailure& operator=(const NativeFailure&) noexcept;
++  NativeFailure& operator=(NativeFailure&&) noexcept;
++  ~NativeFailure();
++  explicit operator bool() const noexcept { return error_ != nullptr; }
++  size_t copy_utf16(bool domain, size_t offset, uint16_t* output,
++      size_t capacity, size_t& remaining) const noexcept;
++  long long code() const noexcept;
++ private:
++  friend class metal::EventImpl;
++  friend class FailureCarrier;
++  friend class metal::CommandEncoder;
++  static NativeFailure from_metal_error(void*) noexcept;
++  void* error_{nullptr};
++  void* description_{nullptr};
++  void* domain_{nullptr};
++};
++
++enum class FailureKind : unsigned char {
++  none, exception, native, source_unavailable
++};
++struct FailureValue {
++  FailureKind kind{FailureKind::none};
++  std::exception_ptr exception;
++  NativeFailure native;
++  const char* message{nullptr};
++  size_t message_size{0};
++  const std::type_info* exception_type{nullptr};
++  static FailureValue from_exception(std::exception_ptr source) noexcept {
++    FailureValue value;
++    value.exception = std::move(source);
++    value.kind = value.exception ? FailureKind::exception : FailureKind::source_unavailable;
++    if (!value.exception) return value;
++    // One capture only. The original exception remains owned; subsequent
++    // polling/formatting borrows these bytes without rethrowing or allocating.
++    // The platform rethrow/capture ABI and arbitrary what() producers still
++    // require their separate original bound; this is not that proof.
++    try { std::rethrow_exception(value.exception); }
++    catch (const std::exception& source) {
++      value.message = source.what();
++      value.message_size = value.message ? std::strlen(value.message) : 0;
++      value.exception_type = &typeid(source);
++    } catch (...) {}
++    return value;
++  }
++};
++
++// One successful publisher, followed only by immutable borrowed/copy reads.
++// No mutex, vector, string, shared control allocation or payload replacement.
++// Exception_ptr capture/copy ABI and the original thrown object are separate
++// producer facts; this representation does not silently bound either one.
++class FailurePublication {
++ public:
++  FailurePublication() noexcept = default;
++  FailurePublication(const FailurePublication&) = delete;
++  const FailureValue* borrow() const noexcept {
++    return state_.load(std::memory_order_acquire) == 2 ? &value_ : nullptr;
++  }
++  bool pending_publication() const noexcept {
++    return state_.load(std::memory_order_acquire) == 1;
++  }
++ private:
++  friend class FailureCarrier;
++  bool begin() noexcept {
++    unsigned expected = 0;
++    return state_.compare_exchange_strong(expected, 1, std::memory_order_acq_rel);
++  }
++  void finish(FailureValue value) noexcept {
++    value_ = std::move(value);
++    state_.store(2, std::memory_order_release);
++  }
++  std::atomic<unsigned> state_{0};
++  FailureValue value_;
++};
++} // namespace mlx::core
++
++namespace mlx::core {
++class FailureCarrier;
++class FailureCarrierRef {
++ public:
++  FailureCarrierRef() noexcept = default;
++  FailureCarrierRef(const FailureCarrierRef&) noexcept;
++  FailureCarrierRef(FailureCarrierRef&& other) noexcept
++      : value_(std::exchange(other.value_, nullptr)) {}
++  FailureCarrierRef& operator=(const FailureCarrierRef&) noexcept;
++  FailureCarrierRef& operator=(FailureCarrierRef&&) noexcept;
++  ~FailureCarrierRef();
++  FailureCarrier* get() const noexcept { return value_; }
++  explicit operator bool() const noexcept { return value_ != nullptr; }
++ private:
++  friend class FailureCarrier;
++  explicit FailureCarrierRef(FailureCarrier* value) noexcept : value_(value) {}
++  FailureCarrier* value_{nullptr};
++};
++
++// This concrete allocation contains no native root, scope or record owner.
++// The supplied closed queue token may retain only original source/account data.
++// Native allocation and every cause field retire before that token is queued.
++class FailureCarrier final {
++ public:
++  static FailureCarrierRef create(void* owner, void (*retire)(void*)) noexcept {
++    if (!owner || !retire) return {};
++    return FailureCarrierRef(new (std::nothrow) FailureCarrier(owner, retire));
++  }
++  FailureCarrierRef clone() noexcept { retain(); return FailureCarrierRef(this); }
++  // Closed C ABI handoff only; safe wrappers never export this raw owner.
++  static FailureCarrier* into_raw(FailureCarrierRef value) noexcept {
++    return std::exchange(value.value_, nullptr);
++  }
++  static void release_raw(FailureCarrier* value) noexcept { if (value) value->release(); }
++  bool bind_scope(uint64_t identity) noexcept {
++    uint64_t expected = 0;
++    return identity && scope_.compare_exchange_strong(expected, identity,
++        std::memory_order_acq_rel);
++  }
++  uint64_t scope_identity() const noexcept { return scope_.load(std::memory_order_acquire); }
++  const FailureValue* borrow() const noexcept { return value_.borrow(); }
++  bool pending_publication() const noexcept { return value_.pending_publication(); }
++  void capture_current_exception() noexcept {
++    if (!value_.begin()) return;
++    value_.finish(FailureValue::from_exception(std::current_exception()));
++  }
++  void capture_exception(const std::exception_ptr& source) noexcept {
++    if (!value_.begin()) return;
++    value_.finish(FailureValue::from_exception(source));
++  }
++  void capture_native_error(void* raw) noexcept {
++    if (!value_.begin()) return;
++    FailureValue value;
++    value.native = NativeFailure::from_metal_error(raw);
++    value.kind = value.native ? FailureKind::native : FailureKind::source_unavailable;
++    value_.finish(std::move(value));
++  }
++  static size_t retirement_control_bytes() noexcept;
++ private:
++  friend class FailureCarrierRef;
++  FailureCarrier(void* owner, void (*retire)(void*)) noexcept
++      : owner_(owner), retire_(retire) {}
++  void retain() noexcept {
++    auto value = references_.load(std::memory_order_relaxed);
++    for (;;) {
++      // Same conservative overflow discipline as closed shared owners. Never
++      // wrap and prematurely retire a native/error/account allocation.
++      if (value == static_cast<size_t>(-1)) std::terminate();
++      if (references_.compare_exchange_weak(value, value + 1,
++              std::memory_order_relaxed)) return;
++    }
++  }
++  void release() noexcept {
++    if (references_.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
++    const Retirement pending{owner_, retire_};
++    owner_ = nullptr;
++    retire_ = nullptr;
++    delete this;
++    pending.retire(pending.owner);
++  }
++  struct Retirement { void* owner; void (*retire)(void*); };
++  std::atomic<size_t> references_{1};
++  std::atomic<uint64_t> scope_{0};
++  FailurePublication value_;
++  void* owner_;
++  void (*retire_)(void*);
++};
++inline size_t FailureCarrier::retirement_control_bytes() noexcept {
++  return sizeof(Retirement);
++}
++inline FailureCarrierRef::FailureCarrierRef(const FailureCarrierRef& other) noexcept
++    : value_(other.value_) { if (value_) value_->retain(); }
++inline FailureCarrierRef& FailureCarrierRef::operator=(const FailureCarrierRef& other) noexcept {
++  if (this != &other) { FailureCarrierRef copy(other); *this = std::move(copy); }
++  return *this;
++}
++inline FailureCarrierRef& FailureCarrierRef::operator=(FailureCarrierRef&& other) noexcept {
++  if (this != &other) {
++    auto* old = value_;
++    value_ = std::exchange(other.value_, nullptr);
++    if (old) old->release();
++  }
++  return *this;
++}
++inline FailureCarrierRef::~FailureCarrierRef() { if (value_) value_->release(); }
++} // namespace mlx::core
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -1,6 +1,7 @@
+ // Copyright © 2023-2026 Apple Inc.
+ 
+ #include "mlx/scheduler.h"
++#include "mlx/submission.h"
+ #include "mlx/backend/cpu/eval.h"
+ #include "mlx/backend/gpu/eval.h"
+ #include "mlx/utils.h"
+@@ -72,11 +73,13 @@
+     std::function<void()> task,
+     bool counted) {
+   auto* st = prepare_stream(s);
+-  st->enqueue([this, st, s, counted, task = std::move(task)]() mutable {
++  const auto* scope = submission::current_scope();
++  auto failure = scope ? scope->failure_owner() : FailureCarrierRef{};
++  st->enqueue([this, st, s, counted, failure = std::move(failure), task = std::move(task)]() mutable {
+     try {
+       task();
+     } catch (...) {
+-      st->record_error(std::current_exception());
++      st->record_error(std::current_exception(), failure);
+     }
+     if (counted) {
+       notify_task_completion(s);
+@@ -122,8 +125,23 @@
+   }
+ }
+ 
++StreamThread*& current_worker() noexcept {
++  static thread_local StreamThread* current = nullptr;
++  return current;
++}
++
++bool record_current_failure(FailureCarrierRef owner) noexcept {
++  auto* worker = current_worker();
++  if (!worker) return false;
++  worker->record_failure(std::move(owner));
++  return true;
++}
++
+ std::shared_ptr<std::string> StreamThread::error(bool consume) {
+-  std::lock_guard lock(error_mtx);
++  // This closed source keeps the native cause/account alive through the legacy
++  // string extraction. Its final destruction occurs only after the mutex loan.
++  FailureCarrierRef retired_failure;
++  std::unique_lock lock(error_mtx);
+   if (!error_pending && !uncaptured_error.load(std::memory_order_acquire)) {
+     return nullptr;
+   }
+@@ -149,6 +167,7 @@
+   if (consume) {
+     first_error = {};
+     error_message.reset();
++    retired_failure = std::move(first_failure);
+     error_pending = false;
+     uncaptured_error.store(false, std::memory_order_release);
+   }
+diff --git a/mlx/scheduler.h b/mlx/scheduler.h
+--- a/mlx/scheduler.h
++++ b/mlx/scheduler.h
+@@ -17,6 +17,7 @@
+ #include "mlx/api.h"
+ #include "mlx/backend/gpu/eval.h"
+ #include "mlx/device.h"
++#include "mlx/failure.h"
+ #include "mlx/stream.h"
+ 
+ namespace mlx::core::scheduler {
+@@ -31,6 +32,10 @@
+ struct CpuStreamToken {
+   const void* state{nullptr};
+ };
++
++struct StreamThread;
++// Borrowed only while the same scheduler worker is executing its FIFO.
++StreamThread*& current_worker() noexcept;
+ 
+ struct StreamThread {
+   static_assert(std::atomic<uint64_t>::is_always_lock_free);
+@@ -50,6 +55,7 @@
+   std::atomic<bool> failed{false};
+   std::atomic<bool> uncaptured_error{false};
+   std::mutex error_mtx;
++  FailureCarrierRef first_failure;
+   std::exception_ptr first_error;
+   std::shared_ptr<std::string> error_message;
+   std::shared_ptr<std::string> fallback_error;
+@@ -62,11 +68,15 @@
+             "Asynchronous CPU stream work failed; diagnostic unavailable.")),
+         thread(&StreamThread::thread_fn, this) {}
+ 
+-  void record_error(std::exception_ptr error) noexcept {
++  void record_error(std::exception_ptr error, FailureCarrierRef owner = {}) noexcept {
++    // Each actual attempt preserves its own first cause, even if this stream
++    // already has an earlier failed attempt. Capture invokes no mutex callback.
++    if (owner) owner.get()->capture_exception(error);
+     try {
+       std::lock_guard lock(error_mtx);
+       if (!error_pending) {
+         first_error = std::move(error);
++        if (owner) first_failure = std::move(owner);
+         error_pending = true;
+       }
+     } catch (...) {
+@@ -78,6 +88,13 @@
+   }
+ 
+   std::shared_ptr<std::string> error(bool consume);
++  void record_failure(FailureCarrierRef owner) noexcept {
++    try {
++      std::lock_guard lock(error_mtx);
++      if (!error_pending) { first_failure = std::move(owner); error_pending = true; }
++    } catch (...) { uncaptured_error.store(true, std::memory_order_release); }
++    failed.store(true, std::memory_order_release);
++  }
+ 
+   ~StreamThread() {
+     {
+@@ -89,12 +106,14 @@
+   }
+ 
+   void thread_fn() {
++    current_worker() = this;
+     while (true) {
+       std::function<void()> task;
+       {
+         std::unique_lock<std::mutex> lk(mtx);
+         cond.wait(lk, [this] { return !this->q.empty() || this->stop; });
+         if (q.empty() && stop) {
++          current_worker() = nullptr;
+           return;
+         }
+         task = std::move(q.front().body);
+@@ -237,6 +256,9 @@
+ MLX_API CpuStreamToken prepare_cpu_stream(Stream s);
+ MLX_API StreamProgress cpu_stream_progress(CpuStreamToken token) noexcept;
+ MLX_API void block_cpu_stream(CpuStreamToken token) noexcept;
++// Existing worker reports a dependency failure without throwing/reformatting.
++// False outside its real FIFO task; no scheduler or stream is constructed.
++MLX_API bool record_current_failure(FailureCarrierRef owner) noexcept;
+ MLX_API std::optional<StreamProgress> cpu_stream_progress(Stream s) noexcept;
+ 
+ template <typename F>
+diff --git a/mlx/submission.cpp b/mlx/submission.cpp
+--- a/mlx/submission.cpp
++++ b/mlx/submission.cpp
+@@ -9,6 +9,18 @@
+ thread_local Scope* active_scope = nullptr;
+ thread_local Record* active_capture = nullptr;
+ thread_local const void* owner_identity = nullptr;
++constinit std::atomic<uint64_t> next_scope_identity{1};
++static_assert(std::atomic<uint64_t>::is_always_lock_free);
++uint64_t take_scope_identity() noexcept {
++  auto next = next_scope_identity.load(std::memory_order_relaxed);
++  while (next && next != UINT64_MAX) {
++    if (next_scope_identity.compare_exchange_weak(next, next + 1,
++          std::memory_order_relaxed, std::memory_order_relaxed)) return next;
++  }
++  // Exhaustion never wraps or reuses an identity. Ordinary legacy scopes can
++  // still exist; the new scoped entry rejects identity zero before work.
++  return 0;
++}
+ 
+ const void* prepare_owner_identity() {
+   if (!owner_identity) {
+@@ -70,7 +82,10 @@
+ } // namespace
+ 
+ Scope::Scope(void* retained_owner, void (*retire_owner)(void*), RecordQuota* quota, GraphQuota* graph)
+-    : owner_(prepare_owner_identity()), parent_(active_scope) {
++    : owner_(prepare_owner_identity()), identity_(take_scope_identity()),
++      scoped_observation_(active_scope && active_scope->scoped_observation_only()),
++      failure_(active_scope ? active_scope->failure_owner() : FailureCarrierRef{}),
++      parent_(active_scope) {
+   // Prepare global ownership before the first possible submission.
+   (void)registry();
+   // A nested ordinary scope inherits the same arena. An explicit foreign
+@@ -101,6 +116,7 @@
+ 
+ namespace {
+ struct ScopeRetirement {
++  FailureCarrierRef failure;
+   Scope* parent;
+   RecordQuota* quota;
+   GraphQuota* graph;
+@@ -123,7 +139,7 @@
+ 
+ void Scope::release() noexcept {
+   if (references_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+-    const ScopeRetirement retirement{parent_, quota_, graph_, retained_owner_, retire_owner_};
++    const ScopeRetirement retirement{std::move(failure_), parent_, quota_, graph_, retained_owner_, retire_owner_};
+     parent_ = nullptr;
+     quota_ = nullptr;
+     graph_ = nullptr;
+@@ -186,7 +202,49 @@
+ }
+ 
+ void Scope::progress() noexcept {
++  if (scoped_observation_) { (void)progress_scoped(); return; }
+   progress_records();
++}
++
++bool Scope::enable_scoped_observation() noexcept {
++  if (!identity_ || !on_owner_thread() || active_scope != this || !active_ ||
++      pending_.load(std::memory_order_acquire) ||
++      activity_.load(std::memory_order_acquire)) return false;
++  scoped_observation_ = true;
++  return true;
++}
++
++bool Scope::bind_failure(FailureCarrierRef failure) noexcept {
++  if (!failure || failure_ || !scoped_observation_ || !on_owner_thread() ||
++      active_scope != this || !active_ || pending_.load(std::memory_order_acquire) ||
++      activity_.load(std::memory_order_acquire) || !failure.get()->bind_scope(identity_))
++    return false;
++  failure_ = std::move(failure);
++  return true;
++}
++
++ScopedProgress Scope::progress_scoped() noexcept {
++  if (!identity_ || !scoped_observation_ || !on_owner_thread())
++    return ScopedProgress::unobservable;
++  // Scope construction already prepared this exact registry. Observation must
++  // not call registry(), which has an allocating lazy-initialization branch.
++  auto* owners = registry_owner.load(std::memory_order_acquire);
++  if (!owners) return ScopedProgress::unobservable;
++  try {
++    std::unique_lock<std::mutex> lock(owners->mutex, std::try_to_lock);
++    if (!lock.owns_lock()) return ScopedProgress::busy;
++    auto outcome = ScopedProgress::observed;
++    for (auto* record = owners->head; record; record = record->next_) {
++      if (!record->belongs_to(*this)) continue;
++      const auto requirement = record->scoped_requirement();
++      if (requirement == ScopedProgress::unobservable) outcome = requirement;
++      else if (requirement == ScopedProgress::funded_progress &&
++               outcome == ScopedProgress::observed) outcome = requirement;
++      if (requirement == ScopedProgress::observed) record->progress(false);
++    }
++    // No registry rotation, removal, resource release or backend progress.
++    return outcome;
++  } catch (...) { return ScopedProgress::unobservable; }
+ }
+ 
+ void Scope::record_started() noexcept {
+@@ -244,6 +302,8 @@
+     }
+   }
+ }
++
++Scope* current_scope() noexcept { return active_scope; }
+ 
+ RecordQuota* current_record_quota() noexcept {
+   if (active_scope && active_scope->record_quota()) return active_scope->record_quota();
+@@ -446,6 +506,28 @@
+   frozen_.store(true, std::memory_order_release);
+ }
+ 
++bool Record::belongs_to(const Scope& target) const noexcept {
++  for (auto* scope = scope_; scope; scope = scope->parent_)
++    if (scope == &target && scope->identity_ == target.identity_) return true;
++  return false;
++}
++
++ScopedProgress Record::scoped_requirement() const noexcept {
++  if (settled_) return ScopedProgress::observed;
++  if (!frozen_.load(std::memory_order_acquire) || !scoped_observation_supported())
++    return ScopedProgress::unobservable;
++  auto result = ScopedProgress::observed;
++  for (const auto& receipt : streams_) {
++    if (receipt.stream.device != Device::gpu) continue;
++    const auto required = gpu::observation_requirement(receipt.gpu, receipt.end);
++    if (required == gpu::ObservationRequirement::unobservable)
++      return ScopedProgress::unobservable;
++    if (required == gpu::ObservationRequirement::funded_progress)
++      result = ScopedProgress::funded_progress;
++  }
++  return result;
++}
++
+ bool Record::progress(bool allow_backend_progress) noexcept {
+   if (settled_) {
+     return true;
+@@ -508,6 +590,10 @@
+ }
+ 
+ void progress_records(bool allow_backend_progress) noexcept {
++  if (active_scope && active_scope->scoped_observation_only()) {
++    (void)active_scope->progress_scoped();
++    return;
++  }
+   try {
+     auto& owners = registry();
+     std::unique_lock<std::mutex> lock(owners.mutex, std::try_to_lock);
+@@ -538,6 +624,10 @@
+ }
+ 
+ RetirementPass try_retire_records() {
++  // Generic native destruction is an explicit ordinary boundary. Even a
++  // terminal unrelated record is untouched inside the new scoped interval.
++  if (active_scope && active_scope->scoped_observation_only())
++    return RetirementPass::busy;
+   Record* retired = nullptr;
+   {
+     auto& owners = registry();
+@@ -640,6 +730,43 @@
+   return false;
+ }
+ 
++ScopedProgress Record::wait_for_scoped_progress() noexcept {
++  if (!scope_ || !scope_->scoped_observation_only() ||
++      !scope_->on_owner_thread() || active_scope != scope_ ||
++      frozen_.load(std::memory_order_acquire) ||
++      !scoped_observation_supported()) return ScopedProgress::unobservable;
++  // These end fields already belong to the paid Record receipt population.
++  // finish() later replaces them with the complete attempt frontier.
++  for (auto& receipt : streams_) {
++    receipt.end = receipt.stream.device == Device::cpu
++        ? scheduler::cpu_stream_progress(receipt.cpu).accepted
++        : gpu::submission_progress(receipt.gpu).accepted;
++  }
++  for (;;) {
++    bool pending = false;
++    for (const auto& receipt : streams_) {
++      if (receipt.stream.device == Device::cpu) {
++        const auto state = scheduler::cpu_stream_progress(receipt.cpu);
++        if (state.failed) return ScopedProgress::failed;
++        pending |= state.completed < receipt.end;
++      } else {
++        const auto requirement = gpu::observation_requirement(receipt.gpu, receipt.end);
++        if (requirement == gpu::ObservationRequirement::funded_progress)
++          return ScopedProgress::funded_progress;
++        if (requirement == gpu::ObservationRequirement::unobservable)
++          return ScopedProgress::unobservable;
++        const auto state = gpu::submission_progress(receipt.gpu);
++        if (state.failed) return ScopedProgress::failed;
++        pending |= state.completed < receipt.end;
++      }
++    }
++    if (!pending) return ScopedProgress::observed;
++    // Only genuinely pending owned frontiers may wait without a deadline.
++    // No scheduler singleton/global active task or failed-work scan occurs.
++    std::this_thread::yield();
++  }
++}
++
+ void Record::wait_for_progress() {
+   for (;;) {
+     progress_records();
+diff --git a/mlx/submission.h b/mlx/submission.h
+--- a/mlx/submission.h
++++ b/mlx/submission.h
+@@ -17,6 +17,7 @@
+ namespace mlx::core::submission {
+ 
+ enum class Activity : uint8_t { none, pending, terminal };
++enum class ScopedProgress : uint8_t { observed, funded_progress, unobservable, busy, failed };
+ struct Status {
+   Activity activity;
+   bool failed;
+@@ -48,6 +49,14 @@
+   // Owner-thread only; no progress or resource-lifetime authority.
+   RecordStatus query_records() const noexcept;
+   void progress() noexcept;
++  // Configure only an actual newly accepted current scope. Identity exhaustion
++  // or preexisting work refuses without a fallback or another allocation.
++  bool enable_scoped_observation() noexcept;
++  bool scoped_observation_only() const noexcept { return scoped_observation_; }
++  uint64_t identity() const noexcept { return identity_; }
++  ScopedProgress progress_scoped() noexcept;
++  bool bind_failure(FailureCarrierRef failure) noexcept;
++  const FailureCarrierRef& failure_owner() const noexcept { return failure_; }
+   void release() noexcept;
+ 
+  private:
+@@ -68,6 +77,9 @@
+   std::atomic<bool> failed_{false};
+   std::atomic<bool> blocked_{false};
+   const void* owner_;
++  uint64_t identity_{0};
++  bool scoped_observation_{false};
++  FailureCarrierRef failure_;
+   Scope* parent_{nullptr};
+   Scope* previous_{nullptr};
+   Scope* next_{nullptr};
+@@ -80,6 +92,8 @@
+ 
+ // Borrowed from the active scope or primitive; cannot manufacture an arena.
+ MLX_API RecordQuota* current_record_quota() noexcept;
++// Borrow only the currently active genuine scope; this does not retain it.
++MLX_API Scope* current_scope() noexcept;
+ 
+ // Exact named final-release controls, excluding allocator/registry costs.
+ MLX_API size_t scope_retirement_control_bytes() noexcept;
+@@ -164,6 +178,9 @@
+   void retain_output(const std::shared_ptr<array::Data>&);
+   void release_success_outputs() noexcept;
+   void wait_for_progress();
++  // Snapshot this current record's own accepted receipt ends before waiting.
++  // No global progress, foreign task wait, allocation or exception formatting.
++  ScopedProgress wait_for_scoped_progress() noexcept;
+   void finish(bool failed) noexcept;
+   void begin_primitive() noexcept;
+   void end_primitive() noexcept;
+@@ -173,6 +190,9 @@
+ 
+  protected:
+   explicit Record(Allocation);
++  // New scoped observation never dispatches unknown extension callbacks.
++  // Audited native records explicitly opt in; ordinary progress is unchanged.
++  virtual bool scoped_observation_supported() const noexcept { return false; }
+   virtual bool recover_event(Stream) noexcept { return true; }
+   virtual bool side_effects_terminal() const noexcept { return true; }
+   virtual bool side_effects_failed() const noexcept { return false; }
+@@ -182,6 +202,7 @@
+   virtual void progress_side_effects() noexcept {}
+ 
+  private:
++  friend class Scope;
+   friend void progress_records(bool) noexcept;
+   friend void retire_records();
+   friend RetirementPass try_retire_records();
+@@ -207,6 +228,8 @@
+   static Allocation legacy_allocation();
+   void destroy() noexcept;
+   bool progress(bool) noexcept;
++  bool belongs_to(const Scope&) const noexcept;
++  ScopedProgress scoped_requirement() const noexcept;
+   void mark_failure() noexcept;
+   GraphQuotaRef graph_;
+   RecordQuota* quota_{nullptr};
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -111,6 +111,9 @@
+     }
+   }
+ 
++  bool scoped_observation_supported() const noexcept override {
++    return gpu::supports_scoped_observation();
++  }
+   bool recover_event(Stream stream) noexcept override {
+     auto event = events.find(stream.index);
+     return event == events.end() || event->second.recover_terminal_failure();
+@@ -166,10 +169,11 @@
+   return sizeof(EvalSubmissionRecord);
+ }
+ 
+-array eval_impl(
++std::optional<array> eval_impl_result(
+     ArrayVector outputs,
+     bool async,
+-    DeviceTimer* timer = nullptr) {
++    DeviceTimer* timer,
++    submission::ScopedProgress* scoped_outcome) {
+   submission::progress_records();
+   submission::retire_records();
+   auto prepared_recovery = submission::Record::create<EvalSubmissionRecord>();
+@@ -219,6 +223,15 @@
+     while (!dfs.empty()) {
+       auto& [a_ref, idx] = dfs.top();
+       auto& a = a_ref.get();
++
++      if (scoped_outcome && a.event().valid() &&
++          a.status() != array::Status::available &&
++          a.event().failure_owner().get() != submission::current_scope()->failure_owner().get()) {
++        *scoped_outcome = submission::ScopedProgress::unobservable;
++        recovery->failed_record = true;
++        recovery->finish(true);
++        return std::nullopt;
++      }
+ 
+       if (idx < a.inputs().size()) {
+         // Add an input, and continue
+@@ -375,7 +388,23 @@
+         // output arrays stream
+         fences[it->second.first].wait(stream, in);
+       } else if (in.event().valid()) {
+-        if (in.event().is_signaled()) {
++        if (scoped_outcome) {
++          const auto observation = in.status() == array::Status::available
++              ? EventObservation::ready : in.event().observe();
++          if (observation == EventObservation::ready) in.detach_event();
++          else if (observation == EventObservation::pending) {
++            if (in.event().stream() != stream) in.event().wait(stream);
++          } else {
++            *scoped_outcome = observation == EventObservation::failed
++                ? submission::ScopedProgress::failed
++                : observation == EventObservation::busy
++                    ? submission::ScopedProgress::busy
++                    : submission::ScopedProgress::unobservable;
++            recovery->failed_record = true;
++            recovery->finish(true);
++            return std::nullopt;
++          }
++        } else if (in.event().is_signaled()) {
+           in.detach_event();
+         } else if (in.event().stream() != stream) {
+           // Use event to wait across async eval
+@@ -405,10 +434,28 @@
+           gpu::finalize(s);
+         }
+       }
+-      recovery->wait_for_progress();
+-      while (get_active_memory() > get_memory_limit() &&
+-             scheduler::n_active_tasks() > 0) {
++      if (scoped_outcome) {
++        *scoped_outcome = recovery->wait_for_scoped_progress();
++        if (*scoped_outcome == submission::ScopedProgress::observed &&
++            get_active_memory() > get_memory_limit() &&
++            scheduler::n_active_tasks() > 0) {
++          // Our exact receipt frontiers are already complete. Relieving any
++          // remaining global pressure requires work outside this observation.
++          *scoped_outcome = submission::ScopedProgress::funded_progress;
++        }
++        if (*scoped_outcome != submission::ScopedProgress::observed) {
++          // Same partial current/tape/output owners as the exception branch.
++          // This refusal creates no thrown exception or diagnostic population.
++          recovery->failed_record = true;
++          recovery->finish(true);
++          return std::nullopt;
++        }
++      } else {
+         recovery->wait_for_progress();
++        while (get_active_memory() > get_memory_limit() &&
++               scheduler::n_active_tasks() > 0) {
++          recovery->wait_for_progress();
++        }
+       }
+     }
+ 
+@@ -463,6 +510,34 @@
+   }
+ }
+ 
++array eval_impl(ArrayVector outputs, bool async, DeviceTimer* timer = nullptr) {
++  // The ordinary path has no status-only exit and preserves its old result.
++  return *eval_impl_result(std::move(outputs), async, timer, nullptr);
++}
++
++submission::ScopedProgress async_eval_with_completion_scoped(
++    ArrayVector outputs, submission::Scope& scope, Completion& destination) {
++  using Outcome = submission::ScopedProgress;
++  if (submission::current_scope() != &scope || !scope.identity() ||
++      !scope.scoped_observation_only() || !scope.on_owner_thread() || !scope.failure_owner())
++    return Outcome::unobservable;
++  bool needed = false;
++  for (auto& output : outputs) {
++    // Do not call is_available(): it can throw a newly formatted event error.
++    // Scheduled outputs pass through the same evaluator/event dependency path.
++    needed |= output.status() == array::Status::unscheduled || output.event().valid();
++  }
++  if (!needed) {
++    destination = Completion{};
++    return Outcome::observed;
++  }
++  Outcome outcome = Outcome::observed;
++  auto synchronizer = eval_impl_result(std::move(outputs), true, nullptr, &outcome);
++  if (!synchronizer) return outcome;
++  destination = Completion{synchronizer->event()};
++  return Outcome::observed;
++}
++
+ void async_eval(ArrayVector outputs) {
+   if (outputs.empty()) {
+     return;
+@@ -559,6 +634,9 @@
+   struct WaitRecord : submission::Record {
+     explicit WaitRecord(Allocation allocation, const Event& value) : Record(allocation), owner(value) {}
+     Event owner;
++    bool scoped_observation_supported() const noexcept override {
++      return gpu::supports_scoped_observation();
++    }
+     bool side_effects_terminal() const noexcept override {
+       return owner.side_effects_terminal();
+     }
+@@ -580,6 +658,10 @@
+     recovery->finish(true);
+     throw;
+   }
++}
++
++EventObservation Completion::observe() const noexcept {
++  return event_ ? event_->observe() : EventObservation::ready;
+ }
+ 
+ bool Completion::is_complete() const {
+diff --git a/mlx/transforms.h b/mlx/transforms.h
+--- a/mlx/transforms.h
++++ b/mlx/transforms.h
+@@ -21,6 +21,11 @@
+  * available return an already-complete token without a device identity.
+  */
+ MLX_API Completion async_eval_with_completion(ArrayVector outputs);
++// Same evaluator, with a fixed partial-attempt refusal instead of global waits.
++// Exceptions remain actual native causes for the caller's prepaid carrier.
++MLX_API submission::ScopedProgress async_eval_with_completion_scoped(
++    ArrayVector outputs, submission::Scope& scope, Completion& destination);
++
+ 
+ /**
+  * Asynchronously evaluate `outputs` between timestamp markers on `stream`.

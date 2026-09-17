@@ -1,0 +1,372 @@
+diff --git a/mlx/backend/metal/indexing.cpp b/mlx/backend/metal/indexing.cpp
+--- a/mlx/backend/metal/indexing.cpp
++++ b/mlx/backend/metal/indexing.cpp
+@@ -9,6 +9,8 @@
+ #include "mlx/backend/gpu/scan.h"
+ #include "mlx/backend/gpu/slicing.h"
+ #include "mlx/backend/metal/device.h"
++#include "mlx/backend/metal/indexing_controls.h"
++#include "mlx/native_control.h"
+ #include "mlx/backend/metal/jit/includes.h"
+ #include "mlx/backend/metal/jit/indexing.h"
+ #include "mlx/backend/metal/kernels.h"
+@@ -19,7 +21,15 @@
+ 
+ namespace mlx::core {
+ 
+-constexpr int METAL_MAX_INDEX_ARRAYS = 20;
++constexpr int METAL_MAX_INDEX_ARRAYS = metal::maximum_index_arrays;
++
++// Source-owned variants of the same generic one-index kernels. The sorted
++// grouped worker produces rank-one Int32/UInt32 indices and these data types.
++static bool single_index_precompiled(Dtype data, Dtype index) {
++  return (index == int32 || index == uint32) &&
++      (data == int32 || data == uint32 || data == float16 ||
++       data == bfloat16 || data == float32);
++}
+ 
+ std::pair<std::string, std::string> make_index_args(
+     const std::string& idx_type,
+@@ -144,7 +154,11 @@
+       large ? "int64_t" : "int");
+   std::string lib_name = kernel_name;
+ 
+-  auto lib = d.get_library_borrowed(lib_name, [&]() {
++  const bool original = d.original_precompiled_kernel_required();
++  if (original && !(nidx == 1 && idx_ndim == 1 &&
++      single_index_precompiled(out.dtype(), inputs[1].dtype())))
++    throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
++  auto lib = original ? d.precompiled_library() : d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+     kernel_source += metal::gather();
+     std::string out_type_str = get_type_string(out.dtype());
+@@ -187,9 +201,10 @@
+   MTL::Size grid_dims = MTL::Size(dim0, dim1, dim2);
+ 
+   // Collect all idx shapes and strides into one place
+-  std::vector<int> idx_shapes;
+-  std::vector<size_t> idx_strides;
+-  std::vector<char> idx_contigs;
++  metal::IndexMetadata metadata;
++  auto& idx_shapes = metadata.shapes;
++  auto& idx_strides = metadata.strides;
++  auto& idx_contigs = metadata.contiguous;
+   for (int i = 0; i < nidx; ++i) {
+     idx_shapes.insert(
+         idx_shapes.end(),
+@@ -320,7 +335,11 @@
+       large ? "int64_t" : "int");
+   std::string lib_name = kernel_name;
+ 
+-  auto lib = d.get_library_borrowed(lib_name, [&]() {
++  const bool original = d.original_precompiled_kernel_required();
++  if (original && !(nidx == 1 && idx_ndim == 1 && nwork == 1 &&
++      reduce_type_ == Scatter::None && single_index_precompiled(out.dtype(), inputs[1].dtype())))
++    throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
++  auto lib = original ? d.precompiled_library() : d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+     concatenate(kernel_source, metal::reduce_utils(), metal::scatter());
+ 
+@@ -363,11 +382,10 @@
+     upd_size *= upd.shape(i);
+   }
+   // Collect all idx shapes and strides into one place
+-  Shape idx_shapes;
+-  Strides idx_strides;
+-  // To access .data() use char instead of bool
+-  // bool is 1 byte in Metal so this is safe
+-  std::vector<char> idx_contigs;
++  metal::IndexMetadata metadata;
++  auto& idx_shapes = metadata.shapes;
++  auto& idx_strides = metadata.strides;
++  auto& idx_contigs = metadata.contiguous;
+   for (int i = 0; i < nidx; ++i) {
+     idx_shapes.insert(
+         idx_shapes.end(),
+diff --git a/mlx/backend/metal/indexing_controls.h b/mlx/backend/metal/indexing_controls.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/metal/indexing_controls.h
+@@ -0,0 +1,15 @@
++#pragma once
++#include "mlx/array.h"
++
++namespace mlx::core::metal {
++inline constexpr int maximum_index_arrays = 20;
++// The selected one-index/rank-one worker stays entirely inline. Ordinary wider
++// indexing keeps the same growing range semantics through Graph's allocator.
++struct IndexMetadata {
++  Shape shapes;
++  Strides strides;
++  // Metal bool is one byte; char preserves contiguous storage and .data().
++  // Scalar-index ordinary calls may append one placeholder after all indices.
++  SmallVector<char, maximum_index_arrays + 1> contiguous;
++};
++} // namespace mlx::core::metal
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -162,6 +162,8 @@
+        "Build standard kernels for admitted request-local pipeline caches" ON)
+ if(NOT MLX_METAL_JIT OR MLX_MANAGED_PRECOMPILED_KERNELS)
+   build_kernel(indexing/gather_front indexing/indexing.h indexing/gather_front.h)
++  build_kernel(indexing/single_index indexing/indexing.h indexing/gather.h
++               indexing/scatter.h reduction/ops.h atomic.h)
+   build_kernel(arange arange.h)
+   build_kernel(binary binary.h binary_ops.h)
+   build_kernel(binary_two binary_two.h)
+diff --git a/mlx/backend/metal/kernels/indexing/single_index.metal b/mlx/backend/metal/kernels/indexing/single_index.metal
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/metal/kernels/indexing/single_index.metal
+@@ -0,0 +1,94 @@
++// Copyright © 2023-2025 Apple Inc.
++// Precompiled wrappers of the existing generic rank-one, one-index workers.
++#include "mlx/backend/metal/kernels/utils.h"
++#include "mlx/backend/metal/kernels/atomic.h"
++#include "mlx/backend/metal/kernels/reduction/ops.h"
++#include "mlx/backend/metal/kernels/indexing/gather.h"
++#include "mlx/backend/metal/kernels/indexing/scatter.h"
++
++template <typename T, typename IdxT, typename LocT>
++
++[[kernel]] void single_index_gather(
++    const device T* src [[buffer(0)]],
++    device T* out [[buffer(1)]],
++    const constant int* src_shape [[buffer(2)]],
++    const constant int64_t* src_strides [[buffer(3)]],
++    const constant size_t& src_ndim [[buffer(4)]],
++    const constant int* slice_sizes [[buffer(5)]],
++    const constant int* axes [[buffer(6)]],
++    const constant int* idx_shapes [[buffer(7)]],
++    const constant int64_t* idx_strides [[buffer(8)]],
++    const constant bool* idx_contigs [[buffer(9)]],
++    const constant int& idx_ndim [[buffer(10)]],
++    const device IdxT* idx0 [[buffer(20)]],
++    uint3 index [[thread_position_in_grid]],
++    uint3 grid_dim [[threads_per_grid]]) {
++  Indices<IdxT, 1> idxs{
++    { idx0 }, idx_shapes, idx_strides, idx_contigs, idx_ndim};
++
++  return gather_impl<T, IdxT, 1, 1, LocT>(
++      src,
++      out,
++      src_shape,
++      src_strides,
++      src_ndim,
++      slice_sizes,
++      axes,
++      idxs,
++      index,
++      grid_dim);
++}
++
++template <typename T, typename IdxT, bool Contiguous, typename LocT>
++
++[[kernel]] void single_index_scatter(
++    const device T* updates [[buffer(1)]],
++    device mlx_atomic<T>* out [[buffer(2)]],
++    const constant int* upd_shape [[buffer(3)]],
++    const constant int64_t* upd_strides [[buffer(4)]],
++    const constant size_t& upd_ndim [[buffer(5)]],
++    const constant size_t& upd_size [[buffer(6)]],
++    const constant int* out_shape [[buffer(7)]],
++    const constant int64_t* out_strides [[buffer(8)]],
++    const constant size_t& out_ndim [[buffer(9)]],
++    const constant int* axes [[buffer(10)]],
++    const constant int* idx_shapes [[buffer(11)]],
++    const constant int64_t* idx_strides [[buffer(12)]],
++    const constant bool* idx_contigs [[buffer(13)]],
++    const constant int& idx_ndim [[buffer(14)]],
++    const constant size_t& idx_size [[buffer(15)]],
++    const device IdxT* idx0 [[buffer(20)]],
++    uint2 gid [[thread_position_in_grid]]) {
++  Indices<IdxT, 1> idxs{ { idx0 }, idx_shapes, idx_strides, idx_contigs, idx_ndim};
++
++  return scatter_impl<T, IdxT, None, 1, Contiguous, 1, LocT>(
++      updates,
++      out,
++      upd_shape,
++      upd_strides,
++      upd_ndim,
++      upd_size,
++      out_shape,
++      out_strides,
++      out_ndim,
++      axes,
++      idx_size,
++      idxs,
++      gid);
++}
++
++#define SINGLE_INDEX_WIDTH(tname, type, iname, index, lname, location) \
++  instantiate_kernel("gather" #tname #iname "_1_1_" #lname, single_index_gather, type, index, location) \
++  instantiate_kernel("scatter" #tname #iname "_none_1_updc_true_nwork1_" #lname, single_index_scatter, type, index, true, location) \
++  instantiate_kernel("scatter" #tname #iname "_none_1_updc_false_nwork1_" #lname, single_index_scatter, type, index, false, location)
++#define SINGLE_INDEX_TYPES(tname, type, iname, index) \
++  SINGLE_INDEX_WIDTH(tname, type, iname, index, int, int) \
++  SINGLE_INDEX_WIDTH(tname, type, iname, index, int64_t, int64_t)
++#define SINGLE_INDEX_DATA(tname, type) \
++  SINGLE_INDEX_TYPES(tname, type, int32, int32_t) \
++  SINGLE_INDEX_TYPES(tname, type, uint32, uint32_t)
++SINGLE_INDEX_DATA(float16, half)
++SINGLE_INDEX_DATA(bfloat16, bfloat16_t)
++SINGLE_INDEX_DATA(float32, float)
++SINGLE_INDEX_DATA(int32, int32_t)
++SINGLE_INDEX_DATA(uint32, uint32_t)
+diff --git a/mlx/backend/metal/selector_controls.cpp b/mlx/backend/metal/selector_controls.cpp
+--- a/mlx/backend/metal/selector_controls.cpp
++++ b/mlx/backend/metal/selector_controls.cpp
+@@ -1,5 +1,6 @@
+ #include "mlx/backend/metal/selector_controls.h"
+ #include "mlx/backend/metal/device.h"
++#include "mlx/backend/metal/indexing_controls.h"
+ #include <algorithm>
+ #include <array>
+ #include <limits>
+@@ -33,12 +34,18 @@
+     3 * integer + text("prod") + dtype_tag;
+ constexpr size_t indexing = text("gather_front___") + 2 * dtype_tag +
+     text("int64_t") + integer;
++constexpr size_t single_index = text("scatter_none_1_updc_false_nwork1_int64_t") + 2 * dtype_tag;
++constexpr size_t sort_name = text("partition_mbsort__bn_tn") + 2 * dtype_tag + 2 * integer;
++constexpr size_t gathered_rhs = text("steel_gather_mm_rhs_nax_n") + 1 +
++    2 * (1 + dtype_tag) + text("_bm_bn_bk_wm_wn") + 5 * integer +
++    text("_align_M__align_N__align_K_") + 3;
+ constexpr size_t pointwise = text("ggnlarge_") + size_integer +
+     text("BitwiseRightShift") + 2 * dtype_tag;
+ constexpr size_t rope = text("rope_single_freqs_large__vjp_traditional_transpose") + dtype_tag;
+ constexpr size_t normalization = text("layer_norm_looped") + dtype_tag;
+ constexpr size_t maximum_name = std::max({gemm_specialized, gemm_split, gemv,
+-    attention, vector_attention, reduce, indexing, pointwise, rope, normalization});
++    attention, vector_attention, reduce, indexing, single_index, sort_name, gathered_rhs,
++    pointwise, rope, normalization});
+ 
+ // The widest formatting call is split-K: two transpose chars, two dtype tags,
+ // five integer tile values and two alignment chars. Other formatting calls use
+@@ -56,13 +63,15 @@
+ // in a monotone name's geometric sequence (including a failed final request)
+ // is below twice its final requested count. That count is at most
+ // round_up(2*maximum_name+1,8). Explicit reserve(64) in SDPA is below this
+-// source bound. Copies and fmt results each request at most one such buffer.
++// source bound, as is GatherMM's reserve(128). Copies and fmt results each
++// request at most one such buffer.
+ constexpr size_t name_request = ((2 * maximum_name + 1 + 7) / 8) * 8;
+ constexpr size_t name_sequence = 2 * name_request;
+ // Largest simultaneously entered name population: SDPA base, specialized name
+ // and concatenate's by-value base loan. The two-pass reduction keeps its first
+ // and second names plus function-name owner. Dense GEMM has two fmt results;
+-// gather_front has kernel/lib copies. No JIT builder body runs in this profile.
++// single-index gathers/scatters have kernel/lib copies; sort has one fmt result.
++// No JIT builder body runs in this profile.
+ constexpr size_t name_owners = 3;
+ // SDPA's first two-pass kernel has six boolean constants plus blocks (integer).
+ // Dense GEMM has six; RoPE three. All are direct vector initializer lists,
+@@ -83,20 +92,24 @@
+   constexpr size_t linked = 0;
+   constexpr size_t allocation = name_owners * name_sequence +
+       constants * sizeof(MTLFCList::value_type);
+-  // The longest concatenate call has 14 arguments (attention base); each
+-  // recursive frame retains its by-value suffix: 14+13+...+1 parameters.
++  // The longest selected concatenate has 16 arguments (sorted GatherMM rhs);
++  // each recursive frame retains its by-value suffix: 16+15+...+1 parameters.
+   // Every parameter is string, pointer, char or int, no larger than string.
+   // Only base_name can exceed inline storage and it is the first argument
+   // of its separate hash call, so this recursion adds no hidden long copies.
+-  constexpr size_t concatenate_arguments = 14;
++  constexpr size_t concatenate_arguments = 16;
+   constexpr size_t concatenate_parameters =
+       concatenate_arguments * (concatenate_arguments + 1) / 2;
+   constexpr size_t controls = sizeof(ResidentSelectorLayout) * 2 +
+       sizeof(fmt::memory_buffer) + sizeof(FormatArguments) + sizeof(fmt::format_args) +
+-      sizeof(std::string) * (name_owners + concatenate_parameters) +
++      // Scatter also keeps its inline index-type and reduction-name strings.
++      sizeof(std::string) * (4 + concatenate_parameters) +
+       sizeof(MTLFCList) + sizeof(MTLFCList::value_type) * constants +
+       sizeof(std::vector<MTL::Function*>) +
+-      sizeof(std::string*) * concatenate_arguments;
++      sizeof(std::string*) * concatenate_arguments + sizeof(IndexMetadata) +
++      // Single-block sort has a second inline stride list. Index metadata's
++      // three range loans remain live through the synchronous encoder binding.
++      sizeof(Strides) + 3 * sizeof(void*) + 2 * sizeof(bool);
+   out = {allocation, controls, maximum_name, constants, linked};
+   return true;
+ #endif
+diff --git a/mlx/backend/metal/sort.cpp b/mlx/backend/metal/sort.cpp
+--- a/mlx/backend/metal/sort.cpp
++++ b/mlx/backend/metal/sort.cpp
+@@ -1,6 +1,7 @@
+ // Copyright © 2023-2024 Apple Inc.
+ 
+ #include <algorithm>
++#include <fmt/format.h>
+ 
+ #include "mlx/backend/gpu/copy.h"
+ #include "mlx/backend/metal/device.h"
+@@ -52,15 +53,10 @@
+   contiguous &= check_strides(out, out_stride_sorted_axis);
+ 
+   // Prepare kernel name
+-  std::ostringstream kname;
+-  kname << (contiguous ? "c" : "nc");
+-  if (argsort) {
+-    kname << "arg";
+-  }
+-
+-  kname << "_block_sort_" << type_to_name(in) << "_" << type_to_name(out)
+-        << "_bn" << bn << "_tn" << tn;
+-  auto kernel = get_sort_kernel(d, kname.str(), in, out, bn, tn);
++  const auto kname = fmt::format("{}{}_block_sort_{}_{}_bn{}_tn{}",
++      contiguous ? "c" : "nc", argsort ? "arg" : "", type_to_name(in),
++      type_to_name(out), bn, tn);
++  auto kernel = get_sort_kernel(d, kname, in, out, bn, tn);
+ 
+   // Prepare command encoder
+   auto& compute_encoder = metal::get_command_encoder(s);
+@@ -164,11 +160,10 @@
+ 
+   // Do blockwise sort
+   {
+-    std::ostringstream kname;
+-    kname << "sort_mbsort_" << type_to_name(dev_vals_0) << "_"
+-          << type_to_name(dev_idxs_0) << "_bn" << bn << "_tn" << tn;
++    const auto kname = fmt::format("sort_mbsort_{}_{}_bn{}_tn{}",
++        type_to_name(dev_vals_0), type_to_name(dev_idxs_0), bn, tn);
+     auto kernel =
+-        get_mb_sort_kernel(d, kname.str(), dev_vals_0, dev_idxs_0, bn, tn);
++        get_mb_sort_kernel(d, kname, dev_vals_0, dev_idxs_0, bn, tn);
+     compute_encoder.set_compute_pipeline_state(kernel);
+ 
+     compute_encoder.set_input_array(in, 0);
+@@ -204,12 +199,11 @@
+ 
+     // Do partition
+     {
+-      std::ostringstream kname;
+-      kname << "partition_mbsort_" << type_to_name(dev_vals_in) << "_"
+-            << type_to_name(dev_idxs_in) << "_bn" << bn << "_tn" << tn;
++      const auto kname = fmt::format("partition_mbsort_{}_{}_bn{}_tn{}",
++          type_to_name(dev_vals_in), type_to_name(dev_idxs_in), bn, tn);
+ 
+       auto kernel =
+-          get_mb_sort_kernel(d, kname.str(), dev_vals_0, dev_idxs_0, bn, tn);
++          get_mb_sort_kernel(d, kname, dev_vals_0, dev_idxs_0, bn, tn);
+       compute_encoder.set_compute_pipeline_state(kernel);
+ 
+       compute_encoder.set_output_array(block_partitions, 0);
+@@ -227,12 +221,11 @@
+ 
+     // Do merge
+     {
+-      std::ostringstream kname;
+-      kname << "merge_mbsort_" << type_to_name(dev_vals_in) << "_"
+-            << type_to_name(dev_idxs_in) << "_bn" << bn << "_tn" << tn;
++      const auto kname = fmt::format("merge_mbsort_{}_{}_bn{}_tn{}",
++          type_to_name(dev_vals_in), type_to_name(dev_idxs_in), bn, tn);
+ 
+       auto kernel =
+-          get_mb_sort_kernel(d, kname.str(), dev_vals_0, dev_idxs_0, bn, tn);
++          get_mb_sort_kernel(d, kname, dev_vals_0, dev_idxs_0, bn, tn);
+       compute_encoder.set_compute_pipeline_state(kernel);
+ 
+       compute_encoder.set_input_array(block_partitions, 0);

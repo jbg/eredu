@@ -14,6 +14,30 @@ fn resolve<'a>(key: impl Into<Option<&'a Array>>) -> Result<Cow<'a, Array>> {
         .ok_or_else(|| Exception::custom("random operations require an explicit PRNG key"))
 }
 
+/// Named native/C/safe controls for the explicit-key Standard sampling path.
+/// Array descriptors and requested buffers remain in the existing Graph/P owners.
+pub fn standard_sampling_control_bytes() -> Option<usize> {
+    use std::mem::size_of;
+    // SAFETY: pure scalar layout query with no runtime object or allocation.
+    let native = unsafe { safemlx_sys::mlx_random_standard_sampling_control_bytes() };
+    if native == 0 {
+        return None;
+    }
+    [
+        size_of::<Cow<'static, Array>>(),
+        size_of::<[Array; 3]>(),
+        size_of::<Result<Array>>(),
+        size_of::<Option<ShapeOrCount<'static>>>(),
+        size_of::<Option<i32>>(),
+        size_of::<[&Array; 3]>(),
+        size_of::<&Stream>(),
+        size_of::<u64>(),
+        size_of::<i32>(),
+    ]
+    .into_iter()
+    .try_fold(native, usize::checked_add)
+}
+
 /// Get a PRNG key from a seed.
 ///
 /// Return a value that can be used as a PRNG key.  All ``random::*``

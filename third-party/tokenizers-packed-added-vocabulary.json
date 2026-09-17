@@ -1,0 +1,53 @@
+{
+  "dependency": "external tokenizers 0.23.2",
+  "files": {
+    "src/models/bpe/compile.rs": {
+      "after": "ef15e3bac1fe20b381974705bd83c98d63636323e7484b73dd8b6cb9b5a60fe0",
+      "before": "88d1d903fc85223ef981c9d45e6ea568641ab7ef0f3a232ae8b703d3fd37bdd0"
+    },
+    "src/models/bpe/compile/json.rs": {
+      "after": null,
+      "before": "effe13aa67509ebd39f3fc3f2612583eef550fa43321386cf7d442b08d8ad135"
+    },
+    "src/tokenizer/added_vocabulary.rs": {
+      "after": "68a15f0b943a88d71645fdbe8477c4f3bc238faefb75b0283dc44371c83b221f",
+      "before": "204b620258633c76a90dbb2e1dc118b54549dc9b9447a12c94569eff67f21e1f"
+    },
+    "src/tokenizer/added_vocabulary/access.rs": {
+      "after": "1451689d76eeff3009dedcba2877990c411eb91e2a0910417b91470d7f8b1809",
+      "before": null
+    },
+    "src/tokenizer/added_vocabulary/packed.rs": {
+      "after": "d62c82814d2c430e42932cb6775a50d21014b9dc35789b66c7c4de4ff019f625",
+      "before": null
+    },
+    "src/tokenizer/added_vocabulary/packed/tests.rs": {
+      "after": "4713444dfc5c026dfcdb796319c307baaf04436cc68f16b63abd154b3b49cbed",
+      "before": null
+    },
+    "src/tokenizer/mod.rs": {
+      "after": "27ccbede2de2cb43281cbe2f08a7fe941b3de4f2aee4f78e7b8dc8b15af30faa",
+      "before": "6eb4cc3992c991acc8b41f8846b7f4c05138195072993a470fbec7d5908d8afb"
+    },
+    "src/utils/borrowed_json.rs": {
+      "after": "b54c57a1134e527344056f3eff74b7e1ef941eaefbf607ab2021e835b968007d",
+      "before": null
+    },
+    "src/utils/mod.rs": {
+      "after": "3e394f3145221948a094de63b36a0be3c6aa2524c6fed1e28e8836c7f2aef748",
+      "before": "cfb69796e5cf0e937e8ae2249fda912d791f908b33639cb81cbb0f421af85f01"
+    }
+  },
+  "final_complete_manifest_sha256": "2e6cf0e5b5134ab0117981500c135e07a6e0be0ef044282207b4e6dfa327971e",
+  "limits": [
+    "Construction and matching component only; no runtime owner or aggregate tokenizer admission.",
+    "Relative Cargo paths already consume this external fork; vanilla crates.io 0.23.2 lacks these APIs.",
+    "No workspace/default-feature/registry/unsafe-boundary change.",
+    "The two direct AddedVocabulary map getters return Cow; Tokenizer owned map APIs are preserved.",
+    "Legacy constructor/mutation/serde/training remain ordinary; packed clone/map materialization are unmanaged copies."
+  ],
+  "patch_sha256": "ecf7db149090f6b1511801987e01d6c112ecc57dc1d9e19b16214dda18d3271b",
+  "predecessor": "exact original BPE residence HF111",
+  "predecessor_complete_manifest_sha256": "c3117d5fb35a26a39b3e7ff659509f7ad59f1220d3616c4250bc9c070607e80b",
+  "upstream_archive_sha256": "7afbf6e88718afcc138bad01d6ccc3051dbbc3b2ce9793d8b8a3aeb610969cfc"
+}

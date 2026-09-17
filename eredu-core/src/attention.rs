@@ -166,13 +166,27 @@ impl LayerSchedule<AttentionPolicy> {
     }
     /// Returns a stable representation suitable for fingerprints.
     pub fn fingerprint_component(&self) -> String {
-        self.iter()
-            .map(|policy| match policy {
-                AttentionPolicy::Full => "f".into(),
-                AttentionPolicy::Sliding { window } => format!("s{}", window.get()),
-            })
-            .collect::<Vec<_>>()
-            .join(",")
+        self.display_fingerprint_component().to_string()
+    }
+
+    /// Borrows the exact fingerprint encoding without allocating its components.
+    pub fn display_fingerprint_component(&self) -> impl std::fmt::Display + '_ {
+        struct Component<'a>(&'a LayerSchedule<AttentionPolicy>);
+        impl std::fmt::Display for Component<'_> {
+            fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                for (index, policy) in self.0.iter().enumerate() {
+                    if index != 0 {
+                        output.write_str(",")?;
+                    }
+                    match policy {
+                        AttentionPolicy::Full => output.write_str("f")?,
+                        AttentionPolicy::Sliding { window } => write!(output, "s{}", window.get())?,
+                    }
+                }
+                Ok(())
+            }
+        }
+        Component(self)
     }
 }
 

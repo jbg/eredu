@@ -21,6 +21,7 @@ include = [
 workspace = true
 
 [dependencies]
+eredu-checkpoint.workspace = true
 eredu-architectures.workspace = true
 eredu-codec.workspace = true
 eredu-core.workspace = true

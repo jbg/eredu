@@ -1,0 +1,187 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T02:24:06.436251+00:00",
+  "scope": "Exact scheduled capture-only source-pin channel on the original working-memory scope",
+  "status": "Verified neutral source-segment mechanism; native chunk retirement and bounded inference remain unfinished",
+  "previous_increment": "bounded-capture-prefill-geometry-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 1044,
+      "ignored": 0
+    },
+    "runtime_integration": {
+      "passed": 68,
+      "ignored": 0
+    },
+    "backend_integration": {
+      "passed": 102,
+      "ignored": 0
+    },
+    "native_observation": {
+      "passed": 10,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 230,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1588,
+  "new_tests": [
+    "segment_exact_original_h_has_no_second_hold_and_short_h_rejects_before_construction",
+    "segment_retirement_preserves_baseline_interleaved_pins_aliases_and_zero_keys",
+    "segment_rejects_sibling_scope_independent_schedule_and_foreign_source_before_allocation",
+    "segment_constructor_rollback_and_abandonment_preserve_both_quarantine_channels",
+    "segment_checks_all_prior_origins_and_parent_health_before_more_work_or_retirement",
+    "segment_release_returns_only_actual_retired_allocation_credit_to_original_account",
+    "segment_source_key_retirement_runs_outside_usage_and_keeps_original_h"
+  ],
+  "new_test_count": 7,
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T02:20:13.158209+00:00",
+      "elapsed_seconds": 22.976,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-capture-source-segment-runtime.log",
+      "log_sha256": "4eee0838f6eb3c386e2c13cc04f8a18b249d4ee523550a69daef5d7fb719f1ad"
+    },
+    "runtime_integration": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test bounded_prefill",
+      "started_utc": "2026-09-14T02:20:36.134655+00:00",
+      "elapsed_seconds": 7.635,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-capture-source-segment-runtime_integration.log",
+      "log_sha256": "84a8e2c8ceca00c700260ed23e8de351d7dd514c01a80ac73a0540aa881ab37a"
+    },
+    "backend_integration": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence",
+      "started_utc": "2026-09-14T02:20:43.770881+00:00",
+      "elapsed_seconds": 3.392,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-capture-source-segment-backend_integration.log",
+      "log_sha256": "0395062d8d883fb21a1cacabe297f8e37e619fb68f0518fb81d30b4d6ff7eb8b"
+    },
+    "native_observation": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::observation:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T02:20:47.163349+00:00",
+      "elapsed_seconds": 98.56,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-capture-source-segment-native_observation.log",
+      "log_sha256": "a664a816d74bd912af1412a0d97153d9bbeeb993af5f6b584ae23c83f0108c2a"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::model_session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T02:22:25.724817+00:00",
+      "elapsed_seconds": 14.382,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-capture-source-segment-session.log",
+      "log_sha256": "89d865237b396eb126daeb945da9257d8cb029a668e28b20f9b80cbb0f8a2dcc"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T02:22:40.107086+00:00",
+      "elapsed_seconds": 47.773,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-capture-source-segment-portable.log",
+      "log_sha256": "0017257b3da3b45fd841566a097f6506d2767c740d3ff789f24fe656ebe3bc06"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T02:23:27.880798+00:00",
+      "elapsed_seconds": 21.297,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-capture-source-segment-minimal.log",
+      "log_sha256": "16ca68ce4fdbc11ec8302493a6ca086efe4e80a0e5c363aadf9fee086ce956c9"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T02:23:49.177919+00:00",
+      "elapsed_seconds": 15.733,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-capture-source-segment-features.log",
+      "log_sha256": "27b3198d1105b0aa67328198ce817cda996ea3fae523da5cb6302abf62a00fa0"
+    }
+  },
+  "source_sha256": {
+    "eredu-runtime/src/working_memory.rs": "89fcfad57531f289c7ebd25e7c871265bcfc93079b28e380848edb8150cb2fd4",
+    "eredu-runtime/src/working_memory/capture_run/claims.rs": "55ff34a4515774347ec9861d798fe3d8c9ad8a42e90cd5fb0d9f9118961165c1",
+    "eredu-runtime/src/working_memory/capture_run/plan.rs": "b6ef10e36b66853e2eac21f93c3ad4259b17ca9d0116848533df88ce688804ad",
+    "eredu-runtime/src/working_memory/capture_run/tests.rs": "5bb96d2aced976959e5f2e2e8f529f77d4cfd86990aa7094e9cd11f75903a15e",
+    "eredu-runtime/src/working_memory/capture_run/tests/segments.rs": "ffbad28bf5f9955ad74f1b3ded8ead591507f4e9cc8f9f87f80a59e49323bcb3",
+    "eredu-runtime/src/working_memory/capture_tensor/transfer.rs": "caf320992dc934ffafa2d077c5dade6743d54c035d048b2155a55882f5825389",
+    "eredu-runtime/src/working_memory/funding.rs": "900ddcfda748529a2ee37ded9320892cfcefe9c32b78dbc83b6cc3f0e56c5e02",
+    "eredu-runtime/src/working_memory/funding/capture_source.rs": "1f9afe045b9c9dbd8a62d2e23d34fc88d5aa8d3c2ffb2fe8a888f3005fc9ce19",
+    "eredu-runtime/src/working_memory/funding/capture_tensor.rs": "3f0dee2572f0e8c310669622e85538a5727ea2e0d1ac702e93ad85da45962920",
+    "eredu-runtime/src/working_memory/funding/decoder_group.rs": "7a2c95992ad40afd527b7da8a21b2f0381de9fb5cb313ecae0332d68d62b1cd5",
+    "eredu-runtime/src/working_memory/funding/no_decoder_prompt.rs": "bfdd2bb9b5a13f97196510e110c03115bb5de5077d49d3d8e7753f344c90cbaa",
+    "doc/backend-architecture.md": "cfd709587615cb676ffb4b211c74485f1bfa3d0128f464bc899f88d87594b4b3",
+    "doc/execution-control.md": "c12b0df0b5015342c7a1a548507d8b62fca6850ae2a698d8ddae2b7246c9bf56",
+    "doc/bounded-inference.md": "58167a577eb162540b5340dc0eb33143b841ea1fc00034db558351e344b89be0"
+  },
+  "source_snapshot": "/private/tmp/eredu-capture-source-segment-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-capture-source-segment-applied.json": "01df313adab1f4d1dbeaba505432a4053eb164f22185dd65ae6c3d7c527c38d5",
+    "/private/tmp/eredu-capture-source-segment-backend_integration.log": "0395062d8d883fb21a1cacabe297f8e37e619fb68f0518fb81d30b4d6ff7eb8b",
+    "/private/tmp/eredu-capture-source-segment-checks.json": "6b35b7efba2f6c957dd3c854d3d45f00679d7b5021fa1f62b92937673128e42f",
+    "/private/tmp/eredu-capture-source-segment-features.log": "27b3198d1105b0aa67328198ce817cda996ea3fae523da5cb6302abf62a00fa0",
+    "/private/tmp/eredu-capture-source-segment-files.txt": "18c7cd7450b8f5d862bba321c66e4184ad338a4736907f941defdaf46c735c80",
+    "/private/tmp/eredu-capture-source-segment-minimal.log": "16ca68ce4fdbc11ec8302493a6ca086efe4e80a0e5c363aadf9fee086ce956c9",
+    "/private/tmp/eredu-capture-source-segment-native_observation.log": "a664a816d74bd912af1412a0d97153d9bbeeb993af5f6b584ae23c83f0108c2a",
+    "/private/tmp/eredu-capture-source-segment-new-tests.json": "fac08eff984406b7073a54d5312966a0ba16909bde3be7ace4c281adad131fd6",
+    "/private/tmp/eredu-capture-source-segment-portable.log": "0017257b3da3b45fd841566a097f6506d2767c740d3ff789f24fe656ebe3bc06",
+    "/private/tmp/eredu-capture-source-segment-review.json": "05ac2f5836f8e1ea55a4214522ed93d4e02313638786f17d5bc07ab4e1e706ae",
+    "/private/tmp/eredu-capture-source-segment-runtime.log": "4eee0838f6eb3c386e2c13cc04f8a18b249d4ee523550a69daef5d7fb719f1ad",
+    "/private/tmp/eredu-capture-source-segment-runtime_integration.log": "84a8e2c8ceca00c700260ed23e8de351d7dd514c01a80ac73a0540aa881ab37a",
+    "/private/tmp/eredu-capture-source-segment-session.log": "89d865237b396eb126daeb945da9257d8cb029a668e28b20f9b80cbb0f8a2dcc",
+    "/private/tmp/eredu-capture-source-segment-stage/README.md": "d5d13c5422dd2a7fb95705c714680decf2057834d7a725614e18a4cec5817138",
+    "/private/tmp/eredu-capture-source-segment-stage/base-hashes.json": "2e7da501d08a9c26865f2d87993dd939d55225067be480d4465b97fbdc6326b8",
+    "/private/tmp/eredu-capture-source-segment-stage/change.patch": "a0aaab4a146283af62d76acd105331e506d0817cddde18402b81a54529e7a7f2",
+    "/private/tmp/eredu-capture-source-segment-stage/checks.json": "a022fae9d1d9af88296e359e1475c29c4f29af8224fe6b41808a3b0c511914f6",
+    "/private/tmp/eredu-capture-source-segment-stage/dependency-hashes.json": "f8cea4dd002827707fe241a04ce905628580aa44efc46975a90b94c3c86ba6a0",
+    "/private/tmp/eredu-capture-source-segment-stage/doc-addition-hashes.json": "54a213fea0fa5f06c11a60ab2e2f59e412c8f0da61f234f015015ae4069edd77",
+    "/private/tmp/eredu-capture-source-segment-stage/doc-additions/backend-architecture.md": "6d88d673dbb41b04948a9b6a9f85bdf6fdbd0d0ec01b93839c8af27350d7532c",
+    "/private/tmp/eredu-capture-source-segment-stage/doc-additions/bounded-inference.md": "aa0c158e0b4618f31860a75bff6ab207e73bb44ded7ca23ec295978c0d85b6c8",
+    "/private/tmp/eredu-capture-source-segment-stage/doc-additions/execution-control.md": "b208757e6f5560fe8c79305d74b184d95bad5bc3474b139e328a32e5cba1eaba",
+    "/private/tmp/eredu-capture-source-segment-stage/files.txt": "18c7cd7450b8f5d862bba321c66e4184ad338a4736907f941defdaf46c735c80",
+    "/private/tmp/eredu-capture-source-segment-stage/implement.py": "cf77d9d3d35e2a5861c75301c767412b2f42727fc686f3cbd0737e0bf02a0c59",
+    "/private/tmp/eredu-capture-source-segment-stage/package.py": "0962799b404c498c38e4f213a520486e66fd7d0ceec813644e451faba417b1a0",
+    "/private/tmp/eredu-capture-source-segment-stage/provenance.json": "c691e63ffb1ab685f83615b9168402f057d0f3c2c82632309aa284bc08d94033",
+    "/private/tmp/eredu-capture-source-segment-stage/staged-hashes.json": "8945174d546b941846eed4f64ad1dca95f6f92f0b454b5e8ffb0306741b64ef4",
+    "/private/tmp/eredu-capture-source-segment-stage/tests.json": "f551e5c1bb38ccd09d0c1773d70d08161ac6a500fbc348c0b36c41b4ce087ed7",
+    "/private/tmp/eredu-capture-source-segment-validate.py": "4772206fd7aa5f2f4d8440c966851b4786be67edcd843d0678a91d16abf11729"
+  },
+  "review": {
+    "review": "Root read complete production diff across all scope constructors, transfer/claim re-use, closed source wrapper/slot, rollback and Drop union, plus all seven mechanism tests.",
+    "behavior": [
+      "Exact active scope slot identity and original schedule/account are checked; equal sibling scopes and independently prepared banks do not substitute.",
+      "Every earlier source origin is revalidated atomically. Construction rollback replaces only the segment channel, preserving permanent/interleaved additions.",
+      "Handle Drop leaves channel sources on scope. Uncertified scope Drop quarantines both permanent and segment inventories.",
+      "Internal retirement validates before detach, drops sources outside Usage, and relies on real last-owner registration retirement for credit.",
+      "H includes actual inline segment/slot controls; source registration/validator containers remain existing accounting metadata."
+    ],
+    "limits": [
+      "Retirement is crate-private with no production caller. Canonical exact native chunk binding, native capture root carrier and ordinary physical-owner retirement remain unfinished.",
+      "Tests use registered neutral key facts and completed scalar host work, not native completion/shape evidence.",
+      "No selected-prefill capture gate or new native certification is added."
+    ]
+  },
+  "behavior": [
+    "A move-only segment names one exact active scope slot and original capture schedule; same-pool sibling scopes and independent schedules cannot substitute.",
+    "Closed registered source validators check every prior origin atomically before binding or retirement. Constructor rollback restores only this channel.",
+    "Handle Drop leaves sources on the scope. Uncertified scope Drop quarantines the union of permanent and capture-only sources.",
+    "Internal retirement detaches only the validated segment and destroys source keys outside Usage; only actual last-owner registration retirement returns credit.",
+    "The original H includes actual inline slot/segment controls; no extra reservation or certification is introduced."
+  ],
+  "corrections": [],
+  "limits": [
+    "The crate-private retirement method has no production caller. Native resource carrier, canonical exact chunk success association and selected-prefill activation remain unfinished.",
+    "New mechanism tests use neutral registered keys and completed scalar host work; they do not establish native completion or physical activation geometry.",
+    "Source-registration containers remain existing accounting metadata exclusions. No total process-memory guarantee or new native/reference measurement is claimed."
+  ]
+}

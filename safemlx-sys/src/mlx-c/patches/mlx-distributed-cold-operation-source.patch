@@ -1,0 +1,189 @@
+diff --git a/mlx/backend/cpu/distributed_storage.cpp b/mlx/backend/cpu/distributed_storage.cpp
+--- a/mlx/backend/cpu/distributed_storage.cpp
++++ b/mlx/backend/cpu/distributed_storage.cpp
+@@ -2,6 +2,7 @@
+ #include "mlx/backend/cpu/copy.h"
+ #include "mlx/backend/cpu/encoder.h"
+ #include "mlx/distributed/primitives.h"
++#include "mlx/distributed/constructor.h"
+ #include "mlx/prepared_input.h"
+ #include "mlx/original_buffer.h"
+ #include "mlx/submission.h"
+@@ -80,61 +81,24 @@
+       sizeof(submission::OriginalBufferRoutingLayout)+sizeof(GraphQuota::Request)*3+
+       sizeof(array::BufferAdoptionLayout)+sizeof(const array*)*3+sizeof(size_t)*20+
+       sizeof(bool)*7+sizeof(int)*4+sizeof(GroupWorkerOperation)+
++      sizeof(const Group*)+sizeof(const array*)+sizeof(CpuDistributedStorage*)+
++      sizeof(GroupWorkerOperation)+sizeof(int)+sizeof(size_t)*4+sizeof(bool)+
+       GraphConstruction::layout_control_bytes();
+ }
+-} // namespace
+-bool is_cpu_distributed_primitive(const array& value) noexcept {
+-  Source selected;return source(value,selected);
+-}
+-size_t cpu_distributed_storage_inspection_controls(const array& value) noexcept {
+-  size_t result=inspection_frames();
+-  Source selected;
+-  if(source(value,selected)) {
+-    const auto& group=selected.primitive->group();
+-    if(!add(result,group.dispatch_storage_inspection_controls()) ||
+-        !add(result,group.worker_storage_inspection_controls()))return SIZE_MAX;
+-  }
+-  return result;
+-}
+-bool cpu_distributed_storage(const array& output,CpuDistributedStorage& out) noexcept {
+-#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+-  return false;
+-#else
+-  Source selected;
+-  if(!source(output,selected) || !output.siblings().empty())return false;
+-  const auto& group=selected.primitive->group();
+-  GroupStorageInventory inventory;
+-  // No fresh-submission terminal check: this is an already accepted primitive.
+-  // EmptyGroup identities emit no primitive and do not become Ring evidence.
+-  if(!group.storage_inventory(inventory) || inventory.kind!=GroupStorageKind::ring)return false;
+-  const int members=group.size(),rank=group.rank();
+-  if(members<=1 || rank<0 || rank>=members)return false;
+-  const bool receive=selected.operation==GroupWorkerOperation::recv;
+-  const bool send=selected.operation==GroupWorkerOperation::send;
+-  const bool gather=selected.operation==GroupWorkerOperation::gather;
++bool prepare_storage(const Group& group,const array& input,
++    GroupWorkerOperation operation,int peer,size_t output_rank,size_t input_bytes,
++    size_t output_bytes,bool tracer,size_t inspection_controls,CpuDistributedStorage& out) noexcept {
++  const bool receive=operation==GroupWorkerOperation::recv;
++  const bool send=operation==GroupWorkerOperation::send;
++  const bool gather=operation==GroupWorkerOperation::gather;
+   const size_t inputs=receive?0:1;
+-  if(output.inputs().size()!=inputs)return false;
+-  const auto& input=receive?output:output.inputs()[0];
+-  if(output.dtype()!=input.dtype())return false;
+-  size_t input_bytes,output_bytes;
+-  if(!bytes(input,input_bytes) || !bytes(output,output_bytes))return false;
+-  if(gather) {
+-    size_t expected;
+-    if(!multiply(input_bytes,size_t(members),expected) || expected!=output_bytes ||
+-        output.ndim()!=(input.ndim()?input.ndim():1))return false;
+-    if(input.ndim()) {
+-      if(input.shape()[0]>INT_MAX/members || output.shape()[0]!=input.shape()[0]*members)return false;
+-      for(size_t d=1;d<input.ndim();++d)if(input.shape()[d]!=output.shape()[d])return false;
+-    } else if(output.shape()[0]!=members)return false;
+-  } else if(input.shape()!=output.shape() || input_bytes!=output_bytes)return false;
+-
+   CpuDistributedStorage value;
+-  value.operation=selected.operation;value.peer=selected.peer;
+-  value.input_rank=input.ndim();value.output_rank=output.ndim();value.inputs=inputs;
+-  value.tracer=output.is_tracer();value.possible_copy=inputs!=0;
++  value.operation=operation;value.peer=peer;
++  value.input_rank=input.ndim();value.output_rank=output_rank;value.inputs=inputs;
++  value.tracer=tracer;value.possible_copy=inputs!=0;
+   GroupDispatchStorage dispatch;
+-  if(!group.dispatch_storage(selected.operation,input,selected.peer,dispatch) ||
+-      !group.worker_storage(selected.operation,input,selected.peer,value.communication))return false;
++  if(!group.dispatch_storage(operation,input,peer,dispatch) ||
++      !group.worker_storage(operation,input,peer,value.communication))return false;
+   submission::CpuEvalCleanupLayout cleanup;
+   cpu::RetentionLayout retention;
+   submission::OriginalBufferRoutingLayout routing;
+@@ -179,7 +143,7 @@
+   value.communication_worker_graph_extent=value.communication.task_graph_extent;
+   if(!add(value.communication_worker_graph_extent,value.communication.destination_graph_extent))return false;
+   const auto adoption=array::buffer_adoption_layout();
+-  value.named_control_bytes=cpu_distributed_storage_inspection_controls(output);
++  value.named_control_bytes=inspection_controls;
+   const size_t execution_frames=sizeof(ArrayVector)*4+sizeof(array)*8+sizeof(Shape)*4+
+       sizeof(Strides)*4+sizeof(Stream)*3+sizeof(allocator::Buffer)*3+
+       sizeof(std::optional<submission::FixedEvalPrologueGuard>)+sizeof(GraphConstruction*)+
+@@ -205,7 +169,79 @@
+   if(!scaled(value.named_control_bytes,adoption_frames,value.data_captures) ||
+       !GraphConstruction::complete_layout(value))return false;
+   out=value;return true;
++}
++} // namespace
++bool is_cpu_distributed_primitive(const array& value) noexcept {
++  Source selected;return source(value,selected);
++}
++size_t cpu_distributed_storage_inspection_controls(const array& value) noexcept {
++  size_t result=inspection_frames();
++  Source selected;
++  if(source(value,selected)) {
++    const auto& group=selected.primitive->group();
++    if(!add(result,group.dispatch_storage_inspection_controls()) ||
++        !add(result,group.worker_storage_inspection_controls()))return SIZE_MAX;
++  }
++  return result;
++}
++bool cpu_distributed_storage(const array& output,CpuDistributedStorage& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  Source selected;
++  if(!source(output,selected) || !output.siblings().empty())return false;
++  const auto& group=selected.primitive->group();
++  GroupStorageInventory inventory;
++  // No fresh-submission terminal check: this is an already accepted primitive.
++  // EmptyGroup identities emit no primitive and do not become Ring evidence.
++  if(!group.storage_inventory(inventory) || inventory.kind!=GroupStorageKind::ring)return false;
++  const int members=group.size(),rank=group.rank();
++  if(members<=1 || rank<0 || rank>=members)return false;
++  const bool receive=selected.operation==GroupWorkerOperation::recv;
++  const bool gather=selected.operation==GroupWorkerOperation::gather;
++  const size_t inputs=receive?0:1;
++  if(output.inputs().size()!=inputs)return false;
++  const auto& input=receive?output:output.inputs()[0];
++  if(output.dtype()!=input.dtype())return false;
++  size_t input_bytes,output_bytes;
++  if(!bytes(input,input_bytes) || !bytes(output,output_bytes))return false;
++  if(gather) {
++    size_t expected;
++    if(!multiply(input_bytes,size_t(members),expected) || expected!=output_bytes ||
++        output.ndim()!=(input.ndim()?input.ndim():1))return false;
++    if(input.ndim()) {
++      if(input.shape()[0]>INT_MAX/members || output.shape()[0]!=input.shape()[0]*members)return false;
++      for(size_t d=1;d<input.ndim();++d)if(input.shape()[d]!=output.shape()[d])return false;
++    } else if(output.shape()[0]!=members)return false;
++  } else if(input.shape()!=output.shape() || input_bytes!=output_bytes)return false;
++
++  return prepare_storage(group,input,selected.operation,selected.peer,output.ndim(),
++      input_bytes,output_bytes,output.is_tracer(),cpu_distributed_storage_inspection_controls(output),out);
+ #endif
++}
++
++size_t cpu_distributed_source_inspection_controls(const Group& group) noexcept {
++  size_t controls=inspection_frames();
++  if(!add(controls,constructor_storage_inspection_controls()) ||
++      !add(controls,group.dispatch_storage_inspection_controls()) ||
++      !add(controls,group.worker_storage_inspection_controls()) ||
++      !add(controls,sizeof(GroupConstructorStorage)+sizeof(const Group*)+sizeof(const array*)+
++          sizeof(GroupWorkerOperation)+sizeof(int)+sizeof(size_t)*3+sizeof(bool)*2))return SIZE_MAX;
++  return controls;
++}
++bool cpu_distributed_source_storage(const Group& group,const array& input,
++    GroupWorkerOperation operation,int peer,CpuDistributedStorage& out) noexcept {
++  GroupConstructorStorage construction;
++  // The original constructor refuses tracer leaves. This is an actual source
++  // condition, not a caller-provided output shape or optional primitive recipe.
++  if(input.is_tracer() || !constructor_storage(group,input,operation,peer,construction) ||
++      construction.primitives!=1)return false;
++  size_t input_bytes,output_bytes;
++  if(!bytes(input,input_bytes) || !multiply(construction.output_elements,input.itemsize(),output_bytes))return false;
++  const size_t controls=cpu_distributed_source_inspection_controls(group);
++  if(controls==SIZE_MAX)return false;
++  return prepare_storage(group,input,operation,peer,construction.output_rank,
++      input_bytes,output_bytes,false,controls,out);
+ }
+ } // namespace mlx::core::distributed
+ 
+diff --git a/mlx/backend/cpu/distributed_storage.h b/mlx/backend/cpu/distributed_storage.h
+--- a/mlx/backend/cpu/distributed_storage.h
++++ b/mlx/backend/cpu/distributed_storage.h
+@@ -21,4 +21,10 @@
+ // Includes the actual Group source query's fixed frames; no query or allocation.
+ MLX_API size_t cpu_distributed_storage_inspection_controls(const array&) noexcept;
+ MLX_API bool cpu_distributed_storage(const array&, CpuDistributedStorage&) noexcept;
++// Cold same-worker source, authenticated by the existing actual lazy constructor.
++// No temporary array/primitive is built. Only fresh qualified non-tracer Ring
++// operations are described; accepted primitives retain the separate entry above.
++MLX_API size_t cpu_distributed_source_inspection_controls(const Group&) noexcept;
++MLX_API bool cpu_distributed_source_storage(const Group&, const array&,
++    GroupWorkerOperation, int peer, CpuDistributedStorage&) noexcept;
+ } // namespace mlx::core::distributed

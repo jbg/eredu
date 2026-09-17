@@ -433,7 +433,7 @@ fn point_to_point_worker() {
     let error =
         <MlxNeuralBackend as PointToPointBackend>::send_receive(wrong_dtype, route, &stream)
             .expect_err("route dtype must be checked before native submission");
-    assert!(error.what().contains("does not advertise dtype"));
+    assert!(error.to_string().contains("does not advertise dtype"));
     let oversized = framed_values(
         vec![MlxTensor::from_array(Array::from_slice(
             &[0.0_f32; 9],
@@ -443,7 +443,7 @@ fn point_to_point_worker() {
     );
     let error = <MlxNeuralBackend as PointToPointBackend>::send_receive(oversized, route, &stream)
         .expect_err("route placeholder shape must be checked before native submission");
-    assert!(error.what().contains("exceeds route limits"));
+    assert!(error.to_string().contains("exceeds route limits"));
     let values = if rank == 0 {
         vec![
             MlxTensor::from_array(Array::from_slice(&[1.0_f32, 2.0], &[2])),
@@ -771,3 +771,9 @@ mod routes;
 mod status;
 
 mod ordered_wave;
+
+mod completed_operation;
+
+mod workspace_source;
+
+mod original_route;

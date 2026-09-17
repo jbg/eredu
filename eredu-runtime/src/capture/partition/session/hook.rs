@@ -14,6 +14,15 @@ pub trait PartitionCaptureHookTransport: PartitionCaptureTransport {
     /// Cold per-member logical bound, including completion and host resolution.
     /// Called on every world rank, including nonmembers. Must submit no work.
     fn estimate_capture_hook(&self, members: &[usize]) -> Result<CaptureUsage, CaptureError>;
+    /// Complete the same member vote under an already admitted native role.
+    /// The default uses the existing submit/wait/resolve worker. An original
+    /// source adapter may keep that exact completion inside its retained role;
+    /// returning a boolean requires completed native work or safe failure custody.
+    fn complete_capture_hook(&self,members:&[usize],wait:BoundedCompletionWait,success:bool)
+        ->Result<bool,PartitionCaptureExchangeError>
+    where Self:Sized,Self::Error:Send+Sync+'static,<Self::Completion as Completion>::Error:Send+Sync+'static {
+        ordinary_vote(self,members,wait,success)
+    }
     /// Submits one payload-free success vote on the declared invocation group.
     /// Runtime settles singleton groups locally without calling this method.
     fn submit_capture_hook(
@@ -29,7 +38,6 @@ pub trait PartitionCaptureHookTransport: PartitionCaptureTransport {
 /// Membership is fixed before common pre-forward coordination. Replicated
 /// nonproducers participate; inactive pipeline ranks do not.
 pub struct SessionPartitionHook<'a, T: PartitionCaptureHookTransport> {
-    owner: Arc<()>,
     epoch: DistributedCommitEpoch,
     key: PartitionCaptureKey,
     transport: &'a T,
@@ -37,6 +45,8 @@ pub struct SessionPartitionHook<'a, T: PartitionCaptureHookTransport> {
     wait: BoundedCompletionWait,
     reserved: CaptureUsage,
     source_preflight: bool,
+    // Last: all retained plan/work payloads retire before preparation custody.
+    owner: Arc<crate::capture::CaptureHostOwner>,
 }
 
 impl<T: PartitionCaptureHookTransport> SessionPartitionHook<'_, T> {
@@ -233,7 +243,23 @@ where
     T::Error: Send + Sync + 'static,
     <T::Completion as Completion>::Error: Send + Sync + 'static,
 {
-    let result = (|| {
+    let result=(|| {
+        transport.ensure_capture_active()?;
+        if members.len()==1 {return Ok(local_success);}
+        let success=transport.complete_capture_hook(members,wait,local_success)?;
+        if success&&!local_success {return Err(PartitionCaptureExchangeError::Protocol("hook agreement omitted local failure"));}
+        Ok(success)
+    })();
+    if let Err(error) = &result {
+        transport.fail_capture_exchange(error);
+    }
+    result
+}
+
+fn ordinary_vote<T:PartitionCaptureHookTransport>(transport:&T,members:&[usize],wait:BoundedCompletionWait,local_success:bool)
+    ->Result<bool,PartitionCaptureExchangeError>
+where T::Error:Send+Sync+'static,<T::Completion as Completion>::Error:Send+Sync+'static {
+    (|| {
         transport.ensure_capture_active()?;
         if members.len() == 1 {
             return Ok(local_success);
@@ -259,9 +285,6 @@ where
             ));
         }
         Ok(success)
-    })();
-    if let Err(error) = &result {
-        transport.fail_capture_exchange(error);
-    }
-    result
+    })()
+
 }

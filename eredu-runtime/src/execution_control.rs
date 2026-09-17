@@ -1,16 +1,25 @@
 //! Shared completed-token lifecycle and non-rewindable snapshot reservations.
 
 use eredu_core::{execution_control::*, generation::FinishReason};
-use std::{cell::RefCell, rc::Rc};
+#[cfg(test)]
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
+mod history;
+pub use history::{ControllerHistoryError, ControllerHistorySuffix};
+mod grammar;
+pub use grammar::{PreparedGrammarBranch, PreparedGrammarBranchCause, PreparedGrammarBranchError};
 mod choice;
 mod sampling;
 mod snapshot;
-pub use choice::{TokenChoiceController, TokenChoiceError};
+pub use choice::{
+    PreparedControllerCause, PreparedControllerDecision, PreparedControllerSource,
+    PreparedForbiddenDecision, PreparedPlainDecision, PreparedGrammarChoice, PreparedGrammarChoiceCause, PreparedGrammarChoiceError, TokenChoiceController, TokenChoiceError,
+};
 pub use sampling::{
-    apply_prepared_sampling_override, apply_sampling_override, validate_sampling_override,
     SamplingOverride, SamplingOverrideError, SamplingStateFacts, TextSamplingControlBackend,
-    ValidatedSamplingOverride,
+    ValidatedSamplingOverride, apply_prepared_sampling_override, apply_sampling_override,
+    validate_sampling_override,
 };
 
 /// Logical owned storage of the audited serialized intervention request DTO.
@@ -22,8 +31,10 @@ pub fn intervention_plan_storage_bytes(
 }
 pub(crate) mod storage;
 pub use snapshot::{
-    ManagedTextContinuation, SnapshotTokenController, TextBranchRequest, TextContinuationBranch,
-    TextContinuationSnapshot, TextSnapshotBackend, TextSnapshotError,
+    ManagedTextContinuation, PendingSnapshotResumeRetention, PreparedTextHostCopy,
+    RetainedSnapshotBackendError, SamplingCopyPolicy, SnapshotTokenController, TextBranchRequest,
+    TextContinuationBranch, TextContinuationSnapshot, TextHostCopyError, TextSnapshotBackend,
+    TextSnapshotError,
 };
 
 /// Quiescent, rewindable lifecycle component of a complete generation snapshot.
@@ -203,6 +214,7 @@ impl GenerationLifecycle {
     }
 }
 
+#[derive(Debug)]
 struct BudgetState {
     limits: SnapshotLimits,
     usage: SnapshotUsage,
@@ -210,20 +222,88 @@ struct BudgetState {
 
 /// Shared logical reservation owner for retained snapshots, child states and
 /// provisional restore copies. It deliberately lives outside rewindable state.
-#[derive(Clone)]
-pub struct SnapshotBudget(Rc<RefCell<BudgetState>>);
+#[derive(Debug)]
+pub struct SnapshotBudget(Option<Arc<BudgetOwner>>);
+#[derive(Debug)]
+struct BudgetOwner {
+    state: Mutex<BudgetState>,
+    // The shared shell and initialized Mutex PAL retire before this custody.
+    _host: eredu_core::HostPreparationAuthority,
+}
+impl Clone for SnapshotBudget {
+    fn clone(&self) -> Self {
+        Self(Some(Arc::clone(self.inner())))
+    }
+}
+impl Drop for SnapshotBudget {
+    fn drop(&mut self) {
+        if let Some(owner) = self.0.take() {
+            drop(Arc::into_inner(owner));
+        }
+    }
+}
 
 impl SnapshotBudget {
+    fn inner(&self) -> &Arc<BudgetOwner> {
+        self.0.as_ref().expect("live snapshot budget")
+    }
     /// Creates an explicitly bounded resource owner; zero limits disable retention.
     pub fn new(limits: SnapshotLimits) -> Self {
-        Self(Rc::new(RefCell::new(BudgetState {
-            limits,
-            usage: SnapshotUsage::default(),
-        })))
+        Self::new_with_host(limits, eredu_core::HostPreparationAuthority::unmanaged())
+    }
+    pub(crate) fn new_with_host(
+        limits: SnapshotLimits,
+        host: eredu_core::HostPreparationAuthority,
+    ) -> Self {
+        let budget = Self(Some(Arc::new(BudgetOwner {
+            state: Mutex::new(BudgetState {
+                limits,
+                usage: SnapshotUsage::default(),
+            }),
+            _host: host,
+        })));
+        // The selected host Mutex may allocate its PAL lazily. Materialize it in
+        // this caller-owned constructor, before any allocation-free reservation.
+        drop(
+            budget
+                .inner()
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        budget
+    }
+    /// Exact shared owner, initialized PAL and fixed constructor transports.
+    /// Unknown platform storage is accepted only by an ordinary caller, whose
+    /// metadata hook does not claim managed funding.
+    pub(crate) fn construction_bytes() -> Option<usize> {
+        use std::mem::size_of;
+        let pal = usize::try_from(
+            crate::working_memory::OriginalHostMetadataCustody::initialized_mutex_bytes().ok()?,
+        )
+        .ok()?;
+        let shared =
+            usize::try_from(crate::working_memory::qualified_shared_bytes::<BudgetOwner>().ok()?)
+                .ok()?;
+        [
+            shared,
+            pal,
+            size_of::<Self>(),
+            size_of::<BudgetOwner>(),
+            size_of::<Option<BudgetOwner>>(),
+            size_of::<(SnapshotLimits, eredu_core::HostPreparationAuthority)>(),
+            size_of::<std::sync::LockResult<std::sync::MutexGuard<'_, BudgetState>>>(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
     }
     /// Observes retained counts and cumulative copying without native side effects.
     pub fn usage(&self) -> SnapshotUsage {
-        self.0.borrow().usage
+        self.inner()
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .usage
     }
     /// Reserves known costs before copying or retaining any state. Unknown costs,
     /// overflows and limits fail without changing accounting. After admission,
@@ -233,8 +313,19 @@ impl SnapshotBudget {
         kind: SnapshotResourceKind,
         estimate: Option<SnapshotEstimate>,
     ) -> Result<SnapshotReservation, ExecutionControlError> {
+        self.reserve_pending(kind, estimate)
+            .map(PendingSnapshotReservation::publish)
+    }
+
+    // Changes only logical usage. The inline lease refunds retention on failure,
+    // preserving consumed copy work; publishing its Arc requires host authority.
+    pub(crate) fn reserve_pending(
+        &self,
+        kind: SnapshotResourceKind,
+        estimate: Option<SnapshotEstimate>,
+    ) -> Result<PendingSnapshotReservation, ExecutionControlError> {
         let estimate = estimate.ok_or(ExecutionControlError::UnknownEstimate)?;
-        let mut state = self.0.borrow_mut();
+        let mut state = self.inner().state.lock().unwrap_or_else(|p| p.into_inner());
         let add = |a: u64, b: u64| a.checked_add(b).ok_or(ExecutionControlError::Overflow);
         let next = SnapshotUsage {
             snapshots: add(
@@ -268,40 +359,108 @@ impl SnapshotBudget {
             }
         }
         state.usage = next;
-        Ok(SnapshotReservation {
-            lease: Rc::new(ReservationLease {
-                budget: self.clone(),
-                kind,
-                retained_bytes: estimate.retained_bytes,
-            }),
-        })
+        Ok(PendingSnapshotReservation(ReservationLease {
+            budget: self.clone(),
+            kind,
+            retained_bytes: estimate.retained_bytes,
+            host: eredu_core::HostPreparationAuthority::unmanaged(),
+        }))
+    }
+}
+
+// The original capture path publishes only after destination host admission.
+pub(crate) struct PendingSnapshotReservation(ReservationLease);
+impl PendingSnapshotReservation {
+    fn publish(self) -> SnapshotReservation {
+        self.publish_with_host(eredu_core::HostPreparationAuthority::unmanaged())
+    }
+    pub(crate) fn publish_with_host(
+        mut self,
+        host: eredu_core::HostPreparationAuthority,
+    ) -> SnapshotReservation {
+        self.0.host = host;
+        SnapshotReservation {
+            lease: Some(Arc::new(self.0)),
+        }
+    }
+    pub(crate) fn control_bytes() -> Option<usize> {
+        use std::{alloc::Layout, mem::size_of, sync::atomic::AtomicUsize};
+        let shared = Layout::new::<[AtomicUsize; 2]>()
+            .extend(Layout::new::<ReservationLease>())
+            .ok()?
+            .0
+            .pad_to_align()
+            .size();
+        [
+            shared,
+            size_of::<Self>(),
+            size_of::<ReservationLease>(),
+            size_of::<SnapshotReservation>(),
+            size_of::<eredu_core::HostPreparationAuthority>(),
+            size_of::<Option<snapshot::PendingSnapshotResumeRetention>>(),
+            size_of::<Option<Arc<ReservationLease>>>(),
+            size_of::<Option<ReservationLease>>(),
+            size_of::<Result<Self, ExecutionControlError>>(),
+            size_of::<SnapshotUsage>(),
+            size_of::<SnapshotEstimate>(),
+            size_of::<std::sync::MutexGuard<'_, BudgetState>>(),
+        ]
+        .into_iter()
+        .try_fold(0usize, usize::checked_add)
     }
 }
 
 /// Retention lease held alongside an opaque snapshot or child state. Cloning the
 /// lease is only for handles sharing that same object; copying native state needs
 /// another reservation. Final drop releases retained resources, not cumulative work.
-#[derive(Clone)]
+#[derive(Debug)]
 pub struct SnapshotReservation {
-    lease: Rc<ReservationLease>,
+    lease: Option<Arc<ReservationLease>>,
 }
-
-impl SnapshotReservation {
-    /// Logical storage charged while any handle to this exact object is retained.
-    pub fn retained_bytes(&self) -> u64 {
-        self.lease.retained_bytes
+impl Clone for SnapshotReservation {
+    fn clone(&self) -> Self {
+        Self {
+            lease: Some(Arc::clone(
+                self.lease.as_ref().expect("live snapshot lease"),
+            )),
+        }
+    }
+}
+impl Drop for SnapshotReservation {
+    fn drop(&mut self) {
+        if let Some(owner) = self.lease.take() {
+            drop(Arc::into_inner(owner));
+        }
     }
 }
 
+impl SnapshotReservation {
+    fn lease(&self) -> &ReservationLease {
+        self.lease.as_deref().expect("live snapshot lease")
+    }
+    /// Logical storage charged while any handle to this exact object is retained.
+    pub fn retained_bytes(&self) -> u64 {
+        self.lease().retained_bytes
+    }
+}
+
+#[derive(Debug)]
 struct ReservationLease {
     budget: SnapshotBudget,
     kind: SnapshotResourceKind,
     retained_bytes: u64,
+    // The lease shell, refund operation and budget alias retire before custody.
+    host: eredu_core::HostPreparationAuthority,
 }
 
 impl Drop for ReservationLease {
     fn drop(&mut self) {
-        let mut state = self.budget.0.borrow_mut();
+        let mut state = self
+            .budget
+            .inner()
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         state.usage.snapshots -= u64::from(self.kind == SnapshotResourceKind::Snapshot);
         state.usage.branches -= u64::from(self.kind == SnapshotResourceKind::Branch);
         state.usage.retained_bytes -= self.retained_bytes;
@@ -325,3 +484,5 @@ pub fn admitted_intervention_storage_bytes(
         .checked_add(plan.session_id().len() as u64)?
         .checked_add(std::mem::size_of_val(plan) as u64)
 }
+
+pub(crate) use choice::ControllerChoiceIdentity;

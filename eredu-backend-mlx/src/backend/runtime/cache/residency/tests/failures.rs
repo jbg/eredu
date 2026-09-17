@@ -287,6 +287,8 @@ fn background_write_failures_surface_on_the_next_foreground_operation() {
             shapes: [vec![1], vec![1]],
             dtypes: ["Float32".into(), "Float32".into()],
             imported: false,
+            original_discard: None,
+            _metadata_funding: None,
         },
         false,
         0,

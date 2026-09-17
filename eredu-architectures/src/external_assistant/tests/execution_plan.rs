@@ -139,12 +139,36 @@ fn execution_plan_retains_exact_source_capture_tokenizer_capacity_and_placement(
                 final_hidden_path: "model.language_model.layers.1.output".into(),
             },
         );
+        let selected_address = materialized.selected() as *const _;
+        let capture_address = materialized.capture() as *const _;
+        assert!(MaterializedExternalAssistantExecution::<InspectPreparation>::selected_visit_control_bytes::<CheckSelectedLoan>().unwrap() > 0);
+        materialized.visit_selected(CheckSelectedLoan { selected_address, capture_address });
         let inspected = materialized.visit(TakeInspection);
         assert_eq!(inspected.model_type, "gemma4_assistant");
         assert_eq!(
             inspected.tokenizer_model_kind,
             crate::configuration::ModelKind::Gemma4
         );
+    }
+}
+
+
+struct CheckSelectedLoan {
+    selected_address: *const eredu_runtime::SelectedSpeculativeRealization,
+    capture_address: *const crate::composite_execution::ExternalPredictionCaptureRequest,
+}
+impl SelectedExternalAssistantVisitor<InspectPreparation> for CheckSelectedLoan {
+    type Output = ();
+    fn visit<A: ExternalAssistantArchitecture>(
+        self,
+        assistant: &mut <InspectPreparation as ExternalAssistantPreparationVisitor>::Output<A>,
+        selected: &eredu_runtime::SelectedSpeculativeRealization,
+        capture: &crate::composite_execution::ExternalPredictionCaptureRequest,
+    ) {
+        assert!(std::ptr::eq(selected, self.selected_address));
+        assert!(std::ptr::eq(capture, self.capture_address));
+        assert_eq!(selected.requirements().strategy().proposal_capacity().get(), 2);
+        assert_eq!(assistant.model_type, "gemma4_assistant");
     }
 }
 
@@ -353,4 +377,52 @@ fn execution_plan_reader_bound_governs_the_exact_prepared_source() {
     .preparation
     .materialize(CheckReaderBound(keys))
     .unwrap();
+}
+
+
+struct RetainSelectedSource;
+impl SelectedExternalAssistantVisitor<InspectPreparation> for RetainSelectedSource {
+    type Output=ExternalSelectionSource;
+    fn visit<A:ExternalAssistantArchitecture>(self,_:&mut <InspectPreparation as ExternalAssistantPreparationVisitor>::Output<A>,
+        _:&eredu_runtime::SelectedSpeculativeRealization,_:&crate::composite_execution::ExternalPredictionCaptureRequest)->Self::Output{
+        panic!("materialized source must lend its actual immutable owner")
+    }
+    fn visit_source<A:ExternalAssistantArchitecture>(self,_:&mut <InspectPreparation as ExternalAssistantPreparationVisitor>::Output<A>,
+        source:&ExternalSelectionSource)->Self::Output{source.clone()}
+}
+#[test]
+fn external_source_and_prepared_identity_survive_native_owner_and_checkpoint_retirement(){
+    use std::sync::{Arc,atomic::{AtomicUsize,Ordering}};
+    struct Host(Arc<AtomicUsize>);
+    impl Drop for Host{fn drop(&mut self){self.0.fetch_add(1,Ordering::SeqCst);}}
+    let root=safetensors_artifact(GEMMA_ASSISTANT,gemma_tensors());
+    let (_target_root,target)=target_inspection(32);
+    let selected=prepare_execution_plan_assistant(&execution_plan(DraftPlacementPlan::Target,2),
+        &target,artifact(root.path()),direct_lowering,&capabilities()).unwrap();
+    let mut materialized=selected.preparation.materialize(InspectPreparation).unwrap();
+    let selected_address=materialized.selected() as *const _;
+    let capture_address=materialized.capture() as *const _;
+    let source=materialized.visit_selected(RetainSelectedSource);
+    drop(materialized);
+    assert!(std::ptr::eq(source.selected(),selected_address));
+    assert!(std::ptr::eq(source.capture(),capture_address));
+    let drops=Arc::new(AtomicUsize::new(0));
+    let host=eredu_core::HostPreparationAuthority::retain(Host(drops.clone()));
+    let mut values=eredu_core::SpeculativeBuffer::try_new_retained(1,host.clone()).unwrap();
+    values.try_push(SpeculativeIdentity::new("prepared-input/nonzero-17").unwrap()).unwrap();
+    let values=eredu_core::SpeculativeValues::from_prepared_buffer(values,host.clone());
+    let text=values[0].as_str().as_ptr();
+    let mut cache=ExternalAssistantCache::from_selected_source(17u32,source,host.clone());
+    cache.bind_retained_prepared_input(values).unwrap();
+    cache.advance_frontier(17).unwrap();
+    let checkpoint=cache.checkpoint(17u32);
+    cache.advance_frontier(21).unwrap();
+    cache.restore_semantics(&checkpoint);
+    assert_eq!(cache.frontier().unwrap(),17);
+    assert_eq!(cache.prepared_input.as_ref().unwrap().as_str().as_ptr(),text);
+    drop(cache);drop(host);
+    assert_eq!(drops.load(Ordering::SeqCst),0);
+    assert_eq!(checkpoint.prepared_input.as_ref().unwrap().as_str().as_ptr(),text);
+    drop(checkpoint);
+    assert_eq!(drops.load(Ordering::SeqCst),1);
 }

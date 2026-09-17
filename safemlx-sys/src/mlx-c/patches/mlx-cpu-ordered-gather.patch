@@ -1,0 +1,48 @@
+diff --git a/mlx/backend/cpu/gather_storage.cpp b/mlx/backend/cpu/gather_storage.cpp
+--- a/mlx/backend/cpu/gather_storage.cpp
++++ b/mlx/backend/cpu/gather_storage.cpp
+@@ -12,7 +12,7 @@
+   if(value>size_t(PTRDIFF_MAX)-total)return false;total+=value;return true;
+ }
+ bool geometry(const array& input,size_t& elements) noexcept {
+-  if(input.ndim()>4||input.strides().size()!=input.ndim())return false;
++  if(input.ndim()>5||input.strides().size()!=input.ndim())return false;
+   elements=1;size_t span=1,delta=0,bytes=0;
+   for(size_t axis=0;axis!=size_t(input.ndim());++axis) {
+     if(input.shape(axis)<=0||input.strides()[axis]<0||
+@@ -32,9 +32,10 @@
+     size_t index_rank,size_t source_elements,size_t index_elements,
+     size_t slice_elements,bool tracer,CopyEvalStorage& out) noexcept {
+   size_t output_elements=0,bytes=0;
+-  if(!((source==float32&&source.size()==4)||(source==bfloat16&&source.size()==2))||
++  if(!((source==float32&&source.size()==4)||(source==bfloat16&&source.size()==2)||
++      (source==int32&&source.size()==4)||(source==uint32&&source.size()==4))||
+       !((index==uint32&&index.size()==4)||(index==int32&&index.size()==4))||
+-      !source_rank||source_rank>4||index_rank>4-source_rank||
++      !source_rank||source_rank>4||index_rank>5-source_rank||
+       !source_elements||source_elements>size_t(INT_MAX)||
+       !index_elements||index_elements>size_t(INT_MAX)||(!index_rank&&index_elements!=1)||
+       !slice_elements||slice_elements>source_elements||source_elements%slice_elements||
+@@ -68,7 +69,7 @@
+   const auto& primitive=static_cast<const Gather&>(output.primitive());
+   const auto& axes=primitive.axes_ref();const auto& slices=primitive.slice_sizes_ref();
+   size_t source_elements=0,index_elements=0,slice_elements=1,output_elements=0;
+-  if(axes.size()!=1||!source_rank||source_rank>4||index_rank>4-source_rank||
++  if(axes.size()!=1||!source_rank||source_rank>4||index_rank>5-source_rank||
+       axes[0]<0||size_t(axes[0])>=source_rank||slices.size()!=source_rank||
+       output.ndim()!=source_rank+index_rank||output.dtype()!=source.dtype()||
+       output.itemsize()!=source.itemsize()||!geometry(source,source_elements)||
+diff --git a/mlx/backend/cpu/indexing.cpp b/mlx/backend/cpu/indexing.cpp
+--- a/mlx/backend/cpu/indexing.cpp
++++ b/mlx/backend/cpu/indexing.cpp
+@@ -226,7 +226,9 @@
+ namespace cpu {
+ bool gather_dispatch_storage(size_t source_rank,size_t index_rank,
+     EvalDispatchStorage& out) noexcept {
+-  if(!source_rank||source_rank>4||index_rank>4-source_rank)return false;
++  if(!source_rank||source_rank>4||index_rank>5-source_rank||
++      source_rank+index_rank>Shape::inline_capacity||
++      source_rank+index_rank>Strides::inline_capacity)return false;
+   DispatchLayout task;WeakCopyStorage weak;
+   ContiguousIteratorLayout index_iterator,source_iterator;
+   size_t iterator_extent=0;

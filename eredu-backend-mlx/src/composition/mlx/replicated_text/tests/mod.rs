@@ -2,6 +2,9 @@ use super::*;
 
 mod admission_failures;
 mod execution;
+mod parameter_owner_sources;
+mod retained_parameters;
+mod retained_rotary;
 mod routing_interventions;
 mod selection_and_lowering;
 mod state_and_controls;
@@ -96,7 +99,7 @@ fn tiny_sharded_artifact(model_type: &str, tied: bool) -> tempfile::TempDir {
     tiny_safetensors_artifact(model_type, tied, true, false)
 }
 
-fn tiny_packed_safetensors_artifact(model_type: &str) -> tempfile::TempDir {
+pub(crate) fn tiny_packed_safetensors_artifact(model_type: &str) -> tempfile::TempDir {
     tiny_safetensors_artifact(model_type, false, false, true)
 }
 
@@ -277,7 +280,7 @@ fn tiny_safetensors_artifact(
     root
 }
 
-fn tiny_heterogeneous_artifact(config: serde_json::Value) -> tempfile::TempDir {
+pub(crate) fn tiny_heterogeneous_artifact(config: serde_json::Value) -> tempfile::TempDir {
     tiny_heterogeneous_artifact_with_layout(config, false)
 }
 
@@ -686,7 +689,7 @@ fn packed_alias_nemotron_h_config() -> serde_json::Value {
     config
 }
 
-fn qwen_hybrid_config() -> serde_json::Value {
+pub(crate) fn qwen_hybrid_config() -> serde_json::Value {
     serde_json::json!({
         "model_type": "qwen3_5_text", "vocab_size": 64, "hidden_size": 32,
         "num_hidden_layers": 2, "mtp_num_hidden_layers": 0,
@@ -714,7 +717,7 @@ fn routed_qwen_next_config() -> serde_json::Value {
     config
 }
 
-fn routed_deepseek_v3_config() -> serde_json::Value {
+pub(crate) fn routed_deepseek_v3_config() -> serde_json::Value {
     serde_json::json!({
         "architectures": ["DeepseekV3ForCausalLM"],
         "model_type": "deepseek_v3", "hidden_size": 16,
@@ -733,7 +736,7 @@ fn routed_deepseek_v3_config() -> serde_json::Value {
     })
 }
 
-fn routed_deepseek_v4_config() -> serde_json::Value {
+pub(crate) fn routed_deepseek_v4_config() -> serde_json::Value {
     serde_json::json!({
         "architectures": ["DeepseekV4ForCausalLM"],
         "model_type": "deepseek_v4", "hidden_size": 8,

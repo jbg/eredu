@@ -218,6 +218,21 @@ pub fn prepare_realtime_model(
     Ok(preparation)
 }
 
+// The test-only normalized config still enters real strict catalog/shard
+// admission. It does not use the metadata-only debug source constructor.
+#[cfg(test)]
+pub(super) fn prepare_personaplex_numeric_fixture(
+    artifact: &Path,
+    config: MoshiConfig,
+) -> Result<RealtimePreparationPlan, RealtimePreparationError> {
+    let catalog = SafetensorsMetadataCatalog::discover(artifact)?;
+    let admitted_shards = catalog.admitted_shards();
+    let mut preparation =
+        prepare_realtime_model_from_catalog(artifact, artifact, config, &catalog)?;
+    preparation.admitted_shards = Some(admitted_shards);
+    Ok(preparation)
+}
+
 /// Prepares one normalized Moshi-family artifact from an exact metadata catalog.
 ///
 /// `artifact_root` and `checkpoint_source` are retained as the authoritative

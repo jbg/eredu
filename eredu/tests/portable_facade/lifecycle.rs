@@ -127,6 +127,30 @@ impl BackendSession<StatefulBackend> for Session {
 }
 
 impl TextGenerationBackend for StatefulBackend {
+    type TextPreparation = ();
+    type TextPreparationControl = ();
+    type TextStepPermit = ();
+    fn begin_text_step<C: eredu_core::TokenFilterController>(
+        _: &eredu_core::ModelRuntime<Self>,
+        _: &Self::TextPreparation,
+        _: &Self::TextGenerationState,
+        _: &C,
+        _: eredu_core::PendingTextInput<&Self::Prompt, &Self::Token>,
+        _: &eredu_core::backend::TextStepContext,
+    ) -> Result<Self::TextStepPermit, Self::Error> {
+        Ok(())
+    }
+    fn finish_text_step(_: Self::TextStepPermit) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn admit_text_preparation<C: eredu_core::TokenFilterController>(
+        _: &ModelRuntime<Self>,
+        _: &eredu_core::TextPreparationInput<'_, Self::Prompt>,
+        _: TextGenerationConfig,
+        _: &C,
+    ) -> Result<(), BackendFailure> {
+        Ok(())
+    }
     type Prompt = Vec<u32>;
     type Token = Token;
     type TextGenerationState = ();
@@ -207,7 +231,8 @@ fn model() -> (LoadedModel<StatefulBackend>, Rc<State>) {
             eos_token_ids: vec![4],
             checkpoint_generation_config: None,
         },
-    );
+    )
+    .unwrap();
     (model, state)
 }
 
@@ -352,4 +377,20 @@ fn reset_failure_reaches_the_generic_caller() {
     assert_eq!(error.kind(), BackendFailureKind::Other);
     assert_eq!(error.source().unwrap().to_string(), "reset failed");
     assert_eq!(state.resets.get(), 0);
+}
+
+#[test]
+fn provider_default_conversion_retains_existing_io_classification_and_source() {
+    let error = StatefulBackend::into_backend_failure(io::ErrorKind::InvalidInput.into());
+    assert_eq!(error.kind(), BackendFailureKind::InvalidInput);
+    assert_eq!(error.operation(), "backend operation");
+    assert_eq!(
+        error
+            .source()
+            .unwrap()
+            .downcast_ref::<io::Error>()
+            .unwrap()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
 }

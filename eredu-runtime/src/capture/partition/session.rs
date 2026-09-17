@@ -5,6 +5,17 @@ use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc};
 
 mod coordination;
+mod funded_coordination;
+mod funded_allowance;
+mod funded_interventions;
+pub use funded_interventions::{PreparedPartitionInterventionSource, PartitionInterventionInvocationSource, PartitionInterventionMemberSource, PartitionInterventionLocalAllowance, PartitionInterventionSourceError};
+pub(crate) use funded_interventions::{PreparedPartitionIntervention,PartitionInterventionOutcome};
+mod funded_fragments;
+pub use funded_fragments::{PartitionCaptureRoutedFragmentGeometry,PartitionCaptureRoutedFragmentSource,PartitionCaptureFragmentGeometry,PartitionCaptureFragmentSource, PreparedPartitionFragmentAllowance, PreparedPartitionFragmentLoan, PartitionCaptureFragmentAllowanceError};
+pub(crate) use funded_allowance::PreparedPartitionRemoteCharge;
+pub(crate) use funded_fragments::{PreparedPartitionFragmentSourceAllowance,SourceBindingError};
+pub use funded_allowance::{PreparedPartitionCaptureAllowance, PartitionCaptureAllowanceError};
+pub use funded_coordination::{PreparedPartitionCaptureCoordination, PartitionCaptureCoordinationError};
 pub use coordination::SessionPartitionCoordination;
 mod hook;
 pub use hook::{PartitionCaptureHookTransport, SessionPartitionHook};
@@ -30,6 +41,17 @@ pub struct PartitionCaptureIdentity {
     first_epoch: Option<DistributedCommitEpoch>,
     overlay: Option<String>,
     world_size: usize,
+}
+
+// The same canonical writer serves ordinary and paid run identities.
+pub(in crate::capture::partition) struct SessionRunName(
+    pub(in crate::capture::partition) crate::CommunicationSessionIdentity,
+    pub(in crate::capture::partition) DistributedCommitEpoch,
+);
+impl std::fmt::Display for SessionRunName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "capture:{}:{}", self.0, self.1.value())
+    }
 }
 
 impl PartitionCaptureIdentity {
@@ -91,7 +113,7 @@ impl PartitionCaptureIdentity {
     fn bind_epoch(&mut self, epoch: DistributedCommitEpoch) {
         if self.first_epoch.is_none() {
             if let Some(setup) = self.setup {
-                self.run = format!("capture:{setup}:{}", epoch.value());
+                self.run = SessionRunName(setup, epoch).to_string();
                 self.first_epoch = Some(epoch);
             }
         }
@@ -145,7 +167,7 @@ fn invalid(message: &str) -> CaptureError {
 /// Side-effect-free native bounds for one producer fragment. The creation bound
 /// covers a deferred input factory in addition to the ordinary capture estimate;
 /// unused credits are not refunded when this point uses an existing tensor.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PartitionCaptureNativeEstimate {
     /// Same conservative source/transform/host/record bound as `CaptureBackend::estimate`.
     pub capture: CaptureUsage,
@@ -305,11 +327,10 @@ impl PartitionCaptureRun {
 /// replacement ledger. Every producer and receiver cost was prepaid globally;
 /// this rank can spend only its local allowance.
 pub struct SessionPartitionCapture<'a, T: PartitionCaptureTransport> {
-    owner: Arc<()>,
     epoch: DistributedCommitEpoch,
     pub(super) index: usize,
     key: PartitionCaptureKey,
-    plan: Arc<AdmittedCapturePlan>,
+    plan: crate::capture::CapturePlanSource,
     rank: usize,
     exchange: PartitionCaptureExchange<'a, T>,
     quota: CaptureQuota,
@@ -320,9 +341,16 @@ pub struct SessionPartitionCapture<'a, T: PartitionCaptureTransport> {
     hook_accepted: Option<bool>,
     source_accepted: Option<bool>,
     routed: Option<routed::RoutedInvocation>,
+    // Last: all retained plan/work payloads retire before preparation custody.
+    owner: Arc<crate::capture::CaptureHostOwner>,
 }
 
 impl<T: PartitionCaptureTransport> SessionPartitionCapture<'_, T> {
+    /// Existing immutable shared source retained by this exact partition work.
+    /// No source payload copy or fresh source registration is manufactured.
+    pub fn shared_plan_source(&self) -> Option<&SharedCapturePlan> {
+        self.plan.shared()
+    }
     /// Full nonrefundable global charge for preparation and working credits.
     pub const fn global_reserved(&self) -> CaptureUsage {
         self.global_reserved
@@ -536,7 +564,7 @@ impl CaptureSession {
     {
         self.prepare_partition_selection(
             transport,
-            Arc::clone(&self.plan),
+            self.plan.clone(),
             PartitionCaptureKey::Observation(index),
             index,
             producers,
@@ -549,7 +577,7 @@ impl CaptureSession {
     fn prepare_partition_selection<'a, T: PartitionCaptureTransport>(
         &mut self,
         transport: &'a T,
-        plan: Arc<AdmittedCapturePlan>,
+        plan: crate::capture::CapturePlanSource,
         key: PartitionCaptureKey,
         index: usize,
         producers: Vec<PartitionCaptureProducer>,
@@ -574,7 +602,7 @@ impl CaptureSession {
         )?;
         self.prepare_partition_work(
             transport,
-            Arc::clone(&plan),
+            plan.clone(),
             key,
             index,
             match combination {
@@ -596,7 +624,7 @@ impl CaptureSession {
     fn prepare_partition_work<'a, T: PartitionCaptureTransport>(
         &mut self,
         transport: &'a T,
-        plan: Arc<AdmittedCapturePlan>,
+        plan: crate::capture::CapturePlanSource,
         key: PartitionCaptureKey,
         index: usize,
         producers: routed::Producers,
@@ -649,61 +677,28 @@ impl CaptureSession {
             epoch,
             self.invocation,
         );
-        let receipt = producers
+        let mut receipt = producers
             .admit(
-                Arc::clone(&plan),
+                plan.clone(),
                 context,
                 world_size,
                 limits,
                 &mut preparation_quota,
             )
             .map_err(|error| match error {
-                PartitionCaptureMergeError::Capture(source @ CaptureError::Limit { .. }) => {
+                PartitionCaptureMergeError::Capture(source)
+                    if matches!(source.cause(), CaptureError::Limit { .. }) =>
+                {
                     prepaid_bound_error(source)
                 }
                 other => other.into(),
             })?;
-        let selection = &plan.plan().selections[index];
         let point = &plan.points()[index];
-        let common = PartitionCaptureExchange::<T>::estimate_usage(transport, &receipt)?
-            .checked_add(receipt.delivery_usage()?)?
-            .checked_add(evidence_usage(&receipt)?)?;
-        let mut global = common.checked_mul(world_size as u64)?;
-        let mut local = common;
-        let mut descriptor = Sha256::new();
-        descriptor.update(receipt.identity().as_bytes());
-        hash_usage(&mut descriptor, common);
         let mut sparse_costs = Vec::new();
-        for (producer, projection) in receipt.producers() {
-            let mut usage = receipt.encoding_usage(producer)?;
-            for fragment in 0..projection.fragments().len() {
-                let native = estimate(&receipt, producer, fragment)?;
-                let fragment_usage =
-                    fragment_metadata_usage(selection, point, projection.global_shape().len())?
-                        .checked_add(
-                            if receipt.combination == PartitionCaptureCombination::SumF64ToF32 {
-                                metadata_reservation(selection, point)?
-                            } else {
-                                CaptureUsage::default()
-                            },
-                        )?
-                        .checked_add(native.capture)?
-                        .checked_add(CaptureUsage {
-                            retained_bytes: native.generated_creation_bytes,
-                            ..Default::default()
-                        })?;
-                usage = usage.checked_add(fragment_usage)?;
-                if producer == rank && receipt.routed_producer(rank).is_some() {
-                    sparse_costs.push(fragment_usage);
-                }
-            }
-            global = global.checked_add(usage)?;
-            descriptor.update((producer as u64).to_le_bytes());
-            hash_usage(&mut descriptor, usage);
-            if producer == rank {
-                local = local.checked_add(usage)?;
-            }
-        }
+        let costs = receipt_work_costs(transport, &mut receipt, &mut estimate,
+            |usage| { sparse_costs.push(usage); Ok(()) })?;
+        let global = costs.global;
+        let local = costs.local;
         let mut quota = self
             .ledger
             .reserve_quota(global)?
@@ -720,7 +715,7 @@ impl CaptureSession {
             .as_mut()
             .expect("checked binding")
             .claimed
-            .insert(key, descriptor.finalize().into());
+            .insert(key, costs.descriptor);
         let sparse = matches!(
             point.value_type,
             eredu_core::ObservationValueType::RoutedUnits { .. }
@@ -959,7 +954,7 @@ fn region(slice: &ResolvedCaptureSlice) -> PartitionCaptureRegion {
     }
 }
 
-fn evidence_usage(receipt: &PartitionCaptureReceiptPlan) -> Result<CaptureUsage, CaptureError> {
+pub(super) fn evidence_usage(receipt: &PartitionCaptureReceiptPlan) -> Result<CaptureUsage, CaptureError> {
     let mut usage = CaptureUsage {
         host_bytes: 8192,
         encoded_bytes: 8192,
@@ -991,10 +986,83 @@ fn evidence_usage(receipt: &PartitionCaptureReceiptPlan) -> Result<CaptureUsage,
 /// A child allowance has already been charged. Exceeding it indicates an invalid
 /// bound and must not become an ordinary application-budget skip.
 fn prepaid_bound_error(error: CaptureError) -> PartitionCaptureExchangeError {
-    match error {
-        source @ CaptureError::Limit { .. } => {
-            PartitionCaptureExchangeError::PrepaidBound { source }
-        }
-        other => other.into(),
+    if matches!(error.cause(), CaptureError::Limit { .. }) {
+        PartitionCaptureExchangeError::PrepaidBound { source: error }
+    } else {
+        error.into()
     }
 }
+
+struct ReceiptWorkCosts { global: CaptureUsage, local: CaptureUsage, descriptor: [u8; 32] }
+fn receipt_work_costs<T: PartitionCaptureTransport>(transport: &T,
+    receipt: &mut PartitionCaptureReceiptPlan,
+    mut estimate: impl FnMut(&PartitionCaptureReceiptPlan, usize, usize)
+        -> Result<PartitionCaptureNativeEstimate, CaptureError>,
+    mut sparse: impl FnMut(CaptureUsage) -> Result<(), CaptureError>,
+) -> Result<ReceiptWorkCosts, CaptureError>
+where T::Error: Send + Sync + 'static,
+    <T::Completion as Completion>::Error: Send + Sync + 'static,
+{
+    let world_size = receipt.world_size();
+    let rank = transport.capture_rank();
+    let index = receipt.context().selection_index;
+    let selection = &receipt.plan.plan().selections[index];
+    let point = &receipt.plan.points()[index];
+    let mut producers_global = CaptureUsage::default();
+    let mut producers_local = CaptureUsage::default();
+    let mut producer_descriptor = Sha256::new();
+    let mut maximum = 0u64;
+    let mut all_bounded = true;
+    for (producer, projection) in receipt.producers() {
+        let mut usage = CaptureUsage::default();
+        let mut record_bytes = receipt.producer_envelope_bytes(producer)?;
+        let mut dtype_bytes = 0u64;
+        // A nonempty fragment's admitted complete-record bound also covers the
+        // repeated source dtype, including a backend's encoded format string.
+        // Empty producers have no such source; keep their explicit caller cap.
+        all_bounded &= !projection.fragments().is_empty();
+        for fragment in 0..projection.fragments().len() {
+            let native = estimate(receipt, producer, fragment)?;
+            let fragment_usage =
+                fragment_metadata_usage(selection, point, projection.global_shape().len())?
+                    .checked_add(if receipt.combination == PartitionCaptureCombination::SumF64ToF32 {
+                        metadata_reservation(selection, point)?
+                    } else { CaptureUsage::default() })?
+                    .checked_add(native.capture)?
+                    .checked_add(CaptureUsage { retained_bytes: native.generated_creation_bytes,
+                        ..Default::default() })?;
+            record_bytes = add(record_bytes,
+                PartitionCaptureReceiptPlan::fragment_envelope_bytes(fragment)?)?;
+            record_bytes = add(record_bytes, fragment_usage.encoded_bytes)?;
+            dtype_bytes = dtype_bytes.max(fragment_usage.encoded_bytes);
+            usage = usage.checked_add(fragment_usage)?;
+            if producer == rank && receipt.routed_producer(rank).is_some() { sparse(fragment_usage)?; }
+        }
+        maximum = maximum.max(add(record_bytes, dtype_bytes)?);
+        producers_global = producers_global.checked_add(usage)?;
+        if producer == rank { producers_local = producers_local.checked_add(usage)?; }
+        producer_descriptor.update((producer as u64).to_le_bytes());
+        hash_usage(&mut producer_descriptor, usage);
+    }
+    if all_bounded { receipt.restrict_record_bytes(maximum)?; }
+    // Transport and decoding use the source-derived record bound, not the
+    // complete per-step encoded budget from which all ranks' work is charged.
+    let common = PartitionCaptureExchange::<T>::estimate_usage(transport, receipt)?
+        .checked_add(receipt.delivery_usage()?)?.checked_add(evidence_usage(receipt)?)?;
+    let mut global = common.checked_mul(world_size as u64)?.checked_add(producers_global)?;
+    let mut local = common.checked_add(producers_local)?;
+    let mut descriptor = Sha256::new();
+    descriptor.update(receipt.identity().as_bytes());
+    hash_usage(&mut descriptor, common);
+    descriptor.update(producer_descriptor.finalize());
+    for (producer, _) in receipt.producers() {
+        let encoding = receipt.encoding_usage(producer)?;
+        global = global.checked_add(encoding)?;
+        if producer == rank { local = local.checked_add(encoding)?; }
+        descriptor.update((producer as u64).to_le_bytes());
+        hash_usage(&mut descriptor, encoding);
+    }
+    Ok(ReceiptWorkCosts { global, local, descriptor: descriptor.finalize().into() })
+}
+
+pub(crate) use funded_fragments::PreparedPartitionAssemblyCharge;

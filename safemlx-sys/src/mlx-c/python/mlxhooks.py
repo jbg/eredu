@@ -154,14 +154,14 @@ extern "C" int mlx_fast_custom_kernel_config_add_template_arg_bool(
         """
         code_def = """
 struct mlx_fast_custom_kernel_cpp_ {
-  mlx::core::fast::CustomKernelFunction mkf;
-  mlx_fast_custom_kernel_cpp_(mlx::core::fast::CustomKernelFunction mkf)
-      : mkf(mkf) {};
+  mlx::core::fast::BorrowedCustomKernelFunction mkf;
+  mlx_fast_custom_kernel_cpp_(mlx::core::fast::BorrowedCustomKernelFunction mkf)
+      : mkf(std::move(mkf)) {};
 };
         """
 
         code = """
-inline mlx::core::fast::CustomKernelFunction& mlx_fast_custom_kernel_get_(
+inline mlx::core::fast::BorrowedCustomKernelFunction& mlx_fast_custom_kernel_get_(
     mlx_fast_custom_kernel d) {
   if (!d.ctx) {
     throw std::runtime_error("expected a non-empty mlx_fast_custom_kernel");
@@ -186,7 +186,7 @@ extern "C" int mlx_fast_custom_kernel_apply(
     const mlx_fast_custom_kernel_config config,
     const mlx_stream stream) {
   try {
-    auto config_ctx = mlx_fast_custom_kernel_config_get_(config);
+    const auto& config_ctx = mlx_fast_custom_kernel_config_get_(config);
     mlx_vector_array_set_(
         *outputs,
         mlx_fast_custom_kernel_get_(cls)(
@@ -288,7 +288,7 @@ inline mlx_fast_cuda_kernel mlx_fast_cuda_kernel_new_(
     bool ensure_row_contiguous,
     int shared_memory) {
   return mlx_fast_cuda_kernel(
-      {new mlx_fast_cuda_kernel_cpp_(mlx::core::fast::cuda_kernel(
+      {new mlx_fast_cuda_kernel_cpp_(mlx::core::fast::cuda_kernel_borrowed(
           name,
           input_names,
           output_names,
@@ -347,7 +347,7 @@ inline mlx_fast_metal_kernel mlx_fast_metal_kernel_new_(
     bool ensure_row_contiguous,
     bool atomic_outputs) {
   return mlx_fast_metal_kernel(
-      {new mlx_fast_metal_kernel_cpp_(mlx::core::fast::metal_kernel(
+      {new mlx_fast_metal_kernel_cpp_(mlx::core::fast::metal_kernel_borrowed(
           name,
           input_names,
           output_names,
@@ -392,6 +392,16 @@ mlx_fast_metal_kernel mlx_fast_metal_kernel_new(
     bool atomic_outputs);
         """
     __implement_mlx_fast_custom_kernel("metal", custom_code, implementation)
+
+
+# These native callables back the existing opaque C handles; they do not add
+# independently generated C constructors or expose std::function ownership.
+def mlx_fast_metal_kernel_borrowed(f, implementation):
+    pass
+
+
+def mlx_fast_cuda_kernel_borrowed(f, implementation):
+    pass
 
 
 def mlx_export_to_dot(f, implementation):

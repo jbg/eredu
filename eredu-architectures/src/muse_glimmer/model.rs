@@ -1,6 +1,8 @@
 //! One neutral Muse-Glimmer multimodal model for resident and bounded runtimes.
 
+mod media_prefill;
 mod observation;
+pub use media_prefill::MediaPrefillPlan;
 
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, Error, GroupedNeuralBackend, Parameterized, Tensor,
@@ -164,7 +166,10 @@ where
     B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
 {
     let prepared = input.prepared();
-    let admitted = input.admitted();
+    let admitted = input
+        .admitted()
+        .legacy()
+        .expect("this family retains ordinary admission");
     if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
         return Err(Error::backend(
             "Muse-Glimmer prepared input no longer matches its admission",
@@ -229,10 +234,15 @@ where
         self.args.clone()
     }
 
+    fn external_assistant_target_profile_ref(config:&Self::AdmissionConfig)
+        ->Option<crate::external_assistant::ExternalAssistantTargetProfileRef<'_>> {
+        Some(crate::external_assistant::ExternalAssistantTargetProfileRef::MuseGlimmer(config))
+    }
+
     fn external_assistant_target_profile(
         config: &Self::AdmissionConfig,
     ) -> Option<crate::external_assistant::ExternalAssistantTargetProfile> {
-        Some(crate::external_assistant::ExternalAssistantTargetProfile::MuseGlimmer(config.clone()))
+        Some(crate::external_assistant::ExternalAssistantTargetProfileRef::MuseGlimmer(config).to_owned())
     }
 
     fn admit_prepared_input(
@@ -254,6 +264,8 @@ where
         group != 0
             || input
                 .admitted()
+                .legacy()
+                .expect("this family retains ordinary admission")
                 .parts()
                 .iter()
                 .any(|part| matches!(part, MuseGlimmerInputPartPlan::Vision { .. }))
@@ -267,6 +279,8 @@ where
         let positions = if group == 0 {
             input
                 .admitted()
+                .legacy()
+                .expect("this family retains ordinary admission")
                 .parts()
                 .iter()
                 .filter_map(|part| match part {
@@ -278,7 +292,11 @@ where
                 .try_fold(0_u64, |total, positions| total.checked_add(positions))
                 .ok_or_else(|| "Muse projected media positions overflowed".to_owned())?
         } else {
-            input.admitted().decoder_positions()
+            input
+                .admitted()
+                .legacy()
+                .expect("this family retains ordinary admission")
+                .decoder_positions()
         };
         i32::try_from(positions)
             .map_err(|_| "Muse prepared boundary sequence exceeds i32".to_owned())
@@ -294,6 +312,8 @@ where
         }
         let patches = input
             .admitted()
+            .legacy()
+            .expect("this family retains ordinary admission")
             .parts()
             .iter()
             .filter_map(|part| match part {
@@ -356,7 +376,7 @@ where
         destination_group: usize,
         schema: &eredu_runtime::ResolvedBoundaryWireSchema,
         values: Vec<B::Tensor>,
-        _forward: &mut Self::ForwardContext,
+        forward: &mut Self::ForwardContext,
     ) -> Result<Option<B::Tensor>, Error> {
         if !matches!((source_group, destination_group), (0, 0) | (0, 1) | (1, 1)) {
             return Ok(None);
@@ -366,9 +386,13 @@ where
                 "Muse boundary must contain exactly its primary activation",
             ));
         }
-        // A rank that already executed vision retains its admitted request
-        // context. Resume the incoming decoder value without reassembling it.
-        Ok(values.into_iter().next())
+        // A retained-media invocation owns its actual projected cut before
+        // decoder span construction. Ordinary boundary ownership is unchanged.
+        let value = values.into_iter().next();
+        if source_group == 0 && destination_group == 1 && forward.pending_media.is_some() {
+            forward.media_output = value.clone();
+        }
+        Ok(value)
     }
 
     fn prepared_group_collective_waves(
@@ -394,6 +418,8 @@ where
         crate::composite_execution::segmented_token_ingress_collectives(
             input
                 .admitted()
+                .legacy()
+                .expect("this family retains ordinary admission")
                 .parts()
                 .iter()
                 .filter_map(|part| match part {
@@ -406,51 +432,40 @@ where
     }
 
     fn primary_ingress_collectives_pending(&self, forward: &Self::ForwardContext) -> bool {
-        forward.parts.iter().any(|part| matches!(part, PreparedPart::PendingText { .. }))
+        forward
+            .parts
+            .iter()
+            .any(|part| matches!(part, PreparedPart::PendingText { .. }))
     }
 
     fn external_prediction_capture_paths(
         request: &ExternalPredictionCaptureRequest,
     ) -> Result<Option<Vec<String>>, Self::Error> {
-        let ExternalPredictionCaptureRequest::MuseGlimmerDFlash {
-            target_layers,
-            target_paths,
-        } = request
-        else {
-            return Ok(None);
-        };
-        if target_layers.is_empty() {
-            return Err(Error::backend(
-                "Muse-Glimmer DFlash capture has no target layers",
-            ));
-        }
-        if target_paths.len() != target_layers.len() {
-            return Err(Error::backend(
-                "Muse-Glimmer DFlash capture path count differs from target layers",
-            ));
-        }
-        Ok(Some(target_paths.to_vec()))
+        external_capture_paths(request, crate::decoder::ModuleMetadata::ordinary())
+    }
+
+    fn external_prediction_capture_paths_with_metadata(
+        request: &ExternalPredictionCaptureRequest,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<Vec<String>>, Error> {
+        external_capture_paths(request, crate::decoder::ModuleMetadata::funded(context))
     }
 
     fn external_prediction_capture(
         request: &ExternalPredictionCaptureRequest,
-        _forward: &Self::ForwardContext,
+        forward: &Self::ForwardContext,
         observed: Vec<B::Tensor>,
     ) -> Result<Option<ExternalPredictionTargetCapture<B::Tensor>>, Self::Error> {
-        let ExternalPredictionCaptureRequest::MuseGlimmerDFlash { target_layers, .. } = request
-        else {
-            return Ok(None);
-        };
-        if observed.len() != target_layers.len() {
-            return Err(Error::backend(format!(
-                "Muse-Glimmer DFlash capture expected {} target states, received {}",
-                target_layers.len(),
-                observed.len()
-            )));
-        }
-        Ok(Some(ExternalPredictionTargetCapture::MuseGlimmerDFlash {
-            target_states: observed,
-        }))
+        external_capture(request, forward, observed, crate::decoder::ModuleMetadata::ordinary())
+    }
+
+    fn external_prediction_capture_with_metadata(
+        request: &ExternalPredictionCaptureRequest,
+        forward: &Self::ForwardContext,
+        observed: Vec<B::Tensor>,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<ExternalPredictionTargetCapture<B::Tensor>>, Error> {
+        external_capture(request, forward, observed, crate::decoder::ModuleMetadata::funded(context))
     }
 
     fn external_prediction_target_operation(
@@ -533,6 +548,9 @@ pub struct ForwardContext<T> {
     mask: Option<T>,
     parts: Vec<PreparedPart<T>>,
     vision: Option<VisionState<T>>,
+    pending_media: Option<PreparedCompositeIngress<T>>,
+    media_output: Option<T>,
+    media_span: bool,
 }
 
 /// Pinned text and media modules shared by every storage policy.
@@ -731,6 +749,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         String,
     > {
         super::static_safetensors_recipes(&self.args, source)
+    }
+
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_nn::Parameterized::visit_retained_values(&self.static_modules, visitor)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -1066,18 +1092,21 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 mask,
                 parts: Vec::new(),
                 vision: None,
+                pending_media: None,
+                media_output: None,
+                media_span: false,
             },
         }
     }
 
     /// Enters or resumes a routed text partition with architecture-owned
-    /// causal-mask construction.
+    /// layer-local causal-mask construction, including retained sliding history.
     pub fn begin_routed_text_partition(
         &mut self,
         input: TextPartitionInput<'_, B::Tensor>,
         explicit_mask: Option<&B::Tensor>,
-        sequence: i32,
-        offset: i32,
+        _sequence: i32,
+        _offset: i32,
         parallel: Option<&B::ParallelContext>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error> {
@@ -1088,12 +1117,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             },
             TextPartitionInput::Hidden(hidden) => hidden,
         };
-        let mask = match explicit_mask {
-            Some(mask) => Some(mask.clone()),
-            None if sequence > 1 => Some(B::causal_mask(sequence, offset, None, context)?),
-            None => None,
-        };
-        Ok(self.resume_partition_text(hidden, mask))
+        Ok(self.resume_partition_text(hidden, explicit_mask.cloned()))
     }
 
     /// Finishes the serial decoder partition through the family output boundary.
@@ -1154,6 +1178,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     embeddings,
                 }],
                 vision: None,
+                pending_media: None,
+                media_output: None,
+                media_span: false,
             },
         })
     }
@@ -1234,6 +1261,9 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 mask: input.mask.cloned(),
                 parts,
                 vision: None,
+                pending_media: None,
+                media_output: None,
+                media_span: false,
             },
         })
     }
@@ -1465,12 +1495,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     "Muse-Glimmer projected media has shape {:?}, expected [{media_tokens}, {}]",
                     vision.shape(),
                     self.args.hidden_size
-                )))
+                )));
             }
             None if media_tokens != 0 => {
                 return Err(Error::backend(
                     "Muse-Glimmer media placeholders require projected media",
-                ))
+                ));
             }
             _ => {}
         }
@@ -1541,6 +1571,48 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn media_prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        // The validated ingress preserves media-prefix placement and the same causal/sliding decoder cache offsets.
+        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 1)?;
+        let mut declarations = crate::decoder::media_prefill_observation_declarations(
+            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index)),
+        )?;
+        // The retained-media ingress changes decoder inputs and positions, but
+        // executes the same row-local routed banks as the ordinary target.
+        // Reuse those exact architecture declarations; encoder hooks remain
+        // outside this decoder contract.
+        declarations.extend(
+            <Self as LayeredArchitecture<B, S>>::prefill_observation_declarations(self)?
+                .into_iter()
+                .filter(|declaration| declaration.flattens_batch_tokens()),
+        );
+        Ok(declarations)
+    }
+
+    fn prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        // Ordinary text uses causal per-layer KV offsets/window masks and fixed
+        // RoPE/NoPE, followed by row-local gates, norms and dense/routed experts.
+        // Group 1 owns these real hooks; vision and external assistant equations
+        // acquire no row declaration from this ordinary target companion.
+        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 1)?;
+        let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
+            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index)),
+            true,
+        )?;
+        // Same target bank invocation as observed execution; its expert equations are row-local.
+        for index in 0..units {
+            let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index)?;
+            if self.args.num_experts > 0 {
+                crate::decoder::append_routed_prefill_path(&mut declarations, &format!("{path}.routing"));
+            }
+        }
+        Ok(declarations)
+    }
+
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
             .with_routed_units(true)
@@ -1594,6 +1666,14 @@ where
     }
 
     type Input<'a> = ModelInput<'a, B::Tensor>;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::segmented_token_shape(input.parts.iter().map(|part| match part {
+            DecoderInputPart::Text(tokens) | DecoderInputPart::Media(tokens) => *tokens,
+        }))
+        .map(Some)
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = Unit<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
@@ -1775,6 +1855,9 @@ where
                 mask: input.mask.cloned(),
                 parts,
                 vision,
+                pending_media: None,
+                media_output: None,
+                media_span: false,
             },
         })
     }
@@ -1788,6 +1871,9 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        if group == 1 && forward.media_span {
+            return Ok(initial.clone());
+        }
         match (group, dependencies) {
             (0, []) => Ok(initial.clone()),
             (1, [vision_or_assembled]) if forward.vision.is_some() => {
@@ -1859,11 +1945,24 @@ where
                     .as_mut()
                     .ok_or_else(|| Error::backend("Muse-Glimmer model has no vision projector"))?
                     .finish(hidden, vision, context)?;
+                if forward.pending_media.is_some() {
+                    forward.media_output = Some(media.clone());
+                }
                 Ok(media)
             }
             (0, None) | (1, _) => Ok(hidden.clone()),
             _ => Err(Error::backend("invalid Muse-Glimmer execution group")),
         }
+    }
+
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        crate::readout::select_readout_positions(hidden, demand, 1, context)
     }
 
     fn finish_forward(
@@ -1884,6 +1983,11 @@ where
     ) -> Self::RetainedContextValues<'a> {
         let mut values = Vec::new();
         values.extend(forward.mask.iter());
+        values.extend(forward.media_output.iter());
+        if let Some(pending) = &forward.pending_media {
+            values.extend(pending.tokens.iter());
+            values.extend(pending.pixels.iter());
+        }
         for part in &forward.parts {
             match part {
                 PreparedPart::Text { tokens, embeddings } => {
@@ -2028,6 +2132,9 @@ where
                 mask: input.mask.cloned(),
                 parts,
                 vision,
+                pending_media: None,
+                media_output: None,
+                media_span: false,
             },
         })
     }
@@ -2209,4 +2316,35 @@ where
             })
         }
     }
+}
+
+
+fn external_capture_paths(
+    request: &ExternalPredictionCaptureRequest,
+    metadata: crate::decoder::ModuleMetadata<'_>,
+) -> Result<Option<Vec<String>>, Error> {
+    if !matches!(request, ExternalPredictionCaptureRequest::MuseGlimmerDFlash { .. }) {
+        return Ok(None);
+    }
+    request.collect_paths(metadata).map(Some)
+}
+
+fn external_capture<T: Clone>(
+    request: &ExternalPredictionCaptureRequest,
+    forward: &ForwardContext<T>,
+    observed: Vec<T>,
+    metadata: crate::decoder::ModuleMetadata<'_>,
+) -> Result<Option<ExternalPredictionTargetCapture<T>>, Error> {
+    metadata.controls::<(Vec<T>, ExternalPredictionTargetCapture<T>, &ForwardContext<T>)>()?;
+    let _ = forward;
+    let ExternalPredictionCaptureRequest::MuseGlimmerDFlash { target_layers, .. } = request else {
+        return Ok(None);
+    };
+    if observed.len() != target_layers.len() {
+        return Err(metadata.error(format_args!(
+            "Muse-Glimmer DFlash capture expected {} target states, received {}",
+            target_layers.len(), observed.len()
+        )));
+    }
+    Ok(Some(ExternalPredictionTargetCapture::MuseGlimmerDFlash { target_states: observed }))
 }

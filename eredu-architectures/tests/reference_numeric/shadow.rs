@@ -241,7 +241,7 @@ impl ReplicatedTextArchitectureVisitor<NumericBackend, State> for Visitor<'_> {
     fn visit<A>(
         self,
         prepared: PreparedReplicatedTextArchitecture<A>,
-        checkpoint: SharedCheckpointSource,
+        checkpoint: RetainedCheckpointSource,
     ) -> Result<Self::Output, String>
     where
         A: eredu_runtime::ReplicatedTextArchitecture<NumericBackend, State, Error = Error>

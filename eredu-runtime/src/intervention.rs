@@ -1,31 +1,55 @@
 //! Prospective intervention scheduling under the ordinary capture/run owner.
 //! There is no additional sampling loop or native-resource owner here.
 
+mod static_preflight;
+pub use static_preflight::{StaticInterventionPreflight,StaticInterventionScratchError,StaticInterventionPreflightError};
+mod hook;
+mod prefill;
+pub use prefill::{InterventionPrefillWindow,InterventionPrefillSourceError,InterventionPrefillProjectionError};
 use crate::capture::{
-    bounded_diagnostic, capture_value, metadata_reservation, CaptureExecutionError, CaptureSession,
+    CaptureExecutionError, CaptureSession, bounded_diagnostic, metadata_reservation,
 };
-use eredu_core::{capture::*, intervention::*, ObservationPosition};
+use eredu_core::{ObservationPosition, capture::*, intervention::*};
+pub use hook::{ActivationHook, activation_hook};
 
 mod activation;
 mod partition;
-mod routed;
+pub(crate) mod routed;
 mod session;
-pub use activation::{apply_activation, localize_component_mask};
+pub use activation::{
+    apply_activation, apply_activation_with_source_shape, localize_component_mask,
+};
 pub use partition::{
     PartitionActivationLayout, PartitionActivationMember, PartitionActivationProjection,
     PartitionRoutedActivationMember, ReservedPartitionActivation,
+    PreparedPartitionInterventionProjection, PartitionInterventionProjectionSourceError, PartitionInterventionUpdate,
+    PartitionInterventionProjectionCost, PartitionInterventionColumnError, validate_partition_column_region, intervention_window_metadata,
+    PreparedWindowInterventionPayload, PreparedWindowInterventionPayloadError, WindowInterventionPayloadError,
 };
 pub use routed::{
-    lower_partition_routed_intervention, lower_routed_intervention, LoweredRoutedIntervention,
+    RoutedInterventionNumericalAction, routed_intervention_full_component_count, routed_intervention_full_component_count_control_bytes,
+    LoweredRoutedIntervention, lower_partition_routed_intervention, lower_routed_intervention,
+    PreparedRoutedInterventionRows, PreparedRoutedIntervention, PreparedRoutedInterventionError,
+    RoutedInterventionLoweringError,
 };
 pub(crate) use session::validate_continuation;
-pub use session::{install_session, validate_session, CaptureObserver};
+pub use session::{CaptureObserver, install_session, validate_session};
 
 pub(crate) struct InterventionRun {
     pub(crate) plan: AdmittedInterventionPlan,
     pub(crate) records: Option<Vec<InterventionRecord>>,
-    pub(crate) routing_pending: Option<usize>,
+    pub(crate) routing_pending: Option<PendingRouting>,
     pub(crate) estimator: std::sync::Arc<dyn InterventionEstimator>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingRouting {
+    index: usize,
+    phase: CapturePhase,
+    prediction: u64,
+    invocation: Option<CaptureInvocationShape>,
+    window: Option<CaptureInvocationWindow>,
+    unmodified: bool,
 }
 
 impl InterventionRun {
@@ -69,23 +93,16 @@ impl InterventionRun {
                     charged,
                 });
             }
-            records.push(InterventionRecord {
-                routed_units: None,
-                schema_version: INTERVENTION_SCHEMA_VERSION,
-                plan_id: self.plan.identity().into(),
-                operation_id: operation.id.clone(),
-                target: operation.target.clone(),
-                node_id: point.node_id.clone(),
+            records.push(initial_record(
+                operation,
+                point,
+                self.plan.identity(),
                 phase,
-                prediction_index: prediction,
-                outcome: if active {
-                    InterventionOutcome::Missing
-                } else {
-                    InterventionOutcome::Inactive
-                },
+                prediction,
                 evidence,
                 charged,
-            });
+                str::to_owned,
+            ));
         }
         self.records = Some(records);
         self.routing_pending = None;
@@ -97,6 +114,36 @@ impl InterventionRun {
     }
 }
 
+// One attribution/schedule constructor for ordinary and prepaid records. The
+// caller supplies its actual string destination; evidence is already owned.
+pub(crate) fn initial_record(
+    operation: &InterventionOperation,
+    point: &InterventionPoint,
+    identity: &str,
+    phase: CapturePhase,
+    prediction: u64,
+    evidence: Vec<CaptureRecord>,
+    charged: CaptureUsage,
+    mut text: impl FnMut(&str) -> String,
+) -> InterventionRecord {
+    InterventionRecord {
+        routed_units: None,
+        schema_version: INTERVENTION_SCHEMA_VERSION,
+        plan_id: text(identity),
+        operation_id: text(&operation.id),
+        target: text(&operation.target),
+        node_id: text(&point.node_id),
+        phase,
+        prediction_index: prediction,
+        outcome: if operation.schedule.includes(phase, prediction) {
+            InterventionOutcome::Missing
+        } else {
+            InterventionOutcome::Inactive
+        },
+        evidence,
+        charged,
+    }
+}
 impl CaptureSession {
     /// Selects an already admitted plan between drained prediction steps. Used
     /// when speculative target/draft rows or isolated branches share one ledger.
@@ -110,6 +157,9 @@ impl CaptureSession {
             return Err(CaptureError::Invalid(
                 "intervention selection requires a drained successful step".into(),
             ));
+        }
+        if let Some(plan) = &plan {
+            validate_capture_origin(&self.plan, plan)?;
         }
         if plan.as_ref().is_some_and(|plan| {
             plan.request() != self.plan.request()
@@ -142,6 +192,7 @@ impl CaptureSession {
                 "interventions must be installed once before generation".into(),
             ));
         }
+        validate_capture_origin(&self.plan, &plan)?;
         if plan.request() != self.plan.request()
             || plan.invocation_bounds() != self.plan.invocation_bounds()
         {
@@ -171,6 +222,7 @@ impl CaptureSession {
     ) -> Result<Option<B::Tensor>, CaptureExecutionError<B::Error>> {
         self.validate_ordinary_intervention()?;
         let tensor_geometry = self.tensor_geometry()?;
+        let invocation_window = self.invocation_window;
         let Some(run) = &mut self.interventions else {
             return Ok(None);
         };
@@ -188,18 +240,87 @@ impl CaptureSession {
             .zip(records)
             .enumerate()
         {
-            if operation.target != path
-                || point.routing.is_some()
-                || point.routed_units.is_some()
-                || record.outcome == InterventionOutcome::Inactive
-            {
-                continue;
+            match activation_hook(operation, point, &record.outcome, path) {
+                ActivationHook::Unrelated => continue,
+                ActivationHook::Active => (),
+                ActivationHook::Repeated => {
+                    return Err(CaptureError::Invalid(
+                        "intervention point executed more than once in one step".into(),
+                    )
+                    .into());
+                }
             }
-            if record.outcome != InterventionOutcome::Missing {
-                return Err(CaptureError::Invalid(
-                    "intervention point executed more than once in one step".into(),
-                )
-                .into());
+            if let Some(window) = invocation_window {
+                let started = std::time::Instant::now();
+                let result = (|| {
+                    let input = effective.as_ref().unwrap_or(tensor);
+                    let metadata = intervention_window_metadata(operation, point)?;
+                    reserve_envelope(&mut self.ledger, metadata)?;
+                    record.charged = record.charged.checked_add(metadata)?;
+                    let shape = backend
+                        .shape(input)
+                        .map_err(CaptureExecutionError::Backend)?;
+                    let geometry = point.observation_geometry();
+                    let (global, axis, coordinates) =
+                        window.source_axes(tensor_geometry, &geometry, &shape)?;
+                    let projected = partition::PartitionActivationProjection::new_at(
+                        &run.plan,
+                        index,
+                        self.phase,
+                        self.prediction,
+                        Some(window.validate(tensor_geometry)?),
+                        &global,
+                        axis,
+                        &coordinates,
+                        1,
+                    )?;
+                    let work = projected.reserve(&mut self.ledger, run.estimator.as_ref())?;
+                    record.charged = record.charged.checked_add(work.charged())?;
+                    work.validate_source(backend, input)?;
+                    let evidence = evidence_selections(operation, point);
+                    if let Some((selection, geometry)) = evidence.first() {
+                        capture_evidence_in_window(
+                            Some(window),
+                            backend,
+                            input,
+                            selection,
+                            geometry,
+                            &mut record.evidence[0],
+                            tensor_geometry,
+                            &mut self.ledger,
+                        )?;
+                    }
+                    let output = work.apply(backend, input)?;
+                    if let Some((selection, geometry)) = evidence.get(1) {
+                        capture_evidence_in_window(
+                            Some(window),
+                            backend,
+                            output.as_ref().unwrap_or(input),
+                            selection,
+                            geometry,
+                            &mut record.evidence[1],
+                            tensor_geometry,
+                            &mut self.ledger,
+                        )?;
+                    }
+                    Ok(output)
+                })();
+                self.capture_seconds += started.elapsed().as_secs_f64();
+                match result {
+                    Ok(output) => {
+                        if let Some(output) = output {
+                            effective = Some(output);
+                        }
+                        record.outcome = InterventionOutcome::Applied;
+                    }
+                    Err(error) => {
+                        record.outcome = InterventionOutcome::Failed {
+                            message: bounded_diagnostic(&error),
+                        };
+                        return Err(error);
+                    }
+                }
+                continue;
             }
             let started = std::time::Instant::now();
             let result = (|| {
@@ -311,7 +432,8 @@ impl CaptureSession {
     }
 }
 
-fn reserve_envelope(
+/// Reserve the shared logical intervention envelope; a refusal never refunds.
+pub fn reserve_envelope(
     ledger: &mut impl CaptureReservation,
     usage: CaptureUsage,
 ) -> Result<(), CaptureError> {
@@ -323,7 +445,8 @@ fn reserve_envelope(
     }
 }
 
-fn intervention_metadata(
+/// Same fixed attributed-record cost for cold inspection and execution.
+pub fn intervention_metadata(
     operation: &InterventionOperation,
     point: &InterventionPoint,
     identity: &str,
@@ -345,46 +468,24 @@ pub(crate) fn evidence_selections(
     operation: &InterventionOperation,
     point: &InterventionPoint,
 ) -> Vec<(CaptureSelection, eredu_core::ObservationPoint)> {
-    let transform = match operation.evidence {
-        InterventionEvidence::None => return vec![],
-        InterventionEvidence::Preview { max_elements } => {
-            CaptureTransform::Preview { max_elements }
-        }
-        InterventionEvidence::Summary => CaptureTransform::Summary,
-    };
+    let layout = eredu_core::capture::InterventionEvidenceLayout::new(operation, point);
     let mut entries = Vec::new();
-    for (label, position) in [
-        ("before", ObservationPosition::BeforeIntervention),
-        ("after", ObservationPosition::AfterIntervention),
-    ] {
-        let fields: &[Option<eredu_core::RoutingObservationField>] = if point.routing.is_some() {
-            &[
-                Some(eredu_core::RoutingObservationField::SelectedExperts),
-                Some(eredu_core::RoutingObservationField::Coefficients),
-            ]
-        } else {
-            &[None]
-        };
-        for field in fields {
-            let mut geometry = point.observation_geometry();
-            geometry.position = position;
-            if let Some(field) = field {
-                geometry.path = field.path(&point.path);
-                if *field == eredu_core::RoutingObservationField::SelectedExperts {
-                    geometry.dtype = eredu_core::ObservationDtype::Integer;
-                }
-            }
-            entries.push((
-                CaptureSelection {
-                    id: format!("{}:{label}:{:?}", operation.id, field),
-                    path: geometry.path.clone(),
-                    schedule: operation.schedule.clone(),
-                    slices: operation.slices.clone(),
-                    transform: transform.clone(),
-                },
-                geometry,
-            ));
-        }
+    for index in 0..layout.len() {
+        let descriptor = layout.descriptor(index).expect("bounded evidence ordinal");
+        let mut geometry = point.observation_geometry();
+        geometry.position = descriptor.position();
+        geometry.dtype = descriptor.dtype();
+        geometry.path = descriptor.path_parts().concat();
+        entries.push((
+            CaptureSelection {
+                id: descriptor.selection_id_parts().concat(),
+                path: geometry.path.clone(),
+                schedule: operation.schedule.clone(),
+                slices: operation.slices.clone(),
+                transform: descriptor.transform(),
+            },
+            geometry,
+        ));
     }
     entries
 }
@@ -398,18 +499,35 @@ pub(crate) fn capture_evidence<B: CaptureBackend>(
     geometry: CaptureInvocationShape,
     ledger: &mut CaptureLedger,
 ) -> Result<(), CaptureExecutionError<B::Error>> {
-    let result = capture_value(backend, tensor, selection, point, record, geometry, ledger);
+    capture_evidence_in_window(
+        None, backend, tensor, selection, point, record, geometry, ledger,
+    )
+}
+
+fn capture_evidence_in_window<B: CaptureBackend>(
+    window: Option<CaptureInvocationWindow>,
+    backend: &mut B,
+    tensor: &B::Tensor,
+    selection: &CaptureSelection,
+    point: &eredu_core::ObservationPoint,
+    record: &mut CaptureRecord,
+    geometry: CaptureInvocationShape,
+    ledger: &mut CaptureLedger,
+) -> Result<(), CaptureExecutionError<B::Error>> {
+    let result = crate::capture::capture_window_value(
+        window, backend, tensor, selection, point, record, geometry, ledger,
+    );
     if let Err(error) = &result {
         record.payload = None;
         record.outcome = CaptureOutcome::Failed {
             reason: match error {
-                CaptureExecutionError::Admission(CaptureError::Limit { budget, cumulative }) => {
-                    CaptureFailureReason::Limit {
+                CaptureExecutionError::Admission(error) => match error.cause() {
+                    CaptureError::Limit { budget, cumulative } => CaptureFailureReason::Limit {
                         budget: *budget,
                         cumulative: *cumulative,
-                    }
-                }
-                CaptureExecutionError::Admission(_) => CaptureFailureReason::Invalid,
+                    },
+                    _ => CaptureFailureReason::Invalid,
+                },
                 CaptureExecutionError::Backend(_) => CaptureFailureReason::Native,
             },
             message: bounded_diagnostic(error),
@@ -428,6 +546,18 @@ pub fn preflight(
     preflight_continuation(capture, intervention, estimator, 0, CaptureUsage::default())
 }
 
+// Coupled sources must retain the same ordinary opening before any estimator
+// call or run mutation. Invocation authority remains a separate mode.
+fn validate_capture_origin(
+    capture: &AdmittedCapturePlan,
+    intervention: &AdmittedInterventionPlan,
+) -> Result<(), CaptureError> {
+    if !intervention.is_empty() && capture.text_origin() != intervention.text_origin() {
+        return Err(CaptureError::Invalid("capture/intervention text origins differ".into()));
+    }
+    Ok(())
+}
+
 pub(crate) fn preflight_continuation(
     capture: &AdmittedCapturePlan,
     intervention: &AdmittedInterventionPlan,
@@ -435,6 +565,7 @@ pub(crate) fn preflight_continuation(
     next_prediction: u64,
     inherited: CaptureUsage,
 ) -> Result<(), CaptureError> {
+    validate_capture_origin(capture, intervention)?;
     if capture.request() != intervention.request()
         || capture.invocation_bounds() != intervention.invocation_bounds()
     {
@@ -511,7 +642,7 @@ pub(crate) fn preflight_continuation(
                 if operation.evidence != InterventionEvidence::None {
                     let geometry = match intervention.invocation_bounds() {
                         Some(bounds) => bounds.maximum()?,
-                        None => intervention.request().invocation_shape(phase, last)?,
+                        None => intervention.geometry_at(phase, last, None)?,
                     };
                     let rows = mul(geometry.batch, geometry.sequence)?;
                     costs[phase_index] = original_route_cost(estimator, policy, rows)?;
@@ -578,6 +709,15 @@ impl CaptureSession {
             GroupScoreStage, GroupSelectionAction, GroupSelectionControl,
         };
         self.validate_ordinary_intervention()?;
+        let physical = self
+            .invocation_window
+            .map(|_| self.tensor_geometry())
+            .transpose()?;
+        let logical = self
+            .invocation_window
+            .zip(physical)
+            .map(|(window, physical)| window.validate(physical))
+            .transpose()?;
         let Some(run) = &mut self.interventions else {
             return Ok(None);
         };
@@ -614,12 +754,74 @@ impl CaptureSession {
                 index,
                 self.phase,
                 self.prediction,
-                self.invocation,
-                &[token_rows, policy.top_k as u64],
+                logical.or(self.invocation),
+                &[
+                    logical.map_or(token_rows, |value| value.sequence),
+                    policy.top_k as u64,
+                ],
                 None,
             )?;
-            run.estimator
-                .validate_geometry(&[token_rows, policy.top_k as u64], &slice)?;
+            run.estimator.validate_geometry(
+                &[
+                    logical.map_or(token_rows, |value| value.sequence),
+                    policy.top_k as u64,
+                ],
+                &slice,
+            )?;
+            if physical.is_some_and(|physical| token_rows != physical.sequence) {
+                return Err(CaptureError::Invalid(
+                    "routing rows differ from actual prefill window".into(),
+                ));
+            }
+            let (first_row, end_row, payload_start, payload_end) =
+                if let Some(window) = self.invocation_window {
+                    let end = add(window.start, token_rows)?;
+                    let ordinal = window
+                        .start
+                        .saturating_sub(slice.starts[0])
+                        .div_ceil(slice.strides[0]);
+                    let first = add(slice.starts[0], mul(ordinal, slice.strides[0])?)?;
+                    let limit = end.min(slice.ends[0]);
+                    if first >= limit {
+                        return Ok(None);
+                    }
+                    let rows = (limit - first).div_ceil(slice.strides[0]);
+                    (
+                        first - window.start,
+                        limit - window.start,
+                        mul(ordinal, policy.top_k as u64)?,
+                        mul(add(ordinal, rows)?, policy.top_k as u64)?,
+                    )
+                } else {
+                    (
+                        slice.starts[0],
+                        slice.ends[0],
+                        0,
+                        mul(slice.shape[0], policy.top_k as u64)?,
+                    )
+                };
+            // The selector owns its native workspace. This separate reservation
+            // covers only the actual host control payload cloned/gathered here.
+            let elements = match &operation.action {
+                InterventionAction::ExcludeExperts { expert_ids }
+                | InterventionAction::ZeroExpertContribution { expert_ids } => {
+                    expert_ids.len() as u64
+                }
+                InterventionAction::ForceExperts { .. } => payload_end - payload_start,
+                InterventionAction::BiasRoutingScores {
+                    expert_ids, biases, ..
+                } => add(expert_ids.len() as u64, biases.len() as u64)?,
+                _ => 0,
+            };
+            let controls = CaptureUsage {
+                host_bytes: add(
+                    std::mem::size_of::<GroupSelectionControl>() as u64,
+                    mul(elements, 4)?,
+                )?,
+                ..Default::default()
+            };
+            reserve_envelope(&mut self.ledger, controls)?;
+            record.charged = record.charged.checked_add(controls)?;
             let action = match &operation.action {
                 InterventionAction::ExcludeExperts { expert_ids } => {
                     GroupSelectionAction::Exclude(expert_ids.clone())
@@ -627,9 +829,20 @@ impl CaptureSession {
                 InterventionAction::ZeroExpertContribution { expert_ids } => {
                     GroupSelectionAction::ZeroContribution(expert_ids.clone())
                 }
-                InterventionAction::ForceExperts { expert_ids, .. } => {
-                    GroupSelectionAction::Force(expert_ids.clone())
-                }
+                InterventionAction::ForceExperts { expert_ids, .. } => GroupSelectionAction::Force(
+                    expert_ids
+                        .get(
+                            usize::try_from(payload_start).map_err(|_| CaptureError::Overflow)?
+                                ..usize::try_from(payload_end)
+                                    .map_err(|_| CaptureError::Overflow)?,
+                        )
+                        .ok_or_else(|| {
+                            CaptureError::Invalid(
+                                "projected routing payload differs from admission".into(),
+                            )
+                        })?
+                        .to_vec(),
+                ),
                 InterventionAction::BiasRoutingScores {
                     stage,
                     expert_ids,
@@ -646,7 +859,7 @@ impl CaptureSession {
                 _ => {
                     return Err(CaptureError::Invalid(
                         "activation operation cannot control routing".into(),
-                    ))
+                    ));
                 }
             };
             let expected = eredu_nn::TopKGroupSelectionSpec::new(
@@ -671,20 +884,27 @@ impl CaptureSession {
                 reserve_envelope(&mut self.ledger, cost)?;
                 record.charged = record.charged.checked_add(cost)?;
             }
-            Ok(GroupSelectionControl {
+            Ok(Some(GroupSelectionControl {
                 expected,
                 learned_coefficient_scale: policy.learned_coefficient_scale,
-                first_row: slice.starts[0],
-                end_row: slice.ends[0],
+                first_row,
+                end_row,
                 row_stride: slice.strides[0],
                 action,
                 capture_original,
-            })
+            }))
         })();
         match result {
             Ok(control) => {
-                run.routing_pending = Some(index);
-                Ok(Some(control))
+                run.routing_pending = Some(PendingRouting {
+                    index,
+                    phase: self.phase,
+                    prediction: self.prediction,
+                    invocation: self.invocation,
+                    window: self.invocation_window,
+                    unmodified: control.is_none(),
+                });
+                Ok(control)
             }
             Err(error) => {
                 record.outcome = InterventionOutcome::Failed {
@@ -703,16 +923,85 @@ impl CaptureSession {
         original: Option<crate::RoutingDecision<'_, B::Tensor>>,
         effective: crate::RoutingDecision<'_, B::Tensor>,
     ) -> Result<(), CaptureExecutionError<B::Error>> {
+        self.finish_routing(backend, path, original, effective, false)
+    }
+
+    /// Requests metadata only for the exact pending no-overlap operation.
+    pub fn routing_unmodified_interest(&self, path: &str) -> crate::RoutingUnmodifiedInterest {
+        if self
+            .interventions
+            .as_ref()
+            .and_then(|run| run.routing_pending.map(|pending| (run, pending)))
+            .is_some_and(|(run, pending)| {
+                pending.unmodified
+                    && run.plan.plan().operations[pending.index].target == path
+                    && pending.phase == self.phase
+                    && pending.prediction == self.prediction
+                    && pending.invocation == self.invocation
+                    && pending.window == self.invocation_window
+            })
+        {
+            crate::RoutingUnmodifiedInterest::Metadata
+        } else {
+            crate::RoutingUnmodifiedInterest::None
+        }
+    }
+
+    /// Receives the actual ordinary decision only for a proved no-overlap window.
+    /// Other ordinary notifications do not create intervention work or records.
+    pub fn routing_unmodified<B: CaptureBackend>(
+        &mut self,
+        backend: &mut B,
+        path: &str,
+        effective: crate::RoutingDecision<'_, B::Tensor>,
+    ) -> Result<(), CaptureExecutionError<B::Error>> {
+        if !self
+            .interventions
+            .as_ref()
+            .and_then(|run| run.routing_pending.map(|pending| (run, pending)))
+            .is_some_and(|(run, pending)| {
+                pending.unmodified && run.plan.plan().operations[pending.index].target == path
+            })
+        {
+            return Ok(());
+        }
+        let original = crate::RoutingDecision {
+            ids: effective.ids,
+            coefficients: effective.coefficients,
+        };
+        self.finish_routing(backend, path, Some(original), effective, true)
+    }
+
+    fn finish_routing<B: CaptureBackend>(
+        &mut self,
+        backend: &mut B,
+        path: &str,
+        original: Option<crate::RoutingDecision<'_, B::Tensor>>,
+        effective: crate::RoutingDecision<'_, B::Tensor>,
+        unmodified: bool,
+    ) -> Result<(), CaptureExecutionError<B::Error>> {
         self.validate_ordinary_intervention()?;
         let tensor_geometry = self.tensor_geometry()?;
         let run = self
             .interventions
             .as_mut()
             .ok_or_else(|| CaptureError::Invalid("unsolicited routing result".into()))?;
-        let index = run
+        let pending = run
             .routing_pending
-            .take()
             .ok_or_else(|| CaptureError::Invalid("routing result has no pending control".into()))?;
+        if pending.unmodified != unmodified
+            || pending.phase != self.phase
+            || pending.prediction != self.prediction
+            || pending.invocation != self.invocation
+            || pending.window != self.invocation_window
+        {
+            return Err(CaptureError::Invalid(
+                "routing result invocation differs from pending control".into(),
+            )
+            .into());
+        }
+        let index = pending.index;
+        run.routing_pending = None;
         let operation = &run.plan.plan().operations[index];
         if operation.target != path {
             return Err(
@@ -728,12 +1017,19 @@ impl CaptureSession {
             let shape = backend
                 .shape(effective.ids)
                 .map_err(CaptureExecutionError::Backend)?;
+            tensor_geometry
+                .validate_actual(&run.plan.points()[index].observation_geometry(), &shape)?;
+            let logical = self
+                .invocation_window
+                .map(|window| window.validate(tensor_geometry))
+                .transpose()?;
+            let logical_shape = [logical.map_or(shape[0], |value| value.sequence), shape[1]];
             run.plan.validate_at(
                 index,
                 self.phase,
                 self.prediction,
-                self.invocation,
-                &shape,
+                logical.or(self.invocation),
+                &logical_shape,
                 None,
             )?;
             if backend
@@ -761,7 +1057,8 @@ impl CaptureSession {
                 .zip(&selections)
                 .zip(&mut record.evidence)
                 {
-                    capture_evidence(
+                    capture_evidence_in_window(
+                        self.invocation_window,
                         backend,
                         tensor,
                         selection,
@@ -776,6 +1073,7 @@ impl CaptureSession {
         })();
         self.capture_seconds += started.elapsed().as_secs_f64();
         record.outcome = match &result {
+            Ok(()) if unmodified => InterventionOutcome::Unmatched,
             Ok(()) => InterventionOutcome::Applied,
             Err(error) => InterventionOutcome::Failed {
                 message: bounded_diagnostic(error),
@@ -787,7 +1085,8 @@ impl CaptureSession {
     /// Retains a bounded selector failure without treating it as proof of rollback.
     pub fn routing_failed(&mut self, path: &str, message: &str) {
         if let Some(run) = &mut self.interventions {
-            if let Some(index) = run.routing_pending.take() {
+            if let Some(pending) = run.routing_pending.take() {
+                let index = pending.index;
                 if run.plan.plan().operations[index].target == path {
                     if let Some(records) = &mut run.records {
                         records[index].outcome = InterventionOutcome::Failed {

@@ -1,0 +1,391 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T08:22:43.499716+00:00",
+  "scope": "Integrated Qwen hybrid width-one state, empty mRoPE axes and conditional causal capture across prepared/parallel/residency execution",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-inkling-causal-prefill-2026-09-14.json",
+  "tests": {
+    "nn": {
+      "passed": 137,
+      "ignored": 0
+    },
+    "architectures": {
+      "passed": 1054,
+      "ignored": 1
+    },
+    "positional": {
+      "passed": 6,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1331,
+  "new_tests": [
+    {
+      "check": "architectures",
+      "name": "width_one_direct_next_and_35_dense_and_routed_preserve_all_rows_and_state",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_hybrid_rows/width_one.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "width_one_layout_keeps_recurrence_and_wider_mixers_still_require_history",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_hybrid_rows/width_one.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "width_one_conditional_dense_and_routed_targets_preserve_complete_state",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_hybrid_rows/width_one.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "width_one_target_mixer_preserves_actual_full_attention_mtp_and_return",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_hybrid_rows/width_one.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "width_one_direct_parallel_consumers_preserve_local_recurrence_and_kv",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_hybrid_rows/width_one/partition.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "width_one_conditional_prepared_partitions_preserve_owned_state_across_all_residencies",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_hybrid_rows/width_one/partition.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "selected_qwen_width_one_preserves_fixed_and_mixed_profiles_and_bound_rows",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/replicated_rows/qwen_width_one.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "selected_qwen_width_one_preserves_routed_and_mtp_cold_rejections",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/replicated_rows/qwen_width_one.rs"
+    },
+    {
+      "check": "architectures",
+      "ignored": false,
+      "name": "zero_mrope_sections_preserve_hf_and_gguf_contract_and_reject_overflow",
+      "path": "eredu-architectures/src/qwen/vl/config.rs"
+    },
+    {
+      "check": "architectures",
+      "ignored": false,
+      "name": "qwen_scalar_zero_sections_keep_the_temporal_fallback",
+      "path": "eredu-architectures/src/qwen/vl/positions.rs"
+    },
+    {
+      "check": "architectures",
+      "ignored": false,
+      "name": "qwen_zero_mrope_tensor_values_keep_distinct_coordinates_and_cached_offsets",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_mrope_zero.rs"
+    },
+    {
+      "check": "architectures",
+      "ignored": false,
+      "name": "prepared_qwen_vl_zero_sections_preserve_complete_cached_text_state",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_mrope_zero.rs"
+    },
+    {
+      "check": "positional",
+      "ignored": false,
+      "name": "zero_rotary_sections_preserve_global_cold_allocation_and_host_bounds",
+      "path": "eredu-backend-mlx/src/backend/nn/workspace/positional/tests.rs"
+    },
+    {
+      "check": "positional",
+      "ignored": true,
+      "name": "metal_zero_sections_preserve_distinct_axes_and_original_cold_bound",
+      "path": "eredu-backend-mlx/src/backend/nn/workspace/positional/tests.rs"
+    },
+    {
+      "check": "nn",
+      "ignored": false,
+      "name": "round_robin_zero_sections_keep_original_coordinates_and_global_frequencies",
+      "path": "eredu-nn/src/multimodal.rs"
+    },
+    {
+      "check": "nn",
+      "ignored": false,
+      "name": "zero_sections_require_round_robin_and_positive_checked_total",
+      "path": "eredu-nn/src/multimodal.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "conditional_qwen_actual_prepared_sources_bind_group1_readout_and_reject_media_origins",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/binding.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "conditional_qwen_rejects_foreign_or_invalidated_runtime_before_any_callback",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/binding.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "conditional_hybrid_target_declarations_preserve_all_existing_mtp_hook_gates",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/binding.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "conditional_qwen_vl_and_hybrid_rows_preserve_all_eighteen_callbacks_and_complete_state",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/equations.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "conditional_qwen_body_rows_precede_state_only_and_last_position_readout",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/equations.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "conditional_qwen_prepared_rows_and_complete_state_cross_tp_pp_and_residency",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/partition.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "conditional_qwen_prepared_routed_rows_keep_actual_tp_pp_ep_ownership",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/partition.rs"
+    },
+    {
+      "check": "architectures",
+      "name": "qwen_vl_zero_sections_cross_real_prepared_tp_pp_with_all_residencies",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/partition.rs"
+    }
+  ],
+  "new_test_count": 24,
+  "checks": {
+    "nn": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-nn --all-features --lib",
+      "started_utc": "2026-09-14T08:16:09.921715+00:00",
+      "elapsed_seconds": 1.697,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-qwen-causal-integration-nn.log",
+      "log_sha256": "802c91d35b7cc85c1b17556d09bfdeda786a62fdb7797c8a05803d086c60e9b1"
+    },
+    "architectures": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib --test reference_numeric",
+      "started_utc": "2026-09-14T08:17:41.752674+00:00",
+      "elapsed_seconds": 117.153,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-qwen-causal-integration-architectures.log",
+      "log_sha256": "29a165c83bf44c2a2abc8b229b49f741d4a68ed113c89b0fdda0b140b7fbe621"
+    },
+    "positional": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::nn::workspace::positional::tests:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T08:19:38.910824+00:00",
+      "elapsed_seconds": 109.967,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-qwen-causal-integration-positional.log",
+      "log_sha256": "2cd93a9ed81d7512865364b94f5b927b0d3fa7663c4812f62231c666cacdbd8e"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T08:21:28.880086+00:00",
+      "elapsed_seconds": 43.927,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-qwen-causal-integration-portable.log",
+      "log_sha256": "eeadc9a1327c01dee128a4104e6bcf14fe697246bdc6da19ddba5181e7596d2a"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T08:22:12.808527+00:00",
+      "elapsed_seconds": 15.992,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-qwen-causal-integration-minimal.log",
+      "log_sha256": "125529cd13bbfe7a060d0b53e2c2f906802c4eadbd31103482676be1958323ee"
+    }
+  },
+  "source_sha256": {
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/equations.rs": "a308930475fc6027687d74769a30ba1b21977f5ca3f920ffe97e5a536d0df669",
+    "doc/backend-architecture.md": "d7c2ee62061e63e7758e4c5d8a15819ede95def9a67e78e23977da502bfddada",
+    "eredu-architectures/src/qwen/hybrid/linear_attention.rs": "ad987701c52e90e3a7872d60a81eea59bc1217f9ca141263f8602b3dbe647868",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_hybrid_rows.rs": "512c87899e54746f272735843f4f4a2325195fa6d280cb987f398046c1ba2cc5",
+    "doc/lm-inspector-execution-control.md": "274ecb4bd96bc03f0f41421a7cbd2729669b92d63674600fa18b838b8d39158c",
+    "eredu-architectures/src/qwen/hybrid/config.rs": "043e3c3c891a38c313515941b23dad93a58a3241b07a757ecd17c86aaa426e81",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_hybrid_rows/width_one.rs": "647982c96039e8e589efa36c8da174494b416d48690ab8fe41283561ae281ae4",
+    "eredu-architectures/src/qwen/vl/config.rs": "023bbdb0fa7a070ecfd600d29cdd97822a73c17884a98909547f6455f8be9490",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/replicated_rows/qwen_width_one.rs": "fced09e3eb0f2b753c5e8be23a22227eb157f395ddde0e4bd595fb34db21ae9b",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/binding.rs": "deb5f96f03fb8b4a4df13dc1426d21362158a4c951ce1bba3f984d7b36d8f955",
+    "eredu-architectures/src/qwen/hybrid/conditional.rs": "4873719f42136f4bdcfdcf211e074692d95945aed9ee2d3e2c7581d9328d6fdc",
+    "eredu-architectures/src/qwen/vl/model.rs": "b413b41113300b86286a7e752d96f9410c54b7306cee59f2a628f4b6690c19d7",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows/partition.rs": "6f12a0e822913b7f1d4465b5c49bf1122499027e04ef8c0322328c0d1f8c3c76",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_hybrid_rows/width_one/partition.rs": "1589c10ead35fd62e0adc8a6743d3111358965c270e3a9595747b913b2c3ed29",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/conditional_qwen_rows.rs": "c341b05573023960429191e152a499ce83e9d4c89ccfc4c962657d6b0f8555e8",
+    "eredu-backend-mlx/src/backend/nn/workspace/positional/tests.rs": "d192ae5f0f37d7445c3b0f5aac9a9ee3dfd7700aabb3e8b2a940ba484969ec9c",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/qwen_mrope_zero.rs": "65a79fb501c5e70e91c3f259c95ac068f700f5254f8e25ab05dfc50fae80aff4",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/replicated_rows.rs": "133bb44fb0527f07beab5add859e4b2f23572a13948b06fa4411c75687570849",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal.rs": "8b168b819d08cf7f99abe4cf8e1eb808f3c222b4c485605b58c35b4026d6a4ef",
+    "doc/execution-control.md": "304cd2f1f252e55f8f387d4c487499cb9480cf37e65ab2d661891ad743e60e17",
+    "doc/bounded-inference.md": "8dae4cd92de07c2b3665b3b3df84ab15501a54dfceb3a37773d327598e14d0ef",
+    "eredu-architectures/src/qwen/vl/positions.rs": "5061da493dc99bbb3c50e0a12cf0d5a963726d01c63335f69897670945113a20",
+    "eredu-nn/src/multimodal.rs": "c04e7f7cfd887cb83bfa55e6aa2484d99d1ddea26e518c421ec6b2b8e674593d"
+  },
+  "source_snapshot": "/private/tmp/eredu-qwen-causal-integration-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-conditional-bound-expert-fixture-stage/FROZEN.json": "b1fcba2c38f0b0c21d49de9ba3f9ad0a2a66e28a92c2718329c680e0d23b7ab5",
+    "/private/tmp/eredu-conditional-bound-expert-fixture-stage/README.md": "efb789c515898e1a21c33b62d7c0147dbe07771a0d628eb62bfd12ab52e05dd9",
+    "/private/tmp/eredu-conditional-bound-expert-fixture-stage/TEST-COMMANDS.md": "8aa3ce919c03309925c1b792f95ff6288cb5dc7fd97b370266e0208dcfd35b3b",
+    "/private/tmp/eredu-conditional-bound-expert-fixture-stage/change.patch": "4a04c76a328c2057c263bbb193d80e9694061dfec8240ba26be1a68d1fcaf1f9",
+    "/private/tmp/eredu-conditional-bound-expert-fixture-stage/checks.json": "09fd8fbb8fce3d5d32daea60c98fdd26782a6e7df0cd60f5b60704b7812ffab8",
+    "/private/tmp/eredu-conditional-bound-expert-fixture-stage/dependencies.json": "055912d5ad1acbabe3a559e1ad4f0dc128616d077a66214c3c57225524c2e0b6",
+    "/private/tmp/eredu-conditional-bound-expert-fixture-stage/freeze.py": "4537caccb814347bc61748a483a7c7301dde2349e4960e568de368e8c1886b5f",
+    "/private/tmp/eredu-conditional-bound-expert-fixture-stage/manifest.json": "2366696eaa0f87910d53c631964f39d8375373251b490b689d176c5adac38848",
+    "/private/tmp/eredu-conditional-qwen-causal-integrated-expert-binding-root-review.json": "2aa35cc9f4abf19c8a6e53293dc35a54fd9d1be611252fe0f92b3ca9f3e21085",
+    "/private/tmp/eredu-conditional-qwen-causal-integrated-review.json": "a15c432cf955c440879167e8527f8cfabc9d8b1211ce636e53a061741b942e2a",
+    "/private/tmp/eredu-conditional-qwen-causal-integrated-stage/all.patch": "5088b9f3a8dfad96d9f33105d7b5e0b241a08cb3fdc12951b5f82ec6910a90c4",
+    "/private/tmp/eredu-conditional-qwen-causal-integrated-stage/change.patch": "cdba0a253e3fbea1f94f07f0d4e60f8f7e54d5c3ea0e22d8b24d840f756642d6",
+    "/private/tmp/eredu-conditional-qwen-causal-integrated-stage/manifest.json": "5ab6a105ff58e8692ccb530cd437c7cb473af96aa33ac05b12c8a0d5f97fe1e3",
+    "/private/tmp/eredu-conditional-qwen-causal-integrated-stage/staged-hashes.json": "ce949e389897ae81926c9237bf7499017a3e2881bc3b842c4896715513d631e5",
+    "/private/tmp/eredu-conditional-qwen-causal-integrated-validation-config.json": "7adcf8c4e212def65cec2314f2b768cde72840efd0ba29d1f26eb71028bd4c0a",
+    "/private/tmp/eredu-conditional-qwen-causal-review.md": "efb846b9b7ab9ecaa54f19457a7e54c7342a418547c4e5ff5a59c42c25f7e146",
+    "/private/tmp/eredu-conditional-qwen-causal-root-review.json": "56122090354d7cd17c4ae5b660552094c491d2427cb06015cf205e34d953f6e2",
+    "/private/tmp/eredu-conditional-qwen-observed-logits-correction.patch": "72f643c014da4f4556c6098cd0a8329858fcae20c02ace8b6f7e6fd07245caa8",
+    "/private/tmp/eredu-conditional-qwen-observed-logits-review.md": "88bdc2808ca68ecee9a38d5598e6ec155e7471a5d0835b7af0fa94f1ac676713",
+    "/private/tmp/eredu-conditional-qwen-observed-logits-root-review.json": "3ebe0dabbd7942550bb6539cea113f87cfceb90a033cefcddd6ee72a0f1ef311",
+    "/private/tmp/eredu-full-observed-logits-review.md": "1846d7588f2ce36e2df03214b113b217811fd20a1e8a07d16d9605827a0e3945",
+    "/private/tmp/eredu-mrope-bound-expert-fixture-stage/FROZEN.json": "ebc461b2913919bf6a9a843708fa8ba13dbeb028018ebc586ac6e056546299af",
+    "/private/tmp/eredu-mrope-bound-expert-fixture-stage/README.md": "841fb8b3d6db9e6550262c0c5af4b8cd9c786f058762e0c5a00f89f0bd3b5e27",
+    "/private/tmp/eredu-mrope-bound-expert-fixture-stage/TEST-COMMANDS.md": "0eb911107c159ecbee058aaa9cc41d1b4e8cbb18bf85647097cee8935022f3ce",
+    "/private/tmp/eredu-mrope-bound-expert-fixture-stage/change.patch": "4ec9c5d5a69dc2eacbaf2045713189fcddcea2dfc4bb830cc084c46f3943981c",
+    "/private/tmp/eredu-mrope-bound-expert-fixture-stage/checks.json": "d348b7ae4069b3cffdeafa5950845b52c36e229ecc464a37186ea8ef7ecbf2da",
+    "/private/tmp/eredu-mrope-bound-expert-fixture-stage/dependencies.json": "7c0d48b8ddbca55d369d9339961f0ab2132f056a6607bd4f3c43e7d0966aa171",
+    "/private/tmp/eredu-mrope-bound-expert-fixture-stage/freeze.py": "4537caccb814347bc61748a483a7c7301dde2349e4960e568de368e8c1886b5f",
+    "/private/tmp/eredu-mrope-bound-expert-fixture-stage/manifest.json": "999606c8295cc347bd0f31653ad9f4e1b2c4678dcb8bea9099ac580f6bfdf8d1",
+    "/private/tmp/eredu-queued-bound-expert-fixture-audit.md": "3cc348a73449a23a3a169153a2218e54c7cb1b8a2296dafad4263822f8374468",
+    "/private/tmp/eredu-queued-bound-expert-fixture-review.md": "46cba00c1160a7a8104bdaa3851ca8d10d0a69e18b2c02c471fe483cee9f1c64",
+    "/private/tmp/eredu-qwen-causal-integration-applied.json": "7780b9fa479fd615b4bf35e6b26683eb5cbe3f46793a288c37b8f76e59075c41",
+    "/private/tmp/eredu-qwen-causal-integration-apply.py": "7f2687c37c51b4eb6245677f7170997c5858ee509b4a30264653f7f9b5ed4317",
+    "/private/tmp/eredu-qwen-causal-integration-architectures.log": "29a165c83bf44c2a2abc8b229b49f741d4a68ed113c89b0fdda0b140b7fbe621",
+    "/private/tmp/eredu-qwen-causal-integration-architectures.log.1789373861752458000.previous": "42849108b0fbe2bca3728559a04b3f820907b4253e691a38ccd1e83cd5e83a95",
+    "/private/tmp/eredu-qwen-causal-integration-checks.json": "ca5b6bc95b9cf03519f012a418eacbbf7a0069c6dbc87ae0ee329baaa631a6ae",
+    "/private/tmp/eredu-qwen-causal-integration-doc-applied.json": "2e6dbefbe157b4087ff3099014ad01ad542873425f87713b63d2ff3dc4980203",
+    "/private/tmp/eredu-qwen-causal-integration-minimal.log": "125529cd13bbfe7a060d0b53e2c2f906802c4eadbd31103482676be1958323ee",
+    "/private/tmp/eredu-qwen-causal-integration-nn.log": "802c91d35b7cc85c1b17556d09bfdeda786a62fdb7797c8a05803d086c60e9b1",
+    "/private/tmp/eredu-qwen-causal-integration-portable.log": "eeadc9a1327c01dee128a4104e6bcf14fe697246bdc6da19ddba5181e7596d2a",
+    "/private/tmp/eredu-qwen-causal-integration-positional.log": "2cd93a9ed81d7512865364b94f5b927b0d3fa7663c4812f62231c666cacdbd8e",
+    "/private/tmp/eredu-qwen-causal-integration-review.json": "e83654c375f0a2824fa335af9f3db4f9f887dd9acdb4cd715253b6e65d7a36a0",
+    "/private/tmp/eredu-qwen-causal-integration-root-review.json": "a0c5ae1a0cda530e79419aa7bc474a50358bc594e5a78157f2d16c5f5743ed98",
+    "/private/tmp/eredu-qwen-causal-integration-stage/all.patch": "922f4776af223bca33bdff9ace61a603e3555de6b9fcca54c6d01f360d5adf1a",
+    "/private/tmp/eredu-qwen-causal-integration-stage/change.patch": "192a019d52836155f615ebddc240cc2061fcda2cf301b1688cab101b67f0b0b7",
+    "/private/tmp/eredu-qwen-causal-integration-stage/constituents.json": "095a1c8b58c250ea3bc78721538b23a29b188898de54da1809ba0d0de816f995",
+    "/private/tmp/eredu-qwen-causal-integration-stage/manifest.json": "7780b9fa479fd615b4bf35e6b26683eb5cbe3f46793a288c37b8f76e59075c41",
+    "/private/tmp/eredu-qwen-causal-integration-stage/staged-hashes.json": "2c2f134b885632fcb62884003d224c0edc5187045371261f4ca8e21d2691a11d",
+    "/private/tmp/eredu-qwen-causal-integration-validate.py": "80d4ba5804471d8bbe7f5ee0d99279e1582c3fbc669135824147d523f561beac",
+    "/private/tmp/eredu-qwen-causal-integration-validation-config.json": "f92f7e5ed15855a3b5f141b70904763ddaaea2f69752fc6181621d1da566bb60",
+    "/private/tmp/eredu-qwen-hybrid-width-one-integrated-review.json": "cbb410f7eb94baf55f0da2e5187de20ffc4edbd4cc2e2ebed19563d5002d911b",
+    "/private/tmp/eredu-qwen-hybrid-width-one-integrated-stage/all.patch": "e4e39a3062b0aea65fd083a1d76c2466df74233877c04706109583503e8041c4",
+    "/private/tmp/eredu-qwen-hybrid-width-one-integrated-stage/change.patch": "87329385db78d562dce09aed5946d12010b91633a3a1120d5b5329205605313e",
+    "/private/tmp/eredu-qwen-hybrid-width-one-integrated-stage/manifest.json": "fdecb9a68095fdfc3202bafa4a6f95b5f06292f7dcd1f061dce7ce40f99a7ad3",
+    "/private/tmp/eredu-qwen-hybrid-width-one-integrated-stage/staged-hashes.json": "fc85e96342f958c1302cd04274913438e2912205f8f9f9d89982848436c1fc9b",
+    "/private/tmp/eredu-qwen-hybrid-width-one-integrated-validation-config.json": "cbe649c44f758488a8ed4375344c31465365bcb859fbdb04c48efffbe25a6885",
+    "/private/tmp/eredu-qwen-hybrid-width-one-review.md": "8d6ee1813819f5ff2ade8127ca4722b7bcfe875acc4164334e4924c536bba389",
+    "/private/tmp/eredu-qwen-hybrid-width-one-root-review.json": "76a77fbbd48c9f18a492c6186d2b0bd67581ae633faedeccf57768a7cb5326a6",
+    "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-expert-binding-root-review.json": "ef9e1b372cf780e3dcfe0a942b9c6b4e4c4836f6f0d73866cbbe36df2953e744",
+    "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-review.json": "1655c5e88a0ee418e1c643b9bbb2352687d629e5a7c3d10790a0bdbda00c42fe",
+    "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-stage/all.patch": "cad408b42bb3a60446019d56d69618a47322b5629418f8dd32d02a26a97d4a23",
+    "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-stage/change.patch": "a0a2669be92766689b67ed26a671570decacfbaee3a570470b004e71d57a228f",
+    "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-stage/manifest.json": "d85e16d8c9cfb5d4f4016e557d4aee11557025ae9fa1377fd3a958a3da6ff8da",
+    "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-stage/staged-hashes.json": "09347e0fae3b4b3616d786907649e7e7c66b4bfdb908bfe7c1b668177a140c56",
+    "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-validation-config.json": "7a6d79bf9c3dd880e1764809e362a9d6d8c4d0ca71ff55929c9747c975bf3d19",
+    "/private/tmp/eredu-qwen-mrope-zero-sections-review.md": "7fa32d3163a630448721331dab14ca48dda4dcb466c74105614d0a02711b65d5",
+    "/private/tmp/eredu-qwen-mrope-zero-sections-root-review.json": "5c6faa440764449b57b871f49118ff4c2cd009878bd94bca0e7f68309a9998c3",
+    "/private/tmp/eredu-qwen-unit-window-correction.patch": "9179dad6699d9cb6f72aa280e5d89706e2e094a699a8df2b594f3dfe601e843d",
+    "/private/tmp/eredu-qwen-unit-window-root-review.json": "496c30065800ed4c2c59f5f7bd876fccdfd910fa1963cce9238ae8d0a1e8616f",
+    "/private/tmp/eredu-qwen-width-one-unit-window-review.md": "440603f737bea04a0d8de940cbc9b85bc9085268806177dcbfb5c507027175d3"
+  },
+  "review": {
+    "full_manifest_sha256": "2c2f134b885632fcb62884003d224c0edc5187045371261f4ca8e21d2691a11d",
+    "full_patch_sha256": "922f4776af223bca33bdff9ace61a603e3555de6b9fcca54c6d01f360d5adf1a",
+    "patch_sha256": "192a019d52836155f615ebddc240cc2061fcda2cf301b1688cab101b67f0b0b7",
+    "reviews": {
+      "/private/tmp/eredu-conditional-bound-expert-fixture-stage/FROZEN.json": "b1fcba2c38f0b0c21d49de9ba3f9ad0a2a66e28a92c2718329c680e0d23b7ab5",
+      "/private/tmp/eredu-conditional-bound-expert-fixture-stage/README.md": "efb789c515898e1a21c33b62d7c0147dbe07771a0d628eb62bfd12ab52e05dd9",
+      "/private/tmp/eredu-conditional-bound-expert-fixture-stage/TEST-COMMANDS.md": "8aa3ce919c03309925c1b792f95ff6288cb5dc7fd97b370266e0208dcfd35b3b",
+      "/private/tmp/eredu-conditional-bound-expert-fixture-stage/change.patch": "4a04c76a328c2057c263bbb193d80e9694061dfec8240ba26be1a68d1fcaf1f9",
+      "/private/tmp/eredu-conditional-bound-expert-fixture-stage/checks.json": "09fd8fbb8fce3d5d32daea60c98fdd26782a6e7df0cd60f5b60704b7812ffab8",
+      "/private/tmp/eredu-conditional-bound-expert-fixture-stage/dependencies.json": "055912d5ad1acbabe3a559e1ad4f0dc128616d077a66214c3c57225524c2e0b6",
+      "/private/tmp/eredu-conditional-bound-expert-fixture-stage/freeze.py": "4537caccb814347bc61748a483a7c7301dde2349e4960e568de368e8c1886b5f",
+      "/private/tmp/eredu-conditional-bound-expert-fixture-stage/manifest.json": "2366696eaa0f87910d53c631964f39d8375373251b490b689d176c5adac38848",
+      "/private/tmp/eredu-conditional-qwen-causal-integrated-expert-binding-root-review.json": "2aa35cc9f4abf19c8a6e53293dc35a54fd9d1be611252fe0f92b3ca9f3e21085",
+      "/private/tmp/eredu-conditional-qwen-causal-integrated-review.json": "a15c432cf955c440879167e8527f8cfabc9d8b1211ce636e53a061741b942e2a",
+      "/private/tmp/eredu-conditional-qwen-causal-integrated-stage/all.patch": "5088b9f3a8dfad96d9f33105d7b5e0b241a08cb3fdc12951b5f82ec6910a90c4",
+      "/private/tmp/eredu-conditional-qwen-causal-integrated-stage/change.patch": "cdba0a253e3fbea1f94f07f0d4e60f8f7e54d5c3ea0e22d8b24d840f756642d6",
+      "/private/tmp/eredu-conditional-qwen-causal-integrated-stage/manifest.json": "5ab6a105ff58e8692ccb530cd437c7cb473af96aa33ac05b12c8a0d5f97fe1e3",
+      "/private/tmp/eredu-conditional-qwen-causal-integrated-stage/staged-hashes.json": "ce949e389897ae81926c9237bf7499017a3e2881bc3b842c4896715513d631e5",
+      "/private/tmp/eredu-conditional-qwen-causal-integrated-validation-config.json": "7adcf8c4e212def65cec2314f2b768cde72840efd0ba29d1f26eb71028bd4c0a",
+      "/private/tmp/eredu-conditional-qwen-causal-review.md": "efb846b9b7ab9ecaa54f19457a7e54c7342a418547c4e5ff5a59c42c25f7e146",
+      "/private/tmp/eredu-conditional-qwen-causal-root-review.json": "56122090354d7cd17c4ae5b660552094c491d2427cb06015cf205e34d953f6e2",
+      "/private/tmp/eredu-conditional-qwen-observed-logits-correction.patch": "72f643c014da4f4556c6098cd0a8329858fcae20c02ace8b6f7e6fd07245caa8",
+      "/private/tmp/eredu-conditional-qwen-observed-logits-review.md": "88bdc2808ca68ecee9a38d5598e6ec155e7471a5d0835b7af0fa94f1ac676713",
+      "/private/tmp/eredu-conditional-qwen-observed-logits-root-review.json": "3ebe0dabbd7942550bb6539cea113f87cfceb90a033cefcddd6ee72a0f1ef311",
+      "/private/tmp/eredu-full-observed-logits-review.md": "1846d7588f2ce36e2df03214b113b217811fd20a1e8a07d16d9605827a0e3945",
+      "/private/tmp/eredu-mrope-bound-expert-fixture-stage/FROZEN.json": "ebc461b2913919bf6a9a843708fa8ba13dbeb028018ebc586ac6e056546299af",
+      "/private/tmp/eredu-mrope-bound-expert-fixture-stage/README.md": "841fb8b3d6db9e6550262c0c5af4b8cd9c786f058762e0c5a00f89f0bd3b5e27",
+      "/private/tmp/eredu-mrope-bound-expert-fixture-stage/TEST-COMMANDS.md": "0eb911107c159ecbee058aaa9cc41d1b4e8cbb18bf85647097cee8935022f3ce",
+      "/private/tmp/eredu-mrope-bound-expert-fixture-stage/change.patch": "4ec9c5d5a69dc2eacbaf2045713189fcddcea2dfc4bb830cc084c46f3943981c",
+      "/private/tmp/eredu-mrope-bound-expert-fixture-stage/checks.json": "d348b7ae4069b3cffdeafa5950845b52c36e229ecc464a37186ea8ef7ecbf2da",
+      "/private/tmp/eredu-mrope-bound-expert-fixture-stage/dependencies.json": "7c0d48b8ddbca55d369d9339961f0ab2132f056a6607bd4f3c43e7d0966aa171",
+      "/private/tmp/eredu-mrope-bound-expert-fixture-stage/freeze.py": "4537caccb814347bc61748a483a7c7301dde2349e4960e568de368e8c1886b5f",
+      "/private/tmp/eredu-mrope-bound-expert-fixture-stage/manifest.json": "999606c8295cc347bd0f31653ad9f4e1b2c4678dcb8bea9099ac580f6bfdf8d1",
+      "/private/tmp/eredu-queued-bound-expert-fixture-audit.md": "3cc348a73449a23a3a169153a2218e54c7cb1b8a2296dafad4263822f8374468",
+      "/private/tmp/eredu-queued-bound-expert-fixture-review.md": "46cba00c1160a7a8104bdaa3851ca8d10d0a69e18b2c02c471fe483cee9f1c64",
+      "/private/tmp/eredu-qwen-causal-integration-root-review.json": "a0c5ae1a0cda530e79419aa7bc474a50358bc594e5a78157f2d16c5f5743ed98",
+      "/private/tmp/eredu-qwen-hybrid-width-one-integrated-review.json": "cbb410f7eb94baf55f0da2e5187de20ffc4edbd4cc2e2ebed19563d5002d911b",
+      "/private/tmp/eredu-qwen-hybrid-width-one-integrated-stage/all.patch": "e4e39a3062b0aea65fd083a1d76c2466df74233877c04706109583503e8041c4",
+      "/private/tmp/eredu-qwen-hybrid-width-one-integrated-stage/change.patch": "87329385db78d562dce09aed5946d12010b91633a3a1120d5b5329205605313e",
+      "/private/tmp/eredu-qwen-hybrid-width-one-integrated-stage/manifest.json": "fdecb9a68095fdfc3202bafa4a6f95b5f06292f7dcd1f061dce7ce40f99a7ad3",
+      "/private/tmp/eredu-qwen-hybrid-width-one-integrated-stage/staged-hashes.json": "fc85e96342f958c1302cd04274913438e2912205f8f9f9d89982848436c1fc9b",
+      "/private/tmp/eredu-qwen-hybrid-width-one-integrated-validation-config.json": "cbe649c44f758488a8ed4375344c31465365bcb859fbdb04c48efffbe25a6885",
+      "/private/tmp/eredu-qwen-hybrid-width-one-review.md": "8d6ee1813819f5ff2ade8127ca4722b7bcfe875acc4164334e4924c536bba389",
+      "/private/tmp/eredu-qwen-hybrid-width-one-root-review.json": "76a77fbbd48c9f18a492c6186d2b0bd67581ae633faedeccf57768a7cb5326a6",
+      "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-expert-binding-root-review.json": "ef9e1b372cf780e3dcfe0a942b9c6b4e4c4836f6f0d73866cbbe36df2953e744",
+      "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-review.json": "1655c5e88a0ee418e1c643b9bbb2352687d629e5a7c3d10790a0bdbda00c42fe",
+      "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-stage/all.patch": "cad408b42bb3a60446019d56d69618a47322b5629418f8dd32d02a26a97d4a23",
+      "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-stage/change.patch": "a0a2669be92766689b67ed26a671570decacfbaee3a570470b004e71d57a228f",
+      "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-stage/manifest.json": "d85e16d8c9cfb5d4f4016e557d4aee11557025ae9fa1377fd3a958a3da6ff8da",
+      "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-stage/staged-hashes.json": "09347e0fae3b4b3616d786907649e7e7c66b4bfdb908bfe7c1b668177a140c56",
+      "/private/tmp/eredu-qwen-mrope-zero-sections-integrated-validation-config.json": "7a6d79bf9c3dd880e1764809e362a9d6d8c4d0ca71ff55929c9747c975bf3d19",
+      "/private/tmp/eredu-qwen-mrope-zero-sections-review.md": "7fa32d3163a630448721331dab14ca48dda4dcb466c74105614d0a02711b65d5",
+      "/private/tmp/eredu-qwen-mrope-zero-sections-root-review.json": "5c6faa440764449b57b871f49118ff4c2cd009878bd94bca0e7f68309a9998c3",
+      "/private/tmp/eredu-qwen-unit-window-correction.patch": "9179dad6699d9cb6f72aa280e5d89706e2e094a699a8df2b594f3dfe601e843d",
+      "/private/tmp/eredu-qwen-unit-window-root-review.json": "496c30065800ed4c2c59f5f7bd876fccdfd910fa1963cce9238ae8d0a1e8616f",
+      "/private/tmp/eredu-qwen-width-one-unit-window-review.md": "440603f737bea04a0d8de940cbc9b85bc9085268806177dcbfb5c507027175d3"
+    },
+    "source_manifest_sha256": "7780b9fa479fd615b4bf35e6b26683eb5cbe3f46793a288c37b8f76e59075c41",
+    "status": "Constituent root/independent source reviews and combined exact replay complete; integrated tests pending",
+    "unit_window_formatting": "Root applied the independently reviewed unique expression change and scoped rustfmt; original assertion text unchanged. Root final source is1589c10ead35fd62e0adc8a6743d3111358965c270e3a9595747b913b2c3ed29."
+  },
+  "behavior": [
+    "Shared architecture geometry omits only zero-history Convolution, preserving Float32 Recurrent/local geometry/residency and wider typed errors.",
+    "Nonzero actual raw parameters precede paths/state. Existing18 direct hooks and complete intermediate state compare cached2+5 full vs2/1/2 and3decodes.",
+    "Selected Fixed and both mixed schedules across all3residencies preserve source/readout identity and body demands; original eligibility unchanged.",
+    "Actual direct/conditional target-draft-target tests preserve target state while one full-attention MTP lane advances.",
+    "DirectTP2 and prepared conditional21worlds72ranks across resident/host/disk compare actual local full-vs-chunk state.",
+    "RoundRobinSections alone admits even zero widths with a positive checked total. Otherlayouts retainpositiveper-axisvalidation.",
+    "Qwen HF/GGUF/scalar/tensor boundaries use checked section sums; tensorentry rejects invalidheadgeometry. Native equations unchanged.",
+    "Independent explicit coordinate selectors, scalar/tensor parity and badgeometryrejects coverfirst/multiple/exhaustedzeroaxes.",
+    "Actualprepared dense/routedVL sevenlayouts comparecompleteKV/fixedPositionDelta state ateverycachedfrontier and3decodes.",
+    "Cold same-width allocation and host bounds remainexact; native signed/unsigned/strided32casescheckvaluesandmeasuredpeak againstexistingallowance.",
+    "Loaded reference contexts explicitly refresh their bound packed expert views; cold contexts and expected values/state/tolerances are unchanged.",
+    "Both conditional owners enumerate actual group1 target unit paths through the shared ordinary causal helper.",
+    "Sixteen equation configurations compare eighteen real callbacks and complete state after cached prefix, uneven continuation and three decodes. Body hooks remain available with selective readout.",
+    "Exact cold source/plan/runtime identity, invalidation, cached origins and physical readout demand reject before callbacks or mutation; 864 declaration/transform bindings retain physical read counts.",
+    "Forty-eight prepared worlds and 168 rank trials compare actual component-mapped rows and topology-local state through TP2, PP2, combined TP/PP and routed EP under resident/host/disk.",
+    "Ordinary VL PositionDelta is Int32 zero; shared width-one and zero-section corrections are preserved. Existing MTP hook availability remains unchanged.",
+    "Partition callbacks compare full observed model.logits after agreed Sequence demand; the separately asserted public return selects its last row afterward. Root corrected a stale test-only special slice, preserving all source/state/numerical assertions.",
+    "Loaded reference contexts explicitly refresh their bound packed expert views; cold contexts and expected values/state/tolerances are unchanged.",
+    "Width-one parallel fixture moves the actual resident Vec<Unit> directly into ResidentUnitWindow; no invalid nested-unit flattening or numerical/assertion change."
+  ],
+  "limits": [
+    "Selected intermediate comparisons prove frontier/nonzero; complete cross-run equality at prefix/final/decodes.",
+    "Prepared partitions compare within topology, not a new global shard oracle. Existing scoped worker transport timeout retained.",
+    "No new conditional row declaration, media, released-checkpoint, native distributed, managed gateway or full-process bound.",
+    "Neutral fixturedoesnotaddconditionalcausaldeclaration, media, parallelpreparedproof, nativeactivation orprocessmemoryguarantee.",
+    "No newlydownloadedreleasedcheckpoint; existingprimaryauditexcerpts supportconfigsemantics, notfullupstreamsourcehashes.",
+    "Initial prefix is population checked; continuation frontiers provide cross-run full-state equality.",
+    "Fixtures use unwindowed attention; no exhaustive rotary/window claim.",
+    "No native managed capture, media/proposal declaration, released-checkpoint or native distributed result is introduced."
+  ]
+}

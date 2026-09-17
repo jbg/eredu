@@ -16,63 +16,55 @@ pub enum PositionPart<'a> {
     Media(&'a [(i32, i32, i32)]),
 }
 
-/// Constructs three position axes and the persisted decode-time delta.
+mod kernel;
+pub(crate) use kernel::{
+    emit_positions, validate_positions, GridRows, PositionComponent, PositionDestination,
+};
+
+/// Constructs three position axes and the persisted decode-time delta. The
+/// shared count pass rejects every overflow before any destination allocation.
 pub fn multimodal_position_ids(
     parts: &[PositionPart<'_>],
     merge: i32,
     expected: i32,
 ) -> Result<([Vec<i32>; 3], i32), String> {
-    if parts.is_empty() || merge <= 0 || expected <= 0 {
-        return Err("multimodal positions require parts and positive geometry".into());
-    }
-    let mut positions = [Vec::new(), Vec::new(), Vec::new()];
-    let mut current = 0i32;
-    for part in parts {
-        match part {
-            PositionPart::Text(length) if *length > 0 => {
-                for position in current..current + *length {
-                    for axis in &mut positions {
-                        axis.push(position);
-                    }
-                }
-                current = current.checked_add(*length).ok_or("position overflow")?;
-            }
-            PositionPart::Media(grid) if !grid.is_empty() => {
-                for &(time, height, width) in *grid {
-                    if time <= 0
-                        || height <= 0
-                        || width <= 0
-                        || height % merge != 0
-                        || width % merge != 0
-                    {
-                        return Err("invalid merged media grid".into());
-                    }
-                    let (height, width) = (height / merge, width / merge);
-                    for temporal in 0..time {
-                        for y in 0..height {
-                            for x in 0..width {
-                                positions[0].push(current + temporal);
-                                positions[1].push(current + y);
-                                positions[2].push(current + x);
-                            }
-                        }
-                    }
-                    current = current
-                        .checked_add(height.max(width))
-                        .ok_or("position overflow")?;
-                }
-            }
-            _ => return Err("empty or invalid position part".into()),
-        }
-    }
-    if positions[0].len() != expected as usize {
-        return Err(format!(
-            "position metadata describes {} tokens, expected {expected}",
-            positions[0].len()
-        ));
-    }
-    let maximum = positions.iter().flatten().copied().max().unwrap_or(0);
-    Ok((positions, maximum + 1 - expected))
+    positions_with_destination(parts, merge, expected, |count| Ok(vec![0; count]), |message| message.to_string())
+}
+
+pub(crate) fn multimodal_position_ids_with_metadata(
+    parts: &[PositionPart<'_>], merge: i32, expected: i32,
+    context: Option<&eredu_nn::workspace::WorkspaceContext>,
+) -> Result<([Vec<i32>; 3], i32), Error> {
+    let metadata = crate::decoder::identity::Metadata::new(context);
+    metadata.controls::<([Vec<i32>; 3], PositionDestination<'_>, PositionComponent<'_>, i32)>()?;
+    positions_with_destination(parts, merge, expected, |count| {
+        let mut values = metadata.vector(count)?;
+        values.resize(count, 0);
+        Ok(values)
+    }, |message| metadata.error(message))
+}
+
+fn positions_with_destination<E>(
+    parts: &[PositionPart<'_>], merge: i32, expected: i32,
+    vector: impl Fn(usize) -> Result<Vec<i32>, E>,
+    error: impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<([Vec<i32>; 3], i32), E> {
+    let source = parts.iter().map(|part| {
+        Ok(match part {
+            PositionPart::Text(length) => PositionComponent::Text(i64::from(*length)),
+            PositionPart::Media(rows) => PositionComponent::Media(GridRows::Tuples(rows)),
+        })
+    });
+    let count = usize::try_from(expected)
+        .map_err(|_| error(format_args!("multimodal positions require positive geometry")))?;
+    validate_positions(source.clone(), merge, count).map_err(|cause| error(format_args!("{cause}")))?;
+    let mut positions = [vector(count)?, vector(count)?, vector(count)?];
+    let [first, second, third] = &mut positions;
+    let delta = emit_positions(
+        source, merge, count,
+        PositionDestination { axes: [first, second, third], prefix: None },
+    ).map_err(|cause| error(format_args!("{cause}")))?;
+    Ok((positions, delta))
 }
 
 /// Scalar reference for Qwen section-interleaved mRoPE cosine/sine values.
@@ -89,7 +81,10 @@ pub fn mrope_values(
         || theta <= 0.0
         || position_ids.iter().any(|axis| axis.len() != length)
         || sections.iter().any(|v| *v < 0)
-        || sections.iter().sum::<i32>() != head_dim / 2
+        || sections
+            .iter()
+            .try_fold(0_i32, |sum, section| sum.checked_add(*section))
+            != Some(head_dim / 2)
     {
         return Err("invalid mRoPE geometry".into());
     }
@@ -110,9 +105,9 @@ pub fn mrope_values(
             .iter()
             .enumerate()
             .map(|(index, inv)| {
-                let axis = if index % 3 == 1 && index < (sections[1] * 3) as usize {
+                let axis = if index % 3 == 1 && index < sections[1] as usize * 3 {
                     1
-                } else if index % 3 == 2 && index < (sections[2] * 3) as usize {
+                } else if index % 3 == 2 && index < sections[2] as usize * 3 {
                     2
                 } else {
                     0
@@ -133,13 +128,24 @@ pub fn position_ids_tensor<T: Tensor>(
     position_ids: &[Vec<i32>; 3],
     context: &T::Context,
 ) -> Result<T, Error> {
+    position_ids_tensor_with_metadata(std::array::from_fn(|axis| position_ids[axis].as_slice()), context, None)
+}
+
+pub(crate) fn position_ids_tensor_with_metadata<T: Tensor>(
+    position_ids: [&[i32]; 3],
+    context: &T::Context,
+    metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+) -> Result<T, Error> {
+    let metadata = crate::decoder::identity::Metadata::new(metadata);
+    metadata.controls::<(T, Vec<i32>, [&[i32]; 3], [i32; 2])>()?;
     let length = position_ids[0].len();
     if position_ids.iter().any(|axis| axis.len() != length) {
-        return Err(Error::backend("mRoPE position axes have different lengths"));
+        return Err(metadata.error(format_args!("mRoPE position axes have different lengths")));
     }
-    let values = (0..length)
-        .flat_map(|token| position_ids.iter().map(move |axis| axis[token]))
-        .collect::<Vec<_>>();
+    let count = length.checked_mul(3)
+        .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+    let mut values = metadata.vector(count)?;
+    values.extend((0..length).flat_map(|token| position_ids.iter().map(move |axis| axis[token])));
     T::from_i32_slice(&values, &[length as i32, 3], context)
 }
 
@@ -151,26 +157,43 @@ pub fn mrope_embeddings<T: Tensor>(
     sections: &[i32; 3],
     context: &T::Context,
 ) -> Result<(T, T), Error> {
-    if sections.iter().any(|section| *section <= 0) || sections.iter().sum::<i32>() != head_dim / 2
+    mrope_embeddings_with_metadata(position_ids, head_dim, theta, sections, context, None)
+}
+
+pub(crate) fn mrope_embeddings_with_metadata<T: Tensor>(
+    position_ids: &T,
+    head_dim: i32,
+    theta: f32,
+    sections: &[i32; 3],
+    context: &T::Context,
+    metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+) -> Result<(T, T), Error> {
+    let metadata = crate::decoder::identity::Metadata::new(metadata);
+    metadata.controls::<((T, T), MultiAxisRotarySpec, Vec<RotaryAxisSpec>)>()?;
+    if head_dim <= 0
+        || head_dim % 2 != 0
+        || sections.iter().any(|section| *section < 0)
+        || sections.iter().try_fold(0_i32, |sum, section| sum.checked_add(*section)) != Some(head_dim / 2)
     {
-        return Err(Error::backend("invalid section-interleaved mRoPE geometry"));
+        return Err(metadata.error(format_args!("invalid section-interleaved mRoPE geometry")));
     }
-    multi_axis_rotary_embeddings(
-        position_ids,
-        &MultiAxisRotarySpec {
-            axes: sections
-                .iter()
-                .map(|section| RotaryAxisSpec {
-                    dimensions: section * 2,
-                    position_offset: 0,
-                })
-                .collect(),
-            base: theta,
-            minimum_position: 0,
-            layout: MultiAxisRotaryLayout::RoundRobinSections,
-        },
-        context,
-    )
+    let mut axes = metadata.vector(sections.len())?;
+    axes.extend(sections.iter().map(|section| RotaryAxisSpec {
+        dimensions: section * 2,
+        position_offset: 0,
+    }));
+    let spec = MultiAxisRotarySpec {
+        axes,
+        base: theta,
+        minimum_position: 0,
+        layout: MultiAxisRotaryLayout::RoundRobinSections,
+    };
+    match metadata.context() {
+        Some(metadata) => eredu_nn::multimodal::multi_axis_rotary_embeddings_with_metadata(
+            position_ids, &spec, context, metadata,
+        ),
+        None => multi_axis_rotary_embeddings(position_ids, &spec, context),
+    }
 }
 
 #[cfg(test)]
@@ -244,5 +267,30 @@ mod tests {
             .iter()
             .zip(actual.1)
             .all(|(a, b)| (a - b).abs() < 1e-6));
+    }
+
+    #[test]
+    fn qwen_scalar_zero_sections_keep_the_temporal_fallback() {
+        let ids = [vec![2], vec![5], vec![9]];
+        for (sections, selected) in [
+            ([4, 0, 0], [0, 0, 0, 0]),
+            ([0, 4, 0], [0, 1, 0, 0]),
+            ([0, 0, 4], [0, 0, 2, 0]),
+            ([0, 2, 2], [0, 1, 2, 0]),
+            ([2, 0, 2], [0, 0, 2, 0]),
+            ([2, 2, 0], [0, 1, 0, 0]),
+        ] {
+            let (cos, sin) = mrope_values(&ids, 8, 100., &sections).unwrap();
+            for i in 0..4 {
+                let angle = f64::from(ids[selected[i]][0]) / 100_f64.powf(i as f64 / 4.);
+                for j in [i, i + 4] {
+                    assert!((f64::from(cos[j]) - angle.cos()).abs() < 2e-6);
+                    assert!((f64::from(sin[j]) - angle.sin()).abs() < 2e-6);
+                }
+            }
+        }
+        for sections in [[0, 0, 0], [-1, 2, 3], [1, 1, 1], [i32::MAX, i32::MAX, 2]] {
+            assert!(mrope_values(&ids, 8, 100., &sections).is_err());
+        }
     }
 }

@@ -2,14 +2,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::rotary::RopeValue;
+use crate::{rotary::RopeValue, decoder::identity::Metadata};
 use eredu_checkpoint::{LinearFormat, WeightQuantization};
 use eredu_nn::{
     multimodal::{
-        multi_axis_rotary_embeddings, MultiAxisRotaryLayout, MultiAxisRotarySpec, RotaryAxisSpec,
+        multi_axis_rotary_embeddings, multi_axis_rotary_embeddings_with_metadata, MultiAxisRotaryLayout, MultiAxisRotarySpec, RotaryAxisSpec,
     },
     Error, Index, LinearOperator, LinearSpec, NeuralBackend, NormalizationConstructionSpec,
-    NormalizationOperator, Parameter, ParameterSpec, Parameterized, Tensor,
+    NormalizationOperator, Parameter, Parameterized, Tensor,
 };
 use serde::Deserialize;
 
@@ -187,7 +187,9 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ClippedLinear<B> {
         output: i32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let weight_name = format!("{prefix}.linear.weight");
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &<B::Tensor as Tensor>::Context, LinearFormat)>()?;
+        let weight_name = metadata.text(format_args!("{prefix}.linear.weight"))?;
         Self::from_format(
             prefix,
             input,
@@ -205,20 +207,23 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> ClippedLinear<B> {
         format: LinearFormat,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &<B::Tensor as Tensor>::Context, LinearSpec, Parameter<B::Tensor>, LinearFormat)>()?;
         let parameter = |suffix: &str| {
             let spec =
-                ParameterSpec::trainable(format!("{prefix}.{suffix}")).map_err(Error::backend)?;
+                metadata.named_parameter(format_args!("{prefix}.{suffix}"))?;
             Parameter::unloaded(spec, &[], context)
         };
-        let weight_name = format!("{prefix}.linear.weight");
+        metadata.borrowed_controls(&parameter)?;
+        let weight_name = metadata.text(format_args!("{prefix}.linear.weight"))?;
         Ok(Self {
             linear: B::linear(
                 LinearSpec {
                     input,
                     output,
-                    weight: ParameterSpec::trainable(&weight_name).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(&weight_name)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(&weight_name, format)?,
+                    format: metadata.format(&weight_name, format)?,
                 },
                 context,
             )?,
@@ -273,26 +278,28 @@ pub struct PatchEmbedder<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> 
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbedder<B> {
     fn new(config: &VisionConfig, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, LinearSpec, [i32; 3], eredu_checkpoint::LinearFormat)>()?;
+        let input = config.patch_size.checked_mul(config.patch_size)
+            .and_then(|area| area.checked_mul(3))
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
         let weight = "model.vision_tower.patch_embedder.input_proj.weight";
         Ok(Self {
             input_projection: B::linear(
                 LinearSpec {
-                    input: 3 * config.patch_size * config.patch_size,
+                    input: input,
                     output: config.hidden_size,
-                    weight: ParameterSpec::trainable(weight).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(weight)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
+                    format: metadata.format(
                         weight,
-                        config.linear_format_for(weight, 3 * config.patch_size * config.patch_size),
+                        config.linear_format_for(weight, input),
                     )?,
                 },
                 context,
             )?,
             position_table: Parameter::unloaded(
-                ParameterSpec::trainable(
-                    "model.vision_tower.patch_embedder.position_embedding_table",
-                )
-                .map_err(Error::backend)?,
+                metadata.plain_parameter("model.vision_tower.patch_embedder.position_embedding_table")?,
                 &[2, config.position_embedding_size, config.hidden_size],
                 context,
             )?,
@@ -335,11 +342,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> PatchEmbedder<B> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 struct VisionAttention<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     query_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     key_value_heads: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     head_dim: i32,
     query: ClippedLinear<B>,
     key: ClippedLinear<B>,
@@ -355,47 +362,53 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("model.vision_tower.encoder.layers.{layer}.self_attn");
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &<B::Tensor as Tensor>::Context, NormalizationConstructionSpec, i32, i32)>()?;
+        let query_width = config.num_attention_heads.checked_mul(config.head_dim)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+        let key_value_width = config.num_key_value_heads.checked_mul(config.head_dim)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+        let prefix = metadata.text(format_args!("model.vision_tower.encoder.layers.{layer}.self_attn"))?;
         let norm = |field: &str| {
             B::normalization(
                 NormalizationConstructionSpec::learned(
                     config.head_dim,
                     config.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
+                    metadata.named_parameter(format_args!("{prefix}.{field}.weight"))?,
                 ),
                 context,
             )
         };
+        metadata.borrowed_controls(&norm)?;
         Ok(Self {
             query_heads: config.num_attention_heads,
             key_value_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
             query: ClippedLinear::new(
                 config,
-                &format!("{prefix}.q_proj"),
+                &metadata.text(format_args!("{prefix}.q_proj"))?,
                 config.hidden_size,
-                config.num_attention_heads * config.head_dim,
+                query_width,
                 context,
             )?,
             key: ClippedLinear::new(
                 config,
-                &format!("{prefix}.k_proj"),
+                &metadata.text(format_args!("{prefix}.k_proj"))?,
                 config.hidden_size,
-                config.num_key_value_heads * config.head_dim,
+                key_value_width,
                 context,
             )?,
             value: ClippedLinear::new(
                 config,
-                &format!("{prefix}.v_proj"),
+                &metadata.text(format_args!("{prefix}.v_proj"))?,
                 config.hidden_size,
-                config.num_key_value_heads * config.head_dim,
+                key_value_width,
                 context,
             )?,
             output: ClippedLinear::new(
                 config,
-                &format!("{prefix}.o_proj"),
-                config.num_attention_heads * config.head_dim,
+                &metadata.text(format_args!("{prefix}.o_proj"))?,
+                query_width,
                 config.hidden_size,
                 context,
             )?,
@@ -412,6 +425,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
         sine: &B::Tensor,
         epsilon: f32,
         context: &<B::Tensor as Tensor>::Context,
+        metadata: Metadata<'_>,
     ) -> Result<B::Tensor, Error> {
         let batch = hidden.dim(0);
         let sequence = hidden.dim(1);
@@ -437,9 +451,9 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionAttention<B> {
             epsilon,
             context,
         )?;
-        let query = apply_two_axis_rotary(&query, cosine, sine, context)?
+        let query = apply_two_axis_rotary(&query, cosine, sine, context, metadata)?
             .transpose_axes(&[0, 2, 1, 3], context)?;
-        let key = apply_two_axis_rotary(&key, cosine, sine, context)?
+        let key = apply_two_axis_rotary(&key, cosine, sine, context, metadata)?
             .transpose_axes(&[0, 2, 1, 3], context)?;
         let value = value.transpose_axes(&[0, 2, 1, 3], context)?;
         let output = B::attention(query, key, value, 1.0, Some(key_mask), context)?
@@ -463,25 +477,27 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionMlp<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("model.vision_tower.encoder.layers.{layer}.mlp");
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &<B::Tensor as Tensor>::Context)>()?;
+        let prefix = metadata.text(format_args!("model.vision_tower.encoder.layers.{layer}.mlp"))?;
         Ok(Self {
             gate: ClippedLinear::new(
                 config,
-                &format!("{prefix}.gate_proj"),
+                &metadata.text(format_args!("{prefix}.gate_proj"))?,
                 config.hidden_size,
                 config.intermediate_size,
                 context,
             )?,
             up: ClippedLinear::new(
                 config,
-                &format!("{prefix}.up_proj"),
+                &metadata.text(format_args!("{prefix}.up_proj"))?,
                 config.hidden_size,
                 config.intermediate_size,
                 context,
             )?,
             down: ClippedLinear::new(
                 config,
-                &format!("{prefix}.down_proj"),
+                &metadata.text(format_args!("{prefix}.down_proj"))?,
                 config.intermediate_size,
                 config.hidden_size,
                 context,
@@ -519,18 +535,20 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionLayer<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("model.vision_tower.encoder.layers.{layer}");
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &<B::Tensor as Tensor>::Context, NormalizationConstructionSpec)>()?;
+        let prefix = metadata.text(format_args!("model.vision_tower.encoder.layers.{layer}"))?;
         let norm = |field: &str| {
             B::normalization(
                 NormalizationConstructionSpec::learned(
                     config.hidden_size,
                     config.rms_norm_eps,
-                    ParameterSpec::trainable(format!("{prefix}.{field}.weight"))
-                        .map_err(Error::backend)?,
+                    metadata.named_parameter(format_args!("{prefix}.{field}.weight"))?,
                 ),
                 context,
             )
         };
+        metadata.borrowed_controls(&norm)?;
         Ok(Self {
             attention: VisionAttention::new(config, layer, context)?,
             mlp: VisionMlp::new(config, layer, context)?,
@@ -551,13 +569,28 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionLayer<B> {
         epsilon: f32,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.forward_with_metadata(hidden, key_mask, cosine, sine, epsilon, context, Metadata::new(B::construction_metadata(context)))
+    }
+
+    pub(super) fn forward_with_metadata(
+        &mut self,
+        hidden: &B::Tensor,
+        key_mask: &B::Tensor,
+        cosine: &B::Tensor,
+        sine: &B::Tensor,
+        epsilon: f32,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: Metadata<'_>,
+    ) -> Result<B::Tensor, Error> {
+        super::model::forward::with_metadata(metadata, || {
+        metadata.controls::<(&Self, &B::Tensor, B::Tensor, B::Tensor, B::Tensor)>()?;
         let attention = self.attention.forward(
             &self.input_norm.forward(hidden, context)?,
             key_mask,
             cosine,
             sine,
             epsilon,
-            context,
+            context, metadata,
         )?;
         let hidden = hidden.add(
             &self.post_attention_norm.forward(&attention, context)?,
@@ -573,6 +606,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionLayer<B> {
                 .forward(&feed_forward, context)?,
             context,
         )
+
+        })
     }
 }
 
@@ -582,7 +617,7 @@ pub struct VisionState<T> {
     key_mask: T,
     cosine: T,
     sine: T,
-    grid_extents: Vec<(i32, i32)>,
+    grid_extents: crate::replicated_text::SharedCompositeConfig<Vec<(i32, i32)>>,
 }
 
 impl<T> VisionState<T> {
@@ -596,11 +631,11 @@ impl<T> VisionState<T> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct VisionStatic<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
-    config: VisionConfig,
     patch_embedder: PatchEmbedder<B>,
     standardization_bias: Option<Parameter<B::Tensor>>,
     standardization_scale: Option<Parameter<B::Tensor>>,
+    #[parameter(skip, metadata)]
+    config: crate::replicated_text::SharedCompositeConfig<VisionConfig>,
 }
 
 impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
@@ -609,15 +644,32 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         config: VisionConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        if B::construction_metadata(context).is_some_and(|m| m.uses_checked_metadata()) {
+            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
+        }
         config.validate().map_err(Error::backend)?;
+        Self::from_source(crate::replicated_text::SharedCompositeConfig::new(
+            config, B::construction_metadata(context),
+        )?, context)
+    }
+
+    // The family constructor has validated this exact immutable child source.
+    pub(super) fn from_source(
+        config: crate::replicated_text::SharedCompositeConfig<VisionConfig>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, PatchEmbedder<B>, Option<Parameter<B::Tensor>>,
+            Option<Parameter<B::Tensor>>, crate::replicated_text::SharedCompositeConfig<VisionConfig>)>()?;
         let patch_embedder = PatchEmbedder::new(&config, context)?;
         let parameter = |name: &str| {
             Parameter::unloaded(
-                ParameterSpec::trainable(name).map_err(Error::backend)?,
+                metadata.plain_parameter(name)?,
                 &[config.hidden_size],
                 context,
             )
         };
+        metadata.borrowed_controls(&parameter)?;
         let (standardization_bias, standardization_scale) = if config.standardize {
             (
                 Some(parameter("model.vision_tower.std_bias")?),
@@ -640,10 +692,23 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         input: VisionInput<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(B::Tensor, VisionState<B::Tensor>), Error> {
-        validate_input(&self.config, &input)?;
+        self.begin_with_metadata(input, context, Metadata::new(B::construction_metadata(context)))
+    }
+
+    pub(super) fn begin_with_metadata(
+        &mut self,
+        input: VisionInput<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: Metadata<'_>,
+    ) -> Result<(B::Tensor, VisionState<B::Tensor>), Error> {
+        super::model::forward::with_metadata(metadata, || {
+        metadata.controls::<(&Self, VisionInput<'_, B::Tensor>, B::Tensor, VisionState<B::Tensor>)>()?;
+        validate_input(&self.config, &input, metadata)?;
         let hidden = self.patch_embedder.forward(&input, context)?;
-        let state = self.prepare_state(input, context)?;
+        let state = self.prepare_state_with_metadata(input, context, metadata)?;
         Ok((hidden, state))
+
+        })
     }
 
     /// Constructs parameter-free rotary and mask state for a downstream
@@ -653,31 +718,39 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         input: VisionInput<'_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<VisionState<B::Tensor>, Error> {
-        validate_input(&self.config, &input)?;
-        let (cosine, sine) = multi_axis_rotary_embeddings(
-            input.position_ids,
-            &MultiAxisRotarySpec {
-                axes: vec![
-                    RotaryAxisSpec {
-                        dimensions: self.config.head_dim / 2,
-                        position_offset: 0,
-                    },
-                    RotaryAxisSpec {
-                        dimensions: self.config.head_dim / 2,
-                        position_offset: 0,
-                    },
-                ],
-                base: self.config.rope_theta(),
-                minimum_position: 0,
-                layout: MultiAxisRotaryLayout::IndependentAxes,
-            },
-            context,
-        )?;
+        self.prepare_state_with_metadata(input, context, Metadata::new(B::construction_metadata(context)))
+    }
+
+    pub(super) fn prepare_state_with_metadata(
+        &self,
+        input: VisionInput<'_, B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: Metadata<'_>,
+    ) -> Result<VisionState<B::Tensor>, Error> {
+        super::model::forward::with_metadata(metadata, || {
+        metadata.controls::<(&Self, VisionInput<'_, B::Tensor>, VisionState<B::Tensor>, MultiAxisRotarySpec, Vec<RotaryAxisSpec>, Vec<(i32,i32)>)>()?;
+        validate_input(&self.config, &input, metadata)?;
+        let mut axes = metadata.vector(2)?;
+        axes.push(RotaryAxisSpec { dimensions: self.config.head_dim / 2, position_offset: 0 });
+        axes.push(RotaryAxisSpec { dimensions: self.config.head_dim / 2, position_offset: 0 });
+        let spec = MultiAxisRotarySpec {
+            axes, base: self.config.rope_theta(), minimum_position: 0,
+            layout: MultiAxisRotaryLayout::IndependentAxes,
+        };
+        let (cosine, sine) = match metadata.context() {
+            Some(source) => multi_axis_rotary_embeddings_with_metadata(input.position_ids, &spec, context, source),
+            None => multi_axis_rotary_embeddings(input.position_ids, &spec, context),
+        }?;
+        let mut grids = metadata.vector(input.grid_extents.len())?;
+        grids.extend_from_slice(input.grid_extents);
+        let grid_extents = crate::replicated_text::SharedCompositeConfig::new(grids, metadata.context())?;
         Ok(VisionState {
             key_mask: input.key_mask.clone(),
             cosine,
             sine,
-            grid_extents: input.grid_extents.to_vec(),
+            grid_extents,
+        })
+
         })
     }
 
@@ -689,14 +762,29 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         state: &VisionState<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
-        layer.forward(
+        self.forward_layer_with_metadata(layer, hidden, state, context, Metadata::new(B::construction_metadata(context)))
+    }
+
+    pub(super) fn forward_layer_with_metadata(
+        &self,
+        layer: &mut VisionLayer<B>,
+        hidden: &B::Tensor,
+        state: &VisionState<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: Metadata<'_>,
+    ) -> Result<B::Tensor, Error> {
+        super::model::forward::with_metadata(metadata, || {
+        metadata.controls::<(&Self, &VisionLayer<B>, &B::Tensor, &VisionState<B::Tensor>)>()?;
+        layer.forward_with_metadata(
             hidden,
             &state.key_mask,
             &state.cosine,
             &state.sine,
             self.config.rms_norm_eps,
-            context,
+            context, metadata,
         )
+
+        })
     }
 
     /// Pools spatial patches and applies optional learned standardization.
@@ -706,10 +794,22 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
         state: &VisionState<B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error> {
+        self.finish_with_metadata(hidden, state, context, Metadata::new(B::construction_metadata(context)))
+    }
+
+    pub(super) fn finish_with_metadata(
+        &self,
+        hidden: &B::Tensor,
+        state: &VisionState<B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: Metadata<'_>,
+    ) -> Result<B::Tensor, Error> {
+        super::model::forward::with_metadata(metadata, || {
+        metadata.controls::<(&Self, &B::Tensor, &VisionState<B::Tensor>, Vec<B::Tensor>, B::Tensor, [Index;3], [i32;6], [i32;3])>()?;
         let kernel = self.config.pooling_kernel_size;
-        let mut pooled = Vec::with_capacity(state.grid_extents.len());
+        let mut pooled = metadata.vector(state.grid_extents.len())?;
         for (batch, (height, width)) in state.grid_extents.iter().copied().enumerate() {
-            let real_patches = height * width;
+            let real_patches = height.checked_mul(width).ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
             let pooled_height = height / kernel;
             let pooled_width = width / kernel;
             let item = hidden
@@ -749,6 +849,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionStatic<B> {
                 .multiply(scale.as_ref(), context)?;
         }
         Ok(hidden)
+
+        })
     }
 }
 
@@ -768,9 +870,12 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionTower<B> {
         config: VisionConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let layers = (0..config.num_hidden_layers as usize)
-            .map(|layer| VisionLayer::new(&config, layer, context))
-            .collect::<Result<Vec<_>, _>>()?;
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &<B::Tensor as Tensor>::Context)>()?;
+        let count = usize::try_from(config.num_hidden_layers)
+            .map_err(|_| metadata.error(format_args!("invalid Gemma 4 vision layer count")))?;
+        let mut layers = metadata.vector(count)?;
+        for layer in 0..count { layers.push(VisionLayer::new(&config, layer, context)?); }
         Ok(Self {
             static_modules: VisionStatic::new(config, context)?,
             layers,
@@ -796,8 +901,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> VisionTower<B> {
 fn validate_input<T: Tensor>(
     config: &VisionConfig,
     input: &VisionInput<'_, T>,
+    metadata: Metadata<'_>,
 ) -> Result<(), Error> {
-    let patch_width = 3 * config.patch_size * config.patch_size;
+    metadata.controls::<(&VisionConfig, &VisionInput<'_,T>, i32)>()?;
+    let patch_width = config.patch_size.checked_mul(config.patch_size).and_then(|v|v.checked_mul(3))
+        .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
     if input.patches.shape().len() != 3
         || input.position_ids.shape() != [input.patches.dim(0), input.patches.dim(1), 2]
         || input.position_valid.shape() != [input.patches.dim(0), input.patches.dim(1), 1]
@@ -807,14 +915,14 @@ fn validate_input<T: Tensor>(
         || input.grid_extents.iter().any(|(height, width)| {
             *height <= 0
                 || *width <= 0
-                || *height * *width > input.patches.dim(1)
+                || height.checked_mul(*width).is_none_or(|n|n > input.patches.dim(1))
                 || *height % config.pooling_kernel_size != 0
                 || *width % config.pooling_kernel_size != 0
                 || *height > config.position_embedding_size
                 || *width > config.position_embedding_size
         })
     {
-        return Err(Error::backend("invalid Gemma 4 prepared vision geometry"));
+        return Err(metadata.error(format_args!("invalid Gemma 4 prepared vision geometry")));
     }
     Ok(())
 }
@@ -824,10 +932,12 @@ fn apply_two_axis_rotary<T: Tensor>(
     cosine: &T,
     sine: &T,
     context: &T::Context,
+    metadata: Metadata<'_>,
 ) -> Result<T, Error> {
+    metadata.controls::<(Vec<T>, T, T, T, T, T, T, [Index;4], [Index;3], [T;2])>()?;
     let half = input.dim(3) / 2;
     let quarter = half / 2;
-    let mut output = Vec::with_capacity(2);
+    let mut output = metadata.vector(2)?;
     for axis in 0..2 {
         let start = axis * half;
         let end = start + half;

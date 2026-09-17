@@ -54,14 +54,14 @@
 //! // a[:, :, 0]
 //! let mut s1 = a.index_device((.., .., 0), &stream);
 //!
-//! let expected = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
-//! assert_eq!(s1.evaluated().unwrap().as_slice::<i32>(), expected.evaluated().unwrap().as_slice::<i32>());
+//! let expected = Array::from_slice(&[0, 2, 4, 6], &[2, 2]);
+//! assert!(s1.evaluated().unwrap().equal_values(&expected.evaluated().unwrap()));
 //!
 //! // a[..., 0]
 //! let mut s2 = a.index_device((Ellipsis, 0), &stream);
 //!
-//! let expected = Array::from_slice(&[0, 1, 2, 3], &[2, 2]);
-//! assert_eq!(s2.evaluated().unwrap().as_slice::<i32>(), expected.evaluated().unwrap().as_slice::<i32>());
+//! let expected = Array::from_slice(&[0, 2, 4, 6], &[2, 2]);
+//! assert!(s2.evaluated().unwrap().equal_values(&expected.evaluated().unwrap()));
 //! ```
 //!
 //! # Set values with indexing
@@ -111,7 +111,9 @@ use crate::{
 };
 
 pub(crate) mod index_impl;
+pub use index_impl::inline_basic_index_control_bytes;
 pub(crate) mod indexmut_impl;
+pub use indexmut_impl::inline_scalar_index_update_control_bytes;
 
 /* -------------------------------------------------------------------------- */
 /*                                Custom types                                */
@@ -1061,10 +1063,11 @@ mod tests {
         let updates = Array::ones::<f32>(&[2, 1], stream).unwrap();
         let out = scatter_single(&input, &indices, &updates, 0, stream).unwrap();
         let expected = array!([1.0f32, 1.0, 0.0, 0.0]);
-        assert!(out
-            .all_close(&expected, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(&stream));
+        assert!(
+            out.all_close(&expected, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(&stream)
+        );
     }
 
     #[test]
@@ -1076,10 +1079,11 @@ mod tests {
         let updates = Array::ones::<f32>(&[3, 1], stream).unwrap();
         let out = scatter_add_single(&input, &indices, &updates, 0, stream).unwrap();
         let expected = array!([3.0f32, 1.0, 1.0, 2.0]);
-        assert!(out
-            .all_close(&expected, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(&stream));
+        assert!(
+            out.all_close(&expected, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(&stream)
+        );
     }
 
     #[test]
@@ -1090,10 +1094,11 @@ mod tests {
         let updates = Array::ones::<f32>(&[3], stream).unwrap();
         let out = scatter_add(&input, &indices, &updates, 0, stream).unwrap();
         let expected = array!([3.0f32, 1.0, 1.0, 2.0]);
-        assert!(out
-            .all_close(&expected, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(&stream));
+        assert!(
+            out.all_close(&expected, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(&stream)
+        );
         assert_eq!(out.dtype(), input.dtype());
     }
 
@@ -1106,10 +1111,11 @@ mod tests {
         let updates = reshape(array!([4.0f32, 5.0, 6.0]), &[3, 1, 1], stream).unwrap();
         let out = scatter_nd(&input, &[&rows, &cols], &updates, &[0, 1], stream).unwrap();
         let expected = array!([[0.0f32, 0.0, 4.0], [5.0, 0.0, 6.0]]);
-        assert!(out
-            .all_close(&expected, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(&stream));
+        assert!(
+            out.all_close(&expected, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(&stream)
+        );
     }
 
     #[test]
@@ -1121,10 +1127,11 @@ mod tests {
         let updates = reshape(array!([4.0f32, 5.0, 6.0, 7.0]), &[4, 1, 1], stream).unwrap();
         let out = scatter_add_nd(&input, &[&rows, &cols], &updates, &[0, 1], stream).unwrap();
         let expected = array!([[0.0f32, 0.0, 4.0], [5.0, 0.0, 13.0]]);
-        assert!(out
-            .all_close(&expected, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(&stream));
+        assert!(
+            out.all_close(&expected, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(&stream)
+        );
     }
 
     #[test]
@@ -1136,10 +1143,11 @@ mod tests {
         let updates = reshape(array!([1.0f32, 6.0, -2.0]), &[3, 1], stream).unwrap();
         let out = scatter_max_single(&input, &indices, &updates, 0, stream).unwrap();
         let expected = array!([6.0f32, 1.0, 1.0, 1.0]);
-        assert!(out
-            .all_close(&expected, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(&stream));
+        assert!(
+            out.all_close(&expected, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(&stream)
+        );
     }
 
     #[test]
@@ -1151,10 +1159,11 @@ mod tests {
         let updates = reshape(array!([1.0f32, -6.0, 2.0]), &[3, 1], stream).unwrap();
         let out = scatter_min_single(&input, &indices, &updates, 0, stream).unwrap();
         let expected = array!([-6.0f32, 1.0, 1.0, 1.0]);
-        assert!(out
-            .all_close(&expected, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(&stream));
+        assert!(
+            out.all_close(&expected, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(&stream)
+        );
     }
 
     #[test]
@@ -1166,10 +1175,11 @@ mod tests {
         let updates = Array::full::<f32>(&[3, 1], array!(2.0f32), stream).unwrap();
         let out = scatter_prod_single(&input, &indices, &updates, 0, stream).unwrap();
         let expected = array!([4.0f32, 1.0, 1.0, 2.0]);
-        assert!(out
-            .all_close(&expected, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(&stream));
+        assert!(
+            out.all_close(&expected, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(&stream)
+        );
     }
 
     #[test]
@@ -1180,10 +1190,11 @@ mod tests {
         let indices = Array::from_slice(&[1u32, 3], &[2]);
         let out = gather_single(&input, &indices, 0, &[1], stream).unwrap();
         let expected = array!([[1.0f32], [3.0]]);
-        assert!(out
-            .all_close(&expected, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(&stream));
+        assert!(
+            out.all_close(&expected, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(&stream)
+        );
     }
 
     #[test]
@@ -1195,9 +1206,10 @@ mod tests {
         let src = Array::from_slice(&[10.0f32, 20.0], &[2]);
         let out = masked_scatter(&input, &mask, &src, stream).unwrap();
         let expected = array!([10.0f32, 2.0, 20.0, 4.0]);
-        assert!(out
-            .all_close(&expected, 1e-5, 1e-5, None, stream)
-            .unwrap()
-            .item::<bool>(&stream));
+        assert!(
+            out.all_close(&expected, 1e-5, 1e-5, None, stream)
+                .unwrap()
+                .item::<bool>(&stream)
+        );
     }
 }

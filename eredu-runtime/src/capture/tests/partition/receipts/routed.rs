@@ -632,3 +632,5 @@ fn empty_sparse_selection_requires_every_acknowledgment_without_fabricating_rout
     assert!(result.capture().contributions().is_empty());
     assert_eq!(result.producers().len(), 7);
 }
+
+mod funded;

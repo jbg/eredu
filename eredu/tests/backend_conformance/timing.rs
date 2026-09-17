@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 
 // Both public output aliases support the same consumer without mode-specific
 // forwarding methods or a second terminal-output representation.
-fn terminal<S>(output: GenerationOutput<S>) -> (Vec<u32>, FinishReason, Option<Duration>) {
+fn terminal<S, T: TerminalTokenStorage>(output: GenerationOutput<S, T>) -> (eredu_core::SpeculativeTokenIds, FinishReason, Option<Duration>) {
     let ttft = output.timing().time_to_first_token();
-    (output.token_ids, output.finish_reason, ttft)
+    (output.token_ids.into_terminal_tokens(), output.finish_reason, ttft)
 }
 
 fn chat(model: &mut LoadedModel<MockBackend>) -> PreparedChat {

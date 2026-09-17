@@ -6,7 +6,7 @@ for t in [
     ["mlx_array", "mlx::core::array", "array"],
     ["mlx_vector_int", "@std::vector<int>", "@std::vector<int>"],
     ["mlx_vector_string", "std::vector<std::string>", "std::vector<std::string>"],
-    ["mlx_vector_array", "std::vector<mlx::core::array>", "std::vector<array>"],
+    ["mlx_vector_array", "mlx::core::ArrayVector", "ArrayVector"],
     [
         "mlx_stream",
         "mlx::core::Stream",
@@ -38,27 +38,27 @@ for t in [
     ],
     [
         "mlx_closure",
-        "std::function<std::vector<array>(std::vector<array>)>",
+        "std::function<ArrayVector(ArrayVector)>",
     ],
     [
         "mlx_closure_value_and_grad",
-        "std::function<std::pair<std::vector<array>, std::vector<array>>(const std::vector<array>&)>",
+        "std::function<std::pair<ArrayVector, ArrayVector>(const ArrayVector&)>",
         "ValueAndGradFn",
     ],
     [
         "mlx_closure_custom",
-        "std::function<std::vector<mlx::core::array>(std::vector<mlx::core::array>,std::vector<mlx::core::array>,std::vector<mlx::core::array>)>",
-        "std::function<std::vector<array>(std::vector<array>,std::vector<array>,std::vector<array>)>",
+        "std::function<mlx::core::ArrayVector(mlx::core::ArrayVector,mlx::core::ArrayVector,mlx::core::ArrayVector)>",
+        "std::function<ArrayVector(ArrayVector,ArrayVector,ArrayVector)>",
     ],
     [
         "mlx_closure_custom_jvp",
-        "std::function<std::vector<mlx::core::array>(std::vector<mlx::core::array>,std::vector<mlx::core::array>,std::vector<int>)>",
-        "std::function<std::vector<array>(std::vector<array>,std::vector<array>,std::vector<int>)>",
+        "std::function<mlx::core::ArrayVector(mlx::core::ArrayVector,mlx::core::ArrayVector,std::vector<int>)>",
+        "std::function<ArrayVector(ArrayVector,ArrayVector,std::vector<int>)>",
     ],
     [
         "mlx_closure_custom_vmap",
-        "std::function<std::pair<std::vector<mlx::core::array>, std::vector<int>>(std::vector<mlx::core::array>,std::vector<int>)>",
-        "std::function<std::pair<std::vector<array>, std::vector<int>>(std::vector<array>,std::vector<int>)>",
+        "std::function<std::pair<mlx::core::ArrayVector, std::vector<int>>(mlx::core::ArrayVector,std::vector<int>)>",
+        "std::function<std::pair<ArrayVector, std::vector<int>>(ArrayVector,std::vector<int>)>",
     ],
 ]:
     if len(t) == 2:
@@ -360,9 +360,9 @@ def register_return_tuple_type(cpp_types, alts=[]):
 register_return_tuple_type(["mlx::core::array", "mlx::core::array"])
 register_return_tuple_type(["mlx::core::array", "mlx::core::array", "mlx::core::array"])
 register_return_tuple_type(
-    ["std::vector<mlx::core::array>", "std::vector<mlx::core::array>"]
+    ["mlx::core::ArrayVector", "mlx::core::ArrayVector"]
 )
-register_return_tuple_type(["std::vector<mlx::core::array>", "@std::vector<int>"])
+register_return_tuple_type(["mlx::core::ArrayVector", "@std::vector<int>"])
 register_return_tuple_type(
     [
         "std::unordered_map<std::string, mlx::core::array>",
@@ -613,13 +613,13 @@ def register_optional_type(cpptype):
 register_optional_type("mlx::core::array")
 register_optional_type("mlx::core::distributed::Group")
 register_optional_type(
-    "std::function<std::vector<mlx::core::array>(std::vector<mlx::core::array>,std::vector<mlx::core::array>,std::vector<mlx::core::array>)>"
+    "std::function<mlx::core::ArrayVector(mlx::core::ArrayVector,mlx::core::ArrayVector,mlx::core::ArrayVector)>"
 )
 register_optional_type(
-    "std::function<std::vector<mlx::core::array>(std::vector<mlx::core::array>,std::vector<mlx::core::array>,std::vector<int>)>"
+    "std::function<mlx::core::ArrayVector(mlx::core::ArrayVector,mlx::core::ArrayVector,std::vector<int>)>"
 )
 register_optional_type(
-    "std::function<std::pair<std::vector<mlx::core::array>, std::vector<int>>(std::vector<mlx::core::array>,std::vector<int>)>"
+    "std::function<std::pair<mlx::core::ArrayVector, std::vector<int>>(mlx::core::ArrayVector,std::vector<int>)>"
 )
 
 ctypes = {}

@@ -1,0 +1,493 @@
+diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
+--- a/mlx/distributed/distributed.cpp
++++ b/mlx/distributed/distributed.cpp
+@@ -219,6 +219,15 @@
+   group_->storage_inventory(out);
+   if (group_->terminal_owner_) out.unresolved |= group_inherited_owner;
+   return true;
++}
++
++size_t Group::worker_storage_inspection_controls() const noexcept {
++  return sizeof(void*) * 2 + sizeof(size_t) + (group_ ? group_->worker_storage_inspection_controls() : 0);
++}
++
++bool Group::worker_storage(GroupWorkerOperation operation, const array& input,
++    int peer, GroupWorkerStorage& out) const noexcept {
++  return group_ && group_->worker_storage(operation, input, peer, out);
+ }
+ 
+ bool Group::same_implementation(const Group& other) const noexcept {
+diff --git a/mlx/distributed/distributed.h b/mlx/distributed/distributed.h
+--- a/mlx/distributed/distributed.h
++++ b/mlx/distributed/distributed.h
+@@ -39,6 +39,15 @@
+   size_t socket_workers{0}, socket_map_buckets{0};
+ };
+ 
++// These partial worker destinations are not a whole-operation or communicator
++// bound. The CPU encoder/primitive/event and persistent transport owner remain
++// separate producers even when every worker field below is qualified.
++enum class GroupWorkerOperation : unsigned { sum, maximum, minimum, gather, send, recv };
++struct GroupWorkerStorage {
++  size_t pool_jobs{0}, socket_attempts{0}, destination_arrays{0};
++  size_t task_graph_extent{0}, destination_graph_extent{0}, controls{0};
++};
++
+ /* Check if a communication backend is available */
+ MLX_API bool is_available();
+ MLX_API bool is_available(const std::string& bk);
+@@ -60,6 +69,11 @@
+   // Read only, no rank/size query, initialization, lock, task, polling or error.
+   bool storage_inventory(GroupStorageInventory&) const noexcept;
+   bool same_implementation(const Group&) const noexcept;
++  // Reads this exact implementation and immutable input geometry only.
++  // False leaves out unchanged; unknown backend/ABI/operation is not zero fit.
++  size_t worker_storage_inspection_controls() const noexcept;
++  bool worker_storage(GroupWorkerOperation, const array&, int peer,
++                      GroupWorkerStorage& out) const noexcept;
+ 
+   int rank() const;
+   int size() const;
+diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
+--- a/mlx/distributed/distributed_impl.h
++++ b/mlx/distributed/distributed_impl.h
+@@ -29,6 +29,10 @@
+   virtual void storage_inventory(GroupStorageInventory& out) const noexcept {
+     out = GroupStorageInventory{};
+   }
++
++  virtual size_t worker_storage_inspection_controls() const noexcept { return 0; }
++  virtual bool worker_storage(GroupWorkerOperation, const array&, int,
++                              GroupWorkerStorage&) const noexcept { return false; }
+ 
+   // Choose the stream this communication group can operate on
+   virtual Stream communication_stream(StreamOrDevice s = {}) = 0;
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -25,6 +25,8 @@
+ #include "mlx/distributed/utils.h"
+ #include "mlx/distributed/ring/socket_tasks.h"
+ #include "mlx/distributed/ring/reduction_plan.h"
++#include "mlx/distributed/ring/worker_geometry.h"
++#include "mlx/distributed/ring/worker_storage.h"
+ #include "mlx/threadpool.h"
+ 
+ #ifndef SOL_TCP
+@@ -371,7 +373,110 @@
+ } // namespace
+ 
+ class RingGroup : public GroupImpl {
++  struct GatherJob {
++    RingGroup* owner;
++    const char* input;
++    char* output;
++    size_t input_size, data_size;
++    int right, left, direction;
++    submission::GraphQuota* graph;
++    void operator()() const { owner->all_gather_impl(input, output, input_size,
++        data_size, right, left, direction, graph); }
++  };
++  template<class T, class ReduceOp> struct ReduceJob {
++    RingGroup* owner;
++    T* buffer;
++    T* data;
++    size_t size;
++    int right, left, direction;
++    ReduceOp operation;
++    submission::GraphQuota* graph;
++    void operator()() const { owner->all_reduce_impl(buffer, data, size,
++        right, left, direction, operation, graph); }
++  };
++  const std::vector<int>* direct_sockets(GroupWorkerOperation operation, int peer) const noexcept {
++    if (size_ <= 0 || rank_ < 0 || rank_ >= size_) return nullptr;
++    const auto right = (rank_ + 1 == size_) ? 0 : rank_ + 1;
++    const auto left = rank_ == 0 ? size_ - 1 : rank_ - 1;
++    // The receive order intentionally differs when both neighbors are equal.
++    if (operation == GroupWorkerOperation::send) {
++      if (peer == right) return &sockets_right_;
++      if (peer == left) return &sockets_left_;
++    } else if (operation == GroupWorkerOperation::recv) {
++      if (peer == left) return &sockets_left_;
++      if (peer == right) return &sockets_right_;
++    }
++    return nullptr;
++  }
++  template<class T, class ReduceOp>
++  bool reduction_storage(size_t items, GroupWorkerStorage& out) const noexcept {
++    ReductionWorkers workers{};
++    if (!reduction_workers(items, sizeof(T), static_cast<size_t>(size_),
++          sockets_right_.size() + sockets_left_.size(), workers)) return false;
++    WorkerStorageCounter counter;
++    if (!workers.padded && (!counter.pool<ReduceJob<T, ReduceOp>>(workers.parts.jobs) ||
++        !counter.vector<std::future<void>>(workers.parts.jobs))) return false;
++    for (size_t i = 0; i != workers.parts.jobs; ++i) {
++      const auto range = workers.parts.range(i);
++      if (!counter.plan(range.second - range.first, static_cast<size_t>(size_), sizeof(T), ALL_SUM_SIZE)) return false;
++    }
++    return counter.finish(sizeof(ReductionWorkers) + sizeof(ReduceJob<T, ReduceOp>) +
++        sizeof(PoolFutures) + sizeof(SocketFuture) * 4 + sizeof(T*) * ALL_SUM_BUFFERS +
++        1024 + sizeof(size_t) * 16 + sizeof(int) * 5 + sizeof(bool) * 3, out);
++  }
++  template<class T> static constexpr size_t reduction_inspection_frames() noexcept {
++    return sizeof(ReduceJob<T, detail::SumOp<T>>) + sizeof(ReduceJob<T, detail::MaxOp<T>>) +
++        sizeof(ReduceJob<T, detail::MinOp<T>>);
++  }
+  public:
++  size_t worker_storage_inspection_controls() const noexcept override {
++    return sizeof(GroupWorkerStorage) * 2 + sizeof(WorkerStorageCounter) +
++        sizeof(ReductionWorkers) + sizeof(WorkerPartitions) + sizeof(DirectWorkers) +
++        sizeof(ReductionPlanLayout) * 2 + sizeof(SocketTaskLayout) * 2 +
++        sizeof(threadpool_detail::TaskLayout) * 2 + sizeof(GatherJob) +
++        reduction_inspection_frames<bool>() + reduction_inspection_frames<int8_t>() +
++        reduction_inspection_frames<int16_t>() + reduction_inspection_frames<int32_t>() +
++        reduction_inspection_frames<int64_t>() + reduction_inspection_frames<uint8_t>() +
++        reduction_inspection_frames<uint16_t>() + reduction_inspection_frames<uint32_t>() +
++        reduction_inspection_frames<uint64_t>() + reduction_inspection_frames<float16_t>() +
++        reduction_inspection_frames<bfloat16_t>() + reduction_inspection_frames<float>() +
++        reduction_inspection_frames<double>() + reduction_inspection_frames<complex64_t>() +
++        sizeof(size_t) * 32 + sizeof(void*) * 12 + sizeof(int) * 3 + sizeof(bool) * 8;
++  }
++  bool worker_storage(GroupWorkerOperation operation, const array& input, int peer,
++      GroupWorkerStorage& out) const noexcept override {
++    if (size_ <= 0 || rank_ < 0 || rank_ >= size_ || sockets_right_.empty() ||
++        sockets_right_.size() != sockets_left_.size() ||
++        sockets_right_.size() > std::numeric_limits<size_t>::max() / 2) return false;
++    if (operation == GroupWorkerOperation::gather) {
++      WorkerPartitions parts{};
++      WorkerStorageCounter counter;
++      const auto rounds = static_cast<size_t>(size_ - 1);
++      if (!gather_partitions(input.nbytes(), sockets_right_.size() + sockets_left_.size(), parts) ||
++          rounds > std::numeric_limits<size_t>::max() / 2 ||
++          (rounds && parts.jobs > std::numeric_limits<size_t>::max() / (2 * rounds)) ||
++          !counter.pool<GatherJob>(parts.jobs) || !counter.vector<std::future<void>>(parts.jobs) ||
++          !counter.sockets(2 * rounds * parts.jobs)) return false;
++      return counter.finish(sizeof(WorkerPartitions) + sizeof(GatherJob) + sizeof(PoolFutures) +
++          sizeof(SocketFuture) * 2 + sizeof(size_t) * 13 + sizeof(int) * 6, out);
++    }
++    if (operation == GroupWorkerOperation::send || operation == GroupWorkerOperation::recv) {
++      const auto* sockets = direct_sockets(operation, peer);
++      DirectWorkers workers{};
++      WorkerStorageCounter counter;
++      if (!sockets || !direct_workers(input.nbytes(), sockets->size(), workers) ||
++          !counter.vector<SocketFuture>(workers.reserved_futures) ||
++          !counter.sockets(workers.parts.jobs)) return false;
++      return counter.finish(sizeof(DirectWorkers) + sizeof(size_t) * 9 + sizeof(void*) * 5, out);
++    }
++    bool qualified = false;
++    SWITCH_TYPE(input,
++      if (operation == GroupWorkerOperation::sum) qualified = reduction_storage<T, detail::SumOp<T>>(input.size(), out);
++      else if (operation == GroupWorkerOperation::maximum) qualified = reduction_storage<T, detail::MaxOp<T>>(input.size(), out);
++      else if (operation == GroupWorkerOperation::minimum) qualified = reduction_storage<T, detail::MinOp<T>>(input.size(), out));
++    return qualified;
++  }
++
+   void storage_inventory(GroupStorageInventory& out) const noexcept override {
+     // These owners are never resized after construction. Workers mutate only
+     // their task queues, which this query deliberately does not inspect.
+@@ -517,29 +622,18 @@
+                       output_ptr = output.data<char>(),
+                       allocation = submission::GraphQuotaRef(submission::current_graph_quota()),
+                       this]() {
+-      constexpr size_t min_send_size = 262144;
+-      size_t n_gathers = std::max(
+-          std::min(
+-              sockets_right_.size() + sockets_left_.size(),
+-              nbytes / min_send_size),
+-          size_t(1));
+-      size_t bytes_per_gather = ceildiv(nbytes, n_gathers);
++      WorkerPartitions parts{};
++      if (!gather_partitions(nbytes, sockets_right_.size() + sockets_left_.size(), parts))
++        throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++      const auto n_gathers = parts.jobs;
+       auto* graph = allocation.get();
+       PoolFutures all_gathers(n_gathers, graph);
+-      for (int i = 0; i < n_gathers; i++) {
+-        auto offset = i * bytes_per_gather;
+-        all_gathers.append(pool_.enqueue_with_graph(graph,
+-            std::bind(
+-                &RingGroup::all_gather_impl,
+-                this,
+-                input_ptr + offset,
+-                output_ptr + offset,
+-                nbytes,
+-                offset + bytes_per_gather > nbytes ? nbytes - offset
+-                                                   : bytes_per_gather,
+-                sockets_right_[i / 2],
+-                sockets_left_[i / 2],
+-                (i % 2) ? -1 : 1, graph)));
++      for (size_t i = 0; i < n_gathers; i++) {
++        const auto range = parts.range(i);
++        all_gathers.append(pool_.enqueue_with_graph(graph, GatherJob{
++            this, input_ptr + range.first, output_ptr + range.first, nbytes,
++            range.second - range.first, sockets_right_[i / 2], sockets_left_[i / 2],
++            (i % 2) ? -1 : 1, graph}));
+       }
+       all_gathers.join();
+     });
+@@ -551,12 +645,8 @@
+     encoder.dispatch(
+         [input_ptr = input.data<char>(), nbytes = input.nbytes(), dst,
+          allocation = submission::GraphQuotaRef(submission::current_graph_quota()), this]() {
+-          int right = (rank_ + 1) % size_;
+-          int left = (rank_ + size_ - 1) % size_;
+-          if (dst == right) {
+-            send(sockets_right_, input_ptr, nbytes, allocation.get());
+-          } else if (dst == left) {
+-            send(sockets_left_, input_ptr, nbytes, allocation.get());
++          if (const auto* sockets = direct_sockets(GroupWorkerOperation::send, dst)) {
++            send(*sockets, input_ptr, nbytes, allocation.get());
+           } else {
+             std::ostringstream msg;
+             msg << "[ring] Send only supported to direct neighbors "
+@@ -576,12 +666,8 @@
+           // NOTE: We 'll check the sockets with the opposite order of send so
+           // that they work even with 2 nodes where left and right is the same
+           // neighbor.
+-          int right = (rank_ + 1) % size_;
+-          int left = (rank_ + size_ - 1) % size_;
+-          if (src == left) {
+-            recv(sockets_left_, out_ptr, nbytes, allocation.get());
+-          } else if (src == right) {
+-            recv(sockets_right_, out_ptr, nbytes, allocation.get());
++          if (const auto* sockets = direct_sockets(GroupWorkerOperation::recv, src)) {
++            recv(*sockets, out_ptr, nbytes, allocation.get());
+           } else {
+             std::ostringstream msg;
+             msg << "[ring] Recv only supported from direct neighbors "
+@@ -714,16 +800,18 @@
+       // all reduce a local buffer prefilled with 0s.
+       size_t nbytes = size * sizeof(T);
+       auto* graph = allocation.get();
+-      if (size < size_) {
+-        // TODO: Maybe allocate dynamically so we don't have the constraint
+-        // below?
+-        if (sizeof(T) * size_ > 1024) {
++      ReductionWorkers workers{};
++      if (!reduction_workers(size, sizeof(T), static_cast<size_t>(size_),
++            sockets_right_.size() + sockets_left_.size(), workers)) {
++        if (size < static_cast<size_t>(size_)) {
+           std::ostringstream msg;
+           msg << "Can't perform the ring all reduce of " << size
+               << " elements with a ring of size " << size_;
+           throw std::runtime_error(msg.str());
+         }
+-
++        throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++      }
++      if (workers.padded) {
+         char buffer[1024];
+         std::memset(buffer, 0, size_ * sizeof(T));
+         std::memcpy(buffer, in_ptr, nbytes);
+@@ -746,28 +834,15 @@
+ 
+       // Split the all reduces so that each member has at least 1 buffer to
+       // send/recv per segment.
+-      constexpr size_t min_send_size = 262144;
+-      size_t n_reduces = std::max(
+-          std::min(
+-              sockets_right_.size() + sockets_left_.size(),
+-              nbytes / (size_ * min_send_size)),
+-          size_t(1));
+-      size_t step = ceildiv(size, n_reduces);
++      const auto n_reduces = workers.parts.jobs;
+       PoolFutures all_sums(n_reduces, graph);
+-
+-      for (int i = 0; i < n_reduces; i++) {
+-        all_sums.append(pool_.enqueue_with_graph(graph,
+-            std::bind(
+-                &RingGroup::all_reduce_impl<T, ReduceOp>,
+-                this,
+-                reinterpret_cast<T*>(
+-                    buffers_.data() + i * ALL_SUM_SIZE * ALL_SUM_BUFFERS),
+-                reinterpret_cast<T*>(out_ptr) + i * step,
+-                std::min(size, (i + 1) * step) - i * step,
+-                sockets_right_[i / 2],
+-                sockets_left_[i / 2],
+-                (i % 2) ? -1 : 1,
+-                reduce_op, graph)));
++      for (size_t i = 0; i < n_reduces; i++) {
++        const auto range = workers.parts.range(i);
++        all_sums.append(pool_.enqueue_with_graph(graph, ReduceJob<T, ReduceOp>{
++            this, reinterpret_cast<T*>(buffers_.data() + i * ALL_SUM_SIZE * ALL_SUM_BUFFERS),
++            reinterpret_cast<T*>(out_ptr) + range.first, range.second - range.first,
++            sockets_right_[i / 2], sockets_left_[i / 2], (i % 2) ? -1 : 1,
++            reduce_op, graph}));
+       }
+       all_sums.join();
+     });
+@@ -877,18 +952,15 @@
+   void
+   send(const std::vector<int>& sockets, const char* data, size_t data_size,
+        submission::GraphQuota* graph) {
+-    size_t segment_size =
+-        std::max(size_t(1024), ceildiv(data_size, sockets.size()));
++    DirectWorkers workers{};
++    if (!direct_workers(data_size, sockets.size(), workers))
++      throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
+     submission::GraphVector<SocketFuture> sends{submission::GraphAllocator<SocketFuture>(graph)};
+-    sends.reserve(sockets.size());
+-    for (int i = 0; i < sockets.size(); i++) {
+-      if (i * segment_size >= data_size) {
+-        break;
+-      }
+-      sends.emplace_back(comm_.send(
+-          sockets[i],
+-          data + i * segment_size,
+-          std::min(data_size, (i + 1) * segment_size) - i * segment_size, graph));
++    sends.reserve(workers.reserved_futures);
++    for (size_t i = 0; i < workers.parts.jobs; i++) {
++      const auto range = workers.parts.range(i);
++      sends.emplace_back(comm_.send(sockets[i], data + range.first,
++          range.second - range.first, graph));
+     }
+     for (auto& f : sends) {
+       f.wait();
+@@ -897,18 +969,15 @@
+ 
+   void recv(const std::vector<int>& sockets, char* data, size_t data_size,
+             submission::GraphQuota* graph) {
+-    size_t segment_size =
+-        std::max(size_t(1024), ceildiv(data_size, sockets.size()));
++    DirectWorkers workers{};
++    if (!direct_workers(data_size, sockets.size(), workers))
++      throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
+     submission::GraphVector<SocketFuture> recvs{submission::GraphAllocator<SocketFuture>(graph)};
+-    recvs.reserve(sockets.size());
+-    for (int i = 0; i < sockets.size(); i++) {
+-      if (i * segment_size >= data_size) {
+-        break;
+-      }
+-      recvs.emplace_back(comm_.recv(
+-          sockets[i],
+-          data + i * segment_size,
+-          std::min(data_size, (i + 1) * segment_size) - i * segment_size, graph));
++    recvs.reserve(workers.reserved_futures);
++    for (size_t i = 0; i < workers.parts.jobs; i++) {
++      const auto range = workers.parts.range(i);
++      recvs.emplace_back(comm_.recv(sockets[i], data + range.first,
++          range.second - range.first, graph));
+     }
+     for (auto& f : recvs) {
+       f.wait();
+diff --git a/mlx/distributed/ring/worker_geometry.h b/mlx/distributed/ring/worker_geometry.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/distributed/ring/worker_geometry.h
+@@ -0,0 +1,49 @@
++#pragma once
++
++#include <algorithm>
++#include <limits>
++#include <utility>
++
++namespace mlx::core::distributed::ring {
++// Exact checked partitions used by both the actual workers and their source
++// query. No communicator, allocator, destination or authority is created here.
++struct WorkerPartitions {
++  size_t items, jobs, step;
++  std::pair<size_t, size_t> range(size_t index) const noexcept {
++    if (index >= jobs || (step && index > items / step)) return {items, items};
++    const auto start = index * step;
++    return {start, start + std::min(step, items - start)};
++  }
++};
++inline bool gather_partitions(size_t bytes, size_t sockets,
++    WorkerPartitions& out) noexcept {
++  if (!sockets) return false;
++  const auto jobs = std::max(std::min(sockets, bytes / 262144), size_t(1));
++  out = {bytes, jobs, bytes / jobs + (bytes % jobs != 0)};
++  return true;
++}
++struct ReductionWorkers { WorkerPartitions parts; bool padded; };
++inline bool reduction_workers(size_t items, size_t item_bytes, size_t members,
++    size_t sockets, ReductionWorkers& out) noexcept {
++  constexpr auto max = std::numeric_limits<size_t>::max();
++  if (!item_bytes || !members || !sockets || items > max / item_bytes) return false;
++  if (items < members) {
++    if (members > 1024 / item_bytes) return false;
++    out = {{members, 1, members}, true};
++    return true;
++  }
++  if (members > max / 262144) return false;
++  const auto jobs = std::max(std::min(sockets,
++      (items * item_bytes) / (members * 262144)), size_t(1));
++  out = {{items, jobs, items / jobs + (items % jobs != 0)}, false};
++  return true;
++}
++struct DirectWorkers { WorkerPartitions parts; size_t reserved_futures; };
++inline bool direct_workers(size_t bytes, size_t sockets, DirectWorkers& out) noexcept {
++  if (!sockets) return false;
++  const auto step = std::max(size_t(1024), bytes / sockets + (bytes % sockets != 0));
++  const auto jobs = bytes / step + (bytes % step != 0);
++  out = {{bytes, jobs, step}, sockets};
++  return true;
++}
++} // namespace mlx::core::distributed::ring
+diff --git a/mlx/distributed/ring/worker_storage.h b/mlx/distributed/ring/worker_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/distributed/ring/worker_storage.h
+@@ -0,0 +1,62 @@
++#pragma once
++
++#include <limits>
++#include "mlx/distributed/distributed.h"
++#include "mlx/distributed/ring/socket_tasks.h"
++#include "mlx/distributed/ring/reduction_plan.h"
++#include "mlx/threadpool.h"
++
++namespace mlx::core::distributed::ring {
++// Counts actual worker allocations, not a graph arena grant or total collective
++// fit. The same concrete task/promise/vector producers supply every extent.
++class WorkerStorageCounter {
++ public:
++  template<class Job> bool pool(size_t count) noexcept {
++    threadpool_detail::TaskLayout layout{};
++    return ThreadPool::task_layout<Job>(layout) &&
++        add(value_.pool_jobs, count) && tasks(layout, count);
++  }
++  bool sockets(size_t count) noexcept {
++    SocketTaskLayout layout{};
++    return socket_task_layout(layout) && add(value_.socket_attempts, count) && tasks(layout, count);
++  }
++  template<class T> bool vector(size_t count) noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++    if (count > static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) / sizeof(T)) return false;
++    size_t extent = 0;
++    if (count && !submission::GraphQuota::allocation_extent(count * sizeof(T), alignof(T), extent)) return false;
++    return add(value_.destination_arrays, count != 0) && add(value_.destination_graph_extent, extent) &&
++        add(value_.controls, sizeof(submission::GraphVector<T>) + sizeof(submission::GraphAllocator<T>) + sizeof(size_t) * 3);
++#else
++    return false;
++#endif
++  }
++  bool plan(size_t items, size_t members, size_t item_bytes, size_t packet_bytes) noexcept {
++    ReductionPlanLayout layout{};
++    if (!PreparedReductionPlan::layout(items, members, item_bytes, packet_bytes, layout) ||
++        layout.geometry.steps > std::numeric_limits<size_t>::max() / 2) return false;
++    return vector<ReductionSpan>(layout.geometry.steps) && vector<ReductionSpan>(layout.geometry.steps) &&
++        sockets(2 * layout.geometry.steps) && add(value_.controls, layout.controls);
++  }
++  bool finish(size_t controls, GroupWorkerStorage& out) noexcept {
++    if (!add(value_.controls, controls) ||
++        !add(value_.controls, sizeof(*this) + sizeof(GroupWorkerStorage) + sizeof(size_t) * 5)) return false;
++    out = value_;
++    return true;
++  }
++ private:
++  static bool add(size_t& destination, size_t value) noexcept {
++    if (value > std::numeric_limits<size_t>::max() - destination) return false;
++    destination += value; return true;
++  }
++  static bool scaled(size_t& destination, size_t value, size_t count) noexcept {
++    return (!count || value <= std::numeric_limits<size_t>::max() / count) && add(destination, value * count);
++  }
++  template<class Layout> bool tasks(const Layout& layout, size_t count) noexcept {
++    return scaled(value_.task_graph_extent, layout.node_extent, count) &&
++        scaled(value_.task_graph_extent, layout.promise_extent, count) &&
++        scaled(value_.controls, layout.controls, count);
++  }
++  GroupWorkerStorage value_{};
++};
++} // namespace mlx::core::distributed::ring

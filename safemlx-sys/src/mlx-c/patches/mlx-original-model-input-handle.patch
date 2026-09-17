@@ -1,0 +1,75 @@
+diff --git a/mlx/prepared_input.cpp b/mlx/prepared_input.cpp
+--- a/mlx/prepared_input.cpp
++++ b/mlx/prepared_input.cpp
+@@ -4,6 +4,7 @@
+ #include <limits>
+ #include <new>
+ #include <utility>
++#include <type_traits>
+ 
+ namespace mlx::core {
+ namespace {
+@@ -153,6 +154,30 @@
+   output = ::new (c.memory) PreparedInputLeaf(array(std::move(owned)), quota);
+   return Cause::success;
+ }
++bool PreparedInputArray::layout(size_t& bytes, size_t& controls) noexcept {
++  if (!submission::GraphQuota::allocation_extent(
++          sizeof(PreparedInputArray), alignof(PreparedInputArray), bytes)) return false;
++  // Actual make_array locals, output pointer and fixed status, including the
++  // pointer retained across object destruction/deallocation.
++  controls = sizeof(void*) + sizeof(PreparedInputArray*) +
++      sizeof(submission::GraphQuota*) + sizeof(allocator::PreparedInputCause);
++  return true;
++}
++allocator::PreparedInputCause PreparedInputLeaf::make_array(
++    PreparedInputArray*& out) const noexcept {
++  static_assert(std::is_nothrow_copy_constructible_v<array>);
++  static_assert(std::is_nothrow_destructible_v<array>);
++  if (out) return allocator::PreparedInputCause::invalid;
++  void* memory = quota_->try_allocate(sizeof(PreparedInputArray), alignof(PreparedInputArray));
++  if (!memory) return allocator::PreparedInputCause::capacity;
++  out = ::new (memory) PreparedInputArray(value_, quota_);
++  return allocator::PreparedInputCause::success;
++}
++void PreparedInputArray::destroy() noexcept {
++  auto* quota = quota_;
++  this->~PreparedInputArray();
++  quota->deallocate(this, sizeof(PreparedInputArray), alignof(PreparedInputArray));
++}
+ void PreparedInputLeaf::destroy() noexcept {
+   auto* quota = quota_;
+   this->~PreparedInputLeaf();
+diff --git a/mlx/prepared_input.h b/mlx/prepared_input.h
+--- a/mlx/prepared_input.h
++++ b/mlx/prepared_input.h
+@@ -16,6 +16,21 @@
+   size_t elements;
+   unsigned kind; // 0 U32, 1 I32, 2 F32
+ };
++// A distinct arena-owned C handle. The C ABI retains its closed owner separately
++// from the array* value; this object must never reach ordinary operator delete.
++class MLX_API PreparedInputArray final {
++ public:
++  static bool layout(size_t& metadata_bytes, size_t& controls) noexcept;
++  void destroy() noexcept;
++  array& value() noexcept { return value_; }
++ private:
++  friend class PreparedInputLeaf;
++  PreparedInputArray(const array& value, submission::GraphQuota* quota) noexcept
++      : value_(value), quota_(quota) {}
++  ~PreparedInputArray() = default;
++  array value_;
++  submission::GraphQuota* quota_;
++};
+ class MLX_API PreparedInputLeaf final {
+  public:
+   static bool layout(const allocator::PreparedInputFacts&, const PreparedInputSource&,
+@@ -24,6 +39,7 @@
+       const allocator::PreparedInputFacts&, submission::GraphQuota*,
+       const PreparedInputSource&, PreparedInputLeaf*&) noexcept;
+   void destroy() noexcept;
++  allocator::PreparedInputCause make_array(PreparedInputArray*&) const noexcept;
+   const array& value() const noexcept { return value_; }
+  private:
+   PreparedInputLeaf(array&& value, submission::GraphQuota* quota) noexcept

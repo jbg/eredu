@@ -138,6 +138,7 @@ impl TokenFilterController for AllowAllTokens {
 }
 
 impl SpeculativeTokenFilterController for AllowAllTokens {
+    type PreparedGrammar = eredu_core::speculative::NoPreparedGrammar;
     fn control_snapshot_bytes(&self) -> Option<u64> {
         Some(0)
     }
@@ -173,7 +174,7 @@ impl SpeculativeSemanticState for TokenOnlySemanticState {
 
     fn push_token(&mut self, token: u32) -> Result<bool, SpeculativeOutputError> {
         self.events
-            .push(SemanticEvent::TextDelta(token.to_string()));
+            .push(SemanticEvent::TextDelta(token.to_string().into()));
         Ok(false)
     }
 
@@ -189,8 +190,8 @@ impl SpeculativeSemanticState for TokenOnlySemanticState {
         Ok(())
     }
 
-    fn take_events(&mut self) -> Vec<SemanticEvent> {
-        std::mem::take(&mut self.events)
+    fn take_events(&mut self) -> eredu_core::SpeculativeBuffer<SemanticEvent> {
+        std::mem::take(&mut self.events).into()
     }
 }
 

@@ -1,0 +1,158 @@
+{
+  "date": "2026-09-13",
+  "source_base_commit": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_state": "uncommitted shared inference span enforcement, logical admission restoration, and native transaction retention",
+  "source_sha256": {
+    "doc/backend-architecture.md": "c4f4782554123d46fa5971d0cf774be2258051861ac1ef3d9b38ac7d9da49884",
+    "doc/bounded-inference.md": "ae599bd76318e7c70a0d14c3aec97c8d04925cf147aa31f88fc53cf8bdd2ff6f",
+    "doc/execution-control.md": "5c36874959c0cf0aff079d988336d6e7e037dd136688712a878efbf02edfbb23",
+    "eredu-architectures/src/composite_execution.rs": "924d57232e0ae25077bd74498fd5830de7b329564cd20e24331cc4a81fc8e77f",
+    "eredu-architectures/src/decoder.rs": "19a1f4b2ae2224268fc3b227540c08906cdc6fea1fcf8e80e3f6cb42ce024c1d",
+    "eredu-architectures/src/deepseek/v3.rs": "94b12c0ea53dc66871819228875f4c72bdf75d04af76c6f3ec69817be68c42ac",
+    "eredu-architectures/src/deepseek/v4.rs": "eb2fc43488b56239f2a596ecb8326929c53de42e03cc172b06d6887d58d80e66",
+    "eredu-architectures/src/gemma4/model.rs": "d3a9f3d011dd766a80cce99bd3e379f46b1e87da2b848dffd10d23498a41fdb2",
+    "eredu-architectures/src/inkling/model.rs": "2b0439c5491eba51d636b367107970a97dab8e1342f3a6177e65d6b93491d1da",
+    "eredu-architectures/src/kimi_linear/mod.rs": "946287def4d370a041ff9da832d06b0c935b4b278c7347708e4214d9093c4ae6",
+    "eredu-architectures/src/kimi_linear/partitioned.rs": "f5a495678d334ea66c65e1d6cc55ef415c372ae2f40756b19908418ff3955125",
+    "eredu-architectures/src/lfm2/mod.rs": "48ca2c70e268b055b4063533830ed0d7c33f3cc514dd6abefa27e82d90551824",
+    "eredu-architectures/src/lfm2/partitioned.rs": "a582346f0040a15f22ace6f8c0b1324a49343615a1990d4913910718c5c7357f",
+    "eredu-architectures/src/moshi/model.rs": "d8c83b02b1f8e7241eb055c8a36d90c0076d65b80297f4c4c375dff898eb9ab7",
+    "eredu-architectures/src/muse_glimmer/model.rs": "d8138c586ca2f3fea70c1d669577178539c5a3b85188d10295bf0eba13171079",
+    "eredu-architectures/src/nemotron_h/model.rs": "59c2752376b29137eea08b81c990cb0e36444077f8b445edb71b3fae11270b6c",
+    "eredu-architectures/src/nemotron_h/partitioned.rs": "116fe0206d8f435d3acf513c57ca180946526a9ad1614e17c0e2767422ed6ef5",
+    "eredu-architectures/src/prefill.rs": "498c13c9c4f395a84319e4a3c372a04585cc83e55fb986fff1064f461c95eeba",
+    "eredu-architectures/src/qwen/hybrid/conditional.rs": "640c8c1cec3ceabc9d1c920f02a9831817c40fbe9d5a95f7b22d2607a5d75ec5",
+    "eredu-architectures/src/qwen/hybrid/model.rs": "d932bd1e67fa71c93b285966f15f22808c982476d255b8c95a1a250403022e34",
+    "eredu-architectures/src/qwen/vl/model.rs": "4aae41e323a5d95b4e9f70fa6067d53d499c9440faae3151c3cf6175a3b63e09",
+    "eredu-architectures/src/replicated_model.rs": "c6fb33ac4a87eb8883eab6ea97a500305b466e71e3a8eb1f792368655f0e698d",
+    "eredu-architectures/tests/reference_numeric.rs": "db5d1b908f86c87ce864b6e05bfb3a353fe9aa070b26695d21b7574de35dc680",
+    "eredu-architectures/tests/reference_numeric/bounded_readout.rs": "1b26519445986f32018f7fe206dd76946abd941e2b351782afd36074aa8d6dcb",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/hybrid.rs": "adb53a3e5c988d909e57b3e7f30dda94e7dac6227bf48bba64d9dbecdd662321",
+    "eredu-backend-mlx/src/backend/runtime/cache/state/key_value.rs": "495d70cc982b6ca37c694122b790d95a10cca7e30896d794488e80b29d48672d",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/mechanisms.rs": "c00c9180a9ae31056160d8d21f23c392ac607d91a3282cccb86928ceccb907d1",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/state.rs": "80c0d53e3c98e51991f30492d34597f54cdc91a07426ab12a45dadff7b97b8d9",
+    "eredu-core/src/inference.rs": "238b6b738c6006b3ef3885200df88d243bfe07cc6571f0943062b7b5a0d75871",
+    "eredu-runtime/src/layered.rs": "671ff79b283ca2350fe1223f7da1e97c94647bc8a63be83971b315ad7bdbee38",
+    "eredu-runtime/src/partitioned_execution.rs": "52b0647ff4c880b8abff4973f9fc32b2520f8ea25d546a401261a6310ba6f212",
+    "eredu-runtime/src/replicated_session.rs": "40218cd198bdc371d04189c2d8368ce935c0ecb0b8dcba61c33873756bb7645f",
+    "eredu-runtime/src/replicated_session/control.rs": "cd662a9a88e8c59680a52e067727349b6de929e41c82e3d016dd1890cf85b5e2",
+    "eredu-runtime/src/replicated_session/prefill.rs": "5ab9af3bb3665c9611061aff09e002f85c0550ee693183db74e9358528b7b113",
+    "eredu-runtime/src/state.rs": "c11453f69588f4ee5853954ceb7998d81defb14f8c48382dfc9b8cefe27cc941",
+    "eredu-runtime/src/working_memory.rs": "6babe25970e27f6cc5cf4cf9587ea6b8139187826b7e9d235a5caf74fd067bc8",
+    "eredu-runtime/src/working_memory/inference.rs": "56137fd184abe47f9f4c9a382b3ef199980e06202cbedcc7a894023763cc35e9",
+    "eredu-runtime/src/working_memory/retention.rs": "09602b8f9a88501d773f765f44add932716f53594feaf17135bacf4f165c0368",
+    "eredu-runtime/tests/backend_independence.rs": "95af2258fcd921d96093ef1e87ad53070d7484b1fc1322469fc13ae45b282a68",
+    "eredu-runtime/tests/bounded_prefill.rs": "a82b34d38e59004fdcb2bd837c9ea07886d6b9d1e8bfd84834ad3b553b21b90a"
+  },
+  "coverage": {
+    "unique_tests_passed": 749,
+    "runtime_tests": 639,
+    "portable_facade_and_conformance_tests": 102,
+    "family_configurations": 9,
+    "weight_residencies": [
+      "resident",
+      "host-layerwise",
+      "disk-streamed"
+    ],
+    "reserved_family_trajectories": 432,
+    "chunks": [
+      1,
+      2,
+      3,
+      5
+    ],
+    "cached_prefix_positions": [
+      0,
+      2
+    ],
+    "drivers": [
+      "run",
+      "step"
+    ],
+    "successful_cached_decodes_per_trajectory": 6,
+    "completed_output_failures_and_rollbacks": 432,
+    "invalid_decoder_shape_rejections": 864,
+    "exhausted_allowance_rejections": 864,
+    "cancelled_or_failed_prefill_followed_by_decode_rejections": 54,
+    "native_retention_and_recovery_tests": 2,
+    "native_snapshot_regressions": 5,
+    "native_peak_measurements_added": 0
+  },
+  "behavior": [
+    "All layered architectures expose decoder input dimensions without native allocation; segmented inputs sum semantic token spans and prepared composites use their admitted decoder geometry.",
+    "Reserved state retains the exact active request and logical frontier separately from nonrefundable backing charges. Stateless ranks advance the logical frontier without fabricating a native position.",
+    "Shared transactions agree exact execution identity, batch, scheduled span length, phase, readout demand, and native state position before checkpointing or model work. One-position sequence and final-position scores are equivalent; state-only remains distinct.",
+    "Decode cannot advance beyond the admitted output allowance; unknown auxiliary invocation equations cannot use an ordinary decoder quote.",
+    "Successful equations must reach the checked native frontier before output observation. Transaction failure and checkpoint restoration restore logical admission alongside state without refunding backing charges.",
+    "Restoring an unadmitted snapshot or presenting an unbudgeted request cannot erase an active reserved admission.",
+    "Reserved prepared-input, ordinary, controlled shared-session, and sequence execution retain a native guard through publication and force completion. Guard-opening failure prevents model work; settlement failure fences further work and retains unresolved ownership.",
+    "The family matrix verifies rejection before projection, exact nonzero state preservation, output-failure rollback, three valid cached decodes, restored replay through the sequence API, and renewed exhaustion rejection."
+  ],
+  "validation": [
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime",
+      "result": "pass",
+      "log": "/private/tmp/eredu-inference-span-runtime-all.log",
+      "log_sha256": "3f2229e4e0f7e5ed9c0ba2796d8e9c723fb9cab99aef91e2d28578692f333582",
+      "tests_passed": 639,
+      "tests_ignored": 0
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric prepared_sessions_complete_state_only_chunks_in_all_weight_residencies",
+      "result": "pass",
+      "log": "/private/tmp/eredu-inference-span-family-matrix-final.log",
+      "log_sha256": "db8ff19c5859ad55ab83878485fa80e60b0d23ef0aed5f4d4f51f74c614994d2",
+      "tests_passed": 1,
+      "tests_ignored": 0
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --lib --features metal,accelerate prefill_reservation_tests -- --include-ignored --test-threads=1",
+      "result": "pass",
+      "log": "/private/tmp/eredu-inference-span-native.log",
+      "log_sha256": "9b0c588600897cf8568a58d7b1a742e4cbd67bfe75f704cf486b575306feb157",
+      "tests_passed": 2,
+      "tests_ignored": 0
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --lib --features metal,accelerate backend::runtime::cache::state::hybrid::isolated_snapshot_tests -- --include-ignored --test-threads=1",
+      "result": "pass",
+      "log": "/private/tmp/eredu-inference-span-snapshots.log",
+      "log_sha256": "3b2218b5935060ccc27159567433a7f52c55ddf68300a1c5d45b074771620096",
+      "tests_passed": 5,
+      "tests_ignored": 0
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "result": "pass",
+      "log": "/private/tmp/eredu-inference-span-facade.log",
+      "log_sha256": "fc6c76e5094dcac4b1e97316ae94a9a86c3c092a68993581654ff30cb191e247",
+      "tests_passed": 102,
+      "tests_ignored": 1
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --tests --features metal,accelerate",
+      "result": "pass",
+      "log": "/private/tmp/eredu-inference-span-native-check.log",
+      "log_sha256": "7bd3ef81177a1d11dafb57990ce2693d05269576aa4cf54c3990cdc4d3702b6b"
+    },
+    {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "result": "pass",
+      "log": "/private/tmp/eredu-inference-span-portable-check.log",
+      "log_sha256": "02781716076da12b82d581164b168184603eea8ab2699af9b64570fca4cc48e9"
+    }
+  ],
+  "remaining_work": [
+    "Construct complete production quotes from exact selected native mechanisms and cached-state capacities, including all preparation and external-to-graph resources.",
+    "Wire facade admission and chunk policy before expensive preparation through shared physical capacity owners across native sessions and models.",
+    "Admit independent state-copy, snapshot, fork, retained input/output, observation, and speculative resources against the same physical pools.",
+    "Complete semantic span and budget integration for media, full-sequence observation, embedded/external speculation, TP, PP, and combined paths.",
+    "Complete actual-family native capacity, distributed, and controlled advancement validation; existing native tests here validate retention and snapshot behavior, not new memory bounds."
+  ],
+  "limitations": [
+    "The ordinary native adapter still uses explicit no-budget authority. The supplied reservation contracts now enforce span geometry and lifetime but do not make the entire production stack budgeted.",
+    "Synthetic portable admissions are accounting witnesses, not native allocation estimates. Existing native snapshot tests do not by themselves prove complete active-admission branch pricing.",
+    "Eredu-managed bounds are distinct from total process/system memory; existing released Qwen peak measurements are unchanged.",
+    "One existing external LFM checkpoint facade test remains ignored. Native linker reports the existing oversized unwind-section warning."
+  ]
+}

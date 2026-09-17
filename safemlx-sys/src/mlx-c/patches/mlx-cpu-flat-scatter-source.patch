@@ -1,0 +1,358 @@
+diff --git a/mlx/backend/cpu/indexing.cpp b/mlx/backend/cpu/indexing.cpp
+--- a/mlx/backend/cpu/indexing.cpp
++++ b/mlx/backend/cpu/indexing.cpp
+@@ -434,6 +434,9 @@
+       array::unsafe_weak_copy(inds),array::unsafe_weak_copy(out)});
+ }
+ 
++using ScatterIterators = SmallVector<ContiguousIterator, 1,
++    submission::GraphAllocator<ContiguousIterator>>;
++
+ template <typename InT, typename IdxT, typename OpT>
+ void scatter(
+     const array& updates,
+@@ -451,7 +454,11 @@
+     update_size *= us;
+   }
+ 
+-  std::vector<ContiguousIterator> its(inds.begin(), inds.end());
++  // The same generic loop uses inline iterator storage for its one-index
++  // source. Broader ordinary inputs retain their actual allocator path.
++  ScatterIterators its;
++  its.reserve(inds.size());
++  for (const auto& index : inds) its.emplace_back(index);
+   ContiguousIterator update_it(updates);
+   ContiguousIterator out_it(update_shape, out.strides(), out.ndim());
+ 
+@@ -547,17 +554,100 @@
+   }
+ }
+ 
++// Named transport of the unchanged ordinary generic Scatter loop.
++struct ScatterTask {
++  Shape axes_;
++  Scatter::ReduceType reduce_type_;
++  array updates;
++  ArrayVector inds;
++  array out;
++  void operator()() {
++    switch (out.dtype()) {
++      case bool_:
++        dispatch_scatter<bool>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case uint8:
++        dispatch_scatter<uint8_t>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case uint16:
++        dispatch_scatter<uint16_t>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case uint32:
++        dispatch_scatter<uint32_t>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case uint64:
++        dispatch_scatter<uint64_t>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case int8:
++        dispatch_scatter<int8_t>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case int16:
++        dispatch_scatter<int16_t>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case int32:
++        dispatch_scatter<int32_t>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case int64:
++        dispatch_scatter<int64_t>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case float16:
++        dispatch_scatter<float16_t>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case float32:
++        dispatch_scatter<float>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case float64:
++        dispatch_scatter<double>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case bfloat16:
++        dispatch_scatter<bfloat16_t>(out, inds, updates, axes_, reduce_type_);
++        break;
++      case complex64:
++        dispatch_scatter<complex64_t>(out, inds, updates, axes_, reduce_type_);
++        break;
++    }
++  }
++};
++namespace cpu {
++bool flat_scatter_dispatch_storage(EvalDispatchStorage& out) noexcept {
++  if (Shape::inline_capacity < 2 || Strides::inline_capacity < 2) return false;
++  DispatchLayout task;
++  WeakCopyStorage weak_one, weak_two;
++  ContiguousIteratorLayout index_it, update_it, output_it;
++  if (!CommandEncoder::dispatch_layout<ScatterTask>(task) ||
++      !PreparedInputLeaf::weak_copy_storage(1, weak_one) ||
++      !PreparedInputLeaf::weak_copy_storage(2, weak_two) ||
++      !contiguous_iterator_layout(1, index_it) ||
++      !contiguous_iterator_layout(2, update_it) ||
++      !contiguous_iterator_layout(1, output_it)) return false;
++  EvalDispatchStorage value{task.task_bytes, task.task_alignment, 0, 0};
++  for (size_t extent : {index_it.graph_extent_sum, update_it.graph_extent_sum, output_it.graph_extent_sum}) {
++    if (extent > SIZE_MAX - value.worker_graph_extents) return false;
++    value.worker_graph_extents += extent;
++  }
++  const size_t controls[] = {task.controls, weak_one.controls, weak_one.controls, weak_two.controls,
++      index_it.controls, update_it.controls, output_it.controls,
++      sizeof(out), sizeof(task), sizeof(weak_one), sizeof(weak_two),
++      sizeof(index_it), sizeof(update_it), sizeof(output_it), sizeof(value),
++      sizeof(ScatterTask) * 2, sizeof(ScatterIterators), sizeof(ContiguousIterator) * 3,
++      sizeof(array) * 4, sizeof(ArrayVector) * 2, sizeof(Shape) * 3, sizeof(Strides) * 2,
++      sizeof(Scatter::ReduceType) * 2, sizeof(int) * 6, sizeof(size_t) * 12,
++      sizeof(int64_t) * 4, sizeof(const void*) * 3, sizeof(Stream), sizeof(CommandEncoder*), sizeof(Dtype) * 2};
++  value.controls = sizeof(controls);
++  for (size_t control : controls) {
++    if (control > SIZE_MAX - value.controls) return false;
++    value.controls += control;
++  }
++  out = value; return true;
++}
++} // namespace cpu
++
+ void Scatter::eval_cpu(const ArrayVector& inputs, array& out) {
+   assert(inputs.size() >= 2);
+-
+   auto& src = inputs[0];
+   auto& updates = inputs.back();
+-
+-  // Copy src into out (copy allocates memory for out)
+-  auto ctype =
+-      src.flags().row_contiguous ? CopyType::Vector : CopyType::General;
++  auto ctype = src.flags().row_contiguous ? CopyType::Vector : CopyType::General;
+   copy_cpu(src, out, ctype, stream());
+-
+   auto& encoder = cpu::get_command_encoder(stream());
+   ArrayVector inds;
+   for (auto it = inputs.begin() + 1; it < inputs.end() - 1; ++it) {
+@@ -566,56 +656,8 @@
+   }
+   encoder.set_input_array(updates);
+   encoder.set_output_array(out);
+-  encoder.dispatch([axes_ = axes_,
+-                    reduce_type_ = reduce_type_,
+-                    updates = array::unsafe_weak_copy(updates),
+-                    inds = std::move(inds),
+-                    out = array::unsafe_weak_copy(out)]() mutable {
+-    switch (out.dtype()) {
+-      case bool_:
+-        dispatch_scatter<bool>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case uint8:
+-        dispatch_scatter<uint8_t>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case uint16:
+-        dispatch_scatter<uint16_t>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case uint32:
+-        dispatch_scatter<uint32_t>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case uint64:
+-        dispatch_scatter<uint64_t>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case int8:
+-        dispatch_scatter<int8_t>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case int16:
+-        dispatch_scatter<int16_t>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case int32:
+-        dispatch_scatter<int32_t>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case int64:
+-        dispatch_scatter<int64_t>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case float16:
+-        dispatch_scatter<float16_t>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case float32:
+-        dispatch_scatter<float>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case float64:
+-        dispatch_scatter<double>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case bfloat16:
+-        dispatch_scatter<bfloat16_t>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-      case complex64:
+-        dispatch_scatter<complex64_t>(out, inds, updates, axes_, reduce_type_);
+-        break;
+-    }
+-  });
++  encoder.dispatch(ScatterTask{axes_, reduce_type_, array::unsafe_weak_copy(updates),
++      std::move(inds), array::unsafe_weak_copy(out)});
+ }
+ 
+ template <typename T, typename IdxT, typename OpT>
+diff --git a/mlx/backend/cpu/scatter_storage.cpp b/mlx/backend/cpu/scatter_storage.cpp
+--- a/mlx/backend/cpu/scatter_storage.cpp
++++ b/mlx/backend/cpu/scatter_storage.cpp
+@@ -17,6 +17,75 @@
+   out.request_bytes[slot]=std::max(out.request_bytes[slot],request.bytes);
+   out.request_alignments[slot]=std::max(out.request_alignments[slot],request.alignment);return true;
+ }
++}
++bool flat_scatter_eval_layout(Dtype index, size_t output_elements,
++    size_t update_elements, bool tracer, CopyEvalStorage& out) noexcept {
++  if (index != int32 || index.size() != 4 || !output_elements || !update_elements ||
++      output_elements > size_t(INT_MAX) || update_elements > size_t(INT_MAX) ||
++      output_elements > size_t(PTRDIFF_MAX) / sizeof(float) ||
++      update_elements > size_t(PTRDIFF_MAX) / sizeof(float)) return false;
++  CopyEvalStorage value;
++  if (!copy_eval_layout(0, 3, false, tracer, value)) return false;
++  CpuCopyDispatchStorage copy;
++  EvalDispatchStorage scatter;
++  WeakCopyStorage one, two;
++  submission::OriginalBufferRoutingLayout routing;
++  size_t allocation_controls = 0;
++  if (!contiguous_copy_dispatch_storage(1, copy) || !flat_scatter_dispatch_storage(scatter) ||
++      !PreparedInputLeaf::weak_copy_storage(1, one) || one.count != 3 ||
++      !PreparedInputLeaf::weak_copy_storage(2, two) || two.count != 3 ||
++      !submission::original_buffer_routing_layout(routing) ||
++      !allocator::original_buffer_allocation_control_bytes(allocation_controls)) return false;
++  // Two rank-one copy aliases, then rank-one index/output and rank-two update.
++  // The fresh output Data and the one actual index-vector allocation are separate.
++  if (!append(value, 3, one.requests[2], 5) || !append(value, 3, two.requests[2], 1) ||
++      !append(value, 4, one.requests[0], 4) || !append(value, 4, two.requests[0], 1) ||
++      !append(value, 5, one.requests[1], 4) || !append(value, 5, two.requests[1], 1)) return false;
++  const submission::GraphQuota::Request first{copy.task_bytes, copy.task_alignment},
++      second{scatter.task_bytes, scatter.task_alignment}, birth{routing.birth_bytes, routing.birth_alignment},
++      index_vector{sizeof(array), alignof(array)};
++  if (!append(value, 6, first, 1) || !append(value, 6, second, 1) ||
++      !append(value, 7, birth, 1) || !append(value, 8, index_vector, 1)) return false;
++  value.rank = 2; value.copy = true; value.backing_births = 1;
++  value.worker_graph_extents = copy.worker_graph_extent_bound;
++  if (!add(value.worker_graph_extents, scatter.worker_graph_extents)) return false;
++  const auto adoption = array::buffer_adoption_layout();
++  const size_t controls[] = {sizeof(value)*2, sizeof(out), sizeof(index), sizeof(output_elements),
++      sizeof(update_elements), sizeof(tracer), sizeof(copy), sizeof(scatter), sizeof(one), sizeof(two),
++      sizeof(routing), sizeof(allocation_controls), sizeof(adoption), sizeof(first), sizeof(second), sizeof(birth), sizeof(index_vector),
++      copy.controls, scatter.controls, one.controls, one.controls, one.controls, one.controls, two.controls,
++      sizeof(std::function<allocator::Buffer(size_t)>)*2, sizeof(allocator::Buffer)*2,
++      sizeof(std::shared_ptr<array::Data>), sizeof(submission::GraphAllocator<array::Data>),
++      sizeof(Shape), sizeof(Strides), sizeof(array::Flags), sizeof(CopyType), sizeof(Stream), sizeof(bool),
++      adoption.incoming_bytes, adoption.scratch_owner_bytes, adoption.deleter_bytes,
++      adoption.allocator_callable_bytes, adoption.prepared_strides_bytes, allocation_controls,
++      sizeof(const array*)*5, sizeof(const Scatter*), sizeof(size_t)*9, sizeof(int)*3,
++      sizeof(std::pair<Scatter::ReduceType, AxisView>), sizeof(submission::FixedEvalPrologueGuard*),
++      sizeof(submission::Record*), sizeof(submission::GraphQuota*),
++      sizeof(submission::GraphConstructionContext), sizeof(submission::GraphFailure)};
++  if (!add(value.named_control_bytes, sizeof(controls))) return false;
++  for (size_t bytes : controls) if (!add(value.named_control_bytes, bytes)) return false;
++  if (!submission::GraphConstruction::complete_layout(value)) return false;
++  out = value; return true;
++}
++bool is_flat_scatter_eval_primitive(const array& output) noexcept {
++  return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
++      typeid(output.primitive()) == typeid(Scatter);
++}
++bool flat_scatter_eval_storage(const array& output, CopyEvalStorage& out) noexcept {
++  if (!is_flat_scatter_eval_primitive(output) || !output.siblings().empty() || output.inputs().size() != 3) return false;
++  const auto& source = output.inputs()[0]; const auto& index = output.inputs()[1]; const auto& updates = output.inputs()[2];
++  const auto state = static_cast<const Scatter&>(output.primitive()).borrowed_state();
++  size_t source_elements = 0, index_elements = 0, update_elements = 0;
++  if (state.first != Scatter::None || state.second.size() != 1 || state.second[0] != 0 ||
++      source.ndim() != 1 || index.ndim() != 1 || updates.ndim() != 2 || output.ndim() != 1 ||
++      source.dtype() != float32 || updates.dtype() != float32 || output.dtype() != float32 ||
++      source.itemsize() != sizeof(float) || updates.itemsize() != sizeof(float) || output.itemsize() != sizeof(float) ||
++      !source.flags().row_contiguous || source.shape() != output.shape() ||
++      updates.shape(0) != index.shape(0) || updates.shape(1) != 1 ||
++      !alias_input_geometry(source, source_elements) || !alias_input_geometry(index, index_elements) ||
++      !alias_input_geometry(updates, update_elements) || source_elements != output.size() || index_elements != update_elements) return false;
++  return flat_scatter_eval_layout(index.dtype(), source_elements, update_elements, output.is_tracer(), out);
+ }
+ bool scatter_axis_eval_layout(Dtype index,size_t rank,size_t output_elements,
+     size_t update_elements,bool tracer,CopyEvalStorage& out) noexcept {
+@@ -94,3 +163,14 @@
+   return create_layout(*graph,context.scope,&record,actual,out,true);
+ }
+ }
++
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_flat_scatter_eval(const FixedEvalPrologueGuard& guard, GraphConstruction*& out) noexcept {
++  auto& record = guard.record(); auto* graph = record.graph_quota(); auto context = current_graph_construction_context();
++  if (out || !graph || !guard.cpu() || !context.scope || context.worker || context.dispatch != &record || current_graph_quota() != graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if (!cpu::flat_scatter_eval_storage(guard.current(), actual)) return GraphFailure::invalid_layout;
++  return create_layout(*graph, context.scope, &record, actual, out, true);
++}
++}
+diff --git a/mlx/backend/cpu/scatter_storage.h b/mlx/backend/cpu/scatter_storage.h
+--- a/mlx/backend/cpu/scatter_storage.h
++++ b/mlx/backend/cpu/scatter_storage.h
+@@ -1,6 +1,13 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
++// Exact one-index F32 general Scatter::None source. Index values keep their
++// ordinary producer precondition; this contract owns no numerical authority.
++MLX_API bool flat_scatter_dispatch_storage(EvalDispatchStorage&) noexcept;
++MLX_API bool flat_scatter_eval_layout(Dtype index, size_t output_elements,
++    size_t update_elements, bool tracer, CopyEvalStorage&) noexcept;
++MLX_API bool is_flat_scatter_eval_primitive(const array&) noexcept;
++MLX_API bool flat_scatter_eval_storage(const array&, CopyEvalStorage&) noexcept;
+ // Source-visible final-axis F32 overwrite scatter. Index validity retains the
+ // ordinary precondition; this storage query conveys no native input authority.
+ MLX_API bool scatter_axis_dispatch_storage(size_t rank,EvalDispatchStorage&) noexcept;
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -59,6 +59,7 @@
+   const bool fixed_value_partition = fixed && cpu::is_partition_eval_primitive(arr);
+   const bool fixed_scan_sum = fixed && cpu::is_scan_sum_eval_primitive(arr);
+   const bool fixed_gather_axis = fixed && cpu::is_gather_axis_eval_primitive(arr);
++  const bool fixed_flat_scatter = fixed && cpu::is_flat_scatter_eval_primitive(arr);
+   const bool fixed_scatter = fixed && cpu::is_scatter_axis_eval_primitive(arr);
+   const bool fixed_gather = fixed && cpu::is_gather_eval_primitive(arr);
+   const bool fixed_copy = fixed && cpu::is_copy_eval_primitive(arr);
+@@ -72,7 +73,7 @@
+   const bool fixed_tiled_matmul = fixed && cpu::is_tiled_matmul_eval_primitive(arr);
+   const bool fixed_matmul = fixed && cpu::is_bf16_matmul_eval_primitive(arr);
+   const bool fixed_random = fixed && cpu::is_random_bits_eval_primitive(arr);
+-  const bool extended = fixed_gather_axis || fixed_value_partition || fixed_scan_sum || fixed_argsort || fixed_scatter || fixed_arange || fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool extended = fixed_flat_scatter || fixed_gather_axis || fixed_value_partition || fixed_scan_sum || fixed_argsort || fixed_scatter || fixed_arange || fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -80,7 +81,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_gather_axis
++    const auto failure = fixed_flat_scatter
++        ? submission::GraphConstruction::create_cpu_flat_scatter_eval(*extended_prologue, extended_bank.value)
++        : fixed_gather_axis
+         ? submission::GraphConstruction::create_cpu_gather_axis_eval(*extended_prologue, extended_bank.value)
+         : fixed_value_partition
+         ? submission::GraphConstruction::create_cpu_partition_eval(*extended_prologue, extended_bank.value)
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -189,6 +189,7 @@
+   static GraphFailure create_cpu_concatenate_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_selection_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_reduction_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_flat_scatter_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_scatter_axis_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_gather_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_copy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -2029,6 +2029,9 @@
+   std::pair<ReduceType, std::vector<int>> state() const {
+     return {reduce_type_, std::vector<int>(axes_.begin(), axes_.end())};
+   };
++  std::pair<ReduceType, AxisView> borrowed_state() const noexcept {
++    return {reduce_type_, AxisView(axes_)};
++  }
+ 
+  private:
+   ReduceType reduce_type_;

@@ -1,14 +1,11 @@
 //! Shared physical-format declarations for architecture operators and parallel plans.
 
+use crate::decoder::parameter_metadata::{DeclarationDestination, ParameterGroupError};
 use eredu_checkpoint::LinearFormat;
 use eredu_nn::{Error, GroupedProjectionSpec, LinearFormatSpec, ParameterSpec};
 use eredu_runtime::{ParallelPlanError, ParameterMemberSpec};
 
-fn expert_parameter(name: &str) -> Result<ParameterSpec, Error> {
-    ParameterSpec::trainable(name).map_err(Error::backend)
-}
-
-fn companion(
+pub(crate) fn companion(
     weight_name: &str,
     companion_name: String,
     component: &str,
@@ -28,54 +25,44 @@ pub(crate) fn standard_linear_format(
     weight_name: &str,
     format: LinearFormat,
 ) -> Result<LinearFormatSpec, Error> {
-    let prefix = weight_name.strip_suffix(".weight").ok_or_else(|| {
-        Error::backend(format!(
-            "encoded ordinary linear parameter {weight_name:?} must end in .weight"
-        ))
-    });
-    match format {
-        LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => LinearFormatSpec::unscaled(format),
-        LinearFormat::E4M3BlockFp8(_) => {
-            let prefix = prefix?;
-            LinearFormatSpec::scaled(
-                format,
-                companion(weight_name, format!("{prefix}.weight_scale_inv"), "scale")?,
-            )
-        }
-        LinearFormat::MxFp4 => {
-            let prefix = prefix?;
-            LinearFormatSpec::scaled(
-                format,
-                companion(weight_name, format!("{prefix}.scales"), "scale")?,
-            )
-        }
-        LinearFormat::Affine(_) => {
-            let prefix = prefix?;
-            LinearFormatSpec::affine(
-                format,
-                companion(weight_name, format!("{prefix}.scales"), "scale")?,
-                companion(weight_name, format!("{prefix}.biases"), "affine-bias")?,
-            )
-        }
-    }
+    crate::decoder::static_construction::format::standard_linear_format_with(
+        weight_name,
+        format,
+        &mut crate::decoder::static_construction::format::OrdinaryFormat,
+    )
 }
 
 pub(crate) fn standard_expert_format(
     weight_name: &str,
     format: LinearFormat,
 ) -> Result<LinearFormatSpec, Error> {
-    let declaration = match format {
-        LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => LinearFormatSpec::unscaled(format),
-        LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => LinearFormatSpec::scaled(
-            format,
-            companion(weight_name, format!("{weight_name}_scales"), "scale")?,
-        ),
-        LinearFormat::Affine(_) => LinearFormatSpec::affine(
-            format,
-            companion(weight_name, format!("{weight_name}_scales"), "scale")?,
-            companion(weight_name, format!("{weight_name}_biases"), "affine-bias")?,
-        ),
-    }?;
+    expert_format_with(
+        weight_name,
+        format,
+        crate::decoder::ModuleMetadata::ordinary(),
+    )
+}
+fn expert_format_with(
+    weight_name: &str,
+    format: LinearFormat,
+    metadata: crate::decoder::ModuleMetadata<'_>,
+) -> Result<LinearFormatSpec, Error> {
+    metadata.controls::<(
+        LinearFormatSpec,
+        Option<ParameterSpec>,
+        Option<ParameterSpec>,
+    )>()?;
+    let companion = |suffix: &str| -> Result<ParameterSpec, Error> {
+        let mut spec = metadata.named_parameter(format_args!("{weight_name}{suffix}"))?;
+        spec.group = Some(metadata.text(format_args!("{weight_name}"))?);
+        Ok(spec)
+    };
+    let (scale, bias) = match format {
+        LinearFormat::Dense | LinearFormat::GgufIQuant { .. } => (None, None),
+        LinearFormat::MxFp4 | LinearFormat::E4M3BlockFp8(_) => (Some(companion("_scales")?), None),
+        LinearFormat::Affine(_) => (Some(companion("_scales")?), Some(companion("_biases")?)),
+    };
+    let declaration = metadata.declared_format(format, scale, bias)?;
     if matches!(format, LinearFormat::E4M3BlockFp8(_)) && weight_name.ends_with(".gate_up_proj") {
         declaration.with_row_layout(eredu_nn::LinearRowLayout::equal_partitions(2)?)
     } else {
@@ -84,18 +71,32 @@ pub(crate) fn standard_expert_format(
 }
 
 /// Declares one expert projection using the repository's checkpoint convention.
-///
-/// The returned neutral specification contains the complete topology. Backends
-/// consume these identities literally and never reconstruct this convention.
 pub(crate) fn standard_expert_projection(
     weight_name: &str,
     bias_name: Option<&str>,
     format: LinearFormat,
 ) -> Result<GroupedProjectionSpec, Error> {
+    standard_expert_projection_with(
+        weight_name,
+        bias_name,
+        format,
+        crate::decoder::ModuleMetadata::ordinary(),
+    )
+}
+/// Same names, companions and row geometry, with the caller's funded producer.
+pub(crate) fn standard_expert_projection_with(
+    weight_name: &str,
+    bias_name: Option<&str>,
+    format: LinearFormat,
+    metadata: crate::decoder::ModuleMetadata<'_>,
+) -> Result<GroupedProjectionSpec, Error> {
+    metadata.controls::<GroupedProjectionSpec>()?;
     GroupedProjectionSpec::new(
-        expert_parameter(weight_name)?,
-        bias_name.map(expert_parameter).transpose()?,
-        standard_expert_format(weight_name, format)?,
+        metadata.plain_parameter(weight_name)?,
+        bias_name
+            .map(|name| metadata.plain_parameter(name))
+            .transpose()?,
+        expert_format_with(weight_name, format, metadata)?,
     )
 }
 
@@ -143,8 +144,35 @@ pub(crate) fn input_partition_units(
     elements_per_unit: usize,
     format: LinearFormat,
 ) -> Result<usize, ParallelPlanError> {
+    input_partition_units_with(
+        name,
+        semantic_units,
+        elements_per_unit,
+        format,
+        DeclarationDestination(None),
+    )
+    .map_err(ParameterGroupError::ordinary)
+}
+pub(crate) fn input_partition_units_with(
+    name: &str,
+    semantic_units: usize,
+    elements_per_unit: usize,
+    format: LinearFormat,
+    destination: DeclarationDestination<'_>,
+) -> Result<usize, ParameterGroupError> {
     let alignment = usize::try_from(input_partition_alignment(format))
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        .map_err(|error| destination.group_error(format_args!("{error}")))?;
+    if let Some(context) = destination.0 {
+        return eredu_runtime::aligned_partition_units_with_metadata(
+            name,
+            semantic_units,
+            elements_per_unit,
+            alignment,
+            matches!(format, LinearFormat::E4M3BlockFp8(_)),
+            context,
+        )
+        .map_err(ParameterGroupError::Metadata);
+    }
     match format {
         LinearFormat::E4M3BlockFp8(_) => eredu_runtime::aligned_partition_units_with_tail(
             name,
@@ -159,6 +187,7 @@ pub(crate) fn input_partition_units(
             alignment,
         ),
     }
+    .map_err(ParameterGroupError::Ordinary)
 }
 
 /// Retains complete FP8 input blocks and a short final block in a dense FFN.
@@ -171,51 +200,67 @@ pub(crate) fn dense_ffn_partition_tail(
     output_format: LinearFormat,
     format_of: impl Fn(&str) -> LinearFormat,
 ) -> Result<eredu_runtime::ParameterGroupSpec, ParallelPlanError> {
+    dense_ffn_partition_tail_with(
+        group,
+        intermediate,
+        output_format,
+        |name| Ok(format_of(name)),
+        DeclarationDestination(None),
+    )
+    .map_err(ParameterGroupError::ordinary)
+}
+pub(crate) fn dense_ffn_partition_tail_with(
+    group: eredu_runtime::ParameterGroupSpec,
+    intermediate: usize,
+    output_format: LinearFormat,
+    format_of: impl Fn(&str) -> Result<LinearFormat, ParameterGroupError>,
+    destination: DeclarationDestination<'_>,
+) -> Result<eredu_runtime::ParameterGroupSpec, ParameterGroupError> {
+    destination.controls::<eredu_runtime::ParameterGroupSpec>()?;
     let LinearFormat::E4M3BlockFp8(block) = output_format else {
         return Ok(group);
     };
     block
         .validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        .map_err(|error| destination.group_error(format_args!("{error}")))?;
     let chunk = usize::try_from(block.block_columns)
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+        .map_err(|error| destination.group_error(format_args!("{error}")))?;
     if intermediate.is_multiple_of(chunk) {
         return Ok(group);
     }
-    eredu_runtime::partition_parameter_group_chunks(group, intermediate.div_ceil(chunk), |member| {
+    destination.chunks(group, intermediate.div_ceil(chunk), |member, _source| {
         let Some(owner) = member.linear_companion_of() else {
             return Ok(chunk);
         };
-        let LinearFormat::E4M3BlockFp8(format) = format_of(owner) else {
+        let LinearFormat::E4M3BlockFp8(format) = format_of(owner)? else {
             // Dense FFN read projections shard output rows. Affine and MXFP4
             // companions retain these rows; only their input axis is packed.
             return Ok(chunk);
         };
         format
             .validate()
-            .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
+            .map_err(|error| destination.group_error(format_args!("{error}")))?;
         let axis = match member.sharding() {
             eredu_runtime::MemberSharding::Partitioned { axis }
             | eredu_runtime::MemberSharding::PartitionedSegments { axis, .. } => *axis,
             _ => {
-                return Err(ParallelPlanError::InvalidTensor(
-                    "dense FFN companion has no partition axis".into(),
-                ))
+                return Err(destination
+                    .tensor_error(format_args!("dense FFN companion has no partition axis")));
             }
         };
         let divisor = match member.global_shape().len().checked_sub(axis) {
             Some(2) => format.block_rows as usize,
             Some(1) => format.block_columns as usize,
             _ => {
-                return Err(ParallelPlanError::InvalidTensor(
-                    "dense FFN companion axis is not a matrix axis".into(),
-                ))
+                return Err(destination.tensor_error(format_args!(
+                    "dense FFN companion axis is not a matrix axis"
+                )));
             }
         };
         if !chunk.is_multiple_of(divisor) {
-            return Err(ParallelPlanError::InvalidTensor(
-                "dense FFN chunk splits a scale block".into(),
-            ));
+            return Err(
+                destination.tensor_error(format_args!("dense FFN chunk splits a scale block"))
+            );
         }
         Ok(chunk / divisor)
     })

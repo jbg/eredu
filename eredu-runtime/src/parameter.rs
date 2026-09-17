@@ -5,7 +5,7 @@ use std::{collections::BTreeMap, marker::PhantomData};
 use eredu_checkpoint::{
     recipe::{AtomicRecipeSet, DerivedWeightRecipe, RecipeCatalog, RecipeDtype, RecipeError},
     store::{
-        CheckpointSource, ReadPolicy, SharedCheckpointSource, StoreError, TensorReadRequest,
+        CheckpointSource, ReadPolicy, RetainedCheckpointSource, StoreError, TensorReadRequest,
         TensorSelection,
     },
 };
@@ -16,6 +16,12 @@ use eredu_nn::{
 use crate::{
     ParameterBackend, ReplicatedTextMaterializationTask, ResidencyDeclarationError, WeightBinding,
     WeightBindingPlan, WeightLoweringKind,
+};
+
+mod binding;
+pub use binding::{
+    bind_prepared_parameter_values, prepared_parameter_binding_control_bytes,
+    PreparedParameterBinding, PreparedParameterBindingError,
 };
 
 /// Portable bound on a group of final parameter allocations during loading.
@@ -472,7 +478,7 @@ pub fn build_exact_replicated_text_bindings<P, M, D, L, E>(
     addressable_parameters: &std::collections::BTreeSet<String>,
     local_layout: Option<&crate::LocalModelLayout>,
     describe: D,
-    mut lower_mxfp4: L,
+    lower_mxfp4: L,
 ) -> Result<Vec<WeightBinding>, ModuleBindingPlanError>
 where
     P: 'static,
@@ -530,9 +536,90 @@ where
         })?;
     }
 
-    let parameter_names = collector
-        .parameters
-        .keys()
+    exact_bindings_from_targets(
+        &collector.parameters,
+        source,
+        tasks,
+        addressable_parameters,
+        local_layout,
+        lower_mxfp4,
+    )
+}
+
+/// Builds exact source bindings from architecture-declared destination geometry.
+///
+/// This is the cold counterpart of [`build_exact_replicated_text_bindings`]. It
+/// uses the same provenance, alias, companion, placement and coverage checks,
+/// without constructing a module or a native parameter handle. The caller must
+/// obtain descriptions from the retained architecture/lowering selection and
+/// validate the actual native destinations against them before binding.
+/// This ordinary planning operation allocates; it is not a memory-admission grant.
+pub fn build_exact_replicated_text_bindings_for_targets<L, E>(
+    targets: &BTreeMap<String, ParameterBindingTarget>,
+    source: &dyn CheckpointSource,
+    tasks: &[&ReplicatedTextMaterializationTask],
+    addressable_parameters: &std::collections::BTreeSet<String>,
+    local_layout: Option<&crate::LocalModelLayout>,
+    lower_mxfp4: L,
+) -> Result<Vec<WeightBinding>, ModuleBindingPlanError>
+where
+    L: FnMut(
+        &ReplicatedTextMaterializationTask,
+        DerivedWeightRecipe,
+        &dyn CheckpointSource,
+    ) -> Result<DerivedWeightRecipe, E>,
+    E: std::fmt::Display,
+{
+    exact_bindings_from_targets(
+        targets,
+        source,
+        tasks,
+        addressable_parameters,
+        local_layout,
+        lower_mxfp4,
+    )
+}
+
+// Both entry points lend their already-owned descriptions. Native traversal
+// needs no second map or copied description to share the cold binding planner.
+trait ExactBindingTargets {
+    fn names(&self) -> impl Iterator<Item = &String>;
+    fn description(&self, name: &str) -> Option<&ParameterBindingTarget>;
+}
+impl ExactBindingTargets for BTreeMap<String, ParameterBindingTarget> {
+    fn names(&self) -> impl Iterator<Item = &String> {
+        self.keys()
+    }
+    fn description(&self, name: &str) -> Option<&ParameterBindingTarget> {
+        self.get(name)
+    }
+}
+impl<P> ExactBindingTargets for BTreeMap<String, (&P, ParameterBindingTarget)> {
+    fn names(&self) -> impl Iterator<Item = &String> {
+        self.keys()
+    }
+    fn description(&self, name: &str) -> Option<&ParameterBindingTarget> {
+        self.get(name).map(|(_, description)| description)
+    }
+}
+fn exact_bindings_from_targets<L, E>(
+    targets: &impl ExactBindingTargets,
+    source: &dyn CheckpointSource,
+    tasks: &[&ReplicatedTextMaterializationTask],
+    addressable_parameters: &std::collections::BTreeSet<String>,
+    local_layout: Option<&crate::LocalModelLayout>,
+    mut lower_mxfp4: L,
+) -> Result<Vec<WeightBinding>, ModuleBindingPlanError>
+where
+    L: FnMut(
+        &ReplicatedTextMaterializationTask,
+        DerivedWeightRecipe,
+        &dyn CheckpointSource,
+    ) -> Result<DerivedWeightRecipe, E>,
+    E: std::fmt::Display,
+{
+    let parameter_names = targets
+        .names()
         .cloned()
         .collect::<std::collections::BTreeSet<_>>();
     let mut covered = std::collections::BTreeSet::new();
@@ -574,7 +661,7 @@ where
         }
         let recipe = exact_task_recipe(task, source, &mut lower_mxfp4)?;
         push_exact_declaration(
-            &collector.parameters,
+            targets,
             &mut declarations,
             &mut conversions,
             target,
@@ -645,7 +732,7 @@ where
                 });
             };
             push_exact_declaration(
-                &collector.parameters,
+                targets,
                 &mut declarations,
                 &mut conversions,
                 target,
@@ -706,18 +793,17 @@ where
         .map_err(Into::into)
 }
 
-fn push_exact_declaration<P>(
-    parameters: &BTreeMap<String, (&P, ParameterBindingTarget)>,
+fn push_exact_declaration(
+    parameters: &impl ExactBindingTargets,
     declarations: &mut Vec<PlannedBinding>,
     conversions: &mut BTreeMap<String, Vec<RecipeDtype>>,
     target: String,
     recipe: DerivedWeightRecipe,
     explicitly_permitted_source_dtypes: &[RecipeDtype],
 ) -> Result<(), ModuleBindingPlanError> {
-    let description = &parameters
-        .get(&target)
-        .expect("validated module destination remains present")
-        .1;
+    let description = parameters
+        .description(&target)
+        .expect("validated destination remains present");
     let mut permitted = description.permitted_source_dtypes.clone();
     for dtype in explicitly_permitted_source_dtypes {
         if !permitted.contains(dtype) {
@@ -967,7 +1053,7 @@ pub struct MaterializedUnit<B: ParameterBackend> {
 /// this token materializes the already selected operations without asking the
 /// backend to select them again.
 pub struct SelectedBindingPlan<B: ParameterBackend> {
-    source: SharedCheckpointSource,
+    source: RetainedCheckpointSource,
     plan: WeightBindingPlan<'static>,
     backend: PhantomData<fn() -> B>,
 }
@@ -1017,9 +1103,10 @@ pub fn preflight_bindings<'a, B: ParameterBackend>(
 /// publishing parameters. The returned token owns both the source and tasks so
 /// later materialization cannot substitute either or repeat backend selection.
 pub fn select_bindings<B: ParameterBackend>(
-    source: SharedCheckpointSource,
+    source: impl Into<RetainedCheckpointSource>,
     bindings: Vec<WeightBinding>,
 ) -> Result<SelectedBindingPlan<B>, ParameterOrchestrationError<B::ParameterError>> {
+    let source = source.into();
     let plan = validated_binding_plan::<B>(source.as_ref(), WeightBindingPlan::owned(bindings)?)?;
     Ok(SelectedBindingPlan {
         source,
@@ -1153,7 +1240,7 @@ where
 /// Binds a realized unit while leaving explicitly excluded destinations untouched.
 pub fn bind_materialized_unit_excluding<B, M, F>(
     module: &mut M,
-    mut unit: MaterializedUnit<B>,
+    unit: MaterializedUnit<B>,
     excluded: F,
 ) -> Result<(), ParameterOrchestrationError<B::ParameterError>>
 where
@@ -1161,140 +1248,25 @@ where
     M: Parameterized<B::Parameter>,
     F: Fn(&ParameterId) -> bool,
 {
-    struct Validator<'a, B: ParameterBackend> {
-        weights: &'a BTreeMap<ParameterId, B::MaterializedWeight>,
-        visited: BTreeMap<ParameterId, ()>,
-        error: Option<ParameterOrchestrationError<B::ParameterError>>,
-        excluded: &'a dyn Fn(&ParameterId) -> bool,
-    }
+    bind_parameter_values(module, unit.weights, excluded, B::validate_bind, B::bind)
+}
 
-    impl<'a, 'value, B: ParameterBackend> ParameterVisitor<'value, B::Parameter> for Validator<'a, B> {
-        fn visit(&mut self, metadata: ParameterMetadata, parameter: &'value B::Parameter) {
-            if self.error.is_some() {
-                return;
-            }
-            if (self.excluded)(&metadata.id) {
-                return;
-            }
-            if self.visited.insert(metadata.id.clone(), ()).is_some() {
-                self.error = Some(ParameterOrchestrationError::DuplicateParameter {
-                    parameter: metadata.id,
-                });
-                return;
-            }
-            let Some(weight) = self.weights.get(&metadata.id) else {
-                self.error = Some(ParameterOrchestrationError::MissingBinding {
-                    parameter: metadata.id,
-                });
-                return;
-            };
-            if let Err(error) = B::validate_bind(parameter, weight) {
-                self.error = Some(ParameterOrchestrationError::Backend(error));
-            }
-        }
-    }
-
-    let mut validator = Validator::<B> {
-        weights: &unit.weights,
-        visited: BTreeMap::new(),
-        error: None,
-        excluded: &excluded,
-    };
-    module.visit_parameters(&mut validator);
-    if let Some(error) = validator.error {
-        return Err(error);
-    }
-    let unexpected = unit
-        .weights
-        .keys()
-        .filter(|id| !validator.visited.contains_key(*id))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !unexpected.is_empty() {
-        return Err(ParameterOrchestrationError::UnexpectedBindings {
-            parameters: unexpected,
-        });
-    }
-
-    struct MutableTopologyValidator<'a> {
-        expected: &'a BTreeMap<ParameterId, ()>,
-        visited: BTreeMap<ParameterId, ()>,
-        unexpected: Vec<ParameterId>,
-        duplicate: Option<ParameterId>,
-        excluded: &'a dyn Fn(&ParameterId) -> bool,
-    }
-
-    impl<'a, 'value, P: 'value> ParameterVisitorMut<'value, P> for MutableTopologyValidator<'a> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, _: &'value mut P) {
-            if self.duplicate.is_some() {
-                return;
-            }
-            if (self.excluded)(&metadata.id) {
-                return;
-            }
-            if self.visited.insert(metadata.id.clone(), ()).is_some() {
-                self.duplicate = Some(metadata.id);
-            } else if !self.expected.contains_key(&metadata.id) {
-                self.unexpected.push(metadata.id);
-            }
-        }
-    }
-
-    let mut mutable_topology = MutableTopologyValidator {
-        expected: &validator.visited,
-        visited: BTreeMap::new(),
-        unexpected: Vec::new(),
-        duplicate: None,
-        excluded: &excluded,
-    };
-    module.visit_parameters_mut(&mut mutable_topology);
-    if let Some(parameter) = mutable_topology.duplicate {
-        return Err(ParameterOrchestrationError::DuplicateParameter { parameter });
-    }
-    let mut mismatch = mutable_topology.unexpected;
-    mismatch.extend(
-        validator
-            .visited
-            .keys()
-            .filter(|id| !mutable_topology.visited.contains_key(*id))
-            .cloned(),
-    );
-    if !mismatch.is_empty() {
-        mismatch.sort();
-        mismatch.dedup();
-        return Err(ParameterOrchestrationError::ParameterTraversalMismatch {
-            parameters: mismatch,
-        });
-    }
-
-    struct Binder<'a, B: ParameterBackend> {
-        weights: &'a mut BTreeMap<ParameterId, B::MaterializedWeight>,
-        excluded: &'a dyn Fn(&ParameterId) -> bool,
-    }
-
-    impl<'a, 'value, B: ParameterBackend> ParameterVisitorMut<'value, B::Parameter> for Binder<'a, B> {
-        fn visit_mut(&mut self, metadata: ParameterMetadata, parameter: &'value mut B::Parameter) {
-            if (self.excluded)(&metadata.id) {
-                return;
-            }
-            let weight = self
-                .weights
-                .remove(&metadata.id)
-                .expect("prepublication mutable traversal validated every binding identity");
-            B::bind(parameter, weight);
-        }
-    }
-
-    let mut binder = Binder::<B> {
-        weights: &mut unit.weights,
-        excluded: &excluded,
-    };
-    module.visit_parameters_mut(&mut binder);
-    assert!(
-        unit.weights.is_empty(),
-        "prepublication mutable traversal validated complete binding consumption"
-    );
-    Ok(())
+/// Shares exact prepublication traversal checks between realized and metadata
+/// parameters. Validation inspects values without replacing them; the final
+/// binding callback is infallible and consumes each supplied value exactly once.
+pub(crate) fn bind_parameter_values<P, W, E, M>(
+    module: &mut M,
+    weights: BTreeMap<ParameterId, W>,
+    excluded: impl Fn(&ParameterId) -> bool,
+    validate: impl Fn(&P, &W) -> Result<(), E>,
+    bind: impl Fn(&mut P, W),
+) -> Result<(), ParameterOrchestrationError<E>>
+where
+    P: 'static,
+    E: std::error::Error + Send + Sync + 'static,
+    M: Parameterized<P>,
+{
+    binding::ordinary(module, weights, excluded, validate, bind)
 }
 
 /// Failure in backend-neutral parameter materialization or binding.

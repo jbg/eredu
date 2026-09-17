@@ -96,19 +96,34 @@ pub(super) fn validate_payload(
     shape: &[u64],
     payload: &CapturePayload,
 ) -> Result<(), CaptureError> {
-    let vocabulary = *shape
-        .last()
-        .ok_or_else(|| invalid("scalar vocabulary source"))?;
-    if vocabulary == 0 {
-        return Err(invalid("empty vocabulary source"));
+    let value=match payload {
+        CapturePayload::Candidates(value)=>VocabularyPayload::Candidates(value),
+        CapturePayload::TokenScores(value)=>VocabularyPayload::Scores(value),
+        _=>return Err(invalid("vocabulary payload kind differs")),
+    };
+    if !payload_valid(selection,position,shape,value) {
+        return Err(invalid("vocabulary payload differs from its admitted reduction or score semantics"));
     }
+    Ok(())
+}
+
+/// Borrowed views of the existing owned payloads; no allocation or new reducer.
+#[derive(Debug)]
+pub(crate) enum VocabularyPayload<'a> {
+    Candidates(&'a CaptureCandidates),Scores(&'a CaptureTokenScores),
+}
+/// Allocation-free source checks shared by ordinary and original receipt readers.
+pub(crate) fn payload_valid(selection:&CaptureSelection,position:ObservationPosition,
+    shape:&[u64],payload:VocabularyPayload<'_>)->bool {
+    let Some(&vocabulary)=shape.last() else{return false};
+    if vocabulary==0 {return false;}
     let expected_source = if position == ObservationPosition::AfterIntervention {
         CandidateLogitsSource::Effective
     } else {
         CandidateLogitsSource::Original
     };
     let valid = match (&selection.transform, payload) {
-        (CaptureTransform::TopCandidates { count }, CapturePayload::Candidates(value)) => {
+        (CaptureTransform::TopCandidates { count }, VocabularyPayload::Candidates(value)) => {
             value.source == expected_source
                 && *count <= vocabulary
                 && value.candidates.len() as u64 == *count
@@ -125,7 +140,7 @@ pub(super) fn validate_payload(
                             && (index == 0 || value.candidates[index - 1].score >= candidate.score)
                     })
         }
-        (CaptureTransform::TokenScores { token_ids }, CapturePayload::TokenScores(value)) => {
+        (CaptureTransform::TokenScores { token_ids }, VocabularyPayload::Scores(value)) => {
             value.source == expected_source
                 && value.vocabulary == vocabulary
                 && value.log_partition.is_finite()
@@ -173,10 +188,64 @@ pub(super) fn validate_payload(
         }
         _ => false,
     };
-    if !valid {
-        return Err(invalid(
-            "vocabulary payload differs from its admitted reduction or score semantics",
-        ));
+    valid
+}
+
+/// Typed terminal source derived from the same immutable capture selection.
+/// Physical row narrowing is supplied only by a retained prefill schedule.
+#[derive(Debug)]
+pub(crate) enum CompleteVocabularyGeometry<'a> {
+    Candidates(CaptureCandidateGeometry<'a>),
+    Scores(CaptureTokenScoreGeometry<'a>),
+}
+impl<'a> CompleteVocabularyGeometry<'a> {
+    pub(crate) fn control_bytes()->Option<usize> {
+        use std::mem::{size_of,size_of_val};
+        let parts=[size_of::<Self>()*2,size_of::<Result<Option<Self>,CaptureTensorGeometryError>>(),
+            size_of::<CaptureCandidateGeometry<'_>>(),size_of::<CaptureTokenScoreGeometry<'_>>(),
+            size_of::<Result<CaptureCandidateGeometry<'_>,CaptureTensorGeometryError>>(),
+            size_of::<Result<CaptureTokenScoreGeometry<'_>,CaptureTensorGeometryError>>(),
+            size_of::<(&AdmittedCapturePlan,usize,CapturePhase,u64,Option<usize>)>(),
+            size_of::<CaptureInvocationShape>()*2,size_of::<Option<CaptureInvocationShape>>(),
+            size_of::<([usize;3],usize,&CaptureSelection,&eredu_core::ObservationPoint)>(),
+        ];
+        parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
     }
-    Ok(())
+
+    pub(crate) fn prepare(source:&'a AdmittedCapturePlan,index:usize,phase:CapturePhase,prediction:u64,rows:Option<usize>)
+        ->Result<Option<Self>,CaptureTensorGeometryError> {
+        let selection=source.plan().selections.get(index)
+            .ok_or(CaptureTensorGeometryError::SelectionMissing {index})?;
+        Ok(match selection.transform {
+            CaptureTransform::TopCandidates { .. }=>{
+                let value=CaptureCandidateGeometry::prepare(source,index,phase,prediction,None)?;
+                Some(Self::Candidates(match rows {Some(rows)=>value.terminal_readout(rows)?,None=>value}))
+            }
+            CaptureTransform::TokenScores { .. }=>{
+                let value=CaptureTokenScoreGeometry::prepare(source,index,phase,prediction,None)?;
+                Some(Self::Scores(match rows {Some(rows)=>value.terminal_readout(rows)?,None=>value}))
+            }
+            _=>{if rows.is_some(){return Err(CaptureTensorGeometryError::Unsupported);}None}
+        })
+    }
+    pub(crate) fn shape(&self)->&[usize;3] {match self {
+        Self::Candidates(value)=>value.source_shape(),Self::Scores(value)=>value.source_shape(),
+    }}
+    pub(crate) fn matches(&self,shape:&[u64])->bool {
+        shape.len()==3&&self.shape().iter().zip(shape).all(|(a,b)|u64::try_from(*a).ok()==Some(*b))
+    }
+}
+
+pub(crate) fn payload_validation_control_bytes()->Option<usize> {
+    use std::mem::{size_of,size_of_val};
+    let parts=[size_of::<VocabularyPayload<'_>>(),size_of::<(&CaptureSelection,ObservationPosition,&[u64])>(),
+        size_of::<Option<CandidateDomain>>(),size_of::<CandidateLogitsSource>(),
+        size_of::<(&CaptureCandidate,Option<CandidateDomain>,u64)>(),
+        size_of::<(f32,f32,f64,u64)>(),size_of::<[f64;7]>(),
+        size_of::<std::iter::Enumerate<std::slice::Iter<'_,CaptureCandidate>>>(),
+        size_of::<std::slice::Iter<'_,CaptureCandidate>>(),
+        size_of::<std::iter::Zip<std::slice::Iter<'_,CaptureTokenScore>,std::slice::Iter<'_,u32>>>(),
+        size_of::<(usize,&CaptureCandidate,&CaptureTokenScore,&u32,u64,bool)>(),
+    ];
+    parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
 }

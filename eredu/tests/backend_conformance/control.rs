@@ -9,6 +9,12 @@ mod snapshots;
 #[path = "control/text.rs"]
 mod text;
 
+#[path = "control/tokenizer_snapshot.rs"]
+mod tokenizer_snapshot;
+
+#[path = "control/provider_errors.rs"]
+pub(crate) mod provider_errors;
+
 fn setup() -> (
     LoadedModel<MockBackend>,
     PreparedChat,
@@ -42,6 +48,81 @@ fn limits() -> TraceLimits {
     }
 }
 
+#[test]
+fn completed_prefix_cancellation_has_ordinary_controlled_parity_without_token_commit() {
+    for fail in [false, true] {
+        for controlled in [false, true] {
+            let (mut model, chat, settings, _) = setup();
+            let mut events = Vec::new();
+            if controlled {
+                let prepared = model
+                    .prepare_observed_chat(&chat, settings, CapturePlan::none(), limits())
+                    .unwrap();
+                let mut session = model
+                    .start_controlled_chat(prepared, &[], Default::default(), |_| {
+                        ControlFlow::Continue(())
+                    })
+                    .unwrap();
+                PREFILL_CANCELLATION.with(|slot| slot.set(if fail { 2 } else { 1 }));
+                let result = session.step(|record| {
+                    if let ObservedGenerationEvent::Semantic { event, .. } = record.generation.event
+                    {
+                        events.push(event);
+                    }
+                    ControlFlow::Continue(())
+                });
+                assert!(session.token_ids().is_empty());
+                assert_eq!(session.next_prediction(), 0);
+                if fail {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("prefill completion failed"));
+                    assert_eq!(session.status(), GenerationStatus::Failed);
+                } else {
+                    assert_eq!(result.unwrap(), GenerationStatus::Cancelled);
+                    assert_eq!(session.finish_reason(), Some(FinishReason::Cancelled));
+                }
+            } else {
+                PREFILL_CANCELLATION.with(|slot| slot.set(if fail { 2 } else { 1 }));
+                let result = model.generate_prepared_chat(PreparedChatGenerationRequest {
+                    input: PreparedChatInput::rendered_prompt(&chat),
+                    settings,
+                    caller_stop_sequences: &[],
+                    cancellation: Default::default(),
+                    on_event: |event| events.push(event),
+                });
+                if fail {
+                    assert!(result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("prefill completion failed"));
+                } else {
+                    let result = result.unwrap();
+                    assert!(result.token_ids.is_empty());
+                    assert_eq!(result.finish_reason, FinishReason::Cancelled);
+                    assert!(result.timing().time_to_first_token().is_none());
+                }
+            }
+            assert_eq!(
+                events,
+                if fail {
+                    vec![]
+                } else {
+                    vec![SemanticEvent::Finished {
+                        reason: FinishReason::Cancelled,
+                    }]
+                }
+            );
+            assert_eq!(
+                PREFILL_CANCELLATION.with(|slot| slot.get()),
+                0,
+                "shared driver must consume the live token"
+            );
+        }
+    }
+}
+
 impl eredu_runtime::execution_control::TextSamplingControlBackend for MockBackend {
     fn sampling_control_facts(state: &observed_mock::State) -> eredu::api::SamplingStateFacts {
         eredu::api::SamplingStateFacts {
@@ -55,6 +136,7 @@ impl eredu_runtime::execution_control::TextSamplingControlBackend for MockBacken
         state: &mut observed_mock::State,
         request: eredu_runtime::execution_control::ValidatedSamplingOverride,
     ) -> Result<(), MockError> {
+        provider_errors::check("sampling")?;
         if let Some(seed) = request.reseed() {
             state.sampling.seed = Some(seed);
         }
@@ -528,9 +610,9 @@ fn controlled_facade_closes_broken_consumers_and_fences_panics_and_transport_fai
 
 #[test]
 fn controlled_choices_use_sparse_tokenizer_ids_instead_of_entry_count() {
-    let base = unicode_model(None);
+    let tokenizer = unicode_tokenizer(None, 64);
     let mut value: serde_json::Value =
-        serde_json::from_str(&base.tokenizer().to_string(false).unwrap()).unwrap();
+        serde_json::from_str(&tokenizer.to_string(false).unwrap()).unwrap();
     // Leave IDs 2 and 3 unmapped, preserving the high mapped IDs and EOS.
     let vocabulary = value["model"]["vocab"].as_object_mut().unwrap();
     vocabulary.remove("ordinary_1");
@@ -551,7 +633,8 @@ fn controlled_choices_use_sparse_tokenizer_ids_instead_of_entry_count() {
             eos_token_ids: vec![eos],
             checkpoint_generation_config: None,
         },
-    );
+    )
+    .unwrap();
     let chat = model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role":"user", "content":"hello"})],
@@ -680,3 +763,6 @@ fn exact_token_prefix_admission_preserves_ids_and_rejects_unknown_vocabulary_bef
         }
     )));
 }
+
+#[path = "control/prepared.rs"]
+mod prepared;

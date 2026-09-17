@@ -11,12 +11,40 @@ use safemlx_sys::mlx_array;
 use std::ffi::c_void;
 
 mod element;
+pub(crate) mod host_read;
+mod metadata;
+mod prepared_clone;
+mod prepared_host;
+mod prepared_mutable;
+mod prepared_prompt;
+mod repeated_i32;
+pub use prepared_clone::{PreparedArrayClone, PreparedArrayCloneCause};
+pub use prepared_host::{
+    CompletedOwnedHostCopy, OwnedHostBufferCopyError, OwnedHostCopyBuffer, OwnedHostCopyCause,
+    OwnedHostCopyError, OwnedHostCopyFacts, OwnedHostCopyPlan, OwnedHostCopyPreparationError,
+    OwnedHostCopyPreparationOwner, OwnedHostCopyStrategy, PreparedOwnedHostCopy,
+};
+pub use prepared_mutable::{
+    OriginalMutablePairCause, OriginalMutablePairCustodies, OriginalMutablePairError,
+    OriginalMutablePairFacts, OriginalMutablePairOwner, OriginalMutablePairPlan,
+    PreparedOriginalMutablePair, RetainedOriginalMutablePair, UnpreparedOriginalMutablePair,
+};
+pub use prepared_prompt::{OriginalPromptInputCause, OriginalPromptInputFacts};
+pub use repeated_i32::RepeatedI32InputPlan;
+mod scoped_evaluation;
+pub use scoped_evaluation::{
+    original_scoped_deep_copy_control_bytes, original_scoped_evaluation_control_bytes,
+};
 
 cfg_safetensors! {
     mod safetensors;
 }
 
 pub use element::ArrayElement;
+pub use metadata::{
+    ArrayDescriptorError, ArrayDescriptorFacts, ArrayDescriptorLoan, ArrayMetadataError,
+    ArrayMetadataSnapshot, OrdinaryArrayMetadataGuard, OwnedArrayDescriptorLoan,
+};
 
 // Not using Complex64 because `num_complex::Complex64` is actually Complex<f64>
 
@@ -33,6 +61,49 @@ pub struct Array {
     c_array: mlx_array,
 }
 
+/// Exact completed backing storage, distinct from a view's logical byte count.
+/// Identity is local to the linked native runtime and never reused, including
+/// after physical retirement. It is not persistent across processes/runtimes.
+/// It grants no pointer access and makes no statement about future allocations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocationInfo {
+    identity: AllocationIdentity,
+    bytes: usize,
+}
+
+/// Opaque allocation equality key. Nonzero generations are never reused by the
+/// linked native runtime, so deferred charges cannot alias a new allocation
+/// that reuses an address. Allocator and host-transfer namespaces are distinct.
+/// Allocation-free empty values use a zero sentinel and carry no storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AllocationIdentity {
+    host_transfer: bool,
+    generation: u64,
+}
+
+/// Allocation information returned by a completed native array.
+pub type ArrayAllocationInfo = AllocationInfo;
+
+impl AllocationInfo {
+    pub(crate) const fn from_native(generation: u64, bytes: usize, host_transfer: bool) -> Self {
+        Self {
+            identity: AllocationIdentity {
+                host_transfer,
+                generation,
+            },
+            bytes,
+        }
+    }
+    /// Opaque equality key for views of the same retained physical allocation.
+    pub const fn identity(&self) -> AllocationIdentity {
+        self.identity
+    }
+    /// Complete certified backing capacity, including padding.
+    pub const fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
 // SAFETY: `Array` owns an MLX C++ array handle. MLX arrays are immutable graph
 // values from the Rust API's perspective; mutation is represented by producing
 // new arrays. Runtime entry points that touch known MLX global state are guarded
@@ -41,7 +112,8 @@ unsafe impl Send for Array {}
 
 // SAFETY: Shared references to `Array` expose only immutable graph/value
 // operations. Concurrent evaluation and host-read paths are covered by runtime
-// guards where MLX requires them, and stress-tested in safemlx-tests.
+// guards where MLX requires them, and stress-tested in safemlx-tests. Allocation
+// owner attachment mutates only a sidecar, serialized by the same runtime lock.
 unsafe impl Sync for Array {}
 
 unsafe extern "C" fn drop_owned_vec<T>(payload: *mut c_void) {
@@ -312,6 +384,58 @@ impl Array {
     pub fn from_complex(val: complex64) -> Array {
         let c_array = unsafe { safemlx_sys::mlx_array_new_complex(val.re, val.im) };
         Array { c_array }
+    }
+
+    /// Construct a scalar while preserving a native allocation/refusal error.
+    pub fn try_from_scalar<T: FromSliceElement>(value: T) -> crate::error::Result<Self> {
+        Self::try_from_slice(std::slice::from_ref(&value), &[])
+    }
+
+    /// Copy a typed host slice after checked shape validation. A native error
+    /// returns its exact source; no null Array is exposed on construction failure.
+    pub fn try_from_slice<T: FromSliceElement>(
+        data: &[T],
+        shape: &[i32],
+    ) -> crate::error::Result<Self> {
+        let dimensions = i32::try_from(shape.len())
+            .map_err(|_| crate::error::Exception::custom("array rank exceeds int32"))?;
+        let elements = shape
+            .iter()
+            .try_fold(1usize, |size, dimension| {
+                usize::try_from(*dimension)
+                    .ok()
+                    .and_then(|dimension| size.checked_mul(dimension))
+            })
+            .ok_or_else(|| {
+                crate::error::Exception::custom("negative or overflowing array shape")
+            })?;
+        if elements != data.len() {
+            return Err(crate::error::Exception::custom(
+                "array shape does not match host slice",
+            ));
+        }
+        Self::try_from_op(|output| unsafe {
+            safemlx_sys::mlx_array_set_data(
+                output,
+                data.as_ptr().cast(),
+                shape.as_ptr(),
+                dimensions,
+                T::DTYPE.into(),
+            )
+        })
+    }
+
+    /// Fallible signed integer scalar construction.
+    pub fn try_from_int(value: i32) -> crate::error::Result<Self> {
+        Self::try_from_scalar(value)
+    }
+    /// Fallible float scalar construction.
+    pub fn try_from_f32(value: f32) -> crate::error::Result<Self> {
+        Self::try_from_scalar(value)
+    }
+    /// Fallible boolean scalar construction.
+    pub fn try_from_bool(value: bool) -> crate::error::Result<Self> {
+        Self::try_from_scalar(value)
     }
 
     /// New array from existing buffer.
@@ -607,7 +731,8 @@ impl Array {
         unsafe { safemlx_sys::mlx_array_size(self.as_ptr()) }
     }
 
-    /// The strides of the array.
+    /// The legacy unsigned strides. Reversed strides wrap as unsigned values;
+    /// use [`Self::signed_strides`] when interpreting logical coordinates.
     pub fn strides(&self) -> &[usize] {
         let ndim = self.ndim();
         if ndim == 0 {
@@ -621,9 +746,47 @@ impl Array {
         }
     }
 
+    /// Native signed strides in elements, including negative and zero strides.
+    /// Evaluate first to inspect the realized layout of a lazy view.
+    pub fn signed_strides(&self) -> &[i64] {
+        let ndim = self.ndim();
+        if ndim == 0 {
+            return &[];
+        }
+        // SAFETY: the retained native descriptor owns exactly ndim int64 strides.
+        // Unlike the legacy size_t API, this preserves the native signed type.
+        unsafe {
+            let data = safemlx_sys::mlx_array_signed_strides(self.as_ptr());
+            std::slice::from_raw_parts(data, ndim)
+        }
+    }
+
     /// The number of bytes in the array.
     pub fn nbytes(&self) -> usize {
         unsafe { safemlx_sys::mlx_array_nbytes(self.as_ptr()) }
+    }
+
+    /// Reads completed allocator or certified host-transfer storage without
+    /// evaluation, polling or waiting. Unfinished or unrecognized storage is unknown.
+    /// Exhausted allocation generations also remain unknown; identity queries
+    /// never assign a replacement generation or interfere with deallocation.
+    /// Logical view size never substitutes for unknown physical capacity.
+    pub fn allocation_info(&self) -> crate::error::Result<Option<ArrayAllocationInfo>> {
+        let _guard = runtime_lock::enter();
+        let (mut known, mut host_transfer, mut identity, mut bytes) = (false, false, 0, 0);
+        // SAFETY: all outputs point to live initialized scalars. The native
+        // query only reads this retained array and certified native-owned data;
+        // it neither exposes nor dereferences a caller-provided data pointer.
+        <() as Guarded>::try_from_op(|_| unsafe {
+            safemlx_sys::mlx_array_allocation_info(
+                &mut known,
+                &mut host_transfer,
+                &mut identity,
+                &mut bytes,
+                self.as_ptr(),
+            )
+        })?;
+        Ok(known.then_some(AllocationInfo::from_native(identity, bytes, host_transfer)))
     }
 
     /// The array’s dimension.
@@ -673,6 +836,12 @@ impl Array {
 
     /// Evaluate the array and return a borrowed host-readable value.
     pub fn evaluated(&self) -> crate::error::Result<EvaluatedArray<'_>> {
+        if let Some(result) = scoped_evaluation::evaluate(self) {
+            result?;
+            return Ok(EvaluatedArray {
+                storage: EvaluatedArrayStorage::Borrowed(self),
+            });
+        }
         let _guard = runtime_lock::enter();
         <() as Guarded>::try_from_op(|_| unsafe { safemlx_sys::mlx_array_eval(self.as_ptr()) })?;
         Ok(EvaluatedArray {
@@ -682,6 +851,12 @@ impl Array {
 
     /// Evaluate the array and return an owned host-readable value.
     pub fn into_evaluated(self) -> crate::error::Result<EvaluatedArray<'static>> {
+        if let Some(result) = scoped_evaluation::evaluate(&self) {
+            result?;
+            return Ok(EvaluatedArray {
+                storage: EvaluatedArrayStorage::Owned(self),
+            });
+        }
         let _guard = runtime_lock::enter();
         <() as Guarded>::try_from_op(|_| unsafe { safemlx_sys::mlx_array_eval(self.as_ptr()) })?;
         Ok(EvaluatedArray {
@@ -772,8 +947,10 @@ impl<'a> EvaluatedArray<'a> {
     ///
     /// # Safety
     ///
-    /// This is unsafe because the underlying data ptr is not checked for null or if the desired
-    /// dtype matches the actual dtype of the array.
+    /// The caller must ensure matching dtype, row-contiguous logical storage,
+    /// valid initialized elements, a non-null aligned data pointer, and a byte
+    /// length no greater than isize::MAX. Reversed, broadcast and other strided
+    /// views cannot be borrowed as a flat Rust slice.
     ///
     /// # Example
     ///
@@ -799,7 +976,8 @@ impl<'a> EvaluatedArray<'a> {
         }
     }
 
-    /// Returns a slice of the array data returning an error if the dtype does not match the actual dtype.
+    /// Borrows contiguous logical data, rejecting incompatible dtype, strides or alignment.
+    /// Empty arrays return an empty slice without dereferencing native storage.
     ///
     /// # Example
     ///
@@ -823,10 +1001,24 @@ impl<'a> EvaluatedArray<'a> {
             });
         }
 
+        let span = host_read::checked_layout(
+            array.shape(),
+            array.signed_strides(),
+            std::mem::size_of::<T>(),
+        )?;
+        if span.size != array.size() {
+            return Err(AsSliceError::InvalidLayout);
+        }
+        if span.size == 0 {
+            return Ok(&[]);
+        }
+        if !span.contiguous {
+            return Err(AsSliceError::NonContiguous);
+        }
         unsafe {
-            let size = array.size();
+            let size = span.size;
             let data = T::array_data(array);
-            if data.is_null() || size == 0 {
+            if data.is_null() {
                 return Err(AsSliceError::Null);
             }
             if !data.is_aligned() {
@@ -836,6 +1028,9 @@ impl<'a> EvaluatedArray<'a> {
                 return Err(AsSliceError::TooLarge);
             }
 
+            // Evaluation retains initialized native elements. The checks above
+            // establish logical contiguity, matching dtype, alignment and a
+            // non-null pointer with a Rust-representable slice length.
             Ok(std::slice::from_raw_parts(data, size))
         }
     }
@@ -843,7 +1038,7 @@ impl<'a> EvaluatedArray<'a> {
     /// Returns a slice of the array data.
     /// # Panics
     ///
-    /// Panics if the array is not evaluated or if the desired dtype does not match the actual dtype
+    /// Panics on incompatible dtype, non-contiguous logical storage or misalignment.
     ///
     /// # Example
     ///
@@ -862,48 +1057,53 @@ impl<'a> EvaluatedArray<'a> {
         self.try_as_slice().unwrap()
     }
 
-    /// Copies evaluated array data into an owned vector.
-    ///
-    /// Unlike [`Self::try_as_slice`], this accepts MLX views whose data pointer
-    /// is not aligned for a Rust slice. Each element is copied with an
-    /// unaligned read instead of constructing a reference to that storage.
+    /// Iterates evaluated values in logical row order without allocating a
+    /// numerical payload. Signed strides and unaligned storage are supported.
+    /// The iterator borrows the evaluated array and yields copied elements.
+    pub fn try_iter<'b, T: ArrayElement + Copy + 'b>(
+        &'b self,
+    ) -> Result<impl ExactSizeIterator<Item = T> + DoubleEndedIterator + 'b, AsSliceError> {
+        self.host_values::<T>()
+    }
+
+    /// Copies evaluated data in logical row order into one owned vector.
+    /// Supports reversed, broadcast, strided and unaligned views without a
+    /// tensor-sized native compaction or an intermediate host payload.
     pub fn try_to_vec<T: ArrayElement + Copy>(&self) -> Result<Vec<T>, AsSliceError> {
-        let array = self.as_array();
-        if array.dtype() != T::DTYPE {
-            return Err(AsSliceError::DtypeMismatch {
-                expecting: T::DTYPE,
-                found: array.dtype(),
-            });
-        }
-
-        let size = array.size();
-        if size == 0 {
-            return Ok(Vec::new());
-        }
-        if size > isize::MAX as usize / std::mem::size_of::<T>() {
-            return Err(AsSliceError::TooLarge);
-        }
-        let data = T::array_data(array);
-        if data.is_null() {
-            return Err(AsSliceError::Null);
-        }
-
-        let mut values = Vec::with_capacity(size);
-        for index in 0..size {
-            // SAFETY: MLX reports `size` initialized elements at `data` after
-            // evaluation. `read_unaligned` does not create a reference to the
-            // possibly unaligned foreign storage.
-            values.push(unsafe { std::ptr::read_unaligned(data.add(index)) });
-        }
-        Ok(values)
+        let values = self.host_values::<T>()?;
+        // Generic iterator collection may round tiny vectors up to its minimum
+        // growth capacity. Preserve the exact requested host payload capacity.
+        let mut output = Vec::with_capacity(values.len());
+        output.extend(values);
+        Ok(output)
     }
 
     /// Clone the array by copying the data.
     ///
     /// This is named `deep_clone` to avoid confusion with the `Clone` trait.
     pub fn deep_clone(&self) -> crate::error::Result<EvaluatedArray<'static>> {
+        let source = self.as_array();
+        if let Some(result) = scoped_evaluation::deep_copy(source) {
+            return result;
+        }
+        let row_contiguous =
+            host_read::checked_layout(source.shape(), source.signed_strides(), source.item_size())
+                .map_err(|error| crate::error::Exception::custom(error.to_string()))?
+                .contiguous;
+        // mlx_array_data returns a pointer into physical storage, not a packed
+        // logical sequence. Copying shape-sized bytes from a strided view can
+        // read cache padding or repeat the wrong batch. This API already makes
+        // a synchronous host copy; compact strided input on a CPU stream first
+        // and retain that evaluated storage through mlx_array_new_data.
+        let compact = if row_contiguous {
+            None
+        } else {
+            let stream = Stream::try_default_cpu()?;
+            Some(source.contiguous(false, &stream)?.into_evaluated()?)
+        };
+        let source = compact.as_ref().map_or(source, |value| value.as_array());
         unsafe {
-            let array = self.as_array();
+            let array = source;
             let dtype = array.dtype();
             let shape = array.shape();
             let data = match dtype {
@@ -953,70 +1153,70 @@ impl<'a> EvaluatedArray<'a> {
     }
 }
 
+impl Array {
+    /// Shares the existing native descriptor through one fallible C handle.
+    /// This does not evaluate or copy tensor storage. The current original
+    /// scope, when present, owns the same handle constructor as `Clone`.
+    pub fn try_clone_handle(&self) -> crate::error::Result<Self> {
+        // SAFETY: the guard supplies a live destination handle and self retains
+        // its valid source handle. mlx_array_set shares the existing descriptor;
+        // it neither evaluates the graph nor copies numerical payload.
+        Array::try_from_op(|res| unsafe { safemlx_sys::mlx_array_set(res, self.as_ptr()) })
+    }
+}
+
 impl Clone for Array {
     fn clone(&self) -> Self {
-        Array::try_from_op(|res| unsafe { safemlx_sys::mlx_array_set(res, self.as_ptr()) })
-            // Exception may be thrown when calling `new` in cpp.
-            .expect("Failed to clone array")
+        // Exception may be thrown when calling `new` in cpp.
+        self.try_clone_handle().expect("Failed to clone array")
     }
 }
 
 impl EvaluatedArray<'_> {
-    /// Copies the evaluated storage into its native-endian byte representation.
+    /// Copies logical values into one native-endian byte vector.
     pub fn to_native_bytes(&self) -> Vec<u8> {
+        let array = self.as_array();
+        let span =
+            host_read::checked_layout(array.shape(), array.signed_strides(), array.item_size())
+                .expect("invalid evaluated host layout");
+        assert_eq!(
+            span.size,
+            array.size(),
+            "inconsistent evaluated host layout"
+        );
+        let mut bytes = Vec::with_capacity(span.size * array.item_size());
         macro_rules! extend_bytes {
-            ($values:expr) => {{
-                let values = $values;
-                let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
-                for value in values {
-                    bytes.extend_from_slice(&value.to_ne_bytes());
+            ($ty:ty, $encode:expr) => {{
+                for value in self
+                    .host_values::<$ty>()
+                    .expect("invalid evaluated host data")
+                {
+                    bytes.extend_from_slice(&$encode(value));
                 }
-                bytes
             }};
         }
-
         match self.as_array().dtype() {
-            Dtype::Bool => self
-                .as_slice::<bool>()
-                .iter()
-                .map(|value| u8::from(*value))
-                .collect(),
-            Dtype::Uint8 => self.as_slice::<u8>().to_vec(),
-            Dtype::Uint16 => extend_bytes!(self.as_slice::<u16>()),
-            Dtype::Uint32 => extend_bytes!(self.as_slice::<u32>()),
-            Dtype::Uint64 => extend_bytes!(self.as_slice::<u64>()),
-            Dtype::Int8 => self
-                .as_slice::<i8>()
-                .iter()
-                .map(|value| *value as u8)
-                .collect(),
-            Dtype::Int16 => extend_bytes!(self.as_slice::<i16>()),
-            Dtype::Int32 => extend_bytes!(self.as_slice::<i32>()),
-            Dtype::Int64 => extend_bytes!(self.as_slice::<i64>()),
-            Dtype::Float16 => self
-                .as_slice::<half::f16>()
-                .iter()
-                .flat_map(|value| value.to_bits().to_ne_bytes())
-                .collect(),
-            Dtype::Float32 => extend_bytes!(self.as_slice::<f32>()),
-            Dtype::Float64 => extend_bytes!(self.as_slice::<f64>()),
-            Dtype::Bfloat16 => self
-                .as_slice::<half::bf16>()
-                .iter()
-                .flat_map(|value| value.to_bits().to_ne_bytes())
-                .collect(),
-            Dtype::Complex64 => self
-                .as_slice::<complex64>()
-                .iter()
-                .flat_map(|value| {
-                    value
-                        .re
-                        .to_ne_bytes()
-                        .into_iter()
-                        .chain(value.im.to_ne_bytes())
-                })
-                .collect(),
+            Dtype::Bool => extend_bytes!(bool, |v| [u8::from(v)]),
+            Dtype::Uint8 => extend_bytes!(u8, |v| [v]),
+            Dtype::Uint16 => extend_bytes!(u16, u16::to_ne_bytes),
+            Dtype::Uint32 => extend_bytes!(u32, u32::to_ne_bytes),
+            Dtype::Uint64 => extend_bytes!(u64, u64::to_ne_bytes),
+            Dtype::Int8 => extend_bytes!(i8, |v: i8| v.to_ne_bytes()),
+            Dtype::Int16 => extend_bytes!(i16, i16::to_ne_bytes),
+            Dtype::Int32 => extend_bytes!(i32, i32::to_ne_bytes),
+            Dtype::Int64 => extend_bytes!(i64, i64::to_ne_bytes),
+            Dtype::Float16 => extend_bytes!(half::f16, |v: half::f16| v.to_bits().to_ne_bytes()),
+            Dtype::Float32 => extend_bytes!(f32, f32::to_ne_bytes),
+            Dtype::Float64 => extend_bytes!(f64, f64::to_ne_bytes),
+            Dtype::Bfloat16 => extend_bytes!(half::bf16, |v: half::bf16| v.to_bits().to_ne_bytes()),
+            Dtype::Complex64 => extend_bytes!(complex64, |v: complex64| {
+                let mut out = [0_u8; 8];
+                out[..4].copy_from_slice(&v.re.to_ne_bytes());
+                out[4..].copy_from_slice(&v.im.to_ne_bytes());
+                out
+            }),
         }
+        bytes
     }
 
     /// Compare two evaluated arrays for equal dtype, shape, and values.
@@ -1029,9 +1229,11 @@ impl EvaluatedArray<'_> {
 
         macro_rules! eq_slice {
             ($ty:ty) => {{
-                let lhs = self.as_slice::<$ty>();
-                let rhs = other.as_slice::<$ty>();
-                lhs == rhs
+                self.host_values::<$ty>()
+                    .expect("invalid evaluated host data")
+                    .eq(other
+                        .host_values::<$ty>()
+                        .expect("invalid evaluated host data"))
             }};
         }
 
@@ -1057,9 +1259,9 @@ impl EvaluatedArray<'_> {
 #[cfg(test)]
 pub(crate) fn eval_vec<T>(array: &Array) -> Vec<T>
 where
-    T: ArrayElement + Clone,
+    T: ArrayElement + Copy,
 {
-    array.evaluated().unwrap().as_slice::<T>().to_vec()
+    array.evaluated().unwrap().try_to_vec::<T>().unwrap()
 }
 
 #[cfg(test)]
@@ -1694,6 +1896,95 @@ mod tests {
             orig.as_slice::<i32>().as_ptr(),
             clone.as_slice::<i32>().as_ptr()
         );
+    }
+
+    #[test]
+    fn deep_clone_preserves_logical_order_of_strided_and_broadcast_arrays() {
+        use crate::ops::indexing::TryIndexOp;
+        let stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+        let storage = Array::from_slice(&(0..2 * 5 * 3).collect::<Vec<i32>>(), &[2, 5, 3]);
+        let padded = storage.try_index_device((.., ..2, ..), &stream).unwrap();
+        let transposed = storage.transpose_axes(&[2, 0, 1], &stream).unwrap();
+        let broadcast = crate::ops::broadcast_to(
+            Array::from_slice(&[7i32, 11, 13], &[1, 1, 3]),
+            &[2, 4, 3],
+            &stream,
+        )
+        .unwrap();
+        let expected = [
+            vec![0, 1, 2, 3, 4, 5, 15, 16, 17, 18, 19, 20],
+            (0..3)
+                .flat_map(|channel| {
+                    (0..2).flat_map(move |batch| {
+                        (0..5).map(move |token| batch * 15 + token * 3 + channel)
+                    })
+                })
+                .collect(),
+            [7, 11, 13].repeat(8),
+        ];
+        for (source, expected) in [padded, transposed, broadcast].into_iter().zip(expected) {
+            let shape = source.shape().to_vec();
+            let evaluated = source.evaluated().unwrap();
+            let copied = evaluated.deep_clone().unwrap();
+            assert_eq!(copied.as_array().shape(), shape);
+            assert_eq!(copied.as_slice::<i32>(), expected);
+            let copied = source.deep_clone().unwrap();
+            assert_eq!(copied.evaluated().unwrap().as_slice::<i32>(), expected);
+        }
+    }
+
+    #[test]
+    fn allocation_info_preserves_completed_backing_capacity_and_alias_identity() {
+        use crate::ops::indexing::TryIndexOp;
+        let stream = Stream::new_with_device(&crate::Device::new(crate::DeviceType::Cpu, 0));
+        let root = Array::from_slice(&(0..120).map(|n| n as f32).collect::<Vec<_>>(), &[2, 20, 3]);
+        let root_info = root.allocation_info().unwrap().unwrap();
+        assert!(root_info.bytes() >= root.nbytes());
+        let tail = root.try_index_device((.., 18.., ..), &stream).unwrap();
+        assert_eq!(
+            tail.allocation_info().unwrap(),
+            None,
+            "facts must not evaluate a lazy view"
+        );
+        let evaluated = tail.evaluated().unwrap();
+        assert_eq!(tail.allocation_info().unwrap(), Some(root_info));
+        assert!(root_info.bytes() > tail.nbytes());
+        let clone = evaluated.deep_clone().unwrap();
+        let cloned_info = clone.as_array().allocation_info().unwrap().unwrap();
+        assert_ne!(root_info.identity(), cloned_info.identity());
+        assert!(cloned_info.bytes() >= tail.nbytes());
+        let expected = (54..60)
+            .chain(114..120)
+            .map(|n| n as f32)
+            .collect::<Vec<_>>();
+        assert_eq!(clone.as_slice::<f32>(), expected);
+        let alias = root.clone();
+        drop(root);
+        assert_eq!(alias.allocation_info().unwrap(), Some(root_info));
+        assert_eq!(tail.allocation_info().unwrap(), Some(root_info));
+    }
+
+    #[test]
+    fn allocation_info_keeps_custom_owned_buffers_unknown_without_touching_them() {
+        let values = (0..32).map(|n| n as f32 * 0.25).collect::<Vec<_>>();
+        let transferred = values.clone();
+        let source = transferred.as_ptr();
+        let foreign = Array::try_from_owned_data(transferred, &[4, 8]).unwrap();
+        let before = foreign.allocation_info().unwrap();
+        let evaluated = foreign.evaluated().unwrap();
+        assert_eq!(evaluated.as_slice::<f32>(), values);
+        if evaluated.as_slice::<f32>().as_ptr() == source {
+            assert_eq!(
+                before, None,
+                "adopted foreign storage has no allocator size bound"
+            );
+        } else {
+            assert!(
+                before.unwrap().bytes() >= foreign.nbytes(),
+                "copy fallback owns native storage"
+            );
+        }
+        assert_eq!(foreign.allocation_info().unwrap(), before);
     }
 
     #[test]

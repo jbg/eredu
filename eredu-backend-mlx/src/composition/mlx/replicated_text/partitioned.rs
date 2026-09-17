@@ -1,5 +1,7 @@
 use super::*;
 
+pub(super) mod parameter_representation;
+
 pub(super) type MlxDirectPartitionExecutor<A> =
     eredu_architectures::partitioned_execution::DirectPartitionExecutor<
         A,
@@ -23,8 +25,8 @@ pub(super) type MlxSharedAddressableBank =
 pub(super) type MlxEmbeddedPredictionObservers =
     eredu_architectures::speculative_execution::EmbeddedPredictionObservers<
         MlxTensor,
-        Array,
-        Exception,
+        crate::composition::mlx::speculative::IndependentLogits,
+        Error,
     >;
 #[derive(Clone, Copy, Default)]
 pub(super) struct MlxPartitionTensorAllocator;
@@ -156,6 +158,61 @@ impl<U: 'static, P> Clone for MlxSelectedLayerwisePolicy<U, P> {
 }
 
 impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
+    fn operation_policy(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, MlxSelectedLayerwisePolicyInner<U, P>>, Error> {
+        self.inner.try_lock().map_err(|error| match error {
+            std::sync::TryLockError::WouldBlock => Error::PrefillScopeReentrant,
+            std::sync::TryLockError::Poisoned(_) => {
+                Error::PrefillControl(eredu_runtime::working_memory::WorkingMemoryError::Poisoned)
+            }
+        })
+    }
+
+    pub(super) fn original_operation_plan<'source>(
+        &self,
+        geometry: eredu_core::InferenceGeometry,
+        retained_sources: Option<
+            &'source crate::backend::runtime::execution::generic::LayerwiseWorkspace,
+        >,
+    ) -> Result<
+        crate::backend::runtime::execution::generic::SelectedOriginalOperationPlan<'source, U>,
+        Error,
+    > {
+        let selected = self.operation_policy()?;
+        match &*selected {
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => policy
+                .original_operation_plan(geometry, retained_sources)
+                .map(crate::backend::runtime::execution::generic::SelectedOriginalOperationPlan::Bounded),
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => {
+                if retained_sources.is_some() {
+                    return Err(Error::PrefillControl(
+                        eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                    ));
+                }
+                policy
+                    .original_neural_plan(geometry)
+                    .map(crate::backend::runtime::execution::generic::SelectedOriginalOperationPlan::Resident)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn inspect_operation_sources_for_test(
+        &self,
+        geometry: eredu_core::InferenceGeometry,
+    ) {
+        let selected = self.operation_policy().expect("available selected policy");
+        match &*selected {
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
+                policy.inspect_operation_sources_for_test(geometry);
+            }
+            MlxSelectedLayerwisePolicyInner::Resident(_) => {
+                panic!("bounded inspection requires the retained bounded policy");
+            }
+        }
+    }
+
     fn parameter_locations(
         layout: &eredu_runtime::ExecutionUnitLayout,
         addresses: &[eredu_runtime::ExecutionUnitAddress],
@@ -244,6 +301,74 @@ impl<U: 'static, P> MlxSelectedLayerwisePolicy<U, P> {
     }
 }
 
+impl<U: 'static> MlxSelectedLayerwisePolicy<U, MlxSelectiveUnitPopulator> {
+    pub(super) fn layerwise_workspace(
+        &self,
+        allocation: crate::backend::nn::workspace::MetalAllocationFacts,
+    ) -> Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error> {
+        self.layerwise_workspace_impl(allocation, None)
+    }
+    pub(super) fn prepared_layerwise_workspace(
+        &self,
+        allocation: crate::backend::nn::workspace::MetalAllocationFacts,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error> {
+        let frames = [
+            std::mem::size_of::<Option<&eredu_nn::workspace::WorkspaceContext>>(),
+            std::mem::size_of::<
+                std::sync::MutexGuard<
+                    '_,
+                    MlxSelectedLayerwisePolicyInner<U, MlxSelectiveUnitPopulator>,
+                >,
+            >(),
+            std::mem::size_of::<
+                Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error>,
+            >(),
+            std::mem::size_of::<crate::backend::nn::workspace::MetalAllocationFacts>(),
+        ];
+        context
+            .charge_metadata(
+                frames
+                    .into_iter()
+                    .try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+                    .ok_or(Error::PrefillControl(
+                        eredu_runtime::working_memory::WorkingMemoryError::Overflow,
+                    ))?,
+            )
+            .map_err(|cause| Error::Neural(cause.into()))?;
+        self.layerwise_workspace_impl(allocation, Some(context))
+    }
+    fn layerwise_workspace_impl(
+        &self,
+        allocation: crate::backend::nn::workspace::MetalAllocationFacts,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<crate::backend::runtime::execution::generic::LayerwiseWorkspace, Error> {
+        let policy = match context {
+            Some(_) => self.operation_policy(),
+            None => self.inner.lock().map_err(|_| {
+                Error::ArchitectureModel("selected layerwise policy lock was poisoned".into())
+            }),
+        }?;
+        match &*policy {
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
+                let workspace = match context {
+                    Some(context) => policy.layerwise_workspace_with_metadata(allocation, context),
+                    None => policy.layerwise_workspace(allocation),
+                }?;
+                workspace.with_parameter_locations(Arc::clone(&self.parameter_locations), context)
+            },
+            MlxSelectedLayerwisePolicyInner::Resident(_) => Err(match context {
+                Some(_) => Error::PrefillControl(
+                    eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                ),
+                None => Error::Other(Box::new(
+                    eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch,
+                )),
+            }),
+        }
+    }
+}
+
 pub(super) enum MlxSelectedUnitLease<U: 'static> {
     Resident(MlxResidentUnit<U>),
     Bounded(MlxUnitLease<U>),
@@ -277,6 +402,31 @@ where
     type Lease = MlxSelectedUnitLease<U>;
     type Error = Error;
 
+    fn uses_shared_group_executor(&self, stream: &Stream) -> Result<bool, Error> {
+        let selected = self.operation_policy()?;
+        let policy = match &*selected {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => Err(policy),
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => Ok(policy),
+        };
+        MlxLayerwisePolicy::selected_shared_neural_executor(policy, stream)
+    }
+
+    fn submit_group(
+        &mut self,
+        stream: &Stream,
+        value: &MlxTensor,
+    ) -> Result<
+        impl eredu_runtime::OrderedLayerwiseCompletion<Stream> + 'static,
+        impl std::error::Error + Send + Sync + 'static,
+    > {
+        let selected = self.operation_policy()?;
+        let policy = match &*selected {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => Err(policy),
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => Ok(policy),
+        };
+        MlxLayerwisePolicy::submit_selected_neural(policy, stream, value)
+    }
+
     fn resident_parameters_available(&self) -> bool {
         let Ok(policy) = self.inner.lock() else {
             return false;
@@ -287,6 +437,43 @@ where
             }
             MlxSelectedLayerwisePolicyInner::Bounded { .. } => false,
         }
+    }
+
+    fn retained_value_slot_bound(&self) -> Option<usize> {
+        let policy = self.inner.try_lock().ok()?;
+        match &*policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => policy.retained_value_slot_bound(),
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
+                policy.retained_value_slot_bound()
+            }
+        }
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&MlxTensor)) -> bool {
+        // Inspection can be reentered by a retained-value callback. Contention
+        // and poison are incomplete evidence, never a reason to wait or reap.
+        let Ok(policy) = self.inner.try_lock() else {
+            return false;
+        };
+        match &*policy {
+            MlxSelectedLayerwisePolicyInner::Resident(policy) => {
+                policy.visit_retained_values(visitor)
+            }
+            MlxSelectedLayerwisePolicyInner::Bounded { policy, .. } => {
+                policy.visit_retained_values(visitor)
+            }
+        }
+    }
+
+    fn visit_resident_parameter_sources<V>(
+        &self,
+        visitor: &mut V,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<bool, eredu_nn::Error>
+    where
+        V: for<'source> eredu_nn::ParameterSourceVisitor<'source, MlxTensor>,
+    {
+        self.visit_parameter_sources_with_metadata(visitor, context)
     }
 
     fn visit_resident_units(&mut self, visitor: &mut impl FnMut(&mut U)) -> bool {
@@ -537,3 +724,6 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod retained_visit_tests;

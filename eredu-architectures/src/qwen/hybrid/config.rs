@@ -7,7 +7,7 @@ use eredu_checkpoint::{BlockFp8Format, BlockFp8ScaleEncoding, LinearFormat, Weig
 use eredu_core::{
     attention::{AttentionPolicy, LayerSchedule},
     cache::{
-        derive_prompt_cache_architecture_fingerprint, LayerCachePolicy, MutableStateResidency,
+        LayerCachePolicy, MutableStateResidency,
         StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
     },
 };
@@ -102,7 +102,7 @@ impl HybridVariant {
 }
 
 /// Normalized Qwen3-Next/Qwen3.5 text configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HybridConfig {
     /// Validated variant policy.
     pub variant: HybridVariant,
@@ -256,10 +256,29 @@ impl HybridConfig {
         )
     }
 
+    pub(crate) fn rotary_algorithm_with_metadata(
+        &self, metadata: crate::decoder::ModuleMetadata<'_>,
+    ) -> Result<eredu_nn::RotaryAlgorithm, eredu_nn::Error> {
+        let config = self.rope_parameters.as_ref().or(self.rope_scaling.as_ref());
+        crate::rotary::normalize_algorithm_lookup(
+            config.map(|values| move |key: &str| values.get(key).and_then(rope_value_view)),
+            |args| metadata.error(args),
+        )
+    }
+
     /// Validates all hybrid geometry and selected physical formats.
     pub fn validate(&self) -> Result<(), HybridConfigError> {
-        let rope_config = self.rope_config();
-        crate::rotary::normalize_algorithm(rope_config.as_ref()).map_err(invalid)?;
+        self.validate_with_diagnostic(|text| invalid(text.to_string()))
+    }
+    pub(crate) fn validate_with_diagnostic<E>(
+        &self,
+        error: impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
+        let rope_config = self.rope_parameters.as_ref().or(self.rope_scaling.as_ref());
+        crate::rotary::normalize_algorithm_lookup(
+            rope_config.map(|values| move |key: &str| values.get(key).and_then(rope_value_view)),
+            &error,
+        )?;
         for (name, value) in [
             ("vocab_size", self.vocab_size),
             ("hidden_size", self.hidden_size),
@@ -275,22 +294,24 @@ impl HybridConfig {
             ("linear_num_value_heads", self.linear_num_value_heads),
         ] {
             if value <= 0 {
-                return Err(invalid(format!(
+                return Err(error(format_args!(
                     "hybrid {name} must be positive, got {value}"
                 )));
             }
         }
         if self.head_dim < 2 {
-            return Err(invalid(format!(
+            return Err(error(format_args!(
                 "hybrid head_dim must be at least 2, got {}",
                 self.head_dim
             )));
         }
         if self.mtp_num_hidden_layers < 0 {
-            return Err(invalid("mtp_num_hidden_layers must be non-negative"));
+            return Err(error(format_args!(
+                "mtp_num_hidden_layers must be non-negative"
+            )));
         }
         if self.layer_schedule.len() != self.num_hidden_layers as usize {
-            return Err(invalid(format!(
+            return Err(error(format_args!(
                 "hybrid layer schedule has {} entries for {} layers",
                 self.layer_schedule.len(),
                 self.num_hidden_layers
@@ -302,38 +323,38 @@ impl HybridConfig {
                 HybridLayerPolicy::SelfAttention(AttentionPolicy::Sliding { .. })
             )
         }) {
-            return Err(invalid(
-                "hybrid decoder does not admit sliding self-attention",
-            ));
+            return Err(error(format_args!(
+                "hybrid decoder does not admit sliding self-attention"
+            )));
         }
         if self.linear_num_value_heads % self.linear_num_key_heads != 0 {
-            return Err(invalid(
-                "linear value-head count must be divisible by key-head count",
-            ));
+            return Err(error(format_args!(
+                "linear value-head count must be divisible by key-head count"
+            )));
         }
         if self.num_attention_heads % self.num_key_value_heads != 0 {
-            return Err(invalid(
-                "attention query-head count must be divisible by key/value heads",
-            ));
+            return Err(error(format_args!(
+                "attention query-head count must be divisible by key/value heads"
+            )));
         }
         self.num_attention_heads
             .checked_mul(self.head_dim)
             .and_then(|width| width.checked_mul(2))
-            .ok_or_else(|| invalid("full-attention projection width overflowed"))?;
+            .ok_or_else(|| error(format_args!("full-attention projection width overflowed")))?;
         let key_width = self
             .linear_num_key_heads
             .checked_mul(self.linear_key_head_dim)
-            .ok_or_else(|| invalid("linear key width overflowed"))?;
+            .ok_or_else(|| error(format_args!("linear key width overflowed")))?;
         let value_width = self
             .linear_num_value_heads
             .checked_mul(self.linear_value_head_dim)
-            .ok_or_else(|| invalid("linear value width overflowed"))?;
+            .ok_or_else(|| error(format_args!("linear value width overflowed")))?;
         key_width
             .checked_mul(2)
             .and_then(|width| width.checked_add(value_width))
-            .ok_or_else(|| invalid("linear fused projection width overflowed"))?;
+            .ok_or_else(|| error(format_args!("linear fused projection width overflowed")))?;
         if self.hidden_act != "silu" {
-            return Err(invalid(format!(
+            return Err(error(format_args!(
                 "unsupported hybrid activation {:?}",
                 self.hidden_act
             )));
@@ -344,32 +365,39 @@ impl HybridConfig {
                 || self.num_experts_per_tok <= 0
                 || self.num_experts_per_tok > self.num_experts
             {
-                return Err(invalid(
-                    "MoE requires positive routed/shared widths and valid top-k",
-                ));
+                return Err(error(format_args!(
+                    "MoE requires positive routed/shared widths and valid top-k"
+                )));
             }
         } else if self.intermediate_size <= 0 {
-            return Err(invalid("dense hybrid intermediate_size must be positive"));
+            return Err(error(format_args!(
+                "dense hybrid intermediate_size must be positive"
+            )));
         }
         if let Some(fp8) = &self.fp8 {
-            fp8.validate()?;
+            fp8.validate_with_diagnostic(&error)?;
         }
         if let Some(quantization) = self.quantization {
             quantization
-                .validate()
-                .map_err(|error| invalid(error.to_string()))?;
+                .validate_fixed()
+                .map_err(|cause| error(format_args!("{cause}")))?;
         }
         for (name, format) in &self.linear_formats {
             if name.trim().is_empty() {
-                return Err(invalid("linear-format identity must not be empty"));
+                return Err(error(format_args!(
+                    "linear-format identity must not be empty"
+                )));
             }
             format
-                .validate()
-                .map_err(|error| invalid(error.to_string()))?;
+                .validate_fixed()
+                .map_err(|cause| error(format_args!("{cause}")))?;
         }
-        validate_rope_policy(self.rope_parameters.as_ref().or(self.rope_scaling.as_ref()))?;
+        validate_rope_policy_with(
+            self.rope_parameters.as_ref().or(self.rope_scaling.as_ref()),
+            &error,
+        )?;
         if self.variant == HybridVariant::Qwen3Next {
-            fused_projection_widths(self)?;
+            fused_projection_widths_with(self, &error)?;
         }
         Ok(())
     }
@@ -393,20 +421,25 @@ pub struct QwenFp8QuantizationConfig {
 }
 
 impl QwenFp8QuantizationConfig {
-    fn validate(&self) -> Result<(), HybridConfigError> {
+    fn validate_with_diagnostic<E>(
+        &self,
+        error: impl Fn(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<(), E> {
         if self.quant_method != "fp8"
             || self.fmt != "e4m3"
             || self.activation_scheme != "dynamic"
             || self.weight_block_size.as_deref() != Some(&[128, 128])
         {
-            return Err(invalid(format!("unsupported hybrid FP8 policy {self:?}")));
+            return Err(error(format_args!(
+                "unsupported hybrid FP8 policy {self:?}"
+            )));
         }
         if self
             .modules_to_not_convert
             .iter()
             .any(|name| name.trim().is_empty())
         {
-            return Err(invalid("FP8 exclusion names must not be empty"));
+            return Err(error(format_args!("FP8 exclusion names must not be empty")));
         }
         Ok(())
     }
@@ -419,9 +452,11 @@ impl QwenFp8QuantizationConfig {
             })
         };
         excluded(weight)
-            || super::text_checkpoint_aliases(weight)
-                .iter()
-                .any(|alias| excluded(alias))
+            || super::text_checkpoint_alias_parts(weight).any(|(prefix, rest)| {
+                self.modules_to_not_convert
+                    .iter()
+                    .any(|module| super::alias_within_module(prefix, rest, module))
+            })
     }
 }
 
@@ -544,7 +579,7 @@ struct TopLevelConfig {
 }
 
 /// Normalized hybrid text plus optional conditional-generation policy.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ParsedHybridConfig {
     /// The shared text decoder policy.
     pub text: HybridConfig,
@@ -985,19 +1020,29 @@ fn gguf_optional_f32(
 pub fn fused_projection_widths(
     config: &HybridConfig,
 ) -> Result<([i32; 4], i32), HybridConfigError> {
+    fused_projection_widths_with(config, |text| invalid(text.to_string()))
+}
+fn fused_projection_widths_with<E>(
+    config: &HybridConfig,
+    error: impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<([i32; 4], i32), E> {
     if config.linear_num_key_heads <= 0
         || config.linear_num_value_heads <= 0
         || config.linear_value_head_dim <= 0
         || config.linear_num_value_heads % config.linear_num_key_heads != 0
     {
-        return Err(invalid("invalid grouped fused projection dimensions"));
+        return Err(error(format_args!(
+            "invalid grouped fused projection dimensions"
+        )));
     }
     let value_dim = config
         .linear_num_value_heads
         .checked_mul(config.linear_value_head_dim)
-        .ok_or_else(|| invalid("fused projection dimension overflow"))?;
+        .ok_or_else(|| error(format_args!("fused projection dimension overflow")))?;
     if value_dim % config.linear_num_key_heads != 0 {
-        return Err(invalid("invalid grouped fused projection dimensions"));
+        return Err(error(format_args!(
+            "invalid grouped fused projection dimensions"
+        )));
     }
     let value_per_key = value_dim / config.linear_num_key_heads;
     Ok((
@@ -1028,88 +1073,180 @@ pub fn fp8_block_row_widths(widths: &[i32]) -> Result<Vec<i32>, HybridConfigErro
 
 /// Stable prompt-cache identity for global hybrid architecture semantics.
 pub fn prompt_cache_architecture_fingerprint(config: &HybridConfig) -> String {
-    let fp8 = config.fp8.as_ref().map_or_else(
-        || "none".into(),
-        |fp8| {
-            let mut exclusions = fp8.modules_to_not_convert.clone();
+    prompt_cache_architecture_fingerprint_with_metadata(
+        config,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary fingerprint formatting is infallible")
+}
+pub(crate) fn prompt_cache_architecture_fingerprint_with_metadata(
+    config: &HybridConfig,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    let fp8 = match &config.fp8 {
+        None => metadata.text("none")?,
+        Some(fp8) => {
+            let mut exclusions = metadata.vector(fp8.modules_to_not_convert.len())?;
+            exclusions.extend(fp8.modules_to_not_convert.iter());
             exclusions.sort_unstable();
-            format!(
+            metadata.format(format_args!(
                 "{}:{}:{}:{:?}:{}",
                 fp8.quant_method,
                 fp8.fmt,
                 fp8.activation_scheme,
                 fp8.weight_block_size,
-                exclusions.join(";")
-            )
-        },
-    );
-    derive_prompt_cache_architecture_fingerprint(
-        config.variant.model_kind().canonical_name(),
-        [
-            ("model_type", config.model_type.clone()),
-            ("layers", config.num_hidden_layers.to_string()),
-            ("mtp_layers", config.mtp_num_hidden_layers.to_string()),
+                crate::cache_identity::Joined(|| exclusions.iter(), ";")
+            ))?
+        }
+    };
+    metadata.fingerprint(config.variant.model_kind().canonical_name(), || {
+        Ok([
+            ("model_type", metadata.text(&config.model_type)?),
+            (
+                "layers",
+                metadata.format(format_args!("{}", config.num_hidden_layers))?,
+            ),
+            (
+                "mtp_layers",
+                metadata.format(format_args!("{}", config.mtp_num_hidden_layers))?,
+            ),
             (
                 "layer_types",
-                config
-                    .layer_schedule
-                    .iter()
-                    .map(|policy| format!("{policy:?}"))
-                    .collect::<Vec<_>>()
-                    .join(","),
+                metadata.format(format_args!(
+                    "{}",
+                    crate::cache_identity::Joined(
+                        || config
+                            .layer_schedule
+                            .iter()
+                            .map(crate::cache_identity::DebugValue),
+                        ","
+                    )
+                ))?,
             ),
-            ("kv_heads", config.num_key_value_heads.to_string()),
-            ("head_dim", config.head_dim.to_string()),
-            ("linear_conv", config.linear_conv_kernel_dim.to_string()),
-            ("linear_key_dim", config.linear_key_head_dim.to_string()),
-            ("linear_value_dim", config.linear_value_head_dim.to_string()),
-            ("linear_key_heads", config.linear_num_key_heads.to_string()),
+            (
+                "kv_heads",
+                metadata.format(format_args!("{}", config.num_key_value_heads))?,
+            ),
+            (
+                "head_dim",
+                metadata.format(format_args!("{}", config.head_dim))?,
+            ),
+            (
+                "linear_conv",
+                metadata.format(format_args!("{}", config.linear_conv_kernel_dim))?,
+            ),
+            (
+                "linear_key_dim",
+                metadata.format(format_args!("{}", config.linear_key_head_dim))?,
+            ),
+            (
+                "linear_value_dim",
+                metadata.format(format_args!("{}", config.linear_value_head_dim))?,
+            ),
+            (
+                "linear_key_heads",
+                metadata.format(format_args!("{}", config.linear_num_key_heads))?,
+            ),
             (
                 "linear_value_heads",
-                config.linear_num_value_heads.to_string(),
+                metadata.format(format_args!("{}", config.linear_num_value_heads))?,
             ),
-            ("max_positions", config.max_position_embeddings.to_string()),
+            (
+                "max_positions",
+                metadata.format(format_args!("{}", config.max_position_embeddings))?,
+            ),
             (
                 "rope_parameters",
-                canonical_config_map(&config.rope_parameters),
+                canonical_config_map(&config.rope_parameters, metadata)?,
             ),
-            ("rope_scaling", canonical_config_map(&config.rope_scaling)),
+            (
+                "rope_scaling",
+                canonical_config_map(&config.rope_scaling, metadata)?,
+            ),
             ("fp8", fp8),
-            ("quantization", format!("{:?}", config.quantization)),
+            (
+                "quantization",
+                metadata.format(format_args!("{:?}", config.quantization))?,
+            ),
             (
                 "linear_formats",
-                crate::cache_identity::debug_map(Some(&config.linear_formats)),
+                crate::cache_identity::debug_map_with_metadata(
+                    Some(&config.linear_formats),
+                    metadata,
+                )?,
             ),
-        ],
-    )
+        ])
+    })
 }
 
 /// Stable cache identity for conditional text, vision, and media-token semantics.
 pub fn conditional_prompt_cache_architecture_fingerprint(config: &ParsedHybridConfig) -> String {
-    derive_prompt_cache_architecture_fingerprint(
-        config.text.variant.model_kind().canonical_name(),
-        [
-            ("text", prompt_cache_architecture_fingerprint(&config.text)),
+    conditional_prompt_cache_architecture_fingerprint_with_metadata(
+        config,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary conditional fingerprint formatting is infallible")
+}
+
+pub(crate) fn conditional_prompt_cache_architecture_fingerprint_with_metadata(
+    config: &ParsedHybridConfig,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    metadata.fingerprint(config.text.variant.model_kind().canonical_name(), || {
+        Ok([
+            (
+                "text",
+                prompt_cache_architecture_fingerprint_with_metadata(&config.text, metadata)?,
+            ),
             (
                 "vision",
-                config
-                    .vision
-                    .as_ref()
-                    .map(crate::qwen::vision::prompt_cache_architecture_fingerprint)
-                    .unwrap_or_else(|| "none".into()),
+                match &config.vision {
+                    Some(vision) => {
+                        crate::qwen::vision::prompt_cache_architecture_fingerprint_with_metadata(
+                            vision, metadata,
+                        )?
+                    }
+                    None => metadata.text("none")?,
+                },
             ),
-            ("image_token", format!("{:?}", config.image_token_id)),
-            ("video_token", format!("{:?}", config.video_token_id)),
-        ],
-    )
+            (
+                "image_token",
+                metadata.format(format_args!("{:?}", config.image_token_id))?,
+            ),
+            (
+                "video_token",
+                metadata.format(format_args!("{:?}", config.video_token_id))?,
+            ),
+        ])
+    })
 }
 
 /// Declares global mutable state for the exact ordered hybrid schedule.
 pub fn state_layout(config: &HybridConfig) -> Result<StateLayout, HybridConfigError> {
-    let geometry = config
-        .layer_schedule
-        .iter()
-        .map(|policy| match policy {
+    state_layout_destination(config, &crate::state_geometry::Ordinary(invalid))
+}
+
+/// Constructs the same actual state geometry using counted metadata destinations.
+pub fn state_layout_with_metadata(
+    config: &HybridConfig,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<StateLayout, eredu_nn::Error> {
+    if !context.uses_checked_metadata() {
+        return state_layout(config).map_err(eredu_nn::Error::backend);
+    }
+    state_layout_destination(
+        config,
+        &crate::state_geometry::Counted::new(context, invalid),
+    )
+}
+
+fn state_layout_destination<D: crate::state_geometry::Destination>(
+    config: &HybridConfig,
+    destination: &D,
+) -> Result<StateLayout, D::Error> {
+    destination.controls::<(StateLayout, &HybridConfig)>()?;
+    let geometry =
+        destination.collect_values(config.layer_schedule.iter().map(|policy| match policy {
             HybridLayerPolicy::SelfAttention(_) => HybridStateGeometry::FullAttention {
                 key_value_heads: config.num_key_value_heads,
             },
@@ -1117,9 +1254,8 @@ pub fn state_layout(config: &HybridConfig) -> Result<StateLayout, HybridConfigEr
                 key_heads: config.linear_num_key_heads,
                 value_heads: config.linear_num_value_heads,
             },
-        })
-        .collect::<Vec<_>>();
-    state_layout_with_geometry(config, &geometry)
+        }))?;
+    state_layout_with_geometry_destination(config, &geometry, destination)
 }
 
 /// Declares rank-local mutable state while retaining global schedule identity.
@@ -1127,11 +1263,25 @@ pub fn state_layout_with_geometry(
     config: &HybridConfig,
     geometry: &[HybridStateGeometry],
 ) -> Result<StateLayout, HybridConfigError> {
+    state_layout_with_geometry_destination(
+        config,
+        geometry,
+        &crate::state_geometry::Ordinary(invalid),
+    )
+}
+
+fn state_layout_with_geometry_destination<D: crate::state_geometry::Destination>(
+    config: &HybridConfig,
+    geometry: &[HybridStateGeometry],
+    destination: &D,
+) -> Result<StateLayout, D::Error> {
+    destination.controls::<(StateLayout, &HybridConfig, &[HybridStateGeometry])>()?;
     let target_layers = config.layer_schedule.len();
-    let mtp_layers = usize::try_from(config.mtp_num_hidden_layers)
-        .map_err(|_| invalid("mtp_num_hidden_layers must be non-negative"))?;
+    let mtp_layers = usize::try_from(config.mtp_num_hidden_layers).map_err(|_| {
+        destination.error(format_args!("mtp_num_hidden_layers must be non-negative"))
+    })?;
     if geometry.len() != target_layers && geometry.len() != target_layers + mtp_layers {
-        return Err(invalid(format!(
+        return Err(destination.error(format_args!(
             "hybrid state geometry has {} layers, expected {} target or {} total units",
             geometry.len(),
             target_layers,
@@ -1141,10 +1291,10 @@ pub fn state_layout_with_geometry(
     let history = config
         .linear_conv_kernel_dim
         .checked_sub(1)
-        .ok_or_else(|| invalid("linear convolution history underflowed"))?;
-    let fixed =
-        |value| StateTensorDimension::fixed(value).map_err(|error| invalid(error.to_string()));
-    let mut policies = config
+        .filter(|history| *history >= 0)
+        .ok_or_else(|| destination.error(format_args!("linear convolution history underflowed")))?;
+    let fixed = |value| destination.fixed(value);
+    let mut policies = destination.collect(config
         .layer_schedule
         .iter()
         .copied()
@@ -1154,8 +1304,8 @@ pub fn state_layout_with_geometry(
             (
                 HybridLayerPolicy::SelfAttention(attention),
                 HybridStateGeometry::FullAttention { key_value_heads },
-            ) => LayerCachePolicy::key_value(attention, key_value_heads, config.head_dim)
-                .map_err(|error| invalid(error.to_string())),
+            ) => destination.key_value(attention, key_value_heads, config.head_dim)
+                ,
             (
                 HybridLayerPolicy::LinearAttention,
                 HybridStateGeometry::LinearAttention {
@@ -1165,85 +1315,92 @@ pub fn state_layout_with_geometry(
             ) => {
                 let key_width = key_heads
                     .checked_mul(config.linear_key_head_dim)
-                    .ok_or_else(|| invalid("rank-local linear key width overflowed"))?;
+                    .ok_or_else(|| destination.error(format_args!("rank-local linear key width overflowed")))?;
                 let value_width = value_heads
                     .checked_mul(config.linear_value_head_dim)
-                    .ok_or_else(|| invalid("rank-local linear value width overflowed"))?;
+                    .ok_or_else(|| destination.error(format_args!("rank-local linear value width overflowed")))?;
                 let convolution_width = key_width
                     .checked_mul(2)
                     .and_then(|width| width.checked_add(value_width))
-                    .ok_or_else(|| invalid("rank-local convolution width overflowed"))?;
-                LayerCachePolicy::fixed_only(vec![
-                    StateTensorPolicy::new(
-                        StateTensorRole::Convolution { slot: 0 },
-                        vec![
-                            StateTensorDimension::Batch,
-                            fixed(history)?,
-                            fixed(convolution_width)?,
-                        ],
-                        StateTensorDtype::Floating,
-                        MutableStateResidency::AlwaysDeviceMutable,
-                    )
-                    .map_err(|error| invalid(error.to_string()))?,
-                    StateTensorPolicy::new(
+                    .ok_or_else(|| destination.error(format_args!("rank-local convolution width overflowed")))?;
+                let mut fixed_state = destination.vector(1 + usize::from(history > 0))?;
+                // Width one retains only the recurrent matrix. No zero-sized
+                // history role is acquired by the actual convolution equation.
+                if history > 0 {
+                    fixed_state.push(
+                        destination.tensor(
+                            StateTensorRole::Convolution { slot: 0 },
+                            destination.values([
+                                StateTensorDimension::Batch,
+                                fixed(history)?,
+                                fixed(convolution_width)?,
+                            ])?,
+                            StateTensorDtype::Floating,
+                            MutableStateResidency::AlwaysDeviceMutable,
+                        )
+                        ?,
+                    );
+                }
+                fixed_state.push(
+                    destination.tensor(
                         StateTensorRole::Recurrent,
-                        vec![
+                        destination.values([
                             StateTensorDimension::Batch,
                             fixed(value_heads)?,
                             fixed(config.linear_key_head_dim)?,
                             fixed(config.linear_value_head_dim)?,
-                        ],
+                        ])?,
                         StateTensorDtype::Float32,
                         MutableStateResidency::LayerScopedOffloadable,
                     )
-                    .map_err(|error| invalid(error.to_string()))?,
-                ])
-                .map_err(|error| invalid(error.to_string()))
+                    ?,
+                );
+                destination.fixed_only(fixed_state)
+
             }
-            (policy, geometry) => Err(invalid(format!(
+            (policy, geometry) => Err(destination.error(format_args!(
                 "hybrid state geometry {geometry:?} does not match layer {layer} policy {policy:?}"
             ))),
         })
-        .collect::<Result<Vec<_>, _>>()?;
+        )?;
     for depth in 0..mtp_layers {
         let key_value_heads = match geometry.get(target_layers + depth).copied() {
             Some(HybridStateGeometry::FullAttention { key_value_heads }) => key_value_heads,
             Some(other) => {
-                return Err(invalid(format!(
+                return Err(destination.error(format_args!(
                     "hybrid MTP geometry {other:?} is not full attention"
-                )))
+                )));
             }
             None => config.num_key_value_heads,
         };
-        policies.push(
-            LayerCachePolicy::key_value(AttentionPolicy::Full, key_value_heads, config.head_dim)
-                .map_err(|error| invalid(error.to_string()))?,
-        );
+        destination.push(
+            &mut policies,
+            destination.key_value(AttentionPolicy::Full, key_value_heads, config.head_dim)?,
+        )?;
     }
-    let schedule = LayerSchedule::new(config.layer_schedule.len() + mtp_layers, policies)
-        .map_err(|error| invalid(error.to_string()))?;
-    let mut segments = vec![StateSegmentSpec::new(
+    let schedule = destination.schedule(config.layer_schedule.len() + mtp_layers, policies)?;
+    let mut segments = destination.vector(1 + usize::from(mtp_layers > 0))?;
+    segments.push(destination.segment(
         TARGET_STATE_SEGMENT,
         0..target_layers,
         StateSegmentLifetime::Persistent,
         0,
-    )
-    .map_err(|error| invalid(error.to_string()))?];
+    )?);
     if mtp_layers > 0 {
-        segments.push(
-            StateSegmentSpec::new(
-                PREDICTION_STATE_SEGMENT,
-                target_layers..target_layers + mtp_layers,
-                StateSegmentLifetime::Persistent,
-                -1,
-            )
-            .map_err(|error| invalid(error.to_string()))?,
-        );
+        segments.push(destination.segment(
+            PREDICTION_STATE_SEGMENT,
+            target_layers..target_layers + mtp_layers,
+            StateSegmentLifetime::Persistent,
+            -1,
+        )?);
     }
-    StateLayout::segmented(schedule, segments).map_err(|error| invalid(error.to_string()))
+    destination.segmented(schedule, segments)
 }
 
-fn validate_rope_policy(config: Option<&HashMap<String, Value>>) -> Result<(), HybridConfigError> {
+fn validate_rope_policy_with<E>(
+    config: Option<&HashMap<String, Value>>,
+    error: impl Fn(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     let Some(config) = config else {
         return Ok(());
     };
@@ -1251,13 +1408,13 @@ fn validate_rope_policy(config: Option<&HashMap<String, Value>>) -> Result<(), H
         return Ok(());
     };
     let Value::String(kind) = value else {
-        return Err(invalid("RoPE type must be a string"));
+        return Err(error(format_args!("RoPE type must be a string")));
     };
     if !matches!(
         kind.as_str(),
         "default" | "linear" | "proportional" | "yarn" | "llama3"
     ) {
-        return Err(invalid(format!("unsupported RoPE type {kind:?}")));
+        return Err(error(format_args!("unsupported RoPE type {kind:?}")));
     }
     Ok(())
 }
@@ -1293,15 +1450,27 @@ fn string_config_value<'a>(
     config.as_ref()?.get(key).and_then(Value::as_str)
 }
 
+fn rope_number(value: &serde_json::Number) -> Option<f32> {
+    value.as_f64().map(|value| value as f32)
+}
+
+fn rope_value_view(value: &Value) -> Option<crate::rotary::RopeValueView<'_>> {
+    use crate::rotary::RopeValueView;
+    match value {
+        Value::Number(value) => rope_number(value).map(RopeValueView::Float),
+        Value::String(value) => Some(RopeValueView::String(value)),
+        Value::Bool(value) => Some(RopeValueView::Bool(*value)),
+        _ => None,
+    }
+}
+
 fn rope_config_value(config: Option<HashMap<String, Value>>) -> Option<HashMap<String, RopeValue>> {
     config.map(|config| {
         config
             .into_iter()
             .filter_map(|(key, value)| {
                 let value = match value {
-                    Value::Number(value) => {
-                        value.as_f64().map(|value| RopeValue::Float(value as f32))
-                    }
+                    Value::Number(value) => rope_number(&value).map(RopeValue::Float),
                     Value::String(value) => Some(RopeValue::String(value)),
                     Value::Bool(value) => Some(RopeValue::Bool(value)),
                     _ => None,
@@ -1312,17 +1481,22 @@ fn rope_config_value(config: Option<HashMap<String, Value>>) -> Option<HashMap<S
     })
 }
 
-fn canonical_config_map(config: &Option<HashMap<String, Value>>) -> String {
-    config.as_ref().map_or_else(String::new, |config| {
-        config
-            .iter()
-            .map(|(key, value)| (key.clone(), value.to_string()))
-            .collect::<BTreeMap<_, _>>()
-            .into_iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join(";")
-    })
+fn canonical_config_map(
+    config: &Option<HashMap<String, Value>>,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    let Some(config) = config else {
+        return metadata.text("");
+    };
+    let mut entries = metadata.vector(config.len())?;
+    entries.extend(config.iter());
+    entries.sort_unstable_by_key(|(key, _)| key.as_str());
+    let mut rows = metadata.vector(entries.len())?;
+    for (key, value) in entries {
+        // Value's ordinary Display writes the same compact JSON bytes to this paid writer.
+        rows.push(metadata.format(format_args!("{key}={value}"))?);
+    }
+    metadata.join(&rows, ";")
 }
 
 const fn default_true() -> bool {

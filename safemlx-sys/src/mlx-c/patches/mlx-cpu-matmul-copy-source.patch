@@ -1,0 +1,164 @@
+diff --git a/mlx/backend/cpu/copy_storage.h b/mlx/backend/cpu/copy_storage.h
+--- a/mlx/backend/cpu/copy_storage.h
++++ b/mlx/backend/cpu/copy_storage.h
+@@ -15,6 +15,9 @@
+ // actual source and output, while native Eval still authenticates the primitive.
+ MLX_API bool cast_eval_layout(size_t rank, Dtype source, Dtype destination,
+     size_t elements, bool tracer, CopyEvalStorage&) noexcept;
++// Adds one existing General-copy temporary inside another Eval: no extra
++// cleanup/Eval/output-vector occurrence. The actual parent owns its lifetime.
++MLX_API bool append_copy_temporary_layout(size_t rank,CopyEvalStorage&) noexcept;
+ MLX_API bool is_copy_eval_primitive(const array&) noexcept;
+ MLX_API bool copy_eval_storage(const array&, CopyEvalStorage&) noexcept;
+ } // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -172,6 +172,36 @@
+   out = value; return true;
+ }
+ 
++bool append_copy_temporary_layout(size_t rank,CopyEvalStorage& out) noexcept {
++  if(rank>5||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
++  CopyEvalStorage copy;
++  submission::GraphQuota::Request descriptor[5]{};size_t count=0;
++  if(!copy_eval_layout(rank,1,true,false,copy)||
++      !PreparedInputLeaf::append_array_requests(rank,descriptor,count)||count!=3)return false;
++  CopyEvalStorage value=out;value.copy=true;
++  // Reuse the actual copy's Data, weak descriptors, task and backing birth.
++  // Slots 0..2 describe its standalone Eval/cleanup and do not occur here.
++  for(size_t slot=3;slot!=9;++slot) {
++    if(!append(value,slot,copy.request_bytes[slot],copy.request_alignments[slot],
++        copy.request_counts[slot]))return false;
++  }
++  // The parent constructs one fresh destination descriptor, then copy_cpu
++  // installs the Data already included above. Both copied ranks are inline.
++  for(size_t i=0;i!=2;++i)
++    if(!append(value,4+i,descriptor[i].bytes,descriptor[i].alignment,1))return false;
++  if(!add(value.backing_births,copy.backing_births)||
++      !add(value.worker_graph_extents,copy.worker_graph_extents)||
++      !add(value.named_control_bytes,copy.named_control_bytes)||
++      !add(value.named_control_bytes,PreparedInputLeaf::descriptor_shared_control_bytes())||
++      !add(value.named_control_bytes,PreparedInputLeaf::descriptor_allocator_control_bytes()))return false;
++  const size_t controls=sizeof(rank)+sizeof(out)+sizeof(copy)+sizeof(value)+sizeof(descriptor)+sizeof(count)+
++      sizeof(size_t)*3+sizeof(array)*2+sizeof(Shape)*2+sizeof(Strides)+sizeof(ArrayVector)+
++      sizeof(std::shared_ptr<Primitive>)+sizeof(Dtype)+sizeof(CopyType)+sizeof(Stream)+sizeof(bool);
++  if(!add(value.named_control_bytes,controls)||
++      !submission::GraphConstruction::complete_layout(value))return false;
++  out=value;return true;
++}
++
+ bool cast_eval_layout(size_t rank, Dtype source, Dtype destination,
+     size_t elements, bool tracer, CopyEvalStorage& out) noexcept {
+   // General-copy loops include an int product over the last three dimensions.
+diff --git a/mlx/backend/cpu/matmul.cpp b/mlx/backend/cpu/matmul.cpp
+--- a/mlx/backend/cpu/matmul.cpp
++++ b/mlx/backend/cpu/matmul.cpp
+@@ -206,6 +206,9 @@
+     } else if (stx == 1 && sty == arr.shape(-2)) {
+       return std::make_tuple(true, sty, arr);
+     } else {
++      // At most two real matrix operands can need this existing copy. Reserve
++      // their single retained batch once; numeric and donation paths are unchanged.
++      if(temps.empty())temps.reserve(2);
+       temps.push_back(array(arr.shape(), arr.dtype(), nullptr, {}));
+       copy_cpu(arr, temps.back(), CopyType::General, stream);
+       stx = arr.shape(-1);
+diff --git a/mlx/backend/cpu/matmul_storage.cpp b/mlx/backend/cpu/matmul_storage.cpp
+--- a/mlx/backend/cpu/matmul_storage.cpp
++++ b/mlx/backend/cpu/matmul_storage.cpp
+@@ -14,20 +14,21 @@
+ bool add(size_t& out,size_t more) noexcept {
+   if(more>size_t(PTRDIFF_MAX)-out)return false;out+=more;return true;
+ }
+-bool matrix_source(const array& value,size_t rank,Dtype dtype) noexcept {
++bool matrix_source(const array& value,size_t rank,Dtype dtype,bool& needs_copy) noexcept {
+   if(value.ndim()!=rank||value.strides().size()!=rank||value.dtype()!=dtype||
+       value.itemsize()!=dtype.size())return false;
+   const auto row=value.strides()[rank-2],column=value.strides()[rank-1];
+-  // Exactly the no-copy branches of ordinary matmul_general::check_transpose.
+-  if(!((row==value.shape(-1)&&column==1)||(row==1&&column==value.shape(-2))))return false;
++  // Exactly the branches of ordinary matmul_general::check_transpose.
++  const bool copy=!((row==value.shape(-1)&&column==1)||(row==1&&column==value.shape(-2)));
+   size_t span=1,extent=0,elements=1,bytes=0;
+   for(size_t i=0;i!=rank;++i) {
+     if(value.shape(i)<=0||value.strides()[i]<0||
+         !product(elements,size_t(value.shape(i)),elements)||
+         !product(size_t(value.shape(i)-1),size_t(value.strides()[i]),extent)||!add(span,extent))return false;
+   }
+-  return elements==value.size()&&elements<=size_t(INT_MAX)&&span<=value.data_size()&&
+-      product(span,dtype.size(),bytes);
++  if(elements!=value.size()||elements>size_t(INT_MAX)||span>value.data_size()||
++      !product(span,dtype.size(),bytes))return false;
++  needs_copy=copy;return true;
+ }
+ }
+ bool is_bf16_matmul_eval_primitive(const array& out) noexcept {
+@@ -60,7 +61,7 @@
+   const size_t controls=sizeof(value)+sizeof(common)+sizeof(task)+sizeof(retention)+
+       sizeof(rank)+sizeof(m)+sizeof(n)+sizeof(k)+sizeof(batches)+sizeof(tracer)+sizeof(out)+
+       sizeof(tiled)+sizeof(facts)+sizeof(CpuMatmulKernel)*2+
+-      sizeof(size_t)*20+sizeof(bool)*5+sizeof(int64_t)*2+sizeof(const array*)*8+
++      sizeof(size_t)*20+sizeof(bool)*8+sizeof(int64_t)*2+sizeof(const array*)*8+
+       sizeof(array)*2+sizeof(ArrayVector)+sizeof(std::tuple<bool,int64_t,array>)*2+
+       sizeof(Stream)*2+sizeof(float)*2+sizeof(detail::TemporaryOwner)*2+
+       sizeof(detail::TemporaryStorage)+sizeof(detail::TemporaryBatch*)*3+
+@@ -80,6 +81,27 @@
+     size_t batches,bool tracer,CopyEvalStorage& out) noexcept {
+   return matmul_eval_layout(rank,m,n,k,batches,tracer,true,out);
+ }
++bool tiled_matmul_copy_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,size_t copies,bool tracer,CopyEvalStorage& out) noexcept {
++  if(copies>2)return false;
++  CopyEvalStorage value;
++  if(!tiled_matmul_eval_layout(rank,m,n,k,batches,tracer,value))return false;
++  for(size_t i=0;i!=copies;++i)
++    if(!append_copy_temporary_layout(rank,value))return false;
++  if(copies) {
++    // check_transpose reserves one actual two-entry ArrayVector, retained by
++    // the already-counted TemporaryBatch through the final CPU callback.
++    value.request_bytes[2]=std::max(value.request_bytes[2],sizeof(array)*2);
++    value.request_alignments[2]=std::max(value.request_alignments[2],alignof(array));
++    if(!add(value.request_counts[2],1))return false;
++  }
++  const size_t controls=sizeof(rank)+sizeof(m)+sizeof(n)+sizeof(k)+sizeof(batches)+
++      sizeof(copies)+sizeof(tracer)+sizeof(out)+sizeof(value)+sizeof(size_t)+
++      sizeof(ArrayVector)+sizeof(submission::GraphAllocator<array>)+sizeof(array)*2;
++  if(!add(value.named_control_bytes,controls)||!submission::GraphConstruction::complete_layout(value))return false;
++  out=value;return true;
++}
++
+ bool tiled_matmul_facts(TiledMatmulFacts& out) noexcept {
+   constexpr auto lanes=simd::max_size<float>;
+   if(lanes<1||lanes>16||16%lanes||Shape::inline_capacity<5||Strides::inline_capacity<5)return false;
+@@ -119,8 +141,16 @@
+       !output.siblings().empty()||output.inputs().size()!=2)return false;
+   const auto& a=output.inputs()[0];const auto& b=output.inputs()[1];size_t batches=0;
+   const auto dtype=tiled?float32:bfloat16;
+-  if(!matmul_shape(a,b,output,tiled,batches)||!matrix_source(a,output.ndim(),dtype)||
+-      !matrix_source(b,output.ndim(),dtype))return false;
++  bool copy_a=false,copy_b=false;
++  if(!matmul_shape(a,b,output,tiled,batches)||!matrix_source(a,output.ndim(),dtype,copy_a)||
++      !matrix_source(b,output.ndim(),dtype,copy_b))return false;
++  if(copy_a||copy_b) {
++    // BF16's independently qualified path remains restricted to its original
++    // compact interiors. This producer is tied to retained Float32Tiles.
++    if(!tiled)return false;
++    return tiled_matmul_copy_eval_layout(output.ndim(),a.shape(-2),b.shape(-1),a.shape(-1),
++        batches,size_t(copy_a)+size_t(copy_b),output.is_tracer(),out);
++  }
+   return matmul_eval_layout(output.ndim(),a.shape(-2),b.shape(-1),a.shape(-1),batches,output.is_tracer(),tiled,out);
+ }
+ bool bf16_matmul_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+diff --git a/mlx/backend/cpu/matmul_storage.h b/mlx/backend/cpu/matmul_storage.h
+--- a/mlx/backend/cpu/matmul_storage.h
++++ b/mlx/backend/cpu/matmul_storage.h
+@@ -7,6 +7,8 @@
+ MLX_API bool tiled_matmul_shape(const array&,const array&,const array&) noexcept;
+ MLX_API bool tiled_matmul_eval_layout(size_t rank,size_t m,size_t n,size_t k,
+     size_t batches,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool tiled_matmul_copy_eval_layout(size_t rank,size_t m,size_t n,size_t k,
++    size_t batches,size_t copies,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool is_tiled_matmul_eval_primitive(const array&) noexcept;
+ MLX_API bool tiled_matmul_eval_storage(const array&,CopyEvalStorage&) noexcept;
+ MLX_API bool bf16_matmul_dispatch_storage(EvalDispatchStorage&) noexcept;

@@ -1,0 +1,676 @@
+diff --git a/mlx/backend/common/utils.cpp b/mlx/backend/common/utils.cpp
+--- a/mlx/backend/common/utils.cpp
++++ b/mlx/backend/common/utils.cpp
+@@ -190,6 +190,29 @@
+   value.graph_extent_sum=value.output_shape.graph_extent_each+value.output_strides.graph_extent_each;
+   out=value;return true;
+ }
++bool contiguous_iterator_layout(size_t prefix, ContiguousIteratorLayout& out) noexcept {
++  if (prefix > size_t(INT_MAX)) return false;
++  CollapseStorageRequest shape, strides;
++  CollapseStorageLayout collapse;
++  if (!collapse_small_request<Shape>(1, prefix, shape) ||
++      !collapse_small_request<Strides>(1, prefix, strides) ||
++      !collapse_single_dims_layout(prefix, collapse)) return false;
++  ContiguousIteratorLayout value;
++  value.prefix_rank = prefix;
++  // Initial copied shape/strides, collapse's fixed destinations, then positions.
++  const size_t extents[] = {shape.graph_extent_each, strides.graph_extent_each,
++      collapse.graph_extent_sum, shape.graph_extent_each};
++  for (auto extent : extents) {
++    if (extent > SIZE_MAX - value.graph_extent_sum) return false;
++    value.graph_extent_sum += extent;
++  }
++  value.controls = sizeof(value) + sizeof(out) + sizeof(prefix) + sizeof(shape) +
++      sizeof(strides) + sizeof(collapse) + sizeof(extents) + sizeof(size_t) +
++      sizeof(ContiguousIterator) + sizeof(const Shape*) + sizeof(const Strides*) +
++      sizeof(std::pair<Shape, Strides>) + sizeof(int) +
++      collapse.borrowed_view_bytes + collapse.result_control_bytes + collapse.layout_control_bytes;
++  out = value; return true;
++}
+ std::pair<Shape, Strides> collapse_contiguous_dims(
+     const Shape& shape,
+     const Strides& strides,
+diff --git a/mlx/backend/common/utils.h b/mlx/backend/common/utils.h
+--- a/mlx/backend/common/utils.h
++++ b/mlx/backend/common/utils.h
+@@ -163,6 +163,12 @@
+ // Get both the block and a grid of blocks that covers dim0, dim1 and dim2.
+ std::pair<Dims, Dims> get_grid_and_block_common(int dim0, int dim1, int dim2);
+ 
++struct ContiguousIteratorLayout {
++  size_t prefix_rank{0}, graph_extent_sum{0}, controls{0};
++};
++// Pure bound for the existing prefix-copy/collapse/position constructor.
++MLX_API bool contiguous_iterator_layout(size_t prefix_rank, ContiguousIteratorLayout&) noexcept;
++
+ struct ContiguousIterator {
+   inline void step() {
+     int dims = shape_.size();
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -45,6 +45,7 @@
+   PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/device_info.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/arg_reduce.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/binary_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/copy.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/copy_storage.cpp
+diff --git a/mlx/backend/cpu/binary.cpp b/mlx/backend/cpu/binary.cpp
+--- a/mlx/backend/cpu/binary.cpp
++++ b/mlx/backend/cpu/binary.cpp
+@@ -268,3 +268,99 @@
+ }
+ 
+ } // namespace mlx::core
++
++#include "mlx/backend/cpu/binary_storage.h"
++#include "mlx/prepared_input.h"
++#include <climits>
++namespace mlx::core::cpu {
++namespace {
++bool binary_add(size_t& value, size_t more) noexcept {
++  if (more > SIZE_MAX - value) return false;
++  value += more; return true;
++}
++template<class Task>
++bool binary_task_storage(size_t rank, size_t elements, EvalDispatchStorage& out) noexcept {
++  if (rank > size_t(INT_MAX) || elements > size_t(INT_MAX)) return false;
++  DispatchLayout task;
++  WeakCopyStorage weak;
++  if (!CommandEncoder::dispatch_layout<Task>(task) ||
++      !PreparedInputLeaf::weak_copy_storage(rank, weak)) return false;
++  EvalDispatchStorage value{task.task_bytes, task.task_alignment, 0, 0};
++  value.controls = sizeof(EvalDispatchStorage) + sizeof(DispatchLayout) + sizeof(WeakCopyStorage) +
++      sizeof(Task) * 2 + sizeof(array) * 5 + sizeof(Stream) * 2 + sizeof(BinaryOpType) * 2 +
++      sizeof(ContiguousIterator) * 2 + sizeof(Shape) * 2 + sizeof(Strides) * 4 +
++      sizeof(CollapsedDimensions) + sizeof(BorrowedStrides) +
++      sizeof(size_t) * 8 + sizeof(int) * 16 + sizeof(int64_t) * 4 + sizeof(bool) * 3 +
++      sizeof(const void*) * 12 +
++      std::max({sizeof(simd::Simd<bool, simd::max_size<bool>>),
++        sizeof(simd::Simd<int8_t, simd::max_size<int8_t>>),
++        sizeof(simd::Simd<int16_t, simd::max_size<int16_t>>),
++        sizeof(simd::Simd<int32_t, simd::max_size<int32_t>>),
++        sizeof(simd::Simd<int64_t, simd::max_size<int64_t>>),
++        sizeof(simd::Simd<uint8_t, simd::max_size<uint8_t>>),
++        sizeof(simd::Simd<uint16_t, simd::max_size<uint16_t>>),
++        sizeof(simd::Simd<uint32_t, simd::max_size<uint32_t>>),
++        sizeof(simd::Simd<uint64_t, simd::max_size<uint64_t>>),
++        sizeof(simd::Simd<float16_t, simd::max_size<float16_t>>),
++        sizeof(simd::Simd<bfloat16_t, simd::max_size<bfloat16_t>>),
++        sizeof(simd::Simd<float, simd::max_size<float>>),
++        sizeof(simd::Simd<double, simd::max_size<double>>),
++        sizeof(simd::Simd<complex64_t, simd::max_size<complex64_t>>)}) * 3;
++  if (!binary_add(value.controls, task.controls)) return false;
++  for (size_t i=0; i!=3; ++i) if (!binary_add(value.controls, weak.controls)) return false;
++  // General uses three borrowed stride rows through the existing fixed-list
++  // adapter. The same collapse worker owns every output/header/marker request.
++  CollapseStorageLayout collapse;
++  if (!collapse_contiguous_dims_layout(3, rank, true, collapse) ||
++      !binary_add(value.worker_graph_extents, collapse.graph_extent_sum) ||
++      !binary_add(value.controls, sizeof(collapse)) ||
++      !binary_add(value.controls, collapse.borrowed_view_bytes) ||
++      !binary_add(value.controls, collapse.fixed_reference_bytes) ||
++      !binary_add(value.controls, collapse.result_control_bytes) ||
++      !binary_add(value.controls, collapse.marker_control_bytes) ||
++      !binary_add(value.controls, collapse.layout_control_bytes) ||
++      !binary_add(value.controls, collapse.fixed_reference_view_bytes)) return false;
++  if (rank > 3) {
++    ContiguousIteratorLayout iterator;
++    if (!contiguous_iterator_layout(rank - 3, iterator) ||
++        !binary_add(value.worker_graph_extents, iterator.graph_extent_sum) ||
++        !binary_add(value.worker_graph_extents, iterator.graph_extent_sum) ||
++        !binary_add(value.controls, iterator.controls) ||
++        !binary_add(value.controls, iterator.controls) ||
++        !binary_add(value.controls, sizeof(iterator))) return false;
++  }
++  out = value; return true;
++}
++bool binary_dtype(Dtype dtype) noexcept {
++  return dtype == bool_ || dtype == int8 || dtype == int16 || dtype == int32 || dtype == int64 ||
++      dtype == uint8 || dtype == uint16 || dtype == uint32 || dtype == uint64 ||
++      dtype == float16 || dtype == bfloat16 || dtype == float32 || dtype == float64 || dtype == complex64;
++}
++} // namespace
++bool binary_dispatch_storage(BinaryEvalKind selected, Dtype dtype, size_t rank,
++    size_t elements, EvalDispatchStorage& out) noexcept {
++  if (!binary_dtype(dtype)) return false;
++  switch (selected) {
++#define ARITHMETIC(Kind, Op) case BinaryEvalKind::Kind: return binary_task_storage<BinaryTask<::mlx::core::detail::Op>>(rank,elements,out);
++    ARITHMETIC(add, Add)
++    ARITHMETIC(subtract, Subtract)
++    ARITHMETIC(multiply, Multiply)
++    ARITHMETIC(divide, Divide)
++    ARITHMETIC(maximum, Maximum)
++    ARITHMETIC(minimum, Minimum)
++    ARITHMETIC(power, Power)
++    ARITHMETIC(logical_and, LogicalAnd)
++    ARITHMETIC(logical_or, LogicalOr)
++#undef ARITHMETIC
++#define COMPARISON(Kind, Op) case BinaryEvalKind::Kind: return binary_task_storage<BinaryComparisonTask<::mlx::core::detail::Op>>(rank,elements,out);
++    COMPARISON(equal, Equal)
++    COMPARISON(not_equal, NotEqual)
++    COMPARISON(greater, Greater)
++    COMPARISON(greater_equal, GreaterEqual)
++    COMPARISON(less, Less)
++    COMPARISON(less_equal, LessEqual)
++#undef COMPARISON
++  }
++  return false;
++}
++} // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/binary.h b/mlx/backend/cpu/binary.h
+--- a/mlx/backend/cpu/binary.h
++++ b/mlx/backend/cpu/binary.h
+@@ -292,6 +292,58 @@
+ }
+ 
+ template <typename Op>
++struct BinaryTask {
++  array a, b, out;
++  BinaryOpType bopt;
++  void operator()() {
++    switch (out.dtype()) {
++      case bool_:
++        binary_op<bool, Op>(a, b, out, bopt);
++        break;
++      case uint8:
++        binary_op<uint8_t, Op>(a, b, out, bopt);
++        break;
++      case uint16:
++        binary_op<uint16_t, Op>(a, b, out, bopt);
++        break;
++      case uint32:
++        binary_op<uint32_t, Op>(a, b, out, bopt);
++        break;
++      case uint64:
++        binary_op<uint64_t, Op>(a, b, out, bopt);
++        break;
++      case int8:
++        binary_op<int8_t, Op>(a, b, out, bopt);
++        break;
++      case int16:
++        binary_op<int16_t, Op>(a, b, out, bopt);
++        break;
++      case int32:
++        binary_op<int32_t, Op>(a, b, out, bopt);
++        break;
++      case int64:
++        binary_op<int64_t, Op>(a, b, out, bopt);
++        break;
++      case float16:
++        binary_op<float16_t, Op>(a, b, out, bopt);
++        break;
++      case float32:
++        binary_op<float, Op>(a, b, out, bopt);
++        break;
++      case float64:
++        binary_op<double, Op>(a, b, out, bopt);
++        break;
++      case bfloat16:
++        binary_op<bfloat16_t, Op>(a, b, out, bopt);
++        break;
++      case complex64:
++        binary_op<complex64_t, Op>(a, b, out, bopt);
++        break;
++    }
++  }
++};
++
++template <typename Op>
+ void binary_op_cpu(
+     const array& a,
+     const array& b,
+@@ -305,56 +357,61 @@
+   encoder.set_input_array(a);
+   encoder.set_input_array(b);
+   encoder.set_output_array(out);
+-  encoder.dispatch([a = array::unsafe_weak_copy(a),
+-                    b = array::unsafe_weak_copy(b),
+-                    out = array::unsafe_weak_copy(out),
+-                    bopt]() mutable {
+-    switch (out.dtype()) {
++  encoder.dispatch(BinaryTask<Op>{array::unsafe_weak_copy(a),
++      array::unsafe_weak_copy(b), array::unsafe_weak_copy(out), bopt});
++}
++
++template <typename Op>
++struct BinaryComparisonTask {
++  array a, b, out;
++  BinaryOpType bopt;
++  void operator()() {
++    switch (a.dtype()) {
+       case bool_:
+-        binary_op<bool, Op>(a, b, out, bopt);
++        binary_op<bool, bool, Op>(a, b, out, bopt);
+         break;
+       case uint8:
+-        binary_op<uint8_t, Op>(a, b, out, bopt);
++        binary_op<uint8_t, bool, Op>(a, b, out, bopt);
+         break;
+       case uint16:
+-        binary_op<uint16_t, Op>(a, b, out, bopt);
++        binary_op<uint16_t, bool, Op>(a, b, out, bopt);
+         break;
+       case uint32:
+-        binary_op<uint32_t, Op>(a, b, out, bopt);
++        binary_op<uint32_t, bool, Op>(a, b, out, bopt);
+         break;
+       case uint64:
+-        binary_op<uint64_t, Op>(a, b, out, bopt);
++        binary_op<uint64_t, bool, Op>(a, b, out, bopt);
+         break;
+       case int8:
+-        binary_op<int8_t, Op>(a, b, out, bopt);
++        binary_op<int8_t, bool, Op>(a, b, out, bopt);
+         break;
+       case int16:
+-        binary_op<int16_t, Op>(a, b, out, bopt);
++        binary_op<int16_t, bool, Op>(a, b, out, bopt);
+         break;
+       case int32:
+-        binary_op<int32_t, Op>(a, b, out, bopt);
++        binary_op<int32_t, bool, Op>(a, b, out, bopt);
+         break;
+       case int64:
+-        binary_op<int64_t, Op>(a, b, out, bopt);
++        binary_op<int64_t, bool, Op>(a, b, out, bopt);
+         break;
+       case float16:
+-        binary_op<float16_t, Op>(a, b, out, bopt);
++        binary_op<float16_t, bool, Op>(a, b, out, bopt);
+         break;
+       case float32:
+-        binary_op<float, Op>(a, b, out, bopt);
++        binary_op<float, bool, Op>(a, b, out, bopt);
+         break;
+       case float64:
+-        binary_op<double, Op>(a, b, out, bopt);
++        binary_op<double, bool, Op>(a, b, out, bopt);
+         break;
+       case bfloat16:
+-        binary_op<bfloat16_t, Op>(a, b, out, bopt);
++        binary_op<bfloat16_t, bool, Op>(a, b, out, bopt);
+         break;
+       case complex64:
+-        binary_op<complex64_t, Op>(a, b, out, bopt);
+-        break;
+-    }
+-  });
+-}
++        binary_op<complex64_t, bool, Op>(a, b, out, bopt);
++        break;
++    }
++  }
++};
+ 
+ template <typename Op>
+ void comparison_op_cpu(
+@@ -370,55 +427,8 @@
+   encoder.set_input_array(a);
+   encoder.set_input_array(b);
+   encoder.set_output_array(out);
+-  encoder.dispatch([a = array::unsafe_weak_copy(a),
+-                    b = array::unsafe_weak_copy(b),
+-                    out = array::unsafe_weak_copy(out),
+-                    bopt]() mutable {
+-    switch (a.dtype()) {
+-      case bool_:
+-        binary_op<bool, bool, Op>(a, b, out, bopt);
+-        break;
+-      case uint8:
+-        binary_op<uint8_t, bool, Op>(a, b, out, bopt);
+-        break;
+-      case uint16:
+-        binary_op<uint16_t, bool, Op>(a, b, out, bopt);
+-        break;
+-      case uint32:
+-        binary_op<uint32_t, bool, Op>(a, b, out, bopt);
+-        break;
+-      case uint64:
+-        binary_op<uint64_t, bool, Op>(a, b, out, bopt);
+-        break;
+-      case int8:
+-        binary_op<int8_t, bool, Op>(a, b, out, bopt);
+-        break;
+-      case int16:
+-        binary_op<int16_t, bool, Op>(a, b, out, bopt);
+-        break;
+-      case int32:
+-        binary_op<int32_t, bool, Op>(a, b, out, bopt);
+-        break;
+-      case int64:
+-        binary_op<int64_t, bool, Op>(a, b, out, bopt);
+-        break;
+-      case float16:
+-        binary_op<float16_t, bool, Op>(a, b, out, bopt);
+-        break;
+-      case float32:
+-        binary_op<float, bool, Op>(a, b, out, bopt);
+-        break;
+-      case float64:
+-        binary_op<double, bool, Op>(a, b, out, bopt);
+-        break;
+-      case bfloat16:
+-        binary_op<bfloat16_t, bool, Op>(a, b, out, bopt);
+-        break;
+-      case complex64:
+-        binary_op<complex64_t, bool, Op>(a, b, out, bopt);
+-        break;
+-    }
+-  });
++  encoder.dispatch(BinaryComparisonTask<Op>{array::unsafe_weak_copy(a),
++      array::unsafe_weak_copy(b), array::unsafe_weak_copy(out), bopt});
+ }
+ 
+ template <typename Op>
+diff --git a/mlx/backend/cpu/binary_storage.cpp b/mlx/backend/cpu/binary_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/binary_storage.cpp
+@@ -0,0 +1,92 @@
++#include "mlx/backend/cpu/binary_storage.h"
++#include "mlx/primitives.h"
++#include "mlx/submission.h"
++#include <climits>
++#include <typeinfo>
++namespace mlx::core::cpu {
++namespace {
++bool kind(const Primitive& primitive, BinaryEvalKind& out) noexcept {
++#define SIMPLE(Type, Kind) if (typeid(primitive) == typeid(Type)) { out = BinaryEvalKind::Kind; return true; }
++  SIMPLE(Add, add)
++  SIMPLE(Subtract, subtract)
++  SIMPLE(Multiply, multiply)
++  SIMPLE(Divide, divide)
++  SIMPLE(Maximum, maximum)
++  SIMPLE(Minimum, minimum)
++  SIMPLE(Power, power)
++  SIMPLE(LogicalAnd, logical_and)
++  SIMPLE(LogicalOr, logical_or)
++  SIMPLE(NotEqual, not_equal)
++  SIMPLE(Greater, greater)
++  SIMPLE(GreaterEqual, greater_equal)
++  SIMPLE(Less, less)
++  SIMPLE(LessEqual, less_equal)
++#undef SIMPLE
++  if (typeid(primitive) == typeid(Equal) && !static_cast<const Equal&>(primitive).state()) {
++    out = BinaryEvalKind::equal; return true;
++  }
++  return false;
++}
++bool comparison(BinaryEvalKind value) noexcept {
++  return value == BinaryEvalKind::equal || value == BinaryEvalKind::not_equal ||
++      value == BinaryEvalKind::greater || value == BinaryEvalKind::greater_equal ||
++      value == BinaryEvalKind::less || value == BinaryEvalKind::less_equal;
++}
++} // namespace
++bool is_binary_eval_primitive(const array& output) noexcept {
++  BinaryEvalKind selected;
++  return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
++      kind(output.primitive(), selected);
++}
++bool binary_eval_layout(BinaryEvalKind selected, Dtype dtype, size_t rank,
++    size_t elements, bool tracer, BinaryEvalStorage& out) noexcept {
++  EvalDispatchStorage dispatch;
++  SingleOutputEvalStorage common;
++  if (!binary_dispatch_storage(selected, dtype, rank, elements, dispatch) ||
++      !single_output_eval_layout(rank, 2, tracer, &dispatch, common)) return false;
++  BinaryEvalStorage value;
++  static_cast<SingleOutputEvalStorage&>(value) = common;
++  value.kind = selected; value.dtype = dtype; value.elements = elements;
++  const size_t controls = sizeof(BinaryEvalStorage) * 2 + sizeof(EvalDispatchStorage) +
++      sizeof(SingleOutputEvalStorage) + sizeof(BinaryEvalKind) * 3 + sizeof(Dtype) * 3 +
++      sizeof(size_t) * 6 + sizeof(bool) * 3 + sizeof(const array*) * 4 +
++      sizeof(const Primitive*) + sizeof(submission::FixedEvalPrologueGuard*) +
++      sizeof(submission::GraphConstruction*) + sizeof(submission::GraphConstructionContext) +
++      sizeof(submission::GraphFailure) + sizeof(submission::Record*) + sizeof(submission::GraphQuota*);
++  if (controls > SIZE_MAX - value.named_control_bytes) return false;
++  value.named_control_bytes += controls;
++  out = value; return true;
++}
++bool binary_eval_storage(const array& output, BinaryEvalStorage& out) noexcept {
++  BinaryEvalKind selected;
++  if (!is_binary_eval_primitive(output) || !kind(output.primitive(), selected) ||
++      !output.siblings().empty() || output.inputs().size() != 2) return false;
++  const auto& left = output.inputs()[0];
++  const auto& right = output.inputs()[1];
++  if (left.dtype() != right.dtype() || left.shape() != output.shape() || right.shape() != output.shape() ||
++      output.dtype() != (comparison(selected) ? bool_ : left.dtype())) return false;
++  size_t size = 1;
++  for (auto dimension : output.shape()) {
++    if (dimension < 0 || (dimension && size > size_t(INT_MAX) / size_t(dimension))) return false;
++    size *= size_t(dimension);
++  }
++  // The unchanged vector/recursive worker takes int sizes. Do not truncate an
++  // accepted source while proving its host iterator population.
++  if (size != left.size() || size != right.size() || size != output.size() ||
++      left.data_size() > size_t(INT_MAX) || right.data_size() > size_t(INT_MAX)) return false;
++  return binary_eval_layout(selected, left.dtype(), output.ndim(), size, output.is_tracer(), out);
++}
++} // namespace mlx::core::cpu
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_binary_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record = guard.record();
++  auto* graph = record.graph_quota();
++  const auto context = current_graph_construction_context();
++  if (out || !graph || !guard.cpu() || !context.scope || context.worker ||
++      context.dispatch != &record || current_graph_quota() != graph) return GraphFailure::foreign_parent;
++  cpu::BinaryEvalStorage actual;
++  if (!cpu::binary_eval_storage(guard.current(), actual)) return GraphFailure::invalid_layout;
++  return create_layout(*graph, context.scope, &record, actual, out, true);
++}
++} // namespace mlx::core::submission
+diff --git a/mlx/backend/cpu/binary_storage.h b/mlx/backend/cpu/binary_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/binary_storage.h
+@@ -0,0 +1,20 @@
++#pragma once
++#include "mlx/array.h"
++#include "mlx/backend/cpu/eval_storage.h"
++namespace mlx::core::cpu {
++enum class BinaryEvalKind {
++  add, subtract, multiply, divide, maximum, minimum, power,
++  logical_and, logical_or, equal, not_equal, greater, greater_equal, less, less_equal
++};
++struct BinaryEvalStorage : SingleOutputEvalStorage {
++  BinaryEvalKind kind{BinaryEvalKind::add};
++  Dtype dtype{float32};
++  size_t elements{0};
++};
++MLX_API bool binary_eval_layout(BinaryEvalKind, Dtype input_dtype, size_t rank,
++    size_t elements, bool tracer, BinaryEvalStorage&) noexcept;
++MLX_API bool is_binary_eval_primitive(const array&) noexcept;
++MLX_API bool binary_eval_storage(const array&, BinaryEvalStorage&) noexcept;
++bool binary_dispatch_storage(BinaryEvalKind, Dtype, size_t rank,
++    size_t elements, EvalDispatchStorage&) noexcept;
++} // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/copy.cpp b/mlx/backend/cpu/copy.cpp
+--- a/mlx/backend/cpu/copy.cpp
++++ b/mlx/backend/cpu/copy.cpp
+@@ -352,17 +352,11 @@
+   // rank is at most input rank-3. This is a declared bound, not an assertion
+   // that every source needs those allocations or that arena space is free.
+   if(rank>3) {
+-    const size_t prefix=rank-3;
+-    CollapseStorageLayout collapse;
+-    size_t shape_extent;
+-    if(!collapse_single_dims_layout(prefix,collapse) ||
+-        !copy_small_extent(prefix,sizeof(Shape::value_type),alignof(Shape::value_type),shape_extent) ||
+-        !copy_small_extent(prefix,sizeof(Strides::value_type),alignof(Strides::value_type),stride_extent) ||
+-        !copy_repeat(2,collapse.graph_extent_sum,value.worker_graph_extent_bound) ||
+-        !copy_repeat(4,shape_extent,value.worker_graph_extent_bound) ||
+-        !copy_repeat(2,stride_extent,value.worker_graph_extent_bound) ||
+-        !copy_repeat(2,sizeof(ContiguousIterator)+collapse.borrowed_view_bytes+
+-            collapse.result_control_bytes+collapse.layout_control_bytes,value.controls))return false;
++    ContiguousIteratorLayout iterator;
++    if(!contiguous_iterator_layout(rank-3,iterator) ||
++        !copy_repeat(2,iterator.graph_extent_sum,value.worker_graph_extent_bound) ||
++        !copy_repeat(2,iterator.controls,value.controls) ||
++        !copy_add(sizeof(iterator),value.controls)) return false;
+   }
+   out=value;return true;
+ }
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+--- a/mlx/backend/cpu/copy_storage.cpp
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -51,7 +51,7 @@
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+-  if (rank > size_t(INT_MAX) || (copy && inputs != 1) || (!copy && rank != 0)) return false;
++  if (rank > size_t(INT_MAX) || (copy && inputs != 1 && inputs != 2) || (!copy && rank != 0)) return false;
+   SingleOutputEvalStorage value;
+   value.rank = rank; value.inputs = inputs; value.tracer = tracer;
+   submission::CpuEvalCleanupLayout cleanup;
+@@ -76,6 +76,7 @@
+   if (!add(value.named_control_bytes, cleanup.named_control_bytes)) return false;
+   if (copy) {
+     const auto& dispatch = *dispatch_source;
++    const size_t weak_copies = inputs + 1;
+     WeakCopyStorage weak;
+     submission::OriginalBufferRoutingLayout routing;
+     size_t allocation_controls = 0;
+@@ -83,18 +84,18 @@
+         (weak.count != 3 && weak.count != 6) ||
+         !submission::original_buffer_routing_layout(routing) ||
+         !allocator::original_buffer_allocation_control_bytes(allocation_controls)) return false;
+-    // One possible fresh output allocation plus two no-op weak Data owners.
++    // One possible fresh output allocation plus the actual task weak Data owners.
+     // Lazy flags and donation cannot reduce the declared bound. The existing
+     // primitive may alias instead; no fresh output descriptor is then created.
+-    if (!append(value, 3, weak.requests[2].bytes, weak.requests[2].alignment, 3) ||
+-        !append(value, 4, weak.requests[0].bytes, weak.requests[0].alignment, 2) ||
+-        !append(value, 5, weak.requests[1].bytes, weak.requests[1].alignment, 2) ||
++    if (!append(value, 3, weak.requests[2].bytes, weak.requests[2].alignment, weak_copies + 1) ||
++        !append(value, 4, weak.requests[0].bytes, weak.requests[0].alignment, weak_copies) ||
++        !append(value, 5, weak.requests[1].bytes, weak.requests[1].alignment, weak_copies) ||
+         !append(value, 6, dispatch.task_bytes, dispatch.task_alignment, 1) ||
+         !append(value, 7, routing.birth_bytes, routing.birth_alignment, 1)) return false;
+-    // Two weak descriptors each own copied shape, initial strides and copied
++    // Each weak descriptor owns copied shape, initial strides and copied
+     // replacement strides. Output adoption separately builds contiguous strides.
+     for (size_t i = 3; i != weak.count; ++i)
+-      if (!append(value, 8, weak.requests[i].bytes, weak.requests[i].alignment, 2)) return false;
++      if (!append(value, 8, weak.requests[i].bytes, weak.requests[i].alignment, weak_copies)) return false;
+     if (weak.count > 3 && !append(value, 8, weak.requests[4].bytes,
+                                 weak.requests[4].alignment, 1)) return false;
+     value.backing_births = 1;
+@@ -104,7 +105,7 @@
+         sizeof(submission::OriginalBufferRoutingLayout) + sizeof(array::BufferAdoptionLayout) +
+         sizeof(std::function<allocator::Buffer(size_t)>) * 2 + sizeof(EvalDispatchStorage*) +
+         sizeof(allocator::Buffer) * 2 + sizeof(array::Flags) + sizeof(Shape) + sizeof(Strides) * 2 +
+-        sizeof(bool) * 2 + sizeof(size_t) * 3 + sizeof(submission::CaptureSlot) +
++        sizeof(bool) * 2 + sizeof(size_t) * 4 + sizeof(submission::CaptureSlot) +
+         sizeof(std::shared_ptr<array::Data>) + sizeof(submission::GraphAllocator<array::Data>) +
+         adoption.incoming_bytes + adoption.scratch_owner_bytes + adoption.deleter_bytes +
+         adoption.allocator_callable_bytes + adoption.prepared_strides_bytes;
+@@ -118,6 +119,7 @@
+ }
+ bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
+     CopyEvalStorage& out) noexcept {
++  if (copy && inputs != 1) return false;
+   CpuCopyDispatchStorage actual;
+   EvalDispatchStorage dispatch;
+   if (copy) {
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -12,6 +12,7 @@
+ #include "mlx/backend/cpu/distributed_storage.h"
+ #include "mlx/backend/cpu/copy_storage.h"
+ #include "mlx/backend/cpu/unary_storage.h"
++#include "mlx/backend/cpu/binary_storage.h"
+ 
+ namespace mlx::core::cpu {
+ 
+@@ -37,7 +38,8 @@
+       partition->state().second == 1;
+   const bool fixed_copy = fixed && cpu::is_copy_eval_primitive(arr);
+   const bool fixed_unary = fixed && cpu::is_unary_eval_primitive(arr);
+-  const bool extended = fixed_partition || fixed_distributed || fixed_copy || fixed_unary;
++  const bool fixed_binary = fixed && cpu::is_binary_eval_primitive(arr);
++  const bool extended = fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -51,7 +53,9 @@
+             ? submission::GraphConstruction::create_cpu_copy_eval(*extended_prologue, extended_bank.value)
+             : fixed_unary
+                 ? submission::GraphConstruction::create_cpu_unary_eval(*extended_prologue, extended_bank.value)
+-                : submission::GraphConstruction::create_cpu_argpartition(*extended_prologue, extended_bank.value);
++                : fixed_binary
++                    ? submission::GraphConstruction::create_cpu_binary_eval(*extended_prologue, extended_bank.value)
++                    : submission::GraphConstruction::create_cpu_argpartition(*extended_prologue, extended_bank.value);
+     if (failure != submission::GraphFailure{}) throw submission::GraphQuotaError(failure);
+   }
+   auto cleanup = [&] {
+diff --git a/mlx/backend/cpu/eval_storage.h b/mlx/backend/cpu/eval_storage.h
+--- a/mlx/backend/cpu/eval_storage.h
++++ b/mlx/backend/cpu/eval_storage.h
+@@ -3,7 +3,7 @@
+ 
+ namespace mlx::core::cpu {
+ // Empty fixed destinations for one output, its ordinary cleanup and optional
+-// two-weak-array task. The caller supplies an exact task query; only a private
++// one/two-input task and its output alias. The caller supplies an exact task query; only a private
+ // actual-primitive constructor can install this bank in an Eval prologue.
+ struct EvalDispatchStorage {
+   size_t task_bytes{0}, task_alignment{0};
+diff --git a/mlx/backend/cpu/unary.cpp b/mlx/backend/cpu/unary.cpp
+--- a/mlx/backend/cpu/unary.cpp
++++ b/mlx/backend/cpu/unary.cpp
+@@ -246,14 +246,6 @@
+ bool unary_add(size_t& value, size_t more) noexcept {
+   if (more > SIZE_MAX - value) return false;
+   value += more; return true;
+-}
+-template<class Vector>
+-bool unary_small_extent(size_t rank, size_t& out) noexcept {
+-  if (rank <= Vector::inline_capacity) { out = 0; return true; }
+-  const size_t capacity = std::max(rank, 2 * Vector::inline_capacity);
+-  if (capacity > size_t(PTRDIFF_MAX) / sizeof(typename Vector::value_type)) return false;
+-  return submission::GraphQuota::allocation_extent(capacity * sizeof(typename Vector::value_type),
+-      alignof(typename Vector::value_type), out);
+ }
+ template<class Task>
+ bool unary_task_storage(size_t rank, EvalDispatchStorage& out) noexcept {
+@@ -286,19 +278,11 @@
+   if (!unary_add(value.controls, task.controls) ||
+       !unary_add(value.controls, weak.controls) || !unary_add(value.controls, weak.controls)) return false;
+   if (rank > 1) {
+-    const size_t prefix = rank - 1;
+-    size_t shape, strides;
+-    CollapseStorageLayout collapse;
+-    if (!collapse_single_dims_layout(prefix, collapse) ||
+-        !unary_small_extent<Shape>(prefix, shape) || !unary_small_extent<Strides>(prefix, strides) ||
+-        !unary_add(value.worker_graph_extents, shape) ||
+-        !unary_add(value.worker_graph_extents, strides) ||
+-        !unary_add(value.worker_graph_extents, collapse.graph_extent_sum) ||
+-        !unary_add(value.worker_graph_extents, shape) ||
+-        !unary_add(value.controls, sizeof(CollapseStorageLayout) + sizeof(prefix) + sizeof(shape) + sizeof(strides)) ||
+-        !unary_add(value.controls, collapse.borrowed_view_bytes) ||
+-        !unary_add(value.controls, collapse.result_control_bytes) ||
+-        !unary_add(value.controls, collapse.layout_control_bytes)) return false;
++    ContiguousIteratorLayout iterator;
++    if (!contiguous_iterator_layout(rank - 1, iterator) ||
++        !unary_add(value.worker_graph_extents, iterator.graph_extent_sum) ||
++        !unary_add(value.controls, iterator.controls) ||
++        !unary_add(value.controls, sizeof(iterator))) return false;
+   }
+   out = value; return true;
+ }
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -166,6 +166,7 @@
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_copy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_unary_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_binary_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   // Configure only an untouched resident bank in its actual current Scope.
+   // A finite attempt is consumed before nested construction starts, even on failure.
+   GraphFailure configure_nested(const NestedGraphEvaluationLimits&, size_t attempts) noexcept;

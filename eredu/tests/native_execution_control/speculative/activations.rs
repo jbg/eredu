@@ -181,7 +181,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                         ..Default::default()
                     },
                     |step| {
-                        continuous.extend(step.activations);
+                        continuous.extend(step.activations.iter().cloned());
                         ControlFlow::Continue(())
                     },
                 )
@@ -190,7 +190,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
             assert!(continuous
                 .iter()
                 .any(|r| r.phase == SpeculativeActivationPhase::Verification));
-            assert_eq!(continuous[0].captures.invocation.unwrap().sequence, 3);
+            assert_eq!(continuous[0].captures.as_step().invocation.unwrap().sequence, 3);
             if fused {
                 assert!(continuous
                     .iter()
@@ -199,7 +199,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                     .iter()
                     .any(|record| record.phase == SpeculativeActivationPhase::PredictionPrefill));
                 for record in &continuous {
-                    for captured in &record.captures.records {
+                    for captured in &record.captures.as_step().records {
                         let context = captured.path == "dspark.context.normalized";
                         let proposal = captured.path == channel.activation;
                         if context || proposal {
@@ -242,12 +242,12 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                             assert!(session
                                 .readmit_activation_interventions(stale.clone())
                                 .is_err());
-                            controlled.extend(session.step()?.unwrap().activations);
+                            controlled.extend(session.step()?.unwrap().activations.iter().cloned());
                             assert!(session.can_snapshot(), "{:?}", session.snapshot_support());
                             let saved = session.snapshot()?;
                             let start = controlled.len();
                             while let Some(step) = session.step()? {
-                                controlled.extend(step.activations);
+                                controlled.extend(step.activations.iter().cloned());
                             }
                             let expected_tokens = session.token_ids().to_vec();
                             let mut last_invocation = controlled.last().unwrap().invocation;
@@ -260,7 +260,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                                 );
                                 let mut replay = Vec::new();
                                 while let Some(step) = session.step()? {
-                                    replay.extend(step.activations);
+                                    replay.extend(step.activations.iter().cloned());
                                 }
                                 assert_eq!(session.token_ids(), expected_tokens);
                                 assert_eq!(replay.len(), controlled.len() - start);
@@ -269,11 +269,11 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                                     last_invocation = a.invocation;
                                     assert_eq!(a.admission_identity, b.admission_identity);
                                     assert_eq!((a.origin, a.phase), (b.origin, b.phase));
-                                    assert_eq!(a.captures.records, b.captures.records);
-                                    assert_eq!(a.captures.interventions, b.captures.interventions);
+                                    assert_eq!(a.captures.as_step().records, b.captures.as_step().records);
+                                    assert_eq!(a.captures.as_step().interventions, b.captures.as_step().interventions);
                                     assert!(
-                                        a.captures.cumulative_usage.encoded_bytes
-                                            > b.captures.cumulative_usage.encoded_bytes
+                                        a.captures.as_step().cumulative_usage.encoded_bytes
+                                            > b.captures.as_step().cumulative_usage.encoded_bytes
                                     );
                                 }
                             }
@@ -286,7 +286,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                             let changed = session.snapshot()?;
                             let mut child_records = Vec::new();
                             while let Some(step) = session.step()? {
-                                child_records.extend(step.activations);
+                                child_records.extend(step.activations.iter().cloned());
                             }
                             assert_ne!(session.token_ids(), expected_tokens);
                             let child_tokens = session.token_ids().to_vec();
@@ -297,12 +297,11 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                             if mask {
                                 assert!(child_records
                                     .iter()
-                                    .all(|r| r.captures.interventions.is_empty()));
+                                    .all(|r| r.captures.as_step().interventions.is_empty()));
                                 for record in &child_records {
                                     let payload = |path: &str| {
                                         record
-                                            .captures
-                                            .records
+                                            .captures.as_step().records
                                             .iter()
                                             .find(|r| r.path == path)
                                             .and_then(|r| r.payload.as_ref())
@@ -317,7 +316,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                             } else {
                                 let applied: Vec<_> = child_records
                                     .iter()
-                                    .flat_map(|r| &r.captures.interventions)
+                                    .flat_map(|r| &r.captures.as_step().interventions)
                                     .filter(|e| e.outcome == InterventionOutcome::Applied)
                                     .collect();
                                 assert!(!applied.is_empty());
@@ -352,14 +351,14 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                             session.restore(&changed)?;
                             let mut replay_records = Vec::new();
                             while let Some(step) = session.step()? {
-                                replay_records.extend(step.activations);
+                                replay_records.extend(step.activations.iter().cloned());
                             }
                             assert_eq!(session.token_ids(), child_tokens);
                             assert_eq!(child_records.len(), replay_records.len());
                             for (a, b) in child_records.iter().zip(&replay_records) {
                                 assert_eq!(a.admission_identity, b.admission_identity);
-                                assert_eq!(a.captures.records, b.captures.records);
-                                assert_eq!(a.captures.interventions, b.captures.interventions);
+                                assert_eq!(a.captures.as_step().records, b.captures.as_step().records);
+                                assert_eq!(a.captures.as_step().interventions, b.captures.as_step().interventions);
                                 assert!(b.invocation > a.invocation);
                             }
                             session.release_snapshot(&changed)?;
@@ -388,15 +387,15 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
             for (a, b) in continuous.iter().zip(&controlled) {
                 assert_eq!(a.admission_identity.as_deref(), Some(identity.as_str()));
                 assert_eq!((a.origin, a.phase), (b.origin, b.phase));
-                assert_eq!(a.captures.records, b.captures.records);
-                assert_eq!(a.captures.interventions, b.captures.interventions);
+                assert_eq!(a.captures.as_step().records, b.captures.as_step().records);
+                assert_eq!(a.captures.as_step().interventions, b.captures.as_step().interventions);
                 assert!(a.completed && b.completed);
             }
             if mask {
                 let logits = |records: &[SpeculativeActivationCapture]| -> Vec<_> {
                     records
                         .iter()
-                        .flat_map(|r| &r.captures.records)
+                        .flat_map(|r| &r.captures.as_step().records)
                         .filter(|r| r.path == scope.readout.logits)
                         .filter_map(|r| r.payload.clone())
                         .collect()
@@ -404,7 +403,7 @@ fn public_internal_activations_profile(device: LocalDevice, pooling: bool, fused
                 assert_ne!(logits(&continuous), logits(&ordinary_records));
                 for edit in continuous
                     .iter()
-                    .flat_map(|r| &r.captures.interventions)
+                    .flat_map(|r| &r.captures.as_step().interventions)
                     .filter(|e| e.outcome == InterventionOutcome::Applied)
                 {
                     let values = |record: &CaptureRecord| {

@@ -1,0 +1,203 @@
+diff --git a/mlx/backend/cuda/eval.cpp b/mlx/backend/cuda/eval.cpp
+index 902eec4f..75ff30ff 100644
+--- a/mlx/backend/cuda/eval.cpp
++++ b/mlx/backend/cuda/eval.cpp
+@@ -165,4 +165,7 @@ bool gpu_eval_prologue_layout(size_t, size_t, bool, GpuEvalPrologueLayout&) noex
+ namespace mlx::core::submission {
+ bool resident_gpu_worker_layout(size_t, size_t, size_t, size_t, size_t,
+     size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
++bool resident_gpu_worker_layout_with_sorts(size_t, size_t, size_t, size_t, size_t,
++    size_t, size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
++bool resident_grouped_sort_additional_kernels(size_t, size_t&) noexcept { return false; }
+ }
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+index 4dc1c4fa..e0d5741f 100644
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -1898,11 +1898,27 @@ bool pipeline_cache_platform_controls(size_t attempts, size_t& output) noexcept
+ #include "mlx/fast.h"
+ #include "mlx/original_buffer.h"
+ #include "mlx/event.h"
++#include "mlx/backend/metal/sort_dispatch.h"
+ 
+ namespace mlx::core::submission {
++bool resident_grouped_sort_additional_kernels(size_t selections, size_t& out) noexcept {
++  if (!selections) { out = 0; return true; }
++  metal::SortDispatchLayout layout;
++  // group_by_id casts the flattened IDs to Int32 before the actual ArgSort.
++  if (!metal::sort_dispatch_layout(selections, sizeof(int32_t), layout)) return false;
++  out = layout.kernel_attempts - 1; // the entry's first kernel already belongs to P
++  return true;
++}
+ bool resident_gpu_worker_layout(size_t entries, size_t input_edges,
+     size_t output_slots, size_t array_nodes, size_t backing_births,
+     size_t maximum_rank, size_t maximum_operands, ResidentGpuWorkerLayout& out) noexcept {
++  return resident_gpu_worker_layout_with_sorts(entries, input_edges, output_slots,
++      array_nodes, backing_births, maximum_rank, maximum_operands, 0, out);
++}
++bool resident_gpu_worker_layout_with_sorts(size_t entries, size_t input_edges,
++    size_t output_slots, size_t array_nodes, size_t backing_births,
++    size_t maximum_rank, size_t maximum_operands, size_t additional_sort_kernels,
++    ResidentGpuWorkerLayout& out) noexcept {
+ #if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
+   return false;
+ #else
+@@ -1929,6 +1945,7 @@ bool resident_gpu_worker_layout(size_t entries, size_t input_edges,
+   if (!add(backing_births, input_edges, temporaries) ||
+       !add(output_slots, temporaries, data_controls) ||
+       !add(entries, temporaries, value.kernel_attempts) ||
++      !add(value.kernel_attempts, additional_sort_kernels, value.kernel_attempts) ||
+       !add(array_nodes, backing_births, value.buffer_universe)) return false;
+   // One threshold end per Eval entry, one possible foreign Event wait per
+   // input edge, root/async Event signal, normal finalization and recovery.
+@@ -2054,7 +2071,10 @@ bool resident_gpu_worker_layout(size_t entries, size_t input_edges,
+       sizeof(array_requests) + sizeof(array_request_count) + sizeof(routing) +
+       sizeof(collapse) + sizeof(persistent) + sizeof(receipts) + sizeof(event) +
+       sizeof(event_dispatch) + sizeof(add) + sizeof(mul) + sizeof(extent) + sizeof(shape) +
+-      sizeof(vector_population) + sizeof(GraphVector<int>) + 3 * sizeof(size_t);
++      sizeof(vector_population) + sizeof(GraphVector<int>) + 3 * sizeof(size_t) +
++      // Shared sort planner: length/element width, potential/bn/per-block/
++      // blocks/attempts/merge tiles; query selection/result and two loans.
++      sizeof(metal::SortDispatchLayout) + 12 * sizeof(size_t) + 2 * sizeof(bool);
+   out = value; return true;
+ #endif
+ }
+diff --git a/mlx/backend/metal/sort.cpp b/mlx/backend/metal/sort.cpp
+index b0666e5b..2ff054ab 100644
+--- a/mlx/backend/metal/sort.cpp
++++ b/mlx/backend/metal/sort.cpp
+@@ -5,6 +5,7 @@
+ #include "mlx/backend/gpu/copy.h"
+ #include "mlx/backend/metal/device.h"
+ #include "mlx/backend/metal/kernels.h"
++#include "mlx/backend/metal/sort_dispatch.h"
+ #include "mlx/backend/metal/utils.h"
+ #include "mlx/primitives.h"
+ 
+@@ -282,29 +283,13 @@ void gpu_merge_sort(
+   int axis = axis_ < 0 ? axis_ + in.ndim() : axis_;
+   int size_sorted_axis = in.shape(axis);
+ 
+-  // Get kernel size
+-  int tn = 4;
+-  int potential_bn = (size_sorted_axis + tn - 1) / tn;
+-
+-  int bn;
+-  if (potential_bn > 256) {
+-    bn = 512;
+-  } else if (potential_bn > 128) {
+-    bn = 256;
+-  } else if (potential_bn > 64) {
+-    bn = 128;
+-  } else if (potential_bn > 32) {
+-    bn = 64;
+-  } else {
+-    bn = 32;
+-  }
+-
+-  if (bn == 512 && size_of(in.dtype()) > 4) {
+-    bn = 256;
+-  }
+-
+-  int n_per_block = bn * tn;
+-  int n_blocks = (size_sorted_axis + n_per_block - 1) / n_per_block;
++  if (size_sorted_axis == 0) return;
++  metal::SortDispatchLayout dispatch;
++  if (!metal::sort_dispatch_layout(size_sorted_axis, size_of(in.dtype()), dispatch))
++    throw std::invalid_argument("[Sort::eval_gpu] Invalid sort geometry.");
++  const int bn = dispatch.block_threads;
++  const int tn = dispatch.values_per_thread;
++  const int n_blocks = dispatch.blocks;
+ 
+   if (n_blocks > 1) {
+     return multi_block_sort(s, d, in, out, axis, bn, tn, n_blocks, argsort);
+diff --git a/mlx/backend/metal/sort_dispatch.h b/mlx/backend/metal/sort_dispatch.h
+new file mode 100644
+index 00000000..f112e8f9
+--- /dev/null
++++ b/mlx/backend/metal/sort_dispatch.h
+@@ -0,0 +1,34 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <limits>
++
++namespace mlx::core::metal {
++struct SortDispatchLayout {
++  int block_threads;
++  int values_per_thread;
++  int blocks;
++  size_t kernel_attempts;
++};
++// Shared with gpu_merge_sort: one block-sort, two kernels per merge level,
++// and the final stride-preserving copy for the multi-block branch.
++inline bool sort_dispatch_layout(size_t length, size_t element_bytes,
++    SortDispatchLayout& out) noexcept {
++  if (!length || length > size_t(std::numeric_limits<int>::max()) || !element_bytes)
++    return false;
++  constexpr size_t tn = 4;
++  const size_t potential = length / tn + (length % tn != 0);
++  size_t bn = potential > 256 ? 512 : potential > 128 ? 256 :
++      potential > 64 ? 128 : potential > 32 ? 64 : 32;
++  if (bn == 512 && element_bytes > 4) bn = 256;
++  const size_t per_block = bn * tn;
++  const size_t blocks = length / per_block + (length % per_block != 0);
++  size_t attempts = 1;
++  if (blocks > 1) {
++    attempts = 2;
++    for (size_t tiles = 1; tiles < blocks; tiles *= 2) attempts += 2;
++  }
++  out = {int(bn), int(tn), int(blocks), attempts};
++  return true;
++}
++} // namespace mlx::core::metal
+diff --git a/mlx/backend/no_gpu/eval.cpp b/mlx/backend/no_gpu/eval.cpp
+index 8466d38b..9e75c628 100644
+--- a/mlx/backend/no_gpu/eval.cpp
++++ b/mlx/backend/no_gpu/eval.cpp
+@@ -76,4 +76,7 @@ bool gpu_eval_prologue_layout(size_t, size_t, bool, GpuEvalPrologueLayout&) noex
+ namespace mlx::core::submission {
+ bool resident_gpu_worker_layout(size_t, size_t, size_t, size_t, size_t,
+     size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
++bool resident_gpu_worker_layout_with_sorts(size_t, size_t, size_t, size_t, size_t,
++    size_t, size_t, size_t, ResidentGpuWorkerLayout&) noexcept { return false; }
++bool resident_grouped_sort_additional_kernels(size_t, size_t&) noexcept { return false; }
+ }
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+index e77937be..bb96aab9 100644
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -54,6 +54,11 @@ struct ResidentGpuWorkerLayout {
+ MLX_API bool resident_gpu_worker_layout(size_t entries, size_t input_edges,
+     size_t output_slots, size_t array_nodes, size_t backing_births,
+     size_t maximum_rank, size_t maximum_operands, ResidentGpuWorkerLayout&) noexcept;
++MLX_API bool resident_gpu_worker_layout_with_sorts(size_t entries, size_t input_edges,
++    size_t output_slots, size_t array_nodes, size_t backing_births,
++    size_t maximum_rank, size_t maximum_operands, size_t additional_sort_kernels,
++    ResidentGpuWorkerLayout&) noexcept;
++MLX_API bool resident_grouped_sort_additional_kernels(size_t selections, size_t& out) noexcept;
+ 
+ // Four fixed-Eval host requests; no Data, worker or stream-frontier owners.
+ struct EvalGraphLayout : GraphConstructionLayout {
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index 47799334..f3f2cbd7 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -3524,7 +3524,7 @@ static array gather_owned(
+   }
+ 
+   // Broadcast and cast indices if necessary
+-  auto inputs = broadcast_arrays(indices);
++  auto inputs = broadcast_arrays(indices, s);
+   for (auto& idx : inputs) {
+     idx = astype(idx, dtype, s);
+   }
+@@ -3837,7 +3837,7 @@ static array scatter_owned(
+   }
+ 
+   // Broadcast and cast indices if necessary
+-  auto inputs = broadcast_arrays(indices);
++  auto inputs = broadcast_arrays(indices, s);
+ 
+   Shape idx_shape;
+   if (!inputs.empty()) {

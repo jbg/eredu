@@ -1,0 +1,13 @@
+{
+  "archive": "safemlx-sys/vendor/mlx-v0.32.0.tar.gz",
+  "archive_sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+  "contract": "rank-one float32 Argsort: same stable result, zero auxiliary numerical heap, existing output/dispatch/custody. No strict CPU admission or whole-operation heap bound.",
+  "floating_point": "Requires ordinary IEEE comparisons/classification; no fast/finite-only math. Compiled-library oracle is mandatory.",
+  "native_after": {
+    "mlx/backend/cpu/argsort_f32.h": "127caaa626ce98c25f3e9eb56c5e90ded4cc9d5d7d386a6354bbbd5da06c2d47",
+    "mlx/backend/cpu/sort.cpp": "53082e84e3011c58cdba440606c139e4f6da16a70a51edc5f611559c35e28f48"
+  },
+  "patch_sha256": "b4ed6443780014ebc8fad19ee88056f5489b5105c8acda8fec450e8b4cbfba8f",
+  "predecessor_patch_set_sha256": "bc09cc427f0627fd7b96641a3e1339601eb959da7560d67e9a58d694a44bdf6c",
+  "upstream": "MLX v0.32.0"
+}

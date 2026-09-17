@@ -31,3 +31,13 @@ The same pinned SLEEF exponential polynomial and Boost license are retained in
 `eredu-backend-mlx/src/backend/nn/exp_f32.metal` for the native FP32 activation
 mechanism. CPU sigmoid uses the same exponential through `exp_f32.h` supplied by
 the softmax/reduction patch.
+
+`mlx-view-descriptor-normalization.patch` repairs the native view descriptor
+invariant used by vector copy/cast and unary kernels. Empty fast-Split results
+use zero-length numerical storage. Nonempty Split results retain their exact
+signed-stride span rather than treating negative axes as scalar storage. Split
+and shared Slice never mark a meaningful negative-stride result contiguous;
+nonempty views still share their original backing and logical offset. These
+cases are reachable through the safe array API, including overlapping strided
+views. The patch is applied to the build-tree copy after the existing patches;
+the pinned MLX archive, its digest and upstream attribution remain unchanged.

@@ -1,0 +1,11 @@
+diff --git a/mlx/backend/cpu/gather_storage.cpp b/mlx/backend/cpu/gather_storage.cpp
+--- a/mlx/backend/cpu/gather_storage.cpp
++++ b/mlx/backend/cpu/gather_storage.cpp
+@@ -33,6 +33,7 @@
+     size_t slice_elements,bool tracer,CopyEvalStorage& out) noexcept {
+   size_t output_elements=0,bytes=0;
+   if(!((source==float32&&source.size()==4)||(source==bfloat16&&source.size()==2)||
++      (source==float16&&source.size()==2)||
+       (source==int32&&source.size()==4)||(source==uint32&&source.size()==4))||
+       !((index==uint32&&index.size()==4)||(index==int32&&index.size()==4))||
+       !source_rank||source_rank>4||index_rank>5-source_rank||

@@ -1,0 +1,34 @@
+diff --git a/mlx/backend/cpu/reshape_storage.cpp b/mlx/backend/cpu/reshape_storage.cpp
+--- a/mlx/backend/cpu/reshape_storage.cpp
++++ b/mlx/backend/cpu/reshape_storage.cpp
+@@ -24,7 +24,7 @@
+   const size_t controls=sizeof(value)+sizeof(rank)+sizeof(output_rank)+sizeof(tracer)+sizeof(out)+
+       sizeof(std::pair<bool,Strides>)+sizeof(Strides)*2+sizeof(array::Flags)+sizeof(Dtype)*2+
+       sizeof(const Shape*)+sizeof(const array*)*5+sizeof(const Reshape*)+sizeof(size_t)*8+
+-      sizeof(int)*2+sizeof(bool)*3+sizeof(Shape::const_iterator)+
++      sizeof(int)*2+sizeof(bool)*4+sizeof(Shape::const_iterator)+
+       sizeof(size_t)*5+sizeof(const array*)+sizeof(Dtype)+sizeof(Shape::const_iterator)+
+       sizeof(submission::FixedEvalPrologueGuard*)+sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
+       sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
+@@ -47,8 +47,19 @@
+   size_t input_elements=1,output_elements=1,bytes=0;
+   for(size_t i=0;i!=rank;++i)
+     if(input.shape(i)<=0||!product(input_elements,size_t(input.shape(i)),input_elements))return false;
+-  for(size_t i=0;i!=output_rank;++i)
+-    if(shape[i]<=0||shape[i]!=output.shape(i)||!product(output_elements,size_t(shape[i]),output_elements))return false;
++  // Reshape stores the requested shape, while ops::reshape resolves its one
++  // optional -1 in the output array. Exact positive dimensions and the checked
++  // total product below prove the same unique inferred extent without creating
++  // a second Shape or entering the ordinary throwing shape constructor.
++  bool inferred=false;
++  for(size_t i=0;i!=output_rank;++i) {
++    if(output.shape(i)<=0)return false;
++    if(shape[i]==-1) {
++      if(inferred)return false;
++      inferred=true;
++    } else if(shape[i]<=0||shape[i]!=output.shape(i))return false;
++    if(!product(output_elements,size_t(output.shape(i)),output_elements))return false;
++  }
+   if(input_elements!=input.size()||output_elements!=output.size()||input_elements!=output_elements||
+       !product(input_elements,size_t(input.itemsize()),bytes))return false;
+   return reshape_alias_eval_layout(rank,output_rank,output.is_tracer(),out);

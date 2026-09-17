@@ -5,6 +5,8 @@ use eredu_nn::{Error, LinearSpec, NeuralBackend, ParameterSpec, Tensor};
 use crate::decoder::Attention;
 
 use super::{LayerPolicy, ModelArgs};
+mod construction;
+pub(crate) use construction::{AttentionSpec, linear_spec, linear_spec_with_metadata};
 
 /// Builds the exact no-RoPE attention operator used by a scheduled unit.
 pub fn new_attention<B: NeuralBackend>(
@@ -14,10 +16,12 @@ pub fn new_attention<B: NeuralBackend>(
     key_value_heads: i32,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Attention<B>, Error> {
+    let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+    metadata.controls::<(&ModelArgs, usize, i32, i32, eredu_core::AttentionPolicy, String)>()?;
     let attention = match args.layer_schedule.get(layer) {
         Some(LayerPolicy::SelfAttention(attention)) => *attention,
         policy => {
-            return Err(Error::backend(format!(
+            return Err(metadata.error(format_args!(
                 "Nemotron-H layer {layer} is not attention: {policy:?}"
             )))
         }
@@ -25,7 +29,7 @@ pub fn new_attention<B: NeuralBackend>(
     new_attention_at(
         args,
         attention,
-        &format!("model.layers.{layer}.attention"),
+        &metadata.text(format_args!("model.layers.{layer}.attention"))?,
         query_heads,
         key_value_heads,
         context,
@@ -41,37 +45,6 @@ pub fn new_attention_at<B: NeuralBackend>(
     key_value_heads: i32,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Attention<B>, Error> {
-    let linear = |field: &str, input, output| {
-        let weight = format!("{prefix}.{field}.weight");
-        B::linear(
-            LinearSpec {
-                input,
-                output,
-                weight: ParameterSpec::trainable(&weight).map_err(Error::backend)?,
-                bias: args
-                    .attention_bias
-                    .then(|| ParameterSpec::trainable(format!("{prefix}.{field}.bias")))
-                    .transpose()
-                    .map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &weight,
-                    args.weight_quantization_for(&weight).into(),
-                )?,
-            },
-            context,
-        )
-    };
-    Attention::from_parts(
-        query_heads,
-        key_value_heads,
-        args.head_dim,
-        linear("q_proj", args.hidden_size, query_heads * args.head_dim)?,
-        linear("k_proj", args.hidden_size, key_value_heads * args.head_dim)?,
-        linear("v_proj", args.hidden_size, key_value_heads * args.head_dim)?,
-        linear("o_proj", query_heads * args.head_dim, args.hidden_size)?,
-        None,
-        None,
-        None,
-        attention.sliding_window_i32().map_err(Error::backend)?,
-    )
-}
+    construction::AttentionSpec::new_with_metadata(args, attention, prefix, query_heads, key_value_heads, crate::decoder::ModuleMetadata::new::<B>(context))?
+        .instantiate::<B>(context)
+    }

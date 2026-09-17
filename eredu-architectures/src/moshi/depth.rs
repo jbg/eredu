@@ -2,11 +2,12 @@
 
 use eredu_nn::{
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, EmbeddingSpec, Error, LinearOperator,
-    LinearSpec, NeuralBackend, ParameterSpec, Tensor, VocabularyParallelRange,
+    LinearSpec, NeuralBackend, Tensor, VocabularyParallelRange,
 };
 use eredu_runtime::LayerRuntimeState;
 
 use super::{block, MoshiConfig, MoshiTransformerConfig};
+use crate::decoder::ModuleMetadata;
 
 /// One ordered codebook slice with its own projections and shared decoder blocks.
 #[derive(Debug, Clone, eredu_nn::Parameterized)]
@@ -20,7 +21,7 @@ pub struct DepthSlice<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     pub output: B::Linear,
     /// Shared decoder blocks reusing the frame-local depth state slots.
     pub blocks: Vec<block::Block<B>>,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     index: usize,
 }
 
@@ -31,24 +32,29 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let transformer = config.depth_transformer(index).map_err(Error::backend)?;
-        let prefix = format!("depformer.slices.{index}");
+        let metadata=ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self,MoshiTransformerConfig,Vec<block::Block<B>>,usize)>()?;
+        let transformer=match B::construction_metadata(context) {
+            Some(context)=>config.depth_transformer_workspace(index,context)?,
+            None=>config.depth_transformer(index).map_err(Error::backend)?,
+        };
+        let prefix=metadata.text(format_args!("depformer.slices.{index}"))?;
         let input_vocabulary = if index == 0 {
             config.text_vocabulary_size()
         } else {
             config.audio_vocabulary_size()
         }
         .checked_add(1)
-        .ok_or_else(|| Error::backend("Moshi depth input vocabulary overflowed"))?;
-        let embedding_name = format!("{prefix}.emb.weight");
-        let input_name = format!("{prefix}.linear_in.weight");
-        let output_name = format!("{prefix}.linear_out.weight");
+        .ok_or_else(|| metadata.error(format_args!("Moshi depth input vocabulary overflowed")))?;
+        let embedding_name = metadata.text(format_args!("{prefix}.emb.weight"))?;
+        let input_name = metadata.text(format_args!("{prefix}.linear_in.weight"))?;
+        let output_name = metadata.text(format_args!("{prefix}.linear_out.weight"))?;
         let embedding = B::embedding(
             EmbeddingSpec {
                 vocabulary: input_vocabulary,
                 dimensions: transformer.hidden_size(),
-                weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
+                weight: metadata.plain_parameter(&embedding_name)?,
+                format: metadata.format(
                     &embedding_name,
                     config.native_quantization().into(),
                 )?,
@@ -59,9 +65,9 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
             LinearSpec {
                 input: config.temporal().hidden_size(),
                 output: transformer.hidden_size(),
-                weight: ParameterSpec::trainable(&input_name).map_err(Error::backend)?,
+                weight: metadata.plain_parameter(&input_name)?,
                 bias: None,
-                format: crate::linear_format::standard_linear_format(
+                format: metadata.format(
                     &input_name,
                     config.native_quantization().into(),
                 )?,
@@ -72,18 +78,19 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
             LinearSpec {
                 input: transformer.hidden_size(),
                 output: config.audio_vocabulary_size(),
-                weight: ParameterSpec::trainable(&output_name).map_err(Error::backend)?,
+                weight: metadata.plain_parameter(&output_name)?,
                 bias: None,
-                format: crate::linear_format::standard_linear_format(
+                format: metadata.format(
                     &output_name,
                     config.native_quantization().into(),
                 )?,
             },
             context,
         )?;
-        let blocks = (0..transformer.num_hidden_layers() as usize)
-            .map(|layer| block::build::<B>(&transformer, layer, context))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut blocks=metadata.vector(transformer.num_hidden_layers() as usize)?;
+        for layer in 0..transformer.num_hidden_layers() as usize {
+            blocks.push(block::build::<B>(&transformer,layer,context)?);
+        }
         Ok(Self {
             embedding,
             input,
@@ -100,23 +107,28 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
         geometry: &super::LocalGeometry,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let transformer = config.depth_transformer(index).map_err(Error::backend)?;
-        let prefix = format!("depformer.slices.{index}");
+        let metadata=ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self,MoshiTransformerConfig,Vec<block::Block<B>>,usize)>()?;
+        let transformer=match B::construction_metadata(context) {
+            Some(context)=>config.depth_transformer_workspace(index,context)?,
+            None=>config.depth_transformer(index).map_err(Error::backend)?,
+        };
+        let prefix=metadata.text(format_args!("depformer.slices.{index}"))?;
         let input_vocabulary = if index == 0 {
             config.text_vocabulary_size()
         } else {
             config.audio_vocabulary_size()
         }
         .checked_add(1)
-        .ok_or_else(|| Error::backend("Moshi depth input vocabulary overflowed"))?;
-        let embedding_name = format!("{prefix}.emb.weight");
-        let output_name = format!("{prefix}.linear_out.weight");
+        .ok_or_else(|| metadata.error(format_args!("Moshi depth input vocabulary overflowed")))?;
+        let embedding_name = metadata.text(format_args!("{prefix}.emb.weight"))?;
+        let output_name = metadata.text(format_args!("{prefix}.linear_out.weight"))?;
         let embedding = B::vocabulary_parallel_embedding(
             EmbeddingSpec {
                 vocabulary: input_vocabulary,
                 dimensions: transformer.hidden_size(),
-                weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
+                weight: metadata.plain_parameter(&embedding_name)?,
+                format: metadata.format(
                     &embedding_name,
                     config.native_quantization().into(),
                 )?,
@@ -126,7 +138,7 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
                 local: geometry
                     .vocabulary_range(&embedding_name)
                     .cloned()
-                    .ok_or_else(|| Error::backend("missing depth embedding range"))?,
+                    .ok_or_else(|| metadata.error(format_args!("missing depth embedding range")))?,
             },
             context,
         )?;
@@ -134,11 +146,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
             LinearSpec {
                 input: config.temporal().hidden_size(),
                 output: transformer.hidden_size(),
-                weight: ParameterSpec::trainable(format!("{prefix}.linear_in.weight"))
-                    .map_err(Error::backend)?,
+                weight: metadata.named_parameter(format_args!("{prefix}.linear_in.weight"))?,
                 bias: None,
-                format: crate::linear_format::standard_linear_format(
-                    &format!("{prefix}.linear_in.weight"),
+                format: metadata.format(
+                    &metadata.text(format_args!("{prefix}.linear_in.weight"))?,
                     config.native_quantization().into(),
                 )?,
             },
@@ -148,9 +159,9 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
             LinearSpec {
                 input: transformer.hidden_size(),
                 output: config.audio_vocabulary_size(),
-                weight: ParameterSpec::trainable(&output_name).map_err(Error::backend)?,
+                weight: metadata.plain_parameter(&output_name)?,
                 bias: None,
-                format: crate::linear_format::standard_linear_format(
+                format: metadata.format(
                     &output_name,
                     config.native_quantization().into(),
                 )?,
@@ -160,18 +171,18 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
                 local: geometry
                     .vocabulary_range(&output_name)
                     .cloned()
-                    .ok_or_else(|| Error::backend("missing depth output range"))?,
+                    .ok_or_else(|| metadata.error(format_args!("missing depth output range")))?,
             },
             context,
         )?;
-        let blocks = (0..transformer.num_hidden_layers() as usize)
-            .map(|layer| {
-                let local = geometry
-                    .depth_config(&transformer, index, layer)
-                    .map_err(Error::backend)?;
-                block::build::<B>(&local, layer, context)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut blocks=metadata.vector(transformer.num_hidden_layers() as usize)?;
+        for layer in 0..transformer.num_hidden_layers() as usize {
+            let local=match B::construction_metadata(context) {
+                Some(context)=>geometry.depth_config_workspace(&transformer,index,layer,context)?,
+                None=>geometry.depth_config(&transformer,index,layer).map_err(Error::backend)?,
+            };
+            blocks.push(block::build::<B>(&local,layer,context)?);
+        }
         Ok(Self {
             embedding,
             input,
@@ -194,6 +205,34 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
         previous: &B::Tensor,
         state_offset: usize,
         state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
+        self.forward_with_readout(
+            transformer,
+            temporal,
+            previous,
+            state_offset,
+            state,
+            eredu_core::OutputDemand::Sequence,
+            context,
+        )
+    }
+
+    /// Executes the complete depth body and projects only demanded positions.
+    /// State-only execution returns the genuine body hidden value to traversal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_with_readout<S>(
+        &mut self,
+        transformer: &MoshiTransformerConfig,
+        temporal: &B::Tensor,
+        previous: &B::Tensor,
+        state_offset: usize,
+        state: &mut S,
+        demand: eredu_core::OutputDemand,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Error>
     where
@@ -227,7 +266,10 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
                 context,
             )?;
         }
-        self.output.forward(&hidden, context)
+        match crate::readout::select_readout_positions(&hidden, demand, 1, context)? {
+            Some(selected) => self.output.forward(&selected, context),
+            None => Ok(hidden),
+        }
     }
 
     /// Executes the shared depth body from a caller-produced vocabulary
@@ -290,6 +332,35 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
+        self.forward_parallel_with_readout(
+            transformer,
+            temporal,
+            previous,
+            state_offset,
+            state,
+            eredu_core::OutputDemand::Sequence,
+            parallel,
+            context,
+        )
+    }
+
+    /// Parallel counterpart preserving the complete body before row selection.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_parallel_with_readout<S>(
+        &mut self,
+        transformer: &MoshiTransformerConfig,
+        temporal: &B::Tensor,
+        previous: &B::Tensor,
+        state_offset: usize,
+        state: &mut S,
+        demand: eredu_core::OutputDemand,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor>,
+    {
         let embedded = B::vocabulary_parallel_lookup(
             &mut self.embedding,
             previous,
@@ -306,6 +377,11 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> DepthSlice<B> {
             parallel,
             context,
         )?;
-        B::vocabulary_parallel_project(&mut self.output, &hidden, parallel, context)
+        match crate::readout::select_readout_positions(&hidden, demand, 1, context)? {
+            Some(selected) => {
+                B::vocabulary_parallel_project(&mut self.output, &selected, parallel, context)
+            }
+            None => Ok(hidden),
+        }
     }
 }

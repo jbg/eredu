@@ -1,0 +1,590 @@
+diff --git a/mlx/distributed/ring/ring.cpp b/mlx/distributed/ring/ring.cpp
+--- a/mlx/distributed/ring/ring.cpp
++++ b/mlx/distributed/ring/ring.cpp
+@@ -12,7 +12,6 @@
+ #include <future>
+ #include <iostream>
+ #include <limits>
+-#include <list>
+ #include <sstream>
+ #include <thread>
+ #include <unordered_map>
+@@ -24,6 +23,7 @@
+ #include "mlx/distributed/distributed_impl.h"
+ #include "mlx/distributed/reduction_ops.h"
+ #include "mlx/distributed/utils.h"
++#include "mlx/distributed/ring/socket_tasks.h"
+ #include "mlx/threadpool.h"
+ 
+ #ifndef SOL_TCP
+@@ -136,7 +136,10 @@
+     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+   }
+   ~SocketThread() {
+-    stop_ = true;
++    {
++      std::unique_lock lock(queue_mutex_);
++      stop_ = true;
++    }
+     condition_.notify_all();
+     worker_.join();
+     int flags = fcntl(fd_, F_GETFL, 0);
+@@ -144,58 +147,38 @@
+   }
+ 
+   template <typename T>
+-  std::future<void> send(const T* buffer, size_t size) {
+-    return send_impl(reinterpret_cast<const char*>(buffer), size * sizeof(T));
++  SocketFuture send(const T* buffer, size_t size, submission::GraphQuota* graph) {
++    return send_impl(reinterpret_cast<const char*>(buffer), size * sizeof(T), graph);
+   }
+ 
+   template <typename T>
+-  std::future<void> recv(T* buffer, size_t size) {
+-    return recv_impl(reinterpret_cast<char*>(buffer), size * sizeof(T));
++  SocketFuture recv(T* buffer, size_t size, submission::GraphQuota* graph) {
++    return recv_impl(reinterpret_cast<char*>(buffer), size * sizeof(T), graph);
+   }
+ 
+  private:
+-  struct SocketTask {
+-    SocketTask(void* b, size_t s, std::promise<void>&& p)
+-        : buffer(b), size(s), promise(std::move(p)) {}
+-    SocketTask(SocketTask&& t)
+-        : buffer(t.buffer), size(t.size), promise(std::move(t.promise)) {}
+-    void* buffer;
+-    size_t size;
+-    std::promise<void> promise;
+-  };
+-
+-  std::future<void> send_impl(const char* buffer, size_t size) {
+-    std::promise<void> send_completed_promise;
+-    auto send_completed_future = send_completed_promise.get_future();
+-    if (size == 0) {
+-      send_completed_promise.set_value();
+-      return send_completed_future;
+-    }
+-
++  SocketFuture send_impl(const char* buffer, size_t size, submission::GraphQuota* graph) {
++    auto ready = SocketTaskQueue::prepare(const_cast<char*>(buffer), size, graph);
++    if (size == 0) return SocketTaskQueue::complete_empty(ready);
++    SocketFuture result;
+     {
+       std::unique_lock lock(queue_mutex_);
+-      sends_.emplace_back(SocketTask(
+-          const_cast<char*>(buffer), size, std::move(send_completed_promise)));
++      result = sends_.push(ready);
+     }
+     condition_.notify_one();
+-    return send_completed_future;
+-  }
+-
+-  std::future<void> recv_impl(char* buffer, size_t size) {
+-    std::promise<void> recv_completed_promise;
+-    auto recv_completed_future = recv_completed_promise.get_future();
+-    if (size == 0) {
+-      recv_completed_promise.set_value();
+-      return recv_completed_future;
+-    }
+-
++    return result;
++  }
++
++  SocketFuture recv_impl(char* buffer, size_t size, submission::GraphQuota* graph) {
++    auto ready = SocketTaskQueue::prepare(buffer, size, graph);
++    if (size == 0) return SocketTaskQueue::complete_empty(ready);
++    SocketFuture result;
+     {
+       std::unique_lock lock(queue_mutex_);
+-      recvs_.emplace_back(
+-          SocketTask(buffer, size, std::move(recv_completed_promise)));
++      result = recvs_.push(ready);
+     }
+     condition_.notify_one();
+-    return recv_completed_future;
++    return result;
+   }
+ 
+   bool have_tasks() {
+@@ -207,17 +190,16 @@
+     bool delete_recv = false;
+     bool delete_send = false;
+     while (true) {
++      socket_detail::Operation *recv_task = nullptr, *send_task = nullptr;
+       {
+         std::unique_lock lock(queue_mutex_);
+ 
+         if (delete_recv) {
+-          recvs_.front().promise.set_value();
+-          recvs_.pop_front();
++          recvs_.complete_front();
+           delete_recv = false;
+         }
+         if (delete_send) {
+-          sends_.front().promise.set_value();
+-          sends_.pop_front();
++          sends_.complete_front();
+           delete_send = false;
+         }
+ 
+@@ -231,10 +213,14 @@
+             return;
+           }
+         }
+-      }
+-
+-      if (!recvs_.empty()) {
+-        auto& task = recvs_.front();
++        // Only this worker pops. Producers append under the same mutex; the
++        // actual front node remains owned throughout this unlocked syscall.
++        recv_task = recvs_.front();
++        send_task = sends_.front();
++      }
++
++      if (recv_task) {
++        auto& task = *recv_task;
+         ssize_t r = ::recv(fd_, task.buffer, task.size, 0);
+         if (r > 0) {
+           task.buffer = static_cast<char*>(task.buffer) + r;
+@@ -247,8 +233,8 @@
+               true, "Receiving from socket", fd_, "failed with errno", errno);
+         }
+       }
+-      if (!sends_.empty()) {
+-        auto& task = sends_.front();
++      if (send_task) {
++        auto& task = *send_task;
+         ssize_t r = ::send(fd_, task.buffer, task.size, 0);
+         if (r > 0) {
+           task.buffer = static_cast<char*>(task.buffer) + r;
+@@ -273,8 +259,8 @@
+   std::thread worker_;
+   std::mutex queue_mutex_;
+   std::condition_variable condition_;
+-  std::list<SocketTask> sends_;
+-  std::list<SocketTask> recvs_;
++  SocketTaskQueue sends_;
++  SocketTaskQueue recvs_;
+ };
+ 
+ class CommunicationThreads {
+@@ -288,13 +274,13 @@
+   }
+ 
+   template <typename T>
+-  std::future<void> send(int socket, T* buffer, size_t size) {
+-    return threads_.at(socket).send<T>(buffer, size);
++  SocketFuture send(int socket, T* buffer, size_t size, submission::GraphQuota* graph) {
++    return threads_.at(socket).send<T>(buffer, size, graph);
+   }
+ 
+   template <typename T>
+-  std::future<void> recv(int socket, T* buffer, size_t size) {
+-    return threads_.at(socket).recv<T>(buffer, size);
++  SocketFuture recv(int socket, T* buffer, size_t size, submission::GraphQuota* graph) {
++    return threads_.at(socket).recv<T>(buffer, size, graph);
+   }
+ 
+  private:
+@@ -536,10 +522,11 @@
+               nbytes / min_send_size),
+           size_t(1));
+       size_t bytes_per_gather = ceildiv(nbytes, n_gathers);
+-      std::vector<std::future<void>> all_gathers;
++      auto* graph = submission::current_graph_quota();
++      PoolFutures all_gathers(n_gathers, graph);
+       for (int i = 0; i < n_gathers; i++) {
+         auto offset = i * bytes_per_gather;
+-        all_gathers.emplace_back(pool_.enqueue(
++        all_gathers.append(pool_.enqueue(
+             std::bind(
+                 &RingGroup::all_gather_impl,
+                 this,
+@@ -550,11 +537,9 @@
+                                                    : bytes_per_gather,
+                 sockets_right_[i / 2],
+                 sockets_left_[i / 2],
+-                (i % 2) ? -1 : 1)));
+-      }
+-      for (auto& f : all_gathers) {
+-        f.wait();
+-      }
++                (i % 2) ? -1 : 1, graph)));
++      }
++      all_gathers.join();
+     });
+   }
+ 
+@@ -630,6 +615,7 @@
+                       send = std::move(send),
+                       recv = std::move(recv),
+                       this]() {
++      auto* graph = submission::current_graph_quota();
+       struct PacketHeader {
+         uint64_t bytes;
+         uint32_t source;
+@@ -660,9 +646,9 @@
+         for (int hop = 1; hop <= distance; ++hop) {
+           PacketHeader incoming_header{};
+           auto recv_header =
+-              comm_.recv(sockets_left_[0], &incoming_header, size_t(1));
++              comm_.recv(sockets_left_[0], &incoming_header, size_t(1), graph);
+           auto send_header =
+-              comm_.send(sockets_right_[0], &current_header, size_t(1));
++              comm_.send(sockets_right_[0], &current_header, size_t(1), graph);
+           recv_header.get();
+           send_header.get();
+ 
+@@ -674,9 +660,9 @@
+           std::vector<char> incoming(
+               static_cast<size_t>(incoming_header.bytes));
+           auto recv_payload =
+-              comm_.recv(sockets_left_[0], incoming.data(), incoming.size());
++              comm_.recv(sockets_left_[0], incoming.data(), incoming.size(), graph);
+           auto send_payload =
+-              comm_.send(sockets_right_[0], current.data(), current.size());
++              comm_.send(sockets_right_[0], current.data(), current.size(), graph);
+           recv_payload.get();
+           send_payload.get();
+           current_header = incoming_header;
+@@ -721,6 +707,7 @@
+       // If the input data cannot be split into size_ segments then copy it and
+       // all reduce a local buffer prefilled with 0s.
+       size_t nbytes = size * sizeof(T);
++      auto* graph = submission::current_graph_quota();
+       if (size < size_) {
+         // TODO: Maybe allocate dynamically so we don't have the constraint
+         // below?
+@@ -741,7 +728,7 @@
+             sockets_right_[0],
+             sockets_left_[0],
+             -1,
+-            reduce_op);
++            reduce_op, graph);
+         std::memcpy(out_ptr, buffer, nbytes);
+         return;
+       }
+@@ -760,10 +747,10 @@
+               nbytes / (size_ * min_send_size)),
+           size_t(1));
+       size_t step = ceildiv(size, n_reduces);
+-      std::vector<std::future<void>> all_sums;
++      PoolFutures all_sums(n_reduces, graph);
+ 
+       for (int i = 0; i < n_reduces; i++) {
+-        all_sums.emplace_back(pool_.enqueue(
++        all_sums.append(pool_.enqueue(
+             std::bind(
+                 &RingGroup::all_reduce_impl<T, ReduceOp>,
+                 this,
+@@ -774,11 +761,9 @@
+                 sockets_right_[i / 2],
+                 sockets_left_[i / 2],
+                 (i % 2) ? -1 : 1,
+-                reduce_op)));
+-      }
+-      for (auto& f : all_sums) {
+-        f.wait();
+-      }
++                reduce_op, graph)));
++      }
++      all_sums.join();
+     });
+   }
+ 
+@@ -790,7 +775,7 @@
+       int socket_right,
+       int socket_left,
+       int direction,
+-      ReduceOp reduce_op) {
++      ReduceOp reduce_op, submission::GraphQuota* graph) {
+     // Choose which socket we send to and recv from
+     int socket_send = (direction < 0) ? socket_right : socket_left;
+     int socket_recv = (direction < 0) ? socket_left : socket_right;
+@@ -843,24 +828,24 @@
+     for (int i = 0; i < ALL_SUM_BUFFERS; i++) {
+       recv_buffers[i] = buffer + i * BUFFER_SIZE;
+     }
+-    std::future<void> sends[2], recvs[2];
++    SocketFuture sends[2], recvs[2];
+     int a = 0;
+     int b = (n_packets > 1) ? 1 : 0;
+     for (int i = 0, j = -b; i < send_plan.size(); j++, i++) {
+       sends[a] = comm_.send(
+           socket_send,
+           data + send_plan[i].first,
+-          send_plan[i].second - send_plan[i].first);
++          send_plan[i].second - send_plan[i].first, graph);
+       if (2 * i < send_plan.size()) {
+         recvs[a] = comm_.recv(
+             socket_recv,
+             recv_buffers[i % ALL_SUM_BUFFERS],
+-            recv_plan[i].second - recv_plan[i].first);
++            recv_plan[i].second - recv_plan[i].first, graph);
+       } else {
+         recvs[a] = comm_.recv(
+             socket_recv,
+             data + recv_plan[i].first,
+-            recv_plan[i].second - recv_plan[i].first);
++            recv_plan[i].second - recv_plan[i].first, graph);
+       }
+ 
+       if (j >= 0) {
+@@ -887,7 +872,7 @@
+       size_t data_size,
+       int socket_right,
+       int socket_left,
+-      int direction) {
++      int direction, submission::GraphQuota* graph) {
+     // Choose which socket we send to and recv from
+     int socket_send = (direction < 0) ? socket_right : socket_left;
+     int socket_recv = (direction < 0) ? socket_left : socket_right;
+@@ -904,9 +889,9 @@
+     // See all_sum_impl for an example.
+     for (int i = 0; i < size_ - 1; i++) {
+       auto sent = comm_.send(
+-          socket_send, output + send_segment * input_size, data_size);
++          socket_send, output + send_segment * input_size, data_size, graph);
+       auto recvd = comm_.recv(
+-          socket_recv, output + recv_segment * input_size, data_size);
++          socket_recv, output + recv_segment * input_size, data_size, graph);
+ 
+       send_segment = (send_segment + size_ + direction) % size_;
+       recv_segment = (recv_segment + size_ + direction) % size_;
+@@ -920,7 +905,9 @@
+   send(const std::vector<int>& sockets, const char* data, size_t data_size) {
+     size_t segment_size =
+         std::max(size_t(1024), ceildiv(data_size, sockets.size()));
+-    std::vector<std::future<void>> sends;
++    auto* graph = submission::current_graph_quota();
++    submission::GraphVector<SocketFuture> sends{submission::GraphAllocator<SocketFuture>(graph)};
++    sends.reserve(sockets.size());
+     for (int i = 0; i < sockets.size(); i++) {
+       if (i * segment_size >= data_size) {
+         break;
+@@ -928,7 +915,7 @@
+       sends.emplace_back(comm_.send(
+           sockets[i],
+           data + i * segment_size,
+-          std::min(data_size, (i + 1) * segment_size) - i * segment_size));
++          std::min(data_size, (i + 1) * segment_size) - i * segment_size, graph));
+     }
+     for (auto& f : sends) {
+       f.wait();
+@@ -938,7 +925,9 @@
+   void recv(const std::vector<int>& sockets, char* data, size_t data_size) {
+     size_t segment_size =
+         std::max(size_t(1024), ceildiv(data_size, sockets.size()));
+-    std::vector<std::future<void>> recvs;
++    auto* graph = submission::current_graph_quota();
++    submission::GraphVector<SocketFuture> recvs{submission::GraphAllocator<SocketFuture>(graph)};
++    recvs.reserve(sockets.size());
+     for (int i = 0; i < sockets.size(); i++) {
+       if (i * segment_size >= data_size) {
+         break;
+@@ -946,7 +935,7 @@
+       recvs.emplace_back(comm_.recv(
+           sockets[i],
+           data + i * segment_size,
+-          std::min(data_size, (i + 1) * segment_size) - i * segment_size));
++          std::min(data_size, (i + 1) * segment_size) - i * segment_size, graph));
+     }
+     for (auto& f : recvs) {
+       f.wait();
+diff --git a/mlx/distributed/ring/socket_tasks.h b/mlx/distributed/ring/socket_tasks.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/distributed/ring/socket_tasks.h
+@@ -0,0 +1,192 @@
++#pragma once
++
++#include <future>
++#include <limits>
++#include <utility>
++#include "mlx/scheduler_task.h"
++
++namespace mlx::core::distributed::ring {
++
++// These are the actual shared owner layouts, not an inferred operation count.
++struct SocketTaskLayout {
++  size_t node_bytes, node_alignment, node_extent;
++  size_t promise_bytes, promise_alignment, promise_extent;
++  size_t controls;
++};
++
++class SocketTaskQueue;
++class SocketFuture {
++ public:
++  SocketFuture() = default;
++  SocketFuture(SocketFuture&&) noexcept = default;
++  SocketFuture& operator=(SocketFuture&& other) noexcept {
++    wait_if_valid();
++    value_ = std::move(other.value_);
++    return *this;
++  }
++  SocketFuture(const SocketFuture&) = delete;
++  ~SocketFuture() { wait_if_valid(); }
++  void wait() { value_.wait(); }
++  void get() { value_.get(); }
++ private:
++  friend class SocketTaskQueue;
++  explicit SocketFuture(std::future<void>&& value) noexcept : value_(std::move(value)) {}
++  void wait_if_valid() noexcept {
++    // A receipt is formed only after queue acceptance (or immediate success).
++    // Its raw buffer borrower cannot retire before that exact socket finishes.
++    // A valid standard future wait has no no-state branch; a platform failure
++    // cannot be treated as safe native completion during destructor unwinding.
++    if (value_.valid()) value_.wait();
++  }
++  std::future<void> value_;
++};
++
++namespace socket_detail {
++inline bool promise_layout(size_t& bytes, size_t& alignment) noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L
++  using State = std::__assoc_sub_state_alloc<submission::GraphAllocator<std::byte>>;
++  bytes = sizeof(State);
++  alignment = alignof(State);
++  return true;
++#else
++  return false;
++#endif
++}
++inline std::promise<void> make_promise(submission::GraphQuota* graph) {
++  if (!graph) return std::promise<void>();
++  size_t bytes, alignment;
++  if (!promise_layout(bytes, alignment))
++    throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++  // The allocator state is retained in the actual promise/future shared state,
++  // including after a socket worker drops its completed task node.
++  return std::promise<void>(std::allocator_arg,
++                           submission::GraphAllocator<std::byte>(graph));
++}
++struct Operation {
++  void* buffer;
++  size_t size;
++  // On an unaccepted prefix, future dies before promise. No broken-promise
++  // exception allocation is needed while another constructor is unwinding.
++  std::promise<void> promise;
++  std::future<void> future;
++  Operation(void* buffer, size_t size, submission::GraphQuota* graph)
++      : buffer(buffer), size(size), promise(make_promise(graph)),
++        future(promise.get_future()) {}
++  Operation(Operation&&) noexcept = default;
++  void operator()() { promise.set_value(); }
++};
++using Node = scheduler::TaskNode<Operation>;
++inline Operation& operation(scheduler::Task* task) noexcept {
++  return static_cast<Node*>(task)->body;
++}
++} // namespace socket_detail
++
++// No list/deque allocation: reuse the exact native scheduler TaskNode and
++// TaskOwner destruction machinery. The existing SocketThread mutex and worker
++// own acceptance/progress; this class neither starts a worker nor creates Scope.
++class SocketTaskQueue {
++ public:
++  class Ready {
++   public:
++    Ready(Ready&&) noexcept = default;
++    Ready(const Ready&) = delete;
++   private:
++    friend class SocketTaskQueue;
++    explicit Ready(scheduler::TaskOwner&& value) noexcept : value_(std::move(value)) {}
++    scheduler::TaskOwner value_;
++  };
++  SocketTaskQueue() = default;
++  SocketTaskQueue(const SocketTaskQueue&) = delete;
++  ~SocketTaskQueue() { while (head_) { auto retired = pop(); } }
++  static Ready prepare(void* buffer, size_t size, submission::GraphQuota* graph) {
++    return Ready(scheduler::make_task(graph, {}, nullptr, false,
++                                     socket_detail::Operation(buffer, size, graph)));
++  }
++  static SocketFuture complete_empty(Ready& ready) {
++    auto* task = ready.value_.get();
++    if (!task || socket_detail::operation(task).size)
++      throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++    task->invoke(task);
++    SocketFuture result(std::move(socket_detail::operation(task).future));
++    ready.value_.reset();
++    return result;
++  }
++  SocketFuture push(Ready& ready) {
++    auto* task = ready.value_.get();
++    if (!task || !socket_detail::operation(task).future.valid())
++      throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++    SocketFuture result(std::move(socket_detail::operation(task).future));
++    if (tail_) tail_->next = task;
++    else head_ = task;
++    tail_ = ready.value_.release();
++    return result;
++  }
++  bool empty() const noexcept { return head_ == nullptr; }
++  socket_detail::Operation* front() noexcept {
++    return head_ ? &socket_detail::operation(head_) : nullptr;
++  }
++  void complete_front() {
++    auto* task = head_;
++    if (!task) throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++    task->invoke(task);
++    auto retired = pop();
++  }
++ private:
++  scheduler::TaskOwner pop() noexcept {
++    auto* task = head_;
++    head_ = task->next;
++    if (!head_) tail_ = nullptr;
++    task->next = nullptr;
++    return scheduler::TaskOwner(task);
++  }
++  scheduler::Task* head_{nullptr};
++  scheduler::Task* tail_{nullptr};
++};
++
++inline bool socket_task_layout(SocketTaskLayout& out) noexcept {
++  SocketTaskLayout value{};
++  value.node_bytes = sizeof(socket_detail::Node);
++  value.node_alignment = alignof(socket_detail::Node);
++  if (!socket_detail::promise_layout(value.promise_bytes, value.promise_alignment) ||
++      !submission::GraphQuota::allocation_extent(value.node_bytes, value.node_alignment, value.node_extent) ||
++      !submission::GraphQuota::allocation_extent(value.promise_bytes, value.promise_alignment, value.promise_extent))
++    return false;
++  value.controls = sizeof(SocketTaskLayout) * 2 + sizeof(SocketTaskQueue) +
++      sizeof(SocketTaskQueue::Ready) + sizeof(SocketFuture) * 2 +
++      sizeof(socket_detail::Operation) + sizeof(scheduler::TaskOwner) * 2 +
++      sizeof(submission::GraphAllocator<socket_detail::Node>) +
++      sizeof(submission::GraphAllocator<std::byte>) * 3 +
++      sizeof(void*) * 5 + sizeof(size_t) * 4 + sizeof(bool) * 2;
++  out = value;
++  return true;
++}
++
++// Every accepted pool sibling must finish before any exception escapes the
++// enclosing CPU task. std::future::wait alone used to discard packaged errors.
++// This joins the same pool jobs; it is not a new executor or completion event.
++class PoolFutures {
++ public:
++  PoolFutures(size_t count, submission::GraphQuota* graph)
++      : values_(submission::GraphAllocator<std::future<void>>(graph)) {
++    values_.reserve(count);
++  }
++  ~PoolFutures() { for (auto& value : values_) if (value.valid()) value.wait(); }
++  void append(std::future<void>&& value) {
++    if (values_.size() == values_.capacity()) {
++      if (value.valid()) value.wait();
++      throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++    }
++    values_.push_back(std::move(value));
++  }
++  void join() {
++    std::exception_ptr first;
++    for (auto& value : values_) {
++      try { value.get(); }
++      catch (...) { if (!first) first = std::current_exception(); }
++    }
++    if (first) std::rethrow_exception(first);
++  }
++ private:
++  submission::GraphVector<std::future<void>> values_;
++};
++} // namespace mlx::core::distributed::ring

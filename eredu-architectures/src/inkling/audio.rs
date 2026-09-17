@@ -21,9 +21,9 @@ pub struct AudioInput<'a, T> {
 pub struct AudioTower<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> {
     embedding: B::Embedding,
     final_norm: B::Normalization,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     num_codebooks: i32,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     codebook_size: i32,
 }
 
@@ -33,31 +33,8 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioTower<B> {
         config: &AudioConfig,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let name = "audio.encoder.weight";
-        Ok(Self {
-            embedding: B::embedding(
-                EmbeddingSpec {
-                    vocabulary: config.num_codebooks * config.codebook_size,
-                    dimensions: config.text_hidden_size,
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
-                    format: crate::linear_format::standard_linear_format(
-                        name,
-                        config.linear_format_for(name),
-                    )?,
-                },
-                context,
-            )?,
-            final_norm: B::normalization(
-                NormalizationConstructionSpec::learned(
-                    config.text_hidden_size,
-                    config.rms_norm_eps,
-                    ParameterSpec::trainable("audio.final_norm.weight").map_err(Error::backend)?,
-                ),
-                context,
-            )?,
-            num_codebooks: config.num_codebooks,
-            codebook_size: config.codebook_size,
-        })
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        AudioTowerSpec::new(config)?.instantiate::<B>(context)
     }
 
     /// Embeds every codebook, sums the codebook axis, normalizes, and crops padding.
@@ -89,5 +66,43 @@ impl<B: NeuralBackend + eredu_nn::DistributedNeuralBackend> AudioTower<B> {
             ],
             context,
         )
+    }
+}
+
+/// Immutable declarations produced once by the same ordinary audio constructor.
+#[derive(Debug)]
+pub(crate) struct AudioTowerSpec {
+    embedding: EmbeddingSpec,
+    final_norm: NormalizationConstructionSpec,
+    num_codebooks: i32,
+    codebook_size: i32,
+}
+impl AudioTowerSpec {
+    pub(crate) fn new(config: &AudioConfig) -> Result<Self, Error> {
+        let name = "audio.encoder.weight";
+        Ok(Self {
+            embedding: EmbeddingSpec {
+                vocabulary: config.num_codebooks * config.codebook_size,
+                dimensions: config.text_hidden_size,
+                weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
+                format: crate::linear_format::standard_linear_format(name, config.linear_format_for(name))?,
+            },
+            final_norm: NormalizationConstructionSpec::learned(config.text_hidden_size, config.rms_norm_eps,
+                ParameterSpec::trainable("audio.final_norm.weight").map_err(Error::backend)?),
+            num_codebooks: config.num_codebooks,
+            codebook_size: config.codebook_size,
+        })
+    }
+    pub(crate) fn instantiate<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
+        &self, context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<AudioTower<B>, Error> {
+        use crate::decoder::construction_specs::{copy_embedding, copy_normalization};
+        crate::decoder::ModuleMetadata::new::<B>(context).controls::<(&Self, AudioTower<B>)>()?;
+        Ok(AudioTower {
+            embedding: B::embedding(copy_embedding::<B>(&self.embedding, context)?, context)?,
+            final_norm: B::normalization(copy_normalization::<B>(&self.final_norm, context)?, context)?,
+            num_codebooks: self.num_codebooks,
+            codebook_size: self.codebook_size,
+        })
     }
 }

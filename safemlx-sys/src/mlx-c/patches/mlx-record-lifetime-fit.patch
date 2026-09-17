@@ -1,0 +1,57 @@
+diff --git a/mlx/record_quota.cpp b/mlx/record_quota.cpp
+--- a/mlx/record_quota.cpp
++++ b/mlx/record_quota.cpp
+@@ -88,6 +88,21 @@
+           start, pointer, used) || used > std::numeric_limits<ptrdiff_t>::max())
+     return false;
+   out = used;
++  return true;
++}
++
++size_t RecordQuota::minimum_split_bytes() noexcept {
++  return sizeof(Block) + sizeof(size_t) + alignment;
++}
++
++bool RecordQuota::fresh_capacity_for_extents(size_t extents, size_t& out) noexcept {
++  size_t capacity, minimum;
++  if (extents % alignment || !add(extents, minimum_split_bytes(), capacity) ||
++      !minimum_capacity(minimum)) return false;
++  capacity = std::max(capacity, minimum);
++  RecordQuotaLayout checked;
++  if (!layout(capacity, checked)) return false;
++  out = capacity;
+   return true;
+ }
+ 
+@@ -165,7 +180,7 @@
+               c.start, c.pointer, c.used) || c.used > c.entry->bytes)
+         continue;
+       c.remainder = c.entry->bytes - c.used;
+-      if (c.remainder >= sizeof(Block) + sizeof(size_t) + alignment) {
++      if (c.remainder >= minimum_split_bytes()) {
+         c.next = c.offset + c.used;
+         ::new (bytes() + c.next) Block{c.remainder, c.offset, c.entry->next, true};
+         if (c.entry->next != absent) block(c.entry->next)->previous = c.next;
+diff --git a/mlx/record_quota.h b/mlx/record_quota.h
+--- a/mlx/record_quota.h
++++ b/mlx/record_quota.h
+@@ -60,6 +60,11 @@
+   // the arena. Includes Block, back-offset, padding and allocator rounding;
+   // no quota is created or inspected. Fragmented/retained blocks are separate.
+   static bool allocation_extent(size_t requested, size_t align, size_t& out) noexcept;
++  // Sufficient fresh-arena capacity when extents is the sum of EVERY finite
++  // allocation attempt's allocation_extent, including failed prefixes. Keeping
++  // the minimum split tail permits arbitrary retirement and first-fit reuse.
++  // This arithmetic query authenticates neither request population nor owner.
++  static bool fresh_capacity_for_extents(size_t extents, size_t& out) noexcept;
+   static bool layout(size_t capacity, RecordQuotaLayout& out) noexcept;
+   static RecordQuota* create(
+       size_t capacity, void* owner, void (*retire)(void*));
+@@ -73,6 +78,7 @@
+ 
+  private:
+   struct Block;
++  static size_t minimum_split_bytes() noexcept;
+   struct Loan;
+   // One serialized allocator scratch representation is part of this exact
+   // header allocation, rather than an unpriced population of heap controls.

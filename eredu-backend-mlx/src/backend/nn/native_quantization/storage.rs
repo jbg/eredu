@@ -137,6 +137,12 @@ pub struct NativeQuantizedTensor {
 }
 
 impl NativeQuantizedTensor {
+    /// Actual packed backing shared by logical row views. Borrowing neither
+    /// decodes values nor creates a descriptor or queries native metadata.
+    pub(crate) fn retained_packed_array(&self) -> &Array {
+        &self.storage.bytes
+    }
+
     /// Copies the packed storage to another execution stream while preserving
     /// this tensor's logical matrix and row view.
     #[cfg(test)]
@@ -306,7 +312,7 @@ impl NativeQuantizedTensor {
         }
         let len = i32::try_from(data.len())
             .map_err(|_| Exception::custom("native tensor exceeds MLX i32 array limits"))?;
-        let source = Array::from_slice(data, &[len]);
+        let source = Array::try_from_slice(data, &[len])?;
         let bytes = source.copy(stream)?;
         eval([&bytes])?;
         let storage = Arc::new(NativeStorage {
@@ -546,7 +552,7 @@ impl NativeQuantizedTensor {
         } else {
             vec![self.matrix_count, self.rows, self.columns]
         };
-        let dense = Array::from_slice(&values, &shape).copy(stream)?;
+        let dense = Array::try_from_slice(&values, &shape)?.copy(stream)?;
         eval([&dense])?;
         Ok(dense)
     }
@@ -617,7 +623,7 @@ impl NativeQuantizedTensor {
         }
         let mut shape = input.shape()[..input.ndim() - 1].to_vec();
         shape.push(output_width);
-        Array::from_slice(&output, &shape).copy(stream)
+        Array::try_from_slice(&output, &shape)?.copy(stream)
     }
 
     pub(super) fn embedding_cpu_streaming(
@@ -643,6 +649,6 @@ impl NativeQuantizedTensor {
         }
         let mut shape = indices.shape().to_vec();
         shape.push(self.columns);
-        Array::from_slice(&output, &shape).copy(stream)
+        Array::try_from_slice(&output, &shape)?.copy(stream)
     }
 }

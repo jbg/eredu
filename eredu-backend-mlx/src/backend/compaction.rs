@@ -19,7 +19,7 @@ fn bool_condition(mask: &Array, stream: &Stream) -> Result<Array> {
     if mask.dtype() == Dtype::Bool {
         Ok(mask.clone())
     } else {
-        mask.ne(Array::from_int(0), stream)
+        mask.ne(Array::try_from_int(0)?, stream)
     }
 }
 

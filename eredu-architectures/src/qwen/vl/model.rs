@@ -2,25 +2,24 @@
 
 mod observation;
 
+mod media_prefill;
+pub use media_prefill::MediaPrefillPlan;
+
 use eredu_core::cache::StateTensorRole;
 use eredu_nn::{
-    multimodal::{assemble_ordered_inputs, OrderedInputPart},
     AttentionCache, EmbeddingLookupPolicy, EmbeddingOperator, Error, GroupedNeuralBackend, Index,
     LinearOperator, NormalizationOperator, Parameterized, RotaryPosition, Tensor,
+    multimodal::{OrderedInputPart, assemble_ordered_inputs},
 };
 use eredu_runtime::{
-    ArchitectureParameterDescription, ExecutionGraph, ExecutionGroupSpec, ExecutionUnitLayout,
-    ExpertPass, LayerRuntimeState, LayeredArchitecture, LayeredForwardState, LayeredPartitionInput,
-    LayeredPartitionOutput, OwnedParameterGroupSpec, ParallelLayeredArchitecture,
-    ParallelRoutedLayeredArchitecture, ParameterGroupOwner, PartitionedLayeredArchitecture,
-    RoutedExpertProvider, RoutedLayeredArchitecture, RuntimeStateComponents, StateLayout,
+    ArchitectureParameterDescription, ExecutionGraph, ExpertPass, LayerRuntimeState,
+    LayeredArchitecture, LayeredForwardState, LayeredPartitionInput, LayeredPartitionOutput,
+    OwnedParameterGroupSpec, ParallelLayeredArchitecture, ParallelRoutedLayeredArchitecture,
+    PartitionedLayeredArchitecture, RoutedExpertProvider, RoutedLayeredArchitecture,
+    RuntimeStateComponents, StateLayout,
 };
 
-use crate::decoder::static_parallel_parameter_groups;
-use crate::qwen::vision::{
-    block_parallel_parameter_groups, VisionBlock, VisionInput, VisionMode, VisionState,
-    VisionStatic,
-};
+use crate::qwen::vision::{VisionBlock, VisionInput, VisionMode, VisionState, VisionStatic};
 use crate::qwen::{self, AttentionInput};
 use crate::{
     composite_execution::{CompositeArchitecture, PreparedCompositeInput},
@@ -28,8 +27,8 @@ use crate::{
 };
 
 use super::{
-    mrope_embeddings, multimodal_position_ids, position_ids_tensor, LocalGeometry, ModelArgs,
-    PositionPart,
+    LocalGeometry, ModelArgs, PositionPart, mrope_embeddings, multimodal_position_ids,
+    position_ids_tensor,
 };
 
 /// Stable execution-group identity for Qwen3-VL vision ingress.
@@ -90,13 +89,42 @@ pub struct PreparedInput<T> {
     projected: Vec<Option<T>>,
 }
 
+// The shared worker has no public forwarding capability. Only its complete
+// grid-retaining result constructs PreparedInput; retained spans use the smaller
+// pending type and borrow semantic grids from their admitted source.
+struct PreparedInputAssembly<T> {
+    tokens: Vec<T>,
+    grids: Vec<Vec<(i32, i32, i32)>>,
+    pixels: Option<T>,
+    kinds: Vec<PreparedInputKind>,
+    projected: Vec<Option<T>>,
+}
+struct PreparedPendingInput<T> {
+    tokens: Vec<T>,
+    pixels: Option<T>,
+    kinds: Vec<PreparedInputKind>,
+    projected: Vec<Option<T>>,
+}
+
 impl<T> PreparedInput<T> {
     /// Borrows the assembled request through the canonical model input vocabulary.
     pub fn with_model_input<R>(&self, apply: impl FnOnce(ModelInput<'_, T>) -> R) -> R {
-        let parts = self
-            .kinds
-            .iter()
-            .map(|kind| match *kind {
+        self.with_model_input_destination(crate::decoder::identity::Metadata::new(None), apply)
+            .expect("ordinary borrowed input construction is infallible")
+    }
+
+    fn with_model_input_destination<R>(
+        &self,
+        metadata: crate::decoder::identity::Metadata<'_>,
+        apply: impl FnOnce(ModelInput<'_, T>) -> R,
+    ) -> Result<R, Error> {
+        metadata.controls::<(Vec<InputPart<'_, T>>, R)>()?;
+        if let Some(context) = metadata.context() {
+            context.charge_metadata(std::mem::size_of_val(&apply))?;
+        }
+        let mut parts = metadata.vector(self.kinds.len())?;
+        parts.extend(self.kinds.iter().map(|kind| {
+            match *kind {
                 PreparedInputKind::Text(token) => InputPart::Text(&self.tokens[token]),
                 PreparedInputKind::Projected(token, original) => InputPart::Projected {
                     tokens: &self.tokens[token],
@@ -112,13 +140,13 @@ impl<T> PreparedInput<T> {
                     tokens: &self.tokens[token],
                     grid: &self.grids[grid],
                 },
-            })
-            .collect::<Vec<_>>();
-        apply(ModelInput {
+            }
+        }));
+        Ok(apply(ModelInput {
             parts: &parts,
             pixels: self.pixels.as_ref(),
             mask: None,
-        })
+        }))
     }
 }
 
@@ -128,58 +156,115 @@ pub fn prepare_input<T: Tensor>(
     input: PreparedCompositeInput<'_, T, QwenVlInputPartPlan>,
     context: &T::Context,
 ) -> Result<PreparedInput<T>, Error> {
+    prepare_input_with_metadata(input, context, None)
+}
+
+fn prepare_input_with_metadata<T: Tensor>(
+    input: PreparedCompositeInput<'_, T, QwenVlInputPartPlan>,
+    context: &T::Context,
+    metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+) -> Result<PreparedInput<T>, Error> {
+    let metadata = crate::decoder::identity::Metadata::new(metadata);
+    metadata.controls::<(PreparedInput<T>, PreparedInputAssembly<T>)>()?;
+    let assembled = assemble_input(input, true, context, metadata)?;
+    Ok(PreparedInput {
+        tokens: assembled.tokens,
+        grids: assembled.grids,
+        pixels: assembled.pixels,
+        kinds: assembled.kinds,
+        projected: assembled.projected,
+    })
+}
+
+fn prepare_pending_input<T: Tensor>(
+    input: PreparedCompositeInput<'_, T, QwenVlInputPartPlan>,
+    context: &T::Context,
+    metadata: Option<&eredu_nn::workspace::WorkspaceContext>,
+) -> Result<PreparedPendingInput<T>, Error> {
+    let metadata = crate::decoder::identity::Metadata::new(metadata);
+    metadata.controls::<(PreparedPendingInput<T>, PreparedInputAssembly<T>)>()?;
+    let assembled = assemble_input(input, false, context, metadata)?;
+    debug_assert!(assembled.grids.is_empty());
+    Ok(PreparedPendingInput {
+        tokens: assembled.tokens,
+        pixels: assembled.pixels,
+        kinds: assembled.kinds,
+        projected: assembled.projected,
+    })
+}
+
+fn assemble_input<T: Tensor>(
+    input: PreparedCompositeInput<'_, T, QwenVlInputPartPlan>,
+    retain_grids: bool,
+    context: &T::Context,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<PreparedInputAssembly<T>, Error> {
+    metadata.controls::<(PreparedInputAssembly<T>, PreparedInputKind, [i32; 2])>()?;
     let prepared = input.prepared();
-    let admitted = input.admitted();
-    if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
-        return Err(Error::backend(
-            "Qwen3-VL prepared input no longer matches its admission",
-        ));
+    if let Some(admitted) = input.admitted().legacy() {
+        if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
+            return Err(metadata.error(format_args!(
+                "Qwen3-VL prepared input no longer matches its admission"
+            )));
+        }
     }
 
-    let mut tokens = Vec::with_capacity(prepared.len());
-    let mut grids = Vec::new();
-    let mut pixels = Vec::new();
-    let mut kinds = Vec::with_capacity(prepared.len());
-    let mut projected = Vec::with_capacity(prepared.len());
-    for (part_index, (part, plan)) in prepared.parts().iter().zip(admitted.parts()).enumerate() {
-        match plan {
-            QwenVlInputPartPlan::TextTokens { .. } => {
+    let mut tokens = metadata.vector(prepared.len())?;
+    let media_count = input
+        .qwen_parts()
+        .filter(|part| part.role == crate::media_plan::qwen::QwenPartRole::Encoded)
+        .count();
+    let mut grids = metadata.vector(if retain_grids { media_count } else { 0 })?;
+    let mut grid_count = 0usize;
+    let mut pixels = metadata.vector(media_count)?;
+    let mut kinds = metadata.vector(prepared.len())?;
+    let mut projected = metadata.vector(prepared.len())?;
+    for (part_index, (part, plan)) in prepared.parts().iter().zip(input.qwen_parts()).enumerate() {
+        match plan.role {
+            crate::media_plan::qwen::QwenPartRole::Tokens => {
                 let eredu_runtime::PreparedInputPayload::TokenIds(value) = part.payload() else {
-                    return Err(Error::backend(
-                        "Qwen3-VL admitted text part lost its token payload",
-                    ));
+                    return Err(metadata.error(format_args!(
+                        "Qwen3-VL admitted text part lost its token payload"
+                    )));
                 };
                 tokens.push(value.clone());
                 kinds.push(PreparedInputKind::Text(tokens.len() - 1));
                 projected.push(None);
             }
-            QwenVlInputPartPlan::ProjectedText { positions } => {
+            crate::media_plan::qwen::QwenPartRole::Projected => {
                 let eredu_runtime::PreparedInputPayload::Embeddings(value) = part.payload() else {
-                    return Err(Error::backend(
-                        "Qwen3-VL admitted projected part lost its embedding payload",
-                    ));
+                    return Err(metadata.error(format_args!(
+                        "Qwen3-VL admitted projected part lost its embedding payload"
+                    )));
                 };
-                let positions = i32::try_from(*positions)
-                    .map_err(|_| Error::backend("Qwen3-VL projected span exceeds I32"))?;
+                let positions = i32::try_from(plan.positions).map_err(|_| {
+                    metadata.error(format_args!("Qwen3-VL projected span exceeds I32"))
+                })?;
                 tokens.push(T::full_i32(0, &[1, positions], context)?);
                 kinds.push(PreparedInputKind::Projected(tokens.len() - 1, part_index));
                 projected.push(Some(value.clone()));
             }
-            QwenVlInputPartPlan::Media { ingress, .. } => {
+            crate::media_plan::qwen::QwenPartRole::Encoded => {
                 let eredu_runtime::PreparedInputPayload::Tensor(value) = part.payload() else {
-                    return Err(Error::backend(
-                        "Qwen3-VL admitted media part lost its tensor payload",
-                    ));
+                    return Err(metadata.error(format_args!(
+                        "Qwen3-VL admitted media part lost its tensor payload"
+                    )));
                 };
-                let count = i32::try_from(ingress.placeholder_count)
-                    .map_err(|_| Error::backend("Qwen3-VL media span exceeds I32"))?;
-                let token = i32::try_from(ingress.placeholder_token_id)
-                    .map_err(|_| Error::backend("Qwen3-VL placeholder ID exceeds I32"))?;
+                let count = i32::try_from(plan.positions)
+                    .map_err(|_| metadata.error(format_args!("Qwen3-VL media span exceeds I32")))?;
+                let token = i32::try_from(plan.placeholder).map_err(|_| {
+                    metadata.error(format_args!("Qwen3-VL placeholder ID exceeds I32"))
+                })?;
                 tokens.push(T::full_i32(token, &[1, count], context)?);
-                grids.push(ingress.patch_grid.clone());
+                if retain_grids {
+                    let mut grid = metadata.vector(plan.grid.iter().count())?;
+                    grid.extend(plan.grid.iter());
+                    grids.push(grid);
+                }
                 pixels.push(value.clone());
                 let token_index = tokens.len() - 1;
-                let grid_index = grids.len() - 1;
+                let grid_index = grid_count;
+                grid_count += 1;
                 kinds.push(match part.modality() {
                     eredu_core::InputModality::Image => {
                         PreparedInputKind::Image(token_index, grid_index)
@@ -188,9 +273,9 @@ pub fn prepare_input<T: Tensor>(
                         PreparedInputKind::Video(token_index, grid_index)
                     }
                     _ => {
-                        return Err(Error::backend(
-                            "Qwen3-VL media admission contains an unsupported modality",
-                        ));
+                        return Err(metadata.error(format_args!(
+                            "Qwen3-VL media admission contains an unsupported modality"
+                        )));
                     }
                 });
                 projected.push(None);
@@ -202,7 +287,7 @@ pub fn prepare_input<T: Tensor>(
         1 => pixels.pop(),
         _ => Some(T::concatenate(&pixels, 0, context)?),
     };
-    Ok(PreparedInput {
+    Ok(PreparedInputAssembly {
         tokens,
         grids,
         pixels,
@@ -218,10 +303,22 @@ where
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
     type InputPartPlan = QwenVlInputPartPlan;
-    type AdmissionConfig = ModelArgs;
+    type AdmissionConfig = crate::replicated_text::SharedCompositeConfig<ModelArgs>;
 
     fn admission_config(&self) -> Self::AdmissionConfig {
         self.args.clone()
+    }
+
+    fn retain_admission_config_with_metadata(
+        config: &Self::AdmissionConfig,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self::AdmissionConfig, Error> {
+        context.charge_metadata(std::mem::size_of::<(
+            Self::AdmissionConfig,
+            Result<Self::AdmissionConfig, Error>,
+        )>())?;
+        // This aliases the selected immutable owner, including its custody.
+        Ok(config.clone())
     }
 
     fn admit_prepared_input(
@@ -235,6 +332,15 @@ where
         crate::media_plan::admit_qwen_vl_input(config, input, inspector)
     }
 
+    fn admit_prepared_input_with_metadata(
+        config: &Self::AdmissionConfig,
+        input: &eredu_runtime::PreparedModelInput<B::Tensor>,
+        inspector: &impl eredu_runtime::PreparedInputInspector<B::Tensor>,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<crate::media_plan::AdmittedCompositeInput<Self::InputPartPlan>, Error> {
+        crate::media_plan::admission::qwen_vl(config, input, inspector, context)
+    }
+
     fn should_execute_prepared_group(
         &self,
         group: usize,
@@ -243,10 +349,8 @@ where
         group == 1
             || (group == 0
                 && input
-                    .admitted()
-                    .parts()
-                    .iter()
-                    .any(|part| matches!(part, QwenVlInputPartPlan::Media { .. })))
+                    .qwen_parts()
+                    .any(|part| part.role == crate::media_plan::qwen::QwenPartRole::Encoded))
     }
 
     fn prepared_group_boundary_sequence(
@@ -256,12 +360,10 @@ where
     ) -> Result<i32, String> {
         let positions = if group == 0 {
             input
-                .admitted()
-                .parts()
-                .iter()
-                .filter_map(|part| match part {
-                    QwenVlInputPartPlan::Media { shape, .. } => Some(shape.decoder_positions),
-                    _ => None,
+                .qwen_parts()
+                .filter_map(|part| {
+                    (part.role == crate::media_plan::qwen::QwenPartRole::Encoded)
+                        .then_some(part.positions)
                 })
                 .try_fold(0_u64, |total, positions| total.checked_add(positions))
                 .ok_or_else(|| "Qwen3-VL projected media positions overflowed".to_owned())?
@@ -281,15 +383,10 @@ where
             return Ok(None);
         }
         let patches = input
-            .admitted()
-            .parts()
-            .iter()
-            .filter_map(|part| match part {
-                QwenVlInputPartPlan::Media { ingress, .. } => Some(&ingress.patch_grid),
-                _ => None,
-            })
-            .flatten()
-            .try_fold(0_u64, |total, &(time, height, width)| {
+            .qwen_parts()
+            .filter(|part| part.role == crate::media_plan::qwen::QwenPartRole::Encoded)
+            .flat_map(|part| part.grid.iter())
+            .try_fold(0_u64, |total, (time, height, width)| {
                 u64::try_from(time)
                     .ok()
                     .and_then(|time| {
@@ -318,104 +415,7 @@ where
         pipeline_stages: usize,
     ) -> Result<Option<Vec<Vec<crate::composite_execution::CompositeTensorCollective>>>, String>
     {
-        if group != 0 || tensor_partitions <= 1 || pipeline_stages <= 1 {
-            return Ok(None);
-        }
-        let mut patch_positions = 0_u64;
-        let mut projected_positions = 0_u64;
-        for part in input.admitted().parts() {
-            let QwenVlInputPartPlan::Media { ingress, shape } = part else {
-                continue;
-            };
-            projected_positions = projected_positions
-                .checked_add(shape.decoder_positions)
-                .ok_or_else(|| "Qwen3-VL projected media positions overflowed".to_owned())?;
-            for &(time, height, width) in &ingress.patch_grid {
-                let patches = u64::try_from(time)
-                    .ok()
-                    .and_then(|time| {
-                        u64::try_from(height)
-                            .ok()
-                            .and_then(|height| time.checked_mul(height))
-                    })
-                    .and_then(|area| {
-                        u64::try_from(width)
-                            .ok()
-                            .and_then(|width| area.checked_mul(width))
-                    })
-                    .ok_or_else(|| "Qwen3-VL patch-grid geometry overflowed".to_owned())?;
-                patch_positions = patch_positions
-                    .checked_add(patches)
-                    .ok_or_else(|| "Qwen3-VL patch positions overflowed".to_owned())?;
-            }
-        }
-        let patch_positions = i32::try_from(patch_positions)
-            .map_err(|_| "Qwen3-VL patch positions exceed i32".to_owned())?;
-        let projected_positions = i32::try_from(projected_positions)
-            .map_err(|_| "Qwen3-VL projected positions exceed i32".to_owned())?;
-        if patch_positions == 0 || projected_positions == 0 {
-            return Ok(Some(vec![Vec::new(); pipeline_stages]));
-        }
-        let layers = self.args.vision.layer_count();
-        if layers < pipeline_stages {
-            return Err(
-                "Qwen3-VL vision collective schedule has fewer units than PP stages".into(),
-            );
-        }
-        let patch_shape = vec![patch_positions, self.args.vision.hidden_size];
-        let projected_shape = vec![projected_positions, self.args.vision.out_hidden_size];
-        let mut ingress_operations = Vec::new();
-        for (part, plan) in input
-            .prepared()
-            .parts()
-            .iter()
-            .zip(input.admitted().parts())
-        {
-            if let QwenVlInputPartPlan::TextTokens { positions } = plan {
-                let batch = part.payload().value().dim(0);
-                let positions = i32::try_from(*positions)
-                    .map_err(|_| "Qwen3-VL text positions exceed i32".to_owned())?;
-                ingress_operations.push(
-                    crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: vec![batch, positions, self.args.text.hidden_size],
-                    },
-                );
-            }
-        }
-        let mut stages = Vec::with_capacity(pipeline_stages);
-        for stage in 0..pipeline_stages {
-            let range =
-                eredu_core::balanced_contiguous_range(layers, pipeline_stages, stage, false)
-                    .map_err(|error| error.to_string())?;
-            let mut operations = ingress_operations.clone();
-            for layer in range.clone() {
-                operations.extend([
-                    crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: patch_shape.clone(),
-                    },
-                    crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: patch_shape.clone(),
-                    },
-                ]);
-                if self
-                    .args
-                    .vision
-                    .layer_policy(layer)
-                    .is_some_and(|policy| policy.deepstack_merger.is_some())
-                {
-                    operations.push(crate::composite_execution::CompositeTensorCollective::Sum {
-                        shape: projected_shape.clone(),
-                    });
-                }
-            }
-            if range.end == layers {
-                operations.push(crate::composite_execution::CompositeTensorCollective::Sum {
-                    shape: projected_shape.clone(),
-                });
-            }
-            stages.push(operations);
-        }
-        Ok(Some(stages))
+        self.ingress_group_collective_waves(group, input, tensor_partitions, pipeline_stages, true)
     }
 
     fn routed_tensor_reductions(
@@ -551,8 +551,8 @@ where
                 values.collect(),
             )
             .map_err(|error| Error::backend(error.to_string()))?;
-            forward.rotary = (boundary.cosine, boundary.sine);
-            forward.position_delta = boundary.position_delta;
+            forward.rotary = Some((boundary.cosine, boundary.sine));
+            forward.position_delta = Some(boundary.position_delta);
             forward.deepstack = boundary.deepstack;
             return Ok(Some(hidden));
         }
@@ -593,9 +593,15 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        prepare_input(input, context)?.with_model_input(|input| {
-            <Self as LayeredArchitecture<B, S>>::begin_forward(self, input, state, context)
-        })
+        let metadata = crate::decoder::identity::Metadata::new(
+            input
+                .metadata()
+                .or_else(|| B::construction_metadata(context)),
+        );
+        prepare_input_with_metadata(input, context, metadata.context())?
+            .with_model_input_destination(metadata, |input| {
+                self.begin_forward_with_metadata(input, state, context, metadata)
+            })?
     }
 
     fn begin_composite_forward_parallel<'a>(
@@ -608,11 +614,15 @@ where
     where
         B: eredu_nn::TensorParallelGroupedNeuralBackend,
     {
-        prepare_input(input, context)?.with_model_input(|input| {
-            <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
-                self, input, state, parallel, context,
-            )
-        })
+        prepare_input_with_metadata(input, context, B::construction_metadata(context))?
+            .with_model_input_destination(
+                crate::decoder::identity::Metadata::new(B::construction_metadata(context)),
+                |input| {
+                    <Self as ParallelLayeredArchitecture<B, S>>::begin_forward_parallel(
+                        self, input, state, parallel, context,
+                    )
+                },
+            )?
     }
 }
 
@@ -762,13 +772,74 @@ pub struct ForwardContext<T> {
     mask: Option<T>,
     tokens: Option<T>,
     parts: Vec<PreparedPart<T>>,
-    rotary: (T, T),
-    position_delta: T,
+    rotary: Option<(T, T)>,
+    position_delta: Option<T>,
+    pending_media: Option<media_prefill::PendingMedia<T>>,
+    media_span: bool,
+    span_assembled: bool,
     vision_state: Option<VisionState<T>>,
     vision_initial: Option<T>,
     vision_output: Option<T>,
     deepstack: Vec<T>,
     visual_mask: Option<T>,
+    // Enclosing source account survives the paid forward containers.
+    metadata: Option<eredu_nn::workspace::WorkspaceContext>,
+}
+
+impl<T> ForwardContext<T> {
+    fn visit_values<'a>(&'a self, visitor: &mut dyn FnMut(&'a T)) {
+        for value in self.mask.iter() {
+            visitor(value);
+        }
+        for value in self.tokens.iter() {
+            visitor(value);
+        }
+        if let Some((cosine, sine)) = &self.rotary {
+            for value in [cosine, sine] {
+                visitor(value);
+            }
+        }
+        for value in self.position_delta.iter() {
+            visitor(value);
+        }
+        if let Some(pending) = &self.pending_media {
+            for value in pending.values() {
+                visitor(value);
+            }
+        }
+        for value in self.vision_initial.iter() {
+            visitor(value);
+        }
+        for value in self.vision_output.iter() {
+            visitor(value);
+        }
+        for value in self.deepstack.iter() {
+            visitor(value);
+        }
+        for value in self.visual_mask.iter() {
+            visitor(value);
+        }
+        if let Some(state) = &self.vision_state {
+            for value in state.retained_values() {
+                visitor(value);
+            }
+        }
+        for part in &self.parts {
+            match part {
+                PreparedPart::Text { tokens, embeddings } => {
+                    visitor(tokens);
+                    visitor(embeddings);
+                }
+                PreparedPart::Media { tokens } => visitor(tokens),
+            }
+        }
+    }
+
+    fn rotary(&self) -> Result<&(T, T), Error> {
+        self.rotary
+            .as_ref()
+            .ok_or_else(|| Error::backend("decoder rotary state is not prepared"))
+    }
 }
 
 /// Request-scoped state transported while pipeline owners execute the shared
@@ -811,11 +882,15 @@ impl<T: Clone> PipelinePrepared<T> {
             LayeredForwardState {
                 hidden: self.hidden,
                 context: ForwardContext {
+                    metadata: None,
                     mask: self.mask,
                     tokens: None,
                     parts: Vec::new(),
-                    rotary: (self.cosine, self.sine),
-                    position_delta: position_delta.clone(),
+                    rotary: Some((self.cosine, self.sine)),
+                    position_delta: Some(position_delta.clone()),
+                    pending_media: None,
+                    media_span: false,
+                    span_assembled: false,
                     vision_state: None,
                     vision_initial: None,
                     vision_output: None,
@@ -832,11 +907,15 @@ impl<T: Clone> PipelinePrepared<T> {
         forward: LayeredForwardState<T, ForwardContext<T>>,
         position_delta: T,
     ) -> (T, PipelineBoundary<T>) {
+        let (cosine, sine) = forward
+            .context
+            .rotary
+            .expect("completed decoder has rotary state");
         (
             forward.hidden,
             PipelineBoundary {
-                cosine: forward.context.rotary.0,
-                sine: forward.context.rotary.1,
+                cosine,
+                sine,
                 position_delta,
                 deepstack: forward.context.deepstack,
             },
@@ -995,6 +1074,28 @@ impl eredu_runtime::ArchitectureBoundary for PipelineBoundarySchema {
         }
         Ok(values)
     }
+
+    fn wire_schema_with_metadata(&self,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<eredu_runtime::BoundaryWireSchema,Error>{
+        use eredu_runtime::{BoundaryTensorDimension as Dim,BoundaryTensorDtype as Dtype};
+        crate::boundary_metadata::schema(context,Self::IDENTITY,self.hidden_size,&[
+            ("cosine",&[Dim::Sequence,Dim::Fixed(self.head_dim)],Dtype::Activation),
+            ("sine",&[Dim::Sequence,Dim::Fixed(self.head_dim)],Dtype::Activation),
+            ("position_delta",&[Dim::Fixed(1)],Dtype::Int32)],
+            Some(("deepstack",self.deepstack_count,&[Dim::Batch,Dim::Sequence,Dim::Fixed(self.hidden_size)],Dtype::Activation)))
+    }
+    fn encode_with_metadata<T>(&self,boundary:Self::Boundary<T>,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Vec<eredu_runtime::ArchitectureBoundaryValue<T>>,Error>{
+        crate::boundary_metadata::encode(context,Self::IDENTITY,
+            [("cosine",boundary.cosine),("sine",boundary.sine),("position_delta",boundary.position_delta)],
+            boundary.deepstack,self.deepstack_count,"deepstack")
+    }
+    fn decode_with_metadata<T>(&self,tensors:Vec<T>,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Self::Boundary<T>,Error>{
+        let ([cosine,sine,position_delta],deepstack)=crate::boundary_metadata::decode(context,Self::IDENTITY,tensors,self.deepstack_count)?;
+        Ok(PipelineBoundary{cosine,sine,position_delta,deepstack})
+    }
+
 }
 
 /// Typed immutable decoder context transported between Qwen-VL partitions.
@@ -1063,7 +1164,7 @@ const fn qwen_vl_routed_tensor_reductions() -> (usize, usize) {
 
 /// One neutral composite model for dense and MoE Qwen3-VL.
 pub struct LayeredModel<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    args: ModelArgs,
+    args: crate::replicated_text::SharedCompositeConfig<ModelArgs>,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry>>,
     partition_geometry: Option<std::sync::Arc<super::PartitionLocalGeometry>>,
@@ -1078,6 +1179,16 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         self.state_layout_impl()
     }
 
+    fn state_layout_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<StateLayout, Self::DefinitionError> {
+        match &self.parallel_geometry {
+            Some(geometry) => geometry.state_layout().clone_workspace(context),
+            None => super::state_layout_with_metadata(&self.args, context),
+        }
+    }
+
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
@@ -1090,6 +1201,21 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
             topology,
         )
         .map_err(|error| Error::backend(error.to_string()))
+    }
+
+    fn state_identity_with_metadata(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+        super::state_identity_with_metadata(
+            &self.args,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+            context,
+        )
     }
 
     fn parameter_description(
@@ -1107,6 +1233,14 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
         String,
     > {
         Ok(super::static_recipes(source))
+    }
+
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_nn::Parameterized::visit_retained_values(&self.static_modules, visitor)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -1137,6 +1271,192 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend>
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<B> {
+    fn begin_forward_with_metadata<S>(
+        &mut self,
+        input: ModelInput<'_, B::Tensor>,
+        state: &mut S,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>, Error>
+    where
+        S: LayerRuntimeState<B>,
+        S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
+    {
+        metadata.controls::<(
+            LayeredForwardState<B::Tensor, ForwardContext<B::Tensor>>,
+            Vec<B::Tensor>,
+            [Index; 3],
+        )>()?;
+        let expected = match self.partition_geometry.as_deref() {
+            Some(geometry) => match metadata.context() {
+                Some(context) => geometry.local_state_layout_with_metadata(context)?,
+                None => geometry
+                    .local_state_layout()
+                    .map_err(|error| Error::backend(error.to_string()))?,
+            },
+            None => match metadata.context() {
+                Some(metadata) => {
+                    <Self as eredu_runtime::ArchitectureParameters<B>>::state_layout_with_metadata(
+                        self, metadata,
+                    )?
+                }
+                None => self.state_layout_impl()?,
+            },
+        };
+        if state.layout() != &expected {
+            return Err(
+                crate::composite_execution::graph::Destination(metadata.context())
+                    .error(format_args!("Qwen3-VL runtime state layout mismatch")),
+            );
+        }
+        let owns_position_delta = expected.layer(0).is_some_and(|policy| {
+            policy
+                .fixed_state()
+                .iter()
+                .any(|tensor| tensor.role == StateTensorRole::PositionDelta)
+        });
+        let (parts, grids) = self.prepare_parts_with_metadata(input.parts, context, metadata)?;
+        let visual_mask = self.prepared_visual_mask_with_metadata(&parts, context, metadata)?;
+        let media = !grids.is_empty();
+        if media != input.pixels.is_some() {
+            return Err(metadata.error(format_args!(
+                "Qwen3-VL pixels and media metadata must appear together"
+            )));
+        }
+        let (vision_initial, vision_state) = match input.pixels {
+            Some(pixels) => {
+                let (hidden, state) = self.static_modules.vision.begin(
+                    VisionInput {
+                        pixels,
+                        grid: &grids,
+                    },
+                    context,
+                )?;
+                (Some(hidden), Some(state))
+            }
+            None => (None, None),
+        };
+        let assembled = self.assemble_with_metadata(&parts, None, context, metadata);
+        let sequence = parts
+            .iter()
+            .map(|part| match part {
+                PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => tokens.dim(1),
+            })
+            .sum::<i32>();
+        let state_layer = state.layer(0).map_err(|cause| metadata.source(cause))?;
+        let offset = state_layer.position();
+        let mut position_parts = metadata.vector(input.parts.len())?;
+        for part in input.parts {
+            match part {
+                InputPart::Text(tokens) | InputPart::Projected { tokens, .. } => {
+                    position_parts.push(PositionPart::Text(tokens.dim(1)))
+                }
+                InputPart::Image { grid, .. } | InputPart::Video { grid, .. } => {
+                    position_parts.push(PositionPart::Media(grid))
+                }
+            }
+        }
+        let (mut positions, computed_delta) =
+            super::positions::multimodal_position_ids_with_metadata(
+                &position_parts,
+                self.args.vision.spatial_merge_size,
+                sequence,
+                metadata.context(),
+            )?;
+        if media && offset != 0 {
+            return Err(metadata.error(format_args!(
+                "Qwen3-VL media input cannot append to a populated cache"
+            )));
+        }
+        if !media {
+            for axis in &mut positions {
+                for position in axis {
+                    *position += offset;
+                }
+            }
+        }
+        let mut positions = super::positions::position_ids_tensor_with_metadata::<B::Tensor>(
+            std::array::from_fn(|axis| positions[axis].as_slice()),
+            context,
+            metadata.context(),
+        )?;
+        let position_delta = if owns_position_delta {
+            let delta = state_layer
+                .fixed_component(StateTensorRole::PositionDelta)
+                .map_err(|cause| metadata.source(cause))?;
+            if media || delta.is_none() {
+                *delta = Some(B::Tensor::full_i32(computed_delta, &[1], context)?);
+            } else if let Some(delta) = delta.as_ref() {
+                positions = positions.add(delta, context)?;
+            }
+            delta
+                .as_ref()
+                .expect("Qwen3-VL installs position delta")
+                .clone()
+        } else {
+            // PositionDelta is architecture-global state owned by text layer zero.
+            // A later PP stage still prepares its rank-local media group from the
+            // immutable request, but receives the authoritative persisted value
+            // with the decoder boundary before it executes any text unit.
+            B::Tensor::full_i32(computed_delta, &[1], context)?
+        };
+        let rotary = super::positions::mrope_embeddings_with_metadata(
+            &positions,
+            self.args.text.head_dim,
+            self.args.text.rope_theta,
+            &self.args.mrope_section,
+            context,
+            metadata.context(),
+        )?;
+        let mask = if let Some(mask) = input.mask {
+            Some(mask.clone())
+        } else if sequence > 1 {
+            Some(B::causal_mask(sequence, offset, None, context)?)
+        } else {
+            None
+        };
+        let (assembled_tokens, assembled_hidden, assembled_error) = match assembled {
+            Ok(value) => (Some(value.token_ids), Some(value.embeddings), None),
+            Err(error) => (None, None, Some(error)),
+        };
+        let hidden = vision_initial
+            .as_ref()
+            .cloned()
+            .or(assembled_hidden)
+            .ok_or_else(|| {
+                assembled_error
+                    .unwrap_or_else(|| metadata.error(format_args!("empty Qwen3-VL input")))
+            })?;
+        let deepstack_count = if media {
+            0
+        } else {
+            self.args.vision.deepstack_layer_count()
+        };
+        let mut deepstack = metadata.vector(deepstack_count)?;
+        for _ in 0..deepstack_count {
+            deepstack.push(hidden.zeros_like(context)?);
+        }
+        Ok(LayeredForwardState {
+            hidden,
+            context: ForwardContext {
+                metadata: metadata.context().cloned(),
+                mask,
+                tokens: assembled_tokens,
+                parts,
+                rotary: Some(rotary),
+                position_delta: Some(position_delta),
+                pending_media: None,
+                media_span: false,
+                span_assembled: false,
+                vision_state,
+                vision_initial,
+                vision_output: None,
+                deepstack,
+                visual_mask,
+            },
+        })
+    }
+
     fn add_deepstack(
         &self,
         index: usize,
@@ -1359,15 +1679,48 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
 
     /// Builds unloaded modules with their canonical checkpoint identities.
     pub fn new(args: ModelArgs, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        crate::operator_requirements::require::<B>(
+        Self::new_with_config(
+            crate::replicated_text::CompositeModelConfig::Owned(args),
+            context,
+        )
+    }
+
+    pub(crate) fn config_owner(&self) -> &crate::replicated_text::SharedCompositeConfig<ModelArgs> {
+        &self.args
+    }
+
+    pub(crate) fn new_with_config(
+        args: crate::replicated_text::CompositeModelConfig<ModelArgs>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        if let Some(metadata) = B::construction_metadata(context) {
+            metadata.charge_metadata(
+                std::mem::size_of_val(&args) + std::mem::size_of::<Result<Self, Error>>(),
+            )?;
+        }
+        let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+        crate::operator_requirements::require_with_metadata::<B>(
             "Qwen3-VL",
             crate::operator_requirements::QWEN_VL,
+            metadata,
         )?;
-        args.vision
-            .validate_for(VisionMode::DeepStack)
-            .map_err(Error::backend)?;
+        match B::construction_metadata(context).filter(|context| context.uses_checked_metadata()) {
+            Some(context) => args
+                .vision
+                .validate_for_with_metadata(VisionMode::DeepStack, context)?,
+            None => args
+                .vision
+                .validate_for(VisionMode::DeepStack)
+                .map_err(Error::backend)?,
+        }
         let text = qwen::StaticModules::new(&args.text, context)?;
-        let vision = VisionStatic::new_with_root(args.vision.clone(), "model.visual", context)?;
+        let args = args.into_shared(B::construction_metadata(context))?;
+        let vision_config = args.project(|args| &args.vision, B::construction_metadata(context))?;
+        let vision = VisionStatic::new_with_config(
+            crate::replicated_text::CompositeModelConfig::Retained(vision_config),
+            "model.visual",
+            context,
+        )?;
         Ok(Self {
             args,
             static_modules: StaticModules { text, vision },
@@ -1398,7 +1751,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             context,
         )?;
         Ok(Self {
-            args,
+            args: crate::replicated_text::SharedCompositeConfig::new(
+                args,
+                B::construction_metadata(context),
+            )?,
             static_modules: StaticModules { text, vision },
             parallel_geometry: Some(std::sync::Arc::new(geometry)),
             partition_geometry: None,
@@ -1414,7 +1770,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
     }
 
     /// Returns normalized nested text and vision policy.
-    pub const fn args(&self) -> &ModelArgs {
+    pub fn args(&self) -> &ModelArgs {
         &self.args
     }
 
@@ -1424,30 +1780,38 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph = ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)?;
+        let metadata = B::construction_metadata(context);
+        let graph = self.canonical_execution_graph(metadata)?;
+        let destination = crate::composite_execution::graph::Destination(metadata);
+        destination.controls::<(
+            ArchitectureParameterDescription,
+            Vec<OwnedParameterGroupSpec>,
+            Vec<eredu_runtime::ParameterGroupSpec>,
+        )>()?;
+        destination.controls::<[usize; 2]>()?;
         let counts = [
-            self.args.vision.layer_count(),
-            usize::try_from(self.args.text.num_hidden_layers).map_err(Error::backend)?,
+            self.canonical_group_unit_count(0, metadata)?,
+            self.canonical_group_unit_count(1, metadata)?,
         ];
-        let layout = ExecutionUnitLayout::new(&graph, counts).map_err(Error::backend)?;
+        let layout = destination.layout(&graph, &counts)?;
         // A partition-local model contains already-local tensor shapes. Its
         // parameter authority must nevertheless continue to describe the
         // immutable checkpoint-global groups selected at admission; applying
         // TP placement to the local shapes would shard them a second time.
+        destination.controls::<(
+            Option<Result<(crate::decoder::StaticModules<B>, VisionStatic<B>), Error>>,
+            Option<(crate::decoder::StaticModules<B>, VisionStatic<B>)>,
+        )>()?;
         let global_static = self.parallel_geometry.is_some().then(|| {
             Ok::<_, Error>((
                 qwen::StaticModules::new(&self.args.text, context)?,
-                VisionStatic::new_with_root(self.args.vision.clone(), "model.visual", context)?,
+                VisionStatic::new_with_config(
+                    crate::replicated_text::CompositeModelConfig::Retained(
+                        self.args.project(|args| &args.vision, metadata)?,
+                    ),
+                    "model.visual",
+                    context,
+                )?,
             ))
         });
         let global_static = global_static.transpose()?;
@@ -1455,50 +1819,42 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             (&self.static_modules.text, &self.static_modules.vision),
             |(text, vision)| (text, vision),
         );
-        let text_static = static_parallel_parameter_groups::<B>(
+        let text_static = crate::decoder::static_parallel_parameter_groups_with_metadata::<B>(
             &text_modules.embeddings,
             &text_modules.norm,
             text_modules.lm_head.as_ref(),
             &self.args.text.parameter_root,
+            metadata,
         )
-        .map_err(Error::backend)?;
-        let vision_static = crate::qwen::vision::owned_static_parallel_parameter_groups::<B>(
-            vision_modules,
-            &self.args.vision,
-            "model.visual",
-            eredu_runtime::ExecutionGroupId::new(VISION_EXECUTION_GROUP).map_err(Error::backend)?,
-            "vision",
-        )
-        .map_err(Error::backend)?;
-        let mut expected = text_static
-            .iter()
-            .cloned()
-            .chain(vision_static.iter().map(|owned| owned.group().clone()))
-            .collect::<Vec<_>>();
-        let mut owned = text_static
-            .into_iter()
-            .enumerate()
-            .map(|(index, group)| {
-                OwnedParameterGroupSpec::new(
-                    if index == 0 && self.args.text.tie_word_embeddings {
-                        ParameterGroupOwner::static_any_of(["embedding", "output"])
-                    } else {
-                        ParameterGroupOwner::static_role(match index {
-                            0 => "embedding",
-                            1 => "norm",
-                            _ => "output",
-                        })
-                    },
-                    group,
-                )
-            })
-            .chain(vision_static)
-            .collect::<Vec<_>>();
+        .map_err(|cause| cause.into_neural())?;
+        let vision_static =
+            crate::qwen::vision::owned_static_parallel_parameter_groups_with_metadata::<B>(
+                vision_modules,
+                &self.args.vision,
+                "model.visual",
+                destination.group_id(VISION_EXECUTION_GROUP)?,
+                "vision",
+                metadata,
+            )?;
+        let mut owned = destination.vector(text_static.len())?;
+        for (index, group) in text_static.into_iter().enumerate() {
+            let roles: &[&str] = if index == 0 && self.args.text.tie_word_embeddings {
+                &["embedding", "output"]
+            } else {
+                match index {
+                    0 => &["embedding"],
+                    1 => &["norm"],
+                    _ => &["output"],
+                }
+            };
+            owned.push(OwnedParameterGroupSpec::new(
+                destination.static_owner(roles)?,
+                group,
+            ));
+        }
+        destination.append_owned(&mut owned, vision_static)?;
         for (group_index, &count) in counts.iter().enumerate() {
-            let group_id = layout
-                .group_id(group_index)
-                .expect("Qwen3-VL layout group")
-                .clone();
+            let group_id = layout.group_id(group_index).expect("Qwen3-VL layout group");
             for index in 0..count {
                 let unit = if self.parallel_geometry.is_some() {
                     match group_index {
@@ -1515,28 +1871,55 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     self.construct_unit(group_index, index, context)?
                 };
                 let groups = match unit {
-                    Unit::Vision(block) => block_parallel_parameter_groups(
-                        &block,
-                        &self.args.vision,
-                        "model.visual",
-                        index,
-                    ),
-                    Unit::Text(block) => {
-                        qwen::routed_layer_parallel_parameter_groups(&block, &self.args.text, index)
+                    Unit::Vision(block) => {
+                        crate::qwen::vision::block_parallel_parameter_groups_with_metadata(
+                            &block,
+                            &self.args.vision,
+                            "model.visual",
+                            index,
+                            metadata,
+                        )
                     }
-                }
-                .map_err(Error::backend)?;
-                expected.extend(groups.iter().cloned());
-                owned.extend(groups.into_iter().map(|group| {
-                    OwnedParameterGroupSpec::new(
-                        ParameterGroupOwner::execution_unit(group_id.clone(), index),
-                        group,
-                    )
-                }));
+                    Unit::Text(block) => {
+                        qwen::routed_layer_parallel_parameter_groups_with_metadata(
+                            &block,
+                            &self.args.text,
+                            index,
+                            metadata,
+                        )
+                    }
+                }?;
+                destination.append_unit(&mut owned, groups, group_id, index)?;
             }
         }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
+        destination.description(graph, layout, owned)
+    }
+
+    fn canonical_group_unit_count(
+        &self,
+        group: usize,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<usize, Error> {
+        let destination = crate::composite_execution::graph::Destination(context);
+        destination.controls::<(usize, &Self)>()?;
+        match group {
+            0 => Ok(self.args.vision.layer_count()),
+            1 => usize::try_from(self.args.text.num_hidden_layers)
+                .map_err(|cause| destination.error(format_args!("{cause}"))),
+            _ => Err(destination.error(format_args!("Qwen3-VL has two execution groups"))),
+        }
+    }
+
+    fn canonical_execution_graph(
+        &self,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<ExecutionGraph, Error> {
+        let destination = crate::composite_execution::graph::Destination(context);
+        destination.controls::<(ExecutionGraph, &Self)>()?;
+        let mut groups = destination.vector(2)?;
+        groups.push(destination.group(VISION_EXECUTION_GROUP, &[])?);
+        groups.push(destination.group(TEXT_EXECUTION_GROUP, &[VISION_EXECUTION_GROUP])?);
+        destination.finish(groups, TEXT_EXECUTION_GROUP)
     }
 
     /// Returns replicated or planner-derived decoder state geometry.
@@ -1640,13 +2023,40 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parts: &[InputPart<'_, B::Tensor>],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<(Vec<PreparedPart<B::Tensor>>, Vec<(i32, i32, i32)>), Error> {
+        self.prepare_parts_with_metadata(
+            parts,
+            context,
+            crate::decoder::identity::Metadata::new(B::construction_metadata(context)),
+        )
+    }
+
+    fn prepare_parts_with_metadata(
+        &mut self,
+        parts: &[InputPart<'_, B::Tensor>],
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<(Vec<PreparedPart<B::Tensor>>, Vec<(i32, i32, i32)>), Error> {
+        metadata.controls::<(
+            Vec<PreparedPart<B::Tensor>>,
+            Vec<(i32, i32, i32)>,
+            PreparedPart<B::Tensor>,
+        )>()?;
         if parts.is_empty() {
-            return Err(Error::backend("Qwen3-VL input has no ordered parts"));
+            return Err(metadata.error(format_args!("Qwen3-VL input has no ordered parts")));
         }
-        let mut grids = Vec::new();
-        let prepared = parts
-            .iter()
-            .map(|part| match part {
+        let grid_count = parts.iter().try_fold(0usize, |count, part| {
+            let rows = match part {
+                InputPart::Image { grid, .. } | InputPart::Video { grid, .. } => grid.len(),
+                _ => 0,
+            };
+            count
+                .checked_add(rows)
+                .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)
+        })?;
+        let mut grids = metadata.vector(grid_count)?;
+        let mut prepared = metadata.vector(parts.len())?;
+        for part in parts {
+            let value: Result<PreparedPart<B::Tensor>, Error> = match part {
                 InputPart::Text(tokens) => Ok(PreparedPart::Text {
                     tokens: (*tokens).clone(),
                     embeddings: self
@@ -1665,15 +2075,17 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     if embeddings.shape()
                         != [tokens.dim(0), tokens.dim(1), self.args.text.hidden_size]
                     {
-                        return Err(Error::backend("Qwen3-VL projected input geometry mismatch"));
+                        return Err(metadata
+                            .error(format_args!("Qwen3-VL projected input geometry mismatch")));
                     }
                     Ok(PreparedPart::Text {
                         tokens: (*tokens).clone(),
                         embeddings: (*embeddings).clone(),
                     })
                 }
-            })
-            .collect::<Result<Vec<_>, Error>>()?;
+            };
+            prepared.push(value?);
+        }
         Ok((prepared, grids))
     }
 
@@ -1728,6 +2140,26 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         vision: Option<&B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<eredu_nn::multimodal::OrderedModelInput<B::Tensor>, Error> {
+        self.assemble_with_metadata(
+            parts,
+            vision,
+            context,
+            crate::decoder::identity::Metadata::new(B::construction_metadata(context)),
+        )
+    }
+    fn assemble_with_metadata(
+        &self,
+        parts: &[PreparedPart<B::Tensor>],
+        vision: Option<&B::Tensor>,
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<eredu_nn::multimodal::OrderedModelInput<B::Tensor>, Error> {
+        metadata.controls::<(
+            eredu_nn::multimodal::OrderedModelInput<B::Tensor>,
+            Vec<B::Tensor>,
+            Vec<OrderedInputPart<'_, B::Tensor>>,
+            [Index; 3],
+        )>()?;
         let media_tokens = parts
             .iter()
             .map(|part| match part {
@@ -1739,19 +2171,19 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
             Some(value) if value.shape() == [1, media_tokens, self.args.text.hidden_size] => {}
             None if media_tokens == 0 => {}
             Some(value) => {
-                return Err(Error::backend(format!(
+                return Err(metadata.error(format_args!(
                     "Qwen3-VL vision output {:?} does not match {media_tokens} placeholders",
                     value.shape()
-                )))
+                )));
             }
             None => {
-                return Err(Error::backend(
-                    "Qwen3-VL media placeholders require vision output",
-                ))
+                return Err(metadata.error(format_args!(
+                    "Qwen3-VL media placeholders require vision output"
+                )));
             }
         }
         let mut offset = 0;
-        let mut embeddings = Vec::with_capacity(parts.len());
+        let mut embeddings = metadata.vector(parts.len())?;
         for part in parts {
             match part {
                 PreparedPart::Text {
@@ -1771,17 +2203,29 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                 }
             }
         }
-        let ordered = parts
-            .iter()
-            .zip(&embeddings)
-            .map(|(part, embeddings)| OrderedInputPart {
-                token_ids: match part {
-                    PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => tokens,
-                },
-                embeddings,
-            })
-            .collect::<Vec<_>>();
-        assemble_ordered_inputs(&ordered, self.args.text.hidden_size, context)
+        let mut ordered = metadata.vector(parts.len())?;
+        ordered.extend(
+            parts
+                .iter()
+                .zip(&embeddings)
+                .map(|(part, embeddings)| OrderedInputPart {
+                    token_ids: match part {
+                        PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => {
+                            tokens
+                        }
+                    },
+                    embeddings,
+                }),
+        );
+        match metadata.context() {
+            Some(metadata) => eredu_nn::multimodal::assemble_ordered_inputs_with_metadata(
+                &ordered,
+                self.args.text.hidden_size,
+                context,
+                metadata,
+            ),
+            None => assemble_ordered_inputs(&ordered, self.args.text.hidden_size, context),
+        }
     }
 
     fn prepared_visual_mask(
@@ -1789,17 +2233,26 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
         parts: &[PreparedPart<B::Tensor>],
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Option<B::Tensor>, Error> {
+        self.prepared_visual_mask_with_metadata(
+            parts,
+            context,
+            crate::decoder::identity::Metadata::new(B::construction_metadata(context)),
+        )
+    }
+    fn prepared_visual_mask_with_metadata(
+        &self,
+        parts: &[PreparedPart<B::Tensor>],
+        context: &<B::Tensor as Tensor>::Context,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<Option<B::Tensor>, Error> {
+        metadata.controls::<(Vec<B::Tensor>, Option<B::Tensor>)>()?;
         if self.args.vision.deepstack_layer_count() == 0 {
             return Ok(None);
         }
-        let tokens = parts
-            .iter()
-            .map(|part| match part {
-                PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => {
-                    tokens.clone()
-                }
-            })
-            .collect::<Vec<_>>();
+        let mut tokens = metadata.vector(parts.len())?;
+        tokens.extend(parts.iter().map(|part| match part {
+            PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => tokens.clone(),
+        }));
         let tokens = B::Tensor::concatenate(&tokens, 1, context)?;
         Ok(Some(
             tokens
@@ -1826,13 +2279,23 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                             context,
                         )?,
                 ),
-                None if !forward.parts.is_empty() => {
-                    self.prepared_visual_mask(&forward.parts, context)?
-                }
+                None if !forward.parts.is_empty() => self.prepared_visual_mask_with_metadata(
+                    &forward.parts,
+                    context,
+                    crate::decoder::identity::Metadata::new(
+                        forward
+                            .metadata
+                            .as_ref()
+                            .or_else(|| B::construction_metadata(context)),
+                    ),
+                )?,
                 None => {
-                    return Err(Error::backend(
-                        "Qwen3-VL compact DeepStack state has no visual-mask authority",
-                    ))
+                    return Err(
+                        crate::decoder::identity::Metadata::new(B::construction_metadata(context))
+                            .error(format_args!(
+                                "Qwen3-VL compact DeepStack state has no visual-mask authority"
+                            )),
+                    );
                 }
             };
         }
@@ -2242,8 +2705,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     ExpertPass::Decode
                 };
                 let mask = forward.mask.as_ref();
-                let cosine = &forward.rotary.0;
-                let sine = &forward.rotary.1;
+                let (cosine, sine) = forward.rotary()?;
                 let output = block.forward_with_feed_forward(
                     AttentionInput {
                         hidden,
@@ -2324,8 +2786,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> LayeredModel<
                     ExpertPass::Decode
                 };
                 let mask = forward.mask.as_ref();
-                let cosine = &forward.rotary.0;
-                let sine = &forward.rotary.1;
+                let (cosine, sine) = forward.rotary()?;
                 let output = block.forward_tensor_parallel_with_feed_forward(
                     AttentionInput {
                         hidden,
@@ -2369,6 +2830,47 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B>,
 {
+    fn media_prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        // The validated source retains its complete MRoPE/DeepStack placement; only decoder rows are declared.
+        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 1)?;
+        let mut declarations = crate::decoder::media_prefill_observation_declarations(
+            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index)),
+        )?;
+        // The retained-media ingress changes decoder inputs and positions, but
+        // executes the same row-local routed banks as the ordinary target.
+        // Reuse those exact architecture declarations; encoder hooks remain
+        // outside this decoder contract.
+        declarations.extend(
+            <Self as LayeredArchitecture<B, S>>::prefill_observation_declarations(self)?
+                .into_iter()
+                .filter(|declaration| declaration.flattens_batch_tokens()),
+        );
+        Ok(declarations)
+    }
+
+    fn prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        // Only the actual group1 ordinary text target is declared. Its KV
+        // prefix and persisted position delta retain causal rotary offsets;
+        // media/deepstack assembly and vision hooks are outside this proof.
+        let units = <Self as LayeredArchitecture<B, S>>::group_unit_count(self, 1)?;
+        let mut declarations = crate::decoder::ordinary_prefill_observation_declarations(
+            (0..units).map(|index| <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index)),
+            true,
+        )?;
+        // Same target bank invocation as observed execution; its expert equations are row-local.
+        for index in 0..units {
+            let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, 1, index)?;
+            if let Some(points) = self.args.text.routed_observation_points(&path, index) {
+                crate::decoder::append_routed_prefill_observations(&mut declarations, &points);
+            }
+        }
+        Ok(declarations)
+    }
+
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
             .with_routed_units(true)
@@ -2418,6 +2920,17 @@ where
     }
 
     type Input<'a> = ModelInput<'a, B::Tensor>;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::segmented_token_shape(input.parts.iter().map(|part| match part {
+            InputPart::Text(tokens)
+            | InputPart::Image { tokens, .. }
+            | InputPart::Video { tokens, .. }
+            | InputPart::Projected { tokens, .. } => *tokens,
+        }))
+        .map(Some)
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = Unit<B>;
     type ForwardContext = ForwardContext<B::Tensor>;
@@ -2429,17 +2942,21 @@ where
 
     fn group_transport(&self, group: usize) -> eredu_runtime::ArchitectureGroupTransport {
         if group == 0 {
-            eredu_runtime::ArchitectureGroupTransport {
-                placement: eredu_runtime::ArchitectureGroupPlacement::Pipeline,
-                kind: eredu_runtime::ArchitectureGroupKind::VisionEncoder,
-                first_owner_static_roles: vec!["vision".into()],
-                last_owner_static_roles: Vec::new(),
-                merge_destination: eredu_runtime::ArchitectureMergeDestination::FirstPipelineOwner,
-                parallel_subgroup: Some(eredu_runtime::ArchitectureParallelSubgroup::TensorSharded),
-                request_optional: true,
-            }
+            crate::transport::vision_declaration().into_owned()
         } else {
             crate::transport::decoder()
+        }
+    }
+
+    fn group_transport_matches(
+        &self,
+        group: usize,
+        expected: &eredu_runtime::ArchitectureGroupTransport,
+    ) -> bool {
+        if group == 0 {
+            crate::transport::vision_declaration().matches(expected)
+        } else {
+            crate::transport::decoder_declaration().matches(expected)
         }
     }
 
@@ -2455,25 +2972,27 @@ where
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        ExecutionGraph::new(
-            vec![
-                ExecutionGroupSpec::root(VISION_EXECUTION_GROUP),
-                ExecutionGroupSpec::with_dependencies(
-                    TEXT_EXECUTION_GROUP,
-                    [VISION_EXECUTION_GROUP],
-                ),
-            ],
-            TEXT_EXECUTION_GROUP,
-        )
-        .map_err(Error::backend)
+        self.canonical_execution_graph(None)
+    }
+
+    fn execution_graph_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        self.canonical_execution_graph(Some(context))
+            .map(eredu_runtime::ArchitectureExecutionGraph::owned)
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
-        match group {
-            0 => Ok(self.args.vision.layer_count()),
-            1 => usize::try_from(self.args.text.num_hidden_layers).map_err(Error::backend),
-            _ => Err(Error::backend("Qwen3-VL has two execution groups")),
-        }
+        self.canonical_group_unit_count(group, None)
+    }
+
+    fn group_unit_count_with_metadata(
+        &self,
+        group: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<usize, Self::Error> {
+        self.canonical_group_unit_count(group, Some(context))
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
@@ -2522,148 +3041,12 @@ where
         state: &mut S,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LayeredForwardState<B::Tensor, Self::ForwardContext>, Self::Error> {
-        let expected = match self.partition_geometry.as_deref() {
-            Some(geometry) => geometry
-                .local_state_layout()
-                .map_err(|error| Error::backend(error.to_string()))?,
-            None => self.state_layout_impl()?,
-        };
-        if state.layout() != &expected {
-            return Err(Error::backend("Qwen3-VL runtime state layout mismatch"));
-        }
-        let owns_position_delta = expected.layer(0).is_some_and(|policy| {
-            policy
-                .fixed_state()
-                .iter()
-                .any(|tensor| tensor.role == StateTensorRole::PositionDelta)
-        });
-        let (parts, grids) = self.prepare_parts(input.parts, context)?;
-        let visual_mask = self.prepared_visual_mask(&parts, context)?;
-        let media = !grids.is_empty();
-        if media != input.pixels.is_some() {
-            return Err(Error::backend(
-                "Qwen3-VL pixels and media metadata must appear together",
-            ));
-        }
-        let (vision_initial, vision_state) = match input.pixels {
-            Some(pixels) => {
-                let (hidden, state) = self.static_modules.vision.begin(
-                    VisionInput {
-                        pixels,
-                        grid: &grids,
-                    },
-                    context,
-                )?;
-                (Some(hidden), Some(state))
-            }
-            None => (None, None),
-        };
-        let assembled = self.assemble(&parts, None, context);
-        let sequence = parts
-            .iter()
-            .map(|part| match part {
-                PreparedPart::Text { tokens, .. } | PreparedPart::Media { tokens } => tokens.dim(1),
-            })
-            .sum::<i32>();
-        let state_layer = state.layer(0).map_err(Error::backend)?;
-        let offset = state_layer.position();
-        let mut position_parts = Vec::with_capacity(input.parts.len());
-        for part in input.parts {
-            match part {
-                InputPart::Text(tokens) | InputPart::Projected { tokens, .. } => {
-                    position_parts.push(PositionPart::Text(tokens.dim(1)))
-                }
-                InputPart::Image { grid, .. } | InputPart::Video { grid, .. } => {
-                    position_parts.push(PositionPart::Media(grid))
-                }
-            }
-        }
-        let (mut positions, computed_delta) = multimodal_position_ids(
-            &position_parts,
-            self.args.vision.spatial_merge_size,
-            sequence,
-        )
-        .map_err(Error::backend)?;
-        if media && offset != 0 {
-            return Err(Error::backend(
-                "Qwen3-VL media input cannot append to a populated cache",
-            ));
-        }
-        if !media {
-            for axis in &mut positions {
-                for position in axis {
-                    *position += offset;
-                }
-            }
-        }
-        let mut positions = position_ids_tensor::<B::Tensor>(&positions, context)?;
-        let position_delta = if owns_position_delta {
-            let delta = state_layer
-                .fixed_component(StateTensorRole::PositionDelta)
-                .map_err(Error::backend)?;
-            if media || delta.is_none() {
-                *delta = Some(B::Tensor::full_i32(computed_delta, &[1], context)?);
-            } else if let Some(delta) = delta.as_ref() {
-                positions = positions.add(delta, context)?;
-            }
-            delta
-                .as_ref()
-                .expect("Qwen3-VL installs position delta")
-                .clone()
-        } else {
-            // PositionDelta is architecture-global state owned by text layer zero.
-            // A later PP stage still prepares its rank-local media group from the
-            // immutable request, but receives the authoritative persisted value
-            // with the decoder boundary before it executes any text unit.
-            B::Tensor::full_i32(computed_delta, &[1], context)?
-        };
-        let rotary = mrope_embeddings(
-            &positions,
-            self.args.text.head_dim,
-            self.args.text.rope_theta,
-            &self.args.mrope_section,
+        self.begin_forward_with_metadata(
+            input,
+            state,
             context,
-        )?;
-        let mask = if let Some(mask) = input.mask {
-            Some(mask.clone())
-        } else if sequence > 1 {
-            Some(B::causal_mask(sequence, offset, None, context)?)
-        } else {
-            None
-        };
-        let (assembled_tokens, assembled_hidden, assembled_error) = match assembled {
-            Ok(value) => (Some(value.token_ids), Some(value.embeddings), None),
-            Err(error) => (None, None, Some(error)),
-        };
-        let hidden = vision_initial
-            .as_ref()
-            .cloned()
-            .or(assembled_hidden)
-            .ok_or_else(|| {
-                assembled_error.unwrap_or_else(|| Error::backend("empty Qwen3-VL input"))
-            })?;
-        let deepstack = if media {
-            Vec::new()
-        } else {
-            (0..self.args.vision.deepstack_layer_count())
-                .map(|_| hidden.zeros_like(context))
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        Ok(LayeredForwardState {
-            hidden,
-            context: ForwardContext {
-                mask,
-                tokens: assembled_tokens,
-                parts,
-                rotary,
-                position_delta,
-                vision_state,
-                vision_initial,
-                vision_output: None,
-                deepstack,
-                visual_mask,
-            },
-        })
+            crate::decoder::identity::Metadata::new(B::construction_metadata(context)),
+        )
     }
 
     fn begin_execution_group(
@@ -2678,12 +3061,29 @@ where
         match group {
             0 => Ok(forward.vision_initial.as_ref().unwrap_or(initial).clone()),
             1 => {
-                let vision = forward
-                    .vision_output
-                    .as_ref()
-                    .and_then(|_| dependencies.first().copied())
-                    .or(forward.vision_output.as_ref());
-                let assembled = self.assemble(&forward.parts, vision, context)?;
+                if forward.span_assembled {
+                    return Ok(initial.clone());
+                }
+                let vision = if forward.media_span {
+                    forward.vision_output.as_ref()
+                } else {
+                    forward
+                        .vision_output
+                        .as_ref()
+                        .and_then(|_| dependencies.first().copied())
+                        .or(forward.vision_output.as_ref())
+                };
+                let assembled = self.assemble_with_metadata(
+                    &forward.parts,
+                    vision,
+                    context,
+                    crate::decoder::identity::Metadata::new(
+                        forward
+                            .metadata
+                            .as_ref()
+                            .or_else(|| B::construction_metadata(context)),
+                    ),
+                )?;
                 forward.visual_mask = if forward.deepstack.is_empty() {
                     None
                 } else {
@@ -2771,8 +3171,8 @@ where
                         })?),
                         allow_sliding_prefill: true,
                         rotary_position: Some(RotaryPosition::Embeddings {
-                            cosine: &forward.rotary.0,
-                            sine: &forward.rotary.1,
+                            cosine: &forward.rotary()?.0,
+                            sine: &forward.rotary()?.1,
                         }),
                     },
                     context,
@@ -2816,6 +3216,16 @@ where
         Ok(hidden.clone())
     }
 
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        crate::readout::select_readout_positions(hidden, demand, 1, context)
+    }
+
     fn finish_forward(
         &mut self,
         hidden: &B::Tensor,
@@ -2826,6 +3236,25 @@ where
         self.finish_logits(hidden, context)
     }
 
+    fn forward_metadata(
+        &self,
+        forward: &Self::ForwardContext,
+    ) -> Option<eredu_runtime::layered::LayeredForwardMetadata<Self::Error>> {
+        forward.metadata.as_ref().map(|context| {
+            eredu_runtime::layered::LayeredForwardMetadata::new(context, |error| error)
+        })
+    }
+
+    fn visit_retained_context_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        _group: usize,
+        _index: usize,
+        visitor: &mut dyn FnMut(&'a B::Tensor),
+    ) {
+        forward.visit_values(visitor);
+    }
+
     fn retained_context_values<'a>(
         &'a self,
         forward: &'a Self::ForwardContext,
@@ -2833,23 +3262,7 @@ where
         _index: usize,
     ) -> Self::RetainedContextValues<'a> {
         let mut values = Vec::new();
-        values.extend(forward.mask.iter());
-        values.extend(forward.tokens.iter());
-        values.extend([&forward.rotary.0, &forward.rotary.1]);
-        values.push(&forward.position_delta);
-        values.extend(forward.vision_initial.iter());
-        values.extend(forward.vision_output.iter());
-        values.extend(forward.deepstack.iter());
-        values.extend(forward.visual_mask.iter());
-        if let Some(state) = &forward.vision_state {
-            values.extend(state.retained_values());
-        }
-        for part in &forward.parts {
-            match part {
-                PreparedPart::Text { tokens, embeddings } => values.extend([tokens, embeddings]),
-                PreparedPart::Media { tokens } => values.push(tokens),
-            }
-        }
+        forward.visit_values(&mut |value| values.push(value));
         values.into_iter()
     }
 }
@@ -2923,15 +3336,27 @@ where
             Some(geometry) => geometry
                 .local_state_layout()
                 .map_err(|error| Error::backend(error.to_string()))?,
-            None => self
-                .parallel_geometry
-                .as_ref()
-                .ok_or_else(|| Error::backend("Qwen3-VL model has no local geometry"))?
-                .state_layout()
-                .clone(),
+            None => {
+                let metadata = B::construction_metadata(context);
+                let layout = self
+                    .parallel_geometry
+                    .as_ref()
+                    .ok_or_else(|| {
+                        crate::composite_execution::graph::Destination(metadata)
+                            .error(format_args!("Qwen3-VL model has no local geometry"))
+                    })?
+                    .state_layout();
+                match metadata {
+                    Some(context) => layout.clone_workspace(context)?,
+                    None => layout.clone(),
+                }
+            }
         };
         if state.layout() != &expected {
-            return Err(Error::backend("Qwen3-VL rank-local state layout mismatch"));
+            return Err(
+                crate::composite_execution::graph::Destination(B::construction_metadata(context))
+                    .error(format_args!("Qwen3-VL rank-local state layout mismatch")),
+            );
         }
         let owns_position_delta = expected.layer(0).is_some_and(|policy| {
             policy
@@ -3053,11 +3478,15 @@ where
         Ok(LayeredForwardState {
             hidden,
             context: ForwardContext {
+                metadata: None,
                 mask,
                 tokens: assembled_tokens,
                 parts,
-                rotary,
-                position_delta,
+                rotary: Some(rotary),
+                position_delta: Some(position_delta),
+                pending_media: None,
+                media_span: false,
+                span_assembled: false,
                 vision_state,
                 vision_initial,
                 vision_output: None,
@@ -3258,9 +3687,13 @@ where
             Ok(LayeredPartitionOutput::Boundary {
                 hidden: hidden.clone(),
                 auxiliary: PipelineBoundary {
-                    cosine: forward.rotary.0.clone(),
-                    sine: forward.rotary.1.clone(),
-                    position_delta: forward.position_delta.clone(),
+                    cosine: forward.rotary()?.0.clone(),
+                    sine: forward.rotary()?.1.clone(),
+                    position_delta: forward
+                        .position_delta
+                        .as_ref()
+                        .ok_or_else(|| Error::backend("decoder has no position delta"))?
+                        .clone(),
                     deepstack: forward.deepstack.clone(),
                 },
             })
@@ -3292,5 +3725,17 @@ mod boundary_tests {
     #[test]
     fn routed_partition_declares_attention_and_expert_output_sums() {
         assert_eq!(qwen_vl_routed_tensor_reductions(), (1, 1));
+    }
+}
+
+#[cfg(test)]
+mod paid_boundary_metadata_tests {
+    use super::*;
+    #[test]
+    fn vision_boundary_keeps_rotary_delta_and_deepstack_roles(){
+        for count in [0,3]{
+            crate::boundary_metadata::tests::check(PipelineBoundarySchema{
+                head_dim:4,hidden_size:8,deepstack_count:count},(0..3+count).map(|n|43+n as i32*13).collect());
+        }
     }
 }

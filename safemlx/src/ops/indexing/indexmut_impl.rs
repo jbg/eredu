@@ -17,6 +17,100 @@ use crate::{
 use super::{ArrayIndex, ArrayIndexOp, Guarded, RangeIndex, TryIndexMutOp};
 
 impl Array {
+    /// Exact rank-one counterpart of ordinary array-valued indexed assignment.
+    /// The caller owns distinct in-range I32 indices. This preserves the shared
+    /// argument shaping and Scatter::None worker without a dense index mask.
+    pub fn try_flat_index_update(&self, indices: &Array, update: &Array,
+        stream: impl AsRef<Stream>) -> Result<Array> {
+        if self.ndim() != 1 || self.shape()[0] <= 0 || indices.ndim() != 1
+            || indices.dtype() != crate::Dtype::Int32 || update.shape() != indices.shape()
+            || update.dtype() != self.dtype() {
+            return Err(match crate::OriginalScopeObserver::try_current() {
+                Ok(Some(observer)) => observer.invalid_input_error(),
+                Err(cause) => cause,
+                Ok(None) => crate::error::Exception::custom(
+                    "flat indexed update requires rank-one I32 indices and exact update shape/dtype"),
+            });
+        }
+        let ScatterArgs { indices, update, axes } =
+            scatter_args_array(self, Cow::Borrowed(indices), update, &stream)?;
+        // Same general overwrite primitive as try_index_mut_device_inner.
+        unsafe { scatter(self, &indices, &update, &axes, stream) }
+    }
+
+    /// Fixed Rust frames for this rank-one wrapper and the same argument worker.
+    /// Shape/Cow arrays stay inline; native C-vector/graph custody is separate.
+    pub fn flat_index_update_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        if DEFAULT_STACK_VEC_LEN < 2 { return None; }
+        let frames = [
+            size_of::<(&Array, &Array, &Array, &Stream)>(),
+            size_of::<ScatterArgs<'static>>() * 2,
+            size_of::<SmallVec<[i32; DEFAULT_STACK_VEC_LEN]>>(),
+            size_of::<Cow<'static, Array>>() * 2,
+            size_of::<[Array; 2]>(), size_of::<[Result<Array>; 3]>(),
+            size_of::<Result<ScatterArgs<'static>>>(),
+            size_of::<Result<Cow<'static, Array>>>(),
+            size_of::<VectorArray>(), size_of::<Result<VectorArray>>(),
+            size_of::<std::iter::Chain<std::slice::Iter<'static, i32>, std::iter::Skip<std::slice::Iter<'static, i32>>>>(),
+            size_of::<std::slice::Iter<'static, Cow<'static, Array>>>(),
+            size_of::<[usize; 4]>(), size_of::<[i32; 2]>(),
+            size_of::<crate::utils::guard::MaybeUninitArray>(),
+            size_of::<crate::error::Result<Option<crate::OriginalScopeObserver>>>(),
+            crate::OriginalScopeObserver::control_bytes()?,
+        ];
+        frames.into_iter().try_fold(size_of_val(&frames), usize::checked_add)
+    }
+
+    /// Replaces one exact positive-stride, rank-preserving region. The update
+    /// must already have the selected shape and dtype; other indexing/broadcast
+    /// semantics belong to the general indexing API. Creates a lazy result only.
+    pub fn try_slice_update(
+        &self, update: &Array, starts: &[i32], ends: &[i32], strides: &[i32],
+        stream: impl AsRef<Stream>,
+    ) -> Result<Array> {
+        if starts.len() != self.ndim() || ends.len() != starts.len()
+            || strides.len() != starts.len() || update.ndim() != self.ndim()
+            || update.dtype() != self.dtype()
+            || starts.iter().zip(ends).zip(strides).zip(self.shape()).zip(update.shape())
+                .any(|((((&a,&b),&step),&n),&width)| a < 0 || b <= a || b > n
+                    || step <= 0 || b.checked_sub(a).and_then(|d|d.checked_add(step-1))
+                        .map(|d|d/step) != Some(width))
+        {
+            return Err(match crate::OriginalScopeObserver::try_current() {
+                Ok(Some(observer)) => observer.invalid_input_error(),
+                Err(cause) => cause,
+                Ok(None) => crate::error::Exception::custom(
+                    "static slice update requires matching dtype/rank and exact positive-stride region",
+                ),
+            });
+        }
+        self.slice_update_device(update, starts, ends, strides, stream)
+    }
+
+    /// Fixed Rust controls for `try_slice_update` with borrowed input arrays,
+    /// shape slices and stream. Native descriptor/storage populations remain
+    /// with the actual SliceUpdate recipe; this query grants no admission.
+    pub fn static_slice_update_control_bytes() -> Option<usize> {
+        use std::{iter::Zip, mem::size_of, slice::Iter};
+        type Axes = Zip<Zip<Zip<Zip<Iter<'static, i32>, Iter<'static, i32>>, Iter<'static, i32>>, Iter<'static, i32>>, Iter<'static, i32>>;
+        let frames = [
+            size_of::<(&Array, &Array, &[i32], &[i32], &[i32], &Stream)>(),
+            size_of::<Axes>(),
+            size_of::<[&i32; 5]>(),
+            size_of::<[usize; 5]>(),
+            size_of::<[i32; 4]>(),
+            size_of::<Option<i32>>() * 2,
+            size_of::<bool>(),
+            size_of::<Array>(),
+            size_of::<Result<Array>>() * 2,
+            size_of::<crate::utils::guard::MaybeUninitArray>(),
+            size_of::<crate::error::Result<Option<crate::OriginalScopeObserver>>>(),
+            crate::OriginalScopeObserver::control_bytes()?,
+        ];
+        frames.into_iter().try_fold(std::mem::size_of_val(&frames), usize::checked_add)
+    }
+
     pub(crate) fn slice_update_device(
         &self,
         update: &Array,
@@ -160,6 +254,9 @@ fn remove_leading_singleton_dimensions(
     a: &Array,
     stream: impl AsRef<Stream>,
 ) -> Result<Cow<'_, Array>> {
+    // A scalar or vector already has the helper's final shape, including [1].
+    // Retain the same borrowed value without allocating an identical shape Vec.
+    if a.ndim() <= 1 { return Ok(Cow::Borrowed(a)); }
     let shape = a.shape();
     let mut new_shape: Vec<_> = shape.iter().skip_while(|&&dim| dim == 1).cloned().collect();
     if shape != new_shape {
@@ -225,10 +322,9 @@ fn scatter_args_index<'a>(
     shape[0] = 1;
 
     Ok(ScatterArgs {
-        indices: smallvec![Cow::Owned(Array::from_int(resolve_index_signed_unchecked(
-            index,
-            src.dim(0)
-        )))],
+        indices: smallvec![Cow::Owned(Array::try_from_int(
+            resolve_index_signed_unchecked(index, src.dim(0))
+        )?)],
         update: broadcast_to(&update, &shape, &stream)?,
         axes: smallvec![0],
     })
@@ -298,7 +394,7 @@ fn scatter_args_slice<'a>(
             .collect();
         let update = broadcast_to(&update, &update_broadcast_shape, &stream)?;
 
-        let indices = Array::from_slice(&[start], &[1]);
+        let indices = Array::try_from_slice(&[start], &[1])?;
         Ok(ScatterArgs {
             indices: smallvec![Cow::Owned(indices)],
             update,
@@ -307,7 +403,7 @@ fn scatter_args_slice<'a>(
     } else {
         // stride != 1, convert the slice to an array
         let a_vals = strided_range_to_vec(start, end, stride);
-        let a = Array::from_slice(&a_vals, &[a_vals.len() as i32]);
+        let a = Array::try_from_slice(&a_vals, &[a_vals.len() as i32])?;
 
         scatter_args_array(src, Cow::Owned(a), update, stream)
     }
@@ -443,7 +539,7 @@ fn scatter_args_nd<'a>(
         match item {
             TakeIndex { index } => {
                 let resolved_index = resolve_index_signed_unchecked(*index, src.dim(axis));
-                array_indices.push(Array::from_int(resolved_index));
+                array_indices.push(Array::try_from_int(resolved_index)?);
                 // SAFETY: axis is always non-negative
                 update_shape[axis as usize] = 1;
                 axis = axis.saturating_add(1);
@@ -458,7 +554,7 @@ fn scatter_args_nd<'a>(
 
                 // If it's a simple slice, we only need to add the start index
                 if array_number >= count_arrays && count_strided_slices <= 0 && stride == 1 {
-                    let index = Array::from_int(start).reshape(&index_shape, &stream)?;
+                    let index = Array::try_from_int(start)?.reshape(&index_shape, &stream)?;
                     let slice_shape_entry = end - start;
                     slice_shapes.push(slice_shape_entry);
                     array_indices.push(index);
@@ -468,7 +564,7 @@ fn scatter_args_nd<'a>(
                 } else {
                     // Otherwise we expand the slice into indices using arange
                     let index_vals = strided_range_to_vec(start, end, stride);
-                    let index = Array::from_slice(&index_vals, &[index_vals.len() as i32]);
+                    let index = Array::try_from_slice(&index_vals, &[index_vals.len() as i32])?;
                     let location = if arrays_first {
                         slice_number.saturating_add(max_dims as i32)
                     } else {
@@ -986,35 +1082,8 @@ where
     }
 }
 
-impl<
-        'a,
-        'b,
-        'c,
-        'd,
-        'e,
-        'f,
-        'g,
-        'h,
-        'i,
-        'j,
-        'k,
-        'l,
-        'm,
-        A,
-        B,
-        C,
-        D,
-        E,
-        F,
-        G,
-        H,
-        I,
-        J,
-        K,
-        L,
-        M,
-        Val,
-    > TryIndexMutOp<(A, B, C, D, E, F, G, H, I, J, K, L, M), Val> for Array
+impl<'a, 'b, 'c, 'd, 'e, 'f, 'g, 'h, 'i, 'j, 'k, 'l, 'm, A, B, C, D, E, F, G, H, I, J, K, L, M, Val>
+    TryIndexMutOp<(A, B, C, D, E, F, G, H, I, J, K, L, M), Val> for Array
 where
     A: ArrayIndex<'a>,
     B: ArrayIndex<'b>,
@@ -1520,4 +1589,36 @@ mod tests {
             "Failed to update slice with broadcast: {result:?}"
         );
     }
+}
+
+/// Fixed host controls of scalar assignment to one static index of a rank-one
+/// array. The caller must validate scalar update rank zero and one in-range
+/// TakeIndex. The leading-singleton Vec then stays empty, the four SmallVecs
+/// remain inline, ellipsis declarations are borrowed, and scatter is not entered.
+/// Native reshape/SliceUpdate descriptors and physical output stay separate.
+pub fn inline_scalar_index_update_control_bytes() -> Option<usize> {
+    use std::mem::size_of;
+    if DEFAULT_STACK_VEC_LEN < 1 {
+        return None;
+    }
+    [
+        size_of::<[ArrayIndexOp<'static>; 1]>() * 2,
+        size_of::<Vec<i32>>(),
+        size_of::<Cow<'static, Array>>(),
+        size_of::<Cow<'static, [ArrayIndexOp<'static>]>>(),
+        size_of::<SmallVec<[i32; DEFAULT_STACK_VEC_LEN]>>() * 4,
+        size_of::<std::slice::Iter<'static, ArrayIndexOp<'static>>>() * 2,
+        size_of::<std::iter::Rev<std::slice::Iter<'static, ArrayIndexOp<'static>>>>(),
+        size_of::<std::slice::Iter<'static, i32>>(),
+        size_of::<[usize; 5]>(),
+        size_of::<[i32; 3]>(),
+        size_of::<Option<Array>>(),
+        size_of::<Result<Option<Array>>>(),
+        size_of::<Result<Cow<'static, Array>>>(),
+        size_of::<Result<()>>(),
+        size_of::<&Array>() * 3,
+        size_of::<&Stream>() * 3,
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
 }

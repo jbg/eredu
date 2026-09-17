@@ -1,0 +1,437 @@
+diff --git a/src/bounded_number.rs b/src/bounded_number.rs
+--- a/src/bounded_number.rs
++++ b/src/bounded_number.rs
+@@ -10,7 +10,7 @@
+ /// Fixed planning refusal without an allocated serde error.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ pub enum PlanError {
+-    /// Float-roundtrip or arbitrary-precision scratch is a separate profile.
++    /// Arbitrary-precision retained Number storage is a separate profile.
+     Features,
+     /// The slice is not a numeric spelling or exceeds the ordinary i32 counter.
+     Input,
+@@ -29,16 +29,22 @@
+ #[cfg(feature = "std")]
+ impl std::error::Error for PlanError {}
+ 
+-/// Concrete parser controls and its one possible owned syntax-error allocation.
++/// Concrete parser controls, synchronous scratch and one possible syntax error.
+ #[derive(Clone, Copy, Debug)]
+ pub struct Requirements {
+     failure: usize,
++    temporary: usize,
+     controls: usize,
+ }
+ impl Requirements {
+-    /// Actual private error Box payload. Successful numeric parsing allocates none.
++    /// Actual private error Box payload. A returned Number owns no heap storage.
+     pub fn failure_bytes(self) -> usize {
+         self.failure
++    }
++    /// Synchronous parser scratch and at most two finite lexical limb buffers.
++    /// These retire before success or a returned syntax error leaves parse.
++    pub fn temporary_bytes(self) -> usize {
++        self.temporary
+     }
+     /// Actual scalar parser, caller/return, and fixed planning controls.
+     pub fn control_bytes(self) -> usize {
+@@ -46,7 +52,7 @@
+     }
+     /// Checked sum to admit before parsing.
+     pub fn required_bytes(self) -> usize {
+-        self.failure + self.controls
++        self.failure + self.temporary + self.controls
+     }
+ }
+ 
+@@ -62,10 +68,7 @@
+     /// check only confines the ordinary parser to numeric/syntax-error branches;
+     /// it does not replace JSON syntax or finite-range validation during parse.
+     pub fn prepare(source: &'a str, range: Range<usize>) -> Result<Self, PlanError> {
+-        if cfg!(any(
+-            feature = "float_roundtrip",
+-            feature = "arbitrary_precision"
+-        )) {
++        if cfg!(feature = "arbitrary_precision") {
+             return Err(PlanError::Features);
+         }
+         let raw = tri!(source.get(range.clone()).ok_or(PlanError::Input));
+@@ -90,11 +93,20 @@
+             .try_fold(size_of::<[usize; 6]>(), usize::checked_add)
+             .ok_or(PlanError::Overflow));
+         let failure = Error::bounded_number_storage_bytes();
+-        tri!(controls.checked_add(failure).ok_or(PlanError::Overflow));
++        let temporary =
++            tri!(crate::de::bounded_number_temporary_bytes(raw.len()).ok_or(PlanError::Overflow));
++        tri!(controls
++            .checked_add(failure)
++            .and_then(|n| n.checked_add(temporary))
++            .ok_or(PlanError::Overflow));
+         Ok(Self {
+             source,
+             range,
+-            requirements: Requirements { failure, controls },
++            requirements: Requirements {
++                failure,
++                temporary,
++                controls,
++            },
+         })
+     }
+     /// Exact known storage before the first ordinary parser invocation.
+@@ -104,7 +116,7 @@
+     /// Consume this plan through the same deserializer as ordinary Number/Value.
+     /// The original serde error retains its exact code and document position.
+     pub fn parse(self) -> Result<Number, Error> {
+-        crate::from_slice(self.source[self.range.clone()].as_bytes())
++        crate::de::from_bounded_number_slice(self.source[self.range.clone()].as_bytes())
+             .map_err(|error: Error| error.relocate_number(&self.source[..self.range.start]))
+     }
+ }
+diff --git a/src/de.rs b/src/de.rs
+--- a/src/de.rs
++++ b/src/de.rs
+@@ -2713,11 +2713,15 @@
+     from_trait(read::StrRead::new(s))
+ }
+ 
+-
+-// Owning controls for the existing non-roundtrip numeric branch. Every parser
++// Owning controls for the existing ordinary numeric branches. Every parser
+ // method is the ordinary method above; this query introduces no numeric engine.
+ pub(crate) fn bounded_number_control_bytes() -> Option<usize> {
+     use core::mem::size_of;
++    #[cfg(feature = "float_roundtrip")]
++    let roundtrip = lexical::bounded::control_bytes()?;
++    #[cfg(not(feature = "float_roundtrip"))]
++    let roundtrip = 0;
++
+     let parts = [
+         size_of::<Deserializer<SliceRead<'static>>>(),
+         size_of::<SliceRead<'static>>(),
+@@ -2736,15 +2740,43 @@
+         size_of::<(bool, u64, i32)>(),
+         // parse_exponent: inputs, exponent sign/digits, zero and saturated sum.
+         size_of::<(bool, u64, i32, bool, u8, i32, i32, bool, i32)>(),
+-        // f64_from_parts and exponent overflow use no scratch allocation.
++        // f64_from_parts and exponent overflow fixed input/return transports.
+         size_of::<(bool, u64, i32, f64, Option<&'static f64>)>(),
+         size_of::<(bool, bool, bool)>(),
+         // Read/peek/end and syntax-error positioning/return transports.
+         size_of::<(Option<u8>, Result<Option<u8>>, Result<u8>, Result<()>)>(),
+         size_of::<(crate::read::Position, ErrorCode, crate::Error)>(),
+         size_of::<(&str, core::str::Bytes<'static>, usize, Option<usize>)>(),
++        roundtrip,
++        // Long-number formatting/reconstruction and final lexical input loans.
++        size_of::<itoa::Buffer>(),
++        size_of::<(bool, u64, i32, usize, usize, bool, i32, u8)>(),
++        size_of::<(&[u8], &[u8], f64)>(),
+     ];
+     parts
+         .into_iter()
+         .try_fold(core::mem::size_of_val(&parts), usize::checked_add)
+ }
++
++// Exactly the ordinary Number deserialize/end sequence, with the sole numeric
++// scratch pre-reserved before parser entry. Every reconstructed mantissa byte is
++// a digit of this numeric token, so input.len bounds all four long-number paths.
++pub(crate) fn from_bounded_number_slice(input: &[u8]) -> Result<crate::Number> {
++    let mut deserializer = Deserializer::from_slice(input);
++    #[cfg(feature = "float_roundtrip")]
++    deserializer.scratch.reserve_exact(input.len());
++    let value = tri!(de::Deserialize::deserialize(&mut deserializer));
++    tri!(deserializer.end());
++    Ok(value)
++}
++pub(crate) fn bounded_number_temporary_bytes(input: usize) -> Option<usize> {
++    #[cfg(feature = "float_roundtrip")]
++    {
++        input.checked_add(lexical::bounded::temporary_bytes()?)
++    }
++    #[cfg(not(feature = "float_roundtrip"))]
++    {
++        let _ = input;
++        Some(0)
++    }
++}
+diff --git a/src/lexical/bignum.rs b/src/lexical/bignum.rs
+--- a/src/lexical/bignum.rs
++++ b/src/lexical/bignum.rs
+@@ -16,12 +16,20 @@
+ impl Default for Bigint {
+     fn default() -> Self {
+         Bigint {
+-            data: Vec::with_capacity(20),
++            data: Vec::with_capacity(super::bounded::bigint_limbs()),
+         }
+     }
+ }
+ 
+ impl Math for Bigint {
++    #[inline]
++    fn imul_pow5(&mut self, n: u32) {
++        // Same exact multiplication worker as the ordinary small-power branch.
++        // Float conversion needs only two Bigints; no recursive product vectors
++        // are created, and the owning float limb bound covers every growth.
++        imul_pow5_iterative(&mut self.data, n);
++    }
++
+     #[inline]
+     fn data(&self) -> &Vec<Limb> {
+         &self.data
+diff --git a/src/lexical/bounded.rs b/src/lexical/bounded.rs
+new file mode 100644
+--- /dev/null
++++ b/src/lexical/bounded.rs
+@@ -0,0 +1,167 @@
++//! Storage of the existing round-trip float conversion, from its owning bounds.
++use super::{
++    bignum::Bigint,
++    cached::{ModeratePathCache, ModeratePathPowers},
++    float::ExtendedFloat,
++    math::Limb,
++    num::Float,
++};
++use core::{
++    iter::Chain,
++    mem::{size_of, size_of_val},
++    slice::Iter,
++};
++
++fn decimal_digits(mut value: u64) -> usize {
++    let mut digits = 1;
++    while value >= 10 {
++        value /= 10;
++        digits += 1;
++    }
++    digits
++}
++
++fn limb_bound() -> Option<usize> {
++    let powers = ExtendedFloat::get_powers();
++    let digits = <f64 as Float>::MAX_DIGITS;
++    let bias = usize::try_from(powers.bias).ok()?;
++    let step = usize::try_from(powers.step).ok()?;
++    // Outside this cached range moderate_path returns a final zero/infinity,
++    // so it never invokes bhcomp. Its retained u64 mantissa has at most these
++    // significant decimal digits; leading fraction zeros do not contribute.
++    let mantissa_digits = decimal_digits(u64::MAX);
++    let positive = step
++        .checked_mul(powers.large.len())?
++        .checked_sub(bias)?
++        .checked_sub(1)?
++        .checked_add(mantissa_digits)?
++        .checked_sub(1)?;
++    // bhcomp scales scientific_exp + 1 - min(significant digits, MAX_DIGITS).
++    let negative = bias.checked_add(digits)?.checked_sub(1)?;
++    // 10 < 2^4 and 5 < 2^3. These are integer bit inequalities, not byte
++    // multipliers. All operations are positive multiplication/addition/shift,
++    // so intermediate magnitudes never exceed their final branch envelope.
++    let mantissa_bits = digits.checked_mul(4)?;
++    let theor_bits = usize::try_from(<f64 as Float>::MANTISSA_SIZE)
++        .ok()?
++        .checked_add(2)?;
++    let smallest_theor =
++        usize::try_from(1i32.checked_sub(<f64 as Float>::DENORMAL_EXPONENT)?).ok()?;
++    let largest_theor = usize::try_from(<f64 as Float>::MAX_EXPONENT.checked_sub(2)?).ok()?;
++    let positive_bits = mantissa_bits.checked_add(positive.checked_mul(4)?)?;
++    let real_bits = mantissa_bits.checked_add(smallest_theor)?;
++    let theoretical_bits = theor_bits
++        .checked_add(negative.checked_mul(3)?)?
++        .checked_add(largest_theor.checked_add(negative)?)?;
++    let bits = positive_bits.max(real_bits).max(theoretical_bits);
++    let limb_bits = size_of::<Limb>().checked_mul(8)?;
++    bits.checked_add(limb_bits - 1)?.checked_div(limb_bits)
++}
++
++/// The same reserve used by each actual float Bigint constructor. Larger
++/// arbitrary-precision math outside float parsing retains ordinary Vec growth;
++/// the numeric profile proves every actual float operation stays within this.
++pub(crate) fn bigint_limbs() -> usize {
++    limb_bound().expect("compiled float/cached-power geometry fits usize")
++}
++
++/// parse_mantissa constructs one Bigint; small_atof constructs one theoretical
++/// Bigint. Bigint's power worker is iterative and creates no product vectors.
++/// large_atof consumes the first Bigint, and no selected float path clones one.
++pub(crate) fn temporary_bytes() -> Option<usize> {
++    limb_bound()?.checked_mul(size_of::<Limb>())?.checked_mul(2)
++}
++
++pub(crate) fn control_bytes() -> Option<usize> {
++    let parts = [
++        // The same pure limb-layout calculation also runs at Bigint birth.
++        size_of::<(&ModeratePathPowers, usize, usize, usize, usize)>(),
++        size_of::<(usize, usize, usize, usize, usize, usize, usize, usize)>(),
++        size_of::<(usize, usize, usize, usize, u64)>(),
++        // parse_concise_float's formatting is inline; the de formatter is
++        // independently included by the owning deserializer control query.
++        size_of::<itoa::Buffer>(),
++        size_of::<(u64, i32, bool, ExtendedFloat, f64)>(),
++        // fast_path exponent limits, mantissa masks, checked product and return.
++        size_of::<(
++            u64,
++            i32,
++            i32,
++            i32,
++            i32,
++            i32,
++            i32,
++            u64,
++            u64,
++            f64,
++            Option<f64>,
++        )>(),
++        // moderate_path and multiply_exponent_extended's cache/index/error loans.
++        size_of::<(u64, i32, bool, ExtendedFloat, bool)>(),
++        size_of::<(
++            &mut ExtendedFloat,
++            i32,
++            bool,
++            &ModeratePathPowers,
++            i32,
++            i32,
++            i32,
++            u32,
++            u64,
++            bool,
++            u32,
++        )>(),
++        size_of::<(ExtendedFloat, ExtendedFloat)>(),
++        // ExtendedFloat::mul's four halves, four products, carry and result.
++        size_of::<(
++            &ExtendedFloat,
++            &ExtendedFloat,
++            u64,
++            u64,
++            u64,
++            u64,
++            u64,
++            u64,
++            u64,
++            u64,
++            u64,
++            ExtendedFloat,
++        )>(),
++        // error_is_accurate and nearest_error_is_accurate's exact scalar controls.
++        size_of::<(u32, &ExtendedFloat, i32, i32, i32, u64, u64)>(),
++        size_of::<(u64, &ExtendedFloat, u64, u64, u64, u64, bool, bool)>(),
++        // parse_truncated_float: input loans, iterator, mantissa and counters.
++        size_of::<(&[u8], &[u8], usize, u64, i32, bool)>(),
++        size_of::<Chain<Iter<'static, u8>, Iter<'static, u8>>>(),
++        // parse_mantissa result, bhcomp transfer and large_atof's consumed value.
++        size_of::<Bigint>(),
++        size_of::<Bigint>(),
++        size_of::<Bigint>(),
++        size_of::<(&[Limb], usize, usize, Limb, usize)>(),
++        // small_atof's real/theoretical values and from_u64 construction.
++        size_of::<Bigint>(),
++        size_of::<Bigint>(),
++        size_of::<Bigint>(),
++        size_of::<(i32, i32, i32, i32, ExtendedFloat)>(),
++        size_of::<[Limb; 2]>(),
++        // Exact iterative small multiply/add/shift and output rounding frames.
++        size_of::<(&mut alloc::vec::Vec<Limb>, &[Limb], usize, usize, Limb)>(),
++        size_of::<(Limb, Limb, Limb, u128, bool)>(),
++        size_of::<(usize, usize, usize, Limb, Limb, Limb)>(),
++        size_of::<(ExtendedFloat, u64, i32, bool, bool, bool, f64)>(),
++        // Native rounding: normalize, round_to_float, nearest/downward and ties.
++        size_of::<(&mut ExtendedFloat, u32, i32, i32, i32)>(),
++        size_of::<(&mut ExtendedFloat, i32, u64, u64, u64, bool, bool)>(),
++        size_of::<(&mut ExtendedFloat, bool, bool, bool)>(),
++        size_of::<(&mut ExtendedFloat, i32, u64, u64, bool)>(),
++        // Overflow avoidance, bit-mask helpers, shifts and final bit conversion.
++        size_of::<(&mut ExtendedFloat, i32, u64, u64, u64, i32)>(),
++        size_of::<(u64, u64, u64, u64)>(),
++        size_of::<(&mut ExtendedFloat, i32, u64)>(),
++        size_of::<(ExtendedFloat, u64, u64, f64)>(),
++        size_of::<core::cmp::Ordering>(),
++    ];
++    parts
++        .into_iter()
++        .try_fold(size_of_val(&parts), usize::checked_add)
++}
+diff --git a/src/lexical/math.rs b/src/lexical/math.rs
+--- a/src/lexical/math.rs
++++ b/src/lexical/math.rs
+@@ -10,7 +10,7 @@
+ use super::num::*;
+ use super::small_powers::*;
+ use alloc::vec::Vec;
+-use core::{cmp, iter, mem};
++use core::{cmp, mem};
+ 
+ // ALIASES
+ // -------
+@@ -388,7 +388,6 @@
+     pub fn imul_pow5(x: &mut Vec<Limb>, n: u32) {
+         use super::large::KARATSUBA_CUTOFF;
+ 
+-        let small_powers = POW5_LIMB;
+         let large_powers = large_powers::POW5;
+ 
+         if n == 0 {
+@@ -407,17 +406,7 @@
+             // We can use iterative small powers to make this faster for the
+             // easy cases.
+ 
+-            // Multiply by the largest small power until n < step.
+-            let step = small_powers.len() - 1;
+-            let power = small_powers[step];
+-            let mut n = n as usize;
+-            while n >= step {
+-                imul(x, power);
+-                n -= step;
+-            }
+-
+-            // Multiply by the remainder.
+-            imul(x, small_powers[n]);
++            imul_pow5_iterative(x, n);
+         } else {
+             // In theory, this code should be asymptotically a lot faster,
+             // in practice, our small::imul seems to be the limiting step,
+@@ -501,8 +490,10 @@
+     pub fn ishl_limbs(x: &mut Vec<Limb>, n: usize) {
+         debug_assert!(n != 0);
+         if !x.is_empty() {
+-            x.reserve(n);
+-            x.splice(..0, iter::repeat(0).take(n));
++            let len = x.len();
++            x.resize(len + n, 0);
++            x.copy_within(..len, n);
++            x[..n].fill(0);
+         }
+     }
+ 
+@@ -778,6 +769,20 @@
+     }
+ } // large
+ 
++/// Shared exact small-power worker, also used by the finite float Bigint.
++/// Unlike the large-power route this creates no temporary limb vectors.
++pub(crate) fn imul_pow5_iterative(x: &mut Vec<Limb>, n: u32) {
++    let powers = POW5_LIMB;
++    let step = powers.len() - 1;
++    let power = powers[step];
++    let mut n = n as usize;
++    while n >= step {
++        small::imul(x, power);
++        n -= step;
++    }
++    small::imul(x, powers[n]);
++}
++
+ // TRAITS
+ // ------
+ 
+diff --git a/src/lexical/mod.rs b/src/lexical/mod.rs
+--- a/src/lexical/mod.rs
++++ b/src/lexical/mod.rs
+@@ -14,6 +14,7 @@
+ pub(crate) mod algorithm;
+ mod bhcomp;
+ mod bignum;
++pub(crate) mod bounded;
+ mod cached;
+ mod cached_float80;
+ mod digit;

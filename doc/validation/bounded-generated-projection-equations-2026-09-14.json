@@ -1,0 +1,204 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T01:18:55.535832+00:00",
+  "scope": "Shared native/metadata FP8 effective-input reconstruction and selected physical projection phase facts",
+  "status": "Verified components; full managed capture and broader bounded inference remain unfinished",
+  "previous_increment": "bounded-funded-session-delivery-2026-09-14.json",
+  "tests": {
+    "nn": {
+      "passed": 127,
+      "ignored": 0
+    },
+    "runtime": {
+      "passed": 997,
+      "ignored": 0
+    },
+    "blueprint": {
+      "passed": 18,
+      "ignored": 0
+    },
+    "native_nn": {
+      "passed": 224,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 202,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 127,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1695,
+  "new_tests": {
+    "nn": [
+      "checked_actual_shapes_preserve_padded_blocks_and_legacy_logical_quota",
+      "shared_program_preserves_source_and_all_prior_values_until_final_operation_or_failure",
+      "dense_borrows_and_fp8_selected_factory_traces_fixed_program_without_skipped_creation",
+      "unknown_selected_mechanism_rejects_before_trace_and_missing_operation_or_host_stays_unknown"
+    ],
+    "native_nn": [
+      "selected_phase_sum_equals_existing_whole_envelope_with_exact_scale_host_lifetime",
+      "actual_selected_reconstruction_and_prepare_roots_coexist_with_finish_output",
+      "malformed_prepared_roles_and_decode_descriptors_reject_tensor_and_host_facts",
+      "native_dense_and_deferred_fp8_selection_preserve_values_dtype_and_skipped_work",
+      "shared_reconstruction_output_keeps_real_quantized_dependencies_after_source_owners_retire"
+    ]
+  },
+  "new_test_count": 9,
+  "checks": {
+    "nn": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-nn --all-features --lib",
+      "started_utc": "2026-09-14T01:08:16.691286+00:00",
+      "elapsed_seconds": 2.004,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-projection-ingress-nn.log",
+      "log_sha256": "4484b34fc5b24341edecf903741051ee1afe67078fb58f79eaa04a0df8b72aff"
+    },
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T01:08:18.696389+00:00",
+      "elapsed_seconds": 22.699,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-projection-ingress-runtime.log",
+      "log_sha256": "1ca9b00f298bbdeb74d1ee0ea5002441a95ff941f136de17a9f8bfb88ace59c1"
+    },
+    "blueprint": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric prepared_workspace",
+      "started_utc": "2026-09-14T01:08:41.395170+00:00",
+      "elapsed_seconds": 66.236,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-projection-ingress-blueprint.log",
+      "log_sha256": "d2d33dcbf3811bee5d964892de0134544fa0d5d4ea7da4c13179f9aa5d875c43"
+    },
+    "native_nn": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::nn:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T01:13:55.800065+00:00",
+      "elapsed_seconds": 196.989,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-projection-ingress-native_nn.log",
+      "log_sha256": "77b96c74a33aacd80c8ec29aa72242c6b01270d40e89d712d4c4a68e482ecff8"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::model_session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T01:17:12.789547+00:00",
+      "elapsed_seconds": 13.238,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-projection-ingress-session.log",
+      "log_sha256": "8e08763a4f2363e5b79012197c6464b96d3b1b3ea376b630a5b447047c3525ec"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T01:17:26.027459+00:00",
+      "elapsed_seconds": 47.39,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-projection-ingress-portable.log",
+      "log_sha256": "24fb9925b6f5b8bc224c42467f4175f19faf1ee9ac2bb6b771294ac01242362a"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T01:18:13.418184+00:00",
+      "elapsed_seconds": 18.692,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-projection-ingress-minimal.log",
+      "log_sha256": "922e2b7434e070d06d267c513fcc71979102e2cca4618a414fd9698d83f2646a"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T01:18:32.110510+00:00",
+      "elapsed_seconds": 19.579,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-projection-ingress-features.log",
+      "log_sha256": "7631630973bdb27c872938b9025d6b24869fc773c80b0be8fc1338e9b09b3d88"
+    }
+  },
+  "source_sha256": {
+    "eredu-backend-mlx/src/backend/nn/fp8.rs": "96f017a5986ac551fbb3e0c305da3a941d6e27adeeae5aed430be3a41a32003f",
+    "eredu-backend-mlx/src/backend/nn/fp8/tests.rs": "dab5b6208d48fd8aef750b1ef03abf091307aae3996f62ba8dc10ef4e0c6bb77",
+    "eredu-backend-mlx/src/backend/nn/fp8/tests/projection_observation.rs": "4c449c62aa4f383c39f7c55cd2a50d1266fa95190c73c688429981f67eed0c48",
+    "eredu-backend-mlx/src/backend/nn/workspace.rs": "bc0e7b344c2b5ff327f84a96eda0cb1da7fd99b95ca7582d351bfc55308c9502",
+    "eredu-backend-mlx/src/backend/nn/workspace/host.rs": "f0b2fe1462e9bcc2fdd15ddf2f6a12a711cc8df85e9c3701a2f826fb9b54d053",
+    "eredu-backend-mlx/src/backend/nn/workspace/packed.rs": "1e404cd19d5ead5c03a538e605a7ba2484e86231d45b73ac7672362c32924704",
+    "eredu-backend-mlx/src/backend/nn/workspace/projection_observation.rs": "13b7fda097c0f4b70009ade424b1f70c685ad8aa0c9ea6835fe174775ee60dd0",
+    "eredu-backend-mlx/src/backend/nn/workspace/projection_observation/tests.rs": "a7705e43c0e04535580aa1875374bf2d4fdc762e128682d48e5644aa5d9d028b",
+    "eredu-core/src/capture.rs": "acc779518bedee53955e1f6e0fbd3dbf6bb974e1110c905e286b2914573770da",
+    "eredu-nn/src/lib.rs": "00a71ebf78f69e613bfefe8e6f34ce4361f28069ec138071e8c9a7226b0c56c1",
+    "eredu-nn/src/projection_observation.rs": "15e970b22b068ae7894ecfdc7f35e11ecae91b4b509f8b758e1dbde9682453ff",
+    "eredu-nn/src/projection_observation/tests.rs": "6aa06d22453c052c1f5f40b8f04b5430a6320a44fac07331faf0b09d8eda0a1e",
+    "eredu-nn/src/workspace.rs": "02538a1158b42d6ed892b0f276b779fafaff63a6a33c84f3c644a32fa420b3ed",
+    "eredu-nn/src/workspace/backend.rs": "0d6648e1fcec4d5bfc594f38f7d9ebab67bc89d69ffff51f13e1ed258c7011e1",
+    "eredu-nn/src/workspace/backend/projection_observation.rs": "33cc2eb31b601c1e49621778b93c01be7729334610efaab0cc915d40957e0140",
+    "eredu-nn/src/workspace/backend/projection_observation/tests.rs": "2466360bb0b59ea1b99d0aa8ede612bbc5c37cd8a2c8ec051e62b2aad9f4589b",
+    "doc/backend-architecture.md": "1b76eb741511b94722b65233aa17100742b97ae5242483e28d4e8c525cb6b7ee",
+    "doc/execution-control.md": "fc99a81493780876dc5d5bd77b5ac346f90f4e719f8a78b0276249866ffc9c73",
+    "doc/bounded-inference.md": "b7cd51ebf067ce8a97f196511386cac88eb609ce236afb467b152f4eada76fc9"
+  },
+  "source_snapshot": "/private/tmp/eredu-projection-ingress-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-projection-ingress-applied.json": "2d4cd89d73571095fdd3eb94992adc101c9e76d0fd383d8bb6763d302f0a420c",
+    "/private/tmp/eredu-projection-ingress-apply.py": "561a0c2d97fed003e1b14103e3122107bd5927c3059cc29c23a38c5eb80e430d",
+    "/private/tmp/eredu-projection-ingress-blueprint.log": "d2d33dcbf3811bee5d964892de0134544fa0d5d4ea7da4c13179f9aa5d875c43",
+    "/private/tmp/eredu-projection-ingress-checks.json": "6a6541a3d88d1369f07050d66b03a576b11d63eeea4b9b67f931ff33f84055d1",
+    "/private/tmp/eredu-projection-ingress-core-doc-merge.patch": "82c2f6c89e76f06f40a3c9c57e15f1b886da19bbff93ec262036cc3619a18215",
+    "/private/tmp/eredu-projection-ingress-dense-fixture.patch": "e6103dc00f0f423e3a0641deedfe04ab705e51e63202138708dd703851b8d63a",
+    "/private/tmp/eredu-projection-ingress-doc-additions.json": "461ecc2318e2ff22e42cfefe40468c4d4b8a6f801aa98ba7a3d39e7f8a226411",
+    "/private/tmp/eredu-projection-ingress-features.log": "7631630973bdb27c872938b9025d6b24869fc773c80b0be8fc1338e9b09b3d88",
+    "/private/tmp/eredu-projection-ingress-files.txt": "cd1d240fb11ad4e9f7726b7afad09ff72be60517548ef4bb63aec07b0ad0b88f",
+    "/private/tmp/eredu-projection-ingress-final-review.json": "bdfff3736de29df24c3004f8a897c0bf7a0d890d87a970b76e2c859de044ad39",
+    "/private/tmp/eredu-projection-ingress-format.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "/private/tmp/eredu-projection-ingress-frozen-sources.json": "de48edda27dc6154f273c04291e1c909e23af5a365342b0180d118c8a4b750fd",
+    "/private/tmp/eredu-projection-ingress-minimal.log": "922e2b7434e070d06d267c513fcc71979102e2cca4618a414fd9698d83f2646a",
+    "/private/tmp/eredu-projection-ingress-native_nn.log": "77b96c74a33aacd80c8ec29aa72242c6b01270d40e89d712d4c4a68e482ecff8",
+    "/private/tmp/eredu-projection-ingress-native_nn.log.prevalidation": "5214f06d139fe327d8ab2b3e9ac9442e9d00cb316202d345dabd7eeacc2aca36",
+    "/private/tmp/eredu-projection-ingress-nn.log": "4484b34fc5b24341edecf903741051ee1afe67078fb58f79eaa04a0df8b72aff",
+    "/private/tmp/eredu-projection-ingress-portable.log": "24fb9925b6f5b8bc224c42467f4175f19faf1ee9ac2bb6b771294ac01242362a",
+    "/private/tmp/eredu-projection-ingress-runtime.log": "1ca9b00f298bbdeb74d1ee0ea5002441a95ff941f136de17a9f8bfb88ace59c1",
+    "/private/tmp/eredu-projection-ingress-session.log": "8e08763a4f2363e5b79012197c6464b96d3b1b3ea376b630a5b447047c3525ec",
+    "/private/tmp/eredu-projection-ingress-validate.py": "98073f05efa1f2953636daeadcb2ab88f68bc9297789cf133d58533f6596b2e1",
+    "/private/tmp/eredu-projection-observation-review-hashes.json": "acb6483446f76d45e16c8ffede26a3a35c354966a7a05ccb5ce5514655801a24",
+    "/private/tmp/eredu-projection-observation-review.md": "1f778abf4a1ddf92bc490e29edb8c0080353a2acf39428cee63d326a202cacdd",
+    "/private/tmp/eredu-projection-observation-root-review.json": "13cb3c3a473295564533d2da0bbe0ed368bf6e2251dc494c94d73986ac26f504",
+    "/private/tmp/eredu-projection-observation-stage/README.md": "79498b25ccb6ac7cf09d8ee8d497bcda4130dbcc0c3ca9af9b0d768eed5251b3",
+    "/private/tmp/eredu-projection-observation-stage/base-hashes.json": "e9d27fa740f41b95aacb9e436c272d6f6ed71b89070e8e20612baa46e8738374",
+    "/private/tmp/eredu-projection-observation-stage/change.patch": "afc78522f007b0ef4a6180b8361c9a826c03090fe1d59c108a88321cf93eadc2",
+    "/private/tmp/eredu-projection-observation-stage/checks.json": "f2c3ea1ec465f23e2318328260bdb7b8d79fe5a8da213752bb1d4794d7765354",
+    "/private/tmp/eredu-projection-observation-stage/core-quota-doc-hashes.json": "6f8c058eca5190bc5e684b0aa3245ccc8fde7d5b78f0e223ca5dacb5e7f68c05",
+    "/private/tmp/eredu-projection-observation-stage/core-quota-doc.patch": "ae2f6896b8b4e0c091804c0fee644cf7e6b5d11f39b595ddc697aa4a4bf91a7b",
+    "/private/tmp/eredu-projection-observation-stage/design.md": "59b6c6d3aaa42d0731395f27ea9b65a9c1e9ae63514b74ce10b423893e9bda6e",
+    "/private/tmp/eredu-projection-observation-stage/doc-additions.json": "f4bc8f9a598b37c37e994a40ae61b4f9c4b3baade770ad014dbfb8fc09264400",
+    "/private/tmp/eredu-projection-observation-stage/native-source-basis.json": "a9e1bf3fa254a0ff122cf6405e7e96a10e4b92b17ccd7f439364ca542da2012e",
+    "/private/tmp/eredu-projection-observation-stage/package-hashes.json": "6eace7e0588321c854d4ac12c7695647276aca02669575b253082eab0358bdc2",
+    "/private/tmp/eredu-projection-observation-stage/package.py": "b541508c152e7bb1cdb9766e08887afb9c285f1903f337dc75bd9a90244c8096",
+    "/private/tmp/eredu-projection-observation-stage/staged-hashes.json": "ca44ae413af8487c5773db2f3b537dee21dc5a2d4043e8186639bcb3b637da62"
+  },
+  "review_findings": {
+    "reviewed_utc": "2026-09-14T01:13:29.242182+00:00",
+    "root_review": "Reviewed all production paths, registration and nine tests; see frozen root review. Independent policy review confirms exact selected mechanism and lifetime equations.",
+    "integration_corrections": [
+      {
+        "path": "/Users/jbg/dev/eredu/eredu-backend-mlx/src/backend/nn/fp8/tests/projection_observation.rs",
+        "change": "Dense numerical fixture originally used F32 weights with F16/BF16 inputs, causing ordinary matmul promotion to F32. Cast dense weights to each tested input precision, preserving exact output dtype and value assertions. Production code unchanged.",
+        "patch": "/private/tmp/eredu-projection-ingress-dense-fixture.patch",
+        "original_log": "/private/tmp/eredu-projection-ingress-native_nn.log.prevalidation",
+        "initial_result": "223 passed; 1 failed; mismatch Float32 vs Float16 in new test"
+      }
+    ],
+    "logical_vs_physical": "Legacy creation quota unchanged. Actual observed prepare/finish and seven reconstruction operations share the same cold context with explicit compact roots. No scalar quota serves as physical authority.",
+    "limits": "No managed gate, partial-factory funding consumer or original observed admission enabled. Native generated reconstruction and equation tests are components only; full-scope source retention remains enclosing responsibility."
+  },
+  "behavior": [
+    "Checked borrowed BlockFp8 prototype geometry validates real compact U8 values/F32 scales and fixed padding. The same seven-operation reconstruction retains all intermediate values through final restore in native and metadata realizations.",
+    "Exact selected input provenance chooses borrowed inputs for unchanged identity formats and actual compact quantizer roots for supported Metal block FP8. A skipped factory emits no reconstruction operations; absent selected provenance rejects and absent operation/host facts remain Unknown.",
+    "Observed prepare/finish phases partition the existing complete projection envelope once. Compact roots are explicit outputs/inputs, decoded weight scales remain live and Ue8m0 host lookup lives in prepare. Reconstruction operations and retained selected output coexist with finish in one workspace context.",
+    "The legacy creation_bytes formula remains unchanged logical capture quota; selected operation facts independently bound physical allocations. No byte scalar constructs an admission, source registration or native completion certificate.",
+    "Actual dense/FP8 F32/F16/BF16 projection callbacks preserve scores and compare selected effective inputs against independent nonzero reference values. Shared CPU/GPU reconstruction remains usable after original input handles retire."
+  ],
+  "limits": [
+    "No managed capture gate enabled. Retained partial-factory protocol, funded generated consumer, original quote/installation and facade envelope still require integration.",
+    "Physical facts describe selected Metal mechanisms, not CPU/CUDA equivalence or distributed row-parallel observation. Those remain distinct mechanisms and validation obligations.",
+    "Input/parameter publication, original request/native scope and recovery remain enclosing backend responsibilities; local runner lifetime does not certify complete model work.",
+    "No new released checkpoint comparison, allocator/process peak measurement or native distributed run is included. Full media/speculation/resume/facade coverage remains unfinished."
+  ]
+}

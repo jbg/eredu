@@ -1,0 +1,320 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T12:05:57.954291+00:00",
+  "scope": "Moshi sequential decision vocabulary demand and required realtime observations",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-descriptor-shared-stop-integration-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 1257,
+      "ignored": 0
+    },
+    "independence": {
+      "passed": 168,
+      "ignored": 0
+    },
+    "numeric": {
+      "passed": 423,
+      "ignored": 0
+    },
+    "architecture": {
+      "passed": 8,
+      "ignored": 0
+    },
+    "realtime": {
+      "passed": 7,
+      "ignored": 6
+    },
+    "recovery": {
+      "passed": 5,
+      "ignored": 0
+    },
+    "native_moshi": {
+      "passed": 1,
+      "ignored": 0
+    },
+    "native_scheduler": {
+      "passed": 1,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 26,
+      "ignored": 1
+    },
+    "conformance": {
+      "passed": 109,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 2005,
+  "new_tests": [
+    {
+      "check": "numeric",
+      "name": "moshi_frame_demand_omits_only_unconsumed_forced_projections_across_residencies",
+      "path": "eredu-architectures/tests/reference_numeric/moshi_frames/demand.rs"
+    },
+    {
+      "check": "numeric",
+      "name": "moshi_required_final_observers_execute_forced_tail_and_intervene_before_decisions",
+      "path": "eredu-architectures/tests/reference_numeric/moshi_frames/demand.rs"
+    },
+    {
+      "check": "numeric",
+      "name": "moshi_state_only_public_scores_preserve_diagnostics_and_terminal_prefix",
+      "path": "eredu-architectures/tests/reference_numeric/moshi_frames/demand.rs"
+    },
+    {
+      "check": "numeric",
+      "name": "moshi_wide_low_level_demand_selects_hidden_before_vocab_and_keeps_complete_cached_state",
+      "path": "eredu-architectures/tests/reference_numeric/moshi_frames/demand.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "absent_scores_reject_before_sampling_and_only_unobserved_forcing_can_proceed",
+      "path": "eredu-runtime/src/decision.rs"
+    },
+    {
+      "check": "runtime",
+      "name": "required_transition_rejection_retires_prepared_inputs_without_model_or_commit",
+      "path": "eredu-runtime/src/realtime_executor.rs"
+    }
+  ],
+  "new_test_count": 6,
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T11:53:36.014465+00:00",
+      "elapsed_seconds": 20.356,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-moshi-decision-demand-integration-runtime.log",
+      "log_sha256": "5d90f31c223fc6a06c95a52f692a7d567980a734f690f443c81d889e37230c3f"
+    },
+    "independence": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence",
+      "started_utc": "2026-09-14T11:53:56.371365+00:00",
+      "elapsed_seconds": 18.634,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-moshi-decision-demand-integration-independence.log",
+      "log_sha256": "f05001f2164a47833a198b14d5f108171219e7ad6a05643692287bde5c2aa288"
+    },
+    "numeric": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric",
+      "started_utc": "2026-09-14T11:57:37.179156+00:00",
+      "elapsed_seconds": 117.061,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-moshi-decision-demand-integration-numeric.log",
+      "log_sha256": "5cc7f44120b03f36a17a83a030991579a5bd1453f236068b7800b9b512b1e3ce"
+    },
+    "architecture": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_conformance",
+      "started_utc": "2026-09-14T11:59:34.243510+00:00",
+      "elapsed_seconds": 133.885,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-moshi-decision-demand-integration-architecture.log",
+      "log_sha256": "5a9f6184656a762407ac43f2bec4b0b6baa0fa7ed0545f9891c23a49bc764cab"
+    },
+    "realtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::realtime::tests -- --test-threads=1",
+      "started_utc": "2026-09-14T12:03:04.965296+00:00",
+      "elapsed_seconds": 78.473,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-moshi-decision-demand-integration-realtime.log",
+      "log_sha256": "0da2017cd618a4a6dcef69d01e36f9aee5fbf9e43d7bc84d488f5a688ba41f16"
+    },
+    "recovery": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::moshi::recovery_tests -- --test-threads=1",
+      "started_utc": "2026-09-14T12:04:23.439646+00:00",
+      "elapsed_seconds": 0.175,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-moshi-decision-demand-integration-recovery.log",
+      "log_sha256": "c1a9604f5c9cbc553f5b707c6d69beb1cb716e39c48f75a3d4ad45efe6002de0"
+    },
+    "native_moshi": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::realtime::tests::moshi_mlx_conformance_suite -- --exact --ignored --nocapture",
+      "started_utc": "2026-09-14T12:04:23.615050+00:00",
+      "elapsed_seconds": 2.561,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-moshi-decision-demand-integration-native_moshi.log",
+      "log_sha256": "89ac70724ea8a244b9cfad7fa58d770ed7b93875e497e25ce8885760a53cf7cc"
+    },
+    "native_scheduler": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::realtime::tests::moshi_mlx_scheduler_transaction_rollback_release_resume -- --exact --ignored --nocapture",
+      "started_utc": "2026-09-14T12:04:26.176737+00:00",
+      "elapsed_seconds": 0.323,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-moshi-decision-demand-integration-native_scheduler.log",
+      "log_sha256": "8ba7ab319a8ca6335f98de99329dc8eb8d9634ffa03b82ed90d7e3cd1f731ec3"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade",
+      "started_utc": "2026-09-14T12:04:26.500157+00:00",
+      "elapsed_seconds": 39.688,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-moshi-decision-demand-integration-portable.log",
+      "log_sha256": "4019c7ff7e54dd99ab924a398e9c7acceb13443856cb8a5e58dd85c650d94a38"
+    },
+    "conformance": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test backend_conformance",
+      "started_utc": "2026-09-14T12:05:06.189040+00:00",
+      "elapsed_seconds": 5.418,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-moshi-decision-demand-integration-conformance.log",
+      "log_sha256": "fc6a1b8657405d885221302ac36a7d01dfc9e9ed7f065fd50ea72872f537e486"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T12:05:11.607742+00:00",
+      "elapsed_seconds": 15.765,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-moshi-decision-demand-integration-minimal.log",
+      "log_sha256": "c15904c6e7c66e590d05af86fecc9e47226f2156a3ed3d33c134fa0dc581e8e5"
+    }
+  },
+  "source_sha256": {
+    "eredu-backend-mlx/src/composition/moshi.rs": "e249204b7246b5308ea9bba0d8d8d136f4579633291a2d6142f6e045187797a3",
+    "eredu-runtime/src/partitioned_execution.rs": "40eca97a2dc62d1264a8932e4c24839af89b98eafe6513b44dbf6b62a54136ee",
+    "doc/backend-architecture.md": "ea2a8dc4e72b32f1d316b3464ba3adda3e043fce2cd509c1cd18f79e5534e0dc",
+    "eredu-architectures/tests/reference_realtime_construction.rs": "fbb5f679504a16282c30c68e424887bf374dfdee205c620531c2cb79fedb6076",
+    "eredu-architectures/tests/reference_numeric/moshi_frames.rs": "ae27750c9a4135f872b6f2668cc14fa1f7beee54ab275e0ec12a84af6196a504",
+    "eredu-architectures/src/moshi/depth.rs": "1157f54aad5ab6cf702b5c73d3a2b02f682dd2d2ed65df41472846db6f9c83ea",
+    "eredu-runtime/src/layered.rs": "698dccb07f9bb4c7c736400386a8a9c07cc5aa9d8bdf8278b00016b0417793fa",
+    "doc/bounded-inference.md": "8a14d526b7c9afa43f4b992ce381b95e0240e465a861694233df142855596ba5",
+    "eredu-runtime/src/realtime_executor.rs": "564b61cc3f0866f64df2811ec20e4d60372ae341b1bd24c045b1995548b4398e",
+    "eredu-architectures/src/moshi/realtime.rs": "fc7b4c90b4da3bce8b1f7d4afdc302cca1c46da570269671f1f9957ab7d55072",
+    "doc/execution-control.md": "6163f779e8d409470e1afaf4054a17c3593e1c1c431a1d581a15a6b419dbb12a",
+    "doc/parallel-execution.md": "75948011d675e8f2918d1a828189c6a7773ec3ddf62d5cdfb1006af8ed2a1ef8",
+    "eredu-runtime/src/lib.rs": "c7957271b956c266d98fcf94318978fb32856709d0c0656ff26c3e0aa1524a72",
+    "eredu-architectures/src/moshi/model.rs": "9051988bd7e1df7f4726b43b9842e1d73321d22d3d94a10025a5b339189c1a49",
+    "eredu-runtime/src/decision.rs": "f91b4c617d49bfddc014d283cf6ff67008d3e2da33ec4f375ff5c71ef6e15439",
+    "eredu-backend-mlx/src/composition/mlx/realtime/tests.rs": "2f9e22a715839d8468b9871e5b4aab212fca24b348658c5065b170b79098c706",
+    "eredu-architectures/src/moshi/mod.rs": "a4de72bcb280094b6e09e49f9da9d235a2688b0512cf8464a4fe9de6b8b435ef",
+    "eredu-architectures/tests/reference_numeric/moshi_frames/demand.rs": "bd5117a1a5a07d857fbbdfaca724fd78476b82cb942e12c04b94cefc6c0dcebd",
+    "eredu-backend-mlx/src/composition/moshi_recovery_tests.rs": "ba7015a854bea17abc222dcf16132589f9634f00c01e621ca8f2eb5bd4025dc4",
+    "eredu-backend-mlx/src/composition/mlx/realtime/frame_execution.rs": "9747801b4784ef9ffddf6229c0d35e2f15d5d3ec2eb99a899034486284938dda"
+  },
+  "source_snapshot": "/private/tmp/eredu-moshi-decision-demand-integration-source-snapshot",
+  "artifacts": {
+    "/Users/jbg/dev/eredu/doc/validation/bounded-descriptor-shared-stop-integration-2026-09-14.json": "d8eaec81582936c5ee3256a447345b919e072fc80cd32a7a59bfd67044beea3f",
+    "/private/tmp/eredu-moshi-decision-demand-final-root-review.json": "77bb7f96dfa51d859385e4827f10657221c53aec31ec2fbf05991d7e155e8287",
+    "/private/tmp/eredu-moshi-decision-demand-integration-applied.json": "7ff65d0fd2663e9d014c888ccdf7ff1b55807260ad57f625ddc843ee89a02f8b",
+    "/private/tmp/eredu-moshi-decision-demand-integration-apply.py": "bca88993bb3290f2a3ca7660c9533b8b5fe40fb3a8d775720a8e8fafaab308c3",
+    "/private/tmp/eredu-moshi-decision-demand-integration-architecture.log": "5a9f6184656a762407ac43f2bec4b0b6baa0fa7ed0545f9891c23a49bc764cab",
+    "/private/tmp/eredu-moshi-decision-demand-integration-checks.json": "090ce557a2d3529e41203abe2b2f85a4829b7e41bde76a692d97a570347f708b",
+    "/private/tmp/eredu-moshi-decision-demand-integration-conformance.log": "fc6a1b8657405d885221302ac36a7d01dfc9e9ed7f065fd50ea72872f537e486",
+    "/private/tmp/eredu-moshi-decision-demand-integration-doc-applied.json": "9cac6969e4f8852b48893be2880c13458b5faaf2e000695c1132717f44174966",
+    "/private/tmp/eredu-moshi-decision-demand-integration-independence.log": "f05001f2164a47833a198b14d5f108171219e7ad6a05643692287bde5c2aa288",
+    "/private/tmp/eredu-moshi-decision-demand-integration-minimal.log": "c15904c6e7c66e590d05af86fecc9e47226f2156a3ed3d33c134fa0dc581e8e5",
+    "/private/tmp/eredu-moshi-decision-demand-integration-native_moshi.log": "89ac70724ea8a244b9cfad7fa58d770ed7b93875e497e25ce8885760a53cf7cc",
+    "/private/tmp/eredu-moshi-decision-demand-integration-native_scheduler.log": "8ba7ab319a8ca6335f98de99329dc8eb8d9634ffa03b82ed90d7e3cd1f731ec3",
+    "/private/tmp/eredu-moshi-decision-demand-integration-numeric.log": "5cc7f44120b03f36a17a83a030991579a5bd1453f236068b7800b9b512b1e3ce",
+    "/private/tmp/eredu-moshi-decision-demand-integration-numeric.log.1789387057178946000.previous": "a11e9b5846b513a09def7b4b7f5d72db6b70515e5c667da85100921a3bb1e63b",
+    "/private/tmp/eredu-moshi-decision-demand-integration-portable.log": "4019c7ff7e54dd99ab924a398e9c7acceb13443856cb8a5e58dd85c650d94a38",
+    "/private/tmp/eredu-moshi-decision-demand-integration-projection-selector-correction-review.json": "1cfb2ab3c36c60ac54d334c74ab5c20ca54ce28d45214865314a945c16bd31a7",
+    "/private/tmp/eredu-moshi-decision-demand-integration-realtime.log": "0da2017cd618a4a6dcef69d01e36f9aee5fbf9e43d7bc84d488f5a688ba41f16",
+    "/private/tmp/eredu-moshi-decision-demand-integration-realtime.log.1789387384965033000.previous": "3b48bad860003d6967028f8ff93f100ff1c13aadf7f9d785c697187f245251c0",
+    "/private/tmp/eredu-moshi-decision-demand-integration-recovery-signature-correction-review.json": "796e84c568ba4f3859ebcd0e28b7bbfbcb75f3bedfc117a4c3f3d9ee5e79e85f",
+    "/private/tmp/eredu-moshi-decision-demand-integration-recovery.log": "c1a9604f5c9cbc553f5b707c6d69beb1cb716e39c48f75a3d4ad45efe6002de0",
+    "/private/tmp/eredu-moshi-decision-demand-integration-review.json": "14a62466cf9b1dea72e7c232f548b10806bd4d88d3320ed802e5623d1584b48e",
+    "/private/tmp/eredu-moshi-decision-demand-integration-root-review.json": "57608a9d35064d1c850e3cfcb078701da2006dfe26370612f0161b7f516ab8bf",
+    "/private/tmp/eredu-moshi-decision-demand-integration-runtime.log": "5d90f31c223fc6a06c95a52f692a7d567980a734f690f443c81d889e37230c3f",
+    "/private/tmp/eredu-moshi-decision-demand-integration-spec.json": "11d9c9d2e90d2e74cd1d6342a694a47bed9ea50f6270fba3b74242951f8fbadf",
+    "/private/tmp/eredu-moshi-decision-demand-integration-spec.pending.json": "7a64884bb1a0826271a2a6ba2597581d8052903c47c5da2f0af90a1de21d69e9",
+    "/private/tmp/eredu-moshi-decision-demand-integration-stage/all.patch": "bf94be58c941996a41c35210ddab7c4cd5c868973932544e05e543bbe86b944d",
+    "/private/tmp/eredu-moshi-decision-demand-integration-stage/change.patch": "9cbac18474098eaac3d975e9635b248c72d902dfa3c3eaaecc5b46904fafe425",
+    "/private/tmp/eredu-moshi-decision-demand-integration-stage/manifest.json": "7ff65d0fd2663e9d014c888ccdf7ff1b55807260ad57f625ddc843ee89a02f8b",
+    "/private/tmp/eredu-moshi-decision-demand-integration-stage/staged-hashes.json": "29b9cf627fea7654f41c9c5d13eebfd1f5b579501f967ab1b94252dcb72e15aa",
+    "/private/tmp/eredu-moshi-decision-demand-integration-validate.py": "d882fdd548ce4d622a34f1f71265f55f73c15ac5ea0fad6e00015f6e638d4db5",
+    "/private/tmp/eredu-moshi-decision-demand-integration-validation-config.json": "70c86170eeae93cb0973543d4abf806d1d526588abba1b28ca6d9198cda7ad82",
+    "/private/tmp/eredu-moshi-decision-demand-reviewed-stage/doc-operations.json": "0c2a7020a81a65ea807650a52be366b190f5a69c28b3e52f877720ca9be539bb",
+    "/private/tmp/eredu-moshi-decision-demand-reviewed-stage/manifest.json": "4c83733813f04b0ef21724a6c5c313b04f0c91e4c0bd6b86009108c468fbe503",
+    "/private/tmp/eredu-moshi-decision-demand-reviewed-stage/provenance.json": "be8bbb990f071200c615aeb369f089ecf6e8cc143678acc63a9c743733abaa8e",
+    "/private/tmp/eredu-moshi-decision-demand-stage/DESIGN.md": "727cd18ed42b0208d43058ec962dd82ba8e121d48100494bb9a0ba49daffb1f7",
+    "/private/tmp/eredu-moshi-decision-demand-stage/FROZEN.json": "0ebfca24647d3665c3775d4a1fa3b6be97aeecae35b8beea144cc14e27f7af49",
+    "/private/tmp/eredu-moshi-decision-demand-stage/README.md": "e80da7f31a6ecae7a26ae0de2506a331f74ff33cafbd66d584237d439645b066",
+    "/private/tmp/eredu-moshi-decision-demand-stage/all.patch": "51685052c4709738cc1598636f21ca9173cde2a8b211f207f0dbf09be8b7ce38",
+    "/private/tmp/eredu-moshi-decision-demand-stage/artifact-hashes.json": "ea5c0d313ff7bf622f209b23aff7ba961313634b1334743c77812bb658caf664",
+    "/private/tmp/eredu-moshi-decision-demand-stage/base-hashes.json": "1ad8bd3ea8f694a575eecebb604506a582bf3b0f179d2f75803b6844a83999f6",
+    "/private/tmp/eredu-moshi-decision-demand-stage/change.patch": "c273bb349ad90534f054c2ceabd3a7d3fdcfd05cd95fb5a25df59ebfb7c4141b",
+    "/private/tmp/eredu-moshi-decision-demand-stage/checks.json": "a2dd072c858db7a5c39020e24273ff09b20614dcf23ae9384994748d072f224c",
+    "/private/tmp/eredu-moshi-decision-demand-stage/dependencies.json": "4d2a87e14ac7a8b443cd520991943fd8b4423ead85d299923202fbfce21af530",
+    "/private/tmp/eredu-moshi-decision-demand-stage/doc-edits.json": "5c19074836ed995720b843b02cd645674ecb73bc260fe3cfabe7bf0f4027f1da",
+    "/private/tmp/eredu-moshi-decision-demand-stage/full-manifest.json": "366dc25eb067cdd11d29d60ced33a31410d880e347b67a44d9f01f836e9b2c9c",
+    "/private/tmp/eredu-moshi-decision-demand-stage/new-tests.json": "7ea46f669483a8ec18a9deb3fe2b3c34dd24955a381366ee4a9a1084dc8fd4eb",
+    "/private/tmp/eredu-moshi-decision-demand-stage/provenance.json": "dc375b73fafaff1fca10ad7fb1bd2b93bc490d64b6bd5948d355112343c96a0f",
+    "/private/tmp/eredu-moshi-decision-demand-stage/replay.py": "c0fe2917926aefc4734bdcb7996c49a4b774d40aba0cf86469257709a131779e",
+    "/private/tmp/eredu-moshi-decision-demand-stage/source-basis.json": "19b96a03ed98c3571928856bc63bcbab5660d4758355dea89de7c68f41a067ca",
+    "/private/tmp/eredu-moshi-decision-demand-stage/source-manifest.json": "0764559f96e5204644192c163d79415c0061dbe7f1fdcf3badbafcae308e87e9",
+    "/private/tmp/eredu-moshi-projection-selector-correction-spec.json": "b226df0c13c60788dc7243a95e486fb216256dd892da8c04555a1415a4816624",
+    "/private/tmp/eredu-moshi-projection-selector-correction-stage/README.md": "d377650dadac395789c517f97a701132ed8a307d1d0c68bc32da527def323a06",
+    "/private/tmp/eredu-moshi-projection-selector-correction-stage/change.patch": "31cde93c8fda682255149d74e0a04a7d4161e8cbc56dace9b4e613b1fb4a9707",
+    "/private/tmp/eredu-moshi-projection-selector-correction-stage/failed-numeric.log": "a11e9b5846b513a09def7b4b7f5d72db6b70515e5c667da85100921a3bb1e63b",
+    "/private/tmp/eredu-moshi-projection-selector-correction-stage/manifest.json": "44cc31c643c5c93bc5076d762c7b4f3c77b4c9e90cea2265c5de5dd51845f55c",
+    "/private/tmp/eredu-moshi-recovery-signature-correction-spec.json": "477e3cf10ddde21da9867e9af958e36b01d68479930dfcc33e22d307b7197ace",
+    "/private/tmp/eredu-moshi-recovery-signature-correction-stage/README.md": "7e6ca7df5c4b58607b156fedd2ab80cbbc8e3ad0d7297d6e73686a3b50f07f97",
+    "/private/tmp/eredu-moshi-recovery-signature-correction-stage/change.patch": "1ae6ba7b0f9f5a63a937e1c330765c820d336c08bad59a9c0e3e8ba6b9026d70",
+    "/private/tmp/eredu-moshi-recovery-signature-correction-stage/failed-native-build.log": "3b48bad860003d6967028f8ff93f100ff1c13aadf7f9d785c697187f245251c0",
+    "/private/tmp/eredu-moshi-recovery-signature-correction-stage/manifest.json": "714d70a2b5805b207de9f5d0e90463b0da58e241f4dea7460b4bb924e023391d",
+    "/private/tmp/eredu-prepare-reviewed-document-operations.py": "6081a1503e5d14a5568342dabe9dec34d7f4e223b8dca406ab90b94360bb8aad"
+  },
+  "review": {
+    "full_manifest_sha256": "29b9cf627fea7654f41c9c5d13eebfd1f5b579501f967ab1b94252dcb72e15aa",
+    "full_patch_sha256": "bf94be58c941996a41c35210ddab7c4cd5c868973932544e05e543bbe86b944d",
+    "patch_sha256": "9cbac18474098eaac3d975e9635b248c72d902dfa3c3eaaecc5b46904fafe425",
+    "replay": "/private/tmp/eredu-moshi-decision-demand-integration-stage/replay",
+    "review": "Root read all 2430 source patch lines, all six tests, actual traversal scheduling and native retention, four docs, and metadata; independently verified 98 artifacts, 36 original/snapshot basis pins, two dependencies, source/full replay and 15 Rust formats. Exact reviewed document replacement/append preserves concurrent additions. No public managed budget enabled.",
+    "reviews": {
+      "/Users/jbg/dev/eredu/doc/validation/bounded-descriptor-shared-stop-integration-2026-09-14.json": "d8eaec81582936c5ee3256a447345b919e072fc80cd32a7a59bfd67044beea3f",
+      "/private/tmp/eredu-moshi-decision-demand-final-root-review.json": "77bb7f96dfa51d859385e4827f10657221c53aec31ec2fbf05991d7e155e8287",
+      "/private/tmp/eredu-moshi-decision-demand-integration-projection-selector-correction-review.json": "1cfb2ab3c36c60ac54d334c74ab5c20ca54ce28d45214865314a945c16bd31a7",
+      "/private/tmp/eredu-moshi-decision-demand-integration-recovery-signature-correction-review.json": "796e84c568ba4f3859ebcd0e28b7bbfbcb75f3bedfc117a4c3f3d9ee5e79e85f",
+      "/private/tmp/eredu-moshi-decision-demand-integration-root-review.json": "57608a9d35064d1c850e3cfcb078701da2006dfe26370612f0161b7f516ab8bf",
+      "/private/tmp/eredu-moshi-decision-demand-integration-spec.json": "11d9c9d2e90d2e74cd1d6342a694a47bed9ea50f6270fba3b74242951f8fbadf",
+      "/private/tmp/eredu-moshi-decision-demand-reviewed-stage/doc-operations.json": "0c2a7020a81a65ea807650a52be366b190f5a69c28b3e52f877720ca9be539bb",
+      "/private/tmp/eredu-moshi-decision-demand-reviewed-stage/manifest.json": "4c83733813f04b0ef21724a6c5c313b04f0c91e4c0bd6b86009108c468fbe503",
+      "/private/tmp/eredu-moshi-decision-demand-reviewed-stage/provenance.json": "be8bbb990f071200c615aeb369f089ecf6e8cc143678acc63a9c743733abaa8e",
+      "/private/tmp/eredu-moshi-decision-demand-stage/DESIGN.md": "727cd18ed42b0208d43058ec962dd82ba8e121d48100494bb9a0ba49daffb1f7",
+      "/private/tmp/eredu-moshi-decision-demand-stage/FROZEN.json": "0ebfca24647d3665c3775d4a1fa3b6be97aeecae35b8beea144cc14e27f7af49",
+      "/private/tmp/eredu-moshi-decision-demand-stage/README.md": "e80da7f31a6ecae7a26ae0de2506a331f74ff33cafbd66d584237d439645b066",
+      "/private/tmp/eredu-moshi-decision-demand-stage/all.patch": "51685052c4709738cc1598636f21ca9173cde2a8b211f207f0dbf09be8b7ce38",
+      "/private/tmp/eredu-moshi-decision-demand-stage/artifact-hashes.json": "ea5c0d313ff7bf622f209b23aff7ba961313634b1334743c77812bb658caf664",
+      "/private/tmp/eredu-moshi-decision-demand-stage/base-hashes.json": "1ad8bd3ea8f694a575eecebb604506a582bf3b0f179d2f75803b6844a83999f6",
+      "/private/tmp/eredu-moshi-decision-demand-stage/change.patch": "c273bb349ad90534f054c2ceabd3a7d3fdcfd05cd95fb5a25df59ebfb7c4141b",
+      "/private/tmp/eredu-moshi-decision-demand-stage/checks.json": "a2dd072c858db7a5c39020e24273ff09b20614dcf23ae9384994748d072f224c",
+      "/private/tmp/eredu-moshi-decision-demand-stage/dependencies.json": "4d2a87e14ac7a8b443cd520991943fd8b4423ead85d299923202fbfce21af530",
+      "/private/tmp/eredu-moshi-decision-demand-stage/doc-edits.json": "5c19074836ed995720b843b02cd645674ecb73bc260fe3cfabe7bf0f4027f1da",
+      "/private/tmp/eredu-moshi-decision-demand-stage/full-manifest.json": "366dc25eb067cdd11d29d60ced33a31410d880e347b67a44d9f01f836e9b2c9c",
+      "/private/tmp/eredu-moshi-decision-demand-stage/new-tests.json": "7ea46f669483a8ec18a9deb3fe2b3c34dd24955a381366ee4a9a1084dc8fd4eb",
+      "/private/tmp/eredu-moshi-decision-demand-stage/provenance.json": "dc375b73fafaff1fca10ad7fb1bd2b93bc490d64b6bd5948d355112343c96a0f",
+      "/private/tmp/eredu-moshi-decision-demand-stage/replay.py": "c0fe2917926aefc4734bdcb7996c49a4b774d40aba0cf86469257709a131779e",
+      "/private/tmp/eredu-moshi-decision-demand-stage/source-basis.json": "19b96a03ed98c3571928856bc63bcbab5660d4758355dea89de7c68f41a067ca",
+      "/private/tmp/eredu-moshi-decision-demand-stage/source-manifest.json": "0764559f96e5204644192c163d79415c0061dbe7f1fdcf3badbafcae308e87e9",
+      "/private/tmp/eredu-moshi-projection-selector-correction-spec.json": "b226df0c13c60788dc7243a95e486fb216256dd892da8c04555a1415a4816624",
+      "/private/tmp/eredu-moshi-projection-selector-correction-stage/README.md": "d377650dadac395789c517f97a701132ed8a307d1d0c68bc32da527def323a06",
+      "/private/tmp/eredu-moshi-projection-selector-correction-stage/change.patch": "31cde93c8fda682255149d74e0a04a7d4161e8cbc56dace9b4e613b1fb4a9707",
+      "/private/tmp/eredu-moshi-projection-selector-correction-stage/failed-numeric.log": "a11e9b5846b513a09def7b4b7f5d72db6b70515e5c667da85100921a3bb1e63b",
+      "/private/tmp/eredu-moshi-projection-selector-correction-stage/manifest.json": "44cc31c643c5c93bc5076d762c7b4f3c77b4c9e90cea2265c5de5dd51845f55c",
+      "/private/tmp/eredu-moshi-recovery-signature-correction-spec.json": "477e3cf10ddde21da9867e9af958e36b01d68479930dfcc33e22d307b7197ace",
+      "/private/tmp/eredu-moshi-recovery-signature-correction-stage/README.md": "7e6ca7df5c4b58607b156fedd2ab80cbbc8e3ad0d7297d6e73686a3b50f07f97",
+      "/private/tmp/eredu-moshi-recovery-signature-correction-stage/change.patch": "1ae6ba7b0f9f5a63a937e1c330765c820d336c08bad59a9c0e3e8ba6b9026d70",
+      "/private/tmp/eredu-moshi-recovery-signature-correction-stage/failed-native-build.log": "3b48bad860003d6967028f8ff93f100ff1c13aadf7f9d785c697187f245251c0",
+      "/private/tmp/eredu-moshi-recovery-signature-correction-stage/manifest.json": "714d70a2b5805b207de9f5d0e90463b0da58e241f4dea7460b4bb924e023391d",
+      "/private/tmp/eredu-prepare-reviewed-document-operations.py": "6081a1503e5d14a5568342dabe9dec34d7f4e223b8dca406ab90b94360bb8aad"
+    },
+    "source_manifest_sha256": "7ff65d0fd2663e9d014c888ccdf7ff1b55807260ad57f625ddc843ee89a02f8b"
+  },
+  "behavior": [
+    "Shared sequential traversal prepares demand before each decision group/unit; omitted scores are allowed only for forced decisions without diagnostics or required observations.",
+    "Moshi selects hidden rows before text/depth vocabulary projection while retaining complete temporal hidden and executed mutable state; legacy score-returning entries remain Sequence wrappers.",
+    "Required observation uses explicit final/sequence semantics and executes forced depth tails; native adapters only retain optional output through existing completion.",
+    "A single prepared transition hook rejects initialization-only required observation after input preparation but before model/completion; unpublished state and original cleanup remain unchanged.",
+    "Nonzero selected resident/host/disk coverage compares ten-frame ordinary/bounded execution, full cache/hidden state for 3/2/1/1 low-level calls, interventions and cancellation/failure prefixes.",
+    "Native conformance harness requires actual named test execution and one passing case; stale module paths corrected."
+  ],
+  "limits": [
+    "Distinct PersonaPlex nonzero/released validation remains open; strict released admission unchanged.",
+    "Native TP numerical execution, PP frame transport, reusable snapshot/fork/persistence and PCM/codec lifecycle remain incomplete.",
+    "This change does not fund native graphs, preparation/output owners or enable a public managed gateway.",
+    "Initialization-only observation rejection follows input preparation; earlier split admission is not claimed."
+  ]
+}

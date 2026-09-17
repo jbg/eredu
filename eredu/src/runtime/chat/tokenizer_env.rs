@@ -1,17 +1,16 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
 use eredu_text::tokenizer::Tokenizer as ChatTokenizer;
 use llguidance::toktrie::{TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv};
-use tokenizers::{
-    normalizers, pre_tokenizers, DecoderWrapper, NormalizerWrapper, PreTokenizerWrapper, Tokenizer,
-};
+use tokenizers::{NormalizerWrapper, PreTokenizerWrapper, Tokenizer, normalizers, pre_tokenizers};
+
+pub(crate) mod recipe;
 
 struct HuggingFaceTokenEnv {
     tokenizer: Tokenizer,
     trie: TokTrie,
+    // The tokenizer and trie must retire before their preparation authority.
+    _authority: eredu_core::HostPreparationAuthority,
 }
 
 impl TokenizerEnv for HuggingFaceTokenEnv {
@@ -46,9 +45,47 @@ pub(super) fn from_tokenizer(
     tokenizer: &ChatTokenizer,
     eos_token_ids: &[u32],
 ) -> Result<TokEnv, String> {
-    let mut tokenizer = (**tokenizer).clone();
-    remove_input_prefixes(&mut tokenizer)?;
+    from_tokenizer_with_authority(
+        tokenizer,
+        eos_token_ids,
+        &eredu_core::HostPreparationAuthority::unmanaged(),
+    )
+}
 
+pub(super) fn from_tokenizer_with_authority(
+    tokenizer: &ChatTokenizer,
+    eos_token_ids: &[u32],
+    authority: &eredu_core::HostPreparationAuthority,
+) -> Result<TokEnv, String> {
+    from_raw((**tokenizer).clone(), eos_token_ids, authority)
+}
+
+fn from_raw(
+    tokenizer: Tokenizer,
+    eos_token_ids: &[u32],
+    authority: &eredu_core::HostPreparationAuthority,
+) -> Result<TokEnv, String> {
+    from_raw_with_info(tokenizer, eos_token_ids, None, authority)
+}
+
+fn from_raw_with_info(
+    mut tokenizer: Tokenizer,
+    eos_token_ids: &[u32],
+    selected_info: Option<&TokRxInfo>,
+    authority: &eredu_core::HostPreparationAuthority,
+) -> Result<TokEnv, String> {
+    remove_input_prefixes(&mut tokenizer)?;
+    from_prepared_raw_with_info(tokenizer, eos_token_ids, selected_info, authority)
+}
+
+// Only the ordinary prefix worker and its closed frozen source can reach this.
+// It consumes the same tokenizer object, with no repeated prefix mutation.
+fn from_prepared_raw_with_info(
+    tokenizer: Tokenizer,
+    eos_token_ids: &[u32],
+    selected_info: Option<&TokRxInfo>,
+    authority: &eredu_core::HostPreparationAuthority,
+) -> Result<TokEnv, String> {
     let decoder = DecoderKind::inspect(&tokenizer)?;
     let vocabulary = eredu_text::tokenizer::token_id_vocabulary(&tokenizer);
     let vocab_size = vocabulary
@@ -67,11 +104,26 @@ pub(super) fn from_tokenizer(
         info.tok_eos = primary_eos;
     }
 
+    if let Some(selected) = selected_info {
+        if selected.vocab_size != vocab_size
+            || eos_token_ids
+                .first()
+                .is_some_and(|id| *id != selected.tok_eos)
+        {
+            return Err("frozen trie metadata differs from its tokenizer or EOS source".into());
+        }
+        info = *selected;
+    }
+
     let mut trie = TokTrie::from(&info, &token_bytes);
     if eos_token_ids.len() > 1 {
         trie = trie.with_eos_tokens(eos_token_ids);
     }
-    Ok(Arc::new(HuggingFaceTokenEnv { tokenizer, trie }))
+    Ok(Arc::new(HuggingFaceTokenEnv {
+        tokenizer,
+        trie,
+        _authority: authority.clone(),
+    }))
 }
 
 fn remove_input_prefixes(tokenizer: &mut Tokenizer) -> Result<(), String> {
@@ -123,87 +175,35 @@ fn remove_input_prefixes(tokenizer: &mut Tokenizer) -> Result<(), String> {
     Ok(())
 }
 
-enum DecoderKind {
-    ByteLevel(HashMap<char, u8>),
-    ByteFallback { space_marker: char },
-}
+struct DecoderKind(eredu_text::token_bytes::TokenByteEncoding);
 
 impl DecoderKind {
     fn inspect(tokenizer: &Tokenizer) -> Result<Self, String> {
-        #[derive(Default)]
-        struct DecoderParts {
-            byte_level: bool,
-            byte_fallback: bool,
-            space_marker: Option<char>,
-        }
-
-        fn visit(decoder: &DecoderWrapper, parts: &mut DecoderParts) -> Result<(), String> {
-            match decoder {
-                DecoderWrapper::ByteLevel(_) => parts.byte_level = true,
-                DecoderWrapper::ByteFallback(_) => parts.byte_fallback = true,
-                DecoderWrapper::Replace(replace) if replace.content == " " => {
-                    let value = serde_json::to_value(replace).map_err(|error| {
-                        format!("failed to inspect replacement decoder: {error}")
-                    })?;
-                    if let Some(pattern) = value["pattern"]["String"].as_str() {
-                        let mut chars = pattern.chars();
-                        if let (Some(marker), None) = (chars.next(), chars.next()) {
-                            parts.space_marker = Some(marker);
-                        }
-                    }
-                }
-                DecoderWrapper::Sequence(sequence) => {
-                    for member in sequence.get_decoders() {
-                        visit(member, parts)?;
-                    }
-                }
-                _ => {}
-            }
-            Ok(())
-        }
-
-        let mut parts = DecoderParts::default();
-        if let Some(decoder) = tokenizer.get_decoder() {
-            visit(decoder, &mut parts)?;
-        }
-        if parts.byte_fallback {
-            Ok(Self::ByteFallback {
-                space_marker: parts.space_marker.unwrap_or(' '),
+        eredu_text::token_bytes::TokenByteEncoding::inspect(tokenizer.get_decoder())
+            .map(Self)
+            .map_err(|_| {
+                format!(
+                    "cannot determine byte encoding from tokenizer decoder {:?}",
+                    tokenizer.get_decoder()
+                )
             })
-        } else if parts.byte_level {
-            Ok(Self::ByteLevel(byte_level_alphabet()))
-        } else {
-            Err(format!(
-                "cannot determine byte encoding from tokenizer decoder {:?}",
-                tokenizer.get_decoder()
-            ))
-        }
     }
 
-    fn token_bytes(&self, token: &str) -> Result<Vec<u8>, String> {
-        match self {
-            Self::ByteLevel(alphabet) => token
-                .chars()
-                .map(|character| {
-                    alphabet.get(&character).copied().ok_or_else(|| {
-                        format!(
-                            "byte-level token {token:?} contains unmapped character {character:?}"
-                        )
-                    })
-                })
-                .collect(),
-            Self::ByteFallback { space_marker } => {
-                if token.len() == 6 && token.starts_with("<0x") && token.ends_with('>') {
-                    u8::from_str_radix(&token[3..5], 16)
-                        .map(|byte| vec![byte])
-                        .map_err(|error| format!("invalid byte-fallback token {token:?}: {error}"))
-                } else if token.starts_with("<0x") {
-                    Err(format!("invalid byte-fallback token {token:?}"))
-                } else {
-                    Ok(token.replace(*space_marker, " ").into_bytes())
-                }
+    fn token_bytes(&self, token: &str, special: bool) -> Result<Vec<u8>, String> {
+        let failure = |cause: eredu_text::token_bytes::TokenByteError| match cause {
+            eredu_text::token_bytes::TokenByteError::Unmapped(character) => {
+                format!("byte-level token {token:?} contains unmapped character {character:?}")
             }
-        }
+            eredu_text::token_bytes::TokenByteError::Fallback(Some(error)) => {
+                format!("invalid byte-fallback token {token:?}: {error}")
+            }
+            _ => format!("invalid byte-fallback token {token:?}"),
+        };
+        let mut bytes = vec![0; self.0.trie_token_len(token, special).map_err(failure)?];
+        self.0
+            .write_trie_token(token, special, &mut bytes)
+            .map_err(failure)?;
+        Ok(bytes)
     }
 }
 
@@ -242,41 +242,16 @@ fn vocabulary_bytes(
 
     // Empty slots are absent from TokTrie, not invented tokenizer entries.
     for (&id, token) in vocabulary {
-        token_bytes[id as usize] = if special_ids.contains(&id) {
-            let mut bytes = Vec::with_capacity(token.len() + 1);
-            bytes.push(TokTrie::SPECIAL_TOKEN_MARKER);
-            bytes.extend_from_slice(token.as_bytes());
-            bytes
-        } else {
-            decoder.token_bytes(token)?
-        };
+        token_bytes[id as usize] = decoder.token_bytes(token, special_ids.contains(&id))?;
     }
 
     Ok(token_bytes)
 }
 
-fn byte_level_alphabet() -> HashMap<char, u8> {
-    let mut alphabet = HashMap::with_capacity(256);
-    let mut escaped = 0x100;
-    for byte in 0..=u8::MAX {
-        let character = byte as char;
-        if matches!(character, '!'..='~' | '\u{00a1}'..='\u{00ac}' | '\u{00ae}'..='\u{00ff}') {
-            alphabet.insert(character, byte);
-        } else {
-            alphabet.insert(
-                char::from_u32(escaped).expect("valid byte-level scalar"),
-                byte,
-            );
-            escaped += 1;
-        }
-    }
-    alphabet
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokenizers::{decoders::byte_level::ByteLevel, models::bpe::BPE, AddedToken};
+    use tokenizers::{AddedToken, decoders::byte_level::ByteLevel, models::bpe::BPE};
 
     #[test]
     fn sparse_ids_keep_their_positions_and_unmapped_eos_is_rejected() {
@@ -291,10 +266,12 @@ mod tests {
         assert_eq!(environment.tok_trie().vocab_size(), 6);
         assert_eq!(environment.tok_trie().token(5), b"b");
         assert!(environment.tok_trie().token(1).is_empty());
-        assert!(from_tokenizer(&tokenizer, &[1])
-            .err()
-            .unwrap()
-            .contains("no consistent tokenizer mapping"));
+        assert!(
+            from_tokenizer(&tokenizer, &[1])
+                .err()
+                .unwrap()
+                .contains("no consistent tokenizer mapping")
+        );
     }
 
     #[test]
@@ -318,5 +295,73 @@ mod tests {
         assert_eq!(environment.tok_trie().token(1), b" b");
         assert_eq!(environment.tok_trie().token(2), b"\xff<|end|>");
         assert_eq!(environment.tok_trie().eos_tokens(), &[2]);
+    }
+    #[test]
+    fn borrowed_packed_vocabulary_matches_actual_trie_for_sparse_special_and_fallback_bytes() {
+        for (decoder, vocabulary) in [
+            (
+                serde_json::json!({"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}),
+                serde_json::json!({"a":0,"Ġb":2,"Ã©":4,"z":7,"<|tool|>":9}),
+            ),
+            (
+                serde_json::json!({"type":"Sequence","decoders":[{"type":"ByteFallback"},{"type":"Fuse"},{"type":"Replace","pattern":{"String":"▁"},"content":" "}]}),
+                serde_json::json!({"a":0,"<0xFF>":2,"é▁🙂":4,"z":7,"<|tool|>":9}),
+            ),
+        ] {
+            let config = serde_json::json!({"version":"1.0","truncation":null,"padding":null,
+                "normalizer":null,"pre_tokenizer":null,"post_processor":null,
+                "decoder":decoder,"added_tokens":[],
+                "model":{"type":"BPE","vocab":vocabulary,"merges":[]}});
+            let mut raw = Tokenizer::from_bytes(config.to_string().as_bytes()).unwrap();
+            raw.add_special_tokens([AddedToken::from("<|tool|>", true).normalized(false)])
+                .unwrap();
+            // Reserve its real ID before marking it special: allocating a new
+            // added token from sparse vocabulary length can shadow existing ID 4.
+            assert_eq!(raw.token_to_id("<|tool|>"), Some(9));
+            assert_eq!(raw.id_to_token(9).as_deref(), Some("<|tool|>"));
+            let frozen = raw.to_string(false).unwrap();
+            let plan =
+                eredu_text::tokenizer_storage::TokenizerPlan::prepare_json(frozen.as_bytes());
+            let source = plan.unwrap().compile().unwrap();
+            let ordinary = from_tokenizer(&ChatTokenizer::from_tokenizer(raw), &[7]).unwrap();
+            let trie_plan = source.token_trie_vocabulary().unwrap();
+            let mut trie_packed = vec![0; trie_plan.packed_bytes()];
+            let trie_view = trie_plan.write_tokens(&mut trie_packed).unwrap();
+            assert_eq!(trie_view.token_count(), ordinary.tok_trie().vocab_size());
+            for token in 0..trie_view.token_count() {
+                assert_eq!(
+                    trie_view.token(token),
+                    Some(ordinary.tok_trie().token(token as u32))
+                );
+            }
+            assert_eq!(trie_view.token(trie_view.token_count()), None);
+            assert_eq!(trie_view.token(9), Some(b"\xff<|tool|>".as_slice()));
+            let plan = source.token_byte_vocabulary().unwrap();
+            assert_eq!(plan.token_count(), ordinary.tok_trie().vocab_size());
+            let mut packed = vec![0; plan.packed_bytes()];
+            plan.write(&mut packed).unwrap();
+            for token in 0..plan.token_count() {
+                let bytes = ordinary.tok_trie().token(token as u32);
+                let expected = bytes
+                    .strip_prefix(&[TokTrie::SPECIAL_TOKEN_MARKER])
+                    .unwrap_or(bytes);
+                assert_eq!(
+                    eredu_core::speculative::packed_controller_token_bytes(
+                        &packed,
+                        plan.token_count(),
+                        plan.maximum_token_bytes(),
+                        token
+                    ),
+                    Some(expected)
+                );
+            }
+            let mut wrong = vec![91; plan.packed_bytes() - 1];
+            assert!(matches!(
+                plan.write(&mut wrong),
+                Err(eredu_text::token_bytes::TokenByteError::Destination)
+            ));
+            assert!(wrong.iter().all(|byte| *byte == 91));
+            assert!(plan.control_bytes().unwrap() > 0);
+        }
     }
 }

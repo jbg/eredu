@@ -20,6 +20,8 @@ use crate::{
 };
 
 use super::{HybridConfig, HybridLayerPolicy, LinearAttention};
+pub(crate) mod construction;
+pub(crate) use construction::{PredictionBlockSpec, TargetBlockSpec};
 
 /// Scheduled hybrid token mixer.
 #[derive(Debug, Clone, Parameterized)]
@@ -35,10 +37,13 @@ pub enum TokenMixer<B: NeuralBackend> {
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
 pub struct SharedRoutedGatedProduct<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     layer: usize,
-    #[parameter(skip)]
-    resident_unit_coordinates: Option<(eredu_core::component::ComponentCoordinateMap, bool)>,
+    #[parameter(skip, metadata)]
+    resident_unit_coordinates: Option<(
+        std::sync::Arc<eredu_core::component::ComponentCoordinateMap>,
+        bool,
+    )>,
     /// Learned top-k router.
     pub router: B::Selector,
     /// Packed routed expert bank.
@@ -57,54 +62,22 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
         routed_spec: Option<GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let prefix = format!("{prefix}.mlp");
-        let routing = config.routing_spec()?;
-        let router_name = format!("{prefix}.gate.weight");
-        let router = B::top_k_group_selector(
-            TopKGroupSelectorSpec::new(
-                config.hidden_size,
-                parameter(&router_name)?,
-                crate::linear_format::standard_linear_format(
-                    &router_name,
-                    config.quantization.into(),
-                )?,
-                routing,
-            )?,
-            context,
-        )?;
-        let experts = B::grouped_gated_product(
-            match routed_spec {
-                Some(spec) => spec,
-                None => expert_bank_spec_at(config, &format!("{prefix}.experts"))?,
-            },
-            context,
-        )?;
-        Ok(Self {
-            layer,
-            resident_unit_coordinates: None,
-            router,
-            experts,
-            shared_expert: new_mlp(
-                config,
-                &format!("{prefix}.shared_expert"),
-                config.shared_expert_intermediate_size,
-                context,
-            )?,
-            shared_expert_gate: new_linear::<B>(
-                config,
-                &format!("{prefix}.shared_expert_gate"),
-                config.hidden_size,
-                1,
-                false,
-                context,
-            )?,
-        })
+        construction::require_source_compiler::<B>(context)?;
+        construction::RoutedSpec::new(config, layer, prefix, routed_spec)?.instantiate::<B>(context)
     }
 
     /// Retains global scalar coordinates for a prepared resident prediction bank.
     pub(crate) fn bind_resident_unit_coordinates(
         &mut self,
         coordinates: eredu_core::component::ComponentCoordinateMap,
+        partitioned: bool,
+    ) {
+        self.bind_shared_resident_unit_coordinates(std::sync::Arc::new(coordinates), partitioned);
+    }
+
+    pub(crate) fn bind_shared_resident_unit_coordinates(
+        &mut self,
+        coordinates: std::sync::Arc<eredu_core::component::ComponentCoordinateMap>,
         partitioned: bool,
     ) {
         self.resident_unit_coordinates = Some((coordinates, partitioned));
@@ -177,8 +150,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
                 pass: pass(input),
             },
             |request| {
-                eredu_runtime::with_resident_unit_coordinates(
-                    self.resident_unit_coordinates.as_ref(),
+                eredu_runtime::with_borrowed_resident_unit_coordinates(
+                    self.resident_unit_coordinates
+                        .as_ref()
+                        .map(|(coordinates, partitioned)| (coordinates.as_ref(), *partitioned)),
                     request,
                     |request| provider.forward_grouped(&mut self.experts, request, context),
                 )
@@ -307,8 +282,10 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> SharedRoutedG
                 pass: pass(input),
             },
             |request| {
-                eredu_runtime::with_resident_unit_coordinates(
-                    self.resident_unit_coordinates.as_ref(),
+                eredu_runtime::with_borrowed_resident_unit_coordinates(
+                    self.resident_unit_coordinates
+                        .as_ref()
+                        .map(|(coordinates, partitioned)| (coordinates.as_ref(), *partitioned)),
                     request,
                     |request| {
                         provider.forward_grouped_tensor_parallel(
@@ -424,27 +401,6 @@ pub enum FeedForward<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBacken
 }
 
 impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> FeedForward<B> {
-    fn new(
-        config: &HybridConfig,
-        layer: usize,
-        prefix: &str,
-        routed_spec: Option<GroupedGatedProductSpec>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        if config.is_moe() {
-            SharedRoutedGatedProduct::new(config, layer, prefix, routed_spec, context)
-                .map(Self::Routed)
-        } else {
-            new_mlp(
-                config,
-                &format!("{prefix}.mlp"),
-                config.intermediate_size,
-                context,
-            )
-            .map(Self::Dense)
-        }
-    }
-
     /// Executes through a runtime-owned expert provider.
     pub fn forward_with_provider<P>(
         &mut self,
@@ -514,17 +470,18 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = crate::decoder::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, &HybridConfig, usize, String, HybridLayerPolicy, TokenMixer<B>,
+            NormalizationConstructionSpec, &<B::Tensor as Tensor>::Context)>()?;
         if config.is_moe() {
-            return Err(Error::backend(
-                "replicated Qwen hybrid unit rejects routed computation",
-            ));
+            return Err(metadata.error(format_args!("replicated Qwen hybrid unit rejects routed computation")));
         }
         let policy = config
             .layer_schedule
             .get(layer)
             .copied()
-            .ok_or_else(|| Error::backend(format!("Qwen hybrid has no layer {layer}")))?;
-        let root = format!("model.layers.{layer}");
+            .ok_or_else(|| metadata.error(format_args!("Qwen hybrid has no layer {layer}")))?;
+        let root = metadata.text(format_args!("model.layers.{layer}"))?;
         let mixer = match policy {
             HybridLayerPolicy::LinearAttention => {
                 TokenMixer::Linear(LinearAttention::new(config, layer, context)?)
@@ -540,18 +497,19 @@ impl<B: NeuralBackend> ReplicatedBlock<B> {
                     dimensions: config.hidden_size,
                     epsilon: config.rms_norm_eps,
                     scale: NormalizationScale::LearnedOffset {
-                        weight: parameter(format!("{root}.{field}.weight"))?,
+                        weight: metadata.named_parameter(format_args!("{root}.{field}.weight"))?,
                         offset: 1.0,
                     },
                 },
                 context,
             )
         };
+        metadata.borrowed_controls(&norm)?;
         Ok(Self {
             mixer,
             feed_forward: new_mlp(
                 config,
-                &format!("{root}.mlp"),
+                &metadata.text(format_args!("{root}.mlp"))?,
                 config.intermediate_size,
                 context,
             )?,
@@ -628,19 +586,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         routed_spec: Option<GroupedGatedProductSpec>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let policy = config
-            .layer_schedule
-            .get(layer)
-            .copied()
-            .ok_or_else(|| Error::backend(format!("Qwen hybrid has no layer {layer}")))?;
-        Self::new_at(
-            config,
-            layer,
-            &format!("model.layers.{layer}"),
-            policy,
-            routed_spec,
-            context,
-        )
+        construction::require_source_compiler::<B>(context)?;
+        TargetBlockSpec::new(config, layer, routed_spec)?.instantiate::<B>(config, context)
     }
 
     /// Builds one configured MTP prediction block at its checkpoint path.
@@ -649,58 +596,8 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> Block<B> {
         depth: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if depth >= usize::try_from(config.mtp_num_hidden_layers).map_err(Error::backend)? {
-            return Err(Error::backend(format!(
-                "Qwen hybrid MTP depth {depth} is outside {} configured layers",
-                config.mtp_num_hidden_layers
-            )));
-        }
-        Self::new_at(
-            config,
-            config.num_hidden_layers as usize + depth,
-            &format!("mtp.layers.{depth}"),
-            HybridLayerPolicy::SelfAttention(eredu_core::attention::AttentionPolicy::Full),
-            None,
-            context,
-        )
-    }
-
-    fn new_at(
-        config: &HybridConfig,
-        layer: usize,
-        root: &str,
-        policy: HybridLayerPolicy,
-        routed_spec: Option<GroupedGatedProductSpec>,
-        context: &<B::Tensor as Tensor>::Context,
-    ) -> Result<Self, Error> {
-        let mixer = match policy {
-            HybridLayerPolicy::LinearAttention => {
-                TokenMixer::Linear(LinearAttention::new(config, layer, context)?)
-            }
-            HybridLayerPolicy::SelfAttention(_) => {
-                TokenMixer::Attention(new_attention(config, root, context)?)
-            }
-        };
-        let norm = |field: &str| {
-            B::normalization(
-                NormalizationConstructionSpec {
-                    groups: None,
-                    dimensions: config.hidden_size,
-                    epsilon: config.rms_norm_eps,
-                    scale: NormalizationScale::LearnedOffset {
-                        weight: parameter(format!("{root}.{field}.weight"))?,
-                        offset: 1.0,
-                    },
-                },
-                context,
-            )
-        };
-        Ok(Self {
-            mixer,
-            feed_forward: FeedForward::new(config, layer, root, routed_spec, context)?,
-            input_norm: norm("input_layernorm")?,
-            post_attention_norm: norm("post_attention_layernorm")?,
-        })
+        construction::require_source_compiler::<B>(context)?;
+        PredictionBlockSpec::new(config, depth)?.instantiate::<B>(context)
     }
 
     /// Executes one block with resident routed experts.
@@ -1026,71 +923,9 @@ fn new_attention<B: NeuralBackend>(
     root: &str,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Attention<B>, Error> {
-    let prefix = format!("{root}.self_attn");
-    let linear = |field: &str, input, output| {
-        new_linear::<B>(
-            config,
-            &format!("{prefix}.{field}"),
-            input,
-            output,
-            config.attention_bias,
-            context,
-        )
-    };
-    let norm = |field: &str| {
-        B::normalization(
-            NormalizationConstructionSpec {
-                groups: None,
-                dimensions: config.head_dim,
-                epsilon: config.rms_norm_eps,
-                scale: NormalizationScale::LearnedOffset {
-                    weight: parameter(format!("{prefix}.{field}.weight"))?,
-                    offset: 1.0,
-                },
-            },
-            context,
-        )
-    };
-    let rope_config = config.rope_config();
-    Attention::from_gated_parts(
-        config.num_attention_heads,
-        config.num_key_value_heads,
-        config.head_dim,
-        linear(
-            "q_proj",
-            config.hidden_size,
-            2 * config.num_attention_heads * config.head_dim,
-        )?,
-        linear(
-            "k_proj",
-            config.hidden_size,
-            config.num_key_value_heads * config.head_dim,
-        )?,
-        linear(
-            "v_proj",
-            config.hidden_size,
-            config.num_key_value_heads * config.head_dim,
-        )?,
-        linear(
-            "o_proj",
-            config.num_attention_heads * config.head_dim,
-            config.hidden_size,
-        )?,
-        Some(norm("q_norm")?),
-        Some(norm("k_norm")?),
-        Some(B::rotary(
-            RotarySpec {
-                arithmetic: eredu_nn::RotaryArithmetic::Native,
-                dimensions: config.rope_dimensions(),
-                base: config.rope_theta(),
-                traditional: false,
-                algorithm: crate::rotary::normalize_algorithm(rope_config.as_ref())
-                    .expect("validated Qwen hybrid RoPE algorithm"),
-            },
-            context,
-        )?),
-        None,
-    )
+    construction::AttentionSpec::new_with_metadata(
+        config, root, crate::decoder::ModuleMetadata::new::<B>(context),
+    )?.instantiate::<B>(context)
 }
 
 fn new_mlp<B: NeuralBackend>(
@@ -1099,59 +934,9 @@ fn new_mlp<B: NeuralBackend>(
     intermediate: i32,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<Mlp<B>, Error> {
-    Ok(Mlp::from_parts(
-        new_linear::<B>(
-            config,
-            &format!("{prefix}.gate_proj"),
-            config.hidden_size,
-            intermediate,
-            false,
-            context,
-        )?,
-        new_linear::<B>(
-            config,
-            &format!("{prefix}.up_proj"),
-            config.hidden_size,
-            intermediate,
-            false,
-            context,
-        )?,
-        new_linear::<B>(
-            config,
-            &format!("{prefix}.down_proj"),
-            intermediate,
-            config.hidden_size,
-            false,
-            context,
-        )?,
-        None,
-    ))
-}
-
-fn new_linear<B: NeuralBackend>(
-    config: &HybridConfig,
-    prefix: &str,
-    input: i32,
-    output: i32,
-    bias: bool,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Linear, Error> {
-    let weight = format!("{prefix}.weight");
-    B::linear(
-        LinearSpec {
-            input,
-            output,
-            weight: parameter(&weight)?,
-            bias: bias
-                .then(|| parameter(format!("{prefix}.bias")))
-                .transpose()?,
-            format: crate::linear_format::standard_linear_format(
-                &weight,
-                config.linear_format(&weight),
-            )?,
-        },
-        context,
-    )
+    construction::MlpSpec::new_with_metadata(
+        config, prefix, intermediate, crate::decoder::ModuleMetadata::new::<B>(context),
+    )?.instantiate::<B>(context)
 }
 
 fn parameter(name: impl AsRef<str>) -> Result<ParameterSpec, Error> {

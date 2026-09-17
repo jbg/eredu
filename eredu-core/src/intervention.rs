@@ -7,6 +7,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
+mod geometry;
+pub use geometry::InterventionGeometryError;
+mod source;
+pub use source::{SharedInterventionPlan, PreparedInterventionPlanCopy, InterventionSourceError};
 mod routed;
 pub use routed::*;
 
@@ -279,6 +283,27 @@ pub struct InterventionMechanisms {
     pub score_stages: Vec<RoutingScoreStage>,
 }
 
+/// Borrowed side-effect-free facts for the same intervention support projection.
+/// These slices grant no tensor, source, allocation, or execution authority.
+#[derive(Debug,Clone,Copy)]
+pub struct InterventionMechanismFacts<'a> {
+    /// Actual sparse collector support.
+    pub routed_units:bool,
+    /// Actual supported operation categories.
+    pub operations:&'a [InterventionKind],
+    /// Actual supported storage dtypes.
+    pub dtypes:&'a [InterventionDtype],
+    /// Actual supported router stages.
+    pub score_stages:&'a [RoutingScoreStage],
+}
+impl InterventionMechanisms {
+    /// Lend the existing facts without allocating an owned discovery DTO.
+    pub fn borrowed(&self)->InterventionMechanismFacts<'_> {
+        InterventionMechanismFacts {routed_units:self.routed_units,operations:&self.operations,
+            dtypes:&self.dtypes,score_stages:&self.score_stages}
+    }
+}
+
 /// One typed mutation. No variant contains native handles or executable code.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -489,7 +514,17 @@ impl InterventionPlan {
         request: CaptureRequestShape,
         session_id: &str,
     ) -> Result<AdmittedInterventionPlan, CaptureError> {
-        self.admit_geometry(discovery, request, None, session_id)
+        self.admit_geometry(discovery, request, None, CaptureTextOrigin::default(), session_id)
+    }
+
+    /// Bind the same ordinary cached opening as the coupled capture request.
+    /// Schedules and Sequence rows remain request-relative; only Context axes
+    /// include the prior cache. This descriptor grants no cached state authority.
+    pub fn admit_with_text_origin(
+        self, discovery: &InterventionDiscovery, request: CaptureRequestShape,
+        origin: CaptureTextOrigin, session_id: &str,
+    ) -> Result<AdmittedInterventionPlan, CaptureError> {
+        self.admit_geometry(discovery, request, None, origin, session_id)
     }
 
     /// Admits edits for independently shaped forwards sharing capture authority.
@@ -505,7 +540,7 @@ impl InterventionPlan {
             prompt_tokens: bounds.max_sequence,
             max_predictions: bounds.max_predictions,
         };
-        self.admit_geometry(discovery, request, Some(bounds), session_id)
+        self.admit_geometry(discovery, request, Some(bounds), CaptureTextOrigin::default(), session_id)
     }
 
     fn admit_geometry(
@@ -513,6 +548,7 @@ impl InterventionPlan {
         discovery: &InterventionDiscovery,
         request: CaptureRequestShape,
         invocation_bounds: Option<CaptureInvocationBounds>,
+        text_origin: CaptureTextOrigin,
         session_id: &str,
     ) -> Result<AdmittedInterventionPlan, CaptureError> {
         require(
@@ -537,6 +573,9 @@ impl InterventionPlan {
         )?;
         if invocation_bounds.is_none() {
             add(request.prompt_tokens, request.max_predictions)?;
+            text_origin.invocation_shape(request, CapturePhase::Decode, request.max_predictions - 1)?;
+        } else {
+            require(text_origin == CaptureTextOrigin::default(), "invocation admission has no ordinary text origin")?;
         }
         mul(request.batch, request.prompt_tokens)?;
         require(
@@ -571,7 +610,7 @@ impl InterventionPlan {
                 matching.next().is_none(),
                 "ambiguous intervention target declaration",
             )?;
-            validate_operation(operation, point, request, invocation_bounds)?;
+            validate_operation(operation, point, request, invocation_bounds, text_origin)?;
             points.push(point.clone());
         }
         for (index, (operation, point)) in self.operations.iter().zip(&points).enumerate() {
@@ -626,6 +665,10 @@ impl InterventionPlan {
                 intervention_digest(IDENTITY_PREFIX, &("invocation", &identity, bounds))?,
                 intervention_digest(INTENT_PREFIX, &("invocation", &intent_identity, bounds))?,
             ),
+            None if text_origin != CaptureTextOrigin::default() => (
+                intervention_digest(IDENTITY_PREFIX, &("text_origin", &identity, text_origin))?,
+                intervention_digest(INTENT_PREFIX, &("text_origin", &intent_identity, text_origin))?,
+            ),
             None => (identity, intent_identity),
         };
         Ok(AdmittedInterventionPlan {
@@ -633,6 +676,7 @@ impl InterventionPlan {
             points,
             request,
             invocation_bounds,
+            text_origin,
             identity,
             intent_identity,
             artifact_identity: discovery.artifact_identity.clone(),
@@ -643,28 +687,29 @@ impl InterventionPlan {
 
 // Stream canonical serialization into the digest instead of copying a complete
 // replacement payload into another JSON buffer at admission.
-fn intervention_digest(prefix: &str, value: &impl Serialize) -> Result<String, CaptureError> {
-    struct DigestWriter(Sha256);
-    impl std::io::Write for DigestWriter {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0.update(bytes);
-            Ok(bytes.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+struct DigestWriter(Sha256);
+impl std::io::Write for DigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
     }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+fn intervention_digest_bytes(value: &impl Serialize) -> Result<[u8; 32], serde_json::Error> {
     let mut writer = DigestWriter(Sha256::new());
-    serde_json::to_writer(&mut writer, value).map_err(|e| CaptureError::Invalid(e.to_string()))?;
-    let digest = writer
-        .0
-        .finalize()
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.0.finalize().into())
+}
+fn intervention_digest(prefix: &str, value: &impl Serialize) -> Result<String, CaptureError> {
+    let digest = intervention_digest_bytes(value)
+        .map_err(|e| CaptureError::Invalid(e.to_string()))?
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Ok(format!("{prefix}-{digest}"))
 }
-
 struct PlanCounter(u64);
 impl std::io::Write for PlanCounter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -687,6 +732,7 @@ pub struct AdmittedInterventionPlan {
     points: Vec<InterventionPoint>,
     request: CaptureRequestShape,
     invocation_bounds: Option<CaptureInvocationBounds>,
+    text_origin: CaptureTextOrigin,
     identity: String,
     intent_identity: String,
     artifact_identity: String,
@@ -730,6 +776,10 @@ impl AdmittedInterventionPlan {
     pub fn request(&self) -> CaptureRequestShape {
         self.request
     }
+    /// Exact ordinary opening origin; independently shaped invocations have none.
+    pub fn text_origin(&self) -> Option<CaptureTextOrigin> {
+        self.invocation_bounds.is_none().then_some(self.text_origin)
+    }
     /// Explicit physical invocation authority, separate from schedule coordinates.
     pub fn invocation_bounds(&self) -> Option<CaptureInvocationBounds> {
         self.invocation_bounds
@@ -747,7 +797,7 @@ impl AdmittedInterventionPlan {
                 bounds.validate(shape, prediction)?;
                 Ok(shape)
             }
-            (None, None) => self.request.invocation_shape(phase, prediction),
+            (None, None) => self.text_origin.invocation_shape(self.request, phase, prediction),
             _ => Err(CaptureError::Invalid(
                 "intervention invocation authority/geometry mismatch".into(),
             )),
@@ -759,6 +809,7 @@ impl AdmittedInterventionPlan {
             discovery,
             self.request,
             self.invocation_bounds,
+            self.text_origin,
             &self.session_id,
         )
     }
@@ -771,8 +822,17 @@ impl AdmittedInterventionPlan {
     ) -> Result<Option<Vec<u64>>, CaptureError> {
         match self.invocation_bounds {
             Some(bounds) => bounds.maximum()?.resolve(point),
-            None => self.request.resolve(point, phase, prediction),
+            None => self.text_origin.invocation_shape(self.request, phase, prediction)?.resolve(point),
         }
+    }
+    /// Active edits at the logits hook retain sequence-score semantics. Edits
+    /// to earlier activations do not themselves request vocabulary projection.
+    pub fn requires_sequence_scores(&self, phase: CapturePhase, prediction: u64) -> bool {
+        prediction < self.request.max_predictions
+            && self.plan.operations.iter().zip(&self.points).any(|(operation, point)| {
+                point.stage == InterventionStage::LogitsBeforeSampling
+                    && operation.schedule.includes(phase, prediction)
+            })
     }
     /// Whether the ordinary path can omit intervention machinery.
     pub fn is_empty(&self) -> bool {
@@ -818,8 +878,8 @@ impl AdmittedInterventionPlan {
             "intervention runtime dtype differs from exact declared dtype",
         )?;
         let point = &self.points[index];
-        let geometry = point.observation_geometry();
-        actual.validate_actual(&geometry, shape)?;
+        actual.validate_actual_axes(Some(&point.axes),shape)
+            .map_err(|cause|cause.legacy_parts(Some((&point.path,&point.axes))))?;
         let slice = operation.resolve_slice(point, shape)?;
         validate_payload_shape(&operation.action, &slice.shape)?;
         Ok(slice)
@@ -833,17 +893,11 @@ impl InterventionOperation {
         point: &InterventionPoint,
         shape: &[u64],
     ) -> Result<ResolvedCaptureSlice, CaptureError> {
-        resolve_slice(
-            &point.observation_geometry(),
-            &CaptureSelection {
-                id: self.id.clone(),
-                path: self.target.clone(),
-                schedule: self.schedule.clone(),
-                slices: self.slices.clone(),
-                transform: CaptureTransform::FullTensor,
-            },
-            shape,
-        )
+        let mut output=ResolvedCaptureSlice {starts:vec![0;shape.len()],ends:shape.to_vec(),
+            strides:vec![1;shape.len()],shape:shape.to_vec()};
+        resolve_slice_into(Some(&point.axes),&self.slices,shape,&mut output.starts,&mut output.ends,
+            &mut output.strides,&mut output.shape).map_err(|cause|cause.legacy(&self.slices))?;
+        Ok(output)
     }
 }
 
@@ -852,6 +906,7 @@ fn validate_operation(
     point: &InterventionPoint,
     request: CaptureRequestShape,
     invocation_bounds: Option<CaptureInvocationBounds>,
+    text_origin: CaptureTextOrigin,
 ) -> Result<(), CaptureError> {
     if let Some(routed) = &point.routed_units {
         routed.validate(point)?;
@@ -965,7 +1020,7 @@ fn validate_operation(
             let geometry = point.observation_geometry();
             let actual = match invocation_bounds {
                 Some(bounds) => bounds.maximum()?,
-                None => request.invocation_shape(phase, last)?,
+                None => text_origin.invocation_shape(request, phase, last)?,
             };
             actual.validate_slices(&geometry, &operation.slices)?;
             if let Some(shape) = actual.resolve(&geometry)? {
@@ -1019,9 +1074,8 @@ fn validate_activation_parameters(
             let width = vocabulary.ok_or_else(|| {
                 CaptureError::Unsupported("component mask requires a known component extent".into())
             })?;
-            let mut unique = BTreeSet::new();
             require(
-                indices.iter().all(|id| *id < width && unique.insert(*id)),
+                unique_ids_in_range(indices, width),
                 "duplicate or out-of-range component indices",
             )?;
         }
@@ -1174,28 +1228,46 @@ fn validate_payload_shape(
     action: &InterventionAction,
     selected: &[u64],
 ) -> Result<(), CaptureError> {
-    let expected: Option<&[u64]> = match action {
-        InterventionAction::Mask { shape, .. } => Some(shape),
-        InterventionAction::Replace { tensor } | InterventionAction::Add { tensor } => {
-            Some(&tensor.shape)
-        }
-        InterventionAction::ForceExperts { shape, .. } => Some(shape),
-        _ => None,
-    };
     require(!selected.contains(&0), "empty intervention selection")?;
-    require(
-        expected.is_none_or(|expected| expected == selected),
-        "intervention payload must exactly match selected shape; broadcasting is prohibited",
-    )
+    require(payload_shape_matches(action,selected),
+        "intervention payload must exactly match selected shape; broadcasting is prohibited")
+}
+fn payload_shape_matches(action:&InterventionAction,selected:&[u64])->bool {
+    let expected:Option<&[u64]>=match action {
+        InterventionAction::Mask {shape,..}=>Some(shape),
+        InterventionAction::ForceExperts {shape,..}=>Some(shape),
+        InterventionAction::Replace {tensor}|InterventionAction::Add {tensor}=>Some(&tensor.shape),
+        _=>None,
+    };
+    !selected.contains(&0) && expected.is_none_or(|expected|expected==selected)
 }
 
 fn validate_ids(ids: &[u32], count: u32) -> Result<(), CaptureError> {
     require(!ids.is_empty(), "intervention ID list must be nonempty")?;
-    let mut unique = BTreeSet::new();
     require(
-        ids.iter().all(|id| *id < count && unique.insert(*id)),
+        unique_ids_in_range(ids, count),
         "intervention IDs are duplicate or out of range",
     )
+}
+
+// Validate the immutable caller order without a temporary tree. Range failure
+// still precedes duplicate comparison for each entry; the first invalid entry
+// stops the scan, just as with insertion into the former validation set.
+fn unique_ids_in_range(ids: &[u32], count: u32) -> bool {
+    let mut maximum: Option<u32> = None;
+    for (offset, &id) in ids.iter().enumerate() {
+        if id >= count {
+            return false;
+        }
+        // Strictly increasing IDs are necessarily new. Only an out-of-order
+        // value needs the borrowed-prefix fallback; normal sorted masks stay
+        // linear without constructing a validation set.
+        if maximum.is_some_and(|previous| id <= previous) && ids[..offset].contains(&id) {
+            return false;
+        }
+        maximum = Some(maximum.map_or(id, |previous| previous.max(id)));
+    }
+    true
 }
 
 fn require(condition: bool, message: &str) -> Result<(), CaptureError> {
@@ -1294,6 +1366,13 @@ pub trait InterventionBackend: CaptureBackend {
     ) -> Option<Result<Self::Tensor, Self::Error>> {
         None
     }
+    /// Compares exact activation shape without evaluating or retaining tensors.
+    /// Backends with borrowed metadata override the default host-vector adapter.
+    fn matches_intervention_shape(
+        &self, tensor: &Self::Tensor, expected: &[u64],
+    ) -> Result<bool, Self::Error> {
+        self.shape(tensor).map(|actual| actual == expected)
+    }
     /// Exact dtype without evaluating the native value.
     fn intervention_dtype(&self, tensor: &Self::Tensor) -> Result<InterventionDtype, Self::Error>;
     /// Checks backend indexing/shape limits without allocating or evaluating tensors.
@@ -1384,6 +1463,19 @@ pub trait InterventionEstimator: Send + Sync {
         Err(CaptureError::Unsupported(
             "sparse unit edits unavailable".into(),
         ))
+    }
+    /// Sparse work for one physical row window. The action and slice retain
+    /// logical prompt coordinates; `physical_source` bounds actual participating
+    /// rows. The default preserves the existing conservative logical estimate.
+    fn window_routed_unit_usage(
+        &self,
+        geometry: RoutedUnitGeometry,
+        logical_source: &[u64],
+        _physical_source: &[u64],
+        slice: &ResolvedCaptureSlice,
+        action: &InterventionAction,
+    ) -> Result<CaptureUsage, CaptureError> {
+        self.routed_unit_usage(geometry, logical_source, slice, action)
     }
     /// Additional native indexing constraints, beyond portable slice validation.
     fn validate_geometry(

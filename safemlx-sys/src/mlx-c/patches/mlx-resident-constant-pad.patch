@@ -1,0 +1,302 @@
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -1451,7 +1451,7 @@
+ 
+ array edge_pad(
+     const array& a,
+-    const std::vector<int>& axes,
++    AxisView axes,
+     const Shape& low_pad_size,
+     const Shape& high_pad_size,
+     const Shape& out_shape,
+@@ -1495,14 +1495,14 @@
+ }
+ 
+ /** Pad an array with a constant value */
+-array pad(
+-    const array& a,
+-    const std::vector<int>& axes,
++array pad_axes(
++    const array& a,
++    AxisView axes,
+     const Shape& low_pad_size,
+     const Shape& high_pad_size,
+-    const array& pad_value /*= array(0)*/,
+-    const std::string& mode /*= "constant"*/,
+-    StreamOrDevice s /* = {}*/) {
++    const array& pad_value,
++    const std::string& mode,
++    StreamOrDevice s) {
+   if (axes.size() != low_pad_size.size() ||
+       axes.size() != high_pad_size.size()) {
+     std::ostringstream msg;
+@@ -1548,6 +1548,17 @@
+   }
+ }
+ 
++array pad(
++    const array& a,
++    const std::vector<int>& axes,
++    const Shape& lows,
++    const Shape& highs,
++    const array& value,
++    const std::string& mode,
++    StreamOrDevice s) {
++  return pad_axes(a, AxisView(axes), lows, highs, value, mode, s);
++}
++
+ /** Pad an array with a constant value along all axes */
+ array pad(
+     const array& a,
+@@ -1555,7 +1566,7 @@
+     const array& pad_value /*= array(0)*/,
+     const std::string& mode /*= "constant"*/,
+     StreamOrDevice s /*= {}*/) {
+-  std::vector<int> axes(a.ndim(), 0);
++  Shape axes(a.ndim(), 0);
+   std::iota(axes.begin(), axes.end(), 0);
+ 
+   Shape lows;
+@@ -1566,7 +1577,7 @@
+     highs.push_back(pads.second);
+   }
+ 
+-  return pad(a, axes, lows, highs, pad_value, mode, s);
++  return pad_axes(a, axes, lows, highs, pad_value, mode, s);
+ }
+ 
+ array pad(
+@@ -1575,12 +1586,10 @@
+     const array& pad_value /*= array(0)*/,
+     const std::string& mode /*= "constant"*/,
+     StreamOrDevice s /*= {}*/) {
+-  return pad(
+-      a,
+-      std::vector<std::pair<int, int>>(a.ndim(), pad_width),
+-      pad_value,
+-      mode,
+-      s);
++  Shape axes(a.ndim(), 0);
++  std::iota(axes.begin(), axes.end(), 0);
++  return pad_axes(a, axes, Shape(a.ndim(), pad_width.first),
++      Shape(a.ndim(), pad_width.second), pad_value, mode, s);
+ }
+ 
+ array pad(
+@@ -1589,12 +1598,7 @@
+     const array& pad_value /*= array(0)*/,
+     const std::string& mode /*= "constant"*/,
+     StreamOrDevice s /*= {}*/) {
+-  return pad(
+-      a,
+-      std::vector<std::pair<int, int>>(a.ndim(), {pad_width, pad_width}),
+-      pad_value,
+-      mode,
+-      s);
++  return pad(a, std::pair<int, int>{pad_width, pad_width}, pad_value, mode, s);
+ }
+ 
+ array moveaxis(
+diff --git a/mlx/ops.h b/mlx/ops.h
+--- a/mlx/ops.h
++++ b/mlx/ops.h
+@@ -6,6 +6,7 @@
+ 
+ #include "mlx/api.h"
+ #include "mlx/array.h"
++#include "mlx/axis_view.h"
+ #include "mlx/device.h"
+ #include "mlx/stream.h"
+ #include "mlx/utils.h"
+@@ -376,6 +377,16 @@
+ /** Move an axis of an array. */
+ MLX_API array
+ moveaxis(const array& a, int source, int destination, StreamOrDevice s = {});
++
++// Shared implementation for borrowed axes; no borrowed view is retained.
++MLX_API array pad_axes(
++    const array& a,
++    AxisView axes,
++    const Shape& low_pad_size,
++    const Shape& high_pad_size,
++    const array& pad_value,
++    const std::string& mode,
++    StreamOrDevice s = {});
+ 
+ /** Pad an array with a constant value */
+ MLX_API array
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -6,6 +6,7 @@
+ 
+ #include "mlx/api.h"
+ #include "mlx/array.h"
++#include "mlx/axis_view.h"
+ #include "mlx/device.h"
+ #include "mlx/io/load.h"
+ #include "mlx/host_transfer.h"
+@@ -1616,8 +1617,15 @@
+       const std::vector<int>& axes,
+       const Shape& low_pad_size,
+       const Shape& high_pad_size)
++      : Pad(stream, AxisView(axes), low_pad_size, high_pad_size) {}
++
++  explicit Pad(
++      Stream stream,
++      AxisView axes,
++      const Shape& low_pad_size,
++      const Shape& high_pad_size)
+       : UnaryPrimitive(stream),
+-        axes_(axes),
++        axes_(axes.begin(), axes.end()),
+         low_pad_size_(low_pad_size),
+         high_pad_size_(high_pad_size) {}
+ 
+@@ -1629,11 +1637,14 @@
+   DEFINE_NAME(Pad)
+   bool is_equivalent(const Primitive& other) const override;
+   auto state() const {
+-    return std::make_tuple(axes_, low_pad_size_, high_pad_size_);
+-  }
+-
+- private:
+-  std::vector<int> axes_;
++    // Preserve the ordinary public state/serializer type. Original execution
++    // does not materialize this diagnostic vector.
++    return std::make_tuple(std::vector<int>(axes_.begin(), axes_.end()),
++        low_pad_size_, high_pad_size_);
++  }
++
++ private:
++  Shape axes_;
+   Shape low_pad_size_;
+   Shape high_pad_size_;
+ };
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -3346,7 +3346,7 @@
+   assert(argnums.size() == 1 && argnums[0] == 0);
+ 
+   return {
+-      pad(tangents[0],
++      pad_axes(tangents[0],
+           axes_,
+           low_pad_size_,
+           high_pad_size_,
+@@ -3367,17 +3367,17 @@
+   }
+ 
+   auto ax = axes[0];
+-  auto pad_axes = axes_;
++  auto mapped_axes = axes_;
+   if (ax >= 0) {
+-    for (auto& pad_ax : pad_axes) {
++    for (auto& pad_ax : mapped_axes) {
+       pad_ax = (pad_ax >= ax) ? pad_ax + 1 : pad_ax;
+     }
+   }
+ 
+   return {
+-      {pad(
++      {pad_axes(
+           inputs[0],
+-          pad_axes,
++          mapped_axes,
+           low_pad_size_,
+           high_pad_size_,
+           inputs[1],
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -380,7 +380,7 @@
+       resident_primitive_control<fast::CustomKernel>(),
+       resident_primitive_control<Sqrt>(), resident_primitive_control<Sigmoid>(),
+       resident_primitive_control<Negative>(),
+-      resident_primitive_control<Convolution>(),
++      resident_primitive_control<Convolution>(), resident_primitive_control<Pad>(),
+       resident_primitive_control<Softmax>(), resident_primitive_control<StopGradient>(),
+       resident_primitive_control<Arange>(), resident_primitive_control<Cos>(),
+       resident_primitive_control<Sin>(), resident_primitive_control<Concatenate>(),
+@@ -448,7 +448,10 @@
+       // Convolution's normalized caller axes, moved aggregate and constructor
+       // parameter are distinct inline frames. The retained five axes are already
+       // inside its actual primitive control, never another heap allowance.
+-      3 * sizeof(Convolution::Axes) + sizeof(Shape) + 4 * sizeof(AxisView);
++      3 * sizeof(Convolution::Axes) + sizeof(Shape) + 4 * sizeof(AxisView) +
++      // Constant pad's C shapes and borrowed axis/control transports. Its
++      // retained axes/lows/highs are in the actual Pad primitive above.
++      4 * sizeof(Shape) + sizeof(AxisView) + sizeof(std::string);
+   if (!GraphConstruction::complete_layout(value)) return false;
+   output = value; return true;
+ #endif
+diff --git a/mlx/backend/gpu/slicing.h b/mlx/backend/gpu/slicing.h
+--- a/mlx/backend/gpu/slicing.h
++++ b/mlx/backend/gpu/slicing.h
+@@ -23,7 +23,7 @@
+     const array& in,
+     const array& val,
+     array& out,
+-    const std::vector<int>& axes,
++    const Shape& axes,
+     const Shape& low_pad_size,
+     const Stream& s);
+ 
+diff --git a/mlx/backend/gpu/slicing.cpp b/mlx/backend/gpu/slicing.cpp
+--- a/mlx/backend/gpu/slicing.cpp
++++ b/mlx/backend/gpu/slicing.cpp
+@@ -19,7 +19,7 @@
+     const array& in,
+     const array& val,
+     array& out,
+-    const std::vector<int>& axes,
++    const Shape& axes,
+     const Shape& low_pad_size,
+     const Stream& s) {
+   // Fill output with val
+@@ -32,13 +32,13 @@
+     data_offset += out.strides()[ax] * low_pad_size[i];
+   }
+ 
+-  // Extract slice from output where input will be pasted
+-  array out_slice(in.shape(), out.dtype(), nullptr, {});
+-  out_slice.copy_shared_buffer(
+-      out, out.strides(), out.flags(), out_slice.size(), data_offset);
+-
+-  // Copy input values into the slice
+-  copy_gpu_inplace(in, out_slice, CopyType::GeneralGeneral, s);
++  // The copy worker already accepts explicit geometry and offsets. Borrow the
++  // output directly instead of allocating an alias descriptor for this slice.
++  // An empty input still leaves the successfully filled padding untouched.
++  if (in.size() != 0) {
++    copy_gpu_inplace(in, out, in.shape(), in.strides(), out.strides(),
++        0, data_offset, CopyType::GeneralGeneral, s);
++  }
+ }
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/cpu/primitives.cpp b/mlx/backend/cpu/primitives.cpp
+--- a/mlx/backend/cpu/primitives.cpp
++++ b/mlx/backend/cpu/primitives.cpp
+@@ -260,13 +260,12 @@
+     data_offset += out.strides()[ax] * low_pad_size_[i];
+   }
+ 
+-  // Extract slice from output where input will be pasted
+-  array out_slice(in.shape(), out.dtype(), nullptr, {});
+-  out_slice.copy_shared_buffer(
+-      out, out.strides(), out.flags(), out_slice.size(), data_offset);
+-
+-  // Copy input values into the slice
+-  copy_cpu_inplace(in, out_slice, CopyType::GeneralGeneral, stream());
++  // Use the same copy worker's explicit slice geometry without a new alias
++  // descriptor. Empty input still requires the padding fill above.
++  if (in.size() != 0) {
++    copy_cpu_inplace(in, out, in.shape(), in.strides(), out.strides(),
++        0, data_offset, CopyType::GeneralGeneral, stream());
++  }
+ }
+ 
+ void RandomBits::eval_cpu(const ArrayVector& inputs, array& out) {

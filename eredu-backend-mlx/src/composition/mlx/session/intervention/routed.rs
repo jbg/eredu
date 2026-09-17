@@ -8,7 +8,7 @@ pub(super) fn indices(values: &[u64]) -> Result<Array, Error> {
         .collect::<Result<Vec<_>, _>>()?;
     let len =
         i32::try_from(values.len()).map_err(|_| Error::observation(CaptureError::Overflow))?;
-    Ok(Array::from_slice(&values, &[len]))
+    Ok(Array::try_from_slice(&values, &[len])?)
 }
 
 pub(super) fn locations(
@@ -56,7 +56,15 @@ pub(super) fn locations(
     let tokens = tokens_array.evaluated()?;
     let slots = slots_array.evaluated()?;
     let mut at = Vec::with_capacity(shape[0] as usize);
-    for (&token, &selection) in tokens.as_slice::<u32>().iter().zip(slots.as_slice::<u32>()) {
+    for (token, selection) in tokens
+        .try_iter::<u32>()
+        .map_err(eredu_nn::Error::backend_source)?
+        .zip(
+            slots
+                .try_iter::<u32>()
+                .map_err(eredu_nn::Error::backend_source)?,
+        )
+    {
         if token as u64 >= coefficients[0] as u64
             || selection as u64 / geometry.routes_per_token != token as u64
         {
@@ -77,11 +85,19 @@ pub(super) fn locations(
         .as_dtype(Dtype::Uint32, stream)?;
     let groups = group_array.evaluated()?;
     let mut rows = Vec::with_capacity(shape[0] as usize);
-    for ((&token, &selection), &group) in tokens
-        .as_slice::<u32>()
-        .iter()
-        .zip(slots.as_slice::<u32>())
-        .zip(groups.as_slice::<u32>())
+    for ((token, selection), group) in tokens
+        .try_iter::<u32>()
+        .map_err(eredu_nn::Error::backend_source)?
+        .zip(
+            slots
+                .try_iter::<u32>()
+                .map_err(eredu_nn::Error::backend_source)?,
+        )
+        .zip(
+            groups
+                .try_iter::<u32>()
+                .map_err(eredu_nn::Error::backend_source)?,
+        )
     {
         let expert = match source.global_groups {
             Some(map) => *map.get(group as usize).ok_or_else(invalid)? as u64,

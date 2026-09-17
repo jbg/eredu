@@ -8,12 +8,13 @@ pub(crate) fn bind_partitioned_routed<A, S, G, F>(
         G,
         <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>>::Boundary,
     >,
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     distributed: crate::backend::distributed::MlxDistributedSession,
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
     finalizer: F,
+    addressable_manager: Option<&AddressableManagerSlot>,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
@@ -25,7 +26,7 @@ where
     G: 'static,
     F: ReplicatedExecutableFinalizer<A, S>,
 {
-    let bank_store = Arc::clone(&store);
+    let bank_store = store.clone();
     eredu_architectures::prepared_execution::construct_selected_partition_providers(
         prepared,
         |prepared, options| {
@@ -36,7 +37,8 @@ where
                 prepared.layout(),
                 weights_stream,
                 stream,
-            )?;
+            addressable_manager,
+        )?;
             prepared
                 .banks()
                 .iter()
@@ -48,15 +50,11 @@ where
                         .filter(|(key, _)| key.bank() == id.value() as usize)
                         .map(|(key, bytes)| (*key, *bytes))
                         .collect();
-                    Ok((
-                        *id,
-                        eredu_architectures::prepared_execution::PartitionBankMechanisms::new(
-                            bytes,
-                            bank.clone(),
-                            crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement,
-                            bank,
-                        ),
-                    ))
+                    let movement=crate::backend::runtime::residency::parameter_bank::MlxIndexedMovement::for_bank(bank.clone(),options);
+                    let retained=movement.indexed_bank_source().cloned().ok_or(Error::PrefillControl(
+                        eredu_runtime::working_memory::WorkingMemoryError::IdentityMismatch))?;
+                    Ok((*id,eredu_architectures::prepared_execution::PartitionBankMechanisms::new(
+                        bytes,bank,movement,retained)))
                 })
                 .collect::<Result<std::collections::BTreeMap<_, _>, Error>>()
         },
@@ -78,7 +76,7 @@ where
 #[allow(clippy::type_complexity)]
 fn bind_selected_partition_provider<A, S, G, Provider, F>(
     (store, distributed, additional, stream, weights_stream, finalizer): (
-        Arc<dyn CheckpointSource>,
+        eredu_checkpoint::store::RetainedCheckpointSource,
         crate::backend::distributed::MlxDistributedSession,
         std::collections::BTreeSet<String>,
         &Stream,
@@ -92,7 +90,7 @@ fn bind_selected_partition_provider<A, S, G, Provider, F>(
         <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>>::Boundary,
     >,
     provider: Provider,
-    bank: std::collections::BTreeMap<eredu_runtime::RoutedBankId, MlxSharedAddressableBank>,
+    bank: std::collections::BTreeMap<eredu_runtime::RoutedBankId, crate::backend::runtime::residency::parameter_bank::IndexedBankSource>,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
     S: MlxStateMechanisms + 'static,
@@ -127,12 +125,12 @@ pub(crate) fn bind_partitioned_routed_with_provider<A, S, G, Provider, F>(
         G,
         <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>>::Boundary,
     >,
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     distributed: crate::backend::distributed::MlxDistributedSession,
     provider: Provider,
     parameter_bank: std::collections::BTreeMap<
         eredu_runtime::RoutedBankId,
-        MlxSharedAddressableBank,
+        crate::backend::runtime::residency::parameter_bank::IndexedBankSource,
     >,
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
@@ -199,12 +197,12 @@ pub(crate) fn bind_partitioned_routed_local_with_provider<A, S, G, Provider, F>(
         G,
         <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>>::Boundary,
     >,
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     distributed: crate::backend::distributed::MlxDistributedSession,
     provider: Provider,
     parameter_bank: std::collections::BTreeMap<
         eredu_runtime::RoutedBankId,
-        MlxSharedAddressableBank,
+        crate::backend::runtime::residency::parameter_bank::IndexedBankSource,
     >,
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
@@ -233,7 +231,7 @@ where
         .addressable_logical_targets()
         .into_iter()
         .collect::<Vec<_>>();
-    let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
+    let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream)?;
     mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(ignored_expert_sources);
     let mut distributed = Some(distributed);

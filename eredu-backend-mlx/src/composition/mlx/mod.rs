@@ -8,6 +8,7 @@ mod inspection;
 mod load_request;
 pub mod loading;
 mod model;
+pub(in crate::composition) use model::settle_loaded_numerical_values;
 mod prepared_speculative;
 mod processor;
 pub mod realtime;
@@ -26,8 +27,12 @@ pub use loading::{MlxModelConfig, MlxSelectedPreparation};
 pub(crate) use model::Executable;
 #[cfg(any(feature = "image", feature = "audio"))]
 pub(crate) use processor::ModelProcessor;
+pub(crate) use session::CompletedOriginalModelInput;
 pub use session::{
-    MlxModelInput, MlxModelOutput, MlxModelSession, MlxNativeTextState, MlxSessionCompletion,
+    MlxHostInputUploadError, MlxModelInput, MlxModelOutput, MlxModelSession, MlxNativeTextState,
+    MlxOriginalPreparedModelInput, MlxOriginalPreparedNativeInput, MlxPreparedInputMaterializer,
+    MlxPreparedModelInputBindError, MlxPreparedModelInputError, MlxPreparedModelInputPlan,
+    MlxPreparedNativeInputError, MlxPreparedNativeInputPlan, MlxSessionCompletion,
     MlxTextSamplingState,
 };
 

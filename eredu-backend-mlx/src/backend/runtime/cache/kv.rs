@@ -1,11 +1,11 @@
 use safemlx::{
+    Array, Dtype, Stream,
     error::Exception,
     ops::{
         broadcast_to, concatenate_axis,
         indexing::{TryIndexMutOp, TryIndexOp},
-        matmul, maximum, r#where, sum_axis, zeros_dtype,
+        matmul, maximum, sum_axis, r#where, zeros_dtype,
     },
-    Array, Dtype, Stream,
 };
 
 use eredu_nn::{
@@ -110,8 +110,10 @@ pub use pooling::{PoolingCache, PoolingCacheState, PoolingWindows};
 
 mod compressed;
 pub use compressed::CompressedLatentCache;
+pub(crate) use compressed::{InvalidResidentCopy, PreparedCompressedCopy};
 
 mod paged;
+pub(crate) use paged::{PagedWorkspaceProjectionFailure, ProjectedPagedCacheSource, ProjectedPagedSource, PagedCacheArrayGeometry, PagedCacheBlockGeometry, PagedCacheSourceGeometry, PagedKeyValueSource};
 pub use paged::{
     LiveKeyValueCache, PagedKeyValueCache, PagedKeyValueTransactionCheckpoint,
     PagedLatentAttentionBlock,

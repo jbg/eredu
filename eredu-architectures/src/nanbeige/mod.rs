@@ -6,9 +6,7 @@
 use std::{collections::HashMap, io::Read};
 
 use eredu_checkpoint::WeightQuantization;
-use eredu_core::{
-    cache::derive_prompt_cache_architecture_fingerprint, AttentionPolicy, LayerSchedule,
-};
+use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_nn::{Error, RotarySpec};
 use serde::Deserialize;
 use serde_json::Value;
@@ -63,14 +61,22 @@ impl ModelArgs {
     }
     /// Physical encoding of one checkpoint parameter.
     pub fn weight_quantization_for(&self, name: &str) -> Option<WeightQuantization> {
-        self.dense.weight_quantization_for(name).or_else(|| {
-            self.dense
-                .weight_quantization_for(&crate::decoder::repeated::source_name(
-                    "model",
-                    self.physical_layer_count(),
-                    name,
-                ))
+        self.weight_quantization_with(name, |source| {
+            Ok::<_, std::convert::Infallible>(source.to_string())
         })
+        .unwrap_or_else(|never| match never {})
+    }
+    fn weight_quantization_with<E>(
+        &self,
+        name: &str,
+        own: impl FnOnce(crate::decoder::repeated::RepeatedParameterName<'_>) -> Result<String, E>,
+    ) -> Result<Option<WeightQuantization>, E> {
+        if let Some(format) = self.dense.weight_quantization_for(name) {
+            return Ok(Some(format));
+        }
+        let source =
+            crate::decoder::repeated::source_name_view("model", self.physical_layer_count(), name);
+        Ok(self.dense.weight_quantization_for(&own(source)?))
     }
 }
 
@@ -302,23 +308,95 @@ pub fn with_checkpoint_formats(
 
 /// Stable cache identity including every pass and inter-pass normalization.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    derive_prompt_cache_architecture_fingerprint(
-        "nanbeige",
-        [
+    prompt_cache_architecture_fingerprint_with_metadata(
+        args,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary fingerprint formatting is infallible")
+}
+fn prompt_cache_architecture_fingerprint_with_metadata(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    metadata.fingerprint("nanbeige", || {
+        Ok([
+            ("dense", metadata.configured(&args.dense)?),
             (
-                "dense",
-                crate::llama::prompt_cache_architecture_fingerprint(&args.dense),
+                "num_loops",
+                metadata.format(format_args!("{}", args.num_loops))?,
             ),
-            ("num_loops", args.num_loops.to_string()),
             (
                 "skip_loop_final_norm",
-                args.skip_loop_final_norm.to_string(),
+                metadata.format(format_args!("{}", args.skip_loop_final_norm))?,
             ),
-        ],
-    )
+        ])
+    })
 }
 
 impl Config for ModelArgs {
+    fn weight_quantization_with_metadata(
+        &self,
+        name: &str,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<WeightQuantization>, eredu_nn::Error> {
+        self.weight_quantization_with(name, |source| {
+            context.metadata_string(format_args!("{source}"))
+        })
+    }
+
+    fn linear_format_with_metadata(
+        &self,
+        name: &str,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        self.weight_quantization_with(name, |source| {
+            context.metadata_string(format_args!("{source}"))
+        })
+        .map(Into::into)
+    }
+
+    fn parameter_alias_with_metadata(
+        &self,
+        name: &str,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        let source =
+            crate::decoder::repeated::source_name_view("model", self.physical_layer_count(), name);
+        let source = context.metadata_string(format_args!("{source}"))?;
+        Ok((source != name).then_some(source))
+    }
+    fn attention_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn feed_forward_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, eredu_nn::Error> {
+        Ok(None)
+    }
+    fn rotary_spec_with_metadata(
+        &self,
+        dimensions: i32,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<RotarySpec, eredu_nn::Error> {
+        self.dense.rotary_spec_with_metadata(dimensions, context)
+    }
+
+    fn attention_value_format_with_metadata(
+        &self,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_checkpoint::LinearFormat, eredu_nn::Error> {
+        crate::decoder::parameter_metadata::default_attention_value_format_with_metadata(
+            self, layer, context,
+        )
+    }
+
     fn parameter_alias(&self, name: &str) -> Option<String> {
         let source =
             crate::decoder::repeated::source_name("model", self.physical_layer_count(), name);
@@ -333,8 +411,23 @@ impl Config for ModelArgs {
     fn architecture_fingerprint(&self) -> String {
         prompt_cache_architecture_fingerprint(self)
     }
+    fn architecture_fingerprint_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<String, eredu_nn::Error> {
+        prompt_cache_architecture_fingerprint_with_metadata(
+            self,
+            crate::decoder::identity::Metadata::new(Some(context)),
+        )
+    }
     fn validate_config(&self) -> Result<(), Error> {
         self.dense.validate_config()
+    }
+    fn validate_config_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), Error> {
+        self.dense.validate_config_with_metadata(context)
     }
     fn hidden_size(&self) -> i32 {
         self.dense.hidden_size()
@@ -343,10 +436,16 @@ impl Config for ModelArgs {
         self.state_layer_count() as i32
     }
     fn block_output_normalization(&self, layer: usize) -> Option<String> {
-        (!self.skip_loop_final_norm
-            && (layer + 1) % self.physical_layer_count() == 0
-            && layer + 1 < self.state_layer_count())
-        .then(|| format!("model.layers.{layer}.output_norm.weight"))
+        output_normalization_name(self, layer).map(|name| name.to_string())
+    }
+    fn block_output_normalization_with_metadata(
+        &self,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, Error> {
+        output_normalization_name(self, layer)
+            .map(|name| context.metadata_string(format_args!("{name}")))
+            .transpose()
     }
     fn intermediate_size(&self) -> i32 {
         self.dense.intermediate_size()
@@ -404,4 +503,19 @@ pub type LayeredModel<B> = crate::decoder::LayeredModel<B, ModelArgs>;
 /// Independent attention state for every logical layer invocation.
 pub fn state_layout(args: &ModelArgs) -> Result<eredu_runtime::StateLayout, Error> {
     eredu_runtime::StateLayout::new(crate::decoder::cache_layout(args)?).map_err(Error::backend)
+}
+
+fn output_normalization_name(
+    args: &ModelArgs,
+    layer: usize,
+) -> Option<crate::decoder::parameter_metadata::LayerParameterName<'_>> {
+    (!args.skip_loop_final_norm
+        && (layer + 1) % args.physical_layer_count() == 0
+        && layer + 1 < args.state_layer_count())
+    .then_some(crate::decoder::parameter_metadata::LayerParameterName {
+        root: "model",
+        layer,
+        module: None,
+        field: "output_norm",
+    })
 }

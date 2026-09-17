@@ -10,7 +10,10 @@ use syn::{
 ///
 /// The container must declare its tensor type with
 /// `#[parameterized(tensor = "B::Tensor")]`. Individual fields may opt out
-/// with `#[parameter(skip)]`.
+/// with `#[parameter(skip)]`, which leaves retained-value coverage unknown.
+/// Add `metadata` for payload-free descriptions, `retained_value` for one raw
+/// tensor, or `retained_optional_value` for an `Option` of raw tensors. These
+/// annotations do not add editable parameter slots.
 #[proc_macro_derive(Parameterized, attributes(parameterized, parameter))]
 pub fn derive_parameterized(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -35,13 +38,25 @@ fn expand_parameterized(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
     }
     let (impl_generics, type_generics, where_clause) = generics.split_for_impl();
     let immutable = traversal(&input.data, Traversal::Immutable)?;
+    let sources = traversal(&input.data, Traversal::Sources)?;
     let mutable = traversal(&input.data, Traversal::Mutable)?;
     let trainable = traversal(&input.data, Traversal::Trainable)?;
+    let retained = traversal(&input.data, Traversal::Retained)?;
+    let bound = traversal(&input.data, Traversal::Bound(&tensor))?;
 
     Ok(quote! {
         impl #impl_generics ::eredu_nn::Parameterized<#tensor> for #name #type_generics
         #where_clause
         {
+            fn visit_parameter_sources<'__eredu, __EreduVisitor>(
+                &'__eredu self, visitor: &mut __EreduVisitor,
+            ) -> Result<(), ::eredu_nn::ParameterSourceError>
+            where __EreduVisitor: ::eredu_nn::ParameterSourceVisitor<'__eredu, #tensor> {
+                let mut __eredu_source_result = Ok(());
+                #sources
+                __eredu_source_result
+            }
+
             fn visit_parameters<'__eredu, __EreduVisitor>(
                 &'__eredu self,
                 visitor: &mut __EreduVisitor,
@@ -62,6 +77,18 @@ fn expand_parameterized(input: DeriveInput) -> syn::Result<proc_macro2::TokenStr
 
             fn set_trainable(&mut self, trainable: bool) {
                 #trainable
+            }
+
+            fn retained_value_slot_bound(&self) -> Option<usize> {
+                let mut __eredu_bound = Some(0usize);
+                #bound
+                __eredu_bound
+            }
+
+            fn visit_retained_values(&self, visitor: &mut dyn FnMut(&#tensor)) -> bool {
+                let mut __eredu_complete = true;
+                #retained
+                __eredu_complete
             }
         }
     })
@@ -91,22 +118,54 @@ fn tensor_type(input: &DeriveInput) -> syn::Result<Type> {
     })
 }
 
-fn skipped(field: &syn::Field) -> syn::Result<bool> {
-    let mut skip = false;
+#[derive(Clone, Copy, Default)]
+struct FieldOptions {
+    skip: bool,
+    metadata: bool,
+    retained_value: bool,
+    retained_optional_value: bool,
+}
+
+fn field_options(field: &syn::Field) -> syn::Result<FieldOptions> {
+    let mut options = FieldOptions::default();
     for attribute in &field.attrs {
         if !attribute.path().is_ident("parameter") {
             continue;
         }
         attribute.parse_nested_meta(|meta| {
             if meta.path.is_ident("skip") {
-                skip = true;
+                options.skip = true;
+                Ok(())
+            } else if meta.path.is_ident("metadata") {
+                options.metadata = true;
+                Ok(())
+            } else if meta.path.is_ident("retained_value") {
+                options.retained_value = true;
+                Ok(())
+            } else if meta.path.is_ident("retained_optional_value") {
+                options.retained_optional_value = true;
                 Ok(())
             } else {
                 Err(meta.error("unsupported parameter option"))
             }
         })?;
     }
-    Ok(skip)
+    let retained_annotations = usize::from(options.metadata)
+        + usize::from(options.retained_value)
+        + usize::from(options.retained_optional_value);
+    if retained_annotations > 1 {
+        return Err(syn::Error::new_spanned(
+            field,
+            "parameter metadata, retained_value and retained_optional_value are mutually exclusive",
+        ));
+    }
+    if retained_annotations != 0 && !options.skip {
+        return Err(syn::Error::new_spanned(
+            field,
+            "parameter retained-value annotations require skip",
+        ));
+    }
+    Ok(options)
 }
 
 fn all_included_field_types(data: &Data) -> syn::Result<Vec<&Type>> {
@@ -127,7 +186,7 @@ fn all_included_field_types(data: &Data) -> syn::Result<Vec<&Type>> {
     };
     for fields in variants {
         for field in fields {
-            if !skipped(field)? {
+            if !field_options(field)?.skip {
                 types.push(&field.ty);
             }
         }
@@ -136,18 +195,25 @@ fn all_included_field_types(data: &Data) -> syn::Result<Vec<&Type>> {
 }
 
 #[derive(Clone, Copy)]
-enum Traversal {
+enum Traversal<'a> {
     Immutable,
+    Sources,
     Mutable,
     Trainable,
+    Retained,
+    Bound(&'a Type),
 }
 
 fn field_call(
     field_type: &Type,
     receiver: proc_macro2::TokenStream,
-    traversal: Traversal,
+    traversal: Traversal<'_>,
 ) -> proc_macro2::TokenStream {
     match traversal {
+        Traversal::Sources => quote! {
+            __eredu_source_result = __eredu_source_result.and(
+                <#field_type as ::eredu_nn::Parameterized<_>>::visit_parameter_sources(#receiver, visitor));
+        },
         Traversal::Immutable => quote! {
             <#field_type as ::eredu_nn::Parameterized<_>>::visit_parameters(#receiver, visitor);
         },
@@ -157,10 +223,63 @@ fn field_call(
         Traversal::Trainable => quote! {
             <#field_type as ::eredu_nn::Parameterized<_>>::set_trainable(#receiver, trainable);
         },
+        Traversal::Bound(tensor) => quote! {
+            __eredu_bound = __eredu_bound.and_then(|sum| {
+                sum.checked_add(<#field_type as ::eredu_nn::Parameterized<#tensor>>::retained_value_slot_bound(#receiver)?)
+            });
+        },
+        Traversal::Retained => quote! {
+            __eredu_complete &= <#field_type as ::eredu_nn::Parameterized<_>>::visit_retained_values(#receiver, visitor);
+        },
     }
 }
 
-fn traversal(data: &Data, traversal: Traversal) -> syn::Result<proc_macro2::TokenStream> {
+fn skipped_retained_call(
+    options: FieldOptions,
+    receiver: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    if options.metadata {
+        quote!()
+    } else if options.retained_value {
+        quote!(visitor(#receiver);)
+    } else if options.retained_optional_value {
+        quote! {
+            if let Some(__eredu_value) = #receiver {
+                visitor(__eredu_value);
+            }
+        }
+    } else {
+        quote!(__eredu_complete = false;)
+    }
+}
+
+fn skipped_source_call(
+    options: FieldOptions,
+    receiver: proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    if options.metadata {
+        quote!()
+    } else if options.retained_value {
+        quote!(visitor.retained(#receiver);)
+    } else if options.retained_optional_value {
+        quote! { if let Some(value) = #receiver { visitor.retained(value); } }
+    } else {
+        quote! { __eredu_source_result = __eredu_source_result.and(Err(::eredu_nn::ParameterSourceError::UnclassifiedRetainedField)); }
+    }
+}
+
+fn skipped_bound_call(options: FieldOptions) -> proc_macro2::TokenStream {
+    if options.metadata {
+        quote!()
+    } else if options.retained_value || options.retained_optional_value {
+        // An explicit tensor/optional tensor field always needs at most one slot.
+        quote!(__eredu_bound = __eredu_bound.and_then(|sum| sum.checked_add(1));)
+    } else {
+        quote!(__eredu_bound = None;)
+    }
+}
+
+fn traversal(data: &Data, traversal: Traversal<'_>) -> syn::Result<proc_macro2::TokenStream> {
     match data {
         Data::Struct(data) => struct_traversal(&data.fields, traversal),
         Data::Enum(data) => {
@@ -181,37 +300,61 @@ fn traversal(data: &Data, traversal: Traversal) -> syn::Result<proc_macro2::Toke
 
 fn struct_traversal(
     fields: &Fields,
-    traversal: Traversal,
+    traversal: Traversal<'_>,
 ) -> syn::Result<proc_macro2::TokenStream> {
     let mut calls = Vec::new();
     for (index, field) in fields.iter().enumerate() {
-        if skipped(field)? {
-            continue;
-        }
+        let options = field_options(field)?;
         let member = field
             .ident
             .clone()
             .map(syn::Member::Named)
             .unwrap_or_else(|| syn::Member::Unnamed(index.into()));
         let receiver = match traversal {
-            Traversal::Immutable => quote!(&self.#member),
+            Traversal::Immutable
+            | Traversal::Sources
+            | Traversal::Retained
+            | Traversal::Bound(_) => {
+                quote!(&self.#member)
+            }
             Traversal::Mutable | Traversal::Trainable => quote!(&mut self.#member),
         };
-        calls.push(field_call(&field.ty, receiver, traversal));
+        if options.skip {
+            if matches!(traversal, Traversal::Sources) {
+                calls.push(skipped_source_call(options, receiver));
+            } else if matches!(traversal, Traversal::Retained) {
+                calls.push(skipped_retained_call(options, receiver));
+            } else if matches!(traversal, Traversal::Bound(_)) {
+                calls.push(skipped_bound_call(options));
+            }
+        } else {
+            calls.push(field_call(&field.ty, receiver, traversal));
+        }
     }
     Ok(quote! { #(#calls)* })
 }
 
 fn enum_variant(
     fields: &Fields,
-    traversal: Traversal,
+    traversal: Traversal<'_>,
 ) -> syn::Result<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
     let mut bindings = Vec::new();
     let mut calls = Vec::new();
     for (index, field) in fields.iter().enumerate() {
         let binding = format_ident!("__eredu_field_{index}");
-        let is_skipped = skipped(field)?;
-        if !is_skipped {
+        let options = field_options(field)?;
+        let is_skipped = options.skip
+            && !(matches!(traversal, Traversal::Retained | Traversal::Sources)
+                && (options.retained_value || options.retained_optional_value));
+        if options.skip {
+            if matches!(traversal, Traversal::Sources) {
+                calls.push(skipped_source_call(options, quote!(#binding)));
+            } else if matches!(traversal, Traversal::Retained) {
+                calls.push(skipped_retained_call(options, quote!(#binding)));
+            } else if matches!(traversal, Traversal::Bound(_)) {
+                calls.push(skipped_bound_call(options));
+            }
+        } else {
             calls.push(field_call(&field.ty, quote!(#binding), traversal));
         }
         bindings.push((field, binding, is_skipped));
@@ -242,3 +385,6 @@ fn enum_variant(
     };
     Ok((pattern, quote! { #(#calls)* }))
 }
+
+#[cfg(test)]
+mod tests;

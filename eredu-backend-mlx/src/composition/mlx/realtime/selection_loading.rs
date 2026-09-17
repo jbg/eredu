@@ -18,19 +18,30 @@ pub struct MlxPreparedRealtimeExecution {
 
 /// MLX stream and collective mechanisms for neutral realtime execution.
 pub struct MlxRealtimeExecutionContext {
-    stream: Stream,
-    weights_stream: Stream,
+    backend: std::rc::Rc<crate::backend::MlxBackend<'static>>,
     world_group: Option<Arc<Group>>,
 }
 
 impl MlxRealtimeExecutionContext {
     /// Selects execution and weight-materialization streams for one backend.
     pub fn new(stream: &Stream, weights_stream: &Stream) -> Self {
-        Self {
-            stream: stream.clone(),
-            weights_stream: weights_stream.clone(),
-            world_group: None,
-        }
+        Self::from_backend(crate::backend::MlxBackend::new(stream, weights_stream))
+    }
+
+    /// Retains the actual factory stream owners; this does not clone native
+    /// stream handles or initialize another allocator domain.
+    pub(crate) fn from_backend(backend: crate::backend::MlxBackend<'static>) -> Self {
+        Self { backend: std::rc::Rc::new(backend), world_group: None }
+    }
+
+    pub(crate) fn backend(&self) -> &crate::backend::MlxBackend<'static> {
+        &self.backend
+    }
+
+    /// Borrow the same prepared owners retained by model completion resources.
+    pub(crate) fn original_copy_environment(&self)
+        -> Result<crate::backend::OriginalCopyEnvironment<'_>, crate::backend::OriginalCopyEnvironmentError> {
+        self.backend.original_copy_environment()
     }
 
     /// Supplies the native world group used to realize architecture-selected resources.
@@ -40,13 +51,13 @@ impl MlxRealtimeExecutionContext {
     }
 
     /// Selected MLX execution stream.
-    pub const fn stream(&self) -> &Stream {
-        &self.stream
+    pub fn stream(&self) -> &Stream {
+        self.backend.stream()
     }
 
     /// Selected MLX checkpoint materialization stream.
-    pub const fn weights_stream(&self) -> &Stream {
-        &self.weights_stream
+    pub fn weights_stream(&self) -> &Stream {
+        self.backend.weights_stream()
     }
 
     /// Fail-closed capabilities of this concrete session mechanism route.
@@ -74,8 +85,7 @@ impl MlxRealtimeExecutionContext {
         materialize_realtime_model(
             selected,
             self.world_group.clone(),
-            &self.stream,
-            &self.weights_stream,
+            std::rc::Rc::clone(&self.backend),
         )
     }
 
@@ -86,7 +96,7 @@ impl MlxRealtimeExecutionContext {
     ) -> Result<MlxKeyValueState, Error> {
         model
             .executor()
-            .validate_context(&self.stream, self.world_group.as_deref())?;
+            .validate_context(self.stream(), self.world_group.as_deref())?;
         model.executor().new_realtime_state()
     }
 
@@ -109,8 +119,8 @@ impl MlxRealtimeExecutionContext {
     ) -> Result<MlxPrepublicationFrame, Error> {
         model
             .executor()
-            .validate_context(&self.stream, self.world_group.as_deref())?;
-        submit_scheduled_realtime_frame(model, branch, frame, &self.stream)
+            .validate_context(self.stream(), self.world_group.as_deref())?;
+        submit_scheduled_realtime_frame(model, branch, frame, self.stream())
     }
 }
 
@@ -121,17 +131,16 @@ pub(super) const fn realtime_session_capabilities() -> eredu_core::SessionCapabi
 fn materialize_realtime_model(
     selected: MlxPreparedRealtimeExecution,
     world: Option<Arc<Group>>,
-    stream: &Stream,
-    weights_stream: &Stream,
+    backend: std::rc::Rc<crate::backend::MlxBackend<'static>>,
 ) -> Result<MoshiRealtimeExecution<MlxRealtimeExecution>, Error> {
     let MlxPreparedRealtimeExecution {
         source,
         rank_context,
     } = selected;
     if let Some(rank) = rank_context {
-        rank.validate_execution_stream(stream)?;
+        rank.validate_execution_stream(backend.stream())?;
     }
-    neutral_moshi::materialize_selected(source, world, stream, weights_stream)
+    neutral_moshi::materialize_selected_with_backend(source, world, backend)
 }
 
 fn select_realtime_model(

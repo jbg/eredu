@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::execution_control::{SnapshotBudget, SnapshotReservation, TraceBudget, TraceLimits};
+use eredu_core::{HostPreparationAuthority, SpeculativeRequestIdentity, SpeculativeValues};
 use eredu_core::{
     execution_control::{
         ExecutionControlError, SnapshotEstimate, SnapshotLimits, SnapshotResourceKind,
@@ -11,10 +12,28 @@ use eredu_core::{
     speculative::{SpeculativeControlError, SpeculativeControlSnapshot, SpeculativeProposalView},
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, rc::Rc, sync::Arc, time::Duration};
+use std::time::Duration;
+mod views;
+use crate::execution_control::PendingSnapshotReservation;
+mod tables;
+use tables::{ControlTable, PreparedSave, SavedOwner};
 
 mod branch;
 pub use branch::*;
+
+// Scheduler Backend errors combine executor and sampler failures of the same
+// associated type. Neither provider identity nor an origin tag is available.
+// An owner which refuses extraction must return the unchanged error to the next
+// owner; both defaults therefore preserve the exact ordinary driver wrapper.
+fn driver_failure<E, S>(error: SpeculativeDriverError<E::Error>) -> SpeculativeControlError
+where
+    E: SpeculativeExecutor,
+    S: SpeculativeSampling<Error = E::Error>,
+{
+    SpeculativeControlError::driver_with_retained(error, |error| {
+        E::take_retained_failure(error).or_else(S::take_retained_failure)
+    })
+}
 
 /// Explicit resource limits for controlled speculative inspection.
 #[derive(Debug, Clone)]
@@ -83,9 +102,9 @@ pub struct SpeculativeVerificationRecord {
     /// Original proposed block, including failed and unvisited proposals.
     pub proposals: SpeculativeProposalView,
     /// One disposition per proposal.
-    pub dispositions: Vec<SpeculativeProposalDisposition>,
+    pub dispositions: SpeculativeValues<SpeculativeProposalDisposition>,
     /// Exact newly committed target tokens (accepted prefix plus replacement/bonus).
-    pub committed_token_ids: Vec<u32>,
+    pub committed_token_ids: SpeculativeValues<u32>,
     /// Optimistic work resolved with this block, if any.
     pub optimistic: Option<SpeculativeProposalView>,
     /// Number of optimistic proposals reused as the next block.
@@ -117,7 +136,7 @@ pub struct ControlledSpeculativeStep {
     /// Completed verification with explicit acceptance and rejection.
     pub verification: Option<SpeculativeVerificationRecord>,
     /// Newly committed tokens; proposals are excluded.
-    pub committed_token_ids: Vec<u32>,
+    pub committed_token_ids: SpeculativeValues<u32>,
     /// Forced canonical token consumed by this action, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forced_token: Option<u32>,
@@ -125,12 +144,12 @@ pub struct ControlledSpeculativeStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sampling: Option<crate::execution_control::SamplingStateFacts>,
     /// Bounded raw-logit captures, including tentative draft and target rows.
-    pub captures: Vec<eredu_core::speculative::SpeculativePredictionCapture>,
+    pub captures: SpeculativeValues<eredu_core::speculative::SpeculativePredictionCapture>,
     /// Internal component evidence from actual forwards in this action. Physical
     /// rows, scheduler coordinates and tentative phases remain distinct. These
     /// records share this step's run/restore identity and transport accounting.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub activations: Vec<eredu_core::speculative::SpeculativeActivationCapture>,
+    #[serde(default, skip_serializing_if = "SpeculativeValues::is_empty")]
+    pub activations: SpeculativeValues<eredu_core::speculative::SpeculativeActivationCapture>,
     /// Active time to the first committed target token, before its callbacks.
     pub timing: GenerationTiming,
     /// Active host duration of this action, including synchronous publication.
@@ -141,7 +160,7 @@ pub struct ControlledSpeculativeStep {
 /// or when the scoped session exits; copying handles does not copy native state.
 #[derive(Debug, Clone)]
 pub struct SpeculativeSnapshotHandle {
-    owner: Arc<()>,
+    owner: SpeculativeRequestIdentity,
     id: u64,
 }
 impl SpeculativeSnapshotHandle {
@@ -247,6 +266,8 @@ struct Saved<E: SpeculativeExecutor, S: SpeculativeSampling, C> {
     run_id: u64,
     estimate: SnapshotEstimate,
     _reservation: SnapshotReservation,
+    // The Rc shell, complete state and logical lease all retire first.
+    _host: HostPreparationAuthority,
 }
 
 struct Session<'a, E, S, C, P>
@@ -259,9 +280,9 @@ where
     scheduler: SpeculativeScheduler<'a, E, S, C, P>,
     lane: Option<PreparedSpeculativeLane<'a, E, S, C, P>>,
     id: Option<SpeculativeRequestId>,
-    owner: Arc<()>,
-    snapshots: BTreeMap<u64, Rc<Saved<E, S, C>>>,
-    branches: BTreeMap<u64, branch::Branch<E, S, C>>,
+    owner: SpeculativeRequestIdentity,
+    snapshots: ControlTable<SavedOwner<E, S, C>>,
+    branches: ControlTable<branch::Branch<E, S, C>>,
     next_branch: u64,
     run_id: u64,
     next_snapshot: u64,
@@ -284,6 +305,25 @@ where
     C: SpeculativeConstraint,
     P: SpeculativePublisher<C>,
 {
+    fn charge_record(&mut self, record: &impl Serialize) -> Result<(), SpeculativeControlError> {
+        let _host = if self.trace.is_prepared() {
+            self.scheduler
+                .executor
+                .driver_host_metadata(
+                    TraceBudget::prepared_control_bytes(),
+                    self.scheduler.context,
+                )
+                .map_err(|e| {
+                    SpeculativeControlError::backend_with_retained(e, E::take_retained_failure)
+                })?
+        } else {
+            HostPreparationAuthority::unmanaged()
+        };
+        // Only the concrete closed Step/Activation records call this helper;
+        // no caller-defined serializer is admitted by the prepared mode.
+        self.trace.charge(record).map_err(Into::into)
+    }
+
     fn request(&self) -> Option<&eredu_core::SpeculativeRequest<'a, E, S, C, P>> {
         self.id.and_then(|id| self.scheduler.requests.request(id))
     }
@@ -318,15 +358,14 @@ where
         result
     }
     fn owned(&self, handle: &SpeculativeSnapshotHandle) -> Result<(), SpeculativeControlError> {
-        if !Arc::ptr_eq(&self.owner, &handle.owner) || !self.snapshots.contains_key(&handle.id) {
+        if !self.owner.same(&handle.owner) || !self.snapshots.contains_key(&handle.id) {
             return Err(SpeculativeControlError::IncompatibleSnapshot);
         }
         Ok(())
     }
-    fn save_state(
-        &self,
-        kind: SnapshotResourceKind,
-    ) -> Result<Rc<Saved<E, S, C>>, SpeculativeControlError> {
+    fn prepare_save(
+        &self, kind: SnapshotResourceKind, table_bytes: Result<usize,SpeculativeControlError>,
+    ) -> Result<PreparedSave, SpeculativeControlError> {
         self.healthy()?;
         let request = self
             .request()
@@ -343,29 +382,74 @@ where
         let estimate = request
             .control_snapshot_estimate(self.scheduler.executor)
             .ok_or(ExecutionControlError::UnknownEstimate)?;
-        // Include the scope's saved-state envelope and conservative map-node
-        // storage as well as the core/native snapshot payload.
-        let overhead = (std::mem::size_of::<Saved<E, S, C>>() as u64)
-            .checked_add(256)
+        let controls = SavedOwner::<E,S,C>::control_bytes()
+            .and_then(|n| n.checked_add(PendingSnapshotReservation::control_bytes()?))
+            .ok_or(ExecutionControlError::Overflow)?;
+        let overhead = controls.checked_add(table_bytes?).and_then(|n| u64::try_from(n).ok())
             .ok_or(ExecutionControlError::Overflow)?;
         let estimate = SnapshotEstimate {
-            retained_bytes: estimate
-                .retained_bytes
-                .checked_add(overhead)
-                .ok_or(ExecutionControlError::Overflow)?,
-            copy_bytes: estimate
-                .copy_bytes
-                .checked_add(overhead)
-                .ok_or(ExecutionControlError::Overflow)?,
+            retained_bytes: estimate.retained_bytes.checked_add(overhead).ok_or(ExecutionControlError::Overflow)?,
+            copy_bytes: estimate.copy_bytes.checked_add(overhead).ok_or(ExecutionControlError::Overflow)?,
         };
-        let reservation = budget.reserve(kind, Some(estimate))?;
-        let state = request.control_snapshot(self.scheduler.executor, self.scheduler.context)?;
-        Ok(Rc::new(Saved {
-            state,
-            run_id: self.run_id,
+        // Logical policy wins before allocating any owner; a later refusal
+        // refunds retained bytes while cumulative copy attempts stay consumed.
+        let reservation = budget.reserve_pending(kind, Some(estimate))?;
+        let host = self
+            .scheduler
+            .executor
+            .driver_host_metadata(Some(controls), self.scheduler.context)
+            .map_err(|e| {
+                SpeculativeControlError::backend_with_retained(e, E::take_retained_failure)
+            })?;
+        Ok(PreparedSave {
             estimate,
-            _reservation: reservation,
+            reservation,
+            host,
+        })
+    }
+    fn finish_save(
+        &self,
+        prepared: PreparedSave,
+    ) -> Result<SavedOwner<E, S, C>, SpeculativeControlError> {
+        let PreparedSave {
+            estimate,
+            reservation,
+            host,
+        } = prepared;
+        let reservation = reservation.publish_with_host(host.clone());
+        let state = self.request().ok_or(SpeculativeControlError::NotQuiescent)?
+            .control_snapshot(self.scheduler.executor, self.scheduler.context)?;
+        Ok(SavedOwner::new(Saved {
+            state, run_id: self.run_id, estimate, _reservation: reservation, _host: host,
         }))
+    }
+    fn save_state(
+        &self,
+        kind: SnapshotResourceKind,
+    ) -> Result<SavedOwner<E, S, C>, SpeculativeControlError> {
+        self.finish_save(self.prepare_save(kind, Ok(0))?)
+    }
+    fn reserve_control(
+        &self,
+        kind: SnapshotResourceKind,
+        estimate: SnapshotEstimate,
+    ) -> Result<SnapshotReservation, SpeculativeControlError> {
+        let pending = self
+            .budget
+            .as_ref()
+            .expect("saved state budget")
+            .reserve_pending(kind, Some(estimate))?;
+        let host = self
+            .scheduler
+            .executor
+            .driver_host_metadata(
+                PendingSnapshotReservation::control_bytes(),
+                self.scheduler.context,
+            )
+            .map_err(|e| {
+                SpeculativeControlError::backend_with_retained(e, E::take_retained_failure)
+            })?;
+        Ok(pending.publish_with_host(host))
     }
     fn step_inner(&mut self) -> Result<Option<ControlledSpeculativeStep>, SpeculativeControlError> {
         self.healthy()?;
@@ -375,21 +459,30 @@ where
         let forced = self
             .request()
             .and_then(|r| r.sampler().control_pending_forced());
-        let before = self.request().map(|r| {
-            (
-                r.sequence().tokens().len(),
-                r.proposals(),
-                r.optimistic_proposals(),
-                r.stats().clone(),
-            )
-        });
+        let before = self
+            .request()
+            .map(|r| {
+                Ok::<_, SpeculativeControlError>((
+                    r.sequence().tokens().len(),
+                    r.proposals_with_metadata(self.scheduler.executor, self.scheduler.context)
+                        .map_err(driver_failure::<E, S>)?,
+                    r.optimistic_proposals_with_metadata(
+                        self.scheduler.executor,
+                        self.scheduler.context,
+                    )
+                    .map_err(driver_failure::<E, S>)?,
+                    r.stats().counters(),
+                ))
+            })
+            .transpose();
+        let before = self.agree_delivery(before)?;
         let started = std::time::Instant::now();
         let was_prefill = self.lane.is_some();
         if let Some(lane) = self.lane.take() {
             self.id = Some(
                 self.scheduler
                     .submit(lane)
-                    .map_err(SpeculativeControlError::backend)?,
+                    .map_err(driver_failure::<E, S>)?,
             );
             self.timing = GenerationTiming::new(
                 self.request()
@@ -397,92 +490,105 @@ where
                     .map(|t| self.preparation + t),
             );
         } else {
-            self.scheduler
-                .step()
-                .map_err(SpeculativeControlError::backend)?;
+            self.scheduler.step().map_err(driver_failure::<E, S>)?;
         }
         let elapsed = started.elapsed();
-        let request = self.request().expect("submitted request");
-        let old_len = before.as_ref().map_or(0, |b| b.0);
-        let committed = request.sequence().tokens()[old_len..].to_vec();
-        let after_proposals = request.proposals();
-        let after_optimistic = request.optimistic_proposals();
-        let drafted = if after_optimistic != before.as_ref().and_then(|b| b.2.clone())
-            && after_optimistic.is_some()
-        {
-            after_optimistic
-        } else if after_proposals != before.as_ref().and_then(|b| b.1.clone())
-            && after_proposals.is_some()
-        {
-            after_proposals
-        } else {
-            None
-        };
-        let verification = before.and_then(|(_, proposals, optimistic, stats)| {
-            let proposals = proposals?;
-            if request.stats().rounds() == stats.rounds()
-                && request.status() != SpeculativeRequestStatus::Cancelled
-            {
-                return None;
-            }
-            let accepted = request.stats().accepted_tokens() - stats.accepted_tokens();
-            let dispositions = (0..proposals.token_ids.len())
-                .map(|i| {
-                    if i < accepted {
-                        SpeculativeProposalDisposition::Accepted
-                    } else if i == accepted && committed.len() > accepted {
-                        SpeculativeProposalDisposition::Rejected
-                    } else {
-                        SpeculativeProposalDisposition::Discarded
-                    }
-                })
-                .collect();
-            Some(SpeculativeVerificationRecord {
-                resolved: request.stats().rounds() > stats.rounds(),
-                proposals,
-                dispositions,
-                committed_token_ids: committed.clone(),
-                optimistic,
-                optimistic_reused: request.stats().reused_optimistic_tokens()
-                    - stats.reused_optimistic_tokens(),
-                optimistic_consumed: request.stats().consumed_optimistic_tokens()
-                    - stats.consumed_optimistic_tokens(),
-                optimistic_discarded: request.stats().discarded_optimistic_tokens()
-                    - stats.discarded_optimistic_tokens(),
-            })
-        });
-        let mut record = ControlledSpeculativeStep {
-            schema_version: 1,
-            sequence: self.sequence,
-            epoch: self.epoch,
-            run_id: self.run_id,
-            status: request.status(),
-            drafted: if was_prefill { None } else { drafted },
-            verification,
-            forced_token: forced.filter(|_| !committed.is_empty()),
-            sampling: self.sampling_state(),
-            committed_token_ids: committed,
-            captures: Vec::new(),
-            activations: Vec::new(),
-            timing: self.timing,
-            step_seconds: elapsed.as_secs_f64(),
-        };
-        record.captures = self
-            .scheduler
-            .requests
-            .request_mut(self.id.expect("submitted request"))
-            .expect("submitted request")
-            .sampler_mut()
-            .take_control_captures();
-        while let Some(capture) = self.scheduler.executor.take_activation_capture() {
-            record.activations.push(capture);
-        }
         let local = (|| {
-            self.trace.charge(&record)?;
-            self.sequence = self
-                .sequence
-                .checked_add(1)
-                .ok_or(ExecutionControlError::Overflow)?;
+            let request = self.request().expect("submitted request");
+            let old_len = before.as_ref().map_or(0, |b| b.0);
+            let committed = views::collect(
+                request.sequence().tokens()[old_len..].iter().copied(),
+                self.scheduler.executor,
+                self.scheduler.context,
+                std::mem::size_of::<ControlledSpeculativeStep>()
+                    + std::mem::size_of::<
+                        Result<Option<ControlledSpeculativeStep>, SpeculativeControlError>,
+                    >(),
+            )?;
+            let after_proposals = request
+                .proposals_with_metadata(self.scheduler.executor, self.scheduler.context)
+                .map_err(driver_failure::<E, S>)?;
+            let after_optimistic = request
+                .optimistic_proposals_with_metadata(self.scheduler.executor, self.scheduler.context)
+                .map_err(driver_failure::<E, S>)?;
+            let drafted = if after_optimistic.as_ref() != before.as_ref().and_then(|b| b.2.as_ref())
+                && after_optimistic.is_some()
+            {
+                after_optimistic
+            } else if after_proposals.as_ref() != before.as_ref().and_then(|b| b.1.as_ref())
+                && after_proposals.is_some()
+            {
+                after_proposals
+            } else {
+                None
+            };
+            let verification = match before {
+                Some((_, Some(proposals), optimistic, stats))
+                    if request.stats().rounds() != stats.rounds()
+                        || request.status() == SpeculativeRequestStatus::Cancelled =>
+                {
+                    let accepted = request.stats().accepted_tokens() - stats.accepted_tokens();
+                    let dispositions = views::collect(
+                        (0..proposals.token_ids.len()).map(|i| {
+                            if i < accepted {
+                                SpeculativeProposalDisposition::Accepted
+                            } else if i == accepted && committed.len() > accepted {
+                                SpeculativeProposalDisposition::Rejected
+                            } else {
+                                SpeculativeProposalDisposition::Discarded
+                            }
+                        }),
+                        self.scheduler.executor,
+                        self.scheduler.context,
+                        std::mem::size_of::<SpeculativeVerificationRecord>(),
+                    )?;
+                    Some(SpeculativeVerificationRecord {
+                        resolved:request.stats().rounds()>stats.rounds(),proposals,dispositions,
+                        committed_token_ids:committed.clone(),optimistic,
+                        optimistic_reused:request.stats().reused_optimistic_tokens()-stats.reused_optimistic_tokens(),
+                        optimistic_consumed:request.stats().consumed_optimistic_tokens()-stats.consumed_optimistic_tokens(),
+                        optimistic_discarded:request.stats().discarded_optimistic_tokens()-stats.discarded_optimistic_tokens(),
+                    })
+                }
+                _=>None,
+            };
+            let mut record=ControlledSpeculativeStep {
+                schema_version:1,sequence:self.sequence,epoch:self.epoch,run_id:self.run_id,status:request.status(),
+                drafted:if was_prefill {None}else {drafted},verification,
+                forced_token:forced.filter(|_|!committed.is_empty()),sampling:self.sampling_state(),
+                committed_token_ids:committed,captures:SpeculativeValues::default(),activations:SpeculativeValues::default(),
+                timing:self.timing,step_seconds:elapsed.as_secs_f64(),
+            };
+            // Preserve the producer's exact buffer and frame custody. The
+            // shared freezer prices only a retained buffer's new immutable shell;
+            // ordinary buffers remain ordinary without post-hoc adoption.
+            let captures = self
+                .scheduler
+                .requests
+                .request_mut(self.id.expect("submitted request"))
+                .expect("submitted request")
+                .sampler_mut()
+                .take_control_captures();
+            record.captures =
+                views::freeze(captures, self.scheduler.executor, self.scheduler.context)?;
+            let mut activations = self
+                .scheduler
+                .executor
+                .driver_buffer(0, self.scheduler.context)
+                .map_err(|e| {
+                    SpeculativeControlError::backend_with_retained(e, E::take_retained_failure)
+                })?;
+            while let Some(capture) = self.scheduler.executor.take_activation_capture() {
+                views::push(
+                    &mut activations,
+                    capture,
+                    self.scheduler.executor,
+                    self.scheduler.context,
+                )?;
+            }
+            record.activations=views::freeze(activations,self.scheduler.executor,self.scheduler.context)?;
+            self.charge_record(&record)?;
+            self.sequence=self.sequence.checked_add(1).ok_or(ExecutionControlError::Overflow)?;
             Ok(Some(record))
         })();
         self.agree_delivery(local)
@@ -506,11 +612,12 @@ where
                 .ok_or(SpeculativeControlError::NotQuiescent)?
                 .validate_control_edit()?;
         }
-        plan.validate(self.activation_discovery.as_ref().ok_or(
-            SpeculativeControlError::Unsupported(
-                "loaded execution has no internal activation discovery",
-            ),
-        )?)?;
+        // The selected executor always authenticates the candidate. An original
+        // observer owns its exact declaration source; ordinary observers require
+        // the controller's loaded discovery. Neither path skips validation.
+        self.scheduler.executor.validate_activation_readmission(
+            &plan, self.activation_discovery.as_ref(),
+        )?;
         self.scheduler
             .executor
             .readmit_activation_interventions(plan)
@@ -611,34 +718,31 @@ where
             .request_mut(self.id.ok_or(SpeculativeControlError::NotQuiescent)?)
             .expect("submitted request");
         request.validate_control_edit()?;
-        Ok(request.sampler_mut().control_clear_forced())
+        request.sampler_mut().try_control_clear_forced()
     }
     fn intervene(
         &mut self,
         plans: Vec<eredu_core::speculative::SpeculativeInterventionPlan>,
     ) -> Result<(), SpeculativeControlError> {
         self.healthy()?;
-        if !plans.is_empty() {
-            let discovery = self.intervention_discovery.as_ref().ok_or(
-                SpeculativeControlError::Unsupported(
-                    "loaded execution has no speculative intervention discovery",
-                ),
-            )?;
+        let controls=eredu_core::intervention::AdmittedInterventionPlan::discovery_validation_control_bytes()
+            .and_then(|n|n.checked_mul(plans.len()))
+            .and_then(|n|n.checked_add(std::mem::size_of::<Result<(),SpeculativeControlError>>()
+                +std::mem::size_of::<Vec<eredu_core::speculative::SpeculativeInterventionPlan>>()));
+        let _host=self.scheduler.executor.driver_host_metadata(controls,self.scheduler.context)
+            .map_err(|e|SpeculativeControlError::backend_with_retained(e,E::take_retained_failure))?;
+        if let Some(discovery) = self.intervention_discovery.as_ref() {
             for plan in &plans {
-                let checked = plan.plan.plan().clone().admit(
-                    discovery,
-                    plan.plan.request(),
-                    plan.plan.session_id(),
-                )?;
-                if checked.identity() != plan.plan.identity() {
-                    return Err(SpeculativeControlError::Invalid(
-                        "intervention belongs to another loaded source or session",
-                    ));
-                }
+                plan.plan.validate_discovery(discovery).map_err(|_|SpeculativeControlError::Invalid(
+                    "intervention belongs to another loaded source or session"))?;
             }
         }
         if let Some(lane) = self.lane.as_mut() {
-            return lane.runtime_mut().sampler_mut().control_intervene(plans);
+            let sampler=lane.runtime_mut().sampler_mut();
+            if self.intervention_discovery.is_none() {
+                sampler.validate_control_interventions_prepared(&plans,self.scheduler.context)?;
+            }
+            return sampler.control_intervene_prepared(plans,self.scheduler.context);
         }
         let request = self
             .scheduler
@@ -646,7 +750,11 @@ where
             .request_mut(self.id.ok_or(SpeculativeControlError::NotQuiescent)?)
             .expect("submitted request");
         request.validate_control_edit()?;
-        request.sampler_mut().control_intervene(plans)
+        let sampler=request.sampler_mut();
+        if self.intervention_discovery.is_none() {
+            sampler.validate_control_interventions_prepared(&plans,self.scheduler.context)?;
+        }
+        sampler.control_intervene_prepared(plans,self.scheduler.context)
     }
     fn epoch(&self) -> u64 {
         self.epoch
@@ -685,7 +793,7 @@ where
             epoch: self.epoch,
             activation,
         };
-        self.trace.charge(&record)?;
+        self.charge_record(&record)?;
         self.sequence = next;
         Ok(Some(record))
     }
@@ -699,9 +807,7 @@ where
                 lane.runtime_mut().cancellation().cancel();
             }
             if let Some(id) = self.id {
-                self.scheduler
-                    .cancel(id)
-                    .map_err(SpeculativeControlError::backend)?;
+                self.scheduler.cancel(id).map_err(driver_failure::<E, S>)?;
             }
             // Use the same action and bounded-record boundary as peers calling
             // step, including cancellation of a retained verification.
@@ -733,7 +839,9 @@ where
         } else if self.budget.is_none() {
             Some("snapshot limits were not supplied")
         } else if self.request().is_none_or(|r| !r.is_control_boundary()) {
-            Some("snapshots require a canonical boundary after prefill, with no retained proposals or verification")
+            Some(
+                "snapshots require a canonical boundary after prefill, with no retained proposals or verification",
+            )
         } else if self
             .request()
             .is_none_or(|r| r.status() == SpeculativeRequestStatus::Cancelled)
@@ -754,12 +862,15 @@ where
             .next_snapshot
             .checked_add(1)
             .ok_or(ExecutionControlError::Overflow)?;
-        let saved = self.save_state(SnapshotResourceKind::Snapshot)?;
+        let table_bytes = self.snapshots.growth_bytes(self.scheduler.executor);
+        let prepared = self.prepare_save(SnapshotResourceKind::Snapshot, table_bytes)?;
+        self.snapshots.prepare_insert(self.scheduler.executor, self.scheduler.context)?;
+        let saved = self.finish_save(prepared)?;
         let id = self.next_snapshot;
+        self.snapshots.insert(id, saved)?;
         self.next_snapshot = next;
-        self.snapshots.insert(id, saved);
         Ok(SpeculativeSnapshotHandle {
-            owner: Arc::clone(&self.owner),
+            owner: self.owner.clone(),
             id,
         })
     }
@@ -780,11 +891,7 @@ where
             return Err(SpeculativeControlError::NotQuiescent);
         }
         let saved = &self.snapshots[&handle.id];
-        let _reservation = self
-            .budget
-            .as_ref()
-            .expect("saved snapshot budget")
-            .reserve(SnapshotResourceKind::Restore, Some(saved.estimate))?;
+        let _reservation = self.reserve_control(SnapshotResourceKind::Restore, saved.estimate)?;
         let request = self
             .scheduler
             .requests
@@ -876,10 +983,14 @@ impl<F> SpeculativeGenerationVisitor for DriveControlledSpeculation<'_, F>
 where
     F: FnOnce(&mut dyn ControlledSpeculativeSession) -> Result<(), SpeculativeControlError>,
 {
+    fn scheduler_options(&self) -> Option<eredu_core::generation::SpeculativeSchedulerOptions> {
+        self.run.scheduler_options()
+    }
+
     fn run<'a, E, S, C, P>(
         self,
         executor: &'a mut E,
-        mut lanes: Vec<PreparedSpeculativeLane<'a, E, S, C, P>>,
+        lanes: impl Into<SpeculativeBuffer<PreparedSpeculativeLane<'a, E, S, C, P>>>,
         topology: eredu_core::SpeculativeExecutionTopology,
         optimistic_execution_available: bool,
         component_timings_collected: bool,
@@ -892,6 +1003,31 @@ where
         C: SpeculativeConstraint,
         P: SpeculativePublisher<C>,
     {
+        let mut lanes = lanes.into();
+        // The shared provider prices this actual scope and final error bridge
+        // before either is constructed. Custody remains live through both return
+        // paths; the exact typed cause stays in the caller's failure destination.
+        let controls = [std::mem::size_of::<Self>(), std::mem::size_of::<Session<'a, E, S, C, P>>(),
+            std::mem::size_of::<HostPreparationAuthority>(), std::mem::size_of::<SpeculativeControlError>(),
+            std::mem::size_of::<eredu_core::SpeculativeOutputError>(),
+            std::mem::size_of::<
+                Result<SpeculativeGenerationBatchOutput, SpeculativeDriverError<E::Error>>,
+            >(),
+        ];
+        let publication_host = executor
+            .driver_host_metadata(
+                controls
+                    .into_iter()
+                    .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+                    .and_then(|n| {
+                        n.checked_add(eredu_core::BackendFailure::source_retention_peak_bytes::<
+                            SpeculativeDriverError<E::Error>,
+                        >()?)
+                    }),
+                context,
+            )
+            .map_err(SpeculativeDriverError::Backend)?;
+        let retained_bridge = !publication_host.is_unmanaged();
         let result = (|| {
             let local = if lanes.len() != 1 {
                 Err(SpeculativeControlError::Unsupported(
@@ -909,7 +1045,7 @@ where
             )?;
             let mut lane = lanes.pop().expect("checked single lane");
             let local = (|| {
-                if let Some(plan) = self.options.activations.clone() {
+                if let Some(plan) = self.options.activations {
                     // A fresh single-lane scheduler assigns its first request index zero.
                     executor.configure_activation_capture(
                         plan,
@@ -917,10 +1053,14 @@ where
                         context,
                     )?;
                 }
-                if let Some(plan) = self.options.capture.clone() {
+                if let Some(plan) = self.options.capture {
+                    if plan.request().batch != 1 || plan.request().prompt_tokens != 1
+                        || plan.request().max_predictions < lane.config().max_tokens as u64 {
+                        return Err(SpeculativeControlError::Invalid("capture admission does not cover the selected one-row speculative request"));
+                    }
                     lane.runtime_mut()
                         .sampler_mut()
-                        .enable_control_capture(plan)?;
+                        .enable_control_capture_prepared(plan, context)?;
                 }
                 Ok(())
             })();
@@ -931,7 +1071,7 @@ where
                 |status| executor.agree_text_preparation(stage, status, context),
                 SpeculativeControlError::backend,
             )?;
-            let scheduler = SpeculativeScheduler::new(
+            let mut scheduler = SpeculativeScheduler::new(
                 executor,
                 self.run.options,
                 topology,
@@ -939,19 +1079,68 @@ where
                 component_timings_collected,
                 context,
             )
-            .map_err(SpeculativeControlError::backend)?;
+            .map_err(driver_failure::<E, S>)?;
+            scheduler.reserve_requests(1).map_err(driver_failure::<E, S>)?;
+            let outputs = scheduler.executor.driver_buffer(1, context)
+                .map_err(SpeculativeDriverError::Backend);
+            let outputs = eredu_core::run_preparation::finish_preparation(
+                stage,
+                outputs,
+                |status| {
+                    scheduler
+                        .executor
+                        .agree_text_preparation(stage, status, context)
+                },
+                SpeculativeDriverError::Preparation,
+            )
+            .map_err(driver_failure::<E, S>)?;
+            let prepared = (|| {
+                let owner = scheduler.executor.driver_identity(context).map_err(|e| {
+                    SpeculativeControlError::backend_with_retained(e, E::take_retained_failure)
+                })?;
+                let budget = self
+                    .options
+                    .snapshots
+                    .map(|limits| {
+                        let host = scheduler
+                            .executor
+                            .driver_host_metadata(SnapshotBudget::construction_bytes(), context)
+                            .map_err(|e| {
+                                SpeculativeControlError::backend_with_retained(
+                                    e,
+                                    E::take_retained_failure,
+                                )
+                            })?;
+                        Ok::<_, SpeculativeControlError>(SnapshotBudget::new_with_host(
+                            limits, host,
+                        ))
+                    })
+                    .transpose()?;
+                Ok::<_, SpeculativeControlError>((owner, budget))
+            })();
+            let (owner, budget) = eredu_core::run_preparation::finish_preparation(
+                stage,
+                prepared,
+                |status| {
+                    scheduler
+                        .executor
+                        .agree_text_preparation(stage, status, context)
+                },
+                SpeculativeControlError::backend,
+            )?;
             let mut session = Session {
                 scheduler,
                 lane: Some(lane),
                 id: None,
-                owner: Arc::new(()),
-                snapshots: BTreeMap::new(),
-                branches: BTreeMap::new(),
+                owner,
+                snapshots: ControlTable::default(),
+                branches: ControlTable::default(),
                 next_branch: 1,
                 run_id: 0,
                 next_snapshot: 0,
-                budget: self.options.snapshots.map(SnapshotBudget::new),
-                trace: TraceBudget::new(self.options.trace_limits),
+                budget,
+                trace: if retained_bridge { TraceBudget::new_prepared(self.options.trace_limits) }
+                    else { TraceBudget::new(self.options.trace_limits) },
                 sequence: 0,
                 epoch: 0,
                 preparation: self.run.started.elapsed(),
@@ -978,17 +1167,17 @@ where
             }
             session.agree_delivery(Ok(()))?;
             let timing = session.timing;
-            let completed = session
-                .scheduler
-                .finish()
-                .map_err(SpeculativeControlError::backend)?;
-            completed_output::<_, E::Error>(completed, |_| timing)
-                .map_err(SpeculativeControlError::backend)
+            let completed = session.scheduler.finish().map_err(driver_failure::<E, S>)?;
+            completed_output::<_, E::Error>(completed, outputs, |_| timing).map_err(driver_failure::<E, S>)
         })();
         result.map_err(|error| {
-            let message = error.to_string();
+            let message = if retained_bridge {
+                eredu_core::SpeculativeOutputError::Storage("controlled speculative driver failed")
+            } else {
+                eredu_core::SpeculativeOutputError::publication(error.to_string())
+            };
             *self.failure = Some(error);
-            SpeculativeDriverError::Output(eredu_core::SpeculativeOutputError::publication(message))
+            SpeculativeDriverError::Output(message)
         })
     }
 }

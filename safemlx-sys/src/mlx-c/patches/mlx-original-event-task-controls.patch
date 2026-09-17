@@ -1,0 +1,1118 @@
+diff --git a/mlx/backend/cuda/event.cu b/mlx/backend/cuda/event.cu
+--- a/mlx/backend/cuda/event.cu
++++ b/mlx/backend/cuda/event.cu
+@@ -518,7 +518,17 @@
+ 
+ } // namespace
+ 
++// Preserve ordinary CUDA construction; original scoped Event support remains
++// unavailable and its cold layout reports that exact missing mechanism.
++void prepare_event_runtime(Device) {}
++size_t event_runtime_object_bytes() noexcept { return 0; }
++
++bool event_control_layout(EventControlLayout&) noexcept { return false; }
++
+ Event::Event(Stream s) : stream_(s) {
++  if (submission::current_native_controls().original)
++    throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
++  submission::mark_native_control_construction();
+   event_ = std::shared_ptr<void>(
+       new EventImpl(), [](void* ptr) { delete static_cast<EventImpl*>(ptr); });
+ }
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -33,6 +33,10 @@
+ } // namespace std
+ 
+ namespace mlx::core::metal {
++namespace {
++std::atomic<Device*> published_device{nullptr};
++static_assert(std::atomic<Device*>::is_always_lock_free);
++}
+ 
+ namespace {
+ 
+@@ -1076,8 +1080,20 @@
+   // Leak singleton device intentionally, to avoid cases where a compute kernel
+   // returns and tries to access the object after it has been freed by the main
+   // thread teardown.
+-  static Device* metal_device = new Device;
++  static Device* metal_device = [] {
++    auto* value = new Device;
++    published_device.store(value, std::memory_order_release);
++    return value;
++  }();
+   return *metal_device;
++}
++
++Device* prepared_device(mlx::core::Device selected) noexcept {
++  // Existing device() realizes only physical index0, for CPU/Metal streams.
++  // Reject a foreign scalar rather than initialize or reinterpret a device.
++  if (selected.index != 0 || (selected.type != mlx::core::Device::cpu &&
++      selected.type != mlx::core::Device::gpu)) return nullptr;
++  return published_device.load(std::memory_order_acquire);
+ }
+ 
+ std::shared_ptr<CommandEncoder> get_command_encoder_owner(Stream s) {
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -285,6 +285,8 @@
+ };
+ 
+ MLX_API Device& device(mlx::core::Device);
++// Borrow an already constructed backend device. No singleton initialization.
++MLX_API Device* prepared_device(mlx::core::Device) noexcept;
+ MLX_API CommandEncoder& get_command_encoder(Stream s);
+ std::shared_ptr<CommandEncoder> get_command_encoder_owner(Stream s);
+ std::shared_ptr<CommandEncoder> make_command_encoder(Device&, int, ResidencySet&);
+diff --git a/mlx/backend/metal/event.cpp b/mlx/backend/metal/event.cpp
+--- a/mlx/backend/metal/event.cpp
++++ b/mlx/backend/metal/event.cpp
+@@ -132,12 +132,51 @@
+ // Event implementations
+ ///////////////////////////////////////////////////////////////////////////////
+ 
++void prepare_event_runtime(Device selected) {
++  if (selected.index != 0 || (selected.type != Device::cpu && selected.type != Device::gpu))
++    throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
++  (void)metal::device(selected);
++}
++size_t event_runtime_object_bytes() noexcept { return sizeof(metal::Device); }
++
++bool event_control_layout(EventControlLayout& out) noexcept {
++#ifndef _LIBCPP_VERSION
++  return false;
++#else
++  using Allocator = submission::GraphAllocator<metal::EventImpl>;
++  using Control = std::__shared_ptr_emplace<metal::EventImpl, Allocator>;
++  size_t extent;
++  if (!submission::GraphQuota::allocation_extent(sizeof(Control), alignof(Control), extent))
++    return false;
++  out = {sizeof(metal::EventImpl), sizeof(Control), alignof(Control), extent,
++         sizeof(submission::NativeControlBinding) + sizeof(EventControlLayout) + sizeof(Allocator) +
++         sizeof(std::shared_ptr<metal::EventImpl>) + sizeof(std::shared_ptr<void>) +
++         sizeof(metal::Device*) + sizeof(FailureCarrierRef) +
++         sizeof(NS::SharedPtr<NS::AutoreleasePool>) * 2 +
++         sizeof(NS::SharedPtr<MTL::SharedEvent>) + sizeof(MTL::SharedEvent*), 1};
++  return true;
++#endif
++}
++
+ Event::Event(Stream stream) : stream_(stream) {
+   if (auto* scope = submission::current_scope(); scope && scope->scoped_observation_only()) {
+     scope_identity_ = scope->identity();
+     failure_ = scope->failure_owner();
+   }
+-  event_ = std::make_shared<metal::EventImpl>(metal::device(stream.device), failure_);
++  const auto binding = submission::current_native_controls();
++  if (binding.failure != submission::NativeControlFailure::none)
++    throw submission::NativeControlError(binding.failure);
++  submission::mark_native_control_construction();
++  if (binding.original) {
++    auto* device = metal::prepared_device(stream.device);
++    if (!device) throw submission::NativeControlError(
++        submission::NativeControlFailure::unsupported_backend);
++    EventControlLayout facts{};
++    if (!event_control_layout(facts)) throw submission::NativeControlError(
++        submission::NativeControlFailure::unsupported_backend);
++    event_ = std::allocate_shared<metal::EventImpl>(
++        submission::GraphAllocator<metal::EventImpl>(binding.graph), *device, failure_);
++  } else event_ = std::make_shared<metal::EventImpl>(metal::device(stream.device), failure_);
+ }
+ 
+ void Event::wait() const {
+diff --git a/mlx/backend/metal/event.h b/mlx/backend/metal/event.h
+--- a/mlx/backend/metal/event.h
++++ b/mlx/backend/metal/event.h
+@@ -32,7 +32,8 @@
+ 
+  private:
+   // Retire every event/error field before this same failure-custody alias.
+-  // The separate shared Event control allocation remains a producer follow-on.
++  // Original construction places the implementation and shared header in its
++  // actual Graph arena; the ordinary constructor remains ordinary.
+   FailureCarrierRef failure_;
+   // TODO: Use std::atomic<std::shared_ptr> when it gets supported in Xcode.
+   std::shared_ptr<std::string> error_;
+diff --git a/mlx/backend/no_gpu/event.cpp b/mlx/backend/no_gpu/event.cpp
+--- a/mlx/backend/no_gpu/event.cpp
++++ b/mlx/backend/no_gpu/event.cpp
+@@ -30,13 +30,50 @@
+   std::condition_variable cv;
+ };
+ 
++void prepare_event_runtime(Device selected) {
++  if (selected.type != Device::cpu || selected.index != 0)
++    throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
++}
++size_t event_runtime_object_bytes() noexcept { return 0; }
++
++bool event_control_layout(EventControlLayout& out) noexcept {
++#ifndef _LIBCPP_VERSION
++  return false;
++#else
++  using Allocator = submission::GraphAllocator<EventCounter>;
++  using Control = std::__shared_ptr_emplace<EventCounter, Allocator>;
++  size_t extent;
++  if (!submission::GraphQuota::allocation_extent(sizeof(Control), alignof(Control), extent))
++    return false;
++  out = {sizeof(EventCounter), sizeof(Control), alignof(Control), extent,
++         sizeof(submission::NativeControlBinding) + sizeof(EventControlLayout) + sizeof(Allocator) +
++         sizeof(std::shared_ptr<EventCounter>) + sizeof(std::shared_ptr<void>) +
++         sizeof(FailureCarrierRef), 0};
++  return true;
++#endif
++}
++
+ Event::Event(Stream stream) : stream_(stream) {
+   if (auto* scope = submission::current_scope(); scope && scope->scoped_observation_only()) {
+     scope_identity_ = scope->identity();
+     failure_ = scope->failure_owner();
+   }
+-  auto dtor = [](void* ptr) { delete static_cast<EventCounter*>(ptr); };
+-  event_ = std::shared_ptr<void>(new EventCounter{}, dtor);
++  const auto binding = submission::current_native_controls();
++  if (binding.failure != submission::NativeControlFailure::none)
++    throw submission::NativeControlError(binding.failure);
++  submission::mark_native_control_construction();
++  if (binding.original) {
++    if (stream.device.type != Device::cpu || stream.device.index != 0)
++      throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
++    EventControlLayout facts{};
++    if (!event_control_layout(facts)) throw submission::NativeControlError(
++        submission::NativeControlFailure::unsupported_backend);
++    event_ = std::allocate_shared<EventCounter>(
++        submission::GraphAllocator<EventCounter>(binding.graph));
++  } else {
++    auto dtor = [](void* ptr) { delete static_cast<EventCounter*>(ptr); };
++    event_ = std::shared_ptr<void>(new EventCounter{}, dtor);
++  }
+ }
+ 
+ void Event::wait() const {
+diff --git a/mlx/event.h b/mlx/event.h
+--- a/mlx/event.h
++++ b/mlx/event.h
+@@ -9,6 +9,23 @@
+ #include "mlx/failure.h"
+ 
+ namespace mlx::core {
++
++struct EventControlLayout {
++  size_t object_bytes;
++  size_t shared_bytes;
++  size_t shared_alignment;
++  size_t graph_extent;
++  size_t construction_controls;
++  size_t platform_events;
++};
++
++// Fixed component facts only; no inferred Event count or whole graph fit.
++MLX_API bool event_control_layout(EventControlLayout&) noexcept;
++// Ordinary runtime construction only, before any original scope. No Event or
++// graph is created; the selected backend establishes its persistent device.
++MLX_API void prepare_event_runtime(Device);
++// Fixed native wrapper only; its maps/libraries/platform resources are separate.
++MLX_API size_t event_runtime_object_bytes() noexcept;
+ 
+ enum class EventObservation { ready, pending, failed, busy, unobservable };
+ 
+@@ -92,6 +109,7 @@
+   }
+ 
+  private:
++  friend struct EventControlTestAccess;
+   FailureCarrierRef failure_;
+   // Default constructed stream should never be used
+   // since the event is not yet valid
+diff --git a/mlx/native_control.h b/mlx/native_control.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/native_control.h
+@@ -0,0 +1,58 @@
++#pragma once
++
++#include <cstdint>
++#include <exception>
++#include "mlx/api.h"
++
++namespace mlx::core {
++class FailureCarrier;
++namespace submission {
++class GraphQuota;
++
++// Fixed native mechanism refusals. Throwing adapters still require the initial
++// C++ exception ABI population; these inline causes do not claim that bound.
++enum class NativeControlFailure : uint8_t {
++  none = 0,
++  missing_scope,
++  invalid_scope,
++  already_configured,
++  missing_graph,
++  missing_record,
++  missing_failure,
++  foreign_domain,
++  missing_receipt,
++  missing_worker,
++  busy_worker,
++  failed_worker,
++  stopped_worker,
++  blocked_during_submit,
++  sequence_exhausted,
++  unsupported_backend,
++  erased_callable,
++};
++
++class MLX_API NativeControlError final : public std::exception {
++ public:
++  explicit NativeControlError(NativeControlFailure failure) noexcept
++      : failure_(failure) {}
++  NativeControlFailure failure() const noexcept { return failure_; }
++  const char* what() const noexcept override;
++ private:
++  NativeControlFailure failure_;
++};
++
++// Only a lexical borrow of the current configured Scope; no owning authority
++// or quota can be reconstructed from this diagnostic population.
++struct NativeControlBinding {
++  NativeControlFailure failure{NativeControlFailure::none};
++  bool original{false};
++  GraphQuota* graph{nullptr};
++  FailureCarrier* carrier{nullptr};
++  uint64_t scope_identity{0};
++};
++MLX_API NativeControlBinding current_native_controls() noexcept;
++// Marks a construction attempt before allocation or callable construction.
++// This prevents later adoption of an ordinary Event/task into original mode.
++MLX_API void mark_native_control_construction() noexcept;
++} // namespace submission
++} // namespace mlx::core
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -46,12 +46,31 @@
+   gpu::init();
+ }
+ 
+-Scheduler::~Scheduler() = default;
++Scheduler::~Scheduler() {
++  // Valid public stack-owned schedulers must drain counted tasks before the
++  // notification state is destroyed. The selected singleton remains process-lived.
++  decltype(threads_) retiring;
++  {
++    std::unique_lock lock(threads_mtx_);
++    stopping_.store(true, std::memory_order_release);
++    for (auto& [index, worker] : threads_) worker->block();
++    retiring.swap(threads_);
++  }
++  // Worker joins, callable/native-cause retirement and foreign custody callbacks
++  // run with no registry loan. Reentrant preparation observes stopping_.
++  retiring.clear();
++}
+ 
+ StreamThread* Scheduler::prepare_stream(Stream s) {
++  if (stopping_.load(std::memory_order_acquire))
++    throw_task_refusal(submission::NativeControlFailure::stopped_worker, false);
+   StreamThread* st = nullptr;
+   {
+     std::shared_lock lock(threads_mtx_);
++    if (stopping_.load(std::memory_order_acquire)) {
++      lock.unlock();
++      throw_task_refusal(submission::NativeControlFailure::stopped_worker, false);
++    }
+     auto it = threads_.find(s.index);
+     if (it != threads_.end()) {
+       st = it->second.get();
+@@ -59,32 +78,122 @@
+   }
+   if (!st) {
+     std::unique_lock lock(threads_mtx_);
++    if (stopping_.load(std::memory_order_acquire)) {
++      lock.unlock();
++      throw_task_refusal(submission::NativeControlFailure::stopped_worker, false);
++    }
+     auto it = threads_.find(s.index);
+     if (it == threads_.end()) {
+-      it = threads_.emplace(s.index, std::make_unique<StreamThread>()).first;
++      it = threads_.emplace(s.index, std::make_unique<StreamThread>(s)).first;
+     }
+     st = it->second.get();
+   }
+   return st;
+ }
+ 
+-void Scheduler::enqueue(
+-    Stream s,
+-    std::function<void()> task,
+-    bool counted) {
+-  auto* st = prepare_stream(s);
++void Scheduler::enqueue(Stream s, std::function<void()> body, bool counted) {
++  auto binding = submission::current_native_controls();
++  if (binding.original) throw submission::NativeControlError(
++      binding.failure == submission::NativeControlFailure::none
++        ? submission::NativeControlFailure::erased_callable : binding.failure);
++  submission::mark_native_control_construction();
++  auto* worker = prepare_stream(s);
+   const auto* scope = submission::current_scope();
+-  auto failure = scope ? scope->failure_owner() : FailureCarrierRef{};
+-  st->enqueue([this, st, s, counted, failure = std::move(failure), task = std::move(task)]() mutable {
+-    try {
+-      task();
+-    } catch (...) {
+-      st->record_error(std::current_exception(), failure);
+-    }
+-    if (counted) {
+-      notify_task_completion(s);
+-    }
+-  }, counted ? &n_active_tasks_ : nullptr);
++  auto task = make_task(nullptr, scope ? scope->failure_owner() : FailureCarrierRef{},
++                        this, counted, std::move(body));
++  submit_task(worker, std::move(task), counted);
++}
++
++[[noreturn]] void throw_task_refusal(submission::NativeControlFailure failure, bool original) {
++  using Failure = submission::NativeControlFailure;
++  if (original) throw submission::NativeControlError(failure);
++  // Preserve existing ordinary native types and diagnostics. Their arbitrary
++  // exception allocation is outside the original fixed-result mechanism.
++  if (failure == Failure::sequence_exhausted)
++    throw std::overflow_error("CPU stream submission sequence exhausted.");
++  if (failure == Failure::blocked_during_submit)
++    throw std::runtime_error("CPU stream blocked during submission.");
++  throw std::runtime_error("Cannot enqueue work after CPU stream is stopped or blocked.");
++}
++
++void Scheduler::submit_task(StreamThread* thread, TaskOwner task, bool counted) {
++  using Failure = submission::NativeControlFailure;
++  const bool original = task.get()->graph.get() != nullptr;
++  if (stopping_.load(std::memory_order_acquire))
++    throw_task_refusal(Failure::stopped_worker, original);
++  if (original) {
++    // Callable construction may throw or reenter; recheck the same lexical
++    // domain and receipt before accepting a node that already owns its block.
++    const auto binding = submission::current_native_controls();
++    if (binding.failure != Failure::none) throw_task_refusal(binding.failure, true);
++    if (!binding.original || binding.graph != task.get()->graph.get() ||
++        binding.carrier != task.get()->failure.get() || !thread->stream)
++      throw_task_refusal(Failure::foreign_domain, true);
++    CpuStreamToken receipt;
++    const auto failure = submission::current_dispatch_stream(*thread->stream, receipt);
++    if (failure != Failure::none) throw_task_refusal(failure, true);
++    if (receipt.state != thread) throw_task_refusal(Failure::foreign_domain, true);
++  }
++  const auto failure = thread->enqueue_node(task, counted ? &n_active_tasks_ : nullptr);
++  if (failure != Failure::none) throw_task_refusal(failure, original);
++}
++
++void task_completed(Scheduler* scheduler) noexcept {
++  if (scheduler) scheduler->notify_task_completion();
++}
++
++submission::NativeControlFailure Scheduler::prepared_cpu_stream(
++    Stream stream, CpuStreamToken& out) const noexcept {
++  using Failure = submission::NativeControlFailure;
++  if (stream.device != Device::cpu) return Failure::foreign_domain;
++  try {
++    std::shared_lock lock(threads_mtx_, std::try_to_lock);
++    if (!lock.owns_lock()) return Failure::busy_worker;
++    if (stopping_.load(std::memory_order_acquire)) return Failure::stopped_worker;
++    auto it = threads_.find(stream.index);
++    if (it == threads_.end()) return Failure::missing_worker;
++    auto* worker = it->second.get();
++    if (!worker->stream || *worker->stream != stream) return Failure::foreign_domain;
++    if (worker->failed.load(std::memory_order_acquire)) return Failure::failed_worker;
++    const auto accepted = worker->admission.load(std::memory_order_acquire);
++    if (accepted & StreamThread::blocked_bit) return Failure::stopped_worker;
++    if ((accepted & StreamThread::sequence_mask) == StreamThread::sequence_mask)
++      return Failure::sequence_exhausted;
++    out.state = worker;
++    return Failure::none;
++  } catch (...) { return Failure::busy_worker; }
++}
++
++submission::NativeControlFailure prepared_cpu_stream(
++    Stream stream, CpuStreamToken& out) noexcept {
++  auto* existing = published_scheduler.load(std::memory_order_acquire);
++  return existing ? existing->prepared_cpu_stream(stream, out)
++                  : submission::NativeControlFailure::missing_worker;
++}
++
++TaskContext prepare_task(Stream stream, bool erased_callable) {
++  using Failure = submission::NativeControlFailure;
++  const auto binding = submission::current_native_controls();
++  if (binding.failure != Failure::none) throw submission::NativeControlError(binding.failure);
++  if (binding.original) {
++    if (erased_callable) throw submission::NativeControlError(Failure::erased_callable);
++    CpuStreamToken receipt;
++    auto failure = submission::current_dispatch_stream(stream, receipt);
++    if (failure != Failure::none) throw submission::NativeControlError(failure);
++    CpuStreamToken worker;
++    failure = prepared_cpu_stream(stream, worker);
++    if (failure != Failure::none) throw submission::NativeControlError(failure);
++    if (receipt.state != worker.state) throw submission::NativeControlError(Failure::foreign_domain);
++    submission::mark_native_control_construction();
++    return {published_scheduler.load(std::memory_order_acquire),
++            const_cast<StreamThread*>(static_cast<const StreamThread*>(worker.state)),
++            binding.graph, submission::current_scope()->failure_owner()};
++  }
++  submission::mark_native_control_construction();
++  auto& owner = scheduler();
++  auto* scope = submission::current_scope();
++  return {&owner, owner.prepare_stream(stream), nullptr,
++          scope ? scope->failure_owner() : FailureCarrierRef{}};
+ }
+ 
+ CpuStreamToken Scheduler::prepare_cpu_stream(Stream s) {
+@@ -141,6 +250,10 @@
+   // This closed source keeps the native cause/account alive through the legacy
+   // string extraction. Its final destruction occurs only after the mutex loan.
+   FailureCarrierRef retired_failure;
++  // Reverse destruction: string/exception sources before their final custody.
++  // The stream exception may differ from a carrier's already-published cause.
++  std::exception_ptr retired_error;
++  std::shared_ptr<std::string> retired_message;
+   std::unique_lock lock(error_mtx);
+   if (!error_pending && !uncaptured_error.load(std::memory_order_acquire)) {
+     return nullptr;
+@@ -165,8 +278,8 @@
+   }
+   auto result = error_message;
+   if (consume) {
+-    first_error = {};
+-    error_message.reset();
++    retired_error = std::move(first_error);
++    retired_message = std::move(error_message);
+     retired_failure = std::move(first_failure);
+     error_pending = false;
+     uncaptured_error.store(false, std::memory_order_release);
+@@ -176,16 +289,28 @@
+ 
+ std::shared_ptr<std::string> Scheduler::stream_error(
+     const Stream& stream) const {
+-  std::shared_lock lock(threads_mtx_);
+-  auto it = threads_.find(stream.index);
+-  return it == threads_.end() ? nullptr : it->second->error(false);
++  StreamThread* worker = nullptr;
++  {
++    std::shared_lock lock(threads_mtx_);
++    auto it = threads_.find(stream.index);
++    if (it != threads_.end()) worker = it->second.get();
++  }
++  // Entries are never removed while this Scheduler lives. Diagnostic cause or
++  // final carrier teardown may reenter the registry; do not carry its lock.
++  return worker ? worker->error(false) : nullptr;
+ }
+ 
+ std::shared_ptr<std::string> Scheduler::take_stream_error(
+     const Stream& stream) {
+-  std::shared_lock lock(threads_mtx_);
+-  auto it = threads_.find(stream.index);
+-  return it == threads_.end() ? nullptr : it->second->error(true);
++  StreamThread* worker = nullptr;
++  {
++    std::shared_lock lock(threads_mtx_);
++    auto it = threads_.find(stream.index);
++    if (it != threads_.end()) worker = it->second.get();
++  }
++  // Entries are never removed while this Scheduler lives. Diagnostic cause or
++  // final carrier teardown may reenter the registry; do not carry its lock.
++  return worker ? worker->error(true) : nullptr;
+ }
+ 
+ CpuStreamToken prepare_cpu_stream(Stream s) {
+diff --git a/mlx/scheduler.h b/mlx/scheduler.h
+--- a/mlx/scheduler.h
++++ b/mlx/scheduler.h
+@@ -5,9 +5,9 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
+-#include <deque>
+ #include <exception>
+ #include <future>
++#include <functional>
+ #include <optional>
+ #include <shared_mutex>
+ #include <string>
+@@ -18,6 +18,8 @@
+ #include "mlx/backend/gpu/eval.h"
+ #include "mlx/device.h"
+ #include "mlx/failure.h"
++#include "mlx/native_control.h"
++#include "mlx/scheduler_task.h"
+ #include "mlx/stream.h"
+ 
+ namespace mlx::core::scheduler {
+@@ -34,6 +36,18 @@
+ };
+ 
+ struct StreamThread;
++struct TaskContext {
++  Scheduler* scheduler{nullptr};
++  StreamThread* thread{nullptr};
++  submission::GraphQuota* graph{nullptr};
++  FailureCarrierRef failure;
++};
++// Fixed original lookup; ordinary preparation remains the existing boundary.
++MLX_API TaskContext prepare_task(Stream, bool erased_callable = false);
++MLX_API submission::NativeControlFailure prepared_cpu_stream(
++    Stream, CpuStreamToken&) noexcept;
++MLX_API void task_completed(Scheduler*) noexcept;
++[[noreturn]] MLX_API void throw_task_refusal(submission::NativeControlFailure, bool original);
+ // Borrowed only while the same scheduler worker is executing its FIFO.
+ StreamThread*& current_worker() noexcept;
+ 
+@@ -42,12 +56,10 @@
+   static constexpr uint64_t blocked_bit = uint64_t{1} << 63;
+   static constexpr uint64_t sequence_mask = blocked_bit - 1;
+ 
+-  struct Task {
+-    std::function<void()> body;
+-  };
+-
+   std::mutex mtx;
+-  std::deque<Task> q;
++  Task* head{nullptr};
++  Task* tail{nullptr};
++  const std::optional<Stream> stream;
+   std::condition_variable cond;
+   bool stop;
+   std::atomic<uint64_t> admission{0};
+@@ -62,8 +74,8 @@
+   bool error_pending{false};
+   std::thread thread;
+ 
+-  StreamThread()
+-      : stop(false),
++  explicit StreamThread(std::optional<Stream> identity = std::nullopt)
++      : stream(identity), stop(false),
+         fallback_error(std::make_shared<std::string>(
+             "Asynchronous CPU stream work failed; diagnostic unavailable.")),
+         thread(&StreamThread::thread_fn, this) {}
+@@ -108,59 +120,69 @@
+   void thread_fn() {
+     current_worker() = this;
+     while (true) {
+-      std::function<void()> task;
++      Task* selected;
+       {
+-        std::unique_lock<std::mutex> lk(mtx);
+-        cond.wait(lk, [this] { return !this->q.empty() || this->stop; });
+-        if (q.empty() && stop) {
++        std::unique_lock<std::mutex> lock(mtx);
++        cond.wait(lock, [this] { return head || stop; });
++        if (!head && stop) {
+           current_worker() = nullptr;
+           return;
+         }
+-        task = std::move(q.front().body);
+-        q.pop_front();
++        selected = head;
++        head = head->next;
++        if (!head) tail = nullptr;
++        selected->next = nullptr;
+       }
+-
+-      try {
+-        task();
+-      } catch (...) {
+-        record_error(std::current_exception());
+-      }
+-      // Release task captures before publishing its terminal sequence number.
+-      task = {};
++      TaskOwner task(selected);
++      // Cause/custody survive the last queued capture and the complete node.
++      auto failure = selected->failure;
++      auto* scheduler = selected->scheduler;
++      const bool counted = selected->counted;
++      try { selected->invoke(selected); }
++      catch (...) { record_error(std::current_exception(), failure); }
++      task.reset();
++      if (counted) task_completed(scheduler);
+       completed.fetch_add(1, std::memory_order_release);
+     }
+   }
+ 
+-  void enqueue(
+-      std::function<void()> f,
+-      std::atomic<int>* counted_tasks = nullptr) {
++ private:
++  friend class Scheduler;
++  submission::NativeControlFailure enqueue_node(
++      TaskOwner& task, std::atomic<int>* counted_tasks = nullptr) {
++    using Failure = submission::NativeControlFailure;
+     {
+-      std::lock_guard<std::mutex> lk(mtx);
++      std::lock_guard<std::mutex> lock(mtx);
+       auto previous = admission.load(std::memory_order_acquire);
+-      if (stop || (previous & blocked_bit)) {
+-        throw std::runtime_error(
+-            "Cannot enqueue work after CPU stream is stopped or blocked.");
+-      }
+-      if ((previous & sequence_mask) == sequence_mask) {
+-        throw std::overflow_error("CPU stream submission sequence exhausted.");
+-      }
+-      q.push_back(Task{std::move(f)});
+-      // Blocking and acceptance share one atomic linearization point. A
+-      // concurrent block either includes this task in its frontier or rejects
+-      // it before the worker can observe it.
+-      if (!admission.compare_exchange_strong(
+-              previous,
+-              previous + 1,
+-              std::memory_order_acq_rel,
+-              std::memory_order_acquire)) {
+-        q.pop_back();
+-        throw std::runtime_error("CPU stream blocked during submission.");
+-      }
+-      if (counted_tasks) {
+-        counted_tasks->fetch_add(1, std::memory_order_relaxed);
+-      }
++      if (stop || (previous & blocked_bit)) return Failure::stopped_worker;
++      if ((previous & sequence_mask) == sequence_mask) return Failure::sequence_exhausted;
++      // No allocation or source destruction occurs under this lock. Blocking
++      // and acceptance retain the same single atomic linearization point.
++      if (!admission.compare_exchange_strong(previous, previous + 1,
++              std::memory_order_acq_rel, std::memory_order_acquire))
++        return Failure::blocked_during_submit;
++      auto* accepted = task.release();
++      if (tail) tail->next = accepted;
++      else head = accepted;
++      tail = accepted;
++      if (counted_tasks) counted_tasks->fetch_add(1, std::memory_order_relaxed);
+     }
+     cond.notify_one();
++    return Failure::none;
++  }
++
++ public:
++  // Legacy direct worker clients remain ordinary, and cannot pass an erased
++  // callable off as a closed original task population.
++  void enqueue(std::function<void()> body, std::atomic<int>* counted_tasks = nullptr) {
++    auto binding = submission::current_native_controls();
++    if (binding.original)
++      throw submission::NativeControlError(submission::NativeControlFailure::erased_callable);
++    submission::mark_native_control_construction();
++    auto task = make_task(nullptr, {}, nullptr, false, std::move(body));
++    auto failure = enqueue_node(task, counted_tasks);
++    if (failure != submission::NativeControlFailure::none)
++      throw_task_refusal(failure, false);
+   }
+ 
+   StreamProgress progress() const noexcept {
+@@ -192,6 +214,9 @@
+       bool counted = false);
+ 
+   CpuStreamToken prepare_cpu_stream(Stream s);
++  submission::NativeControlFailure prepared_cpu_stream(
++      Stream, CpuStreamToken&) const noexcept;
++  void submit_task(StreamThread* thread, TaskOwner task, bool counted);
+   std::optional<StreamProgress> cpu_stream_progress(Stream s) const noexcept;
+ 
+   std::shared_ptr<std::string> stream_error(const Stream& stream) const;
+@@ -206,7 +231,8 @@
+     completion_cv.notify_all();
+   }
+ 
+-  void notify_task_completion(const Stream& stream) noexcept {
++  void notify_task_completion(const Stream&) noexcept { notify_task_completion(); }
++  void notify_task_completion() noexcept {
+     try {
+       std::lock_guard<std::mutex> lk(mtx);
+       n_active_tasks_--;
+@@ -240,10 +266,13 @@
+   }
+ 
+  private:
++  friend struct SchedulerControlTestAccess;
+   friend Stream mlx::core::new_stream(Device d);
++  friend TaskContext prepare_task(Stream, bool);
+ 
+   StreamThread* prepare_stream(Stream s);
+ 
++  std::atomic<bool> stopping_{false};
+   std::atomic<int> n_active_tasks_{0};
+   std::unordered_map<int, std::unique_ptr<StreamThread>> threads_;
+   mutable std::shared_mutex threads_mtx_;
+@@ -263,12 +292,18 @@
+ 
+ template <typename F>
+ void enqueue(const Stream& stream, F&& f) {
+-  scheduler().enqueue(stream, std::forward<F>(f));
++  auto context = prepare_task(stream, std::is_same_v<std::decay_t<F>, std::function<void()>>);
++  auto task = make_task(context.graph, std::move(context.failure), context.scheduler,
++                        false, std::forward<F>(f));
++  context.scheduler->submit_task(context.thread, std::move(task), false);
+ }
+ 
+ template <typename F>
+ void enqueue_counted(const Stream& stream, F&& f) {
+-  scheduler().enqueue(stream, std::forward<F>(f), true);
++  auto context = prepare_task(stream, std::is_same_v<std::decay_t<F>, std::function<void()>>);
++  auto task = make_task(context.graph, std::move(context.failure), context.scheduler,
++                        true, std::forward<F>(f));
++  context.scheduler->submit_task(context.thread, std::move(task), true);
+ }
+ 
+ inline int n_active_tasks() {
+diff --git a/mlx/scheduler_task.h b/mlx/scheduler_task.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/scheduler_task.h
+@@ -0,0 +1,77 @@
++#pragma once
++
++#include <type_traits>
++#include <utility>
++#include "mlx/failure.h"
++#include "mlx/graph_quota.h"
++
++namespace mlx::core::scheduler {
++class MLX_API Scheduler;
++
++// One physical FIFO node. The concrete callable follows inline, before any
++// std::function conversion on original dispatch. No node owns its worker.
++struct Task {
++  Task* next{nullptr};
++  void (*invoke)(Task*);
++  void (*destroy)(Task*) noexcept;
++  submission::GraphQuotaRef graph;
++  FailureCarrierRef failure;
++  Scheduler* scheduler;
++  bool counted;
++
++  Task(void (*call)(Task*), void (*drop)(Task*) noexcept,
++       submission::GraphQuota* arena, FailureCarrierRef owner,
++       Scheduler* scheduler, bool counted) noexcept
++      : invoke(call), destroy(drop), graph(arena), failure(std::move(owner)),
++        scheduler(scheduler), counted(counted) {}
++};
++
++class TaskOwner {
++ public:
++  explicit TaskOwner(Task* task = nullptr) noexcept : task_(task) {}
++  TaskOwner(TaskOwner&& other) noexcept : task_(other.release()) {}
++  TaskOwner(const TaskOwner&) = delete;
++  TaskOwner& operator=(const TaskOwner&) = delete;
++  ~TaskOwner() { reset(); }
++  Task* get() const noexcept { return task_; }
++  Task* release() noexcept { return std::exchange(task_, nullptr); }
++  void reset() noexcept { if (auto* task = release()) task->destroy(task); }
++ private:
++  Task* task_;
++};
++
++template<class F> struct TaskNode final : Task {
++  F body;
++  template<class U> TaskNode(submission::GraphQuota* graph,
++      FailureCarrierRef failure, Scheduler* scheduler, bool counted, U&& body)
++      : Task([](Task* task) { static_cast<TaskNode*>(task)->body(); },
++             [](Task* task) noexcept {
++               auto* node = static_cast<TaskNode*>(task);
++               // The allocator protects the header through callable/base
++               // destruction and block return, even on the final task alias.
++               submission::GraphAllocator<TaskNode> allocator(node->graph.get());
++               node->~TaskNode();
++               allocator.deallocate(node, 1);
++             }, graph, std::move(failure), scheduler, counted),
++        body(std::forward<U>(body)) {}
++};
++
++template<class F> TaskOwner make_task(submission::GraphQuota* graph,
++    FailureCarrierRef failure, Scheduler* scheduler, bool counted, F&& body) {
++  using Node = TaskNode<std::decay_t<F>>;
++  submission::GraphAllocator<Node> allocator(graph);
++  auto* storage = allocator.allocate(1);
++  try {
++    return TaskOwner(::new (storage) Node(graph, std::move(failure), scheduler,
++                                         counted, std::forward<F>(body)));
++  } catch (...) {
++    allocator.deallocate(storage, 1);
++    throw;
++  }
++}
++
++template<class F> bool task_graph_extent(size_t& out) noexcept {
++  using Node = TaskNode<std::decay_t<F>>;
++  return submission::GraphQuota::allocation_extent(sizeof(Node), alignof(Node), out);
++}
++} // namespace mlx::core::scheduler
+diff --git a/mlx/submission.cpp b/mlx/submission.cpp
+--- a/mlx/submission.cpp
++++ b/mlx/submission.cpp
+@@ -8,6 +8,7 @@
+ namespace {
+ thread_local Scope* active_scope = nullptr;
+ thread_local Record* active_capture = nullptr;
++thread_local Record* active_dispatch = nullptr;
+ thread_local const void* owner_identity = nullptr;
+ constinit std::atomic<uint64_t> next_scope_identity{1};
+ static_assert(std::atomic<uint64_t>::is_always_lock_free);
+@@ -84,6 +85,7 @@
+ Scope::Scope(void* retained_owner, void (*retire_owner)(void*), RecordQuota* quota, GraphQuota* graph)
+     : owner_(prepare_owner_identity()), identity_(take_scope_identity()),
+       scoped_observation_(active_scope && active_scope->scoped_observation_only()),
++      original_required_(active_scope && active_scope->original_controls_required()),
+       failure_(active_scope ? active_scope->failure_owner() : FailureCarrierRef{}),
+       parent_(active_scope) {
+   // Prepare global ownership before the first possible submission.
+@@ -214,12 +216,102 @@
+   return true;
+ }
+ 
++bool Scope::active_on_owner_thread() const noexcept {
++  return active_ && active_scope == this && on_owner_thread();
++}
++
++NativeControlFailure Scope::require_original_controls() noexcept {
++  if (!active_on_owner_thread()) return NativeControlFailure::invalid_scope;
++  original_required_ = true;
++  if (pending_.load(std::memory_order_acquire) ||
++      activity_.load(std::memory_order_acquire) || native_construction_started_ ||
++      original_attempted_) return NativeControlFailure::invalid_scope;
++  return NativeControlFailure::none;
++}
++
++NativeControlFailure Scope::enable_original_controls() noexcept {
++  if (!active_on_owner_thread()) return NativeControlFailure::invalid_scope;
++  // A failed explicit attempt spends this configuration population as well.
++  original_required_ = true;
++  if (original_attempted_) return NativeControlFailure::already_configured;
++  original_attempted_ = true;
++  if (!identity_ || !scoped_observation_ || pending_.load(std::memory_order_acquire) ||
++      activity_.load(std::memory_order_acquire) || native_construction_started_)
++    return NativeControlFailure::invalid_scope;
++  if (!graph_) return NativeControlFailure::missing_graph;
++  if (!quota_) return NativeControlFailure::missing_record;
++  if (!failure_) return NativeControlFailure::missing_failure;
++  if (!failure_bound_here_ || failure_.get()->scope_identity() != identity_)
++    return NativeControlFailure::foreign_domain;
++  original_enabled_ = true;
++  return NativeControlFailure::none;
++}
++
++NativeControlBinding current_native_controls() noexcept {
++  auto* scope = active_scope;
++  if (!scope || !scope->original_controls_required()) return {};
++  NativeControlBinding result;
++  result.original = true;
++  if (!scope->active_on_owner_thread() || !scope->original_controls_enabled() ||
++      !scope->scoped_observation_only()) {
++    result.failure = NativeControlFailure::invalid_scope;
++    return result;
++  }
++  result.graph = scope->graph_quota();
++  result.carrier = scope->failure_owner().get();
++  result.scope_identity = scope->identity();
++  if (!result.graph) result.failure = NativeControlFailure::missing_graph;
++  else if (!scope->record_quota()) result.failure = NativeControlFailure::missing_record;
++  else if (!result.carrier) result.failure = NativeControlFailure::missing_failure;
++  else if (result.carrier->scope_identity() != result.scope_identity)
++    result.failure = NativeControlFailure::foreign_domain;
++  return result;
++}
++
++const char* NativeControlError::what() const noexcept {
++  switch (failure_) {
++    case NativeControlFailure::none: return "Native controls have no failure.";
++    case NativeControlFailure::missing_scope: return "Original native controls require an active scope.";
++    case NativeControlFailure::invalid_scope: return "Original native scope is not configured for work.";
++    case NativeControlFailure::already_configured: return "Original native controls were already attempted.";
++    case NativeControlFailure::missing_graph: return "Original native controls require their Graph quota.";
++    case NativeControlFailure::missing_record: return "Original native controls require their Record quota.";
++    case NativeControlFailure::missing_failure: return "Original native controls require their failure carrier.";
++    case NativeControlFailure::foreign_domain: return "Original native control domain differs.";
++    case NativeControlFailure::missing_receipt: return "Original native task has no prepared stream receipt.";
++    case NativeControlFailure::missing_worker: return "Original native task has no prepared worker.";
++    case NativeControlFailure::busy_worker: return "Original native worker lookup is busy.";
++    case NativeControlFailure::failed_worker: return "Original native worker has failed.";
++    case NativeControlFailure::stopped_worker: return "Original native worker is stopped or blocked.";
++    case NativeControlFailure::blocked_during_submit: return "Original CPU stream blocked during submission.";
++    case NativeControlFailure::sequence_exhausted: return "Original native worker sequence is exhausted.";
++    case NativeControlFailure::unsupported_backend: return "Original native controls are not implemented for this backend.";
++    case NativeControlFailure::erased_callable: return "Original native task requires its concrete callable.";
++  }
++  return "Invalid native control failure.";
++}
++
++void mark_native_control_construction() noexcept {
++  if (!active_scope || !active_scope->active_on_owner_thread()) return;
++  for (auto* scope = active_scope; scope; scope = scope->parent_)
++    scope->native_construction_started_ = true;
++}
++
+ bool Scope::bind_failure(FailureCarrierRef failure) noexcept {
+-  if (!failure || failure_ || !scoped_observation_ || !on_owner_thread() ||
+-      active_scope != this || !active_ || pending_.load(std::memory_order_acquire) ||
++  // Only an empty original child with both actual arenas may replace the exact
++  // inherited parent alias. The durable parent keeps that displaced alias
++  // nonfinal. Its binding/cause is never mutated by this child replacement.
++  const bool inherited_original = original_required_ && !original_attempted_ &&
++      !failure_bound_here_ && quota_ && graph_ && parent_ && failure_ &&
++      failure_.get() == parent_->failure_owner().get();
++  if (!failure || failure_bound_here_ || (original_required_ && original_attempted_) ||
++      (failure_ && !inherited_original) ||
++      !scoped_observation_ || !on_owner_thread() || active_scope != this || !active_ ||
++      native_construction_started_ || pending_.load(std::memory_order_acquire) ||
+       activity_.load(std::memory_order_acquire) || !failure.get()->bind_scope(identity_))
+     return false;
+   failure_ = std::move(failure);
++  failure_bound_here_ = true;
+   return true;
+ }
+ 
+@@ -360,6 +452,39 @@
+   }
+ }
+ 
++RecordDispatchGuard::RecordDispatchGuard(Record& record)
++    : previous_(active_dispatch) {
++  const auto binding = current_native_controls();
++  if (binding.failure != NativeControlFailure::none)
++    throw NativeControlError(binding.failure);
++  if (binding.original && (record.scope_ != active_scope ||
++      record.owner_ != owner_identity || record.frozen_.load(std::memory_order_acquire) ||
++      record.quota_ != active_scope->record_quota() || record.graph_.get() != binding.graph))
++    throw NativeControlError(NativeControlFailure::foreign_domain);
++  active_dispatch = &record;
++}
++RecordDispatchGuard::~RecordDispatchGuard() { active_dispatch = previous_; }
++
++NativeControlFailure current_dispatch_stream(
++    Stream stream, scheduler::CpuStreamToken& out) noexcept {
++  const auto binding = current_native_controls();
++  if (binding.failure != NativeControlFailure::none) return binding.failure;
++  if (!binding.original || !active_scope) return NativeControlFailure::missing_scope;
++  const auto* record = active_dispatch;
++  if (!record) return NativeControlFailure::missing_receipt;
++  if (record->scope_ != active_scope || record->owner_ != owner_identity ||
++      record->frozen_.load(std::memory_order_acquire) ||
++      record->quota_ != active_scope->record_quota() || record->graph_.get() != binding.graph)
++    return NativeControlFailure::foreign_domain;
++  for (const auto& receipt : record->streams_) {
++    if (receipt.stream == stream && receipt.cpu.state) {
++      out = receipt.cpu;
++      return NativeControlFailure::none;
++    }
++  }
++  return NativeControlFailure::missing_receipt;
++}
++
+ void Record::prepare_stream(Stream stream) {
+   if (std::any_of(streams_.begin(), streams_.end(), [&](const auto& receipt) {
+         return receipt.stream == stream;
+@@ -373,7 +498,15 @@
+   streams_.reserve(streams_.size() + 1);
+   StreamReceipt receipt{stream, {}, {}};
+   if (stream.device == Device::cpu) {
+-    receipt.cpu = scheduler::prepare_cpu_stream(stream);
++    const auto binding = current_native_controls();
++    if (binding.failure != NativeControlFailure::none) throw NativeControlError(binding.failure);
++    if (binding.original) {
++      if (scope_ != active_scope || quota_ != active_scope->record_quota() ||
++          graph_.get() != binding.graph || frozen_.load(std::memory_order_acquire))
++        throw NativeControlError(NativeControlFailure::foreign_domain);
++      const auto failure = scheduler::prepared_cpu_stream(stream, receipt.cpu);
++      if (failure != NativeControlFailure::none) throw NativeControlError(failure);
++    } else receipt.cpu = scheduler::prepare_cpu_stream(stream);
+     receipt.begin = scheduler::cpu_stream_progress(receipt.cpu).accepted;
+   } else {
+     receipt.gpu = gpu::prepare_submission_stream(stream);
+diff --git a/mlx/submission.h b/mlx/submission.h
+--- a/mlx/submission.h
++++ b/mlx/submission.h
+@@ -9,6 +9,7 @@
+ #include "mlx/array.h"
+ #include "mlx/record_quota.h"
+ #include "mlx/graph_quota.h"
++#include "mlx/native_control.h"
+ #include <new>
+ #include <utility>
+ #include "mlx/backend/gpu/eval.h"
+@@ -53,6 +54,14 @@
+   // or preexisting work refuses without a fallback or another allocation.
+   bool enable_scoped_observation() noexcept;
+   bool scoped_observation_only() const noexcept { return scoped_observation_; }
++  // Configure once on the current empty scope after carrier binding. A refused
++  // original configuration never permits a later ordinary allocation fallback.
++  NativeControlFailure require_original_controls() noexcept;
++  NativeControlFailure enable_original_controls() noexcept;
++  bool original_controls_required() const noexcept { return original_required_; }
++  bool original_controls_enabled() const noexcept { return original_enabled_; }
++  bool active_on_owner_thread() const noexcept;
++
+   uint64_t identity() const noexcept { return identity_; }
+   ScopedProgress progress_scoped() noexcept;
+   bool bind_failure(FailureCarrierRef failure) noexcept;
+@@ -61,6 +70,7 @@
+ 
+  private:
+   friend class Record;
++  friend void mark_native_control_construction() noexcept;
+   ~Scope();
+   void retain() noexcept;
+   void record_started() noexcept;
+@@ -79,6 +89,11 @@
+   const void* owner_;
+   uint64_t identity_{0};
+   bool scoped_observation_{false};
++  bool original_required_{false};
++  bool original_attempted_{false};
++  bool original_enabled_{false};
++  bool failure_bound_here_{false};
++  bool native_construction_started_{false};
+   FailureCarrierRef failure_;
+   Scope* parent_{nullptr};
+   Scope* previous_{nullptr};
+@@ -113,6 +128,21 @@
+ // Existing ordinary callers retain their best-effort retirement behavior.
+ MLX_API void retire_records();
+ MLX_API bool stream_failed(Stream) noexcept;
++
++class Record;
++// Borrow the actual entered Record only during its host dispatch interval.
++// Nested guards restore their predecessor; workers never install this context.
++class MLX_API RecordDispatchGuard final {
++ public:
++  explicit RecordDispatchGuard(Record&);
++  ~RecordDispatchGuard();
++  RecordDispatchGuard(const RecordDispatchGuard&) = delete;
++  RecordDispatchGuard& operator=(const RecordDispatchGuard&) = delete;
++ private:
++  Record* previous_;
++};
++MLX_API NativeControlFailure current_dispatch_stream(
++    Stream, scheduler::CpuStreamToken&) noexcept;
+ 
+ // Construct and prepare before native work. Keep the current array, remaining
+ // tape, primitive owners, fences and events in a derived record. finish and
+@@ -203,6 +233,8 @@
+ 
+  private:
+   friend class Scope;
++  friend class RecordDispatchGuard;
++  friend NativeControlFailure current_dispatch_stream(Stream, scheduler::CpuStreamToken&) noexcept;
+   friend void progress_records(bool) noexcept;
+   friend void retire_records();
+   friend RetirementPass try_retire_records();
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -180,6 +180,7 @@
+   prepared_recovery->enter();
+   auto* recovery = prepared_recovery.release();
+   try {
++  submission::RecordDispatchGuard dispatch(*recovery);
+   auto& tape = recovery->tape;
+ 
+   // Make an effort to choose a good output stream
+@@ -651,6 +652,7 @@
+   prepared->enter();
+   auto* recovery = prepared.release();
+   try {
++    submission::RecordDispatchGuard dispatch(*recovery);
+     recovery->prepare_stream(stream);
+     recovery->owner.wait(stream);
+     recovery->finish(false);

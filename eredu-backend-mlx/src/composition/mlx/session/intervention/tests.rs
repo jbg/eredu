@@ -451,3 +451,70 @@ fn verify_prepaid_partition_activation(device: safemlx::DeviceType) {
         assert_eq!(&data[4..], &[expected_tail; 8]);
     }
 }
+
+
+#[test]
+fn static_activation_all_actions_match_strided_host_oracle_and_trace_population() {
+    use eredu_nn::workspace::{WorkspaceContext,WorkspaceTensor,WorkspaceDtype,WorkspaceMechanisms};
+    use crate::backend::nn::workspace::MlxMetalWorkspaceMechanisms;
+    let stream=Stream::new_with_device(&safemlx::Device::new(safemlx::DeviceType::Cpu,0));
+    let values:Vec<f32>=(0..14).map(|i|i as f32*0.25-1.5).collect();
+    let transposed:Vec<f32>=(0..7).flat_map(|column|[values[column],values[7+column]]).collect();
+    let input=MlxTensor::from_array(Array::from_slice(&transposed,&[7,2]).transpose_axes(&[1,0],&stream).unwrap());
+    for case in 0..7 {
+        let whole=case==3 || case==6;
+        let slice=ResolvedCaptureSlice {starts:vec![1,if whole {0}else{1}],ends:vec![2,7],
+            strides:vec![1,if whole {1}else{2}],shape:vec![1,if whole {7}else{3}]};
+        let dtype=InterventionDtype::Float32;
+        let tensor=||InterventionTensor {shape:vec![1,3],values:InterventionValues::Float32(vec![0.125,-0.5,1.75])};
+        let action=match case {
+            0=>InterventionAction::Zero {dtype},
+            1=>InterventionAction::Scale {dtype,factor:-0.5},
+            2=>InterventionAction::Mask {dtype,shape:vec![1,3],keep:vec![true,false,true]},
+            3=>InterventionAction::MaskComponents {dtype,indices:vec![1,5],keep_selected:true},
+            4=>InterventionAction::Replace {tensor:tensor()},
+            5=>InterventionAction::Add {tensor:tensor()},
+            _=>InterventionAction::MaskLogits {dtype,token_ids:vec![0,4]},
+        };
+        let mut expected=values.clone();
+        for column in 0..7 {
+            if !whole && ![1,3,5].contains(&column) {continue;}
+            let ordinal=column/2;let index=7+column;
+            expected[index]=match case {
+                0=>0.0,
+                1=>values[index]*-0.5,
+                2=>if ordinal==1 {0.0}else{values[index]},
+                3=>if [1,5].contains(&column) {values[index]}else{0.0},
+                4=>[0.125,-0.5,1.75][ordinal],
+                5=>values[index]+[0.125,-0.5,1.75][ordinal],
+                _=>if [0,4].contains(&column) {f32::NEG_INFINITY}else{values[index]},
+            };
+        }
+        let mut native=NativeCapture {stream:&stream,domain:None,partition:None};
+        let actual=eredu_runtime::intervention::apply_activation(&mut native,&input,&action,&slice).unwrap();
+        assert_eq!(actual.to_f32_vec(&stream).unwrap(),expected,"action {case}");
+        assert_eq!(input.to_f32_vec(&stream).unwrap(),values,"source mutated");
+        let program=PreparedStaticActivation::new(&action,&slice,&[2,7],dtype).unwrap();
+        let population=program.population().unwrap();
+        let mechanism=MlxMetalWorkspaceMechanisms::current_host().unwrap();
+        let context=WorkspaceContext::new(mechanism);
+        let source=WorkspaceTensor::existing(context.layout(&[2,7],WorkspaceDtype::Float32).unwrap(),&context).unwrap();
+        context.begin_span();
+        let mut retained=Vec::new();
+        let output=program.trace(&source,&context,&mut retained).unwrap();
+        assert_eq!(output.shape(),&[2,7]);
+        assert_eq!(retained.len(),population.retained_roots);
+        assert_eq!(population.completions,population.retained_roots);
+        assert_eq!(population.host_bytes,if whole {7}else{0});
+        assert!(population.controls>0);
+        let report=context.report(&retained).unwrap();
+        for operation in &report.operations {
+            assert!(mechanism.operation_bound(operation).unwrap().is_some(),"unpriced {operation:?}");
+        }
+        let wrong=WorkspaceTensor::existing(context.layout(&[1,14],WorkspaceDtype::Float32).unwrap(),&context).unwrap();
+        assert!(program.trace(&wrong,&context,&mut Vec::new()).is_err());
+    }
+}
+
+#[path = "tests/precision.rs"]
+mod precision;

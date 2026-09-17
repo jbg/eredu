@@ -130,3 +130,25 @@ fn muse_declares_channel_gates_postnorms_and_scaled_softcap_for_both_weight_conv
         }
     }
 }
+
+#[test]
+fn muse_owned_unit_catalog_reuses_one_shared_effective_pair() {
+    let json = fixture();
+    let prepared = crate::configuration::MODEL_CONFIGURATIONS
+        .resolve_safetensors(&json)
+        .unwrap();
+    let plan = prepared.architecture_plan();
+    let graph = plan.architecture_descriptor();
+    let interventions = plan.intervention_points();
+    validate(&graph);
+    for layer in 0..2 {
+        for boundary in ["input", "output"] {
+            assert_unit_boundary_pair(
+                &graph,
+                &interventions,
+                &format!("model.layers.{layer}.{boundary}"),
+                &axes(8),
+            );
+        }
+    }
+}

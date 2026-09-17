@@ -1,4 +1,13 @@
+mod evidence;
+pub(crate) use evidence::{ExternalCompletedSource, retain_external_evidence,retain_external_evidence_for_roots,retain_external_evidence_for_placement};
 use super::*;
+mod original;
+mod source;
+pub(crate) mod workspace;
+mod phase;
+pub(crate) use phase::execute as execute_original_assistant;
+pub(crate) use source::MlxExternalAssistantSource;
+use original::DrafterRecovery;
 use crate::backend::ordinary_retirement::{self, OrdinaryRetirement};
 use crate::backend::submission_recovery::{Recovery, Retention, Status};
 use std::{
@@ -37,6 +46,9 @@ pub(crate) fn speculative_mechanism_capabilities() -> SpeculativeMechanismCapabi
 pub(crate) struct MlxExternalAssistant<A: eredu_architectures::ExternalAssistantArchitecture> {
     pub(crate) config: A::Config,
     pub(crate) module: MlxModule<A::Module<MlxNeuralBackend>>,
+    // Exact cold source and the actual populated values; no re-discovery or
+    // module/configuration reconstruction is needed by a later managed quote.
+    pub(crate) source: MlxExternalAssistantSource<A>,
     pub(crate) observers: eredu_architectures::external_assistant::ExternalAssistantObservers<
         MlxTensor,
         Array,
@@ -47,6 +59,32 @@ pub(crate) struct MlxExternalAssistant<A: eredu_architectures::ExternalAssistant
 pub(crate) struct MlxAssistantPreparationVisitor {
     pub(super) stream: Stream,
     pub(super) weights_stream: Stream,
+    pub(super) source_pool: Option<eredu_runtime::working_memory::WorkingMemoryPool>,
+}
+
+#[cfg(test)]
+impl MlxAssistantPreparationVisitor {
+    /// Uses the same ordinary exact lowering predicates in native source fixtures.
+    pub(crate) fn lowering_for_native_source_test(
+        descriptor: &eredu_runtime::WeightLoweringDescriptor,
+        transforms: bool,
+    ) -> Option<eredu_runtime::WeightLoweringKind> {
+        if transforms && super::super::replicated_text::supports_transform(descriptor) {
+            Some(eredu_runtime::WeightLoweringKind::Transform)
+        } else if !transforms && super::super::replicated_text::supports_direct(descriptor) {
+            Some(eredu_runtime::WeightLoweringKind::Direct)
+        } else {
+            None
+        }
+    }
+
+    /// Retains ordinary source registration without exposing loader fields.
+    pub(crate) fn for_native_source_test(
+        stream: &Stream,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+    ) -> Self {
+        Self { stream: stream.clone(), weights_stream: stream.clone(), source_pool: Some(pool.clone()) }
+    }
 }
 
 impl eredu_architectures::ExternalAssistantPreparationVisitor for MlxAssistantPreparationVisitor {
@@ -57,7 +95,7 @@ impl eredu_architectures::ExternalAssistantPreparationVisitor for MlxAssistantPr
         self,
         prepared: eredu_architectures::PreparedExternalAssistantSource<A>,
     ) -> Result<Self::Output<A>, Self::Error> {
-        materialize_external_assistant::<A>(prepared, &self.stream, &self.weights_stream)
+        materialize_external_assistant::<A>(prepared, &self.stream, &self.weights_stream, self.source_pool.as_ref())
     }
 }
 
@@ -65,6 +103,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
     prepared: eredu_architectures::PreparedExternalAssistantSource<A>,
     stream: &Stream,
     weights_stream: &Stream,
+    source_pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
 ) -> Result<MlxExternalAssistant<A>, Error> {
     use crate::backend::runtime::{
         checkpoint::binding::{
@@ -73,7 +112,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
         },
         execution::layerwise::quantize_exact_replicated_text_tasks,
     };
-    let (store, _checkpoint, _artifact_identity, source_config, config, tasks) =
+    let (store, checkpoint, artifact_identity, source_config, config, tasks) =
         prepared.into_parts();
     let mut store = store;
     let transformed = tasks
@@ -87,7 +126,7 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
         })
         .collect::<Vec<_>>();
     if !transformed.is_empty() {
-        let source = A::module::<MlxNeuralBackend>(source_config, stream)
+        let source = A::module::<MlxNeuralBackend>(source_config.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
         let target = A::module::<MlxNeuralBackend>(config.clone(), stream)
             .map_err(|error| Error::ArchitectureModel(error.to_string()))?;
@@ -134,10 +173,32 @@ fn materialize_external_assistant<A: eredu_architectures::ExternalAssistantArchi
         None,
     )?;
     let arrays = materialize_module_bindings(store.as_ref(), &bindings, weights_stream, stream)?;
+    // The materialization event settles native work; each array must also cross
+    // its ordinary completion boundary before its descriptor is published as a
+    // cold source. This remains inside the loading recovery owner and cannot
+    // make a later workspace inspection evaluate an unfinished parameter.
+    for array in arrays.values() {
+        array.evaluated()?;
+    }
     populate_module_from_arrays_excluding(&mut module, &arrays, |_| false)?;
+    // This is ordinary loading, before a request can quote these parameters.
+    // Register their actual completed backing and the retained checkpoint source
+    // in the selected backend pool. Later managed quotations only pin these
+    // existing owners; they never invent source credit or materialize a weight.
+    let registered_storage = source_pool.map(|pool| {
+        let mut storage = crate::backend::runtime::residency::storage::RetainedStorage::default();
+        for array in arrays.values() {
+            storage.include_array(array)?;
+        }
+        storage.include_sources(store.source_storage()?)?;
+        storage.register(pool)
+    }).transpose()?;
     Ok(MlxExternalAssistant {
         config,
         module,
+        source: MlxExternalAssistantSource::new(
+            store, checkpoint, artifact_identity, source_config, tasks, bindings, arrays, registered_storage,
+        ),
         observers: Default::default(),
     })
 }
@@ -151,6 +212,9 @@ pub struct MlxDrafter {
 struct DrafterPayload {
     execution: DrafterExecution,
     stream: Stream,
+    // Model and raw stream aliases retire before their admitted placement.
+    // Target placement continues borrowing the loaded target's backend.
+    backend: Option<crate::backend::MlxBackend<'static>>,
 }
 
 enum DrafterExecution {
@@ -204,6 +268,9 @@ impl DrafterExecution {
 struct DrafterRetention {
     _payload: Rc<RefCell<Option<Rc<OrdinaryRetirement<DrafterPayload>>>>>,
     poisoned: Rc<Cell<bool>>,
+    // During loading this owns the actual placement before a payload exists.
+    // On success it moves into that payload; unresolved construction retains it.
+    backend: Option<crate::backend::MlxBackend<'static>>,
 }
 
 impl Retention for DrafterRetention {
@@ -217,7 +284,7 @@ impl Retention for DrafterRetention {
 struct DrafterOperation<'a> {
     drafter: &'a mut MlxDrafter,
     retained: Rc<RefCell<Option<Rc<OrdinaryRetirement<DrafterPayload>>>>>,
-    recovery: Recovery<DrafterRetention>,
+    recovery: DrafterRecovery,
     completed: bool,
 }
 
@@ -240,13 +307,24 @@ impl DrafterOperation<'_> {
         };
         if !status.settled || status.failed || status.blocked {
             self.drafter.poisoned.set(true);
+            if let Some(funding) = self.recovery.funding() {
+                return Err(original::failure(
+                    original::Cause::Unresolved(result.err()), funding.clone(),
+                ));
+            }
             let message = match &result {
                 Ok(_) => "native drafter work failed or remains unresolved".to_owned(),
                 Err(error) => format!("native drafter work failed or remains unresolved: {error}"),
             };
             return Err(Error::Speculative(message));
         }
-        let value = result?;
+        let value = match result {
+            Ok(value) => value,
+            Err(cause) => return Err(match self.recovery.funding() {
+                Some(funding) => original::failure(original::Cause::Operation(cause), funding.clone()),
+                None => cause,
+            }),
+        };
         self.completed = true;
         self.retained.take();
         Ok(value)
@@ -290,11 +368,12 @@ impl MlxDrafter {
         let recovery = Recovery::begin(DrafterRetention {
             _payload: Rc::clone(&retained),
             poisoned: Rc::clone(&self.poisoned),
+            backend: None,
         })?;
         Ok(DrafterOperation {
             drafter: self,
             retained,
-            recovery,
+            recovery: DrafterRecovery::Ordinary(recovery),
             completed: false,
         })
     }
@@ -332,28 +411,84 @@ impl MlxDrafter {
         stream: &Stream,
         weights_stream: &Stream,
     ) -> Result<Self, Error> {
+        Self::materialize_impl(preparation, None, stream, weights_stream, None)
+    }
+
+    /// Same loader with the selected backend's actual source accounting pool.
+    /// Source preparation precedes the ordinary drafter recovery and native
+    /// model construction, matching the target model's provider handoff.
+    pub(crate) fn materialize_with_source_pool(
+        preparation: eredu_architectures::PreparedExternalDraft,
+        pool: &eredu_runtime::working_memory::WorkingMemoryPool,
+        stream: &Stream,
+        weights_stream: &Stream,
+    ) -> Result<Self, Error> {
+        Self::materialize_impl(preparation, Some(pool), stream, weights_stream, None)
+    }
+
+    /// Same loader, retaining the backend selected for an explicit drafter
+    /// placement. Its exact source stream/worker and execution registration are
+    /// used together; they are never reconstructed from the raw Stream value.
+    pub(crate) fn materialize_with_backend(
+        preparation: eredu_architectures::PreparedExternalDraft,
+        backend: crate::backend::MlxBackend<'static>,
+    ) -> Result<Self, Error> {
+        let stream = backend.stream().clone();
+        let weights = backend.weights_stream().clone();
+        let pool = backend.memory_pool().clone();
+        Self::materialize_impl(preparation, Some(&pool), &stream, &weights, Some(backend))
+    }
+
+    fn materialize_impl(
+        preparation: eredu_architectures::PreparedExternalDraft,
+        pool: Option<&eredu_runtime::working_memory::WorkingMemoryPool>,
+        stream: &Stream,
+        weights_stream: &Stream,
+        backend: Option<crate::backend::MlxBackend<'static>>,
+    ) -> Result<Self, Error> {
         ordinary_retirement::reclaim();
+        let layerwise_manager = match (&preparation, pool) {
+            (eredu_architectures::PreparedExternalDraft::Autoregressive(prepared), Some(pool)) => {
+                crate::backend::runtime::execution::generic::prepare_layerwise_manager(
+                    prepared.sources(),
+                    pool,
+                    weights_stream,
+                    stream,
+                )?
+            }
+            _ => None,
+        };
+        let addressable_manager = match (&preparation, pool) {
+            (eredu_architectures::PreparedExternalDraft::Autoregressive(prepared), Some(pool)) =>
+                crate::composition::mlx::loading::prepare_addressable_source(
+                    prepared.sources(), pool, weights_stream, stream)?,
+            _ => None,
+        };
         let poisoned = Rc::new(Cell::new(false));
         let retained = Rc::new(RefCell::new(None));
         let mut recovery = Recovery::begin(DrafterRetention {
             _payload: Rc::clone(&retained),
             poisoned: Rc::clone(&poisoned),
+            backend,
         })?;
         let execution = match preparation {
             eredu_architectures::PreparedExternalDraft::Assistant(p) => {
                 DrafterExecution::Assistant(p.materialize(MlxAssistantPreparationVisitor {
                     stream: stream.clone(),
                     weights_stream: weights_stream.clone(),
+                    source_pool: pool.cloned(),
                 })?)
             }
             eredu_architectures::PreparedExternalDraft::Autoregressive(p) => {
                 let (sources, selected, tokenizer) = p.into_parts();
-                let model = crate::composition::mlx::loading::materialize_model_plan(
+                let model = crate::composition::mlx::loading::materialize_model_plan_with_layerwise_manager(
                     sources,
                     None,
                     stream,
                     weights_stream,
-                )?;
+                    layerwise_manager,
+            addressable_manager,
+        )?;
                 DrafterExecution::Autoregressive {
                     model,
                     selected,
@@ -364,6 +499,7 @@ impl MlxDrafter {
         let payload = Rc::new(OrdinaryRetirement::new(DrafterPayload {
             execution,
             stream: stream.clone(),
+            backend: recovery.retention_mut().backend.take(),
         }));
         retained.replace(Some(Rc::clone(&payload)));
         recovery.seal();

@@ -1,0 +1,102 @@
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -2,6 +2,7 @@
+ #pragma once
+ 
+ #include <memory>
++#include <optional>
+ 
+ #include "mlx/allocator.h"
+ #include "mlx/array.h"
+@@ -17,6 +18,16 @@
+ 
+ class HostTransferStorage;
+ struct DeviceTransfer;
++
++/** Exact physical host-transfer owner, retained by a buffer or array. */
++struct MLX_API HostTransferAllocationInfo {
++  const void* identity;
++  size_t capacity;
++};
++
++/** Cold inspection of certified host-transfer backing; never evaluates/polls. */
++MLX_API std::optional<HostTransferAllocationInfo> host_transfer_allocation_info(
++    const array& value);
+ 
+ struct MLX_API HostTransferMemoryStats {
+   size_t active_bytes;
+@@ -75,6 +86,10 @@
+   size_t nbytes() const;
+   /** Complete charged backing-allocation extent. */
+   size_t capacity() const;
++  /** Opaque physical owner identity, valid only while storage is retained. */
++  const void* allocation_identity() const {
++    return storage_.get();
++  }
+   HostTransferPolicy policy() const;
+   HostTransferStorageKind storage_kind() const;
+ 
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -109,6 +109,38 @@
+   HostTransferStorageKind storage_kind_;
+   size_t capacity_;
+ };
++
++namespace {
++// A named owner lets cold inspection distinguish this exact allocation contract
++// from arbitrary caller-provided deleters. Its lifetime semantics match the
++// previous capturing lambda, including native view/copy_shared_buffer aliases.
++struct HostTransferArrayDeleter {
++  std::shared_ptr<HostTransferStorage> owner;
++  void operator()(allocator::Buffer) {
++    owner.reset();
++  }
++};
++} // namespace
++
++std::optional<HostTransferAllocationInfo> host_transfer_allocation_info(
++    const array& value) {
++  const auto status = value.status();
++  if (status != array::Status::available &&
++      !(status == array::Status::evaluated && !value.event().valid())) {
++    return std::nullopt;
++  }
++  const auto& data = value.data_shared_ptr();
++  if (!data) {
++    return std::nullopt;
++  }
++  const auto* retained = data->d.target<HostTransferArrayDeleter>();
++  if (!retained || !retained->owner ||
++      data->buffer.ptr() != retained->owner->buffer().ptr()) {
++    return std::nullopt;
++  }
++  return HostTransferAllocationInfo{
++      retained->owner.get(), retained->owner->capacity()};
++}
+ 
+ HostTransferMemoryStats host_transfer_memory_stats(
+     HostTransferStorageKind kind) {
+@@ -218,10 +250,8 @@
+   if (!storage_) {
+     throw std::runtime_error("[HostTransferBuffer::attach] Empty buffer.");
+   }
+-  auto owner = storage_;
+   destination.set_data(
+-      storage_->buffer(),
+-      [owner = std::move(owner)](allocator::Buffer) mutable { owner.reset(); });
++      storage_->buffer(), HostTransferArrayDeleter{storage_});
+ }
+ 
+ HostTransfer copy_to_host(
+@@ -248,7 +278,7 @@
+       source.storage_->buffer(),
+       source.shape(),
+       source.dtype(),
+-      [owner = source.storage_](allocator::Buffer) mutable { owner.reset(); });
++      HostTransferArrayDeleter{source.storage_});
+   auto output = array(
+       source.shape(),
+       source.dtype(),

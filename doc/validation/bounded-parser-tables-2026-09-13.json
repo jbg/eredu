@@ -1,0 +1,173 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-13",
+  "scope": "Parser-owned hash-cons capacity and lexer-state publication prerequisites",
+  "created_utc": "2026-09-13T18:45:31.890578+00:00",
+  "status": "verified_increment_full_goal_incomplete",
+  "tests": {
+    "derivre": {
+      "passed": 34,
+      "ignored": 0
+    },
+    "llguidance": {
+      "passed": 38,
+      "ignored": 0
+    },
+    "facade": {
+      "passed": 187,
+      "ignored": 2
+    },
+    "portable": {
+      "passed": 114,
+      "ignored": 1
+    }
+  },
+  "total_passed": 373,
+  "new_tests": {
+    "hashcons": 9,
+    "regexvec": 8,
+    "public_parser": 2
+  },
+  "checks": {
+    "derivre": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p derivre --all-features -- --test-threads=1",
+      "started_utc": "2026-09-13T18:42:36.721796+00:00",
+      "elapsed_seconds": 7.281,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parser-table-derivre.log",
+      "log_sha256": "ce969170fc979d4c8fe9bcefd279ce82dae14b5c8e40722922a500eca7c35211"
+    },
+    "llguidance": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p llguidance --all-features -- --test-threads=1",
+      "started_utc": "2026-09-13T18:44:30.667606+00:00",
+      "elapsed_seconds": 1.434,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parser-table-llguidance.log",
+      "log_sha256": "3bb62a6a0f307a8cf356265f52fe4c28e08e26a310a75b325ded43b359d14487"
+    },
+    "facade": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --lib -- --test-threads=1",
+      "started_utc": "2026-09-13T18:43:37.900555+00:00",
+      "elapsed_seconds": 18.831,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parser-table-facade.log",
+      "log_sha256": "4ab51b6ee74ad6a4a98608b7bc391c885e09af9918092861f5f282b57ec8a33d"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-13T18:43:56.733093+00:00",
+      "elapsed_seconds": 16.648,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parser-table-portable.log",
+      "log_sha256": "970b0fa5402a8bd22d24317f0c89c4f8a9060928091a1e0a247f46f1739c1cc3"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p derivre -p llguidance --no-default-features",
+      "started_utc": "2026-09-13T18:44:13.385486+00:00",
+      "elapsed_seconds": 0.899,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parser-table-minimal.log",
+      "log_sha256": "70efa9f2dad278ed96f9ffd029ba354d7d196bc7e6933ea4719b48a5ac44f727"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-13T18:44:32.102223+00:00",
+      "elapsed_seconds": 0.103,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-parser-table-features.log",
+      "log_sha256": "b544daa73677194f67c38ba7d8fad8ffb38d5d38d6c9c73f87e2f7768433da7f"
+    }
+  },
+  "source_sha256": {
+    "AGENTS.md": "826ae12a972ccde6b79c78010cef422586655aa8bfbe2b0d01992bb9da1d92c0",
+    "Cargo.lock": "e3b9e2b92dcd2c672339f836df5d5ee34b9a5b936f483fd0b05493c3033969bb",
+    "Cargo.toml": "5640ce0048d6026ca6627320ea6925427a3a56f9363b1b83f77b4e73d01d22fc",
+    "doc/backend-architecture.md": "fd44f3baab765fe0c4e3f8478b6e396f5794454fff1dcbd0fc1da04683f5c19d",
+    "doc/bounded-inference.md": "ef5a95a04d71c161bf2fd5f9ef2885e467d39593da964742d5e2afe614de2ee9",
+    "doc/execution-control.md": "7dcaaecc40a9683212ce8e6e1adfcd46357501119e0b1d3564dc0baf4bb0207a",
+    "eredu/Cargo.toml": "8b58b478a0f362e266ba8a2b9bba1c2f7bf14286e73b73ec012cdb28a64fe484",
+    "third-party/README.md": "d35162cdb48d54d6dd197c447dd8cc3b1e9ea2081b8cad8778be6470900488c9",
+    "third-party/derivre-0.3.12/Cargo.toml": "6441fd7f0d65a6b999059ddeb64af5c8795b4a7bb5a942e162a426b6bc2cf7e1",
+    "third-party/derivre-0.3.12/src/hashcons.rs": "4c36f116b7c9b2ca0e8d979d5c6661dfae44702b50c6ec0a7c5b9a7ae74f7528",
+    "third-party/derivre-0.3.12/src/hashcons/tests.rs": "4ec8b0e996cb93252b6768cb6da78de8edaa04d45813bf27de92e83d86713511",
+    "third-party/derivre-0.3.12/src/lib.rs": "ab8b6c392a6622c73def8249c7bc30f1cea4635799abe3e209916714f3f16392",
+    "third-party/llguidance-1.8.0/Cargo.toml": "0b9b2c613bc2b5b453bfbee79ae6a511a36c08b109d3976bf0d1a7ff110c3b2e",
+    "third-party/llguidance-1.8.0/src/earley/regexvec.rs": "a9e22fbbe87dd34077291a78c251d866842620cd5136aec08b39e76d1aa3c208",
+    "third-party/llguidance-1.8.0/src/earley/regexvec/tests.rs": "cb9f54d621305623ef5882d572ca05930492eea1dd85dceef0a1b1c550788dee",
+    "third-party/llguidance-1.8.0/src/lib.rs": "fddd5573bd72cc2731b8af8fd8deb90009ba419984cc306fbf7d5e8d9a89267d",
+    "third-party/llguidance-1.8.0/tests/state_limits.rs": "4bfa7de7fb4ece71b41b4bb49b6b2ac11b24368e21aa78330e31232dc7f3cae1",
+    "third-party/parser-upstream.json": "9aadf9010ece7de6935d0609a1584a49a243f2620889cfa3ece6878eed64ecac"
+  },
+  "artifacts": {
+    "/private/tmp/eredu-parser-table-format.log": {
+      "sha256": "2c0ef6ead6a0590305c0a7a4a6226becfb9a05dd1249f572a4d69c5fa86d4307"
+    },
+    "/private/tmp/eredu-parser-table-review.md": {
+      "sha256": "d91a494a6c721fa17ac76a5f1f2d03e2426bf1e15e5db1e81990ed5965ee78e1"
+    },
+    "/private/tmp/eredu-parser-table-llguidance-initial.log": {
+      "sha256": "ca2ca7e9c6f1747155ce3e22e495a2e2cba8f27c01e7728012f9034418d55892"
+    },
+    "/private/tmp/eredu-parser-table-llguidance-fixture-initial.log": {
+      "sha256": "e9f1c135e0c126bb274f0fc6bdb035e92abb47b183e19bbb3965b54f06c26f3e"
+    },
+    "/private/tmp/eredu-parser-table-checks.py": {
+      "sha256": "2fd5f069bb01337531ea1ad16a92f9afa94719796d86a8db3fa76a8a6317c5b4"
+    }
+  },
+  "upstream_provenance": {
+    "manifest": "third-party/parser-upstream.json",
+    "verified_unchanged_archived_files": 95,
+    "changed_archived_files": {
+      "third-party/derivre-0.3.12/Cargo.toml": {
+        "upstream_sha256": "da90190df818e07e8f4c389476818027c26912934c48fe800377d1c7c9c84d58",
+        "local_sha256": "6441fd7f0d65a6b999059ddeb64af5c8795b4a7bb5a942e162a426b6bc2cf7e1"
+      },
+      "third-party/derivre-0.3.12/src/hashcons.rs": {
+        "upstream_sha256": "83b45e1d9cea4946822a47eea170b19e14082b07f1ed5cbafe523fa16d9421fe",
+        "local_sha256": "4c36f116b7c9b2ca0e8d979d5c6661dfae44702b50c6ec0a7c5b9a7ae74f7528"
+      },
+      "third-party/derivre-0.3.12/src/lib.rs": {
+        "upstream_sha256": "218039c28fa1af4629cf14127991bdd8638f6f1905883fe7f1267fcfbdfe8472",
+        "local_sha256": "ab8b6c392a6622c73def8249c7bc30f1cea4635799abe3e209916714f3f16392"
+      },
+      "third-party/llguidance-1.8.0/Cargo.toml": {
+        "upstream_sha256": "de28ec8cebb0a2203c60eb383a3ec59982b5956f32d59607a0cb648b2a11cc8f",
+        "local_sha256": "0b9b2c613bc2b5b453bfbee79ae6a511a36c08b109d3976bf0d1a7ff110c3b2e"
+      },
+      "third-party/llguidance-1.8.0/src/earley/regexvec.rs": {
+        "upstream_sha256": "b088aceeaa121ac7f32688e8136b6b2b14ff272b1b8bfc50cd7372b22ad61300",
+        "local_sha256": "a9e22fbbe87dd34077291a78c251d866842620cd5136aec08b39e76d1aa3c208"
+      },
+      "third-party/llguidance-1.8.0/src/lib.rs": {
+        "upstream_sha256": "ab2f9466286c11ffb57559769dc5fb261e3621d26c4492a9dad7ec007e83e8eb",
+        "local_sha256": "fddd5573bd72cc2731b8af8fd8deb90009ba419984cc306fbf7d5e8d9a89267d"
+      }
+    },
+    "added_source_files": {
+      "third-party/derivre-0.3.12/src/hashcons/tests.rs": "4ec8b0e996cb93252b6768cb6da78de8edaa04d45813bf27de92e83d86713511",
+      "third-party/llguidance-1.8.0/tests/state_limits.rs": "4bfa7de7fb4ece71b41b4bb49b6b2ac11b24368e21aa78330e31232dc7f3cae1",
+      "third-party/llguidance-1.8.0/src/earley/regexvec/tests.rs": "cb9f54d621305623ef5882d572ca05930492eea1dd85dceef0a1b1c550788dee"
+    }
+  },
+  "behavior": [
+    "Closed prepared hash-cons allocates under caller authority, then fixed insert/lookup/rejection do not grow; duplicates succeed at full capacity.",
+    "Exact owned vector capacities and hashbrown allocation_size replace no diagnostic heuristic; no complete ExprSet/parser claim.",
+    "New lexer state count and representable geometry checked before hashcons insertion, descriptor computation, or transition-row growth; existing states still work at the configured limit.",
+    "Typed ParserError::LexerError and LexerTooComplex runtime stop classification, sticky Matcher failure, and independent nonzero mask/commit clone parity verified.",
+    "Pinned portable workspace forks inherit unsafe forbid. Local llguidance exposes Rust API only; archived C ABI and header build are not compiled."
+  ],
+  "initial_failures": [
+    "Offline resolution initially lacked upstream test dependencies; authorized Cargo dependency downloads succeeded.",
+    "Local manifest initially omitted regex, used by upstream numeric library tests; restored the original dev requirement before successful checks.",
+    "Initial public fixture expected first mask to create a state; that mask reuses warmed states. Corrected test advances a bounded valid prefix to actual new-state exhaustion, preserving typed error and unchanged committed prefix assertions."
+  ],
+  "limits": [
+    "Configured max_lexer_states still activates at mask computation; construction/precompute activation is the next slice.",
+    "Derivative candidate vectors, caches, grammar/compiler/tokenizer storage, mutable parser histories, and independent copy peaks remain outside these table guarantees.",
+    "Legacy growing hashcons insertion is not transactional on allocation failure. Prepared table construction requires existing allocation authority and requested element limits are not byte admission proof.",
+    "Finite managed grammar admission remains Unknown; full family/path goal remains incomplete.",
+    "Archived llguidance integration helper and benchmark fixtures absent from crates.io package are not executable targets or claimed tested. Three preexisting external checkpoint fixtures remain ignored.",
+    "No new released checkpoint numerics, native distributed run, allocator/process peak, or whole-system guarantee."
+  ]
+}

@@ -1,0 +1,22 @@
+diff --git a/mlx/scheduler.cpp b/mlx/scheduler.cpp
+--- a/mlx/scheduler.cpp
++++ b/mlx/scheduler.cpp
+@@ -27,6 +27,18 @@
+     }
+   } else {
+     gpu::synchronize(s);
++  }
++  // Match ordinary Completion::wait: the actual stream wait establishes the
++  // opportunity to settle its receipt owners, but is not itself a registry
++  // observation. A final synchronous call must not leave primitive owners
++  // waiting for an unrelated future evaluation. Scoped/original work retains
++  // its exact explicit observation/retirement boundary.
++  const auto controls = submission::current_native_controls();
++  const auto* scope = submission::current_scope();
++  if (controls.failure == submission::NativeControlFailure::none &&
++      !controls.original && (!scope || !scope->scoped_observation_only())) {
++    submission::progress_records();
++    submission::retire_records();
+   }
+ }
+ 

@@ -1,0 +1,262 @@
+diff --git a/mlx/array.h b/mlx/array.h
+--- a/mlx/array.h
++++ b/mlx/array.h
+@@ -682,6 +682,7 @@
+ 
+   static ArrayVector publish_siblings(ArrayVector outputs);
+   friend class PreparedInputLeaf;
++  friend class PreparedHostTransferSource;
+   friend class PreparedHostCopySlot;
+   explicit array(std::shared_ptr<ArrayDesc> descriptor) noexcept : array_desc_(std::move(descriptor)) {}
+   struct DescriptorRetirement;
+diff --git a/mlx/host_transfer.h b/mlx/host_transfer.h
+--- a/mlx/host_transfer.h
++++ b/mlx/host_transfer.h
+@@ -17,6 +17,7 @@
+ using HostTransferStorageKind = allocator::HostTransferStorageKind;
+ 
+ class HostTransferStorage;
++class PreparedInputArray;
+ struct DeviceTransfer;
+ 
+ /** Exact physical host-transfer owner, retained by a buffer or array. */
+@@ -122,11 +123,39 @@
+   Shape shape_;
+   Dtype dtype_{float32};
+ 
++  friend class PreparedHostTransferSource;
+   friend class CopyToHostTransfer;
+   friend class CopyFromHostTransfer;
+   friend MLX_API DeviceTransfer copy_from_host(
+       const HostTransferBuffer& source,
+       StreamOrDevice stream);
++};
++
++/** Immutable source constructor using the already initialized prepared allocator.
++ * Its own source-only arena survives every native host/array alias. */
++struct PreparedHostTransferLayout {
++  size_t metadata_bytes;
++  size_t backing_bytes;
++  size_t logical_bytes;
++  size_t controls;
++};
++class MLX_API PreparedHostTransferSource {
++ public:
++  static bool layout(const allocator::PreparedInputFacts&, const int*, size_t, Dtype, size_t array_handles,
++      PreparedHostTransferLayout&) noexcept;
++  static allocator::PreparedInputCause create(allocator::Allocator&,
++      const allocator::PreparedInputFacts&, submission::GraphQuota*, const int*, size_t,
++      Dtype, size_t array_handles, PreparedHostTransferSource*&) noexcept;
++  HostTransferBuffer& value() noexcept { return value_; }
++  allocator::PreparedInputCause make_array(PreparedInputArray*&) noexcept;
++  void destroy() noexcept;
++ private:
++  PreparedHostTransferSource(HostTransferBuffer value, submission::GraphQuota* quota, size_t handles) noexcept
++      : value_(std::move(value)), quota_(quota), remaining_(handles) {}
++  HostTransferBuffer value_;
++  submission::GraphQuota* quota_;
++  std::optional<array> ready_;
++  size_t remaining_;
+ };
+ 
+ struct MLX_API HostTransfer {
+diff --git a/mlx/host_transfer.cpp b/mlx/host_transfer.cpp
+--- a/mlx/host_transfer.cpp
++++ b/mlx/host_transfer.cpp
+@@ -8,6 +8,7 @@
+ #include <stdexcept>
+ 
+ #include "mlx/primitives.h"
++#include "mlx/prepared_input.h"
+ #include "mlx/ops.h"
+ #include "mlx/transforms.h"
+ #include "mlx/graph_construction.h"
+@@ -86,8 +87,17 @@
+     record_host_transfer_allocation(storage_kind_, capacity_);
+   }
+ 
++  HostTransferStorage(allocator::PreparedInputAllocation* allocation,
++      HostTransferStorageKind kind, uint64_t generation) noexcept
++      : buffer_(allocation->buffer), policy_(HostTransferPolicy::transfer),
++        storage_kind_(kind), capacity_(allocation->capacity), generation_(generation),
++        prepared_(allocation) {
++    record_host_transfer_allocation(storage_kind_, capacity_);
++  }
++
+   ~HostTransferStorage() {
+-    allocator::allocator().free_host_transfer(buffer_, policy_);
++    if (prepared_) prepared_->destroy();
++    else allocator::allocator().free_host_transfer(buffer_, policy_);
+     record_host_transfer_free(storage_kind_, capacity_);
+   }
+ 
+@@ -128,6 +138,7 @@
+   HostTransferStorageKind storage_kind_;
+   size_t capacity_;
+   uint64_t generation_;
++  allocator::PreparedInputAllocation* prepared_{nullptr};
+   // Released after free_host_transfer and the physical accounting update.
+   AllocationOwners allocation_owners_;
+ };
+@@ -143,6 +154,161 @@
+   }
+ };
+ } // namespace
++
++namespace {
++using HostSourceQuota = submission::GraphQuota;
++using HostSourceCause = allocator::PreparedInputCause;
++struct HostSourceConstruction {
++  HostSourceQuota::Request requests[3];
++  PreparedHostTransferLayout layout{};
++  allocator::PreparedInputAllocation* backing = nullptr;
++  void* memory = nullptr;
++  uint64_t generation = 0;
++};
++struct HostSourceBlocks {
++  HostSourceQuota* quota;
++  ~HostSourceBlocks() { quota->finish_blocks(); }
++};
++struct HostSourceIncoming {
++  allocator::PreparedInputAllocation* backing;
++  ~HostSourceIncoming() { if (backing) backing->destroy(); }
++};
++size_t host_source_function_bytes() noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L && !defined(_LIBCPP_ABI_OPTIMIZED_FUNCTION)
++  using Fn = std::__function::__func<HostTransferArrayDeleter, void(allocator::Buffer)>;
++  if (sizeof(Fn) > 3 * sizeof(void*) ||
++      !std::is_nothrow_copy_constructible_v<HostTransferArrayDeleter>) return 0;
++  return sizeof(Fn);
++#else
++  return 0;
++#endif
++}
++bool host_source_requests(HostSourceQuota::Request* out) noexcept {
++#if defined(_LIBCPP_VERSION) && _LIBCPP_VERSION == 210106 && __cplusplus == 202002L && !defined(_LIBCPP_ABI_OPTIMIZED_FUNCTION)
++  if (!host_source_function_bytes()) return false;
++  using Control = std::__shared_ptr_emplace<HostTransferStorage,
++      submission::GraphAllocator<HostTransferStorage>>;
++  out[0] = {sizeof(allocator::PreparedInputAllocation), alignof(allocator::PreparedInputAllocation)};
++  out[1] = {sizeof(Control), alignof(Control)};
++  out[2] = {sizeof(PreparedHostTransferSource), alignof(PreparedHostTransferSource)};
++  return true;
++#else
++  return false;
++#endif
++}
++}
++bool PreparedHostTransferSource::layout(const allocator::PreparedInputFacts& facts,
++    const int* shape, size_t rank, Dtype dtype, size_t array_handles, PreparedHostTransferLayout& out) noexcept {
++  if (!shape || !rank || rank > Shape::inline_capacity || !facts.page_size ||
++      (facts.page_size & (facts.page_size - 1)) ||
++      facts.kind != HostTransferStorageKind::metal_shared) return false;
++  size_t bytes = size_of(dtype);
++  for (size_t i = 0; i < rank; ++i) {
++    if (shape[i] <= 0 || bytes > static_cast<size_t>(PTRDIFF_MAX) / static_cast<size_t>(shape[i])) return false;
++    bytes *= static_cast<size_t>(shape[i]);
++  }
++  if (bytes > static_cast<size_t>(PTRDIFF_MAX) - (facts.page_size - 1)) return false;
++  const size_t backing = (bytes + facts.page_size - 1) & ~(facts.page_size - 1);
++  if (backing > facts.maximum) return false;
++  HostSourceConstruction c;
++  if (!host_source_requests(c.requests)) return false;
++  size_t metadata = 0;
++  for (const auto& request : c.requests) {
++    size_t extent;
++    if (!HostSourceQuota::allocation_extent(request.bytes, request.alignment, extent) ||
++        metadata > static_cast<size_t>(PTRDIFF_MAX) - extent) return false;
++    metadata += extent;
++  }
++  if (array_handles) {
++    HostSourceQuota::Request requests[5]; size_t count = 0;
++    if (!PreparedInputLeaf::append_array_requests(rank, requests, count)) return false;
++    for (size_t i=0;i<count;++i) {
++      size_t extent;
++      if (!HostSourceQuota::allocation_extent(requests[i].bytes,requests[i].alignment,extent) ||
++          metadata > static_cast<size_t>(PTRDIFF_MAX)-extent) return false;
++      metadata += extent;
++    }
++    size_t extent;
++    if (!HostSourceQuota::allocation_extent(sizeof(PreparedInputArray),alignof(PreparedInputArray),extent) ||
++        array_handles > (static_cast<size_t>(PTRDIFF_MAX)-metadata)/extent) return false;
++    metadata += array_handles*extent;
++  }
++  out = {metadata, backing, bytes,
++      sizeof(HostSourceConstruction) + sizeof(HostSourceBlocks) + sizeof(HostSourceIncoming) +
++      sizeof(HostTransferBuffer) + sizeof(Shape) + sizeof(submission::GraphAllocator<HostTransferStorage>) +
++      sizeof(std::shared_ptr<HostTransferStorage>) + sizeof(allocator::PreparedInputFacts) +
++      sizeof(HostSourceCause) + sizeof(size_t) * 6 + facts.controls +
++      sizeof(std::optional<array>) + sizeof(array) + sizeof(Deleter) +
++      sizeof(HostTransferArrayDeleter) + sizeof(allocator::Buffer) + host_source_function_bytes() +
++      sizeof(HostSourceQuota::Request)*5 + sizeof(size_t)*4 +
++      PreparedInputLeaf::descriptor_shared_control_bytes() +
++      PreparedInputLeaf::descriptor_allocator_control_bytes()};
++  return true;
++}
++HostSourceCause PreparedHostTransferSource::create(allocator::Allocator& allocator,
++    const allocator::PreparedInputFacts& facts, HostSourceQuota* quota,
++    const int* input_shape, size_t rank, Dtype dtype, size_t array_handles, PreparedHostTransferSource*& output) noexcept {
++  HostSourceConstruction c;
++  if (output || !quota || !layout(facts, input_shape, rank, dtype, array_handles, c.layout) ||
++      !host_source_requests(c.requests)) return HostSourceCause::invalid;
++  if (!quota->prepare_blocks(c.requests, 3)) return HostSourceCause::capacity;
++  HostSourceBlocks blocks{quota};
++  c.generation = next_allocation_generation();
++  if (!c.generation) return HostSourceCause::identity_exhausted;
++  c.memory = quota->allocate(sizeof(allocator::PreparedInputAllocation),alignof(allocator::PreparedInputAllocation));
++  c.backing = ::new(c.memory) allocator::PreparedInputAllocation{};
++  c.backing->quota = quota;
++  HostSourceIncoming incoming{c.backing};
++  auto cause = allocator.allocate_prepared_input(c.layout.logical_bytes,*c.backing);
++  if (cause != HostSourceCause::success) return cause;
++  if (c.backing->capacity != c.layout.backing_bytes) std::terminate();
++  HostTransferBuffer value;
++  value.shape_ = Shape(input_shape,input_shape + rank,Shape::allocator_type{quota});
++  value.dtype_ = dtype;
++  value.storage_ = std::allocate_shared<HostTransferStorage>(
++      submission::GraphAllocator<HostTransferStorage>{quota},c.backing,facts.kind,c.generation);
++  incoming.backing = nullptr;
++  c.memory = quota->allocate(sizeof(PreparedHostTransferSource),alignof(PreparedHostTransferSource));
++  output = ::new(c.memory) PreparedHostTransferSource(std::move(value),quota,array_handles);
++  return HostSourceCause::success;
++}
++void PreparedHostTransferSource::destroy() noexcept {
++  auto* quota = quota_;
++  quota->retain();
++  this->~PreparedHostTransferSource();
++  quota->deallocate(this,sizeof(PreparedHostTransferSource),alignof(PreparedHostTransferSource));
++  quota->release();
++}
++
++HostSourceCause PreparedHostTransferSource::make_array(PreparedInputArray*& out) noexcept {
++  if (out || !remaining_) return HostSourceCause::invalid;
++  HostSourceQuota::Request requests[4]; size_t count=0;
++  if (!ready_ && !PreparedInputLeaf::append_array_requests(value_.shape_.size(),requests,count))
++    return HostSourceCause::invalid;
++  requests[count++]={sizeof(PreparedInputArray),alignof(PreparedInputArray)};
++  if (!quota_->prepare_blocks(requests,count)) return HostSourceCause::capacity;
++  HostSourceBlocks blocks{quota_};
++  if (!ready_) {
++    // Same completed host seed and deleter as copy_from_host, with descriptor,
++    // shared controls and final C handles in the actual source-only arena.
++    Shape shape(value_.shape_,Shape::allocator_type{quota_});
++    submission::GraphAllocator<array::ArrayDesc> allocator(quota_);
++    auto* memory=allocator.allocate(1);
++    auto* descriptor=::new(memory) array::ArrayDesc(std::move(shape),value_.dtype_,quota_);
++    descriptor->allocation_quota=quota_;
++    std::shared_ptr<array::ArrayDesc> owned(descriptor,array::RetireDescriptor{},allocator);
++    owned->data=std::allocate_shared<array::Data>(submission::GraphAllocator<array::Data>{quota_},
++        value_.storage_->buffer(),HostTransferArrayDeleter{value_.storage_});
++    owned->data_size=value_.size();
++    const auto maximum=*std::max_element(value_.shape_.begin(),value_.shape_.end());
++    owned->flags={true,true,value_.size()<=1 || value_.size()==static_cast<size_t>(maximum)};
++    ready_.emplace(array(std::move(owned)));
++  }
++  void* memory=quota_->allocate(sizeof(PreparedInputArray),alignof(PreparedInputArray));
++  out=PreparedInputArray::publish_storage(memory,*ready_,quota_);
++  --remaining_;
++  return HostSourceCause::success;
++}
+ 
+ std::optional<HostTransferAllocationInfo> host_transfer_allocation_info(
+     const array& value) {

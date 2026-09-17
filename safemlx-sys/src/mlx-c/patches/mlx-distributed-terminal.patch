@@ -1,0 +1,129 @@
+diff --git a/mlx/distributed/distributed.cpp b/mlx/distributed/distributed.cpp
+--- a/mlx/distributed/distributed.cpp
++++ b/mlx/distributed/distributed.cpp
+@@ -188,6 +188,25 @@
+   return false;
+ }
+ 
++void Group::mark_terminal_submission() const noexcept {
++  auto* root =
++      group_->terminal_owner_ ? group_->terminal_owner_.get() : group_.get();
++  root->terminal_.store(true, std::memory_order_release);
++}
++
++bool Group::terminal_submission() const noexcept {
++  auto* root =
++      group_->terminal_owner_ ? group_->terminal_owner_.get() : group_.get();
++  return root->terminal_.load(std::memory_order_acquire);
++}
++
++void Group::ensure_submission_available() const {
++  if (terminal_submission()) {
++    throw std::runtime_error(
++        "distributed communicator is terminal for new submissions");
++  }
++}
++
+ int Group::rank() const {
+   return group_->rank();
+ }
+@@ -197,7 +216,15 @@
+ }
+ 
+ Group Group::split(int color, int key /* = -1 */) const {
+-  return Group(group_->split(color, key));
++  ensure_submission_available();
++  auto child = group_->split(color, key);
++  // MPI/NCCL construct a fresh child before returning. Ring/JACCL/Empty reject
++  // splitting. The canonical root is bound even if marking races with transport
++  // setup: already-entered setup remains owned, and the result cannot bypass it.
++  if (child != group_) {
++    child->inherit_terminal_owner(group_);
++  }
++  return Group(std::move(child));
+ }
+ 
+ Group init(bool strict /* = false */, const std::string& bk /* = "any" */) {
+diff --git a/mlx/distributed/distributed.h b/mlx/distributed/distributed.h
+--- a/mlx/distributed/distributed.h
++++ b/mlx/distributed/distributed.h
+@@ -26,6 +26,12 @@
+  */
+ struct MLX_API Group {
+   Group(std::shared_ptr<detail::GroupImpl> group) : group_(std::move(group)) {}
++
++  // Monotonic canonical-incarnation fence. No allocation, lock, error channel,
++  // completion or cancellation. Split descendants retain this same root.
++  void mark_terminal_submission() const noexcept;
++  bool terminal_submission() const noexcept;
++  void ensure_submission_available() const;
+ 
+   int rank() const;
+   int size() const;
+diff --git a/mlx/distributed/distributed_impl.h b/mlx/distributed/distributed_impl.h
+--- a/mlx/distributed/distributed_impl.h
++++ b/mlx/distributed/distributed_impl.h
+@@ -1,6 +1,8 @@
+ // Copyright © 2024 Apple Inc.
+ 
+ #pragma once
++
++#include <atomic>
+ 
+ #include "mlx/distributed/distributed.h"
+ 
+@@ -10,6 +12,17 @@
+  * Abstract base class of a distributed group implementation.
+  */
+ class GroupImpl {
++  friend struct ::mlx::core::distributed::Group;
++  static_assert(std::atomic<bool>::is_always_lock_free);
++  std::atomic<bool> terminal_{false};
++  // Bound once, before a freshly split implementation becomes externally
++  // visible. Direct root ownership prevents chains and retains native identity.
++  std::shared_ptr<GroupImpl> terminal_owner_;
++
++  void inherit_terminal_owner(const std::shared_ptr<GroupImpl>& parent) noexcept {
++    terminal_owner_ = parent->terminal_owner_ ? parent->terminal_owner_ : parent;
++  }
++
+  public:
+   virtual ~GroupImpl() {}
+ 
+diff --git a/mlx/distributed/ops.cpp b/mlx/distributed/ops.cpp
+--- a/mlx/distributed/ops.cpp
++++ b/mlx/distributed/ops.cpp
+@@ -14,11 +14,11 @@
+ namespace {
+ 
+ Group to_group(std::optional<Group> group) {
+-  if (group.has_value()) {
+-    return group.value();
+-  } else {
+-    return distributed::init();
+-  }
++  auto selected = group.has_value() ? group.value() : distributed::init();
++  // Before singleton identities, stream selection and new communication arrays.
++  // Previously accepted primitive execution is deliberately not rechecked.
++  selected.ensure_submission_available();
++  return selected;
+ }
+ 
+ } // namespace
+diff --git a/mlx/distributed/primitives.h b/mlx/distributed/primitives.h
+--- a/mlx/distributed/primitives.h
++++ b/mlx/distributed/primitives.h
+@@ -10,8 +10,11 @@
+ 
+ class DistPrimitive : public Primitive {
+  public:
+-  DistPrimitive(Stream stream, Group group)
+-      : Primitive(stream), group_(group) {}
++  DistPrimitive(Stream stream, Group group) : Primitive(stream), group_(group) {
++    // Direct primitive construction is also a new communication graph. Already
++    // accepted primitive evaluation never consults this terminal bit again.
++    group_.ensure_submission_available();
++  }
+ 
+   const Group& group() const {
+     return group_;

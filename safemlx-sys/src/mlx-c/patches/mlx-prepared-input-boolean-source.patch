@@ -1,0 +1,78 @@
+diff --git a/mlx/prepared_input.cpp b/mlx/prepared_input.cpp
+--- a/mlx/prepared_input.cpp
++++ b/mlx/prepared_input.cpp
+@@ -191,7 +191,7 @@
+   // Only positive rank needs a shape pointer; the same product/count and
+   // allocator checks below remain authoritative for every typed source.
+   if ((source.rank && !source.shape) || source.rank > static_cast<size_t>(INT_MAX) ||
+-      source.kind > 2 || !facts.page_size || (facts.page_size & (facts.page_size - 1))) return false;
++      source.kind > 3 || !facts.page_size || (facts.page_size & (facts.page_size - 1))) return false;
+   size_t elements = 1;
+   for (size_t i = 0; i < source.rank; ++i) {
+     if (!source.shape[i] || source.shape[i] > static_cast<size_t>(INT_MAX) ||
+@@ -199,7 +199,8 @@
+   }
+   if (elements != source.elements) return false;
+   size_t bytes, rounded;
+-  if (!multiply(elements, size_t{4}, bytes) || bytes > static_cast<size_t>(PTRDIFF_MAX)) return false;
++  const Dtype dtype = source.kind == 0 ? uint32 : source.kind == 1 ? int32 : source.kind == 2 ? float32 : bool_;
++  if (!multiply(elements, dtype.size(), bytes) || bytes > static_cast<size_t>(PTRDIFF_MAX)) return false;
+   if (facts.kind == allocator::HostTransferStorageKind::cpu) {
+     if (!add(bytes, sizeof(size_t), bytes)) return false;
+   } else if (facts.kind != allocator::HostTransferStorageKind::metal_shared) return false;
+@@ -218,7 +219,8 @@
+       sizeof(Construction) + sizeof(FinishBlocks) + sizeof(Incoming) + sizeof(Shape) +
+       sizeof(submission::GraphAllocator<array::ArrayDesc>) + sizeof(std::shared_ptr<array::ArrayDesc>) +
+       sizeof(std::shared_ptr<array::Data>) + sizeof(array) + sizeof(PreparedInputSource) +
+-      sizeof(allocator::PreparedInputFacts) + sizeof(size_t) * 5 + facts.controls};
++      sizeof(allocator::PreparedInputFacts) + sizeof(size_t) * 6 + sizeof(Dtype) * 2 +
++      sizeof(const uint8_t*) + sizeof(bool*) + facts.controls};
+   return true;
+ }
+ 
+@@ -236,7 +238,8 @@
+   c.backing = ::new (c.memory) allocator::PreparedInputAllocation{};
+   c.backing->quota = quota;
+   Incoming incoming{c.backing};
+-  c.cause = allocator.allocate_prepared_input(source.elements * size_t{4}, *c.backing);
++  const Dtype dtype = source.kind == 0 ? uint32 : source.kind == 1 ? int32 : source.kind == 2 ? float32 : bool_;
++  c.cause = allocator.allocate_prepared_input(source.elements * dtype.size(), *c.backing);
+   if (c.cause != Cause::success) return c.cause;
+   if (c.backing->capacity != c.layout.backing_bytes) std::terminate();
+   Shape shape(source.rank, Shape::allocator_type{quota});
+@@ -244,7 +247,6 @@
+     shape[i] = static_cast<int>(source.shape[i]);
+     c.maximum = std::max(c.maximum, source.shape[i]);
+   }
+-  const Dtype dtype = source.kind == 0 ? uint32 : source.kind == 1 ? int32 : float32;
+   submission::GraphAllocator<array::ArrayDesc> descriptor_allocator(quota);
+   auto* memory = descriptor_allocator.allocate(1);
+   auto* descriptor = ::new (memory) array::ArrayDesc(std::move(shape), dtype, quota);
+@@ -260,8 +262,14 @@
+     std::copy_n(static_cast<const uint32_t*>(source.data), source.elements, static_cast<uint32_t*>(destination));
+   else if (source.kind == 1)
+     std::copy_n(static_cast<const int32_t*>(source.data), source.elements, static_cast<int32_t*>(destination));
+-  else
++  else if (source.kind == 2)
+     std::copy_n(static_cast<const float*>(source.data), source.elements, static_cast<float*>(destination));
++  else {
++    static_assert(sizeof(bool) == 1);
++    const auto* input = static_cast<const uint8_t*>(source.data);
++    auto* boolean_output = static_cast<bool*>(destination);
++    for (size_t i = 0; i < source.elements; ++i) boolean_output[i] = input[i] != 0;
++  }
+   c.memory = quota->allocate(sizeof(PreparedInputLeaf), alignof(PreparedInputLeaf));
+   output = ::new (c.memory) PreparedInputLeaf(array(std::move(owned)), quota);
+   return Cause::success;
+diff --git a/mlx/prepared_input.h b/mlx/prepared_input.h
+--- a/mlx/prepared_input.h
++++ b/mlx/prepared_input.h
+@@ -15,7 +15,7 @@
+   const size_t* shape;
+   size_t rank;
+   size_t elements;
+-  unsigned kind; // 0 U32, 1 I32, 2 F32
++  unsigned kind; // 0 U32, 1 I32, 2 F32, 3 canonical Boolean bytes
+ };
+ // A distinct arena-owned C handle. The C ABI retains its closed owner separately
+ // from the array* value; this object must never reach ordinary operator delete.

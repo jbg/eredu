@@ -94,7 +94,7 @@ impl<B: NeuralBackend> DenseSwiGlu<B> {
 #[parameterized(tensor = "B::Tensor")]
 pub struct RoutedGatedProduct<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
     /// Global physical layer identity.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub layer: usize,
     /// Learned sigmoid top-k router.
     pub router: B::Selector,

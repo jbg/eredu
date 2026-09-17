@@ -1,15 +1,13 @@
 //! MLX realization of backend-neutral token-sampling primitives.
 
-use std::collections::HashMap;
-
 use eredu_runtime::{PenaltyConfig, SamplingBackend, TokenDomain};
-use safemlx::{
-    argmax_axis, array, error::Exception, ops::indexing::TryIndexOp, random, Array, Dtype, Stream,
-};
+use safemlx::{argmax_axis, error::Exception, random, Array, Dtype, Stream};
 
 use crate::backend::{nn::tensor::validate_token_domain, random::RandomState};
 use crate::MlxTensor;
 use eredu_core::TokenFilter;
+
+mod penalties;
 
 /// MLX token-sampling capability implementation.
 #[derive(Debug, Clone, Copy)]
@@ -21,6 +19,22 @@ impl SamplingBackend for MlxSamplingBackend {
     type RandomState = RandomState;
     type Context = Stream;
     type Error = Exception;
+
+    fn clone_token_with_host_source(value:&Self::Token,
+        funding:&eredu_core::HostMetadataFunding,_context:&Self::Context)
+        ->Result<Self::Token,eredu_core::BackendFailure> {
+        value.clone_with_host_source(funding)
+    }
+    fn clone_logits_with_host_source(value:&Self::Logits,
+        funding:&eredu_core::HostMetadataFunding,_context:&Self::Context)
+        ->Result<Self::Logits,eredu_core::BackendFailure> {
+        value.clone_with_host_source(funding)
+    }
+    fn clone_random_with_host_source(value:&Self::RandomState,
+        funding:&eredu_core::HostMetadataFunding,_context:&Self::Context)
+        ->Result<Self::RandomState,eredu_core::BackendFailure> {
+        value.clone_with_host_source(funding)
+    }
 
     fn error(message: String) -> Self::Error {
         Exception::custom(message)
@@ -53,7 +67,7 @@ impl SamplingBackend for MlxSamplingBackend {
     ) -> Result<MlxTensor, Exception> {
         logits
             .as_array()
-            .multiply(array!(1.0 / temperature), stream)
+            .multiply(Array::try_from_f32(1.0 / temperature)?, stream)
             .map(MlxTensor::from_array)
     }
 
@@ -63,59 +77,7 @@ impl SamplingBackend for MlxSamplingBackend {
         penalties: PenaltyConfig,
         stream: &Stream,
     ) -> Result<MlxTensor, Exception> {
-        if history.is_empty() || penalties.is_identity() {
-            return Ok(logits.clone());
-        }
-
-        let logits = logits.as_array();
-        let vocab_size = logits.dim(-1) as usize;
-        if vocab_size == 0 {
-            return Ok(MlxTensor::from_array(logits.clone()));
-        }
-        let row_count = logits.size() / vocab_size;
-        let mut repeat_mask = vec![false; logits.size()];
-        let mut additive = vec![0.0f32; logits.size()];
-        let start = if penalties.repeat_last_n < 0 {
-            0
-        } else {
-            history
-                .len()
-                .saturating_sub(penalties.repeat_last_n as usize)
-        };
-        let mut counts = HashMap::<u32, usize>::new();
-        for &token in &history[start..] {
-            *counts.entry(token).or_default() += 1;
-        }
-        for (token, count) in counts {
-            let token = token as usize;
-            if token >= vocab_size {
-                continue;
-            }
-            for row in 0..row_count {
-                let index = row * vocab_size + token;
-                repeat_mask[index] = true;
-                additive[index] =
-                    penalties.frequency_penalty * count as f32 + penalties.presence_penalty;
-            }
-        }
-
-        let mut adjusted = logits.clone();
-        if penalties.repeat_penalty != 1.0 {
-            let mask = Array::from_slice(&repeat_mask, logits.shape());
-            let positive = adjusted.divide(array!(penalties.repeat_penalty), stream)?;
-            let negative = adjusted.multiply(array!(penalties.repeat_penalty), stream)?;
-            let penalized = safemlx::ops::r#where(
-                adjusted.gt(Array::from_f32(0.0), stream)?,
-                positive,
-                negative,
-                stream,
-            )?;
-            adjusted = safemlx::ops::r#where(mask, penalized, adjusted, stream)?;
-        }
-        if penalties.frequency_penalty != 0.0 || penalties.presence_penalty != 0.0 {
-            adjusted = adjusted.subtract(Array::from_slice(&additive, logits.shape()), stream)?;
-        }
-        Ok(MlxTensor::from_array(adjusted))
+        penalties::apply(logits, history, penalties, stream)
     }
 
     fn apply_top_k(logits: MlxTensor, top_k: i32, stream: &Stream) -> Result<MlxTensor, Exception> {
@@ -140,13 +102,13 @@ impl SamplingBackend for MlxSamplingBackend {
         let cumulative = probabilities.cumsum(-1, None, None, stream)?;
         let before = cumulative.subtract(probabilities, stream)?;
         let masked = mask_logits(
-            before.gt(Array::from_f32(top_p.max(0.0)), stream)?,
+            before.gt(Array::try_from_f32(top_p.max(0.0))?, stream)?,
             sorted,
             stream,
         )?;
         let fill = Array::full::<f32>(
             logits.shape(),
-            Array::from_f32(logits.dtype().finfo_min()? as f32),
+            Array::try_from_f32(logits.dtype().finfo_min()? as f32)?,
             stream,
         )?
         .as_dtype(logits.dtype(), stream)?;
@@ -161,7 +123,7 @@ impl SamplingBackend for MlxSamplingBackend {
         }
         let probabilities = safemlx::ops::softmax_axis(&logits, -1, true, stream)?;
         let maximum = probabilities.max_axis(-1, true, stream)?;
-        let threshold = maximum.multiply(Array::from_f32(min_p), stream)?;
+        let threshold = maximum.multiply(Array::try_from_f32(min_p)?, stream)?;
         mask_logits(probabilities.lt(threshold, stream)?, logits, stream).map(MlxTensor::from_array)
     }
 
@@ -170,24 +132,12 @@ impl SamplingBackend for MlxSamplingBackend {
         filter: &TokenFilter,
         stream: &Stream,
     ) -> Result<MlxTensor, Exception> {
-        let vocab_size = logits.as_array().dim(-1) as usize;
-        let Some(allowed) = filter
-            .allowed_mask_for(vocab_size)
-            .map_err(|error| Exception::custom(error.to_string()))?
-        else {
-            return Ok(logits.clone());
-        };
-        let logits = logits.as_array();
-        let row_count = logits.size() / vocab_size;
-        let invalid = (0..row_count)
-            .flat_map(|_| allowed.iter().map(|allowed| !allowed))
-            .collect::<Vec<_>>();
-        mask_logits(
-            Array::from_slice(&invalid, logits.shape()),
-            logits.clone(),
-            stream,
-        )
-        .map(MlxTensor::from_array)
+        let plan=eredu_runtime::generation::TokenMaskPlan::new(filter,logits.as_array().shape(),None)
+            .map_err(|cause|Exception::custom(cause.to_string()))?;
+        if plan.is_identity() { return Ok(logits.clone()); }
+        let mut invalid=Vec::with_capacity(plan.elements());
+        plan.fill(&mut invalid).map_err(|cause|Exception::custom(cause.to_string()))?;
+        apply_token_mask(logits,&invalid,stream)
     }
 
     fn apply_mirostat(
@@ -208,14 +158,17 @@ impl SamplingBackend for MlxSamplingBackend {
         let scaled = Self::scale_temperature(&logits, temperature, stream)?;
         let scaled = scaled.into_array();
         let probabilities = safemlx::ops::softmax_axis(&scaled, -1, true, stream)?;
-        let cutoff = Array::from_f32((-mu).exp2());
+        let cutoff = Array::try_from_f32((-mu).exp2())?;
         let maximum = probabilities.max_axis(-1, true, stream)?;
         let cutoff_mask = probabilities.lt(&cutoff, stream)?;
         let best =
             argmax_axis!(&probabilities, -1, stream = stream)?.expand_dims_axes(&[-1], stream)?;
-        let fallback =
-            Array::full::<bool>(logits.as_array().shape(), Array::from_bool(true), stream)?;
-        let keep_best = Array::full::<bool>(best.shape(), Array::from_bool(false), stream)?;
+        let fallback = Array::full::<bool>(
+            logits.as_array().shape(),
+            Array::try_from_bool(true)?,
+            stream,
+        )?;
+        let keep_best = Array::full::<bool>(best.shape(), Array::try_from_bool(false)?, stream)?;
         let fallback =
             safemlx::ops::indexing::put_along_axis(&fallback, &best, &keep_best, -1, stream)?;
         let mask =
@@ -251,7 +204,7 @@ impl SamplingBackend for MlxSamplingBackend {
     }
 
     fn token_id(token: &MlxTensor, stream: &Stream) -> Result<u32, Exception> {
-        Ok(token.as_array().clone().item::<u32>(stream))
+        token.as_array().clone().try_item::<u32>(stream)
     }
 
     fn token_probability(
@@ -259,26 +212,43 @@ impl SamplingBackend for MlxSamplingBackend {
         token: u32,
         stream: &Stream,
     ) -> Result<f32, Exception> {
-        let logits = logits.as_array();
-        let vocab_size = logits.dim(-1) as usize;
-        if token as usize >= vocab_size {
-            return Err(Exception::custom(format!(
-                "sampled token {token} exceeds vocabulary size {vocab_size}"
-            )));
-        }
-        let probabilities = safemlx::ops::softmax_axis(logits, -1, true, stream)?;
-        let selected = match probabilities.ndim() {
-            1 => probabilities.try_index_device(token as i32, stream)?,
-            2 => probabilities.try_index_device((0, token as i32), stream)?,
-            3 => probabilities.try_index_device((0, 0, token as i32), stream)?,
-            rank => {
-                return Err(Exception::custom(format!(
-                    "Mirostat V2 processed logits must have rank 1, 2, or 3, got rank {rank}"
-                )))
-            }
-        };
-        Ok(selected.item::<f32>(stream))
+        token_probability_array(logits, token, stream)?.try_item::<f32>(stream)
     }
+}
+
+// The ordinary and admitted samplers construct the identical probability graph.
+// Completion and scalar observation belong to their existing execution contexts.
+pub(super) fn token_probability_array(
+    logits: &MlxTensor,
+    token: u32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    let logits = logits.as_array();
+    let vocab_size = logits.dim(-1) as usize;
+    if token as usize >= vocab_size {
+        return Err(Exception::custom(format!(
+            "sampled token {token} exceeds vocabulary size {vocab_size}"
+        )));
+    }
+    let probabilities = safemlx::ops::softmax_axis(logits, -1, true, stream)?;
+    let rank = probabilities.ndim();
+    if !(1..=3).contains(&rank) {
+        return Err(Exception::custom(format!(
+            "Mirostat V2 processed logits must have rank 1, 2, or 3, got rank {rank}"
+        )));
+    }
+    // All supported ranks select coordinate [0, ..., token]. Use the
+    // existing borrowed static Slice worker, followed by scalar reshape,
+    // so ordinary/admitted execution need no general-index Vec or eager
+    // index tensor. Neither operation changes the selected probability.
+    let mut starts = [0; 3];
+    let mut stops = [1; 3];
+    starts[rank - 1] = token as i32;
+    stops[rank - 1] = token as i32 + 1;
+    let selected = probabilities
+        .try_slice(&starts[..rank], &stops[..rank], &[1; 3][..rank], stream)?
+        .reshape(&[], stream)?;
+    Ok(selected)
 }
 
 fn sample_categorical(
@@ -292,8 +262,62 @@ fn sample_categorical(
     random::categorical(logits, None, None, &key, stream)
 }
 
+// Named Rust transports of the shared TopK/TopP/MinP workers. TopP is the
+// largest live set; source/configuration and native primitive owners are
+// supplied by the selected pipeline and Graph producers respectively.
+pub(super) fn filter_control_bytes() -> Option<usize> {
+    use std::mem::size_of;
+    [
+        eredu_runtime::generation::TokenMaskPlan::control_bytes(),
+        size_of::<[Array; 8]>(),
+        size_of::<[MlxTensor; 2]>(),
+        size_of::<Result<MlxTensor, Exception>>(),
+        size_of::<Result<Array, Exception>>(),
+        size_of::<Option<i32>>(),
+        size_of::<[Option<bool>; 2]>(),
+        size_of::<Option<Dtype>>(),
+        size_of::<[f32; 3]>(),
+        size_of::<i32>(),
+        size_of::<f64>(),
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+}
+
+pub(super) fn mirostat_control_bytes() -> Option<usize> {
+    use std::mem::size_of;
+    [
+        size_of::<[Array; 11]>(),
+        size_of::<[MlxTensor; 2]>(),
+        size_of::<[&Array; 4]>(),
+        size_of::<&Stream>(),
+        size_of::<PenaltyConfig>(),
+        size_of::<&[u32]>(),
+        size_of::<&[i32]>(),
+        size_of::<[f32; 4]>(),
+        size_of::<[usize; 2]>(),
+        size_of::<[[i32; 3]; 3]>(),
+        size_of::<[bool; 2]>(),
+        size_of::<Result<MlxTensor, Exception>>(),
+        size_of::<Result<Array, Exception>>(),
+        size_of::<Result<f32, Exception>>(),
+    ]
+    .into_iter()
+    .try_fold(0usize, usize::checked_add)
+}
+
+pub(super) fn penalty_control_bytes() -> Option<usize> {
+    penalties::control_bytes()
+}
+
+/// Consumes the already-expanded exact invalid mask through the same native
+/// upload/where worker. The caller retains its paid Vec until upload completes.
+pub(crate) fn apply_token_mask(logits:&MlxTensor,invalid:&[bool],stream:&Stream)->Result<MlxTensor,Exception> {
+    mask_logits(Array::try_from_slice(invalid,logits.as_array().shape())?,logits.as_array().clone(),stream).map(MlxTensor::from_array)
+}
+
 fn mask_logits(mask: Array, logits: Array, stream: &Stream) -> Result<Array, Exception> {
-    let minimum = Array::from_f32(f32::NEG_INFINITY);
+    let minimum = Array::try_from_f32(f32::NEG_INFINITY)?;
     safemlx::ops::r#where(mask, minimum, logits, stream)
 }
 

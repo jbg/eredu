@@ -26,3 +26,7 @@ pub use quantization::*;
 pub use reduction::*;
 pub use shapes::*;
 pub use sort::*;
+
+mod graph_rows;
+pub use graph_rows::{OriginalArrayRows, OriginalArrayRowsLayout, OriginalCopyWorkerLayout,
+    reshape_like_prefix, reshape_like_prefix_control_bytes};

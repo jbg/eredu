@@ -1,0 +1,449 @@
+diff --git a/mlx/backend/cuda/eval.cpp b/mlx/backend/cuda/eval.cpp
+--- a/mlx/backend/cuda/eval.cpp
++++ b/mlx/backend/cuda/eval.cpp
+@@ -1,6 +1,7 @@
+ // Copyright © 2025 Apple Inc.
+ 
+ #include "mlx/backend/gpu/eval.h"
++#include "mlx/gpu_stream_registration.h"
+ #include "mlx/backend/cuda/allocator.h"
+ #include "mlx/backend/cuda/cublas_utils.h"
+ #include "mlx/backend/cuda/cudnn_utils.h"
+@@ -12,6 +13,14 @@
+ #include <nvtx3/nvtx3.hpp>
+ 
+ namespace mlx::core::gpu {
++
++GpuStreamRegistrationCause encoder_registration_layout(GpuStreamRegistrationLayout&) noexcept {
++  return GpuStreamRegistrationCause::unsupported;
++}
++GpuStreamRegistrationCause make_prepared_encoder(Stream, uint64_t,
++    StreamRegistrationOwner, std::shared_ptr<void>&) noexcept {
++  return GpuStreamRegistrationCause::unsupported;
++}
+ 
+ bool supports_scoped_observation() noexcept { return false; }
+ ObservationRequirement observation_requirement(const SubmissionToken&, uint64_t) noexcept {
+diff --git a/mlx/backend/metal/device.cpp b/mlx/backend/metal/device.cpp
+--- a/mlx/backend/metal/device.cpp
++++ b/mlx/backend/metal/device.cpp
+@@ -380,14 +380,67 @@
+ 
+ } // namespace
+ 
++// One concrete birth follows physical encoder, initial state and receipt
++// controls. The callback may retain state after publishing its idle frontier.
++struct EncoderBirth {
++  StreamRegistrationOwner owner;
++  std::atomic<size_t> references{1};
++  static_assert(std::atomic<size_t>::is_always_lock_free);
++  void retain() noexcept { references.fetch_add(1, std::memory_order_relaxed); }
++  void release() noexcept {
++    if (references.fetch_sub(1, std::memory_order_acq_rel) != 1) return;
++    const auto source = owner;
++    delete this;
++    if (source.value) source.retire(source.value);
++  }
++};
++struct ReleaseEncoderBirth {
++  void operator()(EncoderBirth* birth) const noexcept { birth->release(); }
++};
++struct EncoderBirthDeleter {
++  void operator()(CommandEncoder* encoder) const noexcept {
++    if (encoder->submission_idle()) delete encoder;
++    // Preserve the raw encoder and birth for ambiguous outstanding work, as the
++    // ordinary deleter does. The shared control may still physically retire.
++    else encoder->birth_->retain();
++  }
++};
++template <class T> struct EncoderBirthAllocator {
++  using value_type = T;
++  EncoderBirth* birth;
++  explicit EncoderBirthAllocator(EncoderBirth* value) noexcept : birth(value) {}
++  template <class U> EncoderBirthAllocator(const EncoderBirthAllocator<U>& other) noexcept
++      : birth(other.birth) {}
++  T* allocate(size_t n) {
++    auto* storage = std::allocator<T>{}.allocate(n);
++    birth->retain();
++    return storage;
++  }
++  void deallocate(T* p, size_t n) noexcept {
++    auto* source = birth;
++    std::allocator<T>{}.deallocate(p, n);
++    source->release(); // actual control storage precedes source retirement
++  }
++  template <class U> bool operator==(const EncoderBirthAllocator<U>& other) const noexcept {
++    return birth == other.birth;
++  }
++};
++
++CommandEncoder::CommandEncoder(Device& d, int index, ResidencySet& residency_set)
++    : CommandEncoder(d, index, residency_set, nullptr) {}
+ CommandEncoder::CommandEncoder(
+-    Device& d,
+-    int index,
+-    ResidencySet& residency_set)
+-    : stream_(index, mlx::core::Device::gpu), device_(d) {
++    Device& d, int index, ResidencySet& residency_set, EncoderBirth* birth)
++    : birth_(birth),
++      submission_state_(birth ? std::allocate_shared<gpu::SubmissionState>(
++          EncoderBirthAllocator<gpu::SubmissionState>{birth})
++          : std::make_shared<gpu::SubmissionState>()),
++      receipt_(birth ? std::allocate_shared<Receipt>(EncoderBirthAllocator<Receipt>{birth})
++          : std::make_shared<Receipt>()),
++      stream_(index, mlx::core::Device::gpu), device_(d) {
+   auto pool = new_scoped_memory_pool();
+   queue_ = NS::TransferPtr(device_.mtl_device()->newCommandQueue());
+   if (!queue_) {
++    if (birth) throw GpuStreamRegistrationCause::queue_failed;
+     throw std::runtime_error(
+         "[metal::CommandEncoder] Failed to make new command queue.");
+   }
+@@ -396,7 +449,58 @@
+   }
+   debug_set_stream_queue_label(queue_.get(), index);
+   buffer_ = NS::RetainPtr(queue_->commandBufferWithUnretainedReferences());
+-  if (!buffer_) { throw std::runtime_error("Failed to make Metal command buffer."); }
++  if (!buffer_) {
++    if (birth) throw GpuStreamRegistrationCause::buffer_failed;
++    throw std::runtime_error("Failed to make Metal command buffer.");
++  }
++}
++
++GpuStreamRegistrationCause CommandEncoder::registration_layout(
++    GpuStreamRegistrationLayout& output) noexcept {
++  using Cause = GpuStreamRegistrationCause;
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L || defined(MLX_METAL_DEBUG)
++  return Cause::unsupported;
++#else
++  using Control = std::__shared_ptr_pointer<CommandEncoder*, EncoderBirthDeleter,
++      EncoderBirthAllocator<CommandEncoder>>;
++  using State = std::__shared_ptr_emplace<gpu::SubmissionState, EncoderBirthAllocator<gpu::SubmissionState>>;
++  using Initial = std::__shared_ptr_emplace<Receipt, EncoderBirthAllocator<Receipt>>;
++  GpuStreamRegistrationLayout value;
++  value.bytes[1] = sizeof(CommandEncoder); value.alignments[1] = alignof(CommandEncoder);
++  value.bytes[2] = sizeof(EncoderBirth); value.alignments[2] = alignof(EncoderBirth);
++  value.bytes[3] = sizeof(Control); value.alignments[3] = alignof(Control);
++  value.bytes[4] = sizeof(State); value.alignments[4] = alignof(State);
++  value.bytes[5] = sizeof(Initial); value.alignments[5] = alignof(Initial);
++  value.controls = sizeof(value) + sizeof(StreamRegistrationOwner) * 2 +
++      sizeof(std::unique_ptr<EncoderBirth, ReleaseEncoderBirth>) + sizeof(std::shared_ptr<CommandEncoder>) +
++      sizeof(std::shared_ptr<void>) + sizeof(EncoderBirthAllocator<CommandEncoder>) +
++      sizeof(EncoderBirthDeleter) + sizeof(NS::SharedPtr<NS::AutoreleasePool>) +
++      sizeof(NS::SharedPtr<MTL::CommandQueue>) + sizeof(NS::SharedPtr<MTL::CommandBuffer>) +
++      sizeof(GpuStreamRegistrationCause) * 2 + sizeof(std::bad_alloc) +
++      sizeof(Device*) + sizeof(CommandEncoder*) + sizeof(int) + sizeof(bool);
++  output = value;
++  return Cause::success;
++#endif
++}
++GpuStreamRegistrationCause CommandEncoder::make_prepared(Device& d, int index,
++    StreamRegistrationOwner owner, std::shared_ptr<void>& output) noexcept {
++  using Cause = GpuStreamRegistrationCause;
++  if (output || !owner.value || !owner.retire) return Cause::invalid;
++  std::unique_ptr<EncoderBirth, ReleaseEncoderBirth> birth(new (std::nothrow) EncoderBirth);
++  if (!birth) return Cause::allocation_failed;
++  try {
++    auto* encoder = new CommandEncoder(d, index, d.residency_set(), birth.get());
++    // Allocation failure invokes the same idle deleter before propagating;
++    // caller custody is not transferred into birth until control success.
++    std::shared_ptr<CommandEncoder> value(encoder, EncoderBirthDeleter{},
++        EncoderBirthAllocator<CommandEncoder>{birth.get()});
++    birth->owner = owner;
++    output = std::move(value);
++    birth.reset();
++    return Cause::success;
++  } catch (Cause cause) { return cause; }
++    catch (const std::bad_alloc&) { return Cause::allocation_failed; }
++    catch (...) { return Cause::construction_failed; }
+ }
+ 
+ CommandEncoder::~CommandEncoder() {
+@@ -1553,6 +1657,8 @@
+         submission::NativeControlFailure::missing_worker);
+     return owner;
+   }
++  if (auto owner = gpu::registered_encoder(s))
++    return std::static_pointer_cast<CommandEncoder>(std::move(owner));
+   auto& encoders = get_command_encoders();
+   auto it = encoders.find(s.index);
+   if (it == encoders.end()) {
+@@ -1582,14 +1688,11 @@
+   // roots are allowed by evaluation, but a GPU receipt must name a GPU stream.
+   if (s.device.type != mlx::core::Device::gpu || s.device.index != 0 ||
+       !prepared_device(s.device)) return {};
+-  if (auto* local = published_local_encoders) {
+-    auto found = local->find(s.index);
+-    if (found != local->end()) return found->second;
+-  }
+-  if (auto* global = published_global_encoders.load(std::memory_order_acquire)) {
+-    auto found = global->find(s.index);
+-    if (found != global->end()) return found->second;
+-  }
++  // An existing ordinary map entry is not paid authority. Only the actual
++  // prepared registration carries its constructor's retained source token.
++  std::shared_ptr<void> owner;
++  if (gpu::borrow_registered_encoder(s, nullptr, owner) == GpuStreamRegistrationCause::success)
++    return std::static_pointer_cast<CommandEncoder>(std::move(owner));
+   return {};
+ }
+ 
+diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
+--- a/mlx/backend/metal/device.h
++++ b/mlx/backend/metal/device.h
+@@ -2,6 +2,7 @@
+ 
+ #pragma once
+ #include "mlx/device_initialization.h"
++#include "mlx/gpu_stream_registration.h"
+ #include <cstdlib>
+ 
+ #include <Metal/Metal.hpp>
+@@ -30,6 +31,8 @@
+ class Device;
+ class EventImpl;
+ struct TimerState;
++struct EncoderBirth;
++struct EncoderBirthDeleter;
+ struct ReceiptControlLayout {
+   AllocationShape receipt, event_node, cleanup_node;
+   size_t fixed_block_capture_bytes{0};
+@@ -129,6 +132,9 @@
+   // Borrow the exact current dispatch allocation owner without accepting work.
+   submission::NativeControlBinding allocation_owner() const;
+   static bool receipt_control_layout(ReceiptControlLayout&) noexcept;
++  static GpuStreamRegistrationCause registration_layout(GpuStreamRegistrationLayout&) noexcept;
++  static GpuStreamRegistrationCause make_prepared(Device&, int, StreamRegistrationOwner,
++      std::shared_ptr<void>&) noexcept;
+   static bool persistent_control_layout(PersistentControlLayout&) noexcept;
+   template<class F> auto prepare_completed_handler(F&& task) {
+     const auto owner = allocation_owner();
+@@ -163,6 +169,9 @@
+  private:
+   // Test peer uses the actual completion worker with a real completed buffer;
+   // no production injection callback, allocator switch or process-global hook.
++  friend struct EncoderBirthDeleter;
++  CommandEncoder(Device&, int, ResidencySet&, EncoderBirth*);
++  EncoderBirth* birth_{nullptr};
+   friend struct ReceiptTestAccess;
+   friend struct PersistentStorageTestAccess;
+   MTL::ComputeCommandEncoder* get_command_encoder();
+diff --git a/mlx/backend/metal/eval.cpp b/mlx/backend/metal/eval.cpp
+--- a/mlx/backend/metal/eval.cpp
++++ b/mlx/backend/metal/eval.cpp
+@@ -4,6 +4,7 @@
+ #include <span>
+ 
+ #include "mlx/backend/gpu/eval.h"
++#include "mlx/gpu_stream_registration.h"
+ #include "mlx/backend/metal/device.h"
+ #include "mlx/backend/metal/utils.h"
+ #include "mlx/primitives.h"
+@@ -13,6 +14,20 @@
+ #include "mlx/utils.h"
+ 
+ namespace mlx::core::gpu {
++
++GpuStreamRegistrationCause encoder_registration_layout(GpuStreamRegistrationLayout& output) noexcept {
++  return metal::CommandEncoder::registration_layout(output);
++}
++GpuStreamRegistrationCause make_prepared_encoder(Stream stream, uint64_t identity,
++    StreamRegistrationOwner owner, std::shared_ptr<void>& output) noexcept {
++  using Cause = GpuStreamRegistrationCause;
++  const auto device = metal::borrow_initialized_device(identity);
++  if (device == metal::DeviceInitializationCause::busy) return Cause::busy;
++  if (device != metal::DeviceInitializationCause::success) return Cause::identity_mismatch;
++  auto* actual = metal::prepared_device(stream.device);
++  if (!actual || stream.device != Device::gpu) return Cause::identity_mismatch;
++  return metal::CommandEncoder::make_prepared(*actual, stream.index, owner, output);
++}
+ 
+ bool supports_scoped_observation() noexcept { return true; }
+ ObservationRequirement observation_requirement(const SubmissionToken& token, uint64_t end) noexcept {
+diff --git a/mlx/backend/no_gpu/eval.cpp b/mlx/backend/no_gpu/eval.cpp
+--- a/mlx/backend/no_gpu/eval.cpp
++++ b/mlx/backend/no_gpu/eval.cpp
+@@ -4,8 +4,17 @@
+ 
+ #include "mlx/backend/gpu/device_info.h"
+ #include "mlx/backend/gpu/eval.h"
++#include "mlx/gpu_stream_registration.h"
+ 
+ namespace mlx::core::gpu {
++
++GpuStreamRegistrationCause encoder_registration_layout(GpuStreamRegistrationLayout&) noexcept {
++  return GpuStreamRegistrationCause::unsupported;
++}
++GpuStreamRegistrationCause make_prepared_encoder(Stream, uint64_t,
++    StreamRegistrationOwner, std::shared_ptr<void>&) noexcept {
++  return GpuStreamRegistrationCause::unsupported;
++}
+ 
+ bool supports_scoped_observation() noexcept { return true; }
+ ObservationRequirement observation_requirement(const SubmissionToken&, uint64_t) noexcept {
+diff --git a/mlx/gpu_stream_registration.h b/mlx/gpu_stream_registration.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/gpu_stream_registration.h
+@@ -0,0 +1,36 @@
++#pragma once
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include "mlx/stream_registration.h"
++
++namespace mlx::core {
++enum class GpuStreamRegistrationCause : unsigned {
++  success = 0, unsupported = 1, invalid = 2, busy = 3,
++  allocation_failed = 4, queue_failed = 5, buffer_failed = 6,
++  identity_mismatch = 8, identity_exhausted = 9, construction_failed = 10,
++  layout_changed = 11,
++};
++struct GpuStreamRegistrationLayout {
++  // Entry, encoder, birth, encoder control, state control, initial receipt control.
++  size_t bytes[6]{}, alignments[6]{};
++  size_t controls{0};
++  size_t platform_queues{1}, platform_buffers{1}, autorelease_pools{1};
++  bool operator==(const GpuStreamRegistrationLayout&) const = default;
++};
++MLX_API GpuStreamRegistrationCause gpu_stream_registration_layout(
++    GpuStreamRegistrationLayout&) noexcept;
++MLX_API GpuStreamRegistrationCause register_prepared_gpu_stream(
++    const GpuStreamRegistrationLayout&, uint64_t device_identity,
++    uint64_t scheduler_identity, StreamRegistrationOwner, Stream&) noexcept;
++namespace gpu {
++// Owning adapter helpers; neither creates a registry nor promotes an old stream.
++MLX_API GpuStreamRegistrationCause encoder_registration_layout(
++    GpuStreamRegistrationLayout&) noexcept;
++MLX_API GpuStreamRegistrationCause make_prepared_encoder(Stream, uint64_t device_identity,
++    StreamRegistrationOwner, std::shared_ptr<void>&) noexcept;
++MLX_API GpuStreamRegistrationCause borrow_registered_encoder(
++    Stream, const void* expected_owner, std::shared_ptr<void>&) noexcept;
++MLX_API std::shared_ptr<void> registered_encoder(Stream) noexcept;
++}
++}
+diff --git a/mlx/stream.cpp b/mlx/stream.cpp
+--- a/mlx/stream.cpp
++++ b/mlx/stream.cpp
+@@ -9,6 +9,8 @@
+ #include "mlx/intrusive_index.h"
+ #include "mlx/scheduler_initialization.h"
+ #include "mlx/stream_registration.h"
++#include "mlx/gpu_stream_registration.h"
++#include "mlx/scheduler.h"
+ #include "mlx/submission.h"
+ 
+ #include <array>
+@@ -43,6 +45,7 @@
+   const Stream value;
+   std::optional<cpu::CommandEncoder> cpu_encoder;
+   StreamRegistrationOwner owner;
++  std::shared_ptr<void> gpu_encoder;
+   StreamEntry(int index, Device device) noexcept
+       : detail::IndexLinks<StreamEntry, int>(index), value(index, device) {}
+ };
+@@ -58,8 +61,12 @@
+     // No registry lock is held while Array/Data or final source custody retires.
+     while (auto* entry = entries.pop_first()) {
+       const auto owner = entry->owner;
++      auto encoder = std::move(entry->gpu_encoder);
+       delete entry;
+-      if (owner.value) owner.retire(owner.value);
++      // The encoder/control allocator retains the same birth beyond this node
++      // and beyond any outstanding receipt token or nonblocking quarantine.
++      if (encoder) encoder.reset();
++      else if (owner.value) owner.retire(owner.value);
+     }
+   }
+   int next_index() const noexcept {
+@@ -208,6 +215,90 @@
+     return Cause::construction_failed;
+   }
+ }
++GpuStreamRegistrationCause gpu_stream_registration_layout(
++    GpuStreamRegistrationLayout& output) noexcept {
++  using Cause = GpuStreamRegistrationCause;
++  StreamRegistrationLayout entry;
++  const auto base = stream_registration_layout(entry);
++  if (base != StreamRegistrationCause::success) return Cause::unsupported;
++  GpuStreamRegistrationLayout value;
++  const auto cause = gpu::encoder_registration_layout(value);
++  if (cause != Cause::success) return cause;
++  value.bytes[0] = entry.object_bytes;
++  value.alignments[0] = entry.object_alignment;
++  const auto controls = entry.controls + sizeof(value) + sizeof(entry) +
++      sizeof(std::shared_ptr<void>) * 3 + sizeof(StreamRegistrationOwner) +
++      sizeof(uint64_t) * 2 + sizeof(GpuStreamRegistrationCause) * 2 +
++      sizeof(StreamEntry*) * 2 + sizeof(std::shared_lock<std::shared_mutex>);
++  if (value.controls > SIZE_MAX - controls) return Cause::invalid;
++  value.controls += controls;
++  output = value;
++  return Cause::success;
++}
++GpuStreamRegistrationCause register_prepared_gpu_stream(
++    const GpuStreamRegistrationLayout& expected, uint64_t device_identity,
++    uint64_t scheduler_identity, StreamRegistrationOwner owner, Stream& output) noexcept {
++  using Cause = GpuStreamRegistrationCause;
++  if (!owner.value || !owner.retire || output.index != -1 ||
++      !submission::submission_context_empty()) return Cause::invalid;
++  const auto scheduler = scheduler::borrow_initialized_scheduler(scheduler_identity);
++  if (scheduler == scheduler::SchedulerInitializationCause::busy) return Cause::busy;
++  if (scheduler != scheduler::SchedulerInitializationCause::success) return Cause::identity_mismatch;
++  GpuStreamRegistrationLayout actual;
++  auto cause = gpu_stream_registration_layout(actual);
++  if (cause != Cause::success) return cause;
++  if (!(actual == expected)) return Cause::layout_changed;
++  try {
++    auto& registry = all_streams();
++    std::unique_lock lock(registry.mutex, std::try_to_lock);
++    if (!lock.owns_lock()) return Cause::busy;
++    const auto index = registry.next_index();
++    if (index < 0) return Cause::identity_exhausted;
++    std::unique_ptr<StreamEntry> entry(new (std::nothrow) StreamEntry(index, Device::gpu));
++    if (!entry) return Cause::allocation_failed;
++    cause = gpu::make_prepared_encoder(entry->value, device_identity, owner, entry->gpu_encoder);
++    if (cause != Cause::success) return cause;
++    // Ownership is now attached to the real encoder. Publication and output
++    // assignment cannot fail, and no map allocation follows Metal creation.
++    entry->owner = owner;
++    output = entry->value;
++    registry.append(entry.release());
++    return Cause::success;
++  } catch (...) { return Cause::construction_failed; }
++}
++namespace {
++GpuStreamRegistrationCause find_registered_encoder(
++    Stream stream, const void* expected_owner, std::shared_ptr<void>& output,
++    bool wait) noexcept {
++  using Cause = GpuStreamRegistrationCause;
++  if (output) return Cause::invalid;
++  if (stream.device != Device::gpu || stream.device.index != 0) return Cause::identity_mismatch;
++  auto* registry = published_registry.load(std::memory_order_acquire);
++  if (!registry) return Cause::identity_mismatch;
++  try {
++    std::shared_lock lock(registry->mutex, std::defer_lock);
++    if (wait) lock.lock();
++    else if (!lock.try_lock()) return Cause::busy;
++    auto* entry = registry->entries.find(stream.index);
++    if (!entry || entry->value != stream || !entry->owner.value || !entry->gpu_encoder ||
++        (expected_owner && entry->owner.value != expected_owner)) return Cause::identity_mismatch;
++    output = entry->gpu_encoder;
++    return Cause::success;
++  } catch (...) { return Cause::construction_failed; }
++}
++} // namespace
++GpuStreamRegistrationCause gpu::borrow_registered_encoder(
++    Stream stream, const void* expected_owner, std::shared_ptr<void>& output) noexcept {
++  return find_registered_encoder(stream, expected_owner, output, false);
++}
++std::shared_ptr<void> gpu::registered_encoder(Stream stream) noexcept {
++  std::shared_ptr<void> result;
++  // Ordinary use preserves the normal blocking directory loan. Original
++  // preflight uses borrow_registered_encoder and never waits on construction.
++  find_registered_encoder(stream, nullptr, result, true);
++  return result;
++}
++
+ StreamRegistrationCause borrow_stream_registration(
+     Stream stream, const void* expected_owner) noexcept {
+   using Cause = StreamRegistrationCause;

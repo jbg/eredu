@@ -12,11 +12,18 @@ use eredu_runtime::{
     LocalTensorLayout, TensorPlacement,
 };
 
+mod intervention_source;
+pub use intervention_source::PartitionInterventionMemberLayout;
+mod contiguous_capture;
+pub use contiguous_capture::{ComponentPartitionCaptureSource, ComponentPartitionCaptureRank, ContiguousPartitionCaptureSource, ContiguousPartitionCaptureRank, PartitionCaptureSourceError};
+mod decoder_invocations;
 mod input_projection;
 mod output_gate;
 mod output_projection;
 mod prediction;
 mod routed;
+mod routed_capture;
+pub use routed_capture::{RoutedPartitionCaptureSource, RoutedPartitionCaptureRank, RoutedPartitionCaptureSourceError};
 mod streams;
 mod transforms;
 pub(crate) use routed::{derive_bank_unit_coordinates, derive_coordinates_for_experts};
@@ -62,6 +69,16 @@ impl PartitionedObservation {
     /// Replicas can still supply dependencies while publication belongs elsewhere.
     pub const fn exports(&self) -> bool {
         self.exports
+    }
+
+    /// The shared executor edits final publication only on its authoritative
+    /// owner. Internal replicas remain independent intervention invocations.
+    fn intervention_coordinates(&self) -> Option<&ComponentCoordinateMap> {
+        if self.site == ObservationHookSite::Publication && !self.exports {
+            None
+        } else {
+            self.coordinates()
+        }
     }
 
     /// Actual execution site whose hook is required in addition to placement.
@@ -118,41 +135,10 @@ impl ComponentPartitionLayout {
         ComponentPartitionError,
     > {
         use eredu_core::capture::CaptureError;
-        let operation_plan = plan.plan().operations.get(operation).ok_or_else(|| {
-            CaptureError::Invalid("unknown partition intervention operation".into())
-        })?;
-        if prediction >= plan.request().max_predictions
-            || !operation_plan.schedule.includes(phase, prediction)
-        {
-            return Err(CaptureError::Invalid(
-                "partition intervention is outside its admitted schedule".into(),
-            )
-            .into());
-        }
-        let point = &plan.points()[operation];
-        let placement = self
-            .observation(&point.path)
-            .ok_or_else(|| CaptureError::MissingPath(point.path.clone()))?;
-        let Some(coordinates) = placement.coordinates() else {
+        let Some(source) = self.intervention_source(plan, operation, phase, prediction)? else {
             return Ok(None);
         };
-        let mut matching = point
-            .axes
-            .iter()
-            .enumerate()
-            .filter(|(_, axis)| axis.name == placement.axis());
-        let Some((axis, _)) = matching.next() else {
-            return Err(CaptureError::Invalid(
-                "intervention has no retained observation axis".into(),
-            )
-            .into());
-        };
-        if matching.next().is_some() {
-            return Err(CaptureError::Invalid(
-                "intervention repeats its retained observation axis".into(),
-            )
-            .into());
-        }
+        let point = &plan.points()[operation];
         let shape = plan
             .geometry_at(phase, prediction, invocation)?
             .resolve(&point.observation_geometry())?
@@ -166,15 +152,13 @@ impl ComponentPartitionLayout {
             prediction,
             invocation,
             &shape,
-            axis,
-            coordinates,
+            source.axis(),
+            source.coordinates(),
             max_regions,
         )?;
-        let projection = match placement.combination() {
-            PartitionCaptureCombination::Disjoint => projection,
-            PartitionCaptureCombination::SumF64ToF32 => {
-                projection.as_sum_term(self.topology.tensor_parallel_rank() == 0)?
-            }
+        let projection = match source.sum_offset_owner() {
+            None => projection,
+            Some(owner) => projection.as_sum_term(owner)?,
         };
         Ok(Some(projection))
     }
@@ -509,6 +493,13 @@ impl ComponentPartitionLayout {
             topology,
             &owns_parameter_invocation,
         )?;
+        decoder_invocations::register(&mut observations, descriptor, parameters, |owner| {
+            owner.is_owned_by(ownership, |group, unit| {
+                owned_groups
+                    .iter()
+                    .any(|owned| owned.group() == group && owned.units().contains(&unit))
+            })
+        })?;
         register_routed_boundaries(
             &mut observations,
             descriptor,
@@ -848,7 +839,7 @@ impl eredu_runtime::intervention::PartitionActivationLayout for ComponentPartiti
             let placement = layout
                 .observation(&point.path)
                 .ok_or_else(|| CaptureError::MissingPath(point.path.clone()))?;
-            let Some(coordinates) = placement.coordinates() else {
+            let Some(coordinates) = placement.intervention_coordinates() else {
                 continue;
             };
             let count = if coordinates.local_count() == 0 {
@@ -1083,6 +1074,29 @@ fn replicated_observation(
     local: bool,
     site: ObservationHookSite,
 ) -> Result<(), ComponentPartitionError> {
+    let placement = replicated_placement(descriptor, path, axis, local, site)?;
+    insert_observation(observations, path, placement.clone())?;
+    let effective = format!("{path}.effective");
+    if descriptor
+        .observations
+        .points
+        .iter()
+        .any(|point| point.path == effective)
+    {
+        insert_observation(observations, &effective, placement)?;
+    }
+    Ok(())
+}
+
+// Project exactly one declared point. Callers choose whether an explicit
+// original/effective convention or exact node bindings establish other points.
+fn replicated_placement(
+    descriptor: &ArchitectureDescriptor,
+    path: &str,
+    axis: &str,
+    local: bool,
+    site: ObservationHookSite,
+) -> Result<PartitionedObservation, ComponentPartitionError> {
     use eredu_core::{capture::CaptureError, SymbolicDimension};
     let point = descriptor
         .observations
@@ -1110,24 +1124,32 @@ fn replicated_observation(
     let coordinates = local
         .then(|| ComponentCoordinateMap::range(*width, 0..*width))
         .transpose()?;
-    let placement = PartitionedObservation {
+    Ok(PartitionedObservation {
         axis: axis.into(),
         coordinates,
         exports: local,
         site,
         combination: PartitionCaptureCombination::Disjoint,
-    };
-    insert_observation(observations, path, placement.clone())?;
-    let effective = format!("{path}.effective");
-    if descriptor
-        .observations
-        .points
-        .iter()
-        .any(|point| point.path == effective)
-    {
-        insert_observation(observations, &effective, placement)?;
-    }
-    Ok(())
+    })
+}
+
+/// A complete replicated observation, with one authoritative existing producer.
+/// This describes architecture placement only; it grants no native transform,
+/// transport or allocation permission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompletePartitionCaptureSource {
+    producer: usize,
+    hook_members: usize,
+    world_size: usize,
+    site: ObservationHookSite,
+}
+impl CompletePartitionCaptureSource {
+    /// Lowest exporting world rank, following the ordinary replica rule.
+    pub const fn producer(self) -> usize { self.producer }
+    /// Whether every rank actually executes this complete observation hook.
+    pub const fn has_world_hooks(self) -> bool { self.hook_members == self.world_size }
+    /// Declared ordinary hook category, including explicit output publication.
+    pub const fn site(self) -> ObservationHookSite { self.site }
 }
 
 /// Reusable, architecture-derived scalar layouts for one complete topology.
@@ -1190,53 +1212,7 @@ impl ComponentPartitionLayouts {
         &self,
         path: &str,
     ) -> Result<PartitionCaptureCombination, eredu_core::capture::CaptureError> {
-        use eredu_core::capture::CaptureError;
-        let mut combination = None;
-        for layout in &self.layouts {
-            let current = if let Some(point) = layout.observation(path) {
-                point.combination()
-            } else if layout.routed_observation(path).is_some() {
-                PartitionCaptureCombination::Disjoint
-            } else {
-                return Err(CaptureError::MissingPath(path.into()));
-            };
-            if combination.is_some_and(|previous| previous != current) {
-                return Err(CaptureError::Invalid(
-                    "partition observation equations disagree".into(),
-                ));
-            }
-            combination = Some(current);
-        }
-        let combination = combination.ok_or_else(|| CaptureError::MissingPath(path.into()))?;
-        if combination == PartitionCaptureCombination::SumF64ToF32 {
-            for layout in &self.layouts {
-                let point = layout.observation(path).expect("agreed scalar equation");
-                let Some(coordinates) = point.coordinates() else {
-                    continue;
-                };
-                if coordinates.contiguous_range() != Some(0..coordinates.global_count()) {
-                    return Err(CaptureError::Invalid(
-                        "additive write has incomplete ordered coordinates".into(),
-                    ));
-                }
-                for peer in layout
-                    .topology
-                    .tensor_parallel_peers()
-                    .map_err(|error| CaptureError::Invalid(error.to_string()))?
-                {
-                    let other = self.layouts[peer]
-                        .observation(path)
-                        .expect("agreed scalar equation");
-                    if other.coordinates() != Some(coordinates) || other.axis() != point.axis() {
-                        return Err(CaptureError::Invalid(
-                            "additive write lacks a complete tensor-parallel invocation group"
-                                .into(),
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(combination)
+        self.capture_combination_source(path).map_err(|error| error.legacy(path))
     }
 
     /// Combines semantic placement with hook coverage from the actual executor.
@@ -1257,6 +1233,56 @@ impl ComponentPartitionLayouts {
             );
         }
         eredu_core::ObservationSupportStatus::Supported
+    }
+
+    /// Selects the same producer as `capture_producers` when every executing
+    /// invocation has the complete ordered semantic axis. Shards, additive
+    /// writes and sparse routed values require their other existing producers.
+    /// This query borrows the actual retained table and allocates no metadata.
+    pub fn complete_capture_source(&self, path: &str) -> Option<CompletePartitionCaptureSource> {
+        let mut site = None;
+        let mut producer = None;
+        let mut width = None;
+        let mut axis = None;
+        let mut hook_members = 0usize;
+        for (rank, layout) in self.layouts.iter().enumerate() {
+            let point = layout.observation(path)?;
+            if point.combination() != PartitionCaptureCombination::Disjoint
+                || site.is_some_and(|prior| prior != point.site()) { return None; }
+            site = Some(point.site());
+            let Some(map) = point.coordinates() else {
+                if point.exports() { return None; }
+                continue;
+            };
+            if map.contiguous_range() != Some(0..map.global_count())
+                || width.is_some_and(|prior| prior != map.global_count())
+                || axis.is_some_and(|prior| prior != point.axis()) { return None; }
+            width = Some(map.global_count()); axis = Some(point.axis());
+            hook_members = hook_members.checked_add(1)?;
+            if point.exports() && producer.is_none() { producer = Some(rank); }
+        }
+        Some(CompletePartitionCaptureSource { producer: producer?, hook_members,
+            world_size: self.topology.world_size(), site: site? })
+    }
+
+    /// Fixed control values for one borrowed complete-source lookup. The
+    /// retained layout table remains its existing owner's storage; this query
+    /// creates no table, coordinate map, path string or allocation destination.
+    pub fn complete_capture_source_control_bytes() -> Option<usize> {
+        use std::mem::{size_of, size_of_val};
+        let parts = [
+            size_of::<(&Self, &str)>(),
+            size_of::<(Option<ObservationHookSite>, Option<usize>, Option<usize>, Option<&str>, usize)>(),
+            size_of::<std::iter::Enumerate<std::slice::Iter<'_, ComponentPartitionLayout>>>(),
+            size_of::<Option<(usize, &ComponentPartitionLayout)>>(),
+            size_of::<Option<&PartitionedObservation>>(),
+            size_of::<Option<&ComponentCoordinateMap>>(),
+            size_of::<(Option<std::ops::Range<usize>>, Option<std::ops::Range<usize>>)>(),
+            size_of::<(Option<CompletePartitionCaptureSource>, CompletePartitionCaptureSource)>(),
+            size_of::<(&ComponentPartitionLayout, &PartitionedObservation, &ComponentCoordinateMap, &str)>(),
+            size_of::<(Option<usize>, bool, PartitionCaptureCombination, ObservationHookSite)>(),
+        ];
+        parts.into_iter().try_fold(size_of_val(&parts), usize::checked_add)
     }
 
     /// All ranks that execute a declared component observation, including
@@ -1305,26 +1331,19 @@ impl ComponentPartitionLayouts {
             .get(request.selection_index)
             .ok_or_else(|| CaptureError::Invalid("unknown component capture selection".into()))?;
         let mut producers = Vec::new();
-        let mut coordinates = Vec::new();
         let combination = self.observation_combination(&selection.path)?;
         let mut fragments = 0usize;
         for (rank, layout) in self.layouts.iter().enumerate() {
             let group = layout
                 .observation(&selection.path)
                 .ok_or_else(|| CaptureError::MissingPath(selection.path.clone()))?;
-            let Some(map) = group.coordinates() else {
+            if group.coordinates().is_none() {
                 continue;
-            };
+            }
             if !group.exports() {
                 continue;
             }
-            let term = match combination {
-                PartitionCaptureCombination::Disjoint => None,
-                PartitionCaptureCombination::SumF64ToF32 => {
-                    Some(layout.topology.tensor_parallel_rank())
-                }
-            };
-            if coordinates.contains(&(map, term)) {
+            if !self.is_capture_producer(&selection.path, rank, combination) {
                 continue;
             }
             if producers.len() == request.max_producers {
@@ -1352,7 +1371,6 @@ impl ComponentPartitionLayouts {
                 )
                 .into());
             }
-            coordinates.push((map, term));
             producers.push(PartitionCaptureProducer { rank, projection });
         }
         if producers.is_empty() {
@@ -2006,6 +2024,24 @@ mod tests {
                 "run",
             )
             .unwrap();
+            // Publication has one actual intervene callback despite real local
+            // logits replicas on the other output-stage ranks.
+            let mut publication = layouts.clone();
+            for (rank, layout) in publication.layouts.iter_mut().enumerate() {
+                let point = layout.observations.get_mut("units").unwrap();
+                point.coordinates = Some(ComponentCoordinateMap::range(256, 0..256).unwrap());
+                point.site = ObservationHookSite::Publication;
+                point.exports = rank == 2;
+            }
+            let members = publication.activation_members(&plan, 0, CapturePhase::Prefill, 0, 4, 4).unwrap();
+            assert_eq!(members.iter().map(|member| member.rank).collect::<Vec<_>>(), [2]);
+            assert_eq!(members[0].projection.local_shape(), [2, 256]);
+            assert_eq!(publication.activation_region_bound(&plan, 0, 4, 4).unwrap(), 1);
+            assert!(publication.complete_capture_source("units").unwrap().has_world_hooks());
+            for layout in &mut publication.layouts {
+                layout.observations.get_mut("units").unwrap().site = ObservationHookSite::Unit;
+            }
+            assert_eq!(publication.activation_members(&plan, 0, CapturePhase::Prefill, 0, 4, 4).unwrap().len(), 4);
             let scoped = plan
                 .plan()
                 .clone()
@@ -2320,6 +2356,22 @@ mod tests {
             let producers = layouts
                 .capture_producers(request(2, usize::from(!empty)))
                 .unwrap();
+            let contiguous = layouts.contiguous_capture_source("units").unwrap();
+            assert_eq!(contiguous.axis(), "component");
+            assert_eq!(contiguous.width(), 256);
+            assert_eq!(contiguous.producer_count(), producers.len());
+            assert_eq!((0..contiguous.world_size()).filter_map(|rank| contiguous.rank(rank))
+                .filter(|row| row.produces).map(|row| row.rank).collect::<Vec<_>>(),
+                producers.iter().map(|row| row.rank).collect::<Vec<_>>());
+            for rank in 0..contiguous.world_size() {
+                assert_eq!(contiguous.rank(rank).unwrap().coordinates,
+                    layouts.layouts[rank].observation("units").unwrap().coordinates().unwrap().contiguous_range().unwrap());
+            }
+            // Selection-empty sources remain explicit producers. Their actual
+            // tensor source is not confused with an absent local invocation.
+            assert_eq!(contiguous.producer_count(), 2);
+            assert!(contiguous.rank(contiguous.world_size()).is_none());
+            assert!(ContiguousPartitionCaptureSource::control_bytes().unwrap() > 0);
             let mut additive = layouts.clone();
             for layout in &mut additive.layouts {
                 let point = layout.observations.get_mut("units").unwrap();
@@ -2341,6 +2393,10 @@ mod tests {
             assert!(terms
                 .iter()
                 .all(|term| term.projection.local_shape() == [2, 256]));
+            let source = additive.contiguous_capture_source("units").unwrap();
+            assert_eq!(source.combination(), PartitionCaptureCombination::SumF64ToF32);
+            assert_eq!((0..source.world_size()).filter_map(|rank| source.rank(rank))
+                .filter(|row| row.produces).map(|row| row.rank).collect::<Vec<_>>(), [0, 2]);
             assert!(additive.capture_producers(request(1, 2)).is_err());
             additive.layouts[1]
                 .observations
@@ -2348,6 +2404,8 @@ mod tests {
                 .unwrap()
                 .coordinates = None;
             assert!(additive.capture_producers(request(2, 2)).is_err());
+            assert_eq!(additive.contiguous_capture_source("units").unwrap_err(),
+                PartitionCaptureSourceError::AdditiveGroup);
             additive.layouts[1]
                 .observations
                 .get_mut("units")
@@ -2371,6 +2429,11 @@ mod tests {
                 .unwrap();
             assert_eq!(exported.len(), 1);
             assert_eq!(exported[0].rank, 3);
+            let source = authoritative.contiguous_capture_source("units").unwrap();
+            assert_eq!(source.producer_count(), 1);
+            assert!(source.rank(3).unwrap().produces);
+            assert!(!source.rank(0).unwrap().produces);
+            assert_eq!(source.rank(0).unwrap().coordinates, 0..256);
             let placement = layouts
                 .capture_placement(
                     &plan,

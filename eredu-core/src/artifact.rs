@@ -996,9 +996,45 @@ pub fn inspect_artifact<R: ModelConfigurationResolver>(
     path: impl AsRef<Path>,
     resolver: &R,
 ) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
-    let path = path.as_ref();
+    inspect_artifact_inner(path.as_ref(), resolver, GgufInspectionHeaders::Ordinary)
+}
+
+/// Inspects a local artifact while retaining its actual GGUF header bytes.
+///
+/// The primary shards and every matching companion candidate are captured at
+/// their first parse. Later cold GGUF reads reject changed headers; tensor
+/// payloads and filesystem identity are not made immutable. This is an explicit
+/// source contract, not a complete storage or execution bound. SafeTensors
+/// inspection is unchanged.
+pub fn inspect_artifact_with_prepared_gguf_headers<R: ModelConfigurationResolver>(
+    path: impl AsRef<Path>,
+    resolver: &R,
+) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
+    inspect_artifact_inner(path.as_ref(), resolver, GgufInspectionHeaders::Captured)
+}
+
+#[derive(Clone, Copy)]
+enum GgufInspectionHeaders {
+    Ordinary,
+    Captured,
+}
+
+impl GgufInspectionHeaders {
+    fn open(self, path: &Path) -> eredu_gguf::Result<GgufCheckpoint> {
+        match self {
+            Self::Ordinary => GgufCheckpoint::open(path),
+            Self::Captured => GgufCheckpoint::open_with_prepared_headers(path),
+        }
+    }
+}
+
+fn inspect_artifact_inner<R: ModelConfigurationResolver>(
+    path: &Path,
+    resolver: &R,
+    headers: GgufInspectionHeaders,
+) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
     if is_gguf(path) {
-        inspect_gguf(path, resolver)
+        inspect_gguf(path, resolver, headers)
     } else if path.is_dir() {
         inspect_safetensors(path, resolver)
     } else if !path.exists() {
@@ -1046,8 +1082,9 @@ pub fn validate_preparation_policy(
 fn inspect_gguf<R: ModelConfigurationResolver>(
     path: &Path,
     resolver: &R,
+    headers: GgufInspectionHeaders,
 ) -> Result<ArtifactInspection<R::ArtifactPlan>, ArtifactError> {
-    let checkpoint = GgufCheckpoint::open(path)?;
+    let checkpoint = headers.open(path)?;
     let architecture_name = checkpoint
         .metadata()
         .get("general.architecture")
@@ -1057,7 +1094,7 @@ fn inspect_gguf<R: ModelConfigurationResolver>(
         .resolve_gguf(architecture_name, &checkpoint)?
         .into_parts();
     let requirements = resolver.gguf_companion_requirements(architecture_name, &checkpoint)?;
-    let companions = resolve_gguf_companions(path, &requirements)?;
+    let companions = resolve_gguf_companions_inner(path, &requirements, headers)?;
     validate_gguf_container(&checkpoint)?;
     let tensors = checkpoint
         .tensors()
@@ -1113,6 +1150,14 @@ pub fn resolve_gguf_companions(
     primary: &Path,
     requirements: &[GgufCompanionRequirement],
 ) -> Result<BTreeMap<GgufCompanionRole, ValidatedGgufCompanion>, ArtifactError> {
+    resolve_gguf_companions_inner(primary, requirements, GgufInspectionHeaders::Ordinary)
+}
+
+fn resolve_gguf_companions_inner(
+    primary: &Path,
+    requirements: &[GgufCompanionRequirement],
+    headers: GgufInspectionHeaders,
+) -> Result<BTreeMap<GgufCompanionRole, ValidatedGgufCompanion>, ArtifactError> {
     let mut resolved = BTreeMap::new();
     let mut declared_roles = BTreeSet::new();
     for requirement in requirements {
@@ -1153,7 +1198,7 @@ pub fn resolve_gguf_companions(
                         })
                     && is_gguf(&path)
                 {
-                    let checkpoint = GgufCheckpoint::open(&path)?;
+                    let checkpoint = headers.open(&path)?;
                     if checkpoint.physical_tensor_count() == 0 {
                         return Err(ArtifactError::InvalidArtifact(format!(
                             "GGUF companion {} contains no tensors",
@@ -2291,3 +2336,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod captured_headers_tests;

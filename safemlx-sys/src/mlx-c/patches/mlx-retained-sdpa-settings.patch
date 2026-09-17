@@ -1,0 +1,78 @@
+diff --git a/mlx/utils.h b/mlx/utils.h
+--- a/mlx/utils.h
++++ b/mlx/utils.h
+@@ -167,6 +167,10 @@
+ 
+ namespace env {
+ 
++// Captured once for both cold inspection and Metal execution. Zero selects
++// device defaults. Invalid overrides are rejected before scratch allocation.
++MLX_API int sdpa_blocks_override();
++
+ int get_var(const char* name, int default_value);
+ std::string get_var(const char* name, const char* default_value);
+ 
+diff --git a/mlx/utils.cpp b/mlx/utils.cpp
+--- a/mlx/utils.cpp
++++ b/mlx/utils.cpp
+@@ -1,6 +1,9 @@
+ // Copyright © 2023 Apple Inc.
+ 
++#include <cerrno>
++#include <climits>
+ #include <cstdlib>
++#include <stdexcept>
+ #include <iomanip>
+ #include <iostream>
+ #include <sstream>
+@@ -285,6 +288,30 @@
+ 
+ namespace env {
+ 
++int sdpa_blocks_override() {
++  // Function-local static initialization is thread safe and initializes no
++  // device. Retain invalid input too: later environment edits cannot change
++  // the mechanism used by a previously inspected process.
++  static const int selected = []() {
++    const char* text = std::getenv("MLX_SDPA_BLOCKS");
++    if (!text) {
++      return 0;
++    }
++    errno = 0;
++    char* end = nullptr;
++    long value = std::strtol(text, &end, 10);
++    if (errno == ERANGE || value > INT_MAX || value < INT_MIN) {
++      return -1;
++    }
++    // The final Metal reduction visits groups of 32 blocks; a partial group
++    // silently drops values. Reject incompatible overrides at inspection.
++    if (value > 0 && value % 32 != 0) {
++      return -2;
++    }
++    // Preserve atoi's whitespace/sign/digit-prefix and nonpositive defaults.
++    return value > 0 ? static_cast<int>(value) : 0;
++  }();
++  if (selected == -1) {
++    throw std::invalid_argument("MLX_SDPA_BLOCKS exceeds native int range");
++  }
++  if (selected == -2) {
++    throw std::invalid_argument("MLX_SDPA_BLOCKS must be a positive multiple of 32");
++  }
++  return selected;
++}
++
+ int get_var(const char* name, int default_value) {
+   if (const char* buff_str = std::getenv(name)) {
+     return atoi(buff_str);
+diff --git a/mlx/backend/metal/scaled_dot_product_attention.cpp b/mlx/backend/metal/scaled_dot_product_attention.cpp
+--- a/mlx/backend/metal/scaled_dot_product_attention.cpp
++++ b/mlx/backend/metal/scaled_dot_product_attention.cpp
+@@ -474,7 +474,7 @@
+       blocks = 32;
+     }
+   }
+-  if (int blocks_env = env::get_var("MLX_SDPA_BLOCKS", 0); blocks_env > 0) {
++  if (int blocks_env = env::sdpa_blocks_override(); blocks_env > 0) {
+     blocks = blocks_env;
+   }
+   size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);

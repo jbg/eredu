@@ -1,0 +1,182 @@
+diff --git a/mlx/fast.h b/mlx/fast.h
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -69,6 +69,19 @@
+     bool,
+     StreamOrDevice)>;
+ 
++// The C bridge owns its configuration throughout a synchronous invocation.
++// No argument reference is retained by this callable or its returned arrays.
++using BorrowedCustomKernelFunction = std::function<ArrayVector(
++    const ArrayVector&,
++    const std::vector<Shape>&,
++    const std::vector<Dtype>&,
++    std::tuple<int, int, int>,
++    std::tuple<int, int, int>,
++    const std::vector<std::pair<std::string, TemplateArg>>&,
++    std::optional<float>,
++    bool,
++    StreamOrDevice)>;
++
+ MLX_API CustomKernelFunction metal_kernel(
+     const std::string& name,
+     const std::vector<std::string>& input_names,
+@@ -80,6 +93,25 @@
+     const CompileOptions& compile_options = {});
+ 
+ MLX_API CustomKernelFunction cuda_kernel(
++    const std::string& name,
++    const std::vector<std::string>& input_names,
++    const std::vector<std::string>& output_names,
++    const std::string& source,
++    const std::string& header = "",
++    bool ensure_row_contiguous = true,
++    int shared_memory = 0);
++
++MLX_API BorrowedCustomKernelFunction metal_kernel_borrowed(
++    const std::string& name,
++    const std::vector<std::string>& input_names,
++    const std::vector<std::string>& output_names,
++    const std::string& source,
++    const std::string& header = "",
++    bool ensure_row_contiguous = true,
++    bool atomic_outputs = false,
++    const CompileOptions& compile_options = {});
++
++MLX_API BorrowedCustomKernelFunction cuda_kernel_borrowed(
+     const std::string& name,
+     const std::vector<std::string>& input_names,
+     const std::vector<std::string>& output_names,
+diff --git a/mlx/backend/common/metal_kernel.cpp b/mlx/backend/common/metal_kernel.cpp
+--- a/mlx/backend/common/metal_kernel.cpp
++++ b/mlx/backend/common/metal_kernel.cpp
+@@ -199,7 +199,7 @@
+ 
+ } // namespace
+ 
+-CustomKernelFunction metal_kernel(
++static auto make_metal_kernel(
+     const std::string& name,
+     const std::vector<std::string>& input_names,
+     const std::vector<std::string>& output_names,
+@@ -367,4 +367,44 @@
+   };
+ }
+ 
++CustomKernelFunction metal_kernel(
++    const std::string& name,
++    const std::vector<std::string>& input_names,
++    const std::vector<std::string>& output_names,
++    const std::string& source,
++    const std::string& header,
++    bool ensure_row_contiguous,
++    bool atomic_outputs,
++    const CompileOptions& compile_options) {
++  return make_metal_kernel(
++      name,
++      input_names,
++      output_names,
++      source,
++      header,
++      ensure_row_contiguous,
++      atomic_outputs,
++      compile_options);
++}
++
++BorrowedCustomKernelFunction metal_kernel_borrowed(
++    const std::string& name,
++    const std::vector<std::string>& input_names,
++    const std::vector<std::string>& output_names,
++    const std::string& source,
++    const std::string& header,
++    bool ensure_row_contiguous,
++    bool atomic_outputs,
++    const CompileOptions& compile_options) {
++  return make_metal_kernel(
++      name,
++      input_names,
++      output_names,
++      source,
++      header,
++      ensure_row_contiguous,
++      atomic_outputs,
++      compile_options);
++}
++
+ } // namespace mlx::core::fast
+diff --git a/mlx/backend/cuda/custom_kernel.cpp b/mlx/backend/cuda/custom_kernel.cpp
+--- a/mlx/backend/cuda/custom_kernel.cpp
++++ b/mlx/backend/cuda/custom_kernel.cpp
+@@ -139,7 +139,7 @@
+ 
+ } // namespace
+ 
+-CustomKernelFunction cuda_kernel(
++static auto make_cuda_kernel(
+     const std::string& name,
+     const std::vector<std::string>& input_names,
+     const std::vector<std::string>& output_names,
+@@ -237,6 +237,42 @@
+             shared_memory),
+         std::move(inputs));
+   };
++}
++
++CustomKernelFunction cuda_kernel(
++    const std::string& name,
++    const std::vector<std::string>& input_names,
++    const std::vector<std::string>& output_names,
++    const std::string& source,
++    const std::string& header,
++    bool ensure_row_contiguous,
++    int shared_memory) {
++  return make_cuda_kernel(
++      name,
++      input_names,
++      output_names,
++      source,
++      header,
++      ensure_row_contiguous,
++      shared_memory);
++}
++
++BorrowedCustomKernelFunction cuda_kernel_borrowed(
++    const std::string& name,
++    const std::vector<std::string>& input_names,
++    const std::vector<std::string>& output_names,
++    const std::string& source,
++    const std::string& header,
++    bool ensure_row_contiguous,
++    int shared_memory) {
++  return make_cuda_kernel(
++      name,
++      input_names,
++      output_names,
++      source,
++      header,
++      ensure_row_contiguous,
++      shared_memory);
+ }
+ 
+ ArrayVector precompiled_cuda_kernel(
+diff --git a/mlx/backend/cuda/no_cuda.cpp b/mlx/backend/cuda/no_cuda.cpp
+--- a/mlx/backend/cuda/no_cuda.cpp
++++ b/mlx/backend/cuda/no_cuda.cpp
+@@ -16,6 +16,17 @@
+ namespace fast {
+ 
+ CustomKernelFunction cuda_kernel(
++    const std::string&,
++    const std::vector<std::string>&,
++    const std::vector<std::string>&,
++    const std::string&,
++    const std::string&,
++    bool,
++    int) {
++  throw std::runtime_error("[cuda_kernel] No CUDA back-end.");
++}
++
++BorrowedCustomKernelFunction cuda_kernel_borrowed(
+     const std::string&,
+     const std::vector<std::string>&,
+     const std::vector<std::string>&,

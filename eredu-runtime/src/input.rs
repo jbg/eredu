@@ -1,12 +1,33 @@
 //! Backend-neutral ownership of prepared multimodal tensors.
+pub mod host;
+mod original_preparation;
+pub use original_preparation::{OriginalModelInput, OriginalModelInputBackend, OriginalModelInputPublicationError};
 
 use std::collections::BTreeMap;
 
 use eredu_core::{
-    CapabilityError, InputExtent, InputMetadataKey, InputModality, InputPartDescriptor,
-    InputPayloadKind, InputTensorIdentity, PreparedInputError, PreparedInputIdentity,
+    CapabilityError, InputExtent, InputIdentityMap, InputMetadataKey, InputModality,
+    InputPartDescriptor, InputPayloadKind, InputTensorIdentity, PreparedInputError,
+    PreparedInputIdentity,
 };
 use sha2::{Digest, Sha256};
+
+mod metadata;
+mod workspace_projection;
+pub use workspace_projection::{OriginalPreparedWorkspaceSource, PreparedMediaWorkspaceTensor};
+mod original_storage;
+pub use original_storage::{
+    OriginalEncoderTableProjection, OriginalPreparedInputProjection, PreparedModelInputOwner, PreparedModelInputSource,
+    PreparedModelInputSourceError, PreparedModelInputSourcePlan, SharedPreparedInputParts,
+};
+
+mod shared_identity;
+pub use shared_identity::SharedPreparedInputCacheIdentity;
+
+mod text_identity;
+pub use text_identity::{
+    BoundTextInputIdentityPlan, TextInputIdentityError, TextInputIdentityPlan,
+};
 
 /// Mechanism for describing native prepared tensors and reading bounded metadata.
 ///
@@ -16,6 +37,35 @@ use sha2::{Digest, Sha256};
 pub trait PreparedInputInspector<Tensor> {
     /// Returns the portable identity of a native tensor.
     fn identity(&self, tensor: &Tensor) -> Result<InputTensorIdentity, PreparedInputError>;
+
+    /// Describes a tensor with host destinations charged before construction.
+    /// Implementations must retain no new source or execution authority. An
+    /// ordinary-only inspector refuses before allocating through this entry.
+    fn identity_with_metadata(
+        &self,
+        _tensor: &Tensor,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<InputTensorIdentity, eredu_nn::Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
+
+    /// Reads signed metadata into counted host destinations.
+    fn i32_values_with_metadata(
+        &self,
+        _tensor: &Tensor,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Vec<i32>, eredu_nn::Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
+
+    /// Reads Boolean metadata into counted host destinations.
+    fn bool_values_with_metadata(
+        &self,
+        _tensor: &Tensor,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Vec<bool>, eredu_nn::Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
 
     /// Reads an evaluated signed-integer metadata tensor in row-major order.
     fn i32_values(&self, tensor: &Tensor) -> Result<Vec<i32>, CapabilityError>;
@@ -59,7 +109,7 @@ impl<Tensor> PreparedInputPayload<Tensor> {
 pub struct PreparedInputPart<Tensor> {
     modality: InputModality,
     payload: PreparedInputPayload<Tensor>,
-    metadata: BTreeMap<InputMetadataKey, Tensor>,
+    metadata: InputIdentityMap<InputMetadataKey, Tensor>,
     extents: Vec<InputExtent>,
 }
 
@@ -111,7 +161,7 @@ impl<Tensor> PreparedInputPart<Tensor> {
         Ok(Self {
             modality,
             payload,
-            metadata: typed_metadata,
+            metadata: InputIdentityMap::from_ordered_map(typed_metadata),
             extents,
         })
     }
@@ -126,8 +176,13 @@ impl<Tensor> PreparedInputPart<Tensor> {
         &self.payload
     }
 
+    /// Consumes this part, moving its payload and retiring its metadata.
+    pub fn into_payload(self) -> PreparedInputPayload<Tensor> {
+        self.payload
+    }
+
     /// Typed metadata tensors in stable key order.
-    pub const fn metadata(&self) -> &BTreeMap<InputMetadataKey, Tensor> {
+    pub const fn metadata(&self) -> &InputIdentityMap<InputMetadataKey, Tensor> {
         &self.metadata
     }
 
@@ -146,16 +201,10 @@ impl<Tensor> PreparedInputPart<Tensor> {
         &self,
         describe: &impl Fn(&Tensor) -> Result<InputTensorIdentity, PreparedInputError>,
     ) -> Result<InputPartDescriptor, PreparedInputError> {
-        InputPartDescriptor::new_with_extents(
-            self.modality,
-            self.payload.kind(),
-            describe(self.payload.value())?,
-            self.metadata
-                .iter()
-                .map(|(key, value)| Ok((*key, describe(value)?)))
-                .collect::<Result<Vec<_>, PreparedInputError>>()?,
-            self.extents.iter().copied(),
-        )
+        metadata::descriptor(self, metadata::Destination(None), &mut |value| {
+            describe(value).map_err(metadata::Failure::Prepared)
+        })
+        .map_err(metadata::Failure::ordinary)
     }
 }
 
@@ -182,6 +231,20 @@ pub struct PreparedInputCacheIdentity {
 }
 
 impl PreparedInputCacheIdentity {
+    // Only the closed text worker supplies already validated descriptors and
+    // fixed canonical fingerprints. It must not repeat generic encoding/copies.
+    fn from_validated_text_parts(
+        prepared: PreparedInputIdentity,
+        semantic_content_fingerprint: String,
+        prefix_content_fingerprint: String,
+    ) -> Self {
+        Self {
+            prepared,
+            semantic_content_fingerprint,
+            prefix_content_fingerprint,
+        }
+    }
+
     /// Couples one prepared-input description to a nonempty semantic-content fingerprint.
     pub fn new(
         prepared: PreparedInputIdentity,
@@ -229,6 +292,22 @@ impl PreparedInputCacheIdentity {
         &self.prefix_content_fingerprint
     }
 
+    /// Exact retained inline and owned capacity of this immutable description.
+    /// Counts both fingerprint string capacities and the prepared description's
+    /// actual allocations without re-encoding or hashing their contents. Shared
+    /// owner/custody and allocator bookkeeping are separate from this payload.
+    pub fn capacity_bytes(&self) -> Option<u64> {
+        let prepared_heap = self
+            .prepared
+            .capacity_bytes()?
+            .checked_sub(u64::try_from(std::mem::size_of::<PreparedInputIdentity>()).ok()?)?;
+        u64::try_from(std::mem::size_of::<Self>())
+            .ok()?
+            .checked_add(prepared_heap)?
+            .checked_add(u64::try_from(self.semantic_content_fingerprint.capacity()).ok()?)?
+            .checked_add(u64::try_from(self.prefix_content_fingerprint.capacity()).ok()?)
+    }
+
     /// Logical host storage retained by a copied identity, including descriptions
     /// and both fingerprints. Allocator capacity/overhead is excluded.
     pub fn logical_metadata_bytes(&self) -> Option<u64> {
@@ -257,13 +336,10 @@ impl<Tensor> PreparedModelInput<Tensor> {
         parts: Vec<PreparedInputPart<Tensor>>,
         describe: impl Fn(&Tensor) -> Result<InputTensorIdentity, PreparedInputError>,
     ) -> Result<Self, PreparedInputError> {
-        let identity = PreparedInputIdentity::new(
-            parts
-                .iter()
-                .map(|part| part.descriptor(&describe))
-                .collect::<Result<Vec<_>, _>>()?,
-        )?;
-        Ok(Self { parts, identity })
+        metadata::input(parts, metadata::Destination(None), &mut |value| {
+            describe(value).map_err(metadata::Failure::Prepared)
+        })
+        .map_err(metadata::Failure::ordinary)
     }
 
     /// Exact payload-free identity used for rank agreement and persistence.
@@ -369,7 +445,7 @@ impl<Tensor> PreparedModelInput<Tensor> {
 
 #[cfg(test)]
 mod tests {
-    use eredu_core::{checkpoint::TensorDtype, PreparedInputError};
+    use eredu_core::{PreparedInputError, checkpoint::TensorDtype};
 
     use super::*;
 
@@ -450,12 +526,14 @@ mod tests {
     #[test]
     fn rejects_payload_geometry_that_disagrees_with_wire_identity() {
         let input = PreparedModelInput::new(
-            vec![PreparedInputPart::new(
-                InputModality::Text,
-                PreparedInputPayload::TokenIds(fake(TensorDtype::U32, &[1, 2], 1)),
-                [],
-            )
-            .unwrap()],
+            vec![
+                PreparedInputPart::new(
+                    InputModality::Text,
+                    PreparedInputPayload::TokenIds(fake(TensorDtype::U32, &[1, 2], 1)),
+                    [],
+                )
+                .unwrap(),
+            ],
             describe,
         )
         .unwrap();
@@ -511,22 +589,26 @@ mod tests {
     #[test]
     fn prompt_cache_identity_requires_both_prepared_description_and_semantic_content() {
         let first = PreparedModelInput::new(
-            vec![PreparedInputPart::new(
-                InputModality::Image,
-                PreparedInputPayload::Tensor(fake(TensorDtype::F32, &[1, 3, 4, 4], 1)),
-                [],
-            )
-            .unwrap()],
+            vec![
+                PreparedInputPart::new(
+                    InputModality::Image,
+                    PreparedInputPayload::Tensor(fake(TensorDtype::F32, &[1, 3, 4, 4], 1)),
+                    [],
+                )
+                .unwrap(),
+            ],
             describe,
         )
         .unwrap();
         let reshaped = PreparedModelInput::new(
-            vec![PreparedInputPart::new(
-                InputModality::Image,
-                PreparedInputPayload::Tensor(fake(TensorDtype::F32, &[1, 3, 8, 8], 2)),
-                [],
-            )
-            .unwrap()],
+            vec![
+                PreparedInputPart::new(
+                    InputModality::Image,
+                    PreparedInputPayload::Tensor(fake(TensorDtype::F32, &[1, 3, 8, 8], 2)),
+                    [],
+                )
+                .unwrap(),
+            ],
             describe,
         )
         .unwrap();

@@ -36,6 +36,10 @@ impl ProjectionPolicy {
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<LowRankProjection<B>, Error> {
+        LowRankProjection::new(self.specification()?, context)
+    }
+
+    pub(crate) fn specification(&self) -> Result<LowRankProjectionSpec, Error> {
         let linear = |weight: &str, input, output, format| -> Result<LinearSpec, Error> {
             Ok(LinearSpec {
                 input,
@@ -45,8 +49,7 @@ impl ProjectionPolicy {
                 format: crate::linear_format::standard_linear_format(weight, format)?,
             })
         };
-        LowRankProjection::new(
-            LowRankProjectionSpec {
+        Ok(LowRankProjectionSpec {
                 first: self
                     .first_weight
                     .as_deref()
@@ -65,8 +68,6 @@ impl ProjectionPolicy {
                     self.output_dimensions,
                     self.second_format,
                 )?,
-            },
-            context,
-        )
+            })
     }
 }

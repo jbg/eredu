@@ -60,7 +60,7 @@ fn conditional_qwen_prediction_tokens_match_interleaved_target_media() {
         )
         .unwrap();
         let admitted =
-            <Model as CompositeArchitecture<NumericBackend, State>>::admit_prepared_input(
+            eredu_architectures::media_plan::admit_qwen_hybrid_input(
                 &parsed,
                 &original,
                 &NumericInputInspector,

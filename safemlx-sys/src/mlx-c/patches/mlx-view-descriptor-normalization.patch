@@ -1,0 +1,87 @@
+diff --git a/mlx/backend/common/common.cpp b/mlx/backend/common/common.cpp
+--- a/mlx/backend/common/common.cpp
++++ b/mlx/backend/common/common.cpp
+@@ -225,7 +225,10 @@
+                               const auto& strides,
+                               size_t in_data_size,
+                               auto flags) {
+-    size_t data_size = 1;
++    size_t no_broadcast_data_size = 1;
++    int64_t low_idx = 0;
++    int64_t high_idx = 0;
++    bool has_negative_stride = false;
+     size_t f_stride = 1;
+     size_t b_stride = 1;
+     flags.row_contiguous = true;
+@@ -235,30 +238,42 @@
+       flags.row_contiguous &= strides[ri] == b_stride || shape[ri] == 1;
+       f_stride *= shape[i];
+       b_stride *= shape[ri];
++      auto delta = strides[i] * (shape[i] - 1);
+       if (strides[i] > 0) {
+-        data_size *= shape[i];
++        no_broadcast_data_size *= shape[i];
++        high_idx += delta;
++      } else {
++        low_idx += delta;
++        has_negative_stride |= strides[i] < 0 && shape[i] > 1;
+       }
+     }
+ 
+-    if (data_size == 1) {
+-      // Broadcasted scalar array is contiguous.
++    // data_size is the actual backing span, including negative strides and
++    // holes. Other primitives use it independently of the contiguous flag.
++    size_t data_size = (high_idx - low_idx) + 1;
++    // Preserve the existing positive-stride classification. Matching a new
++    // span alone must not promote an inherited noncontiguous layout.
++    if (no_broadcast_data_size == 1) {
+       flags.contiguous = true;
+-    } else if (data_size == in_data_size) {
+-      // Means we sliced a broadcasted dimension so leave the "no holes" flag
+-      // alone.
+-    } else {
+-      // We sliced something. So either we are row or col contiguous or we
+-      // punched a hole.
++    } else if (no_broadcast_data_size != in_data_size) {
+       flags.contiguous &= flags.row_contiguous || flags.col_contiguous;
+     }
+-
++    // Vector copies start at the logical origin. Negative strides and a
++    // span/product mismatch require the general path even after that check.
++    flags.contiguous &=
++        !has_negative_stride && no_broadcast_data_size == data_size;
+     return std::pair<decltype(flags), size_t>{flags, data_size};
+   };
+ 
+   std::vector<int> indices(1, 0);
+   indices.insert(indices.end(), indices_.begin(), indices_.end());
+   for (int i = 0; i < indices.size(); i++) {
+-    size_t offset = indices[i] * in.strides()[axis_];
++    // Equal split indices can make a broadcasted axis empty.
++    if (outputs[i].size() == 0) {
++      outputs[i].set_data(allocator::malloc(0));
++      continue;
++    }
++    int64_t offset = indices[i] * in.strides()[axis_];
+     auto [new_flags, data_size] = compute_new_flags(
+         outputs[i].shape(), in.strides(), in.data_size(), in.flags());
+     outputs[i].copy_shared_buffer(
+diff --git a/mlx/backend/common/slicing.cpp b/mlx/backend/common/slicing.cpp
+--- a/mlx/backend/common/slicing.cpp
++++ b/mlx/backend/common/slicing.cpp
+@@ -30,7 +30,13 @@
+   auto flags = in.flags();
+   flags.row_contiguous = is_row_contiguous;
+   flags.col_contiguous = is_col_contiguous;
+-  flags.contiguous = (no_bsx_size == data_size);
++  bool has_negative_stride = false;
++  for (int i = 0; i < out.ndim(); ++i) {
++    has_negative_stride |= out_strides[i] < 0 && out.shape(i) > 1;
++  }
++  // Overlapping axes can make the spans equal despite a negative stride.
++  // A vector copy from the logical origin would then lose its valid offset.
++  flags.contiguous = !has_negative_stride && (no_bsx_size == data_size);
+ 
+   out.copy_shared_buffer(in, out_strides, flags, data_size, data_offset);
+ }

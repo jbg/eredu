@@ -1,0 +1,351 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T07:46:20.226769+00:00",
+  "scope": "Gemma4 ordinary causal text rows and complete shared publisher/receiver state conformance",
+  "status": "Verified increment; broad managed inference goal remains incomplete",
+  "previous_increment": "bounded-native-opening-join-2026-09-14.json",
+  "tests": {
+    "architectures": {
+      "passed": 1023,
+      "ignored": 1
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    },
+    "gemma_focus": {
+      "passed": 10,
+      "ignored": 0
+    },
+    "partition_focus": {
+      "passed": 4,
+      "ignored": 0
+    },
+    "native_session": {
+      "passed": 262,
+      "ignored": 0
+    }
+  },
+  "total_passed_executions": 1433,
+  "new_tests": [
+    {
+      "name": "gemma4_dense_group_two_rows_preserve_shared_kv_and_all_real_callbacks",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "gemma4_sparse_group_two_rows_preserve_normalized_shared_values_and_causal_offsets",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "gemma4_prepared_sources_bind_every_target_row_and_preserve_physical_readout",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "gemma4_body_rows_precede_state_only_and_last_position_readout",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "gemma4_causal_rows_cross_prepublication_and_shared_consumer_pipeline_cuts",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "gemma4_shared_consumers_reject_missing_or_preceding_publications",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "gemma4_native_tail_and_cache_owned_publishers_preserve_uneven_rows_and_decode",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows/sliding.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "gemma4_explicit_sliding_masks_keep_the_existing_cache_request",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows/sliding.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "gemma4_prepared_workspace_records_actual_sliding_mechanism_and_full_attention",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows/sliding.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "gemma4_uncached_shared_attention_is_causal_windowed_and_preserves_explicit_rotary",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows/sliding.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "complete_decoder_rows_follow_composite_invocations_and_all_replicas",
+      "path": "eredu-architectures/src/component_partition/decoder_invocations/tests.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "complete_decoder_rows_keep_shared_physical_passes_as_distinct_logical_invocations",
+      "path": "eredu-architectures/src/component_partition/decoder_invocations/tests.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "complete_decoder_rows_preserve_v4_stream_axes_and_existing_stream_placements",
+      "path": "eredu-architectures/src/component_partition/decoder_invocations/tests.rs",
+      "check": "architectures"
+    },
+    {
+      "name": "complete_decoder_rows_reject_conflicting_placements_and_foreign_node_or_owner",
+      "path": "eredu-architectures/src/component_partition/decoder_invocations/tests.rs",
+      "check": "architectures"
+    }
+  ],
+  "new_test_count": 14,
+  "checks": {
+    "architectures": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib --test reference_numeric",
+      "started_utc": "2026-09-14T07:43:01.312649+00:00",
+      "elapsed_seconds": 71.043,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-gemma4-causal-prefill-integrated-architectures.log",
+      "log_sha256": "c246f207440a17c3f5a661fa9b20e38554080d6d291cb7a580783c2259f6fdde"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T07:37:19.806224+00:00",
+      "elapsed_seconds": 38.891,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-gemma4-causal-prefill-integrated-portable.log",
+      "log_sha256": "38197acb8f03c03f23567c9bde7343850baa1cc1ebfd71efca1599edc2d44f54"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T07:37:58.698619+00:00",
+      "elapsed_seconds": 12.117,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-gemma4-causal-prefill-integrated-minimal.log",
+      "log_sha256": "0e2d7a4d28a9fb876c03e637a56de9a4850ab5c0ac57b41c40f73c74ddf49c32"
+    },
+    "gemma_focus": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --test reference_numeric prepared_workspace::observed::causal::gemma4_rows::",
+      "started_utc": "2026-09-14T07:42:18.399015+00:00",
+      "elapsed_seconds": 42.912,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-gemma4-causal-prefill-integrated-gemma_focus.log",
+      "log_sha256": "c5d321121f7f570dbba613ba6b498bc134a57de014234cb951ded8dcdf92b29c"
+    },
+    "partition_focus": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib component_partition::decoder_invocations::",
+      "started_utc": "2026-09-14T07:29:45.942335+00:00",
+      "elapsed_seconds": 22.54,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-gemma4-causal-prefill-integrated-partition_focus.log",
+      "log_sha256": "5f840e7350c3271d24d93629fd5e0980ce4156a52ff95d6c33604a50fa672de6"
+    },
+    "native_session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::model_session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T07:38:10.816466+00:00",
+      "elapsed_seconds": 111.672,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-gemma4-causal-prefill-integrated-native_session.log",
+      "log_sha256": "6d9092ae0c694139a546181d34ebb90ca4438e60b2edaff59650b37a9b6b1901"
+    }
+  },
+  "source_sha256": {
+    "eredu-architectures/src/component_partition/decoder_invocations/tests.rs": "a252a010804f1cf8855c27234e5e17c71a4644cf347eeba0af59a890fb404ba0",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows/sliding.rs": "2e2737ab75bc102e53ac2e2f35c58c7bd0041be24d3d9c0c962c7efa8094f7b4",
+    "doc/bounded-inference.md": "4c4951bf5d6a238cc8b76dc62332a15e6466350ddee4fc3972f48e13f52fc552",
+    "eredu-architectures/src/component_partition/decoder_invocations.rs": "8fc437e24d2d96db3c4d53fafa102660c50f4e94569a1820ca72fb2fc7caa55b",
+    "doc/backend-architecture.md": "ef12ec30fd87552ae801b79e76c72a94a3068c553c5ee980267ef9a6212addf7",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal.rs": "03632c60057ec12fd0f5b15e2c8ed47cf7d49828cc772d7c60850dee79671ba8",
+    "eredu-architectures/src/gemma4/text.rs": "aa9c9b23692fd4d420207ab6c4800aab839046e9eb26fdcee5d45143786867fe",
+    "eredu-architectures/tests/reference_numeric.rs": "4723c6a832603ab9b0836abf3ebce4b6062b8385cf2db5f107648165760116ab",
+    "eredu-architectures/src/component_partition.rs": "41b545447ee354fd8eb95951d32b77b85d2a86cafaf607a2da9e25bdbfa2c399",
+    "eredu-architectures/src/gemma4/model/observation.rs": "6c01f690668c80b49aee18097645fa0c67649e783c7e37f6a8a29c8fbad1f20b",
+    "eredu-architectures/src/gemma4/model.rs": "f2a4b000808fa9664d24a6f0565217345599db6d69844f060b752b0918ab780c",
+    "doc/execution-control.md": "977fb8b4a1bfdb32d34fe1f89201aa9dd22f5f0ca0084ac0c320c930e504898e",
+    "doc/lm-inspector-execution-control.md": "d52aa3645d1bd15532957f35cc61fb35749a12952896ddcaf721de8677673d9e",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows.rs": "345dcdcce71be0e73a31b877b997f58b9c2bb364f1d80ca4585a0e3414a36beb",
+    "eredu-architectures/src/discovery/families.rs": "c74467bdcf4837dd343ffbe7951195c640871b71b703c911695477e60b95761b"
+  },
+  "source_snapshot": "/private/tmp/eredu-gemma4-causal-prefill-integrated-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-decoder-invocation-placement-apply.py": "900ed9af8c28f9a70f3131ca4a92fafbd2aae10b3555725e2d581de51a799cd9",
+    "/private/tmp/eredu-decoder-invocation-placement-review.md": "10e8f3434f4c4fa3540f2772bb16f512c4b8b1d5402c77fc41ec1e51da619715",
+    "/private/tmp/eredu-decoder-invocation-placement-root-review.json": "4ad1d965186bd055b6f0178722fa2511e22108509a0c016ebb8a1f6e865aa6e1",
+    "/private/tmp/eredu-full-observed-logits-review.md": "1846d7588f2ce36e2df03214b113b217811fd20a1e8a07d16d9605827a0e3945",
+    "/private/tmp/eredu-gemma4-bound-expert-fixture-root-review.json": "5545498810860131ff9633b6fab1718c69458a4552946697ee1105e9c870e5a9",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-applied.json": "b20b9d98fe179b815bf0e30a45aa2e8e05f44402557ec62d3eeda9bfe0b7fd01",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-apply.py": "3efdac2c5a4d1450cff72b241358ce708eb610c564ec52975e376fbb4679a487",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-architectures.log": "c246f207440a17c3f5a661fa9b20e38554080d6d291cb7a580783c2259f6fdde",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-architectures.log.1789371781312464000.previous": "86ef0366533da79fe10969e3b922a8842766fbf13b6b700c5c8221bd8f6f2625",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-checks-before-sliding.json": "65d48eae6be85e50570317c8b86ecf76e4d21d0f5e157588773655e11bcf40f5",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-checks.json": "fb0f1680d58236d02b6019becb865bb88b9566732e089c9780502842147be239",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-doc-applied.json": "490a5c8f77619a627bf47f099ac2db4676bf58fdd5887da6212b04b617946ee2",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-gemma_focus.log": "c5d321121f7f570dbba613ba6b498bc134a57de014234cb951ded8dcdf92b29c",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-gemma_focus.log.1789371008483153000.previous": "67a7d4d8940c6e3603c363b5ae48b7856ef1fd3513473fdca5c90516aa86544f",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-gemma_focus.log.1789371119878015000.previous": "586c13944a1503459072b90e13b0fbe38b83d97d02ac5023c868ef79b8344a92",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-gemma_focus.log.1789371199591246000.previous": "fc23c73b3f377234b8fd6239fb796343fa5e0b37f527bc3ff5bdfafd23d63805",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-gemma_focus.log.1789371334103715000.previous": "ede1568a9d0febb3c781caab1263d7aeb78c4fa2e2c48c6e4fdccb9cae618beb",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-gemma_focus.log.1789371738398808000.previous": "f8e5ae9df1f8a0cde40b5c2cedf68545bd00b17ac2e16ca4325da1ecdc36ddba",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-minimal.log": "0e2d7a4d28a9fb876c03e637a56de9a4850ab5c0ac57b41c40f73c74ddf49c32",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-minimal.log.1789371478698427000.previous": "e6453c1459ff36943734f8cc928ac60121fb40f513aa817659d3afcc9914e6b7",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-native.log": "b9f1628e58cd7aee3e71fa9f8543e1c452543ef5e35a380536177745849242bf",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-native_session.log": "6d9092ae0c694139a546181d34ebb90ca4438e60b2edaff59650b37a9b6b1901",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-partition_focus.log": "5f840e7350c3271d24d93629fd5e0980ce4156a52ff95d6c33604a50fa672de6",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-portable.log": "38197acb8f03c03f23567c9bde7343850baa1cc1ebfd71efca1599edc2d44f54",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-portable.log.1789371439805986000.previous": "62d6fd2effa883b23c24100638a132b564469e66706a0e383f74c32f1db62b0b",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-review.json": "aeb6e8c11d6f9575533aa9e7e713ef7a2d5ffb8f465b13ba5ed892b5bc13b0a4",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/all.patch": "574d5362795d01a2b52b48e2752a9a51e4bb7636f32b89853018222f6148644d",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/change.patch": "b8b9706444a33b68b92a0a25adc9f6bc4f4f2ce5e71692d08ff03e03c4f06ba5",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependencies.json": "08f8c96d192abcad2d4fd6e9b8537bd2d4785e80fc7381dfeabf6ee8b54b9afb",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/bound-expert-fixture-FROZEN.json": "8c8f1076a052f9f4a8a5e8bcdd8a85327797e2e69925d718c3d5213c582e9343",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/bound-expert-fixture-README.md": "11b99f7a21f107448810f31c2f2a0aedc1971cef1c9d724213d177dd23591cf8",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/bound-expert-fixture-archive-hashes.json": "c1effa7523b099b248a1786d0e0753700f7faffc6b6a99cc0fffcedebb7a676a",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/bound-expert-fixture-change.patch": "583edf869f716b3dd5a88f41df3e7856fdf4af70fe81a27bb94baf37a523ac00",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/bound-expert-fixture-checks.json": "49eaec6429a616d2f3f1ec212518cb3e0d46ca44b4648219e9de697107e469cd",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/bound-expert-fixture-manifest.json": "8514bf0874ac1c83fbc0e8b7c52d14bba28f7548e3e3b79a8df21109c8fc498c",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/bound-expert-fixture-source-basis-hashes.json": "322633c3fce162de437993db487291e3553b7a797fdd8a0cb51bf1488537ce38",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-AUDIT.md": "b6b58b3f150bf8a4197d61220dd982e81606c74eb380d9f09012eb4bd9f58b85",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-FROZEN.json": "9d31b0837d5c8bb65c8f3fe9ab4a6754bee736881f3e4f19058f86a4705b9d45",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-README.md": "d36cc859b82174e940071e829d18643c9fe5c694175d7da0cff328f1203a57f4",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-TEST-COMMANDS.md": "94acccd257cb72c9af22af037516a770b9a8fcdc35275a956f04970f992b54da",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-all.patch": "ff6bf93a9f1b5b96e65cd2ad489ad15bd865db9bf7e554110377a9f06e7dd3f1",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-artifact-hashes.json": "f246d96134180db7bbc529346443d7a8457e84b1116841803feb4bd5e55a4dd4",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-change.patch": "8ea8260e66df261a6f7056c69e45cf9a075cd8552963bffde55f573a9d262fd9",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-checks.json": "8ee9a437af9267efbc5c76b7bdee2cfd9ebff793d7c2682370e76d791a7e127c",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-dependencies.json": "a896d012ede7657e1bc24fd2237ddfc40861a6b3b07e94ba2636a898d8c51246",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-doc-snippets.json": "0192dd98b7f75a9098610b488761e5ae8bed6370b75e3a53bb92687091e4e5aa",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-files.txt": "7ddf9bcc1cf559ba10af57ff392ec991a134e424ff018f7a9cb52e26ae3a9fa8",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-manifest.json": "a739ab540aa569c3fa903933ac8183341ee3611c51e48f72b39ce01928275e6f",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-new-tests.json": "541d6171af8a7b396feaf423274344dbcb80a1dbf09a0e770536dce6a0b69c77",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-prepare.py": "62fb912ee2eea7e9e4af9482eb645175717d749de3aefbf4cf942b2691e8f426",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-source-basis.json": "43f9d7a53b6894a251c05643934e0cfa56fce1f84c4e87398ede612d2759ba26",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/decoder-invocation-staged-hashes.json": "b3de9b86be3084e8485ecb70007a2f14442556e046d7258ce3b6561cf842c679",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/roundoff-diagnostic-FROZEN.json": "38cce70d60351b738ed11eaf8197aa94dbec3d39b5fdddda05c74e6924616c9f",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/roundoff-diagnostic-README.md": "f9d19ef0e05e7153ef756f22610b43ac58cdfa8c17b1e02599547640fc5d965f",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/roundoff-diagnostic-archive-hashes.json": "8d67a2a5838aedd663b7aab4d69b65c5918dc43c0b833342d14ec092ef6565cd",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/roundoff-diagnostic-change.patch": "5a67a3314f12ecdce9ffac365f6e1f2c91b9a8c7d4d1e83af0b44ba87f2b62c9",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/roundoff-diagnostic-checks.json": "1b066290d44b633f02b3593b7eb9eaddc52527c9cb0f3286c1b24c9584356143",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/roundoff-diagnostic-failure.log": "f8e5ae9df1f8a0cde40b5c2cedf68545bd00b17ac2e16ca4325da1ecdc36ddba",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/roundoff-diagnostic-manifest.json": "f31d5bdf939df8b5a2264a61ddb151104562faabd706f51f114ec733e2bc3a93",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/roundoff-diagnostic-summarize.py": "89485f1d84ed3fa299494d625378e339b5945c05b800fa2c1ba9e2e02deef447",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-AUDIT.md": "9b59ed3ed67bcbd8ea507c9812df98ef0178aa9b5558f69e027f2a6532dd1917",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-FROZEN.json": "1703f6bb0afc63afe61d24c83592e6e533ae16cf2ddd4934c1a32410dd6d85ae",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-README.md": "2bb8142782382524f745656ad98486a2455c1d6138f6a3e549e9f527418f1e88",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-artifacts.json": "24bf1c5f2285118242ec47d6d560bf852b8fc2beb6b3f8baf31f3b6ccab21731",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-base-hashes.json": "749c86049a5cb14bebc32ea9cb6b4964a321fb5f147ed7e7746cd40eea62d74e",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-change.patch": "b0cca10a0f228e9213443d2b34db86302809f3296fc0f0e28a918914ee5db902",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-checks.json": "69cc0446c10150f6155d9992b1ae3bf5e78282506d52dd34b2521696193a768b",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-dependencies.json": "5224fc43364e3b898ba4d3b075d31d33a2e9de37cb6a4edaa117f6618f323e47",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-doc-additions.json": "d4f87337251f11d63bcdbb2ce27d9b25bc17302264a295f7d588d6c4053ec95c",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-freeze.py": "629901b2b39542f170c1074fc6236cdfd99a2ee3002d91ce87fb0b5d6174a920",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-new-tests.json": "a76f810b488a6d97daf467626edf9add07567f83aba3efa17abfeb4b78045e4a",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-prepare.py": "56717a610ec561954d59901dfe57c61d30b70371fdd23ac4128247ce8a844d08",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-source-basis-hashes.json": "02eeddc929b5447393ca01f00580b1a19bdc2dc156e6fe9c1362aedf5144cfdb",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-source-hashes.json": "c7a938829d1c31046fe268e283f1abfd020178218c1b9b51200f43b9d3c9e86f",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-source.patch": "c55710e740478779f65195616ed3a859c35e995a2f7e9c112c5c332b88e06f91",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/dependency-artifacts/sliding-history-staged-hashes.json": "c95db9393a44dcb72854285a695bb4adf467e046910006e705c7398823aea397",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/doc-edits.json": "feec9a633487e560d8bd2a4786ca971cfc0b32adff46daa6c2b9bd9111b95553",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/manifest.json": "9170e0e071f595e7745b04152228f7145f9b66c258d7053db975f74646e6c837",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/merge-ledger.json": "5f67195b2c11d4767789bd34c778ad155e8c1437bee66b457dee92857ea6be5b",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/new-tests.json": "6eb1331339761f9e1732af6d38c90e00f9e9f7b77865fb78b094c7d3c2ddb4f0",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/staged-hashes.json": "26aa6d15fae01ba2b2109db25a800caa7b386ad944770ee0a1473e4e047a6f2a",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-validate.py": "b7d25d3584465f0abd804c5bdcc36370ec16dc41e950f09c84c35030de2e631c",
+    "/private/tmp/eredu-gemma4-causal-prefill-integrated-validation-config.json": "83521d080bc331fe89efc3599ce2ead8fe7a03b3255897b8002674a5d5d26087",
+    "/private/tmp/eredu-gemma4-causal-prefill-review.md": "b5ad750b009fbe687828983e896f5667b209dc666a2b05802984b193e4daf6e7",
+    "/private/tmp/eredu-gemma4-causal-prefill-root-review.json": "7ef2357a2f682bcb6d0e98dda5d5f5e06c3c43e725d007cb7ea45c1dbee2507e",
+    "/private/tmp/eredu-gemma4-observed-logits-correction.patch": "056bc41d337bc13fc33e0c60e760d5b1c7ae0d040a545b0ba0b32dba7a75717f",
+    "/private/tmp/eredu-gemma4-observed-logits-root-review.json": "a4d6c781f290c3e506b6944c7f29a9652bf07fbad477982c22420e7a4a9a309e",
+    "/private/tmp/eredu-gemma4-partition-roundoff-correction.patch": "d31c0bdb61fc9210507e7923cbea135ee4f293217556cbac3b7bc63de74b45d8",
+    "/private/tmp/eredu-gemma4-partition-roundoff-review.md": "0b0515e1959a87479e8dcf91a47754dc19dd6b55664a2dc055da4613ad876f2c",
+    "/private/tmp/eredu-gemma4-partition-roundoff-root-review.json": "d7ee8cfcee1866bff78218f084315cdd6bef14abe09ee2a62e5db1146408011f",
+    "/private/tmp/eredu-gemma4-partition-world-labels.patch": "f5e77e1e43429cb95347e9bd9416e97688a81e9b61a3d4de87e008bca7ac0ab3",
+    "/private/tmp/eredu-gemma4-roundoff-diagnostic-execution.json": "d652c90155e8b1cc2ee66be28d173a449a2a29647814558f57c1e569ac74be4d",
+    "/private/tmp/eredu-gemma4-roundoff-diagnostic-run.py": "9ad786a14cdc9066709a9aeb5247ed595320837c1ea6b18dd5254a975ac83ffd",
+    "/private/tmp/eredu-gemma4-roundoff-diagnostic-run1.log": "01cafe6e6cda17d9ad56c3b819fb70325ce1a6ea2e0602e1b2cb73275ae71bac",
+    "/private/tmp/eredu-gemma4-roundoff-diagnostic-run2.log": "5dd395251405d7891e6cc307b36afbe4269935a16a2455ec9922474deb397ea8",
+    "/private/tmp/eredu-gemma4-roundoff-summary.json": "3bb3c56db6dfa637b6c30e9864a9943c01288fbfb61fae45de5a2155d7a578ac",
+    "/private/tmp/eredu-gemma4-sliding-history-apply.py": "e9d4e77e881786618fe1ea3abb55a8d0cd510a37a1a0dc21d0b026dd9608a50e",
+    "/private/tmp/eredu-gemma4-sliding-history-review.md": "689789b35966a1f5e01d01272e0e9be37b40bf1cafabfc389afa52c078f06a05",
+    "/private/tmp/eredu-gemma4-sliding-history-root-review.json": "ef5b61be393feb853a429b4311cde35769b509e0dffdac896f2b2b2ad79a3474"
+  },
+  "review": {
+    "status": "Root and independent source reviews complete, including production sliding/placement corrections, observed-logits fixture correction and measured localized roundoff comparison. Central execution is recorded separately.",
+    "reviews": {
+      "/private/tmp/eredu-gemma4-causal-prefill-root-review.json": "7ef2357a2f682bcb6d0e98dda5d5f5e06c3c43e725d007cb7ea45c1dbee2507e",
+      "/private/tmp/eredu-gemma4-causal-prefill-review.md": "b5ad750b009fbe687828983e896f5667b209dc666a2b05802984b193e4daf6e7",
+      "/private/tmp/eredu-gemma4-sliding-history-root-review.json": "ef5b61be393feb853a429b4311cde35769b509e0dffdac896f2b2b2ad79a3474",
+      "/private/tmp/eredu-gemma4-sliding-history-review.md": "689789b35966a1f5e01d01272e0e9be37b40bf1cafabfc389afa52c078f06a05",
+      "/private/tmp/eredu-gemma4-sliding-history-apply.py": "e9d4e77e881786618fe1ea3abb55a8d0cd510a37a1a0dc21d0b026dd9608a50e",
+      "/private/tmp/eredu-decoder-invocation-placement-root-review.json": "4ad1d965186bd055b6f0178722fa2511e22108509a0c016ebb8a1f6e865aa6e1",
+      "/private/tmp/eredu-decoder-invocation-placement-apply.py": "900ed9af8c28f9a70f3131ca4a92fafbd2aae10b3555725e2d581de51a799cd9",
+      "/private/tmp/eredu-gemma4-observed-logits-root-review.json": "a4d6c781f290c3e506b6944c7f29a9652bf07fbad477982c22420e7a4a9a309e",
+      "/private/tmp/eredu-gemma4-observed-logits-correction.patch": "056bc41d337bc13fc33e0c60e760d5b1c7ae0d040a545b0ba0b32dba7a75717f",
+      "/private/tmp/eredu-gemma4-partition-world-labels.patch": "f5e77e1e43429cb95347e9bd9416e97688a81e9b61a3d4de87e008bca7ac0ab3",
+      "/private/tmp/eredu-decoder-invocation-placement-review.md": "10e8f3434f4c4fa3540f2772bb16f512c4b8b1d5402c77fc41ec1e51da619715",
+      "/private/tmp/eredu-full-observed-logits-review.md": "1846d7588f2ce36e2df03214b113b217811fd20a1e8a07d16d9605827a0e3945",
+      "/private/tmp/eredu-gemma4-bound-expert-fixture-root-review.json": "5545498810860131ff9633b6fab1718c69458a4552946697ee1105e9c870e5a9",
+      "/private/tmp/eredu-gemma4-partition-roundoff-root-review.json": "d7ee8cfcee1866bff78218f084315cdd6bef14abe09ee2a62e5db1146408011f",
+      "/private/tmp/eredu-gemma4-partition-roundoff-correction.patch": "d31c0bdb61fc9210507e7923cbea135ee4f293217556cbac3b7bc63de74b45d8",
+      "/private/tmp/eredu-gemma4-roundoff-summary.json": "3bb3c56db6dfa637b6c30e9864a9943c01288fbfb61fae45de5a2155d7a578ac",
+      "/private/tmp/eredu-gemma4-roundoff-diagnostic-execution.json": "d652c90155e8b1cc2ee66be28d173a449a2a29647814558f57c1e569ac74be4d",
+      "/private/tmp/eredu-gemma4-roundoff-diagnostic-run.py": "9ad786a14cdc9066709a9aeb5247ed595320837c1ea6b18dd5254a975ac83ffd",
+      "/private/tmp/eredu-gemma4-roundoff-diagnostic-run1.log": "01cafe6e6cda17d9ad56c3b819fb70325ce1a6ea2e0602e1b2cb73275ae71bac",
+      "/private/tmp/eredu-gemma4-roundoff-diagnostic-run2.log": "5dd395251405d7891e6cc307b36afbe4269935a16a2455ec9922474deb397ea8",
+      "/private/tmp/eredu-gemma4-partition-roundoff-review.md": "0b0515e1959a87479e8dcf91a47754dc19dd6b55664a2dc055da4613ad876f2c"
+    },
+    "source_manifest_sha256": "9170e0e071f595e7745b04152228f7145f9b66c258d7053db975f74646e6c837",
+    "patch_sha256": "b8b9706444a33b68b92a0a25adc9f6bc4f4f2ce5e71692d08ff03e03c4f06ba5",
+    "full_manifest_sha256": "26aa6d15fae01ba2b2109db25a800caa7b386ad944770ee0a1473e4e047a6f2a",
+    "full_patch_sha256": "574d5362795d01a2b52b48e2752a9a51e4bb7636f32b89853018222f6148644d",
+    "merge": "Exact selected-shell parent plus Gemma registration; original Gemma production/main-fixture/test child unchanged; append-only docs after selected/native-join contributions.",
+    "replay": "/private/tmp/eredu-gemma4-causal-prefill-integrated-stage/replay",
+    "source_paths": 4,
+    "new_tests": 6,
+    "correction": {
+      "source_manifest": "c7a938829d1c31046fe268e283f1abfd020178218c1b9b51200f43b9d3c9e86f",
+      "source_patch": "c55710e740478779f65195616ed3a859c35e995a2f7e9c112c5c332b88e06f91",
+      "source_files": [
+        "eredu-architectures/src/gemma4/model/observation.rs",
+        "eredu-architectures/src/gemma4/text.rs",
+        "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows.rs",
+        "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/gemma4_rows/sliding.rs"
+      ]
+    },
+    "decoder_invocation_correction": {
+      "pins": {
+        "manifest.json": "a739ab540aa569c3fa903933ac8183341ee3611c51e48f72b39ce01928275e6f",
+        "change.patch": "8ea8260e66df261a6f7056c69e45cf9a075cd8552963bffde55f573a9d262fd9",
+        "staged-hashes.json": "b3de9b86be3084e8485ecb70007a2f14442556e046d7258ce3b6561cf842c679",
+        "all.patch": "ff6bf93a9f1b5b96e65cd2ad489ad15bd865db9bf7e554110377a9f06e7dd3f1"
+      },
+      "source_files": [
+        "eredu-architectures/src/component_partition.rs",
+        "eredu-architectures/src/component_partition/decoder_invocations.rs",
+        "eredu-architectures/src/component_partition/decoder_invocations/tests.rs",
+        "eredu-architectures/src/discovery/families.rs"
+      ]
+    }
+  },
+  "behavior": [
+    "Actual group2 paths feed the shared ordinary causal declarations without a native branch or duplicate traversal. Media, custom masks, interventions and proposals retain their existing separate semantics.",
+    "Every physical parameter is loaded before preparing paths/state and checked against topology. Dense/sparse, tied/separate head, per-layer inputs, key-as-value and supported rotary variations exercise26 real callbacks.",
+    "Prefix2 plus continuation5 versus2/1/2 and three decodes compare every persistent state field. Invocation-history scratch is compared by exact absolute extent and all payload values; same-next-decode requires complete history equality.",
+    "Actual prepared TP2, PP4 and TP2/PP4 under resident/host/disk cover18 worlds84 rank sessions. Full publisher/receiver payloads are mapped by actual global range and TP head geometry. Public partition output follows the existing last-position API; all observation hooks including model.logits retain Sequence.",
+    "Test-only snapshot closure inspects the existing typed session state. Missing/preceding-publication negatives leave mutable state unchanged.",
+    "The four initial numerical failures exposed a production mask-width error after sliding history truncation. The correction preserves every original assertion and uses the existing neutral sliding mechanism for implicit multirow contiguous or uncached requests.",
+    "Four new regressions cover actual W-minus-one/shared-consumer and cache-owned histories, explicit masks, no-cache causal/window behavior with explicit rotary embeddings, and actual prepared sliding descriptors without checkpoint reads.",
+    "Existing native model-session tests include Gemma sliding resume and resident/host-layerwise parity; no new native distributed or released-checkpoint result is claimed.",
+    "The remaining Gemma partition failure exposed omitted complete-decoder observation metadata. Shared mapping now uses actual target execution nodes, direct declared tensor/hidden points and unique logical parameter owners, preserving stream axes and exact existing placements.",
+    "Composite discovery attaches the already declared logical decoder prefix alongside actual outer hooks; four focused tests cover composite replicas, shared physical passes, V4 and invalid bindings. All expected tensors and state checks are retained.",
+    "After the mapping correction, execution exposed a stale test expectation that truncated model.logits. The test now checks every observed logits row, while retaining the separate last-position public output assertion; production execution was already correct.",
+    "The first sparse partition world exposed direct-reference fixture expert views left at constructor values. All three executing direct contexts now enable the existing packed checkpoint binding mode, with shared-run preflight; all expected tensors and state checks remain.",
+    "Two exact-stable diagnostic passes measured all18 worlds84ranks263952values. F32 TP residual rounding reaches maxabs0.00074482, max normalized6.4645e-5. Only partition observation comparisons use atol=rtol=1e-4; direct, public-score and full-state checks retain shared atol2e-4, with no expected tensor omitted. Temporary diagnostic instrumentation was removed."
+  ],
+  "limits": [
+    "No injected receiver-frontier error test; successful actual receiver state and existing production guard remain covered as documented.",
+    "Neutral synthetic proof does not replace released-checkpoint/native distributed validation.",
+    "No new capture authority, original admission, gateway activation, media/proposal row declaration or process-memory guarantee."
+  ]
+}

@@ -1,0 +1,256 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -47,6 +47,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/binary.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/copy.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/copy_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/distributed_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/eig.cpp
+diff --git a/mlx/backend/cpu/copy_storage.cpp b/mlx/backend/cpu/copy_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/copy_storage.cpp
+@@ -0,0 +1,142 @@
++#include "mlx/backend/cpu/copy_storage.h"
++#include "mlx/backend/cpu/copy.h"
++#include "mlx/backend/cpu/encoder.h"
++#include "mlx/primitives.h"
++#include "mlx/prepared_input.h"
++#include "mlx/original_buffer.h"
++#include "mlx/submission.h"
++#include "mlx/transforms.h"
++#include <algorithm>
++#include <climits>
++#include <typeinfo>
++
++namespace mlx::core::cpu {
++namespace {
++bool add(size_t& value, size_t more) noexcept {
++  if (more > SIZE_MAX - value) return false;
++  value += more; return true;
++}
++bool multiply(size_t a, size_t b, size_t& out) noexcept {
++  if (b && a > size_t(PTRDIFF_MAX) / b) return false;
++  out = a * b; return true;
++}
++bool append(CopyEvalStorage& out, size_t slot, size_t bytes, size_t alignment,
++    size_t count) noexcept {
++  if (!count) return true;
++  if (!bytes || !alignment || (alignment & (alignment - 1)) ||
++      alignment > alignof(std::max_align_t) || !add(out.request_counts[slot], count)) return false;
++  out.request_bytes[slot] = std::max(out.request_bytes[slot], bytes);
++  out.request_alignments[slot] = std::max(out.request_alignments[slot], alignment);
++  return true;
++}
++bool exact_contiguous(const array& output) noexcept {
++  return output.has_primitive() && typeid(output.primitive()) == typeid(Contiguous);
++}
++size_t source_controls() noexcept {
++  return sizeof(const array*) * 3 + sizeof(CopyEvalStorage) * 2 +
++      sizeof(bool) * 5 + sizeof(size_t) * 7 + sizeof(int) * 2 + sizeof(Dtype) * 2 +
++      sizeof(submission::FixedEvalPrologueGuard*) + sizeof(submission::Record*) +
++      sizeof(submission::GraphQuota*) + sizeof(submission::GraphConstruction*) +
++      sizeof(submission::GraphConstructionContext) + sizeof(submission::GraphFailure);
++}
++} // namespace
++bool is_copy_eval_primitive(const array& output) noexcept {
++  return output.has_primitive() && output.primitive().stream().device == Device::cpu &&
++      (exact_contiguous(output) || is_completion_synchronizer(output));
++}
++bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
++    CopyEvalStorage& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  if (rank > size_t(INT_MAX) || (copy && inputs != 1) || (!copy && rank != 0)) return false;
++  CopyEvalStorage value;
++  value.rank = rank; value.inputs = inputs; value.copy = copy; value.tracer = tracer;
++  submission::CpuEvalCleanupLayout cleanup;
++  if (!submission::cpu_eval_cleanup_layout(inputs, 0, cleanup)) return false;
++  for (size_t i = 0; i != 2; ++i)
++    if (!append(value, i, cleanup.request_bytes[i], cleanup.request_alignments[i],
++                cleanup.request_counts[i])) return false;
++  // outputs() has one entry. The optional tracer input copy occurs at its
++  // unchanged point before eval_cpu. Empty input vectors allocate no backing.
++  size_t input_bytes;
++  if (!multiply(std::max(size_t{1}, inputs), sizeof(array), input_bytes) ||
++      !append(value, 2, input_bytes, alignof(array), 1 + size_t(tracer && inputs))) return false;
++  value.named_control_bytes = source_controls() + sizeof(CopyEvalStorage) +
++      sizeof(submission::CpuEvalCleanupLayout) + sizeof(size_t) * 9 + sizeof(bool) * 3 +
++      sizeof(CopyEvalStorage*) + sizeof(ArrayVector) * 3 +
++      sizeof(submission::GraphAllocator<array>) * 3 + sizeof(Stream) +
++      sizeof(std::optional<submission::FixedEvalPrologueGuard>) +
++      sizeof(submission::GraphConstruction*) + sizeof(submission::GraphFailure) +
++      sizeof(submission::NativeControlBinding) + sizeof(detail::PreparedCleanup) +
++      sizeof(CommandEncoder*) + sizeof(array*) + sizeof(scheduler::TaskContext) +
++      sizeof(scheduler::TaskOwner);
++  if (!add(value.named_control_bytes, cleanup.named_control_bytes)) return false;
++  if (copy) {
++    CpuCopyDispatchStorage dispatch;
++    WeakCopyStorage weak;
++    submission::OriginalBufferRoutingLayout routing;
++    size_t allocation_controls = 0;
++    if (!contiguous_copy_dispatch_storage(rank, dispatch) ||
++        !PreparedInputLeaf::weak_copy_storage(rank, weak) || weak.count < 3 ||
++        !submission::original_buffer_routing_layout(routing) ||
++        !allocator::original_buffer_allocation_control_bytes(allocation_controls)) return false;
++    // One possible General output allocation plus two no-op weak Data owners.
++    // Lazy flags and donation cannot reduce the declared bound. The existing
++    // primitive may alias instead; no fresh output descriptor is then created.
++    if (!append(value, 3, weak.requests[2].bytes, weak.requests[2].alignment, 3) ||
++        !append(value, 4, weak.requests[0].bytes, weak.requests[0].alignment, 2) ||
++        !append(value, 5, weak.requests[1].bytes, weak.requests[1].alignment, 2) ||
++        !append(value, 6, dispatch.task_bytes, dispatch.task_alignment, 1) ||
++        !append(value, 7, routing.birth_bytes, routing.birth_alignment, 1)) return false;
++    // Two weak descriptors each own copied shape, initial strides and copied
++    // replacement strides. Output adoption separately builds contiguous strides.
++    for (size_t i = 3; i != weak.count; ++i)
++      if (!append(value, 8, weak.requests[i].bytes, weak.requests[i].alignment, 2)) return false;
++    if (weak.count > 3 && !append(value, 8, weak.requests[4].bytes,
++                                weak.requests[4].alignment, 1)) return false;
++    value.backing_births = 1;
++    value.worker_graph_extents = dispatch.worker_graph_extent_bound;
++    const auto adoption = array::buffer_adoption_layout();
++    const size_t controls = sizeof(CpuCopyDispatchStorage) + sizeof(WeakCopyStorage) +
++        sizeof(submission::OriginalBufferRoutingLayout) + sizeof(array::BufferAdoptionLayout) +
++        sizeof(std::function<allocator::Buffer(size_t)>) * 2 + sizeof(CopyType) +
++        sizeof(allocator::Buffer) * 2 + sizeof(array::Flags) + sizeof(Shape) + sizeof(Strides) * 2 +
++        sizeof(bool) * 2 + sizeof(size_t) * 3 + sizeof(submission::CaptureSlot) +
++        sizeof(std::shared_ptr<array::Data>) + sizeof(submission::GraphAllocator<array::Data>) +
++        adoption.incoming_bytes + adoption.scratch_owner_bytes + adoption.deleter_bytes +
++        adoption.allocator_callable_bytes + adoption.prepared_strides_bytes;
++    if (!add(value.named_control_bytes, controls) ||
++        !add(value.named_control_bytes, dispatch.controls) ||
++        !add(value.named_control_bytes, allocation_controls)) return false;
++  }
++  if (!submission::GraphConstruction::complete_layout(value)) return false;
++  out = value; return true;
++#endif
++}
++bool copy_eval_storage(const array& output, CopyEvalStorage& out) noexcept {
++  if (!is_copy_eval_primitive(output) || !output.siblings().empty()) return false;
++  const bool copy = exact_contiguous(output);
++  if (copy) {
++    if (output.inputs().size() != 1) return false;
++    const auto& input = output.inputs()[0];
++    if (input.dtype() != output.dtype() || input.shape() != output.shape()) return false;
++    for (auto dimension : input.shape()) if (dimension < 0) return false;
++  } else if (output.ndim() != 0 || output.dtype() != bool_) return false;
++  return copy_eval_layout(output.ndim(), output.inputs().size(), copy, output.is_tracer(), out);
++}
++} // namespace mlx::core::cpu
++
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_copy_eval(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record = guard.record();
++  auto* graph = record.graph_quota();
++  const auto context = current_graph_construction_context();
++  if (out || !graph || !guard.cpu() || !context.scope || context.worker ||
++      context.dispatch != &record || current_graph_quota() != graph) return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;
++  if (!cpu::copy_eval_storage(guard.current(), actual)) return GraphFailure::invalid_layout;
++  return create_layout(*graph, context.scope, &record, actual, out, true);
++}
++} // namespace mlx::core::submission
+diff --git a/mlx/backend/cpu/copy_storage.h b/mlx/backend/cpu/copy_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/copy_storage.h
+@@ -0,0 +1,18 @@
++#pragma once
++#include "mlx/array.h"
++#include "mlx/graph_construction.h"
++
++namespace mlx::core::cpu {
++// Existing Contiguous copy branch or the private completion no-op. These are
++// host/worker request populations only; backing, events and source custody are
++// separate. Physical bank installation requires the actual accepted primitive.
++struct CopyEvalStorage : submission::GraphConstructionLayout {
++  size_t rank{0}, inputs{0}, backing_births{0};
++  size_t worker_graph_extents{0};
++  bool copy{false}, tracer{false};
++};
++MLX_API bool copy_eval_layout(size_t rank, size_t inputs, bool copy, bool tracer,
++    CopyEvalStorage&) noexcept;
++MLX_API bool is_copy_eval_primitive(const array&) noexcept;
++MLX_API bool copy_eval_storage(const array&, CopyEvalStorage&) noexcept;
++} // namespace mlx::core::cpu
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -10,6 +10,7 @@
+ #include "mlx/original_buffer.h"
+ #include "mlx/backend/cpu/argpartition.h"
+ #include "mlx/backend/cpu/distributed_storage.h"
++#include "mlx/backend/cpu/copy_storage.h"
+ 
+ namespace mlx::core::cpu {
+ 
+@@ -33,7 +34,8 @@
+   const bool fixed_partition = partition && arr.ndim() == 2 && arr.inputs().size() == 1 &&
+       arr.inputs()[0].ndim() == 2 && arr.siblings().empty() &&
+       partition->state().second == 1;
+-  const bool extended = fixed_partition || fixed_distributed;
++  const bool fixed_copy = fixed && cpu::is_copy_eval_primitive(arr);
++  const bool extended = fixed_partition || fixed_distributed || fixed_copy;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -43,7 +45,9 @@
+     extended_prologue.emplace(arr);
+     const auto failure = fixed_distributed
+         ? submission::GraphConstruction::create_cpu_distributed(*extended_prologue, extended_bank.value)
+-        : submission::GraphConstruction::create_cpu_argpartition(*extended_prologue, extended_bank.value);
++        : fixed_copy
++            ? submission::GraphConstruction::create_cpu_copy_eval(*extended_prologue, extended_bank.value)
++            : submission::GraphConstruction::create_cpu_argpartition(*extended_prologue, extended_bank.value);
+     if (failure != submission::GraphFailure{}) throw submission::GraphQuotaError(failure);
+   }
+   auto cleanup = [&] {
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -164,6 +164,7 @@
+   static GraphFailure create_cpu_cleanup(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_argpartition(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_copy_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   // Configure only an untouched resident bank in its actual current Scope.
+   // A finite attempt is consumed before nested construction starts, even on failure.
+   GraphFailure configure_nested(const NestedGraphEvaluationLimits&, size_t attempts) noexcept;
+diff --git a/mlx/transforms.cpp b/mlx/transforms.cpp
+--- a/mlx/transforms.cpp
++++ b/mlx/transforms.cpp
+@@ -1,3 +1,4 @@
++#include <typeinfo>
+ // Copyright © 2023-2024 Apple Inc.
+ #include <algorithm>
+ #include <deque>
+@@ -65,6 +66,10 @@
+ 
+   DEFINE_NAME(Synchronize);
+ };
++
++bool is_completion_synchronizer(const array& value) noexcept {
++  return value.has_primitive() && typeid(value.primitive()) == typeid(Synchronizer);
++}
+ 
+ // Initialize the static tracing members from transforms_impl.h
+ //
+diff --git a/mlx/transforms.h b/mlx/transforms.h
+--- a/mlx/transforms.h
++++ b/mlx/transforms.h
+@@ -9,6 +9,9 @@
+ #include "mlx/completion.h"
+ 
+ namespace mlx::core {
++
++// Exact private completion primitive recognition; no execution authority.
++MLX_API bool is_completion_synchronizer(const array&) noexcept;
+ 
+ MLX_API void async_eval(ArrayVector outputs);
+ 

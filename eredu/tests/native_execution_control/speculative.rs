@@ -10,7 +10,13 @@ mod pooling;
 #[path = "speculative/v4_components.rs"]
 mod v4_components;
 
-fn artifacts() -> (Fixture, Fixture) {
+pub(super) fn artifacts() -> (Fixture, Fixture) {
+    artifacts_with_ordered_embeddings(false)
+}
+pub(super) fn ordered_artifacts() -> (Fixture, Fixture) {
+    artifacts_with_ordered_embeddings(true)
+}
+fn artifacts_with_ordered_embeddings(ordered: bool) -> (Fixture, Fixture) {
     let target = fixture(false);
     let draft = fixture(false);
     super::candidate_domain::install_vocabulary(&target.0);
@@ -33,9 +39,13 @@ fn artifacts() -> (Fixture, Fixture) {
     draft_text["num_hidden_layers"] = 1.into();
     draft_text["num_kv_shared_layers"] = 0.into();
     draft_text["layer_types"] = serde_json::json!(["full_attention"]);
-    let config = serde_json::json!({"model_type":"gemma4_assistant", "backbone_hidden_size":32,
-        "use_ordered_embeddings":false, "tie_word_embeddings":false,"block_size":3,
+    let mut config = serde_json::json!({"model_type":"gemma4_assistant", "backbone_hidden_size":32,
+        "use_ordered_embeddings":ordered, "tie_word_embeddings":false,"block_size":3,
         "text_config":draft_text});
+    if ordered {
+        config["num_centroids"] = 4.into();
+        config["centroid_intermediate_top_k"] = 2.into();
+    }
     let json = serde_json::to_vec(&config).unwrap();
     std::fs::write(draft.0.join("config.json"), &json).unwrap();
     let config = eredu_architectures::gemma4::AssistantConfig::from_json(&json).unwrap();
@@ -133,6 +143,26 @@ fn speculative_control_artifacts(
     compare: bool,
     temperature: f32,
 ) {
+    selective_control_artifacts(
+        target,
+        draft,
+        experiment,
+        residency,
+        compare,
+        temperature,
+        None,
+    );
+}
+
+fn selective_control_artifacts(
+    target: Fixture,
+    draft: Fixture,
+    experiment: bool,
+    residency: eredu_core::ResidencyPlan,
+    compare: bool,
+    temperature: f32,
+    chunk: Option<std::num::NonZeroU64>,
+) {
     let split = compare && matches!(residency, eredu_core::ResidencyPlan::FullyResident);
     let plan = ExecutionPlan::fully_resident(local_device_plan(LocalDevice::Cpu).unwrap())
         .with_required_session_capabilities(SessionCapabilities::new(true, true, true))
@@ -172,39 +202,58 @@ fn speculative_control_artifacts(
             messages: vec![serde_json::json!({"role":"user","content":"hello"})],
             add_generation_prompt: true,
             tool_choice: ToolChoice::None,
-            tools: vec![serde_json::json!({"type":"function", "function":{"name":"lookup", "parameters":{"type":"object", "properties":{}, "additionalProperties":false}}})],
+            tools: if chunk.is_some() { vec![] } else { vec![serde_json::json!({"type":"function", "function":{"name":"lookup", "parameters":{"type":"object", "properties":{}, "additionalProperties":false}}})] },
             ..Default::default()
         })
         .unwrap();
     let settings = PreparedChatGenerationSettings {
         overrides: GenerationConfigOverrides {
-            max_new_tokens: Some(7),
+            max_new_tokens: Some(if chunk.is_some() { 13 } else { 7 }),
             temperature: Some(temperature),
             top_k: Some(8),
             ..Default::default()
         },
         seed: 17,
+        inference: eredu_core::TextInferencePolicy {
+            prefill_chunk_positions: chunk,
+            ..Default::default()
+        },
         ..Default::default()
     };
     let expected = if compare {
+        let request = PreparedChatSpeculativeGenerationRequest {
+            input: if chunk.is_some() {
+                PreparedChatInput::token_ids(&chat, vec![1, 3, 2, 4, 5])
+            } else {
+                PreparedChatInput::rendered_prompt(&chat)
+            },
+            drafting: drafting.as_speculative_draft().unwrap(),
+            settings: PreparedChatGenerationSettings {
+                inference: Default::default(),
+                ..settings
+            },
+            options: generation_options.clone(),
+            caller_stop_sequences: &[],
+            cancellation: Default::default(),
+            on_event: |_| {},
+        };
         Some(
-            model
-                .generate_prepared_chat_speculative(PreparedChatSpeculativeGenerationRequest {
-                    input: PreparedChatInput::rendered_prompt(&chat),
-                    drafting: drafting.as_speculative_draft().unwrap(),
-                    settings,
-                    options: generation_options.clone(),
-                    caller_stop_sequences: &[],
-                    cancellation: Default::default(),
-                    on_event: |_| {},
-                })
-                .unwrap(),
+            if chunk.is_some() {
+                model.generate_prepared_text_speculative(request)
+            } else {
+                model.generate_prepared_chat_speculative(request)
+            }
+            .unwrap(),
         )
     } else {
         None
     };
     let usage = CaptureUsage {
-        captures: if experiment { 512 } else { 128 },
+        captures: if experiment || chunk.is_some() {
+            512
+        } else {
+            128
+        },
         retained_bytes: 16 << 20,
         host_bytes: 16 << 20,
         encoded_bytes: 16 << 20,
@@ -277,132 +326,142 @@ fn speculative_control_artifacts(
     }
     let mut replays = Vec::new();
     let mut captures = Vec::new();
-    let output = model
-        .with_controlled_chat_speculative(
-            PreparedChatSpeculativeGenerationRequest {
-                input: PreparedChatInput::rendered_prompt(&chat),
-                drafting: drafting.as_speculative_draft().unwrap(),
-                settings,
-                options: generation_options,
-                caller_stop_sequences: &[],
-                cancellation: Default::default(),
-                on_event: |_| {},
-            },
-            ControlledSpeculativeOptions {
-                capture: Some(capture),
-                snapshots: Some(SnapshotLimits {
-                    max_snapshots: 3,
-                    max_branches: 2,
-                    retained_bytes: 64 << 20,
-                    cumulative_copy_bytes: 256 << 20,
-                }),
-                ..Default::default()
-            },
-            |session| {
-                if experiment {
-                    session.intervene(edits.clone())?;
-                }
-                let first = session.step()?.unwrap();
-                if experiment {
-                    assert_eq!(first.committed_token_ids, [12]);
-                    session.intervene(Vec::new())?;
-                }
-                captures.extend(first.captures);
+    let request = PreparedChatSpeculativeGenerationRequest {
+        input: if chunk.is_some() {
+            PreparedChatInput::token_ids(&chat, vec![1, 3, 2, 4, 5])
+        } else {
+            PreparedChatInput::rendered_prompt(&chat)
+        },
+        drafting: drafting.as_speculative_draft().unwrap(),
+        settings,
+        options: generation_options,
+        caller_stop_sequences: &[],
+        cancellation: Default::default(),
+        on_event: |_| {},
+    };
+    let control = ControlledSpeculativeOptions {
+        capture: Some(capture),
+        snapshots: Some(SnapshotLimits {
+            max_snapshots: 3,
+            max_branches: 2,
+            retained_bytes: 64 << 20,
+            cumulative_copy_bytes: 256 << 20,
+        }),
+        ..Default::default()
+    };
+    let drive = |session: &mut dyn ControlledSpeculativeSession| {
+        if experiment {
+            session.intervene(edits.clone())?;
+        }
+        let first = session.step()?.unwrap();
+        if experiment {
+            assert_eq!(first.committed_token_ids, [12]);
+            session.intervene(Vec::new())?;
+        }
+        captures.extend(first.captures.iter().cloned());
+        assert!(
+            session.can_snapshot(),
+            "native seed and cache must have exact storage costs: {:?}",
+            session.snapshot_support()
+        );
+        let saved = session.snapshot()?;
+        for epoch in 0..3 {
+            let mut tokens = Vec::new();
+            while let Some(step) = session.step()? {
+                assert_eq!(step.epoch, epoch);
+                tokens.extend(step.committed_token_ids);
+                captures.extend(step.captures.iter().cloned());
+            }
+            replays.push(tokens);
+            if epoch < 2 {
+                let before = session.snapshot_usage();
+                session.restore(&saved)?;
                 assert!(
-                    session.can_snapshot(),
-                    "native seed and cache must have exact storage costs: {:?}",
-                    session.snapshot_support()
+                    session.snapshot_usage().cumulative_copy_bytes > before.cumulative_copy_bytes
                 );
-                let saved = session.snapshot()?;
-                for epoch in 0..3 {
-                    let mut tokens = Vec::new();
-                    while let Some(step) = session.step()? {
-                        assert_eq!(step.epoch, epoch);
-                        tokens.extend(step.committed_token_ids);
-                        captures.extend(step.captures);
-                    }
-                    replays.push(tokens);
-                    if epoch < 2 {
-                        let before = session.snapshot_usage();
-                        session.restore(&saved)?;
-                        assert!(
-                            session.snapshot_usage().cumulative_copy_bytes
-                                > before.cumulative_copy_bytes
-                        );
-                    }
+            }
+        }
+        if experiment {
+            let original = session.token_ids().to_vec();
+            let original_sampling = session.sampling_state();
+            let child = session.fork(&saved)?;
+            session.exchange(&child)?;
+            session.override_sampling(SamplingOverride {
+                temperature: Some(0.0),
+                reseed: Some(123),
+            })?;
+            session.intervene(edits.clone())?;
+            assert!(session
+                .intervene(vec![edits[0].clone(), edits[0].clone()])
+                .is_err());
+            session.force_next_token(10)?;
+            let changed = session.snapshot()?;
+            let mut child_replays = Vec::new();
+            let mut rejected = false;
+            for pass in 0..2 {
+                let mut tokens = Vec::new();
+                let mut forced = 0;
+                while let Some(step) = session.step()? {
+                    forced += usize::from(step.forced_token == Some(10));
+                    rejected |= step.verification.as_ref().is_some_and(|v| {
+                        v.dispositions
+                            .contains(&SpeculativeProposalDisposition::Rejected)
+                    });
+                    tokens.extend(step.committed_token_ids);
+                    captures.extend(step.captures.iter().cloned());
                 }
-                if experiment {
-                    let original = session.token_ids().to_vec();
-                    let original_sampling = session.sampling_state();
-                    let child = session.fork(&saved)?;
-                    session.exchange(&child)?;
-                    session.override_sampling(SamplingOverride {
-                        temperature: Some(0.0),
-                        reseed: Some(123),
-                    })?;
-                    session.intervene(edits.clone())?;
-                    assert!(session
-                        .intervene(vec![edits[0].clone(), edits[0].clone()])
-                        .is_err());
-                    session.force_next_token(10)?;
-                    let changed = session.snapshot()?;
-                    let mut child_replays = Vec::new();
-                    let mut rejected = false;
-                    for pass in 0..2 {
-                        let mut tokens = Vec::new();
-                        let mut forced = 0;
-                        while let Some(step) = session.step()? {
-                            forced += usize::from(step.forced_token == Some(10));
-                            rejected |= step.verification.as_ref().is_some_and(|v| {
-                                v.dispositions
-                                    .contains(&SpeculativeProposalDisposition::Rejected)
-                            });
-                            tokens.extend(step.committed_token_ids);
-                            captures.extend(step.captures);
-                        }
-                        assert_eq!(forced, 1);
-                        assert_eq!(tokens[0], 10);
-                        assert!(tokens[1..].iter().all(|id| *id == 12));
-                        child_replays.push(tokens);
-                        if pass == 0 {
-                            session.restore(&changed)?;
-                        }
-                    }
-                    assert!(
-                        rejected,
-                        "independent draft edit must be rejected by the target edit"
-                    );
-                    assert_eq!(child_replays[0], child_replays[1]);
-                    session.exchange(&child)?;
-                    assert_eq!(session.run_id(), 0);
-                    assert_eq!(session.token_ids(), original);
-                    assert_eq!(session.sampling_state(), original_sampling);
-                    session.restore(&saved)?;
-                    let mut unedited = Vec::new();
-                    while let Some(step) = session.step()? {
-                        unedited.extend(step.committed_token_ids);
-                        assert!(step
-                            .captures
-                            .iter()
-                            .all(|c| c.capture.interventions.is_empty()));
-                        captures.extend(step.captures);
-                    }
-                    assert_eq!(unedited, replays[0]);
-                    session.release_snapshot(&changed)?;
-                    session.release_branch(&child)?;
+                assert_eq!(forced, 1);
+                assert_eq!(tokens[0], 10);
+                assert!(tokens[1..].iter().all(|id| *id == 12));
+                child_replays.push(tokens);
+                if pass == 0 {
+                    session.restore(&changed)?;
                 }
-                Ok(())
-            },
-        )
-        .unwrap();
+            }
+            assert!(
+                rejected,
+                "independent draft edit must be rejected by the target edit"
+            );
+            assert_eq!(child_replays[0], child_replays[1]);
+            session.exchange(&child)?;
+            assert_eq!(session.run_id(), 0);
+            assert_eq!(session.token_ids(), original);
+            assert_eq!(session.sampling_state(), original_sampling);
+            session.restore(&saved)?;
+            let mut unedited = Vec::new();
+            while let Some(step) = session.step()? {
+                unedited.extend(step.committed_token_ids);
+                assert!(step
+                    .captures
+                    .iter()
+                    .all(|c| c.capture.as_step().interventions.is_empty()));
+                captures.extend(step.captures.iter().cloned());
+            }
+            assert_eq!(unedited, replays[0]);
+            session.release_snapshot(&changed)?;
+            session.release_branch(&child)?;
+        }
+        Ok(())
+    };
+    let output = if chunk.is_some() {
+        model.with_controlled_text_speculative(request, control, drive)
+    } else {
+        model.with_controlled_chat_speculative(request, control, drive)
+    }
+    .unwrap();
+
     if !experiment {
         if let Some(expected) = expected {
             assert_eq!(output.token_ids(), expected.token_ids());
         }
     }
+    if chunk.is_some() {
+        assert_eq!(output.token_ids().len(), 13);
+        assert!(output.stats().rounds() >= 3);
+    }
     assert!(output.timing().time_to_first_token().is_some());
     for capture in &captures {
-        for record in &capture.capture.records {
+        for record in &capture.capture.as_step().records {
             let Some(CapturePayload::Candidates(candidates)) = &record.payload else {
                 panic!()
             };
@@ -423,15 +482,23 @@ fn speculative_control_artifacts(
         assert!(compare && temperature == 0.0 && output.token_ids().len() == 1);
         return;
     }
-    assert!(captures
-        .iter()
-        .any(|c| c.role == SpeculativeCaptureRole::Draft));
-    assert!(captures
-        .iter()
-        .any(|c| c.role == SpeculativeCaptureRole::Target && c.position > 0));
-    assert!(captures
-        .iter()
-        .all(|c| c.capture.records.iter().all(|r| r.payload.is_some())));
+    assert!(
+        captures
+            .iter()
+            .any(|c| c.role == SpeculativeCaptureRole::Draft)
+    );
+    assert!(
+        captures
+            .iter()
+            .any(|c| c.role == SpeculativeCaptureRole::Target && c.position > 0)
+    );
+    assert!(captures.iter().all(|c| {
+        c.capture
+            .as_step()
+            .records
+            .iter()
+            .all(|r| r.payload.is_some())
+    }));
     if experiment {
         use eredu_core::intervention::InterventionOutcome;
         for role in [
@@ -439,7 +506,7 @@ fn speculative_control_artifacts(
             SpeculativeCaptureRole::Draft,
         ] {
             assert!(captures.iter().any(|capture| capture.role == role
-                && capture.capture.interventions.iter().any(|record| matches!(
+                && capture.capture.as_step().interventions.iter().any(|record| matches!(
                     record.outcome,
                     InterventionOutcome::Applied
                 ) && !record
@@ -447,8 +514,76 @@ fn speculative_control_artifacts(
                     .is_empty())));
         }
     }
-    assert!(captures
-        .windows(2)
-        .all(|pair| pair[0].capture.cumulative_usage.captures
-            < pair[1].capture.cumulative_usage.captures));
+    assert!(
+        captures
+            .windows(2)
+            .all(|pair| pair[0].capture.as_step().cumulative_usage.captures
+                < pair[1].capture.as_step().cumulative_usage.captures)
+    );
 }
+
+#[test]
+#[cfg_attr(feature = "metal", ignore = "run CPU-only native initialization")]
+fn k2_independent_selective_prefill_matches_full_run_and_control_on_all_residencies() {
+    for family in ["k2_horizon_dense", "k2_horizon_mova"] {
+        for residency in [
+            eredu_core::ResidencyPlan::FullyResident,
+            eredu_core::ResidencyPlan::LayerwiseHost {
+                device_layer_window: 1,
+                device_budget_bytes: Some(1 << 20),
+                host_budget_bytes: Some(1 << 20),
+            },
+            eredu_core::ResidencyPlan::DenseDiskStream {
+                device_budget_bytes: 1 << 20,
+                host_budget_bytes: 1 << 20,
+                host_lookahead: 1,
+                background_queue: 1,
+            },
+        ] {
+            let target = fixture(false);
+            let draft = fixture(false);
+            use_family_weights(&target.0, family);
+            use_family_weights(&draft.0, "k2_horizon_dense");
+            // This length-bounded fixture deliberately has no EOS stop. It must
+            // execute three verification rounds, rather than pass at prefill.
+            for root in [&target.0, &draft.0] {
+                let path = root.join("config.json");
+                let mut config: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                config["eos_token_id"] = serde_json::json!([]);
+                std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+                // Literal text has no profile terminator either. The ordinary
+                // imported tokenizer is prepared before load; no managed claim.
+                let words = WordLevel::builder()
+                    .vocab((0..64).map(|id| (format!("word{id}"), id)).collect())
+                    .unk_token("word0".into())
+                    .build()
+                    .unwrap();
+                let mut tokenizer = Tokenizer::new(words);
+                tokenizer.with_pre_tokenizer(Some(Whitespace));
+                tokenizer.with_decoder(Some(ByteLevel::default()));
+                tokenizer.save(root.join("tokenizer.json"), false).unwrap();
+                std::fs::write(
+                    root.join("chat_template.jinja"),
+                    "{% for m in messages %}{{ m.content }}{% endfor %} reply: ",
+                )
+                .unwrap();
+            }
+            selective_control_artifacts(
+                target,
+                draft,
+                false,
+                residency,
+                true,
+                0.8,
+                std::num::NonZeroU64::new(2),
+            );
+        }
+    }
+}
+
+#[path = "speculative/captured_prefill.rs"]
+pub(super) mod captured_prefill;
+
+#[path = "speculative/external_prefill.rs"]
+mod external_prefill;

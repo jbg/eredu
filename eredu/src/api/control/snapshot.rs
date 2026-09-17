@@ -1,4 +1,5 @@
 use super::*;
+pub(super) mod host_copy;
 use eredu_runtime::execution_control::{
     GenerationBoundary, SnapshotBudget, SnapshotTokenController, TextContinuationSnapshot,
     TextSnapshotBackend,
@@ -56,22 +57,20 @@ pub struct GenerationSnapshotMetadata {
 /// termination, pending-input and capture/intervention continuation. It is usable
 /// only with the source logical run and loaded driver; metadata may outlive that
 /// run, but cannot authorize restoration into a new model or process.
-pub struct ControlledGenerationSnapshot<B: TextSnapshotBackend> {
+pub struct ControlledGenerationSnapshot<B: TextSnapshotBackend, M: ControlRecordMode = LegacyText> {
     pub(super) continuation: TextContinuationSnapshot<B, ControlConstraints>,
     pub(super) cursor: CommittedGenerationCursor,
     pub(super) pipeline: CommittedTokenPipeline<PreparedChatTokenDecoder>,
     pub(super) lifecycle: GenerationBoundary,
-    pub(super) metadata: GenerationSnapshotMetadata,
+    pub(super) metadata: M::SnapshotMetadata,
+    pub(super) info: SnapshotInfo,
     pub(super) semantic_prefix: Vec<SemanticEvent>,
-    pub(super) prompt_token_ids: std::sync::Arc<[u32]>,
+    pub(super) prompt: PromptRecord,
+    pub(super) host_preparation: HostPreparationAuthority,
 }
-impl<B: TextSnapshotBackend> ControlledGenerationSnapshot<B> {
-    /// Exact immutable canonical prompt, shared safely by the branch tree.
-    pub fn prompt_token_ids(&self) -> &[u32] {
-        &self.prompt_token_ids
-    }
+impl<B: TextSnapshotBackend, M: ControlRecordMode> ControlledGenerationSnapshot<B, M> {
     /// Stable metadata with no native handles.
-    pub fn metadata(&self) -> &GenerationSnapshotMetadata {
+    pub fn metadata(&self) -> &M::SnapshotMetadata {
         &self.metadata
     }
     /// Exact committed canonical prefix, including any terminal special token.
@@ -80,7 +79,7 @@ impl<B: TextSnapshotBackend> ControlledGenerationSnapshot<B> {
     }
 }
 
-impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
+impl<B: TextGenerationBackend, M: ControlRecordMode> ControlledGenerationSession<'_, B, M> {
     /// Current consumer checkpoint; capturing it alone does not save native state.
     pub fn output_checkpoint(&self) -> GenerationOutputCheckpoint {
         GenerationOutputCheckpoint {
@@ -96,7 +95,21 @@ impl<B: TextGenerationBackend> ControlledGenerationSession<'_, B> {
     }
 }
 
-impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
+impl<B: TextSnapshotBackend, M: ControlRecordMode> ControlledGenerationSession<'_, B, M> {
+    /// Fresh destination admission precedes even facade metadata copies. The
+    /// neutral driver independently admits its own copies; retaining an existing
+    /// source token here cannot bypass that check.
+    pub(super) fn acquire_snapshot_host(
+        &self,
+    ) -> Result<HostPreparationAuthority, ControlledGenerationError> {
+        B::acquire_host_preparation(self.driver.runtime()).map_err(|error| {
+            eredu_runtime::execution_control::TextSnapshotError::<BackendFailure>::HostPreparation(
+                error.with_operation("prepare controlled host copy"),
+            )
+            .into()
+        })
+    }
+
     pub(super) fn snapshot_result<T>(
         &mut self,
         result: Result<T, ControlledGenerationError>,
@@ -114,12 +127,21 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             // poisoned native owner must not leave a resumable facade lifecycle.
             self.lifecycle.fail();
         }
-        result
+        result.map_err(|error| M::retain_error(error, self.host_preparation.clone()))
     }
     /// Configures resource limits exactly once. Unknown required native, grammar,
     /// or semantic storage fails explicitly before copying. Limits remain outside
     /// snapshots and cannot be reset by pause, restore or repeated configuration.
     pub fn enable_snapshots(
+        &mut self,
+        limits: SnapshotLimits,
+    ) -> Result<(), ControlledGenerationError> {
+        let host = self.host_preparation.clone();
+        self.enable_snapshots_retained_inner(limits)
+            .map_err(|error| M::retain_error(error, host))
+    }
+
+    fn enable_snapshots_retained_inner(
         &mut self,
         limits: SnapshotLimits,
     ) -> Result<(), ControlledGenerationError> {
@@ -145,13 +167,13 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         let boundary = self.state.boundary(&mut self.driver)?;
         let (runtime, state, pending) = boundary.parts();
         B::estimate_native_text_state(runtime, None)
-            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(eredu_core::BackendFailure::from_error(error)))?
+            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(B::into_backend_failure(error)))?
             .ok_or(ExecutionControlError::UnknownEstimate)?;
         B::estimate_sampling_state(runtime, B::sampling_state(state))
-            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(eredu_core::BackendFailure::from_error(error)))?
+            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(B::into_backend_failure(error)))?
             .ok_or(ExecutionControlError::UnknownEstimate)?;
         B::estimate_pending_input(runtime, pending)
-            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(eredu_core::BackendFailure::from_error(error)))?
+            .map_err(|error| eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Backend(B::into_backend_failure(error)))?
             .ok_or(ExecutionControlError::UnknownEstimate)?;
         drop(boundary);
         self.snapshot_budget = Some(SnapshotBudget::new(limits));
@@ -170,8 +192,8 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
     /// replay, RNG draw, semantic finalization or admission reset occurs.
     pub fn snapshot(
         &mut self,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSnapshot<B>, ControlledGenerationError> {
+        emit: impl FnMut(M::Record) -> ControlFlow<()>,
+    ) -> Result<ControlledGenerationSnapshot<B, M>, ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.snapshot_inner(emit))) {
             Ok(result) => self.snapshot_result(result),
             Err(payload) => {
@@ -183,8 +205,8 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
 
     fn snapshot_inner(
         &mut self,
-        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
-    ) -> Result<ControlledGenerationSnapshot<B>, ControlledGenerationError> {
+        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
+    ) -> Result<ControlledGenerationSnapshot<B, M>, ControlledGenerationError> {
         if self.delivery.control.cancellation().is_cancelled() {
             return Err(
                 CaptureError::Invalid("cancelled generation cannot be snapshotted".into()).into(),
@@ -192,63 +214,35 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         }
         let lifecycle = self.lifecycle.checkpoint()?;
         let budget = self.require_snapshot_budget()?;
-        let mut metadata = GenerationSnapshotMetadata {
-            schema_version: EXECUTION_CONTROL_SCHEMA_VERSION,
-            snapshot_id: new_identity("snapshot"),
-            session_id: self.delivery.template.session_id.clone(),
-            artifact_identity: self.delivery.template.artifact_identity.clone(),
-            capture_plan_id: self.delivery.template.capture_plan_id.clone(),
-            intervention_plan_id: self.delivery.template.intervention_plan_id.clone(),
-            tokenizer_identity: self.tokenizer_identity,
-            configuration_identity: self.delivery.configuration_identity,
-            pending_forced_token: self.pending_forced_token(),
-            status: self.status(),
-            output: self.output_checkpoint(),
-            retained_bytes: 0,
-        };
-        let host_bytes = self
-            .semantic_snapshot_bytes()
-            .ok_or(ExecutionControlError::UnknownEstimate)?
-            .checked_add(std::mem::size_of::<ControlledGenerationSnapshot<B>>() as u64)
-            .and_then(|n| n.checked_add(metadata.snapshot_id.len() as u64))
-            .and_then(|n| n.checked_add(metadata.session_id.len() as u64))
-            .and_then(|n| {
-                n.checked_add(
-                    metadata
-                        .artifact_identity
-                        .as_ref()
-                        .map_or(0, |id| id.len() as u64),
-                )
-            })
-            .and_then(|n| n.checked_add(metadata.output.run_id.len() as u64))
-            .and_then(|n| n.checked_add(metadata.capture_plan_id.len() as u64))
-            .and_then(|n| {
-                n.checked_add(
-                    metadata
-                        .intervention_plan_id
-                        .as_ref()
-                        .map_or(0, |id| id.len() as u64),
-                )
-            })
-            .ok_or(ExecutionControlError::Overflow)?;
-        let continuation = TextContinuationSnapshot::capture(
+        let host_preparation = HostPreparationAuthority::retain((
+            self.host_preparation.clone(),
+            self.acquire_snapshot_host()?,
+        ));
+        let host = host_copy::CaptureHost::<M>::new::<B>(
+            &self.pipeline,
+            &self.cursor,
+            &self.delivery,
+            self.tokenizer_identity,
+            self.pending_forced_token(),
+            self.status(),
+            self.next_prediction(),
+        );
+        let (continuation, host) = TextContinuationSnapshot::capture_host(
             &mut self.state.boundary(&mut self.driver)?,
             &budget,
-            Some(host_bytes),
-        )?;
-        let pipeline = self.pipeline.fork().map_err(
-            eredu_runtime::execution_control::TextSnapshotError::<eredu_core::BackendFailure>::Host,
-        )?;
-        let cursor = self.cursor.clone();
-        metadata.retained_bytes = continuation.retained_bytes();
+            host,
+        )
+        .map_err(provider_snapshot_error::<B>)?;
         let snapshot = ControlledGenerationSnapshot {
             continuation,
-            pipeline,
-            cursor,
+            pipeline: host.pipeline,
+            cursor: host.cursor,
             lifecycle,
-            metadata,
-            semantic_prefix: self.delivery.semantic_prefix.clone(),
-            prompt_token_ids: std::sync::Arc::clone(&self.delivery.prompt_token_ids),
+            metadata: host.metadata,
+            info: host.info,
+            semantic_prefix: host.semantic_prefix,
+            prompt: host.prompt,
+            host_preparation,
         };
         let max_predictions = snapshot.cursor.max_predictions();
         self.branch_growth_known = matches!(
@@ -269,8 +263,8 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
                 .native_continuation_growth(self.driver.runtime(), max_predictions)
                 .is_ok();
         self.delivery.send(
-            ObservedGenerationEvent::SnapshotCreated {
-                metadata: snapshot.metadata.clone(),
+            ControlEvent::SnapshotCreated {
+                metadata: snapshot.info.clone(),
             },
             &mut emit,
         );
@@ -285,8 +279,8 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
     /// be revived by restoration.
     pub fn restore(
         &mut self,
-        snapshot: &ControlledGenerationSnapshot<B>,
-        emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        snapshot: &ControlledGenerationSnapshot<B, M>,
+        emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.restore_inner(snapshot, emit)
@@ -301,8 +295,8 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
 
     fn restore_inner(
         &mut self,
-        snapshot: &ControlledGenerationSnapshot<B>,
-        mut emit: impl FnMut(ControlledGenerationRecord) -> ControlFlow<()>,
+        snapshot: &ControlledGenerationSnapshot<B, M>,
+        mut emit: impl FnMut(M::Record) -> ControlFlow<()>,
     ) -> Result<(), ControlledGenerationError> {
         if self.delivery.control.cancellation().is_cancelled() {
             return Err(
@@ -310,10 +304,10 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
             );
         }
         self.lifecycle.validate_restore()?;
-        if snapshot.metadata.output.run_id != self.delivery.template.run_id
-            || snapshot.metadata.session_id != self.delivery.template.session_id
-            || snapshot.metadata.tokenizer_identity != self.tokenizer_identity
-            || snapshot.metadata.configuration_identity != self.delivery.configuration_identity
+        if snapshot.info.output.run_id != self.delivery.template.run_id
+            || snapshot.info.session_id != self.delivery.template.session_id
+            || snapshot.info.tokenizer_identity != self.tokenizer_identity
+            || snapshot.info.configuration_identity != self.delivery.configuration_identity
         {
             return Err(eredu_runtime::execution_control::TextSnapshotError::<
                 eredu_core::BackendFailure,
@@ -321,20 +315,26 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
                 .into());
         }
         let budget = self.require_snapshot_budget()?;
-        let (pipeline, cursor, semantic_prefix) = snapshot.continuation.restore_with(
-            &mut self.state.boundary(&mut self.driver)?,
-            &budget,
-            || {
-                Ok((
-                    snapshot.pipeline.fork()?,
-                    snapshot.cursor.clone(),
-                    snapshot.semantic_prefix.clone(),
-                ))
-            },
-        )?;
-        self.pipeline = pipeline;
-        self.cursor = cursor;
-        self.delivery.semantic_prefix = semantic_prefix;
+        let host_preparation = HostPreparationAuthority::retain((
+            self.host_preparation.clone(),
+            snapshot.host_preparation.clone(),
+            self.acquire_snapshot_host()?,
+        ));
+        let host = snapshot
+            .continuation
+            .restore_host(
+                &mut self.state.boundary(&mut self.driver)?,
+                &budget,
+                host_copy::RestoreHost { snapshot },
+            )
+            .map_err(provider_snapshot_error::<B>)?;
+        // Install custody first so an old payload destructor unwinding cannot
+        // leave a partially installed destination without its authority.
+        self.host_preparation = host_preparation;
+        self.pipeline = host.pipeline;
+        self.cursor = host.cursor;
+        self.delivery.semantic_prefix = host.semantic_prefix;
+        self.delivery.prompt = host.prompt;
         // Validated before native installation, with no intervening transition.
         self.lifecycle
             .restore(&snapshot.lifecycle)
@@ -343,11 +343,26 @@ impl<B: TextSnapshotBackend> ControlledGenerationSession<'_, B> {
         self.delivery.prediction = self.next_prediction();
         self.delivery.send(
             ObservedGenerationEvent::Restored {
-                snapshot_id: snapshot.metadata.snapshot_id.clone(),
-                output: snapshot.metadata.output.clone(),
+                snapshot_id: snapshot.info.snapshot_id.clone(),
+                output: snapshot.info.output.clone(),
             },
             &mut emit,
         );
         self.delivery_result()
+    }
+}
+
+impl<B: TextSnapshotBackend> ControlledGenerationSnapshot<B, LegacyText> {
+    /// Exact immutable complete canonical prompt, as in the V1 API.
+    pub fn prompt_token_ids(&self) -> &[u32] {
+        self.prompt.tokens()
+    }
+}
+impl<B: TextSnapshotBackend> ControlledGenerationSnapshot<B, PreparedInputV2> {
+    pub fn prompt_attribution(&self) -> &PreparedPromptAttribution {
+        self.prompt.prepared().attribution()
+    }
+    pub fn complete_token_ids(&self) -> Option<&[u32]> {
+        self.prompt_attribution().complete_token_ids()
     }
 }

@@ -1,0 +1,163 @@
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -104,6 +104,15 @@
+   return gpu_eval_prologue_layout(inputs, siblings, false, output);
+ }
+ 
++// Scalar layout of a fixed nested Eval. The owning C producer validates these
++// fields with completion_eval_traversal_layout before configuring a host bank.
++// This copy avoids introducing a completion/graph-construction include cycle.
++struct NestedGraphEvaluationLimits {
++  size_t roots{0}, arrays{0}, tape_entries{0}, input_edges{0};
++  size_t output_slots{0}, streams{0}, captures{0};
++};
++class GraphNestedEvaluation;
++
+ // The header, slots and reserved blocks are ordinary blocks of the existing
+ // GraphQuota. No inner arena, fallback, refill or recycled construction credit.
+ class MLX_API GraphConstruction final {
+@@ -118,16 +127,24 @@
+   static GraphFailure create_gpu_prologue(const GpuEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_cleanup(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_argpartition(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  // Configure only an untouched resident bank in its actual current Scope.
++  // A finite attempt is consumed before nested construction starts, even on failure.
++  GraphFailure configure_nested(const NestedGraphEvaluationLimits&, size_t attempts) noexcept;
++  static GraphFailure validate_nested(GraphQuota&, uint64_t scope, size_t roots) noexcept;
++  static GraphFailure suspend_nested(GraphQuota&, uint64_t scope, size_t roots,
++      GraphNestedEvaluation&) noexcept;
+   void destroy() noexcept;
+   size_t remaining() const noexcept;
+  private:
+   friend class GraphQuota;
++  friend class GraphNestedEvaluation;
++  void resume_nested() noexcept;
+   struct Slot { void* pointer; size_t bytes; };
+   static GraphFailure create_layout(GraphQuota&, uint64_t scope,
+-      const Record* dispatch, const GraphConstructionLayout&, GraphConstruction*&, bool exclusive_host = false) noexcept;
++      const Record* dispatch, const GraphConstructionLayout&, GraphConstruction*&, bool exclusive_host = false, bool resident_host = false) noexcept;
+   GraphConstruction(GraphQuota& quota, uint64_t scope, const Record* dispatch,
+-      size_t count, bool exclusive_host) noexcept
+-      : quota_(&quota), scope_(scope), dispatch_(dispatch), count_(count), exclusive_host_(exclusive_host) {}
++      size_t count, bool exclusive_host, bool resident_host) noexcept
++      : quota_(&quota), scope_(scope), dispatch_(dispatch), count_(count), exclusive_host_(exclusive_host), resident_host_(resident_host) {}
+   ~GraphConstruction() = default;
+   void* take(size_t bytes, size_t alignment); // caller holds GraphQuota::Loan
+   GraphQuota* quota_;
+@@ -136,5 +153,25 @@
+   Slot* slots_{nullptr};
+   size_t count_;
+   bool exclusive_host_;
++  // Only create_resident supplies this tag; worker/pointwise banks cannot nest.
++  bool resident_host_;
++  NestedGraphEvaluationLimits nested_limits_{};
++  size_t nested_remaining_{0};
++  bool nested_configured_{false};
++};
++// Synchronous no-callback suspension. Unused host blocks remain reserved; nested
++// Eval/worker requests use their own ordinary GraphQuota destinations. The caller
++// keeps the bank alive until this guard restores its exact association.
++class GraphNestedEvaluation final {
++ public:
++  GraphNestedEvaluation() noexcept = default;
++  GraphNestedEvaluation(const GraphNestedEvaluation&) = delete;
++  GraphNestedEvaluation& operator=(const GraphNestedEvaluation&) = delete;
++  ~GraphNestedEvaluation() { if (owner_) owner_->resume_nested(); }
++  const NestedGraphEvaluationLimits& limits() const noexcept { return limits_; }
++ private:
++  friend class GraphConstruction;
++  GraphConstruction* owner_{nullptr};
++  NestedGraphEvaluationLimits limits_{};
+ };
+ } // namespace mlx::core::submission
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -528,7 +528,7 @@
+   ResidentGraphLayout actual;
+   if (!resident_graph_layout_with_shells(layout.primitives, layout.seeds, layout.maximum_rank, layout.maximum_operands, layout.additional_shells, actual))
+     return GraphFailure::invalid_layout;
+-  return create_layout(quota, scope, nullptr, actual, output);
++  return create_layout(quota, scope, nullptr, actual, output, false, true);
+ }
+ GraphFailure GraphConstruction::create_eval(GraphQuota& quota, uint64_t scope,
+     const Record& dispatch, GraphConstruction*& output) noexcept {
+@@ -584,7 +584,7 @@
+ }
+ GraphFailure GraphConstruction::create_layout(GraphQuota& quota, uint64_t scope,
+     const Record* dispatch, const GraphConstructionLayout& actual,
+-    GraphConstruction*& output, bool exclusive_host) noexcept {
++    GraphConstruction*& output, bool exclusive_host, bool resident_host) noexcept {
+   {
+     const GraphQuota::Loan loan(quota);
+     if (quota.preparing_ || quota.construction_) return GraphFailure::construction_busy;
+@@ -593,7 +593,7 @@
+   // physical allocation already retains quota independently, through rollback.
+   auto* memory = quota.try_allocate(actual.header_bytes, actual.header_alignment);
+   if (!memory) return GraphFailure::exhausted;
+-  auto* value = ::new (memory) GraphConstruction(quota, scope, dispatch, actual.blocks, exclusive_host);
++  auto* value = ::new (memory) GraphConstruction(quota, scope, dispatch, actual.blocks, exclusive_host, resident_host);
+   if (actual.blocks) {
+     value->slots_ = static_cast<Slot*>(quota.try_allocate(actual.slots_bytes, actual.slots_alignment));
+     if (!value->slots_) { value->count_ = 0; value->destroy(); return GraphFailure::exhausted; }
+@@ -616,6 +616,59 @@
+   output = value;
+   return static_cast<GraphFailure>(0);
+ }
++GraphFailure GraphConstruction::configure_nested(
++    const NestedGraphEvaluationLimits& limits, size_t attempts) noexcept {
++  const auto context = current_graph_construction_context();
++  const GraphQuota::Loan loan(*quota_);
++  if (!context.scope || context.scope != scope_ || context.worker || context.dispatch ||
++      !resident_host_ || dispatch_ || quota_->construction_ != this)
++    return GraphFailure::foreign_parent;
++  if (!attempts || !limits.roots || nested_configured_ || quota_->preparing_)
++    return GraphFailure::construction_mismatch;
++  for (size_t i = 0; i < count_; ++i)
++    if (!slots_[i].pointer) return GraphFailure::construction_mismatch;
++  nested_configured_ = true;
++  nested_limits_ = limits;
++  nested_remaining_ = attempts;
++  return static_cast<GraphFailure>(0);
++}
++GraphFailure GraphConstruction::validate_nested(
++    GraphQuota& quota, uint64_t scope, size_t roots) noexcept {
++  const auto context = current_graph_construction_context();
++  const GraphQuota::Loan loan(quota);
++  const auto* owner = quota.construction_;
++  if (!owner || !scope || context.scope != scope || owner->scope_ != scope ||
++      context.worker || context.dispatch || !owner->resident_host_ || owner->dispatch_)
++    return GraphFailure::foreign_parent;
++  if (quota.preparing_ || !roots || !owner->nested_remaining_ || roots > owner->nested_limits_.roots)
++    return GraphFailure::construction_mismatch;
++  return static_cast<GraphFailure>(0);
++}
++GraphFailure GraphConstruction::suspend_nested(
++    GraphQuota& quota, uint64_t scope, size_t roots, GraphNestedEvaluation& suspended) noexcept {
++  if (suspended.owner_) return GraphFailure::construction_busy;
++  if (const auto failure = validate_nested(quota, scope, roots); static_cast<unsigned>(failure))
++    return failure;
++  const GraphQuota::Loan loan(quota);
++  auto* owner = quota.construction_;
++  // Same owner-thread synchronous entry; no hook runs between the two loans.
++  if (!owner || owner->scope_ != scope || !owner->nested_remaining_)
++    return GraphFailure::foreign_parent;
++  suspended.limits_ = owner->nested_limits_;
++  suspended.limits_.roots = roots;
++  suspended.owner_ = owner;
++  --owner->nested_remaining_;
++  quota.construction_ = nullptr;
++  return static_cast<GraphFailure>(0);
++}
++void GraphConstruction::resume_nested() noexcept {
++  const GraphQuota::Loan loan(*quota_);
++  // All nested banks are lexical owners inside the synchronous caller. A live
++  // replacement here is an internal lifetime violation, never a heap fallback.
++  if (quota_->construction_ || quota_->preparing_) std::terminate();
++  quota_->construction_ = this;
++}
++
+ void* GraphConstruction::take(size_t bytes, size_t align) {
+   if (!align || (align & (align - 1)) || align > alignment)
+     throw GraphQuotaError(GraphFailure::construction_mismatch);

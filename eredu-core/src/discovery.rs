@@ -486,9 +486,9 @@ pub enum RoutingObservationField {
 }
 
 impl RoutingObservationField {
-    /// Formats the exact selector used by instrumentation and discovery.
-    pub fn path(self, module: &str) -> String {
-        let field = match self {
+    /// Borrow the exact field suffix used by source-owned declarations.
+    pub const fn suffix(self) -> &'static str {
+        match self {
             Self::SelectedExperts => "selected_experts",
             Self::SelectedScores => "selected_scores",
             Self::Coefficients => "coefficients",
@@ -497,7 +497,11 @@ impl RoutingObservationField {
             Self::ReducedRoutedOutput => "reduced_routed_output",
             Self::SharedOutput => "shared_output",
             Self::CombinedOutput => "combined_output",
-        };
+        }
+    }
+    /// Formats the exact selector used by instrumentation and discovery.
+    pub fn path(self, module: &str) -> String {
+        let field = self.suffix();
         format!("{module}.routing.{field}")
     }
 }

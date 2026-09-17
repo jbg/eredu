@@ -76,8 +76,7 @@ pub fn routed_composite_partition_supported(
 pub(crate) fn composite_group_continuation_geometry(
     requirements: &CompositeTextRequirements,
     group: usize,
-    source_pipeline: usize,
-    pipeline_stages: usize,
+    source_unit_end: usize,
     maximum_decoder_sequence: i32,
 ) -> Result<Option<(i32, bool, Option<i32>)>, String> {
     let config = composite_config(requirements.inspection().architecture_plan())
@@ -130,15 +129,14 @@ pub(crate) fn composite_group_continuation_geometry(
         CompositeConfig::Inkling(args) => match group {
             0 => match args.vision_config.as_ref() {
                 Some(vision) => {
-                    let specs = vision.layer_specs();
-                    let range = eredu_core::balanced_contiguous_range(
-                        specs.len(),
-                        pipeline_stages,
-                        source_pipeline,
-                        false,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    Some((specs[range.end - 1].1, false, None))
+                    let shape = vision.folded_shape(maximum_decoder_sequence, source_unit_end)?;
+                    let maximum_rows = shape[..4]
+                        .iter()
+                        .try_fold(1i32, |n, d| n.checked_mul(*d))
+                        .ok_or_else(|| {
+                        "Inkling continuation maximum rows overflowed".to_owned()
+                    })?;
+                    Some((shape[4], false, Some(maximum_rows)))
                 }
                 None => None,
             },
@@ -609,26 +607,28 @@ pub struct PreparedCompositeRoutedExecution {
 /// publication, collective placement, and any routed provider schedule. A
 /// backend supplies only its unit policy, parallel context, tensor allocator,
 /// and route-movement mechanism.
+#[derive(Clone)]
 pub struct PreparedCompositeExecutorPlan {
     tensor_group: Option<eredu_core::CollectiveGroupId>,
     requires_independent_banks: bool,
-    resident_provider_plan: Option<PreparedCompositeRoutedExecution>,
+    resident_provider_plan: Option<std::sync::Arc<PreparedCompositeRoutedExecution>>,
     structure: crate::partitioned_execution::PreparedCompositeExecutorStructure,
     strategy: PreparedCompositeUnitStrategy,
 }
 
+#[derive(Clone)]
 enum PreparedCompositeUnitStrategy {
     Direct,
     Routed {
-        plan: crate::routed_text::RoutedGroupedPlan,
+        plans: std::sync::Arc<std::collections::BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>>,
         expert_group: Option<eredu_core::CollectiveGroupId>,
     },
     RoutedCollective {
-        plan: crate::routed_text::RoutedGroupedPlan,
+        plans: std::sync::Arc<std::collections::BTreeMap<eredu_runtime::RoutedBankId, crate::routed_text::RoutedGroupedPlan>>,
         expert_group: eredu_core::CollectiveGroupId,
         tensor_group: Option<eredu_core::CollectiveGroupId>,
         wave_group: eredu_core::CollectiveGroupId,
-        waves: crate::partitioned_execution::RoutedExpertCollectiveWaveSchedule,
+        waves: std::sync::Arc<crate::partitioned_execution::RoutedExpertCollectiveWaveSchedule>,
     },
 }
 
@@ -668,8 +668,8 @@ impl PreparedCompositeExecutorPlan {
             SelectedCompositeTextRealization::Routed { execution, .. }
                 if matches!(execution.bank_residency(), eredu_runtime::ParameterBankResidency::IndependentCache(_))
         );
-        let resident_provider_plan = routed.clone();
-        let strategy = match routed {
+        let resident_provider_plan = routed.map(std::sync::Arc::new);
+        let strategy = match resident_provider_plan.as_deref() {
             Some(routed) => {
                 let plan = routed.plan.gated().cloned().ok_or_else(|| {
                     "composite executor requires a gated routed realization".to_owned()
@@ -679,7 +679,7 @@ impl PreparedCompositeExecutorPlan {
                         usize::try_from(publication.output_width())
                             .map_err(|_| "composite output width exceeds usize")?,
                     );
-                    let waves = crate::partitioned_execution::routed_expert_collective_wave_schedule_with_unit_owners_and_tensor_order(
+                    let mut waves = crate::partitioned_execution::routed_expert_collective_wave_schedule_with_unit_owners_and_tensor_order(
                         &plan,
                         &routed.owner_group,
                         &routed.owner_units,
@@ -691,6 +691,7 @@ impl PreparedCompositeExecutorPlan {
                         routed.hidden_width,
                         output_width,
                     )?;
+                    waves.bind_route_cardinality(eredu_runtime::RoutedBankId::new(0),&routed.routes_by_unit)?;
                     if plan.expert_parallel_size() <= 1 {
                         return Err(
                             "routed pipeline collective waves require expert parallelism".into(),
@@ -705,18 +706,20 @@ impl PreparedCompositeExecutorPlan {
                         .expert_group
                         .ok_or_else(|| "routed composite has no expert group".to_owned())?;
                     PreparedCompositeUnitStrategy::RoutedCollective {
-                        plan: plan.into(),
+                        plans: std::sync::Arc::new(std::collections::BTreeMap::from([
+                            (eredu_runtime::RoutedBankId::new(0), plan.into())])),
                         expert_group,
                         tensor_group,
                         wave_group: selected
                             .composite_execution_plan()?
                             .commit_barrier()
                             .ok_or("routed composite wave has no selected agreement group")?,
-                        waves,
+                        waves: std::sync::Arc::new(waves),
                     }
                 } else {
                     PreparedCompositeUnitStrategy::Routed {
-                        plan: plan.into(),
+                        plans: std::sync::Arc::new(std::collections::BTreeMap::from([
+                            (eredu_runtime::RoutedBankId::new(0), plan.into())])),
                         expert_group: routed.expert_group,
                     }
                 }
@@ -746,6 +749,26 @@ impl PreparedCompositeExecutorPlan {
             structure,
             strategy,
         })
+    }
+
+    pub(crate) fn bind_borrowed_direct<A,B,S,P,F>(&self, architecture:A, policy:P,
+        parallel:Option<B::ParallelContext>, allocator:F,
+        context:&eredu_nn::workspace::WorkspaceContext)
+        -> Result<crate::partitioned_execution::CompositePartitionExecutor<A,B,S,P,F>,eredu_nn::Error>
+    where B:eredu_runtime::SubmissionBackend<Executor=<<B as eredu_nn::NeuralBackend>::Tensor as Tensor>::Context>
+            +eredu_runtime::CommunicationBackend+eredu_nn::TensorParallelGroupedNeuralBackend,
+        S:eredu_runtime::RuntimeState<B>,
+        A:crate::composite_execution::CompositeArchitecture<B,S>
+            +eredu_runtime::ParallelLayeredArchitecture<B,S>,
+        P:eredu_runtime::LayerwisePolicy<B,A::Unit>,
+        F:crate::partitioned_execution::PartitionTensorAllocator<B>, B::ParallelContext:Sized,
+    {
+        if !matches!(self.strategy,PreparedCompositeUnitStrategy::Direct) || self.requires_independent_banks {
+            return Err(context.metadata_error(format_args!("composite quote requires its exact retained provider and movement source")));
+        }
+        crate::partitioned_execution::CompositePartitionExecutor::from_prepared_structure(
+            architecture,policy,parallel,allocator,
+            crate::partitioned_execution::DirectCompositePartitionUnitStrategy,self.structure.clone())
     }
 
     /// Opaque tensor group needed by the backend communication realizer.
@@ -870,7 +893,46 @@ impl PreparedCompositeExecutorPlan {
         F: crate::partitioned_execution::PartitionTensorAllocator<B>,
         B::ParallelContext: Sized,
     {
-        let strategy = match self.strategy {
+        self.bind_borrowed_with_provider(architecture, policy, parallel, allocator, movement, provider)
+    }
+
+    /// Lends the exact prepared routes, addresses and wave tables to a checked quote.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn bind_borrowed_with_provider<A, B, S, P, F, Movement, Provider>(
+        &self,
+        architecture: A,
+        policy: P,
+        parallel: Option<B::ParallelContext>,
+        allocator: F,
+        movement: Movement,
+        provider: Option<Provider>,
+    ) -> Result<
+        crate::partitioned_execution::CompositePartitionExecutor<
+            A,
+            B,
+            S,
+            P,
+            F,
+            crate::partitioned_execution::SelectedCompositePartitionUnitStrategy<
+                Provider,
+                Movement,
+            >,
+        >,
+        eredu_nn::Error,
+    >
+    where
+        B: eredu_runtime::SubmissionBackend<
+                Executor = <<B as eredu_nn::NeuralBackend>::Tensor as Tensor>::Context,
+            > + eredu_runtime::CommunicationBackend
+            + eredu_nn::TensorParallelGroupedNeuralBackend,
+        S: eredu_runtime::RuntimeState<B>,
+        A: crate::composite_execution::CompositeArchitecture<B, S>
+            + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>,
+        P: eredu_runtime::LayerwisePolicy<B, A::Unit>,
+        F: crate::partitioned_execution::PartitionTensorAllocator<B>,
+        B::ParallelContext: Sized,
+    {
+        let strategy = match &self.strategy {
             PreparedCompositeUnitStrategy::Direct => {
                 if provider.is_some() {
                     return Err(eredu_nn::Error::backend(
@@ -880,25 +942,25 @@ impl PreparedCompositeExecutorPlan {
                 crate::partitioned_execution::SelectedCompositePartitionUnitStrategy::Direct
             }
             PreparedCompositeUnitStrategy::Routed {
-                plan,
+                plans,
                 expert_group,
             } => crate::partitioned_execution::SelectedCompositePartitionUnitStrategy::routed_from_prepared_grouped_plan(
-                provider.ok_or_else(|| eredu_nn::Error::backend("routed composite provider was not constructed"))?, std::collections::BTreeMap::from([(eredu_runtime::RoutedBankId::new(0), plan)]), expert_group, self.tensor_group, movement,
+                provider.ok_or_else(|| eredu_nn::Error::backend("routed composite provider was not constructed"))?, plans.clone(), *expert_group, self.tensor_group, movement,
             ),
             PreparedCompositeUnitStrategy::RoutedCollective {
-                plan,
+                plans,
                 expert_group,
                 tensor_group,
                 wave_group,
                 waves,
             } => crate::partitioned_execution::SelectedCompositePartitionUnitStrategy::routed_with_prepared_collective_waves(
                 provider.ok_or_else(|| eredu_nn::Error::backend("routed composite provider was not constructed"))?,
-                std::collections::BTreeMap::from([(eredu_runtime::RoutedBankId::new(0), plan)]),
-                expert_group,
+                plans.clone(),
+                *expert_group,
                 movement,
-                tensor_group,
-                wave_group,
-                waves,
+                *tensor_group,
+                *wave_group,
+                waves.clone(),
             ),
         };
         crate::partitioned_execution::CompositePartitionExecutor::from_prepared_structure(
@@ -907,7 +969,7 @@ impl PreparedCompositeExecutorPlan {
             parallel,
             allocator,
             strategy,
-            self.structure,
+            self.structure.clone(),
         )
     }
 }
@@ -999,6 +1061,7 @@ impl PreparedCompositeRoutedExecution {
 
 /// A typed composite partition together with its exact local payload projection.
 pub struct PreparedCompositePartition<A, G, W> {
+    executor: PreparedCompositeExecutorPlan,
     prepared: PreparedPartitionedAdmission<
         A,
         SelectedCompositeTextRealization,
@@ -1028,6 +1091,11 @@ impl<A, G, W> PreparedCompositePartition<A, G, W> {
         W,
     > {
         &self.prepared
+    }
+
+    /// Borrows the immutable plan emitted by this completed constructor.
+    pub fn retained_executor_plan(&self) -> &PreparedCompositeExecutorPlan {
+        &self.executor
     }
 
     /// Exact tensor-parallel layout used by family-local construction.
@@ -1174,13 +1242,8 @@ impl<A, G, W> PreparedCompositePartition<A, G, W> {
             &<B::Tensor as Tensor>::Context,
         ) -> Result<(R, S), E>,
     {
-        let executor = PreparedCompositeExecutorPlan::new::<A, B, S, G, W>(
-            &self.prepared,
-            self.publication,
-            self.routed.clone(),
-        )
-        .map_err(eredu_runtime::PartitionedSessionPreparationError::Contract)?;
         let Self {
+            executor,
             prepared,
             source_architecture,
             layout,
@@ -1290,6 +1353,23 @@ where
             + 'static,
         A::Error: std::fmt::Display,
         W: eredu_runtime::ArchitectureBoundary;
+
+    /// Optional retained media capability, defaulting to the ordinary selected route.
+    fn visit_media<A, G, W>(
+        self,
+        prepared: PreparedCompositePartition<A, G, W>,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + crate::composite_execution::CompositeMediaIngressArchitecture<B, S>
+            + PartitionedLayeredArchitecture<B, S, Boundary = W>
+            + eredu_runtime::ParallelRoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::Error: std::fmt::Display,
+        W: eredu_runtime::ArchitectureBoundary,
+    {
+        self.visit(prepared)
+    }
 }
 
 /// Backend-generic consumer for an exact composite partition and its paired prediction extension.
@@ -1381,11 +1461,11 @@ fn prepare_composite_partition_banks<G, W: eredu_runtime::ArchitectureBoundary>(
         let local_bank = bank
             .with_partition_geometry(routed.plan.clone(), bank.catalog().clone(), members, layout)
             .map_err(|error| error.to_string())?;
-        let banks = crate::prepared_execution::PreparedPartitionBanks::new(
+        let banks = crate::prepared_execution::PreparedPartitionBanks::prepare(
             execution.bank_residency(),
             std::collections::BTreeMap::from([(id, local_bank)]),
             routed.expert_group.is_some(),
-        );
+        ).map_err(|cause| cause.to_string())?;
         let excluded = banks.addressable_logical_targets();
         tasks.retain(|task| !excluded.contains(task.name()));
         Some(banks)
@@ -1398,7 +1478,9 @@ fn prepare_composite_partition_banks<G, W: eredu_runtime::ArchitectureBoundary>(
 // Keep the typed handoff outside the multi-family constructor's stack frame.
 // Debug builds otherwise reserve a completed admission for every match arm.
 #[inline(never)]
-fn finish_composite_partition<B, S, A, G, W, V>(
+fn finish_composite_partition<B, S, A, G, W, V, F>(
+    source: Option<&crate::prepared_sources::PreparedModelSources>,
+    workspace: Option<crate::prepared_execution::PreparedCompositeModelSource>,
     architecture: A,
     source_architecture: Option<(Box<A>, LocalModelLayout)>,
     selected: SelectedPartitionedAdmission<
@@ -1408,6 +1490,7 @@ fn finish_composite_partition<B, S, A, G, W, V>(
     partition: ArchitecturePartition<G, W>,
     mut details: CompositePartitionDetails,
     visitor: V,
+    visit: F,
 ) -> Result<V::Output, CompositePartitionPreparationError<V::Error>>
 where
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
@@ -1419,6 +1502,7 @@ where
     A::Error: std::fmt::Display,
     W: eredu_runtime::ArchitectureBoundary,
     V: AuthoritativeCompositePartitionVisitor<B, S>,
+    F: FnOnce(V, PreparedCompositePartition<A, G, W>) -> Result<V::Output, V::Error>,
 {
     let banks = prepare_composite_partition_banks(
         &selected,
@@ -1430,8 +1514,33 @@ where
     .map_err(CompositePartitionPreparationError::Architecture)?;
     let prepared = prepare_partitioned::<B, S, _, _, _, _, _>(architecture, selected, partition)
         .map_err(CompositePartitionPreparationError::Architecture)?;
-    visitor
-        .visit(PreparedCompositePartition {
+    let mut executor = PreparedCompositeExecutorPlan::new::<A, B, S, G, W>(
+        &prepared, details.publication, details.routed.clone(),
+    ).map_err(CompositePartitionPreparationError::Architecture)?;
+    if let (Some(source), Some(workspace), Some(state)) = (source, workspace, prepared.selected().partition().state()) {
+        if !crate::replicated_text::config_source::exact_selection(source, prepared.selected().base().execution()) {
+            return Err(CompositePartitionPreparationError::Architecture(
+                "composite workspace source differs from the retained selection".into()));
+        }
+        let rank = prepared.selected().topology();
+        let local_state = prepared.selected().base().execution().state().for_partitioned_geometry(state)
+            .map_err(|cause| CompositePartitionPreparationError::Architecture(cause.to_string()))?;
+        let record = crate::prepared_execution::PreparedDirectPartitionSource::composite(
+            workspace, source.selected().clone(), rank, local_state, state.global_layer_offset(),
+            executor.clone(), std::sync::Arc::new(prepared.selected().composite_execution_plan()
+                .map_err(CompositePartitionPreparationError::Architecture)?),
+            prepared.selected().partition().units().collect(),
+        );
+        let _ = source.construction_semantics().direct_partition.set(record);
+        executor = source.construction_semantics().direct_partition.get().ok_or_else(||
+            CompositePartitionPreparationError::Architecture("composite source publication failed".into()))?
+            .composite_executor(source.selected(), rank)
+            .map_err(CompositePartitionPreparationError::Architecture)?;
+    }
+    visit(
+        visitor,
+        PreparedCompositePartition {
+            executor,
             prepared,
             source_architecture,
             layout: details.layout,
@@ -1441,8 +1550,9 @@ where
             publication: details.publication,
             routed: details.routed,
             banks,
-        })
-        .map_err(CompositePartitionPreparationError::Visitor)
+        },
+    )
+    .map_err(CompositePartitionPreparationError::Visitor)
 }
 
 /// Failure while preparing an already selected composite partition.
@@ -1605,6 +1715,28 @@ fn inkling_gated_execution_plan(
 /// source of family configuration. Routed families additionally retain their
 /// exact localized provider plan in the typed handoff.
 pub fn visit_authoritative_composite_partition<B, S, V>(
+    selected: SelectedPartitionedAdmission<SelectedCompositeTextRealization, CompositeTextRequirements>,
+    context: &<B::Tensor as Tensor>::Context, visitor: V,
+) -> Result<V::Output, CompositePartitionPreparationError<V::Error>>
+where B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + AuxiliaryConvolutionState<B::Tensor>,
+    V: AuthoritativeCompositePartitionVisitor<B, S>,
+{ visit_authoritative_composite_partition_impl::<B,S,V>(None, selected, context, visitor) }
+
+pub(crate) fn visit_authoritative_composite_partition_with_source<B, S, V>(
+    source: &crate::prepared_sources::PreparedModelSources,
+    selected: SelectedPartitionedAdmission<SelectedCompositeTextRealization, CompositeTextRequirements>,
+    context: &<B::Tensor as Tensor>::Context, visitor: V,
+) -> Result<V::Output, CompositePartitionPreparationError<V::Error>>
+where B: eredu_nn::TensorParallelGroupedNeuralBackend + eredu_nn::DistributedNeuralBackend,
+    S: eredu_runtime::LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor> + RuntimeStateComponents<B> + AuxiliaryConvolutionState<B::Tensor>,
+    V: AuthoritativeCompositePartitionVisitor<B, S>,
+{ visit_authoritative_composite_partition_impl::<B,S,V>(Some(source), selected, context, visitor) }
+
+fn visit_authoritative_composite_partition_impl<B, S, V>(
+    source: Option<&crate::prepared_sources::PreparedModelSources>,
     selected: SelectedPartitionedAdmission<
         SelectedCompositeTextRealization,
         CompositeTextRequirements,
@@ -1656,7 +1788,7 @@ where
     })?;
 
     macro_rules! prepare {
-        ($architecture:expr, $parameters:expr, $geometry:expr, $partition_geometry:expr,
+        ($visit:ident, $workspace:expr, $architecture:expr, $parameters:expr, $geometry:expr, $partition_geometry:expr,
          $capability:expr, $effective:expr, $output_width:expr, $foundation:expr,
          $routed:expr $(, $source:expr)?) => {{
             let source_architecture = None$(.or($source))?;
@@ -1695,8 +1827,8 @@ where
             .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
             let publication = crate::partitioned_execution::PublicationValueDescriptor::new($output_width)
                 .map_err(|error| CompositePartitionPreparationError::Architecture(error.to_string()))?;
-            finish_composite_partition::<B, S, _, _, _, _>(
-                architecture, source_architecture, selected, partition,
+            finish_composite_partition::<B, S, _, _, _, _, _>(
+                source, $workspace, architecture, source_architecture, selected, partition,
                 CompositePartitionDetails {
                     layout: $geometry,
                     tasks,
@@ -1704,14 +1836,14 @@ where
                     effective_model_type: $effective,
                     publication,
                     routed: $routed,
-                }, visitor,
+                }, visitor, |visitor: V, prepared| visitor.$visit(prepared),
             )
         }};
     }
 
     match config {
-        CompositeConfig::Gemma4(source) => {
-            let mut exact = source.clone();
+        CompositeConfig::Gemma4(family) => {
+            let mut exact = family.clone();
             if let Some(audio) = exact.audio.as_mut() {
                 audio.output_projection_bias = selected
                     .requirements()
@@ -1828,10 +1960,20 @@ where
                 CompositePartitionPreparationError::Architecture(error.to_string())
             })?;
             let effective = args.effective_model_type().to_owned();
-            let source_architecture =
+            let mut source_architecture =
                 gemma4_transform_source::<B, S>(&exact, &selected, &parameters, &geometry, context)
                     .map_err(CompositePartitionPreparationError::Architecture)?;
+            let workspace = if source.is_some() && !routed {
+                Some(crate::prepared_execution::PreparedCompositeModelSource::Gemma4(
+                    architecture.prepare_source(context).map_err(|cause|
+                        CompositePartitionPreparationError::Architecture(cause.to_string()))?,
+                    source_architecture.as_mut().map(|(value,_)| value.prepare_source(context))
+                        .transpose().map_err(|cause| CompositePartitionPreparationError::Architecture(cause.to_string()))?,
+                ))
+            } else { None };
             prepare!(
+                visit_media,
+                workspace,
                 architecture,
                 parameters,
                 layout,
@@ -1976,6 +2118,8 @@ where
             .map_err(CompositePartitionPreparationError::Architecture)?;
             let effective = args.model_type.clone();
             prepare!(
+                visit_media,
+                None,
                 architecture,
                 parameters,
                 layout,
@@ -2115,6 +2259,8 @@ where
             .map_err(CompositePartitionPreparationError::Architecture)?;
             let effective = args.effective_model_type().to_owned();
             prepare!(
+                visit_media,
+                None,
                 architecture,
                 parameters,
                 layout,
@@ -2249,6 +2395,8 @@ where
             })?;
             let effective = args.text.model_type.clone();
             prepare!(
+                visit_media,
+                None,
                 architecture,
                 parameters,
                 layout,
@@ -2405,6 +2553,8 @@ where
             )
             .map_err(CompositePartitionPreparationError::Architecture)?;
             prepare!(
+                visit_media,
+                None,
                 architecture,
                 parameters,
                 layout,
@@ -3002,9 +3152,13 @@ where
             let prepared =
                 prepare_partitioned::<B, S, _, _, _, _, _>(architecture, selected, partition)
                     .map_err(CompositePartitionPreparationError::Architecture)?;
+            let executor = PreparedCompositeExecutorPlan::new::<_, B, S, _, _>(
+                &prepared, publication, routed.clone(),
+            ).map_err(CompositePartitionPreparationError::Architecture)?;
             visitor
                 .visit(
                     PreparedCompositePartition {
+                        executor,
                         prepared,
                         source_architecture,
                         layout: $layout,

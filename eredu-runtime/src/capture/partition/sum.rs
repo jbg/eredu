@@ -121,29 +121,8 @@ pub(super) fn payload_usage(
     )
 }
 
-#[derive(Default)]
-struct Sum {
-    value: f64,
-    correction: f64,
-}
-impl Sum {
-    fn add(&mut self, value: f64) {
-        let next = self.value + value;
-        if self.value.is_finite() && value.is_finite() {
-            self.correction += if self.value.abs() >= value.abs() {
-                (self.value - next) + value
-            } else {
-                (value - next) + self.value
-            };
-        } else {
-            self.correction = 0.0;
-        }
-        self.value = next;
-    }
-    fn finish(self) -> f64 {
-        self.value + self.correction
-    }
-}
+mod numeric;
+pub(crate) use numeric::{sum_f32_at, summarize_f32, fill_histogram_f32, numeric_control_bytes};
 
 pub(super) fn assemble(
     receipt: &PartitionCaptureReceiptPlan,
@@ -220,17 +199,12 @@ pub(super) fn assemble(
     let emitted = usize::try_from(emitted).map_err(|_| CaptureError::Overflow)?;
     let mut values = Vec::with_capacity(emitted);
     for index in 0..emitted {
-        let mut sum = Sum::default();
-        for fragment in &fragments {
-            let Some(CapturePayload::Tensor(tensor)) = &fragment.record.payload else {
-                unreachable!()
-            };
-            let TensorObservationData::F32(terms) = tensor.data() else {
-                unreachable!()
-            };
-            sum.add(f64::from(terms[index]));
-        }
-        values.push(sum.finish() as f32);
+        let terms = fragments.iter().map(|fragment| {
+            let Some(CapturePayload::Tensor(tensor)) = &fragment.record.payload else { unreachable!() };
+            let TensorObservationData::F32(terms) = tensor.data() else { unreachable!() };
+            terms.as_slice()
+        });
+        values.push(sum_f32_at(terms, index).expect("validated complete F32 terms"));
     }
     let payload = transform(values, &slice.shape, &selection.transform)?;
     let contributions = fragments
@@ -286,42 +260,7 @@ fn transform(
                     .map_err(|error| invalid(&error.to_string()))?,
             )
         }
-        CaptureTransform::Summary => {
-            let mut summary = CaptureSummary {
-                elements: values.len() as u64,
-                finite: 0,
-                non_finite: 0,
-                nan: 0,
-                positive_infinity: 0,
-                negative_infinity: 0,
-                min: None,
-                max: None,
-                mean: None,
-                rms: None,
-            };
-            let mut sum = Sum::default();
-            let mut squares = Sum::default();
-            for value in values {
-                if value.is_finite() {
-                    let value = f64::from(value);
-                    summary.finite += 1;
-                    summary.min = Some(summary.min.map_or(value, |min| min.min(value)));
-                    summary.max = Some(summary.max.map_or(value, |max| max.max(value)));
-                    sum.add(value);
-                    squares.add(value * value);
-                } else {
-                    summary.non_finite += 1;
-                    summary.nan += u64::from(value.is_nan());
-                    summary.positive_infinity += u64::from(value == f32::INFINITY);
-                    summary.negative_infinity += u64::from(value == f32::NEG_INFINITY);
-                }
-            }
-            if summary.finite != 0 {
-                summary.mean = Some(sum.finish() / summary.finite as f64);
-                summary.rms = Some((squares.finish() / summary.finite as f64).sqrt());
-            }
-            CapturePayload::Summary(summary)
-        }
+        CaptureTransform::Summary => CapturePayload::Summary(summarize_f32(&values)),
         CaptureTransform::Histogram { edges } => {
             let mut histogram = CaptureHistogram {
                 edges: edges.clone(),
@@ -330,21 +269,7 @@ fn transform(
                 above: 0,
                 non_finite: 0,
             };
-            for value in values {
-                if !value.is_finite() {
-                    histogram.non_finite += 1;
-                } else if value < edges[0] {
-                    histogram.below += 1;
-                } else if value > *edges.last().expect("admitted histogram") {
-                    histogram.above += 1;
-                } else {
-                    let index = edges
-                        .partition_point(|edge| *edge <= value)
-                        .saturating_sub(1)
-                        .min(histogram.counts.len() - 1);
-                    histogram.counts[index] += 1;
-                }
-            }
+            fill_histogram_f32(&values, &mut histogram).map_err(CaptureError::from)?;
             CapturePayload::Histogram(histogram)
         }
         _ => {

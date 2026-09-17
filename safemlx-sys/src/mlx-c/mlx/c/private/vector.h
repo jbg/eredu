@@ -14,48 +14,48 @@ inline mlx_vector_array mlx_vector_array_new_() {
 }
 
 inline mlx_vector_array mlx_vector_array_new_(
-    const std::vector<mlx::core::array>& s) {
-  return mlx_vector_array({new std::vector<mlx::core::array>(s)});
+    const mlx::core::ArrayVector& s) {
+  return mlx_vector_array({new mlx::core::ArrayVector(s)});
 }
 
 inline mlx_vector_array mlx_vector_array_new_(
-    std::vector<mlx::core::array>&& s) {
-  return mlx_vector_array({new std::vector<mlx::core::array>(std::move(s))});
+    mlx::core::ArrayVector&& s) {
+  return mlx_vector_array({new mlx::core::ArrayVector(std::move(s))});
 }
 
 inline mlx_vector_array& mlx_vector_array_set_(
     mlx_vector_array& d,
-    const std::vector<mlx::core::array>& s) {
+    const mlx::core::ArrayVector& s) {
   if (d.ctx) {
-    *static_cast<std::vector<mlx::core::array>*>(d.ctx) = s;
+    *static_cast<mlx::core::ArrayVector*>(d.ctx) = s;
   } else {
-    d.ctx = new std::vector<mlx::core::array>(s);
+    d.ctx = new mlx::core::ArrayVector(s);
   }
   return d;
 }
 
 inline mlx_vector_array& mlx_vector_array_set_(
     mlx_vector_array& d,
-    std::vector<mlx::core::array>&& s) {
+    mlx::core::ArrayVector&& s) {
   if (d.ctx) {
-    *static_cast<std::vector<mlx::core::array>*>(d.ctx) = std::move(s);
+    *static_cast<mlx::core::ArrayVector*>(d.ctx) = std::move(s);
   } else {
-    d.ctx = new std::vector<mlx::core::array>(std::move(s));
+    d.ctx = new mlx::core::ArrayVector(std::move(s));
   }
   return d;
 }
 
-inline std::vector<mlx::core::array>& mlx_vector_array_get_(
+inline mlx::core::ArrayVector& mlx_vector_array_get_(
     mlx_vector_array d) {
   if (!d.ctx) {
     throw std::runtime_error("expected a non-empty mlx_vector_array");
   }
-  return *static_cast<std::vector<mlx::core::array>*>(d.ctx);
+  return *static_cast<mlx::core::ArrayVector*>(d.ctx);
 }
 
 inline void mlx_vector_array_free_(mlx_vector_array d) {
   if (d.ctx) {
-    delete static_cast<std::vector<mlx::core::array>*>(d.ctx);
+    delete static_cast<mlx::core::ArrayVector*>(d.ctx);
   }
 }
 
@@ -64,51 +64,51 @@ inline mlx_vector_vector_array mlx_vector_vector_array_new_() {
 }
 
 inline mlx_vector_vector_array mlx_vector_vector_array_new_(
-    const std::vector<std::vector<mlx::core::array>>& s) {
+    const std::vector<mlx::core::ArrayVector>& s) {
   return mlx_vector_vector_array(
-      {new std::vector<std::vector<mlx::core::array>>(s)});
+      {new std::vector<mlx::core::ArrayVector>(s)});
 }
 
 inline mlx_vector_vector_array mlx_vector_vector_array_new_(
-    std::vector<std::vector<mlx::core::array>>&& s) {
+    std::vector<mlx::core::ArrayVector>&& s) {
   return mlx_vector_vector_array(
-      {new std::vector<std::vector<mlx::core::array>>(std::move(s))});
+      {new std::vector<mlx::core::ArrayVector>(std::move(s))});
 }
 
 inline mlx_vector_vector_array& mlx_vector_vector_array_set_(
     mlx_vector_vector_array& d,
-    const std::vector<std::vector<mlx::core::array>>& s) {
+    const std::vector<mlx::core::ArrayVector>& s) {
   if (d.ctx) {
-    *static_cast<std::vector<std::vector<mlx::core::array>>*>(d.ctx) = s;
+    *static_cast<std::vector<mlx::core::ArrayVector>*>(d.ctx) = s;
   } else {
-    d.ctx = new std::vector<std::vector<mlx::core::array>>(s);
+    d.ctx = new std::vector<mlx::core::ArrayVector>(s);
   }
   return d;
 }
 
 inline mlx_vector_vector_array& mlx_vector_vector_array_set_(
     mlx_vector_vector_array& d,
-    std::vector<std::vector<mlx::core::array>>&& s) {
+    std::vector<mlx::core::ArrayVector>&& s) {
   if (d.ctx) {
-    *static_cast<std::vector<std::vector<mlx::core::array>>*>(d.ctx) =
+    *static_cast<std::vector<mlx::core::ArrayVector>*>(d.ctx) =
         std::move(s);
   } else {
-    d.ctx = new std::vector<std::vector<mlx::core::array>>(std::move(s));
+    d.ctx = new std::vector<mlx::core::ArrayVector>(std::move(s));
   }
   return d;
 }
 
-inline std::vector<std::vector<mlx::core::array>>& mlx_vector_vector_array_get_(
+inline std::vector<mlx::core::ArrayVector>& mlx_vector_vector_array_get_(
     mlx_vector_vector_array d) {
   if (!d.ctx) {
     throw std::runtime_error("expected a non-empty mlx_vector_vector_array");
   }
-  return *static_cast<std::vector<std::vector<mlx::core::array>>*>(d.ctx);
+  return *static_cast<std::vector<mlx::core::ArrayVector>*>(d.ctx);
 }
 
 inline void mlx_vector_vector_array_free_(mlx_vector_vector_array d) {
   if (d.ctx) {
-    delete static_cast<std::vector<std::vector<mlx::core::array>>*>(d.ctx);
+    delete static_cast<std::vector<mlx::core::ArrayVector>*>(d.ctx);
   }
 }
 

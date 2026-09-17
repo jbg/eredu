@@ -20,7 +20,7 @@ fn ring_logical_world_collectives_preserve_order_across_independent_branches() {
     );
 }
 
-fn run_subgroup_workers(world: usize, worker: &str, worker_rank: &str) {
+pub(super) fn run_subgroup_workers(world: usize, worker: &str, worker_rank: &str) {
     assert!(distributed::is_available(Backend::Ring));
     let sockets = (0..world)
         .map(|_| TcpListener::bind(("127.0.0.1", 0)).unwrap())

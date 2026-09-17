@@ -309,3 +309,227 @@ The external Gemma CPU regression forces a child token, applies conflicting targ
 and draft logits, observes rejection, replays the edited child, then verifies the
 unedited parent still reproduces its original suffix after checkpoint files have
 been removed.
+
+Captured original admission separates cumulative frame/tensor H, newly registered
+source S, span-record/neutral-control P and native-control Q=A+C+W. The same actual
+SpanPlan attachment protects P+Q, while its compact guard follows native work and
+historical quote objects without retaining full numerical diagnostics. Added
+native tests check exact/-1 admission across resident/host/disk, source/plan
+binding, historical and certified-work alias lifetime, and a producing work alias
+from real controlled capture. Selected-prefill opening inventory and native span
+activation remain separate required work; no managed gate changes here. Raw and
+bound hooks may have distinct host-control costs despite numerical parity.
+
+The LFM2/LFM2-MoE row companion is bound through the actual prepared catalog,
+retained target paths and exact accepted source identity. For three target units
+it declares 22 real outer/embedding/readout hooks. Neutral numerical fixtures
+compare every declared nonzero value across a cached two-token prefix, an uneven
+2/1/2-token continuation and three further decodes, checking all convolution and
+KV tensors plus absent state domains after each chunk. Width-one uses no history
+slot; missing history for wider kernels still fails. Source tests include Full
+and zero Preview, reject equal-but-independent admissions, and reject internal
+hooks without causal proof. Physical readout tests separately preserve all body
+rows under StateOnly and LastPosition. These are staged conformance tests, not
+native or released-checkpoint validation results. Nemotron-H ordinary target row
+declarations remain an implementation task requiring its own complete Mamba,
+attention, dense/routed and MTP-boundary audit and tests; no inherent noncausal
+restriction has been established.
+
+### Nemotron-H declared target rows
+
+Nemotron-H target declarations retain actual `model.layers` invocation paths through the shared ordinary helper: embedding and each outer input/output pair (including effective observations), five readout-input hooks and three vocabulary-score hooks. Four-unit fixtures therefore declare 26 points. The actual prepared discovery/source and immutable path token bind each selected point; a separate equal-valued admission is rejected. Internal attention channels and MTP paths do not gain row-assembly declarations. Preview(0) still binds the same declaration and physical readout requirement.
+
+The numerical fixture collects genuine callbacks; it never synthesizes effective companions. It checks full output/state equivalence after a cached two-token prefix, a five-token continuation split 2/1/2 and three further decodes across mixed/homogeneous Mamba, attention, dense and MoE schedules. Complete convolution/recurrent/KV values and absent fields are checked, including width-one history absence and target/MTP state separation. The prepared TP/PP matrix additionally compares all 18 body callbacks on their actual owners and ordinary final predictions for stateless-leading dense/routed schedules. The scalar selective scan validates recurrence semantics but is not evidence for a concrete accelerator's scan-block rounding, and no native/reference-checkpoint execution is asserted by this source-only increment.
+
+Original capture preparation can seal a same-key finite storage-publication schedule after the exact C publication layout. Its S contribution sums all row buffers/registration/node/output peaks and retained stamp controls because rows can escape together. It joins the original P+Q hold once; physical C and newly adopted backing capacities remain separate. Individual published owners and canonical fixed nodes retain raw original custody through ordinary alias escape. The bounded path does not allocate the outer namespace and has no raw-registration export. Native attachment growth, provider key payloads and complete opening-source collection remain distinct measured obligations; ordinary registry metadata retains its existing accounting classification.
+
+### Muse-Glimmer prepared text evidence
+
+Muse ordinary text now binds actual prepared source identity and retained composite path identity to eighteen real outer/embedding/readout points in the two-layer conformance fixture. Five tests include twelve dense/routed, fixed default/linear/YaRN, tied/untied full-versus-chunk cases after a cached prefix, complete intermediate KV contents, and three repeated decodes. The observer requires actual effective callbacks and preserves the enclosing post-softcap logits publication. Full and Preview(0) retain the same physical readout requirement; Preview(0) does not erase source/factory work. Vision projector/assembly discovery and external assistant availability are unchanged. This source increment does not claim native gate activation, released-checkpoint validation or media/proposal causal equivalence.
+
+### DeepSeek V3 target-row conformance
+
+The V3 ordinary row companion uses actual prepared discovery and retained path identity. Nonzero neutral fixtures cover sixteen dense-prefix/routed, direct/low-rank-query, fixed/YaRN and resident/blockwise compressed-attention configurations. Before any observation path or state is created, the fixture compares every actual parameter name and shape with the architecture parameter description and verifies nonzero finite values. Full-versus-uneven rows and complete mutable compressed state use the existing absolute 2e-4 numerical tolerance; all effective observations must arrive from real traversal callbacks. Full and Preview(0) source binding preserve the original physical readout requirement and reject independent owners or undeclared internal hooks. This increment is causal-row evidence, not released-checkpoint validation, native activation, MTP/proposal or intervention support, or new partition admission.
+
+
+V4 ordinary target prefill selection now binds actual declared target boundaries
+and readout stream-collapse hooks to the retained discovery catalogue and path
+owner. Equal independent sources/path owners reject, and Preview(0) still needs
+the same physical readout demand. The new neutral fixture checks nonzero local
+keys, pending compressor values/gates, pooled values, overlap values/gates and
+all cursors at uneven frontiers, including a ratio-128 window completed after a
+126-token prefix. Its per-call attention_local_tokens field is checked against
+the actual preceding local width plus input width; both saved states execute
+the same next decode to prove that scratch width does not alter continuation.
+No state payload is seeded, no callback alias is synthesized, and no cumulative
+capture accounting, snapshot refund or native activation policy is changed.
+
+### Kimi Linear prepared row/source evidence
+
+Kimi Linear supplies an architecture-issued ordinary causal companion for its
+actual target-group paths and shared readout hooks. The cold conformance fixture
+prepares genuine artifact sources and discovery, then binds every one of the
+eighteen declared points to that exact retained path owner. Full and Preview(0)
+selections preserve original source identity and physical readout requirements;
+equal but independently prepared owners reject with `Identity`, undeclared
+internal component hooks reject with `Undeclared`, and insufficient readout demand
+rejects with `Readout`. Six dense/routed fixed/compressed/mixed source cases assert
+that binding performs no physical source reads. Preview(0) does not erase the
+existing generated-value policy or imply a host-accounting exemption.
+
+The paired equation cases collect actual original and effective callbacks from
+prepared traversal and actual readout execution; final model.logits uses the
+existing enclosing publication callback. They do not synthesize effective values.
+All mutable state, including the KDA q/k/v histories and matrix and MLA's latent
+and unrotated positional channels, is compared, and nonzero checks use actual
+loaded parameter slots rather than seeded cache buffers. Kernel-one state has
+only the recurrent role. No native collector, original admission, managed gateway
+or source-publication gate is opened by this family declaration. Seven tests are
+staged for central execution; released-checkpoint and native evidence is unchanged.
+
+
+Original prepared selected fixed/compressed owners now supply their actual
+ordinary row semantics for LFM2, Nemotron-H, Qwen hybrid and dense DeepSeek V3.
+The same prepared path owner binds discovery, exact capture source and physical
+readout: body hooks preserve the requested demand; readout inputs/vocabulary
+hooks require Sequence, including Preview(0). Internal hook availability is a
+separate family fact; Kimi's fixed/compressed row equivalence is now an explicit
+adapter opt-in contingent on central validation of direct and selected tests. Declaration
+Vec/String construction remains under original loading/preparation; retained
+path capacity uses the existing actual-owner measurement. This adds no per-model
+control field, new hold, native publication or capture activation.
+
+### LFM2 NoState/profile consistency
+
+The width-one LFM2 equation now agrees with its declared NoState geometry through
+the actual selected stateless and attention-only shells. It neither acquires an
+absent Convolution role nor advances a nonexistent fixed frontier. Both LFM2
+forward owners derive masks from the actual attention policy inside the local
+invocation segment, preserving source/path identity and original physical
+readout requirements. No new public semantic fact or native grant is added.
+
+New neutral tests use actual prepared checkpoint/session and partition ownership.
+They compare nonzero callbacks and cached predictions across leading/trailing
+stateless cuts; existing direct tests assert zero NoState position and compare
+all persistent KV/convolution payloads. Wider-kernel missing-role assertions remain
+unchanged. These source-only regressions await central execution and make no
+new native, released-checkpoint or managed-admission claim.
+
+### Gemma4 direct causal target selection
+
+Gemma4 now declares the ordinary target's actual `model.language_model.layers.*` boundaries and shared embedding/readout paths, with the existing cold causal-row companion. Four text layers contribute 26 declarations; the eight-layer boundary fixture contributes 42. Prepared-source tests bind every declared path under Full and Preview(0), reject independent source/path identities and down-binding of physical readout demand, and verify no additional checkpoint reads. Internal attention/media/merge paths are not inferred from axis names.
+
+The staged direct fixtures compare all declared real callbacks and complete state for dense/sparse, separate/key-as-value, per-layer-input, tied-head and supported partial-rotary variations. Eighteen prepared resident/host/disk TP/PP worlds exercise actual shared-KV receivers and early/shared pipeline cuts. The existing partition session observes complete model.logits and internal readout rows under Sequence demand, then selects the public last-position return. These boundary trials compare every observed row and separately verify the selected public output; they do not claim partition capture admission. Focused rejection tests cover missing publication and a consumer history preceding its submission. Receiver-frontier rejection remains enforced by the existing production check, with numerical receiver ownership covered at every successful boundary; this package adds no direct injected receiver-error test. No source-staged result is an executed native or released-checkpoint result.
+
+### Gemma4 sliding mask regression scope
+
+The Gemma4 history correction leaves the ordinary group-2 causal declarations and all real observation callbacks unchanged. Existing full-versus-chunk comparisons still cover every declared row, complete persistent publisher/receiver state and invocation-local attention history, with exact same-next-decode equality. No observation is synthesized and no state assertion is removed.
+
+New focused tests distinguish contiguous native-style retained tails from cache-owned shared-consumer requests; an uncached publisher/consumer case verifies causal prefix equivalence and window exclusion while honoring explicit rotary embeddings. Explicit caller masks remain outside the ordinary causal declaration but keep their existing execution behavior. Prepared workspace traversal is checked against the actual sliding descriptor and the unchanged full-attention descriptor. No public capture, conditional/media, speculative or partition admission is enabled by this correction.
+
+
+The selected Kimi successor binds all eighteen actual outer/effective/readout
+rows to the session's original prepared source and path owner. Full and
+Preview(0) retain exact source identity; equal-content foreign capture sources
+reject. BeforeReadout points preserve requested StateOnly/LastPosition output,
+while readout-input and vocabulary points require physical Sequence. Actual
+callbacks, including effective companions, are collected from shared traversal;
+no alias is manufactured. Complete prefix/continuation/decode state and cached
+outputs compare across original prepared resident/host/disk executions.
+
+Routed and MTP rejection tests preserve the existing selected constructor policy.
+The new architecture fact does not provide native inventory, original funding,
+partition binding or managed activation. Four selected tests/168 prepared-session
+constructions are staged for central execution, with the direct71 proof an
+explicit prerequisite rather than a reported result.
+
+
+Inkling's ordinary target declaration binds its actual group-2 outer/effective
+paths and shared readout points, plus the real read-only `readout.scaled` source.
+Full and Preview(0) selections retain exact prepared capture/path identity;
+equal-content foreign owners reject. BeforeReadout points preserve the original
+requested output, while coupled readout/vocabulary points require Sequence.
+Internal attention observations, media assembly and prediction points are not
+authorized by these outer-row declarations. No effective callback is fabricated.
+
+The source package stages eight tests covering nonzero complete state and real
+callbacks, kernel-one state geometry, original-source binding, direct/prepared
+parity, body demand and TP/PP/residency behavior. The cold binding fixture retains
+its exact admitted four-position origin; numerical continuation uses a separate
+real two-token prefix. The latter's full per-call state proof uses the existing
+neutral typed-session snapshot seam, not a new inspection/funding authority.
+Generic cache-owned relative attention is not silently substituted for the
+resident/sliding fixture. No native opening, grant, gate or controller activation
+is added, and no execution result is asserted by this staged documentation.
+
+
+The Qwen shared width-one correction preserves the existing direct and selected
+causal row contracts: only the absent convolution history slot is omitted, while
+the recurrent matrix stays populated and advances. Nonzero neutral fixtures add
+all-row direct and selected comparisons, original prepared-source/readout checks,
+body-only readout, cached continuations and rank-local state comparisons. The
+conditional and MTP regressions exercise their real owners without adding new
+declarations; media, conditional row binding and native capture activation remain
+separate joins. Staged tests have not yet been executed.
+
+
+Zero mRoPE sections preserve the original three-axis Qwen3-VL coordinate mapping:
+secondary sections with no frequencies perform no overwrite, while the first
+axis remains the fallback even when its declared section is zero. The full
+positive rotary width still determines native frequency and cold host storage.
+Explicit distinct-axis scalar oracles, tensor parity, HF/GGUF rejection cases,
+cold allocation comparisons, and a gated native measurement test cover this
+validation correction. Source-only preparation does not establish conditional
+row causality, native readiness, or capture gate activation.
+
+
+Conditional Qwen causal selection is restricted to the original ordinary-text
+origin and exact prepared path owner. All 18 real outer hooks for a two-target-unit
+fixture are compared, including effective companions and readout extras.
+BeforeReadout selections retain selective readout; readout rows require physical
+Sequence output. Zero Preview still binds the same declaration. Foreign source
+owners, live foreign runtime tokens, invalidated tokens, changed cached origins
+and invocation-only admission reject. Media-required catalog points, modality
+merge and prediction units remain outside this ordinary-text declaration.
+Complete state checks include KV values/offsets/windows, convolution and recurrent
+roles, fixed cursors and the VL Int32 PositionDelta. Kernel-one history and zero
+mRoPE section behavior rely on the separately staged correction packages;
+central numerical validation remains pending.
+
+### Cold native record fact for future original-span activation
+
+The MLX accepted-record observation distinguishes an empty live child scope
+from a record awaiting its existing terminal transition, including records in
+durable descendants after an outer scope was sealed. It reads no tensor or
+collector inventory and performs no progress, retirement or housekeeping.
+Quiescence does not establish that retained allocations are gone or that all
+opening sources were collected. Sticky failure/blocked and unavailable states
+cannot authorize reuse.
+
+This native-only prerequisite does not wire the remaining-span account marker,
+change capture selection or budgets, supply a second grant, or turn a canonical
+chunk ticket into general native completion. Original scope association, exact
+opening publication, actual remaining-account checks and scope-control quote
+composition remain separate obligations of the eventual joined caller.
+
+## Moshi selected frame observations
+
+The selected Moshi numerical frame fixture records the actual `temporal.input`,
+two temporal layer outputs, `text_linear.logits`, every executed depth-slice
+logit, and separate final `model.logits` callback. Nonzero batch-one/batch-two
+values and a changed-source logit counterexample supplement exact comparisons
+between ordinary and bounded scheduler driving. Fully forced diagnostics-off
+depth tails retain their existing skip behavior; diagnostics-on tails execute
+and expose their actual depth logits. Their temporal state, decisions and delayed
+history remain equal, while skipped depth caches stay empty after each reset.
+
+This is canonical frame conformance with the existing scalar numerical backend,
+not an independent released-model oracle or an ordinary packed-prompt causal
+declaration. Original bounded capture accounting, callback intervention, exact
+native pending-resource lifetime, true bounded weight residency and distributed
+frame proof remain outside this first unit. Central execution is required before
+recording these added tests as validated.
+
+### Selected Moshi residency fixture scope
+
+Three additional selected Moshi frame tests compare actual resident, host-payload and disk-recipe construction in 33 numerical sessions. They preserve complete temporal/depth snapshots, delayed coordinate history, observed logits, public outputs and terminal failure state. A single live unit and exact eviction order are checked; host execution adds no source reads and every disk reload increases actual physical read counters. Pinned static modules remain bound. The earlier resident-only scope is extended for these scalar fixtures; TP/PP, PersonaPlex, released-checkpoint/native proof and original finite frame admission remain separate unfinished work.

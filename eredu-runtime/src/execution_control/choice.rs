@@ -1,7 +1,19 @@
 //! One prospective canonical choice through the existing ordinary sampler.
 use super::SnapshotTokenController;
 use crate::TokenDomain;
-use eredu_core::{TokenFilter, TokenFilterController};
+mod grammar;
+pub(crate) use grammar::GrammarChoiceIdentity;
+pub use grammar::{PreparedGrammarChoice, PreparedGrammarChoiceCause, PreparedGrammarChoiceError};
+mod prepared;
+pub(crate) use prepared::ControllerChoiceIdentity;
+pub use prepared::{PreparedControllerCause, PreparedControllerDecision, PreparedControllerSource};
+mod forbidden;
+pub(crate) use forbidden::ForbiddenChoiceIdentity;
+pub use forbidden::PreparedForbiddenDecision;
+mod plain;
+use eredu_core::{TextFilterWorkspace, TokenFilter, TokenFilterController};
+pub(crate) use plain::PlainChoiceIdentity;
+pub use plain::PreparedPlainDecision;
 
 /// Rejected canonical choice or error from the original grammar controller.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +55,30 @@ pub struct TokenChoiceController<C> {
 }
 
 impl<C: TokenFilterController> TokenChoiceController<C> {
+    fn check_commit_token<E: std::error::Error + 'static>(
+        &self,
+        token: u32,
+    ) -> Result<(), TokenChoiceError<E>> {
+        if let Some(expected) = self.pending {
+            if expected != token {
+                return Err(TokenChoiceError::UnexpectedCommit {
+                    expected,
+                    actual: token,
+                });
+            }
+        }
+        Ok(())
+    }
+    fn commit_with<E: std::error::Error + 'static>(
+        &mut self,
+        token: u32,
+        commit: impl FnOnce(&mut C, u32) -> Result<(), E>,
+    ) -> Result<(), TokenChoiceError<E>> {
+        self.check_commit_token(token)?;
+        commit(&mut self.inner, token).map_err(TokenChoiceError::Constraint)?;
+        self.last_forced = self.pending.take().is_some();
+        Ok(())
+    }
     /// Wraps the existing grammar with the canonical tokenizer vocabulary domain.
     pub fn new(inner: C, domain: TokenDomain) -> Self {
         Self {
@@ -56,18 +92,29 @@ impl<C: TokenFilterController> TokenChoiceController<C> {
     /// Stages a choice after checking vocabulary and the current active grammar.
     /// No token is committed and no sampler/RNG or model state advances here.
     pub fn force_next(&mut self, token: u32) -> Result<(), TokenChoiceError<C::Error>> {
-        if self.pending.is_some() {
+        Self::validate_forced_choice(self.pending, self.domain, token, || {
+            self.inner
+                .current_filter()
+                .map(|filter| filter.allows(token))
+        })?;
+        self.pending = Some(token);
+        Ok(())
+    }
+    fn validate_forced_choice<E: std::error::Error + 'static>(
+        pending: Option<u32>,
+        domain: TokenDomain,
+        token: u32,
+        allows: impl FnOnce() -> Result<bool, E>,
+    ) -> Result<(), TokenChoiceError<E>> {
+        if pending.is_some() {
             return Err(TokenChoiceError::AlreadyPending);
         }
-        if token as usize >= self.domain.cardinality() {
+        if token as usize >= domain.cardinality() {
             return Err(TokenChoiceError::InvalidToken(token));
         }
-        let filter = self
-            .inner
-            .current_filter()
-            .map_err(TokenChoiceError::Constraint)?;
-        Self::check_filter(&filter, token)?;
-        self.pending = Some(token);
+        if !allows().map_err(TokenChoiceError::Constraint)? {
+            return Err(TokenChoiceError::Forbidden(token));
+        }
         Ok(())
     }
     /// Stages the same one-token choice at a speculative absolute position.
@@ -130,6 +177,54 @@ impl<C: TokenFilterController> TokenChoiceController<C> {
 }
 impl<C: TokenFilterController> TokenFilterController for TokenChoiceController<C> {
     type Error = TokenChoiceError<C::Error>;
+
+    fn inference_workspace(
+        &self,
+        max_output_tokens: u64,
+    ) -> Option<eredu_core::TextControllerWorkspace<'_>> {
+        let mut workspace = self.inner.inference_workspace(max_output_tokens)?;
+        let original = workspace.filter.mask_capacity_bytes().ok()?;
+        match workspace.filter {
+            TextFilterWorkspace::Exact(TokenFilter::Allowed(_)) => {}
+            TextFilterWorkspace::Exact(TokenFilter::All)
+            | TextFilterWorkspace::OptionalMask { .. } => {
+                // No bits are constructed or controller callbacks invoked here.
+                // A forced All decision uses the canonical domain length; an
+                // already masked decision retains its own logical length.
+                let positions = match workspace.filter {
+                    TextFilterWorkspace::OptionalMask {
+                        max_mask_positions, ..
+                    } => max_mask_positions.max(self.domain.cardinality()),
+                    _ => self.domain.cardinality(),
+                };
+                let bytes = u64::try_from(positions)
+                    .ok()?
+                    .checked_mul(std::mem::size_of::<bool>() as u64)?;
+                workspace.filter = TextFilterWorkspace::OptionalMask {
+                    max_mask_positions: positions,
+                    mask_capacity_bytes: original.max(bytes),
+                };
+                workspace.filter.mask_capacity_bytes().ok()?;
+            }
+        }
+        // Sampling prices the final mask. A forced decision also retains the
+        // original mask while constructing its replacement. Nested wrappers
+        // preserve that overlap even if an older observation mask is retained.
+        workspace.additional_host_bytes = workspace.additional_host_bytes.checked_add(original)?;
+        workspace
+            .filter
+            .mask_capacity_bytes()
+            .ok()?
+            .checked_add(workspace.additional_host_bytes)?;
+        Some(workspace)
+    }
+
+    fn inference_storage(&self) -> eredu_core::TextControllerStorage<'_> {
+        // Choice state is scalar metadata. Its owned replacement masks retire
+        // with the emitted decisions; shared source owners remain the inner's.
+        self.inner.inference_storage()
+    }
+
     fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
         let filter = self
             .inner
@@ -154,19 +249,7 @@ impl<C: TokenFilterController> TokenFilterController for TokenChoiceController<C
         Ok(decision)
     }
     fn commit_token(&mut self, token: u32) -> Result<(), Self::Error> {
-        if let Some(expected) = self.pending {
-            if expected != token {
-                return Err(TokenChoiceError::UnexpectedCommit {
-                    expected,
-                    actual: token,
-                });
-            }
-        }
-        self.inner
-            .commit_token(token)
-            .map_err(TokenChoiceError::Constraint)?;
-        self.last_forced = self.pending.take().is_some();
-        Ok(())
+        self.commit_with(token, |inner, token| inner.commit_token(token))
     }
     fn is_complete(&mut self) -> Result<bool, Self::Error> {
         self.inner
@@ -194,6 +277,23 @@ impl<C: SnapshotTokenController> SnapshotTokenController for TokenChoiceControll
 impl<C: eredu_core::SpeculativeTokenFilterController> eredu_core::SpeculativeTokenFilterController
     for TokenChoiceController<C>
 {
+    type PreparedGrammar = C::PreparedGrammar;
+    fn prepared_grammar(&self) -> Option<&Self::PreparedGrammar> { self.inner.prepared_grammar() }
+    fn prepared_grammar_replacement_bytes(&self) -> Option<usize> {
+        self.inner.prepared_grammar_replacement_bytes()?.checked_add(
+            eredu_core::speculative::PreparedGrammarInstallError::<Self::PreparedGrammar>::wrapper_control_bytes::<Self>()?)
+    }
+    fn replace_prepared_grammar(
+        &self, grammar: Self::PreparedGrammar, funding: &eredu_core::HostMetadataFunding,
+    ) -> Result<Self, eredu_core::speculative::PreparedGrammarInstallError<Self::PreparedGrammar>> {
+        let reserve = eredu_core::speculative::PreparedGrammarInstallError::<Self::PreparedGrammar>::wrapper_control_bytes::<Self>()
+            .ok_or(eredu_core::HostMetadataFundingError::Overflow).and_then(|n| funding.reserve_metadata(n));
+        if let Err(cause) = reserve {
+            return Err(eredu_core::speculative::PreparedGrammarInstallError::new(cause.into(), grammar, funding));
+        }
+        Ok(Self { inner: self.inner.replace_prepared_grammar(grammar, funding)?, domain: self.domain,
+            pending: self.pending, last_forced: self.last_forced, pending_position: self.pending_position })
+    }
     fn control_snapshot_bytes(&self) -> Option<u64> {
         self.inner
             .control_snapshot_bytes()?
@@ -261,7 +361,216 @@ impl<C: eredu_core::SpeculativeTokenFilterController> eredu_core::SpeculativeTok
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::convert::Infallible;
+    use eredu_core::{SharedTokenFilter, TextControllerContract, TextControllerStorage};
+    use std::{cell::Cell, convert::Infallible};
+
+    #[derive(Clone)]
+    struct BoundedFilter {
+        filter: SharedTokenFilter,
+        extra: u64,
+        calls: Cell<usize>,
+    }
+
+    impl BoundedFilter {
+        fn new(filter: TokenFilter) -> Self {
+            let filter = SharedTokenFilter::new(filter);
+            Self {
+                extra: filter.capacity_bytes().unwrap(),
+                filter,
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl TokenFilterController for BoundedFilter {
+        type Error = Infallible;
+
+        fn inference_workspace(&self, _: u64) -> Option<eredu_core::TextControllerWorkspace<'_>> {
+            Some(eredu_core::TextControllerWorkspace {
+                filter: self.filter.as_ref().into(),
+                additional_host_bytes: self.extra,
+            })
+        }
+
+        fn inference_storage(&self) -> TextControllerStorage<'_> {
+            TextControllerStorage::RunOwnedWithSharedFilters(std::slice::from_ref(&self.filter))
+        }
+
+        fn current_filter(&mut self) -> Result<TokenFilter, Self::Error> {
+            self.calls.set(self.calls.get() + 1);
+            Ok(self.filter.as_ref().clone())
+        }
+
+        fn current_decision(
+            &mut self,
+        ) -> Result<eredu_core::TokenSamplingDecision<'_>, Self::Error> {
+            Ok(
+                eredu_core::TokenSamplingDecision::new(self.current_filter()?)
+                    .with_shared_tokenizer_validity(&self.filter),
+            )
+        }
+
+        fn commit_token(&mut self, _: u32) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn is_complete(&mut self) -> Result<bool, Self::Error> {
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn cold_choice_quote_covers_original_and_forced_masks_without_querying_controller() {
+        let mut mask = Vec::with_capacity(11);
+        mask.extend([true, false, true, true]);
+        let inner = BoundedFilter::new(TokenFilter::allowed(mask).unwrap());
+        let shared = inner.filter.clone();
+        let mut choices = TokenChoiceController::new(inner, TokenDomain::new(4));
+        let workspace = choices.inference_workspace(2).unwrap();
+        assert_eq!(
+            workspace.additional_host_bytes,
+            2 * shared.capacity_bytes().unwrap()
+        );
+        let contract = TextControllerContract::from_workspace(workspace, 4).unwrap();
+        assert_eq!(choices.inner().calls.get(), 0);
+        let TextControllerStorage::RunOwnedWithSharedFilters(filters) = choices.inference_storage()
+        else {
+            panic!("choice wrapper lost shared storage");
+        };
+        assert_eq!(filters.len(), 1);
+        assert!(filters[0].same_storage(&shared));
+        contract
+            .validate_decision(&choices.current_decision().unwrap())
+            .unwrap();
+        choices.force_next(2).unwrap();
+        let decision = choices.current_decision().unwrap();
+        contract.validate_decision(&decision).unwrap();
+        assert!(
+            decision
+                .shared_tokenizer_validity()
+                .unwrap()
+                .same_storage(&shared)
+        );
+        assert_eq!(
+            decision.filter().allowed_mask(),
+            Some(&[false, false, true, false][..])
+        );
+        assert!(decision.capture_domain().unwrap().filter.allows(3));
+        drop(decision);
+        choices.commit_token(2).unwrap();
+        contract
+            .validate_decision(&choices.current_decision().unwrap())
+            .unwrap();
+        assert!(choices.current_filter().unwrap().allows(3));
+    }
+
+    #[test]
+    fn choice_quote_preserves_unknown_and_overflow() {
+        let unknown = TokenChoiceController::new(Grammar(vec![]), TokenDomain::new(4));
+        assert!(unknown.inference_workspace(2).is_none());
+        assert!(matches!(
+            unknown.inference_storage(),
+            TextControllerStorage::Unknown
+        ));
+
+        let mut bounded = BoundedFilter::new(TokenFilter::allowed(vec![true; 4]).unwrap());
+        bounded.extra = u64::MAX;
+        let choices = TokenChoiceController::new(bounded, TokenDomain::new(4));
+        assert!(choices.inference_workspace(2).is_none());
+        assert_eq!(choices.inner().calls.get(), 0);
+    }
+
+    #[test]
+    fn unfiltered_choices_keep_decision_semantics_without_a_synthetic_cold_mask() {
+        let mut choices =
+            TokenChoiceController::new(BoundedFilter::new(TokenFilter::All), TokenDomain::new(4));
+        let workspace = choices.inference_workspace(2).unwrap();
+        assert!(matches!(
+            workspace.filter,
+            TextFilterWorkspace::OptionalMask {
+                max_mask_positions: 4,
+                mask_capacity_bytes: 4,
+            }
+        ));
+        assert_eq!(workspace.additional_host_bytes, 0);
+        let contract = TextControllerContract::from_workspace(workspace, 8).unwrap();
+        assert_eq!(choices.inner().calls.get(), 0);
+        assert_eq!(choices.current_filter().unwrap(), TokenFilter::All);
+        let unforced = choices.current_decision().unwrap();
+        contract.validate_decision(&unforced).unwrap();
+        assert!(unforced.filter().allows(7));
+        drop(unforced);
+        choices.force_next(3).unwrap();
+        let calls = choices.inner().calls.get();
+        assert!(choices.inference_workspace(2).is_some());
+        assert_eq!(choices.inner().calls.get(), calls);
+        let decision = choices.current_decision().unwrap();
+        contract.validate_decision(&decision).unwrap();
+        assert_eq!(
+            decision.filter().allowed_mask(),
+            Some(&[false, false, false, true][..])
+        );
+        assert!(matches!(
+            decision.capture_domain().unwrap().filter,
+            eredu_core::capture::CaptureTokenFilter::Fixed(TokenFilter::All)
+        ));
+        drop(decision);
+        choices.commit_token(3).unwrap();
+        assert_eq!(choices.current_filter().unwrap(), TokenFilter::All);
+        contract
+            .validate_decision(&choices.current_decision().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn nested_optional_choice_quotes_cover_both_domain_lengths_and_mask_overlap() {
+        for (inner_width, outer_width) in [(4, 8), (8, 4)] {
+            let inner = TokenChoiceController::new(
+                BoundedFilter::new(TokenFilter::All),
+                TokenDomain::new(inner_width),
+            );
+            let mut choices = TokenChoiceController::new(inner, TokenDomain::new(outer_width));
+            let workspace = choices.inference_workspace(3).unwrap();
+            assert!(matches!(
+                workspace.filter,
+                TextFilterWorkspace::OptionalMask {
+                    max_mask_positions: 8,
+                    mask_capacity_bytes: 8,
+                }
+            ));
+            assert_eq!(workspace.additional_host_bytes, inner_width as u64);
+            assert_eq!(choices.inner().inner().calls.get(), 0);
+            let contract = TextControllerContract::from_workspace(workspace, 8).unwrap();
+            contract
+                .validate_decision(&choices.current_decision().unwrap())
+                .unwrap();
+            choices.force_next(2).unwrap();
+            let decision = choices.current_decision().unwrap();
+            assert_eq!(decision.filter().allowed_mask().unwrap().len(), outer_width);
+            contract.validate_decision(&decision).unwrap();
+            drop(decision);
+            choices.commit_token(2).unwrap();
+            choices.inner_mut().force_next(1).unwrap();
+            choices.force_next(1).unwrap();
+            let decision = choices.current_decision().unwrap();
+            assert_eq!(decision.filter().allowed_mask().unwrap().len(), inner_width);
+            contract.validate_decision(&decision).unwrap();
+            drop(decision);
+            choices.commit_token(1).unwrap();
+            contract
+                .validate_decision(&choices.current_decision().unwrap())
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn optional_choice_quote_rejects_total_payload_overflow_without_callbacks() {
+        let mut inner = BoundedFilter::new(TokenFilter::All);
+        inner.extra = u64::MAX;
+        let choices = TokenChoiceController::new(inner, TokenDomain::new(4));
+        assert!(choices.inference_workspace(2).is_none());
+        assert_eq!(choices.inner().calls.get(), 0);
+    }
 
     #[derive(Clone)]
     struct Grammar(Vec<u32>);

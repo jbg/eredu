@@ -8,12 +8,12 @@ pub(crate) fn bind_partitioned_routed_pipeline_with_provider<A, S, G, Provider, 
         G,
         <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, S>>::Boundary,
     >,
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     distributed: crate::backend::distributed::MlxDistributedSession,
     provider: Provider,
     parameter_bank: std::collections::BTreeMap<
         eredu_runtime::RoutedBankId,
-        MlxSharedAddressableBank,
+        crate::backend::runtime::residency::parameter_bank::IndexedBankSource,
     >,
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
@@ -34,7 +34,7 @@ where
 {
     let facts = prepared.session_facts().map_err(Error::ArchitectureModel)?;
     let activation_dtype = facts.activation_dtype();
-    let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_parts();
+    let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_retained_parts();
     let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
         text.into_parts();
     let mut ignored_expert_sources = prepared.unowned_expert_checkpoint_sources();
@@ -43,7 +43,7 @@ where
         .addressable_logical_targets()
         .into_iter()
         .collect::<Vec<_>>();
-    let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
+    let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream)?;
     mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(ignored_expert_sources);
     let mut distributed = Some(distributed);
@@ -91,6 +91,13 @@ where
                 let parallel = execution
                     .select_parallel(parallel)
                     .map_err(Error::ArchitectureModel)?;
+                let tensor_waves = execution.tensor_pipeline_collective_waves();
+                let needs_tensor_world_wave = if tensor_waves.is_some() {
+                    parallel.as_ref()
+                        .map(|group| group.logical_packed_world_plan().map(|plan| plan.is_some()))
+                        .transpose().map_err(|cause| Error::Parallel(cause.to_string()))?
+                        .unwrap_or(false)
+                } else { false };
                 partition_communication_authority = Some(communication.authority());
                 partition_sampling_group = Some(sampling);
                 let provider = provider.take().ok_or_else(|| {
@@ -110,8 +117,10 @@ where
                     activation_dtype,
                     unit_strategy,
                 )
-                .map_err(|error| Error::Other(Box::new(error)))?;
-                let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                .map_err(|error| Error::Other(Box::new(error)))?
+                .with_tensor_collective_waves(tensor_waves, needs_tensor_world_wave)
+                .map_err(Error::Neural)?;
+                let runtime = eredu_runtime::PartitionedTextRuntime::with_retained_plan(
                     execution_plan,
                     executor,
                     communication,
@@ -156,11 +165,12 @@ pub(crate) fn bind_partitioned_pipeline<A, G, F>(
         G,
         <A as eredu_runtime::PartitionedLayeredArchitecture<MlxNeuralBackend, MlxHybridState>>::Boundary,
     >,
-    store: Arc<dyn CheckpointSource>,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     distributed: crate::backend::distributed::MlxDistributedSession,
     additional_claimed_sources: std::collections::BTreeSet<String>,
     stream: &Stream,
     weights_stream: &Stream,
+    layerwise_manager: Option<crate::backend::runtime::execution::generic::PreparedLayerwiseManager>,
     mut finalizer: F,
 ) -> Result<Box<dyn ErasedReplicatedTextExecutable>, Error>
 where
@@ -173,14 +183,17 @@ where
     G: 'static,
     F: ReplicatedExecutableFinalizer<A, MlxHybridState>,
 {
+    let tensor_waves = prepared.tensor_pipeline_collective_waves::<MlxHybridState>()
+        .map_err(Error::ArchitectureModel)?;
     let facts = prepared.session_facts().map_err(Error::ArchitectureModel)?;
     let activation_dtype = facts.activation_dtype();
     let tensor_group = facts.tensor_group();
     let session_group = facts.session_group();
-    let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_parts();
+    let (text, prompt_cache_topology, execution_plan, publication_authority) = facts.into_retained_parts();
     let (prompt_cache_identity, capability_estimate, effective_model_type, selected_residency) =
         text.into_parts();
-    let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream);
+    let mut mechanisms = MlxReplicatedTextMechanisms::new(store, stream, weights_stream)?;
+    mechanisms.set_prepared_layerwise_manager(layerwise_manager);
     mechanisms.set_prediction_residency(finalizer.prediction_residency()?);
     mechanisms.set_ignored_checkpoint_sources(additional_claimed_sources);
     let mut distributed = Some(distributed);
@@ -221,6 +234,10 @@ where
                 })?;
                 let (communication, parallel, sampling, communication_executor) = distributed
                     .into_partition_communication(manifest, tensor_group, session_group)?;
+                let needs_tensor_world_wave = parallel.as_ref()
+                    .map(|group| group.logical_packed_world_plan().map(|plan| plan.is_some()))
+                    .transpose().map_err(|cause| Error::Parallel(cause.to_string()))?
+                    .unwrap_or(false);
                 partition_communication_authority = Some(communication.authority());
                 partition_sampling_group = Some(sampling);
                 let executor =
@@ -232,8 +249,10 @@ where
                         MlxPartitionTensorAllocator,
                         activation_dtype,
                     )
-                    .map_err(|error| Error::Other(Box::new(error)))?;
-                let runtime = eredu_runtime::PartitionedTextRuntime::new(
+                    .map_err(|error| Error::Other(Box::new(error)))?
+                    .with_tensor_collective_waves(tensor_waves, needs_tensor_world_wave)
+                    .map_err(Error::Neural)?;
+                let runtime = eredu_runtime::PartitionedTextRuntime::with_retained_plan(
                     execution_plan,
                     executor,
                     communication,

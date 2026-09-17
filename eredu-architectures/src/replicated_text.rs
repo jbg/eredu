@@ -1,6 +1,21 @@
 //! Architecture-owned admission for replicated text execution.
 
+mod composite_source;
+pub(crate) use composite_source::ModelConfig as CompositeModelConfig;
+pub(crate) mod config_source;
+mod construction_semantics;
+mod plan_identity;
+pub(crate) mod store_handoff;
+pub(crate) use construction_semantics::PreparedConstructionSemantics;
+pub(crate) mod capability_source;
+pub(crate) use config_source::ConfigOwner;
+pub use config_source::ReplicatedTextConstructionSource;
+/// Immutable admission alias of the actual model configuration. Its shared shell
+/// and configuration retain their construction funding through the last alias.
+pub use config_source::SharedConfig as SharedCompositeConfig;
+
 mod profiles;
+mod workspace;
 pub use profiles::{
     IdentityReplicatedTextVisitor, ReplicatedTextStateProfiles, ReplicatedTextVisitorConversion,
     SharedReplicatedTextVisitor,
@@ -13,9 +28,9 @@ use std::{
 
 use eredu_checkpoint::{LinearFormat, SourceTensorEncoding, StoredDtype, WeightQuantization};
 use eredu_core::{
+    ArtifactInspection, InputModalities, InputModality,
     cache::PromptCacheModelIdentity,
     checkpoint::{TensorCatalog, TensorDtype},
-    ArtifactInspection, InputModalities, InputModality,
 };
 use eredu_nn::{AttentionCache, NeuralBackend, NeuralOperatorCapabilities, Tensor};
 use eredu_runtime::{
@@ -27,6 +42,7 @@ use eredu_runtime::{
 };
 
 use crate::{
+    GgufArchitecture,
     configuration::{GgufModelConfig, SafetensorsModelConfig},
     processor_plan::ArtifactArchitecturePlan,
     replicated_model::{
@@ -34,7 +50,6 @@ use crate::{
         FixedReplicatedFamily, FixedReplicatedModel, FixedState, MixedState,
         ReplicatedForwardContext, Stateless,
     },
-    GgufArchitecture,
 };
 
 struct Lfm2Replicated;
@@ -51,6 +66,13 @@ struct InspectionCheckpointSource {
 }
 
 impl eredu_checkpoint::store::CheckpointSource for InspectionCheckpointSource {
+    fn source_storage(
+        &self,
+    ) -> Result<Option<eredu_checkpoint::store::SourceStorage>, eredu_checkpoint::store::StoreError>
+    {
+        Ok(Some(eredu_checkpoint::store::SourceStorage::default()))
+    }
+
     fn recipe_cache(&self) -> Option<&eredu_checkpoint::recipe::RecipeInferenceCache> {
         Some(&self.recipes)
     }
@@ -97,28 +119,43 @@ impl eredu_checkpoint::store::CheckpointSource for InspectionCheckpointSource {
 }
 
 impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
+    // Causal short convolution and attention use the same retained prefix;
+    // replicated dense feedforward and final normalization are token-local.
+    const CAUSAL_PREFILL_ROWS: bool = true;
+    const OBSERVATION_HOOKS: eredu_runtime::inspection::ObservationHookSupport =
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true);
+
     type Config = crate::lfm2::ModelArgs;
     type Unit = crate::lfm2::block::ReplicatedBlock<B>;
 
-    fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
-        config.validate().map_err(eredu_nn::Error::backend)?;
+    fn validate(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<(), eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, bool)>()?;
+        config.validate_with_diagnostic(|text| metadata.error(text))?;
         if config.has_sparse_moe_layers() {
-            return Err(eredu_nn::Error::backend(
-                "replicated LFM2 configuration contains routed layers",
-            ));
+            return Err(metadata.error(format_args!(
+                "replicated LFM2 configuration contains routed layers"
+            )));
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn layer_count(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<usize, eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, usize)>()?;
+        usize::try_from(config.num_hidden_layers)
+            .map_err(|cause| metadata.error(format_args!("{cause}")))
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
+    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpecView<'_> {
         let embedding = "model.embed_tokens.weight";
-        crate::decoder::StaticModuleSpec {
+        crate::decoder::StaticModuleSpecView {
             normalization_groups: None,
-            embedding_weight: embedding.into(),
-            normalization_weight: "model.embedding_norm.weight".into(),
-            head_weight: "lm_head.weight".into(),
+            embedding_weight: embedding,
+            normalization_weight: "model.embedding_norm.weight",
+            head_weight: "lm_head.weight",
             vocabulary: config.vocab_size,
             hidden_size: config.hidden_size,
             normalization_epsilon: config.norm_eps,
@@ -131,6 +168,13 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
     fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
         crate::lfm2::state_layout(config).map_err(eredu_nn::Error::backend)
     }
+
+    fn state_layout_with_metadata(
+        config: &Self::Config,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
+        crate::lfm2::state_layout_with_metadata(config, context)
+    }
     fn state_identity(
         config: &Self::Config,
         layout: &eredu_runtime::StateLayout,
@@ -138,6 +182,21 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
         crate::lfm2::state_identity(config, layout, global_layer_start, topology)
+    }
+    fn state_identity_with_metadata(
+        config: &Self::Config,
+        layout: &eredu_runtime::StateLayout,
+        global_layer_start: usize,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+        crate::lfm2::state_identity_with_metadata(
+            config,
+            layout,
+            global_layer_start,
+            topology,
+            context,
+        )
     }
     fn build_unit(
         config: &Self::Config,
@@ -193,32 +252,47 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for Lfm2Replicated {
 impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
     for KimiLinearReplicated
 {
+    // The selected shell executes the same causal KDA/MLA units and state
+    // equations as the direct owner; constructor eligibility remains separate.
+    const CAUSAL_PREFILL_ROWS: bool = true;
+    const OBSERVATION_HOOKS: eredu_runtime::inspection::ObservationHookSupport =
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true);
+
     type Config = crate::kimi_linear::ModelArgs;
     type Unit = crate::kimi_linear::block::ReplicatedBlock<B>;
 
-    fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
-        config.validate().map_err(eredu_nn::Error::backend)?;
+    fn validate(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<(), eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, bool)>()?;
+        config.validate_with_diagnostic(|text| metadata.error(text))?;
         if config
             .layer_schedule
             .iter()
             .any(|policy| policy.feed_forward != crate::kimi_linear::FeedForwardPolicy::Dense)
         {
-            return Err(eredu_nn::Error::backend(
-                "replicated Kimi Linear configuration contains routed layers",
-            ));
+            return Err(metadata.error(format_args!(
+                "replicated Kimi Linear configuration contains routed layers"
+            )));
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn layer_count(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<usize, eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, usize)>()?;
+        usize::try_from(config.num_hidden_layers)
+            .map_err(|cause| metadata.error(format_args!("{cause}")))
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
+    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpecView<'_> {
         let embedding = "model.embed_tokens.weight";
-        crate::decoder::StaticModuleSpec {
+        crate::decoder::StaticModuleSpecView {
             normalization_groups: None,
-            embedding_weight: embedding.into(),
-            normalization_weight: "model.norm.weight".into(),
-            head_weight: "lm_head.weight".into(),
+            embedding_weight: embedding,
+            normalization_weight: "model.norm.weight",
+            head_weight: "lm_head.weight",
             vocabulary: config.vocab_size,
             hidden_size: config.hidden_size,
             normalization_epsilon: config.rms_norm_eps,
@@ -231,6 +305,13 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
     fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
         crate::kimi_linear::state_layout(config).map_err(eredu_nn::Error::backend)
     }
+
+    fn state_layout_with_metadata(
+        config: &Self::Config,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
+        crate::kimi_linear::state_layout_with_metadata(config, context)
+    }
     fn state_identity(
         config: &Self::Config,
         layout: &eredu_runtime::StateLayout,
@@ -238,6 +319,21 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
         crate::kimi_linear::state_identity(config, layout, global_layer_start, topology)
+    }
+    fn state_identity_with_metadata(
+        config: &Self::Config,
+        layout: &eredu_runtime::StateLayout,
+        global_layer_start: usize,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+        crate::kimi_linear::state_identity_with_metadata(
+            config,
+            layout,
+            global_layer_start,
+            topology,
+            context,
+        )
     }
     fn build_unit(
         config: &Self::Config,
@@ -291,31 +387,53 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
 impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
     for DeepSeekV3DenseReplicated
 {
+    // The validated target has no MTP or routed units. MLA preserves the causal
+    // compressed prefix and rotary origin; its dense MLP and readout are row-local.
+    const CAUSAL_PREFILL_ROWS: bool = true;
+    const OBSERVATION_HOOKS: eredu_runtime::inspection::ObservationHookSupport =
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true);
+
     type Config = crate::deepseek::V3Args;
     type Unit = crate::deepseek::block::DenseV3Block<B>;
 
-    fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
-        config.validate().map_err(eredu_nn::Error::backend)?;
+    fn validate(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<(), eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, bool)>()?;
+        config.validate_with_diagnostic(|text| metadata.error(text))?;
         if config.num_nextn_predict_layers != 0
             || config
                 .layer_schedule
                 .iter()
                 .any(|policy| *policy == crate::deepseek::LayerPolicy::SparseMoe)
         {
-            return Err(eredu_nn::Error::backend(
-                "replicated DeepSeek-V3 configuration contains routed or prediction layers",
-            ));
+            return Err(metadata.error(format_args!(
+                "replicated DeepSeek-V3 configuration contains routed or prediction layers"
+            )));
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn layer_count(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<usize, eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, usize)>()?;
+        usize::try_from(config.num_hidden_layers)
+            .map_err(|cause| metadata.error(format_args!("{cause}")))
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        crate::deepseek::v3::static_spec(config)
+    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpecView<'_> {
+        crate::deepseek::v3::static_spec_view(config)
     }
     fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
         crate::deepseek::v3::state_layout(config)
+    }
+
+    fn state_layout_with_metadata(
+        config: &Self::Config,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
+        crate::deepseek::v3::state_layout_with_metadata(config, context)
     }
     fn state_identity(
         config: &Self::Config,
@@ -324,6 +442,21 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
         crate::deepseek::v3::state_identity(config, layout, global_layer_start, topology)
+    }
+    fn state_identity_with_metadata(
+        config: &Self::Config,
+        layout: &eredu_runtime::StateLayout,
+        global_layer_start: usize,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+        crate::deepseek::v3::state_identity_with_metadata(
+            config,
+            layout,
+            global_layer_start,
+            topology,
+            context,
+        )
     }
     fn build_unit(
         config: &Self::Config,
@@ -373,31 +506,46 @@ impl<B: eredu_nn::BlockwiseAttentionBackend> CompressedReplicatedFamily<B>
 }
 
 impl<B: NeuralBackend> FixedReplicatedFamily<B> for KimiLinearReplicated {
+    // Dense KDA preserves the actual carried histories and recurrent matrix,
+    // including the history-free width-one convolution configuration.
+    const CAUSAL_PREFILL_ROWS: bool = true;
+    const OBSERVATION_HOOKS: eredu_runtime::inspection::ObservationHookSupport =
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true);
+
     type Config = crate::kimi_linear::ModelArgs;
     type Unit = crate::kimi_linear::block::KdaReplicatedBlock<B>;
 
-    fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
-        config.validate().map_err(eredu_nn::Error::backend)?;
+    fn validate(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<(), eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, bool)>()?;
+        config.validate_with_diagnostic(|text| metadata.error(text))?;
         if config.layer_schedule.iter().any(|policy| {
             policy.feed_forward != crate::kimi_linear::FeedForwardPolicy::Dense
                 || policy.attention != crate::kimi_linear::AttentionKind::Kda
         }) {
-            return Err(eredu_nn::Error::backend(
-                "fixed-state Kimi configuration requires dense KDA layers",
-            ));
+            return Err(metadata.error(format_args!(
+                "fixed-state Kimi configuration requires dense KDA layers"
+            )));
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn layer_count(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<usize, eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, usize)>()?;
+        usize::try_from(config.num_hidden_layers)
+            .map_err(|cause| metadata.error(format_args!("{cause}")))
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
+    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpecView<'_> {
         let embedding = "model.embed_tokens.weight";
-        crate::decoder::StaticModuleSpec {
+        crate::decoder::StaticModuleSpecView {
             normalization_groups: None,
-            embedding_weight: embedding.into(),
-            normalization_weight: "model.norm.weight".into(),
-            head_weight: "lm_head.weight".into(),
+            embedding_weight: embedding,
+            normalization_weight: "model.norm.weight",
+            head_weight: "lm_head.weight",
             vocabulary: config.vocab_size,
             hidden_size: config.hidden_size,
             normalization_epsilon: config.rms_norm_eps,
@@ -410,6 +558,13 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for KimiLinearReplicated {
     fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
         crate::kimi_linear::state_layout(config).map_err(eredu_nn::Error::backend)
     }
+
+    fn state_layout_with_metadata(
+        config: &Self::Config,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
+        crate::kimi_linear::state_layout_with_metadata(config, context)
+    }
     fn state_identity(
         config: &Self::Config,
         layout: &eredu_runtime::StateLayout,
@@ -417,6 +572,21 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for KimiLinearReplicated {
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
         crate::kimi_linear::state_identity(config, layout, global_layer_start, topology)
+    }
+    fn state_identity_with_metadata(
+        config: &Self::Config,
+        layout: &eredu_runtime::StateLayout,
+        global_layer_start: usize,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+        crate::kimi_linear::state_identity_with_metadata(
+            config,
+            layout,
+            global_layer_start,
+            topology,
+            context,
+        )
     }
     fn build_unit(
         config: &Self::Config,
@@ -464,33 +634,50 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for KimiLinearReplicated {
 }
 
 impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
+    // Mamba convolution/scan and causal KV attention retain the same prefix;
+    // stateless dense units and the final head act independently on each row.
+    const CAUSAL_PREFILL_ROWS: bool = true;
+    const OBSERVATION_HOOKS: eredu_runtime::inspection::ObservationHookSupport =
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true);
+
     type Config = crate::nemotron_h::ModelArgs;
     type Unit = crate::nemotron_h::block::ReplicatedBlock<B>;
 
-    fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
-        config.validate().map_err(eredu_nn::Error::backend)?;
+    fn validate(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<(), eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, bool)>()?;
+        config.validate_with_diagnostic(|text| {
+            metadata.error(format_args!("unsupported Nemotron-H configuration: {text}"))
+        })?;
         if config.num_nextn_predict_layers != 0
             || config
                 .layer_schedule
                 .iter()
                 .any(|policy| *policy == crate::nemotron_h::LayerPolicy::SparseMoe)
         {
-            return Err(eredu_nn::Error::backend(
-                "replicated Nemotron-H configuration contains routed or prediction layers",
-            ));
+            return Err(metadata.error(format_args!(
+                "replicated Nemotron-H configuration contains routed or prediction layers"
+            )));
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn layer_count(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<usize, eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, usize)>()?;
+        usize::try_from(config.num_hidden_layers)
+            .map_err(|cause| metadata.error(format_args!("{cause}")))
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
+    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpecView<'_> {
         let embedding = "model.embeddings.weight";
-        crate::decoder::StaticModuleSpec {
+        crate::decoder::StaticModuleSpecView {
             normalization_groups: None,
-            embedding_weight: embedding.into(),
-            normalization_weight: "model.norm_f.weight".into(),
-            head_weight: "lm_head.weight".into(),
+            embedding_weight: embedding,
+            normalization_weight: "model.norm_f.weight",
+            head_weight: "lm_head.weight",
             vocabulary: config.vocab_size,
             hidden_size: config.hidden_size,
             normalization_epsilon: config.layer_norm_epsilon,
@@ -503,6 +690,13 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
     fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
         crate::nemotron_h::state_layout(config).map_err(eredu_nn::Error::backend)
     }
+
+    fn state_layout_with_metadata(
+        config: &Self::Config,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
+        crate::nemotron_h::state_layout_with_metadata(config, context)
+    }
     fn state_identity(
         config: &Self::Config,
         layout: &eredu_runtime::StateLayout,
@@ -510,6 +704,21 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
         crate::nemotron_h::state_identity(config, layout, global_layer_start, topology)
+    }
+    fn state_identity_with_metadata(
+        config: &Self::Config,
+        layout: &eredu_runtime::StateLayout,
+        global_layer_start: usize,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+        crate::nemotron_h::state_identity_with_metadata(
+            config,
+            layout,
+            global_layer_start,
+            topology,
+            context,
+        )
     }
     fn build_unit(
         config: &Self::Config,
@@ -561,27 +770,42 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for NemotronHReplicated {
 }
 
 impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
+    // The validated target has no MTP or routed units. Its causal convolution,
+    // delta recurrence and KV attention are the ordinary hybrid equations.
+    const CAUSAL_PREFILL_ROWS: bool = true;
+    const OBSERVATION_HOOKS: eredu_runtime::inspection::ObservationHookSupport =
+        eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true);
+
     type Config = crate::qwen::hybrid::HybridConfig;
     type Unit = crate::qwen::hybrid::block::ReplicatedBlock<B>;
 
-    fn validate(config: &Self::Config) -> Result<(), eredu_nn::Error> {
-        config.validate().map_err(eredu_nn::Error::backend)?;
+    fn validate(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<(), eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, bool)>()?;
+        config.validate_with_diagnostic(|text| metadata.error(text))?;
         if config.is_moe() || config.mtp_num_hidden_layers != 0 {
-            return Err(eredu_nn::Error::backend(
-                "replicated Qwen hybrid configuration contains routed or prediction layers",
-            ));
+            return Err(metadata.error(format_args!(
+                "replicated Qwen hybrid configuration contains routed or prediction layers"
+            )));
         }
         Ok(())
     }
-    fn layer_count(config: &Self::Config) -> Result<usize, eredu_nn::Error> {
-        usize::try_from(config.num_hidden_layers).map_err(eredu_nn::Error::backend)
+    fn layer_count(
+        config: &Self::Config,
+        metadata: crate::decoder::identity::Metadata<'_>,
+    ) -> Result<usize, eredu_nn::Error> {
+        metadata.controls::<(&Self::Config, usize)>()?;
+        usize::try_from(config.num_hidden_layers)
+            .map_err(|cause| metadata.error(format_args!("{cause}")))
     }
-    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpec {
-        crate::decoder::StaticModuleSpec {
+    fn static_spec(config: &Self::Config) -> crate::decoder::StaticModuleSpecView<'_> {
+        crate::decoder::StaticModuleSpecView {
             normalization_groups: None,
-            embedding_weight: "model.embed_tokens.weight".into(),
-            normalization_weight: "model.norm.weight".into(),
-            head_weight: "lm_head.weight".into(),
+            embedding_weight: "model.embed_tokens.weight",
+            normalization_weight: "model.norm.weight",
+            head_weight: "lm_head.weight",
             vocabulary: config.vocab_size,
             hidden_size: config.hidden_size,
             normalization_epsilon: config.rms_norm_eps,
@@ -596,6 +820,13 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
     fn state_layout(config: &Self::Config) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
         crate::qwen::hybrid::state_layout(config).map_err(eredu_nn::Error::backend)
     }
+
+    fn state_layout_with_metadata(
+        config: &Self::Config,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::StateLayout, eredu_nn::Error> {
+        crate::qwen::hybrid::state_layout_with_metadata(config, context)
+    }
     fn state_identity(
         config: &Self::Config,
         layout: &eredu_runtime::StateLayout,
@@ -603,6 +834,21 @@ impl<B: NeuralBackend> FixedReplicatedFamily<B> for QwenHybridReplicated {
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
         crate::qwen::hybrid::state_identity(config, layout, global_layer_start, topology)
+    }
+    fn state_identity_with_metadata(
+        config: &Self::Config,
+        layout: &eredu_runtime::StateLayout,
+        global_layer_start: usize,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ModelStateIdentity, eredu_nn::Error> {
+        crate::qwen::hybrid::state_identity_with_metadata(
+            config,
+            layout,
+            global_layer_start,
+            topology,
+            context,
+        )
     }
     fn build_unit(
         config: &Self::Config,
@@ -683,7 +929,6 @@ pub enum ReplicatedTextIneligibility {
 pub struct PreparedReplicatedTextArchitecture<A> {
     architecture: A,
     source_architecture: Option<A>,
-    requirements: ReplicatedTextRequirements,
     contract: eredu_runtime::PreparedReplicatedTextContract,
     capability_estimate: crate::capability::CapabilityEstimate,
     effective_model_type: String,
@@ -691,8 +936,8 @@ pub struct PreparedReplicatedTextArchitecture<A> {
 
 impl<A> PreparedReplicatedTextArchitecture<A> {
     /// Returns the exact architecture and artifact requirements.
-    pub const fn requirements(&self) -> &ReplicatedTextRequirements {
-        &self.requirements
+    pub fn requirements(&self) -> &ReplicatedTextRequirements {
+        self.contract.selected().requirements()
     }
 
     /// Returns the authoritative selected realization.
@@ -715,6 +960,12 @@ impl<A> PreparedReplicatedTextArchitecture<A> {
         &self.effective_model_type
     }
 
+    pub(crate) fn materialization_source(
+        &self,
+    ) -> Option<&eredu_runtime::PreparedContractMaterialization> {
+        self.contract.materialization_source()
+    }
+
     /// Consumes the handoff into opaque architecture module ownership.
     pub fn into_modules(self) -> PreparedReplicatedTextModules<A> {
         PreparedReplicatedTextModules {
@@ -733,6 +984,33 @@ pub struct PreparedReplicatedTextModules<A> {
 }
 
 impl<A> PreparedReplicatedTextModules<A> {
+    /// Borrows the contract still paired with these exact constructed modules.
+    pub fn contract(&self) -> &eredu_runtime::PreparedReplicatedTextContract {
+        self.contract
+            .as_ref()
+            .expect("prepared construction contract was already taken")
+    }
+
+    /// Consumes the matched module/contract pair and moves its validated
+    /// execution geometry. The optional source-format owner is returned too,
+    /// so a quote can preserve its existing overlapping module lifetime.
+    pub fn into_execution_parts(
+        self,
+    ) -> (
+        A,
+        Option<A>,
+        eredu_runtime::PreparedReplicatedTextExecutionGeometry,
+    ) {
+        (
+            self.architecture
+                .expect("prepared architecture was already taken"),
+            self.source_architecture,
+            self.contract
+                .expect("prepared construction contract was already taken")
+                .into_execution_geometry(),
+        )
+    }
+
     /// Takes the selected-format architecture exactly once.
     pub fn take_architecture(&mut self) -> A {
         self.architecture
@@ -769,7 +1047,7 @@ where
     fn visit<A>(
         self,
         prepared: PreparedReplicatedTextArchitecture<A>,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error> + 'static,
@@ -787,9 +1065,23 @@ pub enum ReplicatedTextDispatchError<E> {
     /// Selected formats could not construct the normalized architecture.
     #[error("replicated text architecture construction failed: {0}")]
     Architecture(String),
+    /// A participating host constructor preserved its typed failure.
+    #[error(transparent)]
+    Metadata(eredu_nn::Error),
     /// The backend visitor rejected the checked architecture.
     #[error("replicated text backend binding failed: {0}")]
     Backend(E),
+}
+
+impl<E> ReplicatedTextDispatchError<E> {
+    fn contract(error: eredu_runtime::PreparedTextContractError) -> Self {
+        match error {
+            eredu_runtime::PreparedTextContractError::Contract(message) => {
+                Self::Architecture(message)
+            }
+            eredu_runtime::PreparedTextContractError::Metadata(error) => Self::Metadata(error),
+        }
+    }
 }
 
 /// Family-blind backend visitor for an exact replicated prediction target.
@@ -814,7 +1106,7 @@ where
         extension: <A as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<
             M,
         >,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: ReplicatedTextArchitecture<B, S, Error = eredu_nn::Error>
@@ -828,7 +1120,7 @@ where
 pub fn visit_replicated_prediction_target_architecture<B, S, M, A, V>(
     prepared: PreparedReplicatedTextArchitecture<A>,
     extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
@@ -856,13 +1148,12 @@ where
 fn prepare_architecture_handoff<B, S, A>(
     architecture: A,
     source_architecture: Option<A>,
-    requirements: ReplicatedTextRequirements,
     selected: SelectedReplicatedTextRealization,
     capability_estimate: crate::capability::CapabilityEstimate,
     effective_model_type: String,
     prompt_cache_architecture_identity: String,
     context: &<B::Tensor as Tensor>::Context,
-) -> Result<PreparedReplicatedTextArchitecture<A>, String>
+) -> Result<PreparedReplicatedTextArchitecture<A>, eredu_runtime::PreparedTextContractError>
 where
     B: NeuralBackend,
     S: LayerRuntimeState<B>,
@@ -870,17 +1161,22 @@ where
     A::StaticModules: Clone,
     A::Error: std::fmt::Display,
 {
-    prepare_architecture_handoff_with_addressable::<B, S, A>(
-        architecture,
-        source_architecture,
-        requirements,
+    let contract = eredu_runtime::prepare_layered_text_contract_with_metadata::<A, B, S>(
+        &architecture,
+        source_architecture.as_ref(),
         selected,
-        capability_estimate,
-        effective_model_type,
-        prompt_cache_architecture_identity,
+        &prompt_cache_architecture_identity,
+        eredu_runtime::ReplicatedTextOutputSelection::LastSequencePosition,
         std::iter::empty::<&str>(),
         context,
-    )
+    )?;
+    Ok(PreparedReplicatedTextArchitecture {
+        architecture,
+        source_architecture,
+        contract,
+        capability_estimate,
+        effective_model_type,
+    })
 }
 
 /// Visits an additional typed architecture through the ordinary production
@@ -894,7 +1190,7 @@ pub fn visit_replicated_text_extension_architecture<B, S, A, V>(
     capability_estimate: crate::capability::CapabilityEstimate,
     effective_model_type: impl Into<String>,
     prompt_cache_architecture_identity: impl Into<String>,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
@@ -907,21 +1203,20 @@ where
     A::Error: std::fmt::Display,
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
-    let requirements = selected.requirements().clone();
+    let requirements = selected.requirements();
     validate_store_handoff(&requirements, store.as_ref())
         .map_err(ReplicatedTextDispatchError::Architecture)?;
     visitor.construction_started();
     let prepared = prepare_architecture_handoff::<B, S, A>(
         architecture,
         source_architecture,
-        requirements,
         selected,
         capability_estimate,
         effective_model_type.into(),
         prompt_cache_architecture_identity.into(),
         context,
     )
-    .map_err(ReplicatedTextDispatchError::Architecture)?;
+    .map_err(ReplicatedTextDispatchError::contract)?;
     visitor
         .visit(prepared, store)
         .map_err(ReplicatedTextDispatchError::Backend)
@@ -931,7 +1226,6 @@ where
 pub(crate) fn prepare_architecture_handoff_with_addressable<'a, B, S, A>(
     architecture: A,
     source_architecture: Option<A>,
-    requirements: ReplicatedTextRequirements,
     selected: SelectedReplicatedTextRealization,
     capability_estimate: crate::capability::CapabilityEstimate,
     effective_model_type: String,
@@ -959,7 +1253,57 @@ where
     Ok(PreparedReplicatedTextArchitecture {
         architecture,
         source_architecture,
-        requirements,
+        contract,
+        capability_estimate,
+        effective_model_type,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_architecture_handoff_with_addressable_metadata<'a, B, S, A>(
+    architecture: A,
+    source_architecture: Option<A>,
+    selected: SelectedReplicatedTextRealization,
+    capability_estimate: crate::capability::CapabilityEstimate,
+    effective_model_type: String,
+    prompt_cache_architecture_identity: String,
+    addressable_parameters: impl IntoIterator<Item = &'a str>,
+    materialization: Option<&eredu_runtime::PreparedContractMaterialization>,
+    context: &<B::Tensor as Tensor>::Context,
+) -> Result<PreparedReplicatedTextArchitecture<A>, eredu_runtime::PreparedTextContractError>
+where
+    B: NeuralBackend,
+    S: LayerRuntimeState<B>,
+    A: eredu_runtime::LayeredArchitecture<B, S, Error = eredu_nn::Error>,
+    A::StaticModules: Clone,
+    A::Error: std::fmt::Display,
+{
+    let contract = match materialization {
+        Some(materialization) => {
+            eredu_runtime::prepare_layered_text_contract_with_materialization::<A, B, S>(
+                &architecture,
+                source_architecture.as_ref(),
+                selected,
+                &prompt_cache_architecture_identity,
+                eredu_runtime::ReplicatedTextOutputSelection::LastSequencePosition,
+                addressable_parameters,
+                materialization,
+                context,
+            )?
+        }
+        None => eredu_runtime::prepare_layered_text_contract_with_metadata::<A, B, S>(
+            &architecture,
+            source_architecture.as_ref(),
+            selected,
+            &prompt_cache_architecture_identity,
+            eredu_runtime::ReplicatedTextOutputSelection::LastSequencePosition,
+            addressable_parameters,
+            context,
+        )?,
+    };
+    Ok(PreparedReplicatedTextArchitecture {
+        architecture,
+        source_architecture,
         contract,
         capability_estimate,
         effective_model_type,
@@ -968,9 +1312,9 @@ where
 
 /// Constructs and visits the architecture using one authoritative realization.
 pub fn visit_replicated_text_architecture<B, S, V>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
@@ -980,159 +1324,269 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
-    let requirements = selected.requirements().clone();
-    let eligible = ordinary_eligible_config(plan)?;
-    validate_plan_identity(&requirements, &eligible)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref())
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+    let requirements = selected.requirements();
+    let eligible = ordinary_eligible_config(source.architecture_plan())?;
+    validate_plan_identity(&requirements, &eligible, metadata)
+        .map_err(ReplicatedTextDispatchError::contract)?;
+    store_handoff::validate::<B, _>(&source, &selected, &store, context)?;
     match eligible {
         EligibleConfig::Gemma2(args) => {
             visitor.construction_started();
-            let capability_estimate = crate::capability::gemma2(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let effective_model_type = "gemma2".to_owned();
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    crate::capability::gemma2(args)
+                })?;
+            let effective_model_type = metadata
+                .text("gemma2")
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| crate::gemma2::LayeredModel::<B>::new(args.clone(), context))
+                .then(|| {
+                    let args = config_source::source_config::<B, _>(
+                        &source,
+                        args,
+                        config_source::gemma2,
+                        context,
+                    )?;
+                    crate::gemma2::LayeredModel::<B>::new_with_config(args, context)
+                })
                 .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_gemma2_args(args, &selected)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let prompt_cache_architecture_identity =
-                crate::gemma2::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::gemma2::LayeredModel::<B>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args = config_source::selected_config::<B, _, _>(
+                &source,
+                args,
+                &selected,
+                config_source::gemma2,
+                selected_gemma2_args,
+                config_source::unchanged,
+                context,
+            )?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
+            let prompt_cache_architecture_identity = metadata
+                .configured(&*args)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+            let architecture = crate::gemma2::LayeredModel::<B>::new_with_config(args, context)
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
-                requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
             visitor
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Llama(args) => {
             visitor.construction_started();
-            let capability_estimate = crate::capability::llama(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let effective_model_type = args.model_type.clone();
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    crate::capability::llama(args)
+                })?;
+            let effective_model_type = metadata
+                .text(&args.model_type)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| crate::llama::LayeredModel::<B>::new(args.clone(), context))
+                .then(|| {
+                    let args = config_source::source_config::<B, _>(
+                        &source,
+                        args,
+                        config_source::llama,
+                        context,
+                    )?;
+                    crate::llama::LayeredModel::<B>::new_with_config(args, context)
+                })
                 .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_llama_args(args, &selected)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let prompt_cache_architecture_identity =
-                crate::llama::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::llama::LayeredModel::<B>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args = config_source::selected_config::<B, _, _>(
+                &source,
+                args,
+                &selected,
+                config_source::llama,
+                selected_llama_args,
+                config_source::unchanged,
+                context,
+            )?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
+            let prompt_cache_architecture_identity = metadata
+                .configured(&*args)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+            let architecture = crate::llama::LayeredModel::<B>::new_with_config(args, context)
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
-                requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
             visitor
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Nanbeige(args) => {
             visitor.construction_started();
-            let capability_estimate = crate::capability::nanbeige(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let effective_model_type = "nanbeige".to_owned();
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    crate::capability::nanbeige(args)
+                })?;
+            let effective_model_type = metadata
+                .text("nanbeige")
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| crate::nanbeige::LayeredModel::<B>::new(args.clone(), context))
+                .then(|| {
+                    let args = config_source::source_config::<B, _>(
+                        &source,
+                        args,
+                        config_source::nanbeige,
+                        context,
+                    )?;
+                    crate::nanbeige::LayeredModel::<B>::new_with_config(args, context)
+                })
                 .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_nanbeige_args(args, &selected)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let prompt_cache_architecture_identity =
-                crate::nanbeige::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::nanbeige::LayeredModel::<B>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args = config_source::selected_config::<B, _, _>(
+                &source,
+                args,
+                &selected,
+                config_source::nanbeige,
+                selected_nanbeige_args,
+                config_source::unchanged,
+                context,
+            )?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
+            let prompt_cache_architecture_identity = metadata
+                .configured(&*args)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+            let architecture =
+                crate::nanbeige::LayeredModel::<B>::new_with_config(args, context)
+                    .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
-                requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
             visitor
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::K2Horizon(args) => {
             visitor.construction_started();
-            let capability_estimate = crate::capability::k2_horizon(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let effective_model_type = args.model_type.clone();
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    crate::capability::k2_horizon(args)
+                })?;
+            let effective_model_type = metadata
+                .text(&args.model_type)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| crate::k2_horizon::DenseLayeredModel::<B>::new(args.clone(), context))
+                .then(|| {
+                    let args = config_source::source_config::<B, _>(
+                        &source,
+                        args,
+                        config_source::k2_horizon,
+                        context,
+                    )?;
+                    crate::k2_horizon::DenseLayeredModel::<B>::new_with_config(args, context)
+                })
                 .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_k2_horizon_args(args, &selected)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let prompt_cache_architecture_identity =
-                crate::k2_horizon::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::k2_horizon::DenseLayeredModel::<B>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args =
+                config_source::selected_k2_horizon::<B, _>(&source, args, &selected, context)?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
+            let prompt_cache_architecture_identity = metadata
+                .configured(&*args)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+            let architecture =
+                crate::k2_horizon::DenseLayeredModel::<B>::new_with_config(args, context)
+                    .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
-                requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
             visitor
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::Qwen(args) => {
             visitor.construction_started();
-            let capability_estimate = crate::capability::qwen(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let effective_model_type = args.model_type.clone();
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    crate::capability::qwen(args)
+                })?;
+            let effective_model_type = metadata
+                .text(&args.model_type)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| crate::qwen::LayeredModel::<B>::new(args.clone(), context))
+                .then(|| {
+                    let args = config_source::source_config::<B, _>(
+                        &source,
+                        args,
+                        config_source::qwen,
+                        context,
+                    )?;
+                    crate::qwen::LayeredModel::<B>::new_with_config(args, context)
+                })
                 .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_qwen_args(args, &selected)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let prompt_cache_architecture_identity =
-                crate::qwen::prompt_cache_architecture_fingerprint(&args);
-            let architecture = crate::qwen::LayeredModel::<B>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args = config_source::selected_config::<B, _, _>(
+                &source,
+                args,
+                &selected,
+                config_source::qwen,
+                selected_qwen_args,
+                config_source::unchanged,
+                context,
+            )?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
+            let prompt_cache_architecture_identity = metadata
+                .configured(&*args)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+            let architecture = crate::qwen::LayeredModel::<B>::new_with_config(args, context)
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
-                requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
             visitor
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
@@ -1167,27 +1621,9 @@ pub(crate) fn selected_uses_transform(selected: &SelectedReplicatedTextRealizati
 fn validate_plan_identity(
     requirements: &ReplicatedTextRequirements,
     config: &EligibleConfig<'_>,
-) -> Result<(), String> {
-    if requirements.architecture_identity() != config.architecture_identity() {
-        return Err("selected realization belongs to a different normalized architecture".into());
-    }
-    let graph = eredu_runtime::ExecutionGraph::chain([config.execution_group()])
-        .map_err(|error| error.to_string())?;
-    let units = eredu_runtime::ExecutionUnitLayout::new(&graph, [config.unit_count()?])
-        .map_err(|error| error.to_string())?;
-    let state_layout = config.state_layout()?;
-    if requirements.operators() != config.operators()
-        || requirements.execution_graph() != &graph
-        || requirements.execution_units() != &units
-        || requirements.group_transports() != [config.group_transport()]
-        || requirements.state_layout() != &state_layout
-        || requirements.state_access() != config.state_access()
-    {
-        return Err(
-            "selected realization structure differs from the normalized architecture".into(),
-        );
-    }
-    Ok(())
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<(), eredu_runtime::PreparedTextContractError> {
+    plan_identity::validate(requirements, config, metadata)
 }
 
 pub(crate) fn validate_store_handoff(
@@ -1316,49 +1752,81 @@ pub(crate) fn validate_store_handoff(
 pub(crate) fn selected_formats(
     selected: &SelectedReplicatedTextRealization,
 ) -> HashMap<String, WeightQuantization> {
-    selected
-        .parameters()
-        .iter()
-        .filter_map(|parameter| {
-            parameter
-                .executable()
-                .weight_quantization()
-                .map(|format| (parameter.name().to_owned(), format))
-        })
+    selected_quantized_format_rows(selected)
+        .map(|(name, format)| (name.to_owned(), format))
         .collect()
+}
+
+// Borrow the retained rows before creating any configuration maps. These workers
+// are also the source of constructor-inspection populations; they declare names
+// and encodings, not module storage, source readiness or admission authority.
+pub(crate) fn selected_quantized_format_rows(
+    selected: &SelectedReplicatedTextRealization,
+) -> impl Iterator<Item = (&str, WeightQuantization)> {
+    selected.parameters().iter().filter_map(|parameter| {
+        parameter
+            .executable()
+            .weight_quantization()
+            .map(|format| (parameter.name(), format))
+    })
 }
 
 pub(crate) fn requirement_formats(
     requirements: &ReplicatedTextRequirements,
 ) -> HashMap<String, WeightQuantization> {
-    requirements
-        .parameters()
-        .iter()
-        .filter_map(|parameter| {
-            parameter
-                .native_executable()
-                .weight_quantization()
-                .map(|format| (parameter.name().to_owned(), format))
-        })
+    requirement_quantized_format_rows(requirements)
+        .map(|(name, format)| (name.to_owned(), format))
         .collect()
+}
+
+pub(crate) fn requirement_quantized_format_rows(
+    requirements: &ReplicatedTextRequirements,
+) -> impl Iterator<Item = (&str, WeightQuantization)> {
+    requirements.parameters().iter().filter_map(|parameter| {
+        parameter
+            .native_executable()
+            .weight_quantization()
+            .map(|format| (parameter.name(), format))
+    })
 }
 
 pub(crate) fn selected_matrix_formats(
     requirements: &ReplicatedTextRequirements,
     selected: &SelectedReplicatedTextRealization,
 ) -> HashMap<String, LinearFormat> {
-    let matrices = requirement_matrix_formats(requirements);
+    // The ordinary adapter keeps indexed membership, but the index borrows its
+    // names. A fixed inspection caller can use a read-only scan of the same
+    // requirement rows instead; no copied-name map is required for that scan.
+    let matrices: std::collections::HashSet<&str> = requirement_matrix_format_rows(requirements)
+        .map(|(name, _)| name)
+        .collect();
+    selected_matrix_format_rows(selected, |name| matrices.contains(name))
+        .map(|(name, format)| (name.to_owned(), format))
+        .collect()
+}
+
+pub(crate) fn selected_matrix_format_rows<'a>(
+    selected: &'a SelectedReplicatedTextRealization,
+    mut is_matrix: impl FnMut(&str) -> bool + 'a,
+) -> impl Iterator<Item = (&'a str, LinearFormat)> + 'a {
     selected
         .parameters()
         .iter()
-        .filter(|parameter| matrices.contains_key(parameter.name()))
-        .map(|parameter| (parameter.name().to_owned(), parameter.executable()))
-        .collect()
+        .filter(move |parameter| is_matrix(parameter.name()))
+        .map(|parameter| (parameter.name(), parameter.executable()))
 }
 
 fn requirement_matrix_formats(
     requirements: &ReplicatedTextRequirements,
 ) -> HashMap<String, LinearFormat> {
+    requirement_matrix_format_rows(requirements)
+        .map(|(name, format)| (name.to_owned(), format))
+        .collect()
+}
+
+pub(crate) fn requirement_matrix_format_rows(
+    requirements: &ReplicatedTextRequirements,
+) -> impl Iterator<Item = (&str, LinearFormat)> {
     requirements
         .parameters()
         .iter()
@@ -1368,8 +1836,7 @@ fn requirement_matrix_formats(
                 ReplicatedTextParameterRole::LinearWeight | ReplicatedTextParameterRole::Embedding
             )
         })
-        .map(|parameter| (parameter.name().to_owned(), parameter.native_executable()))
-        .collect()
+        .map(|parameter| (parameter.name(), parameter.native_executable()))
 }
 
 pub(crate) fn selected_gemma2_args(
@@ -1638,6 +2105,10 @@ where
         config: F::Config,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error>;
+    fn new_with_config(
+        config: ConfigOwner<F::Config>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Model, eredu_nn::Error>;
 }
 
 impl<B, S, F> FixedProfile<B, S, F> for MixedState
@@ -1653,6 +2124,12 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error> {
         FixedReplicatedModel::new(config, context)
+    }
+    fn new_with_config(
+        config: ConfigOwner<F::Config>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Model, eredu_nn::Error> {
+        FixedReplicatedModel::new_with_config(config, context)
     }
 }
 
@@ -1670,6 +2147,12 @@ where
     ) -> Result<Self::Model, eredu_nn::Error> {
         FixedReplicatedModel::new(config, context)
     }
+    fn new_with_config(
+        config: ConfigOwner<F::Config>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Model, eredu_nn::Error> {
+        FixedReplicatedModel::new_with_config(config, context)
+    }
 }
 
 impl<B, S, F> FixedProfile<B, S, F> for FixedState
@@ -1686,6 +2169,12 @@ where
     ) -> Result<Self::Model, eredu_nn::Error> {
         FixedReplicatedModel::new(config, context)
     }
+    fn new_with_config(
+        config: ConfigOwner<F::Config>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Model, eredu_nn::Error> {
+        FixedReplicatedModel::new_with_config(config, context)
+    }
 }
 
 impl<B, S, F> FixedProfile<B, S, F> for Stateless
@@ -1701,12 +2190,18 @@ where
     ) -> Result<Self::Model, eredu_nn::Error> {
         FixedReplicatedModel::new(config, context)
     }
+    fn new_with_config(
+        config: ConfigOwner<F::Config>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Model, eredu_nn::Error> {
+        FixedReplicatedModel::new_with_config(config, context)
+    }
 }
 
 fn visit_fixed_profile<B, S, V, P>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
@@ -1719,135 +2214,233 @@ where
         + FixedProfile<B, S, NemotronHReplicated>
         + FixedProfile<B, S, QwenHybridReplicated>,
 {
-    let requirements = selected.requirements().clone();
-    let eligible = eligible_config(plan)?;
-    validate_plan_identity(&requirements, &eligible)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref())
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+    let requirements = selected.requirements();
+    let eligible = eligible_config(source.architecture_plan())?;
+    validate_plan_identity(&requirements, &eligible, metadata)
+        .map_err(ReplicatedTextDispatchError::contract)?;
+    store_handoff::validate::<B, _>(&source, &selected, &store, context)?;
     match eligible {
         EligibleConfig::Lfm2(args) => {
             visitor.construction_started();
-            let capability_estimate = crate::capability::lfm2(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let effective_model_type = args.model_type.clone();
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    crate::capability::lfm2(args)
+                })?;
+            let effective_model_type = metadata
+                .text(&args.model_type)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| <P as FixedProfile<B, S, Lfm2Replicated>>::new(args.clone(), context))
+                .then(|| {
+                    let args = config_source::source_config::<B, _>(
+                        &source,
+                        args,
+                        config_source::lfm2,
+                        context,
+                    )?;
+                    <P as FixedProfile<B, S, Lfm2Replicated>>::new_with_config(args, context)
+                })
                 .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_lfm2_args(args, &selected)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args = config_source::selected_config::<B, _, _>(
+                &source,
+                args,
+                &selected,
+                config_source::lfm2,
+                selected_lfm2_args,
+                config_source::unchanged,
+                context,
+            )?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
             let prompt_cache_architecture_identity =
-                crate::lfm2::prompt_cache_architecture_fingerprint(&args);
-            let architecture = <P as FixedProfile<B, S, Lfm2Replicated>>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+                crate::lfm2::config::prompt_cache_architecture_fingerprint_with_metadata(
+                    &args, metadata,
+                )
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+            let architecture =
+                <P as FixedProfile<B, S, Lfm2Replicated>>::new_with_config(args, context)
+                    .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
-                requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
             visitor
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::NemotronH(args) => {
             visitor.construction_started();
-            let capability_estimate = crate::capability::nemotron_h(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let effective_model_type = args.model_type.clone();
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    crate::capability::nemotron_h(args)
+                })?;
+            let effective_model_type = metadata
+                .text(&args.model_type)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| <P as FixedProfile<B, S, NemotronHReplicated>>::new(args.clone(), context))
+                .then(|| {
+                    let args = config_source::source_config::<B, _>(
+                        &source,
+                        args,
+                        config_source::nemotron_h,
+                        context,
+                    )?;
+                    <P as FixedProfile<B, S, NemotronHReplicated>>::new_with_config(args, context)
+                })
                 .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_nemotron_h_args(args, &selected)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args = config_source::selected_config::<B, _, _>(
+                &source,
+                args,
+                &selected,
+                config_source::nemotron_h,
+                selected_nemotron_h_args,
+                config_source::unchanged,
+                context,
+            )?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
             let prompt_cache_architecture_identity =
-                crate::nemotron_h::prompt_cache_architecture_fingerprint(&args);
-            let architecture = <P as FixedProfile<B, S, NemotronHReplicated>>::new(args, context)
-                .map_err(|error| {
-                ReplicatedTextDispatchError::Architecture(error.to_string())
-            })?;
+                crate::nemotron_h::config::prompt_cache_architecture_fingerprint_with_metadata(
+                    &args, metadata,
+                )
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+            let architecture =
+                <P as FixedProfile<B, S, NemotronHReplicated>>::new_with_config(args, context)
+                    .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
-                requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
             visitor
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::QwenHybrid(args) => {
             visitor.construction_started();
-            let capability_estimate = crate::capability::qwen_hybrid_text(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let effective_model_type = args.model_type.clone();
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    crate::capability::qwen_hybrid_text(args)
+                })?;
+            let effective_model_type = metadata
+                .text(&args.model_type)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let source_architecture = selected_uses_transform(&selected)
                 .then(|| {
-                    <P as FixedProfile<B, S, QwenHybridReplicated>>::new(args.clone(), context)
+                    let args = config_source::source_config::<B, _>(
+                        &source,
+                        args,
+                        config_source::qwen_hybrid,
+                        context,
+                    )?;
+                    <P as FixedProfile<B, S, QwenHybridReplicated>>::new_with_config(args, context)
                 })
                 .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_qwen_hybrid_args(args, &selected)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args = config_source::selected_config::<B, _, _>(
+                &source,
+                args,
+                &selected,
+                config_source::qwen_hybrid,
+                selected_qwen_hybrid_args,
+                |args| args.validate().map_err(|error| error.to_string()),
+                context,
+            )?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
             let prompt_cache_architecture_identity =
-                crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&args);
-            let architecture = <P as FixedProfile<B, S, QwenHybridReplicated>>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+                crate::qwen::hybrid::prompt_cache_architecture_fingerprint_with_metadata(
+                    &args, metadata,
+                )
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+            let architecture =
+                <P as FixedProfile<B, S, QwenHybridReplicated>>::new_with_config(args, context)
+                    .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
-                requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
             visitor
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
         }
         EligibleConfig::KimiLinear(args) => {
             visitor.construction_started();
-            let capability_estimate = crate::capability::kimi_linear(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let effective_model_type = args.model_type.clone();
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    crate::capability::kimi_linear(args)
+                })?;
+            let effective_model_type = metadata
+                .text(&args.model_type)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let source_architecture = selected_uses_transform(&selected)
                 .then(|| {
-                    <P as FixedProfile<B, S, KimiLinearReplicated>>::new(args.clone(), context)
+                    let args = config_source::source_config::<B, _>(
+                        &source,
+                        args,
+                        config_source::kimi_linear,
+                        context,
+                    )?;
+                    <P as FixedProfile<B, S, KimiLinearReplicated>>::new_with_config(args, context)
                 })
                 .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_kimi_linear_args(args, &selected)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args = config_source::selected_config::<B, _, _>(
+                &source,
+                args,
+                &selected,
+                config_source::kimi_linear,
+                selected_kimi_linear_args,
+                config_source::unchanged,
+                context,
+            )?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
             let prompt_cache_architecture_identity =
-                crate::kimi_linear::prompt_cache_architecture_fingerprint(&args);
-            let architecture = <P as FixedProfile<B, S, KimiLinearReplicated>>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+                crate::kimi_linear::config::prompt_cache_architecture_fingerprint_with_metadata(
+                    &args, metadata,
+                )
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+            let architecture =
+                <P as FixedProfile<B, S, KimiLinearReplicated>>::new_with_config(args, context)
+                    .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
-                requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
             visitor
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
@@ -1872,9 +2465,9 @@ where
 
 /// Constructs a replicated architecture using key/value attention and fixed components.
 pub fn visit_replicated_fixed_state_text_architecture<B, S, V>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
@@ -1884,14 +2477,14 @@ where
     S::LayerState: AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
-    visit_fixed_profile::<B, S, V, MixedState>(plan, selected, store, context, visitor)
+    visit_fixed_profile::<B, S, V, MixedState>(&source, selected, store, context, visitor)
 }
 
 /// Constructs a replicated architecture using only key/value attention state.
 pub fn visit_replicated_attention_state_text_architecture<B, S, V>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
@@ -1901,14 +2494,14 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
-    visit_fixed_profile::<B, S, V, AttentionState>(plan, selected, store, context, visitor)
+    visit_fixed_profile::<B, S, V, AttentionState>(&source, selected, store, context, visitor)
 }
 
 /// Constructs a replicated architecture using only recurrent or convolutional state.
 pub fn visit_replicated_component_state_text_architecture<B, S, V>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
@@ -1918,14 +2511,14 @@ where
     S::LayerState: eredu_runtime::RuntimeStateComponents<B>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
-    visit_fixed_profile::<B, S, V, FixedState>(plan, selected, store, context, visitor)
+    visit_fixed_profile::<B, S, V, FixedState>(&source, selected, store, context, visitor)
 }
 
 /// Constructs a replicated architecture whose execution units retain no token state.
 pub fn visit_replicated_stateless_text_architecture<B, S, V>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
@@ -1934,7 +2527,7 @@ where
     S: LayerRuntimeState<B>,
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
-    visit_fixed_profile::<B, S, V, Stateless>(plan, selected, store, context, visitor)
+    visit_fixed_profile::<B, S, V, Stateless>(&source, selected, store, context, visitor)
 }
 
 trait CompressedProfile<B, S, F>
@@ -1951,6 +2544,10 @@ where
         > + 'static;
     fn new(
         config: F::Config,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Model, eredu_nn::Error>;
+    fn new_with_config(
+        config: ConfigOwner<F::Config>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Model, eredu_nn::Error>;
 }
@@ -1970,6 +2567,12 @@ where
     ) -> Result<Self::Model, eredu_nn::Error> {
         CompressedReplicatedModel::new(config, context)
     }
+    fn new_with_config(
+        config: ConfigOwner<F::Config>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Model, eredu_nn::Error> {
+        CompressedReplicatedModel::new_with_config(config, context)
+    }
 }
 
 impl<B, S, F> CompressedProfile<B, S, F> for crate::replicated_model::CompressedState
@@ -1986,12 +2589,18 @@ where
     ) -> Result<Self::Model, eredu_nn::Error> {
         CompressedReplicatedModel::new(config, context)
     }
+    fn new_with_config(
+        config: ConfigOwner<F::Config>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self::Model, eredu_nn::Error> {
+        CompressedReplicatedModel::new_with_config(config, context)
+    }
 }
 
 fn visit_compressed_profile<B, S, V, P>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     mut visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
@@ -2002,39 +2611,51 @@ where
     P: CompressedProfile<B, S, KimiLinearReplicated>
         + CompressedProfile<B, S, DeepSeekV3DenseReplicated>,
 {
-    let requirements = selected.requirements().clone();
-    let eligible = eligible_config(plan)?;
-    validate_plan_identity(&requirements, &eligible)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref())
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
+    let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+    let requirements = selected.requirements();
+    let eligible = eligible_config(source.architecture_plan())?;
+    validate_plan_identity(&requirements, &eligible, metadata)
+        .map_err(ReplicatedTextDispatchError::contract)?;
+    store_handoff::validate::<B, _>(&source, &selected, &store, context)?;
     macro_rules! visit_family {
-        ($family:ty, $args:expr, $capability:path, $select:path, $identity:path) => {{
+        ($family:ty, $args:expr, $capability:path, $select:ident, $project:path, $identity:path) => {{
             visitor.construction_started();
             let args = $args;
-            let capability_estimate = $capability(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let effective_model_type = args.model_type.clone();
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    $capability(args)
+                })?;
+            let effective_model_type = metadata
+                .text(&args.model_type)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let source_architecture = selected_uses_transform(&selected)
-                .then(|| <P as CompressedProfile<B, S, $family>>::new(args.clone(), context))
+                .then(|| {
+                    let args =
+                        config_source::source_config::<B, _>(&source, args, $project, context)?;
+                    <P as CompressedProfile<B, S, $family>>::new_with_config(args, context)
+                })
                 .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args =
-                $select(args, &selected).map_err(ReplicatedTextDispatchError::Architecture)?;
-            let prompt_cache_architecture_identity = $identity(&args);
-            let architecture = <P as CompressedProfile<B, S, $family>>::new(args, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args = config_source::$select::<B, _>(&source, args, &selected, context)?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
+            let prompt_cache_architecture_identity =
+                $identity(&args, metadata).map_err(ReplicatedTextDispatchError::Metadata)?;
+            let architecture =
+                <P as CompressedProfile<B, S, $family>>::new_with_config(args, context)
+                    .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
             let prepared = prepare_architecture_handoff::<B, S, _>(
                 architecture,
                 source_architecture,
-                requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
             visitor
                 .visit(prepared, store)
                 .map_err(ReplicatedTextDispatchError::Backend)
@@ -2045,15 +2666,17 @@ where
             KimiLinearReplicated,
             args,
             crate::capability::kimi_linear,
-            selected_kimi_linear_args,
-            crate::kimi_linear::prompt_cache_architecture_fingerprint
+            selected_kimi_linear,
+            config_source::kimi_linear,
+            crate::kimi_linear::config::prompt_cache_architecture_fingerprint_with_metadata
         ),
         EligibleConfig::DeepSeekV3(args) => visit_family!(
             DeepSeekV3DenseReplicated,
             args,
             crate::capability::deepseek_v3,
-            selected_deepseek_v3_args,
-            crate::deepseek::v3_architecture_fingerprint
+            selected_deepseek_v3,
+            config_source::deepseek_v3,
+            crate::deepseek::config::v3_architecture_fingerprint_with_metadata
         ),
         _ => Err(ReplicatedTextIneligibility::Unrelated.into()),
     }
@@ -2061,9 +2684,9 @@ where
 
 /// Constructs a replicated architecture using compressed attention and fixed components.
 pub fn visit_replicated_compressed_state_text_architecture<B, S, V>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
@@ -2075,15 +2698,15 @@ where
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
     visit_compressed_profile::<B, S, V, crate::replicated_model::MixedCompressedState>(
-        plan, selected, store, context, visitor,
+        &source, selected, store, context, visitor,
     )
 }
 
 /// Constructs a replicated architecture using only compressed attention state.
 pub fn visit_replicated_compressed_only_text_architecture<B, S, V>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
@@ -2094,7 +2717,7 @@ where
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
     visit_compressed_profile::<B, S, V, crate::replicated_model::CompressedState>(
-        plan, selected, store, context, visitor,
+        &source, selected, store, context, visitor,
     )
 }
 
@@ -2128,46 +2751,46 @@ where
 
     /// Visitor for a stateless architecture.
     type StatelessVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::StatelessState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
+            B,
+            Self::StatelessState,
+            Output = Self::Output,
+            Error = Self::Error,
+        >;
     /// Visitor for an ordinary key/value architecture.
     type AttentionVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::AttentionState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
+            B,
+            Self::AttentionState,
+            Output = Self::Output,
+            Error = Self::Error,
+        >;
     /// Visitor for a fixed-component architecture.
     type ComponentVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::ComponentState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
+            B,
+            Self::ComponentState,
+            Output = Self::Output,
+            Error = Self::Error,
+        >;
     /// Visitor for key/value attention with fixed components.
     type AttentionComponentVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::AttentionComponentState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
+            B,
+            Self::AttentionComponentState,
+            Output = Self::Output,
+            Error = Self::Error,
+        >;
     /// Visitor for compressed attention.
     type CompressedVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::CompressedState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
+            B,
+            Self::CompressedState,
+            Output = Self::Output,
+            Error = Self::Error,
+        >;
     /// Visitor for compressed attention with fixed components.
     type CompressedComponentVisitor: ReplicatedTextArchitectureVisitor<
-        B,
-        Self::CompressedComponentState,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
+            B,
+            Self::CompressedComponentState,
+            Output = Self::Output,
+            Error = Self::Error,
+        >;
 
     /// Consumes the adapter into its stateless visitor.
     fn into_stateless_visitor(self) -> Self::StatelessVisitor;
@@ -2185,9 +2808,9 @@ where
 
 /// Dispatches an ordinary key/value selection without requiring unrelated backend mechanisms.
 pub(crate) fn dispatch_replicated_key_value_text_architecture<B, S, V>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
@@ -2198,12 +2821,17 @@ where
     V: ReplicatedTextArchitectureVisitor<B, S>,
 {
     if selected.state().access() != ReplicatedTextStateAccess::KeyValue {
-        return Err(ReplicatedTextDispatchError::Architecture(format!(
-            "selected state profile {:?} is not ordinary key/value attention",
-            selected.state().access()
-        )));
+        return Err(ReplicatedTextDispatchError::contract(
+            plan_identity::message(
+                crate::decoder::identity::Metadata::new(B::construction_metadata(context)),
+                format_args!(
+                    "selected state profile {:?} is not ordinary key/value attention",
+                    selected.state().access()
+                ),
+            ),
+        ));
     }
-    let eligible = eligible_config(plan)?;
+    let eligible = eligible_config(source.architecture_plan())?;
     if matches!(
         eligible,
         EligibleConfig::Gemma2(_)
@@ -2212,17 +2840,19 @@ where
             | EligibleConfig::K2Horizon(_)
             | EligibleConfig::Qwen(_)
     ) {
-        visit_replicated_text_architecture(plan, selected, store, context, visitor)
+        visit_replicated_text_architecture(&source, selected, store, context, visitor)
     } else {
-        visit_replicated_attention_state_text_architecture(plan, selected, store, context, visitor)
+        visit_replicated_attention_state_text_architecture(
+            &source, selected, store, context, visitor,
+        )
     }
 }
 
 /// Dispatches one selected replicated-text architecture through its exact typed state profile.
 pub fn dispatch_replicated_text_architecture<B, D>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     dispatcher: D,
 ) -> Result<D::Output, ReplicatedTextDispatchError<D::Error>>
@@ -2239,7 +2869,7 @@ where
     <D::CompressedComponentState as LayerRuntimeState<B>>::LayerState:
         eredu_nn::CompressedAttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
 {
-    let eligible = eligible_config(plan)?;
+    let eligible = eligible_config(source.architecture_plan())?;
     let ordinary = matches!(
         eligible,
         EligibleConfig::Gemma2(_)
@@ -2250,7 +2880,7 @@ where
     );
     match (ordinary, selected.state().access()) {
         (true, ReplicatedTextStateAccess::KeyValue) => visit_replicated_text_architecture(
-            plan,
+            &source,
             selected,
             store,
             context,
@@ -2258,7 +2888,7 @@ where
         ),
         (false, ReplicatedTextStateAccess::Stateless) => {
             visit_replicated_stateless_text_architecture(
-                plan,
+                &source,
                 selected,
                 store,
                 context,
@@ -2267,7 +2897,7 @@ where
         }
         (false, ReplicatedTextStateAccess::KeyValue) => {
             visit_replicated_attention_state_text_architecture(
-                plan,
+                &source,
                 selected,
                 store,
                 context,
@@ -2276,7 +2906,7 @@ where
         }
         (false, ReplicatedTextStateAccess::Fixed) => {
             visit_replicated_component_state_text_architecture(
-                plan,
+                &source,
                 selected,
                 store,
                 context,
@@ -2285,7 +2915,7 @@ where
         }
         (false, ReplicatedTextStateAccess::AttentionWithFixed) => {
             visit_replicated_fixed_state_text_architecture(
-                plan,
+                &source,
                 selected,
                 store,
                 context,
@@ -2294,7 +2924,7 @@ where
         }
         (false, ReplicatedTextStateAccess::CompressedAttention) => {
             visit_replicated_compressed_only_text_architecture(
-                plan,
+                &source,
                 selected,
                 store,
                 context,
@@ -2303,16 +2933,21 @@ where
         }
         (false, ReplicatedTextStateAccess::CompressedAttentionWithFixed) => {
             visit_replicated_compressed_state_text_architecture(
-                plan,
+                &source,
                 selected,
                 store,
                 context,
                 dispatcher.into_compressed_component_visitor(),
             )
         }
-        (_, profile) => Err(ReplicatedTextDispatchError::Architecture(format!(
-            "selected state profile {profile:?} does not match the dispatched architecture"
-        ))),
+        (_, profile) => Err(ReplicatedTextDispatchError::contract(
+            plan_identity::message(
+                crate::decoder::identity::Metadata::new(B::construction_metadata(context)),
+                format_args!(
+                    "selected state profile {profile:?} does not match the dispatched architecture"
+                ),
+            ),
+        )),
     }
 }
 
@@ -2333,12 +2968,12 @@ where
     type State: LayerRuntimeState<B>;
     /// Exact prediction-aware visitor for that representation.
     type Visitor: ReplicatedPredictionTargetVisitor<
-        B,
-        Self::State,
-        M,
-        Output = Self::Output,
-        Error = Self::Error,
-    >;
+            B,
+            Self::State,
+            M,
+            Output = Self::Output,
+            Error = Self::Error,
+        >;
 
     /// Consumes the adapter into its exact typed visitor.
     fn into_visitor(self) -> Self::Visitor;
@@ -2346,10 +2981,10 @@ where
 
 /// Constructs a replicated prediction target and pairs its extension before backend erasure.
 pub fn dispatch_replicated_prediction_target_architecture<B, M, D>(
-    plan: &ArtifactArchitecturePlan,
+    source: impl ReplicatedTextConstructionSource,
     selected: SelectedReplicatedTextRealization,
     extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
     dispatcher: D,
 ) -> Result<D::Output, ReplicatedTextDispatchError<D::Error>>
@@ -2363,92 +2998,139 @@ where
     <D::State as LayerRuntimeState<B>>::LayerState:
         AttentionCache<B::Tensor> + eredu_runtime::RuntimeStateComponents<B>,
 {
-    let requirements = selected.requirements().clone();
-    let eligible = eligible_config(plan)?;
-    validate_plan_identity(&requirements, &eligible)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
-    validate_store_handoff(&requirements, store.as_ref())
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
-    let args = match eligible {
+    let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+    let requirements = selected.requirements();
+    let eligible = eligible_config(source.architecture_plan())?;
+    validate_plan_identity(&requirements, &eligible, metadata)
+        .map_err(ReplicatedTextDispatchError::contract)?;
+    store_handoff::validate::<B, _>(&source, &selected, &store, context)?;
+    match eligible {
         EligibleConfig::QwenHybrid(args) => {
-            let capability_estimate = crate::capability::qwen_hybrid_text(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let effective_model_type = args.model_type.clone();
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    crate::capability::qwen_hybrid_text(args)
+                })?;
+            let effective_model_type = metadata
+                .text(&args.model_type)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let source_architecture = selected_uses_transform(&selected)
                 .then(|| {
-                    <MixedState as FixedProfile<B, D::State, QwenHybridReplicated>>::new(
-                        args.clone(),
+                    let args = config_source::source_config::<B, _>(
+                        &source,
+                        args,
+                        config_source::qwen_hybrid,
                         context,
-                    )
+                    )?;
+                    <MixedState as FixedProfile<B, D::State, QwenHybridReplicated>>::new_with_config(args, context)
                 })
                 .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let args = selected_qwen_hybrid_args(args, &selected)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args = config_source::selected_config::<B, _, _>(
+                &source,
+                args,
+                &selected,
+                config_source::qwen_hybrid,
+                selected_qwen_hybrid_args,
+                |args| args.validate().map_err(|error| error.to_string()),
+                context,
+            )?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
             let prompt_cache_architecture_identity =
-                crate::qwen::hybrid::prompt_cache_architecture_fingerprint(&args);
+                crate::qwen::hybrid::prompt_cache_architecture_fingerprint_with_metadata(
+                    &args, metadata,
+                )
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
             let architecture =
-                <MixedState as FixedProfile<B, D::State, QwenHybridReplicated>>::new(args, context)
-                    .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
-                    .with_prediction_capture();
+                <MixedState as FixedProfile<B, D::State, QwenHybridReplicated>>::new_with_config(
+                    args, context,
+                )
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?
+                .with_prediction_capture();
             let prepared = prepare_architecture_handoff::<B, D::State, _>(
                 architecture,
                 source_architecture,
-                requirements,
                 selected,
                 capability_estimate,
                 effective_model_type,
                 prompt_cache_architecture_identity,
                 context,
             )
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
-            return visit_replicated_prediction_target_architecture(
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
+            visit_replicated_prediction_target_architecture(
                 prepared,
                 extension,
                 store,
                 dispatcher.into_visitor(),
-            );
+            )
         }
-        EligibleConfig::NemotronH(args) => args,
-        _ => return Err(ReplicatedTextIneligibility::Unrelated.into()),
-    };
-    let capability_estimate = crate::capability::nemotron_h(args)
-        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-    let effective_model_type = args.model_type.clone();
-    let source_architecture = selected_uses_transform(&selected)
-        .then(|| {
-            <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::new(
-                args.clone(),
+        EligibleConfig::NemotronH(args) => {
+            let capability_estimate =
+                capability_source::prepare::<B, _, _>(&source, &selected, context, || {
+                    crate::capability::nemotron_h(args)
+                })?;
+            let effective_model_type = metadata
+                .text(&args.model_type)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+            let source_architecture = selected_uses_transform(&selected)
+                .then(|| {
+                    let args = config_source::source_config::<B, _>(
+                        &source,
+                        args,
+                        config_source::nemotron_h,
+                        context,
+                    )?;
+                    <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::new_with_config(
+                        args, context,
+                    )
+                })
+                .transpose()
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?;
+            let args = config_source::selected_config::<B, _, _>(
+                &source,
+                args,
+                &selected,
+                config_source::nemotron_h,
+                selected_nemotron_h_args,
+                config_source::unchanged,
+                context,
+            )?;
+            let config_publication =
+                config_source::publication::<B, _, _>(&source, &args, &selected, context)?;
+            let prompt_cache_architecture_identity =
+                crate::nemotron_h::config::prompt_cache_architecture_fingerprint_with_metadata(
+                    &args, metadata,
+                )
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+            let architecture =
+                <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::new_with_config(
+                    args, context,
+                )
+                .map_err(|error| config_source::constructor_error::<B, _>(error, context))?
+                .with_prediction_capture();
+            let prepared = prepare_architecture_handoff::<B, D::State, _>(
+                architecture,
+                source_architecture,
+                selected,
+                capability_estimate,
+                effective_model_type,
+                prompt_cache_architecture_identity,
                 context,
             )
-        })
-        .transpose()
-        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-    let args = selected_nemotron_h_args(args, &selected)
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
-    let prompt_cache_architecture_identity =
-        crate::nemotron_h::prompt_cache_architecture_fingerprint(&args);
-    let architecture =
-        <MixedState as FixedProfile<B, D::State, NemotronHReplicated>>::new(args, context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
-            .with_prediction_capture();
-    let prepared = prepare_architecture_handoff::<B, D::State, _>(
-        architecture,
-        source_architecture,
-        requirements,
-        selected,
-        capability_estimate,
-        effective_model_type,
-        prompt_cache_architecture_identity,
-        context,
-    )
-    .map_err(ReplicatedTextDispatchError::Architecture)?;
-    visit_replicated_prediction_target_architecture(
-        prepared,
-        extension,
-        store,
-        dispatcher.into_visitor(),
-    )
+            .map_err(ReplicatedTextDispatchError::contract)?;
+            config_publication.commit(prepared.selected())?;
+            capability_source::publish::<B, _, _>(&source, &prepared, context)?;
+            visit_replicated_prediction_target_architecture(
+                prepared,
+                extension,
+                store,
+                dispatcher.into_visitor(),
+            )
+        }
+        _ => Err(ReplicatedTextIneligibility::Unrelated.into()),
+    }
 }
 
 enum EligibleConfig<'a> {
@@ -2889,6 +3571,10 @@ impl EligibleConfig<'_> {
         let layout = self
             .state_layout()
             .expect("eligible configuration has a valid state layout");
+        Self::state_access_from_layout(&layout)
+    }
+
+    fn state_access_from_layout(layout: &eredu_runtime::StateLayout) -> ReplicatedTextStateAccess {
         let roles = (0..layout.len()).flat_map(|layer| {
             layout
                 .components(layer)
@@ -2994,6 +3680,13 @@ impl EligibleConfig<'_> {
     }
 
     fn unit_count(&self) -> Result<usize, String> {
+        self.unit_count_with_diagnostic(|text| text.to_string())
+    }
+
+    fn unit_count_with_diagnostic<E>(
+        &self,
+        mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<usize, E> {
         let count = match self {
             Self::Nanbeige(args) => args.state_layer_count() as i32,
             Self::Gemma2(args) => args.dense_config().num_hidden_layers,
@@ -3019,7 +3712,7 @@ impl EligibleConfig<'_> {
                 ]
                 .into_iter()
                 .try_fold(0usize, |total, count| total.checked_add(count))
-                .ok_or_else(|| "Gemma 4 execution unit count overflowed".to_owned());
+                .ok_or_else(|| error(format_args!("Gemma 4 execution unit count overflowed")));
             }
             Self::Inkling(args) => {
                 return args
@@ -3028,27 +3721,30 @@ impl EligibleConfig<'_> {
                     .map_or(0, |vision| vision.num_hidden_layers as usize)
                     .checked_add(
                         usize::try_from(args.text_config.num_hidden_layers)
-                            .map_err(|_| "invalid Inkling text layer count".to_owned())?,
+                            .map_err(|_| error(format_args!("invalid Inkling text layer count")))?,
                     )
-                    .ok_or_else(|| "Inkling execution unit count overflowed".to_owned());
+                    .ok_or_else(|| error(format_args!("Inkling execution unit count overflowed")));
             }
             Self::MuseGlimmer(args) => {
                 return args
                     .vision_config
                     .as_ref()
                     .map_or(0, |vision| vision.layer_count())
-                    .checked_add(
-                        usize::try_from(args.num_hidden_layers)
-                            .map_err(|_| "invalid Muse-Glimmer text layer count".to_owned())?,
-                    )
-                    .ok_or_else(|| "Muse-Glimmer execution unit count overflowed".to_owned());
+                    .checked_add(usize::try_from(args.num_hidden_layers).map_err(|_| {
+                        error(format_args!("invalid Muse-Glimmer text layer count"))
+                    })?)
+                    .ok_or_else(|| {
+                        error(format_args!("Muse-Glimmer execution unit count overflowed"))
+                    });
             }
             Self::QwenVl(args) => {
                 return args
                     .vision
                     .layer_count()
                     .checked_add(args.text.num_hidden_layers as usize)
-                    .ok_or_else(|| "Qwen3-VL execution unit count overflowed".to_owned());
+                    .ok_or_else(|| {
+                        error(format_args!("Qwen3-VL execution unit count overflowed"))
+                    });
             }
             Self::QwenCompositeHybrid(args) => {
                 return args
@@ -3056,10 +3752,15 @@ impl EligibleConfig<'_> {
                     .as_ref()
                     .map_or(0, |vision| vision.layer_count())
                     .checked_add(args.text.num_hidden_layers as usize)
-                    .ok_or_else(|| "Qwen composite execution unit count overflowed".to_owned());
+                    .ok_or_else(|| {
+                        error(format_args!(
+                            "Qwen composite execution unit count overflowed"
+                        ))
+                    });
             }
         };
-        usize::try_from(count).map_err(|_| format!("invalid replicated layer count {count}"))
+        usize::try_from(count)
+            .map_err(|_| error(format_args!("invalid replicated layer count {count}")))
     }
 
     fn state_layout(&self) -> Result<eredu_runtime::StateLayout, String> {
@@ -4036,7 +4737,7 @@ fn decoder_parameter_role<C: crate::decoder::Config>(
 /// Derives exact replicated text requirements from an admitted artifact.
 pub(crate) fn inspection_recipe_source(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
-) -> Result<eredu_checkpoint::store::SharedCheckpointSource, ReplicatedTextRequirementsError> {
+) -> Result<eredu_checkpoint::store::RetainedCheckpointSource, ReplicatedTextRequirementsError> {
     let plan = inspection.architecture_plan();
     match (
         plan.safetensors_architecture(),
@@ -4085,7 +4786,9 @@ pub(crate) fn inspection_recipe_source(
             }
             builder
                 .build()
-                .map(|source| Arc::new(source) as eredu_checkpoint::store::SharedCheckpointSource)
+                .map(|source| {
+                    eredu_checkpoint::store::RetainedCheckpointSource::from(Arc::new(source))
+                })
                 .map_err(|error| {
                     ReplicatedTextRequirementsError::InvalidArtifact(error.to_string())
                 })
@@ -4099,7 +4802,7 @@ pub(crate) fn inspection_recipe_source(
 fn safetensors_inspection_recipe_source(
     inspection: &ArtifactInspection<ArtifactArchitecturePlan>,
     architecture: &crate::configuration::SafetensorsArchitecturePlan,
-) -> Result<eredu_checkpoint::store::SharedCheckpointSource, ReplicatedTextRequirementsError> {
+) -> Result<eredu_checkpoint::store::RetainedCheckpointSource, ReplicatedTextRequirementsError> {
     let selected = architecture.checkpoint_resolution().ok_or_else(|| {
         ReplicatedTextRequirementsError::InvalidArtifact(
             "SafeTensors architecture omitted exact catalog admission".into(),
@@ -4143,7 +4846,8 @@ fn safetensors_inspection_recipe_source(
         recipes: Default::default(),
         metadata,
         backend: eredu_checkpoint::store::WeightStoreBackend::Safetensors,
-    }))
+    })
+    .into())
 }
 
 /// Derives the complete replicated execution and checkpoint contract.
@@ -6311,7 +7015,7 @@ impl CompositeTextRequirements {
 }
 
 /// Authoritative direct or routed execution paired with one processor selection.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SelectedCompositeTextRealization {
     /// Direct decoder execution through the shared replicated session.
     Direct(eredu_runtime::SelectedCompositeRealization),
@@ -6472,7 +7176,7 @@ pub fn select_composite_text_realization_with_processor(
 pub struct PreparedCompositeTextArchitecture<A, C> {
     architecture: crate::composite_execution::PreparedCompositeArchitecture<A>,
     source_architecture: Option<crate::composite_execution::PreparedCompositeArchitecture<A>>,
-    requirements: CompositeTextRequirements,
+    requirements: composite_source::Requirements,
     contract: eredu_runtime::PreparedReplicatedTextContract,
     processor: eredu_runtime::SelectedProcessorExecution,
     admission: C,
@@ -6485,7 +7189,7 @@ pub struct PreparedRoutedCompositeTextArchitecture<A, C> {
     routed: crate::PreparedRoutedTextArchitecture<
         crate::composite_execution::PreparedCompositeArchitecture<A>,
     >,
-    requirements: CompositeTextRequirements,
+    requirements: composite_source::Requirements,
     processor: eredu_runtime::SelectedProcessorExecution,
     admission: C,
     capability_estimate: crate::capability::CapabilityEstimate,
@@ -6494,7 +7198,7 @@ pub struct PreparedRoutedCompositeTextArchitecture<A, C> {
 
 impl<A, C> PreparedRoutedCompositeTextArchitecture<A, C> {
     /// Exact architecture, artifact, processor, and grouped-bank requirements.
-    pub const fn requirements(&self) -> &CompositeTextRequirements {
+    pub fn requirements(&self) -> &CompositeTextRequirements {
         &self.requirements
     }
 
@@ -6536,9 +7240,55 @@ impl<A, C> PreparedRoutedCompositeTextArchitecture<A, C> {
     }
 }
 
+impl<A>
+    PreparedReplicatedTextModules<crate::composite_execution::PreparedCompositeArchitecture<A>>
+{
+    /// Attaches only this closed pair's already validated selected graph owner.
+    /// Clone shares the existing immutable owner and allocates no graph payload.
+    pub(crate) fn retain_composite_graph(
+        &mut self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), eredu_nn::Error> {
+        let controls = [
+            std::mem::size_of::<SelectedReplicatedTextRealization>(),
+            std::mem::size_of::<(&mut Self, &eredu_nn::workspace::WorkspaceContext)>(),
+            std::mem::size_of::<Result<(), eredu_nn::Error>>(),
+        ];
+        let bytes = controls
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+        context.charge_metadata(bytes)?;
+        let selected = self.contract().selected().clone();
+        self.architecture
+            .as_mut()
+            .expect("prepared architecture is present")
+            .retain_prepared_graph(selected);
+        Ok(())
+    }
+}
+
 impl<A, C> PreparedCompositeTextArchitecture<A, C> {
+    /// Moves the exact selected/source module owners and validated contract into
+    /// the shared prepared runtime handoff, without rebuilding graph metadata.
+    pub fn into_modules(
+        self,
+    ) -> (
+        PreparedReplicatedTextModules<crate::composite_execution::PreparedCompositeArchitecture<A>>,
+        C,
+    ) {
+        (
+            PreparedReplicatedTextModules {
+                architecture: Some(self.architecture),
+                source_architecture: self.source_architecture,
+                contract: Some(self.contract),
+            },
+            self.admission,
+        )
+    }
+
     /// Exact architecture, artifact, and processor requirements.
-    pub const fn requirements(&self) -> &CompositeTextRequirements {
+    pub fn requirements(&self) -> &CompositeTextRequirements {
         &self.requirements
     }
 
@@ -6608,7 +7358,7 @@ where
             A,
             <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
         >,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
@@ -6625,7 +7375,7 @@ where
             A,
             <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
         >,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
@@ -6634,6 +7384,48 @@ where
         A::InputPartPlan: 'static,
         A::StaticModules: Clone,
         A::Error: std::fmt::Display;
+
+    /// Retains the optional semantic media capability; default preserves ordinary dispatch.
+    fn visit_media<A>(
+        self,
+        prepared: PreparedCompositeTextArchitecture<
+            A,
+            <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
+        >,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + crate::composite_execution::CompositeMediaIngressArchitecture<B, S>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        self.visit(prepared, store)
+    }
+
+    /// Retains the optional semantic media capability; default preserves ordinary dispatch.
+    fn visit_routed_media<A>(
+        self,
+        prepared: PreparedRoutedCompositeTextArchitecture<
+            A,
+            <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
+        >,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
+    ) -> Result<Self::Output, Self::Error>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + crate::composite_execution::CompositeMediaIngressArchitecture<B, S>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        A::Error: std::fmt::Display,
+    {
+        self.visit_routed(prepared, store)
+    }
 }
 
 /// Family-blind backend visitor for an exact composite prediction target.
@@ -6663,7 +7455,7 @@ where
             <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
         >,
         extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<M>,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
@@ -6683,7 +7475,7 @@ where
             <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
         >,
         extension: <crate::composite_execution::PreparedCompositeArchitecture<A> as crate::prediction_extension::MaterializedPredictionTarget<B>>::Extension<M>,
-        store: eredu_checkpoint::store::SharedCheckpointSource,
+        store: eredu_checkpoint::store::RetainedCheckpointSource,
     ) -> Result<Self::Output, Self::Error>
     where
         A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
@@ -6703,7 +7495,7 @@ pub fn visit_composite_prediction_target_architecture<B, S, M, A, V>(
         <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
     >,
     extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
@@ -6741,7 +7533,7 @@ pub fn visit_routed_composite_prediction_target_architecture<B, S, M, A, V>(
         <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
     >,
     extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
@@ -6974,7 +7766,7 @@ impl CompositeConfig<'_> {
                         args.text_config.num_hidden_layers as usize,
                     ],
                     vec![
-                        media(ArchitectureGroupKind::VisionEncoder, vec!["vision"]),
+                        crate::inkling::model::vision_group_transport(),
                         ArchitectureGroupTransport {
                             placement: ArchitectureGroupPlacement::Pipeline,
                             kind: ArchitectureGroupKind::AudioEncoder,
@@ -7643,7 +8435,7 @@ pub(crate) fn qwen_hybrid_composite_with_formats(
 fn prepare_composite_architecture_handoff<B, S, A>(
     architecture: A,
     source_architecture: Option<A>,
-    requirements: CompositeTextRequirements,
+    requirements: composite_source::Requirements,
     selected: SelectedReplicatedTextRealization,
     processor: eredu_runtime::SelectedProcessorExecution,
     capability_estimate: crate::capability::CapabilityEstimate,
@@ -7655,7 +8447,7 @@ fn prepare_composite_architecture_handoff<B, S, A>(
         A,
         <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
     >,
-    String,
+    eredu_runtime::PreparedTextContractError,
 >
 where
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
@@ -7663,22 +8455,58 @@ where
     A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error> + 'static,
     A::InputPartPlan: 'static,
 {
+    use eredu_runtime::PreparedTextContractError;
+    let metadata =
+        B::construction_metadata(context).filter(|context| context.uses_checked_metadata());
+    let diagnostic = |message: &'static str| match metadata {
+        Some(context) => {
+            PreparedTextContractError::Metadata(context.metadata_error(format_args!("{message}")))
+        }
+        None => PreparedTextContractError::Contract(message.to_owned()),
+    };
+    if let Some(context) = metadata {
+        let controls = [
+            std::mem::size_of::<PreparedCompositeTextArchitecture<A, A::AdmissionConfig>>(),
+            std::mem::size_of::<
+                Result<
+                    PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
+                    PreparedTextContractError,
+                >,
+            >(),
+            std::mem::size_of::<A::AdmissionConfig>(),
+            std::mem::size_of_val(&metadata),
+            std::mem::size_of_val(&diagnostic),
+        ];
+        let bytes = controls
+            .into_iter()
+            .try_fold(std::mem::size_of_val(&controls), usize::checked_add)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)
+            .map_err(eredu_nn::Error::from)?;
+        context
+            .charge_metadata(bytes)
+            .map_err(eredu_nn::Error::from)?;
+    }
     if selected.requirements() != requirements.execution() {
-        return Err("selected composite execution differs from exact requirements".into());
+        return Err(diagnostic(
+            "selected composite execution differs from exact requirements",
+        ));
     }
     if processor.requirements() != requirements.processor_execution() {
-        return Err("selected composite processor differs from exact requirements".into());
+        return Err(diagnostic(
+            "selected composite processor differs from exact requirements",
+        ));
     }
     let admission = architecture.admission_config();
     let architecture = crate::composite_execution::PreparedCompositeArchitecture::new(architecture);
     let source_architecture =
         source_architecture.map(crate::composite_execution::PreparedCompositeArchitecture::new);
-    let contract = eredu_runtime::prepare_layered_text_contract::<_, B, S>(
+    let contract = eredu_runtime::prepare_layered_text_contract_with_metadata::<_, B, S>(
         &architecture,
         source_architecture.as_ref(),
         selected,
         &prompt_cache_architecture_identity,
         eredu_runtime::ReplicatedTextOutputSelection::LastSequencePosition,
+        std::iter::empty::<&str>(),
         context,
     )?;
     Ok(PreparedCompositeTextArchitecture {
@@ -7697,19 +8525,20 @@ where
 fn prepare_routed_composite_architecture_handoff<B, S, A>(
     architecture: A,
     source_architecture: Option<A>,
-    requirements: CompositeTextRequirements,
+    requirements: composite_source::Requirements,
     selected: crate::SelectedRoutedTextRealization,
     processor: eredu_runtime::SelectedProcessorExecution,
     capability_estimate: crate::capability::CapabilityEstimate,
     effective_model_type: String,
     prompt_cache_architecture_identity: String,
+    store: &eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
 ) -> Result<
     PreparedRoutedCompositeTextArchitecture<
         A,
         <A as crate::composite_execution::CompositeArchitecture<B, S>>::AdmissionConfig,
     >,
-    String,
+    eredu_runtime::PreparedTextContractError,
 >
 where
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
@@ -7720,24 +8549,56 @@ where
     A::InputPartPlan: 'static,
     A::StaticModules: Clone,
 {
+    let metadata = crate::decoder::identity::Metadata::new(B::construction_metadata(context));
+    metadata.controls::<(
+        A,
+        Option<A>,
+        composite_source::Requirements,
+        crate::SelectedRoutedTextRealization,
+        eredu_runtime::SelectedProcessorExecution,
+        A::AdmissionConfig,
+        crate::capability::CapabilityEstimate,
+        String,
+        String,
+        PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
+    )>()?;
+    if metadata.context().is_some() {
+        metadata.controls::<(
+            Option<&composite_source::Completed>,
+            &composite_source::Configurations,
+            bool,
+        )>()?;
+        requirements.validate_completed_units()?;
+    }
+    let diagnostic = |message: &'static str| match metadata.context() {
+        Some(_) => eredu_runtime::PreparedTextContractError::Metadata(
+            metadata.error(format_args!("{message}")),
+        ),
+        None => eredu_runtime::PreparedTextContractError::Contract(message.to_owned()),
+    };
+    metadata.controls::<(&crate::decoder::identity::Metadata<'_>, &str)>()?;
     if processor.requirements() != requirements.processor_execution() {
-        return Err("selected composite processor differs from exact requirements".into());
+        return Err(diagnostic(
+            "selected composite processor differs from exact requirements",
+        ));
     }
     let routed_requirements = requirements
         .routed_execution()
-        .cloned()
-        .ok_or_else(|| "routed composite selection has no grouped-bank requirements".to_owned())?;
+        .ok_or_else(|| diagnostic("routed composite selection has no grouped-bank requirements"))?;
     let admission = architecture.admission_config();
     let architecture = crate::composite_execution::PreparedCompositeArchitecture::new(architecture);
     let source_architecture =
         source_architecture.map(crate::composite_execution::PreparedCompositeArchitecture::new);
-    let routed = crate::routed_text::prepare_routed_architecture_handoff::<B, S, _>(
+    let retained_model_type = metadata.text(&effective_model_type)?;
+    let routed = crate::routed_text::prepare_composite_handoff::<B, S, _>(
         architecture,
         source_architecture,
+        requirements.source(),
         routed_requirements,
         selected,
+        store,
         capability_estimate.clone(),
-        effective_model_type.clone(),
+        retained_model_type,
         prompt_cache_architecture_identity,
         context,
     )?;
@@ -7755,9 +8616,9 @@ where
 pub fn visit_composite_text_architecture<B, S, V>(
     requirements: CompositeTextRequirements,
     selected: SelectedCompositeTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
     B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
@@ -7767,19 +8628,181 @@ where
         + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
     V: CompositeTextArchitectureVisitor<B, S>,
 {
-    validate_store_handoff(requirements.execution(), store.as_ref())
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
-    let retained = requirements.inspection.clone();
-    let config = composite_config(retained.architecture_plan())
+    visit_composite_text_architecture_with_requirements::<B, S, V>(
+        composite_source::Requirements::owned::<B>(requirements, context)
+            .map_err(ReplicatedTextDispatchError::Metadata)?,
+        selected,
+        store,
+        context,
+        visitor,
+    )
+}
+
+pub(crate) fn visit_prepared_composite_text_architecture<B, S, V>(
+    source: &crate::prepared_sources::PreparedModelSources,
+    selected: SelectedCompositeTextRealization,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
+    context: &<B::Tensor as Tensor>::Context,
+    visitor: V,
+) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+where
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
+    V: CompositeTextArchitectureVisitor<B, S>,
+{
+    let requirements =
+        composite_source::Requirements::prepared::<B, V::Error>(source, &selected, context)?;
+    visit_composite_text_architecture_with_requirements::<B, S, V>(
+        requirements,
+        selected,
+        store,
+        context,
+        visitor,
+    )
+}
+
+fn visit_composite_text_architecture_with_requirements<B, S, V>(
+    requirements: composite_source::Requirements,
+    selected: SelectedCompositeTextRealization,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
+    context: &<B::Tensor as Tensor>::Context,
+    visitor: V,
+) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+where
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
+    V: CompositeTextArchitectureVisitor<B, S>,
+{
+    with_composite_construction::<B, S, _, _, _>(
+        requirements,
+        selected,
+        store,
+        context,
+        visitor,
+        false,
+        |visitor| visitor.construction_started(),
+        |config, construction| match config {
+            CompositeConfig::QwenVl(args) => construction.qwen_vl(args),
+            CompositeConfig::Gemma4(args) => construction.gemma4(args),
+            CompositeConfig::Muse(args) => construction.muse(args),
+            CompositeConfig::Inkling(args) => construction.inkling(args),
+            CompositeConfig::QwenHybrid(args) => construction.qwen_hybrid(args),
+        },
+    )
+}
+
+fn with_composite_construction<'context, B, S, V, O, E>(
+    requirements: composite_source::Requirements,
+    selected: SelectedCompositeTextRealization,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
+    context: &'context <B::Tensor as Tensor>::Context,
+    mut visitor: V,
+    requires_completed: bool,
+    start: impl FnOnce(&mut V),
+    finish: impl for<'config> FnOnce(
+        CompositeConfig<'config>,
+        CompositeTextConstruction<'context, B, S, V>,
+    ) -> Result<O, ReplicatedTextDispatchError<E>>,
+) -> Result<O, ReplicatedTextDispatchError<E>>
+where
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
+{
+    if let Some(source) = requirements.source() {
+        store_handoff::validate::<B, E>(source, selected.execution(), &store, context)?;
+    } else {
+        validate_store_handoff(requirements.execution(), store.as_ref())
+            .map_err(ReplicatedTextDispatchError::Architecture)?;
+    }
+    if let Some(metadata) = B::construction_metadata(context) {
+        metadata
+            .charge_metadata(
+                size_of::<Option<crate::prepared_sources::PreparedModelSources>>()
+                    + size_of::<Option<ArtifactInspection<ArtifactArchitecturePlan>>>(),
+            )
+            .map_err(|cause| ReplicatedTextDispatchError::Metadata(cause.into()))?;
+    }
+    let source = requirements.source().cloned();
+    let retained = source.is_none().then(|| requirements.inspection.clone());
+    let architecture = match &source {
+        Some(source) => source.architecture(),
+        None => retained
+            .as_ref()
+            .expect("ordinary inspection")
+            .architecture_plan(),
+    };
+    let config = composite_config(architecture)
         .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
         .ok_or(ReplicatedTextIneligibility::Unrelated)?;
-    let source_linear_formats = requirement_matrix_formats(requirements.execution());
-    let target_linear_formats =
-        selected_matrix_formats(requirements.execution(), selected.execution());
-    let source_formats = requirement_formats(requirements.execution());
-    let target_formats = selected_formats(selected.execution());
+    if let Some(metadata) = B::construction_metadata(context) {
+        let controls = [
+            size_of::<CompositeTextConstruction<'_, B, S, V>>(),
+            size_of::<Result<O, ReplicatedTextDispatchError<E>>>(),
+            size_of::<CompositeConfig<'_>>(),
+            size_of::<V>(),
+            size_of_val(&start),
+            size_of_val(&finish),
+            size_of::<bool>(),
+        ];
+        let bytes = controls
+            .into_iter()
+            .try_fold(size_of_val(&controls), usize::checked_add)
+            .ok_or_else(|| {
+                ReplicatedTextDispatchError::Metadata(
+                    eredu_nn::workspace::WorkspaceMetadataError::Overflow.into(),
+                )
+            })?;
+        metadata
+            .charge_metadata(bytes)
+            .map_err(|cause| ReplicatedTextDispatchError::Metadata(cause.into()))?;
+    }
+    let completed = if matches!(
+        config,
+        CompositeConfig::QwenVl(_) | CompositeConfig::QwenHybrid(_) | CompositeConfig::Inkling(_)
+            | CompositeConfig::Gemma4(_)
+    ) {
+        requirements.completed::<B, E>(&selected, context)?
+    } else {
+        None
+    };
+    if requires_completed
+        && completed.is_none()
+        && B::construction_metadata(context)
+            .is_some_and(|metadata| metadata.uses_checked_metadata())
+    {
+        return Err(ReplicatedTextDispatchError::Metadata(
+            eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+        ));
+    }
+    // A completed native handoff already owns the exact effective source and
+    // target maps. Empty maps allocate nothing and are never read by this path.
+    let (source_linear_formats, target_linear_formats, source_formats, target_formats) =
+        if completed.is_some() {
+            (
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+        } else {
+            (
+                requirement_matrix_formats(requirements.execution()),
+                selected_matrix_formats(requirements.execution(), selected.execution()),
+                requirement_formats(requirements.execution()),
+                selected_formats(selected.execution()),
+            )
+        };
     let has_transform = selected_uses_transform(selected.execution());
-    visitor.construction_started();
+    start(&mut visitor);
     let construction = CompositeTextConstruction::<B, S, V> {
         requirements,
         selected,
@@ -7791,24 +8814,20 @@ where
         source_formats,
         target_formats,
         has_transform,
+        completed,
+        publication: None,
         state: std::marker::PhantomData,
     };
-    match config {
-        CompositeConfig::QwenVl(args) => construction.qwen_vl(args),
-        CompositeConfig::Gemma4(args) => construction.gemma4(args),
-        CompositeConfig::Muse(args) => construction.muse(args),
-        CompositeConfig::Inkling(args) => construction.inkling(args),
-        CompositeConfig::QwenHybrid(args) => construction.qwen_hybrid(args),
-    }
+    finish(config, construction)
 }
 
 // Keep cold family construction in separate stack frames: one debug dispatch frame
 // containing every family's source/target and direct/routed temporaries can exceed
 // the default thread stack before construction reaches its first layer.
 struct CompositeTextConstruction<'a, B: eredu_nn::NeuralBackend, S, V> {
-    requirements: CompositeTextRequirements,
+    requirements: composite_source::Requirements,
     selected: SelectedCompositeTextRealization,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &'a <B::Tensor as Tensor>::Context,
     visitor: V,
     source_linear_formats: HashMap<String, LinearFormat>,
@@ -7816,6 +8835,8 @@ struct CompositeTextConstruction<'a, B: eredu_nn::NeuralBackend, S, V> {
     source_formats: HashMap<String, WeightQuantization>,
     target_formats: HashMap<String, WeightQuantization>,
     has_transform: bool,
+    completed: Option<composite_source::Completed>,
+    publication: Option<composite_source::Configurations>,
     state: std::marker::PhantomData<fn() -> S>,
 }
 
@@ -7844,70 +8865,151 @@ where
         A::InputPartPlan: 'static,
         A::StaticModules: Clone,
     {
-        match self.selected {
-            SelectedCompositeTextRealization::Direct(selected) => {
-                let (execution, processor) = selected.into_parts();
-                let prepared = prepare_composite_architecture_handoff::<B, S, _>(
-                    architecture,
-                    source,
-                    self.requirements,
-                    execution,
-                    processor,
-                    capability,
-                    model_type,
-                    cache_identity,
-                    self.context,
-                )
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-                self.visitor
-                    .visit(prepared, self.store)
+        self.visit_with(
+            architecture,
+            source,
+            capability,
+            model_type,
+            cache_identity,
+            |visitor, prepared, store| {
+                visitor
+                    .visit(prepared, store)
                     .map_err(ReplicatedTextDispatchError::Backend)
-            }
-            SelectedCompositeTextRealization::Routed {
-                execution,
-                processor,
-            } => {
-                let prepared = prepare_routed_composite_architecture_handoff::<B, S, _>(
-                    architecture,
-                    source,
-                    self.requirements,
-                    execution,
-                    processor,
-                    capability,
-                    model_type,
-                    cache_identity,
-                    self.context,
-                )
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-                self.visitor
-                    .visit_routed(prepared, self.store)
+            },
+            |visitor, prepared, store| {
+                visitor
+                    .visit_routed(prepared, store)
                     .map_err(ReplicatedTextDispatchError::Backend)
-            }
-        }
+            },
+        )
+    }
+
+    #[inline(never)]
+    fn visit_media<A>(
+        self,
+        architecture: A,
+        source: Option<A>,
+        capability: crate::capability::CapabilityEstimate,
+        model_type: String,
+        cache_identity: String,
+    ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + crate::composite_execution::CompositeMediaIngressArchitecture<B, S>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+    {
+        self.visit_with(
+            architecture,
+            source,
+            capability,
+            model_type,
+            cache_identity,
+            |visitor, prepared, store| {
+                visitor
+                    .visit_media(prepared, store)
+                    .map_err(ReplicatedTextDispatchError::Backend)
+            },
+            |visitor, prepared, store| {
+                visitor
+                    .visit_routed_media(prepared, store)
+                    .map_err(ReplicatedTextDispatchError::Backend)
+            },
+        )
     }
 
     #[inline(never)]
     fn qwen_vl(
-        self,
+        mut self,
         args: &crate::qwen::vl::ModelArgs,
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
-        let capability = crate::capability::qwen_vl(args)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let source = self
-            .has_transform
-            .then(|| qwen_vl_with_formats(args, self.source_linear_formats.clone()))
+        let (target, source_config, capability) = match self.completed.take() {
+            Some(composite_source::Completed {
+                configurations: composite_source::Configurations::QwenVl { target, source },
+                capability,
+            }) => {
+                if source.is_some() != self.has_transform {
+                    return Err(ReplicatedTextDispatchError::Metadata(
+                        eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+                    ));
+                }
+                (
+                    CompositeModelConfig::Retained(target),
+                    source.map(CompositeModelConfig::Retained),
+                    capability,
+                )
+            }
+            Some(_) => {
+                return Err(ReplicatedTextDispatchError::Metadata(
+                    eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+                ));
+            }
+            None => {
+                let capability = crate::capability::qwen_vl(args).map_err(|error| {
+                    ReplicatedTextDispatchError::Architecture(error.to_string())
+                })?;
+                let source = self
+                    .has_transform
+                    .then(|| {
+                        qwen_vl_with_formats(args, std::mem::take(&mut self.source_linear_formats))
+                    })
+                    .transpose()
+                    .map_err(ReplicatedTextDispatchError::Architecture)?
+                    .map(CompositeModelConfig::Owned);
+                // Keep source construction before target format validation, as in
+                // the ordinary worker. Its failure remains the first cause.
+                let source = source
+                    .map(|args| {
+                        crate::qwen::vl::LayeredModel::<B>::new_with_config(args, self.context)
+                    })
+                    .transpose()
+                    .map_err(|error| {
+                        config_source::constructor_error::<B, _>(error, self.context)
+                    })?;
+                let target =
+                    qwen_vl_with_formats(args, std::mem::take(&mut self.target_linear_formats))
+                        .map_err(ReplicatedTextDispatchError::Architecture)?;
+                return self.qwen_vl_constructed(
+                    CompositeModelConfig::Owned(target),
+                    source,
+                    capability,
+                );
+            }
+        };
+        let source = source_config
+            .map(|args| crate::qwen::vl::LayeredModel::<B>::new_with_config(args, self.context))
             .transpose()
-            .map_err(ReplicatedTextDispatchError::Architecture)?
-            .map(|args| crate::qwen::vl::LayeredModel::<B>::new(args, self.context))
-            .transpose()
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let target = qwen_vl_with_formats(args, self.target_linear_formats.clone())
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
-        let effective_model_type = target.effective_model_type().to_owned();
-        let cache_identity = crate::qwen::vl::prompt_cache_architecture_fingerprint(&target);
-        let architecture = crate::qwen::vl::LayeredModel::<B>::new(target, self.context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        self.visit(
+            .map_err(|error| config_source::constructor_error::<B, _>(error, self.context))?;
+        self.qwen_vl_constructed(target, source, capability)
+    }
+
+    fn qwen_vl_constructed(
+        mut self,
+        target: CompositeModelConfig<crate::qwen::vl::ModelArgs>,
+        source: Option<crate::qwen::vl::LayeredModel<B>>,
+        capability: crate::capability::CapabilityEstimate,
+    ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
+        let metadata =
+            crate::decoder::identity::Metadata::new(B::construction_metadata(self.context));
+        let effective_model_type = metadata
+            .text(target.effective_model_type())
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
+        let cache_identity =
+            crate::qwen::vl::prompt_cache_architecture_fingerprint_with_metadata(&target, metadata)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+        let architecture =
+            crate::qwen::vl::LayeredModel::<B>::new_with_config(target, self.context)
+                .map_err(|error| config_source::constructor_error::<B, _>(error, self.context))?;
+        if self.requirements.source().is_some() && B::construction_metadata(self.context).is_none()
+        {
+            self.publication = Some(composite_source::Configurations::QwenVl {
+                target: architecture.config_owner().clone(),
+                source: source.as_ref().map(|source| source.config_owner().clone()),
+            });
+        }
+        self.visit_media(
             architecture,
             source,
             capability,
@@ -7918,9 +9020,68 @@ where
 
     #[inline(never)]
     fn gemma4(
-        self,
+        mut self,
         args: &crate::gemma4::FamilyConfig,
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
+        let metadata=crate::decoder::identity::Metadata::new(B::construction_metadata(self.context));
+        metadata.controls::<(ConstructedGemma4<B>,
+            Result<ConstructedGemma4<B>,ReplicatedTextDispatchError<V::Error>>,
+            &mut Self,&crate::gemma4::FamilyConfig,Option<composite_source::Completed>)>()
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
+        // Initial source construction and retained-source construction finish
+        // before the visitor enters its own nested equation quote.
+        let ConstructedGemma4 {architecture,source,capability,model_type,cache_identity:fingerprint}=self.prepare_gemma4(args)?;
+        self.visit_media(architecture,source,capability,model_type,fingerprint)
+    }
+
+    #[inline(never)]
+    fn prepare_gemma4(&mut self,args:&crate::gemma4::FamilyConfig)
+        -> Result<ConstructedGemma4<B>,ReplicatedTextDispatchError<V::Error>> {
+        match self.completed.take() {
+            Some(completed)=>self.prepare_gemma4_completed(completed),
+            None=>self.prepare_gemma4_initial(args),
+        }
+    }
+
+    #[inline(never)]
+    fn prepare_gemma4_completed(&mut self,completed:composite_source::Completed)
+        -> Result<ConstructedGemma4<B>,ReplicatedTextDispatchError<V::Error>> {
+        let composite_source::Completed {
+            configurations: composite_source::Configurations::Gemma4 { target, source },
+            capability,
+        } = completed else {
+            return Err(ReplicatedTextDispatchError::Metadata(
+                eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+            ));
+        };
+        if source.is_some() != self.has_transform {
+            return Err(ReplicatedTextDispatchError::Metadata(
+                eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+            ));
+        }
+        let metadata=crate::decoder::identity::Metadata::new(B::construction_metadata(self.context));
+        metadata.controls::<(crate::gemma4::model::RetainedModelSource,
+            Option<crate::gemma4::model::RetainedModelSource>,
+            crate::gemma4::LayeredModel<B>,Option<crate::gemma4::LayeredModel<B>>,
+            crate::capability::CapabilityEstimate,String,String)>()
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
+        let model_type=metadata.text(target.effective_model_type())
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
+        let fingerprint=metadata.text(target.fingerprint())
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
+        let source=source.map(|source|crate::gemma4::LayeredModel::<B>::new_with_source(source,self.context))
+            .transpose().map_err(|e|config_source::constructor_error::<B,_>(e,self.context))?;
+        let architecture=crate::gemma4::LayeredModel::<B>::new_with_source(target,self.context)
+            .map_err(|e|config_source::constructor_error::<B,_>(e,self.context))?;
+        Ok(ConstructedGemma4 {architecture,source,capability,model_type,cache_identity:fingerprint})
+    }
+
+    #[inline(never)]
+    fn prepare_gemma4_initial(&mut self,args:&crate::gemma4::FamilyConfig)
+        -> Result<ConstructedGemma4<B>,ReplicatedTextDispatchError<V::Error>> {
+        // No reconstructed configuration/map becomes a source for a checked quote.
+        crate::decoder::construction_specs::require_source_compiler::<B>(self.context)
+            .map_err(|e|config_source::constructor_error::<B,_>(e,self.context))?;
         let output_projection_bias = self
             .requirements
             .execution()
@@ -7939,7 +9100,7 @@ where
         }
         let capability = crate::capability::gemma4(&exact_args)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let source = self
+        let mut source = self
             .has_transform
             .then(|| {
                 crate::gemma4::with_checkpoint_formats(&exact_args, self.source_formats.clone())
@@ -7954,15 +9115,18 @@ where
                 .map_err(ReplicatedTextDispatchError::Architecture)?;
         let effective_model_type = target.effective_model_type().to_owned();
         let cache_identity = target.architecture_fingerprint();
-        let architecture = crate::gemma4::LayeredModel::<B>::new(target, self.context)
+        let mut architecture = crate::gemma4::LayeredModel::<B>::new(target, self.context)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        self.visit(
-            architecture,
-            source,
-            capability,
-            effective_model_type,
-            cache_identity,
-        )
+        let source_declarations=source.as_mut().map(|source|source.prepare_source(self.context))
+            .transpose().map_err(|e|config_source::constructor_error::<B,_>(e,self.context))?;
+        let target_declarations=architecture.prepare_source(self.context)
+            .map_err(|e|config_source::constructor_error::<B,_>(e,self.context))?;
+        if self.requirements.source().is_some() {
+            self.publication=Some(composite_source::Configurations::Gemma4 {
+                target:target_declarations,source:source_declarations,
+            });
+        }
+        Ok(ConstructedGemma4 {architecture,source,capability,model_type:effective_model_type,cache_identity})
     }
 
     #[inline(never)]
@@ -7989,7 +9153,7 @@ where
         let cache_identity = target.architecture_fingerprint();
         let architecture = crate::muse_glimmer::LayeredModel::<B>::new(target, self.context)
             .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        self.visit(
+        self.visit_media(
             architecture,
             source,
             capability,
@@ -8003,28 +9167,17 @@ where
         self,
         args: &crate::inkling::ModelArgs,
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
-        let capability = crate::capability::inkling(args)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let source = self
-            .has_transform
-            .then(|| crate::inkling::with_checkpoint_formats(args, self.source_formats.clone()))
-            .transpose()
-            .map_err(ReplicatedTextDispatchError::Architecture)?
-            .map(|args| crate::inkling::LayeredModel::<B>::new(args, self.context))
-            .transpose()
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let target = crate::inkling::with_checkpoint_formats(args, self.target_formats.clone())
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
-        let effective_model_type = target.model_type.clone();
-        let cache_identity = target.architecture_fingerprint();
-        let architecture = crate::inkling::LayeredModel::<B>::new(target, self.context)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        self.visit(
-            architecture,
-            source,
-            capability,
-            effective_model_type,
-            cache_identity,
+        self.inkling_with(
+            args,
+            |construction, architecture, source, capability, model_type, cache_identity| {
+                construction.visit_media(
+                    architecture,
+                    source,
+                    capability,
+                    model_type,
+                    cache_identity,
+                )
+            },
         )
     }
 
@@ -8033,25 +9186,675 @@ where
         self,
         args: &crate::qwen::hybrid::ParsedHybridConfig,
     ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>> {
-        let capability = crate::capability::qwen_hybrid(args)
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let source = self
-            .has_transform
-            .then(|| qwen_hybrid_composite_with_formats(args, self.source_linear_formats.clone()))
+        self.qwen_hybrid_with(
+            args,
+            |construction, architecture, source, capability, model_type, cache_identity| {
+                construction.visit_media(
+                    architecture,
+                    source,
+                    capability,
+                    model_type,
+                    cache_identity,
+                )
+            },
+        )
+    }
+}
+
+// The prepared family values cross the constructor/continuation boundary by
+// ownership; the caller's existing metadata account pays the exact destination.
+struct ConstructedGemma4<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    architecture: crate::gemma4::LayeredModel<B>,
+    source: Option<crate::gemma4::LayeredModel<B>>,
+    capability: crate::capability::CapabilityEstimate,
+    model_type: String,
+    cache_identity: String,
+}
+
+struct ConstructedInkling<B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend> {
+    architecture: crate::inkling::LayeredModel<B>,
+    source: Option<crate::inkling::LayeredModel<B>>,
+    capability: crate::capability::CapabilityEstimate,
+    model_type: String,
+    cache_identity: String,
+}
+
+impl<B, S, V> CompositeTextConstruction<'_, B, S, V>
+where
+    B: eredu_nn::GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + Clone,
+    S: LayerRuntimeState<B>,
+    S::LayerState: AttentionCache<B::Tensor>
+        + eredu_runtime::RuntimeStateComponents<B>
+        + eredu_nn::AuxiliaryConvolutionState<B::Tensor>,
+{
+    #[inline(never)]
+    fn visit_with<A, Direct, Routed, O, E>(
+        self,
+        architecture: A,
+        source: Option<A>,
+        capability: crate::capability::CapabilityEstimate,
+        model_type: String,
+        cache_identity: String,
+        direct: Direct,
+        routed: Routed,
+    ) -> Result<O, ReplicatedTextDispatchError<E>>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        Direct: FnOnce(
+            V,
+            PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
+            eredu_checkpoint::store::RetainedCheckpointSource,
+        ) -> Result<O, ReplicatedTextDispatchError<E>>,
+        Routed: FnOnce(
+            V,
+            PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
+            eredu_checkpoint::store::RetainedCheckpointSource,
+        ) -> Result<O, ReplicatedTextDispatchError<E>>,
+    {
+        if let Some(metadata) = B::construction_metadata(self.context) {
+            let controls = [
+                // Arguments of this common chooser and the one selected typed
+                // direct/routed helper coexist until the helper returns.
+                size_of::<Self>(),
+                size_of::<Self>(),
+                size_of::<A>(),
+                size_of::<A>(),
+                size_of::<Option<A>>(),
+                size_of::<Option<A>>(),
+                size_of::<crate::capability::CapabilityEstimate>(),
+                size_of::<crate::capability::CapabilityEstimate>(),
+                size_of::<String>(),
+                size_of::<String>(),
+                size_of::<String>(),
+                size_of::<String>(),
+                size_of::<Direct>(),
+                size_of::<Routed>(),
+                size_of::<Result<O, ReplicatedTextDispatchError<E>>>(),
+            ];
+            let bytes = controls
+                .into_iter()
+                .try_fold(size_of_val(&controls), usize::checked_add)
+                .ok_or_else(|| {
+                    ReplicatedTextDispatchError::Metadata(
+                        eredu_nn::workspace::WorkspaceMetadataError::Overflow.into(),
+                    )
+                })?;
+            metadata
+                .charge_metadata(bytes)
+                .map_err(|cause| ReplicatedTextDispatchError::Metadata(cause.into()))?;
+        }
+        // Each prepared handoff carries architecture-owned modules by value. Keep
+        // the mutually exclusive direct/routed temporaries in separate frames,
+        // so the other route's storage is absent during visitor construction.
+        if matches!(&self.selected, SelectedCompositeTextRealization::Direct(_)) {
+            self.visit_direct_with(
+                architecture,
+                source,
+                capability,
+                model_type,
+                cache_identity,
+                direct,
+            )
+        } else {
+            self.visit_routed_with(
+                architecture,
+                source,
+                capability,
+                model_type,
+                cache_identity,
+                routed,
+            )
+        }
+    }
+
+    #[inline(never)]
+    fn visit_direct_with<A, Direct, O, E>(
+        self,
+        architecture: A,
+        source: Option<A>,
+        capability: crate::capability::CapabilityEstimate,
+        model_type: String,
+        cache_identity: String,
+        direct: Direct,
+    ) -> Result<O, ReplicatedTextDispatchError<E>>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        Direct: FnOnce(
+            V,
+            PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
+            eredu_checkpoint::store::RetainedCheckpointSource,
+        ) -> Result<O, ReplicatedTextDispatchError<E>>,
+    {
+        if let Some(metadata) = B::construction_metadata(self.context) {
+            let controls = [
+                size_of::<(A, Option<A>, composite_source::Requirements,
+                    SelectedCompositeTextRealization,
+                    crate::capability::CapabilityEstimate, String, String,
+                    Option<composite_source::Configurations>,
+                    &<B::Tensor as Tensor>::Context,
+                )>(),
+                size_of::<Result<PreparedCompositeTextArchitecture<A, A::AdmissionConfig>,
+                    ReplicatedTextDispatchError<E>>>(),
+            ];
+            let bytes = controls.into_iter()
+                .try_fold(size_of_val(&controls), usize::checked_add)
+                .ok_or_else(|| ReplicatedTextDispatchError::Metadata(
+                    eredu_nn::workspace::WorkspaceMetadataError::Overflow.into()))?;
+            metadata.charge_metadata(bytes)
+                .map_err(|cause| ReplicatedTextDispatchError::Metadata(cause.into()))?;
+        }
+        // Complete selected-source validation and publication before entering
+        // the visitor's nested quote. Their Result and selection temporaries
+        // belong to the helper frame, which has returned at that boundary.
+        let prepared = Self::prepare_direct_handoff::<A, E>(
+            architecture, source, self.requirements, self.selected, capability,
+            model_type, cache_identity, self.publication, self.context,
+        )?;
+        direct(self.visitor, prepared, self.store)
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_direct_handoff<A, E>(
+        architecture: A,
+        source: Option<A>,
+        requirements: composite_source::Requirements,
+        selected: SelectedCompositeTextRealization,
+        capability: crate::capability::CapabilityEstimate,
+        model_type: String,
+        cache_identity: String,
+        publication: Option<composite_source::Configurations>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<PreparedCompositeTextArchitecture<A, A::AdmissionConfig>, ReplicatedTextDispatchError<E>>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+    {
+        let SelectedCompositeTextRealization::Direct(selected) = selected else {
+            unreachable!("direct handoff is called only for the selected direct route");
+        };
+        let (execution, processor) = selected.into_parts();
+        let prepared = prepare_composite_architecture_handoff::<B, S, _>(
+            architecture,
+            source,
+            requirements,
+            execution,
+            processor,
+            capability,
+            model_type,
+            cache_identity,
+            context,
+        )
+        .map_err(ReplicatedTextDispatchError::contract)?;
+        prepared.requirements.publish::<B, E>(
+            prepared.selected(),
+            publication,
+            prepared.capability_estimate(),
+            context,
+        )?;
+        Ok(prepared)
+    }
+
+    #[inline(never)]
+    fn visit_routed_with<A, Routed, O, E>(
+        self,
+        architecture: A,
+        source: Option<A>,
+        capability: crate::capability::CapabilityEstimate,
+        model_type: String,
+        cache_identity: String,
+        routed: Routed,
+    ) -> Result<O, ReplicatedTextDispatchError<E>>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+        Routed: FnOnce(
+            V,
+            PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
+            eredu_checkpoint::store::RetainedCheckpointSource,
+        ) -> Result<O, ReplicatedTextDispatchError<E>>,
+    {
+        if let Some(metadata) = B::construction_metadata(self.context) {
+            let controls = [
+                size_of::<(A, Option<A>, composite_source::Requirements,
+                    SelectedCompositeTextRealization,
+                    crate::capability::CapabilityEstimate, String, String,
+                    Option<composite_source::Configurations>,
+                    &<B::Tensor as Tensor>::Context,
+                    &eredu_checkpoint::store::RetainedCheckpointSource,
+                )>(),
+                size_of::<Result<PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>,
+                    ReplicatedTextDispatchError<E>>>(),
+            ];
+            let bytes = controls.into_iter()
+                .try_fold(size_of_val(&controls), usize::checked_add)
+                .ok_or_else(|| ReplicatedTextDispatchError::Metadata(
+                    eredu_nn::workspace::WorkspaceMetadataError::Overflow.into()))?;
+            metadata.charge_metadata(bytes)
+                .map_err(|cause| ReplicatedTextDispatchError::Metadata(cause.into()))?;
+        }
+        // Complete selected-source validation and publication before entering
+        // the visitor's nested quote. Their Result and selection temporaries
+        // belong to the helper frame, which has returned at that boundary.
+        let prepared = Self::prepare_routed_handoff::<A, E>(
+            architecture, source, self.requirements, self.selected, capability,
+            model_type, cache_identity, self.publication, self.context, &self.store,
+        )?;
+        routed(self.visitor, prepared, self.store)
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_routed_handoff<A, E>(
+        architecture: A,
+        source: Option<A>,
+        requirements: composite_source::Requirements,
+        selected: SelectedCompositeTextRealization,
+        capability: crate::capability::CapabilityEstimate,
+        model_type: String,
+        cache_identity: String,
+        publication: Option<composite_source::Configurations>,
+        context: &<B::Tensor as Tensor>::Context,
+        store: &eredu_checkpoint::store::RetainedCheckpointSource,
+    ) -> Result<PreparedRoutedCompositeTextArchitecture<A, A::AdmissionConfig>, ReplicatedTextDispatchError<E>>
+    where
+        A: crate::composite_execution::CompositeArchitecture<B, S, Error = eredu_nn::Error>
+            + eredu_runtime::RoutedLayeredArchitecture<B, S>
+            + 'static,
+        A::InputPartPlan: 'static,
+        A::StaticModules: Clone,
+    {
+        let SelectedCompositeTextRealization::Routed {
+            execution,
+            processor,
+        } = selected
+        else {
+            unreachable!("routed handoff is called only for the selected routed route");
+        };
+        let prepared = prepare_routed_composite_architecture_handoff::<B, S, _>(
+            architecture,
+            source,
+            requirements,
+            execution,
+            processor,
+            capability,
+            model_type,
+            cache_identity,
+            store,
+            context,
+        )
+        .map_err(ReplicatedTextDispatchError::contract)?;
+        prepared.requirements.publish::<B, E>(
+            prepared.routed.text().selected(),
+            publication,
+            prepared.capability_estimate(),
+            context,
+        )?;
+        Ok(prepared)
+    }
+
+    #[inline(never)]
+    fn inkling_with<O, E, F>(
+        mut self,
+        args: &crate::inkling::ModelArgs,
+        finish: F,
+    ) -> Result<O, ReplicatedTextDispatchError<E>>
+    where
+        F: FnOnce(
+            Self,
+            crate::inkling::LayeredModel<B>,
+            Option<crate::inkling::LayeredModel<B>>,
+            crate::capability::CapabilityEstimate,
+            String,
+            String,
+        ) -> Result<O, ReplicatedTextDispatchError<E>>,
+    {
+        let metadata =
+            crate::decoder::identity::Metadata::new(B::construction_metadata(self.context));
+        metadata
+            .controls::<(
+                crate::inkling::RetainedModelSource,
+                Option<crate::inkling::RetainedModelSource>,
+                F,
+                ConstructedInkling<B>,
+                Result<ConstructedInkling<B>, ReplicatedTextDispatchError<E>>,
+                &mut Self,
+                &crate::inkling::ModelArgs,
+                crate::capability::CapabilityEstimate,
+                String,
+                String,
+            )>()
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
+        // The source/materialization constructor returns before the typed
+        // continuation starts another equation quote. No construction temporary
+        // remains on that deeper visitor stack.
+        let ConstructedInkling {architecture, source, capability, model_type, cache_identity} =
+            self.prepare_inkling::<E>(args)?;
+        finish(self, architecture, source, capability, model_type, cache_identity)
+    }
+
+    #[inline(never)]
+    fn prepare_inkling<E>(
+        &mut self,
+        args: &crate::inkling::ModelArgs,
+    ) -> Result<ConstructedInkling<B>, ReplicatedTextDispatchError<E>> {
+        let metadata =
+            crate::decoder::identity::Metadata::new(B::construction_metadata(self.context));
+        // A checked caller must provide the actual completed source, before any
+        // initial format maps or family declarations are constructed.
+        if metadata.context().is_some() && self.completed.is_none() {
+            return Err(ReplicatedTextDispatchError::Metadata(
+                eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+            ));
+        }
+        let (mut architecture, mut source, capability) = match self.completed.take() {
+            Some(composite_source::Completed {
+                configurations: composite_source::Configurations::Inkling { target, source },
+                capability,
+            }) => {
+                if source.is_some() != self.has_transform
+                    || !target.has_units()
+                    || source.as_ref().is_some_and(|source| !source.has_units())
+                {
+                    return Err(ReplicatedTextDispatchError::Metadata(
+                        eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+                    ));
+                }
+                let source = source
+                    .map(|source| {
+                        crate::inkling::LayeredModel::<B>::new_with_source(source, self.context)
+                    })
+                    .transpose()
+                    .map_err(|cause| {
+                        config_source::constructor_error::<B, _>(cause, self.context)
+                    })?;
+                let architecture =
+                    crate::inkling::LayeredModel::<B>::new_with_source(target, self.context)
+                        .map_err(|cause| {
+                            config_source::constructor_error::<B, _>(cause, self.context)
+                        })?;
+                (architecture, source, capability)
+            }
+            Some(_) => {
+                return Err(ReplicatedTextDispatchError::Metadata(
+                    eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+                ));
+            }
+            None => {
+                let capability = crate::capability::inkling(args).map_err(|error| {
+                    ReplicatedTextDispatchError::Architecture(error.to_string())
+                })?;
+                let source = self
+                    .has_transform
+                    .then(|| {
+                        crate::inkling::with_checkpoint_formats(
+                            args,
+                            std::mem::take(&mut self.source_formats),
+                        )
+                    })
+                    .transpose()
+                    .map_err(ReplicatedTextDispatchError::Architecture)?
+                    .map(|args| crate::inkling::LayeredModel::<B>::new(args, self.context))
+                    .transpose()
+                    .map_err(|cause| {
+                        config_source::constructor_error::<B, _>(cause, self.context)
+                    })?;
+                let target = crate::inkling::with_checkpoint_formats(
+                    args,
+                    std::mem::take(&mut self.target_formats),
+                )
+                .map_err(ReplicatedTextDispatchError::Architecture)?;
+                let architecture = crate::inkling::LayeredModel::<B>::new(target, self.context)
+                    .map_err(|cause| {
+                        config_source::constructor_error::<B, _>(cause, self.context)
+                    })?;
+                (architecture, source, capability)
+            }
+        };
+        if !architecture.construction_source().has_units() {
+            let selected = match &self.selected {
+                SelectedCompositeTextRealization::Routed { execution, .. } => Some(execution),
+                _ => None,
+            };
+            architecture
+                .prepare_graph_units(selected, self.context)
+                .map_err(|cause| config_source::constructor_error::<B, _>(cause, self.context))?;
+        }
+        if let Some(source) = source.as_mut() {
+            if !source.construction_source().has_units() {
+                source
+                    .prepare_graph_units(None, self.context)
+                    .map_err(|cause| {
+                        config_source::constructor_error::<B, _>(cause, self.context)
+                    })?;
+            }
+        }
+        let effective_model_type = metadata
+            .text(&architecture.args().model_type)
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
+        let cache_identity = architecture
+            .args()
+            .architecture_fingerprint_with_metadata(metadata)
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
+        if self.requirements.source().is_some() && B::construction_metadata(self.context).is_none()
+        {
+            self.publication = Some(composite_source::Configurations::Inkling {
+                target: architecture.construction_source().clone(),
+                source: source
+                    .as_ref()
+                    .map(|source| source.construction_source().clone()),
+            });
+        }
+        Ok(ConstructedInkling {architecture, source, capability, model_type: effective_model_type, cache_identity})
+    }
+
+    #[inline(never)]
+    fn qwen_hybrid_with<O, E, F>(
+        mut self,
+        args: &crate::qwen::hybrid::ParsedHybridConfig,
+        finish: F,
+    ) -> Result<O, ReplicatedTextDispatchError<E>>
+    where
+        F: FnOnce(
+            Self,
+            crate::qwen::hybrid::ConditionalLayeredModel<B>,
+            Option<crate::qwen::hybrid::ConditionalLayeredModel<B>>,
+            crate::capability::CapabilityEstimate,
+            String,
+            String,
+        ) -> Result<O, ReplicatedTextDispatchError<E>>,
+    {
+        crate::decoder::identity::Metadata::new(B::construction_metadata(self.context))
+            .controls::<(
+                crate::qwen::hybrid::RetainedConditionalUnits,
+                Option<crate::qwen::hybrid::RetainedConditionalUnits>,
+                F,
+            )>()
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
+        let (target, source_config, capability, target_units, source_units) =
+            match self.completed.take() {
+                Some(composite_source::Completed {
+                    configurations:
+                        composite_source::Configurations::QwenHybrid {
+                            target,
+                            source,
+                            target_units,
+                            source_units,
+                        },
+                    capability,
+                }) => {
+                    if source.is_some() != self.has_transform
+                        || source_units.is_some() != source.is_some()
+                    {
+                        return Err(ReplicatedTextDispatchError::Metadata(
+                            eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+                        ));
+                    }
+                    (
+                        CompositeModelConfig::Retained(target),
+                        source.map(CompositeModelConfig::Retained),
+                        capability,
+                        target_units,
+                        source_units,
+                    )
+                }
+                Some(_) => {
+                    return Err(ReplicatedTextDispatchError::Metadata(
+                        eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into(),
+                    ));
+                }
+                None => {
+                    let capability = crate::capability::qwen_hybrid(args).map_err(|error| {
+                        ReplicatedTextDispatchError::Architecture(error.to_string())
+                    })?;
+                    let source = self
+                        .has_transform
+                        .then(|| {
+                            qwen_hybrid_composite_with_formats(
+                                args,
+                                std::mem::take(&mut self.source_linear_formats),
+                            )
+                        })
+                        .transpose()
+                        .map_err(ReplicatedTextDispatchError::Architecture)?
+                        .map(CompositeModelConfig::Owned);
+                    // Keep source construction before target format validation, as in
+                    // the ordinary worker. Its failure remains the first cause.
+                    let source = source
+                        .map(|args| {
+                            crate::qwen::hybrid::ConditionalLayeredModel::<B>::new_with_config(
+                                args,
+                                self.context,
+                            )
+                        })
+                        .transpose()
+                        .map_err(|error| {
+                            config_source::constructor_error::<B, _>(error, self.context)
+                        })?;
+                    let target = qwen_hybrid_composite_with_formats(
+                        args,
+                        std::mem::take(&mut self.target_linear_formats),
+                    )
+                    .map_err(ReplicatedTextDispatchError::Architecture)?;
+                    return self.qwen_hybrid_constructed_with(
+                        CompositeModelConfig::Owned(target),
+                        source,
+                        capability,
+                        None,
+                        finish,
+                    );
+                }
+            };
+        let mut source = source_config
+            .map(|args| {
+                crate::qwen::hybrid::ConditionalLayeredModel::<B>::new_with_config(
+                    args,
+                    self.context,
+                )
+            })
             .transpose()
-            .map_err(ReplicatedTextDispatchError::Architecture)?
-            .map(|args| crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args, self.context))
-            .transpose()
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        let target = qwen_hybrid_composite_with_formats(args, self.target_linear_formats.clone())
-            .map_err(ReplicatedTextDispatchError::Architecture)?;
-        let effective_model_type = target.text.model_type.clone();
+            .map_err(|error| config_source::constructor_error::<B, _>(error, self.context))?;
+        if let (Some(source), Some(units)) = (source.as_mut(), source_units) {
+            source
+                .install_construction_units(units, self.context)
+                .map_err(ReplicatedTextDispatchError::Metadata)?;
+        }
+        self.qwen_hybrid_constructed_with(target, source, capability, Some(target_units), finish)
+    }
+
+    fn qwen_hybrid_constructed_with<O, E, F>(
+        mut self,
+        target: CompositeModelConfig<crate::qwen::hybrid::ParsedHybridConfig>,
+        mut source: Option<crate::qwen::hybrid::ConditionalLayeredModel<B>>,
+        capability: crate::capability::CapabilityEstimate,
+        units: Option<crate::qwen::hybrid::RetainedConditionalUnits>,
+        finish: F,
+    ) -> Result<O, ReplicatedTextDispatchError<E>>
+    where
+        F: FnOnce(
+            Self,
+            crate::qwen::hybrid::ConditionalLayeredModel<B>,
+            Option<crate::qwen::hybrid::ConditionalLayeredModel<B>>,
+            crate::capability::CapabilityEstimate,
+            String,
+            String,
+        ) -> Result<O, ReplicatedTextDispatchError<E>>,
+    {
+        let metadata =
+            crate::decoder::identity::Metadata::new(B::construction_metadata(self.context));
+        metadata
+            .controls::<(
+                Option<crate::qwen::hybrid::RetainedConditionalUnits>,
+                crate::qwen::hybrid::RetainedConditionalUnits,
+                Option<&crate::SelectedRoutedTextRealization>,
+            )>()
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
+        let effective_model_type = metadata
+            .text(&target.text.model_type)
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
         let cache_identity =
-            crate::qwen::hybrid::conditional_prompt_cache_architecture_fingerprint(&target);
-        let architecture =
-            crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(target, self.context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-        self.visit(
+            crate::qwen::hybrid::conditional_prompt_cache_architecture_fingerprint_with_metadata(
+                &target, metadata,
+            )
+            .map_err(ReplicatedTextDispatchError::Metadata)?;
+        let mut architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new_with_config(
+            target,
+            self.context,
+        )
+        .map_err(|error| config_source::constructor_error::<B, _>(error, self.context))?;
+        match units {
+            Some(units) => architecture.install_construction_units(units, self.context),
+            None => {
+                let selected = match &self.selected {
+                    SelectedCompositeTextRealization::Routed { execution, .. } => Some(execution),
+                    _ => None,
+                };
+                architecture.prepare_construction_units(selected, self.context)
+            }
+        }
+        .map_err(|cause| config_source::constructor_error::<B, _>(cause, self.context))?;
+        if let Some(source) = source.as_mut() {
+            if source.construction_units().is_none() {
+                source
+                    .prepare_construction_units(None, self.context)
+                    .map_err(|cause| {
+                        config_source::constructor_error::<B, _>(cause, self.context)
+                    })?;
+            }
+        }
+        if self.requirements.source().is_some() && B::construction_metadata(self.context).is_none()
+        {
+            self.publication = Some(composite_source::Configurations::QwenHybrid {
+                target: architecture.config_owner().clone(),
+                source: source.as_ref().map(|source| source.config_owner().clone()),
+                target_units: architecture
+                    .construction_units()
+                    .expect("constructed source is installed")
+                    .clone(),
+                source_units: source.as_ref().map(|source| {
+                    source
+                        .construction_units()
+                        .expect("constructed source is installed")
+                        .clone()
+                }),
+            });
+        }
+        finish(
+            self,
             architecture,
             source,
             capability,
@@ -8066,9 +9869,9 @@ pub fn visit_composite_prediction_target_text_architecture<B, S, M, V>(
     requirements: CompositeTextRequirements,
     selected: SelectedCompositeTextRealization,
     extension: crate::prediction_extension::MaterializedPredictionExtension<B, M>,
-    store: eredu_checkpoint::store::SharedCheckpointSource,
+    store: eredu_checkpoint::store::RetainedCheckpointSource,
     context: &<B::Tensor as Tensor>::Context,
-    mut visitor: V,
+    visitor: V,
 ) -> Result<V::Output, ReplicatedTextDispatchError<V::Error>>
 where
     B: eredu_nn::BlockwiseAttentionBackend
@@ -8083,121 +9886,15 @@ where
     M: crate::prediction_extension::PredictionExtensionMaterializer<B>,
     V: CompositePredictionTargetVisitor<B, S, M>,
 {
-    validate_store_handoff(requirements.execution(), store.as_ref())
-        .map_err(ReplicatedTextDispatchError::Architecture)?;
-    let retained = requirements.inspection.clone();
-    let config = composite_config(retained.architecture_plan())
-        .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?
-        .ok_or(ReplicatedTextIneligibility::Unrelated)?;
-    let source_linear_formats = requirement_matrix_formats(requirements.execution());
-    let target_linear_formats =
-        selected_matrix_formats(requirements.execution(), selected.execution());
-    let source_formats = requirement_formats(requirements.execution());
-    let target_formats = selected_formats(selected.execution());
-    let has_transform = selected_uses_transform(selected.execution());
-    visitor.construction_started();
-    macro_rules! visit_constructed_prediction_target {
-        ($architecture:expr, $source:expr, $capability:expr, $model_type:expr, $cache_identity:expr) => {{
-            match selected {
-                SelectedCompositeTextRealization::Direct(selected) => {
-                    let (execution, processor) = selected.into_parts();
-                    let prepared = prepare_composite_architecture_handoff::<B, S, _>(
-                        $architecture,
-                        $source,
-                        requirements,
-                        execution,
-                        processor,
-                        $capability,
-                        $model_type,
-                        $cache_identity,
-                        context,
-                    )
-                    .map_err(ReplicatedTextDispatchError::Architecture)?;
-                    visit_composite_prediction_target_architecture(
-                        prepared, extension, store, visitor,
-                    )
-                }
-                SelectedCompositeTextRealization::Routed {
-                    execution,
-                    processor,
-                } => {
-                    let prepared = prepare_routed_composite_architecture_handoff::<B, S, _>(
-                        $architecture,
-                        $source,
-                        requirements,
-                        execution,
-                        processor,
-                        $capability,
-                        $model_type,
-                        $cache_identity,
-                        context,
-                    )
-                    .map_err(ReplicatedTextDispatchError::Architecture)?;
-                    visit_routed_composite_prediction_target_architecture(
-                        prepared, extension, store, visitor,
-                    )
-                }
-            }
-        }};
-    }
-    match config {
-        CompositeConfig::Inkling(args) => {
-            let capability = crate::capability::inkling(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let source = has_transform
-                .then(|| crate::inkling::with_checkpoint_formats(args, source_formats))
-                .transpose()
-                .map_err(ReplicatedTextDispatchError::Architecture)?
-                .map(|args| crate::inkling::LayeredModel::<B>::new(args, context))
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let target = crate::inkling::with_checkpoint_formats(args, target_formats)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let effective_model_type = target.model_type.clone();
-            let cache_identity = target.architecture_fingerprint();
-            let architecture = crate::inkling::LayeredModel::<B>::new(target, context)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            visit_constructed_prediction_target!(
-                architecture,
-                source,
-                capability,
-                effective_model_type,
-                cache_identity
-            )
-        }
-        CompositeConfig::QwenHybrid(args) => {
-            let capability = crate::capability::qwen_hybrid(args)
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let source = has_transform
-                .then(|| qwen_hybrid_composite_with_formats(args, source_linear_formats))
-                .transpose()
-                .map_err(ReplicatedTextDispatchError::Architecture)?
-                .map(|args| crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(args, context))
-                .transpose()
-                .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            let target = qwen_hybrid_composite_with_formats(args, target_linear_formats)
-                .map_err(ReplicatedTextDispatchError::Architecture)?;
-            let effective_model_type = target.text.model_type.clone();
-            let cache_identity =
-                crate::qwen::hybrid::conditional_prompt_cache_architecture_fingerprint(&target);
-            let architecture = crate::qwen::hybrid::ConditionalLayeredModel::<B>::new(
-                target, context,
-            )
-            .map_err(|error| ReplicatedTextDispatchError::Architecture(error.to_string()))?;
-            visit_constructed_prediction_target!(
-                architecture,
-                source,
-                capability,
-                effective_model_type,
-                cache_identity
-            )
-        }
-        CompositeConfig::Gemma4(_) | CompositeConfig::Muse(_) | CompositeConfig::QwenVl(_) => {
-            Err(ReplicatedTextDispatchError::Architecture(
-                "composite architecture does not admit an embedded prediction extension".into(),
-            ))
-        }
-    }
+    composite_prediction::visit_with_requirements::<B, S, M, V>(
+        composite_source::Requirements::owned::<B>(requirements, context)
+            .map_err(ReplicatedTextDispatchError::Metadata)?,
+        selected,
+        extension,
+        store,
+        context,
+        visitor,
+    )
 }
 
 /// Architecture-owned selection of replicated text or another execution class.
@@ -8479,7 +10176,7 @@ where
 mod tests {
     use super::*;
     use eredu_core::ModelConfigurationResolver;
-    use safetensors::{tensor::serialize_to_file, tensor::TensorView, Dtype};
+    use safetensors::{Dtype, tensor::TensorView, tensor::serialize_to_file};
 
     fn config(model_type: &str) -> serde_json::Value {
         let architecture = match model_type {
@@ -8552,6 +10249,16 @@ mod tests {
         assert_eq!(matrices[embedding], LinearFormat::Dense);
         assert!(!matrices.contains_key("model.language_model.norm.weight"));
         assert!(!matrices.contains_key("model.visual.pos_embed.weight"));
+        for (name, format) in requirement_matrix_format_rows(requirements.execution()) {
+            let source = requirements
+                .execution()
+                .parameters()
+                .iter()
+                .find(|parameter| parameter.name() == name)
+                .unwrap();
+            assert!(std::ptr::eq(name, source.name()));
+            assert_eq!(format, source.native_executable());
+        }
         let logical = EligibleConfig::QwenVl(&args)
             .linear_parameter_shapes()
             .unwrap();
@@ -8582,13 +10289,15 @@ mod tests {
                 .find(|tensor| tensor.key == "model.visual.blocks.0.attn.qkv.weight")
                 .unwrap();
             *matrix.shape.last_mut().unwrap() += 1;
-            assert!(family_linear_parameter_shapes(
-                plan,
-                |_| Some(format.into()),
-                "model.language_model.embed_tokens.weight"
-            )
-            .unwrap_err()
-            .contains("GGUF block geometry"));
+            assert!(
+                family_linear_parameter_shapes(
+                    plan,
+                    |_| Some(format.into()),
+                    "model.language_model.embed_tokens.weight"
+                )
+                .unwrap_err()
+                .contains("GGUF block geometry")
+            );
         }
     }
 
@@ -8664,10 +10373,11 @@ mod tests {
                 "model.layers.0.mlp.down_proj.biases"
             ))
         );
-        assert!(down
-            .sources()
-            .iter()
-            .any(|source| source == "model.language_model.layers.0.mlp.down_proj.weight"));
+        assert!(
+            down.sources()
+                .iter()
+                .any(|source| source == "model.language_model.layers.0.mlp.down_proj.weight")
+        );
         for quantization in [
             WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(32, 4).unwrap()),
             WeightQuantization::Affine(eredu_checkpoint::AffineQuantization::new(64, 4).unwrap()),
@@ -9627,7 +11337,7 @@ mod tests {
                 .with_transactions(true, true)
                 .with_reset(true),
         );
-        eredu_runtime::select_replicated_text_realization(
+        let selected = eredu_runtime::select_replicated_text_realization(
             &requirements,
             &eredu_runtime::ReplicatedTextSelectionRequest::new(
                 eredu_runtime::LayerWeightResidency::FullyResident,
@@ -9636,6 +11346,30 @@ mod tests {
             &capabilities,
         )
         .expect("dense DeepSeek-V3 requirements select without grouped mechanisms");
+
+        let indexed = selected_matrix_formats(&requirements, &selected);
+        let mut visited = 0;
+        for (name, format) in selected_matrix_format_rows(&selected, |name| {
+            requirement_matrix_format_rows(&requirements).any(|(matrix, _)| matrix == name)
+        }) {
+            let source = selected
+                .parameters()
+                .iter()
+                .find(|parameter| parameter.name() == name)
+                .unwrap();
+            assert!(std::ptr::eq(name, source.name()));
+            assert_eq!(indexed[name], format);
+            visited += 1;
+        }
+        assert_eq!(visited, indexed.len());
+        assert!(!indexed.contains_key("model.norm.weight"));
+        assert!(indexed.contains_key("model.embed_tokens.weight"));
+        assert!(selected_quantized_format_rows(&selected).next().is_none());
+        assert!(
+            requirement_quantized_format_rows(&requirements)
+                .next()
+                .is_none()
+        );
 
         let request = crate::partitioned_execution::PartitionedSelectionRequest::new(
             eredu_core::ParallelTopology::new(2, 1, 1, 1).unwrap(),
@@ -9810,11 +11544,13 @@ mod tests {
             ])
             .unwrap(),
         );
-        assert!(incomplete
-            .validate_manifest(requirements.communication())
-            .unwrap_err()
-            .to_string()
-            .contains("AllGather"));
+        assert!(
+            incomplete
+                .validate_manifest(requirements.communication())
+                .unwrap_err()
+                .to_string()
+                .contains("AllGather")
+        );
         assert_eq!(
             requirements.activation_dtype(),
             eredu_runtime::PipelineActivationDtype::Float32
@@ -9839,9 +11575,11 @@ mod tests {
             CollectPartitionedAdmission,
         )
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("data-parallel execution is not supported"));
+        assert!(
+            error
+                .to_string()
+                .contains("data-parallel execution is not supported")
+        );
     }
 
     #[test]
@@ -9937,12 +11675,14 @@ mod tests {
                 selected.schema().identity()
             );
         }
-        assert!(requirements
-            .communication()
-            .routes()
-            .iter()
-            .all(|route| route.requirement().operation()
-                == eredu_runtime::CommunicationOperation::SendReceive));
+        assert!(
+            requirements
+                .communication()
+                .routes()
+                .iter()
+                .all(|route| route.requirement().operation()
+                    == eredu_runtime::CommunicationOperation::SendReceive)
+        );
     }
 
     #[test]
@@ -10162,3 +11902,6 @@ mod tests {
         }
     }
 }
+
+mod composite_prediction;
+pub(crate) use composite_prediction::visit_prepared_composite_prediction_target_text_architecture;

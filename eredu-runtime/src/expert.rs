@@ -9,6 +9,9 @@ use crate::ExpertPass;
 
 mod agreement;
 mod banks;
+mod demand_source;
+pub use demand_source::{IndexedDemandSource, PreparedIndexedDemandLoan, IndexedDemandLoanError};
+mod compact_plan;
 mod route_intervention;
 mod units;
 use crate::{
@@ -19,11 +22,12 @@ use crate::{
 pub use agreement::{
     AgreeingAddressableExpertProvider, AgreeingRoutedExpertProvider, ProviderAgreementRejected,
 };
-pub use banks::{RoutedBankProviderError, RoutedBankProviders};
+pub use banks::{BorrowedRoutedBankProviders, RoutedBankProviderError, RoutedBankProviders};
+pub use compact_plan::{AddressableChunkCensus,AddressableChunkPlan, AddressableChunkPlanError};
 pub use route_intervention::{select_routes_with_observer, select_routes_with_provider};
 pub use units::{
     with_exchanged_unit_observer, with_partition_unit_observer, with_provider_unit_observer,
-    with_resident_unit_coordinates, with_routed_unit_invocation, ProviderUnitObserver,
+    with_resident_unit_coordinates, with_borrowed_resident_unit_coordinates, with_routed_unit_invocation, ProviderUnitObserver,
     RoutedUnitBatch, RoutedUnitInvocation, RoutedUnitObserver, RoutedUnitOrigin, RoutedUnitOrigins,
 };
 
@@ -852,6 +856,49 @@ pub enum AddressableBankMemberError {
     },
 }
 
+/// Original borrowed operands and retained declaration of the reached
+/// addressable invocation. This source describes work; it grants no capacity.
+pub struct IndexedInvocationRequest<'a, T> {
+    pub declaration: eredu_nn::workspace::WorkspaceAddressableRegionView<'a>,
+    pub input: &'a T,
+    pub routes: &'a eredu_nn::GroupSelection<T>,
+}
+
+impl<T> Copy for IndexedInvocationRequest<'_, T> {}
+impl<T> Clone for IndexedInvocationRequest<'_, T> {
+    fn clone(&self) -> Self { *self }
+}
+
+/// Borrowed callback for one indexed invocation. The architecture retains its
+/// typed failure; an abort marker returns only after native scope retirement.
+/// Neither this loan nor the marker creates execution authority.
+pub trait IndexedInvocationCallback<T: Tensor, M> {
+    fn movement(&mut self) -> &mut M;
+    fn run(&mut self, funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
+        -> Result<eredu_nn::TensorParallelGroupedOutput<T>, ()>;
+}
+
+/// Fixed borrowed adapter; the caller owns both its provider and callback.
+pub struct BorrowedIndexedInvocation<'a, P, M, T: Tensor> {
+    owner: &'a mut P,
+    movement: fn(&mut P) -> &mut M,
+    run: &'a mut dyn FnMut(&mut P, Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
+        -> Result<eredu_nn::TensorParallelGroupedOutput<T>, ()>,
+}
+impl<'a, P, M, T: Tensor> BorrowedIndexedInvocation<'a, P, M, T> {
+    pub fn new(owner: &'a mut P, movement: fn(&mut P) -> &mut M,
+        run: &'a mut dyn FnMut(&mut P, Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
+            -> Result<eredu_nn::TensorParallelGroupedOutput<T>, ()>) -> Self {
+        Self { owner, movement, run }
+    }
+    pub fn control_bytes() -> usize { std::mem::size_of::<Self>() }
+}
+impl<P, M, T: Tensor> IndexedInvocationCallback<T, M> for BorrowedIndexedInvocation<'_, P, M, T> {
+    fn movement(&mut self) -> &mut M { (self.movement)(self.owner) }
+    fn run(&mut self, funding: Option<&eredu_nn::workspace::WorkspaceMetadataFunding>)
+        -> Result<eredu_nn::TensorParallelGroupedOutput<T>, ()> { (self.run)(self.owner, funding) }
+}
+
 /// Generic indexed tensor movement required by bounded grouped execution.
 ///
 /// Implementations expose integer-index discovery and tensor movement without
@@ -863,6 +910,21 @@ where
     /// Indexed movement failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Installs the explicitly selected invocation while the shared provider
+    /// keeps ownership of its existing movement field. Ordinary mechanisms need
+    /// no source; a supplied checked loan requires an actual native consumer.
+    fn with_invocation_source(
+        callback: &mut dyn IndexedInvocationCallback<B::Tensor, Self>,
+        request: IndexedInvocationRequest<'_, B::Tensor>,
+        source: Option<eredu_nn::PreparedIndexedInvocationLoan<'_>>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Result<eredu_nn::TensorParallelGroupedOutput<B::Tensor>, ()>, IndexedDemandLoanError<Self::Error>>
+    where Self: Sized {
+        let _ = (request, context);
+        if source.is_some() { return Err(IndexedDemandLoanError::MissingProducer); }
+        Ok(callback.run(None))
+    }
+
     /// Returns deterministic demand counts for integer indices below `upper_bound`.
     fn index_demands(
         &mut self,
@@ -870,6 +932,52 @@ where
         upper_bound: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Vec<(usize, u64)>, Self::Error>;
+
+    /// Returns the same exact demand counts with their original completed
+    /// source and metadata custody when a checked producer is selected.
+    /// Ordinary mechanisms preserve the existing discovery operation.
+    fn index_demand_source(
+        &mut self,
+        indices: &B::Tensor,
+        upper_bound: usize,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<IndexedDemandSource, Self::Error> {
+        self.index_demands(indices, upper_bound, context)
+            .map(IndexedDemandSource::ordinary)
+    }
+
+    /// Binds the existing discovery operation to the actual selected chunk.
+    /// The default preserves mechanisms that do not carry original sources.
+    fn index_demand_source_for_chunk(&mut self, indices: &B::Tensor,
+        census: AddressableChunkCensus, context: &<B::Tensor as Tensor>::Context)
+        -> Result<IndexedDemandSource, Self::Error> {
+        self.index_demand_source(indices, census.members(), context)
+    }
+
+    /// Lends the actual acquisition source after discovery/remap. Completed
+    /// demand ownership remains independent of this nonescaping callback loan.
+    fn with_demand_loan<R,E,F>(&mut self,source:&IndexedDemandSource,run:F)
+        ->Result<Result<R,E>,IndexedDemandLoanError<Self::Error>>
+    where Self:Sized,F:FnOnce(Option<PreparedIndexedDemandLoan<'_>>)->Result<R,E> {
+        if source.funding().is_some(){return Err(IndexedDemandLoanError::MissingProducer);}
+        Ok(run(None))
+    }
+    /// Copies one route handle under the same source, without evaluating it.
+    fn copy_route_value(&mut self,value:&B::Tensor,source:&IndexedDemandSource,
+        context:&<B::Tensor as Tensor>::Context)->Result<B::Tensor,IndexedDemandLoanError<Self::Error>> {
+        let _=context;
+        if source.funding().is_some(){return Err(IndexedDemandLoanError::MissingProducer);}
+        Ok(value.clone())
+    }
+
+    /// Rewrites using the exact completed ID owner returned by discovery.
+    /// Original producers authenticate that owner before copying its remap.
+    fn remap_demand_indices(&mut self, indices: &B::Tensor, mapping: &[(usize, usize)],
+        source: &IndexedDemandSource, context: &<B::Tensor as Tensor>::Context)
+        -> Result<B::Tensor, Self::Error> {
+        let _ = source;
+        self.remap_indices(indices, mapping, context)
+    }
 
     /// Rewrites source indices through one exact source-to-compact mapping.
     fn remap_indices(
@@ -896,6 +1004,29 @@ where
     ) -> Result<B::Tensor, Self::Error>;
 }
 
+/// Lexically borrowed producer for the already selected expert movement.
+/// A concrete backend validates its private retained source, invocation and
+/// funding identity. This loan carries neither row values nor byte authority.
+#[derive(Clone, Copy)]
+pub struct PreparedExpertMovementLoan<'a> {
+    source: &'a dyn std::any::Any,
+    funding: &'a eredu_nn::workspace::WorkspaceMetadataFunding,
+}
+impl<'a> PreparedExpertMovementLoan<'a> {
+    pub fn new(source: &'a dyn std::any::Any,
+        funding: &'a eredu_nn::workspace::WorkspaceMetadataFunding) -> Self { Self { source, funding } }
+    pub fn source<T: std::any::Any>(&self) -> Option<&'a T> { self.source.downcast_ref() }
+    pub fn funding(&self) -> &'a eredu_nn::workspace::WorkspaceMetadataFunding { self.funding }
+}
+
+/// A present original source requires an actual movement producer.
+#[derive(Debug, thiserror::Error)]
+pub enum ExpertRouteMovementSourceError<E: std::error::Error + 'static> {
+    #[error("selected expert movement has no original source producer")]
+    MissingProducer,
+    #[error(transparent)] Backend(E),
+}
+
 /// Backend-neutral tensor movement needed by an expert-exchange protocol.
 ///
 /// Architecture code supplies already validated row and flattened-route
@@ -905,8 +1036,35 @@ pub trait ExpertRouteTensorMovement<T> {
     /// Tensor movement failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// Loans the selected original producer to the same ordinary movement
+    /// worker. Concrete original backends authenticate a present loan before
+    /// running; the default preserves ordinary mechanisms and no new source.
+    fn with_prepared_region<R, E, F>(&mut self, source: Option<PreparedExpertMovementLoan<'_>>, run: F)
+        -> Result<Result<R, E>, ExpertRouteMovementSourceError<Self::Error>>
+    where Self: Sized, F: FnOnce(&mut Self) -> Result<R, E> {
+        if source.is_some() { return Err(ExpertRouteMovementSourceError::MissingProducer); }
+        Ok(run(self))
+    }
+
+    /// Authenticates the shared route driver's actual movement itinerary against
+    /// its retained cold declaration before submitting inverse route traffic.
+    fn validate_population(&self, _population: eredu_nn::workspace::WorkspaceExpertMovementPopulation,
+        _transfers: eredu_nn::workspace::WorkspaceExpertTransfers)
+        -> Result<(), Self::Error> { Ok(()) }
+
+    /// Empty host directory for the shared route driver's order/destination
+    /// indices. Original producers charge it to their already retained region
+    /// account; callers fill at most count entries and keep the producer alive.
+    fn index_directory(&self, count: usize) -> Result<Vec<usize>, Self::Error> {
+        Ok(Vec::with_capacity(count))
+    }
+
     /// Returns the logical tensor shape without materializing its values.
     fn shape(&self, value: &T) -> Vec<usize>;
+
+    /// The checked driver lends its shape directory from the same cumulative
+    /// source account. Ordinary implementations keep their existing behavior.
+    fn checked_shape(&self, value: &T) -> Result<Vec<usize>, Self::Error> { Ok(self.shape(value)) }
 
     /// Duplicates and reorders leading-axis rows in the supplied order.
     fn gather_rows(&mut self, value: &T, rows: &[usize]) -> Result<T, Self::Error>;
@@ -953,6 +1111,17 @@ pub trait ExpertRouteExchange<T> {
         counts: &crate::CommunicationPeerCounts,
         value: T,
     ) -> Result<T, Self::Error>;
+
+    /// Borrows packed metadata directly. Original producers override this to
+    /// pay only the actual conversion and receive destinations. The default
+    /// preserves compatibility with ordinary owned transports.
+    fn exchange_indices_ref(
+        &mut self,
+        counts: &crate::CommunicationPeerCounts,
+        values: &[usize],
+    ) -> Result<Vec<usize>, Self::Error> {
+        self.exchange_indices(counts, values.to_vec())
+    }
 
     /// Exchanges one unsigned metadata value per leading tensor row.
     fn exchange_indices(
@@ -1115,6 +1284,16 @@ where
         request: ParameterBankAcquisition<'_>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Acquisition, Self::Error>;
+
+    /// Acquires ordered keys from the supplied source. A present loan or
+    /// funded demand must never select the ordinary fallback.
+    fn acquire_from_demand(&mut self,request:ParameterBankAcquisition<'_>,
+        source:&IndexedDemandSource,loan:Option<PreparedIndexedDemandLoan<'_>>,
+        context:&<B::Tensor as Tensor>::Context)
+        ->Result<Self::Acquisition,IndexedDemandLoanError<Self::Error>> {
+        if loan.is_some() || source.funding().is_some(){return Err(IndexedDemandLoanError::MissingProducer);}
+        self.acquire(request,context).map_err(IndexedDemandLoanError::Backend)
+    }
 
     /// Constructs one compact gated-product operator from acquired bindings.
     fn gated_product_groups(
@@ -1308,6 +1487,21 @@ pub trait RoutedExpertProvider<B>
 where
     B: GroupedNeuralBackend,
 {
+    /// Whether ordinary local calls execute the supplied resident bank with the
+    /// same input, routes and grouped operator as the architecture's unit path.
+    /// This excludes acquisition, compact-bank construction, movement and extra
+    /// tensor operations. It describes equation parity only; source inventory,
+    /// host controls, observation and native completion remain independently
+    /// qualified. Custom and addressable providers are unqualified by default.
+    /// Sized dispatch keeps this type-level fact out of the object vtable;
+    /// existing tensor-parallel provider trait objects remain valid.
+    fn resident_unit_equations() -> bool
+    where
+        Self: Sized,
+    {
+        false
+    }
+
     /// Provider-specific acquisition or execution failure.
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -1320,7 +1514,20 @@ where
         Ok(None)
     }
 
-    /// Consumes bounded decision evidence before dispatch. Shared experts are not included.
+    /// Declares ordinary-decision interest without work or authority.
+    fn routing_unmodified_interest(&self, _bank: RoutedBankId) -> crate::RoutingUnmodifiedInterest {
+        crate::RoutingUnmodifiedInterest::None
+    }
+    /// Borrows one ordinary selector decision before dispatch when requested.
+    fn routing_unmodified(
+        &mut self,
+        _bank: RoutedBankId,
+        _effective: crate::RoutingDecision<'_, B::Tensor>,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    /// Consumes bounded control evidence before dispatch; shared experts are excluded.
     fn routing_applied(
         &mut self,
         _bank: RoutedBankId,
@@ -1461,6 +1668,10 @@ impl RoutedObservationPoints {
             },
         );
         Ok(self)
+    }
+    /// Borrow every actual bank identity in stable bank order without cloning paths.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (RoutedBankId, &RoutedObservationPoint)> {
+        self.0.iter().map(|(bank, point)| (*bank, point))
     }
     /// Resolves one bank's canonical path and global cardinality.
     pub fn bank(&self, bank: RoutedBankId) -> Option<&RoutedObservationPoint> {
@@ -1617,6 +1828,28 @@ where
             .ok_or(ObservedExpertProviderError::Bank(bank))?;
         self.observer
             .routing_control(point.path(), token_rows)
+            .map_err(ObservedExpertProviderError::Observer)
+    }
+
+    /// Declares ordinary-decision interest without work or authority.
+    fn routing_unmodified_interest(&self, bank: RoutedBankId) -> crate::RoutingUnmodifiedInterest {
+        self.point
+            .bank(bank)
+            .map_or(crate::RoutingUnmodifiedInterest::None, |point| {
+                self.observer.routing_unmodified_interest(point.path())
+            })
+    }
+    fn routing_unmodified(
+        &mut self,
+        bank: RoutedBankId,
+        effective: crate::RoutingDecision<'_, B::Tensor>,
+    ) -> Result<(), Self::Error> {
+        let point = self
+            .point
+            .bank(bank)
+            .ok_or(ObservedExpertProviderError::Bank(bank))?;
+        self.observer
+            .routing_unmodified(point.path(), effective)
             .map_err(ObservedExpertProviderError::Observer)
     }
 
@@ -1805,6 +2038,20 @@ struct RecordingUnitObserver<'a, T: Tensor> {
     failure: &'a mut Option<eredu_nn::Error>,
 }
 impl<T: Tensor> RoutedUnitObserver<T> for RecordingUnitObserver<'_, T> {
+    fn observe_addressable_source(&mut self,source:eredu_nn::workspace::WorkspaceAddressableObservationView<'_>)
+        ->Result<eredu_nn::workspace::WorkspaceAddressableObservationSource,eredu_nn::Error>{
+        self.inner.observe_addressable_source(source).inspect_err(|error|{
+            self.failure.get_or_insert_with(||error.clone());
+        })
+    }
+
+    fn observe_region_source(&mut self, source: eredu_nn::workspace::WorkspaceExpertObservationView<'_>)
+        -> Result<eredu_nn::workspace::WorkspaceExpertObservationSource,eredu_nn::Error> {
+        self.inner.observe_region_source(source).inspect_err(|error| {
+            self.failure.get_or_insert_with(||error.clone());
+        })
+    }
+
     fn begin_invocation(
         &mut self,
         invocation: &RoutedUnitInvocation<'_, T>,
@@ -1885,6 +2132,40 @@ where
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ResidentExpertProvider;
 
+impl ResidentExpertProvider {
+    /// Fixed controls for the shared resident observation invocation. Native
+    /// tensors, callbacks and their retained destinations are priced separately.
+    pub fn observation_control_bytes<T: Tensor>() -> Option<usize> {
+        use std::mem::size_of;
+        [
+            size_of::<RoutedExpertRequest<'_, '_, T>>(),
+            size_of::<RoutedExpertRequest<'_, '_, T>>(),
+            size_of::<RoutedUnitInvocation<'_, T>>(),
+            size_of::<Option<&mut dyn RoutedUnitObserver<T>>>(),
+            size_of::<Option<&mut dyn RoutedUnitObserver<T>>>(),
+            size_of::<Result<T, eredu_nn::Error>>(),
+            size_of::<Result<RoutedExpertTensorParallelOutput<T>, eredu_nn::Error>>(),
+            size_of::<Result<(), eredu_nn::Error>>(),
+        ].into_iter().try_fold(0usize, usize::checked_add)
+    }
+}
+
+fn with_resident_provider_invocation<'data, T: Tensor, R>(
+    request: RoutedExpertRequest<'data, '_, T>,
+    execute: impl for<'unit> FnOnce(RoutedExpertRequest<'data, 'unit, T>)
+        -> Result<R, eredu_nn::Error>,
+) -> Result<R, eredu_nn::Error> {
+    with_routed_unit_invocation(
+        request.unit_observer,
+        RoutedUnitInvocation { input: request.input, origins: None, unit_coordinates: None },
+        |unit_observer| execute(RoutedExpertRequest {
+            bank: request.bank, layer: request.layer, input: request.input,
+            routes: request.routes, pass: request.pass, unit_observer,
+        }),
+        std::convert::identity,
+    )
+}
+
 impl<B> RoutedExpertProvider<B> for ResidentExpertProvider
 where
     B: GroupedNeuralBackend,
@@ -1894,9 +2175,10 @@ where
     fn forward_grouped(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        with_resident_provider_invocation(request, |mut request| {
         with_provider_unit_observer(
             &mut request.unit_observer,
             request.routes.group_indices(),
@@ -1911,6 +2193,7 @@ where
                 )
             },
         )
+        })
     }
 
     /// Executes an activated selected-linear bank with owned output rows.
@@ -1931,9 +2214,10 @@ where
     fn forward_relu2_routed(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
+        with_resident_provider_invocation(request, |mut request| {
         with_provider_unit_observer(
             &mut request.unit_observer,
             request.routes.group_indices(),
@@ -1948,6 +2232,7 @@ where
                 )
             },
         )
+        })
     }
 }
 
@@ -1958,10 +2243,11 @@ where
     fn forward_grouped_tensor_parallel(
         &mut self,
         resident_bank: &mut B::GatedProductGroups,
-        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        with_resident_provider_invocation(request, |mut request| {
         with_provider_unit_observer(
             &mut request.unit_observer,
             request.routes.group_indices(),
@@ -1978,16 +2264,18 @@ where
                 )
             },
         )
+        })
         .map(RoutedExpertTensorParallelOutput::Partial)
     }
 
     fn forward_relu2_routed_tensor_parallel(
         &mut self,
         resident_bank: &mut B::Relu2Groups,
-        mut request: RoutedExpertRequest<'_, '_, B::Tensor>,
+        request: RoutedExpertRequest<'_, '_, B::Tensor>,
         partitions: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<RoutedExpertTensorParallelOutput<B::Tensor>, Self::Error> {
+        with_resident_provider_invocation(request, |mut request| {
         with_provider_unit_observer(
             &mut request.unit_observer,
             request.routes.group_indices(),
@@ -2004,6 +2292,7 @@ where
                 )
             },
         )
+        })
         .map(RoutedExpertTensorParallelOutput::Partial)
     }
 }

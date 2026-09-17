@@ -1,0 +1,82 @@
+use super::*;
+use crate::working_memory::WorkingMemoryPool;
+use eredu_text::{stop_storage::StopCompilePlan, tokenizer_storage::TokenizerPlan};
+
+#[test]
+fn source_preparation_ceiling_constrains_concurrent_compilers_until_retirement() {
+    let json = br#"{"version":"1.0","truncation":null,"padding":null,"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},"added_tokens":[],"model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]}}"#;
+    let pool = WorkingMemoryPool::new(u64::MAX, 0).unwrap();
+    let source = pool
+        .compile_tokenizer(TokenizerPlan::prepare_json(json).unwrap())
+        .unwrap();
+    let execution = InferenceExecutionIdentity::default();
+    let source_bytes = pool.used_bytes().unwrap();
+    let probe = source
+        .prepare_text_source_budget(&execution, u64::MAX)
+        .unwrap();
+    let controls = pool.used_bytes().unwrap() - source_bytes;
+    assert!(controls > 0);
+    drop(probe);
+    assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+    let refusal = source
+        .prepare_text_source_budget(&execution, source_bytes)
+        .unwrap_err();
+    assert!(matches!(
+        refusal.cause,
+        WorkingMemoryError::BudgetExceeded { .. }
+    ));
+    assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+    let encoding =
+        WorkingMemoryPool::tokenizer_encode_required_bytes(&source, "abba", false).unwrap();
+    let capacity = source_bytes + controls + encoding;
+    let budget = source
+        .prepare_text_source_budget(&execution, capacity)
+        .unwrap();
+    let encoded = pool.encode_tokenizer_ids(&source, "abba", false).unwrap();
+    assert_eq!(encoded.ids(), [0, 1, 1, 0]);
+    assert_eq!(pool.used_bytes().unwrap(), capacity);
+    std::thread::scope(|scope| {
+        let other = &pool;
+        scope
+            .spawn(move || {
+                let error = other
+                    .compile_stop_source(StopCompilePlan::prepare_refs(&[]).unwrap())
+                    .unwrap_err();
+                assert!(matches!(
+                    error.accounting_failure(),
+                    Some(WorkingMemoryError::BudgetExceeded {
+                        available_bytes: 0,
+                        ..
+                    })
+                ));
+            })
+            .join()
+            .unwrap();
+    });
+    assert!(matches!(
+        pool.acquire_unquoted(),
+        Err(WorkingMemoryError::ReservedWorkActive)
+    ));
+    // A later larger request cannot override the still-live smaller ceiling.
+    let too_large = source
+        .prepare_text_source_budget(&execution, u64::MAX)
+        .unwrap_err();
+    assert!(matches!(
+        too_large.cause,
+        WorkingMemoryError::BudgetExceeded {
+            available_bytes: 0,
+            ..
+        }
+    ));
+    drop(too_large);
+    drop(encoded);
+    assert_eq!(pool.used_bytes().unwrap(), source_bytes + controls);
+    drop(budget);
+    assert_eq!(pool.used_bytes().unwrap(), source_bytes);
+    drop(
+        pool.compile_stop_source(StopCompilePlan::prepare_refs(&[]).unwrap())
+            .unwrap(),
+    );
+    drop(source);
+    assert_eq!(pool.used_bytes().unwrap(), 0);
+}

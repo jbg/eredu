@@ -1,0 +1,189 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -71,6 +71,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/reduction_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/scan.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/select.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/concatenate_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/selection_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/softmax.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/softmax_storage.cpp
+diff --git a/mlx/backend/cpu/concatenate_storage.cpp b/mlx/backend/cpu/concatenate_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/concatenate_storage.cpp
+@@ -0,0 +1,99 @@
++#include "mlx/backend/cpu/concatenate_storage.h"
++#include "mlx/backend/cpu/alias_storage.h"
++#include "mlx/backend/cpu/copy.h"
++#include "mlx/prepared_input.h"
++#include "mlx/original_buffer.h"
++#include "mlx/primitives.h"
++#include "mlx/submission.h"
++#include <algorithm>
++#include <climits>
++#include <functional>
++#include <typeinfo>
++namespace mlx::core::cpu {
++namespace {
++bool add(size_t& total,size_t value) noexcept {if(value>SIZE_MAX-total)return false;total+=value;return true;}
++bool append(CopyEvalStorage& out,size_t slot,const submission::GraphQuota::Request& request,size_t count) noexcept {
++  if(!request.bytes||!request.alignment||!add(out.request_counts[slot],count))return false;
++  out.request_bytes[slot]=std::max(out.request_bytes[slot],request.bytes);
++  out.request_alignments[slot]=std::max(out.request_alignments[slot],request.alignment);return true;
++}
++}
++bool concatenate_eval_layout(Dtype dtype,size_t rank,size_t left,size_t right,bool tracer,CopyEvalStorage& out) noexcept {
++  if(((dtype!=float32&&dtype!=bfloat16)||(dtype==float32&&dtype.size()!=4)||(dtype==bfloat16&&dtype.size()!=2))||rank<1||rank>4||!left||!right||
++      left>size_t(INT_MAX)||right>size_t(INT_MAX)-left)return false;
++  CopyEvalStorage value;
++  // One real Eval/cleanup over two inputs. Its two inplace jobs below have no
++  // independent output allocation or cleanup occurrence.
++  if(!copy_eval_layout(0,2,false,tracer,value))return false;
++  CpuCopyDispatchStorage dispatch;WeakCopyStorage weak;
++  submission::GraphQuota::Request shells[2]{};
++  submission::OriginalBufferRoutingLayout routing;
++  size_t allocation_controls=0;
++  if(!contiguous_copy_dispatch_storage(rank,dispatch)||
++      !PreparedInputLeaf::weak_copy_storage(rank,weak)||weak.count!=3||
++      !PreparedInputLeaf::descriptor_shell_requests(shells)||
++      !submission::original_buffer_routing_layout(routing)||
++      !allocator::original_buffer_allocation_control_bytes(allocation_controls))return false;
++  // Four task weak copies, two ordinary out_slice shells, one true output Data
++  // and birth. Each worker loans its source/destination until its real return.
++  if(!append(value,3,weak.requests[2],5)||
++      !append(value,4,weak.requests[0],4)||!append(value,4,shells[0],2)||
++      !append(value,5,weak.requests[1],4)||!append(value,5,shells[1],2))return false;
++  const submission::GraphQuota::Request task{dispatch.task_bytes,dispatch.task_alignment};
++  const submission::GraphQuota::Request birth{routing.birth_bytes,routing.birth_alignment};
++  if(!append(value,6,task,2)||!append(value,7,birth,1))return false;
++  value.rank=rank;value.copy=true;value.backing_births=1;
++  if(dispatch.worker_graph_extent_bound>SIZE_MAX/2)return false;
++  value.worker_graph_extents=dispatch.worker_graph_extent_bound*2;
++  const auto adoption=array::buffer_adoption_layout();
++  const size_t controls[]={sizeof(value)*2,sizeof(out),sizeof(dtype),sizeof(rank),sizeof(left),sizeof(right),sizeof(tracer),
++      sizeof(dispatch),sizeof(weak),sizeof(shells),sizeof(routing),sizeof(adoption),sizeof(allocation_controls),
++      dispatch.controls,dispatch.controls,weak.controls,weak.controls,weak.controls,weak.controls,
++      PreparedInputLeaf::descriptor_shared_control_bytes(),PreparedInputLeaf::descriptor_shared_control_bytes(),
++      PreparedInputLeaf::descriptor_allocator_control_bytes(),PreparedInputLeaf::descriptor_allocator_control_bytes(),
++      sizeof(Shape),sizeof(Strides),sizeof(array::Flags),sizeof(array),sizeof(size_t),sizeof(int),sizeof(const ArrayVector&),
++      sizeof(std::function<allocator::Buffer(size_t)>)*2,sizeof(allocator::Buffer)*2,
++      sizeof(std::shared_ptr<array::Data>),sizeof(submission::GraphAllocator<array::Data>),
++      adoption.incoming_bytes,adoption.scratch_owner_bytes,adoption.deleter_bytes,
++      adoption.allocator_callable_bytes,adoption.prepared_strides_bytes,allocation_controls,
++      sizeof(const array*)*4,sizeof(const Concatenate*),sizeof(size_t)*9,sizeof(int)*3,
++      sizeof(submission::FixedEvalPrologueGuard*),sizeof(submission::Record*),sizeof(submission::GraphQuota*),
++      sizeof(submission::GraphConstructionContext),sizeof(submission::GraphFailure)};
++  if(!add(value.named_control_bytes,sizeof(controls)))return false;
++  for(auto bytes:controls)if(!add(value.named_control_bytes,bytes))return false;
++  if(!submission::GraphConstruction::complete_layout(value))return false;
++  out=value;return true;
++}
++bool is_concatenate_eval_primitive(const array& out) noexcept {
++  return out.has_primitive()&&out.primitive().stream().device==Device::cpu&&typeid(out.primitive())==typeid(Concatenate);
++}
++bool concatenate_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  if(!is_concatenate_eval_primitive(output)||!output.siblings().empty()||output.inputs().size()!=2)return false;
++  const auto& left=output.inputs()[0];const auto& right=output.inputs()[1];
++  const int axis=static_cast<const Concatenate&>(output.primitive()).state();
++  const size_t rank=left.ndim();size_t a=0,b=0,total=1;
++  if(rank<1||rank>4||right.ndim()!=rank||output.ndim()!=rank||axis<0||size_t(axis)>=rank||
++      left.dtype()!=output.dtype()||right.dtype()!=output.dtype()||
++      left.itemsize()!=output.itemsize()||right.itemsize()!=output.itemsize()||
++      !alias_input_geometry(left,a)||!alias_input_geometry(right,b))return false;
++  for(size_t i=0;i<rank;++i) {
++    const int l=left.shape(i),r=right.shape(i);
++    if(l<=0||r<=0||(i!=size_t(axis)&&l!=r)||
++        (i==size_t(axis)&&l>INT_MAX-r))return false;
++    const int expected=i==size_t(axis)?l+r:l;
++    if(output.shape(i)!=expected||total>size_t(INT_MAX)/size_t(expected))return false;
++    total*=size_t(expected);
++  }
++  if(total!=output.size()||a>size_t(INT_MAX)||b>size_t(INT_MAX)-a||total!=a+b)return false;
++  return concatenate_eval_layout(output.dtype(),rank,a,b,output.is_tracer(),out);
++}
++}
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_concatenate_eval(const FixedEvalPrologueGuard& guard,GraphConstruction*& out) noexcept {
++  auto& record=guard.record();auto* graph=record.graph_quota();auto context=current_graph_construction_context();
++  if(out||!graph||!guard.cpu()||!context.scope||context.worker||context.dispatch!=&record||current_graph_quota()!=graph)
++    return GraphFailure::foreign_parent;
++  cpu::CopyEvalStorage actual;if(!cpu::concatenate_eval_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
++}
++}
+diff --git a/mlx/backend/cpu/concatenate_storage.h b/mlx/backend/cpu/concatenate_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/concatenate_storage.h
+@@ -0,0 +1,10 @@
++#pragma once
++#include "mlx/backend/cpu/copy_storage.h"
++namespace mlx::core::cpu {
++// The existing two-source concatenation, including both destination slice
++// descriptors and both unchanged GeneralGeneral copy jobs.
++MLX_API bool concatenate_eval_layout(Dtype,size_t rank,size_t left_elements,
++    size_t right_elements,bool tracer,CopyEvalStorage&) noexcept;
++MLX_API bool is_concatenate_eval_primitive(const array&) noexcept;
++MLX_API bool concatenate_eval_storage(const array&,CopyEvalStorage&) noexcept;
++}
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -1,3 +1,4 @@
++#include "mlx/backend/cpu/concatenate_storage.h"
+ // Copyright © 2025 Apple Inc.
+ #include "mlx/backend/cpu/eval.h"
+ #include "mlx/backend/cpu/encoder.h"
+@@ -46,6 +47,7 @@
+   const bool fixed_partition = partition && arr.ndim() == 2 && arr.inputs().size() == 1 &&
+       arr.inputs()[0].ndim() == 2 && arr.siblings().empty() &&
+       partition->state().second == 1;
++  const bool fixed_concatenate = fixed && cpu::is_concatenate_eval_primitive(arr);
+   const bool fixed_selection = fixed && cpu::is_selection_eval_primitive(arr);
+   const bool fixed_reduction = fixed && cpu::is_reduction_eval_primitive(arr);
+   const bool fixed_gather = fixed && cpu::is_gather_eval_primitive(arr);
+@@ -60,7 +62,7 @@
+   const bool fixed_tiled_matmul = fixed && cpu::is_tiled_matmul_eval_primitive(arr);
+   const bool fixed_matmul = fixed && cpu::is_bf16_matmul_eval_primitive(arr);
+   const bool fixed_random = fixed && cpu::is_random_bits_eval_primitive(arr);
+-  const bool extended = fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
++  const bool extended = fixed_concatenate || fixed_selection || fixed_reduction || fixed_gather || fixed_alias || fixed_tiled_matmul || fixed_matmul || fixed_random || fixed_reshape || fixed_greedy || fixed_softmax || fixed_slice || fixed_partition || fixed_distributed || fixed_copy || fixed_unary || fixed_binary;
+   std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+@@ -68,7 +70,9 @@
+   } extended_bank;
+   if (extended) {
+     extended_prologue.emplace(arr);
+-    const auto failure = fixed_selection
++    const auto failure = fixed_concatenate
++        ? submission::GraphConstruction::create_cpu_concatenate_eval(*extended_prologue, extended_bank.value)
++        : fixed_selection
+         ? submission::GraphConstruction::create_cpu_selection_eval(*extended_prologue, extended_bank.value)
+         : fixed_reduction
+         ? submission::GraphConstruction::create_cpu_reduction_eval(*extended_prologue, extended_bank.value)
+diff --git a/mlx/backend/cpu/primitives.cpp b/mlx/backend/cpu/primitives.cpp
+--- a/mlx/backend/cpu/primitives.cpp
++++ b/mlx/backend/cpu/primitives.cpp
+@@ -180,7 +180,7 @@
+ }
+ 
+ void Concatenate::eval_cpu(const ArrayVector& inputs, array& out) {
+-  std::vector<int> sizes;
++  Shape sizes;
+   sizes.push_back(0);
+   for (auto& p : inputs) {
+     sizes.push_back(p.shape(axis_));
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -174,6 +174,7 @@
+   static GraphFailure create_cpu_random_bits_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_softmax_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_slice_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_concatenate_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_selection_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_reduction_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_gather_eval(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;

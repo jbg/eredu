@@ -23,17 +23,21 @@ impl CaptureSession {
             .into());
         }
         let tensor_geometry = self.tensor_geometry()?;
+        let window = self.invocation_window;
+        let phase = self.phase;
+        let prediction = self.prediction;
         let records = self
             .records
             .as_mut()
             .ok_or_else(|| CaptureError::Invalid("capture step not started".into()))?;
-        for ((selection, point), record) in self
+        for (index, ((selection, point), record)) in self
             .plan
             .plan()
             .selections
             .iter()
             .zip(self.plan.points())
             .zip(records)
+            .enumerate()
         {
             let eredu_core::ObservationValueType::RoutedUnits {
                 routing: path,
@@ -51,10 +55,26 @@ impl CaptureSession {
             }
             let started = std::time::Instant::now();
             let result = (|| {
-                let shape = tensor_geometry
-                    .resolve(point)?
-                    .ok_or_else(|| CaptureError::Invalid("unknown routed-unit geometry".into()))?;
-                let slice = resolve_slice(point, selection, &shape)?;
+                if window.is_some() && record.payload.is_none() {
+                    let metadata = partition::fragment_metadata_usage(
+                        selection,
+                        point,
+                        point.axes.as_ref().map_or(32, Vec::len),
+                    )?;
+                    if let Some(reason) = self.ledger.reserve(metadata)? {
+                        record.outcome = CaptureOutcome::Skipped { reason };
+                        return Ok(());
+                    }
+                    record.charged = record.charged.checked_add(metadata)?;
+                }
+                let (shape, slice) = routed_invocation_geometry(
+                    &self.plan,
+                    index,
+                    phase,
+                    prediction,
+                    tensor_geometry,
+                    window,
+                )?;
                 geometry.validate_slice(&slice)?;
                 let dtype = backend.source_dtype(source.values);
                 if record.payload.is_none() {
@@ -142,17 +162,7 @@ impl CaptureSession {
                 record.payload = None;
                 let reason = match &error {
                     CaptureExecutionError::Backend(_) => CaptureFailureReason::Native,
-                    CaptureExecutionError::Admission(CaptureError::Limit {
-                        budget,
-                        cumulative,
-                    }) => CaptureFailureReason::Limit {
-                        budget: *budget,
-                        cumulative: *cumulative,
-                    },
-                    CaptureExecutionError::Admission(CaptureError::Unsupported(_)) => {
-                        CaptureFailureReason::Unsupported
-                    }
-                    CaptureExecutionError::Admission(_) => CaptureFailureReason::Invalid,
+                    CaptureExecutionError::Admission(error) => policy::failure_reason(error),
                 };
                 record.outcome = CaptureOutcome::Failed {
                     reason,
@@ -166,13 +176,16 @@ impl CaptureSession {
 
     pub(crate) fn finish_routed_captures(&mut self) -> Result<(), CaptureError> {
         let mut first_failure = None;
-        for ((selection, point), record) in self
+        let window = self.invocation_window;
+        let physical = window.map(|_| self.tensor_geometry()).transpose()?;
+        for (index, ((selection, point), record)) in self
             .plan
             .plan()
             .selections
             .iter()
             .zip(self.plan.points())
             .zip(self.records.iter_mut().flatten())
+            .enumerate()
         {
             if record.outcome == CaptureOutcome::Captured {
                 continue;
@@ -185,7 +198,24 @@ impl CaptureSession {
                     .source_shape
                     .as_ref()
                     .ok_or_else(|| CaptureError::Invalid("missing routed source shape".into()))?;
-                let slice = resolve_slice(point, selection, shape)?;
+                let slice = if window.is_some() {
+                    let (expected, slice) = routed_invocation_geometry(
+                        &self.plan,
+                        index,
+                        self.phase,
+                        self.prediction,
+                        physical.expect("window has physical geometry"),
+                        window,
+                    )?;
+                    if &expected != shape {
+                        return Err(CaptureError::Invalid(
+                            "routed physical window changed before completion".into(),
+                        ));
+                    }
+                    slice
+                } else {
+                    resolve_slice(point, selection, shape)?
+                };
                 payload.finish_ordinary(&slice, shape[0])?;
                 record.outcome = CaptureOutcome::Captured;
                 let mut sink = CountingWriter {
@@ -209,5 +239,40 @@ impl CaptureSession {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+/// Ordinary and original destinations use the same selected physical sparse
+/// axes. The outer speculative envelope retains the independent logical span;
+/// every actual invocation still pays and completes its own captured record.
+fn routed_invocation_geometry(
+    source: &AdmittedCapturePlan,
+    index: usize,
+    phase: CapturePhase,
+    prediction: u64,
+    physical: CaptureInvocationShape,
+    window: Option<CaptureInvocationWindow>,
+) -> Result<(Vec<u64>, ResolvedCaptureSlice), CaptureError> {
+    if let Some(window) = window {
+        let geometry = CaptureRoutedUnitsGeometry::prepare_window(
+            source, index, phase, prediction, physical, window,
+        )
+        .map_err(|cause| CaptureError::Invalid(cause.to_string()))?;
+        Ok((
+            geometry.source_shape().iter().map(|&n| n as u64).collect(),
+            ResolvedCaptureSlice {
+                starts: geometry.starts().to_vec(),
+                ends: geometry.ends().to_vec(),
+                strides: geometry.strides().to_vec(),
+                shape: geometry.shape().iter().map(|&n| n as u64).collect(),
+            },
+        ))
+    } else {
+        let point = &source.points()[index];
+        let shape = physical
+            .resolve(point)?
+            .ok_or_else(|| CaptureError::Invalid("unknown routed-unit geometry".into()))?;
+        let slice = resolve_slice(point, &source.plan().selections[index], &shape)?;
+        Ok((shape, slice))
     }
 }

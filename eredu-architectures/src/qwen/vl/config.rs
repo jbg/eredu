@@ -4,8 +4,8 @@ use eredu_core::cache::PromptCacheTopology;
 use eredu_core::{
     attention::LayerSchedule,
     cache::{
-        derive_prompt_cache_architecture_fingerprint, LayerCachePolicy, MutableStateResidency,
-        StateTensorDimension, StateTensorDtype, StateTensorPolicy, StateTensorRole,
+        LayerCachePolicy, MutableStateResidency,
+        StateTensorDimension, StateTensorDtype, StateTensorRole,
     },
 };
 use eredu_gguf::MetadataValue;
@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// Normalized Qwen3-VL policy over shared vision and ordinary Qwen text.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelArgs {
     /// Ordinary neutral Qwen/Qwen-MoE decoder configuration.
     pub text: qwen::ModelArgs,
@@ -207,7 +207,10 @@ pub fn model_args_from_config_value(value: &Value) -> Result<ModelArgs, VlConfig
     let text = qwen::model_args_from_text_config_value(&text_value, context)
         .map_err(|error| invalid(error.to_string()))?;
     if mrope_section.iter().any(|value| *value < 0)
-        || mrope_section.iter().sum::<i32>() != text.head_dim / 2
+        || mrope_section
+            .iter()
+            .try_fold(0_i32, |sum, section| sum.checked_add(*section))
+            != Some(text.head_dim / 2)
     {
         return Err(invalid(format!(
             "mrope_section {mrope_section:?} must cover half of head_dim {}",
@@ -272,7 +275,10 @@ pub fn model_args_from_gguf_parts(
         .try_into()
         .map_err(|_| invalid("Qwen3-VL mRoPE requires three sections"))?;
     if mrope_section.iter().any(|value| *value < 0)
-        || mrope_section.iter().sum::<i32>() != text.head_dim / 2
+        || mrope_section
+            .iter()
+            .try_fold(0_i32, |sum, section| sum.checked_add(*section))
+            != Some(text.head_dim / 2)
     {
         return Err(invalid(format!(
             "Qwen3-VL mRoPE sections {mrope_section:?} do not cover half of head_dim {}",
@@ -310,22 +316,41 @@ pub fn model_args_from_gguf_parts(
 
 /// Stable text/media position identity.
 pub fn prompt_cache_architecture_fingerprint(args: &ModelArgs) -> String {
-    derive_prompt_cache_architecture_fingerprint(
-        args.model_kind().canonical_name(),
-        [
-            (
-                "text",
-                qwen::prompt_cache_architecture_fingerprint(&args.text),
-            ),
+    prompt_cache_architecture_fingerprint_with_metadata(
+        args,
+        crate::decoder::identity::Metadata::new(None),
+    )
+    .expect("ordinary composite fingerprint formatting is infallible")
+}
+
+pub(crate) fn prompt_cache_architecture_fingerprint_with_metadata(
+    args: &ModelArgs,
+    metadata: crate::decoder::identity::Metadata<'_>,
+) -> Result<String, eredu_nn::Error> {
+    metadata.fingerprint(args.model_kind().canonical_name(), || {
+        Ok([
+            ("text", metadata.configured(&args.text)?),
             (
                 "vision",
-                crate::qwen::vision::prompt_cache_architecture_fingerprint(&args.vision),
+                crate::qwen::vision::prompt_cache_architecture_fingerprint_with_metadata(
+                    &args.vision,
+                    metadata,
+                )?,
             ),
-            ("image_token", args.image_token_id.to_string()),
-            ("video_token", args.video_token_id.to_string()),
-            ("mrope_section", format!("{:?}", args.mrope_section)),
-        ],
-    )
+            (
+                "image_token",
+                metadata.format(format_args!("{}", args.image_token_id))?,
+            ),
+            (
+                "video_token",
+                metadata.format(format_args!("{}", args.video_token_id))?,
+            ),
+            (
+                "mrope_section",
+                metadata.format(format_args!("{:?}", args.mrope_section))?,
+            ),
+        ])
+    })
 }
 
 /// Declares ordinary KV state plus the persisted decode position delta.
@@ -341,40 +366,78 @@ pub fn state_layout_with_key_value_heads(
     args: &ModelArgs,
     key_value_heads: &[i32],
 ) -> Result<StateLayout, VlConfigError> {
-    let layers = usize::try_from(args.text.num_hidden_layers)
-        .map_err(|_| invalid("invalid text layer count"))?;
-    if key_value_heads.len() != layers || key_value_heads.iter().any(|heads| *heads <= 0) {
-        return Err(invalid("rank-local Qwen3-VL KV-head layout is incomplete"));
+    state_layout_destination(
+        args,
+        key_value_heads,
+        &crate::state_geometry::Ordinary(invalid),
+    )
+}
+
+/// Constructs the actual KV/position-delta state through counted destinations.
+pub fn state_layout_with_metadata(
+    args: &ModelArgs,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<StateLayout, eredu_nn::Error> {
+    use crate::state_geometry::Destination;
+    if !context.uses_checked_metadata() {
+        return state_layout(args).map_err(eredu_nn::Error::backend);
     }
-    let policies = (0..layers)
-        .map(|layer| {
-            let attention = *args
-                .text
-                .attention_schedule
-                .get(layer)
-                .ok_or_else(|| invalid(format!("missing attention layer {layer}")))?;
-            if layer == 0 {
-                LayerCachePolicy::key_value_with_fixed_state(
-                    attention,
-                    key_value_heads[layer],
-                    args.text.head_dim,
-                    vec![StateTensorPolicy::new(
-                        StateTensorRole::PositionDelta,
-                        vec![StateTensorDimension::Scalar],
-                        StateTensorDtype::Int32,
-                        MutableStateResidency::AlwaysDeviceMutable,
-                    )
-                    .map_err(|error| invalid(error.to_string()))?],
-                )
-            } else {
-                LayerCachePolicy::key_value(attention, key_value_heads[layer], args.text.head_dim)
-            }
-            .map_err(|error| invalid(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let schedule =
-        LayerSchedule::new(layers, policies).map_err(|error| invalid(error.to_string()))?;
-    StateLayout::new(schedule).map_err(|error| invalid(error.to_string()))
+    let destination = crate::state_geometry::Counted::new(context, invalid);
+    destination.controls::<(Vec<i32>, &ModelArgs)>()?;
+    let layers = usize::try_from(args.text.num_hidden_layers)
+        .map_err(|_| destination.error(format_args!("invalid text layer count")))?;
+    let heads =
+        destination.collect_values(std::iter::repeat_n(args.text.num_key_value_heads, layers))?;
+    state_layout_destination(args, &heads, &destination)
+}
+
+fn state_layout_destination<D: crate::state_geometry::Destination>(
+    args: &ModelArgs,
+    key_value_heads: &[i32],
+    destination: &D,
+) -> Result<StateLayout, D::Error> {
+    destination.controls::<(
+        StateLayout,
+        LayerSchedule<LayerCachePolicy>,
+        &ModelArgs,
+        &[i32],
+    )>()?;
+    let layers = usize::try_from(args.text.num_hidden_layers)
+        .map_err(|_| destination.error(format_args!("invalid text layer count")))?;
+    if key_value_heads.len() != layers || key_value_heads.iter().any(|heads| *heads <= 0) {
+        return Err(destination.error(format_args!(
+            "rank-local Qwen3-VL KV-head layout is incomplete"
+        )));
+    }
+    let mut policies = destination.vector(layers)?;
+    for (layer, &heads) in key_value_heads.iter().enumerate() {
+        let attention =
+            *args.text.attention_schedule.get(layer).ok_or_else(|| {
+                destination.error(format_args!("missing attention layer {layer}"))
+            })?;
+        let policy = if layer == 0 {
+            let mut tensors = destination.vector(1)?;
+            let shape = destination.values([StateTensorDimension::Scalar])?;
+            tensors.push(destination.tensor(
+                StateTensorRole::PositionDelta,
+                shape,
+                StateTensorDtype::Int32,
+                MutableStateResidency::AlwaysDeviceMutable,
+            )?);
+            LayerCachePolicy::key_value_with_fixed_state_with_diagnostic(
+                attention,
+                heads,
+                args.text.head_dim,
+                tensors,
+                |cause| destination.error(cause),
+            )?
+        } else {
+            destination.key_value(attention, heads, args.text.head_dim)?
+        };
+        policies.push(policy);
+    }
+    let schedule = destination.schedule(layers, policies)?;
+    destination.layout(schedule)
 }
 
 /// Declares Qwen3-VL prompt identity independently of concrete cache storage.
@@ -384,16 +447,10 @@ pub fn state_identity(
     global_layer_start: usize,
     topology: PromptCacheTopology,
 ) -> Result<ModelStateIdentity, VlConfigError> {
-    let layer_count = usize::try_from(args.text.num_hidden_layers)
-        .map_err(|_| invalid("invalid text layer count"))?;
-    let global_layer_end = global_layer_start
-        .checked_add(layout.len())
-        .ok_or_else(|| invalid("Qwen3-VL owned layer range overflowed"))?;
-    if global_layer_end > layer_count {
-        return Err(invalid(format!(
-            "Qwen3-VL owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
-        )));
-    }
+    let layer_count =
+        validate_state_identity_geometry(args, layout, global_layer_start, |message| {
+            invalid(message.to_string())
+        })?;
     eredu_runtime::ModelStateIdentity::new(
         args.model_kind().canonical_name(),
         args.effective_model_type.clone(),
@@ -405,6 +462,70 @@ pub fn state_identity(
     )
     .map_err(|error| invalid(error.to_string()))
 }
+
+fn validate_state_identity_geometry<E>(
+    args: &ModelArgs,
+    layout: &StateLayout,
+    global_layer_start: usize,
+    mut error: impl FnMut(std::fmt::Arguments<'_>) -> E,
+) -> Result<usize, E> {
+    let layer_count = usize::try_from(args.text.num_hidden_layers)
+        .map_err(|_| error(format_args!("invalid text layer count")))?;
+    let global_layer_end = global_layer_start
+        .checked_add(layout.len())
+        .ok_or_else(|| error(format_args!("Qwen3-VL owned layer range overflowed")))?;
+    if global_layer_end > layer_count {
+        return Err(error(format_args!(
+            "Qwen3-VL owns layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers"
+        )));
+    }
+    Ok(layer_count)
+}
+
+/// Builds the same actual architecture/placement identity with counted strings
+/// and diagnostics. The caller retains metadata funding with the returned value.
+pub fn state_identity_with_metadata(
+    args: &ModelArgs,
+    layout: &StateLayout,
+    global_layer_start: usize,
+    topology: PromptCacheTopology,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<ModelStateIdentity, eredu_nn::Error> {
+    if !context.uses_checked_metadata() {
+        return state_identity(args, layout, global_layer_start, topology)
+            .map_err(|cause| eredu_nn::Error::backend(cause.to_string()));
+    }
+    let metadata = crate::decoder::identity::Metadata::new(Some(context));
+    metadata.controls::<(
+        ModelStateIdentity,
+        &ModelArgs,
+        &StateLayout,
+        PromptCacheTopology,
+    )>()?;
+    let layer_count = validate_state_identity_geometry(
+        args,
+        layout,
+        global_layer_start,
+        |message| match metadata.format(message) {
+            Ok(message) => metadata.source(invalid(message)),
+            Err(cause) => cause,
+        },
+    )?;
+    let family = metadata.text(args.model_kind().canonical_name())?;
+    let effective = metadata.text(&args.effective_model_type)?;
+    let fingerprint = prompt_cache_architecture_fingerprint_with_metadata(args, metadata)?;
+    ModelStateIdentity::new_with_diagnostic(
+        family,
+        effective,
+        fingerprint,
+        layer_count,
+        global_layer_start,
+        0,
+        topology,
+        |message| metadata.prompt_error(message),
+    )
+}
+
 
 fn token_id(value: Option<&Value>, name: &str) -> Result<i32, VlConfigError> {
     value
@@ -527,5 +648,63 @@ mod tests {
             prompt_cache_architecture_fingerprint(&dense),
             prompt_cache_architecture_fingerprint(&quantized)
         );
+    }
+
+    #[test]
+    fn zero_mrope_sections_preserve_hf_and_gguf_contract_and_reject_overflow() {
+        for (kind, text_kind, architecture) in [
+            ("qwen3_vl", "qwen3_vl_text", "qwen3vl"),
+            ("qwen3_vl_moe", "qwen3_vl_moe_text", "qwen3vlmoe"),
+        ] {
+            let mut source = config(kind, text_kind);
+            if kind == "qwen3_vl_moe" {
+                source["text_config"]["intermediate_size"] = 0.into();
+                source["text_config"]["moe_intermediate_size"] = 16.into();
+                source["text_config"]["num_experts"] = 4.into();
+                source["text_config"]["num_experts_per_tok"] = 2.into();
+            }
+            let original = model_args_from_config_value(&source).unwrap();
+            for sections in [
+                [4, 0, 0],
+                [0, 4, 0],
+                [0, 0, 4],
+                [0, 2, 2],
+                [2, 0, 2],
+                [2, 2, 0],
+                [1, 1, 2],
+                [-1, 2, 3],
+                [0, 0, 0],
+                [1, 1, 1],
+                [i32::MAX, i32::MAX, 2],
+            ] {
+                let valid = sections.iter().all(|n| *n >= 0)
+                    && sections.iter().try_fold(0_i32, |a, b| a.checked_add(*b)) == Some(4);
+                let mut source = source.clone();
+                source["text_config"]["rope_scaling"]["mrope_section"] =
+                    serde_json::json!(sections);
+                let hf = model_args_from_config_value(&source);
+                let metadata = HashMap::from([
+                    (
+                        "general.architecture".into(),
+                        MetadataValue::String(architecture.into()),
+                    ),
+                    (
+                        format!("{architecture}.rope.dimension_sections"),
+                        MetadataValue::Array(eredu_gguf::MetadataArray::Int32(sections.to_vec())),
+                    ),
+                ]);
+                let gguf = model_args_from_gguf_parts(
+                    original.text.clone(),
+                    &metadata,
+                    original.vision.clone(),
+                );
+                assert_eq!(hf.is_ok(), valid, "HF {kind} {sections:?}");
+                assert_eq!(gguf.is_ok(), valid, "GGUF {kind} {sections:?}");
+                if valid {
+                    assert_eq!(hf.unwrap().mrope_section, sections);
+                    assert_eq!(gguf.unwrap().mrope_section, sections);
+                }
+            }
+        }
     }
 }

@@ -162,7 +162,7 @@ fn quarantine_teardown_releases_terminal_resources_when_runtime_access_is_availa
             // Explicitly finish this fixture before teardown; production TLS
             // destruction itself must never wait for an outstanding event.
             orphans.work[0].event.synchronize().unwrap();
-            while !orphans.work[0].recovery.progress().settled {
+            while !orphans.work[0].recovery.settled() {
                 std::thread::yield_now();
             }
         });

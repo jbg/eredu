@@ -1,0 +1,146 @@
+diff --git a/mlx/backend/cpu/select.cpp b/mlx/backend/cpu/select.cpp
+--- a/mlx/backend/cpu/select.cpp
++++ b/mlx/backend/cpu/select.cpp
+@@ -92,14 +92,14 @@
+ } // namespace
+ 
+ namespace cpu {
+-bool select_dispatch_storage(size_t rank,EvalDispatchStorage& out) noexcept {
+-  if(rank>4)return false;
++static bool select_task_storage(size_t rank,bool general,EvalDispatchStorage& out) noexcept {
++  if(rank>(general?5:4)||(general&&rank==0))return false;
+   DispatchLayout task;WeakCopyStorage weak;
+   using Body=SelectTask<::mlx::core::detail::Select>;
+   if(!CommandEncoder::dispatch_layout<Body>(task)||!PreparedInputLeaf::weak_copy_storage(rank,weak))return false;
+   EvalDispatchStorage value{task.task_bytes,task.task_alignment,0,0};
+   const size_t controls[]={task.controls,weak.controls,weak.controls,weak.controls,weak.controls,
+-      sizeof(value)+sizeof(out)+sizeof(rank)+sizeof(task)+sizeof(weak)+sizeof(Body)*2+
++      sizeof(value)+sizeof(out)+sizeof(rank)+sizeof(general)+sizeof(task)+sizeof(weak)+sizeof(Body)*2+
+       sizeof(array)*5+sizeof(TernaryOpType)*3+sizeof(Stream)+sizeof(CommandEncoder*)+
+       sizeof(::mlx::core::detail::Select)*2+sizeof(size_t)*8+sizeof(void*)*8+sizeof(bool)*5+sizeof(float)*4+
+       sizeof(std::function<allocator::Buffer(size_t)>)+sizeof(array::Flags)+sizeof(Strides)};
+@@ -107,7 +107,43 @@
+   for(size_t control:controls) {
+     if(control>SIZE_MAX-value.controls)return false;value.controls+=control;
+   }
++  if(general) {
++    // The unchanged General worker borrows four stride rows, then owns the
++    // collapse result and three rank-minus-two prefix iterators. The accepted
++    // FixedEval loan follows the same task through all of this scratch work.
++    CollapseStorageLayout collapse;
++    if(!collapse_contiguous_dims_layout(4,rank,true,collapse))return false;
++    const size_t frames[]={sizeof(general),sizeof(collapse),sizeof(ContiguousIteratorLayout),
++        sizeof(CollapsedDimensions),sizeof(BorrowedStrides),sizeof(ContiguousIterator)*3,
++        sizeof(const Shape*)*3,sizeof(const Strides*)*12,sizeof(const void*)*12,
++        sizeof(void*)*3,sizeof(size_t)*8,sizeof(int)*8,sizeof(int64_t)*12,
++        sizeof(::mlx::core::detail::Select)*3,
++        collapse.borrowed_view_bytes,collapse.fixed_reference_bytes,
++        collapse.result_control_bytes,collapse.marker_control_bytes,
++        collapse.layout_control_bytes,collapse.fixed_reference_view_bytes};
++    if(sizeof(frames)>SIZE_MAX-value.controls)return false;value.controls+=sizeof(frames);
++    for(size_t bytes:frames) {
++      if(bytes>SIZE_MAX-value.controls)return false;value.controls+=bytes;
++    }
++    value.worker_graph_extents=collapse.graph_extent_sum;
++    if(rank>2) {
++      ContiguousIteratorLayout iterator;
++      if(!contiguous_iterator_layout(rank-2,iterator))return false;
++      for(unsigned i=0;i!=3;++i) {
++        if(iterator.graph_extent_sum>SIZE_MAX-value.worker_graph_extents||
++            iterator.controls>SIZE_MAX-value.controls)return false;
++        value.worker_graph_extents+=iterator.graph_extent_sum;
++        value.controls+=iterator.controls;
++      }
++    }
++  }
+   out=value;return true;
++}
++bool select_dispatch_storage(size_t rank,EvalDispatchStorage& out) noexcept {
++  return select_task_storage(rank,false,out);
++}
++bool select_broadcast_dispatch_storage(size_t rank,EvalDispatchStorage& out) noexcept {
++  return select_task_storage(rank,true,out);
+ }
+ } // namespace cpu
+ 
+diff --git a/mlx/backend/cpu/selection_storage.cpp b/mlx/backend/cpu/selection_storage.cpp
+--- a/mlx/backend/cpu/selection_storage.cpp
++++ b/mlx/backend/cpu/selection_storage.cpp
+@@ -21,8 +21,8 @@
+   size_t bytes=0;
+   return canonical(dtype)&&rank<=4&&elements&&elements<=size_t(INT_MAX)&&product(elements,dtype.size(),bytes);
+ }
+-bool shape(const array& input,size_t& elements) noexcept {
+-  if(input.ndim()>4||input.strides().size()!=input.ndim())return false;
++bool shape(const array& input,size_t& elements,size_t maximum_rank=4) noexcept {
++  if(size_t(input.ndim())>maximum_rank||input.strides().size()!=input.ndim())return false;
+   elements=1;
+   for(int extent:input.shape())if(extent<=0||!product(elements,size_t(extent),elements))return false;
+   return elements==input.size()&&elements<=size_t(INT_MAX);
+@@ -98,7 +98,7 @@
+   if(!add(value.named_control_bytes,controls))return false;
+   out=value;return true;
+ }
+-bool selection_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++static bool row_selection_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
+   if(!is_selection_eval_primitive(output)||!output.siblings().empty()||!canonical(output.dtype()))return false;
+   size_t elements=0;if(!shape(output,elements))return false;
+   const bool full=typeid(output.primitive())==typeid(Full);
+@@ -120,6 +120,45 @@
+   return full?scalar_full_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out):
+       select_eval_layout(output.dtype(),output.ndim(),elements,output.is_tracer(),out);
+ }
++// An additive source for the existing F32 Select over stored or broadcast
++// operands. Rank five is the actual GQA mask expansion; the legacy row source
++// and scalar Full contracts remain unchanged.
++bool select_broadcast_eval_layout(size_t rank,size_t elements,bool tracer,CopyEvalStorage& out) noexcept {
++  size_t bytes=0;
++  if(!rank||rank>5||!elements||elements>size_t(INT_MAX)||!product(elements,sizeof(float),bytes))return false;
++  EvalDispatchStorage dispatch;SingleOutputEvalStorage common;
++  if(!select_broadcast_dispatch_storage(rank,dispatch)||
++      !single_output_eval_layout(rank,3,tracer,&dispatch,common))return false;
++  CopyEvalStorage value;static_cast<SingleOutputEvalStorage&>(value)=common;value.copy=true;
++  const size_t controls=sizeof(rank)+sizeof(elements)+sizeof(tracer)+sizeof(out)+sizeof(bytes)+
++      sizeof(dispatch)+sizeof(common)+sizeof(value)+sizeof(const array*)*5+sizeof(size_t)*18+
++      sizeof(int)*3+sizeof(bool)*5+sizeof(Dtype)*3+sizeof(submission::FixedEvalPrologueGuard*)+
++      sizeof(submission::Record*)+sizeof(submission::GraphQuota*)+
++      sizeof(submission::GraphConstructionContext)+sizeof(submission::GraphFailure);
++  if(!add(value.named_control_bytes,controls))return false;
++  out=value;return true;
++}
++static bool broadcast_selection_source(const array& output,CopyEvalStorage& out) noexcept {
++  if(!is_selection_eval_primitive(output)||typeid(output.primitive())!=typeid(Select)||
++      !output.siblings().empty()||output.inputs().size()!=3||output.dtype()!=float32)return false;
++  size_t elements=0;if(!shape(output,elements,5)||output.ndim()==0)return false;
++  for(size_t i=0;i!=3;++i) {
++    const auto& input=output.inputs()[i];size_t actual=0,span=1;
++    if(input.shape()!=output.shape()||!shape(input,actual,5)||actual!=elements||
++        input.dtype()!=(i==0?bool_:float32)||!canonical(input.dtype())||
++        !input.data_size()||input.data_size()>elements)return false;
++    for(size_t axis=0;axis!=size_t(input.ndim());++axis) {
++      size_t offset=0;
++      if(input.strides()[axis]<0||!product(size_t(input.shape(axis)-1),size_t(input.strides()[axis]),offset)||
++          !add(span,offset))return false;
++    }
++    if(span>input.data_size())return false;
++  }
++  return select_broadcast_eval_layout(output.ndim(),elements,output.is_tracer(),out);
++}
++bool selection_eval_storage(const array& output,CopyEvalStorage& out) noexcept {
++  return row_selection_eval_storage(output,out)||broadcast_selection_source(output,out);
++}
+ }
+ namespace mlx::core::submission {
+ GraphFailure GraphConstruction::create_cpu_selection_eval(const FixedEvalPrologueGuard& guard,
+diff --git a/mlx/backend/cpu/selection_storage.h b/mlx/backend/cpu/selection_storage.h
+--- a/mlx/backend/cpu/selection_storage.h
++++ b/mlx/backend/cpu/selection_storage.h
+@@ -1,6 +1,8 @@
+ #pragma once
+ #include "mlx/backend/cpu/copy_storage.h"
+ namespace mlx::core::cpu {
++MLX_API bool select_broadcast_dispatch_storage(size_t rank,EvalDispatchStorage&) noexcept;
++MLX_API bool select_broadcast_eval_layout(size_t rank,size_t elements,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool select_dispatch_storage(size_t rank,EvalDispatchStorage&) noexcept;
+ MLX_API bool select_eval_layout(Dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage&) noexcept;
+ MLX_API bool scalar_full_eval_layout(Dtype,size_t rank,size_t elements,bool tracer,CopyEvalStorage&) noexcept;

@@ -18,24 +18,45 @@ mod format;
 mod iquant;
 mod iquant_tables;
 mod reader;
+mod supplied_storage;
 mod writer;
 
 pub use catalog::{
     CatalogShard, CatalogTensor, Checkpoint, ConvertedCheckpointTensor, ConvertedTensorIter,
-    LogicalDtype, LogicalTensorLayout, RawCheckpointTensor, TensorMaterializer,
-    TranslatedTensorLayout,
+    LogicalDtype, LogicalTensorLayout, MetadataLayouts, MetadataPreparationFailure,
+    MetadataSelection, PreparedTensorMetadata, RawCheckpointTensor, SharedTensorMetadataSource,
+    TensorMaterializer, TensorMetadataSource, TranslatedTensorLayout,
 };
 pub use codebook::IQuantCodebook;
 pub use convert::{
-    convert_affine, AffineTensor, ConvertedTensor, DenseDtype, DenseTensor, IQuantTensor,
-    MxFp4Tensor,
+    convert_affine, AffineTensor, ConversionDestinationError, ConversionLayouts,
+    ConversionOutputPlan, ConversionPlan, ConvertedTensor, DenseDtype, DenseTensor, IQuantTensor,
+    MxFp4Tensor, PreparedConversion, PreparedConversionFailure, StoredConversion,
+    StoredConversionFailure, StoredConvertedTensor,
 };
-pub use error::{Error, Result};
+pub use error::{Error, Result, UnsupportedGgmlType};
 pub use format::{
-    Endian, GgmlType, MetadataArray, MetadataValue, TensorDescriptor, DEFAULT_ALIGNMENT,
+    Endian, GgmlType, MetadataArray, MetadataValue, TensorDescriptor, TensorDescriptorView,
+    DEFAULT_ALIGNMENT,
 };
 pub use reader::{
-    DenseTensorSpan, DenseTensorSpanPlan, EncodedSpan, Limits, Reader, SelectionAlignment,
-    TensorSelection, TensorSelectionPlan,
+    DenseTensorSpan, DenseTensorSpanPlan, EncodedSpan, HeaderStorageKind, HeaderStorageStep,
+    Limits, MetadataDestinationError, PreparedHeader, PreparedHeaderChanged, ReadDestinationError,
+    Reader, ReaderBuffer, ReaderBufferPreparationFailure, SelectionAlignment,
+    StoredPhysicalDescriptor, StoredPhysicalFailure, TensorSelection, TensorSelectionPlan,
 };
 pub use writer::{TensorInput, Writer, WriterOptions};
+
+pub use supplied_storage::{
+    InitializedStorage, StorageFamily, StorageProvider, StorageRequestBound, StoredBuffer,
+    StoredDescriptor, SuppliedStorageError,
+};
+
+pub use catalog::{
+    StoredCheckpointTensor, StoredMetadataFailure, StoredOutputNames, StoredTensorMetadata,
+    StoredTensorPair,
+};
+
+pub use convert::{packed_iquant_shape, ConvertedParts};
+
+pub use catalog::{PreparedMaterializerFailure, PreparedMaterializerStorage};

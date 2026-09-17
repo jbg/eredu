@@ -6,15 +6,17 @@ fn detached_host_demotion_worker_keeps_active_request_owned() {
     let (started_tx, started_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let (finished_tx, finished_rx) = mpsc::channel();
-    assert!(worker
-        .sender
-        .send(super::HostDemotionRequest::Pause {
-            started: started_tx,
-            release: release_rx,
-            retained,
-            finished: finished_tx,
-        })
-        .is_ok());
+    assert!(
+        worker
+            .sender
+            .send(super::HostDemotionRequest::Pause {
+                started: started_tx,
+                release: release_rx,
+                retained,
+                finished: finished_tx,
+            })
+            .is_ok()
+    );
     started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
     let (dropped_tx, dropped_rx) = mpsc::channel();
     thread::spawn(move || {
@@ -33,9 +35,19 @@ fn detached_host_demotion_worker_keeps_active_request_owned() {
 #[test]
 fn manager_drop_does_not_lock_worker_retained_state_and_final_owner_cleans_files() {
     let directory = tempfile::tempdir().unwrap();
-    let location = missing_location(directory.path(), "ephemeral.safetensors");
-    fs::write(&location.path, b"owned until the final state retires").unwrap();
-    let path = location.path.clone();
+    let publication = super::LiveCacheBlockPublication::begin(directory.path(), &disk_test_id(0));
+    fs::write(
+        publication.staging_path(),
+        b"owned until the final state retires",
+    )
+    .unwrap();
+    let live_source = publication.commit_owned().unwrap();
+    let path = live_source.path().to_path_buf();
+    let location = DiskLocation::ordinary(DiskLocationData {
+        path: path.clone(),
+        live_source: Some(live_source),
+        ..missing_location_data(directory.path(), "unused")
+    });
     let manager =
         CacheResidencyManager::new(PagedCacheOptions::new(1, 64, 64, 1).unwrap()).unwrap();
     {
@@ -48,6 +60,8 @@ fn manager_drop_does_not_lock_worker_retained_state_and_final_owner_cleans_files
                 shapes: [vec![1], vec![1]],
                 dtypes: ["Float32".into(), "Float32".into()],
                 imported: false,
+                original_discard: None,
+                _metadata_funding: None,
             },
             false,
             0,
@@ -100,11 +114,12 @@ fn layer_truncation_clears_only_the_selected_pages_and_mutable_tail() {
         let mut state = manager.lock().unwrap();
         for global_layer in 0..=1 {
             let id = block_id(global_layer);
-            let mut location = missing_location(
+            let mut location = missing_location_data(
                 Path::new("/nonexistent/eredu-cache-test"),
                 &format!("layer-{global_layer}.safetensors"),
             );
             location.persistent = true;
+            let location = DiskLocation::ordinary(location);
             insert_test_record(
                 &mut state,
                 CacheBlockRecord {
@@ -113,6 +128,8 @@ fn layer_truncation_clears_only_the_selected_pages_and_mutable_tail() {
                     shapes: [vec![1, 1, 1, 1], vec![1, 1, 1, 1]],
                     dtypes: ["Float32".into(), "Float32".into()],
                     imported: false,
+                    original_discard: None,
+                    _metadata_funding: None,
                 },
                 false,
                 0,
@@ -216,6 +233,8 @@ fn disk_backed_device_blocks_bypass_a_zero_host_budget() {
                     shapes: [vec![1], vec![1]],
                     dtypes: ["Float32".into(), "Float32".into()],
                     imported: false,
+                    original_discard: None,
+                    _metadata_funding: None,
                 },
                 false,
                 0,
@@ -280,6 +299,8 @@ fn per_layer_residency_report_is_bounded_and_losslessly_aggregated() {
                     shapes: [vec![1], vec![1]],
                     dtypes: ["Float32".into(), "Float32".into()],
                     imported: false,
+                    original_discard: None,
+                    _metadata_funding: None,
                 },
                 global_layer % 5 == 0,
                 0,
@@ -411,10 +432,103 @@ fn per_layer_cumulative_attention_is_bounded_and_survives_clear() {
         after_clear.per_layer_overflow.decode_full_attention_bytes,
         report.per_layer_overflow.decode_full_attention_bytes
     );
-    assert!(after_clear
-        .per_layer
-        .iter()
-        .all(|layer| layer.stats.current_device_bytes == 0
-            && layer.stats.current_host_bytes == 0
-            && layer.stats.current_disk_bytes == 0));
+    assert!(
+        after_clear
+            .per_layer
+            .iter()
+            .all(|layer| layer.stats.current_device_bytes == 0
+                && layer.stats.current_host_bytes == 0
+                && layer.stats.current_disk_bytes == 0)
+    );
+}
+
+#[test]
+fn queued_disk_read_keeps_published_file_after_manager_drop_until_task_release() {
+    let directory = tempfile::tempdir().unwrap();
+    let id = disk_test_id(0);
+    let publication = super::LiveCacheBlockPublication::begin(directory.path(), &id);
+    fs::write(
+        publication.staging_path(),
+        b"cancelled before payload decoding",
+    )
+    .unwrap();
+    let file = publication.commit_owned().unwrap();
+    let path = file.path().to_path_buf();
+    let alias = file.clone();
+    assert!(file.same_source(&alias));
+    let location = DiskLocation::ordinary(DiskLocationData {
+        path: path.clone(),
+        live_source: Some(file),
+        ..missing_location_data(directory.path(), "unused")
+    });
+    let manager =
+        CacheResidencyManager::new(PagedCacheOptions::new(1, 64, 64, 1).unwrap()).unwrap();
+    {
+        let mut state = manager.lock().unwrap();
+        insert_test_record(
+            &mut state,
+            CacheBlockRecord {
+                physical: MlxCacheBlockStorage::disk(id.clone(), location.clone()),
+                bytes: 0,
+                shapes: [vec![1], vec![1]],
+                dtypes: ["Float32".into(), "Float32".into()],
+                imported: false,
+                original_discard: None,
+                _metadata_funding: None,
+            },
+            false,
+            0,
+        );
+    }
+    // A different actual task occupies the existing worker. The selected read
+    // stays queued with its source, so logical cancellation cannot release it.
+    let worker = DiskWorker::new(1).unwrap();
+    let (started_tx, started_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let pause = worker
+        .prepare(
+            CacheIoOperationKey {
+                generation: 0,
+                id: disk_test_id(1),
+                kind: CacheIoOperationKind::Read,
+            },
+            DiskTask::Pause {
+                started: started_tx,
+                release: release_rx,
+            },
+        )
+        .unwrap();
+    pause.enqueue().unwrap();
+    started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let read = worker
+        .prepare_read(0, &id, &location, CacheRepresentation::KeyValue)
+        .unwrap();
+    let ticket = read.ticket.clone();
+    read.enqueue().unwrap();
+    drop(location);
+    drop(manager);
+    let retained_after_manager = path.exists();
+    let cancelled = ticket.cancel();
+    drop(alias);
+    let retained_by_task = path.exists();
+    // Release before assertions so a failed test still tears down the worker.
+    release_tx.send(()).unwrap();
+    ticket.wait_for_task_resources().unwrap();
+    assert!(
+        retained_after_manager,
+        "canonical teardown unlinked a queued source"
+    );
+    assert!(cancelled);
+    assert!(
+        retained_by_task,
+        "logical cancellation released task storage early"
+    );
+    assert!(
+        !path.exists(),
+        "last task source did not retire the ephemeral file"
+    );
+    assert!(matches!(
+        ticket.wait(),
+        Err(CacheResidencyError::DiskOperationCancelled { generation: 0 })
+    ));
 }

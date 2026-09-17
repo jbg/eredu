@@ -1,39 +1,39 @@
 // Residency, persistence, and resource-lifetime tests.
 
 use super::{
-    buffer_prompt_cache_shard, cpu_stream, hash_prompt_cache_shard_payload,
-    host_cache_capacity_upper_bound, inspect_prompt_cache, open_prompt_cache, verify_disk_payload,
     CacheBlockArrays, CacheBlockId, CacheBlockRecord, CacheIoOperationKey, CacheIoOperationKind,
     CacheLayerResidencyStats, CacheManagerState, CachePoolError, CachePoolResource,
     CacheRankIdentity, CacheRepresentation, CacheResidencyError, CacheResidencyManager,
-    CacheResidencyPool, CacheStoragePhase, CacheTier, DiskLocation, DiskResult, DiskTask,
-    DiskWorker, DiskWriteCommit, HostCacheBlock, HostDemotionCompletion, HostDemotionTicket,
-    HostWriteReservation, MlxCacheBlockStorage, MlxCacheIoOperation, PagedCacheOptions,
-    StateTensorOwner, StateTensorRole,
+    CacheResidencyPool, CacheStoragePhase, CacheTier, DiskLocation, DiskLocationData, DiskResult,
+    DiskTask, DiskWorker, DiskWriteCommit, HostCacheBlock, HostDemotionCompletion,
+    HostDemotionTicket, HostWriteReservation, MlxCacheBlockStorage, MlxCacheIoOperation,
+    PagedCacheOptions, StateTensorOwner, StateTensorRole, buffer_prompt_cache_shard, cpu_stream,
+    hash_prompt_cache_shard_payload, host_cache_capacity_upper_bound, inspect_prompt_cache,
+    open_prompt_cache, verify_disk_payload,
 };
 use eredu_core::cache::{
-    prompt_cache_token_fingerprint, validate_prompt_cache_model_identity, LayerCachePolicy,
-    MutableStateResidency, PromptCacheBlock, PromptCacheDescriptor, PromptCacheError,
-    PromptCacheManifest, PromptCacheModelIdentity, PromptCacheOptions, PromptCacheStateTensor,
-    PromptCacheTopology, StateResidencyClass, StateTensorDimension, StateTensorDtype,
-    StateTensorPolicy, PROMPT_CACHE_SCHEMA_VERSION,
+    LayerCachePolicy, MutableStateResidency, PROMPT_CACHE_SCHEMA_VERSION, PromptCacheBlock,
+    PromptCacheDescriptor, PromptCacheError, PromptCacheManifest, PromptCacheModelIdentity,
+    PromptCacheOptions, PromptCacheStateTensor, PromptCacheTopology, StateResidencyClass,
+    StateTensorDimension, StateTensorDtype, StateTensorPolicy, prompt_cache_token_fingerprint,
+    validate_prompt_cache_model_identity,
 };
 use eredu_core::{AttentionPolicy, LayerSchedule};
 use eredu_runtime::{
-    resolve_prompt_cache_root, CachePoolLimits, CacheResidencyConfigurationError, MutableCacheTail,
-    PromptCachePersistenceError, CACHE_RESIDENCY_LAYER_REPORT_LIMIT, PROMPT_CACHE_CURRENT_FILE,
-    PROMPT_CACHE_GENERATIONS_DIRECTORY,
+    CACHE_RESIDENCY_LAYER_REPORT_LIMIT, CachePoolLimits, CacheResidencyConfigurationError,
+    MutableCacheTail, PROMPT_CACHE_CURRENT_FILE, PROMPT_CACHE_GENERATIONS_DIRECTORY,
+    PromptCachePersistenceError, resolve_prompt_cache_root,
 };
 use safemlx::{
-    host_transfer_capacity_upper_bound, transforms::async_eval_with_event, Array, Device,
-    DeviceType, HostTransferPolicy, HostTransferStorageKind, Stream,
+    Array, Device, DeviceType, HostTransferPolicy, HostTransferStorageKind, Stream,
+    host_transfer_capacity_upper_bound, transforms::async_eval_with_event,
 };
-use safetensors::tensor::{serialize_to_file, Dtype as StoredDtype, TensorView};
+use safetensors::tensor::{Dtype as StoredDtype, TensorView, serialize_to_file};
 use std::{
     fs,
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
-    sync::{mpsc, Arc, OnceLock},
+    sync::{Arc, OnceLock, mpsc},
     thread,
     time::Duration,
 };
@@ -50,7 +50,11 @@ fn disk_test_id(start: i64) -> CacheBlockId {
 }
 
 fn missing_location(root: &Path, name: &str) -> DiskLocation {
-    DiskLocation {
+    DiskLocation::ordinary(missing_location_data(root, name))
+}
+
+fn missing_location_data(root: &Path, name: &str) -> DiskLocationData {
+    DiskLocationData {
         path: root.join(name),
         first_name: "keys".into(),
         second_name: "values".into(),
@@ -58,6 +62,7 @@ fn missing_location(root: &Path, name: &str) -> DiskLocation {
         buffered: None,
         payload_sha256: None,
         payload_verification: Arc::new(OnceLock::new()),
+        live_source: None,
     }
 }
 
@@ -78,6 +83,7 @@ fn test_host_writing(block: HostCacheBlock, ticket: super::DiskTicket) -> MlxCac
         .begin_write(MlxCacheIoOperation {
             ticket,
             reserved_host_bytes: None,
+            prepared_read: None,
         })
         .unwrap();
     physical
@@ -129,6 +135,8 @@ fn manager_with_leased_block() -> CacheResidencyManager {
             shapes: [vec![1, 1, 1, 1], vec![1, 1, 1, 1]],
             dtypes: ["Float32".into(), "Float32".into()],
             imported: false,
+            original_discard: None,
+            _metadata_funding: None,
         },
         false,
         1,

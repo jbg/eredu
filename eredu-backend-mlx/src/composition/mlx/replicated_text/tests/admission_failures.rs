@@ -121,11 +121,12 @@ fn selected_paged_state_controls_generic_construction() {
             >(
                 &architecture_plan,
                 selected,
-                store,
+                store.into(),
                 &stream,
                 BindingVisitor {
                     stream: &stream,
                     weights_stream: &weights_stream,
+                    layerwise_manager: None,
                 },
             )
             .unwrap();
@@ -389,10 +390,12 @@ fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
         &capabilities(&invalid_requirements, &request),
     )
     .unwrap_err();
-    assert!(error
-        .issues()
-        .iter()
-        .any(|issue| issue.contains("weight lowering")));
+    assert!(
+        error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("weight lowering"))
+    );
 
     let routed_root = tiny_artifact("qwen3_moe", false);
     let routed = eredu_architectures::configuration::inspect_artifact(routed_root.path()).unwrap();
@@ -412,9 +415,11 @@ fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
         &[GroupedOperationRequirement::GatedProduct],
     )
     .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("GatedProductTensorParallelPartial"));
+    assert!(
+        error
+            .to_string()
+            .contains("GatedProductTensorParallelPartial")
+    );
 
     let affine_error = eredu_runtime::select_replicated_text_realization(
         &requirements,
@@ -427,10 +432,12 @@ fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
         &capabilities(&requirements, &request),
     )
     .unwrap_err();
-    assert!(affine_error
-        .issues()
-        .iter()
-        .any(|issue| issue.contains("affine group size")));
+    assert!(
+        affine_error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("affine group size"))
+    );
 
     let linear_index = requirements
         .parameters()
@@ -486,10 +493,12 @@ fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
         &capabilities(&invalid_mxfp4_requirements, &mxfp4_request),
     )
     .unwrap_err();
-    assert!(mxfp4_error
-        .issues()
-        .iter()
-        .any(|issue| issue.contains("MXFP4 packed extent 48")));
+    assert!(
+        mxfp4_error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("MXFP4 packed extent 48"))
+    );
 
     let full = capabilities(&requirements, &request);
     let only_basic = BackendMechanismCapabilities::new(
@@ -515,10 +524,12 @@ fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
         &only_basic,
     )
     .unwrap_err();
-    assert!(state_error
-        .issues()
-        .iter()
-        .any(|issue| issue.contains("state component")));
+    assert!(
+        state_error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("state component"))
+    );
     let session_error = eredu_runtime::select_replicated_text_realization(
         &requirements,
         &request
@@ -527,10 +538,12 @@ fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
         &only_basic,
     )
     .unwrap_err();
-    assert!(session_error
-        .issues()
-        .iter()
-        .any(|issue| issue.contains("session capability")));
+    assert!(
+        session_error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("session capability"))
+    );
     let residency_error = eredu_runtime::select_replicated_text_realization(
         &requirements,
         &eredu_runtime::ReplicatedTextSelectionRequest::new(
@@ -542,10 +555,12 @@ fn invalid_source_and_missing_grouped_mechanism_never_reach_production_paths() {
         &only_basic,
     )
     .unwrap_err();
-    assert!(residency_error
-        .issues()
-        .iter()
-        .any(|issue| issue.contains("weight residency")));
+    assert!(
+        residency_error
+            .issues()
+            .iter()
+            .any(|issue| issue.contains("weight residency"))
+    );
     assert_eq!(
         crate::tests::support::path_instrumentation::snapshot(),
         crate::tests::support::path_instrumentation::Counts::default()
@@ -727,28 +742,31 @@ fn heterogeneous_state_and_operator_gaps_reject_before_any_production_path() {
                 &capabilities_with(&full, full.operators(), without_compressed),
             )
             .expect_err("missing compressed attention was admitted");
-            assert!(error
-                .issues()
-                .iter()
-                .any(|issue| issue.contains("attention.compressed_latent")));
+            assert!(
+                error
+                    .issues()
+                    .iter()
+                    .any(|issue| issue.contains("attention.compressed_latent"))
+            );
         }
 
         for fixed in &fixed_components {
             let StateComponentRole::Fixed(role) = fixed.component().role() else {
                 unreachable!("fixed component filter changed")
             };
-            let wrong_shape =
-                LayerCachePolicy::fixed_only(vec![StateTensorPolicy::new_with_residency(
+            let wrong_shape = LayerCachePolicy::fixed_only(vec![
+                StateTensorPolicy::new_with_residency(
                     role,
                     vec![eredu_core::cache::StateTensorDimension::fixed(999).unwrap()],
                     fixed.component().dtype(),
                     fixed.component().residency(),
                 )
-                .unwrap()])
-                .unwrap()
-                .components()
-                .pop()
-                .unwrap();
+                .unwrap(),
+            ])
+            .unwrap()
+            .components()
+            .pop()
+            .unwrap();
             let components = full.state().components().iter().map(|mechanism| {
                 if mechanism == fixed {
                     StateComponentMechanism::new(
@@ -771,27 +789,30 @@ fn heterogeneous_state_and_operator_gaps_reject_before_any_production_path() {
                 ),
             )
             .expect_err("wrong fixed-state shape was admitted");
-            assert!(error
-                .issues()
-                .iter()
-                .any(|issue| issue.contains("shape") && issue.contains("dtype")));
+            assert!(
+                error
+                    .issues()
+                    .iter()
+                    .any(|issue| issue.contains("shape") && issue.contains("dtype"))
+            );
 
             let alternate_dtype = match fixed.component().dtype() {
                 StateTensorDtype::Float32 => StateTensorDtype::Floating,
                 _ => StateTensorDtype::Float32,
             };
-            let wrong_dtype =
-                LayerCachePolicy::fixed_only(vec![StateTensorPolicy::new_with_residency(
+            let wrong_dtype = LayerCachePolicy::fixed_only(vec![
+                StateTensorPolicy::new_with_residency(
                     role,
                     fixed.component().shape().to_vec(),
                     alternate_dtype,
                     fixed.component().residency(),
                 )
-                .unwrap()])
-                .unwrap()
-                .components()
-                .pop()
-                .unwrap();
+                .unwrap(),
+            ])
+            .unwrap()
+            .components()
+            .pop()
+            .unwrap();
             let components = full.state().components().iter().map(|mechanism| {
                 if mechanism == fixed {
                     StateComponentMechanism::new(

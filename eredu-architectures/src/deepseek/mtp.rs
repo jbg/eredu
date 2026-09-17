@@ -11,7 +11,7 @@ use eredu_runtime::{ExpertPass, RoutedExpertProvider};
 
 use crate::decoder::ComponentInstrumentation;
 
-use super::{block::V3Block, block::V4Block, V3Args, V4Args};
+use super::{V3Args, V4Args, block::V3Block, block::V4Block};
 
 /// Borrowed input selecting target execution or one embedded prediction depth.
 pub enum EmbeddedInput<'a, T> {
@@ -137,6 +137,9 @@ pub struct PredictionOutput<T> {
     pub tokens: T,
 }
 
+pub(crate) mod construction;
+pub(crate) use construction::V3PredictionLayerSpec;
+
 /// One V3/R1 embedded prediction layer.
 #[derive(Debug, Clone, Parameterized)]
 #[parameterized(tensor = "B::Tensor")]
@@ -160,44 +163,12 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         depth: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let count = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
-        if depth >= count {
-            return Err(Error::backend(format!(
-                "V3 prediction depth {depth} is outside {count} layers"
-            )));
+        if B::construction_metadata(context)
+            .is_some_and(|metadata| metadata.uses_checked_metadata())
+        {
+            return Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into());
         }
-        let global = usize::try_from(args.num_hidden_layers).map_err(Error::backend)? + depth;
-        let root = format!("model.layers.{global}");
-        let norm = |name: String| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    parameter(name)?,
-                ),
-                context,
-            )
-        };
-        Ok(Self {
-            embedding_norm: norm(format!("{root}.enorm.weight"))?,
-            hidden_norm: norm(format!("{root}.hnorm.weight"))?,
-            fusion: linear::<B>(
-                format!("{root}.eh_proj.weight"),
-                2 * args.hidden_size,
-                args.hidden_size,
-                args.linear_format_for(&format!("{root}.eh_proj.weight")),
-                context,
-            )?,
-            decoder: V3Block::new_prediction(args, global, context)?,
-            output_norm: norm(format!("{root}.shared_head.norm.weight"))?,
-            output_head: linear::<B>(
-                format!("{root}.shared_head.head.weight"),
-                args.hidden_size,
-                args.vocab_size,
-                args.linear_format_for(&format!("{root}.shared_head.head.weight")),
-                context,
-            )?,
-        })
+        V3PredictionLayerSpec::new(args, depth)?.instantiate::<B>(context)
     }
 
     /// Executes one prediction depth over the target capture and current token
@@ -466,6 +437,43 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
             &mut ComponentInstrumentation<'_, B::Tensor>,
         ) -> Result<B::Tensor, Error>,
     {
+        let hidden =
+            self.prefill_hidden_with_decoder(hidden, embedded, context, instrumentation, decoder)?;
+        let normalized = instrumentation.apply(
+            "prediction.readout.normalized",
+            self.output_norm.forward(&hidden, context)?,
+        )?;
+        let logits = instrumentation.project::<B>(
+            "prediction.readout.projection_input",
+            &mut self.output_head,
+            &normalized,
+            None,
+            context,
+        )?;
+        let logits = instrumentation.apply("prediction.readout.linear", logits)?;
+        Ok(PredictionOutput {
+            logits,
+            hidden,
+            tokens: tokens.clone(),
+        })
+    }
+
+    pub(crate) fn prefill_hidden_with_decoder<F>(
+        &mut self,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        decoder: F,
+    ) -> Result<B::Tensor, Error>
+    where
+        F: FnOnce(
+            &mut V3Block<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
         let embedded = instrumentation.apply(
             "prediction.embedding.normalized",
             self.embedding_norm.forward(embedded, context)?,
@@ -485,23 +493,7 @@ impl<B: GroupedNeuralBackend + eredu_nn::DistributedNeuralBackend + BlockwiseAtt
         let fused = instrumentation.apply("prediction.fusion.output", fused)?;
         let hidden = decoder(&mut self.decoder, &fused, context, instrumentation)?;
         let hidden = instrumentation.apply("prediction.readout.residual", hidden)?;
-        let normalized = instrumentation.apply(
-            "prediction.readout.normalized",
-            self.output_norm.forward(&hidden, context)?,
-        )?;
-        let logits = instrumentation.project::<B>(
-            "prediction.readout.projection_input",
-            &mut self.output_head,
-            &normalized,
-            None,
-            context,
-        )?;
-        let logits = instrumentation.apply("prediction.readout.linear", logits)?;
-        Ok(PredictionOutput {
-            logits,
-            hidden,
-            tokens: tokens.clone(),
-        })
+        Ok(hidden)
     }
 }
 
@@ -532,61 +524,8 @@ where
         depth: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        if args.dspark.is_some() {
-            return Err(Error::backend(
-                "fused DSpark checkpoints do not expose sequential V4 prediction layers",
-            ));
-        }
-        let count = usize::try_from(args.num_nextn_predict_layers).map_err(Error::backend)?;
-        if depth >= count {
-            return Err(Error::backend(format!(
-                "V4 prediction depth {depth} is outside {count} layers"
-            )));
-        }
-        let global = usize::try_from(args.num_hidden_layers).map_err(Error::backend)? + depth;
-        let root = format!("mtp.{depth}");
-        let norm = |name: String| {
-            B::normalization(
-                NormalizationConstructionSpec::learned(
-                    args.hidden_size,
-                    args.rms_norm_eps,
-                    parameter(name)?,
-                ),
-                context,
-            )
-        };
-        Ok(Self {
-            embedding_projection: linear::<B>(
-                format!("{root}.e_proj.weight"),
-                args.hidden_size,
-                args.hidden_size,
-                args.linear_format_for(&format!("{root}.e_proj.weight")),
-                context,
-            )?,
-            hidden_projection: linear::<B>(
-                format!("{root}.h_proj.weight"),
-                args.hidden_size,
-                args.hidden_size,
-                args.linear_format_for(&format!("{root}.h_proj.weight")),
-                context,
-            )?,
-            embedding_norm: norm(format!("{root}.enorm.weight"))?,
-            hidden_norm: norm(format!("{root}.hnorm.weight"))?,
-            decoder: V4Block::new_at(args, global, &root, None, context)?,
-            output_norm: norm(format!("{root}.norm.weight"))?,
-            hyper_head: HyperHead::new(
-                HyperHeadSpec {
-                    streams: args.hc_mult,
-                    hidden_size: args.hidden_size,
-                    norm_epsilon: args.rms_norm_eps,
-                    epsilon: args.hc_eps,
-                    function: parameter(format!("{root}.hc_head_fn"))?,
-                    base: parameter(format!("{root}.hc_head_base"))?,
-                    scale: parameter(format!("{root}.hc_head_scale"))?,
-                },
-                context,
-            )?,
-        })
+        crate::decoder::construction_specs::require_source_compiler::<B>(context)?;
+        v4_construction::V4PredictionLayerSpec::new(args, depth)?.instantiate::<B>(context)
     }
 
     /// Executes one V4 prediction depth using the target model's shared
@@ -954,6 +893,53 @@ where
             &mut ComponentInstrumentation<'_, B::Tensor>,
         ) -> Result<B::Tensor, Error>,
     {
+        let hidden = self.prefill_hidden_with_execution(
+            hidden,
+            embedded,
+            context,
+            instrumentation,
+            execute,
+        )?;
+        let logits = instrumentation.with_scope("prediction.readout", |instrumentation| {
+            let effective = if instrumentation.enabled() {
+                Some(instrumentation.apply("streams", hidden.clone())?)
+            } else {
+                None
+            };
+            let collapsed = instrumentation.collapse_streams::<B>(
+                "stream_coefficients",
+                &mut self.hyper_head,
+                effective.as_ref().unwrap_or(&hidden),
+                context,
+            )?;
+            let normalized =
+                instrumentation.normalize_readout(&collapsed, &mut self.output_norm, context)?;
+            let logits = project(&normalized, context, instrumentation)?;
+            instrumentation.apply("linear", logits)
+        })?;
+        Ok(PredictionOutput {
+            logits,
+            hidden: instrumentation.apply("output", hidden)?,
+            tokens: tokens.clone(),
+        })
+    }
+
+    pub(crate) fn prefill_hidden_with_execution<D>(
+        &mut self,
+        hidden: &B::Tensor,
+        embedded: &B::Tensor,
+        context: &<B::Tensor as Tensor>::Context,
+        instrumentation: &mut ComponentInstrumentation<'_, B::Tensor>,
+        execute: D,
+    ) -> Result<B::Tensor, Error>
+    where
+        D: FnOnce(
+            &mut V4Block<B>,
+            &B::Tensor,
+            &<B::Tensor as Tensor>::Context,
+            &mut ComponentInstrumentation<'_, B::Tensor>,
+        ) -> Result<B::Tensor, Error>,
+    {
         let effective_input = if instrumentation.enabled() {
             Some(instrumentation.apply("input", hidden.clone())?)
         } else {
@@ -993,51 +979,13 @@ where
         let fused =
             instrumentation.apply("prediction.fusion.output", embedded.add(&hidden, context)?)?;
         let hidden = execute(&mut self.decoder, &fused, context, instrumentation)?;
-        let logits = instrumentation.with_scope("prediction.readout", |instrumentation| {
-            let effective = if instrumentation.enabled() {
-                Some(instrumentation.apply("streams", hidden.clone())?)
-            } else {
-                None
-            };
-            let collapsed = instrumentation.collapse_streams::<B>(
-                "stream_coefficients",
-                &mut self.hyper_head,
-                effective.as_ref().unwrap_or(&hidden),
-                context,
-            )?;
-            let normalized =
-                instrumentation.normalize_readout(&collapsed, &mut self.output_norm, context)?;
-            let logits = project(&normalized, context, instrumentation)?;
-            instrumentation.apply("linear", logits)
-        })?;
-        Ok(PredictionOutput {
-            logits,
-            hidden: instrumentation.apply("output", hidden)?,
-            tokens: tokens.clone(),
-        })
+        Ok(hidden)
     }
-}
-
-fn linear<B: NeuralBackend + eredu_nn::DistributedNeuralBackend>(
-    name: impl Into<String>,
-    input: i32,
-    output: i32,
-    format: eredu_checkpoint::LinearFormat,
-    context: &<B::Tensor as Tensor>::Context,
-) -> Result<B::Linear, Error> {
-    let name = name.into();
-    B::linear(
-        LinearSpec {
-            input,
-            output,
-            weight: parameter(&name)?,
-            bias: None,
-            format: crate::linear_format::standard_linear_format(&name, format)?,
-        },
-        context,
-    )
 }
 
 fn parameter(name: impl Into<String>) -> Result<ParameterSpec, Error> {
     ParameterSpec::trainable(name).map_err(Error::backend)
 }
+
+mod v4_construction;
+pub(crate) use v4_construction::V4PredictionLayerSpec;

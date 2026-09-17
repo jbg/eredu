@@ -8,6 +8,17 @@
 #include "mlx/c/private/mlx.h"
 #include "mlx/random.h"
 
+extern "C" size_t mlx_random_standard_sampling_control_bytes(void) {
+  // key/split/categorical share these C transports; no output payload or
+  // heap fallback is introduced by the read-only layout query.
+  const size_t native = mlx::core::random::standard_sampling_control_bytes();
+  if (!native) return 0;
+  return native + sizeof(native) +
+      4 * sizeof(mlx_array) + sizeof(mlx_array*) + sizeof(mlx_stream) +
+      sizeof(std::optional<mlx::core::array>) + sizeof(uint64_t) +
+      2 * sizeof(int) + sizeof(const std::exception*);
+}
+
 extern "C" int mlx_random_bernoulli(
     mlx_array* res,
     const mlx_array p,

@@ -19,6 +19,7 @@ struct Tensor(Vec<i32>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Cache {
+    fail_restore: bool,
     target: Vec<i32>,
     prediction: Vec<i32>,
 }
@@ -30,15 +31,24 @@ enum Failure {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct TestError(String);
+enum TestError {
+    Message(String),
+    Rollback(Arc<eredu_core::speculative::SpeculativeRollbackFailure<TestError, TestError>>),
+}
 
 impl fmt::Display for TestError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Rollback(failure) => fmt::Display::fmt(failure, formatter),
+        }
     }
 }
-
-impl std::error::Error for TestError {}
+impl std::error::Error for TestError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self { Self::Message(_) => None, Self::Rollback(failure) => Some(failure.as_ref()) }
+    }
+}
 
 #[derive(Debug)]
 struct Done {
@@ -76,7 +86,7 @@ impl SpeculativeTensorMechanisms for Mechanisms {
     type Error = TestError;
 
     fn observation_error(message: &'static str) -> Self::Error {
-        TestError(message.into())
+        TestError::Message(message.into())
     }
 
     fn control_tensor_estimate(
@@ -93,15 +103,15 @@ impl SpeculativeTensorMechanisms for Mechanisms {
     }
 
     fn empty_prediction_input() -> Self::Error {
-        TestError("empty prediction input".into())
+        TestError::Message("empty prediction input".into())
     }
 
     fn fused_prediction_exhausted() -> Self::Error {
-        TestError("prediction block exhausted".into())
+        TestError::Message("prediction block exhausted".into())
     }
 
     fn invalid_prediction_commit(verified: usize, available: usize) -> Self::Error {
-        TestError(format!("invalid commit {verified}/{available}"))
+        TestError::Message(format!("invalid commit {verified}/{available}"))
     }
 
     fn invalid_prediction_output(
@@ -110,17 +120,25 @@ impl SpeculativeTensorMechanisms for Mechanisms {
         tokens: usize,
         expected: Option<usize>,
     ) -> Self::Error {
-        TestError(format!(
+        TestError::Message(format!(
             "invalid output {logits}/{capture}/{tokens}/{expected:?}"
         ))
     }
 
     fn invalid_fused_capacity(requested: usize, available: usize) -> Self::Error {
-        TestError(format!("invalid fused capacity {requested}/{available}"))
+        TestError::Message(format!("invalid fused capacity {requested}/{available}"))
     }
 
     fn sequence_len(value: &Self::Tensor) -> Result<usize, Self::Error> {
         Ok(value.0.len())
+    }
+
+    fn selected_prefill_logits(value: Self::Tensor) -> Result<Self::Logits, Self::Error> {
+        value
+            .0
+            .last()
+            .copied()
+            .ok_or_else(Self::empty_prediction_input)
     }
 
     fn logits_row<'a>(
@@ -132,7 +150,7 @@ impl SpeculativeTensorMechanisms for Mechanisms {
             .0
             .get(row)
             .copied()
-            .ok_or_else(|| TestError("logits row is missing".into()))
+            .ok_or_else(|| TestError::Message("logits row is missing".into()))
     }
 
     fn tensor_row<'a>(
@@ -192,7 +210,7 @@ impl SpeculativeTensorMechanisms for Mechanisms {
             retained: Arc::from([
                 output.logits.clone(),
                 output.capture.clone(),
-                output.tokens.clone(),
+                output.tokens().clone(),
                 inputs.clone(),
             ]),
         })
@@ -222,6 +240,11 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
     type TargetCache = Cache;
     type PredictionCache = Vec<i32>;
     type Telemetry = ();
+
+    fn prepare_rollback_failure<'context: 'context>(_: ())
+        -> Result<impl FnOnce(eredu_core::speculative::SpeculativeRollbackFailure<TestError, TestError>) -> TestError, TestError> {
+        Ok(|failure| TestError::Rollback(Arc::new(failure)))
+    }
 
     fn supports_internal_observations(&self) -> bool {
         self.fused_rows.is_none()
@@ -266,7 +289,7 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
         _: (),
     ) -> Result<Option<Vec<i32>>, SpeculativeControlError> {
         if self.failure == Failure::Advance {
-            return Err(SpeculativeControlError::backend(TestError(
+            return Err(SpeculativeControlError::backend(TestError::Message(
                 "seed copy failed".into(),
             )));
         }
@@ -313,7 +336,7 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
 
     fn verify_target<'a>(
         &mut self,
-        tokens: &Tensor,
+        tokens: &EmbeddedPredictionTensor<Tensor>,
         cache: &mut Self::TargetCache,
         _: <Mechanisms as SpeculativeTensorMechanisms>::Context<'a>,
         observer: Option<&mut dyn SpeculativeActivationObserver<Tensor, TestError>>,
@@ -321,7 +344,7 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
     ) -> Result<EmbeddedPredictionOutput<Tensor>, TestError> {
         with_speculative_activation(observer, phase, tokens.0.len(), |observer| {
             cache.target.extend_from_slice(&tokens.0);
-            let mut output = Self::output(tokens.clone(), self.corrupt_capture);
+            let mut output = Self::output((**tokens).clone(), self.corrupt_capture);
             if let Some(observer) = observer {
                 output.logits = eredu_runtime::observe_and_intervene(
                     observer,
@@ -359,8 +382,12 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
         )
     }
 
-    fn prediction_cache(&self, cache: &Self::TargetCache) -> Self::PredictionCache {
-        cache.prediction.clone()
+    fn prediction_cache(&self, cache: &Self::TargetCache) -> Result<Self::PredictionCache, TestError> {
+        Ok(cache.prediction.clone())
+    }
+
+    fn copy_prediction_cache(&self, cache: &Self::PredictionCache) -> Result<Self::PredictionCache, TestError> {
+        Ok(cache.clone())
     }
 
     fn commit_prediction_cache(
@@ -377,6 +404,9 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
         checkpoint: &Self::TargetCache,
         _: <Mechanisms as SpeculativeTensorMechanisms>::Context<'a>,
     ) -> Result<(), TestError> {
+        if cache.fail_restore {
+            return Err(TestError::Message("injected target restoration failure".into()));
+        }
         cache.clone_from(checkpoint);
         Ok(())
     }
@@ -417,13 +447,13 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
         _: &mut Self::PredictionCache,
         _: <Mechanisms as SpeculativeTensorMechanisms>::Context<'a>,
         observer: Option<&mut dyn SpeculativeActivationObserver<Tensor, TestError>>,
-    ) -> Result<Option<Tensor>, TestError> {
+    ) -> Result<Option<EmbeddedPredictionLogitBlock<Tensor>>, TestError> {
         if observer.is_some() && self.fused_rows.is_some() {
             return Err(Mechanisms::observation_error("fixture fused hooks absent"));
         }
         Ok(self
             .fused_rows
-            .map(|rows| Tensor((0..rows as i32).collect())))
+            .map(|rows| EmbeddedPredictionLogitBlock::ordinary(Tensor((0..rows as i32).collect()))))
     }
 
     fn advance_prediction_cache<'a>(
@@ -440,7 +470,7 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
             tokens.0.len(),
             |observer| {
                 if self.failure == Failure::Advance {
-                    return Err(TestError("injected prediction advance failure".into()));
+                    return Err(TestError::Message("injected prediction advance failure".into()));
                 }
                 cache.extend_from_slice(&tokens.0);
                 if let Some(observer) = observer {
@@ -454,6 +484,7 @@ impl EmbeddedPredictionStrategy<Mechanisms> for Strategy {
 
 fn cache() -> Cache {
     Cache {
+        fail_restore: false,
         target: vec![9],
         prediction: vec![9],
     }
@@ -465,9 +496,9 @@ fn embedded_cache_envelope_owns_prediction_fork_commit_and_target_membership() {
     let checkpoint = cache
         .checkpoint(|target| Ok::<_, TestError>(*target))
         .unwrap();
-    let mut draft = cache.prediction_fork();
+    let mut draft = cache.prediction_fork().unwrap();
     draft.prediction_mut().push(2);
-    cache.commit_prediction(&draft);
+    cache.commit_prediction(&draft).unwrap();
     assert_eq!(cache.prediction(), &[1, 2]);
 
     let active = cache.take_target().unwrap();
@@ -510,7 +541,7 @@ fn sequential_partial_commit_replays_target_and_commits_prediction_state() {
     assert_eq!(executor.proposal_logits(&mut draft, 2, ()).unwrap(), 2);
     assert_eq!(executor.proposal_logits(&mut draft, 3, ()).unwrap(), 4);
     assert_eq!(
-        executor.proposal_logits(&mut draft, 4, ()).unwrap_err().0,
+        executor.proposal_logits(&mut draft, 4, ()).unwrap_err().to_string(),
         "prediction block exhausted"
     );
     let checkpoint = executor.checkpoint(&cache).unwrap();
@@ -538,7 +569,7 @@ fn prefill_geometry_failure_restores_target_and_prediction_cache() {
     let mut cache = cache();
     let checkpoint = executor.checkpoint(&cache).unwrap();
     let error = executor.prefill(vec![1, 2], &mut cache, ()).err().unwrap();
-    assert!(error.0.starts_with("invalid output"));
+    assert!(error.to_string().starts_with("invalid output"));
     assert_eq!(cache, checkpoint.cache);
 }
 
@@ -554,7 +585,7 @@ fn fused_capacity_is_rejected_before_any_proposal_row() {
     let prefill = executor.prefill(vec![1], &mut cache, ()).unwrap();
     let (_, state, _) = prefill.into_parts();
     let error = executor.begin_proposal(&state, 1, 2, ()).err().unwrap();
-    assert_eq!(error.0, "invalid fused capacity 2/1");
+    assert_eq!(error.to_string(), "invalid fused capacity 2/1");
 }
 
 #[test]
@@ -577,7 +608,7 @@ fn commit_failure_restores_exact_preverification_checkpoint() {
         .commit_verification(submission.output, draft, &mut cache, &checkpoint, 2, ())
         .err()
         .unwrap();
-    assert_eq!(error.0, "injected prediction advance failure");
+    assert_eq!(error.to_string(), "injected prediction advance failure");
     assert_eq!(cache, checkpoint.cache);
 }
 
@@ -643,4 +674,25 @@ fn production_observers_reach_causal_embedded_boundaries_and_can_intervene() {
             EMBEDDED_TARGET_CAPTURE_PATH,
         ]
     );
+}
+
+#[test]
+fn embedded_commit_keeps_operation_and_restoration_failures() {
+    let mut strategy = Strategy { fused_rows: None, corrupt_capture: false, failure: Failure::Advance };
+    let mut executor = EmbeddedPredictionExecutor::<_, Mechanisms>::new(&mut strategy);
+    let mut cache = cache();
+    let prefill = executor.prefill(vec![1, 2], &mut cache, ()).unwrap();
+    let (_, state, _) = prefill.into_parts();
+    let draft = executor.begin_proposal(&state, 2, 2, ()).unwrap();
+    let checkpoint = executor.checkpoint(&cache).unwrap();
+    let submission = executor.submit_verification(&[2, 3, 4], &mut cache, ()).unwrap();
+    cache.fail_restore = true;
+    let error = executor.commit_verification(submission.output, draft, &mut cache, &checkpoint, 2, ())
+        .err().unwrap();
+    let pair = std::error::Error::source(&error).unwrap()
+        .downcast_ref::<eredu_core::speculative::SpeculativeRollbackFailure<TestError, TestError>>().unwrap();
+    assert_eq!(pair.operation.to_string(), "injected prediction advance failure");
+    assert_eq!(pair.rollback.to_string(), "injected target restoration failure");
+    assert_eq!(std::error::Error::source(pair).unwrap().to_string(), pair.operation.to_string());
+    assert_ne!(cache, checkpoint.cache, "failed restoration must not certify reusable cache state");
 }

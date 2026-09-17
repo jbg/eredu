@@ -6,7 +6,7 @@ use std::{
     sync::Arc,
 };
 
-use serde::{de::MapAccess, Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, de::MapAccess};
 
 use crate::{
     recipe::RecipeCatalog,
@@ -508,7 +508,7 @@ mod tests {
     use std::io::Write;
 
     use super::*;
-    use safetensors::{tensor::serialize_to_file, tensor::TensorView, Dtype};
+    use safetensors::{Dtype, tensor::TensorView, tensor::serialize_to_file};
 
     use crate::store::{SafetensorsWeightStore, WeightStore};
 
@@ -537,14 +537,18 @@ mod tests {
 
     #[test]
     fn header_admission_rejects_duplicate_tensor_fields() {
-        assert!(parse_header(
-            br#"{"weight":{"dtype":"U8","dtype":"I8","shape":[1],"data_offsets":[0,1]}}"#
-        )
-        .is_err());
-        assert!(parse_header(
-            br#"{"weight":{"dtype":"U8","shape":[1],"shape":[1],"data_offsets":[0,1]}}"#
-        )
-        .is_err());
+        assert!(
+            parse_header(
+                br#"{"weight":{"dtype":"U8","dtype":"I8","shape":[1],"data_offsets":[0,1]}}"#
+            )
+            .is_err()
+        );
+        assert!(
+            parse_header(
+                br#"{"weight":{"dtype":"U8","shape":[1],"shape":[1],"data_offsets":[0,1]}}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -846,3 +850,6 @@ mod tests {
         );
     }
 }
+
+mod header;
+pub use header::{SafetensorsHeaderError, SafetensorsHeaderPlan};

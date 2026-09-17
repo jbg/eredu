@@ -163,7 +163,7 @@ fn speculative_partition_provider_retains_sparse_edits_and_native_failures() {
                         let record = collector.take_activation_capture().unwrap();
                         assert_eq!(record.completed, fault.is_none());
                         assert_eq!(
-                            record.captures.invocation,
+                            record.captures.as_step().invocation,
                             Some(CaptureInvocationShape {
                                 batch: 1,
                                 sequence: 3,
@@ -171,10 +171,10 @@ fn speculative_partition_provider_retains_sparse_edits_and_native_failures() {
                             })
                         );
                         assert!(
-                            record.captures.records.is_empty()
-                                && record.captures.partitions.is_empty()
+                            record.captures.as_step().records.is_empty()
+                                && record.captures.as_step().partitions.is_empty()
                         );
-                        for (index, operation) in record.captures.interventions.iter().enumerate() {
+                        for (index, operation) in record.captures.as_step().interventions.iter().enumerate() {
                             if fault.is_none() {
                                 assert_eq!(operation.outcome, InterventionOutcome::Applied);
                                 let receipt = operation.routed_units.unwrap();
@@ -193,7 +193,7 @@ fn speculative_partition_provider_retains_sparse_edits_and_native_failures() {
                                 ));
                             }
                         }
-                        record.captures.cumulative_usage
+                        record.captures.as_step().cumulative_usage
                     })
                 })
                 .collect::<Vec<_>>()

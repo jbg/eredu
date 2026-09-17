@@ -1,0 +1,361 @@
+diff --git a/mlx/backend/cpu/CMakeLists.txt b/mlx/backend/cpu/CMakeLists.txt
+--- a/mlx/backend/cpu/CMakeLists.txt
++++ b/mlx/backend/cpu/CMakeLists.txt
+@@ -48,6 +48,7 @@
+           ${CMAKE_CURRENT_SOURCE_DIR}/conv.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/copy.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/distributed.cpp
++          ${CMAKE_CURRENT_SOURCE_DIR}/distributed_storage.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/eig.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/eigh.cpp
+           ${CMAKE_CURRENT_SOURCE_DIR}/encoder.cpp
+diff --git a/mlx/backend/cpu/distributed_storage.cpp b/mlx/backend/cpu/distributed_storage.cpp
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/distributed_storage.cpp
+@@ -0,0 +1,224 @@
++#include "mlx/backend/cpu/distributed_storage.h"
++#include "mlx/backend/cpu/copy.h"
++#include "mlx/backend/cpu/encoder.h"
++#include "mlx/distributed/primitives.h"
++#include "mlx/prepared_input.h"
++#include "mlx/original_buffer.h"
++#include "mlx/submission.h"
++#include <algorithm>
++#include <climits>
++#include <limits>
++#include <typeinfo>
++
++namespace mlx::core::distributed {
++namespace {
++using submission::GraphQuota;
++using submission::GraphConstruction;
++using submission::GraphConstructionLayout;
++struct Source {
++  const DistPrimitive* primitive{nullptr};
++  GroupWorkerOperation operation{GroupWorkerOperation::sum};
++  int peer{0};
++};
++bool source(const array& value, Source& out) noexcept {
++  if (!value.has_primitive() || value.primitive().stream().device != Device::cpu) return false;
++  const auto& primitive=value.primitive();
++  Source selected;
++  if (typeid(primitive)==typeid(AllReduce)) {
++    const auto& reduce=static_cast<const AllReduce&>(primitive);
++    selected.primitive=&reduce;
++    switch(reduce.reduce_type()) {
++      case AllReduce::Sum: selected.operation=GroupWorkerOperation::sum; break;
++      case AllReduce::Min: selected.operation=GroupWorkerOperation::minimum; break;
++      case AllReduce::Max: selected.operation=GroupWorkerOperation::maximum; break;
++      default: return false;
++    }
++  } else if(typeid(primitive)==typeid(AllGather)) {
++    selected.primitive=&static_cast<const AllGather&>(primitive);
++    selected.operation=GroupWorkerOperation::gather;
++  } else if(typeid(primitive)==typeid(Send)) {
++    const auto& send=static_cast<const Send&>(primitive);
++    selected.primitive=&send;selected.operation=GroupWorkerOperation::send;selected.peer=send.destination();
++  } else if(typeid(primitive)==typeid(Recv)) {
++    const auto& recv=static_cast<const Recv&>(primitive);
++    selected.primitive=&recv;selected.operation=GroupWorkerOperation::recv;selected.peer=recv.source();
++  } else return false;
++  out=selected;return true;
++}
++bool add(size_t& into,size_t value) noexcept {
++  if(value>SIZE_MAX-into)return false;into+=value;return true;
++}
++bool multiply(size_t a,size_t b,size_t& out) noexcept {
++  if(b && a>size_t(PTRDIFF_MAX)/b)return false;out=a*b;return true;
++}
++bool scaled(size_t& into,size_t value,size_t count) noexcept {
++  size_t total;return multiply(value,count,total)&&add(into,total);
++}
++bool bytes(const array& value,size_t& out) noexcept {
++  size_t count=1;
++  if(value.ndim()>size_t(INT_MAX))return false;
++  for(auto dimension:value.shape()) {
++    if(dimension<0 || !multiply(count,size_t(dimension),count))return false;
++  }
++  return multiply(count,value.itemsize(),out);
++}
++// One closed producer chooses its ten classes. Combining concrete request
++// kinds uses their maximum extent and summed attempt count, never a guessed
++// allocator slab or a scalar recipe provided by the caller.
++bool append(GraphConstructionLayout& out,size_t slot,size_t bytes,size_t alignment,size_t count) noexcept {
++  if(!count)return true;
++  if(!bytes || !alignment || (alignment&(alignment-1)) || alignment>alignof(std::max_align_t) ||
++      !add(out.request_counts[slot],count))return false;
++  out.request_bytes[slot]=std::max(out.request_bytes[slot],bytes);
++  out.request_alignments[slot]=std::max(out.request_alignments[slot],alignment);
++  return true;
++}
++size_t inspection_frames() noexcept {
++  return sizeof(Source)*2+sizeof(CpuDistributedStorage)*2+sizeof(GroupStorageInventory)+
++      sizeof(submission::CpuEvalCleanupLayout)+sizeof(cpu::RetentionLayout)+
++      sizeof(GroupDispatchStorage)+sizeof(CpuCopyDispatchStorage)+sizeof(WeakCopyStorage)+
++      sizeof(submission::OriginalBufferRoutingLayout)+sizeof(GraphQuota::Request)*3+
++      sizeof(array::BufferAdoptionLayout)+sizeof(const array*)*3+sizeof(size_t)*20+
++      sizeof(bool)*7+sizeof(int)*4+sizeof(GroupWorkerOperation)+
++      GraphConstruction::layout_control_bytes();
++}
++} // namespace
++bool is_cpu_distributed_primitive(const array& value) noexcept {
++  Source selected;return source(value,selected);
++}
++size_t cpu_distributed_storage_inspection_controls(const array& value) noexcept {
++  size_t result=inspection_frames();
++  Source selected;
++  if(source(value,selected)) {
++    const auto& group=selected.primitive->group();
++    if(!add(result,group.dispatch_storage_inspection_controls()) ||
++        !add(result,group.worker_storage_inspection_controls()))return SIZE_MAX;
++  }
++  return result;
++}
++bool cpu_distributed_storage(const array& output,CpuDistributedStorage& out) noexcept {
++#if !defined(_LIBCPP_VERSION) || _LIBCPP_VERSION != 210106 || __cplusplus != 202002L
++  return false;
++#else
++  Source selected;
++  if(!source(output,selected) || !output.siblings().empty())return false;
++  const auto& group=selected.primitive->group();
++  GroupStorageInventory inventory;
++  // No fresh-submission terminal check: this is an already accepted primitive.
++  // EmptyGroup identities emit no primitive and do not become Ring evidence.
++  if(!group.storage_inventory(inventory) || inventory.kind!=GroupStorageKind::ring)return false;
++  const int members=group.size(),rank=group.rank();
++  if(members<=1 || rank<0 || rank>=members)return false;
++  const bool receive=selected.operation==GroupWorkerOperation::recv;
++  const bool send=selected.operation==GroupWorkerOperation::send;
++  const bool gather=selected.operation==GroupWorkerOperation::gather;
++  const size_t inputs=receive?0:1;
++  if(output.inputs().size()!=inputs)return false;
++  const auto& input=receive?output:output.inputs()[0];
++  if(output.dtype()!=input.dtype())return false;
++  size_t input_bytes,output_bytes;
++  if(!bytes(input,input_bytes) || !bytes(output,output_bytes))return false;
++  if(gather) {
++    size_t expected;
++    if(!multiply(input_bytes,size_t(members),expected) || expected!=output_bytes ||
++        output.ndim()!=(input.ndim()?input.ndim():1))return false;
++    if(input.ndim()) {
++      if(input.shape()[0]>INT_MAX/members || output.shape()[0]!=input.shape()[0]*members)return false;
++      for(size_t d=1;d<input.ndim();++d)if(input.shape()[d]!=output.shape()[d])return false;
++    } else if(output.shape()[0]!=members)return false;
++  } else if(input.shape()!=output.shape() || input_bytes!=output_bytes)return false;
++
++  CpuDistributedStorage value;
++  value.operation=selected.operation;value.peer=selected.peer;
++  value.input_rank=input.ndim();value.output_rank=output.ndim();value.inputs=inputs;
++  value.tracer=output.is_tracer();value.possible_copy=inputs!=0;
++  GroupDispatchStorage dispatch;
++  if(!group.dispatch_storage(selected.operation,input,selected.peer,dispatch) ||
++      !group.worker_storage(selected.operation,input,selected.peer,value.communication))return false;
++  submission::CpuEvalCleanupLayout cleanup;
++  cpu::RetentionLayout retention;
++  submission::OriginalBufferRoutingLayout routing;
++  size_t allocation_controls=0;
++  GraphQuota::Request descriptor[3]{};size_t descriptor_count=0;
++  if(!submission::cpu_eval_cleanup_layout(inputs,0,cleanup) ||
++      !cpu::CommandEncoder::retention_layout(inputs,0,retention) ||
++      !submission::original_buffer_routing_layout(routing) ||
++      !allocator::original_buffer_allocation_control_bytes(allocation_controls) ||
++      !PreparedInputLeaf::append_array_requests(0,descriptor,descriptor_count) || descriptor_count!=3)return false;
++  // A potential copy is derived from immutable source shape. No lazy
++  // contiguity flag or alias-sensitive donation is assumed during quotation.
++  value.backing_births=gather?2:1;
++  value.copy_backing_bytes=value.possible_copy?input_bytes:0;
++  value.output_backing_bytes=send?0:output_bytes;
++  value.logical_backing_bytes=value.copy_backing_bytes;
++  if(gather) { if(!add(value.logical_backing_bytes,output_bytes))return false; }
++  else value.logical_backing_bytes=std::max(value.logical_backing_bytes,value.output_backing_bytes);
++  value.data_captures=value.backing_births+(value.possible_copy?2:0);
++  value.temporary_batches=(gather||send)?1:0;
++  for(size_t i=0;i<2;++i)
++    if(!append(value,i,cleanup.request_bytes[i],cleanup.request_alignments[i],cleanup.request_counts[i]))return false;
++  if(!append(value,2,sizeof(array),alignof(array),1+size_t(value.tracer&&inputs)) ||
++      !append(value,3,descriptor[2].bytes,descriptor[2].alignment,value.data_captures) ||
++      !append(value,6,dispatch.task_bytes,dispatch.task_alignment,1) ||
++      !append(value,7,routing.birth_bytes,routing.birth_alignment,value.backing_births) ||
++      !append(value,9,retention.temporary_batch.bytes,retention.temporary_batch.alignment,value.temporary_batches))return false;
++  CpuCopyDispatchStorage copy;
++  WeakCopyStorage weak;
++  if(value.possible_copy) {
++    if(!contiguous_copy_dispatch_storage(input,copy) ||
++        !PreparedInputLeaf::weak_copy_storage(input.ndim(),weak) || weak.count<3)return false;
++    for(size_t i=0;i<2;++i)
++      if(!append(value,4+i,descriptor[i].bytes,descriptor[i].alignment,3))return false;
++    if(!append(value,6,copy.task_bytes,copy.task_alignment,1))return false;
++    // Fresh contiguous destination: copied Shape plus initialized Strides.
++    // Two unsafe weak captures also copy replacement Strides at set_data.
++    for(size_t i=3;i<weak.count;++i)
++      if(!append(value,8,weak.requests[i].bytes,weak.requests[i].alignment,2+(i<5?1:0)))return false;
++    value.copy_worker_graph_extent=copy.worker_graph_extent_bound;
++  }
++  value.communication_worker_graph_extent=value.communication.task_graph_extent;
++  if(!add(value.communication_worker_graph_extent,value.communication.destination_graph_extent))return false;
++  const auto adoption=array::buffer_adoption_layout();
++  value.named_control_bytes=cpu_distributed_storage_inspection_controls(output);
++  const size_t execution_frames=sizeof(ArrayVector)*4+sizeof(array)*8+sizeof(Shape)*4+
++      sizeof(Strides)*4+sizeof(Stream)*3+sizeof(allocator::Buffer)*3+
++      sizeof(std::optional<submission::FixedEvalPrologueGuard>)+sizeof(GraphConstruction*)+
++      sizeof(submission::GraphFailure)+sizeof(submission::NativeControlBinding)+
++      sizeof(submission::GraphConstructionContext)+sizeof(cpu::detail::PreparedCleanup)+
++      sizeof(cpu::detail::TemporaryOwner)+sizeof(cpu::detail::TemporaryStorage)+
++      sizeof(cpu::CommandEncoder*)+sizeof(std::function<allocator::Buffer(size_t)>)*2+
++      sizeof(std::pair<array,bool>)+sizeof(size_t)*12+sizeof(bool)*5+
++      sizeof(std::shared_ptr<Primitive>)*3+
++      PreparedInputLeaf::descriptor_shared_control_bytes()*3+
++      PreparedInputLeaf::descriptor_allocator_control_bytes()*3;
++  if(!add(value.named_control_bytes,execution_frames) ||
++      !add(value.named_control_bytes,cleanup.named_control_bytes) ||
++      !add(value.named_control_bytes,dispatch.controls) ||
++      !add(value.named_control_bytes,value.communication.controls) ||
++      (value.possible_copy && (!add(value.named_control_bytes,copy.controls) ||
++                              !add(value.named_control_bytes,weak.controls))) ||
++      !scaled(value.named_control_bytes,allocation_controls,value.backing_births))return false;
++  const size_t adoption_frames=adoption.incoming_bytes+adoption.scratch_owner_bytes+
++      adoption.deleter_bytes+adoption.allocator_callable_bytes+adoption.prepared_strides_bytes+
++      sizeof(submission::CaptureSlot)+sizeof(std::shared_ptr<array::Data>)+
++      sizeof(submission::GraphAllocator<array::Data>);
++  if(!scaled(value.named_control_bytes,adoption_frames,value.data_captures) ||
++      !GraphConstruction::complete_layout(value))return false;
++  out=value;return true;
++#endif
++}
++} // namespace mlx::core::distributed
++
++namespace mlx::core::submission {
++GraphFailure GraphConstruction::create_cpu_distributed(const FixedEvalPrologueGuard& guard,
++    GraphConstruction*& out) noexcept {
++  auto& record=guard.record();
++  auto* graph=record.graph_quota();
++  const auto context=current_graph_construction_context();
++  if(out || !graph || !guard.cpu() || !context.scope || context.worker ||
++      context.dispatch!=&record || current_graph_quota()!=graph)return GraphFailure::foreign_parent;
++  distributed::CpuDistributedStorage actual;
++  if(!distributed::cpu_distributed_storage(guard.current(),actual))return GraphFailure::invalid_layout;
++  return create_layout(*graph,context.scope,&record,actual,out,true);
++}
++} // namespace mlx::core::submission
+diff --git a/mlx/backend/cpu/distributed_storage.h b/mlx/backend/cpu/distributed_storage.h
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/cpu/distributed_storage.h
+@@ -0,0 +1,24 @@
++#pragma once
++#include "mlx/distributed/distributed.h"
++#include "mlx/graph_construction.h"
++
++namespace mlx::core::distributed {
++// Host requests of the existing exact native primitive/Eval worker. The copy
++// branch is bounded from immutable input shape, never a guess at lazy flags or
++// donation. Worker requests and logical backing bytes are separate populations.
++struct CpuDistributedStorage : submission::GraphConstructionLayout {
++  GroupWorkerOperation operation{GroupWorkerOperation::sum};
++  int peer{0};
++  size_t input_rank{0}, output_rank{0}, inputs{0};
++  bool tracer{false}, possible_copy{false};
++  size_t backing_births{0}, data_captures{0}, temporary_batches{0};
++  size_t logical_backing_bytes{0}, copy_backing_bytes{0}, output_backing_bytes{0};
++  size_t copy_worker_graph_extent{0}, communication_worker_graph_extent{0};
++  GroupWorkerStorage communication;
++};
++// Recognition is exact native dynamic type. It grants no group/source fit.
++MLX_API bool is_cpu_distributed_primitive(const array&) noexcept;
++// Includes the actual Group source query's fixed frames; no query or allocation.
++MLX_API size_t cpu_distributed_storage_inspection_controls(const array&) noexcept;
++MLX_API bool cpu_distributed_storage(const array&, CpuDistributedStorage&) noexcept;
++} // namespace mlx::core::distributed
+diff --git a/mlx/backend/cpu/eval.cpp b/mlx/backend/cpu/eval.cpp
+--- a/mlx/backend/cpu/eval.cpp
++++ b/mlx/backend/cpu/eval.cpp
+@@ -9,6 +9,7 @@
+ #include "mlx/prepared_input.h"
+ #include "mlx/original_buffer.h"
+ #include "mlx/backend/cpu/argpartition.h"
++#include "mlx/backend/cpu/distributed_storage.h"
+ 
+ namespace mlx::core::cpu {
+ 
+@@ -24,28 +25,31 @@
+ void eval(array& arr) {
+   auto s = arr.primitive().stream();
+   auto& encoder = cpu::get_command_encoder(s);
+-  // Only the actual rank-two, last-axis partition worker uses the extended
+-  // bank. Ordinary Eval and other primitives retain the same cleanup path.
+-  const auto* partition = submission::fixed_eval_prologue_required()
+-      ? dynamic_cast<const ArgPartition*>(&arr.primitive()) : nullptr;
++  // Closed native producers extend the same bank around their real ordinary
++  // primitive. All other Eval paths keep the existing cleanup-only lifetime.
++  const bool fixed = submission::fixed_eval_prologue_required();
++  const bool fixed_distributed = fixed && distributed::is_cpu_distributed_primitive(arr);
++  const auto* partition = fixed ? dynamic_cast<const ArgPartition*>(&arr.primitive()) : nullptr;
+   const bool fixed_partition = partition && arr.ndim() == 2 && arr.inputs().size() == 1 &&
+       arr.inputs()[0].ndim() == 2 && arr.siblings().empty() &&
+       partition->state().second == 1;
+-  std::optional<submission::FixedEvalPrologueGuard> partition_prologue;
++  const bool extended = fixed_partition || fixed_distributed;
++  std::optional<submission::FixedEvalPrologueGuard> extended_prologue;
+   struct Bank {
+     submission::GraphConstruction* value{nullptr};
+     ~Bank() { if (value) value->destroy(); }
+-  } partition_bank;
+-  if (fixed_partition) {
+-    partition_prologue.emplace(arr);
+-    const auto failure = submission::GraphConstruction::create_cpu_argpartition(
+-        *partition_prologue, partition_bank.value);
++  } extended_bank;
++  if (extended) {
++    extended_prologue.emplace(arr);
++    const auto failure = fixed_distributed
++        ? submission::GraphConstruction::create_cpu_distributed(*extended_prologue, extended_bank.value)
++        : submission::GraphConstruction::create_cpu_argpartition(*extended_prologue, extended_bank.value);
+     if (failure != submission::GraphFailure{}) throw submission::GraphQuotaError(failure);
+   }
+   auto cleanup = [&] {
+     std::optional<submission::FixedEvalPrologueGuard> prologue;
+     Bank bank;
+-    if (!fixed_partition && submission::fixed_eval_prologue_required()) {
++    if (!extended && fixed) {
+       prologue.emplace(arr);
+       const auto failure = submission::GraphConstruction::create_cpu_cleanup(*prologue, bank.value);
+       if (failure != submission::GraphFailure{}) throw submission::GraphQuotaError(failure);
+diff --git a/mlx/distributed/primitives.h b/mlx/distributed/primitives.h
+--- a/mlx/distributed/primitives.h
++++ b/mlx/distributed/primitives.h
+@@ -48,6 +48,7 @@
+       const std::vector<int>& argnums,
+       const ArrayVector& outputs) override;
+ 
++  ReduceType reduce_type() const noexcept { return reduce_type_; }
+   const char* name() const override {
+     switch (reduce_type_) {
+       case And:
+@@ -108,6 +109,7 @@
+       const ArrayVector& inputs,
+       const std::vector<int>& axes) override;
+ 
++  int destination() const noexcept { return dst_; }
+   DEFINE_NAME(Send);
+ 
+  private:
+@@ -124,6 +126,7 @@
+   void eval_gpu(const ArrayVector& inputs, ArrayVector& outputs)
+       override;
+ 
++  int source() const noexcept { return src_; }
+   DEFINE_NAME(Recv);
+ 
+  private:
+diff --git a/mlx/graph_construction.h b/mlx/graph_construction.h
+--- a/mlx/graph_construction.h
++++ b/mlx/graph_construction.h
+@@ -155,6 +155,7 @@
+   static GraphFailure create_gpu_prologue(const GpuEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_cleanup(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   static GraphFailure create_cpu_argpartition(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
++  static GraphFailure create_cpu_distributed(const FixedEvalPrologueGuard&, GraphConstruction*&) noexcept;
+   // Configure only an untouched resident bank in its actual current Scope.
+   // A finite attempt is consumed before nested construction starts, even on failure.
+   GraphFailure configure_nested(const NestedGraphEvaluationLimits&, size_t attempts) noexcept;

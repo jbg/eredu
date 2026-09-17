@@ -440,6 +440,9 @@ fn build_and_link_mlx_c(out_path: &Path) {
         if target_os == "windows" { "ON" } else { "OFF" },
     );
     config.define("MLX_C_BUILD_EXAMPLES", "OFF");
+    // Native patch suites are configured explicitly by their dedicated runner.
+    // A reused cache must not add those targets to ordinary Cargo builds.
+    config.define("MLX_C_BUILD_PATCH_TESTS", "OFF");
     config.define("MLX_BUILD_GGUF", "OFF");
 
     if let Some(platform) = mobile_target {

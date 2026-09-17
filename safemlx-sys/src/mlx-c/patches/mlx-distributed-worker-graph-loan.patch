@@ -1,0 +1,199 @@
+diff --git a/mlx/distributed/ring/socket_tasks.h b/mlx/distributed/ring/socket_tasks.h
+--- a/mlx/distributed/ring/socket_tasks.h
++++ b/mlx/distributed/ring/socket_tasks.h
+@@ -109,6 +109,7 @@
+   void complete_front() {
+     auto* task = head_;
+     if (!task) throw submission::GraphQuotaError(submission::GraphFailure::invalid_layout);
++    submission::GraphWorkerAllocationLoan allocation(*task);
+     task->invoke(task);
+     auto retired = pop();
+   }
+@@ -135,6 +136,8 @@
+   value.controls = sizeof(SocketTaskLayout) * 2 + sizeof(SocketTaskQueue) +
+       sizeof(SocketTaskQueue::Ready) + sizeof(SocketFuture) * 2 +
+       sizeof(socket_detail::Operation) + sizeof(scheduler::TaskOwner) * 2 +
++      sizeof(submission::GraphWorkerAllocationLoan) +
++      sizeof(submission::GraphConstructionContext) +
+       sizeof(submission::GraphAllocator<socket_detail::Node>) +
+       sizeof(submission::GraphAllocator<std::byte>) * 3 +
+       sizeof(void*) * 5 + sizeof(size_t) * 4 + sizeof(bool) * 2;
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -237,10 +237,16 @@
+     if (block.pointer) deallocate(block.pointer, block.bytes, block.alignment);
+ }
+ void* GraphQuota::allocate(size_t requested, size_t align) {
++  const auto context = current_graph_construction_context();
++  // An accepted queue worker may use only its retained explicit Graph. This
++  // check is independent of bank presence, so a foreign arena never becomes
++  // valid merely because its host happens to have no constructor in progress.
++  if (context.allocation_worker &&
++      (context.allocation_worker != this || !context.independent_worker))
++    throw GraphQuotaError(GraphFailure::foreign_parent);
+   {
+     const Loan loan(*this);
+     if (construction_) {
+-      const auto context = current_graph_construction_context();
+       // Nested/stale host capture cannot route around this bank. A previously
+       // accepted real worker keeps its own allocator projection, as before.
+       if (construction_->exclusive_host_ && context.worker && !context.independent_worker)
+@@ -257,6 +263,10 @@
+       // consume a later host constructor's reserved destinations.
+     }
+     if (preparing_) {
++      // Closed source construction owns these exact prepared blocks. Queue
++      // progress must not consume them or treat them as free arena capacity.
++      if (context.allocation_worker)
++        throw GraphQuotaError(GraphFailure::foreign_parent);
+       for (auto& block : prepared_) {
+         if (block.pointer && block.bytes == requested && block.alignment == align) {
+           void* pointer = block.pointer;
+diff --git a/mlx/graph_quota.h b/mlx/graph_quota.h
+--- a/mlx/graph_quota.h
++++ b/mlx/graph_quota.h
+@@ -12,6 +12,9 @@
+ #include <vector>
+ #include "mlx/api.h"
+ 
++class ThreadPool;
++namespace mlx::core::scheduler { struct Task; }
++namespace mlx::core::distributed::ring { class SocketTaskQueue; }
+ namespace mlx::core::fast { class PreparedPipelineCache; }
+ 
+ namespace mlx::core::submission {
+@@ -121,6 +124,9 @@
+   // An already accepted scheduler/buffer worker owns its independent allocator
+   // projection. It must never consume a concurrent host bank.
+   bool independent_worker{false};
++  // Only a native queue's accepted Task can install this exact allocation
++  // source. It supplies no default allocator, Scope, Record or backing loan.
++  const GraphQuota* allocation_worker{nullptr};
+ };
+ // Reads only authenticated host/worker TLS; creates no scope or task authority.
+ MLX_API GraphConstructionContext current_graph_construction_context() noexcept;
+@@ -136,6 +142,23 @@
+   GraphQuota* get() const noexcept { return value_; }
+  private:
+   GraphQuota* value_;
++};
++
++// Allocation-only loan of an accepted native Task's retained Graph. The queue
++// installs it after acceptance and keeps it through invocation and node death.
++// A caller cannot manufacture this loan from a Graph pointer or scalar facts.
++class MLX_API GraphWorkerAllocationLoan final {
++ public:
++  ~GraphWorkerAllocationLoan();
++  GraphWorkerAllocationLoan(const GraphWorkerAllocationLoan&) = delete;
++  GraphWorkerAllocationLoan& operator=(const GraphWorkerAllocationLoan&) = delete;
++ private:
++  friend class ::ThreadPool;
++  friend class mlx::core::distributed::ring::SocketTaskQueue;
++  friend GraphConstructionContext current_graph_construction_context() noexcept;
++  explicit GraphWorkerAllocationLoan(const scheduler::Task&) noexcept;
++  const GraphWorkerAllocationLoan* previous_;
++  GraphQuotaRef graph_;
+ };
+ 
+ template<class T> class GraphAllocator {
+diff --git a/mlx/submission.cpp b/mlx/submission.cpp
+--- a/mlx/submission.cpp
++++ b/mlx/submission.cpp
+@@ -1,6 +1,7 @@
+ #include "mlx/submission.h"
+ #include "mlx/submission_identity.h"
+ #include "mlx/primitives.h"
++#include "mlx/scheduler_task.h"
+ 
+ #include <algorithm>
+ #include <limits>
+@@ -9,6 +10,7 @@
+ namespace mlx::core::submission {
+ namespace {
+ thread_local Scope* active_scope = nullptr;
++thread_local const GraphWorkerAllocationLoan* active_graph_worker = nullptr;
+ thread_local Record* active_capture = nullptr;
+ thread_local Record* active_dispatch = nullptr;
+ thread_local const allocator::OriginalBufferBinding* active_buffer_worker = nullptr;
+@@ -308,13 +310,21 @@
+ 
+ bool bound_buffer_worker_active() noexcept { return active_buffer_worker != nullptr; }
+ void refuse_bound_buffer_worker_submission() {
+-  if (bound_buffer_worker_active()) throw NativeControlError(NativeControlFailure::invalid_scope);
++  if (bound_buffer_worker_active() || active_graph_worker)
++    throw NativeControlError(NativeControlFailure::invalid_scope);
++}
++GraphWorkerAllocationLoan::GraphWorkerAllocationLoan(const scheduler::Task& task) noexcept
++    : previous_(active_graph_worker), graph_(task.graph.get()) {
++  if (graph_.get()) active_graph_worker = this;
++}
++GraphWorkerAllocationLoan::~GraphWorkerAllocationLoan() {
++  if (graph_.get()) active_graph_worker = previous_;
+ }
+ BufferWorkerGuard::BufferWorkerGuard(const allocator::OriginalBufferBinding& binding,
+     FailureCarrier* failure)
+     : previous_(active_buffer_worker), previous_failure_(active_buffer_worker_failure) {
+   if (!binding) return;
+-  if (active_scope || active_capture || active_dispatch || active_buffer_worker ||
++  if (active_scope || active_capture || active_dispatch || active_buffer_worker || active_graph_worker ||
+       !binding.graph() || !failure || !binding.scope_identity() ||
+       failure->scope_identity() != binding.scope_identity())
+     throw NativeControlError(NativeControlFailure::foreign_domain);
+@@ -336,7 +346,7 @@
+   return current_native_controls().failure;
+ }
+ NativeControlBinding current_native_controls() noexcept {
+-  if (active_buffer_worker) {
++  if (active_buffer_worker || active_graph_worker) {
+     NativeControlBinding result;
+     result.original = true;
+     result.failure = NativeControlFailure::invalid_scope;
+@@ -656,6 +666,12 @@
+ }
+ 
+ GraphConstructionContext current_graph_construction_context() noexcept {
++  if (active_graph_worker) {
++    const bool valid = !active_graph_worker->previous_ && !active_scope &&
++        !active_capture && !active_dispatch && !active_buffer_worker &&
++        !active_buffer_worker_failure && !scheduler::current_worker();
++    return {0, true, nullptr, valid, active_graph_worker->graph_.get()};
++  }
+   if (active_buffer_worker || active_buffer_worker_failure) {
+     const bool valid = active_buffer_worker && !active_scope && !active_capture && !active_dispatch &&
+         active_buffer_worker->graph() && active_buffer_worker_failure &&
+diff --git a/mlx/threadpool.h b/mlx/threadpool.h
+--- a/mlx/threadpool.h
++++ b/mlx/threadpool.h
+@@ -41,7 +41,8 @@
+   auto enqueue(F&& f, Args&&... args)
+       -> std::future<typename std::invoke_result_t<F, Args...>>;
+   // Source allocation is explicit and retained by the accepted task/promise.
+-  // This grants no submission Scope or worker TLS context.
++  // Only the accepted worker installs an explicit allocation-only loan.
++  // This grants no submission Scope, default allocator or Data authority.
+   template <class F, class... Args>
+   auto enqueue_with_graph(mlx::core::submission::GraphQuota*, F&& f, Args&&... args)
+       -> std::future<typename std::invoke_result_t<F, Args...>>;
+@@ -158,6 +159,9 @@
+           selected->next = nullptr;
+         }
+ 
++        // The accepted Task is the source, including while its captures and
++        // promise retire. The loan owns no worker/thread or submission role.
++        mlx::core::submission::GraphWorkerAllocationLoan allocation(*selected);
+         mlx::core::scheduler::TaskOwner task(selected);
+         selected->invoke(selected);
+       }
+diff --git a/mlx/threadpool_task.h b/mlx/threadpool_task.h
+--- a/mlx/threadpool_task.h
++++ b/mlx/threadpool_task.h
+@@ -48,6 +48,8 @@
+       !submission::GraphQuota::allocation_extent(value.promise_bytes, value.promise_alignment, value.promise_extent)) return false;
+   value.controls = sizeof(TaskLayout) * 2 + sizeof(Body) + sizeof(F) +
+       sizeof(scheduler::TaskOwner) * 2 + sizeof(std::future<R>) * 2 +
++      sizeof(submission::GraphWorkerAllocationLoan) +
++      sizeof(submission::GraphConstructionContext) +
+       sizeof(submission::GraphAllocator<Node>) + sizeof(submission::GraphAllocator<std::byte>) * 3 +
+       sizeof(std::unique_lock<std::mutex>) + sizeof(std::exception_ptr) +
+       sizeof(void*) * 6 + sizeof(size_t) * 4 + sizeof(bool) * 2;

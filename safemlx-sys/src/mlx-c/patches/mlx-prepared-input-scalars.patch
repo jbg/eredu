@@ -1,0 +1,14 @@
+--- a/mlx/prepared_input.cpp
++++ b/mlx/prepared_input.cpp
+@@ -187,7 +187,10 @@
+ 
+ bool PreparedInputLeaf::layout(const allocator::PreparedInputFacts& facts,
+     const PreparedInputSource& source, PreparedInputSlotLayout& out) noexcept {
+-  if (!source.shape || !source.rank || source.rank > static_cast<size_t>(INT_MAX) ||
++  // A rank-zero source has exactly one element, like ordinary array scalars.
++  // Only positive rank needs a shape pointer; the same product/count and
++  // allocator checks below remain authoritative for every typed source.
++  if ((source.rank && !source.shape) || source.rank > static_cast<size_t>(INT_MAX) ||
+       source.kind > 2 || !facts.page_size || (facts.page_size & (facts.page_size - 1))) return false;
+   size_t elements = 1;
+   for (size_t i = 0; i < source.rank; ++i) {

@@ -1,0 +1,82 @@
+diff --git a/mlx/submission.h b/mlx/submission.h
+--- a/mlx/submission.h
++++ b/mlx/submission.h
+@@ -67,6 +67,12 @@
+   // Constructor-only owner handoff. On failure the caller still owns payload.
+   Scope(void* retained_owner = nullptr, void (*retire_owner)(void*) = nullptr,
+         RecordQuota* quota = nullptr, GraphQuota* graph = nullptr);
++  // Independently funded control work may use its own arenas only through this
++  // explicit active-parent entry. It retains ordinary durable ancestry and
++  // inherits the parent's immutable backing origin.
++  static Scope* original_child(Scope& parent, void* owner,
++      void (*retire)(void*), RecordQuota*, GraphQuota*);
++  static size_t original_child_control_bytes() noexcept;
+   Scope(const Scope&) = delete;
+   Scope& operator=(const Scope&) = delete;
+   RecordQuota* record_quota() const noexcept { return quota_; }
+@@ -114,6 +120,7 @@
+  private:
+   friend class Record;
+   friend void mark_native_control_construction() noexcept;
++  Scope(void*, void (*)(void*), RecordQuota*, GraphQuota*, Scope* expected_parent);
+   ~Scope();
+   void retain() noexcept;
+   void record_started() noexcept;
+diff --git a/mlx/submission.cpp b/mlx/submission.cpp
+--- a/mlx/submission.cpp
++++ b/mlx/submission.cpp
+@@ -139,7 +139,23 @@
+ }
+ void Scope::operator delete(void* value) noexcept { ::operator delete(value); }
+ 
++size_t Scope::original_child_control_bytes() noexcept {
++  // Factory arguments plus the explicit constructor parent and selection
++  // locals; no new allocated object or mutable domain slot is introduced.
++  return sizeof(Scope*) * 2 + sizeof(void*) + sizeof(void (*)(void*)) +
++      sizeof(RecordQuota*) * 2 + sizeof(GraphQuota*) * 2 + sizeof(bool);
++}
++
++Scope* Scope::original_child(Scope& parent, void* owner, void (*retire)(void*),
++    RecordQuota* quota, GraphQuota* graph) {
++  return new Scope(owner, retire, quota, graph, &parent);
++}
++
+ Scope::Scope(void* retained_owner, void (*retire_owner)(void*), RecordQuota* quota, GraphQuota* graph)
++    : Scope(retained_owner, retire_owner, quota, graph, nullptr) {}
++
++Scope::Scope(void* retained_owner, void (*retire_owner)(void*), RecordQuota* quota,
++    GraphQuota* graph, Scope* expected_parent)
+     : owner_(prepare_owner_identity()), identity_(take_scope_identity()),
+       scoped_observation_(active_scope && active_scope->scoped_observation_only()),
+       original_required_(active_scope && active_scope->original_controls_required()),
+@@ -148,16 +164,24 @@
+   required_buffer_origin_ = parent_ ? parent_->required_buffer_origin_ : nullptr;
+   // Prepare global ownership before the first possible submission.
+   (void)registry();
+-  // A nested ordinary scope inherits the same arena. An explicit foreign
+-  // arena cannot replace the parent's original physical capacity.
++  // Default nesting still inherits exact arenas. The explicit child entry
++  // validates the actual current original observer before any transfer, and
++  // cannot interpose in a Record capture/dispatch or an accepted worker.
++  const bool independent = expected_parent != nullptr;
++  if (independent && (expected_parent != parent_ || !quota || !graph ||
++      !expected_parent->active_on_owner_thread() ||
++      !expected_parent->valid_original_observer() || active_capture ||
++      active_dispatch || active_buffer_worker || active_buffer_worker_failure ||
++      active_graph_worker || scheduler::current_worker()))
++    throw NativeControlError(NativeControlFailure::foreign_domain);
+   auto* inherited = current_record_quota();
+-  if (inherited && quota && inherited != quota)
++  if (!independent && inherited && quota && inherited != quota)
+     throw RecordQuotaError(QuotaFailure::foreign_parent);
+   auto* inherited_graph = current_graph_quota();
+-  if (inherited_graph && graph && inherited_graph != graph)
++  if (!independent && inherited_graph && graph && inherited_graph != graph)
+     throw GraphQuotaError(GraphFailure::foreign_parent);
+-  quota_ = inherited ? inherited : quota;
+-  graph_ = inherited_graph ? inherited_graph : graph;
++  quota_ = independent ? quota : (inherited ? inherited : quota);
++  graph_ = independent ? graph : (inherited_graph ? inherited_graph : graph);
+   if (quota_) quota_->retain();
+   if (graph_) graph_->retain();
+   // All fallible setup precedes both owner transfer and ancestry mutation.

@@ -4,14 +4,44 @@ use safemlx::{
     error::Exception,
     fast::ScaledDotProductAttentionMask,
     ops::{
-        broadcast_to, concatenate_axis, einsum,
-        indexing::{take_along_axis, NewAxis, TryIndexOp},
+        broadcast_to, concatenate_axis,
+        indexing::{NewAxis, TryIndexOp},
         r#where, softmax_axis,
     },
     Array, Dtype, Stream,
 };
 
 use crate::backend::nn::tensor::create_causal_mask;
+
+mod pooling;
+pub(in crate::backend::nn) mod indexed;
+pub(in crate::backend::nn) mod pooled_positions;
+pub(in crate::backend::nn) mod gather_mask;
+pub(super) use pooling::{pooled_mask_shapes, pooled_mask_shapes_fixed, pooled_attention_control_bytes};
+
+// One native policy shared by execution and cold allocation facts.
+pub(super) const INPUT_SCORE_ROW_BUDGET: i32 = 8192;
+pub(super) const INPUT_SCORE_KEY_TILE: i32 = 256;
+pub(super) const SLIDING_QUERY_TILE: i32 = 256;
+pub(super) fn input_score_query_step(keys: i32) -> i32 {
+    (INPUT_SCORE_ROW_BUDGET / keys).clamp(1, 32)
+}
+
+// Every selected tile retains rank four. General tuple indexing constructs
+// host index-plan Vecs; this shared view uses fixed bounds on the actual array.
+fn sequence_slice(
+    input: &Array,
+    start: i32,
+    end: i32,
+    stream: &Stream,
+) -> Result<Array, Exception> {
+    input.try_slice(
+        &[0, 0, start, 0],
+        &[input.dim(0), input.dim(1), end, input.dim(3)],
+        &[1; 4],
+        stream,
+    )
+}
 
 /// Sparse attention over a bounded local window and indexed compressed tokens.
 ///
@@ -35,132 +65,34 @@ pub fn indexed_sparse_attention(
     sinks: Option<&Array>,
     stream: &Stream,
 ) -> Result<Array, Exception> {
-    if queries.ndim() != 4
-        || local_keys.ndim() != 3
-        || local_values.ndim() != 3
-        || pooled_keys.ndim() != 3
-        || pooled_values.ndim() != 3
-        || pooled_indices.ndim() != 3
-        || queries.dim(0) != local_keys.dim(0)
-        || queries.dim(0) != local_values.dim(0)
-        || queries.dim(0) != pooled_keys.dim(0)
-        || queries.dim(0) != pooled_values.dim(0)
-        || queries.dim(0) != pooled_indices.dim(0)
-        || queries.dim(2) != pooled_indices.dim(1)
-        || queries.dim(3) != local_keys.dim(2)
-        || queries.dim(3) != pooled_keys.dim(2)
-        || local_keys.dim(1) != local_values.dim(1)
-        || pooled_keys.dim(1) != pooled_values.dim(1)
-        || local_values.dim(2) != pooled_values.dim(2)
-    {
-        return Err(Exception::custom(format!(
-            "indexed sparse attention received incompatible shapes q={:?}, local_keys={:?}, local_values={:?}, pooled_keys={:?}, pooled_values={:?}, indices={:?}",
-            queries.shape(),
-            local_keys.shape(),
-            local_values.shape(),
-            pooled_keys.shape(),
-            pooled_values.shape(),
-            pooled_indices.shape()
-        )));
-    }
-    let batch = queries.dim(0);
-    let heads = queries.dim(1);
-    let query_tokens = queries.dim(2);
-    let key_dim = queries.dim(3);
-    let value_dim = local_values.dim(2);
-    let selected = pooled_indices.dim(2);
-    let pooled_tokens = pooled_keys.dim(1);
-    if selected <= 0 || pooled_tokens <= 0 {
-        return Err(Exception::custom(
-            "indexed sparse attention requires at least one pooled token and selected index",
-        ));
-    }
-
-    let expanded_pooled_keys = broadcast_to(
-        &pooled_keys.try_index_device((.., NewAxis, .., ..), stream)?,
-        &[batch, query_tokens, pooled_tokens, key_dim],
-        stream,
-    )?;
-    let expanded_key_indices = broadcast_to(
-        &pooled_indices.try_index_device((.., .., .., NewAxis), stream)?,
-        &[batch, query_tokens, selected, key_dim],
-        stream,
-    )?;
-    let selected_pooled_keys =
-        take_along_axis(expanded_pooled_keys, &expanded_key_indices, 2, stream)?;
-    let expanded_pooled_values = broadcast_to(
-        &pooled_values.try_index_device((.., NewAxis, .., ..), stream)?,
-        &[batch, query_tokens, pooled_tokens, value_dim],
-        stream,
-    )?;
-    let expanded_value_indices = broadcast_to(
-        &pooled_indices.try_index_device((.., .., .., NewAxis), stream)?,
-        &[batch, query_tokens, selected, value_dim],
-        stream,
-    )?;
-    let selected_pooled_values =
-        take_along_axis(expanded_pooled_values, &expanded_value_indices, 2, stream)?;
-
-    let scaled_queries = queries.multiply(Array::from_f32(scale), stream)?;
-    let mut local_scores = einsum("bhld,btd->bhlt", [&scaled_queries, local_keys], stream)?;
-    let mut pooled_scores = einsum(
-        "bhld,blkd->bhlk",
-        [&scaled_queries, &selected_pooled_keys],
-        stream,
-    )?;
-    apply_score_mask(&mut local_scores, local_mask, stream)?;
-    apply_score_mask(&mut pooled_scores, pooled_mask, stream)?;
-
-    let mut score_parts = vec![local_scores, pooled_scores];
-    if let Some(sinks) = sinks {
-        if sinks.shape() != [heads] {
-            return Err(Exception::custom(format!(
-                "attention sinks require shape [{heads}], got {:?}",
-                sinks.shape()
-            )));
-        }
-        score_parts.push(broadcast_to(
-            &sinks
-                .as_dtype(score_parts[0].dtype(), stream)?
-                .reshape(&[1, heads, 1, 1], stream)?,
-            &[batch, heads, query_tokens, 1],
-            stream,
-        )?);
-    }
-    let scores = concatenate_axis(&score_parts, -1, stream)?;
-    let weights = softmax_axis(scores, -1, true, stream)?;
-    let local_tokens = local_keys.dim(1);
-    let local_weights = weights.try_index_device((.., .., .., ..local_tokens), stream)?;
-    let pooled_weights =
-        weights.try_index_device((.., .., .., local_tokens..local_tokens + selected), stream)?;
-    let local_context = einsum("bhlt,btv->bhlv", [&local_weights, local_values], stream)?;
-    let pooled_context = einsum(
-        "bhlk,blkv->bhlv",
-        [&pooled_weights, &selected_pooled_values],
-        stream,
-    )?;
-    local_context.add(pooled_context, stream)
+    indexed::run(indexed::Input {
+        values: [queries, local_keys, local_values, pooled_keys, pooled_values, pooled_indices],
+        scale, local_mask, pooled_mask, sinks,
+    }, stream)
 }
 
-fn apply_score_mask(
-    scores: &mut Array,
-    mask: Option<&Array>,
-    stream: &Stream,
-) -> Result<(), Exception> {
-    let Some(mask) = mask else {
-        return Ok(());
-    };
-    *scores = if mask.dtype() == Dtype::Bool {
-        r#where(
-            mask,
-            &*scores,
-            Array::from_f32(scores.dtype().finfo_min()? as f32),
-            stream,
-        )?
-    } else {
-        scores.add(mask.as_dtype(scores.dtype(), stream)?, stream)?
-    };
-    Ok(())
+// Actual Rust owners in apply_rotary_embeddings; numerical descriptors and
+// buffers are supplied by the shared explicit-embedding recipe separately.
+pub(super) fn apply_rotary_embeddings_control_bytes() -> Option<usize> {
+    use std::mem::size_of;
+    [
+        size_of::<(&Array, &Array, &Array, &Stream)>(),
+        size_of::<(&Array, &Stream)>(), // add_batch_axis closure
+        size_of::<&Stream>(), // rotate_half closure
+        size_of::<(&Array, i32)>(), // rotate_half arguments and split
+        size_of::<[Array; 2]>(), // batch-normalized cosine and sine
+        size_of::<[Array; 2]>(), // cast cosine and sine temporaries
+        size_of::<[Array; 2]>(), // head-expanded cosine and sine
+        size_of::<[Array; 2]>(), // first and second halves
+        size_of::<[Array; 2]>(), // scalar and negated second half
+        size_of::<[Array; 2]>(), // concatenate's moved operands
+        size_of::<[Array; 4]>(), // two products, rotated half and sum
+        size_of::<Result<Array, Exception>>(),
+        size_of::<eredu_nn::RotaryPosition<'_, crate::MlxTensor>>(),
+        size_of::<Result<crate::MlxTensor, eredu_nn::Error>>(),
+        safemlx::ops::indexing::inline_basic_index_control_bytes()?.checked_mul(4)?,
+        safemlx::ops::concatenate_axis_control_bytes()?,
+    ].into_iter().try_fold(0usize, usize::checked_add)
 }
 
 /// Applies caller-provided rotary cosine and sine tensors to one head view.
@@ -192,7 +124,7 @@ pub fn apply_rotary_embeddings(
         let first = x.try_index_device((.., .., .., ..half), stream)?;
         let second = x.try_index_device((.., .., .., half..), stream)?;
         concatenate_axis(
-            &[second.multiply(Array::from_f32(-1.0), stream)?, first],
+            &[second.multiply(Array::try_from_f32(-1.0)?, stream)?, first],
             -1,
             stream,
         )
@@ -266,12 +198,14 @@ pub fn sliding_window_prefill_attention_with_softcap(
             "sliding prefill attention received inconsistent sequence lengths",
         ));
     }
-    let key_position_offset = query_position_offset + seq_len - key_len;
-    if key_position_offset < 0 {
-        return Err(Exception::custom(
-            "sliding prefill attention key origin precedes position zero",
-        ));
-    }
+    let key_position_offset = eredu_nn::operation_geometry::SlidingAttentionGeometry::new(
+        seq_len,
+        key_len,
+        window_size,
+        query_position_offset,
+    )
+    .map_err(|error| Exception::custom(error.to_string()))?
+    .key_origin();
 
     if arithmetic == eredu_nn::AttentionArithmetic::Fused
         && softcap.is_none()
@@ -292,19 +226,21 @@ pub fn sliding_window_prefill_attention_with_softcap(
     }
 
     let max_past = window_size - 1;
-    let chunk_size = 256;
-    let mut chunks = Vec::new();
+    let chunk_size = SLIDING_QUERY_TILE;
+    let mut chunks = crate::backend::nn::tensor::GroupedChunkOutputs::prepare(
+        (seq_len as usize).div_ceil(chunk_size as usize),
+    )?;
     let mut start = 0;
     while start < seq_len {
-        let end = (start + chunk_size).min(seq_len);
+        let end = start + chunk_size.min(seq_len - start);
         let query_abs_start = query_position_offset + start;
         let wanted_key_start = (query_abs_start - max_past).max(key_position_offset);
         let key_start = wanted_key_start - key_position_offset;
         let key_end = query_position_offset + end - key_position_offset;
         let relative_offset = query_abs_start - wanted_key_start;
-        let query_chunk = queries.try_index_device((.., .., start..end, ..), stream)?;
-        let key_chunk = keys.try_index_device((.., .., key_start..key_end, ..), stream)?;
-        let value_chunk = values.try_index_device((.., .., key_start..key_end, ..), stream)?;
+        let query_chunk = sequence_slice(&queries, start, end, stream)?;
+        let key_chunk = sequence_slice(&keys, key_start, key_end, stream)?;
+        let value_chunk = sequence_slice(&values, key_start, key_end, stream)?;
         let mask = create_causal_mask(
             end - start,
             Some(relative_offset),
@@ -322,12 +258,11 @@ pub fn sliding_window_prefill_attention_with_softcap(
             softcap,
             arithmetic,
             stream,
-        )?);
+        )?)?;
         start = end;
     }
 
-    let refs = chunks.iter().collect::<Vec<_>>();
-    concatenate_axis(&refs, 2, stream)?
+    concatenate_axis(chunks.as_slice(), 2, stream)?
         .transpose_axes(&[0, 2, 1, 3], stream)?
         .reshape(&[batch, seq_len, -1], stream)
 }
@@ -381,7 +316,7 @@ pub fn attention_with_softcap(
         ));
     }
     if arithmetic == eredu_nn::AttentionArithmetic::InputScores
-        && i64::from(queries.dim(2)) * i64::from(keys.dim(2)) > 8192
+        && i64::from(queries.dim(2)) * i64::from(keys.dim(2)) > i64::from(INPUT_SCORE_ROW_BUDGET)
     {
         return bounded_input_score_attention(
             queries, keys, values, scale, mask, sinks, softcap, stream,
@@ -415,19 +350,24 @@ pub fn attention_with_softcap(
     };
     scores = scores
         .as_dtype(Dtype::Float32, stream)?
-        .multiply(Array::from_f32(scale), stream)?
+        .multiply(Array::try_from_f32(scale)?, stream)?
         .as_dtype(score_dtype, stream)?;
     if let Some(cap) = softcap {
         scores = safemlx::ops::tanh(
-            &scores.multiply(Array::from_f32(cap.recip()), stream)?,
+            &scores.multiply(Array::try_from_f32(cap.recip())?, stream)?,
             stream,
         )?
-        .multiply(Array::from_f32(cap), stream)?
+        .multiply(Array::try_from_f32(cap)?, stream)?
         .as_dtype(score_dtype, stream)?;
     }
     if let Some(mask) = mask {
         scores = if mask.dtype() == safemlx::Dtype::Bool {
-            safemlx::ops::r#where(mask, &scores, &Array::from_f32(f32::NEG_INFINITY), stream)?
+            safemlx::ops::r#where(
+                mask,
+                &scores,
+                &Array::try_from_f32(f32::NEG_INFINITY)?,
+                stream,
+            )?
         } else {
             scores
                 .add(mask.as_dtype(score_dtype, stream)?, stream)?
@@ -449,8 +389,15 @@ pub fn attention_with_softcap(
         Some(value) => value,
         None => safemlx::ops::softmax_axis(&scores, -1, true, stream)?,
     };
+    // The direct worker keeps rank four and removes only the optional sink
+    // column. Borrowed fixed bounds avoid general indexing's host plan vectors.
     let probabilities = probabilities
-        .try_index_device((.., .., .., ..tokens), stream)?
+        .try_slice(
+            &[0; 4],
+            &[batch, heads, queries.dim(2), tokens],
+            &[1; 4],
+            stream,
+        )?
         .as_dtype(queries.dtype(), stream)?;
     match super::matrix::bf16_batched_product(&probabilities, &values, true, stream)? {
         Some(output) => Ok(output),
@@ -485,16 +432,18 @@ fn bounded_input_score_attention(
             )
         })
         .transpose()?;
-    let mut outputs = Vec::new();
-    let query_step = (8192 / keys.dim(2)).clamp(1, 32);
+    let query_step = input_score_query_step(keys.dim(2));
+    let mut outputs = crate::backend::nn::tensor::GroupedChunkOutputs::prepare(
+        (queries.dim(2) as usize).div_ceil(query_step as usize),
+    )?;
     for start in (0..queries.dim(2)).step_by(query_step as usize) {
-        let end = (start + query_step).min(queries.dim(2));
-        let query = queries.try_index_device((.., .., start..end, ..), stream)?;
+        let end = start + query_step.min(queries.dim(2) - start);
+        let query = sequence_slice(queries, start, end, stream)?;
         let mask = mask
             .as_ref()
-            .map(|mask| mask.try_index_device((.., .., start..end, ..), stream))
+            .map(|mask| sequence_slice(mask, start, end, stream))
             .transpose()?;
-        if keys.dim(2) <= 8192 {
+        if keys.dim(2) <= INPUT_SCORE_ROW_BUDGET {
             outputs.push(attention_with_softcap(
                 &query,
                 keys,
@@ -505,7 +454,7 @@ fn bounded_input_score_attention(
                 softcap,
                 eredu_nn::AttentionArithmetic::InputScores,
                 stream,
-            )?);
+            )?)?;
             continue;
         }
         let mut accumulator = BlockwiseAttentionAccumulator::new(
@@ -526,18 +475,18 @@ fn bounded_input_score_attention(
             if pass == 1 {
                 accumulator.begin_value_pass()?;
             }
-            for key_start in (0..keys.dim(2)).step_by(256) {
-                let key_end = (key_start + 256).min(keys.dim(2));
+            for key_start in (0..keys.dim(2)).step_by(INPUT_SCORE_KEY_TILE as usize) {
+                let key_end = key_start + INPUT_SCORE_KEY_TILE.min(keys.dim(2) - key_start);
                 let block = KeyValueAttentionBlock::unleased(
                     i64::from(key_start),
                     i64::from(key_end),
-                    keys.try_index_device((.., .., key_start..key_end, ..), stream)?,
-                    values.try_index_device((.., .., key_start..key_end, ..), stream)?,
+                    sequence_slice(keys, key_start, key_end, stream)?,
+                    sequence_slice(values, key_start, key_end, stream)?,
                 );
                 accumulator.accumulate(&block, stream)?;
             }
         }
-        outputs.push(accumulator.finish(stream)?);
+        outputs.push(accumulator.finish(stream)?)?;
     }
-    concatenate_axis(&outputs, 2, stream)
+    concatenate_axis(outputs.as_slice(), 2, stream)
 }

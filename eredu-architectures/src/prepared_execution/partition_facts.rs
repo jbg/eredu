@@ -16,11 +16,22 @@ use crate::partitioned_execution::{
 pub struct PreparedPartitionSessionFacts {
     text: PreparedTextSessionFacts,
     topology: PromptCacheTopology,
-    execution: PartitionedExecutionPlan,
+    execution: ExecutionPlan,
     publication: PartitionOutputAuthority,
     tensor_group: Option<CollectiveGroupId>,
     session_group: CollectiveGroupId,
     activation_dtype: PipelineActivationDtype,
+}
+
+enum ExecutionPlan {
+    Owned(PartitionedExecutionPlan),
+    Retained(std::sync::Arc<PartitionedExecutionPlan>),
+}
+impl std::ops::Deref for ExecutionPlan {
+    type Target = PartitionedExecutionPlan;
+    fn deref(&self) -> &Self::Target {
+        match self { Self::Owned(value) => value, Self::Retained(value) => value }
+    }
 }
 
 impl PreparedPartitionSessionFacts {
@@ -56,7 +67,7 @@ impl PreparedPartitionSessionFacts {
     }
 
     /// Architecture-selected complete execution plan.
-    pub const fn execution_plan(&self) -> &PartitionedExecutionPlan {
+    pub fn execution_plan(&self) -> &PartitionedExecutionPlan {
         &self.execution
     }
 
@@ -74,12 +85,27 @@ impl PreparedPartitionSessionFacts {
         PartitionedExecutionPlan,
         PartitionOutputAuthority,
     ) {
-        (self.text, self.topology, self.execution, self.publication)
+        let execution=match self.execution {
+            ExecutionPlan::Owned(value)=>value,
+            ExecutionPlan::Retained(value)=>std::sync::Arc::unwrap_or_clone(value),
+        };
+        (self.text, self.topology, execution, self.publication)
+    }
+
+    /// Moves the exact retained pipeline plan into the native runtime without
+    /// reconstructing or copying its selected routes and schedule.
+    pub fn into_retained_parts(self) -> (PreparedTextSessionFacts, PromptCacheTopology,
+        std::sync::Arc<PartitionedExecutionPlan>, PartitionOutputAuthority) {
+        let execution = match self.execution {
+            ExecutionPlan::Owned(value) => std::sync::Arc::new(value),
+            ExecutionPlan::Retained(value) => value,
+        };
+        (self.text, self.topology, execution, self.publication)
     }
 
     fn from_admission<B, A, R, Q, G, W>(
         prepared: &PreparedPartitionedAdmission<A, R, Q, G, W>,
-        execution: PartitionedExecutionPlan,
+        execution: ExecutionPlan,
         capability: &crate::capability::CapabilityEstimate,
         model_type: &str,
         residency: LayerWeightResidency,
@@ -131,10 +157,12 @@ where
     /// Projects publication/cache/session facts through this exact dense partition selection.
     pub fn session_facts(&self) -> Result<PreparedPartitionSessionFacts, String> {
         let selected = self.prepared().selected();
-        let execution = if selected.topology().pipeline_parallel_size() > 1 {
-            selected.pipeline_execution_plan()?
+        let execution = if let Some(plan) = self.prepared().retained_pipeline_plan() {
+            ExecutionPlan::Retained(plan.clone())
         } else {
-            selected.direct_execution_plan()?
+            ExecutionPlan::Owned(if selected.topology().pipeline_parallel_size() > 1 {
+                selected.pipeline_execution_plan()?
+            } else { selected.direct_execution_plan()? })
         };
         PreparedPartitionSessionFacts::from_admission::<B, _, _, _, _, _>(
             self.prepared(),
@@ -156,7 +184,7 @@ where
     pub fn session_facts(&self) -> Result<PreparedPartitionSessionFacts, String> {
         PreparedPartitionSessionFacts::from_admission::<B, _, _, _, _, _>(
             self.prepared(),
-            self.execution_handoff().execution_plan().clone(),
+            ExecutionPlan::Owned(self.execution_handoff().execution_plan().clone()),
             self.capability_estimate(),
             self.effective_model_type(),
             self.prepared().selected().base().text().residency(),
@@ -174,7 +202,7 @@ impl<A, G, W> crate::composite_partitioned::PreparedCompositePartition<A, G, W> 
     {
         PreparedPartitionSessionFacts::from_admission::<B, _, _, _, _, _>(
             self.prepared(),
-            self.execution_plan()?,
+            ExecutionPlan::Owned(self.execution_plan()?),
             self.capability_estimate(),
             self.effective_model_type(),
             self.prepared().selected().base().execution().residency(),

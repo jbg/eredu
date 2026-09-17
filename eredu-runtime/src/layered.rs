@@ -2,6 +2,26 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+pub(crate) mod invocation;
+mod observation_paths;
+pub(crate) use observation_paths::BorrowedHook;
+mod ordered_completion;
+mod resident_construction;
+pub use resident_construction::ordinary_addressed_units;
+mod metadata;
+pub use metadata::LayeredForwardMetadata;
+use invocation::{LayeredInvocation, OrdinaryLayeredInput};
+use ordered_completion::BackendLayerwiseCompletion;
+pub use ordered_completion::OrderedLayerwiseCompletion;
+
+use observation_paths::ObservationBinding;
+pub use observation_paths::{
+    BoundCaptureSelection, ObservationBinding as LayeredObservationBinding, PrefillObservationDeclaration, PrefillReadoutStage,
+    PreparedCaptureSelection, PreparedCaptureSelectionError, PreparedLayeredObservationError,
+    PreparedLayeredObservationPaths, PreparedObservationBindingIdentity,
+    SharedLayeredObservationPaths,
+};
+
 use std::collections::BTreeMap;
 
 use eredu_checkpoint::{recipe::DerivedWeightRecipe, store::CheckpointSource};
@@ -48,6 +68,15 @@ pub trait ArchitectureParameters<B: NeuralBackend> {
     /// Returns the authoritative mutable-state geometry for this realization.
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError>;
 
+    /// Constructs the actual geometry using an explicit metadata destination.
+    /// The compatibility default does not qualify unmodified constructors.
+    fn state_layout_with_metadata(
+        &self,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<StateLayout, Self::DefinitionError> {
+        self.state_layout()
+    }
+
     /// Declares cache-relevant architecture identity for one realized state partition.
     ///
     /// The partition supplies the exact rank-local layout and architecture-global
@@ -58,11 +87,31 @@ pub trait ArchitectureParameters<B: NeuralBackend> {
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<crate::ModelStateIdentity, Self::DefinitionError>;
 
+    /// Derives the actual architecture identity with a metadata destination.
+    /// The default preserves existing implementations; only an overriding producer
+    /// participates in checked identity construction.
+    fn state_identity_with_metadata(
+        &self,
+        state: &crate::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+        _metadata: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<crate::ModelStateIdentity, Self::DefinitionError> {
+        self.state_identity(state, topology)
+    }
+
     /// Describes every parameter with its canonical graph owner and placement.
     fn parameter_description(
         &self,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<crate::ArchitectureParameterDescription, Self::DefinitionError>;
+
+    /// Borrows the completed immutable description when the actual constructor
+    /// retains one. Compatibility implementations keep their existing producer.
+    fn parameter_description_with_metadata(
+        &self, context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<std::borrow::Cow<'_, crate::ArchitectureParameterDescription>, Self::DefinitionError> {
+        self.parameter_description(context).map(std::borrow::Cow::Owned)
+    }
 
     /// Returns architecture-owned checkpoint rewrites for pinned parameters.
     fn static_parameter_recipes(
@@ -76,6 +125,40 @@ pub trait ArchitectureParameters<B: NeuralBackend> {
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
     where
         V: StaticParameterVisitor<B>;
+
+    /// Stable retained-value slot ceiling for this exact static topology.
+    /// Unknown is not inferred from parameter or current-value traversal. This
+    /// diagnostic grants no completion, replacement, source or storage authority.
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        None
+    }
+
+    /// Borrows all currently retained numerical values outside execution units.
+    /// Include pinned module parameters, operator helpers and other static
+    /// tensors, without evaluating, constructing or mutating them. Return true
+    /// only for complete coverage; false may still contribute known values.
+    ///
+    /// The default traverses declared parameter modules but cannot establish
+    /// that the architecture retains no other numerical owners. Architectures
+    /// with complete static aggregates should traverse those explicitly.
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        struct Values<'a, T>(&'a mut dyn FnMut(&T));
+        impl<B: NeuralBackend> StaticParameterVisitor<B> for Values<'_, B::Tensor> {
+            type Error = std::convert::Infallible;
+            fn visit<M: Parameterized<B::Tensor>>(
+                &mut self,
+                _: &str,
+                module: &M,
+            ) -> Result<(), Self::Error> {
+                module.visit_retained_values(self.0);
+                Ok(())
+            }
+        }
+        match self.visit_static_parameters(&mut Values(visitor)) {
+            Ok(()) => false,
+            Err(never) => match never {},
+        }
+    }
 
     /// Mutably visits every available pinned parameter module exactly once.
     fn visit_static_parameters_mut<V>(&mut self, visitor: &mut V) -> Result<(), V::Error>
@@ -134,23 +217,36 @@ impl<'a> LayeredPipelineSchedule<'a> {
     /// roots. Mandatory encoders, decoder ingress, and finalization always run;
     /// structural merge activity is derived from dependency activity; and
     /// prediction is a later phase.
-    pub fn try_new<E>(
-        graph: &'a ExecutionGraph,
+    pub fn try_new<E>(graph: &'a ExecutionGraph,
         group_contracts: impl IntoIterator<Item = (ArchitectureGroupKind, bool)>,
-        mut request_group_active: impl FnMut(usize) -> Result<bool, E>,
-    ) -> Result<Self, E>
-    where
-        E: From<LayeredPipelineScheduleError>,
-    {
-        let group_contracts = group_contracts.into_iter().collect::<Vec<_>>();
-        if group_contracts.len() != graph.groups().len() {
-            return Err(LayeredPipelineScheduleError::GroupContractCount {
-                graph: graph.groups().len(),
-                declared: group_contracts.len(),
-            }
-            .into());
+        request_group_active: impl FnMut(usize) -> Result<bool,E>) -> Result<Self,E>
+    where E: From<LayeredPipelineScheduleError> {
+        let contracts=group_contracts.into_iter().collect::<Vec<_>>();
+        let active=Self::activity_for(graph,&contracts,vec![false;contracts.len()],request_group_active)?;
+        Ok(Self{graph,schedule:ExecutionGroupSchedule::new(graph),active,completed:0})
+    }
+
+    pub(crate) fn try_new_with_metadata<E>(graph: &'a ExecutionGraph,
+        contracts:&[(ArchitectureGroupKind,bool)], request_group_active:impl FnMut(usize)->Result<bool,E>,
+        context:&eredu_nn::workspace::WorkspaceContext)->Result<Result<Self,E>,eredu_nn::Error>
+    where E:From<LayeredPipelineScheduleError> {
+        context.charge_metadata(std::mem::size_of::<(Self,E,Result<Self,E>,
+            Result<Result<Self,E>,eredu_nn::Error>,&[(ArchitectureGroupKind,bool)])>()
+            .checked_add(std::mem::size_of_val(&request_group_active))
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?)?;
+        let mut active=context.metadata_vec(contracts.len())?;active.resize(contracts.len(),false);
+        let active=match Self::activity_for(graph,contracts,active,request_group_active){
+            Ok(active)=>active,Err(cause)=>return Ok(Err(cause)),
+        };
+        Ok(Ok(Self{graph,schedule:ExecutionGroupSchedule::new_with_metadata(graph,context)?,active,completed:0}))
+    }
+
+    fn activity_for<E>(graph:&ExecutionGraph,group_contracts:&[(ArchitectureGroupKind,bool)],
+        mut active:Vec<bool>,mut request_group_active:impl FnMut(usize)->Result<bool,E>)->Result<Vec<bool>,E>
+    where E:From<LayeredPipelineScheduleError> {
+        if group_contracts.len()!=graph.groups().len(){
+            return Err(LayeredPipelineScheduleError::GroupContractCount{graph:graph.groups().len(),declared:group_contracts.len()}.into());
         }
-        let mut active = vec![false; group_contracts.len()];
         for &group in graph.execution_order() {
             let (kind, request_optional) = group_contracts[group];
             if request_optional
@@ -180,12 +276,7 @@ impl<'a> LayeredPipelineSchedule<'a> {
                 ArchitectureGroupKind::Prediction => false,
             };
         }
-        Ok(Self {
-            graph,
-            schedule: ExecutionGroupSchedule::new(graph),
-            active,
-            completed: 0,
-        })
+        Ok(active)
     }
 
     /// Returns whether a group participates in this pipeline ingress pass.
@@ -229,6 +320,10 @@ impl<'a> LayeredPipelineSchedule<'a> {
     /// another consumer after this group has captured its dependencies.
     pub fn started(&mut self, group: usize) -> Result<Vec<usize>, LayeredPipelineScheduleError> {
         self.schedule.started(group).map_err(Into::into)
+    }
+
+    pub(crate) fn started_without_release(&mut self,group:usize)->Result<(),LayeredPipelineScheduleError>{
+        self.schedule.started_with_release(group,|_|{}).map_err(Into::into)
     }
 
     /// Commits one successfully submitted group and unlocks its dependents.
@@ -318,6 +413,65 @@ pub struct ArchitectureGroupTransport {
     pub request_optional: bool,
 }
 
+/// Borrowed role names and scalar transport policy from an actual architecture declaration.
+#[derive(Clone, Copy)]
+pub struct ArchitectureGroupTransportDeclaration<'a> {
+    /// Physical ownership of the group.
+    pub placement: ArchitectureGroupPlacement,
+    /// Semantic compute role.
+    pub kind: ArchitectureGroupKind,
+    /// Actual first-owner static role names.
+    pub first_owner_static_roles: &'a [&'a str],
+    /// Actual final-owner static role names.
+    pub last_owner_static_roles: &'a [&'a str],
+    /// Dependency merge destination.
+    pub merge_destination: ArchitectureMergeDestination,
+    /// Active Cartesian subgroup.
+    pub parallel_subgroup: Option<ArchitectureParallelSubgroup>,
+    /// Whether request media may omit this group.
+    pub request_optional: bool,
+}
+impl ArchitectureGroupTransportDeclaration<'_> {
+    /// Constructs the ordinary owned policy from these same declarations.
+    pub fn into_owned(self) -> ArchitectureGroupTransport {
+        ArchitectureGroupTransport {
+            placement: self.placement,
+            kind: self.kind,
+            first_owner_static_roles: self
+                .first_owner_static_roles
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+            last_owner_static_roles: self
+                .last_owner_static_roles
+                .iter()
+                .map(|name| (*name).to_owned())
+                .collect(),
+            merge_destination: self.merge_destination,
+            parallel_subgroup: self.parallel_subgroup,
+            request_optional: self.request_optional,
+        }
+    }
+    /// Compares every scalar and ordered role name without constructing owned rows.
+    pub fn matches(&self, expected: &ArchitectureGroupTransport) -> bool {
+        self.placement == expected.placement
+            && self.kind == expected.kind
+            && self
+                .first_owner_static_roles
+                .iter()
+                .copied()
+                .eq(expected.first_owner_static_roles.iter().map(String::as_str))
+            && self
+                .last_owner_static_roles
+                .iter()
+                .copied()
+                .eq(expected.last_owner_static_roles.iter().map(String::as_str))
+            && self.merge_destination == expected.merge_destination
+            && self.parallel_subgroup == expected.parallel_subgroup
+            && self.request_optional == expected.request_optional
+    }
+}
+
 /// Stable layered traversal boundary exposed to generic runtime drivers.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum LayeredTraversalPoint {
@@ -353,6 +507,17 @@ pub trait LayeredTraversalHook<B, C, E>
 where
     B: NeuralBackend,
 {
+    /// Synchronously borrows the complete compact media cut after its owner is
+    /// installed and before decoder assembly. This is not completion, capture
+    /// permission, source publication, or a reason to reset an allocation ledger.
+    fn retained_media_cut(
+        &mut self,
+        _roots: &mut dyn FnMut(&mut dyn FnMut(&B::Tensor)),
+        _context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        Ok(())
+    }
+
     /// Whether architecture-owned input, internal unit and readout observation is enabled.
     fn observes_activations(&self) -> bool {
         false
@@ -376,6 +541,18 @@ where
         } else {
             Ok(())
         }
+    }
+    /// Forward the actual generated program and its caller-owned root retention.
+    fn observe_generated_activation_retained(
+        &mut self,
+        path: &str,
+        prototype: &B::Tensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<B::Tensor, E>,
+    ) -> Result<(), E> {
+        self.observe_generated_activation(path, prototype, source, &mut || {
+            factory.generate(&mut |_| Ok(()))
+        })
     }
 
     /// Returns an admitted replacement at an architecture-owned boundary.
@@ -435,6 +612,40 @@ where
     }
 }
 
+/// A borrowed hook delegates to its existing owner without rebuilding paths.
+impl<B, C, E, H> LayeredTraversalHook<B, C, E> for &mut H
+where B: NeuralBackend, H: LayeredTraversalHook<B, C, E> + ?Sized,
+{
+    fn retained_media_cut(&mut self, roots: &mut dyn FnMut(&mut dyn FnMut(&B::Tensor)), context: &<B::Tensor as eredu_nn::Tensor>::Context) -> Result<(), E> {
+        (**self).retained_media_cut(roots, context)
+    }
+    fn observes_activations(&self) -> bool { (**self).observes_activations() }
+    fn observe_activation(&mut self, path: &str, value: &B::Tensor) -> Result<(), E> {
+        (**self).observe_activation(path, value)
+    }
+    fn observe_generated_activation(&mut self, path: &str, prototype: &B::Tensor, source: &eredu_core::capture::GeneratedCaptureSource, generate: &mut dyn FnMut() -> Result<B::Tensor, E>) -> Result<(), E> {
+        (**self).observe_generated_activation(path, prototype, source, generate)
+    }
+    fn observe_generated_activation_retained(&mut self, path: &str, prototype: &B::Tensor, source: &eredu_core::capture::GeneratedCaptureSource, factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<B::Tensor, E>) -> Result<(), E> {
+        (**self).observe_generated_activation_retained(path, prototype, source, factory)
+    }
+    fn intervene_activation(&mut self, path: &str, value: &B::Tensor) -> Result<Option<B::Tensor>, E> {
+        (**self).intervene_activation(path, value)
+    }
+    fn before_unit(&mut self, group: usize, index: usize, remaining_units: usize, value: &mut B::Tensor, forward: &mut C, context: &<B::Tensor as eredu_nn::Tensor>::Context) -> Result<LayeredUnitAction, E> {
+        (**self).before_unit(group, index, remaining_units, value, forward, context)
+    }
+    fn after_group_begin(&mut self, group: usize, value: &mut B::Tensor, forward: &mut C, context: &<B::Tensor as eredu_nn::Tensor>::Context) -> Result<(), E> {
+        (**self).after_group_begin(group, value, forward, context)
+    }
+    fn after_unit(&mut self, group: usize, index: usize, value: &mut B::Tensor, forward: &mut C, context: &<B::Tensor as eredu_nn::Tensor>::Context) -> Result<(), E> {
+        (**self).after_unit(group, index, value, forward, context)
+    }
+    fn after_group(&mut self, group: usize, value: &mut B::Tensor, forward: &mut C, context: &<B::Tensor as eredu_nn::Tensor>::Context) -> Result<(), E> {
+        (**self).after_group(group, value, forward, context)
+    }
+}
+
 /// Statically combines two traversal hooks over one production forward pass.
 ///
 /// Both hooks observe every reached boundary in left-to-right order. A unit is
@@ -466,6 +677,15 @@ where
     fn observes_activations(&self) -> bool {
         self.left.observes_activations() || self.right.observes_activations()
     }
+    fn retained_media_cut(
+        &mut self,
+        roots: &mut dyn FnMut(&mut dyn FnMut(&B::Tensor)),
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+    ) -> Result<(), E> {
+        self.left.retained_media_cut(roots, context)?;
+        self.right.retained_media_cut(roots, context)
+    }
+
     fn observe_activation(&mut self, path: &str, value: &B::Tensor) -> Result<(), E> {
         self.left.observe_activation(path, value)?;
         self.right.observe_activation(path, value)
@@ -482,6 +702,20 @@ where
         self.right
             .observe_generated_activation(path, prototype, source, generate)
     }
+    /// Forward the actual generated program and its caller-owned root retention.
+    fn observe_generated_activation_retained(
+        &mut self,
+        path: &str,
+        prototype: &B::Tensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<B::Tensor, E>,
+    ) -> Result<(), E> {
+        self.left
+            .observe_generated_activation_retained(path, prototype, source, factory)?;
+        self.right
+            .observe_generated_activation_retained(path, prototype, source, factory)
+    }
+
     fn intervene_activation(
         &mut self,
         path: &str,
@@ -556,11 +790,26 @@ where
     }
 }
 
+/// Observes one traversal-owned boundary, applies its intervention, then
+/// observes the effective value without a second intervention opportunity.
+/// Both names are borrowed so prepared traversals can reuse their retained
+/// paths. Architecture-owned boundaries must not also call this helper.
+pub fn observe_outer_boundary<T: Clone, E, O: ActivationObserver<T, E> + ?Sized>(
+    observer: &mut O,
+    path: &str,
+    effective_path: &str,
+    value: &T,
+) -> Result<T, E> {
+    let effective = observe_and_intervene(observer, path, value)?;
+    observer.observe(effective_path, &effective)?;
+    Ok(effective)
+}
+
 struct NoopLayeredTraversalHook;
 
-struct TraversalActivationObserver<'a, H: ?Sized, B, C, E> {
-    hook: &'a mut H,
-    types: std::marker::PhantomData<fn() -> (B, C, E)>,
+pub(crate) struct TraversalActivationObserver<'a, H: ?Sized, B, C, E> {
+    pub(crate) hook: &'a mut H,
+    pub(crate) types: std::marker::PhantomData<fn() -> (B, C, E)>,
 }
 impl<B, C, E, H> ActivationObserver<B::Tensor, E> for TraversalActivationObserver<'_, H, B, C, E>
 where
@@ -580,6 +829,18 @@ where
         self.hook
             .observe_generated_activation(path, prototype, source, generate)
     }
+    /// Forward the actual generated program and its caller-owned root retention.
+    fn observe_generated_retained(
+        &mut self,
+        path: &str,
+        prototype: &B::Tensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<B::Tensor, E>,
+    ) -> Result<(), E> {
+        self.hook
+            .observe_generated_activation_retained(path, prototype, source, factory)
+    }
+
     fn intervene(&mut self, path: &str, value: &B::Tensor) -> Result<Option<B::Tensor>, E> {
         self.hook.intervene_activation(path, value)
     }
@@ -616,6 +877,19 @@ where
             .borrow_mut()
             .observe_generated(path, prototype, source, generate)
     }
+    /// Forward the actual generated program and its caller-owned root retention.
+    fn observe_generated_activation_retained(
+        &mut self,
+        path: &str,
+        prototype: &B::Tensor,
+        source: &eredu_core::capture::GeneratedCaptureSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<B::Tensor, E>,
+    ) -> Result<(), E> {
+        self.observer
+            .borrow_mut()
+            .observe_generated_retained(path, prototype, source, factory)
+    }
+
     fn intervene_activation(
         &mut self,
         path: &str,
@@ -637,7 +911,8 @@ where
         };
         let path = eredu_core::UnitObservation::Input.path(unit);
         let mut observer = self.observer.borrow_mut();
-        *value = observe_and_intervene(&mut **observer, &path, value)?;
+        *value =
+            observe_outer_boundary(&mut **observer, &path, &format!("{path}.effective"), value)?;
         Ok(LayeredUnitAction::Execute)
     }
 
@@ -654,7 +929,8 @@ where
         };
         let path = eredu_core::UnitObservation::Output.path(unit);
         let mut observer = self.observer.borrow_mut();
-        *value = observe_and_intervene(&mut **observer, &path, value)?;
+        *value =
+            observe_outer_boundary(&mut **observer, &path, &format!("{path}.effective"), value)?;
         Ok(())
     }
 
@@ -746,10 +1022,39 @@ where
         Default::default()
     }
 
+    /// Non-serialized ordinary-text row semantics emitted by this actual
+    /// architecture beside its hooks. This is a semantic declaration, not native
+    /// support, capture admission or execution authority. Empty means unfinished
+    /// row-assembly coverage, not architectural inapplicability.
+    ///
+    /// Declarations apply only to canonical ordinary text with its retained
+    /// causal prefix, no supplied attention mask or activation interventions.
+    /// Construction/rebinding occurs under loading/preparation authority.
+    fn prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<PrefillObservationDeclaration>, Self::Error> {
+        Ok(Vec::new())
+    }
+
+    /// Decoder-row equivalence for this architecture's validated retained-media
+    /// ingress. This never declares encoder axes or intervention equivalence.
+    /// The session must authenticate the actual source/ingress plan before use.
+    fn media_prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<PrefillObservationDeclaration>, Self::Error> {
+        Ok(Vec::new())
+    }
+
     /// Borrowed prepared model input.
     type Input<'a>
     where
         Self: 'a;
+
+    /// Inspects the decoder dimensions without native allocation or execution.
+    /// `None` identifies an auxiliary invocation whose equations are not covered
+    /// by an ordinary prompt/decode workspace quote (for example an embedded
+    /// proposal pass). It must be separately admitted before budgeted execution.
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error>;
     /// Pinned model modules such as embeddings, final normalization, and head.
     type StaticModules: Parameterized<B::Tensor>;
     /// One ordered execution unit.
@@ -767,6 +1072,11 @@ where
     /// Declares transport and physical placement semantics for one canonical group slot.
     fn group_transport(&self, group: usize) -> ArchitectureGroupTransport;
 
+    /// Compares actual transport policy. Overrides may borrow their original role declarations.
+    fn group_transport_matches(&self, group: usize, expected: &ArchitectureGroupTransport) -> bool {
+        self.group_transport(group) == *expected
+    }
+
     /// Returns the stable identifier of the primary pipeline execution group.
     ///
     /// Pipeline composition resolves this identifier against [`Self::execution_graph`]
@@ -782,6 +1092,11 @@ where
     fn prediction_execution_groups(&self) -> Vec<String> {
         Vec::new()
     }
+
+    /// Requests the existing target-capture retention before equation execution.
+    /// Architectures that already retain it need no setup. This is not a support
+    /// claim: consumers must still require an actual `prediction_target_capture`.
+    fn retain_prediction_target_capture(&mut self) {}
 
     /// Borrows the exact ordinary-target value consumed by an additive prediction extension.
     fn prediction_target_capture(_context: &Self::ForwardContext) -> Option<&B::Tensor> {
@@ -802,11 +1117,39 @@ where
     /// Declares the dependency graph between ordered execution groups.
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error>;
 
+    /// Supplies actual graph declarations for checked construction. The compatibility
+    /// default retains the existing owned producer and is not a metadata qualification.
+    fn execution_graph_with_metadata(
+        &self,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<crate::ArchitectureExecutionGraph<'_>, Self::Error> {
+        self.execution_graph()
+            .map(crate::ArchitectureExecutionGraph::owned)
+    }
+
     /// Returns the number of ordered execution units in one graph group.
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error>;
 
+    /// Reads the same unit population with a paid diagnostic destination when overridden.
+    fn group_unit_count_with_metadata(
+        &self,
+        group: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<usize, Self::Error> {
+        self.group_unit_count(group)
+    }
+
     /// Returns the stable architecture-owned path of one group-local execution unit.
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error>;
+
+    /// Emits the same architecture-owned unit name into a participating metadata
+    /// destination. The compatibility default preserves the existing producer;
+    /// original constructors qualify this hook alongside their unit factories.
+    fn unit_path_with_metadata(&self,group:usize,index:usize,
+        _context:&eredu_nn::workspace::WorkspaceContext)->Result<String,Self::Error>{
+        self.unit_path(group,index)
+    }
+
 
     /// Whether observed unit execution owns both input/output capture and
     /// intervention, including their effective companions. The traversal omits
@@ -824,6 +1167,17 @@ where
     /// Architecture-owned name for the activation emitted after group completion.
     fn group_output_observation_path(&self, _group: usize) -> Result<Option<String>, Self::Error> {
         Ok(None)
+    }
+
+    /// Emits the same group ingress name into the selected metadata destination.
+    fn group_input_observation_path_with_metadata(&self, group:usize,
+        _context:&eredu_nn::workspace::WorkspaceContext)->Result<Option<String>,Self::Error>{
+        self.group_input_observation_path(group)
+    }
+    /// Emits the same group completion name into the selected metadata destination.
+    fn group_output_observation_path_with_metadata(&self, group:usize,
+        _context:&eredu_nn::workspace::WorkspaceContext)->Result<Option<String>,Self::Error>{
+        self.group_output_observation_path(group)
     }
 
     /// Borrows pinned modules for parameter discovery and binding.
@@ -945,6 +1299,28 @@ where
         Ok(hidden.clone())
     }
 
+    /// Supplies final public demand before any group or unit projection.
+    /// Architectures with earlier decision readouts merge their other consumers
+    /// with this demand while preserving complete mutable state.
+    fn set_readout_demand(
+        &self,
+        _forward: &mut Self::ForwardContext,
+        _demand: eredu_core::OutputDemand,
+    ) {
+    }
+
+    /// Selects hidden positions before final normalization and vocabulary
+    /// projection. Family geometry owns the sequence axis; mutable state and
+    /// prediction captures in `forward` retain their complete sequence.
+    /// Return `None` exactly for state-only execution.
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error>;
+
     /// Applies final normalization and output projection.
     fn finish_forward(
         &mut self,
@@ -967,6 +1343,30 @@ where
         O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         self.finish_forward(hidden, state, forward, context)
+    }
+
+    /// Existing forward-owned metadata destination, when its constructors participate.
+    /// The default reports no destination and preserves ordinary allocation behavior.
+    fn forward_metadata(
+        &self,
+        _forward: &Self::ForwardContext,
+    ) -> Option<LayeredForwardMetadata<Self::Error>> {
+        None
+    }
+
+    /// Visits the same unit retention in order. The default preserves the
+    /// existing iterator; implementations with paid forward metadata can avoid
+    /// an intermediate owning container by lending their actual fields.
+    fn visit_retained_context_values<'a>(
+        &'a self,
+        forward: &'a Self::ForwardContext,
+        group: usize,
+        index: usize,
+        visitor: &mut dyn FnMut(&'a B::Tensor),
+    ) {
+        for value in self.retained_context_values(forward, group, index) {
+            visitor(value);
+        }
     }
 
     /// Borrows transient forward tensors required by one unit's submission.
@@ -1137,6 +1537,11 @@ pub enum LayeredPartitionInput<'a, T, A = NoAuxiliaryBoundary> {
 /// transport boundary. Families retain ownership of auxiliary boundary values
 /// and of any hidden activation required by an embedded predictor.
 pub enum LayeredPartitionOutput<T, A = NoAuxiliaryBoundary> {
+    /// State-only execution retains completion dependencies without scores.
+    StateOnly {
+        /// Full final hidden value, including any prediction dependency.
+        retained: T,
+    },
     /// Complete architecture output produced by the output owner.
     Final {
         /// Projected architecture output, normally vocabulary logits.
@@ -1178,6 +1583,12 @@ where
 
     /// Derives the complete transport schema from the normalized architecture.
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error>;
+
+    /// Derives the same typed boundary using an admitted metadata destination.
+    fn boundary_schema_with_metadata(&self,context:&eredu_nn::workspace::WorkspaceContext)
+        ->Result<Self::Boundary,eredu_nn::Error> {
+        Err(context.metadata_source(eredu_nn::workspace::WorkspaceMetadataError::Unqualified))
+    }
 
     /// Prepares a replicated partition from tokens or upstream hidden state.
     fn begin_partition<'a>(
@@ -1335,6 +1746,66 @@ where
         O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         self.finish_partition(hidden, state, forward, owns_output, parallel, context)
+    }
+
+    /// Restores a retained prediction value from full hidden positions after
+    /// selective readout. Families retaining transformed or concatenated state
+    /// override this equation; the default retains the ordinary hidden value.
+    fn partition_prediction_capture(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<B::Tensor, Self::Error> {
+        Ok(hidden.clone())
+    }
+
+    /// Selects readout positions only on the output owner, preserving transport
+    /// and prediction values at their full sequence geometry.
+    fn finish_partition_with_readout<O>(
+        &mut self,
+        hidden: &B::Tensor,
+        state: &mut S,
+        forward: &Self::ForwardContext,
+        owns_output: bool,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+        observer: &mut O,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<
+        LayeredPartitionOutput<
+            B::Tensor,
+            <Self::Boundary as crate::ArchitectureBoundary>::Boundary<B::Tensor>,
+        >,
+        Self::Error,
+    >
+    where
+        O: ActivationObserver<B::Tensor, Self::Error> + ?Sized,
+    {
+        if !owns_output {
+            return self.finish_partition_observed(
+                hidden, state, forward, false, parallel, context, observer,
+            );
+        }
+        let Some(selected) = self.select_readout_positions(hidden, forward, demand, context)?
+        else {
+            return Ok(LayeredPartitionOutput::StateOnly {
+                retained: hidden.clone(),
+            });
+        };
+        let mut result = self.finish_partition_observed(
+            &selected, state, forward, true, parallel, context, observer,
+        )?;
+        if let LayeredPartitionOutput::Final {
+            retained: Some(retained),
+            ..
+        } = &mut result
+        {
+            if demand != eredu_core::OutputDemand::Sequence {
+                *retained = self.partition_prediction_capture(hidden, forward, context)?;
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -1634,8 +2105,9 @@ where
     A: LayeredArchitecture<B, S>,
 {
     architecture: A,
-    graph: ExecutionGraph,
+    graph: resident_construction::ResidentGraph,
     units: Vec<Vec<A::Unit>>,
+    observation_binding: ObservationBinding,
     backend: std::marker::PhantomData<fn() -> (B, S)>,
 }
 
@@ -1650,22 +2122,7 @@ where
         architecture: A,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
     ) -> Result<Self, A::Error> {
-        let graph = architecture.execution_graph()?;
-        let mut units = Vec::with_capacity(graph.groups().len());
-        for group in 0..graph.groups().len() {
-            let count = architecture.group_unit_count(group)?;
-            units.push(
-                (0..count)
-                    .map(|index| architecture.build_unit(group, index, context))
-                    .collect::<Result<Vec<_>, _>>()?,
-            );
-        }
-        Ok(Self {
-            architecture,
-            graph,
-            units,
-            backend: std::marker::PhantomData,
-        })
+        resident_construction::ordinary(architecture, context)
     }
 
     /// Runs one complete prefill or decode pass without dynamic dispatch.
@@ -1704,36 +2161,154 @@ where
     where
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
-        let forward = if hook.observes_activations() {
-            self.architecture.begin_forward_observed(
-                input,
-                state,
-                context,
-                &mut TraversalActivationObserver {
-                    hook,
-                    types: std::marker::PhantomData,
-                },
-            )
-        } else {
-            self.architecture.begin_forward(input, state, context)
-        }?;
-        let initial = forward.hidden;
+        self.forward_with_traversal_hook_with_readout(
+            input,
+            state,
+            context,
+            hook,
+            eredu_core::OutputDemand::Sequence,
+        )
+        .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
+    }
+
+    /// Runs the same traversal with explicit vocabulary output demand.
+    pub fn forward_with_traversal_hook_with_readout<'a, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: &mut H,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), A::Error>
+    where
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
+        self.forward_with_invocation_and_traversal_hook(
+            OrdinaryLayeredInput::new(input),
+            state,
+            context,
+            hook,
+            demand,
+        )
+    }
+
+    pub(crate) fn forward_with_invocation_and_traversal_hook<I, H>(
+        &mut self,
+        invocation: I,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: &mut H,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), A::Error>
+    where
+        I: LayeredInvocation<A, B, S>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
+        self.forward_with_invocation_and_unit_executor(
+            invocation, state, context, hook, demand,
+            |architecture, group, index, unit, hidden, state, forward, context, hook| {
+                if hook.observes_activations() {
+                        architecture.forward_unit_observed(
+                            group,
+                            index,
+                            unit,
+                            hidden,
+                            state,
+                            forward,
+                            context,
+                            &mut TraversalActivationObserver {
+                                hook,
+                                types: std::marker::PhantomData,
+                            },
+                        )
+                    } else {
+                        architecture.forward_unit(
+                            group,
+                            index,
+                            unit,
+                            hidden,
+                            state,
+                            forward,
+                            context,
+                        )
+                    }
+            })
+    }
+
+    pub(crate) fn forward_with_invocation_and_unit_executor<I, H, E>(
+        &mut self,
+        mut invocation: I,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: &mut H,
+        demand: eredu_core::OutputDemand,
+        mut execute: E,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), A::Error>
+    where
+        I: LayeredInvocation<A, B, S>,
+        E: FnMut(&mut A, usize, usize, &mut A::Unit, &B::Tensor, &mut S,
+            &mut A::ForwardContext, &<B::Tensor as Tensor>::Context, &mut H)
+            -> Result<B::Tensor, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
+        let forward = invocation.begin(&mut self.architecture, state, context, hook)?;
+        let metadata = metadata::Destination(<A as LayeredArchitecture<B, S>>::forward_metadata(&self.architecture, &forward.context));
+        metadata.controls::<(
+            E,
+            Vec<Option<B::Tensor>>,
+            Vec<B::Tensor>,
+            Vec<&B::Tensor>,
+            metadata::Destination<A::Error>,
+        )>()?;
+        let mut initial = forward.hidden;
         let mut forward_context = forward.context;
-        let mut schedule = ExecutionGroupSchedule::new(&self.graph);
-        let mut outputs: Vec<Option<B::Tensor>> = vec![None; self.graph.groups().len()];
+        self.architecture
+            .set_readout_demand(&mut forward_context, demand);
+        let mut schedule = metadata.schedule(&self.graph)?;
+        let mut outputs: Vec<Option<B::Tensor>> = metadata.vector(self.graph.groups().len())?;
+        outputs.resize_with(self.graph.groups().len(), || None);
         for &group in self.graph.execution_order() {
-            let dependencies = schedule
+            if let Some(retained) = invocation.retained_group(group) {
+                schedule
+                    .started_with_release(group, |dependency| outputs[dependency] = None)
+                    .expect("retained group is dependency ready");
+                outputs[group] = retained;
+                schedule
+                    .ordered(group)
+                    .expect("retained group is ordered once");
+                continue;
+            }
+            if invocation.before_group_with_hook(
+                &mut self.architecture,
+                group,
+                &mut initial,
+                &mut forward_context,
+                state,
+                None,
+                context,
+                hook,
+            )? {
+                self.architecture
+                    .set_readout_demand(&mut forward_context, demand);
+            }
+            let dependency_slots = schedule
                 .dependencies(group)
-                .expect("validated execution order contains a known group")
-                .iter()
-                .map(|&dependency| {
-                    outputs[dependency]
-                        .as_ref()
-                        .expect("topological dependency has completed")
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            let dependency_refs = dependencies.iter().collect::<Vec<_>>();
+                .expect("validated execution order contains a known group");
+            let mut dependencies = metadata.vector(dependency_slots.len())?;
+            dependencies.extend(dependency_slots.iter().filter_map(|&dependency| {
+                if invocation.is_inactive_dependency(dependency) {
+                    None
+                } else {
+                    Some(
+                        outputs[dependency]
+                            .as_ref()
+                            .expect("active topological dependency has completed")
+                            .clone(),
+                    )
+                }
+            }));
+            let mut dependency_refs = metadata.vector(dependencies.len())?;
+            dependency_refs.extend(dependencies.iter());
             let mut hidden = self.architecture.begin_execution_group(
                 group,
                 &initial,
@@ -1743,16 +2318,13 @@ where
                 context,
             )?;
             hook.after_group_begin(group, &mut hidden, &mut forward_context, context)?;
-            for dependency in schedule
-                .started(group)
-                .expect("topological execution starts only ready groups")
-            {
-                outputs[dependency] = None;
-            }
-            if self
+            schedule
+                .started_with_release(group, |dependency| outputs[dependency] = None)
+                .expect("topological execution starts only ready groups");
+            let active = self
                 .architecture
-                .should_execute_group(group, &forward_context)
-            {
+                .should_execute_group(group, &forward_context);
+            if active {
                 let unit_count = self.units[group].len();
                 for (index, unit) in self.units[group].iter_mut().enumerate() {
                     if hook.before_unit(
@@ -1766,31 +2338,8 @@ where
                     {
                         break;
                     }
-                    hidden = if hook.observes_activations() {
-                        self.architecture.forward_unit_observed(
-                            group,
-                            index,
-                            unit,
-                            &hidden,
-                            state,
-                            &mut forward_context,
-                            context,
-                            &mut TraversalActivationObserver {
-                                hook,
-                                types: std::marker::PhantomData,
-                            },
-                        )
-                    } else {
-                        self.architecture.forward_unit(
-                            group,
-                            index,
-                            unit,
-                            &hidden,
-                            state,
-                            &mut forward_context,
-                            context,
-                        )
-                    }?;
+                    hidden = execute(&mut self.architecture, group, index, unit, &hidden,
+                        state, &mut forward_context, context, hook)?;
                     hook.after_unit(group, index, &mut hidden, &mut forward_context, context)?;
                 }
             }
@@ -1802,6 +2351,11 @@ where
                 context,
             )?;
             hook.after_group(group, &mut hidden, &mut forward_context, context)?;
+            if active {
+                invocation.after_group(group, &hidden);
+            } else {
+                invocation.after_inactive_group(group);
+            }
             outputs[group] = Some(hidden);
             schedule
                 .ordered(group)
@@ -1810,21 +2364,32 @@ where
         let hidden = outputs[self.graph.output()]
             .take()
             .expect("validated graph output completed");
-        let output = if hook.observes_activations() {
-            self.architecture.finish_forward_observed(
-                &hidden,
-                state,
-                &forward_context,
-                context,
-                &mut TraversalActivationObserver {
-                    hook,
-                    types: std::marker::PhantomData,
-                },
-            )
+        let selected_hidden = self.architecture.select_readout_positions(
+            &hidden,
+            &forward_context,
+            demand,
+            context,
+        )?;
+        let output = if let Some(selected_hidden) = selected_hidden {
+            let output = if hook.observes_activations() {
+                self.architecture.finish_forward_observed(
+                    &selected_hidden,
+                    state,
+                    &forward_context,
+                    context,
+                    &mut TraversalActivationObserver {
+                        hook,
+                        types: std::marker::PhantomData,
+                    },
+                )
+            } else {
+                self.architecture
+                    .finish_forward(&selected_hidden, state, &forward_context, context)
+            }?;
+            Some(output)
         } else {
-            self.architecture
-                .finish_forward(&hidden, state, &forward_context, context)
-        }?;
+            None
+        };
         Ok((output, forward_context))
     }
 
@@ -1833,8 +2398,31 @@ where
         &self.architecture
     }
 
+    /// Runs a typed prediction operation against retained target modules.
+    /// Only an operation declaring stable target geometry and observation
+    /// declarations preserves the binding; arbitrary mutable access still
+    /// invalidates it before execution, including on error or unwind.
+    pub fn apply_prediction_target_operation<O>(
+        &mut self,
+        operation: O,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<O::Output, A::Error>
+    where
+        O: crate::PredictionTargetOperation<A, B, S>,
+    {
+        let architecture = if operation.preserves_architecture_declarations() {
+            &mut self.architecture
+        } else {
+            self.architecture_mut()
+        };
+        operation.apply(architecture, state, parallel, context)
+    }
+
     /// Mutably borrows the architecture.
     pub fn architecture_mut(&mut self) -> &mut A {
+        self.observation_binding.invalidate();
         &mut self.architecture
     }
 
@@ -1872,6 +2460,44 @@ where
         false
     }
 
+    /// Stable slot ceiling for current idle policy-owned topology. Future unit
+    /// materialization is separate. Pending or unknown ownership returns None.
+    fn retained_value_slot_bound(&self) -> Option<usize>
+    where
+        U: Parameterized<B::Tensor>,
+    {
+        None
+    }
+
+    /// Inspects values currently owned by the policy without acquiring units,
+    /// mutating parameters or establishing native completion. Include resident
+    /// modules, their numerical helpers and overrides used on future loads. Unloaded parameters
+    /// have no value here; source and future materialization are separate costs.
+    /// False means incomplete coverage, including when some values were visited.
+    fn visit_retained_values(&self, _visitor: &mut dyn FnMut(&B::Tensor)) -> bool
+    where
+        U: Parameterized<B::Tensor>,
+    {
+        false
+    }
+
+    /// Borrows strict metadata and actual values from the idle resident owner.
+    /// The higher-ranked visitor cannot retain a unit reference beyond its
+    /// lexical source loan. No unit acquisition, mutation, evaluation or
+    /// completion is authorized. False means incomplete coverage and callers
+    /// must discard partial rows. The existing quote pays callback/source controls.
+    fn visit_resident_parameter_sources<V>(
+        &self,
+        _visitor: &mut V,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<bool, eredu_nn::Error>
+    where
+        U: Parameterized<B::Tensor>,
+        V: for<'source> eredu_nn::ParameterSourceVisitor<'source, B::Tensor>,
+    {
+        Ok(false)
+    }
+
     /// Visits all permanently bound units, with no native work or reloading.
     /// Returns false before invoking the visitor when this mechanism is unavailable.
     fn visit_resident_units(&mut self, _visitor: &mut impl FnMut(&mut U)) -> bool {
@@ -1906,6 +2532,38 @@ where
         _active: bool,
     ) -> Result<bool, Self::Error> {
         Ok(false)
+    }
+
+    /// Selects the supplied executor for every group of this forward.
+    /// A policy may opt in only from its retained preparation and must validate
+    /// that executor before returning true. The default preserves backend forks.
+    fn uses_shared_group_executor(&self, _executor: &B::Executor) -> Result<bool, Self::Error>
+    where
+        B: SubmissionBackend,
+    {
+        Ok(false)
+    }
+
+    /// Submits one graph-boundary value using this retained execution policy.
+    /// The returned owner cannot borrow this policy, executor or input; it may
+    /// retain finite backend resources through subsequent group scheduling.
+    /// The default preserves ordinary backend submission and ordering exactly.
+    /// Initial submission precedes `begin`; later groups use the same method
+    /// through the active policy. No arbitrary host-retention API is implied.
+    /// Creation errors retain the policy's own concrete type; the default uses
+    /// the backend completion error without allocating a conversion wrapper.
+    fn submit_group(
+        &mut self,
+        executor: &B::Executor,
+        value: &B::Tensor,
+    ) -> Result<
+        impl OrderedLayerwiseCompletion<B::Executor> + 'static,
+        impl std::error::Error + Send + Sync + 'static,
+    >
+    where
+        B: SubmissionBackend,
+    {
+        B::submit(executor, [value]).map(BackendLayerwiseCompletion::<B>::new)
     }
 
     /// Starts one forward after architecture input preparation.
@@ -2100,7 +2758,7 @@ where
     Policy(P),
     /// Backend-native graph submission or dependency ordering failed.
     #[error("layerwise backend submission failed: {0}")]
-    Submission(String),
+    Submission(#[source] eredu_core::BackendFailure),
 }
 
 /// Bounded-unit runtime invoking the same architecture lifecycle as resident execution.
@@ -2114,6 +2772,9 @@ where
     architecture: A,
     policy: P,
     executors: Option<Vec<B::OwnedExecutor>>,
+    prepared_geometry: Option<crate::PreparedReplicatedTextExecutionGeometry>,
+    geometry_stale: bool,
+    observation_binding: ObservationBinding,
     backend: std::marker::PhantomData<fn() -> (B, S)>,
 }
 
@@ -2128,8 +2789,44 @@ where
     type Architecture = A;
     type Policy = P;
     fn parameter_parts(&mut self) -> Option<(&mut A, &mut P)> {
+        self.observation_binding.invalidate();
+        self.geometry_stale |= self.prepared_geometry.is_some();
         Some((&mut self.architecture, &mut self.policy))
     }
+    fn parameter_parts_ref(&self) -> Option<(&A, &P)> {
+        Some((&self.architecture, &self.policy))
+    }
+    fn visit_loaded_parameters(
+        &mut self,
+        visitor: &mut dyn eredu_nn::ParameterSlotVisitor<B::Tensor>,
+    ) -> bool {
+        self.observation_binding.invalidate();
+        crate::parameter_operations::visit_loaded_parameters_in_parts::<A, B, S, P>(
+            &mut self.architecture, &mut self.policy, visitor,
+        )
+    }
+    fn with_parameter_slots(
+        &mut self,
+        location: &crate::parameter_operations::PreparedParameterLocation,
+        operation: &mut crate::parameter_operations::ParameterSlotOperation<'_, B::Tensor, P::Error>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<bool, LayerwiseAcquireError<A::Error, P::Error>> {
+        self.observation_binding.invalidate();
+        crate::parameter_operations::with_parameter_slots_in_parts::<A, B, S, P>(
+            &mut self.architecture, &mut self.policy, location, operation, context,
+        )
+    }
+    fn publish_parameter_replacements(
+        &mut self,
+        values: &BTreeMap<String, B::Tensor>,
+        active: bool,
+    ) -> Result<bool, P::Error> {
+        self.observation_binding.invalidate();
+        crate::parameter_operations::publish_parameter_replacements_in_parts::<A, B, S, P>(
+            &mut self.architecture, &mut self.policy, values, active,
+        )
+    }
+
 }
 
 impl<A, B, S, P> LayerwiseRuntime<A, B, S, P>
@@ -2147,6 +2844,29 @@ where
             architecture,
             policy,
             executors: None,
+            prepared_geometry: None,
+            geometry_stale: false,
+            observation_binding: ObservationBinding::new(),
+            backend: std::marker::PhantomData,
+        }
+    }
+
+    /// Uses the existing geometry from the matching validated construction
+    /// contract. No graph, declaration or layout clone is made. Mutation through
+    /// an arbitrary architecture handle makes subsequent traversal refuse this
+    /// retained geometry instead of falling back to ordinary reconstruction.
+    pub fn new_with_prepared_geometry(
+        architecture: A,
+        policy: P,
+        geometry: crate::PreparedReplicatedTextExecutionGeometry,
+    ) -> Self {
+        Self {
+            architecture,
+            policy,
+            executors: None,
+            prepared_geometry: Some(geometry),
+            geometry_stale: false,
+            observation_binding: ObservationBinding::new(),
             backend: std::marker::PhantomData,
         }
     }
@@ -2163,8 +2883,32 @@ where
         &self.architecture
     }
 
+    /// Runs a typed prediction operation against retained target modules.
+    /// Only an operation declaring stable target geometry and observation
+    /// declarations preserves the binding; arbitrary mutable access still
+    /// invalidates it before execution, including on error or unwind.
+    pub fn apply_prediction_target_operation<O>(
+        &mut self,
+        operation: O,
+        state: &mut S,
+        parallel: Option<&B::ParallelContext>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<O::Output, A::Error>
+    where
+        O: crate::PredictionTargetOperation<A, B, S>,
+    {
+        let architecture = if operation.preserves_architecture_declarations() {
+            &mut self.architecture
+        } else {
+            self.architecture_mut()
+        };
+        operation.apply(architecture, state, parallel, context)
+    }
+
     /// Mutably borrows the concrete architecture instance.
     pub fn architecture_mut(&mut self) -> &mut A {
+        self.observation_binding.invalidate();
+        self.geometry_stale |= self.prepared_geometry.is_some();
         &mut self.architecture
     }
 
@@ -2293,7 +3037,29 @@ where
     where
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_with_internal_observer_and_context(
+        self.forward_with_observer_and_context_with_readout(
+            input,
+            state,
+            context,
+            observer,
+            eredu_core::OutputDemand::Sequence,
+        )
+        .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
+    }
+
+    /// Runs the same traversal with explicit vocabulary output demand.
+    pub fn forward_with_observer_and_context_with_readout<'a, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_with_internal_observer_and_context_with_readout(
             input,
             state,
             context,
@@ -2303,6 +3069,7 @@ where
                 )
             },
             observer,
+            demand,
         )
     }
 
@@ -2367,7 +3134,14 @@ where
                     .transpose()?;
                 let input = path
                     .as_ref()
-                    .map(|path| observe_and_intervene(observer, &format!("{path}.input"), hidden))
+                    .map(|path| {
+                        observe_outer_boundary(
+                            observer,
+                            &format!("{path}.input"),
+                            &format!("{path}.input.effective"),
+                            hidden,
+                        )
+                    })
                     .transpose()?;
                 let output = execute(
                     architecture,
@@ -2380,9 +3154,12 @@ where
                     context,
                 )?;
                 match path {
-                    Some(path) => {
-                        observe_and_intervene(observer, &format!("{path}.output"), &output)
-                    }
+                    Some(path) => observe_outer_boundary(
+                        observer,
+                        &format!("{path}.output"),
+                        &format!("{path}.output.effective"),
+                        &output,
+                    ),
                     None => Ok(output),
                 }
             },
@@ -2396,7 +3173,7 @@ where
         input: A::Input<'a>,
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        mut execute: E,
+        execute: E,
         observer: &mut Observer,
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
@@ -2413,10 +3190,89 @@ where
         ) -> Result<B::Tensor, A::Error>,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
+        self.forward_with_internal_observer_and_context_with_readout(
+            input,
+            state,
+            context,
+            execute,
+            observer,
+            eredu_core::OutputDemand::Sequence,
+        )
+        .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
+    }
+
+    /// Runs the same traversal with explicit vocabulary output demand.
+    pub fn forward_with_internal_observer_and_context_with_readout<'a, E, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        execute: E,
+        observer: &mut Observer,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+            &mut Observer,
+        ) -> Result<B::Tensor, A::Error>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_invocation_with_internal_observer(
+            OrdinaryLayeredInput::new(input),
+            state,
+            context,
+            execute,
+            observer,
+            demand,
+            false,
+        )
+    }
+
+    pub(crate) fn forward_invocation_with_internal_observer<I, E, Observer>(
+        &mut self,
+        invocation: I,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        observer: &mut Observer,
+        demand: eredu_core::OutputDemand,
+        retained_unit_selection: bool,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        I: LayeredInvocation<A, B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+            &mut Observer,
+        ) -> Result<B::Tensor, A::Error>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        if self.geometry_stale {
+            return Err(crate::ExecutionUnitLayoutError::StalePreparedGeometry.into());
+        }
+        let ordinary_graph;
+        let graph = match self.prepared_geometry.as_ref() {
+            Some(geometry) => geometry.graph(),
+            None => {
+                ordinary_graph = self.architecture.execution_graph()
+                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                &ordinary_graph
+            }
+        };
         let mut units = Vec::with_capacity(graph.groups().len());
         let mut group_inputs = Vec::with_capacity(graph.groups().len());
         let mut group_outputs = Vec::with_capacity(graph.groups().len());
@@ -2456,11 +3312,11 @@ where
             group_inputs,
             group_outputs,
         };
-        self.forward_with_unit_executor_and_traversal_hook(
-            input,
+        self.forward_with_unit_executor_and_invocation(
+            invocation,
             state,
             context,
-            |architecture, group, index, unit, hidden, state, forward, context| {
+            |architecture, group, index, unit, hidden, state, forward, context, _hook| {
                 execute(
                     architecture,
                     group,
@@ -2474,6 +3330,9 @@ where
                 )
             },
             &mut hook,
+            false,
+            retained_unit_selection,
+            demand,
         )
     }
 
@@ -2527,7 +3386,38 @@ where
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_with_internal_observer_and_context(
+        self.forward_with_provider_and_observer_and_context_with_readout(
+            input,
+            state,
+            pass,
+            provider,
+            context,
+            observer,
+            eredu_core::OutputDemand::Sequence,
+        )
+        .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
+    }
+
+    /// Runs the same traversal with explicit vocabulary output demand.
+    pub fn forward_with_provider_and_observer_and_context_with_readout<'a, Provider, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        pass: ExpertPass,
+        provider: &mut Provider,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        B: eredu_nn::GroupedNeuralBackend,
+        A: RoutedLayeredArchitecture<B, S>,
+        A::Error: std::fmt::Display,
+        Provider: RoutedExpertProvider<B>,
+        Provider::Error: std::fmt::Display,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_with_internal_observer_and_context_with_readout(
             input,
             state,
             context,
@@ -2537,6 +3427,7 @@ where
                 )
             },
             observer,
+            demand,
         )
     }
 
@@ -2584,10 +3475,18 @@ where
         Provider::Error: std::fmt::Display,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
+        if self.geometry_stale {
+            return Err(crate::ExecutionUnitLayoutError::StalePreparedGeometry.into());
+        }
+        let ordinary_graph;
+        let graph = match self.prepared_geometry.as_ref() {
+            Some(geometry) => geometry.graph(),
+            None => {
+                ordinary_graph = self.architecture.execution_graph()
+                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                &ordinary_graph
+            }
+        };
         let mut units = Vec::with_capacity(graph.groups().len());
         let mut group_inputs = Vec::with_capacity(graph.groups().len());
         let mut group_outputs = Vec::with_capacity(graph.groups().len());
@@ -2726,6 +3625,28 @@ where
     where
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
+        self.forward_with_traversal_hook_with_readout(
+            input,
+            state,
+            context,
+            hook,
+            eredu_core::OutputDemand::Sequence,
+        )
+        .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
+    }
+
+    /// Runs the same traversal with explicit vocabulary output demand.
+    pub fn forward_with_traversal_hook_with_readout<'a, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: &mut H,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
         self.forward_with_unit_executor_and_traversal_hook_impl(
             input,
             state,
@@ -2735,6 +3656,7 @@ where
             },
             hook,
             true,
+            demand,
         )
     }
 
@@ -2760,20 +3682,27 @@ where
         ) -> Result<B::Tensor, A::Error>,
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
-        self.forward_with_unit_executor_and_traversal_hook_impl(
-            input, state, context, execute, hook, false,
+        self.forward_with_unit_executor_and_traversal_hook_with_readout(
+            input,
+            state,
+            context,
+            execute,
+            hook,
+            eredu_core::OutputDemand::Sequence,
         )
+        .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
     }
 
-    fn forward_with_unit_executor_and_traversal_hook_impl<'a, E, H>(
+    /// Runs the same traversal with explicit vocabulary output demand.
+    pub fn forward_with_unit_executor_and_traversal_hook_with_readout<'a, E, H>(
         &mut self,
         input: A::Input<'a>,
         state: &mut S,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        mut execute: E,
+        execute: E,
         hook: &mut H,
-        observe_unit_internals: bool,
-    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
         E: FnMut(
             &mut A,
@@ -2787,86 +3716,248 @@ where
         ) -> Result<B::Tensor, A::Error>,
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        let counts = (0..graph.groups().len())
-            .map(|group| {
-                self.architecture
-                    .group_unit_count(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let layout = ExecutionUnitLayout::new(&graph, counts)?;
-        if self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
-            self.executors = Some(
-                B::fork_executors(context, graph.groups().len())
-                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
-            );
+        self.forward_with_unit_executor_and_traversal_hook_impl(
+            input, state, context, execute, hook, false, demand,
+        )
+    }
+
+    fn forward_with_unit_executor_and_traversal_hook_impl<'a, E, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        hook: &mut H,
+        observe_unit_internals: bool,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
+        self.forward_with_unit_executor_and_invocation(
+            OrdinaryLayeredInput::new(input),
+            state,
+            context,
+            |architecture, group, index, unit, hidden, state, forward, context, _hook| {
+                execute(
+                    architecture,
+                    group,
+                    index,
+                    unit,
+                    hidden,
+                    state,
+                    forward,
+                    context,
+                )
+            },
+            hook,
+            observe_unit_internals,
+            false,
+            demand,
+        )
+    }
+
+    pub(crate) fn forward_with_unit_executor_and_invocation<I, E, H>(
+        &mut self,
+        mut invocation: I,
+        state: &mut S,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        hook: &mut H,
+        observe_unit_internals: bool,
+        preserve_observation_binding: bool,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        I: LayeredInvocation<A, B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+            &mut H,
+        ) -> Result<B::Tensor, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
+        // Only the validated crate-private prepared traversal may retain its
+        // binding while using the selected canonical/provider unit callback.
+        if !observe_unit_internals && !preserve_observation_binding {
+            self.observation_binding.invalidate();
         }
-        let executors = self
-            .executors
-            .as_ref()
-            .expect("layered runtime initialized its executor cache");
-        let forward = if hook.observes_activations() {
-            self.architecture.begin_forward_observed(
-                input,
-                state,
-                context,
-                &mut TraversalActivationObserver {
-                    hook,
-                    types: std::marker::PhantomData,
+
+        if self.geometry_stale {
+            return Err(crate::ExecutionUnitLayoutError::StalePreparedGeometry.into());
+        }
+        let ordinary_geometry;
+        let (graph, layout) = match self.prepared_geometry.as_ref() {
+            Some(geometry) => (geometry.graph(), geometry.units()),
+            None => {
+                let graph = self
+                    .architecture
+                    .execution_graph()
+                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                let counts = (0..graph.groups().len())
+                    .map(|group| {
+                        self.architecture
+                            .group_unit_count(group)
+                            .map_err(LayerwiseRuntimeError::Architecture)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let layout = ExecutionUnitLayout::new(&graph, counts)?;
+                ordinary_geometry = (graph, layout);
+                (&ordinary_geometry.0, &ordinary_geometry.1)
+            }
+        };
+        if !observe_unit_internals && !preserve_observation_binding {
+            self.geometry_stale |= self.prepared_geometry.is_some();
+        }
+        let shared_executor = self
+            .policy
+            .uses_shared_group_executor(context)
+            .map_err(LayerwiseRuntimeError::Policy)?;
+        if !shared_executor && self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
+            self.executors = Some(B::fork_executors(context, graph.groups().len()).map_err(
+                |error| {
+                    LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(error))
                 },
-            )
-        } else {
-            self.architecture.begin_forward(input, state, context)
+            )?);
         }
-        .map_err(LayerwiseRuntimeError::Architecture)?;
+        let executors = self.executors.as_ref();
+        let forward = invocation
+            .begin(&mut self.architecture, state, context, hook)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let metadata = metadata::Destination(<A as LayeredArchitecture<B, S>>::forward_metadata(&self.architecture, &forward.context));
+        if preserve_observation_binding && !observe_unit_internals {
+            metadata.controls::<(E, E, &mut H,
+                Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>)>()
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+        }
+        metadata
+            .controls::<(
+                Vec<Option<B::Tensor>>,
+                Vec<B::Tensor>,
+                Vec<&B::Tensor>,
+                metadata::Destination<A::Error>,
+            )>()
+            .map_err(LayerwiseRuntimeError::Architecture)?;
         let initial_completion = (graph.groups().len() > 1)
-            .then(|| B::submit(context, [&forward.hidden]))
+            .then(|| self.policy.submit_group(context, &forward.hidden))
             .transpose()
-            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+            .map_err(|error| {
+                LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(error))
+            })?;
         let mut policy = LayerwisePolicyForward::begin(&mut self.policy, &forward.hidden, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
-        let initial = forward.hidden;
+        let mut initial = forward.hidden;
         let mut forward_context = forward.context;
-        let mut schedule = ExecutionGroupSchedule::new(&graph);
-        let mut outputs: Vec<Option<B::Tensor>> = vec![None; graph.groups().len()];
-        let mut completions: Vec<Option<B::Completion>> =
-            (0..graph.groups().len()).map(|_| None).collect();
+        self.architecture
+            .set_readout_demand(&mut forward_context, demand);
+        let mut schedule = metadata
+            .schedule(&graph)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let mut outputs: Vec<Option<B::Tensor>> = metadata
+            .vector(graph.groups().len())
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        outputs.resize_with(graph.groups().len(), || None);
+        let mut completions = metadata
+            .completions(&initial_completion, graph.groups().len())
+            .map_err(LayerwiseRuntimeError::Architecture)?;
         for &group in graph.execution_order() {
-            let executor = std::borrow::Borrow::borrow(&executors[group]);
+            if let Some(retained) = invocation.retained_group(group) {
+                schedule
+                    .started_with_release(group, |dependency| outputs[dependency] = None)
+                    .expect("retained group is dependency ready");
+                outputs[group] = retained;
+                schedule
+                    .ordered(group)
+                    .expect("retained group is ordered once");
+                continue;
+            }
+            let executor = if shared_executor {
+                context
+            } else {
+                std::borrow::Borrow::borrow(
+                    &executors.expect("layered runtime initialized its executor cache")[group],
+                )
+            };
             let group_dependencies = schedule
                 .dependencies(group)
                 .expect("validated execution order contains a known group");
             if group_dependencies.is_empty() {
                 if let Some(completion) = &initial_completion {
-                    B::order_after(completion, executor)
-                        .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+                    completion.order_after(executor).map_err(|error| {
+                        LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(
+                            error,
+                        ))
+                    })?;
                 }
             }
             for &dependency in group_dependencies {
-                B::order_after(
-                    completions[dependency]
-                        .as_ref()
-                        .expect("topological dependency has a completion"),
-                    executor,
-                )
-                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+                if let Some(completion) = completions[dependency].as_ref() {
+                    completion.order_after(executor).map_err(|error| {
+                        LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(
+                            error,
+                        ))
+                    })?;
+                } else {
+                    debug_assert!(
+                        invocation.is_retained_group(dependency),
+                        "only completed retained ingress omits a new completion"
+                    );
+                }
             }
-            let dependencies = schedule
+            if invocation
+                .before_group_with_hook(
+                    &mut self.architecture,
+                    group,
+                    &mut initial,
+                    &mut forward_context,
+                    state,
+                    None,
+                    executor,
+                    hook,
+                )
+                .map_err(LayerwiseRuntimeError::Architecture)?
+            {
+                self.architecture
+                    .set_readout_demand(&mut forward_context, demand);
+            }
+            let dependency_slots = schedule
                 .dependencies(group)
-                .expect("validated execution order contains a known group")
-                .iter()
-                .map(|&dependency| {
-                    outputs[dependency]
-                        .as_ref()
-                        .expect("topological dependency has completed")
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            let dependency_refs = dependencies.iter().collect::<Vec<_>>();
+                .expect("validated execution order contains a known group");
+            let mut dependencies = metadata
+                .vector(dependency_slots.len())
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            dependencies.extend(dependency_slots.iter().filter_map(|&dependency| {
+                if invocation.is_inactive_dependency(dependency) {
+                    None
+                } else {
+                    Some(
+                        outputs[dependency]
+                            .as_ref()
+                            .expect("active topological dependency has completed")
+                            .clone(),
+                    )
+                }
+            }));
+            let mut dependency_refs = metadata
+                .vector(dependencies.len())
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            dependency_refs.extend(dependencies.iter());
             let mut hidden = self
                 .architecture
                 .begin_execution_group(
@@ -2880,16 +3971,13 @@ where
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             hook.after_group_begin(group, &mut hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            for dependency in schedule
-                .started(group)
-                .expect("topological execution starts only ready groups")
-            {
-                outputs[dependency] = None;
-            }
-            if self
+            schedule
+                .started_with_release(group, |dependency| outputs[dependency] = None)
+                .expect("topological execution starts only ready groups");
+            let active = self
                 .architecture
-                .should_execute_group(group, &forward_context)
-            {
+                .should_execute_group(group, &forward_context);
+            if active {
                 let unit_count = layout
                     .group_range(group)
                     .expect("layout covers every graph group")
@@ -2951,27 +4039,75 @@ where
                             state,
                             &mut forward_context,
                             executor,
+                            hook,
                         )
                     }
                     .map_err(LayerwiseRuntimeError::Architecture)?;
                     hook.after_unit(group, index, &mut hidden, &mut forward_context, executor)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
-                    let mut state_values = Vec::new();
+                    metadata
+                        .controls::<(Vec<&B::Tensor>, Option<usize>)>()
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
+                    let mut state_values = metadata
+                        .vector(0)
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
                     for state_ordinal in self
                         .architecture
                         .retained_state_ordinals(group, index, ordinal)
                     {
-                        state_values.extend(
+                        let address = address.with_index(state_ordinal);
+                        if metadata.context().is_some() {
+                            let mut count = Some(0usize);
                             state
-                                .retained_values(state_ordinal, address.with_index(state_ordinal))
-                                .map_err(LayerwiseRuntimeError::State)?,
-                        );
+                                .visit_unit_retained_values(state_ordinal, address, &mut |_| {
+                                    count = count.and_then(|count| count.checked_add(1));
+                                })
+                                .map_err(LayerwiseRuntimeError::State)?;
+                            let count = count.ok_or_else(|| {
+                                LayerwiseRuntimeError::Architecture(metadata.map(
+                                    eredu_nn::workspace::WorkspaceMetadataError::Overflow.into(),
+                                ))
+                            })?;
+                            metadata
+                                .reserve(&mut state_values, count)
+                                .map_err(LayerwiseRuntimeError::Architecture)?;
+                            let mut failure = None;
+                            state
+                                .visit_unit_retained_values(state_ordinal, address, &mut |value| {
+                                    if failure.is_none() {
+                                        failure = metadata.push(&mut state_values, value).err();
+                                    }
+                                })
+                                .map_err(LayerwiseRuntimeError::State)?;
+                            if let Some(error) = failure {
+                                return Err(LayerwiseRuntimeError::Architecture(error));
+                            }
+                        } else {
+                            state_values.extend(
+                                state
+                                    .retained_values(state_ordinal, address)
+                                    .map_err(LayerwiseRuntimeError::State)?,
+                            );
+                        }
                     }
-                    let context_values =
-                        self.architecture
-                            .retained_context_values(&forward_context, group, index);
+                    let architecture = &self.architecture;
+                    let retained_forward = &forward_context;
+                    let context_values = metadata
+                        .retained(|visitor| {
+                            architecture.visit_retained_context_values(
+                                retained_forward,
+                                group,
+                                index,
+                                visitor,
+                            );
+                        })
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
                     policy
-                        .complete(&hidden, state_values.into_iter(), context_values)
+                        .complete(
+                            &hidden,
+                            state_values.into_iter(),
+                            context_values.into_iter(),
+                        )
                         .map_err(LayerwiseRuntimeError::Policy)?;
                 }
             }
@@ -2981,16 +4117,27 @@ where
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             hook.after_group(group, &mut hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
+            if active {
+                invocation.after_group(group, &hidden);
+            } else {
+                invocation.after_inactive_group(group);
+            }
             outputs[group] = Some(hidden);
             if graph.groups().len() > 1 {
                 completions[group] = Some(
-                    B::submit(
-                        executor,
-                        [outputs[group]
-                            .as_ref()
-                            .expect("group output was stored before submission")],
-                    )
-                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
+                    policy
+                        .policy
+                        .submit_group(
+                            executor,
+                            outputs[group]
+                                .as_ref()
+                                .expect("group output was stored before submission"),
+                        )
+                        .map_err(|error| {
+                            LayerwiseRuntimeError::Submission(
+                                eredu_core::BackendFailure::from_error(error),
+                            )
+                        })?,
                 );
             }
             schedule
@@ -3001,28 +4148,51 @@ where
             .take()
             .expect("validated graph output completed");
         if let Some(completion) = &completions[graph.output()] {
-            B::order_after(completion, context)
-                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+            completion.order_after(context).map_err(|error| {
+                LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(error))
+            })?;
         }
-        let output = if hook.observes_activations() {
-            self.architecture.finish_forward_observed(
-                &hidden,
-                state,
-                &forward_context,
-                context,
-                &mut TraversalActivationObserver {
-                    hook,
-                    types: std::marker::PhantomData,
-                },
-            )
+        let selected_hidden = self
+            .architecture
+            .select_readout_positions(&hidden, &forward_context, demand, context)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let output = if let Some(selected_hidden) = selected_hidden {
+            let output = if hook.observes_activations() {
+                self.architecture.finish_forward_observed(
+                    &selected_hidden,
+                    state,
+                    &forward_context,
+                    context,
+                    &mut TraversalActivationObserver {
+                        hook,
+                        types: std::marker::PhantomData,
+                    },
+                )
+            } else {
+                self.architecture
+                    .finish_forward(&selected_hidden, state, &forward_context, context)
+            }
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+            Some(output)
         } else {
-            self.architecture
-                .finish_forward(&hidden, state, &forward_context, context)
-        }
-        .map_err(LayerwiseRuntimeError::Architecture)?;
+            None
+        };
         policy
-            .finish(&output)
+            .finish(output.as_ref().unwrap_or(&hidden))
             .map_err(LayerwiseRuntimeError::Policy)?;
+        // The readout and policy are complete. Consume each actual boundary
+        // owner before returning or allowing the next bounded span. If one
+        // fails, the iterator retains remaining owners on their safe Drop path.
+        for completion in completions.into_iter().flatten() {
+            completion.finish().map_err(|error| {
+                LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(error))
+            })?;
+        }
+        if let Some(completion) = initial_completion {
+            completion.finish().map_err(|error| {
+                LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(error))
+            })?;
+        }
         Ok((output, forward_context))
     }
 
@@ -3133,7 +4303,52 @@ where
         A: ParallelLayeredArchitecture<B, S>,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        self.forward_parallel_with_internal_observer_and_context(
+        self.forward_parallel_with_observer_and_context_with_readout(
+            input,
+            state,
+            parallel,
+            context,
+            observer,
+            eredu_core::OutputDemand::Sequence,
+        )
+        .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
+    }
+
+    /// Runs the fixed ordinary parallel equations without an observer or a
+    /// caller-supplied unit/context mutation hook. Its retained geometry remains
+    /// valid across spans, just as for the fixed observed entry.
+    pub fn forward_parallel_fixed_with_readout<'a>(
+        &mut self, input:A::Input<'a>, state:&mut S, parallel:&B::ParallelContext,
+        context:&<B::Tensor as Tensor>::Context, demand:eredu_core::OutputDemand,
+    )->Result<(Option<B::Tensor>,A::ForwardContext),LayerwiseRuntimeError<A::Error,P::Error>>
+    where A:ParallelLayeredArchitecture<B,S> {
+        self.observation_binding.invalidate();
+        // `true` preserves the checked geometry. The no-op hook observes no
+        // activations, so the common worker calls only the ordinary numerical
+        // input/unit/readout methods and creates no observation path owner.
+        self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
+            input,state,parallel,context,
+            |architecture,group,index,unit,hidden,state,forward,parallel,context|
+                architecture.forward_unit_parallel(group,index,unit,hidden,state,forward,parallel,context),
+            &mut NoopLayeredTraversalHook,true,demand,
+        )
+    }
+
+    /// Runs the same traversal with explicit vocabulary output demand.
+    pub fn forward_parallel_with_observer_and_context_with_readout<'a, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        observer: &mut Observer,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_parallel_with_internal_observer_and_context_with_readout(
             input,
             state,
             parallel,
@@ -3153,6 +4368,7 @@ where
                 )
             },
             observer,
+            demand,
         )
     }
 
@@ -3163,7 +4379,7 @@ where
         state: &mut S,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        mut execute: E,
+        execute: E,
         observer: &mut Observer,
     ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
@@ -3182,10 +4398,97 @@ where
         ) -> Result<B::Tensor, A::Error>,
         Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
+        self.forward_parallel_with_internal_observer_and_context_with_readout(
+            input,
+            state,
+            parallel,
+            context,
+            execute,
+            observer,
+            eredu_core::OutputDemand::Sequence,
+        )
+        .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
+    }
+
+    /// Runs the same traversal with explicit vocabulary output demand.
+    pub fn forward_parallel_with_internal_observer_and_context_with_readout<'a, E, Observer>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        execute: E,
+        observer: &mut Observer,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+            &mut Observer,
+        ) -> Result<B::Tensor, A::Error>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        self.forward_parallel_invocation_with_internal_observer(
+            OrdinaryLayeredInput::new(input),
+            state,
+            parallel,
+            context,
+            execute,
+            observer,
+            demand,
+            false,
+        )
+    }
+
+    pub(crate) fn forward_parallel_invocation_with_internal_observer<I, E, Observer>(
+        &mut self,
+        invocation: I,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        observer: &mut Observer,
+        demand: eredu_core::OutputDemand,
+        retained_unit_selection: bool,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        I: LayeredInvocation<A, B, S>,
+        A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+            &mut Observer,
+        ) -> Result<B::Tensor, A::Error>,
+        Observer: ActivationObserver<B::Tensor, A::Error> + ?Sized,
+    {
+        if self.geometry_stale {
+            return Err(crate::ExecutionUnitLayoutError::StalePreparedGeometry.into());
+        }
+        let ordinary_graph;
+        let graph = match self.prepared_geometry.as_ref() {
+            Some(geometry) => geometry.graph(),
+            None => {
+                ordinary_graph = self.architecture.execution_graph()
+                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                &ordinary_graph
+            }
+        };
         let mut units = Vec::with_capacity(graph.groups().len());
         let mut group_inputs = Vec::with_capacity(graph.groups().len());
         let mut group_outputs = Vec::with_capacity(graph.groups().len());
@@ -3225,12 +4528,12 @@ where
             group_inputs,
             group_outputs,
         };
-        self.forward_parallel_with_unit_executor_and_traversal_hook(
-            input,
+        self.forward_parallel_with_unit_executor_and_invocation_hook(
+            invocation,
             state,
             parallel,
             context,
-            |architecture, group, index, unit, hidden, state, forward, parallel, context| {
+            |architecture, group, index, unit, hidden, state, forward, parallel, context, _hook| {
                 execute(
                     architecture,
                     group,
@@ -3245,6 +4548,9 @@ where
                 )
             },
             &mut hook,
+            false,
+            retained_unit_selection,
+            demand,
         )
     }
 
@@ -3280,7 +4586,12 @@ where
             context,
             |architecture, group, index, unit, hidden, state, forward, parallel, context| {
                 let path = architecture.unit_path(group, index)?;
-                let input = observe_and_intervene(observer, &format!("{path}.input"), hidden)?;
+                let input = observe_outer_boundary(
+                    observer,
+                    &format!("{path}.input"),
+                    &format!("{path}.input.effective"),
+                    hidden,
+                )?;
                 let output = execute(
                     architecture,
                     group,
@@ -3292,7 +4603,12 @@ where
                     parallel,
                     context,
                 )?;
-                observe_and_intervene(observer, &format!("{path}.output"), &output)
+                observe_outer_boundary(
+                    observer,
+                    &format!("{path}.output"),
+                    &format!("{path}.output.effective"),
+                    &output,
+                )
             },
         )
     }
@@ -3390,6 +4706,31 @@ where
         A: ParallelLayeredArchitecture<B, S>,
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
+        self.forward_parallel_with_traversal_hook_with_readout(
+            input,
+            state,
+            parallel,
+            context,
+            hook,
+            eredu_core::OutputDemand::Sequence,
+        )
+        .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
+    }
+
+    /// Runs the same traversal with explicit vocabulary output demand.
+    pub fn forward_parallel_with_traversal_hook_with_readout<'a, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        hook: &mut H,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
         self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
             input,
             state,
@@ -3402,6 +4743,7 @@ where
             },
             hook,
             true,
+            demand,
         )
     }
 
@@ -3430,21 +4772,29 @@ where
         ) -> Result<B::Tensor, A::Error>,
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
-        self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
-            input, state, parallel, context, execute, hook, false,
+        self.forward_parallel_with_unit_executor_and_traversal_hook_with_readout(
+            input,
+            state,
+            parallel,
+            context,
+            execute,
+            hook,
+            eredu_core::OutputDemand::Sequence,
         )
+        .map(|(output, forward)| (output.expect("sequence readout returns scores"), forward))
     }
 
-    fn forward_parallel_with_unit_executor_and_traversal_hook_impl<'a, E, H>(
+    /// Runs the same traversal with explicit vocabulary output demand.
+    pub fn forward_parallel_with_unit_executor_and_traversal_hook_with_readout<'a, E, H>(
         &mut self,
         input: A::Input<'a>,
         state: &mut S,
         parallel: &B::ParallelContext,
         context: &<B::Tensor as eredu_nn::Tensor>::Context,
-        mut execute: E,
+        execute: E,
         hook: &mut H,
-        observe_unit_internals: bool,
-    ) -> Result<(B::Tensor, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
     where
         A: ParallelLayeredArchitecture<B, S>,
         E: FnMut(
@@ -3460,88 +4810,276 @@ where
         ) -> Result<B::Tensor, A::Error>,
         H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
     {
-        let graph = self
-            .architecture
-            .execution_graph()
-            .map_err(LayerwiseRuntimeError::Architecture)?;
-        let counts = (0..graph.groups().len())
-            .map(|group| {
-                self.architecture
-                    .group_unit_count(group)
-                    .map_err(LayerwiseRuntimeError::Architecture)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let layout = ExecutionUnitLayout::new(&graph, counts)?;
-        if self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
-            self.executors = Some(
-                B::fork_executors(context, graph.groups().len())
-                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
-            );
+        self.forward_parallel_with_unit_executor_and_traversal_hook_impl(
+            input, state, parallel, context, execute, hook, false, demand,
+        )
+    }
+
+    fn forward_parallel_with_unit_executor_and_traversal_hook_impl<'a, E, H>(
+        &mut self,
+        input: A::Input<'a>,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        execute: E,
+        hook: &mut H,
+        observe_unit_internals: bool,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
+        self.forward_parallel_with_unit_executor_and_invocation(
+            OrdinaryLayeredInput::new(input),
+            state,
+            parallel,
+            context,
+            execute,
+            hook,
+            observe_unit_internals,
+            demand,
+        )
+    }
+
+    pub(crate) fn forward_parallel_with_unit_executor_and_invocation<I, E, H>(
+        &mut self,
+        invocation: I,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        hook: &mut H,
+        observe_unit_internals: bool,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        I: LayeredInvocation<A, B, S>,
+        A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+        ) -> Result<B::Tensor, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
+        self.forward_parallel_with_unit_executor_and_invocation_hook(
+            invocation, state, parallel, context,
+            |architecture, group, index, unit, hidden, state, forward, parallel, context, _hook|
+                execute(architecture, group, index, unit, hidden, state, forward, parallel, context),
+            hook, observe_unit_internals, false, demand,
+        )
+    }
+
+    pub(crate) fn forward_parallel_with_unit_executor_and_invocation_hook<I, E, H>(
+        &mut self,
+        mut invocation: I,
+        state: &mut S,
+        parallel: &B::ParallelContext,
+        context: &<B::Tensor as eredu_nn::Tensor>::Context,
+        mut execute: E,
+        hook: &mut H,
+        observe_unit_internals: bool,
+        retained_unit_selection: bool,
+        demand: eredu_core::OutputDemand,
+    ) -> Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>
+    where
+        I: LayeredInvocation<A, B, S>,
+        A: ParallelLayeredArchitecture<B, S>,
+        E: FnMut(
+            &mut A,
+            usize,
+            usize,
+            &mut A::Unit,
+            &B::Tensor,
+            &mut S,
+            &mut A::ForwardContext,
+            &B::ParallelContext,
+            &<B::Tensor as eredu_nn::Tensor>::Context,
+            &mut H,
+        ) -> Result<B::Tensor, A::Error>,
+        H: LayeredTraversalHook<B, A::ForwardContext, A::Error> + ?Sized,
+    {
+        if !observe_unit_internals && !retained_unit_selection {
+            self.observation_binding.invalidate();
         }
-        let executors = self
-            .executors
-            .as_ref()
-            .expect("layered runtime initialized its executor cache");
-        let forward = if hook.observes_activations() {
-            self.architecture.begin_forward_parallel_observed(
-                input,
-                state,
-                parallel,
-                context,
-                &mut TraversalActivationObserver {
-                    hook,
-                    types: std::marker::PhantomData,
+
+        if self.geometry_stale {
+            return Err(crate::ExecutionUnitLayoutError::StalePreparedGeometry.into());
+        }
+        let ordinary_geometry;
+        let (graph, layout) = match self.prepared_geometry.as_ref() {
+            Some(geometry) => (geometry.graph(), geometry.units()),
+            None => {
+                let graph = self
+                    .architecture
+                    .execution_graph()
+                    .map_err(LayerwiseRuntimeError::Architecture)?;
+                let counts = (0..graph.groups().len())
+                    .map(|group| {
+                        self.architecture
+                            .group_unit_count(group)
+                            .map_err(LayerwiseRuntimeError::Architecture)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let layout = ExecutionUnitLayout::new(&graph, counts)?;
+                ordinary_geometry = (graph, layout);
+                (&ordinary_geometry.0, &ordinary_geometry.1)
+            }
+        };
+        if !observe_unit_internals && !retained_unit_selection {
+            self.geometry_stale |= self.prepared_geometry.is_some();
+        }
+        let shared_executor = self
+            .policy
+            .uses_shared_group_executor(context)
+            .map_err(LayerwiseRuntimeError::Policy)?;
+        if !shared_executor && self.executors.as_ref().map(Vec::len) != Some(graph.groups().len()) {
+            self.executors = Some(B::fork_executors(context, graph.groups().len()).map_err(
+                |error| {
+                    LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(error))
                 },
-            )
-        } else {
-            self.architecture
-                .begin_forward_parallel(input, state, parallel, context)
+            )?);
         }
-        .map_err(LayerwiseRuntimeError::Architecture)?;
+        let executors = self.executors.as_ref();
+        let forward = invocation
+            .begin_parallel(&mut self.architecture, state, parallel, context, hook)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let metadata = metadata::Destination(<A as LayeredArchitecture<B, S>>::forward_metadata(&self.architecture, &forward.context));
+        if retained_unit_selection {
+            metadata.controls::<(E, E, &mut H, bool,
+                Result<(Option<B::Tensor>, A::ForwardContext), LayerwiseRuntimeError<A::Error, P::Error>>)>()
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+        }
+        metadata
+            .controls::<(
+                Vec<Option<B::Tensor>>,
+                Vec<B::Tensor>,
+                Vec<&B::Tensor>,
+                metadata::Destination<A::Error>,
+            )>()
+            .map_err(LayerwiseRuntimeError::Architecture)?;
         let initial_completion = (graph.groups().len() > 1)
-            .then(|| B::submit(context, [&forward.hidden]))
+            .then(|| self.policy.submit_group(context, &forward.hidden))
             .transpose()
-            .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+            .map_err(|error| {
+                LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(error))
+            })?;
         let mut policy = LayerwisePolicyForward::begin(&mut self.policy, &forward.hidden, context)
             .map_err(LayerwiseRuntimeError::Policy)?;
-        let initial = forward.hidden;
+        let mut initial = forward.hidden;
         let mut forward_context = forward.context;
-        let mut schedule = ExecutionGroupSchedule::new(&graph);
-        let mut outputs: Vec<Option<B::Tensor>> = vec![None; graph.groups().len()];
-        let mut completions: Vec<Option<B::Completion>> =
-            (0..graph.groups().len()).map(|_| None).collect();
+        self.architecture
+            .set_readout_demand(&mut forward_context, demand);
+        let mut schedule = metadata
+            .schedule(&graph)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let mut outputs: Vec<Option<B::Tensor>> = metadata
+            .vector(graph.groups().len())
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        outputs.resize_with(graph.groups().len(), || None);
+        let mut completions = metadata
+            .completions(&initial_completion, graph.groups().len())
+            .map_err(LayerwiseRuntimeError::Architecture)?;
         for &group in graph.execution_order() {
-            let executor = std::borrow::Borrow::borrow(&executors[group]);
+            if let Some(retained) = invocation.retained_group(group) {
+                schedule
+                    .started_with_release(group, |dependency| outputs[dependency] = None)
+                    .expect("retained group is dependency ready");
+                outputs[group] = retained;
+                schedule
+                    .ordered(group)
+                    .expect("retained group is ordered once");
+                continue;
+            }
+            let executor = if shared_executor {
+                context
+            } else {
+                std::borrow::Borrow::borrow(
+                    &executors.expect("layered runtime initialized its executor cache")[group],
+                )
+            };
             let group_dependencies = schedule
                 .dependencies(group)
                 .expect("validated execution order contains a known group");
             if group_dependencies.is_empty() {
                 if let Some(completion) = &initial_completion {
-                    B::order_after(completion, executor)
-                        .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+                    completion.order_after(executor).map_err(|error| {
+                        LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(
+                            error,
+                        ))
+                    })?;
                 }
             }
             for &dependency in group_dependencies {
-                B::order_after(
-                    completions[dependency]
-                        .as_ref()
-                        .expect("topological dependency has a completion"),
-                    executor,
-                )
-                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+                if let Some(completion) = completions[dependency].as_ref() {
+                    completion.order_after(executor).map_err(|error| {
+                        LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(
+                            error,
+                        ))
+                    })?;
+                } else {
+                    debug_assert!(
+                        invocation.is_retained_group(dependency),
+                        "only completed retained ingress omits a new completion"
+                    );
+                }
             }
-            let dependencies = schedule
+            if invocation
+                .before_group_with_hook(
+                    &mut self.architecture,
+                    group,
+                    &mut initial,
+                    &mut forward_context,
+                    state,
+                    Some(parallel),
+                    executor,
+                    hook,
+                )
+                .map_err(LayerwiseRuntimeError::Architecture)?
+            {
+                self.architecture
+                    .set_readout_demand(&mut forward_context, demand);
+            }
+            let dependency_slots = schedule
                 .dependencies(group)
-                .expect("validated execution order contains a known group")
-                .iter()
-                .map(|&dependency| {
-                    outputs[dependency]
-                        .as_ref()
-                        .expect("topological dependency has completed")
-                        .clone()
-                })
-                .collect::<Vec<_>>();
-            let dependency_refs = dependencies.iter().collect::<Vec<_>>();
+                .expect("validated execution order contains a known group");
+            let mut dependencies = metadata
+                .vector(dependency_slots.len())
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            dependencies.extend(dependency_slots.iter().filter_map(|&dependency| {
+                if invocation.is_inactive_dependency(dependency) {
+                    None
+                } else {
+                    Some(
+                        outputs[dependency]
+                            .as_ref()
+                            .expect("active topological dependency has completed")
+                            .clone(),
+                    )
+                }
+            }));
+            let mut dependency_refs = metadata
+                .vector(dependencies.len())
+                .map_err(LayerwiseRuntimeError::Architecture)?;
+            dependency_refs.extend(dependencies.iter());
             let mut hidden = self
                 .architecture
                 .begin_execution_group_parallel(
@@ -3556,16 +5094,13 @@ where
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             hook.after_group_begin(group, &mut hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
-            for dependency in schedule
-                .started(group)
-                .expect("topological execution starts only ready groups")
-            {
-                outputs[dependency] = None;
-            }
-            if self
+            schedule
+                .started_with_release(group, |dependency| outputs[dependency] = None)
+                .expect("topological execution starts only ready groups");
+            let active = self
                 .architecture
-                .should_execute_group(group, &forward_context)
-            {
+                .should_execute_group(group, &forward_context);
+            if active {
                 let unit_count = layout
                     .group_range(group)
                     .expect("layout covers every graph group")
@@ -3629,27 +5164,75 @@ where
                             &mut forward_context,
                             parallel,
                             executor,
+                            hook,
                         )
                     }
                     .map_err(LayerwiseRuntimeError::Architecture)?;
                     hook.after_unit(group, index, &mut hidden, &mut forward_context, executor)
                         .map_err(LayerwiseRuntimeError::Architecture)?;
-                    let mut state_values = Vec::new();
+                    metadata
+                        .controls::<(Vec<&B::Tensor>, Option<usize>)>()
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
+                    let mut state_values = metadata
+                        .vector(0)
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
                     for state_ordinal in self
                         .architecture
                         .retained_state_ordinals(group, index, ordinal)
                     {
-                        state_values.extend(
+                        let address = address.with_index(state_ordinal);
+                        if metadata.context().is_some() {
+                            let mut count = Some(0usize);
                             state
-                                .retained_values(state_ordinal, address.with_index(state_ordinal))
-                                .map_err(LayerwiseRuntimeError::State)?,
-                        );
+                                .visit_unit_retained_values(state_ordinal, address, &mut |_| {
+                                    count = count.and_then(|count| count.checked_add(1));
+                                })
+                                .map_err(LayerwiseRuntimeError::State)?;
+                            let count = count.ok_or_else(|| {
+                                LayerwiseRuntimeError::Architecture(metadata.map(
+                                    eredu_nn::workspace::WorkspaceMetadataError::Overflow.into(),
+                                ))
+                            })?;
+                            metadata
+                                .reserve(&mut state_values, count)
+                                .map_err(LayerwiseRuntimeError::Architecture)?;
+                            let mut failure = None;
+                            state
+                                .visit_unit_retained_values(state_ordinal, address, &mut |value| {
+                                    if failure.is_none() {
+                                        failure = metadata.push(&mut state_values, value).err();
+                                    }
+                                })
+                                .map_err(LayerwiseRuntimeError::State)?;
+                            if let Some(error) = failure {
+                                return Err(LayerwiseRuntimeError::Architecture(error));
+                            }
+                        } else {
+                            state_values.extend(
+                                state
+                                    .retained_values(state_ordinal, address)
+                                    .map_err(LayerwiseRuntimeError::State)?,
+                            );
+                        }
                     }
-                    let context_values =
-                        self.architecture
-                            .retained_context_values(&forward_context, group, index);
+                    let architecture = &self.architecture;
+                    let retained_forward = &forward_context;
+                    let context_values = metadata
+                        .retained(|visitor| {
+                            architecture.visit_retained_context_values(
+                                retained_forward,
+                                group,
+                                index,
+                                visitor,
+                            );
+                        })
+                        .map_err(LayerwiseRuntimeError::Architecture)?;
                     policy
-                        .complete(&hidden, state_values.into_iter(), context_values)
+                        .complete(
+                            &hidden,
+                            state_values.into_iter(),
+                            context_values.into_iter(),
+                        )
                         .map_err(LayerwiseRuntimeError::Policy)?;
                 }
             }
@@ -3666,16 +5249,27 @@ where
                 .map_err(LayerwiseRuntimeError::Architecture)?;
             hook.after_group(group, &mut hidden, &mut forward_context, executor)
                 .map_err(LayerwiseRuntimeError::Architecture)?;
+            if active {
+                invocation.after_group(group, &hidden);
+            } else {
+                invocation.after_inactive_group(group);
+            }
             outputs[group] = Some(hidden);
             if graph.groups().len() > 1 {
                 completions[group] = Some(
-                    B::submit(
-                        executor,
-                        [outputs[group]
-                            .as_ref()
-                            .expect("group output was stored before submission")],
-                    )
-                    .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?,
+                    policy
+                        .policy
+                        .submit_group(
+                            executor,
+                            outputs[group]
+                                .as_ref()
+                                .expect("group output was stored before submission"),
+                        )
+                        .map_err(|error| {
+                            LayerwiseRuntimeError::Submission(
+                                eredu_core::BackendFailure::from_error(error),
+                            )
+                        })?,
                 );
             }
             schedule
@@ -3686,34 +5280,57 @@ where
             .take()
             .expect("validated graph output completed");
         if let Some(completion) = &completions[graph.output()] {
-            B::order_after(completion, context)
-                .map_err(|error| LayerwiseRuntimeError::Submission(error.to_string()))?;
+            completion.order_after(context).map_err(|error| {
+                LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(error))
+            })?;
         }
-        let output = if hook.observes_activations() {
-            self.architecture.finish_forward_parallel_observed(
-                &hidden,
-                state,
-                &forward_context,
-                parallel,
-                context,
-                &mut TraversalActivationObserver {
-                    hook,
-                    types: std::marker::PhantomData,
-                },
-            )
+        let selected_hidden = self
+            .architecture
+            .select_readout_positions(&hidden, &forward_context, demand, context)
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+        let output = if let Some(selected_hidden) = selected_hidden {
+            let output = if hook.observes_activations() {
+                self.architecture.finish_forward_parallel_observed(
+                    &selected_hidden,
+                    state,
+                    &forward_context,
+                    parallel,
+                    context,
+                    &mut TraversalActivationObserver {
+                        hook,
+                        types: std::marker::PhantomData,
+                    },
+                )
+            } else {
+                self.architecture.finish_forward_parallel(
+                    &selected_hidden,
+                    state,
+                    &forward_context,
+                    parallel,
+                    context,
+                )
+            }
+            .map_err(LayerwiseRuntimeError::Architecture)?;
+            Some(output)
         } else {
-            self.architecture.finish_forward_parallel(
-                &hidden,
-                state,
-                &forward_context,
-                parallel,
-                context,
-            )
-        }
-        .map_err(LayerwiseRuntimeError::Architecture)?;
+            None
+        };
         policy
-            .finish(&output)
+            .finish(output.as_ref().unwrap_or(&hidden))
             .map_err(LayerwiseRuntimeError::Policy)?;
+        // The readout and policy are complete. Consume each actual boundary
+        // owner before returning or allowing the next bounded span. If one
+        // fails, the iterator retains remaining owners on their safe Drop path.
+        for completion in completions.into_iter().flatten() {
+            completion.finish().map_err(|error| {
+                LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(error))
+            })?;
+        }
+        if let Some(completion) = initial_completion {
+            completion.finish().map_err(|error| {
+                LayerwiseRuntimeError::Submission(eredu_core::BackendFailure::from_error(error))
+            })?;
+        }
         Ok((output, forward_context))
     }
 }
@@ -3758,6 +5375,26 @@ where
 {
     type Lease = ResidentUnitLease<U>;
     type Error = ResidentUnitWindowError;
+
+    fn retained_value_slot_bound(&self) -> Option<usize>
+    where
+        U: Parameterized<B::Tensor>,
+    {
+        self.units.iter().try_fold(0usize, |n, unit| {
+            n.checked_add(unit.as_ref()?.retained_value_slot_bound()?)
+        })
+    }
+
+    fn visit_retained_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool
+    where
+        U: Parameterized<B::Tensor>,
+    {
+        let mut complete = self.units.iter().all(Option::is_some);
+        for unit in self.units.iter().flatten() {
+            complete &= unit.visit_retained_values(visitor);
+        }
+        complete
+    }
 
     fn begin(
         &mut self,

@@ -65,10 +65,17 @@ const QWEN_TEMPLATE: &str =
 const NO_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX;
 const MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN: u32 = u32::MAX - 1;
 
+#[path = "backend_conformance/shared_delivery.rs"]
+mod shared_delivery;
+
 #[path = "backend_conformance/control.rs"]
 mod control;
 #[path = "backend_conformance/controlled_speculative.rs"]
 mod controlled_speculative;
+#[path = "backend_conformance/controller_storage.rs"]
+mod controller_storage;
+#[path = "backend_conformance/host_authority.rs"]
+mod host_authority;
 #[path = "backend_conformance/observed_mock.rs"]
 mod observed_mock;
 #[path = "backend_conformance/preparation.rs"]
@@ -106,6 +113,10 @@ impl Drop for TestDirectory {
 }
 
 struct MockBackend;
+thread_local! {
+    // One-shot completed-prefix disposition, confined to the invoking test.
+    static PREFILL_CANCELLATION: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
 struct MockSession {
     authority: eredu_core::SessionAuthority,
     intervention_identity: String,
@@ -113,11 +124,23 @@ struct MockSession {
 }
 struct Done;
 struct MockSessionCompletion(eredu_core::SubmissionLease);
+impl MockSessionCompletion {
+    fn resolve(&self) {
+        // Either successful polling or waiting can establish completion. Record
+        // admission retention once, at the actual submission-resolution boundary.
+        if self.0.resolve() {
+            preparation::completion();
+            shared_delivery::completion();
+        }
+    }
+}
 #[derive(Clone)]
 struct MockToken(u32);
 
 #[derive(Debug, thiserror::Error)]
 enum MockError {
+    #[error(transparent)]
+    ProviderRetained(eredu_core::BackendFailure),
     #[error("synthetic capture failure: {0}")]
     Capture(String),
     #[error(transparent)]
@@ -158,12 +181,12 @@ impl Completion for MockSessionCompletion {
     type Error = MockError;
 
     fn is_complete(&self) -> Result<bool, Self::Error> {
-        self.0.resolve();
+        self.resolve();
         Ok(true)
     }
 
     fn wait(&self) -> Result<(), Self::Error> {
-        self.0.resolve();
+        self.resolve();
         Ok(())
     }
 }
@@ -182,6 +205,13 @@ impl BackendProvider for MockBackend {
     type Model = ();
     type Session = MockSession;
     type Error = MockError;
+
+    fn into_backend_failure(error: MockError) -> eredu_core::BackendFailure {
+        match error {
+            MockError::ProviderRetained(error) => error,
+            error => eredu_core::BackendFailure::from_error(error),
+        }
+    }
 
     fn descriptor(&self) -> BackendDescriptor {
         BackendDescriptor::new("mock", "test")
@@ -249,6 +279,7 @@ impl BackendSession<MockBackend> for MockSession {
         input: Self::PrefillInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, MockError> {
         let lease = self.authority.begin_submission()?;
+        shared_delivery::submitted();
         Ok(Submission {
             output: input.len() as u32,
             completion: MockSessionCompletion(lease),
@@ -261,6 +292,7 @@ impl BackendSession<MockBackend> for MockSession {
         input: Self::DecodeInput,
     ) -> Result<Submission<Self::Output, Self::Completion>, MockError> {
         let lease = self.authority.begin_submission()?;
+        shared_delivery::submitted();
         Ok(Submission {
             output: input + 1,
             completion: MockSessionCompletion(lease),
@@ -391,6 +423,68 @@ impl DistributedBackend for MockBackend {
 }
 
 impl TextGenerationBackend for MockBackend {
+    type TextPreparation = Option<std::sync::Arc<preparation::PreparationCharge>>;
+    type TextPreparationControl = ();
+    type TextStepPermit = ();
+    fn acquire_host_preparation(
+        _: &ModelRuntime<Self>,
+    ) -> Result<eredu_core::HostPreparationAuthority, eredu_core::BackendFailure> {
+        host_authority::acquire()
+    }
+    fn prepare_shared_controller_bytes(
+        _: &ModelRuntime<Self>,
+        factory: impl FnOnce() -> Vec<u8>,
+    ) -> Result<eredu_core::SharedControllerBytes, eredu_core::BackendFailure> {
+        controller_storage::prepare(factory)
+    }
+
+    fn begin_text_step<C: eredu_core::TokenFilterController>(
+        _: &eredu_core::ModelRuntime<Self>,
+        _: &Self::TextPreparation,
+        _: &Self::TextGenerationState,
+        _: &C,
+        _: eredu_core::PendingTextInput<&Self::Prompt, &Self::Token>,
+        context: &eredu_core::backend::TextStepContext,
+    ) -> Result<Self::TextStepPermit, Self::Error> {
+        host_authority::record_step(context);
+        Ok(())
+    }
+    fn finish_text_step(_: Self::TextStepPermit) -> Result<(), Self::Error> {
+        Ok(())
+    }
+    fn admit_text_preparation<C: eredu_core::TokenFilterController>(
+        _: &ModelRuntime<Self>,
+        input: &eredu_core::TextPreparationInput<'_, Self::Prompt>,
+        config: TextGenerationConfig,
+        _: &C,
+    ) -> Result<Self::TextPreparation, eredu_core::BackendFailure> {
+        preparation::admit(input, config)
+    }
+    fn submit_text_prefill_cancellable_decision(
+        runtime: &mut ModelRuntime<Self>,
+        prompt: Self::Prompt,
+        decision: &eredu_core::TokenSamplingDecision<'_>,
+        state: &mut Self::TextGenerationState,
+        cancellation: &eredu_core::GenerationCancellationToken,
+    ) -> Result<Option<Submission<Self::Token, Self::TextCompletion>>, Self::Error> {
+        let disposition = PREFILL_CANCELLATION.with(|slot| slot.replace(0));
+        if disposition != 0 {
+            preparation::forward();
+            runtime
+                .prefill(prompt.into_iter().take(2).collect())?
+                .wait()?;
+            cancellation.cancel();
+            return if disposition == 1 {
+                Ok(None)
+            } else {
+                Err(MockError::Capture(
+                    "prefill completion failed while cancelling".into(),
+                ))
+            };
+        }
+        Self::submit_text_prefill_decision(runtime, prompt, decision, state)
+            .and_then(|submission| shared_delivery::prefill_result(submission, cancellation))
+    }
     fn agree_text_preparation(
         _: &ModelRuntime<Self>,
         stage: eredu_core::run_preparation::TextPreparationStage,
@@ -496,10 +590,20 @@ impl TextGenerationBackend for MockBackend {
             .and_then(eredu_runtime::capture::CaptureSession::take_step)
     }
 
+    fn try_take_text_capture(
+        state: &mut Self::TextGenerationState,
+    ) -> Result<Option<eredu_core::capture::CapturedStepDelivery>, Self::Error> {
+        shared_delivery::take(state)
+    }
+    fn text_capture_pending(_: &Self::TextGenerationState) -> bool {
+        shared_delivery::pending()
+    }
+
     fn start_text_generation(
         _: &Self,
         config: TextGenerationConfig,
     ) -> Result<Self::TextGenerationState, Self::Error> {
+        control::provider_errors::check("start")?;
         preparation::native(eredu_core::run_preparation::TextPreparationStage::Sampling)?;
         Ok(observed_mock::State {
             sampling: observed_mock::Sampling {
@@ -615,7 +719,7 @@ impl ModelCapabilityBackend for MockBackend {
                 image: true,
                 ..InputModalities::TEXT
             },
-            estimation: EstimationCompleteness::Complete,
+            estimation: EstimationCompleteness::PersistentStateOnly,
         })
     }
 
@@ -876,7 +980,7 @@ impl ExecutionPlanBackendFactory for MockBackend {
             _ => {
                 return Err(AutomaticPlanningError::Invalid(
                     "unsupported drafting plan".into(),
-                ))
+                ));
             }
         })
     }
@@ -891,6 +995,15 @@ struct MockSpeculativeExecutor {
 const CONTROL_REJECTION_PROMPT_TOKEN: u32 = u32::MAX - 32;
 
 impl SpeculativeExecutor for MockSpeculativeExecutor {
+    fn take_retained_failure(
+        error: Self::Error,
+    ) -> Result<eredu_core::BackendFailure, Self::Error> {
+        controlled_speculative::retained_errors::take(
+            error,
+            controlled_speculative::retained_errors::Owner::Executor,
+        )
+    }
+
     fn coordinate_speculative_step<'a>(
         &mut self,
         states: Vec<eredu_core::SpeculativeScheduleState>,
@@ -974,6 +1087,17 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
     type Cache = usize;
     type TargetState = ();
     type DraftState = ();
+
+    fn copy_draft_state<'a>(
+        &self,
+        state: &Self::DraftState,
+        _context: Self::Context<'a>,
+    ) -> Result<Self::DraftState, Self::Error>
+    where
+        Self: 'a,
+    {
+        Ok(state.clone())
+    }
     type CacheCheckpoint = usize;
     type Verification = Vec<u32>;
     type Logits = u32;
@@ -998,6 +1122,7 @@ impl SpeculativeExecutor for MockSpeculativeExecutor {
     ) -> Result<SpeculativePrefill<Self::TargetState, Self::Logits>, Self::Error> {
         preparation::forward();
         preparation::action("prefill");
+        controlled_speculative::retained_errors::check("prefill")?;
         *cache = input.len();
         let scale = self
             .activations
@@ -1126,6 +1251,15 @@ struct MockSpeculativeSampling {
 }
 
 impl SpeculativeSampling for MockSpeculativeSampling {
+    fn take_retained_failure(
+        error: Self::Error,
+    ) -> Result<eredu_core::BackendFailure, Self::Error> {
+        controlled_speculative::retained_errors::take(
+            error,
+            controlled_speculative::retained_errors::Owner::Sampler,
+        )
+    }
+
     fn control_requires_positive_temperature(&self) -> Option<bool> {
         Some(false)
     }
@@ -1209,6 +1343,7 @@ impl SpeculativeSampling for MockSpeculativeSampling {
     where
         Self: 'a,
     {
+        controlled_speculative::retained_errors::check("reseed")?;
         Ok(SpeculativeRandomness::new(None, None))
     }
 
@@ -1235,6 +1370,7 @@ impl SpeculativeSampling for MockSpeculativeSampling {
         Self: 'a,
     {
         preparation::sampling(placement)?;
+        controlled_speculative::retained_errors::check("sample")?;
         Ok(self
             .forced
             .filter(|p| p.1 == history.len())
@@ -1354,7 +1490,7 @@ impl SpeculativeGenerationBackend for MockBackend {
             .copied();
         let mut caches = vec![0; lanes.len()];
         let mut prepared = Vec::with_capacity(lanes.len());
-        for (mut lane, cache) in lanes.drain(..).zip(caches.iter_mut()) {
+        for (mut lane, cache) in lanes.drain().zip(caches.iter_mut()) {
             assert!(!lane.prompt().is_empty());
             assert_eq!(lane.generation().seed(), 0);
             let constraint = lane.take_constraint();
@@ -1372,7 +1508,7 @@ impl SpeculativeGenerationBackend for MockBackend {
                     MockSpeculativeSampling { forced: None },
                     sequence,
                     SpeculativeSemanticConstraint::semantic(lane.take_semantic()),
-                    SpeculativeCallbackPublisher::semantic(lane.take_on_event()),
+                    SpeculativeCallbackPublisher::semantic_callback(lane.take_on_event()),
                     lane.take_cancellation(),
                 ),
                 SpeculativeRandomness::new(None, None),
@@ -1394,8 +1530,8 @@ impl SpeculativeGenerationBackend for MockBackend {
         match result_cardinality {
             Some(NO_SPECULATIVE_RESULTS_PROMPT_TOKEN) => output.clear_requests(),
             Some(MULTIPLE_SPECULATIVE_RESULTS_PROMPT_TOKEN) => {
-                output.push_request(SpeculativeGenerationOutput::new(
-                    Vec::new(),
+                output.push_request(SpeculativeGenerationOutput::from_speculative(
+                    eredu_core::SpeculativeTokenIds::default(),
                     FinishReason::MaxTokens,
                     Default::default(),
                     Default::default(),
@@ -1551,7 +1687,7 @@ fn capability_client_code<B: ModelCapabilityBackend>(model: &LoadedModel<B>, pre
                 None,
             )
             .unwrap(),
-        AdmissionResult::Admitted(_)
+        AdmissionResult::Rejected(eredu_core::AdmissionRejection::EstimationUnsupported { .. })
     ));
 }
 
@@ -2271,7 +2407,8 @@ fn assert_prepared_generation_and_speculative_conformance() {
             eos_token_ids: vec![eos_token_id],
             checkpoint_generation_config: None,
         },
-    );
+    )
+    .unwrap();
     let prepared = model
         .prepare_chat(ChatTemplateRequest {
             messages: vec![serde_json::json!({"role": "user", "content": "hello"})],
@@ -2523,6 +2660,13 @@ fn unicode_model_with_template(
     vocabulary_size: u32,
     template: &str,
 ) -> LoadedModel<MockBackend> {
+    unicode_model_from_tokenizer(
+        ChatTokenizer::from_tokenizer(unicode_tokenizer(first, vocabulary_size)),
+        template,
+    )
+}
+
+fn unicode_tokenizer(first: Option<u32>, vocabulary_size: u32) -> Tokenizer {
     let mut vocabulary: std::collections::HashMap<String, u32> =
         std::iter::once(("[UNK]".into(), 0))
             .chain((0..vocabulary_size).map(|i| (format!("ordinary_{i}"), i + 1)))
@@ -2544,10 +2688,17 @@ fn unicode_model_with_template(
     tokenizer
         .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(false)])
         .unwrap();
+    tokenizer
+}
+
+fn unicode_model_from_tokenizer(
+    tokenizer: ChatTokenizer,
+    template: &str,
+) -> LoadedModel<MockBackend> {
     let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
     LoadedModel::from_runtime(
         ModelRuntime::prepare(MockBackend, ()).unwrap(),
-        ChatTokenizer::from_tokenizer(tokenizer),
+        tokenizer,
         LoadedTextModelConfig {
             model_family: ModelKind::Qwen2,
             effective_model_type: "qwen2".into(),
@@ -2557,6 +2708,7 @@ fn unicode_model_with_template(
             checkpoint_generation_config: None,
         },
     )
+    .unwrap()
 }
 
 #[test]
@@ -2740,4 +2892,18 @@ fn non_mlx_backend_conforms_to_automatic_planning() {
 #[test]
 fn non_mlx_backend_conforms_to_residency_realization() {
     assert_residency_realization_conformance();
+}
+
+// Test consumers move the actual token container, preserving retained custody.
+// The ordinary Vec variant is wrapped without copying or relabeling its source.
+trait TerminalTokenStorage {
+    fn into_terminal_tokens(self) -> eredu_core::SpeculativeTokenIds;
+}
+impl TerminalTokenStorage for Vec<u32> {
+    fn into_terminal_tokens(self) -> eredu_core::SpeculativeTokenIds {
+        eredu_core::SpeculativeTokenIds::Ordinary(self)
+    }
+}
+impl TerminalTokenStorage for eredu_core::SpeculativeTokenIds {
+    fn into_terminal_tokens(self) -> eredu_core::SpeculativeTokenIds { self }
 }

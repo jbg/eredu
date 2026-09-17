@@ -1,0 +1,11 @@
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -452,7 +452,7 @@
+       resident_primitive_control<Maximum>(), resident_primitive_control<Minimum>(),
+       resident_primitive_control<Power>(), resident_primitive_control<Select>(),
+       resident_primitive_control<Square>(), resident_primitive_control<Exp>(),
+-      resident_primitive_control<Tanh>(), resident_primitive_control<Reshape>(),
++      resident_primitive_control<Tanh>(), resident_primitive_control<Reshape>(), resident_primitive_control<View>(),
+       resident_primitive_control<Squeeze>(), resident_primitive_control<ExpandDims>(),
+       resident_primitive_control<Transpose>(), resident_primitive_control<Contiguous>(),
+       resident_primitive_control<Copy>(), resident_primitive_control<Full>(),

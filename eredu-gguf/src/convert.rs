@@ -1,8 +1,21 @@
 // Conversion layout translated from MLX v0.32.0 `mlx/io/gguf_quants.cpp`
 // (Apple Inc., MIT license) and Eredu's former in-tree MLX patch set. The resulting
 // buffers intentionally match MLX affine quantization byte-for-byte.
-use crate::{Endian, Error, GgmlType, Result, TensorDescriptor};
+use crate::{Endian, Error, GgmlType, Result, TensorDescriptor, TensorDescriptorView};
 use half::f16;
+mod destination;
+mod plan;
+mod preparation;
+mod supplied;
+use destination::{
+    capacity, copied, q8_codes, shape, AffineOutput, CResult, ConversionOutput, MxFp4Output, Slot,
+    Storage, Vector,
+};
+pub use destination::{
+    ConversionDestinationError, ConversionLayouts, PreparedConversion, PreparedConversionFailure,
+};
+pub use plan::{ConversionOutputPlan, ConversionPlan};
+pub use supplied::{StoredConversion, StoredConversionFailure, StoredConvertedTensor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenseDtype {
@@ -156,21 +169,33 @@ pub(crate) fn affine_shapes(
     bits: u8,
     group_size: u32,
 ) -> Result<(Vec<u64>, Vec<u64>)> {
-    let mut weight_shape = desc.row_major_shape();
+    affine_shapes_with_storage(desc.view(), bits, group_size, None, None)
+        .map(|(a, b)| (a.into_vec(), b.into_vec()))
+        .map_err(ConversionDestinationError::ordinary)
+}
+fn affine_shapes_with_storage<'a>(
+    desc: TensorDescriptorView<'_>,
+    bits: u8,
+    group_size: u32,
+    first: Option<Slot<'a, u64>>,
+    second: Option<Slot<'a, u64>>,
+) -> CResult<(Vector<'a, u64>, Vector<'a, u64>)> {
+    let mut weight_shape = shape(desc, first)?;
     let last = weight_shape
         .last_mut()
-        .ok_or_else(|| Error::tensor(&desc.name, "quantized scalar is invalid"))?;
+        .ok_or_else(|| Error::tensor(desc.name, "quantized scalar is invalid"))?;
     if *last % u64::from(group_size) != 0 {
         return Err(Error::tensor(
-            &desc.name,
+            desc.name,
             format!("last dimension is not divisible by group size {group_size}"),
-        ));
+        )
+        .into());
     }
     *last = last
         .checked_mul(u64::from(bits))
         .ok_or(Error::Overflow("affine packed dimension"))?
         / 32;
-    let mut scale_shape = desc.row_major_shape();
+    let mut scale_shape = shape(desc, second)?;
     *scale_shape.last_mut().unwrap() /= u64::from(group_size);
     Ok((weight_shape, scale_shape))
 }
@@ -195,18 +220,24 @@ pub(crate) fn iquant_packed_shape(shape: &[u64], ty: GgmlType) -> Result<Vec<u64
 }
 
 pub(crate) fn mxfp4_shapes(desc: &TensorDescriptor) -> Result<(Vec<u64>, Vec<u64>)> {
-    let mut weight_shape = desc.row_major_shape();
+    mxfp4_shapes_with_storage(desc.view(), None, None)
+        .map(|(a, b)| (a.into_vec(), b.into_vec()))
+        .map_err(ConversionDestinationError::ordinary)
+}
+fn mxfp4_shapes_with_storage<'a>(
+    desc: TensorDescriptorView<'_>,
+    first: Option<Slot<'a, u64>>,
+    second: Option<Slot<'a, u64>>,
+) -> CResult<(Vector<'a, u64>, Vector<'a, u64>)> {
+    let mut weight_shape = shape(desc, first)?;
     let columns = weight_shape
         .last_mut()
-        .ok_or_else(|| Error::tensor(&desc.name, "MXFP4 scalar is invalid"))?;
+        .ok_or_else(|| Error::tensor(desc.name, "MXFP4 scalar is invalid"))?;
     if *columns % 32 != 0 {
-        return Err(Error::tensor(
-            &desc.name,
-            "MXFP4 row width is not divisible by 32",
-        ));
+        return Err(Error::tensor(desc.name, "MXFP4 row width is not divisible by 32").into());
     }
     *columns /= 8;
-    let mut scale_shape = desc.row_major_shape();
+    let mut scale_shape = shape(desc, second)?;
     *scale_shape.last_mut().unwrap() /= 32;
     Ok((weight_shape, scale_shape))
 }
@@ -216,41 +247,64 @@ pub(crate) fn convert(
     raw: &[u8],
     endian: Endian,
 ) -> Result<ConvertedTensor> {
+    convert_view(desc.view(), raw, endian)
+}
+pub(crate) fn convert_view(
+    desc: TensorDescriptorView<'_>,
+    raw: &[u8],
+    endian: Endian,
+) -> Result<ConvertedTensor> {
+    convert_with_storage(desc, raw, endian, Storage::ordinary())
+        .map(ConversionOutput::into_owned)
+        .map_err(ConversionDestinationError::ordinary)
+}
+fn convert_with_storage<'a>(
+    desc: TensorDescriptorView<'_>,
+    raw: &[u8],
+    endian: Endian,
+    storage: Storage<'a>,
+) -> CResult<ConversionOutput<'a>> {
     if raw.len() as u64 != desc.byte_len {
-        return Err(Error::tensor(
-            &desc.name,
-            "payload length does not match descriptor",
-        ));
+        return Err(Error::tensor(desc.name, "payload length does not match descriptor").into());
     }
-    match conversion_kind(desc.ggml_type, endian)? {
+    let kind = conversion_kind(desc.ggml_type, endian)?;
+    storage.validate(desc, endian)?;
+    match kind {
         ConversionKind::Dense(dtype) => {
-            return Ok(ConvertedTensor::Dense(DenseTensor {
-                shape: desc.row_major_shape(),
-                dtype,
-                data: normalize_dense(raw, dtype, endian),
-            }));
+            let shape = shape(desc, storage.shape1)?;
+            let data = normalize_dense_with_storage(raw, dtype, endian, storage.bytes)?;
+            return Ok(ConversionOutput::Dense { shape, dtype, data });
         }
         ConversionKind::IQuant => {
-            return Ok(ConvertedTensor::IQuant(IQuantTensor {
-                shape: desc.row_major_shape(),
+            let shape = shape(desc, storage.shape1)?;
+            let data = copied(raw, storage.bytes)?;
+            return Ok(ConversionOutput::IQuant {
+                shape,
                 ggml_type: desc.ggml_type,
                 endian,
-                data: raw.to_vec(),
-            }));
+                data,
+            });
         }
-        ConversionKind::MxFp4 => return mxfp4(desc, raw).map(ConvertedTensor::MxFp4),
+        ConversionKind::MxFp4 => {
+            return mxfp4_with_storage(desc, raw, storage).map(ConversionOutput::MxFp4);
+        }
         ConversionKind::Affine { .. } => {}
     }
-    affine(desc, raw, endian).map(ConvertedTensor::Affine)
+    affine_with_storage(desc, raw, endian, storage).map(ConversionOutput::Affine)
 }
 
-fn mxfp4(desc: &TensorDescriptor, raw: &[u8]) -> Result<MxFp4Tensor> {
-    let (weight_shape, scale_shape) = mxfp4_shapes(desc)?;
+fn mxfp4_with_storage<'a>(
+    desc: TensorDescriptorView<'_>,
+    raw: &[u8],
+    storage: Storage<'a>,
+) -> CResult<MxFp4Output<'a>> {
+    let (weight_shape, scale_shape) =
+        mxfp4_shapes_with_storage(desc, storage.shape1, storage.shape2)?;
     let blocks = raw.len() / 17;
-    let mut weights = Vec::with_capacity(blocks * 4);
-    let mut scales = Vec::with_capacity(blocks);
+    let mut weights = capacity(blocks * 4, storage.words)?;
+    let mut scales = capacity(blocks, storage.e8m0)?;
     for block in raw.as_chunks::<17>().0 {
-        scales.push(block[0]);
+        scales.push(block[0])?;
         let quants = &block[1..];
         let mut values = [0u8; 32];
         for index in 0..16 {
@@ -265,10 +319,10 @@ fn mxfp4(desc: &TensorDescriptor, raw: &[u8]) -> Result<MxFp4Tensor> {
                     .fold(0u32, |packed, (index, value)| {
                         packed | (u32::from(*value) << (index * 4))
                     }),
-            );
+            )?;
         }
     }
-    Ok(MxFp4Tensor {
+    Ok(MxFp4Output {
         weight_shape,
         scale_shape,
         weights,
@@ -290,7 +344,12 @@ fn dense_dtype(ty: GgmlType) -> Option<DenseDtype> {
     })
 }
 
-fn normalize_dense(raw: &[u8], dtype: DenseDtype, endian: Endian) -> Vec<u8> {
+fn normalize_dense_with_storage<'a>(
+    raw: &[u8],
+    dtype: DenseDtype,
+    endian: Endian,
+    slot: Option<Slot<'a, u8>>,
+) -> CResult<Vector<'a, u8>> {
     let width = match dtype {
         DenseDtype::I8 => 1,
         DenseDtype::F16 | DenseDtype::Bf16 | DenseDtype::I16 => 2,
@@ -301,13 +360,13 @@ fn normalize_dense(raw: &[u8], dtype: DenseDtype, endian: Endian) -> Vec<u8> {
         || (cfg!(target_endian = "little") && endian == Endian::Little)
         || (cfg!(target_endian = "big") && endian == Endian::Big)
     {
-        return raw.to_vec();
+        return copied(raw, slot);
     }
-    let mut out = raw.to_vec();
+    let mut out = copied(raw, slot)?;
     for chunk in out.chunks_exact_mut(width) {
         chunk.reverse();
     }
-    out
+    Ok(out)
 }
 
 /// Converts a GGML affine-compatible encoding into the canonical packed
@@ -322,13 +381,12 @@ pub fn convert_affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Re
             "payload length does not match descriptor",
         ));
     }
-    affine(desc, raw, endian)
+    affine_with_storage(desc.view(), raw, endian, Storage::ordinary())
+        .map(AffineOutput::finish)
+        .map_err(ConversionDestinationError::ordinary)
 }
 
-fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineTensor> {
-    let (bits, group_size) = affine_config(desc.ggml_type)
-        .ok_or_else(|| Error::tensor(&desc.name, "tensor encoding has no affine conversion"))?;
-    let (weight_shape, scale_shape) = affine_shapes(desc, bits, group_size)?;
+fn affine_counts(weight_shape: &[u64], scale_shape: &[u64]) -> Result<(u64, u64)> {
     let groups = scale_shape.iter().try_fold(1u64, |a, &b| {
         a.checked_mul(b)
             .ok_or(Error::Overflow("affine group count"))
@@ -336,59 +394,73 @@ fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineT
     let words = weight_shape.iter().try_fold(1u64, |a, &b| {
         a.checked_mul(b).ok_or(Error::Overflow("affine word count"))
     })?;
-    let mut out = AffineTensor {
+    Ok((groups, words))
+}
+fn affine_with_storage<'a>(
+    desc: TensorDescriptorView<'_>,
+    raw: &[u8],
+    endian: Endian,
+    mut storage: Storage<'a>,
+) -> CResult<AffineOutput<'a>> {
+    let (bits, group_size) = affine_config(desc.ggml_type)
+        .ok_or_else(|| Error::tensor(desc.name, "tensor encoding has no affine conversion"))?;
+    let (weight_shape, scale_shape) =
+        affine_shapes_with_storage(desc, bits, group_size, storage.shape1, storage.shape2)?;
+    let (groups, words) = affine_counts(&weight_shape, &scale_shape)?;
+    let mut out = AffineOutput {
         weight_shape,
         scale_shape,
         bits,
         group_size,
-        weights: Vec::with_capacity(words as usize),
-        scales: Vec::with_capacity(groups as usize),
-        biases: Vec::with_capacity(groups as usize),
+        weights: capacity(words as usize, storage.words)?,
+        scales: capacity(groups as usize, storage.scales)?,
+        biases: capacity(groups as usize, storage.biases)?,
     };
     match desc.ggml_type {
         GgmlType::Q4_0 => {
             for b in raw.as_chunks::<18>().0 {
                 let d = half(b, endian);
-                out.scales.push(d);
-                out.biases.push(hbits(-8.0 * f16::from_bits(d).to_f32()));
+                out.scales.push(d)?;
+                out.biases.push(hbits(-8.0 * f16::from_bits(d).to_f32()))?;
                 let mut codes = [0; 32];
                 for i in 0..16 {
                     codes[i] = b[2 + i] & 15;
                     codes[16 + i] = b[2 + i] >> 4;
                 }
-                pack(&codes, 4, &mut out.weights);
+                pack(&codes, 4, &mut out.weights)?;
             }
         }
         GgmlType::Q4_1 => {
             for b in raw.as_chunks::<20>().0 {
-                out.scales.push(half(b, endian));
-                out.biases.push(half(&b[2..], endian));
+                out.scales.push(half(b, endian))?;
+                out.biases.push(half(&b[2..], endian))?;
                 let mut codes = [0; 32];
                 for i in 0..16 {
                     codes[i] = b[4 + i] & 15;
                     codes[16 + i] = b[4 + i] >> 4;
                 }
-                pack(&codes, 4, &mut out.weights);
+                pack(&codes, 4, &mut out.weights)?;
             }
         }
         GgmlType::Q5_0 | GgmlType::Q5_1 => {
-            q5(raw, endian, desc.ggml_type == GgmlType::Q5_0, &mut out)
+            q5(raw, endian, desc.ggml_type == GgmlType::Q5_0, &mut out)?
         }
         GgmlType::Q8_0 => {
             for b in raw.as_chunks::<34>().0 {
                 let d = half(b, endian);
-                out.scales.push(d);
-                out.biases.push(hbits(-128.0 * f16::from_bits(d).to_f32()));
-                let codes: Vec<_> = b[2..].iter().map(|x| x ^ 0x80).collect();
-                pack(&codes, 8, &mut out.weights);
+                out.scales.push(d)?;
+                out.biases
+                    .push(hbits(-128.0 * f16::from_bits(d).to_f32()))?;
+                let codes = q8_codes(&b[2..], storage.scratch.as_deref_mut());
+                pack(&codes, 8, &mut out.weights)?;
             }
         }
         GgmlType::Q4K | GgmlType::Q5K => {
-            q45k(raw, endian, desc.ggml_type == GgmlType::Q5K, &mut out)
+            q45k(raw, endian, desc.ggml_type == GgmlType::Q5K, &mut out)?
         }
-        GgmlType::Q6K => q6k(raw, endian, &mut out),
-        GgmlType::Q2K => q2k(raw, endian, &mut out),
-        GgmlType::Q3K => q3k(raw, endian, &mut out),
+        GgmlType::Q6K => q6k(raw, endian, &mut out)?,
+        GgmlType::Q2K => q2k(raw, endian, &mut out)?,
+        GgmlType::Q3K => q3k(raw, endian, &mut out)?,
         _ => unreachable!(),
     }
     if out.weights.len() as u64 != words
@@ -396,9 +468,10 @@ fn affine(desc: &TensorDescriptor, raw: &[u8], endian: Endian) -> Result<AffineT
         || out.biases.len() != out.scales.len()
     {
         return Err(Error::tensor(
-            &desc.name,
+            desc.name,
             "conversion produced an inconsistent affine shape",
-        ));
+        )
+        .into());
     }
     Ok(out)
 }
@@ -410,10 +483,10 @@ fn hbits(v: f32) -> u16 {
     f16::from_f32(v).to_bits()
 }
 
-fn pack(codes: &[u8], bits: u8, out: &mut Vec<u32>) {
+fn pack(codes: &[u8], bits: u8, out: &mut Vector<'_, u32>) -> CResult<()> {
     let words = (codes.len() * bits as usize).div_ceil(32);
     let start = out.len();
-    out.resize(start + words, 0);
+    out.resize(start + words, 0)?;
     let mask = (1u32 << bits) - 1;
     for (i, &c) in codes.iter().enumerate() {
         let off = i * bits as usize;
@@ -424,6 +497,7 @@ fn pack(codes: &[u8], bits: u8, out: &mut Vec<u32>) {
             out[start + w + 1] |= (c as u32) >> (32 - s);
         }
     }
+    Ok(())
 }
 
 fn scale_min(s: &[u8], i: usize) -> (u8, u8) {
@@ -436,7 +510,7 @@ fn scale_min(s: &[u8], i: usize) -> (u8, u8) {
         )
     }
 }
-fn q45k(raw: &[u8], e: Endian, is_q5: bool, out: &mut AffineTensor) {
+fn q45k(raw: &[u8], e: Endian, is_q5: bool, out: &mut AffineOutput<'_>) -> CResult<()> {
     let size = if is_q5 { 176 } else { 144 };
     for b in raw.chunks_exact(size) {
         let d = f16::from_bits(half(b, e)).to_f32();
@@ -446,8 +520,8 @@ fn q45k(raw: &[u8], e: Endian, is_q5: bool, out: &mut AffineTensor) {
         let qs = if is_q5 { &b[48..] } else { &b[16..] };
         for g in 0..8 {
             let (sc, m) = scale_min(s, g);
-            out.scales.push(hbits(d * sc as f32));
-            out.biases.push(hbits(-dm * m as f32));
+            out.scales.push(hbits(d * sc as f32))?;
+            out.biases.push(hbits(-dm * m as f32))?;
             let mut c = [0; 32];
             for i in 0..32 {
                 let p = qs[(g / 2) * 32 + i];
@@ -459,12 +533,13 @@ fn q45k(raw: &[u8], e: Endian, is_q5: bool, out: &mut AffineTensor) {
                 };
                 c[i] = lo | hi;
             }
-            pack(&c, if is_q5 { 5 } else { 4 }, &mut out.weights);
+            pack(&c, if is_q5 { 5 } else { 4 }, &mut out.weights)?;
         }
     }
+    Ok(())
 }
 
-fn q6k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
+fn q6k(raw: &[u8], e: Endian, out: &mut AffineOutput<'_>) -> CResult<()> {
     for b in raw.as_chunks::<210>().0 {
         let d = f16::from_bits(half(&b[208..], e)).to_f32();
         for section in 0..2 {
@@ -480,34 +555,36 @@ fn q6k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
             }
             for g in 0..8 {
                 let sc = d * (scales[g] as i8) as f32;
-                out.scales.push(hbits(sc));
-                out.biases.push(hbits(-32.0 * sc));
-                pack(&vals[g * 16..g * 16 + 16], 6, &mut out.weights);
+                out.scales.push(hbits(sc))?;
+                out.biases.push(hbits(-32.0 * sc))?;
+                pack(&vals[g * 16..g * 16 + 16], 6, &mut out.weights)?;
             }
         }
     }
+    Ok(())
 }
 
-fn q2k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
+fn q2k(raw: &[u8], e: Endian, out: &mut AffineOutput<'_>) -> CResult<()> {
     for b in raw.as_chunks::<84>().0 {
         let d = f16::from_bits(half(&b[80..], e)).to_f32();
         let dm = f16::from_bits(half(&b[82..], e)).to_f32();
         let mut all = [0; 256];
         for g in 0..16 {
             let s = b[g];
-            out.scales.push(hbits(d * (s & 15) as f32));
-            out.biases.push(hbits(-dm * (s >> 4) as f32));
+            out.scales.push(hbits(d * (s & 15) as f32))?;
+            out.biases.push(hbits(-dm * (s >> 4) as f32))?;
             let qo = (g / 8) * 32 + (g % 2) * 16;
             let shift = ((g % 8) / 2) * 2;
             for i in 0..16 {
                 all[g * 16 + i] = (b[16 + qo + i] >> shift) & 3;
             }
         }
-        pack(&all, 2, &mut out.weights);
+        pack(&all, 2, &mut out.weights)?;
     }
+    Ok(())
 }
 
-fn q3k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
+fn q3k(raw: &[u8], e: Endian, out: &mut AffineOutput<'_>) -> CResult<()> {
     for b in raw.as_chunks::<110>().0 {
         let hm = &b[..32];
         let qs = &b[32..96];
@@ -523,8 +600,8 @@ fn q3k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
         let mut all = [0; 256];
         for g in 0..16 {
             let sc = d * (enc[g] as i32 - 32) as f32;
-            out.scales.push(hbits(sc));
-            out.biases.push(hbits(-4.0 * sc));
+            out.scales.push(hbits(sc))?;
+            out.biases.push(hbits(-4.0 * sc))?;
             let qo = (g / 8) * 32 + (g % 2) * 16;
             let shift = ((g % 8) / 2) * 2;
             let mask = 1 << (g / 2);
@@ -537,19 +614,20 @@ fn q3k(raw: &[u8], e: Endian, out: &mut AffineTensor) {
                     };
             }
         }
-        pack(&all, 3, &mut out.weights);
+        pack(&all, 3, &mut out.weights)?;
     }
+    Ok(())
 }
 
-fn q5(raw: &[u8], e: Endian, is_q5_0: bool, out: &mut AffineTensor) {
+fn q5(raw: &[u8], e: Endian, is_q5_0: bool, out: &mut AffineOutput<'_>) -> CResult<()> {
     let size = if is_q5_0 { 22 } else { 24 };
     for b in raw.chunks_exact(size) {
         let d = half(b, e);
-        out.scales.push(d);
+        out.scales.push(d)?;
         if is_q5_0 {
-            out.biases.push(hbits(-16.0 * f16::from_bits(d).to_f32()));
+            out.biases.push(hbits(-16.0 * f16::from_bits(d).to_f32()))?;
         } else {
-            out.biases.push(half(&b[2..], e));
+            out.biases.push(half(&b[2..], e))?;
         }
         let qh_off = if is_q5_0 { 2 } else { 4 };
         let qs_off = if is_q5_0 { 6 } else { 8 };
@@ -559,6 +637,10 @@ fn q5(raw: &[u8], e: Endian, is_q5_0: bool, out: &mut AffineTensor) {
             codes[j] = (b[qs_off + j] & 15) | (((qh >> j) as u8 & 1) << 4);
             codes[j + 16] = (b[qs_off + j] >> 4) | (((qh >> (j + 16)) as u8 & 1) << 4);
         }
-        pack(&codes, 5, &mut out.weights);
+        pack(&codes, 5, &mut out.weights)?;
     }
+    Ok(())
 }
+
+mod parts;
+pub use parts::{packed_iquant_shape, ConvertedParts};

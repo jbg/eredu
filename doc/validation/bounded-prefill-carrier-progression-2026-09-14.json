@@ -1,0 +1,393 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T03:15:37.450387+00:00",
+  "scope": "Canonical native capture retirement and one shared logical p0 progression under original funding",
+  "status": "Verified prerequisites; full bounded capture/inference integration remains unfinished",
+  "previous_increment": "bounded-native-submission-try-entry-2026-09-14.json",
+  "tests": {
+    "runtime": {
+      "passed": 1080,
+      "ignored": 0
+    },
+    "bounded": {
+      "passed": 68,
+      "ignored": 0
+    },
+    "backend_independence": {
+      "passed": 107,
+      "ignored": 0
+    },
+    "native_capture": {
+      "passed": 30,
+      "ignored": 0
+    },
+    "native_observation": {
+      "passed": 10,
+      "ignored": 0
+    },
+    "session": {
+      "passed": 236,
+      "ignored": 0
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1665,
+  "new_tests": [
+    {
+      "name": "shared_cold_and_host_progression_charge_full_rows_once_and_keep_one_scatter_buffer",
+      "source": "eredu-runtime/src/working_memory/capture_run/tests/prefill/progression.rs",
+      "check": "runtime"
+    },
+    {
+      "name": "missing_zero_hook_blocks_whole_row_advance_and_duplicate_zero_is_rejected",
+      "source": "eredu-runtime/src/working_memory/capture_run/tests/prefill/progression.rs",
+      "check": "runtime"
+    },
+    {
+      "name": "exact_source_and_schedule_bind_progress_without_mutating_old_decode_policy",
+      "source": "eredu-runtime/src/working_memory/capture_run/tests/prefill/progression.rs",
+      "check": "runtime"
+    },
+    {
+      "name": "abandoned_or_failed_attempt_cannot_retry_or_refund_its_logical_usage",
+      "source": "eredu-runtime/src/working_memory/capture_run/tests/prefill/progression.rs",
+      "check": "runtime"
+    },
+    {
+      "name": "quota_skip_disables_later_hooks_and_fail_remains_terminal_without_new_counter",
+      "source": "eredu-runtime/src/working_memory/capture_run/tests/prefill/progression.rs",
+      "check": "runtime"
+    },
+    {
+      "name": "generated_full_padded_creation_charged_once_while_preview_zero_preserves_factories",
+      "source": "eredu-runtime/src/working_memory/capture_run/tests/prefill/progression.rs",
+      "check": "runtime"
+    },
+    {
+      "name": "exact_host_envelope_prices_progress_handles_before_private_target_construction",
+      "source": "eredu-runtime/src/working_memory/capture_run/tests/prefill/progression.rs",
+      "check": "runtime"
+    },
+    {
+      "name": "schedule_inactive_geometry_needs_no_hook_and_true_empty_slice_skips_factory",
+      "source": "eredu-runtime/src/working_memory/capture_run/tests/prefill/progression.rs",
+      "check": "runtime"
+    },
+    {
+      "name": "partial_host_failure_keeps_original_buffer_and_usage_until_abort_retirement",
+      "source": "eredu-runtime/src/working_memory/capture_run/tests/prefill/progression.rs",
+      "check": "runtime"
+    },
+    {
+      "name": "host_skip_retires_unstarted_targets_and_host_fail_cannot_retry",
+      "source": "eredu-runtime/src/working_memory/capture_run/tests/prefill/progression.rs",
+      "check": "runtime"
+    },
+    {
+      "name": "canonical_native_prefill_retires_source_outside_loans_before_whole_work_certification",
+      "source": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/capture/tests/metal/carrier.rs",
+      "check": "session"
+    },
+    {
+      "name": "escaped_native_alias_and_shared_frame_retain_their_actual_original_owners",
+      "source": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/capture/tests/metal/carrier.rs",
+      "check": "session"
+    },
+    {
+      "name": "initial_cancellation_creates_no_carrier_frame_or_source_claim",
+      "source": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/capture/tests/metal/carrier.rs",
+      "check": "session"
+    },
+    {
+      "name": "late_native_hook_failure_preserves_original_cause_and_uncertified_source_custody",
+      "source": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/capture/tests/metal/carrier.rs",
+      "check": "session"
+    },
+    {
+      "name": "retirement_busy_aborts_sealed_frame_and_keeps_complete_original_carrier",
+      "source": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/capture/tests/metal/carrier.rs",
+      "check": "session"
+    },
+    {
+      "name": "measured_carrier_controls_reject_arithmetic_overflow_without_native_work",
+      "source": "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/capture/tests/metal/carrier.rs",
+      "check": "session"
+    }
+  ],
+  "new_test_count": 16,
+  "checks": {
+    "runtime": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --lib",
+      "started_utc": "2026-09-14T03:07:23.134156+00:00",
+      "elapsed_seconds": 17.638,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-carrier-progression-runtime.log",
+      "log_sha256": "5795876ac00b407c1bddad55c9fbc5634dc391fdab1466529718b1ad08138617"
+    },
+    "bounded": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test bounded_prefill",
+      "started_utc": "2026-09-14T03:08:32.796375+00:00",
+      "elapsed_seconds": 7.812,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-carrier-progression-bounded.log",
+      "log_sha256": "be48f1c1bcd3432b13c10638e7ddaa75ac0e2fa78b6137831930991cd1fce997"
+    },
+    "backend_independence": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-runtime --test backend_independence",
+      "started_utc": "2026-09-14T03:08:40.609612+00:00",
+      "elapsed_seconds": 3.519,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-carrier-progression-backend_independence.log",
+      "log_sha256": "c65964d30b10589c36483ec9816f51c18e140cd5762f4d887d605de3bbc05a13"
+    },
+    "native_capture": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib backend::array_copy::capture_tensor:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T03:09:57.270221+00:00",
+      "elapsed_seconds": 69.639,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-carrier-progression-native_capture.log",
+      "log_sha256": "36fe4a27b5c8e79b10c6246cf29b9f9dd3ade1617ff60c20ba6178938383c9ce"
+    },
+    "native_observation": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::observation:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T03:11:06.910326+00:00",
+      "elapsed_seconds": 0.402,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-carrier-progression-native_observation.log",
+      "log_sha256": "43606049cc1854d7a6c618018686734fc6a82d1cea1ea646b5925fa746aee3b2"
+    },
+    "session": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-backend-mlx --no-default-features --features metal --lib composition::mlx::session::model_session:: -- --include-ignored --test-threads=1",
+      "started_utc": "2026-09-14T03:12:42.306123+00:00",
+      "elapsed_seconds": 86.528,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-carrier-progression-session.log",
+      "log_sha256": "4ba1d4f6156ce9f1d1c70ee85a0cfcc0d82b54548e6e8369fac2be410afa9aaf"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T03:14:08.835934+00:00",
+      "elapsed_seconds": 43.341,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-carrier-progression-portable.log",
+      "log_sha256": "7c24be2b618f7151c0971df4bb2e03dbfda4a3a6ed55a9708034836621702a8e"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T03:14:52.177976+00:00",
+      "elapsed_seconds": 15.036,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-carrier-progression-minimal.log",
+      "log_sha256": "d55d35b1aa6a05fa1c802e55714a740e394cc4036ca9309367accaa16c08687f"
+    },
+    "features": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu --no-default-features --features mlx,metal,image,audio",
+      "started_utc": "2026-09-14T03:15:07.214613+00:00",
+      "elapsed_seconds": 20.802,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-prefill-carrier-progression-features.log",
+      "log_sha256": "4f70caff609d6d21e851495479f97c9046349e87f08639f423016df27a8bdd0d"
+    }
+  },
+  "source_sha256": {
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/saved_array_copy.rs": "d9a13f5e5b0deb9af8874d16c5188e28e4cae6b5c125803b48594583b2e612d0",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/saved_array_copy/decoder.rs": "591c690cf6fe17e3a6f3f3e90cd7da366fb0397edd063a1d5794fd73f35dccae",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/saved_array_copy/decoder/resume_quote.rs": "81b40d9e4687f80d7f2ea9903607e58a70a9126a04ee626e188f4f5a1f2b25e2",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/saved_array_copy/tests.rs": "7fccad78fe714c72d40684287570b5dc24f695fb625ac5f9def4a078500d34c1",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding.rs": "e7d26925d7f2fa0bf5f31aa79deee5f5c7f05980c16581642d6a6be011da1ced",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/capture.rs": "f3d054943abcca9d2962209dea9376aec4cc9c89a60bad6b02b3afd90d6977b9",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/capture/carrier.rs": "8dae798d1c58c5ad42491dc42fc8fe4308d8751727962c44134e6cbb2a9f248e",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/capture/observer.rs": "73041c1e983579cde63e8304d17f22c48a853a67aa68cb2ec56c52f48f3bdb49",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote.rs": "9865a882e25d2f408ee7d20b4629cb8fd671826a3b4b599b52ddb03b28b59760",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_quote/capture.rs": "741a425a7e586a28dc017241164863abb05f969046682dbd8dc6a351fe1f88d4",
+    "eredu-runtime/src/working_memory.rs": "52f957049ea43b6ca945f56718bfe3a16b932b4115b9ce226b1b495077b27680",
+    "eredu-runtime/src/working_memory/funding.rs": "44cedafb36dbdb3ecce1902add64f6f367685b45b02f96ba928e6c150a24a3bc",
+    "eredu-runtime/src/working_memory/funding/capture_source.rs": "698470796c8efdac4788b32f5b7fbb2f979070f0b2b8980e081d7d3f16fe3dba",
+    "eredu-runtime/src/working_memory/funding/capture_source/prefill.rs": "626397741aceeb9b177dac309548ee341757c6f798497e2e810a04794536bf04",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/binding.rs": "21ba8b4f638846be932b53d9659638868a57ecbfcffbed87106c97aa02f724f6",
+    "eredu-backend-mlx/src/composition/mlx/replicated_text/session/binding/prefill_retention_fixture.rs": "ec45f0eb959a2238064bc1692865291d5d97e8bd6a25b24ac980c2ba94952fb3",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/capture/tests.rs": "99a69ad3f74a7981fbdcfcd838ea553bc9b4991a8067980e4903fe9f755debc6",
+    "eredu-backend-mlx/src/composition/mlx/session/model_session/text_funding/capture/tests/metal/carrier.rs": "8e2f95c22189ae322ba1c9213ca658eeb25ef900dd74f184c5f15c0af12eb311",
+    "eredu-runtime/src/capture.rs": "6a6c09a717c96f75ad55a47f84cbbb0edb01fd6d43ded73de2fc2f0ab31af47d",
+    "eredu-runtime/src/capture/policy.rs": "b4be7e2b7be54569bcc52900d3c125cc531c5ac80a529e5a5bd240f4004aa487",
+    "eredu-runtime/src/capture/policy/prefill.rs": "873d9dfe0d5f0727109051551d5721812c37a80718b33f3416f17dac7dba78b6",
+    "eredu-runtime/src/working_memory/capture_run/claims/prefill.rs": "7f9b622e60719cfd0cb597ac1e967964a5cc5a7f8bfa233002d29c9ab0f5e86d",
+    "eredu-runtime/src/working_memory/capture_run/claims/prefill/progression.rs": "a212761f0d99d9db54eec3903dff3c2959b96a52329208dae21ae80231a2d66e",
+    "eredu-runtime/src/working_memory/capture_run/plan.rs": "7ba2e2d50fe0e81d951c1b2d9771b6c0015e628430c9c6db374c4ea1a3a21e28",
+    "eredu-runtime/src/working_memory/capture_run/tests/prefill.rs": "cd918de4b97e0ed30c4524ac8e4c9b8510dd5732533ace1c2ecd317b08c63607",
+    "eredu-runtime/src/working_memory/capture_run/tests/prefill/progression.rs": "1d811020eb36bd981e736199f087f2086a50aa29aa12e9433b661674b1849c6d",
+    "eredu-runtime/src/working_memory/capture_tensor/prefill.rs": "472fe3760a262de251ba5fc3edf8d58136957eca76d2bf1197e83d52fcd15d79",
+    "doc/backend-architecture.md": "af30d57674b49e49946f1307a87745dd7fd686731437d715c2504c20cdc9caa0",
+    "doc/execution-control.md": "8b82e9984279c8cdb2e3456ad02e1da03620b41b61192e3409d6da92bb947377",
+    "doc/bounded-inference.md": "f69be8c931638ec177a476157cdf5c09507f3d04a3bbdd971a1f1d3211fdff63"
+  },
+  "source_snapshot": "/private/tmp/eredu-prefill-carrier-progression-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-capture-native-carrier-borrow-fix-stage/README.md": "b5d9b9e4fda183b10dc3fd8b4279e2e2d09989965971b61ea41aae6c356af935",
+    "/private/tmp/eredu-capture-native-carrier-borrow-fix-stage/base-hashes.json": "71f04d33aa2e80f4cbb24062856ffa6ff90d3a2d6b6b637537e9eaa80d09c946",
+    "/private/tmp/eredu-capture-native-carrier-borrow-fix-stage/change.patch": "90e252410b124e6cea3f254f5b06e5851e6806e1f288419d42c3ea8e4f7e43d0",
+    "/private/tmp/eredu-capture-native-carrier-borrow-fix-stage/checks.json": "ec12f33c8d94f4e83a1cc48741895d332e5781850b45c5fbe61ba88c796c7ff2",
+    "/private/tmp/eredu-capture-native-carrier-borrow-fix-stage/dependency-hashes.json": "2138af286990d5a2770369111b07e0780bf70f969c20b49cae683a93ea08cc7d",
+    "/private/tmp/eredu-capture-native-carrier-borrow-fix-stage/files.txt": "c300c2e16f7f528f4d6771d68d0d0af496d46d02ee4300c56c2117c7558e094e",
+    "/private/tmp/eredu-capture-native-carrier-borrow-fix-stage/staged-hashes.json": "64dcc764411a8108c6381e8b77f835fd16f8de6e9ee4fad85a9917944add54f4",
+    "/private/tmp/eredu-capture-native-carrier-stage/PRICING.md": "420fe4bfb12182bd39bb374bab11a9152099511a2431a524b64000534f80f841",
+    "/private/tmp/eredu-capture-native-carrier-stage/README.md": "513f712895596b66c35ac55c03d437d22172b54a6c4bf074f445729a6d703fcb",
+    "/private/tmp/eredu-capture-native-carrier-stage/TEST-COMMANDS.md": "59cd29c45d8127d0664e47a7637e89b28e7b2ba146af4e80832ac8b525259867",
+    "/private/tmp/eredu-capture-native-carrier-stage/add_copy_test.py": "2d5f6532ee7261d2f3d85561d23c058c78a5f6349e874c718c07594f6e143dcf",
+    "/private/tmp/eredu-capture-native-carrier-stage/artifact-hashes.json": "6b2cd7fd709b9ad33fb3108955a835f45e6979add62f1f43face1605d5a6b216",
+    "/private/tmp/eredu-capture-native-carrier-stage/base-hashes.json": "d977bbac8d2b326aa1f65973bae411058b6c3f0f2955a938aba23b0e26d3ddcc",
+    "/private/tmp/eredu-capture-native-carrier-stage/change.patch": "fd388dbd2d71f1370c0997ed4efa2031ab842695d4b78fc216b272fc5e13d1f9",
+    "/private/tmp/eredu-capture-native-carrier-stage/checks.json": "98bfeb1cc23930eb45c087a963124395dbb9def6b54ad024ad45dfc26468555f",
+    "/private/tmp/eredu-capture-native-carrier-stage/combined-staged-hashes.json": "ccd1730ac2f4b4f236cab0b80a94f42600bc3cd9ca9d2d08f4fa2a65a07c7fb3",
+    "/private/tmp/eredu-capture-native-carrier-stage/companion-checks.json": "fca696f59e3eb282e053bc9e8c643ce2db2977f146df0518120ef5a599993f8f",
+    "/private/tmp/eredu-capture-native-carrier-stage/dependency-hashes.json": "224ac7e1eac3ddbe62e39a38a97aa6eaf0008a9d9b75a4471c33462374e3d7e2",
+    "/private/tmp/eredu-capture-native-carrier-stage/doc-additions/backend-architecture.md": "b457ddaae6e0f250804b4c197f58bd84e659efd5c304b8236eed3cb72d9def9f",
+    "/private/tmp/eredu-capture-native-carrier-stage/doc-additions/execution-control.md": "70c444703f64cd97b7e319c2fa6198d683a2f74945c5f7395066b358ad1b434b",
+    "/private/tmp/eredu-capture-native-carrier-stage/doc-additions/working-memory.md": "b6c9ae38fab22ccfc5478cc07bb9c1d02dfea46b57546475f0847ea424e17978",
+    "/private/tmp/eredu-capture-native-carrier-stage/files.txt": "504262ffa8b56b8939fb4512cffc0b860d769c3cab4d5ccbc625fefe806ecde8",
+    "/private/tmp/eredu-capture-native-carrier-stage/format-draft.json": "11bb7ec4473dd063893c399aa460ff54289b3968b1d3af4391d79c910ac84304",
+    "/private/tmp/eredu-capture-native-carrier-stage/package_sources.py": "318540c6e9805b92c9b2108ee363e8394de83739a70e43176dd5ee60d8bcfc3c",
+    "/private/tmp/eredu-capture-native-carrier-stage/source-basis.json": "3c6d0cef9d6eef59ed9879d4ab4dfa21c5f83ddf60134d24c6e8fc5d7520ebfd",
+    "/private/tmp/eredu-capture-native-carrier-stage/staged-hashes.json": "7cd316b4757d4b255b8cb7780a728c8f2afef2047e6b8915b3986b71b1fa53b7",
+    "/private/tmp/eredu-capture-native-carrier-stage/tests.json": "f2ef3c3f2b16721073e527aea5c2b4c8ee605279e2411ecafb54ee579444762f",
+    "/private/tmp/eredu-capture-native-carrier-stage/tighten_controls.py": "1651392a3577d4ab27fbd1ef295ba0273855a34fcca8014cb334e2c2966a84b4",
+    "/private/tmp/eredu-capture-native-carrier-stage/write_pricing.py": "ec68a3f1e0b2150734b9aa39b4f366744b56fe149f5ce1c9961b366e6afda547",
+    "/private/tmp/eredu-capture-native-carrier-stage/write_production.py": "407cc07d52a537d8cb3592d3e4f95858d460b2a6992036277fab739ed219b9c4",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/README.md": "38bcecfbb096d47d4ff5966a65b7fcb22f141a9bccf5d3b9384127f0a873ae5d",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/artifact-hashes.json": "a825bf30f6cb3cd708d6c91aa8580af218d21fed8f5034bf9ce678cc25016d83",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/base-hashes.json": "acbeb44ffe59e8bda43a8d26f7aad0f0964235ad4db52158a6274c4219be7875",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/build.py": "f2a631d60b16ed311513d424653717b7d3819f0f59128641eb8d2d8fefc1a5bf",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/change.patch": "acb03075c3decff81a938b9a7277dff6750eef7246e1ea2a793575e3a22b2102",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/checks.json": "6792a8ce666643bebff562db6ce19b8d9dd34eabe413a98abdcffefe2723e2e8",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/dependencies.json": "6affb6c9de38fbb3dee7b800dcb745242837a181e15496bc6ce068454c35f6ac",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/documentation-additions.md": "5ac05342211f0e24b1d5997fc3b82c0b5f7e8d016494ebc8ed28102add1e6737",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/files.txt": "812b882912a395fb1512d977747d05a9ca585f356bea6593cbef28e299b00e89",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/new-tests.json": "d79ec7082001002505db1dccc98e9b3060d537c4cfca5d2e2fbfec5669bedef5",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/package.py": "f1086186ac1a015a926101811db5cdd22755fbd86ec34c381c8fdac7012b1816",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/source-basis.json": "757d9de101df8aa3fca79545972ef0d1d7b75db643b6e522e1c5842e3d2ed688",
+    "/private/tmp/eredu-native-prefill-retention-fixture-stage/staged-hashes.json": "239ab880aa4bacf58f0b011416396e3803d2550f98abbe929967c18c87b8e0bd",
+    "/private/tmp/eredu-prefill-carrier-progression-applied.json": "3b06b7f770b6cf7010e9406cc7412aa6804ccad7b0c3e20ae1fa246d24a07bb2",
+    "/private/tmp/eredu-prefill-carrier-progression-apply.py": "71bb2a5b8981e0eacb6db8c0241534ca68c84a564e3c84e6794560fb08629846",
+    "/private/tmp/eredu-prefill-carrier-progression-backend_independence.log": "c65964d30b10589c36483ec9816f51c18e140cd5762f4d887d605de3bbc05a13",
+    "/private/tmp/eredu-prefill-carrier-progression-bounded.log": "be48f1c1bcd3432b13c10638e7ddaa75ac0e2fa78b6137831930991cd1fce997",
+    "/private/tmp/eredu-prefill-carrier-progression-bounded.log.prevalidation": "baa83a787e276195cafa823f7f6eb24ef82e6779e3ae515813fd97bc38a79d2c",
+    "/private/tmp/eredu-prefill-carrier-progression-checks.json": "6b825985401f62477409041f7e092e24f6ff2a39fcfad9bff33fcf51c06b61c6",
+    "/private/tmp/eredu-prefill-carrier-progression-command-target-failure.json": "4cd92745dc057a92e3a207b97bba0451b88688fb31573a26f99c0905ee187b6f",
+    "/private/tmp/eredu-prefill-carrier-progression-command-target-failure.log": "baa83a787e276195cafa823f7f6eb24ef82e6779e3ae515813fd97bc38a79d2c",
+    "/private/tmp/eredu-prefill-carrier-progression-doc-snippets.json": "bfa61d2d70fa08fc9afa2bd4f83154886fc3ac0b871b84b3b7f1f68663ac7806",
+    "/private/tmp/eredu-prefill-carrier-progression-features.log": "4f70caff609d6d21e851495479f97c9046349e87f08639f423016df27a8bdd0d",
+    "/private/tmp/eredu-prefill-carrier-progression-independent-carrier-review.md": "8fbcc056d1bbc2a58a794100f4bde3ba80bff630c2879d5006ba121c749efa34",
+    "/private/tmp/eredu-prefill-carrier-progression-minimal.log": "d55d35b1aa6a05fa1c802e55714a740e394cc4036ca9309367accaa16c08687f",
+    "/private/tmp/eredu-prefill-carrier-progression-native-source-stream-failure.json": "503b099fa145e534ddbab802f86b5ee88d4b341fbd1ef07f2b54cbdc3c600478",
+    "/private/tmp/eredu-prefill-carrier-progression-native-source-stream-failure.log": "aeea42eca754694d8987e35c2a5cca334846db13f0c9cb50db7da3ee9dd98405",
+    "/private/tmp/eredu-prefill-carrier-progression-native-source-stream-stage/base-hashes.json": "2e68a24b5ec6ae77220b3efc678478f450dd77479d03a1628183b3a8794f4711",
+    "/private/tmp/eredu-prefill-carrier-progression-native-source-stream-stage/change.patch": "0d06fddf66a3c61d01dd3654a3203d7c67bbcac983d155486dca753a7a2efe0f",
+    "/private/tmp/eredu-prefill-carrier-progression-native-source-stream-stage/staged-hashes.json": "08be7d5aa34db5c110e5b1fccac7203bc7e2b4431e7ce4252133dcf5ba63754d",
+    "/private/tmp/eredu-prefill-carrier-progression-native-test-compile-failure.json": "17ca673603e87ba1039274bd681aced111d7eb3124d82d12780de201285a007a",
+    "/private/tmp/eredu-prefill-carrier-progression-native-test-compile-failure.log": "4dd32dec1ca8362e8e8e36975524d2cc819d9e0e68aa40ff53a749d00c77cbe8",
+    "/private/tmp/eredu-prefill-carrier-progression-native-test-compile-stage/base-hashes.json": "681ba140a60ae19357e8d9f2c22d048ac7e8b3a6d42ae3c07e7bd8a869f6798e",
+    "/private/tmp/eredu-prefill-carrier-progression-native-test-compile-stage/change.patch": "66052993abac7d0a120132022ef0db43266d78155266578612609d15152ef085",
+    "/private/tmp/eredu-prefill-carrier-progression-native-test-compile-stage/staged-hashes.json": "fd0e23d03a6697605fe47931e881e5909ba18a4e7eec8691e94182c4e0e83799",
+    "/private/tmp/eredu-prefill-carrier-progression-native_capture.log": "36fe4a27b5c8e79b10c6246cf29b9f9dd3ade1617ff60c20ba6178938383c9ce",
+    "/private/tmp/eredu-prefill-carrier-progression-native_capture.log.prevalidation": "4dd32dec1ca8362e8e8e36975524d2cc819d9e0e68aa40ff53a749d00c77cbe8",
+    "/private/tmp/eredu-prefill-carrier-progression-native_observation.log": "43606049cc1854d7a6c618018686734fc6a82d1cea1ea646b5925fa746aee3b2",
+    "/private/tmp/eredu-prefill-carrier-progression-portable.log": "7c24be2b618f7151c0971df4bb2e03dbfda4a3a6ed55a9708034836621702a8e",
+    "/private/tmp/eredu-prefill-carrier-progression-review.json": "b8783ebc602abb58c0e35811fa5f85a8d691442c441bee4ef8f12949b1a4cef8",
+    "/private/tmp/eredu-prefill-carrier-progression-runtime.log": "5795876ac00b407c1bddad55c9fbc5634dc391fdab1466529718b1ad08138617",
+    "/private/tmp/eredu-prefill-carrier-progression-runtime.log.prevalidation": "22b1b8f75065e0fecd3b3ed4055547aa00056e0aea2a99917e0a7deae5c2d2c5",
+    "/private/tmp/eredu-prefill-carrier-progression-session.log": "4ba1d4f6156ce9f1d1c70ee85a0cfcc0d82b54548e6e8369fac2be410afa9aaf",
+    "/private/tmp/eredu-prefill-carrier-progression-session.log.prevalidation": "aeea42eca754694d8987e35c2a5cca334846db13f0c9cb50db7da3ee9dd98405",
+    "/private/tmp/eredu-prefill-carrier-progression-test-borrow-failure.json": "f0921ba407b59752258a431c4832a12c41a5fe9620f642bda1843dd41f1d9015",
+    "/private/tmp/eredu-prefill-carrier-progression-test-borrow-failure.log": "22b1b8f75065e0fecd3b3ed4055547aa00056e0aea2a99917e0a7deae5c2d2c5",
+    "/private/tmp/eredu-prefill-carrier-progression-test-borrow-stage/base-hashes.json": "cad050b4eadd35ff1f0bc460671cedc6a53473d13e88d36dc3ee9b2b8fff5e34",
+    "/private/tmp/eredu-prefill-carrier-progression-test-borrow-stage/change.patch": "5734d89558055da4a8e04b87ffa49124761968ffb8e77dbee323401f8108cc55",
+    "/private/tmp/eredu-prefill-carrier-progression-test-borrow-stage/staged-hashes.json": "738b8d89e38595cea9b0601caa63bf68a53e12086107e2551cdd35eca42d0e00",
+    "/private/tmp/eredu-prefill-carrier-progression-validate.py": "644def00b848981db9a3bcafef6c33366d4ae4d607d871362bdacd69ab042d9a",
+    "/private/tmp/eredu-prefill-logical-progression-stage/README.md": "b177294b49ffc6d9508b6208bb627b80a49bbc3746e777a3a9f8af8a79c1733a",
+    "/private/tmp/eredu-prefill-logical-progression-stage/artifact-hashes.json": "7c373ef45f9abf18e7af3a7476edee1197634b9ab437a1b5389cac1fd0a89f3e",
+    "/private/tmp/eredu-prefill-logical-progression-stage/base-hashes.json": "eccfbfaaaf92258b824532d04842bf4baf078caaaba4952ebf636c75af7fa592",
+    "/private/tmp/eredu-prefill-logical-progression-stage/change.patch": "2c3c6ae4f993b59071fe9eb4bdba3e4a0c2bc9fcb8d98aae4118de4d7a1e3576",
+    "/private/tmp/eredu-prefill-logical-progression-stage/checks.json": "1da6ddc7e6c7db9df3f52ab5096a94ad5e52612c0540e1012a4958a6ce4bf646",
+    "/private/tmp/eredu-prefill-logical-progression-stage/files.txt": "96f29a0e0182079d0aaffe7ff91de5424607f3d70bb9f96ce62a442b9cc016a6",
+    "/private/tmp/eredu-prefill-logical-progression-stage/init.py": "5e7f97d6202a7fd6549b7c4213a933e2e4c97fc72a8e0e7633cfcfa2b7e7d3ab",
+    "/private/tmp/eredu-prefill-logical-progression-stage/new-tests.json": "6308fd77085ca6d4d0c4881357b2bec12049ac3e9ecfcaae6daf7a061bc84356",
+    "/private/tmp/eredu-prefill-logical-progression-stage/package.py": "fa8628671726d41f62311e755dc6e78c7ff057fd54cd0ce39067dffcece7fc91",
+    "/private/tmp/eredu-prefill-logical-progression-stage/review-supplement.json": "be01a779614d1dbc9660eb2785fcb5a8f2cf9b81d286caf7dcba631e7e4dcf0e",
+    "/private/tmp/eredu-prefill-logical-progression-stage/review-supplement.patch": "39742689c03acf64682c6ba92df82a8b292f78a4a481a3eda3ffc4da91013f17",
+    "/private/tmp/eredu-prefill-logical-progression-stage/source-basis.json": "13abe08174273c5b411a2d224ad0382c7766fa0f33afa7863165370a3cd9c435",
+    "/private/tmp/eredu-prefill-logical-progression-stage/staged-hashes.json": "f20dbf3bd4e1ba401687f111a411b5f8d5b303fc1c6a7fc91df4383497656cae"
+  },
+  "review": {
+    "root_full_source_tests_docs_review": true,
+    "stages": {
+      "/private/tmp/eredu-capture-native-carrier-stage": {
+        "manifest_sha256": "7cd316b4757d4b255b8cb7780a728c8f2afef2047e6b8915b3986b71b1fa53b7",
+        "patch_sha256": "fd388dbd2d71f1370c0997ed4efa2031ab842695d4b78fc216b272fc5e13d1f9"
+      },
+      "/private/tmp/eredu-capture-native-carrier-borrow-fix-stage": {
+        "manifest_sha256": "64dcc764411a8108c6381e8b77f835fd16f8de6e9ee4fad85a9917944add54f4",
+        "patch_sha256": "90e252410b124e6cea3f254f5b06e5851e6806e1f288419d42c3ea8e4f7e43d0"
+      },
+      "/private/tmp/eredu-native-prefill-retention-fixture-stage": {
+        "manifest_sha256": "239ab880aa4bacf58f0b011416396e3803d2550f98abbe929967c18c87b8e0bd",
+        "patch_sha256": "acb03075c3decff81a938b9a7277dff6750eef7246e1ea2a793575e3a22b2102"
+      },
+      "/private/tmp/eredu-prefill-logical-progression-stage": {
+        "manifest_sha256": "f20dbf3bd4e1ba401687f111a411b5f8d5b303fc1c6a7fc91df4383497656cae",
+        "patch_sha256": "2c3c6ae4f993b59071fe9eb4bdba3e4a0c2bc9fcb8d98aae4118de4d7a1e3576"
+      }
+    },
+    "independent_carrier_review": {
+      "path": "/private/tmp/eredu-prefill-carrier-progression-independent-carrier-review.md",
+      "sha256": "8fbcc056d1bbc2a58a794100f4bde3ba80bff630c2879d5006ba121c749efa34"
+    },
+    "corrections": [
+      "Carrier whole-self capacity checks moved before mutable segment field borrows.",
+      "Progression adds checked public cold-row advancement and actual host Skip/Fail coverage."
+    ],
+    "limits": [
+      "Private fragment ingress has no production caller.",
+      "C native fixtures use genuine SessionPrefill with one full Sequence chunk and settled external F32 source.",
+      "Logical progression constructor is private until architecture causal/readout binding and original quote integration."
+    ],
+    "test_borrow_correction": {
+      "stage": "/private/tmp/eredu-prefill-carrier-progression-test-borrow-stage",
+      "manifest_sha256": "738b8d89e38595cea9b0601caa63bf68a53e12086107e2551cdd35eca42d0e00",
+      "patch_sha256": "5734d89558055da4a8e04b87ffa49124761968ffb8e77dbee323401f8108cc55",
+      "reason": "Drop exclusive step loan before moving its owning bank; four fixture-only E0505 errors",
+      "production_changed": false
+    },
+    "native_fixture_compile_correction": {
+      "stage": "/private/tmp/eredu-prefill-carrier-progression-native-test-compile-stage",
+      "manifest_sha256": "fd0e23d03a6697605fe47931e881e5909ba18a4e7eec8691e94182c4e0e83799",
+      "patch_sha256": "66052993abac7d0a120132022ef0db43266d78155266578612609d15152ef085",
+      "reason": "Import Arc explicitly and reuse actual production construction-start instrumentation in test visitor",
+      "production_changed": false
+    },
+    "native_source_stream_correction": {
+      "stage": "/private/tmp/eredu-prefill-carrier-progression-native-source-stream-stage",
+      "manifest_sha256": "08be7d5aa34db5c110e5b1fccac7203bc7e2b4431e7ce4252133dcf5ba63754d",
+      "patch_sha256": "0d06fddf66a3c61d01dd3654a3203d7c67bbcac983d155486dca753a7a2efe0f",
+      "reason": "Use the actual CPU weights stream in both prepared route and typed construction visitor, matching production loading; five new fixture load failures before execution",
+      "production_changed": false
+    }
+  },
+  "behavior": [
+    "Canonical success tickets move only their exact original scheduled capture source channel into an opaque parcel; no source credit, extra hold or native completion is invented.",
+    "Native source arrays/publications retire outside all Usage/RefCell loans after positive observable retirement; Busy and original errors preserve the full carrier and uncertified original owner.",
+    "Actual common work, active carrier, snapshots and fixed collector controls enter original quote/copy accounting; user safety reserve remains additive.",
+    "Shared logical rows charge full selection/generated quota once, require every expected hook including zero output, preflight all rows before chunk advancement, and never refund on failure.",
+    "Six native fixtures run the real prepared-construction and SessionPrefill paths with a settled external F32 hook through an existing whole-value claim; ten neutral cases exercise original fixed target storage."
+  ],
+  "limits": [
+    "Private physical fragment ingress still has no production callback; new native fixtures do not execute the stamped fragment-transfer leaf.",
+    "Architecture causal/readout binding, original physical-output quotation and ordinary/controlled split capture delivery remain separate integration work.",
+    "Current publication checks happen after allocation. Whole upcoming-span pre-evaluation headroom proof must account for exact current state and same-account work before activation.",
+    "Existing native infrastructure bookkeeping exclusions remain; no total-process memory bound, new released checkpoint validation or multi-rank native result is claimed.",
+    "Fixture-only borrow/import/construction/source-stream corrections and all failed validation logs are retained in artifacts; no production relaxation was needed."
+  ]
+}

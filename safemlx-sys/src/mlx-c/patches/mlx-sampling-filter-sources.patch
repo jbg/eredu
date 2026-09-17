@@ -1,0 +1,125 @@
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -3735,7 +3735,7 @@
+     int axis,
+     ScatterAxis::ReduceType mode,
+     StreamOrDevice s) {
+-  std::string prefix =
++  const char* prefix =
+       (mode == ScatterAxis::None) ? "[put_along_axis]" : "[scatter_add_axis]";
+   if (axis + a.ndim() < 0 || axis >= static_cast<int>(a.ndim())) {
+     std::ostringstream msg;
+@@ -3759,9 +3759,9 @@
+ 
+   // Squeeze leading singletons out of update
+   if (upd.ndim() > indices.ndim()) {
+-    std::vector<int> sq_ax(upd.ndim() - indices.ndim());
++    Shape sq_ax(upd.ndim() - indices.ndim());
+     std::iota(sq_ax.begin(), sq_ax.end(), 0);
+-    upd = squeeze(upd, sq_ax, s);
++    upd = squeeze_impl(upd, std::move(sq_ax), s);
+   }
+ 
+   auto inputs = broadcast_arrays({indices, upd}, s);
+@@ -3771,7 +3771,7 @@
+   axis = axis < 0 ? a.ndim() + axis : axis;
+ 
+   // Broadcast src, indices, values while ignoring the take axis
+-  inputs = broadcast_arrays(inputs, {axis - int(a.ndim())}, s);
++  inputs = broadcast_arrays_ignoring(inputs, Shape{axis - int(a.ndim())}, s);
+ 
+   auto out_shape = inputs[0].shape();
+   return array(
+diff --git a/mlx/graph_quota.cpp b/mlx/graph_quota.cpp
+--- a/mlx/graph_quota.cpp
++++ b/mlx/graph_quota.cpp
+@@ -429,6 +429,8 @@
+       resident_primitive_control<Copy>(), resident_primitive_control<Full>(),
+       resident_primitive_control<Gather>(), resident_primitive_control<GatherAxis>(),
+       resident_primitive_control<Scatter>(), resident_primitive_control<ArgSort>(),
++      resident_primitive_control<ScatterAxis>(), resident_primitive_control<Partition>(),
++      resident_primitive_control<Scan>(),
+       resident_primitive_control<GatherMM>(), resident_primitive_control<Reduce>(),
+       resident_primitive_control<Slice>(), resident_primitive_control<SliceUpdate>(),
+       resident_primitive_control<ArgReduce>(), resident_primitive_control<ArgPartition>(),
+diff --git a/mlx/backend/metal/indexing.cpp b/mlx/backend/metal/indexing.cpp
+--- a/mlx/backend/metal/indexing.cpp
++++ b/mlx/backend/metal/indexing.cpp
+@@ -596,7 +596,12 @@
+   kernel_name += upd.flags().row_contiguous ? "c" : "nc";
+   kernel_name += idx.flags().row_contiguous ? "c" : "nc";
+ 
+-  auto lib = d.get_library_borrowed(lib_name, [&]() {
++  const bool original = d.original_precompiled_kernel_required();
++  if (original && (reduce_type_ != ScatterAxis::None ||
++      (out.dtype() != float32 && out.dtype() != float16 && out.dtype() != bfloat16) ||
++      idx.dtype() != uint32))
++    throw submission::NativeControlError(submission::NativeControlFailure::unsupported_backend);
++  auto lib = original ? d.precompiled_library() : d.get_library_borrowed(lib_name, [&]() {
+     std::string kernel_source = metal::utils();
+     kernel_source += metal::reduce_utils();
+     kernel_source += metal::scatter_axis();
+diff --git a/mlx/backend/metal/selector_controls.cpp b/mlx/backend/metal/selector_controls.cpp
+--- a/mlx/backend/metal/selector_controls.cpp
++++ b/mlx/backend/metal/selector_controls.cpp
+@@ -35,6 +35,8 @@
+ constexpr size_t indexing = text("gather_front___") + 2 * dtype_tag +
+     text("int64_t") + integer;
+ constexpr size_t gather_axis = text("gather_axis_int64_tncnc") + 2 * dtype_tag;
++constexpr size_t scatter_axis = text("scatter_axis_none_int64_tncnc") + 2 * dtype_tag;
++constexpr size_t scan = text("strided_scan_reverse_exclusive_logaddexp__") + 2 * dtype_tag;
+ constexpr size_t single_index = text("scatter_none_1_updc_false_nwork1_int64_t") + 2 * dtype_tag;
+ constexpr size_t sort_name = text("partition_mbsort__bn_tn") + 2 * dtype_tag + 2 * integer;
+ constexpr size_t gathered_rhs = text("steel_gather_mm_rhs_nax_n") + 1 +
+@@ -45,7 +47,7 @@
+ constexpr size_t rope = text("rope_single_freqs_large__vjp_traditional_transpose") + dtype_tag;
+ constexpr size_t normalization = text("layer_norm_looped") + dtype_tag;
+ constexpr size_t maximum_name = std::max({gemm_specialized, gemm_split, gemv,
+-    attention, vector_attention, reduce, indexing, gather_axis, single_index, sort_name, gathered_rhs,
++    attention, vector_attention, reduce, indexing, gather_axis, scatter_axis, scan, single_index, sort_name, gathered_rhs,
+     pointwise, rope, normalization});
+ 
+ // The widest formatting call is split-K: two transpose chars, two dtype tags,
+@@ -111,7 +113,7 @@
+       // Single-block sort has a second inline stride list. Index metadata's
+       // three range loans remain live through the synchronous encoder binding.
+       sizeof(Strides) + 3 * sizeof(void*) + 2 * sizeof(bool) +
+-      // GatherAxis binds one removed Shape and two removed Strides, all inline
++      // GatherAxis and ScatterAxis each bind one removed Shape and two removed Strides, all inline
+       // for the rank-two router (only one temporary is alive per binding call).
+       sizeof(Shape) + 2 * sizeof(Strides);
+   out = {allocation, controls, maximum_name, constants, linked};
+diff --git a/mlx/backend/metal/kernels/CMakeLists.txt b/mlx/backend/metal/kernels/CMakeLists.txt
+--- a/mlx/backend/metal/kernels/CMakeLists.txt
++++ b/mlx/backend/metal/kernels/CMakeLists.txt
+@@ -184,6 +184,7 @@
+   build_kernel(quantized quantized.h quantized_utils.h ${STEEL_HEADERS})
+   build_kernel(fp_quantized fp4.h fp8.h fp_quantized.h quantized_utils.h
+                ${STEEL_HEADERS})
++  build_kernel(indexing/scatter_axis indexing/scatter_axis.h reduction/ops.h atomic.h)
+   build_kernel(scan scan.h)
+   build_kernel(softmax softmax.h)
+   build_kernel(logsumexp logsumexp.h)
+diff --git a/mlx/backend/metal/kernels/indexing/scatter_axis.metal b/mlx/backend/metal/kernels/indexing/scatter_axis.metal
+new file mode 100644
+--- /dev/null
++++ b/mlx/backend/metal/kernels/indexing/scatter_axis.metal
+@@ -0,0 +1,17 @@
++// Copyright © 2025 Apple Inc.
++// Existing overwrite worker for floating scores and UInt32 argsort indices.
++#include "mlx/backend/metal/kernels/utils.h"
++#include "mlx/backend/metal/kernels/atomic.h"
++#include "mlx/backend/metal/kernels/reduction/ops.h"
++#include "mlx/backend/metal/kernels/indexing/scatter_axis.h"
++#define SCATTER_AXIS_WIDTH(tname, type, lname, location) \
++  instantiate_kernel("scatter_axis" #tname "uint32_none_" #lname "cc", scatter_axis, type, uint32_t, location, None, true, true) \
++  instantiate_kernel("scatter_axis" #tname "uint32_none_" #lname "cnc", scatter_axis, type, uint32_t, location, None, true, false) \
++  instantiate_kernel("scatter_axis" #tname "uint32_none_" #lname "ncc", scatter_axis, type, uint32_t, location, None, false, true) \
++  instantiate_kernel("scatter_axis" #tname "uint32_none_" #lname "ncnc", scatter_axis, type, uint32_t, location, None, false, false)
++#define SCATTER_AXIS_TYPE(tname, type) \
++  SCATTER_AXIS_WIDTH(tname, type, int, int) \
++  SCATTER_AXIS_WIDTH(tname, type, int64_t, int64_t)
++SCATTER_AXIS_TYPE(float32, float)
++SCATTER_AXIS_TYPE(float16, half)
++SCATTER_AXIS_TYPE(bfloat16, bfloat16_t)

@@ -5,7 +5,11 @@ use std::{
     sync::Arc,
 };
 
+use eredu_core::HostPreparationAuthority;
 use serde_json::{Map, Value};
+
+pub(crate) mod original;
+pub(crate) mod registered;
 
 pub(crate) fn compile(schema: &Value) -> Result<jsonschema::Validator, String> {
     // No HTTP/file retrieval features: all referenced resources must be included
@@ -14,20 +18,39 @@ pub(crate) fn compile(schema: &Value) -> Result<jsonschema::Validator, String> {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ToolSchemas(Arc<HashMap<String, jsonschema::Validator>>);
+pub(crate) struct ToolSchemas(Arc<ToolSchemasPayload>);
+
+#[derive(Debug, Default)]
+struct ToolSchemasPayload {
+    schemas: HashMap<String, jsonschema::Validator>,
+    // Every shared validator retires before its construction authority.
+    _authority: HostPreparationAuthority,
+}
 
 impl ToolSchemas {
+    #[cfg(test)]
     pub(crate) fn new(tools: &[Value]) -> Result<Self, String> {
+        Self::new_under_authority(tools, &HostPreparationAuthority::unmanaged())
+    }
+
+    pub(crate) fn new_under_authority(
+        tools: &[Value],
+        authority: &HostPreparationAuthority,
+    ) -> Result<Self, String> {
         let schemas = parse_tools(tools)?
             .into_iter()
             .map(|tool| (tool.name, tool.validator))
             .collect();
-        Ok(Self(Arc::new(schemas)))
+        Ok(Self(Arc::new(ToolSchemasPayload {
+            schemas,
+            _authority: authority.clone(),
+        })))
     }
 
     pub(crate) fn validate(&self, name: &str, arguments: &str) -> Result<(), String> {
         let validator = self
             .0
+            .schemas
             .get(name)
             .ok_or_else(|| format!("unknown tool function {name:?}"))?;
         let arguments: Value = serde_json::from_str(arguments)
@@ -40,6 +63,9 @@ impl ToolSchemas {
             .map_err(|error| format!("tool {name:?} arguments do not match its schema: {error}"))
     }
 }
+
+#[cfg(test)]
+mod authority_tests;
 
 impl crate::runtime::generation::storage::SnapshotStorage for ToolSchemas {
     fn heap_bytes(&self) -> Option<u64> {
@@ -138,13 +164,17 @@ pub(crate) fn embed(schema: &Value, prefix: &str) -> Result<Value, String> {
 }
 
 #[derive(Debug)]
-pub(crate) struct ToolDefinition {
+pub(crate) struct ToolDefinition<V = jsonschema::Validator> {
     pub(crate) name: String,
     pub(crate) parameters: Value,
-    validator: jsonschema::Validator,
+    pub(super) validator: V,
 }
 
 pub(crate) fn parse_tools(tools: &[Value]) -> Result<Vec<ToolDefinition>, String> {
+    parse_tools_with(tools, compile)
+}
+// One ordinary declaration/validation worker; only the compiled representation differs.
+fn parse_tools_with<V>(tools: &[Value], mut compile: impl FnMut(&Value) -> Result<V, String>) -> Result<Vec<ToolDefinition<V>>, String> {
     let mut names = HashSet::new();
     tools
         .iter()

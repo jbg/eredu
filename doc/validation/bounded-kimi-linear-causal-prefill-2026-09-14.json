@@ -1,0 +1,166 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-14",
+  "created_utc": "2026-09-14T06:47:17.074517+00:00",
+  "scope": "Kimi Linear direct ordinary causal observation rows and width-one KDA state correction",
+  "status": "Verified direct family declarations; selected wrapper/native/outer managed composition remains unfinished",
+  "previous_increment": "bounded-deepseek-causal-prefill-2026-09-14.json",
+  "tests": {
+    "architectures": {
+      "passed": 1002,
+      "ignored": 1
+    },
+    "portable": {
+      "passed": 134,
+      "ignored": 1
+    }
+  },
+  "total_passed_executions": 1136,
+  "new_tests": [
+    {
+      "name": "kimi_linear_dense_rows_preserve_all_real_hooks_and_complete_heterogeneous_state",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/kimi_linear_rows.rs"
+    },
+    {
+      "name": "kimi_linear_routed_rows_preserve_causal_recurrence_and_blockwise_attention",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/kimi_linear_rows.rs"
+    },
+    {
+      "name": "kimi_linear_width_one_has_recurrence_without_fabricated_convolution_history",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/kimi_linear_rows.rs"
+    },
+    {
+      "name": "kimi_linear_prepared_paths_bind_actual_sources_and_physical_readout",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/kimi_linear_rows.rs"
+    },
+    {
+      "name": "kimi_linear_body_rows_keep_positions_before_state_only_and_last_position_readout",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/kimi_linear_rows.rs"
+    },
+    {
+      "name": "kimi_linear_target_rows_preserve_existing_nope_and_prediction_policy",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/kimi_linear_rows.rs"
+    },
+    {
+      "name": "kimi_linear_wider_convolution_still_rejects_a_missing_declared_state_role",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/kimi_linear_rows.rs"
+    }
+  ],
+  "new_test_count": 7,
+  "checks": {
+    "architectures": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu-architectures --lib --test reference_numeric",
+      "started_utc": "2026-09-14T06:44:31.040994+00:00",
+      "elapsed_seconds": 107.95,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-kimi-linear-causal-prefill-architectures.log",
+      "log_sha256": "fc153fad5d59a7733529f6f5d73465929e2faf167f5f8ba238ec7cbd0b5852eb"
+    },
+    "portable": {
+      "command": "CARGO_INCREMENTAL=0 cargo test -p eredu --no-default-features --test portable_facade --test backend_conformance",
+      "started_utc": "2026-09-14T06:46:18.992114+00:00",
+      "elapsed_seconds": 38.965,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-kimi-linear-causal-prefill-portable.log",
+      "log_sha256": "c440df0d4b02d99a9317617d73db87d224921eae4a556030695eb874596eb2a0"
+    },
+    "minimal": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features",
+      "started_utc": "2026-09-14T06:46:57.957714+00:00",
+      "elapsed_seconds": 12.185,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-kimi-linear-causal-prefill-minimal.log",
+      "log_sha256": "4d8f71f718547c28f9bc09e98a006c34146faf887ee1ecb0a06fc80342c46c39"
+    },
+    "native": {
+      "command": "CARGO_INCREMENTAL=0 cargo check -p eredu-backend-mlx --no-default-features --features metal",
+      "started_utc": "2026-09-14T06:47:10.143596+00:00",
+      "elapsed_seconds": 3.715,
+      "exit_code": 0,
+      "log": "/private/tmp/eredu-kimi-linear-causal-prefill-native.log",
+      "log_sha256": "23ee8cbb242394d249966c5c1f79c65d38634b98878a69ca30ebca3682761b12"
+    }
+  },
+  "source_sha256": {
+    "eredu-architectures/src/kimi_linear/config.rs": "a2aaa80c2e8164ad102b7a259d91caaaae1af985de40be6dc1da34609ef27d2a",
+    "eredu-architectures/src/kimi_linear/kda.rs": "87c5095d907fe6272781392020b7570d6d0e6ab56542caeaa03544dbdfdf7828",
+    "eredu-architectures/src/kimi_linear/mod.rs": "16727dc80e3ce41ce1792242ee747d05d9217043ff82ef2804e267667d1175d8",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal.rs": "0648c7343f16f953dca7e456501f7b1837c3cc3de6ee32ae527d51552185c24b",
+    "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/kimi_linear_rows.rs": "16e55a6abcf83594eab66f1dea1829398c2bc040fe14110169378a5712c23d77",
+    "doc/backend-architecture.md": "737727ddb4c330060c8ed516919f137c0ff65dea2ea90ec1a6820f6fe590de46",
+    "doc/execution-control.md": "5db1fceea033c651dd37972b4764167bac0200768e77b9e008653e28136668ec",
+    "doc/lm-inspector-execution-control.md": "071db819e8b6c78ffaa296e5e6828fc990032f71ad0d8cce9e72d4793f1a35b3",
+    "doc/bounded-inference.md": "76758835bcf997da296fedef09b58c85540cc75aad9378e47db55f6b95b812ee"
+  },
+  "source_snapshot": "/private/tmp/eredu-kimi-linear-causal-prefill-source-snapshot",
+  "artifacts": {
+    "/private/tmp/eredu-kimi-linear-causal-prefill-application.patch": "f71a391a580e33a462c0def4d6c28ade22dc4fd12bf3c03bc1e54fb86ca943b0",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-applied.json": "bb10294fad2f199443290fb2bc43856e39adebf34e6381747b0bcf0e36e099a4",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-apply.py": "5ab4c66d1fe1324d8a2b573af5bc2c8a34ecf94c28fa388e89babd723fdd35be",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-architectures.log": "fc153fad5d59a7733529f6f5d73465929e2faf167f5f8ba238ec7cbd0b5852eb",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-architectures.log.1789368271040798000.previous": "d1ca08c464fc4de473e75d1e1f084ecbcaaf2bfdeacb76c96dad129763d838fb",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-checks.json": "5d69c72438144279ddfaef12e362eba7be0d0084e70eb043f8935fab1599975f",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-doc-applied.json": "d21fd5b2e423b770a5d779215e98ffc65ae2001432ccc8aeeb8b02a8f974ea72",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-minimal.log": "4d8f71f718547c28f9bc09e98a006c34146faf887ee1ecb0a06fc80342c46c39",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-native.log": "23ee8cbb242394d249966c5c1f79c65d38634b98878a69ca30ebca3682761b12",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-portable.log": "c440df0d4b02d99a9317617d73db87d224921eae4a556030695eb874596eb2a0",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-review-sha256.json": "b3a6d4d4c28e0dbc6c889f1a2fd622b6b0d054ede1376d7e775e1ca6fe519f1b",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-review.json": "fad4e21d5a986ba30f74cba11668e42e2feb4b6abbee2b65e1d94697d33704c8",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-review.md": "bad2ff946446fd38ea0dc692adacf5e05893950223f1390561100a27b6213ab9",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-root-review.json": "1aee0648a4b9d5bf4c076496bc48fe9489e16670843f81a8d56b27dc15104a34",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-schedule-iterator-fixture.patch": "a89c9612021f84c50d012f3158d1758bd19c9b34ee5ff1abed458fbb53da052a",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/AUDIT.md": "2a2944e7b25e62a9e359a1e1a5b7d2fc5d25b7185b281cd4c269d911f31875d4",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/FROZEN.json": "16dc2e630cec8870b674e1009b6bb7c05f1934dba3074a9bc4e3e497eb8d904d",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/README.md": "801217a67c2acbad49fbfd57e7750206eca2064ba3c75d7ff49f1737d40184a6",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/artifacts.json": "0c63cbdf4cc19b6e61a23135b93b554a8d67fc6b20db3ab94866080b717f94b8",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/base-hashes.json": "f83655dc2ef2ea4cbfdd27c304fe1e8a388855a44b539b5766cc9d29113c32db",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/change.patch": "82f335769c91bd0972e6a1bc4df85916ba1124f137796fd31f92eff15953364f",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/checks.json": "eedf2abf7bfc2f975b87ccc8d056272fd3cb63bb65ccbb1baa617c4059cffdab",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/dependencies.json": "01120ac5c5ccd3277ca82bc0974f50e5f36909ca8557f4ce4288dbc043a4d136",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/doc-additions.json": "38d4e4bbd53f033900d9f2e1157b2d14a4df9ed0b3cc82f24aa4fc42a94e36ec",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/freeze.py": "ba8399a08c0d95cc3b524a79d7164aa6163ae1170e222a783f812a3ae8e9455d",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/new-tests.json": "2d0d4dba77a1cda42d8c674fb1ab235cfb97217162fe50b0d1b54dbb2e1f71eb",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/source-basis-hashes.json": "623ca16b89af0af33291aa4a9b0e62ff1263779b810e7cd9c149bd059e5eb62e",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-stage/staged-hashes.json": "1acfa50b90f93728cc14700eb4fa015f42dc1dc6bbd04c82af4192bf39342a3a",
+    "/private/tmp/eredu-kimi-linear-causal-prefill-validate.py": "547bbb65088b0382a70972355fdc55f2ac66f11cc88517d995826eeecb51e69d"
+  },
+  "review": {
+    "reviews": {
+      "/private/tmp/eredu-kimi-linear-causal-prefill-review-sha256.json": "b3a6d4d4c28e0dbc6c889f1a2fd622b6b0d054ede1376d7e775e1ca6fe519f1b",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-review.md": "bad2ff946446fd38ea0dc692adacf5e05893950223f1390561100a27b6213ab9",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-root-review.json": "1aee0648a4b9d5bf4c076496bc48fe9489e16670843f81a8d56b27dc15104a34",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/AUDIT.md": "2a2944e7b25e62a9e359a1e1a5b7d2fc5d25b7185b281cd4c269d911f31875d4",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/FROZEN.json": "16dc2e630cec8870b674e1009b6bb7c05f1934dba3074a9bc4e3e497eb8d904d",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/README.md": "801217a67c2acbad49fbfd57e7750206eca2064ba3c75d7ff49f1737d40184a6",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/artifacts.json": "0c63cbdf4cc19b6e61a23135b93b554a8d67fc6b20db3ab94866080b717f94b8",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/base-hashes.json": "f83655dc2ef2ea4cbfdd27c304fe1e8a388855a44b539b5766cc9d29113c32db",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/change.patch": "82f335769c91bd0972e6a1bc4df85916ba1124f137796fd31f92eff15953364f",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/checks.json": "eedf2abf7bfc2f975b87ccc8d056272fd3cb63bb65ccbb1baa617c4059cffdab",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/dependencies.json": "01120ac5c5ccd3277ca82bc0974f50e5f36909ca8557f4ce4288dbc043a4d136",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/doc-additions.json": "38d4e4bbd53f033900d9f2e1157b2d14a4df9ed0b3cc82f24aa4fc42a94e36ec",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/freeze.py": "ba8399a08c0d95cc3b524a79d7164aa6163ae1170e222a783f812a3ae8e9455d",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/new-tests.json": "2d0d4dba77a1cda42d8c674fb1ab235cfb97217162fe50b0d1b54dbb2e1f71eb",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/source-basis-hashes.json": "623ca16b89af0af33291aa4a9b0e62ff1263779b810e7cd9c149bd059e5eb62e",
+      "/private/tmp/eredu-kimi-linear-causal-prefill-stage/staged-hashes.json": "1acfa50b90f93728cc14700eb4fa015f42dc1dc6bbd04c82af4192bf39342a3a"
+    },
+    "root": "Read complete direct Kimi production/test/documentation patch, original state/convolution implementations and independent source review. Exact archive reconstruction and scoped format checks passed. Width-one recurrence and actual history-free convolution remain coherent; actual prepared callback/state comparisons preserve original token. Independent selected wrapper opt-in and all native/outer gateway work remain separate. Central numerical/build validation pending.",
+    "root_compile_correction": {
+      "reason": "LayerSchedule provides iter(), not IntoIterator for a reference; fixture uses actual schedule.iter() without changing comparisons.",
+      "path": "eredu-architectures/tests/reference_numeric/prepared_workspace/observed/causal/kimi_linear_rows.rs",
+      "after": "16e55a6abcf83594eab66f1dea1829398c2bc040fe14110169378a5712c23d77",
+      "patch": "/private/tmp/eredu-kimi-linear-causal-prefill-schedule-iterator-fixture.patch",
+      "patch_sha256": "a89c9612021f84c50d012f3158d1758bd19c9b34ee5ff1abed458fbb53da052a"
+    }
+  },
+  "behavior": [
+    "Actual direct group0 paths feed the shared causal helper; KDA convolution and gated-delta recurrence and no-positional MLA preserve causal rows.",
+    "Width-one KDA omits only three zero-length convolution roles, retains recurrent matrix/frontier and invokes the existing no-history convolution; wider kernels preserve missing-role diagnostics.",
+    "Fourteen nonzero dense/routed fixed/compressed/mixed configurations cover direct/low-rank query, resident/paged MLA and fused/split KV-B. Actual raw model parameters are loaded before paths and mutable state.",
+    "Full and 2/1/2 continuation compare every real declared row and all persistent state at each frontier and after three cached decodes; exact source/readout/undeclared rejections and body output demands are preserved."
+  ],
+  "limits": [
+    "Neutral synthetic evidence does not replace released-checkpoint or native distributed validation.",
+    "Selected wrapper Kimi causal opt-in and original native capture inventory/outer-resource/gateway composition remain separate unfinished work.",
+    "No new funding authority, source publication, snapshot refund, caller-mask guarantee or process-memory guarantee is introduced."
+  ]
+}

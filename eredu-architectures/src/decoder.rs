@@ -3,6 +3,23 @@
 //! Architecture families retain configuration, checkpoint naming, identity, and
 //! policy while reusing these statically dispatched decoder operations.
 
+pub(crate) mod identity;
+pub(crate) mod parameter_metadata;
+pub(crate) use parameter_metadata::static_groups as static_parallel_parameter_groups_with_metadata;
+mod module_metadata;
+pub(crate) mod construction_specs;
+pub(crate) use module_metadata::ModuleMetadata;
+mod prefill_observations;
+/// Borrowed declarations and shared ordering for actual pinned-module construction.
+pub mod static_construction;
+pub(crate) use static_construction::StaticModuleSpecView;
+pub(crate) use prefill_observations::{
+    media_prefill_observation_declarations, ordinary_prefill_observation_declarations,
+    append_routed_prefill_observations, append_routed_prefill_path,
+    append_dense_component_prefill_observations,
+};
+
+use parameter_metadata::{DeclarationDestination, NormalizationName, ParameterGroupError};
 use std::ops::Range;
 
 pub(crate) mod attention_partition;
@@ -129,6 +146,20 @@ impl<T: Tensor> eredu_nn::ProjectionInputObserver<T> for ComponentProjectionObse
             prototype,
             &eredu_runtime::capture::generated_capture_source(source),
             generate,
+        )
+    }
+    /// Forward the actual generated program and its caller-owned root retention.
+    fn observe_generated_retained(
+        &mut self,
+        prototype: &T,
+        source: &eredu_nn::GeneratedTensorSource,
+        factory: &mut dyn eredu_nn::RetainedGeneratedTensorFactory<T, Error>,
+    ) -> Result<(), Error> {
+        self.observer.observe_generated_retained(
+            &self.path,
+            prototype,
+            &eredu_runtime::capture::generated_capture_source(source),
+            factory,
         )
     }
 }
@@ -397,6 +428,13 @@ impl Default for BlockParameterFields<'_> {
 
 impl BlockParameterFields<'_> {
     fn validate(self) -> Result<Self, Error> {
+        self.validate_with(|args| Error::backend(args))
+    }
+
+    fn validate_with<E>(
+        self,
+        mut invalid: impl FnMut(std::fmt::Arguments<'_>) -> E,
+    ) -> Result<Self, E> {
         for (role, field) in [
             ("attention module", self.attention),
             ("attention query projection", self.attention_query),
@@ -414,7 +452,7 @@ impl BlockParameterFields<'_> {
             ("post-attention norm", self.post_attention_norm),
         ] {
             if field.trim().is_empty() {
-                return Err(Error::backend(format!(
+                return Err(invalid(format_args!(
                     "decoder block {role} field must not be empty"
                 )));
             }
@@ -434,6 +472,12 @@ pub trait Config: 'static {
     /// Implementations must bind every construction, equation, state, and
     /// encoding policy that can affect decoder or cache compatibility.
     fn architecture_fingerprint(&self) -> String;
+    /// Constructs the same semantic fingerprint through the caller's metadata account.
+    /// All intermediate strings and sort storage must use that account as well.
+    fn architecture_fingerprint_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<String, Error>;
     /// Canonical parameter namespace for this decoder body.
     fn parameter_root(&self) -> &str {
         "model"
@@ -443,6 +487,14 @@ pub trait Config: 'static {
     /// binding parameter queries and edits to the shared value.
     fn parameter_alias(&self, _name: &str) -> Option<String> {
         None
+    }
+    /// Produces the same source alias through the checked construction account.
+    fn parameter_alias_with_metadata(
+        &self,
+        _name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
     }
     /// Canonical parameter fields used within each shared decoder block.
     fn block_parameter_fields(&self) -> BlockParameterFields<'_> {
@@ -458,6 +510,18 @@ pub trait Config: 'static {
     }
     /// Validates architecture-owned configuration policy.
     fn validate_config(&self) -> Result<(), Error>;
+    /// Validates the same configuration with a caller-owned diagnostic destination.
+    /// Custom configurations must provide their actual checked producer.
+    fn validate_config_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), Error> {
+        if context.uses_checked_metadata() {
+            Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+        } else {
+            self.validate_config()
+        }
+    }
     /// Transformer hidden size.
     fn hidden_size(&self) -> i32;
     /// Number of decoder layers.
@@ -538,13 +602,41 @@ pub trait Config: 'static {
     /// Encoding of the projection that supplies this layer's key/value-head rows.
     /// Routed value providers override this with their declared bank encoding.
     fn attention_value_format(&self, layer: usize) -> LinearFormat {
-        let fields = self.block_parameter_fields();
-        self.linear_format(&format!(
-            "{}.layers.{layer}.{}.{}.weight",
-            self.parameter_root(),
-            fields.attention,
-            fields.attention_value
-        ))
+        let name = parameter_metadata::default_attention_value_name(self, layer);
+        self.linear_format(&name.to_string())
+    }
+    /// Builds the same selected value-format lookup through a metadata account.
+    /// An overriding format policy must supply this companion explicitly.
+    fn attention_value_format_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<LinearFormat, Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
+    /// Builds an optional block-output normalization name through the caller account.
+    fn block_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
+    /// Builds an actual post-attention normalization name through the caller account.
+    fn attention_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
+    /// Builds an actual post-feed-forward normalization name through the caller account.
+    fn feed_forward_output_normalization_with_metadata(
+        &self,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<String>, Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
     }
 
     /// Physical layout of the query, key, and optional ordinary value projections.
@@ -575,12 +667,37 @@ pub trait Config: 'static {
     fn attention_schedule(&self) -> &LayerSchedule<AttentionPolicy>;
     /// Physical encoding selected for one canonical checkpoint parameter.
     fn weight_quantization(&self, name: &str) -> Option<WeightQuantization>;
+    /// Performs the same embedding encoding lookup using the caller's metadata destination.
+    fn weight_quantization_with_metadata(
+        &self,
+        _name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Option<WeightQuantization>, Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
     /// Complete matrix encoding, including block-FP8 companions.
     fn linear_format(&self, name: &str) -> eredu_checkpoint::LinearFormat {
         self.weight_quantization(name).into()
     }
+    /// Performs the same format lookup using the caller's metadata destination.
+    fn linear_format_with_metadata(
+        &self,
+        _name: &str,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<LinearFormat, Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
     /// Complete rotary-position construction specification.
     fn rotary_spec(&self, dimensions: i32) -> RotarySpec;
+    /// Normalizes the same rotary configuration without unaccounted scratch.
+    fn rotary_spec_with_metadata(
+        &self,
+        _dimensions: i32,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<RotarySpec, Error> {
+        Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+    }
+
     /// Whether this decoder stack applies rotary position encoding.
     fn rotary_enabled(&self) -> bool {
         true
@@ -675,28 +792,48 @@ pub fn state_identity<C: Config>(
     global_layer_start: usize,
     topology: eredu_core::cache::PromptCacheTopology,
 ) -> Result<eredu_runtime::ModelStateIdentity, Error> {
+    state_identity_with(
+        args,
+        layout,
+        global_layer_start,
+        topology,
+        identity::Metadata::new(None),
+    )
+}
+
+fn state_identity_with<C: Config>(
+    args: &C,
+    layout: &StateLayout,
+    global_layer_start: usize,
+    topology: eredu_core::cache::PromptCacheTopology,
+    metadata: identity::Metadata<'_>,
+) -> Result<eredu_runtime::ModelStateIdentity, Error> {
+    metadata.controls::<eredu_runtime::ModelStateIdentity>()?;
+    // Configuration validation remains the authoritative architecture producer.
     args.validate_config()?;
-    topology.validate().map_err(Error::backend)?;
-    let layer_count = usize::try_from(args.num_hidden_layers()).map_err(Error::backend)?;
+    topology.validate_with_diagnostic(|message| metadata.prompt_error(message))?;
+    let layer_count =
+        usize::try_from(args.num_hidden_layers()).map_err(|error| metadata.source(error))?;
     let global_layer_end = global_layer_start
         .checked_add(layout.len())
-        .ok_or_else(|| Error::backend("decoder owned state range overflowed"))?;
+        .ok_or_else(|| metadata.error(format_args!("decoder owned state range overflowed")))?;
     if global_layer_end > layer_count {
-        return Err(Error::backend(format!(
+        return Err(metadata.error(format_args!(
             "{} owns state layers {global_layer_start}..{global_layer_end}, outside {layer_count} layers",
             args.model_family()
         )));
     }
-    eredu_runtime::ModelStateIdentity::new(
-        args.model_family(),
-        args.model_identity(),
-        args.architecture_fingerprint(),
+    let fingerprint = metadata.configured(args)?;
+    eredu_runtime::ModelStateIdentity::new_with_diagnostic(
+        metadata.text(args.model_family())?,
+        metadata.text(args.model_identity())?,
+        fingerprint,
         layer_count,
         global_layer_start,
         0,
         topology,
+        |message| metadata.prompt_error(message),
     )
-    .map_err(Error::backend)
 }
 
 /// Semantic attention projection selected by architecture policy.
@@ -753,9 +890,9 @@ pub struct NamedEmbeddingSpec {
 pub struct NamedEmbedding<B: NeuralBackend> {
     /// Backend-native embedding operator.
     pub embedding: B::Embedding,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     name: String,
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     lookup: EmbeddingLookupPolicy,
 }
 
@@ -958,6 +1095,28 @@ pub fn state_layout<C: Config>(config: &C) -> Result<StateLayout, Error> {
     StateLayout::new(cache_layout(config)?).map_err(Error::backend)
 }
 
+/// Derives this actual decoder's mutable geometry in the metadata context.
+/// Validation and policy construction are shared with the ordinary producer.
+pub fn state_layout_with_metadata<C: Config>(
+    config: &C,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<StateLayout, Error> {
+    if !context.uses_checked_metadata() {
+        return state_layout(config);
+    }
+    use crate::state_geometry::Destination;
+    let destination = crate::state_geometry::Counted::new(context, Error::backend_message);
+    let schedule = cache_layout_destination(
+        config,
+        std::iter::repeat_n(
+            config.num_key_value_heads(),
+            config.attention_schedule().len(),
+        ),
+        &destination,
+    )?;
+    destination.layout(schedule)
+}
+
 /// Complete planner-derived construction geometry for one shared decoder rank.
 ///
 /// The value is backend-neutral and is the single source of truth for local
@@ -1148,24 +1307,33 @@ pub fn cache_layout_with_key_value_heads<C: Config>(
     config: &C,
     key_value_heads: impl IntoIterator<Item = i32>,
 ) -> Result<LayerSchedule<LayerCachePolicy>, Error> {
-    let layers = usize::try_from(config.num_hidden_layers()).map_err(Error::backend)?;
-    let key_value_heads = key_value_heads.into_iter().collect::<Vec<_>>();
+    cache_layout_destination(
+        config,
+        key_value_heads.into_iter(),
+        &crate::state_geometry::Ordinary(Error::backend_message),
+    )
+}
+
+fn cache_layout_destination<C: Config, D: crate::state_geometry::Destination>(
+    config: &C,
+    key_value_heads: impl Iterator<Item = i32>,
+    destination: &D,
+) -> Result<LayerSchedule<LayerCachePolicy>, D::Error> {
+    destination.controls::<(LayerSchedule<LayerCachePolicy>, &C)>()?;
+    let layers = usize::try_from(config.num_hidden_layers())
+        .map_err(|cause| destination.error(format_args!("{cause}")))?;
+    let key_value_heads = destination.collect_values(key_value_heads)?;
     if key_value_heads.len() != layers {
-        return Err(Error::backend(format!(
+        return Err(destination.error(format_args!(
             "decoder cache geometry has {} layers, expected {layers}",
-            key_value_heads.len()
+            key_value_heads.len(),
         )));
     }
-    let policies = config
-        .attention_schedule()
-        .iter()
-        .zip(key_value_heads)
-        .map(|(attention, key_value_heads)| {
-            LayerCachePolicy::key_value(*attention, key_value_heads, config.head_dim())
-                .map_err(Error::backend)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    LayerSchedule::new(layers, policies).map_err(Error::backend)
+    let policies =
+        destination.collect(config.attention_schedule().iter().zip(key_value_heads).map(
+            |(attention, heads)| destination.key_value(*attention, heads, config.head_dim()),
+        ))?;
+    destination.schedule(layers, policies)
 }
 
 /// Creates one concrete backend cache per decoder layer from the neutral policy.
@@ -1262,7 +1430,7 @@ pub struct FusedAttentionProjection<B: NeuralBackend> {
     /// Component-major affine projection.
     pub projection: B::Linear,
     /// Validated query/key/value component geometry.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub layout: FusedProjectionLayout,
 }
 
@@ -1297,28 +1465,28 @@ pub struct Attention<B: NeuralBackend> {
     /// Independent projection of the attention output gate.
     pub output_gate: Option<B::Linear>,
     /// Activation applied to either separately projected or fused-query gates.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub output_gate_activation: OutputGateActivation,
     /// Normalize complete Q/K projections using per-head scale vectors.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub query_key_norm_per_head_weights: bool,
     /// Rotated paired width; zero means the complete head.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub rotary_pair_dimensions: i32,
     /// Number of query heads.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub query_heads: i32,
     /// Number of key/value heads.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub key_value_heads: i32,
     /// Inverse square-root head scaling.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub scale: f32,
     /// Optional score cap applied before masking and softmax.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub softcap: Option<f32>,
     /// Selected score/probability arithmetic.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub arithmetic: eredu_nn::AttentionArithmetic,
     /// Split or fused query/key/value projections.
     pub input_projection: AttentionInputProjection<B>,
@@ -1333,10 +1501,10 @@ pub struct Attention<B: NeuralBackend> {
     /// Optional rotary-position operator for positioned attention families.
     pub rotary: Option<B::Rotary>,
     /// Layer-local sliding window.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub sliding_window: Option<i32>,
     /// Whether the query projection's second half gates attended values.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub query_output_gate: bool,
 }
 
@@ -1495,53 +1663,68 @@ impl<B: NeuralBackend> Attention<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
+        let metadata = ModuleMetadata::new::<B>(context);
+        metadata.controls::<(
+            Self,
+            LinearSpec,
+            NormalizationConstructionSpec,
+            RotarySpec,
+            [FusedProjectionSegment; 3],
+        )>()?;
         if config.learned_attention_sinks() {
-            crate::operator_requirements::require::<B>(
+            metadata.require::<B>(
                 "shared decoder attention sinks",
                 eredu_nn::NeuralOperatorCapabilities::ATTENTION_SINKS,
             )?;
         }
-        let fields = config.block_parameter_fields().validate()?;
-        let prefix = format!(
+        let fields = config
+            .block_parameter_fields()
+            .validate_with(|args| metadata.error(args))?;
+        let prefix = metadata.text(format_args!(
             "{}.layers.{layer}.{}",
             config.parameter_root(),
             fields.attention
-        );
+        ))?;
         let hidden = config.hidden_size();
         let head = config.head_dim();
         let query_heads = config.num_attention_heads();
         let key_value_heads = config.num_key_value_heads();
         let linear = |field: &str, input, output, bias: bool| {
-            let weight_name = format!("{prefix}.{field}.weight");
+            let weight_name = metadata.text(format_args!("{prefix}.{field}.weight"))?;
             let bias = bias
-                .then(|| parameter_spec(config, format!("{prefix}.{field}.bias")))
-                .transpose()
-                .map_err(Error::backend)?;
+                .then(|| {
+                    metadata.parameter(
+                        config,
+                        metadata.text(format_args!("{prefix}.{field}.bias"))?,
+                    )
+                })
+                .transpose()?;
             B::linear(
                 LinearSpec {
                     input,
                     output,
-                    weight: parameter_spec(config, &weight_name).map_err(Error::backend)?,
+                    weight: metadata
+                        .parameter(config, metadata.text(format_args!("{weight_name}"))?)?,
                     bias,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight_name,
-                        config.linear_format(&weight_name),
-                    )?,
+                    format: metadata
+                        .format(&weight_name, metadata.linear_format(config, &weight_name)?)?,
                 },
                 context,
             )
         };
         let policy = config.attention_schedule().get(layer).ok_or_else(|| {
-            Error::backend(format!(
+            metadata.error(format_args!(
                 "decoder attention schedule has no policy for layer {layer}"
             ))
         })?;
-        let query_width = query_heads
-            .checked_mul(head)
-            .ok_or_else(|| Error::backend("decoder query projection width overflowed"))?;
-        let key_value_width = key_value_heads
-            .checked_mul(head)
-            .ok_or_else(|| Error::backend("decoder key/value projection width overflowed"))?;
+        let query_width = query_heads.checked_mul(head).ok_or_else(|| {
+            metadata.error(format_args!("decoder query projection width overflowed"))
+        })?;
+        let key_value_width = key_value_heads.checked_mul(head).ok_or_else(|| {
+            metadata.error(format_args!(
+                "decoder key/value projection width overflowed"
+            ))
+        })?;
         let input_projection = match config.attention_projection_layout() {
             AttentionProjectionLayout::Split if config.external_attention_value(layer) => {
                 AttentionInputProjection::ExternalValue {
@@ -1581,9 +1764,8 @@ impl<B: NeuralBackend> Attention<B> {
             },
             AttentionProjectionLayout::Fused { field } => {
                 if field.trim().is_empty() {
-                    return Err(Error::backend(
-                        "fused QKV projection field must not be empty",
-                    ));
+                    return Err(metadata
+                        .error(format_args!("fused QKV projection field must not be empty")));
                 }
                 let biases = [
                     config.attention_bias(AttentionProjection::Query),
@@ -1591,14 +1773,14 @@ impl<B: NeuralBackend> Attention<B> {
                     config.attention_bias(AttentionProjection::Value),
                 ];
                 if biases.iter().any(|bias| *bias != biases[0]) {
-                    return Err(Error::backend(
-                        "fused QKV projection requires identical query/key/value bias policy",
-                    ));
+                    return Err(metadata.error(format_args!(
+                        "fused QKV projection requires identical query/key/value bias policy"
+                    )));
                 }
-                let layout = FusedProjectionLayout::new([
-                    FusedProjectionSegment::new("query", query_width)?,
-                    FusedProjectionSegment::new("key", key_value_width)?,
-                    FusedProjectionSegment::new("value", key_value_width)?,
+                let layout = metadata.fused([
+                    metadata.segment("query", query_width)?,
+                    metadata.segment("key", key_value_width)?,
+                    metadata.segment("value", key_value_width)?,
                 ])?;
                 let projection = linear(field, hidden, layout.output_width(), biases[0])?;
                 AttentionInputProjection::Fused(FusedAttentionProjection { projection, layout })
@@ -1630,8 +1812,10 @@ impl<B: NeuralBackend> Attention<B> {
                 .learned_attention_sinks()
                 .then(|| {
                     Parameter::unloaded(
-                        parameter_spec(config, format!("{prefix}.{}", fields.attention_sinks))
-                            .map_err(Error::backend)?,
+                        metadata.parameter(
+                            config,
+                            metadata.text(format_args!("{prefix}.{}", fields.attention_sinks))?,
+                        )?,
                         &[query_heads],
                         context,
                     )
@@ -1647,14 +1831,16 @@ impl<B: NeuralBackend> Attention<B> {
                             head
                         },
                         epsilon,
-                        parameter_spec(
+                        metadata.parameter(
                             config,
-                            format!("{prefix}.{}.weight", fields.attention_query_norm),
-                        )
-                        .map_err(Error::backend)?,
+                            metadata.text(format_args!(
+                                "{prefix}.{}.weight",
+                                fields.attention_query_norm
+                            ))?,
+                        )?,
                     );
                     if config.query_key_norm_per_head_weights() {
-                        spec = spec.with_groups(query_heads)?;
+                        spec = metadata.with_groups(spec, query_heads)?;
                     }
                     B::normalization(spec, context)
                 })
@@ -1669,27 +1855,29 @@ impl<B: NeuralBackend> Attention<B> {
                             head
                         },
                         epsilon,
-                        parameter_spec(
+                        metadata.parameter(
                             config,
-                            format!("{prefix}.{}.weight", fields.attention_key_norm),
-                        )
-                        .map_err(Error::backend)?,
+                            metadata.text(format_args!(
+                                "{prefix}.{}.weight",
+                                fields.attention_key_norm
+                            ))?,
+                        )?,
                     );
                     if config.query_key_norm_per_head_weights() {
-                        spec = spec.with_groups(key_value_heads)?;
+                        spec = metadata.with_groups(spec, key_value_heads)?;
                     }
                     B::normalization(spec, context)
                 })
                 .transpose()?,
             rotary: config
                 .rotary_enabled()
-                .then(|| B::rotary(config.rotary_spec(head), context))
+                .then(|| B::rotary(metadata.rotary(config, head)?, context))
                 .transpose()?,
             sliding_window: policy
                 .window()
                 .map(|window| i32::try_from(window.get()))
                 .transpose()
-                .map_err(Error::backend)?,
+                .map_err(|cause| metadata.error(format_args!("{cause}")))?,
             query_output_gate: false,
         })
     }
@@ -2070,7 +2258,7 @@ pub struct FusedGatedProjection<B: NeuralBackend> {
     /// Fused affine operator.
     pub projection: B::Linear,
     /// Validated gate/up component geometry.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub layout: FusedProjectionLayout,
 }
 
@@ -2098,7 +2286,7 @@ pub struct Mlp<B: NeuralBackend> {
     /// Down projection.
     pub down: B::Linear,
     /// Optional shared pre-activation bound.
-    #[parameter(skip)]
+    #[parameter(skip, metadata)]
     pub limit: Option<GatedProductPolicy>,
 }
 
@@ -2123,29 +2311,36 @@ impl<B: NeuralBackend> Mlp<B> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let fields = config.block_parameter_fields().validate()?;
-        let prefix = format!(
+        let metadata = ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, LinearSpec, [FusedProjectionSegment; 2])>()?;
+        let fields = config
+            .block_parameter_fields()
+            .validate_with(|args| metadata.error(args))?;
+        let prefix = metadata.text(format_args!(
             "{}.layers.{layer}.{}",
             config.parameter_root(),
             fields.feed_forward
-        );
+        ))?;
         let build = |field: &str, input, output| {
-            let weight_name = format!("{prefix}.{field}.weight");
+            let weight_name = metadata.text(format_args!("{prefix}.{field}.weight"))?;
             let bias = config
                 .mlp_bias()
-                .then(|| parameter_spec(config, format!("{prefix}.{field}.bias")))
-                .transpose()
-                .map_err(Error::backend)?;
+                .then(|| {
+                    metadata.parameter(
+                        config,
+                        metadata.text(format_args!("{prefix}.{field}.bias"))?,
+                    )
+                })
+                .transpose()?;
             B::linear(
                 LinearSpec {
                     input,
                     output,
-                    weight: parameter_spec(config, &weight_name).map_err(Error::backend)?,
+                    weight: metadata
+                        .parameter(config, metadata.text(format_args!("{weight_name}"))?)?,
                     bias,
-                    format: crate::linear_format::standard_linear_format(
-                        &weight_name,
-                        config.linear_format(&weight_name),
-                    )?,
+                    format: metadata
+                        .format(&weight_name, metadata.linear_format(config, &weight_name)?)?,
                 },
                 context,
             )
@@ -2165,13 +2360,13 @@ impl<B: NeuralBackend> Mlp<B> {
             },
             GatedProjectionLayout::Fused { field } => {
                 if field.trim().is_empty() {
-                    return Err(Error::backend(
-                        "fused gate/up projection field must not be empty",
-                    ));
+                    return Err(metadata.error(format_args!(
+                        "fused gate/up projection field must not be empty"
+                    )));
                 }
-                let layout = FusedProjectionLayout::new([
-                    FusedProjectionSegment::new("gate", config.intermediate_size())?,
-                    FusedProjectionSegment::new("up", config.intermediate_size())?,
+                let layout = metadata.fused([
+                    metadata.segment("gate", config.intermediate_size())?,
+                    metadata.segment("up", config.intermediate_size())?,
                 ])?;
                 GatedInputProjection::Fused(FusedGatedProjection {
                     projection: build(field, config.hidden_size(), layout.output_width())?,
@@ -2241,6 +2436,14 @@ impl<B: NeuralBackend> Mlp<B> {
 
 /// Replaceable value and feed-forward projections inside the shared residual block.
 pub trait DecoderProjectionOperator<B: NeuralBackend>: eredu_nn::Parameterized<B::Tensor> {
+    /// Exact dense component hooks of this selected row-local projection worker.
+    /// The enclosing block must separately establish causal prefix equivalence.
+    /// Custom/routed workers publish only their own actual internal hooks.
+    fn append_component_prefill_observations(
+        _unit_path: &str,
+        _declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+    ) {}
+
     /// Optionally projects mixed values from normalized attention input. The
     /// result has `[batch, tokens, local_kv_heads * head_width]` geometry.
     fn project_values(
@@ -2310,6 +2513,14 @@ pub trait TensorParallelProjectionOperator<B: NeuralBackend>: DecoderProjectionO
 }
 
 impl<B: NeuralBackend> DecoderProjectionOperator<B> for Mlp<B> {
+    fn append_component_prefill_observations(
+        unit_path: &str,
+        declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+    ) {
+        // hidden() is the same per-row gate/up product in ordinary and TP;
+        // the shared residual block emits its completed down-projection write.
+        append_dense_component_prefill_observations(declarations, &format!("{unit_path}.feed_forward"));
+    }
     fn forward_feed_forward(
         &mut self,
         input: &B::Tensor,
@@ -2391,7 +2602,11 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
         layer: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let fields = config.block_parameter_fields().validate()?;
+        let metadata = ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, NormalizationConstructionSpec)>()?;
+        let fields = config
+            .block_parameter_fields()
+            .validate_with(|args| metadata.error(args))?;
         let norm = |name: String| {
             B::normalization(
                 NormalizationConstructionSpec {
@@ -2399,7 +2614,7 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
                     dimensions: config.hidden_size(),
                     epsilon: config.rms_norm_epsilon(),
                     scale: normalization_scale(
-                        parameter_spec(config, name).map_err(Error::backend)?,
+                        metadata.parameter(config, name)?,
                         config.normalization_offset(),
                     ),
                 },
@@ -2407,22 +2622,30 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
             )
         };
         Ok(Self {
-            attention_output_norm: config
-                .attention_output_normalization(layer)
+            attention_output_norm: metadata
+                .normalization_name(
+                    config,
+                    layer,
+                    parameter_metadata::NormalizationName::Attention,
+                )?
                 .map(&norm)
                 .transpose()?,
-            feed_forward_output_norm: config
-                .feed_forward_output_normalization(layer)
+            feed_forward_output_norm: metadata
+                .normalization_name(
+                    config,
+                    layer,
+                    parameter_metadata::NormalizationName::FeedForward,
+                )?
                 .map(&norm)
                 .transpose()?,
-            output_norm: config
-                .block_output_normalization(layer)
+            output_norm: metadata
+                .normalization_name(config, layer, parameter_metadata::NormalizationName::Block)?
                 .map(|name| {
                     B::normalization(
                         NormalizationConstructionSpec::learned(
                             config.hidden_size(),
                             config.rms_norm_epsilon(),
-                            parameter_spec(config, name).map_err(Error::backend)?,
+                            metadata.parameter(config, name)?,
                         ),
                         context,
                     )
@@ -2430,16 +2653,16 @@ impl<B: NeuralBackend> TransformerBlock<B, Mlp<B>> {
                 .transpose()?,
             self_attention: Attention::new(config, layer, context)?,
             mlp: Mlp::new(config, layer, context)?,
-            input_norm: norm(format!(
+            input_norm: norm(metadata.text(format_args!(
                 "{}.layers.{layer}.{}.weight",
                 config.parameter_root(),
                 fields.input_norm
-            ))?,
-            post_attention_norm: norm(format!(
+            ))?)?,
+            post_attention_norm: norm(metadata.text(format_args!(
                 "{}.layers.{layer}.{}.weight",
                 config.parameter_root(),
                 fields.post_attention_norm
-            ))?,
+            ))?)?,
         })
     }
 }
@@ -2848,109 +3071,136 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
     config: &impl Config,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let prefix = format!("{}.layers.{layer}", config.parameter_root());
+    block_common_parallel_parameter_groups_with(block, config, layer, DeclarationDestination(None))
+        .map_err(ParameterGroupError::ordinary)
+}
+pub(crate) fn block_common_parallel_parameter_groups_with<B: NeuralBackend, F>(
+    block: &TransformerBlock<B, F>,
+    config: &impl Config,
+    layer: usize,
+    destination: DeclarationDestination<'_>,
+) -> Result<Vec<ParameterGroupSpec>, ParameterGroupError> {
+    destination.controls::<(
+        Vec<ParameterGroupSpec>,
+        attention_partition::AttentionPartition,
+    )>()?;
+    let prefix = destination.text(format_args!("{}.layers.{layer}", config.parameter_root()))?;
     let fields = config
         .block_parameter_fields()
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let attention_prefix = format!("{prefix}.{}", fields.attention);
+        .validate_with(|args| destination.group_error(args))?;
+    let attention_prefix = destination.text(format_args!("{prefix}.{}", fields.attention))?;
     let query_heads = usize::try_from(config.num_attention_heads()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("decoder query-head count exceeds usize".into())
+        destination.group_error(format_args!("decoder query-head count exceeds usize"))
     })?;
     let key_value_heads = usize::try_from(config.num_key_value_heads()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("decoder key/value-head count exceeds usize".into())
+        destination.group_error(format_args!("decoder key/value-head count exceeds usize"))
     })?;
     let head_dimension = usize::try_from(config.head_dim()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("decoder head dimension exceeds usize".into())
+        destination.group_error(format_args!("decoder head dimension exceeds usize"))
     })?;
     if head_dimension == 0 || key_value_heads == 0 || !query_heads.is_multiple_of(key_value_heads) {
-        return Err(ParallelPlanError::InvalidGroup(format!(
+        return Err(destination.group_error(format_args!(
             "decoder attention geometry q={query_heads}, kv={key_value_heads}, dim={head_dimension} does not form positive integral GQA groups"
         )));
     }
-    let head_partition = attention_partition::AttentionPartition::new(config, layer)?;
+    let head_partition =
+        attention_partition::AttentionPartition::new_with(config, layer, destination)?;
     let attention_units = head_partition.preferred_units();
     let attention = match &block.self_attention.input_projection {
         AttentionInputProjection::ExternalValue { query, key } => {
-            let mut projections = vec![
+            let fixed = [
                 (query, ProjectionSharding::Column),
                 (key, ProjectionSharding::Column),
                 (&block.self_attention.output, ProjectionSharding::Row),
             ];
+            let mut projections = destination
+                .vector(fixed.len() + usize::from(block.self_attention.output_gate.is_some()))?;
+            projections.extend_from_slice(&fixed);
             if let Some(gate) = &block.self_attention.output_gate {
                 projections.push((gate, ProjectionSharding::Column));
             }
-            partitioned_projection_group::<B::Tensor, B::Linear>(
-                format!("{attention_prefix}.projections"),
+            destination.projections::<B::Tensor, B::Linear>(
+                format_args!("{attention_prefix}.projections"),
                 ParameterRole::AttentionHeads,
                 &projections,
                 attention_units,
             )?
         }
         AttentionInputProjection::Split { query, key, value } => {
-            let mut projections = vec![
+            let fixed = [
                 (query, ProjectionSharding::Column),
                 (key, ProjectionSharding::Column),
                 (value, ProjectionSharding::Column),
                 (&block.self_attention.output, ProjectionSharding::Row),
             ];
+            let mut projections = destination
+                .vector(fixed.len() + usize::from(block.self_attention.output_gate.is_some()))?;
+            projections.extend_from_slice(&fixed);
             if let Some(gate) = &block.self_attention.output_gate {
                 projections.push((gate, ProjectionSharding::Column));
             }
-            partitioned_projection_group::<B::Tensor, B::Linear>(
-                format!("{attention_prefix}.projections"),
+            destination.projections::<B::Tensor, B::Linear>(
+                format_args!("{attention_prefix}.projections"),
                 ParameterRole::AttentionHeads,
                 &projections,
                 attention_units,
             )?
         }
-        AttentionInputProjection::Fused(fused) => {
-            segmented_projection_group::<B::Tensor, B::Linear>(
-                format!("{attention_prefix}.projections"),
-                ParameterRole::AttentionHeads,
-                &fused.projection,
-                &block.self_attention.output,
-                fused_projection_ranges(&fused.layout)?,
-                attention_units,
-            )?
-        }
+        AttentionInputProjection::Fused(fused) => destination.segmented::<B::Tensor, B::Linear>(
+            format_args!("{attention_prefix}.projections"),
+            ParameterRole::AttentionHeads,
+            &fused.projection,
+            &block.self_attention.output,
+            fused_projection_ranges_with(&fused.layout, destination)?,
+            attention_units,
+        )?,
     };
 
-    let input_norm = module_parameter_group::<B::Tensor, _>(
-        format!("{prefix}.{}", fields.input_norm),
+    let input_norm = destination.module::<B::Tensor, _>(
+        format_args!("{prefix}.{}", fields.input_norm),
         ParameterRole::Replicated,
         &block.input_norm,
-        |_, _| Ok(MemberSharding::Replicated),
+        |_| Ok(MemberSharding::Replicated),
     )?;
-    let post_attention_norm = module_parameter_group::<B::Tensor, _>(
-        format!("{prefix}.{}", fields.post_attention_norm),
+    let post_attention_norm = destination.module::<B::Tensor, _>(
+        format_args!("{prefix}.{}", fields.post_attention_norm),
         ParameterRole::Replicated,
         &block.post_attention_norm,
-        |_, _| Ok(MemberSharding::Replicated),
+        |_| Ok(MemberSharding::Replicated),
     )?;
-    let mut groups = vec![attention];
+    let count = 3
+        + usize::from(block.output_norm.is_some())
+        + usize::from(block.self_attention.sinks.is_some())
+        + usize::from(block.self_attention.query_norm.is_some())
+        + usize::from(block.self_attention.key_norm.is_some())
+        + usize::from(block.attention_output_norm.is_some())
+        + usize::from(block.feed_forward_output_norm.is_some());
+    let mut groups = destination.vector(count)?;
+    groups.push(attention);
     if let Some(norm) = &block.output_norm {
-        let name = config.block_output_normalization(layer).ok_or_else(|| {
-            ParallelPlanError::InvalidGroup(
-                "block output normalization is absent from configuration".into(),
-            )
-        })?;
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            name.trim_end_matches(".weight"),
+        let name = destination
+            .normalization_name(config, layer, NormalizationName::Block, true)?
+            .ok_or_else(|| {
+                destination.group_error(format_args!(
+                    "block output normalization is absent from configuration"
+                ))
+            })?;
+        groups.push(destination.module::<B::Tensor, _>(
+            format_args!("{}", name.trim_end_matches(".weight")),
             ParameterRole::Replicated,
             norm,
-            |_, _| Ok(MemberSharding::Replicated),
+            |_| Ok(MemberSharding::Replicated),
         )?);
     }
     if let Some(sinks) = &block.self_attention.sinks {
-        groups.push(partitioned_module_parameter_group::<B::Tensor, _>(
-            format!("{attention_prefix}.{}", fields.attention_sinks),
+        groups.push(destination.partitioned_module::<B::Tensor, _>(
+            format_args!("{attention_prefix}.{}", fields.attention_sinks),
             ParameterRole::AttentionHeads,
             query_heads,
             sinks,
-            |_, shape| {
+            |shape| {
                 if shape != [query_heads] {
-                    return Err(ParallelPlanError::InvalidTensor(format!(
+                    return Err(destination.tensor_error(format_args!(
                         "decoder attention sinks have shape {shape:?}, expected [{query_heads}]"
                     )));
                 }
@@ -2971,49 +3221,64 @@ pub fn block_common_parallel_parameter_groups<B: NeuralBackend, F>(
         ),
     ] {
         if let Some(norm) = norm {
-            let name = format!("{attention_prefix}.{field}");
+            let name = destination.text(format_args!("{attention_prefix}.{field}"))?;
             groups.push(if config.query_key_norm_per_head_weights() {
-                partitioned_module_parameter_group::<B::Tensor, _>(
-                    name,
+                destination.partitioned_module::<B::Tensor, _>(
+                    format_args!("{name}"),
                     ParameterRole::AttentionHeads,
                     heads,
                     norm,
-                    |_, _| Ok(MemberSharding::Partitioned { axis: 0 }),
+                    |_| Ok(MemberSharding::Partitioned { axis: 0 }),
                 )?
             } else {
-                module_parameter_group::<B::Tensor, _>(
-                    name,
+                destination.module::<B::Tensor, _>(
+                    format_args!("{name}"),
                     ParameterRole::Replicated,
                     norm,
-                    |_, _| Ok(MemberSharding::Replicated),
+                    |_| Ok(MemberSharding::Replicated),
                 )?
             });
         }
     }
     for (name, norm) in [
         (
-            config.attention_output_normalization(layer),
+            destination.normalization_name(
+                config,
+                layer,
+                NormalizationName::Attention,
+                block.attention_output_norm.is_some(),
+            )?,
             &block.attention_output_norm,
         ),
         (
-            config.feed_forward_output_normalization(layer),
+            destination.normalization_name(
+                config,
+                layer,
+                NormalizationName::FeedForward,
+                block.feed_forward_output_norm.is_some(),
+            )?,
             &block.feed_forward_output_norm,
         ),
     ] {
         if let (Some(name), Some(norm)) = (name, norm) {
-            groups.push(module_parameter_group::<B::Tensor, _>(
-                name.trim_end_matches(".weight"),
+            groups.push(destination.module::<B::Tensor, _>(
+                format_args!("{}", name.trim_end_matches(".weight")),
                 ParameterRole::Replicated,
                 norm,
-                |_, _| Ok(MemberSharding::Replicated),
+                |_| Ok(MemberSharding::Replicated),
             )?);
         }
     }
     groups.extend([input_norm, post_attention_norm]);
-    groups
-        .into_iter()
-        .map(|group| head_partition.apply(group, |name| config.linear_format(name)))
-        .collect()
+    let mut result = destination.vector(groups.len())?;
+    for group in groups {
+        result.push(head_partition.apply_with(
+            group,
+            |name| destination.linear_format(config, name),
+            destination,
+        )?);
+    }
+    Ok(result)
 }
 
 /// Declares the dense SwiGLU placement group shared by dense decoder families.
@@ -3022,26 +3287,45 @@ pub fn dense_mlp_parallel_parameter_group<B: NeuralBackend>(
     config: &impl Config,
     layer: usize,
 ) -> Result<ParameterGroupSpec, ParallelPlanError> {
+    dense_mlp_parallel_parameter_group_with(mlp, config, layer, DeclarationDestination(None))
+        .map_err(ParameterGroupError::ordinary)
+}
+pub(crate) fn dense_mlp_parallel_parameter_group_with<B: NeuralBackend>(
+    mlp: &Mlp<B>,
+    config: &impl Config,
+    layer: usize,
+    destination: DeclarationDestination<'_>,
+) -> Result<ParameterGroupSpec, ParameterGroupError> {
+    destination.controls::<ParameterGroupSpec>()?;
     let fields = config
         .block_parameter_fields()
-        .validate()
-        .map_err(|error| ParallelPlanError::InvalidGroup(error.to_string()))?;
-    let prefix = format!(
+        .validate_with(|args| destination.group_error(args))?;
+    let prefix = destination.text(format_args!(
         "{}.layers.{layer}.{}",
         config.parameter_root(),
         fields.feed_forward
-    );
+    ))?;
     let intermediate = usize::try_from(config.intermediate_size()).map_err(|_| {
-        ParallelPlanError::InvalidGroup("decoder feed-forward width exceeds usize".into())
+        destination.group_error(format_args!("decoder feed-forward width exceeds usize"))
     })?;
-    let output_format =
-        config.linear_format(&format!("{prefix}.{}.weight", fields.feed_forward_output));
-    let units =
-        crate::linear_format::input_partition_units(&prefix, intermediate, 1, output_format)?;
+    let output_format = destination.linear_format(
+        config,
+        &destination.text(format_args!(
+            "{prefix}.{}.weight",
+            fields.feed_forward_output
+        ))?,
+    )?;
+    let units = crate::linear_format::input_partition_units_with(
+        &prefix,
+        intermediate,
+        1,
+        output_format,
+        destination,
+    )?;
     let group = match &mlp.input_projection {
-        GatedInputProjection::Split { gate, up } => {
-            partitioned_projection_group::<B::Tensor, B::Linear>(
-                format!("{prefix}.projections"),
+        GatedInputProjection::Split { gate, up } => destination
+            .projections::<B::Tensor, B::Linear>(
+                format_args!("{prefix}.projections"),
                 ParameterRole::FeedForwardIntermediate,
                 &[
                     (gate, ProjectionSharding::Column),
@@ -3049,46 +3333,47 @@ pub fn dense_mlp_parallel_parameter_group<B: NeuralBackend>(
                     (&mlp.down, ProjectionSharding::Row),
                 ],
                 units,
-            )
-        }
-        GatedInputProjection::Fused(fused) => segmented_projection_group::<B::Tensor, B::Linear>(
-            format!("{prefix}.projections"),
+            ),
+        GatedInputProjection::Fused(fused) => destination.segmented::<B::Tensor, B::Linear>(
+            format_args!("{prefix}.projections"),
             ParameterRole::FeedForwardIntermediate,
             &fused.projection,
             &mlp.down,
-            fused_projection_ranges(&fused.layout)?,
+            fused_projection_ranges_with(&fused.layout, destination)?,
             units,
         ),
     }?;
-    crate::linear_format::dense_ffn_partition_tail(group, intermediate, output_format, |name| {
-        config.linear_format(name)
-    })
+    crate::linear_format::dense_ffn_partition_tail_with(
+        group,
+        intermediate,
+        output_format,
+        |name| destination.linear_format(config, name),
+        destination,
+    )
 }
 
-fn fused_projection_ranges(
+fn fused_projection_ranges_with(
     layout: &FusedProjectionLayout,
-) -> Result<Vec<std::ops::Range<usize>>, ParallelPlanError> {
+    destination: DeclarationDestination<'_>,
+) -> Result<Vec<Range<usize>>, ParameterGroupError> {
+    let mut ranges = destination.vector(layout.segments().len())?;
     let mut start = 0usize;
-    layout
-        .segments()
-        .iter()
-        .map(|segment| {
-            let width = usize::try_from(segment.width()).map_err(|_| {
-                ParallelPlanError::InvalidTensor(format!(
-                    "fused projection segment {} exceeds usize",
-                    segment.name()
-                ))
-            })?;
-            let end = start.checked_add(width).ok_or_else(|| {
-                ParallelPlanError::InvalidTensor(
-                    "fused projection segment ranges overflowed usize".into(),
-                )
-            })?;
-            let range = start..end;
-            start = end;
-            Ok(range)
-        })
-        .collect()
+    for segment in layout.segments() {
+        let width = usize::try_from(segment.width()).map_err(|_| {
+            destination.tensor_error(format_args!(
+                "fused projection segment {} exceeds usize",
+                segment.name()
+            ))
+        })?;
+        let end = start.checked_add(width).ok_or_else(|| {
+            destination.tensor_error(format_args!(
+                "fused projection segment ranges overflowed usize"
+            ))
+        })?;
+        ranges.push(start..end);
+        start = end;
+    }
+    Ok(ranges)
 }
 
 /// Declares every rank-local placement group for one dense shared decoder block.
@@ -3097,10 +3382,34 @@ pub fn layer_parallel_parameter_groups<B: NeuralBackend>(
     config: &impl Config,
     layer: usize,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = block_common_parallel_parameter_groups(block, config, layer)?;
-    groups.push(dense_mlp_parallel_parameter_group(
-        &block.mlp, config, layer,
-    )?);
+    layer_parallel_parameter_groups_with(block, config, layer, DeclarationDestination(None))
+        .map_err(ParameterGroupError::ordinary)
+}
+pub(crate) fn layer_parallel_parameter_groups_with_metadata<B: NeuralBackend>(
+    block: &TransformerBlock<B>,
+    config: &impl Config,
+    layer: usize,
+    context: &eredu_nn::workspace::WorkspaceContext,
+) -> Result<Vec<ParameterGroupSpec>, Error> {
+    layer_parallel_parameter_groups_with(
+        block,
+        config,
+        layer,
+        DeclarationDestination(Some(context)),
+    )
+    .map_err(ParameterGroupError::into_neural)
+}
+fn layer_parallel_parameter_groups_with<B: NeuralBackend>(
+    block: &TransformerBlock<B>,
+    config: &impl Config,
+    layer: usize,
+    destination: DeclarationDestination<'_>,
+) -> Result<Vec<ParameterGroupSpec>, ParameterGroupError> {
+    let mut groups =
+        block_common_parallel_parameter_groups_with(block, config, layer, destination)?;
+    let group = dense_mlp_parallel_parameter_group_with(&block.mlp, config, layer, destination)?;
+    destination.reserve(&mut groups, 1)?;
+    groups.push(group);
     Ok(groups)
 }
 
@@ -3459,45 +3768,8 @@ pub fn static_parallel_parameter_groups<B: NeuralBackend>(
     head: Option<&B::Linear>,
     parameter_root: &str,
 ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
-    let mut groups = vec![
-        module_parameter_group::<B::Tensor, _>(
-            format!("{parameter_root}.embed_tokens"),
-            ParameterRole::Vocabulary,
-            embeddings,
-            |_, shape| {
-                if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "decoder embedding parameter is scalar".into(),
-                    ))
-                } else {
-                    Ok(MemberSharding::Balanced { axis: 0 })
-                }
-            },
-        )?,
-        module_parameter_group::<B::Tensor, _>(
-            format!("{parameter_root}.norm"),
-            ParameterRole::Replicated,
-            norm,
-            |_, _| Ok(MemberSharding::Replicated),
-        )?,
-    ];
-    if let Some(head) = head {
-        groups.push(module_parameter_group::<B::Tensor, _>(
-            "lm_head",
-            ParameterRole::Vocabulary,
-            head,
-            |_, shape| {
-                if shape.is_empty() {
-                    Err(ParallelPlanError::InvalidTensor(
-                        "decoder language-model head parameter is scalar".into(),
-                    ))
-                } else {
-                    Ok(MemberSharding::Balanced { axis: 0 })
-                }
-            },
-        )?);
-    }
-    Ok(groups)
+    parameter_metadata::static_groups::<B>(embeddings, norm, head, parameter_root, None)
+        .map_err(parameter_metadata::ParameterGroupError::ordinary)
 }
 
 /// Pinned modules shared by resident and bounded-residency execution.
@@ -3630,58 +3902,7 @@ impl<B: NeuralBackend> StaticModules<B> {
         spec: StaticModuleSpec,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let embeddings = B::embedding(
-            EmbeddingSpec {
-                vocabulary: spec.vocabulary,
-                dimensions: spec.hidden_size,
-                weight: ParameterSpec::trainable(&spec.embedding_weight).map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &spec.embedding_weight,
-                    spec.embedding_quantization.into(),
-                )?,
-            },
-            context,
-        )?;
-        let normalization_weight =
-            ParameterSpec::trainable(&spec.normalization_weight).map_err(Error::backend)?;
-        let norm = B::normalization(
-            eredu_nn::NormalizationConstructionSpec {
-                groups: spec.normalization_groups,
-                dimensions: spec.hidden_size,
-                epsilon: spec.normalization_epsilon,
-                scale: if spec.normalization_offset == 0.0 {
-                    eredu_nn::NormalizationScale::Learned(normalization_weight)
-                } else {
-                    eredu_nn::NormalizationScale::LearnedOffset {
-                        weight: normalization_weight,
-                        offset: spec.normalization_offset,
-                    }
-                },
-            },
-            context,
-        )?;
-        let lm_head = if spec.tied_head {
-            None
-        } else {
-            Some(B::linear(
-                LinearSpec {
-                    input: spec.hidden_size,
-                    output: spec.vocabulary,
-                    weight: ParameterSpec::trainable(&spec.head_weight).map_err(Error::backend)?,
-                    bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        &spec.head_weight,
-                        spec.head_format,
-                    )?,
-                },
-                context,
-            )?)
-        };
-        Ok(Self {
-            embeddings,
-            norm,
-            lm_head,
-        })
+        static_construction::ordinary::<B>(&spec, context)
     }
 
     /// Builds the same pinned modules with planner-derived vocabulary ownership.
@@ -3694,74 +3915,7 @@ impl<B: NeuralBackend> StaticModules<B> {
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        embedding_range.validate_global_rows(spec.vocabulary)?;
-        let embeddings = B::vocabulary_parallel_embedding(
-            EmbeddingSpec {
-                vocabulary: spec.vocabulary,
-                dimensions: spec.hidden_size,
-                weight: ParameterSpec::trainable(&spec.embedding_weight).map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &spec.embedding_weight,
-                    spec.embedding_quantization.into(),
-                )?,
-            },
-            embedding_range,
-            context,
-        )?;
-        let normalization_weight =
-            ParameterSpec::trainable(&spec.normalization_weight).map_err(Error::backend)?;
-        let norm = B::normalization(
-            eredu_nn::NormalizationConstructionSpec {
-                groups: spec.normalization_groups,
-                dimensions: spec.hidden_size,
-                epsilon: spec.normalization_epsilon,
-                scale: if spec.normalization_offset == 0.0 {
-                    eredu_nn::NormalizationScale::Learned(normalization_weight)
-                } else {
-                    eredu_nn::NormalizationScale::LearnedOffset {
-                        weight: normalization_weight,
-                        offset: spec.normalization_offset,
-                    }
-                },
-            },
-            context,
-        )?;
-        let lm_head = match (spec.tied_head, output_range) {
-            (true, None) => None,
-            (true, Some(_)) => {
-                return Err(Error::backend(
-                    "tied decoder output must not declare separate vocabulary ownership",
-                ));
-            }
-            (false, None) => {
-                return Err(Error::backend(
-                    "untied decoder output is missing vocabulary ownership",
-                ));
-            }
-            (false, Some(range)) => {
-                range.validate_global_rows(spec.vocabulary)?;
-                Some(B::vocabulary_parallel_linear(
-                    LinearSpec {
-                        input: spec.hidden_size,
-                        output: spec.vocabulary,
-                        weight: ParameterSpec::trainable(&spec.head_weight)
-                            .map_err(Error::backend)?,
-                        bias: None,
-                        format: crate::linear_format::standard_linear_format(
-                            &spec.head_weight,
-                            spec.head_format,
-                        )?,
-                    },
-                    range,
-                    context,
-                )?)
-            }
-        };
-        Ok(Self {
-            embeddings,
-            norm,
-            lm_head,
-        })
+        static_construction::parallel::<B>(&spec, &embedding_range, output_range.as_ref(), context)
     }
 
     /// Builds unloaded pinned modules for a decoder family.
@@ -3769,22 +3923,8 @@ impl<B: NeuralBackend> StaticModules<B> {
         config: &C,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self, Error> {
-        let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
-        let norm_name = format!("{}.norm.weight", config.parameter_root());
         Self::from_spec(
-            StaticModuleSpec {
-                normalization_groups: config.normalization_groups(),
-                embedding_weight: embedding_name.clone(),
-                normalization_weight: norm_name,
-                head_weight: "lm_head.weight".into(),
-                vocabulary: config.vocabulary_size(),
-                hidden_size: config.hidden_size(),
-                normalization_epsilon: config.rms_norm_epsilon(),
-                normalization_offset: config.normalization_offset(),
-                embedding_quantization: config.weight_quantization(&embedding_name),
-                head_format: config.linear_format("lm_head.weight"),
-                tied_head: config.tie_word_embeddings(),
-            },
+            static_construction::from_config::<B, C>(config, context)?,
             context,
         )
     }
@@ -3798,22 +3938,8 @@ impl<B: NeuralBackend> StaticModules<B> {
     where
         B: eredu_nn::DistributedNeuralBackend,
     {
-        let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
-        let norm_name = format!("{}.norm.weight", config.parameter_root());
         Self::from_parallel_spec(
-            StaticModuleSpec {
-                normalization_groups: config.normalization_groups(),
-                embedding_weight: embedding_name.clone(),
-                normalization_weight: norm_name,
-                head_weight: "lm_head.weight".into(),
-                vocabulary: config.vocabulary_size(),
-                hidden_size: config.hidden_size(),
-                normalization_epsilon: config.rms_norm_epsilon(),
-                normalization_offset: config.normalization_offset(),
-                embedding_quantization: config.weight_quantization(&embedding_name),
-                head_format: config.linear_format("lm_head.weight"),
-                tied_head: config.tie_word_embeddings(),
-            },
+            static_construction::from_config::<B, C>(config, context)?,
             geometry.embedding_range().clone(),
             geometry.output_range().cloned(),
             context,
@@ -3873,33 +3999,71 @@ impl SequentialPredictionGroups {
         prediction_groups: usize,
         units_per_group: usize,
     ) -> Result<Self, Error> {
-        if (prediction_groups != 0 && units_per_group == 0) || prediction_parameter_root.is_empty()
-        {
-            return Err(Error::backend(
+        Self::new_pattern_with_metadata(
+            target_parameter_root,
+            target_units,
+            prediction_parameter_root,
+            prediction_groups,
+            units_per_group,
+            None,
+        )
+    }
+
+    pub(crate) fn new_pattern_with_metadata(
+        target_parameter_root: &'static str,
+        target_units: usize,
+        prediction_parameter_root: &'static str,
+        prediction_groups: usize,
+        units_per_group: usize,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Self, Error> {
+        Self::new_indexed_with_metadata(target_parameter_root, target_units,
+            prediction_parameter_root, 0, prediction_groups, units_per_group, context)
+    }
+
+    /// Uses the same physical namespace worker with an explicit initial index.
+    pub(crate) fn new_indexed_with_metadata(
+        target_parameter_root: &'static str,
+        target_units: usize,
+        prediction_parameter_root: &'static str,
+        first_physical: usize,
+        prediction_groups: usize,
+        units_per_group: usize,
+        context: Option<&eredu_nn::workspace::WorkspaceContext>,
+    ) -> Result<Self, Error> {
+        let metadata = identity::Metadata::new(context);
+        metadata.controls::<(Self, Vec<Vec<String>>, Vec<String>)>()?;
+        if (prediction_groups != 0 && units_per_group == 0) || prediction_parameter_root.is_empty() {
+            return Err(metadata.error(format_args!(
                 "prediction execution groups require non-empty names and units",
-            ));
+            )));
         }
-        let prediction_paths = (0..prediction_groups)
-            .map(|group| {
-                let start = group
-                    .checked_mul(units_per_group)
-                    .ok_or_else(|| Error::backend("prediction physical index overflowed"))?;
-                (0..units_per_group)
-                    .map(|unit| {
-                        start
-                            .checked_add(unit)
-                            .map(|physical| format!("{prediction_parameter_root}.{physical}"))
-                            .ok_or_else(|| Error::backend("prediction physical index overflowed"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            target: SequentialGroup::new(
+        let mut prediction_paths = metadata.vector(prediction_groups)?;
+        for group in 0..prediction_groups {
+            let start = group
+                .checked_mul(units_per_group)
+                .and_then(|offset| first_physical.checked_add(offset))
+                .ok_or_else(|| metadata.error(format_args!("prediction physical index overflowed")))?;
+            let mut paths = metadata.vector(units_per_group)?;
+            for unit in 0..units_per_group {
+                let physical = start.checked_add(unit).ok_or_else(|| {
+                    metadata.error(format_args!("prediction physical index overflowed"))
+                })?;
+                paths.push(metadata.format(format_args!("{prediction_parameter_root}.{physical}"))?);
+            }
+            prediction_paths.push(paths);
+        }
+        let target = match metadata.context() {
+            Some(context) => SequentialGroup::new_with_metadata(
                 TARGET_EXECUTION_GROUP,
                 target_parameter_root,
                 target_units,
+                context,
             )?,
+            None => SequentialGroup::new(TARGET_EXECUTION_GROUP, target_parameter_root, target_units)?,
+        };
+        Ok(Self {
+            target,
             prediction_paths,
         })
     }
@@ -3911,6 +4075,43 @@ impl SequentialPredictionGroups {
                 .chain(self.prediction_execution_groups()),
         )
         .map_err(Error::backend)
+    }
+
+    /// Describes the actual chain through the caller's metadata destination.
+    pub(crate) fn execution_graph_with_metadata(
+        &self, context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
+        let metadata = identity::Metadata::new(Some(context));
+        metadata.controls::<(eredu_runtime::ArchitectureExecutionGraph<'_>,
+            Vec<eredu_runtime::ExecutionGroupSpec>, Vec<String>, String)>()?;
+        if self.prediction_paths.is_empty() {
+            return self.target.execution_graph_with_metadata(context);
+        }
+        let count = self.prediction_paths.len().checked_add(1)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+        let mut groups: Vec<eredu_runtime::ExecutionGroupSpec> = metadata.vector(count)?;
+        for index in 0..count {
+            let id = if index == 0 { metadata.text(TARGET_EXECUTION_GROUP)? }
+                else { metadata.format(format_args!("mtp.{}", index - 1))? };
+            let mut dependencies = metadata.vector(usize::from(index != 0))?;
+            if let Some(previous) = groups.last() {
+                dependencies.push(metadata.text(previous.id())?);
+            }
+            groups.push(eredu_runtime::ExecutionGroupSpec::from_parts(id, dependencies));
+        }
+        let output = metadata.text(groups.last().expect("target group exists").id())?;
+        eredu_runtime::ExecutionGraph::new_with_metadata(groups, &output, context)
+            .map(eredu_runtime::ArchitectureExecutionGraph::owned)
+    }
+
+    pub(crate) fn unit_count_with_metadata(
+        &self, group: usize, context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<usize, Error> {
+        if group == 0 { return self.target.unit_count_with_metadata(group, context); }
+        self.prediction_paths.get(group - 1).map(Vec::len).ok_or_else(||
+            context.metadata_error(format_args!(
+                "execution group {group} is outside target plus {} prediction groups",
+                self.prediction_paths.len())))
     }
 
     /// Returns stable prediction-group identities in prediction-depth order.
@@ -3984,10 +4185,31 @@ impl SequentialGroup {
         parameter_root: &'static str,
         units: usize,
     ) -> Result<Self, Error> {
+        Self::new_with(name, parameter_root, units, |args| Error::backend(args))
+    }
+
+    pub(crate) fn new_with_metadata(
+        name: &'static str,
+        parameter_root: &'static str,
+        units: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<Self, Error> {
+        context.charge_metadata(size_of::<Self>() + size_of::<Result<Self, Error>>())?;
+        Self::new_with(name, parameter_root, units, |args| {
+            context.metadata_error(args)
+        })
+    }
+
+    fn new_with(
+        name: &'static str,
+        parameter_root: &'static str,
+        units: usize,
+        invalid: impl FnOnce(std::fmt::Arguments<'_>) -> Error,
+    ) -> Result<Self, Error> {
         if name.is_empty() || parameter_root.is_empty() || units == 0 {
-            return Err(Error::backend(
+            return Err(invalid(format_args!(
                 "sequential decoder group requires non-empty names and units",
-            ));
+            )));
         }
         Ok(Self {
             name,
@@ -3998,7 +4220,31 @@ impl SequentialGroup {
 
     /// Builds the corresponding one-group dependency graph.
     pub fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Error> {
-        eredu_runtime::ExecutionGraph::chain([self.name]).map_err(Error::backend)
+        eredu_runtime::ArchitectureExecutionGraph::single(self.name)
+            .and_then(eredu_runtime::ArchitectureExecutionGraph::into_owned)
+            .map_err(Error::backend)
+    }
+
+    pub(crate) fn execution_graph_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Error> {
+        eredu_runtime::ArchitectureExecutionGraph::single(self.name)
+            .map_err(|cause| context.metadata_source(cause))
+    }
+
+    pub(crate) fn unit_count_with_metadata(
+        &self,
+        group: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<usize, Error> {
+        if group != 0 {
+            return Err(context.metadata_error(format_args!(
+                "execution group {group} is outside {}",
+                self.name
+            )));
+        }
+        Ok(self.units)
     }
 
     /// Validates the group ordinal and returns its unit count.
@@ -4048,17 +4294,47 @@ pub struct ForwardContext<T> {
     mask: Option<T>,
     allow_sliding_prefill: bool,
     rotary_embeddings: Option<(T, T)>,
+    // Same original Context, retained after the actual transient tensor roots.
+    metadata: Option<eredu_nn::workspace::WorkspaceContext>,
 }
 
 /// Statically dispatched construction policy for one decoder block family.
 pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
+    /// This factory's complete shared block equations preserve causal ordinary
+    /// request rows. Unknown custom factories must declare their own semantics;
+    /// implementing the outer decoder interface is not a causal proof.
+    const CAUSAL_PREFILL_ROWS: bool = false;
+
     /// Architecture-selected feed-forward policy inside the shared block.
     type FeedForward: DecoderProjectionOperator<B>;
+
+    /// Delegate exact internal row declarations to the actual selected worker.
+    /// Dynamic factories override this using the same configuration branch as
+    /// their construction; a tensor axis or matching path is not a proof.
+    fn append_component_prefill_observations(
+        _config: &C, unit_path: &str, _layer: usize,
+        declarations: &mut Vec<eredu_runtime::layered::PrefillObservationDeclaration>,
+    ) {
+        <Self::FeedForward as DecoderProjectionOperator<B>>::append_component_prefill_observations(unit_path, declarations);
+    }
 
     /// Validates configuration requirements specific to this block policy.
     fn validate(config: &C) -> Result<(), Error> {
         let _ = config;
         Ok(())
+    }
+
+    /// Checked counterpart of this factory's own validation policy.
+    /// The ordinary default does not qualify a custom metadata constructor.
+    fn validate_with_metadata(
+        config: &C,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), Error> {
+        if context.uses_checked_metadata() {
+            Err(eredu_nn::workspace::WorkspaceMetadataError::Unqualified.into())
+        } else {
+            Self::validate(config)
+        }
     }
 
     /// Builds one unloaded decoder block.
@@ -4089,6 +4365,16 @@ pub trait BlockFactory<B: NeuralBackend, C: Config>: 'static {
         config: &C,
         layer: usize,
     ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError>;
+    /// Optional checked producer for this factory's exact parameter groups.
+    /// Absence is not evidence that its ordinary constructor is metadata bounded.
+    fn parameter_groups_with_metadata(
+        _block: &TransformerBlock<B, Self::FeedForward>,
+        _config: &C,
+        _layer: usize,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Option<Result<Vec<ParameterGroupSpec>, Error>> {
+        None
+    }
 }
 
 /// Feed-forward policy that can delegate routed experts to runtime residency.
@@ -4235,7 +4521,17 @@ pub trait TensorParallelRoutedProjectionOperator<B: GroupedNeuralBackend>:
 pub struct DenseBlockFactory;
 
 impl<B: NeuralBackend, C: Config> BlockFactory<B, C> for DenseBlockFactory {
+    // Causal attention and row-local normalization/SwiGLU/residual equations.
+    const CAUSAL_PREFILL_ROWS: bool = true;
     type FeedForward = Mlp<B>;
+
+    fn validate_with_metadata(
+        _config: &C,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<(), Error> {
+        // This factory has no additional configuration predicate.
+        Ok(())
+    }
 
     fn build(
         config: &C,
@@ -4252,14 +4548,25 @@ impl<B: NeuralBackend, C: Config> BlockFactory<B, C> for DenseBlockFactory {
     ) -> Result<Vec<ParameterGroupSpec>, ParallelPlanError> {
         layer_parallel_parameter_groups(block, config, layer)
     }
+    fn parameter_groups_with_metadata(
+        block: &TransformerBlock<B, Self::FeedForward>,
+        config: &C,
+        layer: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Option<Result<Vec<ParameterGroupSpec>, Error>> {
+        Some(layer_parallel_parameter_groups_with_metadata(
+            block, config, layer, context,
+        ))
+    }
 }
 
 /// Shared layered decoder lifecycle over architecture configuration and block policy.
 pub struct LayeredModel<B: NeuralBackend, C: Config, P = DenseBlockFactory> {
-    args: C,
     static_modules: StaticModules<B>,
     parallel_geometry: Option<std::sync::Arc<LocalGeometry<C>>>,
     block_factory: std::marker::PhantomData<fn() -> P>,
+    // Retire module shells before their retained immutable source configuration.
+    args: crate::replicated_text::ConfigOwner<C>,
 }
 
 /// Pinned decoder modules physically present on one pipeline partition.
@@ -4368,11 +4675,18 @@ impl<C: Config> PartitionLocalGeometry<C> {
 
 /// A dense decoder whose modules are limited to one admitted pipeline partition.
 pub struct PartitionedLayeredModel<B: NeuralBackend, C: Config, P = DenseBlockFactory> {
-    args: C,
+    source: std::sync::Arc<PartitionModelSource<C>>,
     static_modules: PartitionStaticModules<B>,
+    block_factory: std::marker::PhantomData<fn() -> P>,
+}
+
+// The immutable semantic payload from this exact completed constructor. It
+// owns no tensors, source graph, request, quote Context or execution authority.
+pub(crate) struct PartitionModelSource<C> {
+    args: C,
     geometry: PartitionLocalGeometry<C>,
     parameters: ArchitectureParameterDescription,
-    block_factory: std::marker::PhantomData<fn() -> P>,
+    ownership: eredu_runtime::PartitionOwnership,
 }
 
 fn partition_static_modules<B, C>(
@@ -4385,7 +4699,9 @@ where
     B: eredu_nn::DistributedNeuralBackend,
     C: Config,
 {
-    let embedding_name = format!("{}.embed_tokens.weight", config.parameter_root());
+    let metadata = module_metadata::ModuleMetadata::new::<B>(context);
+    metadata.controls::<(PartitionStaticModules<B>, Result<PartitionStaticModules<B>, Error>)>()?;
+    let embedding_name = metadata.text(format_args!("{}.embed_tokens.weight", config.parameter_root()))?;
     let embeddings = (ownership.owns_input()
         || (ownership.owns_output() && config.tie_word_embeddings()))
     .then(|| {
@@ -4393,11 +4709,8 @@ where
             EmbeddingSpec {
                 vocabulary: config.vocabulary_size(),
                 dimensions: config.hidden_size(),
-                weight: ParameterSpec::trainable(&embedding_name).map_err(Error::backend)?,
-                format: crate::linear_format::standard_linear_format(
-                    &embedding_name,
-                    config.linear_format(&embedding_name),
-                )?,
+                weight: metadata.plain_parameter(&embedding_name)?,
+                format: metadata.format(&embedding_name, metadata.linear_format(config, &embedding_name)?)?,
             },
             geometry.embedding_range.clone(),
             context,
@@ -4413,11 +4726,7 @@ where
                     dimensions: config.hidden_size(),
                     epsilon: config.rms_norm_epsilon(),
                     scale: normalization_scale(
-                        ParameterSpec::trainable(format!(
-                            "{}.norm.weight",
-                            config.parameter_root()
-                        ))
-                        .map_err(Error::backend)?,
+                        metadata.named_parameter(format_args!("{}.norm.weight", config.parameter_root()))?,
                         config.normalization_offset(),
                     ),
                 },
@@ -4429,18 +4738,15 @@ where
         .then(|| {
             let name = "lm_head.weight";
             let range = geometry.output_range.clone().ok_or_else(|| {
-                Error::backend("untied decoder output owner has no vocabulary range")
+                metadata.error(format_args!("untied decoder output owner has no vocabulary range"))
             })?;
             B::vocabulary_parallel_linear(
                 LinearSpec {
                     input: config.hidden_size(),
                     output: config.vocabulary_size(),
-                    weight: ParameterSpec::trainable(name).map_err(Error::backend)?,
+                    weight: metadata.plain_parameter(name)?,
                     bias: None,
-                    format: crate::linear_format::standard_linear_format(
-                        name,
-                        config.linear_format(name),
-                    )?,
+                    format: metadata.format(name, metadata.linear_format(config, name)?)?,
                 },
                 range,
                 context,
@@ -4511,22 +4817,41 @@ where
         let static_modules =
             partition_static_modules(&args, &geometry, partition.ownership(), context)?;
         Ok(Self {
-            args,
+            source: std::sync::Arc::new(PartitionModelSource {
+                args, geometry, parameters: parameters.clone(),
+                ownership: partition.ownership().clone(),
+            }),
             static_modules,
-            geometry,
-            parameters: parameters.clone(),
             block_factory: std::marker::PhantomData,
         })
     }
 
+    pub(crate) fn retained_partition_source(&self) -> std::sync::Arc<PartitionModelSource<C>> {
+        self.source.clone()
+    }
+
+    pub(crate) fn from_retained_partition_source(
+        source: std::sync::Arc<PartitionModelSource<C>>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        // Only from_partition can create the source. Reuse its validated
+        // ownership, local geometry and parameters without a deep clone.
+        let metadata = module_metadata::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(Self, std::sync::Arc<PartitionModelSource<C>>, Result<Self, Error>)>()?;
+        let static_modules = partition_static_modules(
+            &source.args, &source.geometry, &source.ownership, context,
+        )?;
+        Ok(Self { source, static_modules, block_factory: std::marker::PhantomData })
+    }
+
     /// Returns normalized architecture configuration.
-    pub const fn args(&self) -> &C {
-        &self.args
+    pub fn args(&self) -> &C {
+        &self.source.args
     }
 
     /// Returns exact local pipeline geometry.
-    pub const fn local_geometry(&self) -> &PartitionLocalGeometry<C> {
-        &self.geometry
+    pub fn local_geometry(&self) -> &PartitionLocalGeometry<C> {
+        &self.source.geometry
     }
 
     /// Returns the physically allocated static modules.
@@ -4540,13 +4865,13 @@ where
         global_unit: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TransformerBlock<B, P::FeedForward>, Error> {
-        let config = self.geometry.block(global_unit).ok_or_else(|| {
+        let config = self.source.geometry.block(global_unit).ok_or_else(|| {
             Error::backend(format!(
                 "decoder unit {global_unit} is not owned by local range {:?}",
-                self.geometry.owned_units
+                self.source.geometry.owned_units
             ))
         })?;
-        P::build_partitioned(&self.args, config, global_unit, context)
+        P::build_partitioned(&self.source.args, config, global_unit, context)
     }
 }
 
@@ -4720,17 +5045,21 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
+        let metadata=module_metadata::ModuleMetadata::new::<B>(context);
+        metadata.controls::<(
+            LayeredForwardState<B::Tensor,ForwardContext<B::Tensor>>,
+            Result<LayeredForwardState<B::Tensor,ForwardContext<B::Tensor>>,Error>,
+            eredu_runtime::layered::LayeredForwardMetadata<Error>,
+        )>()?;
         if state.layout() != expected {
-            return Err(Error::backend(
-                "decoder runtime state does not match partition state layout",
-            ));
+            return Err(metadata.error(format_args!("decoder runtime state does not match partition state layout")));
         }
         let sequence = hidden.dim(1);
         let allow_sliding_prefill = mask.is_none();
         let mask = match mask {
             Some(mask) => Some(mask.clone()),
             None if sequence > 1 => {
-                let cache = state.layer(0).map_err(Error::backend)?;
+                let cache = state.layer(0).map_err(|cause|metadata.error(format_args!("{cause}")))?;
                 Some(B::causal_mask(sequence, cache.offset(), None, context)?)
             }
             None => None,
@@ -4741,6 +5070,7 @@ where
                 mask,
                 allow_sliding_prefill,
                 rotary_embeddings: None,
+                metadata: B::construction_metadata(context).filter(|c| c.uses_checked_metadata()).cloned(),
             },
         })
     }
@@ -4801,7 +5131,7 @@ where
             ),
         }?;
         let logits = instrumentation.apply("linear", logits)?;
-        softcap_logits(logits, self.args.output_softcap(), context)
+        softcap_logits(logits, self.source.args.output_softcap(), context)
     }
 }
 
@@ -4814,7 +5144,14 @@ where
     type DefinitionError = Error;
 
     fn state_layout(&self) -> Result<StateLayout, Self::DefinitionError> {
-        Ok(self.geometry.complete_state_layout.clone())
+        Ok(self.source.geometry.complete_state_layout.clone())
+    }
+
+    fn state_layout_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<StateLayout, Self::DefinitionError> {
+        self.source.geometry.complete_state_layout.clone_workspace(context)
     }
 
     fn state_identity(
@@ -4823,10 +5160,25 @@ where
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
         state_identity(
-            &self.args,
+            &self.source.args,
             state.layout(),
             state.global_layer_offset(),
             topology,
+        )
+    }
+
+    fn state_identity_with_metadata(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+        state_identity_with(
+            &self.source.args,
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+            identity::Metadata::new(Some(context)),
         )
     }
 
@@ -4834,7 +5186,22 @@ where
         &self,
         _context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
-        Ok(self.parameters.clone())
+        Ok(self.source.parameters.clone())
+    }
+
+    fn parameter_description_with_metadata<'a>(
+        &'a self,
+        _context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<std::borrow::Cow<'a, ArchitectureParameterDescription>, Self::DefinitionError> {
+        Ok(std::borrow::Cow::Borrowed(&self.source.parameters))
+    }
+
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_nn::Parameterized::visit_retained_values(&self.static_modules, visitor)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -4878,11 +5245,27 @@ where
     S: LayerRuntimeState<B>,
     S::LayerState: AttentionCache<B::Tensor>,
 {
+    fn prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        // Partitioning changes parameter/state ownership, not the ordinary
+        // decoder's causal row semantics. Keep the complete global declaration
+        // so inactive ranks can reserve the same remote observation receipt;
+        // the separate retained placement still determines actual hook owners.
+        prefill_observations::declarations(&self.source.args, P::CAUSAL_PREFILL_ROWS,
+            |path, layer, declarations| <P as BlockFactory<B, C>>::append_component_prefill_observations(&self.source.args, path, layer, declarations))
+    }
+
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
 
     type Input<'a> = LayeredInput<'a, B::Tensor>;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::token_shape(input.tokens).map(Some)
+    }
+
     type StaticModules = PartitionStaticModules<B>;
     type Unit = TransformerBlock<B, P::FeedForward>;
     type ForwardContext = ForwardContext<B::Tensor>;
@@ -4894,6 +5277,19 @@ where
 
     fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
         crate::transport::decoder()
+    }
+
+    fn group_transport_matches(
+        &self,
+        _group: usize,
+        expected: &eredu_runtime::ArchitectureGroupTransport,
+    ) -> bool {
+        crate::transport::decoder_declaration().matches(expected)
+    }
+
+    fn forward_metadata(&self, forward: &Self::ForwardContext)
+        -> Option<eredu_runtime::layered::LayeredForwardMetadata<Error>> {
+        forward.metadata.as_ref().map(|context|eredu_runtime::layered::LayeredForwardMetadata::new(context,|error|error))
     }
 
     fn primary_execution_group(&self) -> &str {
@@ -4908,23 +5304,53 @@ where
     }
 
     fn execution_graph(&self) -> Result<ExecutionGraph, Self::Error> {
-        Ok(self.parameters.graph().clone())
+        Ok(self.source.parameters.graph().clone())
+    }
+
+    fn execution_graph_with_metadata(
+        &self,
+        _context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        Ok(eredu_runtime::ArchitectureExecutionGraph::borrowed(
+            self.source.parameters.graph(),
+        ))
+    }
+
+    fn group_unit_count_with_metadata(
+        &self,
+        group: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<usize, Self::Error> {
+        if group != 0 {
+            return Err(
+                context.metadata_error(format_args!("decoder group is outside the text decoder"))
+            );
+        }
+        usize::try_from(self.source.args.num_hidden_layers())
+            .map_err(|cause| context.metadata_source(cause))
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
         if group != 0 {
             return Err(Error::backend("decoder group is outside the text decoder"));
         }
-        usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)
+        usize::try_from(self.source.args.num_hidden_layers()).map_err(Error::backend)
     }
 
     fn unit_path(&self, group: usize, index: usize) -> Result<String, Self::Error> {
         if group != 0
-            || index >= usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)?
+            || index >= usize::try_from(self.source.args.num_hidden_layers()).map_err(Error::backend)?
         {
             return Err(Error::backend("decoder unit is outside the text decoder"));
         }
-        Ok(format!("{}.layers.{index}", self.args.parameter_root()))
+        Ok(format!("{}.layers.{index}", self.source.args.parameter_root()))
+    }
+
+    fn unit_path_with_metadata(&self,group:usize,index:usize,
+        context:&eredu_nn::workspace::WorkspaceContext)->Result<String,Self::Error>{
+        let count=<Self as LayeredArchitecture<B,S>>::group_unit_count_with_metadata(self,group,context)?;
+        if index>=count {return Err(context.metadata_error(format_args!("decoder unit is outside the text decoder")));}
+        context.metadata_string(format_args!("{}.layers.{index}",self.source.args.parameter_root()))
     }
 
     fn static_modules(&self) -> &Self::StaticModules {
@@ -4958,12 +5384,12 @@ where
             .as_mut()
             .ok_or_else(|| Error::backend("decoder partition does not own input embedding"))?
             .forward(input.tokens, context)?;
-        let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
+        let hidden = scale_token_embeddings(hidden, self.source.args.embedding_scale(), context)?;
         Self::begin_hidden(
             hidden,
             input.mask,
             state,
-            self.geometry.complete_state_layout(),
+            self.source.geometry.complete_state_layout(),
             0,
             context,
         )
@@ -5013,11 +5439,11 @@ where
         forward: &mut Self::ForwardContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
+        if group != 0 || !self.source.geometry.owned_units.contains(&index) {
             return Err(Error::backend("decoder attempted an unowned unit"));
         }
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(index - self.source.geometry.owned_units.start)
             .map_err(Error::backend)?;
         unit.forward(
             AttentionInput {
@@ -5045,12 +5471,12 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
+        if group != 0 || !self.source.geometry.owned_units.contains(&index) {
             return Err(Error::backend("decoder attempted an unowned unit"));
         }
         let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(index - self.source.geometry.owned_units.start)
             .map_err(Error::backend)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_observed(
@@ -5064,6 +5490,16 @@ where
             context,
             &mut ComponentInstrumentation::new(&path, &mut observer),
         )
+    }
+
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        crate::readout::select_readout_positions(hidden, demand, 1, context)
     }
 
     fn finish_forward(
@@ -5136,12 +5572,12 @@ where
             parallel,
             context,
         )?;
-        let hidden = scale_token_embeddings(hidden, self.args.embedding_scale(), context)?;
+        let hidden = scale_token_embeddings(hidden, self.source.args.embedding_scale(), context)?;
         Self::begin_hidden(
             hidden,
             input.mask,
             state,
-            self.geometry.complete_state_layout(),
+            self.source.geometry.complete_state_layout(),
             0,
             context,
         )
@@ -5176,11 +5612,11 @@ where
         parallel: &B::ParallelContext,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<B::Tensor, Self::Error> {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
+        if group != 0 || !self.source.geometry.owned_units.contains(&index) {
             return Err(Error::backend("decoder attempted an unowned unit"));
         }
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(index - self.source.geometry.owned_units.start)
             .map_err(Error::backend)?;
         unit.forward_tensor_parallel(
             AttentionInput {
@@ -5210,12 +5646,12 @@ where
     where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
+        if group != 0 || !self.source.geometry.owned_units.contains(&index) {
             return Err(Error::backend("decoder attempted an unowned unit"));
         }
         let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(index - self.source.geometry.owned_units.start)
             .map_err(Error::backend)?;
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
         unit.forward_tensor_parallel_observed(
@@ -5287,13 +5723,13 @@ where
         group: usize,
         index: usize,
     ) -> Result<Option<eredu_runtime::RoutedObservationPoints>, Self::Error> {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
+        if group != 0 || !self.source.geometry.owned_units.contains(&index) {
             return Err(Error::backend(
                 "routed decoder observation requested for an unowned unit",
             ));
         }
         let unit_path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        Ok(self.args.routed_observation_points(&unit_path, index))
+        Ok(self.source.args.routed_observation_points(&unit_path, index))
     }
 
     fn forward_unit_observed_with_provider<R, O>(
@@ -5315,13 +5751,13 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        let points = self.args.routed_observation_points(&path, index);
+        let points = self.source.args.routed_observation_points(&path, index);
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
+        if group != 0 || !self.source.geometry.owned_units.contains(&index) {
             return Err(Error::backend("routed decoder attempted an unowned unit"));
         }
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(index - self.source.geometry.owned_units.start)
             .map_err(Error::backend)?;
         unit.forward_routed_observed(
             index,
@@ -5356,11 +5792,11 @@ where
         R: eredu_runtime::RoutedExpertProvider<B>,
         R::Error: std::fmt::Display,
     {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
+        if group != 0 || !self.source.geometry.owned_units.contains(&index) {
             return Err(Error::backend("routed decoder attempted an unowned unit"));
         }
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(index - self.source.geometry.owned_units.start)
             .map_err(Error::backend)?;
         unit.forward_routed(
             index,
@@ -5416,13 +5852,13 @@ where
         O: eredu_runtime::ActivationObserver<B::Tensor, Self::Error> + ?Sized,
     {
         let path = <Self as LayeredArchitecture<B, S>>::unit_path(self, group, index)?;
-        let points = self.args.routed_observation_points(&path, index);
+        let points = self.source.args.routed_observation_points(&path, index);
         let mut observer = eredu_runtime::BorrowedActivationObserver(observer);
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
+        if group != 0 || !self.source.geometry.owned_units.contains(&index) {
             return Err(Error::backend("routed decoder attempted an unowned unit"));
         }
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(index - self.source.geometry.owned_units.start)
             .map_err(Error::backend)?;
         unit.forward_routed_parallel_observed(
             index,
@@ -5459,11 +5895,11 @@ where
         R: eredu_runtime::TensorParallelRoutedExpertProvider<B>,
         R::Error: std::fmt::Display,
     {
-        if group != 0 || !self.geometry.owned_units.contains(&index) {
+        if group != 0 || !self.source.geometry.owned_units.contains(&index) {
             return Err(Error::backend("routed decoder attempted an unowned unit"));
         }
         let cache = state
-            .layer(index - self.geometry.owned_units.start)
+            .layer(index - self.source.geometry.owned_units.start)
             .map_err(Error::backend)?;
         unit.forward_routed_parallel(
             index,
@@ -5502,7 +5938,7 @@ where
 
     fn boundary_schema(&self) -> Result<Self::Boundary, Self::Error> {
         Ok(eredu_runtime::NoAuxiliaryBoundarySchema::new(
-            self.args.hidden_size(),
+            self.source.args.hidden_size(),
         ))
     }
 
@@ -5525,7 +5961,7 @@ where
                         Error::backend("decoder partition does not own input embedding")
                     })?
                     .forward(tokens, context)?;
-                scale_token_embeddings(hidden, self.args.embedding_scale(), context)?
+                scale_token_embeddings(hidden, self.source.args.embedding_scale(), context)?
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
@@ -5553,7 +5989,7 @@ where
                     parallel,
                     context,
                 )?;
-                scale_token_embeddings(hidden, self.args.embedding_scale(), context)?
+                scale_token_embeddings(hidden, self.source.args.embedding_scale(), context)?
             }
             LayeredPartitionInput::Hidden { hidden, .. } => hidden,
         };
@@ -5676,11 +6112,11 @@ where
     }
 
     fn partition_output_width(&self) -> i32 {
-        self.args.vocabulary_size()
+        self.source.args.vocabulary_size()
     }
 
     fn partition_routed_bank_order(&self, unit: usize) -> Vec<eredu_runtime::RoutedBankId> {
-        self.args.routed_bank_order(unit)
+        self.source.args.routed_bank_order(unit)
     }
 
     fn partition_routed_bank_tensor_reductions(
@@ -5688,7 +6124,7 @@ where
         unit: usize,
         bank: eredu_runtime::RoutedBankId,
     ) -> Result<(usize, usize), Error> {
-        self.args.routed_bank_tensor_reductions(unit, bank)
+        self.source.args.routed_bank_tensor_reductions(unit, bank)
     }
 }
 
@@ -5700,13 +6136,28 @@ where
 {
     /// Builds unloaded pinned modules from normalized architecture arguments.
     pub fn new(args: C, context: &<B::Tensor as Tensor>::Context) -> Result<Self, Error> {
-        args.validate_config()?;
-        P::validate(&args)?;
-        crate::operator_requirements::require::<B>(
+        Self::new_with_config(args.into(), context)
+    }
+
+    pub(crate) fn new_with_config(
+        args: crate::replicated_text::ConfigOwner<C>,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Self, Error> {
+        let metadata = identity::Metadata::new(B::construction_metadata(context));
+        metadata.controls::<(&C, std::marker::PhantomData<P>)>()?;
+        if let Some(context) = metadata.context() {
+            args.validate_config_with_metadata(context)?;
+            P::validate_with_metadata(&*args, context)?;
+        } else {
+            args.validate_config()?;
+            P::validate(&*args)?;
+        }
+        crate::operator_requirements::require_with_metadata::<B>(
             "shared decoder equations",
-            operator_requirements(&args),
+            operator_requirements(&*args),
+            metadata,
         )?;
-        let static_modules = StaticModules::new(&args, context)?;
+        let static_modules = StaticModules::new(&*args, context)?;
         Ok(Self {
             args,
             static_modules,
@@ -5733,7 +6184,7 @@ where
         geometry.validate_for(&args).map_err(Error::backend)?;
         let static_modules = StaticModules::new_parallel(&args, &geometry, context)?;
         Ok(Self {
-            args,
+            args: args.into(),
             static_modules,
             parallel_geometry: Some(std::sync::Arc::new(geometry)),
             block_factory: std::marker::PhantomData,
@@ -5741,7 +6192,7 @@ where
     }
 
     /// Returns the normalized architecture arguments.
-    pub const fn args(&self) -> &C {
+    pub fn args(&self) -> &C {
         &self.args
     }
 
@@ -5760,7 +6211,7 @@ where
         self.parallel_geometry
             .as_ref()
             .map(|geometry| geometry.state_layout().clone())
-            .map_or_else(|| state_layout(&self.args), Ok)
+            .map_or_else(|| state_layout(self.args()), Ok)
     }
 
     /// Returns planner-derived geometry when this is a rank-local realization.
@@ -5785,19 +6236,24 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<TransformerBlock<B, P::FeedForward>, Error> {
-        let count = usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)?;
+        let metadata = ModuleMetadata::new::<B>(context);
+        metadata.controls::<(usize, &C, TransformerBlock<B, P::FeedForward>)>()?;
+        let count = usize::try_from(self.args.num_hidden_layers())
+            .map_err(|cause| metadata.error(format_args!("{cause}")))?;
         if index >= count {
-            return Err(Error::backend(format!(
+            return Err(metadata.error(format_args!(
                 "decoder unit {index} is outside {count} decoder layers"
             )));
         }
         let args = match &self.parallel_geometry {
             Some(geometry) => geometry.block(index).ok_or_else(|| {
-                Error::backend(format!("decoder local geometry is missing block {index}"))
+                metadata.error(format_args!(
+                    "decoder local geometry is missing block {index}"
+                ))
             })?,
-            None => &self.args,
+            None => self.args(),
         };
-        P::build_partitioned(&self.args, args, index, context)
+        P::build_partitioned(self.args(), args, index, context)
     }
 
     /// Prepares architecture-owned mask state after an execution policy has
@@ -5813,7 +6269,7 @@ where
         S: LayerRuntimeState<B>,
         S::LayerState: AttentionCache<B::Tensor>,
     {
-        let expected = state_layout(&self.args)?;
+        let expected = state_layout(self.args())?;
         self.begin_embedded_with_layout(hidden, supplied_mask, state, &expected, context)
     }
 
@@ -5982,6 +6438,7 @@ where
                 allow_sliding_prefill: supplied_mask.is_none(),
                 rotary_embeddings: rotary_embeddings
                     .map(|(cosine, sine)| (cosine.clone(), sine.clone())),
+                metadata: None,
             },
         })
     }
@@ -6216,19 +6673,54 @@ where
         &self,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Error> {
-        let graph =
-            ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP]).map_err(Error::backend)?;
-        let count = usize::try_from(self.args.num_hidden_layers()).map_err(Error::backend)?;
-        let layout = ExecutionUnitLayout::new(&graph, [count]).map_err(Error::backend)?;
-        let static_groups = static_parallel_parameter_groups::<B>(
+        let metadata =
+            B::construction_metadata(context).filter(|context| context.uses_checked_metadata());
+        if let Some(metadata) = metadata {
+            let controls = [
+                size_of::<ArchitectureParameterDescription>(),
+                size_of::<ExecutionGraph>(),
+                size_of::<ExecutionUnitLayout>(),
+                size_of::<[usize; 1]>(),
+                size_of::<Vec<OwnedParameterGroupSpec>>(),
+                size_of::<Option<Vec<ParameterGroupSpec>>>(),
+                size_of::<ParameterGroupOwner>(),
+                size_of::<Result<ArchitectureParameterDescription, Error>>(),
+            ]
+            .into_iter()
+            .try_fold(0usize, usize::checked_add)
+            .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Overflow)?;
+            metadata.charge_metadata(controls)?;
+        }
+        let graph = match metadata {
+            Some(context) => {
+                ExecutionGraph::single_with_metadata(TEXT_DECODER_EXECUTION_GROUP, context)?
+            }
+            None => {
+                ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP]).map_err(Error::backend)?
+            }
+        };
+        let count =
+            usize::try_from(self.args.num_hidden_layers()).map_err(|cause| match metadata {
+                Some(context) => context.metadata_source(cause),
+                None => Error::backend(cause),
+            })?;
+        let layout = match metadata {
+            Some(context) => ExecutionUnitLayout::new_with_metadata(&graph, &[count], context)?,
+            None => ExecutionUnitLayout::new(&graph, [count]).map_err(Error::backend)?,
+        };
+        let static_groups = parameter_metadata::static_groups::<B>(
             &self.static_modules.embeddings,
             &self.static_modules.norm,
             self.static_modules.lm_head.as_ref(),
             self.args.parameter_root(),
+            metadata,
         )
-        .map_err(Error::backend)?;
-        let mut expected = static_groups.clone();
-        let mut owned = Vec::new();
+        .map_err(parameter_metadata::ParameterGroupError::into_neural)?;
+        let mut expected = metadata.is_none().then(|| static_groups.clone());
+        let mut owned = match metadata {
+            Some(context) => context.metadata_vec(static_groups.len())?,
+            None => Vec::new(),
+        };
         for (index, group) in static_groups.into_iter().enumerate() {
             let role = match index {
                 0 => "embedding",
@@ -6236,26 +6728,67 @@ where
                 _ => "output",
             };
             let owner = if index == 0 && self.args.tie_word_embeddings() {
-                ParameterGroupOwner::static_any_of(["embedding", "output"])
+                match metadata {
+                    Some(context) => {
+                        let mut roles = context.metadata_vec(2)?;
+                        roles.push(context.metadata_string(format_args!("embedding"))?);
+                        roles.push(context.metadata_string(format_args!("output"))?);
+                        ParameterGroupOwner::StaticAnyOf(roles)
+                    }
+                    None => ParameterGroupOwner::static_any_of(["embedding", "output"]),
+                }
             } else {
-                ParameterGroupOwner::static_role(role)
+                match metadata {
+                    Some(context) => ParameterGroupOwner::static_role(
+                        context.metadata_string(format_args!("{role}"))?,
+                    ),
+                    None => ParameterGroupOwner::static_role(role),
+                }
             };
             owned.push(OwnedParameterGroupSpec::new(owner, group));
         }
-        let group_id = layout.group_id(0).expect("decoder layout group").clone();
+        let group_id = layout.group_id(0).expect("decoder layout group");
         for index in 0..count {
             let unit = self.construct_unit(index, context)?;
-            let groups = P::parameter_groups(&unit, &self.args, index).map_err(Error::backend)?;
-            expected.extend(groups.iter().cloned());
-            owned.extend(groups.into_iter().map(|group| {
-                OwnedParameterGroupSpec::new(
-                    ParameterGroupOwner::execution_unit(group_id.clone(), index),
+            let groups = match metadata {
+                Some(context) => {
+                    P::parameter_groups_with_metadata(&unit, self.args(), index, context)
+                        .ok_or(eredu_nn::workspace::WorkspaceMetadataError::Unqualified)??
+                }
+                None => P::parameter_groups(&unit, self.args(), index).map_err(Error::backend)?,
+            };
+            if let Some(expected) = &mut expected {
+                expected.extend(groups.iter().cloned());
+            }
+            if let Some(context) = metadata {
+                context.reserve_metadata_vec(&mut owned, groups.len())?;
+            }
+            for group in groups {
+                let group_id = match metadata {
+                    Some(context) => eredu_runtime::ExecutionGroupId::new(
+                        context.metadata_string(format_args!("{}", group_id.as_str()))?,
+                    )
+                    .map_err(|cause| context.metadata_source(cause))?,
+                    None => group_id.clone(),
+                };
+                owned.push(OwnedParameterGroupSpec::new(
+                    ParameterGroupOwner::execution_unit(group_id, index),
                     group,
-                )
-            }));
+                ));
+            }
         }
-        ArchitectureParameterDescription::new(&graph, &layout, expected, owned)
-            .map_err(Error::backend)
+        match metadata {
+            Some(context) => ArchitectureParameterDescription::from_owned_with_metadata(
+                graph, layout, owned, context,
+            ),
+            None => ArchitectureParameterDescription::new(
+                &graph,
+                &layout,
+                expected.expect("ordinary description retains expected groups"),
+                owned,
+            )
+            .map_err(Error::backend),
+        }
     }
 }
 
@@ -6271,16 +6804,41 @@ where
         self.state_layout_impl()
     }
 
+    fn state_layout_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<StateLayout, Self::DefinitionError> {
+        match &self.parallel_geometry {
+            Some(geometry) => geometry.state_layout.clone_workspace(context),
+            None => state_layout_with_metadata(self.args(), context),
+        }
+    }
+
     fn state_identity(
         &self,
         state: &eredu_runtime::PartitionState,
         topology: eredu_core::cache::PromptCacheTopology,
     ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
         state_identity(
-            &self.args,
+            self.args(),
             state.layout(),
             state.global_layer_offset(),
             topology,
+        )
+    }
+
+    fn state_identity_with_metadata(
+        &self,
+        state: &eredu_runtime::PartitionState,
+        topology: eredu_core::cache::PromptCacheTopology,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ModelStateIdentity, Self::DefinitionError> {
+        state_identity_with(
+            self.args(),
+            state.layout(),
+            state.global_layer_offset(),
+            topology,
+            identity::Metadata::new(Some(context)),
         )
     }
 
@@ -6289,6 +6847,14 @@ where
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<ArchitectureParameterDescription, Self::DefinitionError> {
         self.parameter_description_impl(context)
+    }
+
+    fn retained_static_value_slot_bound(&self) -> Option<usize> {
+        eredu_nn::Parameterized::retained_value_slot_bound(&self.static_modules)
+    }
+
+    fn visit_retained_static_values(&self, visitor: &mut dyn FnMut(&B::Tensor)) -> bool {
+        eredu_nn::Parameterized::visit_retained_values(&self.static_modules, visitor)
     }
 
     fn visit_static_parameters<V>(&self, visitor: &mut V) -> Result<(), V::Error>
@@ -6325,6 +6891,11 @@ where
     S::LayerState: AttentionCache<B::Tensor>,
 {
     type Input<'a> = LayeredInput<'a, B::Tensor>;
+
+    fn inference_input_shape(input: &Self::Input<'_>) -> Result<Option<[u64; 2]>, Self::Error> {
+        crate::prefill::token_shape(input.tokens).map(Some)
+    }
+
     type StaticModules = StaticModules<B>;
     type Unit = TransformerBlock<B, P::FeedForward>;
     type ForwardContext = ForwardContext<B::Tensor>;
@@ -6334,12 +6905,27 @@ where
         B::Tensor: 'a;
     type Error = Error;
 
+    fn prefill_observation_declarations(
+        &self,
+    ) -> Result<Vec<eredu_runtime::layered::PrefillObservationDeclaration>, Self::Error> {
+        prefill_observations::declarations(self.args(), P::CAUSAL_PREFILL_ROWS,
+            |path, layer, declarations| <P as BlockFactory<B, C>>::append_component_prefill_observations(self.args(), path, layer, declarations))
+    }
+
     fn observation_hooks(&self) -> eredu_runtime::inspection::ObservationHookSupport {
         eredu_runtime::inspection::ObservationHookSupport::internal(true, true, true)
     }
 
     fn group_transport(&self, _group: usize) -> eredu_runtime::ArchitectureGroupTransport {
         crate::transport::decoder()
+    }
+
+    fn group_transport_matches(
+        &self,
+        _group: usize,
+        expected: &eredu_runtime::ArchitectureGroupTransport,
+    ) -> bool {
+        crate::transport::decoder_declaration().matches(expected)
     }
 
     fn primary_execution_group(&self) -> &str {
@@ -6354,7 +6940,31 @@ where
     }
 
     fn execution_graph(&self) -> Result<eredu_runtime::ExecutionGraph, Self::Error> {
-        eredu_runtime::ExecutionGraph::chain([TEXT_DECODER_EXECUTION_GROUP]).map_err(Error::backend)
+        eredu_runtime::ArchitectureExecutionGraph::single(TEXT_DECODER_EXECUTION_GROUP)
+            .and_then(eredu_runtime::ArchitectureExecutionGraph::into_owned)
+            .map_err(Error::backend)
+    }
+
+    fn execution_graph_with_metadata(
+        &self,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<eredu_runtime::ArchitectureExecutionGraph<'_>, Self::Error> {
+        eredu_runtime::ArchitectureExecutionGraph::single(TEXT_DECODER_EXECUTION_GROUP)
+            .map_err(|cause| context.metadata_source(cause))
+    }
+
+    fn group_unit_count_with_metadata(
+        &self,
+        group: usize,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<usize, Self::Error> {
+        if group != 0 {
+            return Err(context.metadata_error(format_args!(
+                "decoder execution group {group} is outside the text decoder"
+            )));
+        }
+        usize::try_from(self.args().num_hidden_layers())
+            .map_err(|cause| context.metadata_source(cause))
     }
 
     fn group_unit_count(&self, group: usize) -> Result<usize, Self::Error> {
@@ -6395,8 +7005,10 @@ where
         index: usize,
         context: &<B::Tensor as Tensor>::Context,
     ) -> Result<Self::Unit, Self::Error> {
+        let metadata = ModuleMetadata::new::<B>(context);
+        metadata.controls::<(usize, usize, Result<Self::Unit, Self::Error>)>()?;
         if group != 0 {
-            return Err(Error::backend(format!(
+            return Err(metadata.error(format_args!(
                 "decoder execution group {group} is outside the text decoder"
             )));
         }
@@ -6496,6 +7108,16 @@ where
             context,
             &mut ComponentInstrumentation::new(&path, &mut observer),
         )
+    }
+
+    fn select_readout_positions(
+        &self,
+        hidden: &B::Tensor,
+        _forward: &Self::ForwardContext,
+        demand: eredu_core::OutputDemand,
+        context: &<B::Tensor as Tensor>::Context,
+    ) -> Result<Option<B::Tensor>, Self::Error> {
+        crate::readout::select_readout_positions(hidden, demand, 1, context)
     }
 
     fn finish_forward(

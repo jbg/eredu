@@ -67,110 +67,28 @@ impl PackedRelu2Groups {
         dense_dtype: Dtype,
         stream: &Stream,
     ) -> Result<Self, Exception> {
-        let split = |quantization| {
-            Ok::<_, Exception>(match quantization {
-                Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
-                packed => (packed, None),
-            })
+        Self::new_with_parameter_factory(group_count, hidden_size, intermediate_size,
+            quantization, dense_dtype, &mut UnloadedParameters(stream))
+    }
+
+    /// Constructs the ordinary final fields from an explicit parameter source.
+    pub(crate) fn new_with_parameter_factory<F: ParameterFactory>(group_count:i32,
+        hidden_size:i32, intermediate_size:i32, quantization:[Option<WeightQuantization>;2],
+        dense_dtype:Dtype, factory:&mut F) -> Result<Self,F::Error> {
+        let split = |quantization| match quantization {
+            Some(iq @ WeightQuantization::GgufIQuant { .. }) => (None, Some(iq)),
+            packed => (packed, None),
         };
-        let (up_quantization, up_iquant) = split(quantization[0])?;
-        let (down_quantization, down_iquant) = split(quantization[1])?;
-        let projection = |out_features: i32,
-                          in_features: i32,
-                          quantization: Option<WeightQuantization>,
-                          iquant: Option<WeightQuantization>|
-         -> Result<GroupProjectionParams, Exception> {
-            if let Some(iquant) = iquant {
-                let (ggml_type, _) = iquant.gguf_iquant().expect("IQ group format");
-                let (block_values, block_bytes) = ggml_type
-                    .block_and_bytes()
-                    .expect("canonical IQ block geometry");
-                return Ok((
-                    PhysicalParam::<Array>::unloaded(
-                        &[
-                            group_count,
-                            out_features,
-                            in_features / block_values as i32 * block_bytes as i32,
-                        ],
-                        Dtype::Uint8,
-                        stream,
-                    )?,
-                    PhysicalParam::new(None),
-                    PhysicalParam::new(None),
-                ));
-            }
-            match quantization {
-                Some(quantization) => Ok((
-                    PhysicalParam::<Array>::unloaded(
-                        &[
-                            group_count,
-                            out_features,
-                            quantized_packed_dimension(in_features, quantization.bits()),
-                        ],
-                        Dtype::Uint32,
-                        stream,
-                    )?,
-                    PhysicalParam::<Option<Array>>::unloaded_some(
-                        &[
-                            group_count,
-                            out_features,
-                            in_features / quantization.group_size(),
-                        ],
-                        if quantization == WeightQuantization::MxFp4 {
-                            Dtype::Uint8
-                        } else {
-                            Dtype::Float16
-                        },
-                        stream,
-                    )?,
-                    if quantization.has_biases() {
-                        PhysicalParam::<Option<Array>>::unloaded_some(
-                            &[
-                                group_count,
-                                out_features,
-                                in_features / quantization.group_size(),
-                            ],
-                            Dtype::Float16,
-                            stream,
-                        )?
-                    } else {
-                        PhysicalParam::new(None)
-                    },
-                )),
-                None => Ok((
-                    PhysicalParam::<Array>::unloaded(
-                        &[group_count, out_features, in_features],
-                        dense_dtype,
-                        stream,
-                    )?,
-                    PhysicalParam::new(None),
-                    PhysicalParam::new(None),
-                )),
-            }
-        };
-        let (up_proj, up_proj_scales, up_proj_biases) =
-            projection(intermediate_size, hidden_size, up_quantization, up_iquant)?;
-        let (down_proj, down_proj_scales, down_proj_biases) = projection(
-            hidden_size,
-            intermediate_size,
-            down_quantization,
-            down_iquant,
-        )?;
-        Ok(Self {
-            group_count,
-            hidden_size,
-            intermediate_size,
-            up_quantization,
-            down_quantization,
-            up_iquant,
-            down_iquant,
-            up_proj,
-            up_proj_scales,
-            up_proj_biases,
-            down_proj,
-            down_proj_scales,
-            down_proj_biases,
-        })
+        let (up_quantization, up_iquant) = split(quantization[0]);
+        let (down_quantization, down_iquant) = split(quantization[1]);
+        let (up_proj, up_proj_scales, up_proj_biases) = construction::projection(factory,
+            ["up_proj", "up_proj_scales", "up_proj_biases"], group_count, intermediate_size,
+            hidden_size, up_quantization, up_iquant, dense_dtype, None)?;
+        let (down_proj, down_proj_scales, down_proj_biases) = construction::projection(factory,
+            ["down_proj", "down_proj_scales", "down_proj_biases"], group_count, hidden_size,
+            intermediate_size, down_quantization, down_iquant, dense_dtype, None)?;
+        Ok(Self {group_count,hidden_size,intermediate_size,up_quantization,down_quantization,
+            up_iquant,down_iquant,up_proj,up_proj_scales,up_proj_biases,down_proj,down_proj_scales,down_proj_biases})
     }
 
     /// Evaluates selected groups and reduces their outputs back to tokens.

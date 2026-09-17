@@ -5,6 +5,45 @@ pub(crate) enum Pointwise {
     Sigmoid = 1,
     Silu = 2,
 }
+// Invocation and lazy compiler transports. Immutable source/cache slots are
+// separately funded once by the prepared pointwise family.
+pub(crate) fn f32_pointwise_control_bytes(rank: usize) -> Option<usize> {
+    use std::mem::size_of;
+    [
+        Stream::device_type_control_bytes()?,
+        size_of::<Option<safemlx::fast::CustomKernelConfig>>(),
+        size_of::<Result<Option<Array>, Exception>>(),
+        size_of::<std::cell::Ref<'static, Option<safemlx::fast::MetalKernel>>>(),
+        size_of::<std::cell::RefMut<'static, Option<safemlx::fast::MetalKernel>>>(),
+        size_of::<Pointwise>(),
+        size_of::<i32>(),
+        size_of::<bool>(),
+        size_of::<Option<safemlx::OriginalScopeObserver>>(),
+        size_of::<
+            Option<
+                &safemlx::fast::PreparedMetalKernelFamily<
+                    eredu_runtime::working_memory::SharedNativeInitializationCustody,
+                >,
+            >,
+        >(),
+    ]
+    .into_iter()
+    .try_fold(
+        safemlx::fast::PreparedMetalKernelFamily::<
+            eredu_runtime::working_memory::SharedNativeInitializationCustody,
+        >::control_bytes::<1, 1>(1, rank)?,
+        usize::checked_add,
+    )
+}
+// CPU exits before native kernel/TLS/source construction. Quote only this
+// actual probe, never use GPU kernel storage to qualify the CPU equation.
+pub(crate) fn cpu_pointwise_probe_control_bytes() -> Option<usize> {
+    use std::mem::{size_of,size_of_val};
+    let parts=[Stream::device_type_control_bytes()?,
+        size_of::<(&Array,Pointwise,&Stream)>(),size_of::<Result<Option<Array>,Exception>>(),
+        size_of::<safemlx::Dtype>(),size_of::<usize>(),size_of::<bool>()];
+    parts.into_iter().try_fold(size_of_val(&parts),usize::checked_add)
+}
 pub(crate) fn f32_pointwise(
     input: &Array,
     operation: Pointwise,
@@ -20,27 +59,80 @@ pub(crate) fn f32_pointwise(
         thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
         if input.dtype() != Dtype::Float32
             || input.size() == 0
-            || stream.get_device()?.get_type()? != DeviceType::Gpu
+            || stream.device_type()? != DeviceType::Gpu
         {
             return Ok(None);
         }
         let size = i32::try_from(input.size())
             .map_err(|_| Exception::custom("pointwise size overflow"))?;
-        let config = CustomKernelConfig::new()
-            .with_template_arg_int("SIZE", size)
-            .with_template_arg_int("OP", operation as i32)
-            .with_grid([size, 1, 1])
-            .with_thread_group([256, 1, 1])
-            .with_output_arg(input.shape(), Dtype::Float32);
-        let mut output=KERNEL.with(|cell| -> Result<Vec<Array>,Exception> {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut()=Some(MetalKernel::new("f32_pointwise",["input"],["output"],
-                    "uint i=thread_position_in_grid.x; if(i>=SIZE) return; float x=input[i]; float denominator=1.0f+stable_exp_f32(-x); output[i]=(OP==1 ? 1.0f : x)/denominator;",
-                    include_str!("exp_f32.metal"),true,false)?);
+        let fixed = MetalKernel::fixed_control_bytes::<1, 1>(1, input.ndim()).is_some();
+        let original = safemlx::OriginalScopeObserver::try_current()?;
+        if let Some(observer) = &original {
+            if !fixed || crate::backend::managed_memory::pointwise_kernel::definition().is_none() {
+                return Err(observer.capacity_error());
             }
-            cell.borrow().as_ref().expect("pointwise kernel initialized").apply_device([input],&config,stream)
-        })?;
-        return Ok(output.pop());
+        }
+        if fixed {
+            if let Some(kernel) = crate::backend::managed_memory::pointwise_kernel::definition() {
+                use safemlx::fast::{BorrowedKernelOutput, BorrowedKernelTemplate};
+                let [output] = kernel.apply_fixed_device(
+                    [input],
+                    [BorrowedKernelOutput {
+                        shape: input.shape(),
+                        dtype: Dtype::Float32,
+                    }],
+                    &[BorrowedKernelTemplate::Int(c"OP", operation as i32)],
+                    [size, 1, 1],
+                    [256, 1, 1],
+                    stream,
+                )?;
+                return Ok(Some(output));
+            }
+        }
+        // Arbitrary ordinary ranks keep their historical owning config. The
+        // closed inline route borrows the shape and static template names.
+        let config = (!fixed).then(|| {
+            CustomKernelConfig::new()
+                .with_template_arg_int("OP", operation as i32)
+                .with_grid([size, 1, 1])
+                .with_thread_group([256, 1, 1])
+                .with_output_arg(input.shape(), Dtype::Float32)
+        });
+        return KERNEL.with(|cell| -> Result<Option<Array>, Exception> {
+            if cell.borrow().is_none() {
+                let plan = &crate::backend::managed_memory::pointwise_kernel::PLAN;
+                *cell.borrow_mut() = Some(MetalKernel::new(
+                    plan.name,
+                    plan.inputs,
+                    plan.outputs,
+                    plan.source,
+                    plan.header,
+                    plan.ensure_row_contiguous,
+                    plan.atomic_outputs,
+                )?);
+            }
+            let kernel = cell.borrow();
+            let kernel = kernel.as_ref().expect("pointwise kernel initialized");
+            if let Some(config) = &config {
+                kernel
+                    .apply_device([input], config, stream)
+                    .map(|mut outputs| outputs.pop())
+            } else {
+                use safemlx::fast::{BorrowedKernelOutput, BorrowedKernelTemplate};
+                let [output] = kernel.apply_fixed_device(
+                    [input],
+                    [BorrowedKernelOutput {
+                        shape: input.shape(),
+                        dtype: Dtype::Float32,
+                    }],
+                    &[BorrowedKernelTemplate::Int(c"OP", operation as i32)],
+                    [size, 1, 1],
+                    [256, 1, 1],
+                    stream,
+                )?;
+                Ok(Some(output))
+            }
+        });
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
@@ -105,39 +197,21 @@ mod tests {
 pub(crate) fn softmax_last(input: &Array, stream: &Stream) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
-        use safemlx::{
-            fast::{CustomKernelConfig, MetalKernel},
-            DeviceType, Dtype,
-        };
-        use std::cell::RefCell;
-        thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
+        use crate::backend::managed_memory::row_kernels::{self, RowKernel};
+        use safemlx::{DeviceType, Dtype};
         if input.dtype() != Dtype::Float32
             || input.size() == 0
+            || input.ndim() == 0
             || input.dim(-1) < 4
-            || stream.get_device()?.get_type()? != DeviceType::Gpu
+            || stream.device_type()? != DeviceType::Gpu
         {
             return Ok(None);
         }
+        row_kernels::validate_call(RowKernel::Softmax, input.ndim())?;
         let width = input.dim(-1);
         let rows = i32::try_from(input.size() / width as usize)
             .map_err(|_| Exception::custom("softmax row count overflow"))?;
-        let config = CustomKernelConfig::new()
-            .with_template_arg_int("WIDTH", width)
-            .with_template_arg_int("ROWS", rows)
-            .with_grid([rows, 1, 1])
-            .with_thread_group([32, 1, 1])
-            .with_output_arg(input.shape(), Dtype::Float32);
-        let mut output=KERNEL.with(|cell| -> Result<Vec<Array>,Exception> {
-            if cell.borrow().is_none() { *cell.borrow_mut()=Some(MetalKernel::new("f32_softmax_last",["input"],["output"],
-                concat!("uint row=thread_position_in_grid.x; if(row>=ROWS) return; size_t base=size_t(row)*WIDTH;",
-                    "float maximum=-INFINITY; for(uint i=0;i<WIDTH;++i) { float v=input[base+i]; maximum=(isnan(v)||isnan(maximum)) ? NAN : max(maximum,v); }",
-                    "float sums[4]={}; for(uint i=0;i<WIDTH;++i) { float v=stable_exp_f32(input[base+i]-maximum); output[base+i]=v; sums[i%4]+=v; }",
-                    "float inverse=1.0f/((sums[0]+sums[2])+(sums[1]+sums[3]));",
-                    "for(uint i=0;i<WIDTH;++i) output[base+i]*=inverse;"),
-                include_str!("exp_f32.metal"),true,false)?); }
-            cell.borrow().as_ref().expect("softmax kernel initialized").apply_device([input],&config,stream)
-        })?;
-        return Ok(output.pop());
+        row_kernels::apply(RowKernel::Softmax, [input], input.shape(), rows, stream).map(Some)
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {

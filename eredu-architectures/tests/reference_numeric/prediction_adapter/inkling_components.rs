@@ -132,6 +132,9 @@ fn inkling_materialized_prediction_observations_preserve_scoring_and_replay() {
                 snapshots: Rc::new(RefCell::new(Vec::new())),
             },
         };
+        let snapshots_before = extension.state.snapshots.borrow().len();
+        retained_resources::verify::<Model, Extension>(&mut extension, 1);
+        assert_eq!(extension.state.snapshots.borrow().len(), snapshots_before);
         let output_weight =
             <Model as LayeredArchitecture<NumericBackend, State>>::static_modules(&model)
                 .output

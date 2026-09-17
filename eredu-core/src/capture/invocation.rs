@@ -1,5 +1,7 @@
 //! Physical geometry is independent of the prediction being inspected.
 use super::*;
+mod window_source;
+pub use window_source::CaptureWindowSourceError;
 
 /// Exact host-known tensor axes for one forward invocation. A cached forward may
 /// contain multiple sequence rows. Context is optional only when no selected axis
@@ -14,33 +16,188 @@ pub struct CaptureInvocationShape {
     pub context: Option<u64>,
 }
 
+/// Allocation-free refusal while checking an actual invocation against borrowed axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum CaptureAxisError {
+    /// The independent logical prediction allowance is empty.
+    #[error("empty invocation prediction range")]
+    EmptyPredictionRange,
+    /// The physical source or logical coordinate exceeds admitted bounds.
+    #[error("invocation exceeds admitted geometry or prediction range")]
+    InvocationBounds,
+    /// The actual invocation has an empty required extent.
+    #[error("empty invocation geometry")]
+    Empty,
+    /// An extent or product overflows.
+    #[error("capture geometry overflow")]
+    Overflow,
+    /// An undeclared source exceeds the fixed metadata rank bound.
+    #[error("capture rank exceeds the 32-axis metadata bound")]
+    RankBound,
+    /// The actual and declared ranks differ.
+    #[error("runtime rank differs from the catalog")]
+    Rank,
+    /// A declared context axis lacks an exact source extent.
+    #[error("selected context axis requires exact invocation context")]
+    Context,
+    /// An actual declared axis differs from its resolved extent.
+    #[error("runtime axis {index} extent {actual} differs from expected {expected}")]
+    Extent {
+        /// Index in the declared axis order.
+        index: usize,
+        /// Actual source extent.
+        actual: u64,
+        /// Exact resolved extent.
+        expected: u64,
+    },
+}
+impl CaptureAxisError {
+    fn legacy(self, point: Option<&ObservationPoint>) -> CaptureError {
+        self.legacy_parts(point.and_then(|point| {
+            point
+                .axes
+                .as_deref()
+                .map(|axes| (point.path.as_str(), axes))
+        }))
+    }
+    pub(crate) fn legacy_parts(self, point: Option<(&str, &[crate::TensorAxis])>) -> CaptureError {
+        match self {
+            Self::EmptyPredictionRange => {
+                CaptureError::Invalid("empty invocation prediction range".into())
+            }
+            Self::InvocationBounds => CaptureError::Invalid(
+                "invocation exceeds admitted geometry or prediction range".into(),
+            ),
+            Self::Empty => CaptureError::Invalid("empty invocation geometry".into()),
+            Self::Overflow => CaptureError::Overflow,
+            Self::RankBound => {
+                CaptureError::Unsupported("capture rank exceeds the 32-axis metadata bound".into())
+            }
+            Self::Rank => CaptureError::Invalid("runtime rank differs from the catalog".into()),
+            Self::Context => CaptureError::Unsupported(
+                "selected context axis requires exact invocation context".into(),
+            ),
+            Self::Extent {
+                index,
+                actual,
+                expected,
+            } => {
+                let (path, axes) = point.expect("extent diagnostic has declaration");
+                CaptureError::Invalid(format!(
+                    "runtime extent for {}/{} is {actual}, expected {expected} from catalog/request",
+                    path, axes[index].name
+                ))
+            }
+        }
+    }
+}
 impl CaptureInvocationShape {
     /// Validates positive extents and checked products without touching tensors.
     pub fn validate(self) -> Result<(), CaptureError> {
+        self.validate_fixed().map_err(|cause| cause.legacy(None))
+    }
+    /// Allocation-free validation for an already retained original descriptor.
+    pub fn validate_fixed(self) -> Result<(), CaptureAxisError> {
         if self.batch == 0 || self.sequence == 0 || self.context == Some(0) {
-            return Err(CaptureError::Invalid("empty invocation geometry".into()));
+            return Err(CaptureAxisError::Empty);
         }
-        mul(self.batch, self.sequence)?;
+        self.batch
+            .checked_mul(self.sequence)
+            .ok_or(CaptureAxisError::Overflow)?;
         if let Some(context) = self.context {
-            mul(self.batch, context)?;
+            self.batch
+                .checked_mul(context)
+                .ok_or(CaptureAxisError::Overflow)?;
         }
         Ok(())
     }
-    pub(super) fn extent(self, dimension: &SymbolicDimension) -> Result<Option<u64>, CaptureError> {
+    fn extent_fixed(self, dimension: &SymbolicDimension) -> Result<Option<u64>, CaptureAxisError> {
+        use CaptureAxisError as E;
         Ok(match dimension {
-            SymbolicDimension::Known(n) => {
-                Some(u64::try_from(*n).map_err(|_| CaptureError::Overflow)?)
-            }
+            SymbolicDimension::Known(n) => Some(u64::try_from(*n).map_err(|_| E::Overflow)?),
             SymbolicDimension::Batch => Some(self.batch),
             SymbolicDimension::Sequence => Some(self.sequence),
-            SymbolicDimension::TokenRows => Some(mul(self.batch, self.sequence)?),
-            SymbolicDimension::Context => Some(self.context.ok_or_else(|| {
-                CaptureError::Unsupported(
-                    "selected context axis requires exact invocation context".into(),
-                )
-            })?),
+            SymbolicDimension::TokenRows => {
+                Some(self.batch.checked_mul(self.sequence).ok_or(E::Overflow)?)
+            }
+            SymbolicDimension::Context => Some(self.context.ok_or(E::Context)?),
             SymbolicDimension::MediaPositions | SymbolicDimension::Unknown => None,
         })
+    }
+    pub(super) fn extent(self, dimension: &SymbolicDimension) -> Result<Option<u64>, CaptureError> {
+        self.extent_fixed(dimension)
+            .map_err(|cause| cause.legacy(None))
+    }
+    /// Checks borrowed source dimensions without constructing declaration clones
+    /// or diagnostic storage. Ordinary and prepared geometry use this same loop.
+    pub fn validate_actual_axes(
+        self,
+        axes: Option<&[crate::TensorAxis]>,
+        shape: &[u64],
+    ) -> Result<(), CaptureAxisError> {
+        use CaptureAxisError as E;
+        if self.batch == 0 || self.sequence == 0 || self.context == Some(0) {
+            return Err(E::Empty);
+        }
+        self.batch.checked_mul(self.sequence).ok_or(E::Overflow)?;
+        if let Some(n) = self.context {
+            self.batch.checked_mul(n).ok_or(E::Overflow)?;
+        }
+        if let Some(axes) = axes {
+            if axes.len() != shape.len() {
+                return Err(E::Rank);
+            }
+            for (index, (axis, actual)) in axes.iter().zip(shape).enumerate() {
+                if let Some(expected) = self.extent_fixed(&axis.dimension)? {
+                    if expected != *actual {
+                        return Err(E::Extent {
+                            index,
+                            actual: *actual,
+                            expected,
+                        });
+                    }
+                }
+            }
+        } else if shape.len() > 32 {
+            return Err(E::RankBound);
+        }
+        elements(shape).map_err(|_| E::Overflow)?;
+        Ok(())
+    }
+    /// Resolve borrowed symbolic axes into an existing exact-rank destination.
+    /// Returns false for an unknown axis after checking every other declaration.
+    pub fn resolve_axes_into(
+        self,
+        axes: &[crate::TensorAxis],
+        output: &mut [u64],
+    ) -> Result<bool, CaptureAxisError> {
+        if axes.len() != output.len() {
+            return Err(CaptureAxisError::Rank);
+        }
+        if self.batch == 0 || self.sequence == 0 || self.context == Some(0) {
+            return Err(CaptureAxisError::Empty);
+        }
+        self.batch
+            .checked_mul(self.sequence)
+            .ok_or(CaptureAxisError::Overflow)?;
+        if let Some(context) = self.context {
+            self.batch
+                .checked_mul(context)
+                .ok_or(CaptureAxisError::Overflow)?;
+        }
+        let mut known = true;
+        for (axis, out) in axes.iter().zip(output.iter_mut()) {
+            match self.extent_fixed(&axis.dimension)? {
+                Some(n) => *out = n,
+                None => {
+                    *out = 0;
+                    known = false;
+                }
+            }
+        }
+        // Unknown placeholders do not conceal overflow among known axes.
+        elements(output).map_err(|_| CaptureAxisError::Overflow)?;
+        Ok(known)
     }
     /// Checks every declared axis even when other axes remain runtime-dependent.
     pub fn validate_actual(
@@ -48,31 +205,8 @@ impl CaptureInvocationShape {
         point: &ObservationPoint,
         shape: &[u64],
     ) -> Result<(), CaptureError> {
-        self.validate()?;
-        let Some(axes) = &point.axes else {
-            if shape.len() > 32 {
-                return Err(CaptureError::Unsupported(
-                    "capture rank exceeds the 32-axis metadata bound".into(),
-                ));
-            }
-            return elements(shape).map(|_| ());
-        };
-        if axes.len() != shape.len() {
-            return Err(CaptureError::Invalid(
-                "runtime rank differs from the catalog".into(),
-            ));
-        }
-        for (axis, actual) in axes.iter().zip(shape) {
-            if let Some(expected) = self.extent(&axis.dimension)? {
-                if expected != *actual {
-                    return Err(CaptureError::Invalid(format!(
-                        "runtime extent for {}/{} is {actual}, expected {expected} from catalog/request",
-                        point.path, axis.name
-                    )));
-                }
-            }
-        }
-        elements(shape).map(|_| ())
+        self.validate_actual_axes(point.axes.as_deref(), shape)
+            .map_err(|cause| cause.legacy(Some(point)))
     }
     /// Checks all known selected axes before execution, even in a partially
     /// declared tensor. Runtime still validates unknown extents before capture.
@@ -106,18 +240,66 @@ impl CaptureInvocationShape {
         let Some(axes) = &point.axes else {
             return Ok(None);
         };
-        let mut shape = Vec::with_capacity(axes.len());
-        // Do not return at the first unknown: later context and overflow checks
-        // remain mandatory for a partially declared shape.
-        let mut known = true;
-        for axis in axes {
-            match self.extent(&axis.dimension)? {
-                Some(n) => shape.push(n),
-                None => known = false,
-            }
-        }
-        elements(&shape)?;
+        let mut shape = vec![0; axes.len()];
+        let known = self
+            .resolve_axes_into(axes, &mut shape)
+            .map_err(|cause| cause.legacy(Some(point)))?;
         Ok(known.then_some(shape))
+    }
+}
+
+/// Logical row placement of an explicitly split invocation. This is geometry,
+/// not source, quota, execution or completion authority. Prediction schedules
+/// remain independent of this prompt-relative origin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaptureInvocationWindow {
+    /// Total logical rows in this phase (shifted seed phases can be shorter).
+    pub logical_sequence: u64,
+    /// Logical coordinate of the first physical row.
+    pub start: u64,
+}
+impl CaptureInvocationWindow {
+    /// Checks the complete physical span before any source work.
+    pub fn validate(
+        self,
+        physical: CaptureInvocationShape,
+    ) -> Result<CaptureInvocationShape, CaptureError> {
+        self.validate_fixed(physical).map_err(|cause|cause.legacy(None))
+    }
+    /// Resolves one actual tensor and a contiguous row map using declared axes.
+    /// Multiple/unknown row interpretations require their own composition contract.
+    pub fn source_axes(
+        self,
+        physical: CaptureInvocationShape,
+        point: &ObservationPoint,
+        actual: &[u64],
+    ) -> Result<(Vec<u64>, usize, crate::component::ComponentCoordinateMap), CaptureError> {
+        let plan=self.source_axes_plan(physical,point.axes.as_deref(),actual).map_err(|cause|cause.legacy(Some(point)))?;
+        let logical=plan.logical;
+        let axis=plan.axis;
+        let mut global=actual.to_vec();
+        global[axis]=logical.sequence;
+        logical.validate_actual(point,&global)?;
+        let host = |value| usize::try_from(value).map_err(|_| CaptureError::Overflow);
+        let coordinates = crate::component::ComponentCoordinateMap::range(
+            host(logical.sequence)?,
+            host(self.start)?..host(self.start + physical.sequence)?,
+        )
+        .map_err(|error| CaptureError::Invalid(error.to_string()))?;
+        Ok((global, axis, coordinates))
+    }
+    /// Projects the original global selection; stride origins never reset at a
+    /// span boundary. A no-overlap window has no fragment, not a fabricated value.
+    pub fn project(
+        self,
+        physical: CaptureInvocationShape,
+        point: &ObservationPoint,
+        selection: &CaptureSelection,
+        actual: &[u64],
+    ) -> Result<CaptureSlicePartition, CaptureError> {
+        let (global, axis, coordinates) = self.source_axes(physical, point, actual)?;
+        let selected = resolve_slice(point, selection, &global)?;
+        CaptureSlicePartition::new(&global, &selected, axis, &coordinates, 1)
     }
 }
 
@@ -139,17 +321,18 @@ pub struct CaptureInvocationBounds {
 impl CaptureInvocationBounds {
     /// Conservative geometry for static shape and budget checks.
     pub fn maximum(self) -> Result<CaptureInvocationShape, CaptureError> {
+        self.maximum_fixed().map_err(|cause| cause.legacy(None))
+    }
+    fn maximum_fixed(self) -> Result<CaptureInvocationShape, CaptureAxisError> {
         if self.max_predictions == 0 {
-            return Err(CaptureError::Invalid(
-                "empty invocation prediction range".into(),
-            ));
+            return Err(CaptureAxisError::EmptyPredictionRange);
         }
         let shape = CaptureInvocationShape {
             batch: self.batch,
             sequence: self.max_sequence,
             context: self.max_context,
         };
-        shape.validate()?;
+        shape.validate_fixed()?;
         Ok(shape)
     }
     /// Checks caller-supplied actual geometry before any observed execution.
@@ -158,8 +341,18 @@ impl CaptureInvocationBounds {
         shape: CaptureInvocationShape,
         prediction: u64,
     ) -> Result<(), CaptureError> {
-        self.maximum()?;
-        shape.validate()?;
+        self.validate_fixed(shape, prediction)
+            .map_err(|cause| cause.legacy(None))
+    }
+    /// The identical bounds/overflow ordering with a fixed typed failure. This
+    /// read-only check creates no source, invocation or execution authority.
+    pub fn validate_fixed(
+        self,
+        shape: CaptureInvocationShape,
+        prediction: u64,
+    ) -> Result<(), CaptureAxisError> {
+        self.maximum_fixed()?;
+        shape.validate_fixed()?;
         if shape.batch != self.batch
             || shape.sequence > self.max_sequence
             || prediction >= self.max_predictions
@@ -169,9 +362,7 @@ impl CaptureInvocationBounds {
                 _ => false,
             }
         {
-            return Err(CaptureError::Invalid(
-                "invocation exceeds admitted geometry or prediction range".into(),
-            ));
+            return Err(CaptureAxisError::InvocationBounds);
         }
         Ok(())
     }
@@ -273,24 +464,28 @@ mod tests {
         let partly_known = point(&[SymbolicDimension::Unknown, SymbolicDimension::Sequence]);
         assert_eq!(shape.resolve(&partly_known).unwrap(), None);
         assert!(shape.validate_actual(&partly_known, &[8, 1]).is_err());
-        assert!(shape
-            .validate_slices(
-                &partly_known,
-                &[CaptureSlice {
-                    axis: "axis1".into(),
-                    start: 0,
-                    end: 4,
-                    stride: 1
-                }]
-            )
-            .is_err());
-        assert!(CaptureInvocationShape {
-            batch: u64::MAX,
-            sequence: 2,
-            context: None
-        }
-        .validate()
-        .is_err());
+        assert!(
+            shape
+                .validate_slices(
+                    &partly_known,
+                    &[CaptureSlice {
+                        axis: "axis1".into(),
+                        start: 0,
+                        end: 4,
+                        stride: 1
+                    }]
+                )
+                .is_err()
+        );
+        assert!(
+            CaptureInvocationShape {
+                batch: u64::MAX,
+                sequence: 2,
+                context: None
+            }
+            .validate()
+            .is_err()
+        );
         let schedule = CaptureSchedule {
             first_prediction: 3,
             every: 2,

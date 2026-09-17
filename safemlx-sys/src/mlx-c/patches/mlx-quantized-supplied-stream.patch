@@ -1,0 +1,103 @@
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -4834,7 +4834,7 @@
+   ArrayVector inputs;
+   if (qmode == QuantizationMode::Affine) {
+     inputs = {
+-        astype(x, dtype), w, astype(scales, dtype), astype(*biases, dtype)};
++        astype(x, dtype, s), w, astype(scales, dtype, s), astype(*biases, dtype, s)};
+   } else {
+     inputs = {x, w, scales};
+   }
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -26,6 +26,9 @@
+     int group_size,
+     int bits,
+     Args... args) {
++  // The admitted precompiled route consumes the same selected name directly.
++  // Do not construct a JIT definition that this route cannot use.
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(name);
+   std::string template_def;
+   std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
+   template_def = get_template_definition(
+@@ -43,6 +46,9 @@
+     int group_size,
+     int bits,
+     Args... args) {
++  // The admitted precompiled route consumes the same selected name directly.
++  // Do not construct a JIT definition that this route cannot use.
++  if (d.original_precompiled_kernel_required()) return d.get_kernel(name);
+   std::string template_def;
+   std::string fname = ((mode == "affine") ? "affine_" : "fp_") + func;
+   template_def = get_template_definition(
+diff --git a/mlx/backend/metal/selector_controls.cpp b/mlx/backend/metal/selector_controls.cpp
+--- a/mlx/backend/metal/selector_controls.cpp
++++ b/mlx/backend/metal/selector_controls.cpp
+@@ -46,9 +46,24 @@
+     text("BitwiseRightShift") + 2 * dtype_tag;
+ constexpr size_t rope = text("rope_single_freqs_large__vjp_traditional_transpose") + dtype_tag;
+ constexpr size_t normalization = text("layer_norm_looped") + dtype_tag;
++// Actual QuantizedMatmul selectors, including the architecture-selected NAX
++// alternative. Both wrapper entrypoints bypass JIT definition construction
++// before allocating it on the admitted precompiled route. Group/bit/tile/K
++// values are integers; mode and dtype strings fit inline storage.
++constexpr size_t quantized_vector = text("affine_qmv_wide__gs__b__nv__kl__batch_1") +
++    source_type + 4 * integer;
++constexpr size_t quantized_quad = text("affine_qmv_quad__gs__b__d__batch_1") +
++    source_type + 3 * integer;
++constexpr size_t quantized_matrix = text("affine_qmm_t_nax__gs__b__bm_bn_bk_wm_wn_alN_false_batch_1") +
++    source_type + 7 * integer;
++constexpr size_t quantized_split = text("affine_qmm_t_splitk__gs__b__alN_false") +
++    source_type + 2 * integer;
++constexpr size_t quantized_vector_split = text("affine_qvm_split_k__gs__b__spk_") +
++    source_type + 3 * integer;
+ constexpr size_t maximum_name = std::max({gemm_specialized, gemm_split, gemv,
+     attention, vector_attention, reduce, indexing, gather_axis, scatter_axis, scan, single_index, sort_name, gathered_rhs,
+-    pointwise, rope, normalization});
++    pointwise, rope, normalization, quantized_vector, quantized_quad,
++    quantized_matrix, quantized_split, quantized_vector_split});
+ 
+ // The widest formatting call is split-K: two transpose chars, two dtype tags,
+ // five integer tile values and two alignment chars. Other formatting calls use
+@@ -74,6 +89,8 @@
+ // and concatenate's by-value base loan. The two-pass reduction keeps its first
+ // and second names plus function-name owner. Dense GEMM has two fmt results;
+ // single-index gathers/scatters have kernel/lib copies; sort has one fmt result.
++// Quantized selectors retain one kname and inline mode/type/function strings;
++// their first concatenate prefix is at most affine_qmm_t_splitk_ (inline).
+ // No JIT builder body runs in this profile.
+ constexpr size_t name_owners = 3;
+ // SDPA's first two-pass kernel has six boolean constants plus blocks (integer).
+@@ -95,12 +112,12 @@
+   constexpr size_t linked = 0;
+   constexpr size_t allocation = name_owners * name_sequence +
+       constants * sizeof(MTLFCList::value_type);
+-  // The longest selected concatenate has 16 arguments (sorted GatherMM rhs);
+-  // each recursive frame retains its by-value suffix: 16+15+...+1 parameters.
++  // The longest selected concatenate has 18 arguments (quantized NAX matrix);
++  // each recursive frame retains its by-value suffix: 18+17+...+1 parameters.
+   // Every parameter is string, pointer, char or int, no larger than string.
+   // Only base_name can exceed inline storage and it is the first argument
+   // of its separate hash call, so this recursion adds no hidden long copies.
+-  constexpr size_t concatenate_arguments = 16;
++  constexpr size_t concatenate_arguments = 18;
+   constexpr size_t concatenate_parameters =
+       concatenate_arguments * (concatenate_arguments + 1) / 2;
+   constexpr size_t controls = sizeof(ResidentSelectorLayout) * 2 +
+@@ -115,7 +132,12 @@
+       sizeof(Strides) + 3 * sizeof(void*) + 2 * sizeof(bool) +
+       // GatherAxis and ScatterAxis each bind one removed Shape and two removed Strides, all inline
+       // for the rank-two router (only one temporary is alive per binding call).
+-      sizeof(Shape) + 2 * sizeof(Strides);
++      sizeof(Shape) + 2 * sizeof(Strides) +
++      // Quantized wrapper's four borrowed string parameters, mode/type/func
++      // and unused outer template shells, plus its nine scalar template args.
++      // No ostringstream or fmt template payload exists on this route.
++      sizeof(const std::string*) * 4 + sizeof(std::string) * 4 +
++      sizeof(int) * 9 + sizeof(Device*) + sizeof(MTL::ComputePipelineState*) + sizeof(bool);
+   out = {allocation, controls, maximum_name, constants, linked};
+   return true;
+ #endif

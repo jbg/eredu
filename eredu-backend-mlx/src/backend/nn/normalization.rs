@@ -37,52 +37,29 @@ pub(crate) fn f32_weightless_rms(
 ) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
-        use safemlx::{
-            fast::{CustomKernelConfig, MetalKernel},
-            DeviceType, Dtype,
-        };
-        use std::cell::RefCell;
-        thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
+        use crate::backend::managed_memory::row_kernels::{self, RowKernel};
+        use safemlx::{DeviceType, Dtype};
         if input.dtype() != Dtype::Float32
             || input.size() == 0
-            || stream.get_device()?.get_type()? != DeviceType::Gpu
+            || input.ndim() == 0
+            || stream.device_type()? != DeviceType::Gpu
         {
             return Ok(None);
         }
+        row_kernels::validate_call(RowKernel::Rms, input.ndim())?;
         let width = input.dim(-1);
         let rows = i32::try_from(input.size() / width as usize)
             .map_err(|_| Exception::custom("normalization row count overflow"))?;
         let squared = input.square(stream)?;
-        let epsilon = Array::from_slice(&[epsilon], &[1]);
-        let config = CustomKernelConfig::new()
-            .with_template_arg_int("WIDTH", width)
-            .with_grid([rows, 1, 1])
-            .with_thread_group([32, 1, 1])
-            .with_template_arg_int("ROWS", rows)
-            .with_output_arg(input.shape(), Dtype::Float32);
-        let mut output = KERNEL.with(|cell| -> Result<Vec<Array>, Exception> {
-            if cell.borrow().is_none() {
-                *cell.borrow_mut() =
-                    Some(MetalKernel::new(
-                        "f32_weightless_rms",
-                        ["input", "squared", "epsilon"],
-                        ["output"],
-                        concat!("uint row = thread_position_in_grid.x; if (row >= ROWS) return;",
-                        "size_t base = size_t(row) * WIDTH;",
-                        "float variance = cascade_sum_f32(squared + base, WIDTH) / float(WIDTH);",
-                        "float inverse = 1.0f / metal::precise::sqrt(variance + epsilon[0]);",
-                        "for (uint i=0; i<WIDTH; ++i) output[base+i] = input[base+i] * inverse;"),
-                        include_str!("rms_cascade.metal"),
-                        true,
-                        false,
-                    )?);
-            }
-            cell.borrow()
-                .as_ref()
-                .expect("normalization kernel initialized")
-                .apply_device([input, &squared, &epsilon], &config, stream)
-        })?;
-        return Ok(output.pop());
+        let epsilon = Array::try_from_slice(&[epsilon], &[1])?;
+        row_kernels::apply(
+            RowKernel::Rms,
+            [input, &squared, &epsilon],
+            input.shape(),
+            rows,
+            stream,
+        )
+        .map(Some)
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {
@@ -143,36 +120,32 @@ mod tests {
 pub(crate) fn f32_sum_last(input: &Array, stream: &Stream) -> Result<Option<Array>, Exception> {
     #[cfg(all(feature = "metal", not(feature = "cuda")))]
     {
-        use safemlx::{
-            fast::{CustomKernelConfig, MetalKernel},
-            DeviceType, Dtype,
-        };
-        use std::cell::RefCell;
-        thread_local! { static KERNEL: RefCell<Option<MetalKernel>> = const { RefCell::new(None) }; }
+        use crate::backend::managed_memory::row_kernels::{self, RowKernel};
+        use safemlx::{DeviceType, Dtype};
         if input.dtype() != Dtype::Float32
             || input.size() == 0
-            || stream.get_device()?.get_type()? != DeviceType::Gpu
+            || input.ndim() == 0
+            || stream.device_type()? != DeviceType::Gpu
         {
             return Ok(None);
         }
+        row_kernels::validate_call(RowKernel::Sum, input.ndim())?;
         let width = input.dim(-1);
         let rows = i32::try_from(input.size() / width as usize)
             .map_err(|_| Exception::custom("row sum count overflow"))?;
-        let mut shape = input.shape().to_vec();
+        let mut fixed_shape = [0; row_kernels::OUTPUT_DIMENSIONS];
+        let mut ordinary_shape;
+        let shape = if input.ndim() <= fixed_shape.len() {
+            fixed_shape[..input.ndim()].copy_from_slice(input.shape());
+            &mut fixed_shape[..input.ndim()]
+        } else {
+            // Only the ordinary path reaches this branch: validate_call checks
+            // the fixed native shape capacity before any original construction.
+            ordinary_shape = input.shape().to_vec();
+            ordinary_shape.as_mut_slice()
+        };
         *shape.last_mut().expect("row sum rank") = 1;
-        let config = CustomKernelConfig::new()
-            .with_template_arg_int("WIDTH", width)
-            .with_template_arg_int("ROWS", rows)
-            .with_grid([rows, 1, 1])
-            .with_thread_group([32, 1, 1])
-            .with_output_arg(shape.as_slice(), Dtype::Float32);
-        let mut output=KERNEL.with(|cell| -> Result<Vec<Array>,Exception> {
-            if cell.borrow().is_none() { *cell.borrow_mut()=Some(MetalKernel::new("f32_sum_last",["input"],["output"],
-                "uint row=thread_position_in_grid.x; if(row>=ROWS) return; output[row]=cascade_sum_f32(input+size_t(row)*WIDTH,WIDTH);",
-                include_str!("rms_cascade.metal"),true,false)?); }
-            cell.borrow().as_ref().expect("row sum kernel initialized").apply_device([input],&config,stream)
-        })?;
-        return Ok(output.pop());
+        row_kernels::apply(RowKernel::Sum, [input], shape, rows, stream).map(Some)
     }
     #[cfg(not(all(feature = "metal", not(feature = "cuda"))))]
     {

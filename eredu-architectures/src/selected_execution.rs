@@ -38,7 +38,7 @@ type SelectedOrdinaryExecution = SelectedReplicatedTextExecution<
     SelectedCompositeTextRealization,
 >;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 enum SelectedExecutionKind {
     Replicated(SelectedReplicatedTextRealization),
     Routed(SelectedRoutedTextRealization),
@@ -93,12 +93,62 @@ pub trait SelectedExecutionDispatcher: Sized {
     ) -> Result<Self::Output, Self::Error>;
 }
 
+/// A borrowed adapter for exactly the retained selected execution branch.
+///
+/// Cold inspection can read the same branch that owned construction consumes,
+/// without cloning selections or reconstructing execution-class policy. The
+/// dispatcher may return references with the selection's lifetime. This gives
+/// descriptive access only: no materialization, completion or admission authority.
+/// Arbitrary adapter implementations are not thereby allocation-free.
+pub trait SelectedExecutionBorrowedDispatcher<'a>: Sized {
+    /// Inspection result, which may borrow the retained selection.
+    type Output;
+    /// The adapter's unchanged inspection failure.
+    type Error;
+
+    /// Inspects ordinary replicated execution.
+    fn replicated(
+        self,
+        selected: &'a SelectedReplicatedTextRealization,
+    ) -> Result<Self::Output, Self::Error>;
+
+    /// Inspects ordinary routed execution.
+    fn routed(
+        self,
+        selected: &'a SelectedRoutedTextRealization,
+    ) -> Result<Self::Output, Self::Error>;
+
+    /// Inspects ordinary composite execution.
+    fn composite(
+        self,
+        selected: &'a SelectedCompositeTextRealization,
+    ) -> Result<Self::Output, Self::Error>;
+
+    /// Inspects partitioned dense execution.
+    fn partitioned_dense(
+        self,
+        selected: &'a SelectedDensePartitionedExecution,
+    ) -> Result<Self::Output, Self::Error>;
+
+    /// Inspects partitioned routed execution.
+    fn partitioned_routed(
+        self,
+        selected: &'a SelectedRoutedPartitionedExecution,
+    ) -> Result<Self::Output, Self::Error>;
+
+    /// Inspects partitioned composite execution.
+    fn partitioned_composite(
+        self,
+        selected: &'a SelectedCompositePartitionedExecution,
+    ) -> Result<Self::Output, Self::Error>;
+}
+
 /// One authoritative backend-neutral execution selection.
 ///
-/// The semantic branch is private. Backends can only consume it through the
-/// typed dispatcher, preventing a materializer from substituting or rebuilding
-/// the selection after admission.
-#[derive(Debug, Clone)]
+/// The semantic branch is private. Typed dispatchers lend it for descriptive
+/// inspection or consume it for construction, preventing a materializer from
+/// substituting or rebuilding the selection after admission.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SelectedExecution {
     kind: Box<SelectedExecutionKind>,
 }
@@ -395,6 +445,28 @@ impl SelectedExecution {
             .expect("ordinary execution conversion is infallible")
     }
 
+    /// Invokes exactly one adapter with a borrow of the authoritative branch.
+    /// The selection remains retained and unchanged for subsequent construction.
+    pub fn dispatch_ref<'a, D>(&'a self, dispatcher: D) -> Result<D::Output, D::Error>
+    where
+        D: SelectedExecutionBorrowedDispatcher<'a>,
+    {
+        match self.kind.as_ref() {
+            SelectedExecutionKind::Replicated(selected) => dispatcher.replicated(selected),
+            SelectedExecutionKind::Routed(selected) => dispatcher.routed(selected),
+            SelectedExecutionKind::Composite(selected) => dispatcher.composite(selected),
+            SelectedExecutionKind::PartitionedDense(selected) => {
+                dispatcher.partitioned_dense(selected)
+            }
+            SelectedExecutionKind::PartitionedRouted(selected) => {
+                dispatcher.partitioned_routed(selected)
+            }
+            SelectedExecutionKind::PartitionedComposite(selected) => {
+                dispatcher.partitioned_composite(selected)
+            }
+        }
+    }
+
     /// Invokes exactly one backend materializer with the owned selected branch.
     pub fn dispatch<D>(self, dispatcher: D) -> Result<D::Output, D::Error>
     where
@@ -418,14 +490,49 @@ impl SelectedExecution {
 
     /// Returns the shared text-session realization selected for every execution class.
     pub fn text_realization(&self) -> &SelectedReplicatedTextRealization {
-        match self.kind.as_ref() {
-            SelectedExecutionKind::Replicated(selected) => selected,
-            SelectedExecutionKind::Routed(selected) => selected.text(),
-            SelectedExecutionKind::Composite(selected) => selected.execution(),
-            SelectedExecutionKind::PartitionedDense(selected) => selected.base(),
-            SelectedExecutionKind::PartitionedRouted(selected) => selected.base().text(),
-            SelectedExecutionKind::PartitionedComposite(selected) => selected.base().execution(),
+        struct TextRealization;
+        impl<'a> SelectedExecutionBorrowedDispatcher<'a> for TextRealization {
+            type Output = &'a SelectedReplicatedTextRealization;
+            type Error = std::convert::Infallible;
+            fn replicated(
+                self,
+                selected: &'a SelectedReplicatedTextRealization,
+            ) -> Result<Self::Output, Self::Error> {
+                Ok(selected)
+            }
+            fn routed(
+                self,
+                selected: &'a SelectedRoutedTextRealization,
+            ) -> Result<Self::Output, Self::Error> {
+                Ok(selected.text())
+            }
+            fn composite(
+                self,
+                selected: &'a SelectedCompositeTextRealization,
+            ) -> Result<Self::Output, Self::Error> {
+                Ok(selected.execution())
+            }
+            fn partitioned_dense(
+                self,
+                selected: &'a SelectedDensePartitionedExecution,
+            ) -> Result<Self::Output, Self::Error> {
+                Ok(selected.base())
+            }
+            fn partitioned_routed(
+                self,
+                selected: &'a SelectedRoutedPartitionedExecution,
+            ) -> Result<Self::Output, Self::Error> {
+                Ok(selected.base().text())
+            }
+            fn partitioned_composite(
+                self,
+                selected: &'a SelectedCompositePartitionedExecution,
+            ) -> Result<Self::Output, Self::Error> {
+                Ok(selected.base().execution())
+            }
         }
+        self.dispatch_ref(TextRealization)
+            .unwrap_or_else(|never| match never {})
     }
 
     /// Complete unsharded executable parameter accounting from retained tasks.
@@ -466,6 +573,13 @@ impl SelectedExecution {
             BTreeSet::new()
         };
         (bank_targets, excluded)
+    }
+
+    /// Whether this retained selection uses independent parameter acquisition.
+    /// This is descriptive load policy, not a native source or operation grant.
+    pub fn has_independent_parameter_banks(&self) -> bool {
+        self.routed_realization().is_some_and(|selected|
+            matches!(selected.bank_residency(), ParameterBankResidency::IndependentCache(_)))
     }
 
     fn routed_realization(&self) -> Option<&SelectedRoutedTextRealization> {
@@ -880,6 +994,30 @@ impl SelectedExecution {
         }
     }
 
+    /// Exact tensor group retained by the architecture's partition selection.
+    /// This is descriptive identity; native group ownership and operation
+    /// qualification remain the backend consumer's responsibility.
+    pub fn partitioned_tensor_group(&self) -> Option<CollectiveGroupId> {
+        match self.kind.as_ref() {
+            SelectedExecutionKind::PartitionedDense(selected) => selected.requirements().tensor_group(),
+            SelectedExecutionKind::PartitionedRouted(selected) => selected.requirements().tensor_group(),
+            SelectedExecutionKind::PartitionedComposite(selected) => selected.requirements().tensor_group(),
+            SelectedExecutionKind::Replicated(_) | SelectedExecutionKind::Routed(_)
+            | SelectedExecutionKind::Composite(_) => None,
+        }
+    }
+
+    /// Exact architecture-selected output owner and publication group.
+    pub fn partitioned_output_publication(&self)->Option<eredu_runtime::PartitionOutputPublication> {
+        let (group,owner_rank)=match self.kind.as_ref() {
+            SelectedExecutionKind::PartitionedDense(selected)=>(selected.requirements().session_group(),selected.requirements().publication_owner()),
+            SelectedExecutionKind::PartitionedRouted(selected)=>(selected.requirements().session_group(),selected.requirements().publication_owner()),
+            SelectedExecutionKind::PartitionedComposite(selected)=>(selected.requirements().session_group(),selected.requirements().publication_owner()),
+            _=>return None,
+        };
+        Some(eredu_runtime::PartitionOutputPublication {group:group?,owner_rank})
+    }
+
     /// Returns the selected session-wide publication group for partitioned execution.
     pub fn partitioned_session_group(&self) -> Option<CollectiveGroupId> {
         match self.kind.as_ref() {
@@ -921,6 +1059,18 @@ pub struct SelectedPreparation {
 }
 
 impl SelectedPreparation {
+    pub(crate) fn same_complete_selection(&self, other: &Self) -> bool {
+        self.admission_token.same_admission(&other.admission_token)
+            && self.execution == other.execution
+            && self.admission == other.admission
+            && self.prediction_realization == other.prediction_realization
+            && match (&self.prediction_extension, &other.prediction_extension) {
+                (Some(a), Some(b)) => a.same_admission(b),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
     pub(crate) const fn new(
         admission_token: ArtifactAdmissionToken,
         execution: SelectedExecution,
@@ -987,6 +1137,11 @@ impl SelectedPreparation {
     /// Returns the admitted pipeline activation dtype for partitioned execution.
     pub fn partitioned_activation_dtype(&self) -> Option<PipelineActivationDtype> {
         self.execution.partitioned_activation_dtype()
+    }
+
+    /// Exact architecture-selected output owner and publication group.
+    pub fn partitioned_output_publication(&self)->Option<eredu_runtime::PartitionOutputPublication> {
+        self.execution.partitioned_output_publication()
     }
 
     /// Returns the selected session-wide publication group for partitioned execution.

@@ -9,6 +9,12 @@ models. The [completed checklist](component-analysis-checklist.md) links each
 required outcome to implementation and behavioral evidence. Topology metadata
 alone is not access to effective loaded parameters; always consult loaded support.
 
+Capture, copy and transport limits in these workflows are logical operation
+budgets. They do not establish a complete native managed-memory ceiling. Managed
+capture/intervention admission remains unfinished; see the
+[current managed-admission matrix](bounded-inference.md#current-integration-status)
+and [capture budget scope](bounded-capture.md).
+
 The method motivating these interfaces decomposes a component's write into its
 observed signed scalar activation times an output projection column. Keep-only
 experiments instead perform new forward computations, with survivors responding

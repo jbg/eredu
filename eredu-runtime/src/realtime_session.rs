@@ -204,23 +204,24 @@ impl RealtimeHistoryGeneration {
 }
 
 /// Canonical state for one fair-scheduler realtime request.
-pub struct RealtimeSessionState<M, S, R, C> {
-    model: RealtimeModelSessionIdentity,
-    owner: RealtimeModelOwnerIdentity,
+pub struct RealtimeSessionState<M, S, R, C, P = ()> {
+    model: std::sync::Arc<RealtimeModelSessionIdentity>,
+    owner: std::sync::Arc<RealtimeModelOwnerIdentity>,
     incarnation: RealtimeSessionIncarnation,
     history_generation: RealtimeHistoryGeneration,
     committed_batch: Option<NonZeroUsize>,
     generation: RealtimeGenerationState<M, S, R, C>,
+    preparation:std::marker::PhantomData<fn()->P>,
 }
 
-impl<M, S, R, C> RealtimeSessionState<M, S, R, C> {
+impl<M, S, R, C, P> RealtimeSessionState<M, S, R, C, P> {
     /// Exact selected model identity.
-    pub const fn model_identity(&self) -> &RealtimeModelSessionIdentity {
+    pub fn model_identity(&self) -> &RealtimeModelSessionIdentity {
         &self.model
     }
 
     /// Typed model owner derived from the selected contract.
-    pub const fn model_owner(&self) -> &RealtimeModelOwnerIdentity {
+    pub fn model_owner(&self) -> &RealtimeModelOwnerIdentity {
         &self.owner
     }
 
@@ -263,6 +264,36 @@ impl<M, S, R, C> RealtimeSessionState<M, S, R, C> {
         .expect("scheduler-admitted payload contract has a positive batch"))
     }
 
+    /// Derives the first or later frame contract from canonical scheduler
+    /// identity before any state branch or native input construction.
+    pub fn payload_contract_for_frame(&self,ingress:&RealtimeIngressContract,batch:usize,
+        funding:&eredu_core::HostMetadataFunding)->Result<RealtimePayloadContract,RealtimeSessionExecutionError> {
+        let occurrence=self.frame_occurrence_for(batch)?;
+        if ingress.schedule()!=self.model.schedule() {
+            return Err(RealtimeSessionExecutionError::IngressScheduleMismatch);
+        }
+        funding.reserve_metadata(std::mem::size_of::<RealtimePayloadContract>()
+            +std::mem::size_of::<Result<RealtimePayloadContract,RealtimeSessionExecutionError>>())?;
+        let schedule=ingress.schedule().try_clone_with_host_source(funding)?;
+        Ok(RealtimePayloadContract::new(schedule,occurrence.batch().get(),
+            ingress.text_domain(),ingress.audio_domain(),
+            RealtimePayloadGeneration::new(occurrence.history_generation().value()).expect("nonzero scheduler history"),
+            RealtimePayloadOwnerIdentity::new(occurrence.incarnation().value()).expect("nonzero scheduler incarnation"))
+            .expect("validated ingress domains and positive frame batch"))
+    }
+
+    /// Borrows the actual pre-branch frame occurrence after positive batch
+    /// validation. This identity grants no source construction or allocation.
+    pub fn frame_occurrence_for(&self,batch:usize)->Result<RealtimeFrameOccurrence,RealtimeSessionExecutionError> {
+        let batch=NonZeroUsize::new(batch).ok_or(RealtimeSessionExecutionError::EmptyBatch)?;
+        if let Some(committed)=self.committed_batch {
+            if committed!=batch {return Err(RealtimeSessionExecutionError::Batch {
+                committed:committed.get(),submitted:batch.get()});}
+        }
+        Ok(RealtimeFrameOccurrence{incarnation:self.incarnation,history:self.history_generation,
+            frontier:self.generation.schedule_state().frontier(),batch})
+    }
+
     /// Canonical atomic generation state.
     pub const fn generation(&self) -> &RealtimeGenerationState<M, S, R, C> {
         &self.generation
@@ -274,24 +305,58 @@ impl<M, S, R, C> RealtimeSessionState<M, S, R, C> {
     }
 }
 
+/// Actual session/frame coordinates from canonical scheduler state or its
+/// unpublished branch. This descriptor contains no allocation or submission authority.
+#[derive(Debug,Clone,Copy,Eq,PartialEq)]
+pub struct RealtimeFrameOccurrence {
+    incarnation:RealtimeSessionIncarnation,
+    history:RealtimeHistoryGeneration,
+    frontier:usize,
+    batch:NonZeroUsize,
+}
+impl RealtimeFrameOccurrence {
+    /// Actual session incarnation, preserved by released state.
+    pub const fn incarnation(self)->RealtimeSessionIncarnation {self.incarnation}
+    /// Actual history generation, distinct across session restoration policies.
+    pub const fn history_generation(self)->RealtimeHistoryGeneration {self.history}
+    /// Next input frame of the actual canonical schedule.
+    pub const fn frontier(self)->usize {self.frontier}
+    /// Batch already admitted by the scheduler for this frame.
+    pub const fn batch(self)->NonZeroUsize {self.batch}
+}
+
 /// Unpublished realtime session branch owned by the core scheduler.
-pub struct RealtimeSessionBranch<MB, S, R, C> {
-    model: RealtimeModelSessionIdentity,
-    owner: RealtimeModelOwnerIdentity,
+pub struct RealtimeSessionBranch<MB, S, R, C, P = ()> {
+    model: std::sync::Arc<RealtimeModelSessionIdentity>,
+    owner: std::sync::Arc<RealtimeModelOwnerIdentity>,
     incarnation: RealtimeSessionIncarnation,
     history_generation: RealtimeHistoryGeneration,
     committed_batch: Option<NonZeroUsize>,
     generation: RealtimeGenerationBranch<MB, S, R, C>,
+    // Last field: source/account custody outlives every branch-owned payload.
+    preparation:Option<P>,
+    preparation_issued:bool,
 }
 
-impl<MB, S, R, C> RealtimeSessionBranch<MB, S, R, C> {
+impl<MB, S, R, C, P> RealtimeSessionBranch<MB, S, R, C, P> {
+    /// Installs one move-only source/plan after admission and before scheduler
+    /// submission. Rejection returns the unchanged source to its owner.
+    pub fn install_preparation(&mut self,source:P)->Result<(),P> {
+        if self.preparation_issued {return Err(source);}
+        self.preparation_issued=true;self.preparation=Some(source);Ok(())
+    }
+    /// Borrows the exact preparation retained by this unpublished branch.
+    pub fn preparation(&self)->Option<&P> {self.preparation.as_ref()}
+    /// Consumes this branch's preparation exactly once for native activation.
+    pub fn take_preparation(&mut self)->Option<P> {self.preparation.take()}
+
     /// Exact selected model identity.
-    pub const fn model_identity(&self) -> &RealtimeModelSessionIdentity {
+    pub fn model_identity(&self) -> &RealtimeModelSessionIdentity {
         &self.model
     }
 
     /// Typed model owner used by payload contracts.
-    pub const fn model_owner(&self) -> &RealtimeModelOwnerIdentity {
+    pub fn model_owner(&self) -> &RealtimeModelOwnerIdentity {
         &self.owner
     }
 
@@ -308,6 +373,13 @@ impl<MB, S, R, C> RealtimeSessionBranch<MB, S, R, C> {
     /// Batch admitted by this unpublished branch, including its current frame.
     pub const fn committed_batch(&self) -> Option<NonZeroUsize> {
         self.committed_batch
+    }
+
+    /// Borrows the scheduler's actual frame coordinates before owned preparation.
+    pub fn frame_occurrence(&self)->Result<RealtimeFrameOccurrence,RealtimeSessionExecutionError> {
+        Ok(RealtimeFrameOccurrence{incarnation:self.incarnation,history:self.history_generation,
+            frontier:self.generation.schedule_state().frontier(),
+            batch:self.committed_batch.ok_or(RealtimeSessionExecutionError::BatchNotAdmitted)?})
     }
 
     /// Derives the exact payload contract after scheduler batch admission.
@@ -355,7 +427,39 @@ impl<MB, S, R, C> RealtimeSessionBranch<MB, S, R, C> {
     }
 }
 
-impl<M, S, R, C> SemanticStateTransaction for RealtimeSessionState<M, S, R, C>
+impl<M,S,R,C,P> RealtimeSessionState<M,S,R,C,P>
+where M:SemanticStateTransaction,M::Error:Send+Sync+'static,C:Completion {
+    /// Actual session/generation branch shells and owned schedule/directory.
+    /// Child payload, model, sampler and random producers are counted separately.
+    pub fn branch_host_bytes<F,G,H>(&self)->Option<usize> {
+        Self::branch_shell_bytes::<F,G,H>()?.checked_add(self.generation.branch_host_bytes::<F,G,H>()?)
+    }
+    fn branch_shell_bytes<F,G,H>()->Option<usize> {
+        let parts=[std::mem::size_of::<F>(),std::mem::size_of::<G>(),std::mem::size_of::<H>(),
+            std::mem::size_of::<RealtimeSessionBranch<M::Branch,S,R,C,P>>(),
+            std::mem::size_of::<Result<RealtimeSessionBranch<M::Branch,S,R,C,P>,BackendFailure>>(),
+            eredu_core::HostMetadataFunding::reservation_control_bytes()];
+        parts.into_iter().try_fold(std::mem::size_of_val(&parts),usize::checked_add)
+    }
+
+    /// Creates the scheduler branch from explicit paid child sources while
+    /// sharing the canonical immutable selected identity.
+    pub fn branch_with_host_source<F,G,H>(&self,funding:&eredu_core::HostMetadataFunding,
+        branch_model:F,clone_sampler:G,clone_random:H)
+        ->Result<RealtimeSessionBranch<M::Branch,S,R,C,P>,BackendFailure>
+    where F:FnOnce(&M,&eredu_core::HostMetadataFunding)->Result<M::Branch,BackendFailure>,
+        G:FnMut(&S,&eredu_core::HostMetadataFunding)->Result<S,BackendFailure>,
+        H:FnOnce(&R,&eredu_core::HostMetadataFunding)->Result<R,BackendFailure> {
+        funding.reserve_metadata(Self::branch_shell_bytes::<F,G,H>()
+            .ok_or(eredu_core::HostMetadataFundingError::Overflow)?)?;
+        let generation=self.generation.branch_with_host_source(funding,branch_model,clone_sampler,clone_random)?;
+        Ok(RealtimeSessionBranch{model:self.model.clone(),owner:self.owner.clone(),
+            incarnation:self.incarnation,history_generation:self.history_generation,
+            committed_batch:self.committed_batch,generation,preparation:None,preparation_issued:false})
+    }
+}
+
+impl<M, S, R, C, P> SemanticStateTransaction for RealtimeSessionState<M, S, R, C, P>
 where
     M: SemanticStateTransaction,
     M::Error: Send + Sync + 'static,
@@ -363,7 +467,7 @@ where
     R: Clone,
     C: Completion,
 {
-    type Branch = RealtimeSessionBranch<M::Branch, S, R, C>;
+    type Branch = RealtimeSessionBranch<M::Branch, S, R, C, P>;
     type Error = RealtimeSessionTransactionError;
 
     fn branch(&self) -> Result<Self::Branch, Self::Error> {
@@ -377,6 +481,8 @@ where
                 .generation
                 .branch()
                 .map_err(RealtimeSessionTransactionError::Generation)?,
+            preparation:None,
+            preparation_issued:false,
         })
     }
 
@@ -413,13 +519,13 @@ where
 }
 
 /// Released canonical state which can resume only under the exact model identity.
-pub struct ReleasedRealtimeSession<M, S, R, C> {
-    state: RealtimeSessionState<M, S, R, C>,
+pub struct ReleasedRealtimeSession<M, S, R, C, P = ()> {
+    state: RealtimeSessionState<M, S, R, C, P>,
 }
 
-impl<M, S, R, C> ReleasedRealtimeSession<M, S, R, C> {
+impl<M, S, R, C, P> ReleasedRealtimeSession<M, S, R, C, P> {
     /// Exact selected model identity required for resumption.
-    pub const fn model_identity(&self) -> &RealtimeModelSessionIdentity {
+    pub fn model_identity(&self) -> &RealtimeModelSessionIdentity {
         self.state.model_identity()
     }
 
@@ -435,7 +541,7 @@ impl<M, S, R, C> ReleasedRealtimeSession<M, S, R, C> {
 }
 
 /// Singular fair scheduler for one exact selected realtime model.
-pub struct RealtimeSessionScheduler<M, S, R, C, O>
+pub struct RealtimeSessionScheduler<M, S, R, C, O, P = ()>
 where
     M: SemanticStateTransaction,
     M::Error: Send + Sync + 'static,
@@ -444,11 +550,20 @@ where
     C: Completion,
     O: TransitionOutput,
 {
-    model: RealtimeModelSessionIdentity,
-    scheduler: Scheduler<RealtimeInputFrame, RealtimeSessionState<M, S, R, C>, O>,
+    model: std::sync::Arc<RealtimeModelSessionIdentity>,
+    scheduler: Scheduler<RealtimeInputFrame, RealtimeSessionState<M, S, R, C, P>, O>,
 }
 
-impl<M, S, R, C, O> RealtimeSessionScheduler<M, S, R, C, O>
+impl<M,S,R,C,O> RealtimeSessionScheduler<M,S,R,C,O,()>
+where M:SemanticStateTransaction,M::Error:Send+Sync+'static,S:Clone,R:Clone,
+    C:Completion,O:TransitionOutput {
+    /// Creates the ordinary shared scheduler without a preparation payload.
+    pub fn new(model:RealtimeModelSessionIdentity,limits:SchedulerLimits)->Result<Self,SchedulerError> {
+        Self::new_with_preparation(model,limits)
+    }
+}
+
+impl<M, S, R, C, O, P> RealtimeSessionScheduler<M, S, R, C, O, P>
 where
     M: SemanticStateTransaction,
     M::Error: Send + Sync + 'static,
@@ -458,17 +573,18 @@ where
     O: TransitionOutput,
 {
     /// Exact selected model identity shared by every admitted request.
-    pub const fn model_identity(&self) -> &RealtimeModelSessionIdentity {
+    pub fn model_identity(&self) -> &RealtimeModelSessionIdentity {
         &self.model
     }
 
-    /// Creates one scheduler for both single-request and concurrent production use.
-    pub fn new(
+    /// Creates a scheduler whose prepared branches retain the explicit P
+    /// source type. The ordinary constructor continues to select P=().
+    pub fn new_with_preparation(
         model: RealtimeModelSessionIdentity,
         limits: SchedulerLimits,
     ) -> Result<Self, SchedulerError> {
         Ok(Self {
-            model,
+            model:std::sync::Arc::new(model),
             scheduler: Scheduler::new(limits)?,
         })
     }
@@ -486,11 +602,12 @@ where
         let incarnation = allocate_incarnation()?;
         let state = RealtimeSessionState {
             model: self.model.clone(),
-            owner: self.model.model_owner(),
+            owner: std::sync::Arc::new(self.model.model_owner()),
             incarnation,
             history_generation: RealtimeHistoryGeneration(incarnation.0),
             committed_batch: None,
             generation,
+            preparation:std::marker::PhantomData,
         };
         self.scheduler.register(request, state)?;
         Ok(incarnation)
@@ -501,7 +618,7 @@ where
     pub fn resume(
         &mut self,
         request: RequestId,
-        released: &mut Option<ReleasedRealtimeSession<M, S, R, C>>,
+        released: &mut Option<ReleasedRealtimeSession<M, S, R, C, P>>,
     ) -> Result<(), RealtimeSessionError> {
         let state = released
             .as_ref()
@@ -555,7 +672,7 @@ where
         mut execute: impl FnMut(
             WorkId,
             &RealtimeInputFrame,
-            &mut RealtimeSessionBranch<M::Branch, S, R, C>,
+            &mut RealtimeSessionBranch<M::Branch, S, R, C, P>,
         ) -> Result<O, E>,
     ) -> Result<SchedulerProgress<RealtimeInputFrame, O>, SchedulerError>
     where
@@ -578,15 +695,30 @@ where
         mut execute: impl FnMut(
             WorkId,
             &RealtimeInputFrame,
-            &mut RealtimeSessionBranch<M::Branch, S, R, C>,
+            &mut RealtimeSessionBranch<M::Branch, S, R, C, P>,
         ) -> Result<O, E>,
     ) -> Result<SchedulerProgress<RealtimeInputFrame, O>, SchedulerError>
     where
         E: std::error::Error,
     {
+        self.run_local_bounded_with_preparation(now,maximum_frames,
+            |_,_,state|state.branch(),execute)
+    }
+
+    /// Runs the existing local fair turn with source admission before any
+    /// branch clone. A typed preparation payload travels inside the returned
+    /// branch through queued, submitted, failed and retired ownership.
+    pub fn run_local_bounded_with_preparation<A,E>(
+        &mut self,now:Instant,maximum_frames:usize,
+        prepare:impl FnMut(WorkId,&RealtimeInputFrame,&RealtimeSessionState<M,S,R,C,P>)
+            ->Result<RealtimeSessionBranch<M::Branch,S,R,C,P>,A>,
+        mut execute:impl FnMut(WorkId,&RealtimeInputFrame,&mut RealtimeSessionBranch<M::Branch,S,R,C,P>)
+            ->Result<O,E>,
+    )->Result<SchedulerProgress<RealtimeInputFrame,O>,SchedulerError>
+    where A:std::error::Error,E:std::error::Error {
         self.ensure_local_topology()?;
         let mut progress = self.scheduler.poll_completions(now);
-        self.scheduler.prepare_bounded(maximum_frames, now)?;
+        self.scheduler.prepare_bounded_with(maximum_frames,now,prepare)?;
         progress.newly_submitted = self.scheduler.submit_prepared(now, |id, frame, branch| {
             branch
                 .admit_batch(frame.batch())
@@ -608,7 +740,7 @@ where
         mut execute: impl FnMut(
             WorkId,
             &RealtimeInputFrame,
-            &mut RealtimeSessionBranch<M::Branch, S, R, C>,
+            &mut RealtimeSessionBranch<M::Branch, S, R, C, P>,
         ) -> Result<O, E>,
     ) -> Result<SchedulerProgress<RealtimeInputFrame, O>, SchedulerError>
     where
@@ -617,14 +749,69 @@ where
         E: std::error::Error,
         O: eredu_core::scheduler::DistributedTransitionOutput,
     {
+        let wait = self.distributed_turn_wait(protocol, transport)?;
+        self.scheduler
+            .run_distributed_turn(protocol, transport, wait, now, |id, frame, branch| {
+                branch
+                    .admit_batch(frame.batch())
+                    .map_err(RealtimeSessionSubmissionError::<E>::Session)?;
+                execute(id, frame, branch).map_err(RealtimeSessionSubmissionError::Execution)
+            })
+    }
+
+    /// Runs the existing distributed turn with a source compiler before the
+    /// actual state branch. Admission refusal is agreed before any model call;
+    /// completion, publication, cancellation and epoch rules remain unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_distributed_bounded_with_preparation<T, A, E>(
+        &mut self, protocol: u64, transport: &T, now: Instant, maximum_frames: usize,
+        prepare: impl FnMut(WorkId, &RealtimeInputFrame, &RealtimeSessionState<M,S,R,C,P>)
+            -> Result<RealtimeSessionBranch<M::Branch,S,R,C,P>, A>,
+        execute: impl FnMut(WorkId, &RealtimeInputFrame, &mut RealtimeSessionBranch<M::Branch,S,R,C,P>)
+            -> Result<O, E>,
+    ) -> Result<SchedulerProgress<RealtimeInputFrame,O>, SchedulerError>
+    where T: BoundedConsensusTransport,
+        <T::Completion as Completion>::Error: std::fmt::Display,
+        A: std::error::Error, E: std::error::Error,
+        O: eredu_core::scheduler::DistributedTransitionOutput {
+        self.run_distributed_bounded_with_preparation_and_errors(protocol,transport,now,
+            maximum_frames,prepare,execute,|_,_|{})
+    }
+
+    /// Preserves each exact completion or host-observation source before the
+    /// shared distributed protocol resolves its original frame output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_distributed_bounded_with_preparation_and_errors<T, A, E>(
+        &mut self, protocol: u64, transport: &T, now: Instant, maximum_frames: usize,
+        prepare: impl FnMut(WorkId, &RealtimeInputFrame, &RealtimeSessionState<M,S,R,C,P>)
+            -> Result<RealtimeSessionBranch<M::Branch,S,R,C,P>, A>,
+        mut execute: impl FnMut(WorkId, &RealtimeInputFrame, &mut RealtimeSessionBranch<M::Branch,S,R,C,P>)
+            -> Result<O, E>,
+        observe_failure: impl FnMut(WorkId,O::Error),
+    ) -> Result<SchedulerProgress<RealtimeInputFrame,O>, SchedulerError>
+    where T: BoundedConsensusTransport,
+        <T::Completion as Completion>::Error: std::fmt::Display,
+        A: std::error::Error, E: std::error::Error,
+        O: eredu_core::scheduler::DistributedTransitionOutput {
+        let wait = self.distributed_turn_wait(protocol, transport)?;
+        self.scheduler.run_distributed_bounded_with_preparation_and_errors(protocol, transport, wait,
+            now, maximum_frames, prepare, |id, frame, branch| {
+                branch.admit_batch(frame.batch())
+                    .map_err(RealtimeSessionSubmissionError::<E>::Session)?;
+                execute(id, frame, branch).map_err(RealtimeSessionSubmissionError::Execution)
+            },observe_failure)
+    }
+
+    fn distributed_turn_wait<T: BoundedConsensusTransport>(
+        &self, protocol: u64, transport: &T,
+    ) -> Result<BoundedCompletionWait, SchedulerError>
+    where <T::Completion as Completion>::Error: std::fmt::Display {
         if self.model.topology().is_replicated() {
-            return Err(SchedulerError::Consensus(
-                "distributed realtime turns require a non-replicated selected topology".into(),
-            ));
+            return Err(SchedulerError::with_host_source(transport.metadata_funding(),SchedulerError::Consensus,format_args!("distributed realtime turns require a non-replicated selected topology")));
         }
         let participants = self.model.topology().world_size();
         if transport.participant_count() != participants {
-            return Err(SchedulerError::Consensus(format!(
+            return Err(SchedulerError::with_host_source(transport.metadata_funding(),SchedulerError::Consensus,format_args!(
                 "distributed realtime transport has {} participants; selected topology requires {participants}",
                 transport.participant_count(),
             )));
@@ -637,14 +824,8 @@ where
             self.model.rank,
             wait,
         )
-        .map_err(|error| SchedulerError::Consensus(error.to_string()))?;
-        self.scheduler
-            .run_distributed_turn(protocol, transport, wait, now, |id, frame, branch| {
-                branch
-                    .admit_batch(frame.batch())
-                    .map_err(RealtimeSessionSubmissionError::<E>::Session)?;
-                execute(id, frame, branch).map_err(RealtimeSessionSubmissionError::Execution)
-            })
+        .map_err(|error| SchedulerError::from_consensus_with_host_source(transport.metadata_funding(),error))?;
+        Ok(wait)
     }
 
     fn ensure_local_topology(&self) -> Result<(), SchedulerError> {
@@ -695,7 +876,7 @@ where
     pub fn release(
         &mut self,
         request: RequestId,
-    ) -> Result<ReleasedRealtimeSession<M, S, R, C>, SchedulerError> {
+    ) -> Result<ReleasedRealtimeSession<M, S, R, C, P>, SchedulerError> {
         self.scheduler
             .release(request)
             .map(|state| ReleasedRealtimeSession { state })
@@ -717,7 +898,7 @@ where
     }
 
     /// Immutable canonical session state, when active.
-    pub fn request_state(&self, request: RequestId) -> Option<&RealtimeSessionState<M, S, R, C>> {
+    pub fn request_state(&self, request: RequestId) -> Option<&RealtimeSessionState<M, S, R, C, P>> {
         self.scheduler.request_state(request)
     }
 
@@ -766,6 +947,9 @@ pub enum RealtimeSessionError {
 #[derive(Debug, Clone, Copy, Eq, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum RealtimeSessionExecutionError {
+    /// The admitted frame's host metadata source refused contract construction.
+    #[error(transparent)]
+    HostMetadata(#[from] eredu_core::HostMetadataFundingError),
     /// Payload-contract derivation was attempted before scheduler batch admission.
     #[error("realtime session frame batch has not been admitted")]
     BatchNotAdmitted,
@@ -1073,6 +1257,113 @@ mod tests {
             .attach_submission_completion(completion.clone())
             .unwrap();
         Ok(MockOutput { completion })
+    }
+
+    #[test]
+    #[cfg(all(target_arch="aarch64",target_os="macos"))]
+    fn original_frame_claims_and_retained_outputs_share_the_actual_pool_account() {
+        use crate::working_memory::{WorkingMemoryPool,WorkingMemoryError,InferenceExecutionIdentity,
+            RealtimeFrameRequirements,HostSourceConstructionFacts};
+        let mut sessions=Sessions::new(identity("frame-account"),limits(1)).unwrap();
+        let request=RequestId::new(41);
+        sessions.register(request,generation()).unwrap();
+        sessions.enqueue(request,frame(1)).unwrap();
+        let pool=WorkingMemoryPool::new(1<<24,0).unwrap();
+        let execution=InferenceExecutionIdentity::default();
+        let mut observed=false;
+        sessions.run_local_turn(Instant::now(),|id,frame,branch| {
+            observed=true;
+            let occurrence=branch.frame_occurrence().unwrap();
+            let requirements=||RealtimeFrameRequirements::new(occurrence,Some(128),Some(256),
+                Some(64),Some(32),Some(4096),HostSourceConstructionFacts::new(128,2,0).unwrap()).unwrap();
+            let required=requirements().required_bytes().unwrap();
+            let mut accepted=pool.reserve_realtime_frame(&execution,requirements(),required,None).unwrap();
+            assert_eq!(pool.used_bytes().unwrap(),required);
+            assert!(matches!(accepted.validate(&InferenceExecutionIdentity::default(),occurrence),
+                Err(WorkingMemoryError::IdentityMismatch)));
+            accepted.validate(&execution,occurrence).unwrap();
+            let native=accepted.claim_native().unwrap();
+            assert!(matches!(accepted.claim_native(),Err(WorkingMemoryError::AlreadyStarted)));
+            let source=accepted.take_source_constructions().unwrap();
+            assert!(matches!(accepted.take_source_constructions(),Err(WorkingMemoryError::AlreadyStarted)));
+            let funding=accepted.metadata_funding().unwrap();
+            funding.reserve_metadata(128).unwrap();
+            let alias=funding.clone();
+            assert!(alias.reserve_metadata(usize::MAX).is_err());
+            funding.reserve_metadata(128).unwrap();
+            assert!(accepted.metadata_funding().is_err());
+            let output_custody=native.budget_custody();
+            drop((accepted,native,source,funding,alias));
+            assert_eq!(pool.used_bytes().unwrap(),required);
+            assert!(matches!(pool.reserve_realtime_frame(&execution,requirements(),required,None)
+                .unwrap_err().cause(),WorkingMemoryError::BudgetExceeded{..}));
+            drop(output_custody);
+            assert_eq!(pool.used_bytes().unwrap(),0);
+            let retry=pool.reserve_realtime_frame(&execution,requirements(),required,None).unwrap();
+            drop(retry);
+            assert_eq!(pool.used_bytes().unwrap(),0);
+            execute_immediately(id,frame,branch)
+        }).unwrap();
+        assert!(observed);
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn original_realtime_source_admits_startup_under_its_accepted_capacity() {
+        use crate::{
+            prefetch::BackgroundPrefetchWorker,
+            working_memory::{HostSourceConstructionFacts, InferenceExecutionIdentity,
+                OriginalHostSourceCustody, RealtimeFrameRequirements, WorkingMemoryError,
+                WorkingMemoryPool},
+        };
+        fn operation(_: &eredu_core::residency::OffloadUnitId) -> Result<(), String> { Ok(()) }
+        let operation = operation as fn(&eredu_core::residency::OffloadUnitId) -> Result<(), String>;
+        let plan = match BackgroundPrefetchWorker::thread_startup_plan(
+            &operation, "realtime-source-startup") {
+            Ok(plan) => plan,
+            Err(WorkingMemoryError::UnknownBound) => {
+                assert!(std::env::var_os("EREDU_REQUIRE_STATIC_BASELINE_QUALIFICATION").is_none());
+                return;
+            }
+            Err(cause) => panic!("unexpected startup source refusal: {cause}"),
+        };
+        let mut sessions = Sessions::new(identity("startup-account"), limits(1)).unwrap();
+        let request = RequestId::new(42);
+        sessions.register(request, generation()).unwrap();
+        sessions.enqueue(request, frame(1)).unwrap();
+        let pool = WorkingMemoryPool::new(1 << 24, 0).unwrap();
+        let execution = InferenceExecutionIdentity::default();
+        let mut observed = false;
+        sessions.run_local_turn(Instant::now(), |id, frame, branch| {
+            observed = true;
+            let occurrence = branch.frame_occurrence().unwrap();
+            let requirements = || RealtimeFrameRequirements::new(occurrence, Some(128),
+                Some(256), Some(64), Some(32), Some(4096),
+                HostSourceConstructionFacts::new(128, 2, 0).unwrap()).unwrap();
+            let frame_bytes = requirements().required_bytes().unwrap();
+            let capacity = frame_bytes.checked_add(plan.required_bytes()).unwrap();
+            let small = pool.reserve_realtime_frame(
+                &execution, requirements(), capacity - 1, None).unwrap();
+            let source = OriginalHostSourceCustody::from(small.budget_custody());
+            assert!(matches!(plan.prepare_for_source(&source, None),
+                Err(WorkingMemoryError::BudgetExceeded { .. })));
+            assert_eq!(pool.used_bytes().unwrap(), frame_bytes);
+            drop((source, small));
+            assert_eq!(pool.used_bytes().unwrap(), 0);
+            let accepted = pool.reserve_realtime_frame(
+                &execution, requirements(), capacity, None).unwrap();
+            let source = OriginalHostSourceCustody::from(accepted.budget_custody());
+            let startup = plan.prepare_for_source(&source, None).unwrap();
+            assert_eq!(pool.used_bytes().unwrap(), capacity);
+            // A separate, unstarted host hold does not keep the original frame
+            // alive or acquire any of its native/source construction claims.
+            drop((source, accepted));
+            assert_eq!(pool.used_bytes().unwrap(), plan.required_bytes());
+            drop(startup);
+            assert_eq!(pool.used_bytes().unwrap(), 0);
+            execute_immediately(id, frame, branch)
+        }).unwrap();
+        assert!(observed);
     }
 
     #[test]

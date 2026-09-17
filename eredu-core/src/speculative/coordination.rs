@@ -46,7 +46,7 @@ pub(super) fn publish_candidate<'a, E, S, C, P>(
     executor: &mut E,
     runtime: &mut super::SpeculativeOutputRuntime<S, C, P>,
     constraint: &mut C,
-    sequence: &mut crate::GenerationSequence,
+    sequence: &mut super::SpeculativeSequence,
     tokens: &[u32],
     context: E::Context<'a>,
 ) -> Result<bool, super::SpeculativeDriverError<E::Error>>

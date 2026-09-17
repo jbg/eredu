@@ -413,6 +413,9 @@ fn kimi_observed_pipeline_cut_preserves_components_and_cached_trials() {
                         )
                         .unwrap()
                     {
+                        LayeredPartitionOutput::StateOnly { .. } => {
+                            panic!("sequence readout omitted scores")
+                        }
                         LayeredPartitionOutput::Boundary { hidden, .. } => {
                             input = LayeredPartitionInput::Hidden {
                                 hidden,

@@ -1,14 +1,22 @@
-//! Typed runtime inputs for model prefill.
+mod original_semantics;
+pub(crate) use original_semantics::OriginalMediaPacket;
+#[cfg(test)]
+pub(crate) use original_semantics::{
+    original_semantic_preparations, record_original_semantic_preparation,
+    reset_original_semantic_preparations,
+};
+
+// Typed runtime inputs for model prefill.
 
 use safemlx::{
+    Array, Dtype, Stream,
     error::Exception,
     ops::{concatenate_axis, indexing::NewAxis, indexing::TryIndexOp},
-    Array, Dtype, Stream,
 };
 
 use eredu_core::{
-    checkpoint::TensorDtype, CapabilityError, InputExtent, InputMetadataKey, InputModality,
-    InputTensorIdentity, PreparedInputError,
+    CapabilityError, InputExtent, InputMetadataKey, InputModality, InputTensorIdentity,
+    PreparedInputError, checkpoint::TensorDtype,
 };
 use eredu_runtime::{
     PreparedInputCacheIdentity, PreparedInputInspector, PreparedInputPart as RuntimeInputPart,
@@ -27,14 +35,63 @@ pub struct ModelInput<'a> {
     /// Ordered input parts consumed by the model.
     pub parts: &'a [InputPart],
     cache_identity: Option<&'a PreparedInputCacheIdentity>,
+    shared_cache_identity: Option<&'a eredu_runtime::SharedPreparedInputCacheIdentity>,
+    memory_owner: Option<&'a crate::backend::managed_memory::NativeMemoryOwner>,
+    prefill_chunk_positions: Option<std::num::NonZeroU64>,
+    inference_request: Option<&'a eredu_runtime::working_memory::InferenceRequest>,
+    original_media: Option<&'a OriginalMediaPacket>,
+    original_media_metadata: Option<&'a eredu_nn::workspace::WorkspaceContext>,
+    copied_media_semantics:
+        Option<&'a eredu_architectures::media_plan::BoundPreparedMediaSemantics>,
 }
 
 impl<'a> ModelInput<'a> {
+    pub(crate) fn with_copied_media_semantics(
+        mut self,
+        semantics: &'a eredu_architectures::media_plan::BoundPreparedMediaSemantics,
+    ) -> Self {
+        self.copied_media_semantics = Some(semantics);
+        self
+    }
+    pub(crate) fn copied_media_semantics(
+        self,
+    ) -> Option<&'a eredu_architectures::media_plan::BoundPreparedMediaSemantics> {
+        self.copied_media_semantics
+    }
+
+    pub(crate) fn with_original_media_metadata(
+        mut self,
+        metadata: &'a eredu_nn::workspace::WorkspaceContext,
+    ) -> Self {
+        self.original_media_metadata = Some(metadata);
+        self
+    }
+    pub(crate) fn original_media_metadata(
+        self,
+    ) -> Option<&'a eredu_nn::workspace::WorkspaceContext> {
+        self.original_media_metadata
+    }
+
+    pub(crate) fn with_original_media(mut self, packet: &'a OriginalMediaPacket) -> Self {
+        self.original_media = Some(packet);
+        self
+    }
+    pub(crate) fn original_media(self) -> Option<&'a OriginalMediaPacket> {
+        self.original_media
+    }
+
     /// Creates a typed input from ordered parts.
     pub fn new(parts: &'a [InputPart]) -> Self {
         Self {
             parts,
             cache_identity: None,
+            shared_cache_identity: None,
+            memory_owner: None,
+            prefill_chunk_positions: None,
+            inference_request: None,
+            original_media: None,
+            original_media_metadata: None,
+            copied_media_semantics: None,
         }
     }
 
@@ -46,7 +103,81 @@ impl<'a> ModelInput<'a> {
         Self {
             parts,
             cache_identity: Some(cache_identity),
+            shared_cache_identity: None,
+            memory_owner: None,
+            prefill_chunk_positions: None,
+            inference_request: None,
+            original_media: None,
+            original_media_metadata: None,
+            copied_media_semantics: None,
         }
+    }
+
+    /// Borrows an existing immutable identity without copying its payload or
+    /// changing the accounting authority retained by its aliases.
+    pub fn with_shared_cache_identity(
+        parts: &'a [InputPart],
+        identity: &'a eredu_runtime::SharedPreparedInputCacheIdentity,
+    ) -> Self {
+        Self {
+            parts,
+            cache_identity: Some(identity.as_ref()),
+            shared_cache_identity: Some(identity),
+            memory_owner: None,
+            prefill_chunk_positions: None,
+            inference_request: None,
+            original_media: None,
+            original_media_metadata: None,
+            copied_media_semantics: None,
+        }
+    }
+
+    /// Existing physical identity owner, when supplied by owned preparation.
+    pub const fn shared_cache_identity(
+        self,
+    ) -> Option<&'a eredu_runtime::SharedPreparedInputCacheIdentity> {
+        self.shared_cache_identity
+    }
+
+    pub(crate) fn with_memory_owner(
+        mut self,
+        owner: &'a crate::backend::managed_memory::NativeMemoryOwner,
+    ) -> Self {
+        self.memory_owner = Some(owner);
+        self
+    }
+
+    pub(crate) fn memory_owner(
+        self,
+    ) -> Option<&'a crate::backend::managed_memory::NativeMemoryOwner> {
+        self.memory_owner
+    }
+
+    /// Sets the ordinary prefill span size; selected media keeps its typed ingress.
+    pub fn with_prefill_chunk_positions(mut self, positions: std::num::NonZeroU64) -> Self {
+        self.prefill_chunk_positions = Some(positions);
+        self
+    }
+
+    /// Requested ordinary span size. No setting preserves the existing ingress default.
+    pub const fn prefill_chunk_positions(self) -> Option<std::num::NonZeroU64> {
+        self.prefill_chunk_positions
+    }
+
+    /// Exact internal request admitted before native preparation. Borrowing a
+    /// prompt preserves its charge owner; it does not create another admission.
+    pub(crate) fn with_inference_request(
+        mut self,
+        request: &'a eredu_runtime::working_memory::InferenceRequest,
+    ) -> Self {
+        self.inference_request = Some(request);
+        self
+    }
+
+    pub(crate) const fn inference_request(
+        self,
+    ) -> Option<&'a eredu_runtime::working_memory::InferenceRequest> {
+        self.inference_request
     }
 
     /// Returns the identity coupled to these exact prepared values, when supplied.
@@ -127,6 +258,28 @@ impl PreparedInputInspector<crate::MlxTensor> for MlxTensorInputInspector {
         MlxInputInspector.identity(tensor.as_array())
     }
 
+    fn identity_with_metadata(
+        &self,
+        tensor: &crate::MlxTensor,
+        context: &eredu_nn::workspace::WorkspaceContext,
+    ) -> Result<InputTensorIdentity, eredu_nn::Error> {
+        context.charge_metadata(std::mem::size_of::<(
+            InputTensorIdentity,
+            Result<InputTensorIdentity, PreparedInputError>,
+            &crate::MlxTensor,
+        )>())?;
+        let mut shape = context.metadata_vec(tensor.as_array().shape().len())?;
+        for &dimension in tensor.as_array().shape() {
+            shape.push(usize::try_from(dimension).map_err(|_| {
+                context.metadata_error(format_args!(
+                    "prepared-input tensor has negative dimension {dimension}"
+                ))
+            })?);
+        }
+        InputTensorIdentity::new(portable_dtype(tensor.as_array().dtype()), shape)
+            .map_err(|cause| context.metadata_source(cause))
+    }
+
     fn i32_values(&self, tensor: &crate::MlxTensor) -> Result<Vec<i32>, CapabilityError> {
         MlxInputInspector.i32_values(tensor.as_array())
     }
@@ -186,24 +339,15 @@ pub fn validate(input: ModelInput<'_>) -> Result<(), Exception> {
 /// Builds a `[batch, sequence]` token array from text-only typed input.
 pub fn text_token_ids(input: ModelInput<'_>, stream: &Stream) -> Result<Array, Exception> {
     validate(input)?;
-    let mut parts = Vec::new();
-    for part in input.parts {
-        match (part.modality(), part.payload()) {
-            (InputModality::Text, InputPayload::TokenIds(tokens)) => parts.push(tokens.clone()),
-            (InputModality::Text, InputPayload::Embeddings(_)) => {
-                return Err(Exception::custom(
-                    "text embeddings are not supported by this model",
-                ));
-            }
-            _ => {
-                return Err(Exception::custom(format!(
-                    "{} input is not supported by this model",
-                    part.modality().as_str()
-                )));
-            }
-        }
+    if let [part] = input.parts {
+        return text_token_part(part).cloned();
     }
-    concatenate_token_parts(&parts, stream)
+    let parts = input
+        .parts
+        .iter()
+        .map(text_token_part)
+        .collect::<Result<Vec<_>, _>>()?;
+    concatenate_axis(&parts, 1, stream)
 }
 
 /// Converts a slice of token IDs to a batch-1 text input array.
@@ -230,31 +374,40 @@ fn portable_dtype(dtype: Dtype) -> TensorDtype {
     }
 }
 
-fn concatenate_token_parts(parts: &[Array], stream: &Stream) -> Result<Array, Exception> {
-    if parts.is_empty() {
-        return Err(Exception::custom("text input must contain token ids"));
+fn text_token_part(part: &InputPart) -> Result<&Array, Exception> {
+    match (part.modality(), part.payload()) {
+        (InputModality::Text, InputPayload::TokenIds(tokens)) => Ok(tokens),
+        (InputModality::Text, InputPayload::Embeddings(_)) => Err(Exception::custom(
+            "text embeddings are not supported by this model",
+        )),
+        _ => Err(Exception::custom(format!(
+            "{} input is not supported by this model",
+            part.modality().as_str()
+        ))),
     }
-    if parts.len() == 1 {
-        return Ok(parts[0].clone());
-    }
-    let refs = parts.iter().collect::<Vec<_>>();
-    concatenate_axis(&refs, 1, stream)
 }
 
 fn validate_token_ids(tokens: &Array) -> Result<(), Exception> {
+    validate_token_ids_with_diagnostic(tokens, |message| Exception::custom(message.to_string()))
+}
+
+pub(crate) fn validate_token_ids_with_diagnostic<E>(
+    tokens: &Array,
+    mut diagnostic: impl FnMut(std::fmt::Arguments<'_>) -> E,
+) -> Result<(), E> {
     let shape = tokens.shape();
     if shape.len() != 2 {
-        return Err(Exception::custom(format!(
+        return Err(diagnostic(format_args!(
             "token ids must be shaped [batch, sequence], got {shape:?}"
         )));
     }
     if shape[0] <= 0 || shape[1] <= 0 {
-        return Err(Exception::custom(format!(
+        return Err(diagnostic(format_args!(
             "token ids must have non-empty batch and sequence dimensions, got {shape:?}"
         )));
     }
     if !matches!(tokens.dtype(), Dtype::Int32 | Dtype::Uint32) {
-        return Err(Exception::custom(format!(
+        return Err(diagnostic(format_args!(
             "public token ids must use int32 or uint32 storage, got {:?}",
             tokens.dtype()
         )));
@@ -289,9 +442,77 @@ fn validate_rank_at_least(tensor: &Array, min_rank: usize, name: &str) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::{input_part, validate, InputPayload, ModelInput};
+    use super::{InputPayload, ModelInput, input_part, text_token_ids, token_ids_part, validate};
     use eredu_core::InputModality;
-    use safemlx::Array;
+    use safemlx::{Array, Device, DeviceType, Stream};
+
+    #[test]
+    fn text_token_extraction_preserves_single_backing_and_ordered_segments() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let first = Array::from_slice(&[11_u32, 7, 19], &[1, 3]);
+        let second = Array::from_slice(&[2_u32, 23], &[1, 2]);
+        first.evaluated().unwrap();
+        let backing = first.allocation_info().unwrap().unwrap();
+        let parts = [
+            token_ids_part(&first).unwrap(),
+            token_ids_part(&second).unwrap(),
+        ];
+        let single = text_token_ids(ModelInput::new(&parts[..1]), &stream).unwrap();
+        single.evaluated().unwrap();
+        assert_eq!(single.allocation_info().unwrap(), Some(backing));
+        let joined = text_token_ids(ModelInput::new(&parts), &stream).unwrap();
+        drop(parts);
+        drop(first);
+        drop(second);
+        assert_eq!(single.shape(), [1, 3]);
+        assert_eq!(
+            single.evaluated().unwrap().try_as_slice::<u32>().unwrap(),
+            [11, 7, 19]
+        );
+        assert_eq!(joined.shape(), [1, 5]);
+        assert_eq!(
+            joined.evaluated().unwrap().try_as_slice::<u32>().unwrap(),
+            [11, 7, 19, 2, 23]
+        );
+    }
+
+    #[test]
+    fn text_token_extraction_validates_all_parts_before_selecting_payloads() {
+        let stream = Stream::new_with_device(&Device::new(DeviceType::Cpu, 0));
+        let embeddings = input_part(
+            InputModality::Text,
+            InputPayload::Embeddings(Array::from_slice(&[0.5_f32, 0.25], &[1, 1, 2])),
+            [],
+            [],
+        )
+        .unwrap();
+        let invalid = input_part(
+            InputModality::Text,
+            InputPayload::TokenIds(Array::from_slice(&[1_i64, 2], &[1, 2])),
+            [],
+            [],
+        )
+        .unwrap();
+        let parts = [embeddings, invalid];
+        assert!(
+            text_token_ids(ModelInput::new(&parts), &stream)
+                .unwrap_err()
+                .to_string()
+                .contains("public token ids must use int32 or uint32")
+        );
+        assert!(
+            text_token_ids(ModelInput::new(&parts[..1]), &stream)
+                .unwrap_err()
+                .to_string()
+                .contains("text embeddings are not supported by this model")
+        );
+        assert!(
+            text_token_ids(ModelInput::new(&[]), &stream)
+                .unwrap_err()
+                .to_string()
+                .contains("at least one part")
+        );
+    }
 
     #[test]
     fn validates_text_token_part() {
@@ -309,9 +530,11 @@ mod tests {
             [input_part(InputModality::Text, InputPayload::TokenIds(tokens), [], []).unwrap()];
 
         let error = validate(ModelInput::new(&parts)).unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("public token ids must use int32 or uint32"));
+        assert!(
+            error
+                .to_string()
+                .contains("public token ids must use int32 or uint32")
+        );
     }
 
     #[test]

@@ -16,6 +16,15 @@ use eredu_core::residency::{
     ResidencyLedger, ResidencyLedgerError, UnitResidencyReport,
 };
 
+mod construction;
+use construction::{AliasRow, BindingLocation};
+pub use construction::{ResidencyConstructionError, ResidencyControllerPlan};
+
+mod acquisition;
+pub use acquisition::{ResidencyAcquisitionFailure, ResidencyAcquisitionRef};
+mod operation_source;
+pub use operation_source::{ResidencyClosure, ResidencyClosureError, ResidencyClosureSlot};
+
 /// Deterministic telemetry from one bounded weight-materialization pass.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct WeightMaterializationReport {
@@ -361,6 +370,31 @@ impl WeightBinding {
         })
     }
 
+    /// Inspects the complete source metadata without cloning this declaration.
+    /// Derived recipes borrow a retained successful inference result; direct
+    /// bindings borrow catalog metadata and apply the same selection validator.
+    /// Custom catalogs and failed inference retain their ordinary fallback/error
+    /// behavior. Logical aliases must first resolve their canonical binding.
+    pub fn with_source_metadata<T>(
+        &self,
+        source: &dyn eredu_checkpoint::store::CheckpointSource,
+        inspect: impl FnOnce(eredu_checkpoint::recipe::RecipeMetadataView<'_>) -> T,
+    ) -> Result<T, RecipeError> {
+        assert!(
+            self.alias_of.is_none(),
+            "logical aliases have no physical recipe"
+        );
+        match &self.recipe {
+            Some(recipe) => recipe.with_inferred(source, |metadata| inspect(metadata.borrowed())),
+            None => DerivedWeightRecipe::with_source_metadata(
+                &self.checkpoint_key,
+                &self.selection,
+                source,
+                inspect,
+            ),
+        }
+    }
+
     /// Returns every checkpoint key consumed by this binding.
     pub fn checkpoint_keys(&self) -> Vec<&str> {
         if self.alias_of.is_some() {
@@ -536,8 +570,8 @@ pub struct OffloadUnit {
 #[derive(Debug)]
 pub struct ResidencyController {
     ledger: ResidencyLedger,
-    units: BTreeMap<OffloadUnitId, OffloadUnit>,
-    alias_owners: BTreeMap<(OffloadUnitId, String), (OffloadUnitId, String)>,
+    units: Vec<OffloadUnit>,
+    alias_owners: Vec<AliasRow>,
 }
 
 /// One validated immutable-weight acquisition batch and its initial hit/miss state.
@@ -751,31 +785,56 @@ where
     }
 }
 
+/// A retained manager identity used only to release a lease's existing pin.
+/// Implementations must tolerate a destroyed manager and keep any identity
+/// allocation and its accounting custody alive through the handle's destruction.
+/// This interface cannot acquire storage, create a pin, or grant admission.
+pub trait ResidencyLeaseHandle<O: ResidencyLeaseOwner> {
+    /// Releases the existing pin if the same manager is still alive.
+    fn release_residency_pin(&self, id: &OffloadUnitId, tier: MemoryTier);
+}
+impl<O: ResidencyLeaseOwner> ResidencyLeaseHandle<O> for Weak<O> {
+    fn release_residency_pin(&self, id: &OffloadUnitId, tier: MemoryTier) {
+        if let Some(owner) = self.upgrade() {
+            owner.release_residency_pin(id, tier);
+        }
+    }
+}
+
 /// Statically dispatched lease retaining one backend-native resident unit.
-pub struct ResidencyLease<S, O>
+pub struct ResidencyLease<S, O, H = Weak<O>>
 where
     S: ResidencyLeaseStorage,
     O: ResidencyLeaseOwner,
+    H: ResidencyLeaseHandle<O>,
 {
     id: OffloadUnitId,
     tier: MemoryTier,
     storage: S,
-    owner: Weak<O>,
+    owner: H,
+    _owner_type: std::marker::PhantomData<fn() -> O>,
 }
 
-impl<S, O> ResidencyLease<S, O>
+impl<S, O, H> ResidencyLease<S, O, H>
 where
     S: ResidencyLeaseStorage,
     O: ResidencyLeaseOwner,
+    H: ResidencyLeaseHandle<O>,
 {
     /// Creates a lease after the neutral controller has pinned the resident copy.
-    pub fn new(id: OffloadUnitId, tier: MemoryTier, storage: S, owner: Weak<O>) -> Self {
+    pub fn with_owner(id: OffloadUnitId, tier: MemoryTier, storage: S, owner: H) -> Self {
         Self {
             id,
             tier,
             storage,
             owner,
+            _owner_type: std::marker::PhantomData,
         }
+    }
+
+    /// Borrows retained storage without releasing its lease or owner handle.
+    pub fn storage(&self) -> &S {
+        &self.storage
     }
 
     /// Returns the acquired unit identifier.
@@ -804,19 +863,38 @@ where
     }
 }
 
-impl<S, O> Drop for ResidencyLease<S, O>
+impl<S, O, H> Drop for ResidencyLease<S, O, H>
+where
+    S: ResidencyLeaseStorage,
+    O: ResidencyLeaseOwner,
+    H: ResidencyLeaseHandle<O>,
+{
+    fn drop(&mut self) {
+        self.owner.release_residency_pin(&self.id, self.tier);
+    }
+}
+
+impl<S, O> ResidencyLease<S, O>
 where
     S: ResidencyLeaseStorage,
     O: ResidencyLeaseOwner,
 {
-    fn drop(&mut self) {
-        if let Some(owner) = self.owner.upgrade() {
-            owner.release_residency_pin(&self.id, self.tier);
-        }
+    /// Creates an ordinary weak-manager lease after the controller pins the copy.
+    pub fn new(id: OffloadUnitId, tier: MemoryTier, storage: S, owner: Weak<O>) -> Self {
+        Self::with_owner(id, tier, storage, owner)
     }
 }
 
 impl ResidencyAcquisition {
+    /// Borrows the same initial snapshot without cloning either destination.
+    pub fn as_ref(&self) -> ResidencyAcquisitionRef<'_, '_> {
+        ResidencyAcquisitionRef::from_owned(&self.ids, &self.missing)
+    }
+
+    /// Returns the same owned initial flags, dropping only ordinary ID storage.
+    pub fn into_missing(self) -> Vec<bool> {
+        self.missing
+    }
     /// Returns requested units in caller order.
     pub fn ids(&self) -> &[OffloadUnitId] {
         &self.ids
@@ -863,85 +941,35 @@ impl ResidencyController {
         plan: OffloadPlan,
         units: impl IntoIterator<Item = OffloadUnit>,
     ) -> Result<Self, ResidencyControllerError> {
-        let mut definitions = BTreeMap::new();
-        for unit in units {
-            let id = unit.id().clone();
-            if definitions.insert(id.clone(), unit).is_some() {
-                return Err(ResidencyControllerError::DuplicateUnitDefinition { id });
-            }
-        }
-        for spec in plan.units() {
-            if !definitions.contains_key(spec.id()) {
-                return Err(ResidencyControllerError::MissingUnitDefinition {
-                    id: spec.id().clone(),
-                });
-            }
-        }
-        if let Some(id) = definitions
-            .keys()
-            .find(|id| plan.unit(id).is_none())
-            .cloned()
-        {
-            return Err(ResidencyControllerError::UnexpectedUnitDefinition { id });
-        }
-
-        let alias_owners = validate_global_binding_aliases(&definitions)?;
-
-        for spec in plan.units() {
-            let unit = definitions
-                .get(spec.id())
-                .expect("definition identity validated above");
-            let catalog = catalog_for_unit(unit.id());
-            let mut total = 0u64;
-            for binding in unit.bindings().iter().filter(|binding| !binding.is_alias()) {
-                total = total.checked_add(binding.expected_bytes()).ok_or(
-                    ResidencyControllerError::ArithmeticOverflow {
-                        context: "unit binding byte total",
-                    },
-                )?;
-                if !binding.is_alias() {
-                    let actual = binding
-                        .source_recipe()
-                        .infer(catalog)
-                        .map_err(|source| ResidencyControllerError::Recipe {
-                            binding: binding.name().to_owned(),
-                            source,
-                        })?
-                        .byte_len();
-                    if actual != binding.expected_bytes() {
-                        return Err(ResidencyControllerError::BindingByteMismatch {
-                            id: unit.id().clone(),
-                            binding: binding.name().to_owned(),
-                            expected_bytes: binding.expected_bytes(),
-                            actual_bytes: actual,
-                        });
-                    }
-                }
-            }
-            if total != spec.bytes() {
-                return Err(ResidencyControllerError::UnitByteMismatch {
-                    id: unit.id().clone(),
-                    planned_bytes: spec.bytes(),
-                    actual_bytes: total,
-                });
-            }
-        }
-
-        Ok(Self {
-            ledger: ResidencyLedger::new(plan),
-            units: definitions,
-            alias_owners,
-        })
+        construction::build(
+            catalog_for_unit,
+            plan,
+            units.into_iter().collect(),
+            None::<&[&str]>,
+            |binding, catalog| {
+                binding
+                    .source_recipe()
+                    .infer(catalog)
+                    .map(|metadata| metadata.byte_len())
+                    .map_err(|source| ResidencyControllerError::Recipe {
+                        binding: binding.name.clone(),
+                        source,
+                    })
+            },
+        )
     }
 
     /// Returns the validated declaration for one planned unit.
     pub fn unit(&self, id: &OffloadUnitId) -> Option<&OffloadUnit> {
-        self.units.get(id)
+        self.units
+            .binary_search_by(|unit| unit.id.cmp(id))
+            .ok()
+            .map(|index| &self.units[index])
     }
 
     /// Returns declarations in stable unit-identifier order.
     pub fn units(&self) -> impl ExactSizeIterator<Item = &OffloadUnit> {
-        self.units.values()
+        self.units.iter()
     }
 
     /// Resolves a logical alias to its canonical owner unit and binding.
@@ -950,19 +978,27 @@ impl ResidencyController {
         unit: &OffloadUnitId,
         binding: &WeightBinding,
     ) -> Option<(&OffloadUnitId, &WeightBinding)> {
-        let (owner_unit, owner_name) = self
+        let unit = self
+            .units
+            .binary_search_by(|value| value.id.cmp(unit))
+            .ok()?;
+        let binding = self.units[unit]
+            .bindings
+            .binary_search_by(|value| value.name().cmp(binding.name()))
+            .ok()?;
+        let location = BindingLocation { unit, binding };
+        let row = self
             .alias_owners
-            .get(&(unit.clone(), binding.name().to_owned()))?;
-        let owner = self.units.get(owner_unit)?;
-        let binding = owner
-            .bindings()
-            .iter()
-            .find(|binding| binding.name() == owner_name)?;
-        Some((owner_unit, binding))
+            .binary_search_by_key(&location, |row| row.alias)
+            .ok()?;
+        let owner = self.alias_owners[row].owner;
+        Some((
+            &self.units[owner.unit].id,
+            &self.units[owner.unit].bindings[owner.binding],
+        ))
     }
 
-    /// Returns the canonical owner location when a binding participates in a
-    /// shared alias family, including the canonical owner itself.
+    /// Returns the canonical owner location for a shared alias family, including its owner.
     pub fn shared_binding_owner(
         &self,
         unit: &OffloadUnitId,
@@ -971,16 +1007,19 @@ impl ResidencyController {
         if binding.is_alias() {
             return self.binding_owner(unit, binding);
         }
-        let location = (unit.clone(), binding.name().to_owned());
-        if !self.alias_owners.values().any(|owner| owner == &location) {
-            return None;
-        }
-        let (owner_unit, owner) = self.units.get_key_value(unit)?;
-        let owner = owner
-            .bindings()
+        let unit = self
+            .units
+            .binary_search_by(|value| value.id.cmp(unit))
+            .ok()?;
+        let binding = self.units[unit]
+            .bindings
+            .binary_search_by(|value| value.name().cmp(binding.name()))
+            .ok()?;
+        let location = BindingLocation { unit, binding };
+        self.alias_owners
             .iter()
-            .find(|candidate| candidate.name() == binding.name())?;
-        Some((owner_unit, owner))
+            .any(|row| row.owner == location)
+            .then(|| (&self.units[unit].id, &self.units[unit].bindings[binding]))
     }
 
     /// Returns immutable ownership, capacity, and telemetry state.
@@ -1017,11 +1056,10 @@ impl ResidencyController {
         ids: &[OffloadUnitId],
         tier: MemoryTier,
     ) -> Result<ResidencyAcquisition, ResidencyLedgerError> {
-        self.ledger.validate_batch(ids, tier)?;
-        let missing = ids
-            .iter()
-            .map(|id| self.ledger.is_resident(id, tier).map(|resident| !resident))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut order = vec![0; ids.len()];
+        let mut missing = vec![false; ids.len()];
+        self.plan_acquisition_in(ids, tier, true, &mut order, &mut missing)
+            .map_err(ResidencyAcquisitionFailure::into_owned)?;
         Ok(ResidencyAcquisition {
             ids: ids.to_vec(),
             missing,
@@ -1045,12 +1083,7 @@ impl ResidencyController {
         acquisition: &ResidencyAcquisition,
         tier: MemoryTier,
     ) -> Result<(), ResidencyLedgerError> {
-        for (id, &missing) in acquisition.ids.iter().zip(&acquisition.missing) {
-            if !missing {
-                self.ledger.touch(id, tier)?;
-            }
-        }
-        Ok(())
+        self.touch_acquisition_hits_ref(acquisition.as_ref(), tier)
     }
 
     /// Rolls back every missing copy which remains an unpublished reservation.
@@ -1059,10 +1092,7 @@ impl ResidencyController {
         acquisition: &ResidencyAcquisition,
         tier: MemoryTier,
     ) -> Result<(), ResidencyLedgerError> {
-        for id in acquisition.missing_ids() {
-            self.ledger.rollback_reserved(id, tier)?;
-        }
-        Ok(())
+        self.rollback_acquisition_ref(acquisition.as_ref(), tier)
     }
 
     /// Publishes one realized copy and records its backend transfer observation.
@@ -1145,98 +1175,24 @@ impl ResidencyController {
         active: &[OffloadUnitId],
         tier: MemoryTier,
     ) -> Result<(), eredu_core::residency::ResidencyLedgerError> {
-        self.commit_group_window(group, active, &[], tier)
-            .map(|_| ())
+        self.ledger.require_initialized()?;
+        for id in active { self.ledger.spec(id)?; }
+        self.ledger.set_group_window(group, active, tier)
     }
-}
-
-type BindingLocation = (OffloadUnitId, String);
-type BindingAliasMap = BTreeMap<BindingLocation, BindingLocation>;
-
-fn validate_global_binding_aliases(
-    units: &BTreeMap<OffloadUnitId, OffloadUnit>,
-) -> Result<BindingAliasMap, ResidencyControllerError> {
-    let mut identities = BTreeMap::<String, Vec<BindingLocation>>::new();
-    let mut aliases = BTreeMap::<BindingLocation, String>::new();
-    let mut bytes = BTreeMap::<BindingLocation, u64>::new();
-    for (unit_id, unit) in units {
-        for binding in unit.bindings() {
-            let location = (unit_id.clone(), binding.name().to_owned());
-            let identity = binding
-                .logical_target()
-                .unwrap_or(binding.name())
-                .to_owned();
-            identities
-                .entry(identity)
-                .or_default()
-                .push(location.clone());
-            bytes.insert(location.clone(), binding.expected_bytes());
-            if let Some(owner) = binding.alias_of() {
-                aliases.insert(location, owner.to_owned());
-            }
-        }
-    }
-
-    fn resolve(
-        location: &BindingLocation,
-        identities: &BTreeMap<String, Vec<BindingLocation>>,
-        aliases: &BTreeMap<BindingLocation, String>,
-        visiting: &mut BTreeSet<BindingLocation>,
-    ) -> Result<BindingLocation, ResidencyControllerError> {
-        let Some(destination) = aliases.get(location) else {
-            return Ok(location.clone());
-        };
-        if !visiting.insert(location.clone()) {
-            return Err(ResidencyControllerError::Declaration(
-                ResidencyDeclarationError::BindingAliasCycle {
-                    name: location.1.clone(),
-                },
-            ));
-        }
-        let candidates = identities.get(destination).ok_or_else(|| {
-            ResidencyControllerError::Declaration(
-                ResidencyDeclarationError::UnknownBindingAliasOwner {
-                    alias: location.1.clone(),
-                    owner: destination.clone(),
-                },
-            )
-        })?;
-        if candidates.len() != 1 {
-            return Err(ResidencyControllerError::Declaration(
-                ResidencyDeclarationError::AmbiguousBindingAliasOwner {
-                    alias: location.1.clone(),
-                    owner: destination.clone(),
-                },
-            ));
-        }
-        let owner = resolve(&candidates[0], identities, aliases, visiting)?;
-        visiting.remove(location);
-        Ok(owner)
-    }
-
-    let mut resolved = BTreeMap::new();
-    for alias in aliases.keys() {
-        let owner = resolve(alias, &identities, &aliases, &mut BTreeSet::new())?;
-        let alias_bytes = bytes[alias];
-        let owner_bytes = bytes[&owner];
-        if alias_bytes != owner_bytes {
-            return Err(ResidencyControllerError::Declaration(
-                ResidencyDeclarationError::BindingAliasByteMismatch {
-                    alias: alias.1.clone(),
-                    owner: owner.1.clone(),
-                    alias_bytes,
-                    owner_bytes,
-                },
-            ));
-        }
-        resolved.insert(alias.clone(), owner);
-    }
-    Ok(resolved)
 }
 
 /// Failure while validating a residency control plane.
 #[derive(Debug, thiserror::Error)]
 pub enum ResidencyControllerError {
+    /// One finite index destination failed to reserve.
+    #[error("residency controller index reserve failed")]
+    StorageReserve(#[source] std::collections::TryReserveError),
+    /// Finite ledger construction failed before publication.
+    #[error(transparent)]
+    Storage(#[from] eredu_core::residency::ResidencyStorageError),
+    /// Source-borrowed uncached inference construction failed.
+    #[error(transparent)]
+    FiniteInference(eredu_checkpoint::recipe::RecipeInferenceError),
     /// A binding alias graph was invalid.
     #[error(transparent)]
     Declaration(#[from] ResidencyDeclarationError),
@@ -1753,7 +1709,9 @@ pub enum ResidencyDeclarationError {
         name: String,
     },
     /// Alias and resolved owner disagreed on materialized byte geometry.
-    #[error("weight binding alias {alias:?} declares {alias_bytes} bytes but owner {owner:?} declares {owner_bytes}")]
+    #[error(
+        "weight binding alias {alias:?} declares {alias_bytes} bytes but owner {owner:?} declares {owner_bytes}"
+    )]
     BindingAliasByteMismatch {
         /// Alias identity.
         alias: String,
@@ -1779,12 +1737,20 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
-    use eredu_checkpoint::{store::TensorMetadata, StoredDtype};
+    use eredu_checkpoint::{StoredDtype, store::TensorMetadata};
     use eredu_core::residency::{MemoryTier, OffloadConfig, OffloadUnitSpec, ResidencyPolicy};
 
     use super::*;
 
     struct Catalog(BTreeMap<String, TensorMetadata>);
+
+    mod acquisition_tests {
+        include!("residency/acquisition/tests.rs");
+    }
+
+    mod operation_source_tests {
+        include!("residency/operation_source_tests.rs");
+    }
 
     struct TestLeaseStorage(BTreeMap<String, u32>);
 
@@ -2218,13 +2184,15 @@ mod tests {
         let acquisition = controller
             .plan_acquisition(&ids, MemoryTier::Device)
             .unwrap();
-        assert!(controller
-            .reserve_acquisition(
-                &acquisition,
-                &[(ids[0].clone(), 4), (ids[1].clone(), 8)],
-                MemoryTier::Device
-            )
-            .is_err());
+        assert!(
+            controller
+                .reserve_acquisition(
+                    &acquisition,
+                    &[(ids[0].clone(), 4), (ids[1].clone(), 8)],
+                    MemoryTier::Device
+                )
+                .is_err()
+        );
         assert_eq!(
             controller
                 .ledger()
@@ -2304,25 +2272,31 @@ mod tests {
             .plan_acquisition(&ids, MemoryTier::Device)
             .unwrap();
         assert_eq!(acquisition.missing(), &[true, true]);
-        assert!(controller
-            .reserve_acquisition(
-                &acquisition,
-                &[(ids[0].clone(), 4), (ids[1].clone(), 4)],
-                MemoryTier::Device,
-            )
-            .unwrap()
-            .is_empty());
+        assert!(
+            controller
+                .reserve_acquisition(
+                    &acquisition,
+                    &[(ids[0].clone(), 4), (ids[1].clone(), 4)],
+                    MemoryTier::Device,
+                )
+                .unwrap()
+                .is_empty()
+        );
         controller
             .rollback_acquisition(&acquisition, MemoryTier::Device)
             .unwrap();
-        assert!(!controller
-            .ledger()
-            .is_resident(&ids[0], MemoryTier::Device)
-            .unwrap());
-        assert!(!controller
-            .ledger()
-            .is_resident(&ids[1], MemoryTier::Device)
-            .unwrap());
+        assert!(
+            !controller
+                .ledger()
+                .is_resident(&ids[0], MemoryTier::Device)
+                .unwrap()
+        );
+        assert!(
+            !controller
+                .ledger()
+                .is_resident(&ids[1], MemoryTier::Device)
+                .unwrap()
+        );
 
         let acquisition = controller
             .plan_acquisition(&[ids[0].clone()], MemoryTier::Device)
@@ -2341,10 +2315,12 @@ mod tests {
                 Duration::from_millis(2),
             )
             .unwrap();
-        assert!(controller
-            .ledger()
-            .is_resident(&ids[0], MemoryTier::Device)
-            .unwrap());
+        assert!(
+            controller
+                .ledger()
+                .is_resident(&ids[0], MemoryTier::Device)
+                .unwrap()
+        );
         assert_eq!(
             controller
                 .ledger()

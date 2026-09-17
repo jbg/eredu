@@ -760,3 +760,115 @@ FFN units and the actual prediction readout. Scope identities distinguish depths
 while parameter identities preserve shared fusion and target embedding/head
 ownership. Native TP/PP capture compares these values with resident execution;
 failed routed capture closes its provider scope before later collective work.
+
+### Qwen causal prefill row evidence
+
+Dense Qwen2/Qwen3 and the shared dense-or-MoE Qwen factory declare causal equivalence for the common decoder's existing outer row hooks. Body hooks occur before physical readout selection and may preserve an originally admitted LastPosition contract. Coupled readout input and vocabulary-score selections require physical Sequence demand selected before the original quote; a declaration never upgrades an accepted LastPosition request. Exact capture source/catalog, immutable path owner, original geometry and canonical chunk bindings remain required.
+
+Neutral numerical coverage compares all 18 declared hooks of a two-layer model against full-sequence execution, with a two-token cached prefix, uneven 2/1/2 prefill chunks and three further cached decodes. It includes Qwen2 mixed full/sliding attention across its window, dense Qwen3, both dense alternatives through the routed factory, normalized and unnormalized Qwen3-MoE selection, and tied/untied output heads. Each captured hook must be present, finite and nonzero with every requested row; cached state is compared as well. Separate source/discovery binding coverage preserves body-versus-readout demand rejection. These fixtures do not establish native physical capture admission, partition capture capacity or released-checkpoint numerical validation; existing source/funding/native gates remain unchanged.
+
+### GPT-OSS and K2 causal prefill row evidence
+
+GPT-OSS and K2 dense/routed factories use the existing shared outer row declarations. Nine nonzero scalar cases cover learned attention sinks and biased SelectedSoftmax experts, grouped/QK normalization, dense/shared/routed SwiGLU, routed activated values, attention gates, partial RoPE and full/sliding windows. All 18 two-layer declarations, including actual effective callbacks, must match a full five-row Sequence forward against uneven 2/1/2 chunks after a cached prefix, followed by three cached decodes. Tests compare all actual KV state fields and full vocabulary outputs. Observe-only collectors do not manufacture missing effective aliases.
+
+Actual prepared-source/path binding tests cover every declaration for FullTensor and Preview(0). Body hooks may preserve LastPosition; readout-input and vocabulary-score hooks require physical Sequence selected before original admission. Equal independent capture owners, undeclared internals and downreadout reject. These are neutral equation/discovery fixtures, not released-checkpoint or native quantized/distributed validation. Native funding, original-source health, complete opening inventory and control/publication custody remain separate activation requirements.
+
+
+### Selected-policy inspection contention
+
+Cold retained-value inspection of the actual selected MLX policy returns `false`
+when its mutex is held or poisoned. It cannot wait for callback reentry, and an
+incomplete child retains the existing visited-prefix semantics. The result is
+inventory evidence only: it neither performs native completion nor proves outer
+manager/source coverage, collector capacity, source health or capture admission.
+The change adds no fields or retained control allocation, so existing measured
+control representations are unchanged. Callback-owned collectors and aliases keep
+their existing original pricing and lifetime obligations.
+
+
+### Hybrid text causal row evidence
+
+Qwen hybrid text uses its actual target-unit paths and the same common readout
+declarations as the ordinary decoder. Body hooks precede physical readout
+selection; readout-input and vocabulary selections still require an original
+Sequence request. Preview(0) retains this requirement. The declaration supplies
+no native source pin, row writer, retained-owner capacity, budget grant or gate.
+
+Neutral tests require all 18 real callbacks from two hybrid layers, comparing
+full five-row execution with uneven 2/1/2 chunks after a two-token prefix and
+three further decodes. They compare each convolution/recurrent slot, KV arrays,
+positions, reset count and exact fixed-state keys, including intermediate chunk
+frontiers. Nonzero fixtures cover dense and routed/shared Qwen3-Next/Qwen3.5,
+expanded recurrent heads and history, tied heads and fixed rotary alternatives.
+Actual prepared-source discovery binds every declared Full/Preview(0) selection
+to the same shared path owner and original physical readout; internal mixer
+selections remain undeclared. This is not released-checkpoint or native managed
+capture validation.
+Finite S includes each successful pin row's retained stamp Arc payload/counters and actual core/attempt controls, so escaped rows keep their original once-held custody. Capture H measures the boxed source slot, optional opening owner, parcel and quarantine-element construction overlap. Ordinary absent funding scopes store only a pointer; both real channel constructors allocate their priced slot before the accounting loan. Busy, comparison unwind or failed origin validation preserves the caller's pending group. No later hold, byte grant or refund is introduced. A group proves only its registered origins, not that an external inventory is complete.
+
+
+### Original path seal for scheduled Sequence capture
+
+Scheduled ordinary capture now distinguishes a declaration-bound selection from
+an accepted physical capture contract. The cold text-control producer seals the
+actual immutable path identity together with original C, geometry and plan. The
+accepted owner can lend a reference-only view; the shared gateway authenticates
+that original association and the current prepared execution token before any
+source factory or one-use prefill claim. A declaration alone remains diagnostic.
+
+Physical Sequence rows enter the existing original finite frame/fragment bank.
+All selected rows survive the per-chunk public-score release in run_final; only
+the last public prediction is returned through the existing final index. Failure
+or cooperative cancellation preserves spent quota and existing frame/error
+ownership. This removes the private Sequence gateway rejection while preserving
+public eligibility gates and the independent complete-opening, quiescence,
+active-spend and outer/error-retirement prerequisites.
+
+
+### Independently admitted compiled sources
+
+A loaded compiled decoder source can now retain its own original cold construction allowance while successive original R banks lease the same immutable program. Checked planning precedes every compiler reserve; partial failures retain their actual buffers and cause under that allowance. Idle source ownership permits ordinary host preparation while continuing to reduce available capacity. Exact domain/N/skip/mode checks precede the one-use atomic request claim, and bank attachment checks the accepted reservation's domain before consuming staging. Replays and foreign preflight failures add no source lease or error allocation.
+
+The existing destination/kernel and original provider/cursor lifecycle are shared with the unique-source path. Freeze retires the decoder lease/destinations before returning the same token buffer; surviving loaded-source aliases and token-result aliases retain their distinct original tails. Source-only compilation does not retroactively fund HF, tokenizer snapshots, template/input graphs or caller containers. Shared stop sources, full facade payload ownership and public managed activation remain unfinished. Author validation is source replay/format only; central execution is recorded separately.
+
+The loaded decoder source native regression covers two separately admitted requests continuing one cache across resident, host-layerwise and disk-streamed execution. It compares each request across those realizations and against HF text decoding, and checks retained positions 6 then 12. After the first request, reset rejects with `ReservedWorkActive` even after completion and preserves position 6. Reset requires its own original admitted memory path for replacement state and old/new overlap; this source-sharing integration does not supply that path.
+
+
+### Original TopCandidates under bounded prefill
+
+The original ordinary/controlled collector supports the existing unsliced batch-one `model.logits` TopCandidates contract: one descending K-vector from the final prediction row, with raw scores and actual source/domain attribution. Candidate-only requests use LastPosition and StateOnly earlier chunks. Independently selected raw tensors retain their required Sequence spans; only the final physical span creates candidates. The original finite H bank owns the candidate Vec once, and the result moves into the existing frame without another payload copy. The frame remains provisional until whole-prefill completion.
+
+Exact source/coordinates, logical cumulative limits, native buffer trace, original host construction and actual native completion remain distinct checks. CPU ordinary numerical behavior keeps its current sorter, but its stable-sort scratch is still unavailable for original physical-bound admission. Arbitrary unadmitted Sequence callbacks, independent invocation-window candidates, spatial candidate fusion and complete speculative original funding remain required follow-ons. No generic feature-axis or time-axis TopK, Preview/TokenScores/evidence expansion, or public managed activation is claimed.
+
+### Original tensor control allocation custody
+
+Original Preview/Slice/FullTensor host destinations include the final shared tensor Arc and concrete custody Box in their pre-accepted construction P. Every alias uses the same closed consuming drop path, so both allocations and the actual shape/data storage retire before final original custody. Payload-capacity inspection and wire/value APIs retain their prior meanings. Failed/partial and zero-length Preview destinations keep the same original hold until retirement.
+
+This closes a host tensor allocation tail; it does not implement global Preview across independent speculative windows, fund an original speculative capture schedule, or complete native workspace/graph/Record/task/encoder accounting. Ordinary and controlled global Preview row assembly remains the existing source-bound fixed-buffer mechanism.
+
+
+### Global Preview from independent captured-prefill windows
+
+The existing logical companion now also carries Preview. For original selected shape S and maximum M, it allocates only min(M, product(S)) output elements and maps physical selected prefixes into their global row-major destinations. Leading dimensions and global stride origins are preserved; physical records keep their own shape, values, outcome and attribution. No full prompt is concatenated for the host aggregate. The existing native worker may still process a whole selected physical rectangle, so the host prefix extent is not a native-workspace bound.
+
+Controls, logical shape and numeric extent are charged before the first transform. Floating/Bool allocate immediately; Integer reserves exactly 8*N and creates one I64 or U64 buffer after the first actual source is validated, without another grant. Every required window is observed even for an empty or already-filled prefix. The complete companion's terminal Captured/Truncated wire growth is checked before infallible final publication. Failure or cancellation drops its provisional values without refunding successful physical work.
+
+The original ordinary/control Preview path retains its existing source-bound Q/H target, frame and escaped-tensor retirement. Online speculative Preview here remains ordinary ledger-accounted evidence. Its original source-bound operation/host/native population is an explicit missing admission integration, not a new managed capability. Generated sources, prefix-valued assistant tensors, arbitrary callback splitting, intervention evidence and window×TP/PP composition remain unfinished.
+
+
+### Ordinary captured prepared-media spans
+
+The ordinary V2 attachment supports explicit architecture decoder-row FullTensor/Slice selections. It reserves one logical result and envelope plus the scheduled physical fragment estimates before selected extraction, uses the existing fixed slice/scatter algebra, validates zero/no-overlap hooks and precision, and retains partial results through failure/cancellation without refund. Final p0 delivery follows outer prefill indexing and settlement, not an intermediate native completion.
+
+These are ordinary logical quotas and existing host/native lifetime owners. They are not an original source bank, complete native allocation bound, or managed activation. Source and checkpoint controls are reported separately from payload diagnostics. Shared source/tensor aliases preserve final-allocation custody; exact saved checkpoint markers contain no owning predecessor payload or allowance. Original prepared-media admission and global/encoder/distributed capture remain required follow-ons.
+
+
+### Ordinary prepared-media global transform lifecycle
+
+The collector extension binds Summary/Histogram/Preview fragments to actual Unit3 source geometry and reserves their complete logical destination plus every canonical native physical allowance before the first transform. Terminal candidates reserve the real last-row operation once. Fixed shape descriptors avoid allocation during cold estimation; slice/index buffers and host results are constructed only after the existing ledger comparison. Required metadata fails closed, value Skip stays permanent for the logical selection, and consumed usage is not refunded.
+
+The final record uses the existing p0 transaction and cannot commit before the shared whole-prefill finalizer. Checked Summary/Histogram state and global Preview prefix algebra are reused from text/speculative capture; existing physical envelopes remain unchanged. Exact ordinary row/geometry/tensor-control sizes are accounted, while original managed media admission, CPU stable-sort original scratch and complete native allocator/scheduler/encoder/backing bounds remain unfinished. This increment makes no end-to-end public managed-admission claim.
+
+### Ordinary prepared-media final frame control
+
+The complete ordinary frame, including record metadata, diagnostic Strings, Histogram and Candidates buffers, now uses a preallocated SharedCapturedStep control under the actual HostPreparationAuthority. Its exact existing Arc/Box layout is a mandatory host metadata charge before records, including empty or skipped frames; Skip cannot bypass it and no drain-time refill exists. Shared tensor payloads keep their independent all-alias custody. This corrects earlier frame/session-lifetime wording: a raw CapturedStep alone retained no host owner. Logical transform allowances remain distinct from complete native bounds, and separately returned raw error ownership remains unfinished.
