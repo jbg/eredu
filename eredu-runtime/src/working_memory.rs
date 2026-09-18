@@ -44,9 +44,7 @@ pub use funding::{
     SettledPrefillChunkRetention,
 };
 
-mod original_bpe_model;
 mod original_stop_source;
-pub use original_bpe_model::{OriginalBpeModel, OriginalBpeModelError};
 pub use original_stop_source::{
     OriginalStopSource, OriginalStopSourceBackend, OriginalStopSourceError,
 };

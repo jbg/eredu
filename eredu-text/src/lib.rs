@@ -10,9 +10,6 @@
 /// Closed fresh chat-template construction and shared VM rendering.
 pub mod chat_storage;
 
-/// Packed BPE model construction and readonly component access.
-pub mod bpe_storage;
-
 /// Prepared plain-join and ByteLevel decoding with fixed caller-owned destinations.
 pub mod decoder_storage;
 /// Error types returned by tokenizer and template operations.
