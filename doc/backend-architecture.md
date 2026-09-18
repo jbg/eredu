@@ -6,6 +6,17 @@ feature boundaries. This document describes the current contracts; validation
 status is maintained separately in [bounded inference](bounded-inference.md) and
 [the design overview](bounded-inference-design.md).
 
+## Library distribution
+
+Eredu libraries must support distribution through crates.io with ordinary
+versioned Rust dependencies on unmodified upstream releases. Dependency patching,
+modified vendored dependencies and private forks are prohibited by the
+[distribution rules](../AGENTS.md#library-distribution-and-dependencies).
+Native MLX patches are the explicit exception: Eredu controls their application
+through the `safemlx-sys` native build, including when building the published crate.
+Downstream consumers must not need an Eredu checkout or dependency overrides.
+The local Rust dependency forks and root patch table do not satisfy this requirement.
+
 ## Dependency direction
 
 Production dependencies point from applications toward these roots:

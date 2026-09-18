@@ -3,6 +3,37 @@
 These rules apply to the entire repository. They describe semantic ownership
 and dependency direction; directory names alone are not an architectural API.
 
+## Library distribution and dependencies
+
+Eredu crates are libraries intended for publication and distribution through
+crates.io. Downstream consumers must be able to use the published libraries with
+ordinary versioned Cargo dependencies, without an Eredu repository checkout,
+dependency overrides, or special workspace configuration.
+
+Patching third-party dependencies is unacceptable except for the native MLX
+build described below. Do not add or rely on
+`[patch]`, `[replace]`, Cargo source overrides, modified vendored dependencies,
+or private dependency forks, including forks republished under different package
+names. Do not require downstream consumers to reproduce overrides. Dependency
+patches or forks present in the repository do not constitute an exception.
+
+Native MLX patches are explicitly permitted because Eredu controls its native
+build through `safemlx-sys`. Keep those patches within that build and ensure they
+are applied when building the published crate, without downstream Cargo
+overrides. This exception does not permit patching Rust dependencies.
+
+Use the public APIs of unmodified upstream Rust releases available through crates.io.
+Local path dependencies between Eredu crates are permitted for workspace
+development only when their versioned dependencies also support publication and
+consumption through crates.io. A successful build inside this workspace is not
+sufficient evidence of library distributability.
+
+If a requested guarantee cannot be implemented using upstream public APIs,
+explain the limitation and discuss the architectural tradeoff with the user
+before proceeding. Requirements such as memory accounting or bounded execution
+do not authorize dependency patching. Preserve third-party licenses and provenance
+for any redistributed source.
+
 ## Documentation and naming
 
 Documentation, comments and names describe current behavior, ownership and
@@ -37,8 +68,8 @@ it.
 
 - `eredu-collections` owns the safe ordered-map worker and exact prospective
   node allocation callbacks. It is a dependency-free portable foundation used
-  by the local JSON fork and portable source producers. It owns no admission
-  policy, funding account, source custody, or native resources.
+  by portable source producers. It owns no admission policy, funding account,
+  source custody, or native resources.
 - `eredu-gguf` owns framework-independent GGUF reading, writing, validation,
   canonical tensor encodings, and bounded conversion. `eredu-checkpoint` owns
   backend-neutral checkpoint schemas, recipes, exact prepared source stores,
@@ -231,12 +262,9 @@ crate-local, document the safety boundary here and in
 `doc/backend-architecture.md`, and must not weaken the lint for neutral or
 unrelated crates.
 
-Pinned parser forks under `third-party` are portable workspace members and
-inherit the same `unsafe_code = "forbid"` lint. They own dependency-internal
-allocation facts and parser growth checks, never backend resources or admission
-policy. The local llguidance fork exposes only its safe Rust API; upstream C-ABI
-modules and header generation are not compiled. Preserve upstream licenses and
-archive provenance in `third-party/parser-upstream.json` when updating them.
+Third-party dependencies retain their upstream safety boundaries. Their use
+must not weaken the workspace's `unsafe_code = "forbid"` policy or grant native
+resource ownership to portable crates.
 
 Do not add tests that inspect the Cargo dependency graph, recursively inspect
 repository source text, forbid family names by substring, or assert a particular
@@ -263,18 +291,3 @@ cargo check -p eredu-backend-mlx --no-default-features
 cargo test -p eredu --no-default-features --test portable_facade
 cargo test -p eredu --no-default-features --test backend_conformance
 ```
-
-Pinned auxiliary collection forks (`hashbrown` and `indexmap`) remain external
-collection dependencies and retain their upstream unsafe implementation
-boundaries. Local changes add safe prospective allocation facts and reservation
-hooks; they do not introduce unsafe code or weaken the `unsafe_code = "forbid"`
-policy of parser workspace members and portable production crates. IndexMap
-preserves insertion order and shares one growth worker between ordinary and
-funded reservation. Archive provenance and licenses remain under `third-party`.
-
-Pinned literal-search dependencies (`aho-corasick` and `memchr`) remain external
-search dependencies alongside `regex-automata`. Their upstream search/SIMD unsafe
-internals retain their existing boundary; local prospective construction hooks
-are safe Rust and introduce no unsafe code. They preserve the selected ordinary
-search algorithms and do not weaken parser/workspace unsafe forbids. Pristine
-archive hashes and licenses are recorded in `third-party/prefilter-upstream.json`.
