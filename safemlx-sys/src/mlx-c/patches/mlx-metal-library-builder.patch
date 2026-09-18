@@ -91,7 +91,7 @@ diff --git a/mlx/backend/metal/device.h b/mlx/backend/metal/device.h
 +  // Explicit borrowed lambda/object calls avoid a temporary std::function
 +  // allocation before a cache hit. The reference remains valid until this call
 +  // returns, including exceptional exit. The unchanged get_library overloads
-+  // retain the ordinary std::function adapter and its historical copy/ownership
++  // retain the ordinary std::function adapter and its copy/ownership
 +  // semantics.
 +  template <class Builder, BorrowableBuilder<Builder> = 0>
 +  MTL::Library* get_library_borrowed(

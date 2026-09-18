@@ -1,13 +1,13 @@
 # Released Qwen readout and chunk measurements
 
-Historical numerical and allocation evidence is retained here with its original
-commands, dates and tolerances. It does not establish current tool admission,
-process-wide bounds or the latest controlled/media API. See
-[bounded inference](bounded-inference.md) for the current contract.
+These measurements compare readout selection and prefill chunking on the pinned
+Qwen3.5-0.8B checkpoint. They establish the stated numerical and allocation
+behavior, not tool admission or process-wide bounds. See
+[bounded inference](bounded-inference.md) for admission contracts.
 
-## Released Qwen readout measurements (2026-09-13)
+## Released Qwen readout measurements
 
-The [recorded measurements](validation/bounded-qwen-readout-2026-09-13.json)
+The [recorded measurements](validation/qwen35-readout-results.json)
 compare fresh native processes with identical token IDs and three teacher-forced
 cached decodes. `last` uses ordinary prefill; `sequence` uses an empty capture
 selection that preserves the sequence observer's full-row demand. Both return
@@ -26,8 +26,7 @@ At 3,000 positions, peak process footprint drops by 2,978,283,640 bytes
 (2.774 GiB), from 27,199,392,672 to 24,221,109,032 bytes. The observed output dtype
 is F32, so a full 3,000 × 248,320 score tensor occupies about 2.775 GiB before
 selection. MLX's live peak remains 22,433,750,408 bytes in both modes: other
-full-prompt transients establish that earlier peak. This directly demonstrates
-why readout selection alone does not finish the working-memory task. MLX cached
+full-prompt transients establish that earlier peak. Readout selection alone does not bound all working memory. MLX cached
 allocations, process RSS and process physical footprint are distinct metrics;
 the record retains both maximum RSS and peak footprint from `/usr/bin/time -l`.
 Neither allocator telemetry nor these measurements establish an enforceable bound.
@@ -61,16 +60,12 @@ PYINPUT
 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 /private/tmp/qwen-reference-env/bin/python eredu-backend-mlx/validation/bounded_qwen_reference.py /private/tmp/qwen-reference /private/tmp/qwen-input-3000.json /private/tmp/qwen-reference-scores.json --compare /private/tmp/qwen-last.json
 ```
 
-Repeat both fresh native processes with each input length for the table. The link
-flag strips debug symbols from the probe executable to limit build-disk use; it
-does not change numerical compilation settings. A failed initial debug link
-exhausted local disk space; deleting generated incremental build caches allowed
-the probe to build. The native linker still reports its existing large unwind
-section warning. No hardware limitation prevented this single-device matrix.
+Repeat both fresh native processes with each input length for the table. The
+link flag strips debug symbols and does not change numerical compilation settings.
 
-## Released Qwen chunk measurements (2026-09-13)
+## Released Qwen chunk measurements
 
-The [chunk-policy record](validation/bounded-qwen-chunks-2026-09-13.json) uses
+The [chunk-policy record](validation/qwen35-chunk-results.json) uses
 the same checkpoint, hardware and inputs. All 15 runs use final-position readout
 and three teacher-forced cached decodes in fresh native processes. `full` sets
 the chunk limit to the prompt length; the other policies cap it at 128 or 512.
@@ -95,7 +90,7 @@ fixed chunk limit; chunk scheduling alone does not prove total memory bounded.
 Every vocabulary score in all four output rows passes native chunk/full
 comparison with `atol=1e-4`, `rtol=1e-4`. Maximum absolute difference is
 `3.2783e-5`; all argmax results match. Both 3,000-position chunk policies also pass
-the independent MLX-LM comparison with the previously declared `atol=0.25`,
+the independent MLX-LM comparison with the declared `atol=0.25`,
 `rtol=0.02`. Maximum absolute reference error is `0.210024`, maximum RMSE is
 `0.038212`, and all four argmax results match. Native outputs are F32; the
 independent implementation loads the released BF16 weights. These tolerances
@@ -126,8 +121,5 @@ done
 
 The native input builder exposes `with_prefill_chunk_positions(NonZeroU64)`;
 omitting the probe's final argument selects the default 512-position limit.
-These commands describe the recorded September 13 probe and source revision.
-They measure the ordinary chunk/readout mechanism, not current public bounded
-chat admission. Later managed measurements and their distinct executable hashes
-are in [the public Qwen record](validation/bounded-public-qwen-2026-09-16.json).
-Current tool/media acceptance is tracked in [the consolidation overview](bounded-followup.md).
+The probe measures ordinary chunk/readout execution. Bounded public chat and
+media admission have separate [validation](prepared-chat-validation.md).

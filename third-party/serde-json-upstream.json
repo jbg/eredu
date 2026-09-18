@@ -1,6 +1,11 @@
 {
   "archive": "https://static.crates.io/crates/serde_json/serde_json-1.0.151.crate",
   "archive_sha256": "c841b55ecdae098c80dcae9cf767f6f8a0c2cdb3416bbef72181df4d0fe73f14",
+  "local_changes": {
+    "src/error.rs": "Expose the dependency-owned boxed I/O error footprint for prospective serialization failure funding.",
+    "src/map.rs": "The ordered representation consumes the shared safe AVL worker in eredu-collections and forwards prospective node callbacks and fixed allocation failures. Collection tests belong to eredu-collections; JSON behavior tests belong to this fork.",
+    "src/number.rs": "Compare with floating zero without constructing an owned number, preserving arbitrary-precision equality semantics."
+  },
   "members": {
     ".cargo_vcs_info.json": "5bfedd83df665d1746f17958cdf29a1e62743049730e95ffc64912a984336eb5",
     ".github/workflows/ci.yml": "c34145e098a9d1891a740ee7d805933b6c6869df675b651d1433e256ef724e74",
@@ -99,10 +104,5 @@
     },
     "path_in_vcs": ""
   },
-  "version": "1.0.151",
-  "local_followup_changes": {
-    "src/error.rs": "Expose the dependency-owned boxed I/O error footprint for prospective serialization failure funding.",
-    "src/number.rs": "Compare with floating zero without constructing an owned number, preserving arbitrary-precision equality semantics.",
-    "src/map.rs": "The default ordered representation consumes the single safe local AVL worker extracted into the dependency-free eredu-collections foundation. The adapter forwards exact prospective node callbacks and original fixed allocation failures; generic collection tests moved with the worker and JSON behavior tests remain in the fork."
-  }
+  "version": "1.0.151"
 }

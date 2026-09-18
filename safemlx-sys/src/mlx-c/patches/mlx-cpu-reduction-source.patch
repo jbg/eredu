@@ -100,7 +100,7 @@ diff --git a/mlx/backend/cpu/reduce.cpp b/mlx/backend/cpu/reduce.cpp
 -                    out = array::unsafe_weak_copy(out),
 -                    reduce_type_ = reduce_type_,
 -                    axes_ = axes_]() mutable {
-+// Same shared dispatch body, now named so its real queued payload is priced.
++// The named shared dispatch body exposes its queued payload for pricing.
 +struct ReductionTask {
 +  array in,out;
 +  Reduce::ReduceType reduce_type_;

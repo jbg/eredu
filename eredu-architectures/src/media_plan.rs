@@ -46,9 +46,9 @@ impl MediaAdmissionInput {
         qwen::InspectedPartRef {
             modality: self.descriptor.modality(),
             kind: self.descriptor.payload_kind(),
-            shape: qwen::ShapeRef::Legacy(&self.payload_shape),
+            shape: qwen::ShapeRef::Dimensions(&self.payload_shape),
             grid: self.patch_grid.as_ref().map(|grid| qwen::GridRef {
-                shape: qwen::ShapeRef::Legacy(&grid.shape),
+                shape: qwen::ShapeRef::Dimensions(&grid.shape),
                 values: &grid.values,
             }),
         }
@@ -2130,9 +2130,9 @@ mod original_semantic_kernel_tests {
             qwen::InspectedPartRef {
                 modality,
                 kind: eredu_core::InputPayloadKind::Tensor,
-                shape: qwen::ShapeRef::Legacy(&shape64),
+                shape: qwen::ShapeRef::Dimensions(&shape64),
                 grid: Some(qwen::GridRef {
-                    shape: qwen::ShapeRef::Legacy(&grid64),
+                    shape: qwen::ShapeRef::Dimensions(&grid64),
                     values: grid,
                 }),
             },

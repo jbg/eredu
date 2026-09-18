@@ -21,7 +21,7 @@ impl TriggerPrefix {
     }
 }
 
-/// Two borrowed pieces reproduce the former activation buffer exactly. Only
+/// Two borrowed pieces represent the complete activation bytes. Only
 /// the grammar activation consumer materializes them; forbidden checks do not.
 pub struct TriggerMatch<'a> {
     /// Trigger bytes preceding the token-local activation tail.

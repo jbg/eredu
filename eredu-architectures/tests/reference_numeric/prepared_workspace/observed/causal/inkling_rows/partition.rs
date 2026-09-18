@@ -51,8 +51,8 @@ fn compare_partition_state(
     }
 }
 
-// The snapshot is the existing typed-session test seam added by the pinned
-// Gemma4 package. No public accessor or fabricated local state is introduced.
+// The snapshot uses the typed-session test seam shared with Gemma4.
+// It reads actual local state without a public accessor.
 #[test]
 fn inkling_group_two_rows_and_complete_histories_cross_prepared_tp_pp_residencies() {
     for sparse in [false, true] {

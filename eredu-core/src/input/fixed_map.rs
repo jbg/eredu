@@ -106,7 +106,7 @@ impl<'de, K: Deserialize<'de> + Ord, V: Deserialize<'de>> Deserialize<'de>
     for InputIdentityMap<K, V>
 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        // Preserve the former BTreeMap serde representation and duplicate-key
+        // Preserve the BTreeMap serde representation and duplicate-key
         // behavior. Validated public constructors and wire decoding separately
         // enforce the modality and uniqueness rules for prepared input.
         BTreeMap::deserialize(deserializer).map(Self::from_map)

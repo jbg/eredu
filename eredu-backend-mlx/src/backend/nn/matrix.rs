@@ -199,9 +199,8 @@ pub(crate) fn bf16_batched_product(
     let rows = lhs.dim(2);
     let width = lhs.dim(3);
     let outputs = rhs.dim(3);
-    // Validate the exact final I32 extent before creating either view. This
-    // replaces the host Vec and unchecked length cast, retaining the same
-    // batch-major sequence and one eager native source generation.
+    // Validate the exact final I32 extent before creating either view.
+    // Generate one eager native source in batch-major order.
     let ids = usize::try_from(batches)
         .ok()
         .zip(usize::try_from(rows).ok())

@@ -347,10 +347,10 @@ each materialized unit; parameter-work reservations cover retained originals,
 replacements and operation outputs. Completed overlay copies are applied again on
 every affected unit reload. Dense/affine queries and overlays passed on host-layerwise
 and disk-streamed execution, including tied embeddings and repeated invocations.
-Parallel queries and projections now use the same public APIs with collective
+Parallel queries and projections use the same public APIs with collective
 participation by all ranks. Distributed overlays, cached prediction rollback and
 active-overlay controlled capture pass the 24 CPU Ring configurations recorded in
-[parallel validation](component-validation.md#effective-parameter-coordinates-for-parallel-execution).
+[parallel validation](component-validation.md).
 Overlays are installed on an idle `LoadedModel`. A controlled run and all of its
 snapshot branches use that immutable parameter version. Installation/removal
 invalidates old prepared runs and snapshots, requiring fresh exact-token prefill.
@@ -400,14 +400,14 @@ and text construction returns `ReplicatedTextIneligibility::Realtime`. A realtim
 component-analysis workflow requires the separate frame protocol.
 
 CPU Ring results establish native collective behavior on the tested local CPU
-configuration. Separate distributed GPU suites now cover shared, recurrent,
+configuration. Separate distributed GPU suites cover shared, recurrent,
 quantized, prediction and media paths with local Ring transport; all ranks use
 one physical Metal device. Multiple physical GPUs and hosts remain hardware
 validation gaps. Exact device-specific cases are recorded in the evidence.
 
 ## Numerical conventions for packed parameters
 
-FP8 validation now includes native CPU models with inexact activations, several
+FP8 validation includes native CPU models with inexact activations, several
 feature blocks and a partial final-head input block. Both CPU and GPU block-FP8 projections dynamically quantize their input activations;
 the CPU fallback also dequantizes the weights. Effective weight columns alone
 therefore do not establish an exact additive decomposition using pre-quantization
@@ -464,7 +464,7 @@ check before an experiment.
 helpers perform the research calculations in the example; the library supplies
 portable observations, admitted operations and lifecycle guarantees. After
 creating the pinned reference fixture with the commands in
-[released dense validation](component-validation.md#validation-in-progress), run:
+[released dense validation](component-validation.md), run:
 
 ```sh
 cargo run -p eredu --no-default-features --features mlx \
@@ -477,7 +477,7 @@ Transformers reference, signed score and score-difference reconstruction, deleti
 keep-only, backward queries, a three-prefix association and coordinated
 attention-plus-FFN edits. The reported editing effect is illustrative; it does
 not establish the paper's measured editing efficacy. See also the
-[released sparse workflow](component-validation.md#released-sparse-checkpoint-validation).
+[released sparse workflow](component-validation.md).
 
 Muse's readout declares `scaled_softcap`: first reconstruct the unscaled affine
 score, then apply `cap * tanh(score * scale / cap)` to the complete score.

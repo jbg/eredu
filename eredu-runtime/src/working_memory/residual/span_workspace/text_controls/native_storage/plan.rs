@@ -205,7 +205,7 @@ impl<M: OriginalNativeStorageMechanism> PreparedNativeStoragePlan<M> {
         let nested = mechanism.key_clone_storage_bytes();
         let complete = qualified && nested.is_some() && population.is_some();
         // Reuse exactly the same coverage selection, cardinality and arithmetic.
-        // The extra term below replaces the old unexplained managed header/key
+        // The term below accounts for the managed header/key
         // contribution; it never supplies a native payload or span bound.
         let mut plan = Self::prepare(
             workspace,

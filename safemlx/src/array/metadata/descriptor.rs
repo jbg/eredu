@@ -81,7 +81,7 @@ impl ArrayDescriptorFacts {
 ///
 /// Construct this through [`crate::RuntimeCallGuard::descriptor`]. The read/fill
 /// body and this borrowed loan's destruction neither acquire nor release runtime
-/// ownership. The private runtime lock now uses only try-acquire routes, so its
+/// ownership. The private runtime lock uses only try-acquire routes, so its
 /// final unlock cannot enter parking bookkeeping. Current-thread TLS and actual
 /// dependency features still require their layout/build evidence; this loan
 /// supplies no original budget grant.

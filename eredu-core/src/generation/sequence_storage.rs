@@ -20,14 +20,14 @@ pub(super) mod sealed {
 /// transfer their actual owner through the retained adapter instead.
 pub trait GenerationSequenceStorage: sealed::Storage {}
 
-/// Legacy EOS and token vectors used by the default sequence.
+/// Owned EOS and token vectors used by the default sequence.
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub struct LegacyGenerationStorage {
+pub struct OwnedGenerationStorage {
     pub(super) eos_token_ids: Vec<u32>,
     pub(super) tokens: Vec<u32>,
 }
-impl GenerationSequenceStorage for LegacyGenerationStorage {}
-impl sealed::Storage for LegacyGenerationStorage {
+impl GenerationSequenceStorage for OwnedGenerationStorage {}
+impl sealed::Storage for OwnedGenerationStorage {
     fn tokens(&self) -> &[u32] {
         &self.tokens
     }
@@ -169,7 +169,7 @@ impl AsRef<str> for GenerationText {
     }
 }
 impl From<Vec<u32>> for GenerationTokenIds {
-    /// Legacy conversion allocates its immutable Arc header, but does not copy
+    /// Owned conversion allocates its immutable Arc header, but does not copy
     /// the Vec's token buffer. Managed providers instead use `from_owner`.
     fn from(tokens: Vec<u32>) -> Self {
         Self::from_owner(Arc::new(tokens))

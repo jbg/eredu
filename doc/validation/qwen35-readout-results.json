@@ -1,0 +1,371 @@
+{
+  "status": "readout-only, unchunked; native budget enforcement and chunk matrix still pending",
+  "hardware": {
+    "chip": "Apple M3 Ultra",
+    "cpu_cores": 32,
+    "unified_memory_bytes": 274877906944,
+    "gpu_architecture": "applegpu_g15d"
+  },
+  "checkpoint": {
+    "repository": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17",
+    "weight_sha256": "04b1c301231dd422b8860db31311ab2721511346a32cb1e079c4c4e5f1fe4696"
+  },
+  "inputs": {
+    "repeated_prefix_ids": [
+      760,
+      6511,
+      314,
+      9338,
+      369
+    ],
+    "construction": "repeat and truncate to the exact position count",
+    "decode_ids": [
+      11751,
+      13,
+      198
+    ]
+  },
+  "matrix": [
+    {
+      "positions": 5,
+      "mode": "last",
+      "baseline_mlx_active_bytes": 1705977024,
+      "prefill_peak_bytes": 3769234409,
+      "peak_bytes": 3769234409,
+      "max_rss_bytes": 1966784512,
+      "peak_footprint_bytes": 5374102312,
+      "prefill_seconds": 0.090427833,
+      "native_dtype": "Float32",
+      "argmax": [
+        11751,
+        13,
+        198,
+        760
+      ]
+    },
+    {
+      "positions": 5,
+      "mode": "sequence",
+      "baseline_mlx_active_bytes": 1705977024,
+      "prefill_peak_bytes": 3769185257,
+      "peak_bytes": 3769185257,
+      "max_rss_bytes": 1967341568,
+      "peak_footprint_bytes": 5379427064,
+      "prefill_seconds": 0.212771917,
+      "native_dtype": "Float32",
+      "argmax": [
+        11751,
+        13,
+        198,
+        760
+      ]
+    },
+    {
+      "positions": 128,
+      "mode": "last",
+      "baseline_mlx_active_bytes": 1705977024,
+      "prefill_peak_bytes": 4544444944,
+      "peak_bytes": 4544444944,
+      "max_rss_bytes": 1970880512,
+      "peak_footprint_bytes": 6161484536,
+      "prefill_seconds": 0.541800833,
+      "native_dtype": "Float32",
+      "argmax": [
+        9338,
+        369,
+        198,
+        760
+      ]
+    },
+    {
+      "positions": 128,
+      "mode": "sequence",
+      "baseline_mlx_active_bytes": 1705977024,
+      "prefill_peak_bytes": 4544444944,
+      "peak_bytes": 4544444944,
+      "max_rss_bytes": 1969864704,
+      "peak_footprint_bytes": 6287592232,
+      "prefill_seconds": 0.132894542,
+      "native_dtype": "Float32",
+      "argmax": [
+        9338,
+        369,
+        198,
+        760
+      ]
+    },
+    {
+      "positions": 512,
+      "mode": "last",
+      "baseline_mlx_active_bytes": 1705977024,
+      "prefill_peak_bytes": 6737248784,
+      "peak_bytes": 6737248784,
+      "max_rss_bytes": 1974353920,
+      "peak_footprint_bytes": 8379190296,
+      "prefill_seconds": 0.495485625,
+      "native_dtype": "Float32",
+      "argmax": [
+        314,
+        369,
+        198,
+        760
+      ]
+    },
+    {
+      "positions": 512,
+      "mode": "sequence",
+      "baseline_mlx_active_bytes": 1705977024,
+      "prefill_peak_bytes": 6737248784,
+      "peak_bytes": 6737248784,
+      "max_rss_bytes": 1973977088,
+      "peak_footprint_bytes": 8887323576,
+      "prefill_seconds": 0.237314458,
+      "native_dtype": "Float32",
+      "argmax": [
+        314,
+        369,
+        198,
+        760
+      ]
+    },
+    {
+      "positions": 1500,
+      "mode": "last",
+      "baseline_mlx_active_bytes": 1705977024,
+      "prefill_peak_bytes": 12662147824,
+      "peak_bytes": 12662147824,
+      "max_rss_bytes": 1988018176,
+      "peak_footprint_bytes": 14309559152,
+      "prefill_seconds": 0.759082625,
+      "native_dtype": "Float32",
+      "argmax": [
+        760,
+        369,
+        11751,
+        760
+      ]
+    },
+    {
+      "positions": 1500,
+      "mode": "sequence",
+      "baseline_mlx_active_bytes": 1705977024,
+      "prefill_peak_bytes": 12662147824,
+      "peak_bytes": 12662147824,
+      "max_rss_bytes": 1987674112,
+      "peak_footprint_bytes": 15799176072,
+      "prefill_seconds": 0.604736875,
+      "native_dtype": "Float32",
+      "argmax": [
+        760,
+        369,
+        11751,
+        760
+      ]
+    },
+    {
+      "positions": 3000,
+      "mode": "last",
+      "baseline_mlx_active_bytes": 1705977024,
+      "prefill_peak_bytes": 22433750408,
+      "peak_bytes": 22433750408,
+      "max_rss_bytes": 2008383488,
+      "peak_footprint_bytes": 24221109032,
+      "prefill_seconds": 1.147330208,
+      "native_dtype": "Float32",
+      "argmax": [
+        760,
+        369,
+        11751,
+        760
+      ]
+    },
+    {
+      "positions": 3000,
+      "mode": "sequence",
+      "baseline_mlx_active_bytes": 1705977024,
+      "prefill_peak_bytes": 22433750408,
+      "peak_bytes": 22433750408,
+      "max_rss_bytes": 2007449600,
+      "peak_footprint_bytes": 27199392672,
+      "prefill_seconds": 1.178619667,
+      "native_dtype": "Float32",
+      "argmax": [
+        760,
+        369,
+        11751,
+        760
+      ]
+    }
+  ],
+  "readout_score_parity": [
+    {
+      "positions": 5,
+      "max_absolute_score_delta_by_step": [
+        2.288818359375e-05,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "same_argmax": true
+    },
+    {
+      "positions": 128,
+      "max_absolute_score_delta_by_step": [
+        2.288818359375e-05,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "same_argmax": true
+    },
+    {
+      "positions": 512,
+      "max_absolute_score_delta_by_step": [
+        2.574920654296875e-05,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "same_argmax": true
+    },
+    {
+      "positions": 1500,
+      "max_absolute_score_delta_by_step": [
+        1.9073486328125e-05,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "same_argmax": true
+    },
+    {
+      "positions": 3000,
+      "max_absolute_score_delta_by_step": [
+        2.09808349609375e-05,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "same_argmax": true
+    }
+  ],
+  "reference_comparisons": [
+    {
+      "positions": 5,
+      "atol": 0.25,
+      "rtol": 0.02,
+      "passed": true,
+      "passes": [
+        {
+          "step": 0,
+          "max_abs": 0.14955711364746094,
+          "rmse": 0.033593235761161175,
+          "allclose": true,
+          "argmax_equal": true
+        },
+        {
+          "step": 1,
+          "max_abs": 0.12318563461303711,
+          "rmse": 0.025879907098821,
+          "allclose": true,
+          "argmax_equal": true
+        },
+        {
+          "step": 2,
+          "max_abs": 0.1586458683013916,
+          "rmse": 0.03378831268127073,
+          "allclose": true,
+          "argmax_equal": true
+        },
+        {
+          "step": 3,
+          "max_abs": 0.137725830078125,
+          "rmse": 0.028256633167496107,
+          "allclose": true,
+          "argmax_equal": true
+        }
+      ]
+    },
+    {
+      "positions": 3000,
+      "atol": 0.25,
+      "rtol": 0.02,
+      "passed": true,
+      "passes": [
+        {
+          "step": 0,
+          "max_abs": 0.2100236415863037,
+          "rmse": 0.03821117669470927,
+          "allclose": true,
+          "argmax_equal": true
+        },
+        {
+          "step": 1,
+          "max_abs": 0.14544880390167236,
+          "rmse": 0.02705577011513269,
+          "allclose": true,
+          "argmax_equal": true
+        },
+        {
+          "step": 2,
+          "max_abs": 0.13289451599121094,
+          "rmse": 0.02902344104757054,
+          "allclose": true,
+          "argmax_equal": true
+        },
+        {
+          "step": 3,
+          "max_abs": 0.16245651245117188,
+          "rmse": 0.03156161419259269,
+          "allclose": true,
+          "argmax_equal": true
+        }
+      ]
+    }
+  ],
+  "reference_packages": [
+    "annotated-doc==0.0.5",
+    "anyio==4.15.1",
+    "certifi==2026.7.22",
+    "click==8.5.0",
+    "filelock==3.32.6",
+    "fsspec==2026.7.0",
+    "h11==0.16.0",
+    "hf-xet==1.6.0",
+    "httpcore==1.0.9",
+    "httpx==0.28.1",
+    "huggingface_hub==1.31.0",
+    "idna==3.19",
+    "Jinja2==3.1.6",
+    "markdown-it-py==4.2.0",
+    "MarkupSafe==3.0.3",
+    "mdurl==0.1.2",
+    "mlx==0.32.2",
+    "mlx-lm==0.31.3",
+    "mlx-metal==0.32.2",
+    "numpy==2.4.6",
+    "packaging==26.3",
+    "protobuf==7.36.1",
+    "Pygments==2.21.0",
+    "PyYAML==6.0.3",
+    "regex==2026.9.10",
+    "rich==15.0.0",
+    "safetensors==0.8.0",
+    "sentencepiece==0.2.2",
+    "shellingham==1.5.4",
+    "tokenizers==0.23.2",
+    "tqdm==4.70.1",
+    "transformers==5.17.0",
+    "typer==0.27.2",
+    "typing_extensions==4.16.0"
+  ],
+  "native_runtime": {
+    "mlx": "0.32.0",
+    "vendored_archive_sha256": "8e74a0eb613861ce50c09402dd99dbc42b65a762e7fdd291caa39f611db978ec",
+    "patches": "safemlx-sys/src/mlx-c/patches at the recorded source revision",
+    "safemlx": "0.3.1"
+  },
+  "source_base_revision": "c513e17c583ad7cbc1caa1c9e8d9a4a2c5f62fa3",
+  "source_scope": "Readout/chunk fixture and source modifications are identified by the probe configuration and result fields; the base revision alone does not identify the built executable."
+}

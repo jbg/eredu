@@ -1,4 +1,4 @@
-//! Full nonzero residual cycle: former einsum contractions, independent host
+//! Full nonzero residual cycle: einsum contractions, independent host
 //! arithmetic, and the actual original completion/escaped-account harness.
 use super::*;
 use eredu_nn::{

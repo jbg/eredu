@@ -47,7 +47,7 @@ and its by-value argument snapshots, replacing recursive suffix copies with a
 borrowed fold. Its portable helper is shared by Metal selectors and host-only
 tests. The selector control query prices the resulting actual parameter and
 temporary population; name-allocation and kernel-attempt bounds are unchanged.
-See `doc/bounded-followup-kernel-name.md` for pristine-source parity and layout
+See `doc/bounded-native-execution.md` for pristine-source parity and layout
 evidence.
 
 `mlx-cpu-host-transfer-source.patch` qualifies the existing CPU Host-transfer

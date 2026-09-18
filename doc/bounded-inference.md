@@ -11,38 +11,17 @@ and commitment mechanisms with additional proposal/verification state. The
 
 ## Current integration status
 
-The breaking API and implementation consolidation is in progress. The ordinary
-public prepared-chat path supports bounded semantic tools with an ordinary backend
-and no speculative capability. The final portable facade run passes 38 tests,
-with zero failures and two external-checkpoint cases ignored. All 126 neutral
-backend-conformance tests also pass. Native validation is scoped by execution
-path: all seven public native cases pass, including ordinary tools and child
-sampling, combined image/audio tools, single-device image snapshots/speculation,
-and TP2, PP2 and combined TP2/PP2 media. The earlier
-combined-topology second-request capacity failure is closed. The distributed
-CLI and focused native fixture results are tracked separately in
-[the current overview](bounded-followup.md); this public result does not certify
-every residency or application combination.
+Ordinary prepared chat supports bounded semantic tools with an ordinary backend.
+The portable facade and neutral backend-conformance suites pass; native coverage
+includes seven public tools/media cases and six distributed CLI residency cases.
+Required and Auto tools share ordinary, manual and recorded execution. TP2, PP2
+and combined TP2/PP2 media use an 8 GiB capacity; distributed CLI cases use 64 GiB.
 
-Current work, concrete removals and remaining purposeful mechanisms are listed in
-[the consolidation overview](bounded-followup.md). In particular, the released
-ordinary sensor-recording request now completes under Required and Auto at the
-enforced 64 GiB capacity after reducing the actual collector destinations.
-[Released tool validation](bounded-followup-released-tools.md) records this
-success and the repaired grammar funding refusal on the earlier generic action
-request. That request now completes its 48-token allowance but truncates without
-a tool call. Authenticated single-device media branches and independent
-speculative parity now pass, as do the exercised distributed media paths. These
-results do not establish external application memory policy or unrun native
-configurations.
-
-Historical native evidence covers selected resident/Host/Disk, TP/PP/EP,
-saved-state, capture, realtime and model-family combinations. Those results retain
-their exact source and fixture scope. They do not establish the current whole
-matrix after consolidation. The [evidence index](bounded-inference-evidence.md)
-preserves 205 implementation records and the
-[public conformance record](bounded-followup-public-conformance.md) identifies
-current portable results separately.
+The [design guide](bounded-inference-design.md) describes mechanism ownership.
+[Validation](bounded-inference-validation.md) identifies tested profiles,
+commands, results and platform limits. The released text/image sensor request
+passes Required and Auto under a 64 GiB ceiling; this establishes the stated
+request and hardware configuration, not arbitrary application memory policy.
 
 ## Public request and source identity
 
@@ -148,7 +127,7 @@ Escaping diagnostic errors keep that producer account; fixed scalar refusals nee
 no unrelated payload owner. The focused report tests and the 244-case
 residual-admission checkpoint cover refusal before reservation, final-owner
 retirement and unchanged smaller-candidate classification; commands and scope are
-in [public conformance](bounded-followup-public-conformance.md).
+in [public conformance](prepared-chat-conformance.md).
 
 A complete incremental quote may credit exact already registered decoder roots
 and fixed shared controller sources. It does not authorize subtracting an old
@@ -178,9 +157,9 @@ submitting a refused collective.
 
 Unknown native worker storage remains a typed refusal. Source-derived graph,
 collector, pipeline and host-control costs can dominate small requests even when
-tensor storage fits. The released sensor tool request now succeeds under the
-unchanged 64 GiB limit. Combined TP2/PP2 repeated requests also pass at their
-unchanged 8 GiB per-rank capacity after removing only inactive installed control
+tensor storage fits. The released sensor tool request succeeds under the
+64 GiB limit. Combined TP2/PP2 repeated requests also pass at their
+8 GiB per-rank capacity. Completed-session cleanup retires inactive installed control
 aliases. Escaped owners retain their charges; neither result uses a larger
 allowance or an unenforced fallback.
 
@@ -195,9 +174,9 @@ Capture frames precede associated semantic events and may exist for a failed ste
 with no token. Pending, failed and escaped results retain their actual owners.
 Raw capture/intervention plans are compiled after prompt geometry is known.
 Their source compilation and later native transforms are separate admitted
-producers. Parallel partition discovery now constructs its exact source under
+producers. Parallel partition discovery constructs its exact source under
 funding, including fresh Unix artifact identity. Its source/refusal tests and
-native execution limits are recorded in [partition-source evidence](bounded-followup-partition-source.md).
+native execution limits are recorded in [partition-source evidence](bounded-source-contracts.md).
 
 Snapshots preserve native state, pending input, RNG/adaptive history, constraints,
 semantic prefixes, cursor, timing and lifecycle. Restore/fork use the same copy
@@ -214,47 +193,24 @@ remain explicitly documented.
 
 ## Numerical and performance evidence
 
-The [released Qwen readout/chunk measurements](bounded-qwen-measurements.md)
-preserve independent full-score comparisons, pinned dependencies, original
-commands and tolerances. At 3,000 prompt positions, ordinary 128-position chunking
-recorded an MLX peak of 4,813,825,208 bytes versus 22,433,750,408 for the full chunk.
-A later allocator-corrected managed run recorded 4,811,351,232 bytes. That result
-belongs to executable SHA-256
-`d0dcefcf2ff567ac0e78c9c39014382e7345bdb1596149f21ac252564dd4e5b2` in
-[the public Qwen record](validation/bounded-public-qwen-2026-09-16.json).
-These measurements include model residency and are not process-memory bounds.
+[Released Qwen measurements](bounded-qwen-measurements.md) cover readout and
+chunk selection with pinned reference versions and full-score tolerances.
+[Prepared-chat validation](prepared-chat-validation.md) covers ordinary tool
+requests and authenticated image ingress. Numerical inference, bounded tool
+admission and whole-process memory are separate claims.
 
-The separate graph-construction index optimization preserved best-fit allocation
-semantics while reducing its recorded 3,000-token run from 65.796 to 4.705 seconds
-with identical token IDs. Its distinct executable and measurements are recorded
-under `graph_construction_class_index` in the same evidence file. Its timing must
-not be combined with the earlier executable's peak or treated as current tool
-request performance.
+[Tokenizer measurements](bounded-text-processing.md#storage-and-search-cost)
+record workload-specific throughput and storage tradeoffs. Native functional
+runs establish behavior and custody; their wall times are not isolated benchmarks.
 
-Current tokenizer parity/throughput and ordinary tool behavior are documented in
-[public conformance](bounded-followup-public-conformance.md) and
-[tokenizer consolidation](bounded-followup-tokenizer.md). Current native mechanism,
-released numerical and tool-admission results have separate records; successful
-ordinary numerical inference does not establish bounded tool admission.
+## Verification and limits
 
-## Verification and remaining work
-
-Focused verification follows each changed producer or shared lifecycle. The
-portable facade uses neutral backends. Native metadata builds establish type and
-feature compatibility; actual device tests establish numerical/lifetime behavior.
+Portable tests use neutral backends. Metadata builds establish type/feature
+compatibility; actual device tests establish numerical and lifetime behavior.
 Released checkpoints stay outside the tracked tree with pinned provenance.
 
-The exercised native image/tool, independent-media and branch/terminal cases
-have recorded passing results. Released text and authenticated image requests
-pass both Required and Auto policies with freshly verified pinned artifacts.
-These results retain their exact fixture and hardware scope. The current
-distributed CLI and focused native follow-up verdicts remain in the overview;
-fresh funded file opening outside Unix remains an explicit qualification gap.
-See [the work overview](bounded-followup.md) for current status and
-[the evidence index](bounded-inference-evidence.md) for prior results.
-
-Historical implementation notes remain in repository history at
-`77e08045401912c502e6ab1600e8b622c3563478`. Their intermediate startup/record names and
-old pending statements are superseded by the current contracts here. Reproducible
-commands and measurements remain in the linked evidence rather than being
-repeated as claims of current completeness.
+The [validation guide](bounded-inference-validation.md) records native profiles,
+stack requirements, tested hardware and unqualified configurations. Fresh funded
+file opening outside Unix and downstream memory/cache policy require separate
+validation. Unknown native bounds and unsupported prediction-extension producers
+return typed refusals; they are not inherent model-family limitations.

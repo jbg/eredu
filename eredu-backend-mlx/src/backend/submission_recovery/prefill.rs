@@ -637,7 +637,7 @@ pub(crate) fn facts(
         .ok()
         .and_then(|n| Layout::array::<Slot>(n).ok())
         .ok_or_else(|| memory(WorkingMemoryError::Overflow))?;
-    // D2 replaces the four inspector boxes with fixed borrowed companions.
+    // Inspectors use four fixed borrowed companions.
     // These are the actual outer-boundary/inner-callback return shapes; install
     // and retirement share the same projection shape. No callback is executed
     // here, and these controls do not certify full media workspace/completion.

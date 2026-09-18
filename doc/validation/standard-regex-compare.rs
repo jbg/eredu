@@ -1,5 +1,5 @@
-//! Pinned upstream wrapper and lower dependency comparison; run via the isolated
-//! manifest recorded in bounded-followup-schema-compiler.md.
+//! Pinned wrapper/lower-engine comparison. Requires current/reference regex
+//! dependencies and a current_automata alias; see bounded-grammar-construction.md.
 use std::{hint::black_box, sync::Arc, time::Instant};
 fn compare(pattern: &str, texts: &[&str]) -> usize {
     let actual =

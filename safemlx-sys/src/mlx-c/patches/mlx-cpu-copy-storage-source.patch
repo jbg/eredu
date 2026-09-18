@@ -80,8 +80,8 @@ diff --git a/mlx/backend/cpu/copy.cpp b/mlx/backend/cpu/copy.cpp
    }
  }
  
-+// This is the existing fixed copy dispatch, now named so its exact bound
-+// TaskNode can be queried without allocating or constructing weak arrays.
++// The named fixed copy dispatch exposes its bound TaskNode layout
++// without allocating or constructing weak arrays.
 +struct InplaceCopyTask {
 +  array src,dst;
 +  CopyType ctype;

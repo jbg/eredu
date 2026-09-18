@@ -100,7 +100,7 @@ impl PendingWeightMaterialization {
             gguf_custody: None,
             acquisition_metadata: None,
             // Native primitives/accepted records own core::Stream values;
-            // only ordinary recovery retains the historical wrapper clones.
+            // only ordinary recovery retains the wrapper clones.
             _source_stream: original.is_none().then(|| source_stream.clone()),
             _execution_stream: original.is_none().then(|| execution_stream.clone()),
         };

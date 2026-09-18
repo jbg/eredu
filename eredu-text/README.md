@@ -34,7 +34,7 @@ Split profiles. Metaspace decoding and the selected byte/fallback decoder forms
 share their ordinary component workers. Source compilation checks the complete
 configuration and returns typed profile refusals for other programs.
 
-See [composition coverage and limits](../doc/bounded-followup-tokenizer-composition.md)
+See [composition coverage and limits](../doc/bounded-text-processing.md)
 for independent-reference, funding-refusal and public-generation evidence,
 including the scoped census of published tokenizer configurations. These tests
 do not establish arbitrary regex, decoder, stochastic Unigram or training bounds.

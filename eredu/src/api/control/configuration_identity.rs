@@ -56,7 +56,7 @@ mod tests {
                     [0_u32, 123, u32::MAX],
                     ["", long_stop.as_str()],
                 );
-                // The pre-change representation is the compatibility oracle.
+                // Serialized policy and text provide an independent identity oracle.
                 let prior: [u8; 32] = Sha256::digest(serde_json::to_vec(&input).unwrap()).into();
                 assert_eq!(digest(&input).unwrap(), prior);
             }

@@ -376,8 +376,8 @@ fn valid_cross_unit_cycle_materializes_canonical_rows_once_then_binds_both_alias
         )
         .unwrap();
         manager.initialize().unwrap();
-        // This previously recursed first -> second -> first before any hit or
-        // materialization. Individual tensor aliases have real canonical roots.
+        // Resolve individual tensor aliases to their canonical roots without
+        // recursing through the two logical units.
         let mut transfer = manager
             .acquire_many_with_transfer(&[(id("first"), 1)], tier)
             .unwrap();

@@ -239,7 +239,7 @@ pub struct TokenCommit {
 mod sequence_storage;
 pub use sequence_storage::{
     GenerationSequenceStorage, GenerationText, GenerationTokenIdStorage, GenerationTokenIds,
-    GenerationTokenIdsIntoIter, LegacyGenerationStorage, RetainedGenerationSequence,
+    GenerationTokenIdsIntoIter, OwnedGenerationStorage, RetainedGenerationSequence,
     RetainedGenerationSequenceCopy, RetainedGenerationSequenceStorage, RetainedGenerationStorage,
     RetainedGenerationStorageOwner, RetainedSequenceConstructionError,
     RetainedSequenceCopyMismatch, RetainedSequencePreparationError,
@@ -250,7 +250,7 @@ pub use sequence_storage::{
 /// Default storage retains the legacy allocating constructor, Clone and Vec
 /// extraction. Retained storage uses the same algorithm with one mutable owner.
 #[derive(Debug, Eq, PartialEq)]
-pub struct GenerationSequence<S = LegacyGenerationStorage> {
+pub struct GenerationSequence<S = OwnedGenerationStorage> {
     max_tokens: usize,
     storage: S,
     finish_reason: Option<FinishReason>,
@@ -271,7 +271,7 @@ impl GenerationSequence {
         eos_token_ids.dedup();
         Self {
             max_tokens,
-            storage: LegacyGenerationStorage {
+            storage: OwnedGenerationStorage {
                 eos_token_ids,
                 tokens: Vec::with_capacity(max_tokens),
             },

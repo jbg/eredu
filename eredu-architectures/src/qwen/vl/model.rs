@@ -204,7 +204,7 @@ fn assemble_input<T: Tensor>(
 ) -> Result<PreparedInputAssembly<T>, Error> {
     metadata.controls::<(PreparedInputAssembly<T>, PreparedInputKind, [i32; 2])>()?;
     let prepared = input.prepared();
-    if let Some(admitted) = input.admitted().legacy() {
+    if let Some(admitted) = input.admitted().ordinary() {
         if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
             return Err(metadata.error(format_args!(
                 "Qwen3-VL prepared input no longer matches its admission"

@@ -810,7 +810,7 @@ impl<B: TextGenerationBackend, C: TokenFilterController> TextContinuationBoundar
                 capture_source: self.state.inner.capture_source.clone(),
                 intervention_source: self.state.inner.intervention_source.clone(),
                 resume_host: self.state.inner.resume_host.clone(),
-                prepared_sequence: preparation::PreparedSequence::Legacy,
+                prepared_sequence: preparation::PreparedSequence::Ordinary,
                 preparation: self.state.inner.preparation.clone(),
                 preparation_control: self.state.inner.preparation_control.clone(),
                 backend_state,

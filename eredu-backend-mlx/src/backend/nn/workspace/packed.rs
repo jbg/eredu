@@ -233,7 +233,7 @@ fn observed_operation_bound(
         }
         let score_prefix = &shape[..shape.len() - 1];
         let score_tail = [weight_shape[0]];
-        // The former synthesized score layout validated before packed geometry.
+        // Validate score layout before packed geometry to preserve error precedence.
         // Keep that ordering through the shared two-slice byte-count kernel.
         let score_bytes =
             WorkspaceLayoutView::joined_bytes(score_prefix, &score_tail, WorkspaceDtype::Float32)?;

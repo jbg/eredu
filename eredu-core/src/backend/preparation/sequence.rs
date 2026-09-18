@@ -180,14 +180,14 @@ impl GenerationSequenceAdmissionError {
 
 #[derive(Debug)]
 pub(in crate::backend) enum PreparedSequence {
-    Legacy,
-    // None means already taken, not permission to fall back to legacy copying.
+    Ordinary,
+    // None means already taken, not permission to fall back to ordinary copying.
     Retained(Option<RetainedGenerationSequence>),
 }
 impl PreparedSequence {
     pub(in crate::backend) fn take(&mut self) -> Option<RetainedGenerationSequence> {
         match self {
-            Self::Legacy => None,
+            Self::Ordinary => None,
             Self::Retained(value) => value.take(),
         }
     }

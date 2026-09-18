@@ -114,7 +114,7 @@ impl PreparedPendingWeight {
 
     /// Source layouts, immutable copied backing and one cache-control debit.
     /// Key buffers are in host_destination_requests; shared existing owners are
-    /// separate. This replaces the previous control-only source bank term.
+    /// separate. The source bank includes both controls and owned payloads.
     pub(crate) fn source_copy_storage_bytes(
         plan: &eredu_checkpoint::gguf_store::GgufConversionPlan,
         runtime: &safemlx::PreparedInputRuntime,

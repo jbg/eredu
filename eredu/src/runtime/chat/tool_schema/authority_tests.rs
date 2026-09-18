@@ -356,7 +356,7 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     drop((scalar, funding));
 
     // Cross the actual property-table and string-enum thresholds. Both ordinary
-    // and original validation now inspect the same pinned completed hash maps.
+    // and original validation inspect the same pinned completed hash maps.
     let properties: serde_json::Map<String, Value> = (0..19)
         .map(|i| (format!("p{i}"), serde_json::json!({"type":"boolean"})))
         .collect();
@@ -902,7 +902,7 @@ fn original_borrowed_schema_input_matches_full_engine_and_retains_first_failure(
     }
 
     // The pinned analyzer routes these patterns to the general engine. Its
-    // retained source census and invocation-owned cache now participate in the
+    // retained source census and invocation-owned cache participate in the
     // same admission and first-failure rules as the other schema producers.
     for pattern in ["^é", "^(?!bad)"] {
         let schema =

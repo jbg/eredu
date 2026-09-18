@@ -1250,7 +1250,7 @@ where
 }
 
 // Original failures retain their existing paid cause. Ordinary conversion keeps
-// the former outer Exception wrapper; sequence storage does not alter its policy.
+// an outer Exception wrapper; sequence storage does not alter its policy.
 fn batch_preparation_error(cause: Error, streams: SpeculativeExecutionStreams<'_>) -> Error {
     match streams.original_numerical() {
         Some((sources, _)) => sources.retain_error(cause),

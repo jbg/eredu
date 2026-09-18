@@ -83,7 +83,7 @@ impl PackedOperations for Native<'_>{
     fn at(&self,value:&Array,slot:i32)->Result<Array,Self::Error>{
         let shape=value.shape();let rank=shape.len();
         if rank==0||slot<0||slot>=shape[0]{return Err(self.invalid());}
-        // Same Slice + reshape as the ordinary static index, now exposing
+        // Slice + reshape uses the ordinary static index and exposes
         // its actual coordinates to the cold adapter. StaticSlice's existing
         // narrow-axis control source pays these inline/fallback destinations.
         let selected=if rank<=4 {

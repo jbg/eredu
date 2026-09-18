@@ -230,7 +230,7 @@ fn real_aggregate_partial_frontiers_keep_both_original_allowances_in_one_core_en
 
 #[test]
 fn root_rejection_empty_and_late_semantics_keep_input_without_reclassifying_it_as_c() {
-    // These formerly unqualified regex producers now use fresh construction.
+    // These regex producers require fresh source construction.
     // Preserve both as real C-admission refusals while I remains retained.
     for supported in [
         JSON.replace("\"use_regex\":false", "\"use_regex\":true"),

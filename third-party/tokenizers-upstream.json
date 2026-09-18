@@ -104,24 +104,6 @@
     "tests/training.rs": "f0433b135226479693729e4ebe15d91767545b17a5ecefe87717afc42e0dcb19",
     "tests/unigram.rs": "73192b32a0a6d53a7b22e50e74f48e9b85c1295cd956e0b6def51b5a1f71be4f"
   },
-  "historical_local_deltas": [
-    {
-      "changed_paths": [
-        "src/models/bpe/model.rs",
-        "src/models/mod.rs",
-        "src/models/unigram/model.rs",
-        "src/models/wordlevel/mod.rs",
-        "src/models/wordpiece/mod.rs",
-        "src/normalizers/replace.rs",
-        "src/tokenizer/added_vocabulary.rs",
-        "src/tokenizer/decode_vocabulary_tests.rs",
-        "src/tokenizer/mod.rs"
-      ],
-      "patch": "tokenizers-borrowed-decode.patch",
-      "patch_sha256": "ebe704a037d685a549daeffdea08faabf1e98fe62e8f8cde0ae6fd6af1ffb468",
-      "scope": "Initial borrowed-decoder accessor patch only; superseded by the current local delta below."
-    }
-  ],
   "local_changed_paths": [
     "Cargo.lock",
     "Cargo.toml",
@@ -318,8 +300,7 @@
   },
   "local_delta_format": "SHA-256 of local_delta_files serialized as UTF-8 JSON with sorted keys, ensure_ascii=true, separators=(comma, colon), and no trailing newline. Values are current file SHA-256 digests; null denotes removal. Compare with files for original hashes; absent original paths are additions.",
   "local_delta_sha256": "e18d6313cab6daf899979ff61aae08a30198dc6fc087d308961605546df7cc71",
-  "local_snapshot_date": "2026-09-18",
-  "local_snapshot_scope": "Current tokenizers-0.23.2 source tree, including manifests, lockfile, benches and tests; target, .git, __pycache__ and .DS_Store are excluded. Original archive file hashes remain in files.",
+  "local_source_scope": "Current tokenizers-0.23.2 source tree, including manifests, lockfile, benches and tests; target, .git, __pycache__ and .DS_Store are excluded. Original archive file hashes remain in files.",
   "unsafe_boundary": "Locally modified pinned external tokenizer dependency, explicitly excluded from the Cargo workspace; it does not inherit the workspace unsafe_code=forbid lint. Retained upstream UTF-8 conversion, trainer and alignment unsafe internals remain within this existing external dependency boundary. The current archive-to-fork diff adds no unsafe sites and removes the upstream unchecked byte-to-character conversion; local source construction and execution changes use safe Rust.",
   "url": "https://static.crates.io/crates/tokenizers/tokenizers-0.23.2.crate",
   "vcs": {

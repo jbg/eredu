@@ -275,9 +275,9 @@ pub(in crate::composition::mlx::session::model_session) fn active_control_bytes(
     u64::try_from(controls).map_err(|_| error(WorkingMemoryError::Overflow))
 }
 
-// Replaces the old threefold Carrier term: the existing Box payload is counted
-// once, with its two existing preparation/Box::new moves. Added terms are named
-// owner/result and unboxing controls, not a second carrier allocation.
+// Count the Box payload once, plus its preparation and Box::new moves.
+// The other terms cover owner/result and unboxing controls, not another
+// carrier allocation.
 fn carrier_owner_control_bytes() -> Option<usize> {
     size_of::<CaptureCarrier>() // existing Box payload
         .checked_add(size_of::<CaptureCarrier>())? // prepared value

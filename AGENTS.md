@@ -3,6 +3,15 @@
 These rules apply to the entire repository. They describe semantic ownership
 and dependency direction; directory names alone are not an architectural API.
 
+## Documentation and naming
+
+Documentation, comments and names describe current behavior, ownership and
+constraints. Keep implementation chronology, superseded failures and development
+checklists in version control history rather than maintained guides or source
+comments. Phases and steps may describe software execution, algorithms or user
+procedures. Preserve dependency provenance and reproducible validation inputs,
+profiles, results and limitations without a development narrative.
+
 ## Dependency direction
 
 Production crates occupy these dependency strata, from dependency roots to

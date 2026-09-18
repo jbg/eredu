@@ -105,7 +105,7 @@ fn model_clone_and_clone_from_replace_table_identity_with_preserved_state() {
     let old_token = destination.layer_slot_metadata().clone();
     attach(&old_token, &domain, &used);
     destination.clone_from(&source);
-    // The former derived Clone used the default whole-value clone_from. Equal
+    // clone_from preserves independently owned state. Equal
     // extents still replace the actual allocation and retire its old identity.
     assert_retired(&old_token, &domain);
     assert!(!old_token.same_storage(destination.layer_slot_metadata()));

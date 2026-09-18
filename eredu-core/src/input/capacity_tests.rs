@@ -59,7 +59,7 @@ fn fixed_entries_preserve_sorted_lookup_wire_and_legacy_map_serde() {
     assert!(map.contains_key(&InputMetadataKey::PatchGrid));
     assert!(map.get(&InputMetadataKey::AudioMask).is_none());
 
-    // The former representation was two serialized BTreeMaps. Construct that
+    // The wire representation contains two serialized BTreeMaps. Construct that
     // representation independently rather than comparing a serializer to itself.
     #[derive(Serialize)]
     struct LegacyPart<'a> {

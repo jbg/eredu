@@ -201,7 +201,7 @@ impl WorkspacePoolingStateFactory {
             )
         };
         // Keep ingestion/duplicate rejection before declared-role validation and
-        // unknown-role rejection last, as in the former ordered map worker.
+        // unknown-role rejection last, following ordered-map traversal.
         let mut supplied = self
             .context
             .metadata_vec::<(StateTensorRole, Option<Option<WorkspaceTensor>>)>(

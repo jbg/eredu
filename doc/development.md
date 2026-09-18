@@ -103,9 +103,8 @@ staging is exclusively locked and cleaned after validation.
 Rust keys include the source commit and fall back across compatible dependency
 versions, allowing the snapshot to improve after source-only fixes. Gate cleanup
 keeps only the newest snapshot per configuration, with a 4 GiB aggregate Rust
-budget across all cache revisions, and removes the superseded `rust-v2`
-snapshots. The `rust-v4` keys fall back to compatible `rust-v3` snapshots during
-migration. Archive subsets have distinct exact keys on the same commit but
+budget across all cache revisions, and removes `rust-v2` snapshots. The `rust-v4` keys can restore compatible
+`rust-v3` snapshots. Archive subsets have distinct exact keys on the same commit but
 share fallback artifacts. Exact hits are not saved again. Cleanup leaves all native
 caches untouched. Pull requests restore caches but do not save Rust snapshots or
 run cache cleanup. Missing caches only affect performance, never test selection.

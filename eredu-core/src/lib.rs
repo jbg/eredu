@@ -162,7 +162,7 @@ pub use generation::{
     GenerationConfigOverrides, GenerationError, GenerationOutput, GenerationPlainTextOutput,
     GenerationSequence, GenerationSequenceStorage, GenerationText, GenerationTiming,
     GenerationTokenIdStorage, GenerationTokenIds, GenerationTokenIdsIntoIter,
-    LegacyGenerationStorage, OptimisticReuseDecision, ResolvedGenerationConfig,
+    OwnedGenerationStorage, OptimisticReuseDecision, ResolvedGenerationConfig,
     RetainedGenerationSequence, RetainedGenerationSequenceCopy, RetainedGenerationSequenceStorage,
     RetainedGenerationStorage, RetainedGenerationStorageOwner, RetainedSequenceConstructionError,
     RetainedSequenceCopyMismatch, RetainedSequencePreparationError, SemanticEvent,

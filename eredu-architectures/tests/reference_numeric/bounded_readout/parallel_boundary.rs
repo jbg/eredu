@@ -124,7 +124,7 @@ impl eredu_runtime::ActivationObserver<NumericTensor, Error> for BoundaryObserve
     }
 }
 
-/// The former explicit-step body of scheduled_composite_text, now shared with
+/// Explicit advancement for scheduled composite text, shared with
 /// run/cancellation instrumentation. Both forms invoke the production scheduler.
 /// The observer accepts only the readout rows actually requested by that driver.
 pub(crate) fn scheduled<A, D>(

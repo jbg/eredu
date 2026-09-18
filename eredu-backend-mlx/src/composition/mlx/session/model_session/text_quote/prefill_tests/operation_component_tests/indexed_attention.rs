@@ -1,4 +1,4 @@
-//! Fixed indexed attention compared with the former einsum worker and host oracle.
+//! Fixed indexed attention compared with an einsum worker and host oracle.
 use super::*;
 use eredu_nn::IndexedAttentionInput;
 use safemlx::{

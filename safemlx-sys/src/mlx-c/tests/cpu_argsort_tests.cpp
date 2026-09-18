@@ -147,7 +147,7 @@ TEST_CASE("CPU argsort actual F32 views preserve signed strides and flattened re
   eval(flat);
   const auto expected = oracle::ordinary(values.data(), 1, values.size());
   CHECK(std::vector<uint32_t>(flat.data<uint32_t>(), flat.data<uint32_t>() + flat.size()) == expected);
-  // Nonselected multidimensional-axis and F64 paths retain their old worker.
+  // Multidimensional-axis and F64 paths use their own selected worker.
   auto axes = argsort(matrix, 1, stream);
   eval(axes);
   for (size_t row = 0; row < 3; ++row) {

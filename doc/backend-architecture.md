@@ -4,7 +4,7 @@ Eredu separates portable model semantics and execution policy from native
 realization. [Repository rules](../AGENTS.md) define dependency ownership and
 feature boundaries. This document describes the current contracts; validation
 status is maintained separately in [bounded inference](bounded-inference.md) and
-[the consolidation overview](bounded-followup.md).
+[the design overview](bounded-inference-design.md).
 
 ## Dependency direction
 
@@ -199,7 +199,8 @@ that prepared manager even when the local partition has no paged attention rows;
 layout, global layer indices, child roles and physical pool identity remain exact.
 Old pages and escaped fixed tensors keep their original owners. This constructs
 empty metadata and tables without copying tensors or refunding cumulative work.
-Native distributed reset validation remains in progress.
+The six-case Dense/Mova Resident/Host/Disk CLI matrix covers distributed reset;
+its exact profile and limits are in [validation](bounded-inference-validation.md).
 
 The portable residency plan's device depth remains the maximum moving-unit
 window. Ordinary and admitted native acquisition settle the preceding consumer
@@ -451,13 +452,12 @@ its payer. `retained_source_construction_bytes` describes that worker's actual
 Box/shared-shell allocations and fixed constructor transports. Paid callers use
 that quote or the same `metadata_source` worker before erasure. `Message(String)`
 holds already produced diagnostic text and grants no funding or source authority.
-The former eager-format `backend_source` constructor is removed.
 
 Native kernel-name construction also uses one worker for ordinary and admitted
 execution. It preserves by-value argument snapshots and appends them by borrow,
 removing recursive suffix copies. The qualified selector query prices the actual
 entry values, numeric temporary and references while preserving lookup counts,
-name heap bounds and cache ownership. [Host evidence](bounded-followup-kernel-name.md)
+name heap bounds and cache ownership. [Host evidence](bounded-native-execution.md)
 records pristine parity and the derived storage reduction separately from whole
 request cost and device execution.
 
@@ -483,9 +483,9 @@ lexer plan, and failures preserve the first funding cause and original account.
 Framework-managed bounds do not describe total process or system memory. Application
 buffers, event copies, allocator caches and opaque driver/JIT internals need their
 own declared policy. [Bounded inference](bounded-inference.md) defines the public
-scope; [released tool validation](bounded-followup-released-tools.md) records
+scope; [released tool validation](prepared-chat-validation.md) records
 current Required/Auto text and image successes, exact capacity and process-memory
-measurements, and earlier refusals with their limitations.
+measurements and validation limits.
 
 Native candidate refusals retain scalar component diagnostics beneath the neutral
 `BackendFailure`. They describe initial, minimum and final candidates without
@@ -643,7 +643,7 @@ identity reduction and shared resolution cache. Fresh Unix identity construction
 funds read buffers, members, paths and errors before their producers, without an
 ordinary cache warmup. The safe `rustix` filesystem dependency is host operating
 system support and introduces no unsafe-code exception. Fresh funded opening on
-other hosts still requires qualification. [Partition-source evidence](bounded-followup-partition-source.md)
+other hosts still requires qualification. [Partition-source evidence](bounded-source-contracts.md)
 records the exact behavior, refusal/custody tests and native validation scope.
 
 Synchronous host summaries use the same once-only original capture claim. A closed
@@ -893,10 +893,8 @@ in [the MLX backend guide](../eredu-backend-mlx/doc/README.md). Detailed discove
 contracts are in [architecture discovery](architecture-discovery.md), and public
 control integration is in [the Inspector guide](lm-inspector-execution-control.md).
 
-Reproducible commands, checkpoint revisions, hashes, tolerances and failed attempts
-remain in `doc/validation/` and the linked support documents. Earlier chronological
-architecture notes are retained in repository history at
-`77e08045401912c502e6ab1600e8b622c3563478`; they are not the current support matrix.
-[Current consolidation status](bounded-followup.md) separates completed mechanisms
-and released/public tool validation from the remaining distributed CLI checks
-and explicitly qualified platform or test-environment limitations.
+Reproducible commands, checkpoint revisions, artifact hashes and tolerances are
+in the [validation guide](bounded-inference-validation.md) and its result records.
+The [design guide](bounded-inference-design.md) describes execution ownership;
+validation distinguishes portable contracts, native mechanisms and released
+requests with explicit platform and test-environment limits.

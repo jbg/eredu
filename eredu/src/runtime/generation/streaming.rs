@@ -6,7 +6,7 @@
 
 use eredu_core::HostPreparationAuthority;
 use eredu_core::generation::{
-    FinishReason, GenerationCancellationToken, GenerationSequence, LegacyGenerationStorage,
+    FinishReason, GenerationCancellationToken, GenerationSequence, OwnedGenerationStorage,
     SemanticEvent, TokenTerminalSignals,
 };
 use std::collections::{BTreeSet, HashMap};
@@ -1207,7 +1207,7 @@ pub(crate) enum CommittedGenerationError<S, D, P = std::convert::Infallible> {
 /// specialization supports Clone/snapshot; source and pipeline ownership stay
 /// outside this cursor and still require their original facade admission.
 #[derive(Debug)]
-pub(crate) struct CommittedGenerationCursor<S: CursorStorage = LegacyGenerationStorage> {
+pub(crate) struct CommittedGenerationCursor<S: CursorStorage = OwnedGenerationStorage> {
     // Taken only for consuming core preparation. Its typed failure owns the
     // same sequence; no replacement or cloned provider is installed here.
     sequence: Option<GenerationSequence<S>>,

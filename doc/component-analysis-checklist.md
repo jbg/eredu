@@ -60,7 +60,7 @@ The integration guide records exact loaded capabilities and protocol limitations
   pass independent pinned-reference comparisons, reconstruction, causal masks,
   effective queries, coordinated edits and restoration. Source and derivative
   hashes match provenance. The sparse comparison checks **10,944,290 values**.
-- The [validation record](component-validation.md#current-acceptance-summary)
+- The [validation record](component-validation.md)
   preserves exact commands, revisions, geometries, tolerances and detailed results.
   The guide and checklist's local links and documentation whitespace were checked.
 

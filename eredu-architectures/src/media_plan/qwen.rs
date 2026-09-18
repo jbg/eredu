@@ -112,19 +112,19 @@ impl std::error::Error for MediaSemanticError {}
 #[derive(Clone, Copy)]
 pub(crate) enum ShapeRef<'a> {
     Host(&'a [usize]),
-    Legacy(&'a [u64]),
+    Dimensions(&'a [u64]),
 }
 impl ShapeRef<'_> {
     pub(crate) fn len(self) -> usize {
         match self {
             Self::Host(s) => s.len(),
-            Self::Legacy(s) => s.len(),
+            Self::Dimensions(s) => s.len(),
         }
     }
     pub(crate) fn get(self, axis: usize) -> Option<u64> {
         match self {
             Self::Host(s) => s.get(axis).and_then(|n| u64::try_from(*n).ok()),
-            Self::Legacy(s) => s.get(axis).copied(),
+            Self::Dimensions(s) => s.get(axis).copied(),
         }
     }
     fn dimension(self, axis: usize) -> Result<u64, MediaSemanticError> {

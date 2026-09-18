@@ -155,7 +155,7 @@ where
     let prepared = input.prepared();
     let admitted = input
         .admitted()
-        .legacy()
+        .ordinary()
         .expect("this family retains ordinary admission");
     if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
         return Err(Error::backend(
@@ -250,7 +250,7 @@ where
         group != 0
             || input
                 .admitted()
-                .legacy()
+                .ordinary()
                 .expect("this family retains ordinary admission")
                 .parts()
                 .iter()
@@ -265,7 +265,7 @@ where
         let positions = if group == 0 {
             input
                 .admitted()
-                .legacy()
+                .ordinary()
                 .expect("this family retains ordinary admission")
                 .parts()
                 .iter()
@@ -280,7 +280,7 @@ where
         } else {
             input
                 .admitted()
-                .legacy()
+                .ordinary()
                 .expect("this family retains ordinary admission")
                 .decoder_positions()
         };
@@ -298,7 +298,7 @@ where
         }
         let patches = input
             .admitted()
-            .legacy()
+            .ordinary()
             .expect("this family retains ordinary admission")
             .parts()
             .iter()
@@ -409,7 +409,7 @@ where
         crate::composite_execution::segmented_token_ingress_collectives_in(
             input
                 .admitted()
-                .legacy()
+                .ordinary()
                 .expect("this family retains ordinary admission")
                 .parts()
                 .iter()

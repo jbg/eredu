@@ -510,7 +510,7 @@ where
         eredu_runtime::input::host::HostTensorView<'_>)>()?;
     let prepared = input.prepared();
     let admitted = input.admitted();
-    if admitted.legacy().is_some_and(|value| prepared.identity() != value.identity())
+    if admitted.ordinary().is_some_and(|value| prepared.identity() != value.identity())
         || prepared.len() != admitted.gemma_parts().len() {
         return Err(metadata.error(format_args!("Gemma 4 prepared input no longer matches its admission")));
     }

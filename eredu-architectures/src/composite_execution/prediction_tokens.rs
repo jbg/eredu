@@ -21,7 +21,7 @@ pub(crate) fn visit<T: Tensor, P>(
     visitor: &mut dyn FnMut(PredictionTokenPart<'_, T>) -> Result<(), eredu_nn::Error>,
 ) -> Result<(), eredu_nn::Error> {
     let metadata = Metadata::new(input.metadata());
-    let admitted = input.admitted().legacy().ok_or_else(|| metadata.error(format_args!(
+    let admitted = input.admitted().ordinary().ok_or_else(|| metadata.error(format_args!(
         "generic placeholder conversion requires ordinary family admission")))?;
     for (part, plan) in input.prepared().parts().iter().zip(admitted.parts()) {
         let part = match placeholder(plan) {

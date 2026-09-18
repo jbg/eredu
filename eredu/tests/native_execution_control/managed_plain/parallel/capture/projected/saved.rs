@@ -4,7 +4,6 @@ use eredu_core::capture::{CaptureBudget, CaptureLimitPolicy};
 
 const RECORDS: usize = 4;
 // This is the same finite positive capacity as the projected decode fixture.
-// The previously recorded 8 GiB admission refusal remains separate evidence.
 const CAPACITY: u64 = 16 * 1024 * 1024 * 1024;
 
 fn selected_saved(discovery: &eredu_core::capture::CaptureDiscovery, world: usize, captures: u64) -> CapturePlan {

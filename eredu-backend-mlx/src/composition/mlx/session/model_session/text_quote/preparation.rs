@@ -502,7 +502,7 @@ pub(super) fn facts() -> Result<TextPreparationScopeFacts, Error> {
 ))]
 pub(super) mod tests;
 
-// Exact read-only pending query introduced by the original input route. The
+// Exact read-only pending query for the original input route. The
 // returned bool carries no owner; the underlying slot stays in the quote A.
 pub(super) fn original_input_borrow_control_bytes() -> Option<usize> {
     size_of::<std::cell::Ref<'_, Slot<Prompt>>>()

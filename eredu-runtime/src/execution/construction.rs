@@ -164,7 +164,7 @@ pub(super) fn layout(
     })
 }
 
-// The ordinary derived-clone layout is now explicit so paid copies use the
+// The explicit derived-clone layout lets paid copies use the
 // identical field order, names, adjacency rows, execution order and output.
 pub(super) fn clone_graph(
     source: &ExecutionGraph,

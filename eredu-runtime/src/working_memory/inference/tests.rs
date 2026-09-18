@@ -201,7 +201,7 @@ fn request_quote_prices_overlapping_cache_generations_and_rejects_the_old_undere
     assert_eq!(persistent.requested_state_bytes, 96);
     let estimate = report.compose(persistent, outside(g)).unwrap();
     let mut request = request(g);
-    // Omitting displaced state formerly quoted 96 persistent + 24 transient.
+    // Displaced state contributes to both persistent and transient demand.
     request.application_memory_budget_bytes = Some(128);
     assert!(matches!(
         eredu_core::apply_admission_policy(&capabilities(), request, estimate.clone(), None)

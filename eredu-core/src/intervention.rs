@@ -1239,7 +1239,7 @@ fn validate_ids(ids: &[u32], count: u32) -> Result<(), CaptureError> {
 
 // Validate the immutable caller order without a temporary tree. Range failure
 // still precedes duplicate comparison for each entry; the first invalid entry
-// stops the scan, just as with insertion into the former validation set.
+// stops the scan, preserving insertion-order validation precedence.
 fn unique_ids_in_range(ids: &[u32], count: u32) -> bool {
     let mut maximum: Option<u32> = None;
     for (offset, &id) in ids.iter().enumerate() {

@@ -129,7 +129,7 @@ toktrie = { path = "third-party/toktrie-1.8.0" }
 # Safe borrowed decode accessors; provenance in third-party/tokenizers-upstream.json.
 tokenizers = { path = "third-party/tokenizers-0.23.2" }
 
-# Closed fallible PikeVM workspace; exact upstream provenance in third-party/regex-automata-workspace.json.
+# Closed fallible PikeVM workspace; exact upstream provenance in third-party/regex-automata-upstream.json.
 regex-automata = { path = "third-party/regex-automata-0.4.18" }
 
 # Canonical 0.19 engine for tokenizer and schema consumers; original workers and explicit search storage.

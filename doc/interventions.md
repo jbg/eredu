@@ -187,7 +187,7 @@ statistics. Route previews include original and effective expert IDs and
 coefficients. They are taken from one router evaluation, not a second model pass.
 The ordinary capture catalog continues to describe activations before intervention
 and effective route observations after dispatch.
-Raw candidate payloads now include `source: "original"` or `"effective"` in
+Raw candidate payloads include `source: "original"` or `"effective"` in
 addition to `stage: "raw_logits_before_sampling"`. Ordinary candidate captures
 are original at the logits hook; interventions at earlier hooks may already have
 affected them. Candidate scores are never processed sampling probabilities.
@@ -286,7 +286,7 @@ of the facade's neutral `BackendFailure`; native exceptions retain their origina
 message and creation location. Bounded failure records still contain bounded text,
 and consumed reservations are not refunded by restore. The error source does not
 replace the existing completion and state-recovery checks. See
-[the observation error evidence](component-validation.md#observation-error-causes).
+[the observation error evidence](component-validation.md).
 
 A new model family declares its genuine hooks and ordinary selector policy in
 `eredu-architectures`; these drivers do not require a new action implementation for
@@ -296,7 +296,7 @@ listed above, and it does not add a production backend.
 
 The lower-level Rust interfaces changed: the coarse
 `InterventionBackend::apply_intervention` method was replaced by native primitives;
-intervention preflight and `CaptureSession::enable_interventions` now take backend
+intervention preflight and `CaptureSession::enable_interventions` take backend
 estimates. Backend implementers must update those call sites. `RoutingMechanism`
 and the shared session/observer helpers provide the replacement execution path.
 Serialized plans/records and the application facade workflow are unchanged.
@@ -345,7 +345,7 @@ Component boundaries additionally support `MaskComponents`: a compact list of
 unique indices and a keep-only/deletion flag over the complete final `component`
 axis. Explicit token-row slices are independent of prediction schedules. Surviving
 values are recomputed in the current forward. Activation-edit storage and host
-uploads are now reserved via `InterventionEstimator::activation_usage` before
+uploads are reserved via `InterventionEstimator::activation_usage` before
 native work, in addition to evidence and diagnostic charges. See
 [component analysis](component-analysis.md) for the API and current coverage.
 
@@ -361,10 +361,10 @@ Nemotron-H target execution uses this path for dense/shared ReLU² units and att
 channels, alongside the sparse expert-unit driver. Native deletion, keep-only,
 ordered edits and controlled replay are verified across SafeTensors/GGUF and all
 seven TP/EP/PP combinations in each residency mode. See
-[the family validation](component-validation.md#nemotron-h-partition-component-execution)
+[the family validation](component-validation.md)
 for exact scope and tolerances. Shared-unit edits occur before down projection;
 shared-input edits affect only that branch, and effective shared writes feed the
-sparse sum. The [shared-expert extension](component-validation.md#shared-expert-scalar-extension)
+sparse sum. The [shared-expert extension](component-validation.md)
 documents its parameter joins and position-specific keep-only reconstruction.
 
 The preparation layer also exposes `PartitionActivationProjection` and
@@ -434,7 +434,7 @@ Nonowners still validate dtype/shape and participate in completion. Reservations
 charge the projected action, so an Add acknowledgment creates no native update or
 payload copy. Per-term rounding has numerical, not bitwise, equivalence to an edit
 after reduction. Vocabulary sentinel masking is rejected for this contract.
-Target-only mixed V3 TP now invokes these hooks through both resident and provider
+Target-only mixed V3 TP invokes these hooks through both resident and provider
 traversals. Native F32 SafeTensors/GGUF and load-time affine acceptance passes all 63 TP/PP/EP and
 residency cases, including Zero, Scale, Add, Replace and strided masks at shared
 write/output seams. The affine cases retain 4-bit/group-32 packed weights before
@@ -456,7 +456,7 @@ verified prediction hooks in the selected call path. Typed extension hooks prese
 these timings through public phase-specific speculative admission.
 
 
-The shared embedded strategy now forwards explicit internal observers through
+The shared embedded strategy forwards explicit internal observers through
 actual target and V3 prediction operations. Component replacements reach downstream
 equations under their invocation phase; no-op execution retains ordinary values.
 Public phase-specific plans additionally require the loaded activation authority;
@@ -520,7 +520,7 @@ Preview/Summary evidence, immutable source identity and cumulative lifetime
 accounting. The public case
 `native_original_qwen_window_intervention_evidence_matches_ordinary_and_controlled`
 records ordinary 0.453s, managed 0.620s and controlled 0.650s in the
-[bounded native evidence](validation/bounded-media-and-submission-2026-09-16.json).
+[bounded native evidence](validation/bounded-native-results.json).
 The original speculative outer checkpoint retains the collector and monotone
 invocation/ledger source; it is distinct from the plain capture checkpoint.
 

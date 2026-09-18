@@ -1303,7 +1303,7 @@ fn prepare_closure(
                     None
                 };
                 // The original bank prices one whole-unit detachment and retry.
-                // Ordinary acquisition retains its historical retry behavior.
+                // Ordinary acquisition permits retries under its recovery policy.
                 let mut retried_original_unit = false;
                 let item = loop {
                     let item = if let Some(arrays) = destination.as_mut() {

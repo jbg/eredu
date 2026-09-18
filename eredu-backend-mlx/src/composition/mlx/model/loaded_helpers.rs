@@ -23,7 +23,7 @@ impl Executable {
         let storage = {
             // This model is still private to ordinary loading: its new dense
             // workers have no submitted forward windows. Serialize the required
-            // inventory against unrelated old workers without changing cold or
+            // inventory against unrelated workers without changing cold or
             // original inspection into a waiting operation. No manager/source
             // loan precedes entry, and no producer or wait retains the guard.
             let _inspection = safemlx::OrdinaryArrayMetadataGuard::enter()?;

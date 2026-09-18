@@ -200,7 +200,7 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
             prepared,
             metadata: None,
             admission: CompositeAdmissionRef {
-                legacy: Some(admitted),
+                ordinary: Some(admitted),
                 original: None,
             },
         })
@@ -241,7 +241,7 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
     }
 
     /// Borrows either the original ordinary admission or its closed compiled
-    /// representation. Common scalar geometry never materializes legacy parts.
+    /// representation. Common scalar geometry never materializes ordinary parts.
     pub const fn admitted(&self) -> CompositeAdmissionRef<'a, P> {
         self.admission
     }
@@ -265,7 +265,7 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
             prepared,
             metadata: None,
             admission: CompositeAdmissionRef {
-                legacy: None,
+                ordinary: None,
                 original: Some(original),
             },
         })
@@ -285,7 +285,7 @@ impl<'a, T, P> PreparedCompositeInput<'a, T, P> {
 
 /// Borrowed common admission geometry with explicit ordinary-part access.
 pub struct CompositeAdmissionRef<'a, P> {
-    legacy: Option<&'a AdmittedCompositeInput<P>>,
+    ordinary: Option<&'a AdmittedCompositeInput<P>>,
     original: Option<&'a crate::media_plan::BoundPreparedMediaSemantics>,
 }
 impl<P> Copy for CompositeAdmissionRef<'_, P> {}
@@ -296,24 +296,24 @@ impl<P> Clone for CompositeAdmissionRef<'_, P> {
 }
 impl<'a, P> CompositeAdmissionRef<'a, P> {
     /// Existing ordinary part storage, when this is an ordinary admission.
-    pub const fn legacy(self) -> Option<&'a AdmittedCompositeInput<P>> {
-        self.legacy
+    pub const fn ordinary(self) -> Option<&'a AdmittedCompositeInput<P>> {
+        self.ordinary
     }
     pub fn decoder_positions(self) -> u64 {
-        match self.legacy {
+        match self.ordinary {
             Some(value) => value.decoder_positions(),
             None => self.original.expect("closed admission").decoder_positions() as u64,
         }
     }
     pub fn decoder_shape(self) -> [u64; 2] {
-        self.legacy.map_or_else(
+        self.ordinary.map_or_else(
             || [1, self.decoder_positions()],
-            |legacy| legacy.decoder_shape(),
+            |ordinary| ordinary.decoder_shape(),
         )
     }
     pub fn active_modalities(self) -> eredu_core::InputModalities {
-        if let Some(legacy) = self.legacy {
-            return legacy.active_modalities();
+        if let Some(ordinary) = self.ordinary {
+            return ordinary.active_modalities();
         }
         let mut result = eredu_core::InputModalities {
             text: false,
@@ -333,7 +333,7 @@ impl<'a, P> CompositeAdmissionRef<'a, P> {
         result
     }
     fn len(self) -> usize {
-        match self.legacy {
+        match self.ordinary {
             Some(value) => value.parts().len(),
             None => self.original.expect("closed admission").records().len(),
         }
@@ -344,7 +344,7 @@ impl<'a> CompositeAdmissionRef<'a, crate::media_plan::Gemma4InputPartPlan> {
     /// Fixed ordinary plans or equivalent scalar projections from the exact
     /// original source. No metadata Vec, native read or admission is repeated.
     pub(crate) fn gemma_parts(self) -> impl ExactSizeIterator<Item = crate::media_plan::Gemma4InputPartPlan> + Clone + 'a {
-        (0..self.len()).map(move |index| match self.legacy {
+        (0..self.len()).map(move |index| match self.ordinary {
             Some(value) => value.parts()[index].clone(),
             None => self.original.expect("closed Gemma admission").gemma_part(index),
         })
@@ -1529,7 +1529,7 @@ impl<'a, T> PreparedCompositeInput<'a, T, crate::media_plan::QwenVlInputPartPlan
     pub(crate) fn qwen_parts(self) -> impl ExactSizeIterator<Item = QwenPartView<'a>> + Clone {
         use crate::media_plan::{qwen::QwenPartRole as R, QwenVlInputPartPlan as P};
         (0..self.admission.len()).map(move |index| {
-            let Some(legacy) = self.admission.legacy else {
+            let Some(ordinary) = self.admission.ordinary else {
                 return QwenPartView::original(
                     self.admission
                         .original
@@ -1538,7 +1538,7 @@ impl<'a, T> PreparedCompositeInput<'a, T, crate::media_plan::QwenVlInputPartPlan
                 );
             };
             let (role, positions, placeholder, grid, workspace_scalars) =
-                match &legacy.parts()[index] {
+                match &ordinary.parts()[index] {
                     P::TextTokens { positions } => (R::Tokens, *positions, 0, &[][..], 0),
                     P::ProjectedText { positions } => (R::Projected, *positions, 0, &[][..], 0),
                     P::Media { ingress, shape } => (
@@ -1564,7 +1564,7 @@ impl<'a, T> PreparedCompositeInput<'a, T, crate::media_plan::QwenHybridInputPart
     pub(crate) fn qwen_parts(self) -> impl ExactSizeIterator<Item = QwenPartView<'a>> + Clone {
         use crate::media_plan::{qwen::QwenPartRole as R, QwenHybridInputPartPlan as P};
         (0..self.admission.len()).map(move |index| {
-            let Some(legacy) = self.admission.legacy else {
+            let Some(ordinary) = self.admission.ordinary else {
                 return QwenPartView::original(
                     self.admission
                         .original
@@ -1573,7 +1573,7 @@ impl<'a, T> PreparedCompositeInput<'a, T, crate::media_plan::QwenHybridInputPart
                 );
             };
             let (role, positions, placeholder, grid, workspace_scalars) =
-                match &legacy.parts()[index] {
+                match &ordinary.parts()[index] {
                     P::TextTokens { positions } => (R::Tokens, *positions, 0, &[][..], 0),
                     P::Projected { positions, .. } => (R::Projected, *positions, 0, &[][..], 0),
                     P::Media { ingress, shape } => (

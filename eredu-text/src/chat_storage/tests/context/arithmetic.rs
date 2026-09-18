@@ -142,7 +142,7 @@ fn arithmetic_errors_and_partial_render_destinations_keep_original_custody() {
     drop((source, caller));
     assert!(failure.retained_buffer_bytes() > 0);
 
-    // Dispatch migration preserves ordinary dynamic multiplication; it grants
+    // Dispatch preserves ordinary dynamic multiplication; it grants
     // no repeated-string storage to the closed scalar producer.
     let template = "{{value*count}}";
     let caller = json!({"value":"é界","count":3});

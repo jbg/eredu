@@ -133,8 +133,8 @@ impl SummaryProgram {
             out.max = Some(out.max.map_or(max, |value| value.max(max)));
             let scale = min.abs().max(max.abs());
             if scale != 0.0 {
-                // Construct only when consumed. Previously this Where was born
-                // before min/max and left unevaluated for an all-zero chunk.
+                // Construct Where only for a nonzero chunk so every constructed
+                // node participates in the evaluated moments.
                 let zero = kernel.scalar(0.0)?;
                 let clean = kernel.select(&finite, &chunk, &zero)?;
                 let divisor = kernel.scalar(scale as f32)?;

@@ -172,7 +172,7 @@ portable producer. Backend transformations consume the admitted plan. Dynamic
 callbacks require their own declared storage and attribution contract. Parallel
 raw capture and intervention declarations construct exact partition/support
 sources through the shared funded worker, including fresh Unix artifact identity.
-[Partition-source evidence](bounded-followup-partition-source.md) separates these
+[Partition-source evidence](bounded-source-contracts.md) separates these
 producer guarantees from native distributed execution validation.
 
 ## Controlled speculative generation
@@ -193,7 +193,7 @@ observation or copy spending, and failure retains partially completed native wor
 Target and independent drafter have distinct authenticated prefill roles and span
 origins. Media must retain its real prepared payload through encoder ingress and
 subsequent decoder chunks. A semantic token projection describes coordinates; it
-cannot replace image/audio content. Captured composite quotation now includes the
+cannot replace image/audio content. Captured composite quotation includes the
 original input roots and traces the shared full forward. Target and independent
 drafter compile distinct semantic bindings from the same authenticated host media
 and their actual retained caches. The current shared-input source requires the
@@ -246,47 +246,23 @@ and event-consumer time are excluded. Required capture transformations remain
 execution work. Snapshots preserve accumulated timing rather than restarting
 it, and external wall time still includes pauses and application processing.
 
-The current full portable facade run passes 38 cases with no failures and two
-external-checkpoint cases ignored. It includes ordinary tools without speculative
-capability, reasoning, split arguments, automatic/forbidden policy, provider errors,
-manual/run parity, exact speculative prefixes and source/admission refusals.
-Commands and scoped results are recorded in
-[public conformance](bounded-followup-public-conformance.md).
+[Public conformance](prepared-chat-conformance.md) covers ordinary tools without
+speculation, reasoning, partial arguments, provider errors, manual/run parity,
+exact speculative prefixes and source refusals. The portable facade has 38
+passing cases with two external fixtures ignored; backend conformance has 126.
 
-All 126 neutral backend-conformance cases pass, including terminal restore and
-capture/intervention combinations. The expanded ordinary native tool/capture test
-now passes partial and terminal restore/fork/exchange, sampling queries and
-exactly-once output. The released sensor request completes under Required and Auto
-at 64 GiB. The generic request's grammar funding refusal is repaired; its 48-token
-output truncates without a tool call. Authenticated image pending/partial snapshots
-and independent speculative parity also pass. All seven Metal public tool/media
-cases and all six paged Device/Host/Disk control cases pass, including resume-time
-child sampling, preserved parent state and Host-backed Device-view retirement.
-TP2, PP2 and combined TP2/PP2 media retain Required/Auto ordinary, manual and
-recorded parity at the unchanged 8 GiB capacity. These native debug tests use an
-explicit 64 MiB Rust test-thread stack; they do not establish default 2 MiB stack
-execution. The documented default-stack run overflows in a finite startup chain.
+Seven public native tools/media cases and six paged Device/Host/Disk cases cover
+snapshots, restore, fork, exchange, child sampling, preserved parent state and
+Host-backed Device-view retirement. TP2/PP2 media uses an 8 GiB capacity.
+Six Dense/Mova distributed CLI cases cover Resident/Host/Disk with both samplers,
+unfinished branch exchange, Hybrid reset and cumulative capture refusal under a
+64 GiB ceiling and 120-second deadline. Native tests use an explicit 64 MiB Rust
+test-thread stack and the build profiles in [validation](bounded-inference-validation.md).
+Default 2 MiB debug-stack execution is not established.
 
-The CLI completes Dense/Resident, Dense/Host and Dense/Disk at both sampling
-settings under the unchanged 64 GiB ceiling, including repeated unfinished
-parent/child exchange, paid Hybrid reset and the intended cumulative capture
-refusal. Ten focused publication/collector cases and the four-request persistent
-CPU Disk fixture verify source custody and retirement. The completed routed-bank
-source is now retained through direct partition quotation. Subsequent CPU source
-corrections have their own focused validation; the final routed CLI rerun remains
-pending. Its current outcome is recorded in [CLI validation](bounded-followup-cli.md).
-Exact acceptance scope is recorded in
-[the overview](bounded-followup.md), [control evidence](bounded-followup-control.md)
-and [released validation](bounded-followup-released-tools.md).
-
-Earlier reproducibility records remain in
-[resident-chat evidence](validation/bounded-public-resident-chat-2026-09-16.json)
-and [media/submission evidence](validation/bounded-media-and-submission-2026-09-16.json).
-They establish only their recorded source and test scope. The current API and
-consolidation do not inherit every historical success without checking affected
-behavior. Historical implementation notes are available in repository history at
-`77e08045401912c502e6ab1600e8b622c3563478`; the maintained guide describes the current
-contracts rather than intermediate record or startup representations.
+[Released validation](prepared-chat-validation.md) separately covers the pinned
+text/image sensor request with Required and Auto. These scoped results do not
+establish arbitrary prompt behavior or downstream application memory policy.
 
 New inference functionality must use these shared controlled drivers by default.
 Any exception needs a concrete state, completion, attribution or accounting reason,

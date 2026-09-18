@@ -545,7 +545,7 @@ fn run<B: TextGenerationBackend, C: TokenFilterController, R: Route<B, C>>(
         input,
         prompt: None,
         state: None,
-        sequence: PreparedSequence::Legacy,
+        sequence: PreparedSequence::Ordinary,
         preparation: None,
         control: None,
         control_failed: false,

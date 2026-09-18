@@ -23,7 +23,7 @@ pub(crate) trait CursorStorage: GenerationSequenceStorage + Sized {
         sequence: GenerationSequence<Self>,
     ) -> Result<GenerationSequence<Self>, Self::PreparationError>;
 }
-impl CursorStorage for LegacyGenerationStorage {
+impl CursorStorage for OwnedGenerationStorage {
     type PreparationError = std::convert::Infallible;
     fn prepare(
         sequence: GenerationSequence<Self>,

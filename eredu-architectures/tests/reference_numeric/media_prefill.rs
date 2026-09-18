@@ -263,7 +263,7 @@ where
     let mut cached = Vec::new();
     // This entry is explicitly ordinary: unfunded requests do not install an
     // InferenceStateAdmission. Preserve cached decode from the actually committed
-    // prefix; funded prompt-end authority remains a separate Unit C obligation.
+    // prefix; this fixture does not exercise funded prompt-end authority.
     if schedule.follow_decode {
         let checkpoint = session
             .checkpoint_complete_distributed(context)

@@ -8,7 +8,7 @@ not the repository name or quantization bit width.
 ## Current validation scope
 
 The converted-checkpoint results below retain their 2026-09-12 scope. Later
-[official Qwen released-checkpoint evidence](validation/bounded-public-qwen-2026-09-16.json)
+[official Qwen released-checkpoint evidence](validation/bounded-native-results.json)
 closes selected resident ordinary/managed/controlled parity at 5 through 3,000
 prompt positions, independent prefill/cached-decode score comparisons, automatic
 smaller-chunk admission and refusal before execution. These use the separately

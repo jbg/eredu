@@ -203,7 +203,7 @@ fn worker(
         }
     }
     // Each nonempty range was appended after advancing the cumulative decoder
-    // offset. Their starts are already strictly increasing, so the former sort
+    // offset. Their starts are strictly increasing, so an additional sort
     // cannot change order and needs neither scratch nor recursive controls.
     debug_assert!(
         local_state_ranges

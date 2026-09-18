@@ -22,7 +22,7 @@ impl std::fmt::Debug for Shape<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
             ShapeRef::Host(values) => values.fmt(f),
-            ShapeRef::Legacy(values) => values.fmt(f),
+            ShapeRef::Dimensions(values) => values.fmt(f),
         }
     }
 }
@@ -33,7 +33,7 @@ pub(super) struct Values<'a, T> {
 }
 impl<'a, T> Values<'a, T> {
     pub(super) fn legacy(input: &'a MetadataValues<T>) -> Self {
-        Self { shape: Shape(ShapeRef::Legacy(&input.shape)), values: &input.values }
+        Self { shape: Shape(ShapeRef::Dimensions(&input.shape)), values: &input.values }
     }
 }
 #[derive(Clone, Copy)]
@@ -50,11 +50,11 @@ pub(in crate::media_plan) struct Input<'a> {
 impl<'a> Input<'a> {
     pub(super) fn legacy(input: &'a MediaAdmissionInput) -> Self {
         fn values<T>(input: &MetadataValues<T>) -> Values<'_, T> {
-            Values { shape: Shape(ShapeRef::Legacy(&input.shape)), values: &input.values }
+            Values { shape: Shape(ShapeRef::Dimensions(&input.shape)), values: &input.values }
         }
         Self {
             modality: input.descriptor.modality(), kind: input.descriptor.payload_kind(),
-            shape: Shape(ShapeRef::Legacy(&input.payload_shape)),
+            shape: Shape(ShapeRef::Dimensions(&input.payload_shape)),
             patch_extent: input.patch_extent(), audio_valid_frames: input.audio_valid_frames(),
             patch_grid: input.patch_grid.as_ref().map(values),
             patch_positions: input.patch_positions.as_ref().map(values),

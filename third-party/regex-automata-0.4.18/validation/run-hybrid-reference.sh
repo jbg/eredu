@@ -7,11 +7,11 @@ python3 - "$reference_source" "$automata_root" "$artifact_dir" <<'PY'
 import hashlib, json, shutil, sys
 from pathlib import Path
 reference, root, artifacts = map(Path, sys.argv[1:])
-provenance = json.loads((root.parent / 'regex-automata-workspace.json').read_text())
-for name, expected in provenance['upstream_files'].items():
+provenance = json.loads((root.parent / 'regex-automata-upstream.json').read_text())
+for name, expected in provenance['files'].items():
     if hashlib.sha256((reference / name).read_bytes()).hexdigest() != expected:
         raise SystemExit(f'pristine source mismatch: {name}')
-print(f"Verified {len(provenance['upstream_files'])} pristine upstream files.")
+print(f"Verified {len(provenance['files'])} pristine upstream files.")
 (artifacts / 'src').mkdir(parents=True, exist_ok=True)
 shutil.copyfile(root / 'validation/hybrid-reference.rs', artifacts / 'src/main.rs')
 features = '["std", "syntax", "hybrid", "unicode"]'

@@ -47,7 +47,7 @@ impl CompletionOutputIngress {
     }
 
     // Move the selected prepared owner out before the no-hooks native call or
-    // any destructor. Ordinary completion preserves its historical clone path.
+    // any destructor. Ordinary completion clones its wrapper owners.
     pub(super) fn take(&mut self) -> Self {
         if matches!(self, Self::Ordinary) {
             Self::Ordinary

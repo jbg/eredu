@@ -1,10 +1,9 @@
 # Eredu collections
 
 A dependency-free, `no_std` foundation for the safe ordered AVL map shared by
-portable source construction and the local JSON fork. The node worker was
-extracted from the local implementation previously at
-`third-party/serde_json-1.0.151/src/map/ordered.rs`; it is not an upstream JSON
-implementation. Existing upstream archive hashes and licenses are unchanged.
+portable source construction and the local JSON fork. Eredu owns this map's
+implementation; upstream JSON archive provenance and licenses are recorded
+under `third-party`.
 
 `Map::try_insert_with` calls the supplied policy with the exact new node layout
 before `Box::new`. Existing-key replacement, rotations, removals and iterators

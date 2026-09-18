@@ -1392,7 +1392,7 @@ where
     /// Returns the physical shape used to close the selected capture contract.
     fn shape(tensor: &B::Tensor) -> &[i32];
     /// Completes the actual architecture-selected state/output values using the
-    /// full execution source. Ordinary implementations retain their old worker.
+    /// full execution source. Ordinary implementations use their own worker.
     fn complete_prediction_state<P>(
         extension: &P,
         state: &mut P::LaneState,

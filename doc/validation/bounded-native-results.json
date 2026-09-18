@@ -1,0 +1,663 @@
+{
+  "scope": "Apple CPU/Metal and Ring. Separate suites overlap; counts are not additive. Functional timings are not benchmarks.",
+  "rust_min_stack_bytes": 67108864,
+  "cli_case_deadline_seconds": 120,
+  "cli_capacity_bytes": 68719476736,
+  "public_parallel_media_capacity_bytes": 8589934592,
+  "builds": [
+    {
+      "command": [
+        "cargo",
+        "+1.98.0",
+        "test",
+        "--offline",
+        "-p",
+        "eredu-backend-mlx",
+        "--no-default-features",
+        "--features",
+        "metal,image,audio",
+        "--lib",
+        "--no-run",
+        "--profile",
+        "dev",
+        "--message-format=json-render-diagnostics",
+        "--config",
+        "profile.dev.package.\"eredu-backend-mlx\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-cli\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-runtime\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-architectures\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-nn\".opt-level=2"
+      ],
+      "exit_code": 0,
+      "environment": {
+        "CARGO_INCREMENTAL": "0",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "CARGO_BUILD_JOBS": "4"
+      },
+      "targets": [
+        {
+          "name": "eredu_backend_mlx",
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          },
+          "features": [
+            "audio",
+            "image",
+            "metal"
+          ]
+        }
+      ]
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.98.0",
+        "build",
+        "--offline",
+        "-p",
+        "eredu",
+        "-p",
+        "eredu-cli",
+        "--no-default-features",
+        "--features",
+        "eredu/mlx,eredu/metal,eredu/image,eredu/audio,eredu-cli/mlx,eredu-cli/metal",
+        "--test",
+        "k2_distributed_control",
+        "--test",
+        "prepared_chat_native",
+        "--message-format=json-render-diagnostics",
+        "--config",
+        "profile.dev.package.\"eredu-backend-mlx\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-cli\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-runtime\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-architectures\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-nn\".opt-level=2"
+      ],
+      "exit_code": 0,
+      "environment": {
+        "CARGO_INCREMENTAL": "0",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "CARGO_BUILD_JOBS": "4"
+      },
+      "targets": [
+        {
+          "name": "k2_distributed_control",
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          },
+          "features": [
+            "metal",
+            "mlx"
+          ]
+        },
+        {
+          "name": "prepared_chat_native",
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          },
+          "features": [
+            "audio",
+            "image",
+            "metal",
+            "mlx"
+          ]
+        }
+      ]
+    },
+    {
+      "command": [
+        "cargo",
+        "+1.98.0",
+        "test",
+        "--offline",
+        "-p",
+        "eredu-backend-mlx",
+        "--no-default-features",
+        "--features",
+        "metal,image,audio",
+        "--lib",
+        "--no-run",
+        "--profile",
+        "dev",
+        "--message-format=json-render-diagnostics",
+        "--config",
+        "profile.dev.package.\"eredu\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-cli\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-runtime\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-architectures\".opt-level=2",
+        "--config",
+        "profile.dev.package.\"eredu-nn\".opt-level=2"
+      ],
+      "exit_code": 0,
+      "environment": {
+        "CARGO_INCREMENTAL": "0",
+        "DEVELOPER_DIR": "/Library/Developer/CommandLineTools",
+        "SDKROOT": "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+        "CARGO_BUILD_JOBS": "4"
+      },
+      "targets": [
+        {
+          "name": "eredu_backend_mlx",
+          "profile": {
+            "opt_level": "0",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          },
+          "features": [
+            "audio",
+            "image",
+            "metal"
+          ]
+        }
+      ]
+    }
+  ],
+  "suites": {
+    "backend": [
+      {
+        "name": "communication-timeout",
+        "returncode": 0,
+        "seconds": 1.0967137911356986,
+        "expected_cases": 1,
+        "expected_cases_passed": true,
+        "log_sha256": "8590588e37582bbbeaef08798429840a92aae1521f1fb2fe426a0d6cc815647a",
+        "arguments": [
+          "bounded_communication_timeout_quarantines_all_retained_resources",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "artifact": {
+          "sha256": "0b1082d72d11a95c7b0e59a4e23979424c528f6cab83305ec881d685d1c0db9c",
+          "bytes": 317568984,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "communication-reap",
+        "returncode": 0,
+        "seconds": 1.0821041672024876,
+        "expected_cases": 1,
+        "expected_cases_passed": true,
+        "log_sha256": "d49c302cb335ff708e73215e982071ac17b3ac2a15fa990a321e6845493c6a4a",
+        "arguments": [
+          "completed_quarantine_is_reaped_on_an_unrelated_runtime_entry",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "artifact": {
+          "sha256": "0b1082d72d11a95c7b0e59a4e23979424c528f6cab83305ec881d685d1c0db9c",
+          "bytes": 317568984,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "communication-teardown",
+        "returncode": 0,
+        "seconds": 1.087590959155932,
+        "expected_cases": 1,
+        "expected_cases_passed": true,
+        "log_sha256": "9c9b6d0c5ee5251b58d2f92eb38e5247e0b8d9e4adebfc59dcdca1c654852d66",
+        "arguments": [
+          "quarantine_teardown_releases_terminal_resources_when_runtime_access_is_available",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "artifact": {
+          "sha256": "0b1082d72d11a95c7b0e59a4e23979424c528f6cab83305ec881d685d1c0db9c",
+          "bytes": 317568984,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "inner-event-quarantine",
+        "returncode": 0,
+        "seconds": 1.1025363749358803,
+        "expected_cases": 1,
+        "expected_cases_passed": true,
+        "log_sha256": "07ee07ed728f371fd224103c8ee8921ad9cdc4910535d564f86e8848de572e40",
+        "arguments": [
+          "original_communication_event_completes_inside_current_role_and_keeps_prepaid_quarantine",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "artifact": {
+          "sha256": "0b1082d72d11a95c7b0e59a4e23979424c528f6cab83305ec881d685d1c0db9c",
+          "bytes": 317568984,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "manual-group-source",
+        "returncode": 0,
+        "seconds": 0.024830209091305733,
+        "expected_cases": 1,
+        "expected_cases_passed": true,
+        "log_sha256": "538c7eaed840ea7b189c6dd7442fffab4a5efd6786a75e4af3713d8e34943575",
+        "arguments": [
+          "manual_group_traversal_retains_only_actual_policy_final_submissions",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "artifact": {
+          "sha256": "0b1082d72d11a95c7b0e59a4e23979424c528f6cab83305ec881d685d1c0db9c",
+          "bytes": 317568984,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "actual-source-population",
+        "returncode": 0,
+        "seconds": 0.024423083057627082,
+        "expected_cases": 2,
+        "expected_cases_passed": true,
+        "log_sha256": "65e5805bf8cf19435cebb79a6d1d35068abf3282b009d6e1a94a3b0505af0317",
+        "arguments": [
+          "population_composes_one_scope_and_real_nested_frontiers",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "artifact": {
+          "sha256": "0b1082d72d11a95c7b0e59a4e23979424c528f6cab83305ec881d685d1c0db9c",
+          "bytes": 317568984,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "readiness-pending",
+        "returncode": 0,
+        "seconds": 4.648505791090429,
+        "expected_cases": 1,
+        "expected_cases_passed": true,
+        "log_sha256": "b0493ed186f59a67439b1d923b0624d8d8e62df776dfa6ad9228cbe8013f8e82",
+        "arguments": [
+          "readiness_event_does_not_retire_a_pending_enclosing_scope",
+          "--nocapture",
+          "--test-threads=1",
+          "--ignored"
+        ],
+        "artifact": {
+          "sha256": "30f1d8a5d696705414f17a9415ee7ce69f25489229b4116e15665df6ffd4eaa4",
+          "bytes": 671374696,
+          "profile": {
+            "opt_level": "0",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "readiness-deadline",
+        "returncode": 0,
+        "seconds": 0.2633844579104334,
+        "expected_cases": 1,
+        "expected_cases_passed": true,
+        "log_sha256": "55fb35f8a74ad7568310dd2c70789ebcfdecfb5501a01689bc098597ae68457e",
+        "arguments": [
+          "readiness_deadline_keeps_pending_scope_custody_until_terminal",
+          "--nocapture",
+          "--test-threads=1",
+          "--ignored"
+        ],
+        "artifact": {
+          "sha256": "30f1d8a5d696705414f17a9415ee7ce69f25489229b4116e15665df6ffd4eaa4",
+          "bytes": 671374696,
+          "profile": {
+            "opt_level": "0",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      }
+    ],
+    "public": [
+      {
+        "name": "audio-tools",
+        "seconds": 4.4328895839862525,
+        "returncode": 0,
+        "one_case_passed": true,
+        "log_sha256": "cde179c959d3f82b3e64e06be2a28ea37d0d5776b9e0216025ca15680a1f3e58",
+        "arguments": [
+          "audio::authenticated_image_audio_tools_preserve_ordinary_manual_and_recorded_semantics",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact",
+          "--ignored"
+        ],
+        "artifact": {
+          "sha256": "06fdf15f943ffb3dcfbb7a1e26ba0c2bbc4cf25caf624d58c9ca1500c902e50a",
+          "bytes": 294877768,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "distributed-media",
+        "seconds": 3.677455540979281,
+        "returncode": 0,
+        "one_case_passed": true,
+        "log_sha256": "a90d913be393438180b627255d0ddadb9c3a6ff44f96d5bfe05d535558aaa147",
+        "arguments": [
+          "media::distributed::two_rank_image_tools_preserve_ordinary_manual_and_recorded_output",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact",
+          "--ignored"
+        ],
+        "artifact": {
+          "sha256": "06fdf15f943ffb3dcfbb7a1e26ba0c2bbc4cf25caf624d58c9ca1500c902e50a",
+          "bytes": 294877768,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "pipeline-media",
+        "seconds": 5.42630225000903,
+        "returncode": 0,
+        "one_case_passed": true,
+        "log_sha256": "c4b84615ce1c3871e07a9c6844d40df1d198ea1d3071c59f297705b6490d1d8a",
+        "arguments": [
+          "media::distributed::two_rank_pipeline_image_tools_preserve_ordinary_manual_and_recorded_output",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact",
+          "--ignored"
+        ],
+        "artifact": {
+          "sha256": "06fdf15f943ffb3dcfbb7a1e26ba0c2bbc4cf25caf624d58c9ca1500c902e50a",
+          "bytes": 294877768,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "tensor-pipeline-media",
+        "seconds": 9.802006875164807,
+        "returncode": 0,
+        "one_case_passed": true,
+        "log_sha256": "fb9fa7a4b1a404cfa75a40501e5ff3b4788944e54638f5786ffbb070ced8f739",
+        "arguments": [
+          "media::distributed::four_rank_tensor_pipeline_image_tools_preserve_ordinary_manual_and_recorded_output",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact",
+          "--ignored"
+        ],
+        "artifact": {
+          "sha256": "06fdf15f943ffb3dcfbb7a1e26ba0c2bbc4cf25caf624d58c9ca1500c902e50a",
+          "bytes": 294877768,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "media",
+        "seconds": 3.433926959056407,
+        "returncode": 0,
+        "one_case_passed": true,
+        "log_sha256": "ef08036f540b039b9bd25b851706b9a411779dd7cdfd6d83c712007090260bc1",
+        "arguments": [
+          "media::authenticated_image_tools_refuse_foreign_chat_and_preserve_manual_and_speculative_parity",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact",
+          "--ignored"
+        ],
+        "artifact": {
+          "sha256": "06fdf15f943ffb3dcfbb7a1e26ba0c2bbc4cf25caf624d58c9ca1500c902e50a",
+          "bytes": 294877768,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "media-snapshot",
+        "seconds": 2.678862415952608,
+        "returncode": 0,
+        "one_case_passed": true,
+        "log_sha256": "c88a077d63fefb1f25e1bd2a82ec5ff3214572389c1f849c83a054aeb4c9662b",
+        "arguments": [
+          "media::authenticated_image_tool_snapshots_preserve_pending_branches_and_partial_events",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact",
+          "--ignored"
+        ],
+        "artifact": {
+          "sha256": "06fdf15f943ffb3dcfbb7a1e26ba0c2bbc4cf25caf624d58c9ca1500c902e50a",
+          "bytes": 294877768,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "name": "ordinary",
+        "seconds": 1.532982625067234,
+        "returncode": 0,
+        "one_case_passed": true,
+        "log_sha256": "c716cb3a48c817ecdb3f1afcbd7be24e4abf8afc62e434264bb84109f8d5cadc",
+        "arguments": [
+          "ordinary_tool_capture_snapshot_restore_and_fork_preserve_committed_semantics",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact",
+          "--ignored"
+        ],
+        "artifact": {
+          "sha256": "06fdf15f943ffb3dcfbb7a1e26ba0c2bbc4cf25caf624d58c9ca1500c902e50a",
+          "bytes": 294877768,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      }
+    ],
+    "cli": [
+      {
+        "returncode": 0,
+        "seconds": 65.01227954193018,
+        "expected_cases": 1,
+        "expected_cases_passed": true,
+        "log_sha256": "cb16e602660d475b86b36c4003d06b4ce5ccb6ecdfef83ab3647ccba8f4f051f",
+        "arguments": [
+          "k2_distributed_facade_control_matrix::mova_resident",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "artifact": {
+          "sha256": "bbcb3257c20aec02840b41e31db5462c0d0b026c1e59c9e34a118fc04ec5afa6",
+          "bytes": 285583368,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "returncode": 0,
+        "seconds": 64.26285404199734,
+        "expected_cases": 1,
+        "expected_cases_passed": true,
+        "log_sha256": "0806f05098ab8ac5c395de196693f6c2466abdcde8774e3ab7680e22f5684d48",
+        "arguments": [
+          "k2_distributed_facade_control_matrix::mova_host",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "artifact": {
+          "sha256": "bbcb3257c20aec02840b41e31db5462c0d0b026c1e59c9e34a118fc04ec5afa6",
+          "bytes": 285583368,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "returncode": 0,
+        "seconds": 63.49246658314951,
+        "expected_cases": 1,
+        "expected_cases_passed": true,
+        "log_sha256": "731a688e0109c90821c59b262f5a3d8f817077df4467c80fe202dc4763f2ecbc",
+        "arguments": [
+          "k2_distributed_facade_control_matrix::mova_disk",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1",
+          "--exact"
+        ],
+        "artifact": {
+          "sha256": "bbcb3257c20aec02840b41e31db5462c0d0b026c1e59c9e34a118fc04ec5afa6",
+          "bytes": 285583368,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      },
+      {
+        "returncode": 0,
+        "seconds": 41.02994279190898,
+        "expected_cases": 3,
+        "expected_cases_passed": true,
+        "log_sha256": "20d4807cf8361e30f255be37a1fdc436ff5a2f3debb12eaecdb8452bf1c7a92b",
+        "arguments": [
+          "k2_distributed_facade_control_matrix::dense_",
+          "--ignored",
+          "--nocapture",
+          "--test-threads=1"
+        ],
+        "artifact": {
+          "sha256": "bbcb3257c20aec02840b41e31db5462c0d0b026c1e59c9e34a118fc04ec5afa6",
+          "bytes": 285583368,
+          "profile": {
+            "opt_level": "2",
+            "debuginfo": 2,
+            "debug_assertions": true,
+            "overflow_checks": true,
+            "test": true
+          }
+        }
+      }
+    ]
+  },
+  "source_revision": "68408f0765c5df6d5bd7b0d09c38d02886c25266"
+}

@@ -1,0 +1,246 @@
+{
+  "source": "eredu-backend-mlx/examples/readout_memory_probe.rs",
+  "build_command": "cargo build -p eredu-backend-mlx --features metal --example readout_memory_probe",
+  "sha256": "62a9b3920271a897d477bfb6127c99aae819a2b150b8b757c25eb88f7e503a1e",
+  "preparation": "/usr/bin/strip -o OUTPUT target/debug/examples/readout_memory_probe",
+  "scope": "Ordinary fully resident Metal numerical behavior; no bounded working-memory enforcement claim. Last-token scores with prefill chunk 128 followed by three teacher-forced cached decode steps. Full rows compared with independent MLX-LM reference.",
+  "comparisons": [
+    {
+      "atol": 0.25,
+      "rtol": 0.02,
+      "prompt_length": 5,
+      "decode_ids": [
+        11751,
+        13,
+        198
+      ],
+      "passes": [
+        {
+          "step": 0,
+          "shape": [
+            1,
+            248320
+          ],
+          "native_dtype": "Float32",
+          "argmax": 11751,
+          "seconds": 0.841179041,
+          "mlx_active_bytes": 1729512640,
+          "mlx_peak_bytes": 3769857009,
+          "mlx_cache_bytes": 3058463351,
+          "process_rss_bytes": 2231238656,
+          "reference_argmax": 11751,
+          "max_abs_error": 0.14955711364746094,
+          "rmse": 0.033593235761161175,
+          "tolerance_violations": 0
+        },
+        {
+          "step": 1,
+          "shape": [
+            1,
+            248320
+          ],
+          "native_dtype": "Float32",
+          "argmax": 13,
+          "seconds": 0.17320925,
+          "mlx_active_bytes": 1727767744,
+          "mlx_peak_bytes": 3769857009,
+          "mlx_cache_bytes": 3063679690,
+          "process_rss_bytes": 2252521472,
+          "reference_argmax": 13,
+          "max_abs_error": 0.12318563461303711,
+          "rmse": 0.025879907098821,
+          "tolerance_violations": 0
+        },
+        {
+          "step": 2,
+          "shape": [
+            1,
+            248320
+          ],
+          "native_dtype": "Float32",
+          "argmax": 198,
+          "seconds": 0.031290125,
+          "mlx_active_bytes": 1727792320,
+          "mlx_peak_bytes": 3769857009,
+          "mlx_cache_bytes": 3065696970,
+          "process_rss_bytes": 2270461952,
+          "reference_argmax": 198,
+          "max_abs_error": 0.1586458683013916,
+          "rmse": 0.03378831268127073,
+          "tolerance_violations": 0
+        },
+        {
+          "step": 3,
+          "shape": [
+            1,
+            248320
+          ],
+          "native_dtype": "Float32",
+          "argmax": 760,
+          "seconds": 0.03050425,
+          "mlx_active_bytes": 1727816896,
+          "mlx_peak_bytes": 3769857009,
+          "mlx_cache_bytes": 3065866954,
+          "process_rss_bytes": 2288369664,
+          "reference_argmax": 760,
+          "max_abs_error": 0.137725830078125,
+          "rmse": 0.028256633167496107,
+          "tolerance_violations": 0
+        }
+      ],
+      "reference_versions": {
+        "mlx": "0.32.2",
+        "mlx-lm": "0.31.3",
+        "transformers": "5.17.0",
+        "numpy": "2.4.6"
+      },
+      "actual_scores_sha256": "cd894eb31f72896362e809fd4f2551c1b3475f34a72fdbdcc87ecf1c624487ea",
+      "reference_scores_sha256": "5ca7db3e770be6a06a2b502b5491f76022e8a0d8691a1b92ebd0e027500c34d9"
+    },
+    {
+      "atol": 0.25,
+      "rtol": 0.02,
+      "prompt_length": 3000,
+      "decode_ids": [
+        561,
+        6511,
+        314
+      ],
+      "passes": [
+        {
+          "step": 0,
+          "shape": [
+            1,
+            248320
+          ],
+          "native_dtype": "Float32",
+          "argmax": 561,
+          "seconds": 3.1136065,
+          "mlx_active_bytes": 1825825984,
+          "mlx_peak_bytes": 4814218424,
+          "mlx_cache_bytes": 5722054532,
+          "process_rss_bytes": 2234957824,
+          "reference_argmax": 561,
+          "max_abs_error": 0.2758617401123047,
+          "rmse": 0.06350768000987778,
+          "tolerance_violations": 0
+        },
+        {
+          "step": 1,
+          "shape": [
+            1,
+            248320
+          ],
+          "native_dtype": "Float32",
+          "argmax": 6511,
+          "seconds": 0.051305416,
+          "mlx_active_bytes": 1801544896,
+          "mlx_peak_bytes": 4814218424,
+          "mlx_cache_bytes": 5824978087,
+          "process_rss_bytes": 2256257024,
+          "reference_argmax": 6511,
+          "max_abs_error": 0.1941232681274414,
+          "rmse": 0.03896782053989147,
+          "tolerance_violations": 0
+        },
+        {
+          "step": 2,
+          "shape": [
+            1,
+            248320
+          ],
+          "native_dtype": "Float32",
+          "argmax": 314,
+          "seconds": 0.029187541,
+          "mlx_active_bytes": 1801544896,
+          "mlx_peak_bytes": 4814218424,
+          "mlx_cache_bytes": 5900672167,
+          "process_rss_bytes": 2274181120,
+          "reference_argmax": 314,
+          "max_abs_error": 0.219801664352417,
+          "rmse": 0.04523695972486881,
+          "tolerance_violations": 0
+        },
+        {
+          "step": 3,
+          "shape": [
+            1,
+            248320
+          ],
+          "native_dtype": "Float32",
+          "argmax": 9338,
+          "seconds": 0.028897917,
+          "mlx_active_bytes": 1801544896,
+          "mlx_peak_bytes": 4814218424,
+          "mlx_cache_bytes": 5900672167,
+          "process_rss_bytes": 2292105216,
+          "reference_argmax": 9338,
+          "max_abs_error": 0.26070284843444824,
+          "rmse": 0.03674153235550097,
+          "tolerance_violations": 0
+        }
+      ],
+      "reference_versions": {
+        "mlx": "0.32.2",
+        "mlx-lm": "0.31.3",
+        "transformers": "5.17.0",
+        "numpy": "2.4.6"
+      },
+      "actual_scores_sha256": "551e9af4fa7a27526bb0ff1c493e041f7d3dfb51cb4c056c719a894d7e56d498",
+      "reference_scores_sha256": "d61392be2d9d95161ff7587691a4ce298bce0f111c42d082348c60b04d5e72d3"
+    }
+  ],
+  "reproduction": {
+    "example": "eredu-backend-mlx/examples/readout_memory_probe.rs",
+    "checkpoint_manifest": "qwen35-checkpoint.json",
+    "prompt_lengths": [
+      5,
+      3000
+    ],
+    "readout": "last",
+    "prefill_chunk_positions": 128,
+    "reference_script": "eredu-backend-mlx/validation/bounded_qwen_reference.py",
+    "inputs": [
+      {
+        "prompt_length": 5,
+        "prefix": [
+          760,
+          6511,
+          314,
+          9338,
+          369
+        ],
+        "repeat": [],
+        "repeat_count": 0,
+        "decode_ids": [
+          11751,
+          13,
+          198
+        ]
+      },
+      {
+        "prompt_length": 3000,
+        "prefix": [
+          760,
+          6511,
+          314,
+          9338,
+          369
+        ],
+        "repeat": [
+          561,
+          6511,
+          314,
+          9338,
+          369
+        ],
+        "repeat_count": 599,
+        "decode_ids": [
+          561,
+          6511,
+          314
+        ]
+      }
+    ]
+  }
+}

@@ -137,7 +137,7 @@ fn host_reset_preserves_actual_sources_without_promotion_or_copy_authority() {
     let funding = pool
         .prepare_workspace_metadata(&InferenceExecutionIdentity::default(), 1 << 24)
         .unwrap();
-    // Cold copy inspection now describes the same two Host/Device pages. It
+    // Cold copy inspection describes the same two Host/Device pages. It
     // allocates no destination, promotes nothing and grants no numerical copy.
     let copy_layout = manager.inspect_paged_array_copy().unwrap();
     assert_eq!(copy_layout.page_operands(), Some(4));

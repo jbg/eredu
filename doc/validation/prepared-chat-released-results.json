@@ -1,0 +1,390 @@
+{
+  "checkpoint_manifest": "qwen35-checkpoint.json",
+  "capacity_bytes": 68719476736,
+  "binary": {
+    "size": 858661048,
+    "sha256": "7b4ae36fafeaaf35f3307abbffb2641697d5e3927f567bd964896687306a8bac"
+  },
+  "environment": {
+    "system": "Darwin",
+    "macos": "26.6.2",
+    "machine": "arm64",
+    "RUST_MIN_STACK": "67108864"
+  },
+  "scope": "Fully resident ordinary tool generation on Metal. Timings include loading and planning. Image values are supplied in text, so image processing is not a recognition-accuracy test.",
+  "text_runs": [
+    {
+      "policy": "required",
+      "status": "passed",
+      "returncode": 0,
+      "wall_seconds": 31.24743462493643,
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+          },
+          {
+            "role": "user",
+            "content": "The sensor value is 17. Please record this reading."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "reading",
+              "description": "Record the requested integer value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "integer",
+                    "enum": [
+                      17
+                    ]
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": "required",
+        "max_tokens": 48,
+        "seed": 0,
+        "prefill_chunk_positions": 128,
+        "enable_thinking": false
+      },
+      "request_sha256": "5dd7bdf61781b7b565aef0a284909112c537892fb90ed59d561e4e1f40b6fc59",
+      "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+      "stderr_sha256": "b6dc3052e5db514a2824ecbbe1aef0552155a66201d3655253c982064c582c1e",
+      "process_memory": {
+        "scope": "whole subprocess; not framework-domain usage",
+        "maximum_resident_set_size_bytes": 3127853056,
+        "peak_memory_footprint_bytes": 5613948216
+      },
+      "events": [
+        {
+          "ToolCallStart": {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading"
+          }
+        },
+        {
+          "ToolArgumentsDelta": {
+            "index": 0,
+            "json_fragment": "{\"value\":17}"
+          }
+        },
+        "ToolCallEnd",
+        {
+          "Finished": {
+            "reason": "grammar_complete"
+          }
+        }
+      ],
+      "semantic_result": {
+        "tool_calls": [
+          {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading",
+            "arguments": {
+              "value": 17
+            }
+          }
+        ],
+        "finish_reason": "grammar_complete",
+        "visible_text": "",
+        "reasoning_text": ""
+      },
+      "committed_tokens": 25
+    },
+    {
+      "policy": "auto",
+      "status": "passed",
+      "returncode": 0,
+      "wall_seconds": 24.354606834007427,
+      "request": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+          },
+          {
+            "role": "user",
+            "content": "The sensor value is 17. Please record this reading."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "reading",
+              "description": "Record the requested integer value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "integer",
+                    "enum": [
+                      17
+                    ]
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": "auto",
+        "max_tokens": 48,
+        "seed": 0,
+        "prefill_chunk_positions": 128,
+        "enable_thinking": false
+      },
+      "request_sha256": "728ef4725de67f93d41746cd35a1a4c874230fe2dcd2a26cf7becdc73a5c2fa4",
+      "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+      "stderr_sha256": "a822961db977426a17709ae77db6a8db38420681531cb48b034638498bb283be",
+      "process_memory": {
+        "scope": "whole subprocess; not framework-domain usage",
+        "maximum_resident_set_size_bytes": 3128885248,
+        "peak_memory_footprint_bytes": 5617798480
+      },
+      "events": [
+        {
+          "ToolCallStart": {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading"
+          }
+        },
+        {
+          "ToolArgumentsDelta": {
+            "index": 0,
+            "json_fragment": "{\"value\":17}"
+          }
+        },
+        "ToolCallEnd",
+        {
+          "Finished": {
+            "reason": "grammar_complete"
+          }
+        }
+      ],
+      "semantic_result": {
+        "tool_calls": [
+          {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading",
+            "arguments": {
+              "value": 17
+            }
+          }
+        ],
+        "finish_reason": "grammar_complete",
+        "visible_text": "",
+        "reasoning_text": ""
+      },
+      "committed_tokens": 25
+    }
+  ],
+  "image_runs": [
+    {
+      "policy": "required",
+      "status": "passed",
+      "returncode": 0,
+      "wall_seconds": 30.190906667150557,
+      "request_sha256": "ead41b654aa496e81e3dc686b13c6e37e47182f1290d266b13bd765019413d0f",
+      "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+      "stderr_sha256": "60ed28d75486d13978e4eae99d26467b01171bc45cf240577afd1cb78ef6a354",
+      "process_memory": {
+        "scope": "whole subprocess; not framework-domain usage",
+        "maximum_resident_set_size_bytes": 3186294784,
+        "peak_memory_footprint_bytes": 5679861048
+      },
+      "events": [
+        {
+          "ToolCallStart": {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading"
+          }
+        },
+        {
+          "ToolArgumentsDelta": {
+            "index": 0,
+            "json_fragment": "{\"value\":17}"
+          }
+        },
+        "ToolCallEnd",
+        {
+          "Finished": {
+            "reason": "grammar_complete"
+          }
+        }
+      ],
+      "semantic_result": {
+        "tool_calls": [
+          {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading",
+            "arguments": {
+              "value": 17
+            }
+          }
+        ],
+        "finish_reason": "grammar_complete",
+        "visible_text": "",
+        "reasoning_text": ""
+      },
+      "committed_tokens": 25,
+      "request_fields": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+          },
+          {
+            "role": "user",
+            "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "reading",
+              "description": "Record the requested integer value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "integer",
+                    "enum": [
+                      17
+                    ]
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": "required",
+        "max_tokens": 48,
+        "seed": 0,
+        "prefill_chunk_positions": 128,
+        "enable_thinking": false
+      },
+      "prepared_parts_recipe": "See input_preparation and the retained generator; exact expanded document identified by request_sha256."
+    },
+    {
+      "policy": "auto",
+      "status": "passed",
+      "returncode": 0,
+      "wall_seconds": 28.800949750002474,
+      "request_sha256": "b2b872c7b4d9685c2c568d2255d6209d36067ec0cc71027a24e3c88e3f179b1d",
+      "stdout_sha256": "8f8aca422849421eceaad3b254194734c4ec2a938ff669e61f16a09a94b0da49",
+      "stderr_sha256": "70c79441297cd87c77aa3c30304fa9d8ebc728115b762825c257deee6fa36294",
+      "process_memory": {
+        "scope": "whole subprocess; not framework-domain usage",
+        "maximum_resident_set_size_bytes": 3186229248,
+        "peak_memory_footprint_bytes": 5679369480
+      },
+      "events": [
+        {
+          "ToolCallStart": {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading"
+          }
+        },
+        {
+          "ToolArgumentsDelta": {
+            "index": 0,
+            "json_fragment": "{\"value\":17}"
+          }
+        },
+        "ToolCallEnd",
+        {
+          "Finished": {
+            "reason": "grammar_complete"
+          }
+        }
+      ],
+      "semantic_result": {
+        "tool_calls": [
+          {
+            "index": 0,
+            "id": "call_0",
+            "name": "reading",
+            "arguments": {
+              "value": 17
+            }
+          }
+        ],
+        "finish_reason": "grammar_complete",
+        "visible_text": "",
+        "reasoning_text": ""
+      },
+      "committed_tokens": 25,
+      "request_fields": {
+        "messages": [
+          {
+            "role": "system",
+            "content": "You are a sensor logging assistant. Use the reading function to save the sensor value the user gives you."
+          },
+          {
+            "role": "user",
+            "content": "Reference image: <|vision_start|><|image_pad|><|vision_end|> The sensor value is 17. Please record this reading."
+          }
+        ],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "reading",
+              "description": "Record the requested integer value.",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "value": {
+                    "type": "integer",
+                    "enum": [
+                      17
+                    ]
+                  }
+                },
+                "required": [
+                  "value"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": "auto",
+        "max_tokens": 48,
+        "seed": 0,
+        "prefill_chunk_positions": 128,
+        "enable_thinking": false
+      },
+      "prepared_parts_recipe": "See input_preparation and the retained generator; exact expanded document identified by request_sha256."
+    }
+  ],
+  "reproduction": "See ../prepared-chat-validation.md and ../../validation/prepared_chat_tools.py."
+}

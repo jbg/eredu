@@ -171,7 +171,7 @@ pub fn prepare_input<T: Tensor>(
     let prepared = input.prepared();
     let admitted = input
         .admitted()
-        .legacy()
+        .ordinary()
         .expect("this family retains ordinary admission");
     if prepared.identity() != admitted.identity() || prepared.len() != admitted.parts().len() {
         return Err(Error::backend(
@@ -315,7 +315,7 @@ where
         match group {
             0 => input
                 .admitted()
-                .legacy()
+                .ordinary()
                 .expect("this family retains ordinary admission")
                 .parts()
                 .iter()
@@ -330,7 +330,7 @@ where
                 }),
             1 => input
                 .admitted()
-                .legacy()
+                .ordinary()
                 .expect("this family retains ordinary admission")
                 .parts()
                 .iter()
@@ -361,7 +361,7 @@ where
             };
             input
                 .admitted()
-                .legacy()
+                .ordinary()
                 .expect("this family retains ordinary admission")
                 .parts()
                 .iter()
@@ -378,7 +378,7 @@ where
         } else {
             input
                 .admitted()
-                .legacy()
+                .ordinary()
                 .expect("this family retains ordinary admission")
                 .decoder_positions()
         };
@@ -524,7 +524,7 @@ where
         crate::composite_execution::segmented_token_ingress_collectives_in(
             input
                 .admitted()
-                .legacy()
+                .ordinary()
                 .expect("this family retains ordinary admission")
                 .parts()
                 .iter()

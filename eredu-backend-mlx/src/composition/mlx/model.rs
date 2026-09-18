@@ -184,7 +184,7 @@ impl Executable {
             Some(enclosing) => nonstate.merge(enclosing)?,
             None => nonstate.mark_incomplete(),
         }
-        // Each retained module now supplies explicit numerical coverage,
+        // Each retained module supplies explicit numerical coverage,
         // including nonparameter helpers. Unknown leaves propagate through the
         // inventory; complete parameter topology alone never upgrades it.
         let decoder_state = self.erased().retained_decoder_state_storage()?;

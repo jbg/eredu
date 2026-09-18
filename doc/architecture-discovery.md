@@ -120,7 +120,7 @@ and media boundaries, without normalized routing events. Media projector points
 require media input during prefill and explicitly report decode as unsupported.
 Partitioned support requires both retained invocation placement and callable hooks;
 the logical graph remains independent of rank placement. All-dense V3 target
-execution verifies both for TP, PP and combined TP/PP. Target-only sparse V3 TP now emits the same internal hooks, including additive
+execution verifies both for TP, PP and combined TP/PP. Target-only sparse V3 TP emits the same internal hooks, including additive
 shared-write terms, and passes neutral TP/PP/residency conformance and native
 TP/PP/EP acceptance for F32 SafeTensors/GGUF and load-time affine 4-bit/group-32.
 Embedded prediction interiors remain unverified.
@@ -186,10 +186,10 @@ routed-unit values, require `PredictionExecution`. Selected target-only call pat
 report them unsupported even when their tensor collectors are available. A full
 declaration therefore does not advertise public speculative component support.
 The shared readout equation preserves existing primary JSON fields; Rust struct
-construction now places head fields in `ComponentReadoutEquation`.
+construction places head fields in `ComponentReadoutEquation`.
 
 
-Internal V3 speculative calls now carry explicit invocation phase, proposal depth
+Internal V3 speculative calls carry explicit invocation phase, proposal depth
 and physical sequence width through the shared architecture strategy. This does
 not change loaded capture support: a typed hook fact alone cannot supply public
 phase/frontier admission, cumulative collection or record delivery. The existing
@@ -224,10 +224,8 @@ parameter identities. Node ownership locates the transform in a target or
 prediction invocation. These records are equations, not extra additive residual
 contributions and not loaded-operation capabilities. For causal kernels, the last
 tap consumes the current input; earlier taps may consume retained state. The
-ordinary capture API admits only the requested current positions. Inkling's
-expanded transform declarations currently supplement its partial component graph;
-complete scalar groups, prediction scopes and native component support remain work
-in progress.
+ordinary capture API admits only the requested current positions. Transform declarations complement component groups; native queries, prediction
+scopes and scalar operations require their own selected support reports.
 
 Descriptor schema 11/component schema 10 describes gated-delta recurrence with
 separate projected key-head and recurrent value-head geometry, exact per-head or

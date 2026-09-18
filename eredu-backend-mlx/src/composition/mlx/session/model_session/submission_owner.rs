@@ -199,8 +199,8 @@ impl Drop for SubmissionResourcesOwner {
 }
 
 /// Original diagnostics only. Supported Rust1.98 RcInner is repr(C, align(2))
-/// with two Cell<usize> counters followed by T; official source is pinned in
-/// this change. Layout includes trailing padding; this is requested allocation
+/// with two Cell<usize> counters followed by T. The supported toolchain layout
+/// includes trailing padding; this is requested allocation
 /// storage, not allocator usable size/RSS. Reaudit on a toolchain layout change.
 /// No separately owned payload buffer or arbitrary alias population is added.
 pub(super) fn control_bytes() -> Option<u64> {

@@ -143,7 +143,7 @@ fn pooling_stream_geometry(
     tensors: &[StateTensorPolicy],
     error: &mut impl FnMut(fmt::Arguments<'_>) -> eredu_nn::Error,
 ) -> Result<(i32, bool), eredu_nn::Error> {
-    // BTreeMap::insert historically selected the last duplicate declaration.
+    // Duplicate declarations use BTreeMap::insert last-value precedence.
     let find = |component| {
         tensors
             .iter()

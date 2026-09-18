@@ -139,14 +139,14 @@ Malformed chunks and failed or repeated completion cannot become committed
 records. Ordinary all-rank receipt delivery still stages provisional records,
 and only the shared transaction's final commit publishes them.
 
-`RoutedUnitObserver::begin_invocation` and `finish_invocation` now bracket each
+`RoutedUnitObserver::begin_invocation` and `finish_invocation` bracket each
 actual local prepared provider, including idle EP owners. The runtime scope
 suppresses duplicate callbacks from nested bank adapters and always calls finish
 after a local error, before reverse exchange or a downstream tensor reduction.
 Begin borrows the original provider input, source origins and available unit map;
 an EP outer scope can precede the bank map, which remains present on each actual
 chunk. Native forwarding preserves these borrows and the original error source.
-The shared `PartitionCaptureObserver` now consumes these callbacks using
+The shared `PartitionCaptureObserver` consumes these callbacks using
 `PartitionCaptureLayout::routed_capture_placement`. Sparse placement identifies
 distinct producers and every source member, including idle owners and replicas.
 It reserves worst-case received input rows before source work, then checks actual
@@ -171,7 +171,7 @@ Disconnected groups still require coordinated relay support.
 The verified Ring configurations include TP2, EP2, TP2/EP2, TP2/PP2, host TP2 and
 disk PP2 for packed Qwen MoE. Full and strided captures, prefill, two cached decodes,
 snapshot replay, sibling isolation and skip-on-limit use the ordinary public
-capture contract. Sparse interventions now share this observer's admitted session
+capture contract. Sparse interventions share this observer's admitted session
 and commit protocol. Original captures precede all operations, effective captures
 follow them, and aborted forwards publish neither successful captures nor edits.
 See [interventions](interventions.md) for operation ordering and affected counts.
@@ -309,11 +309,11 @@ geometry, support and reconstruction conventions.
 Nemotron-H target partitions emit normalized inputs, dense/shared/routed ReLU² units,
 attention channels, readout values and complete Mamba/sparse contributions through
 these same contracts. Native SafeTensors/GGUF coverage spans TP/EP/PP and all three
-residencies; see [the Nemotron validation](component-validation.md#nemotron-h-partition-component-execution).
+residencies; see [the Nemotron validation](component-validation.md).
 Shared-expert scalar observations use `model.layers.N.shared.feed_forward.units`;
 their write is a constituent of the complete sparse write. Its declaration joins
 the actual up/down parameters and the enclosing normalization. See
-[the shared-expert extension](component-validation.md#shared-expert-scalar-extension)
+[the shared-expert extension](component-validation.md)
 for original/effective timing and reconstruction without counting the write twice.
 
 Shared routed Qwen and GPT-OSS decoders also expose their attention channels,
@@ -440,21 +440,21 @@ estimates. These records and transport credits do not authorize producer tensor
 work. The live session and observer integration described below grants that
 producer authority; loaded public composition is still required before support changes.
 
-Architecture composition can now obtain all component producers from the retained
+Architecture composition can obtain all component producers from the retained
 selection through `ComponentPartitionLayouts::capture_producers`. Its remote-rank projections reuse
 the same ownership rules as local admission. Identical invocation replicas select
 one capture producer; distinct empty-overlap shards retain their acknowledgments.
 The supplied maps still pass runtime receipt coverage checks and must be bound to
 the session's live ledger, run and forward before native work.
 
-The shared runtime now provides transactional observer callbacks for local
+The shared runtime provides transactional observer callbacks for local
 admission, coordinated preparation, delivery after exact completion, and final
 commit/discard notification. Local admission never submits a collective. Uniform
 participation is checked before coordinated callbacks, including on inactive
 pipeline ranks. A completed delivery is provisional until ordinary state commit
 succeeds; delivery rejection uses the same rollback checkpoint as model failure.
 These callbacks are the integration point for the bounded receipt mechanism.
-`PartitionCaptureObserver` now composes producer quotas and common identity into
+`PartitionCaptureObserver` composes producer quotas and common identity into
 these callbacks. Loaded public distributed generation binds this observer
 through shared preparation and intervention admission.
 
@@ -599,7 +599,7 @@ settle before common commit; rollback publishes no payload and restore refunds n
 work. Evidence identifies host assembly and term precision, without claiming a
 separate complete native tensor. Mixed V3 TP hooks pass neutral conformance and
 native F32 SafeTensors/GGUF and load-time affine 4-bit/group-32 acceptance;
-see [the component guide](component-validation.md#additive-tensor-parallel-write-mechanism).
+see [the component guide](component-validation.md).
 
 Mixed V3 independently cached expert variants also pass all 63 CPU Ring cases
 across F32 SafeTensors/GGUF and load-time affine 4-bit/group-32. The same capture
@@ -612,12 +612,12 @@ V3 prediction component scopes are separate from primary target components. Thei
 fusion and head projection-input captures describe actual multiplication inputs;
 all scope points require prediction execution. Ordinary loaded capture reports
 reject them without an explicitly instrumented prediction call path. Typed
-extension observers now provide the internal hook seam, but bounded public
+extension observers provide the internal hook seam, but bounded public
 speculative admission, phase geometry and record delivery remain integration work.
 Existing one-row speculative logits plans retain their existing meaning.
 
 
-A separate internal speculative observer seam now brackets real forward phases with
+A separate internal speculative observer seam brackets real forward phases with
 their physical sequence width. The runtime error bridge preserves the observer's
 generated-source reservation callback and original failure; it never invokes a
 skipped factory itself. Ending an invocation does not refund reservations or turn
@@ -713,7 +713,7 @@ records only through the ordinary completion/final-commit protocol. Completion
 failures preserve their original native source. Uncertain commit outcomes fence
 subsequent mutation and produce no successful capture publication. This lifecycle
 does not by itself supply partition producers or transport; distributed internal
-admission requires those selected resources; the loaded V3 path now binds and verifies
+admission requires those selected resources; the loaded V3 path binds and verifies
 them as described below.
 
 `PartitionCaptureBackendProvider` composes the ordinary speculative collector with
@@ -727,7 +727,7 @@ provider is reusable infrastructure; public partitioned internal activation
 admission requires selected prediction layouts and native factory binding. The loaded
 V3 path below supplies both.
 
-Prediction producer discovery now reads the layout retained by actual module
+Prediction producer discovery reads the layout retained by actual module
 materialization. It combines target placement with independent prediction scopes,
 including tensor-sharded components, resident routed units, replicated fusion
 values and separate prediction heads. The native execution context supplies the
@@ -810,7 +810,7 @@ Finite S includes each successful pin row's retained stamp Arc payload/counters 
 
 ### Original path seal for scheduled Sequence capture
 
-Scheduled ordinary capture now distinguishes a declaration-bound selection from
+Scheduled ordinary capture distinguishes a declaration-bound selection from
 an accepted physical capture contract. The cold text-control producer seals the
 actual immutable path identity together with original C, geometry and plan. The
 accepted owner can lend a reference-only view; the shared gateway authenticates
@@ -828,9 +828,9 @@ active-spend and outer/error-retirement prerequisites.
 
 ### Independently admitted compiled sources
 
-A loaded compiled decoder source can now retain its own original cold construction allowance while successive original R banks lease the same immutable program. Checked planning precedes every compiler reserve; partial failures retain their actual buffers and cause under that allowance. Idle source ownership permits ordinary host preparation while continuing to reduce available capacity. Exact domain/N/skip/mode checks precede the one-use atomic request claim, and bank attachment checks the accepted reservation's domain before consuming staging. Replays and foreign preflight failures add no source lease or error allocation.
+A loaded compiled decoder source can retain its own original cold construction allowance while successive original R banks lease the same immutable program. Checked planning precedes every compiler reserve; partial failures retain their actual buffers and cause under that allowance. Idle source ownership permits ordinary host preparation while continuing to reduce available capacity. Exact domain/N/skip/mode checks precede the one-use atomic request claim, and bank attachment checks the accepted reservation's domain before consuming staging. Replays and foreign preflight failures add no source lease or error allocation.
 
-The existing destination/kernel and original provider/cursor lifecycle are shared with the unique-source path. Freeze retires the decoder lease/destinations before returning the same token buffer; surviving loaded-source aliases and token-result aliases retain their distinct original tails. Source-only compilation does not retroactively fund HF, tokenizer snapshots, template/input graphs or caller containers. Shared stop sources, full facade payload ownership and public managed activation remain unfinished. Author validation is source replay/format only; central execution is recorded separately.
+The existing destination/kernel and original provider/cursor lifecycle are shared with the unique-source path. Freeze retires the decoder lease/destinations before returning the same token buffer; surviving loaded-source aliases and token-result aliases retain their distinct original tails. Source-only compilation does not retroactively fund HF, tokenizer snapshots, template/input graphs or caller containers. Shared stop sources and facade payloads retain their own admitted owners. Public managed activation uses the shared prepared-chat driver; its tested scope is described in [public conformance](prepared-chat-conformance.md).
 
 The loaded decoder source native regression covers two separately admitted requests continuing one cache across resident, host-layerwise and disk-streamed execution. It compares each request across those realizations and against HF text decoding, and checks retained positions 6 then 12. After the first request, reset rejects with `ReservedWorkActive` even after completion and preserves position 6. Reset requires its own original admitted memory path for replacement state and old/new overlap; this source-sharing integration does not supply that path.
 
@@ -850,7 +850,7 @@ This closes a host tensor allocation tail; it does not implement global Preview 
 
 ### Global Preview from independent captured-prefill windows
 
-The existing logical companion now also carries Preview. For original selected shape S and maximum M, it allocates only min(M, product(S)) output elements and maps physical selected prefixes into their global row-major destinations. Leading dimensions and global stride origins are preserved; physical records keep their own shape, values, outcome and attribution. No full prompt is concatenated for the host aggregate. The existing native worker may still process a whole selected physical rectangle, so the host prefix extent is not a native-workspace bound.
+The existing logical companion also carries Preview. For original selected shape S and maximum M, it allocates only min(M, product(S)) output elements and maps physical selected prefixes into their global row-major destinations. Leading dimensions and global stride origins are preserved; physical records keep their own shape, values, outcome and attribution. No full prompt is concatenated for the host aggregate. The existing native worker may still process a whole selected physical rectangle, so the host prefix extent is not a native-workspace bound.
 
 Controls, logical shape and numeric extent are charged before the first transform. Floating/Bool allocate immediately; Integer reserves exactly 8*N and creates one I64 or U64 buffer after the first actual source is validated, without another grant. Every required window is observed even for an empty or already-filled prefix. The complete companion's terminal Captured/Truncated wire growth is checked before infallible final publication. Failure or cancellation drops its provisional values without refunding successful physical work.
 
@@ -868,8 +868,8 @@ These are ordinary logical quotas and existing host/native lifetime owners. They
 
 The collector extension binds Summary/Histogram/Preview fragments to actual Unit3 source geometry and reserves their complete logical destination plus every canonical native physical allowance before the first transform. Terminal candidates reserve the real last-row operation once. Fixed shape descriptors avoid allocation during cold estimation; slice/index buffers and host results are constructed only after the existing ledger comparison. Required metadata fails closed, value Skip stays permanent for the logical selection, and consumed usage is not refunded.
 
-The final record uses the existing p0 transaction and cannot commit before the shared whole-prefill finalizer. Checked Summary/Histogram state and global Preview prefix algebra are reused from text/speculative capture; existing physical envelopes remain unchanged. Exact ordinary row/geometry/tensor-control sizes are accounted, while original managed media admission, CPU stable-sort original scratch and complete native allocator/scheduler/encoder/backing bounds remain unfinished. This increment makes no end-to-end public managed-admission claim.
+The final record uses the existing p0 transaction and cannot commit before the shared whole-prefill finalizer. Checked Summary/Histogram state and global Preview prefix algebra are reused from text/speculative capture; existing physical envelopes remain unchanged. Exact ordinary row/geometry/tensor-control sizes are accounted, while original managed media admission, CPU stable-sort original scratch and complete native allocator/scheduler/encoder/backing bounds remain unfinished. This fixture scope makes no end-to-end public managed-admission claim.
 
 ### Ordinary prepared-media final frame control
 
-The complete ordinary frame, including record metadata, diagnostic Strings, Histogram and Candidates buffers, now uses a preallocated SharedCapturedStep control under the actual HostPreparationAuthority. Its exact existing Arc/Box layout is a mandatory host metadata charge before records, including empty or skipped frames; Skip cannot bypass it and no drain-time refill exists. Shared tensor payloads keep their independent all-alias custody. This corrects earlier frame/session-lifetime wording: a raw CapturedStep alone retained no host owner. Logical transform allowances remain distinct from complete native bounds, and separately returned raw error ownership remains unfinished.
+The complete ordinary frame, including record metadata, diagnostic Strings, Histogram and Candidates buffers, uses a preallocated SharedCapturedStep control under the actual HostPreparationAuthority. Its exact existing Arc/Box layout is a mandatory host metadata charge before records, including empty or skipped frames; Skip cannot bypass it and no drain-time refill exists. Shared tensor payloads keep their independent all-alias custody. A raw CapturedStep alone carries no host owner. Logical transform allowances remain distinct from complete native bounds, and diagnostic wire errors do not recreate original funding authority.
